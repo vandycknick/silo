@@ -314,7 +314,7 @@ the selected backend's live capability vector for this host: `pause`,
 `capture`, `restore`, `fork` and `incremental`, each `supported` or
 `unsupported` with one reason from the closed set
 [ADR 0021](0021-live-snapshots-and-forks.md) defines (`backend-excluded`,
-`host-os-below-floor`, `lane-not-qualified`, `hypervisor-unavailable`,
+`host-os-below-floor`, `hypervisor-unavailable`,
 `build-excluded`, `not-delivered`), plus a diagnostic `native` field per
 operation reporting whether the embedded libkrun primitive exists on this
 lane. The backend argument follows the same selection the manager uses for a
@@ -343,9 +343,11 @@ protocol/observation error, never an implicit unsupported/default vector.
 
 Host and machine reports carry distinct mandatory scopes. A running report names
 the backend that actually constructed the run, regardless of the manager's
-current prospective backend override. Production qualification is compiled into
-the monitor and bound to its resolved libkrun revision and build profile; mutable
-home files, database rows and environment variables cannot grant support.
+current prospective backend override. Delivered live operations are supported
+when the backend supplies the native primitive and host and machine checks pass.
+Checkpoints record `liveStateSchema` and guest `architecture`; restore refuses
+those format/architecture mismatches, not different native or monitor builds.
+Each component checks its own state magic and schema when decoding.
 
 **Live commands** are additions to `VmMonitorService` on `--socket`, for the
 current run only: `Pause`, `Resume`, `Capture`, `GetOperation`,

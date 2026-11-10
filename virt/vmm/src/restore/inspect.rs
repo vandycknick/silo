@@ -114,15 +114,12 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
         "restore requires the krun backend"
     );
     let host = selection.host_report()?;
-    let native_producer = libkrun::capabilities::compiled_live_build()
-        .execution_producer()
-        .map_err(|error| eyre::eyre!("native producer unavailable: {error}"))?;
     let report = RestoreInspectionReport {
         version: RESTORE_INSPECTION_VERSION,
         request: Sha256Digest::of_bytes(record),
         checkpoint: restore.checkpoint,
-        native_producer,
-        silo_producer: Sha256Digest::from_bytes(crate::capabilities::capture_producer()?),
+        live_state_schema: libkrun::capabilities::LIVE_STATE_SCHEMA.to_string(),
+        architecture: std::env::consts::ARCH.to_string(),
         lane: host.lane,
         cpu_count: u32::try_from(shape.cpu_count())?,
         ram_bytes: restore.configuration.ram_bytes(),

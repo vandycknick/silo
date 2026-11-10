@@ -73,7 +73,6 @@ fn reason_to_wire(v: &LiveUnsupportedReason) -> w::LiveUnsupportedReason {
         code: Some(match v.code {
             LiveReasonCode::BackendExcluded => 1,
             LiveReasonCode::HostOsBelowFloor => 2,
-            LiveReasonCode::LaneNotQualified => 3,
             LiveReasonCode::HypervisorUnavailable => 4,
             LiveReasonCode::BuildExcluded => 5,
             LiveReasonCode::NotDelivered => 6,
@@ -100,7 +99,6 @@ fn reason_from_wire(v: w::LiveUnsupportedReason) -> Result<LiveUnsupportedReason
         code: match required(v.code, "live.reason.code")? {
             1 => LiveReasonCode::BackendExcluded,
             2 => LiveReasonCode::HostOsBelowFloor,
-            3 => LiveReasonCode::LaneNotQualified,
             4 => LiveReasonCode::HypervisorUnavailable,
             5 => LiveReasonCode::BuildExcluded,
             6 => LiveReasonCode::NotDelivered,
@@ -183,7 +181,6 @@ pub fn host_to_wire(v: &LiveHostReport) -> Result<w::LiveHostReport, ConversionE
         lane: Some(lane_to_wire(v.lane)),
         live: Some(vector_to_wire(&v.live)),
         build_identity: Some(v.build_identity.clone()),
-        qualification_identity: Some(v.qualification_identity.clone()),
         scenario_digest: v.scenario_digest.clone(),
     })
 }
@@ -195,7 +192,6 @@ pub fn host_from_wire(v: w::LiveHostReport) -> Result<LiveHostReport, Conversion
         lane: lane_from_wire(required(v.lane, "live.lane")?)?,
         live: vector_from_wire(required(v.live, "live.vector")?)?,
         build_identity: required(v.build_identity, "live.build_identity")?,
-        qualification_identity: required(v.qualification_identity, "live.qualification_identity")?,
         scenario_digest: v.scenario_digest,
     };
     value
@@ -325,7 +321,6 @@ mod tests {
             lane: LiveLane::NotApplicable,
             live: LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded),
             build_identity: "test-build".into(),
-            qualification_identity: "test-unqualified".into(),
             scenario_digest: None,
         }
     }
@@ -352,6 +347,14 @@ mod tests {
         let mut wire = valid;
         wire.scope = Some(2);
         assert!(host_from_wire(wire).is_err());
+    }
+    #[test]
+    fn reserved_reason_number_is_rejected() {
+        assert!(crate::live::reason_from_wire(w::LiveUnsupportedReason {
+            code: Some(3),
+            subject: None,
+        })
+        .is_err());
     }
     #[test]
     fn typed_device_subject_is_required_and_bounded() {

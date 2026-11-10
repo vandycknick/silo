@@ -6,18 +6,12 @@
 #![allow(dead_code)]
 #[path = "guest_lifecycle_controller/attach/mod.rs"]
 mod attach;
-#[cfg(test)]
-#[path = "../build_inputs.rs"]
-mod build_inputs;
 #[path = "../src/capabilities.rs"]
 mod capabilities;
 #[path = "../src/clock_sync.rs"]
 mod clock_sync;
 #[path = "../src/context.rs"]
 mod context;
-#[cfg(test)]
-#[path = "../dependency_source.rs"]
-mod dependency_source;
 #[path = "../src/durable_file.rs"]
 mod durable_file;
 #[path = "../src/exec_log.rs"]

@@ -61,8 +61,9 @@ pub const STREAM_CHUNK_BYTES: u64 = 8 << 20;
 pub const MAX_STREAM_BYTES: u64 = 4 << 40;
 /// Bound for libvm's opaque read-only input identities.
 pub const MAX_INPUT_IDENTITY_BYTES: usize = 256;
-/// Native execution ABI's maximum producer binding, including build inputs.
-pub const MAX_NATIVE_PRODUCER_BYTES: usize = 64 * 1024;
+/// Public native binding string bounds.
+pub const MAX_LIVE_STATE_SCHEMA_BYTES: usize = 256;
+pub const MAX_ARCHITECTURE_BYTES: usize = 32;
 
 const MIB: u64 = 1 << 20;
 
@@ -898,8 +899,8 @@ impl CapturePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaptureStateBinding {
-    pub native_producer: String,
-    pub silo_producer: Sha256Digest,
+    pub live_state_schema: String,
+    pub architecture: String,
     pub profile: Sha256Digest,
     pub topology: Sha256Digest,
     pub ram_layout: Sha256Digest,
@@ -978,11 +979,13 @@ impl CaptureMemoryEvidence {
                 .packed_length
                 .is_multiple_of(u64::from(self.page_granule))
             || u64::from(self.regions) > self.packed_length / u64::from(self.page_granule)
-            || self.binding.native_producer.is_empty()
-            || self.binding.native_producer.contains('\0')
-            || self.binding.native_producer.len() > MAX_NATIVE_PRODUCER_BYTES
+            || self.binding.live_state_schema.is_empty()
+            || self.binding.live_state_schema.contains('\0')
+            || self.binding.live_state_schema.len() > MAX_LIVE_STATE_SCHEMA_BYTES
+            || self.binding.architecture.is_empty()
+            || self.binding.architecture.contains('\0')
+            || self.binding.architecture.len() > MAX_ARCHITECTURE_BYTES
             || [
-                self.binding.silo_producer,
                 self.binding.profile,
                 self.binding.topology,
                 self.binding.ram_layout,
@@ -1252,8 +1255,8 @@ impl CaptureEvidence {
                     || memory.binding.pause_generation != token.generation
                     || memory.binding.capture != self.capture_id
                     || memory.binding.source_run != self.run_id
-                    || memory.binding.native_producer.is_empty()
-                    || memory.binding.native_producer.len() > MAX_NATIVE_PRODUCER_BYTES
+                    || memory.binding.live_state_schema.is_empty()
+                    || memory.binding.live_state_schema.len() > MAX_LIVE_STATE_SCHEMA_BYTES
                 {
                     return Err(invalid("capture binding does not match its cut"));
                 }
@@ -1775,8 +1778,8 @@ mod tests {
                     .unwrap()
                     .id(),
                 binding: CaptureStateBinding {
-                    native_producer: "libkrun".into(),
-                    silo_producer: digest,
+                    live_state_schema: "silo.live-state/1".into(),
+                    architecture: "x86_64".into(),
                     profile: digest,
                     topology: digest,
                     ram_layout: digest,
@@ -1995,19 +1998,43 @@ mod tests {
     }
 
     #[test]
-    fn evidence_preserves_native_producer_through_its_abi_bound() {
+    fn evidence_preserves_state_schema_through_its_format_bound() {
         let mut record = evidence(&plan());
         for length in [
-            8239,
-            MAX_NATIVE_PRODUCER_BYTES,
-            MAX_NATIVE_PRODUCER_BYTES + 1,
+            1,
+            MAX_LIVE_STATE_SCHEMA_BYTES,
+            MAX_LIVE_STATE_SCHEMA_BYTES + 1,
         ] {
-            record.memory.as_mut().unwrap().binding.native_producer = "p".repeat(length);
+            record.memory.as_mut().unwrap().binding.live_state_schema = "p".repeat(length);
             assert_eq!(
                 record.validate().is_ok(),
-                length <= MAX_NATIVE_PRODUCER_BYTES
+                length <= MAX_LIVE_STATE_SCHEMA_BYTES
             );
         }
+    }
+
+    #[test]
+    fn evidence_requires_bounded_nonempty_schema_and_architecture() {
+        for (schema, architecture) in [
+            ("".to_string(), "x86_64".to_string()),
+            ("silo.live-state/1\0".to_string(), "x86_64".to_string()),
+            ("silo.live-state/1".to_string(), "".to_string()),
+            ("silo.live-state/1".to_string(), "x86_64\0".to_string()),
+            (
+                "silo.live-state/1".to_string(),
+                "a".repeat(MAX_ARCHITECTURE_BYTES + 1),
+            ),
+        ] {
+            let mut record = evidence(&plan());
+            let binding = &mut record.memory.as_mut().unwrap().binding;
+            binding.live_state_schema = schema;
+            binding.architecture = architecture;
+            assert!(record.validate().is_err());
+        }
+        let record = evidence(&plan());
+        let json = serde_json::to_value(record.memory.unwrap().binding).unwrap();
+        assert_eq!(json["liveStateSchema"], "silo.live-state/1");
+        assert_eq!(json["architecture"], "x86_64");
     }
 
     #[test]
@@ -2290,19 +2317,27 @@ mod tests {
             RestoreAdmittedDevice, RestoreDeviceKind as Kind, RestoreInspectionReport,
             RestoreInspectionRequest,
         };
-        let request = RestoreInspectionRequest {
+        let mut request = RestoreInspectionRequest {
             version: 1,
             restore: restore_request(),
             network: false,
         };
+        request
+            .restore
+            .evidence
+            .memory
+            .as_mut()
+            .unwrap()
+            .binding
+            .live_state_schema = "silo.live-state/1".into();
         let bytes = serde_json::to_vec(&request).unwrap();
         let binding = &request.restore.evidence.memory.as_ref().unwrap().binding;
         let report = RestoreInspectionReport {
             version: 1,
             request: Sha256Digest::of_bytes(&bytes),
             checkpoint: request.restore.checkpoint,
-            native_producer: binding.native_producer.clone(),
-            silo_producer: binding.silo_producer,
+            live_state_schema: binding.live_state_schema.clone(),
+            architecture: binding.architecture.clone(),
             lane: crate::live::LiveLane::KvmX86_64,
             cpu_count: u32::from(request.restore.configuration.cpus),
             ram_bytes: request.restore.configuration.ram_bytes(),
@@ -2330,6 +2365,20 @@ mod tests {
         let mut reordered = report.clone();
         reordered.devices.reverse();
         reordered.validate_against(&bytes, &request).unwrap();
+        let mut wrong = report.clone();
+        wrong.live_state_schema = "silo.live-state/2".into();
+        assert!(wrong.validate_against(&bytes, &request).is_err());
+        let refusal = wrong.portability_refusal(&request).unwrap();
+        assert_eq!(refusal.pin, "live-state-schema");
+        assert_eq!(refusal.expected, "silo.live-state/2");
+        assert_eq!(refusal.actual, "silo.live-state/1");
+        let mut wrong = report.clone();
+        wrong.architecture = "aarch64".into();
+        assert!(wrong.validate_against(&bytes, &request).is_err());
+        let refusal = wrong.portability_refusal(&request).unwrap();
+        assert_eq!(refusal.pin, "architecture");
+        assert_eq!(refusal.expected, "aarch64");
+        assert_eq!(refusal.actual, "x86_64");
         let mut wrong = report.clone();
         wrong.devices.pop();
         assert!(wrong.validate_against(&bytes, &request).is_err());

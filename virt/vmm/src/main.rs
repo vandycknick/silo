@@ -4,15 +4,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-#[cfg(test)]
-#[path = "../build_inputs.rs"]
-mod build_inputs;
 mod capabilities;
 mod clock_sync;
 mod context;
-#[cfg(test)]
-#[path = "../dependency_source.rs"]
-mod dependency_source;
 mod durable_file;
 mod exec_log;
 mod execution;

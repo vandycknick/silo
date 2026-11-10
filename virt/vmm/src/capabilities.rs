@@ -16,8 +16,7 @@ use vm_spec::live::{
 };
 
 pub(crate) const MAX_SCENARIO_BYTES: usize = 1024 * 1024;
-/// Implemented end to end in this build. Delivery alone never supports an
-/// operation: the lane still needs its qualification grant.
+/// Implemented end to end in this build.
 const DELIVERED: &[LiveOperation] = &[
     LiveOperation::Pause,
     LiveOperation::Capture,
@@ -197,9 +196,7 @@ impl ResolvedSelection {
     }
 
     pub(crate) fn host_report(&self) -> eyre::Result<LiveHostReport> {
-        let build = compiled_build();
-        let qualification_identity = build.qualification_identity()?;
-        let qualification_ready = build.qualification_ready();
+        let build_identity = build_identity();
         // Only the selected native backend may touch its machine-less host API.
         let native_report = (self.backend == LiveBackend::Krun).then(native::query_live_host);
         let lane = native_report
@@ -216,13 +213,6 @@ impl ResolvedSelection {
             backend_allowed: self.backend == LiveBackend::Krun,
             native: operations.is_some_and(|operations| native_primitive(operation, operations)),
             delivered: DELIVERED.contains(&operation),
-            qualified: qualification_matches(
-                &qualification_identity,
-                qualification_ready,
-                lane,
-                operation,
-                QUALIFICATIONS,
-            ),
             host,
         })?;
         #[cfg(feature = "mock-backend")]
@@ -240,8 +230,7 @@ impl ResolvedSelection {
             backend: self.backend,
             lane,
             live,
-            build_identity: build.public_identity(),
-            qualification_identity,
+            build_identity,
             scenario_digest: self.scenario_digest.clone(),
         };
         report.validate().map_err(eyre::Report::msg)?;
@@ -292,174 +281,13 @@ fn vector(mut capability: impl FnMut(LiveOperation) -> LiveCapability) -> LiveCa
     }
 }
 
-/// Parent observations and linked dependency-local facts remain separate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BuildIdentity<'a> {
-    revision: &'a str,
-    target: &'a str,
-    profile: &'a str,
-    declared_features: &'a str,
-    source_kind: &'a str,
-    source_root: &'a str,
-    source_state: &'a str,
-    source_content: &'a str,
-    native_build: Option<&'a native::NativeBuildFacts>,
-}
-
-impl BuildIdentity<'_> {
-    fn qualification_ready(&self) -> bool {
-        let Some(build) = self.native_build else {
-            return false;
-        };
-        build.binding_complete()
-            && build.control_abi.is_some()
-            && self.source_content.len() == 64
-            && self
-                .source_content
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            && match self.source_kind {
-                "path" => self.source_state == "clean" && !self.source_root.is_empty(),
-                "git" => self.source_state == "revision-bound",
-                _ => false,
-            }
-            && build.packages.iter().all(|package| {
-                package.target == Some(self.target)
-                    && package.source.clean_revision() == Some(self.revision)
-                    && (self.source_kind != "path" || package.source.root == Some(self.source_root))
-            })
-    }
-
-    fn public_identity(&self) -> String {
-        format!(
-            "v2:{}:{}:{}:content={}:inputs={}",
-            self.source_kind, self.source_state, self.revision, self.source_content, self.profile
-        )
-    }
-
-    fn qualification_identity(&self) -> eyre::Result<String> {
-        use std::fmt::Write as _;
-        let native = native_build_digest(self.native_build)?;
-        let mut hash = Sha256::new();
-        hash.update(b"silo-qualification-binding-v2\0");
-        for field in [
-            self.revision,
-            self.target,
-            self.profile,
-            self.declared_features,
-            self.source_kind,
-            self.source_root,
-            self.source_state,
-            self.source_content,
-            &native,
-        ] {
-            hash.update((field.len() as u64).to_be_bytes());
-            hash.update(field.as_bytes());
-        }
-        let mut binding = String::with_capacity(64);
-        for byte in hash.finalize() {
-            write!(binding, "{byte:02x}")?;
-        }
-        Ok(format!(
-            "v2:native={native}:binding={binding}:eligible={}",
-            self.qualification_ready()
-        ))
-    }
-}
-
-/// Stream native canonical observations directly into the digest, including
-/// unknown fields. The public schema stays bounded and never loses partial facts.
-fn native_build_digest(build: Option<&native::NativeBuildFacts>) -> eyre::Result<String> {
-    use std::fmt::Write as _;
-    struct HashWriter(Sha256);
-    impl std::fmt::Write for HashWriter {
-        fn write_str(&mut self, value: &str) -> std::fmt::Result {
-            self.0.update(value.as_bytes());
-            Ok(())
-        }
-    }
-    let Some(build) = build else {
-        return Ok("unobserved".into());
-    };
-    let mut output = HashWriter(Sha256::new());
-    write!(
-        output,
-        "silo-native-build-v1;query={};control={:?};backend={:?};arch={:?};",
-        build.query_abi, build.control_abi, build.backend, build.architecture
-    )?;
-    for package in build.packages {
-        package.write_canonical(&mut output)?;
-    }
-    let mut digest = String::with_capacity(64);
-    for byte in output.0.finalize() {
-        write!(digest, "{byte:02x}")?;
-    }
-    Ok(digest)
-}
-
-fn compiled_build() -> BuildIdentity<'static> {
-    BuildIdentity {
-        revision: env!("SILO_LIBKRUN_REVISION"),
-        target: env!("SILO_BUILD_TARGET"),
-        profile: env!("SILO_BUILD_INPUT_FINGERPRINT"),
-        declared_features: env!("SILO_DECLARED_FEATURES_FINGERPRINT"),
-        source_kind: env!("SILO_LIBKRUN_SOURCE_KIND"),
-        source_root: env!("SILO_LIBKRUN_SOURCE_ROOT"),
-        source_state: env!("SILO_LIBKRUN_SOURCE_STATE"),
-        source_content: env!("SILO_LIBKRUN_SOURCE_CONTENT"),
-        native_build: Some(native::compiled_live_build()),
-    }
-}
-
-/// The Silo producer bound into every captured execution state: this
-/// compiled monitor's qualification identity (libkrun revision, build
-/// inputs, native build facts), so restore admits only the exact producer.
-pub(crate) fn capture_producer() -> eyre::Result<[u8; 32]> {
-    let identity = compiled_build().qualification_identity()?;
-    let mut hash = Sha256::new();
-    hash.update(b"silo-capture-producer-v1\0");
-    hash.update((identity.len() as u64).to_be_bytes());
-    hash.update(identity.as_bytes());
-    Ok(hash.finalize().into())
-}
-
-struct Qualification<'a> {
-    binding: &'a str,
-    lane: LiveLane,
-    operations: &'a [LiveOperation],
-    evidence: &'a str,
-}
-
-// Phase 24 exact-build functional, budget and host-workspace evidence.
-const QUALIFICATIONS: &[Qualification<'static>] = &[Qualification {
-    binding: "v2:native=659b7f3e192ede9ced9c8c77e9ac173fc34a7de9ebc9b2b458fc6c56ff24b986:binding=1abf26fa6638c4f0c81f40ee2f192b79c40d789fa1f5088b4e388740b3a1586d:eligible=true",
-    lane: LiveLane::KvmX86_64,
-    operations: &[
-        LiveOperation::Pause,
-        LiveOperation::Capture,
-        LiveOperation::Restore,
-        LiveOperation::Fork,
-        LiveOperation::Incremental,
-    ],
-    evidence: "phase-24/wrapup-live-suites-3.log (isolated candidate of this build: restore, fork, incremental, capture, capture lifecycle, stopped, restore lifecycle, pause, handoff, artifact live, native live API); phase-24/batch4d-{btrfs,ext4} (capture, fork4, incremental budgets); phase-24/batch4c-{btrfs,ext4} (restore, boot budgets; same restore monitor except parallel seal); phase-24/batch4d-host-workspace-nextest.log",
-}];
-
-fn qualification_matches(
-    binding: &str,
-    eligible: bool,
-    lane: LiveLane,
-    operation: LiveOperation,
-    records: &[Qualification<'_>],
-) -> bool {
-    if records.is_empty() || !eligible {
-        return false;
-    }
-    records.iter().any(|record| {
-        record.binding == binding
-            && record.lane == lane
-            && record.operations.contains(&operation)
-            && !record.evidence.is_empty()
-    })
+/// Informational monitor identity, not a state-format compatibility gate.
+fn build_identity() -> String {
+    format!(
+        "v1:silo:{}:{}",
+        env!("SILO_BUILD_TARGET"),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn native_primitive(operation: LiveOperation, operations: &native::NativeLiveOperations) -> bool {
@@ -552,13 +380,12 @@ impl HostAdmission {
     }
 }
 
-/// Four independent product facts. Unknown host admission never becomes support.
+/// Independent product facts. Unknown host admission never becomes support.
 #[derive(Clone, Copy)]
 struct EvaluationFacts {
     backend_allowed: bool,
     native: bool,
     delivered: bool,
-    qualified: bool,
     host: HostAdmission,
 }
 
@@ -595,8 +422,8 @@ fn evaluate(facts: EvaluationFacts) -> Result<LiveCapability, EvaluationIncomple
         Some(LiveReasonCode::HypervisorUnavailable)
     } else if matches!(facts.host.lane, HostCheck::NotEvaluated) {
         return Err(EvaluationIncomplete);
-    } else if matches!(facts.host.lane, HostCheck::Failed) || !facts.qualified {
-        Some(LiveReasonCode::LaneNotQualified)
+    } else if matches!(facts.host.lane, HostCheck::Failed) {
+        Some(LiveReasonCode::HypervisorUnavailable)
     } else {
         None
     };
@@ -694,23 +521,6 @@ fn narrow(live: LiveCapabilityVector, subject: Option<LiveDeviceSubject>) -> Liv
 mod tests {
     use crate::capabilities::*;
 
-    fn qualification_matches(
-        build: &BuildIdentity<'_>,
-        lane: LiveLane,
-        operation: LiveOperation,
-        records: &[Qualification<'_>],
-    ) -> bool {
-        crate::capabilities::qualification_matches(
-            &build
-                .qualification_identity()
-                .expect("canonical build binding"),
-            build.qualification_ready(),
-            lane,
-            operation,
-            records,
-        )
-    }
-
     fn admitted() -> HostAdmission {
         HostAdmission {
             os_floor: HostCheck::Passed,
@@ -720,14 +530,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_four_facts_are_independent() {
-        for bits in 0..16 {
+    fn capabilities_native_delivery_and_host_admission_are_independent() {
+        for bits in 0..8 {
             let capability = evaluate(EvaluationFacts {
                 backend_allowed: true,
                 native: bits & 1 != 0,
                 delivered: bits & 2 != 0,
-                qualified: bits & 4 != 0,
-                host: if bits & 8 != 0 {
+                host: if bits & 4 != 0 {
                     admitted()
                 } else {
                     HostAdmission {
@@ -740,7 +549,7 @@ mod tests {
             assert_eq!(capability.native, bits & 1 != 0);
             assert_eq!(
                 capability.availability == LiveAvailability::Supported,
-                bits == 15
+                bits == 7
             );
         }
     }
@@ -751,7 +560,6 @@ mod tests {
             backend_allowed: true,
             native: true,
             delivered: true,
-            qualified: true,
             host: admitted(),
         };
         let cases = [
@@ -803,20 +611,13 @@ mod tests {
             ),
             (
                 EvaluationFacts {
-                    qualified: false,
-                    ..base
-                },
-                LiveReasonCode::LaneNotQualified,
-            ),
-            (
-                EvaluationFacts {
                     host: HostAdmission {
                         lane: HostCheck::Failed,
                         ..admitted()
                     },
                     ..base
                 },
-                LiveReasonCode::LaneNotQualified,
+                LiveReasonCode::HypervisorUnavailable,
             ),
         ];
         for (facts, code) in cases {
@@ -846,222 +647,8 @@ mod tests {
         );
     }
 
-    const fn known_native_build() -> native::NativeBuildFacts {
-        const SETTINGS: &[(&str, Option<&str>)] = &[
-            ("TARGET", Some("target")),
-            ("HOST", Some("host")),
-            ("OPT_LEVEL", Some("2")),
-            ("DEBUG", Some("false")),
-            ("PROFILE", Some("release")),
-            ("CARGO_CFG_TARGET_ARCH", Some("x86_64")),
-            ("CARGO_CFG_TARGET_OS", Some("linux")),
-            ("CARGO_CFG_TARGET_ENDIAN", Some("little")),
-            ("CARGO_CFG_TARGET_POINTER_WIDTH", Some("64")),
-            ("CARGO_CFG_TARGET_ENV", Some("gnu")),
-            ("CARGO_CFG_TARGET_FEATURE", Some("")),
-            ("CARGO_ENCODED_RUSTFLAGS", Some("")),
-        ];
-        const BASE: native::PackageBuildFacts = native::PackageBuildFacts {
-            name: "libkrun",
-            version: "1",
-            target: Some("target"),
-            features: Some(&[]),
-            settings: SETTINGS,
-            settings_observed: true,
-            rustc_version: Some("rustc"),
-            source: native::SourceProvenance {
-                root: Some("/native"),
-                revision: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                worktree: native::WorktreeState::Clean,
-            },
-        };
-        const PACKAGES: &[native::PackageBuildFacts] = &[
-            BASE,
-            native::PackageBuildFacts {
-                name: "krun-arch",
-                ..BASE
-            },
-            native::PackageBuildFacts {
-                name: "krun-arch-gen",
-                ..BASE
-            },
-            native::PackageBuildFacts {
-                name: "krun-devices",
-                ..BASE
-            },
-            native::PackageBuildFacts {
-                name: "krun-kernel",
-                ..BASE
-            },
-            native::PackageBuildFacts {
-                name: "krun-polly",
-                ..BASE
-            },
-            native::PackageBuildFacts {
-                name: "krun-utils",
-                ..BASE
-            },
-            native::PackageBuildFacts {
-                name: "krun-smbios",
-                ..BASE
-            },
-            native::PackageBuildFacts {
-                name: "krun-cpuid",
-                ..BASE
-            },
-        ];
-        native::NativeBuildFacts {
-            query_abi: native::LIVE_QUERY_ABI,
-            control_abi: Some(1),
-            backend: native::NativeBackend::Kvm,
-            architecture: native::NativeArchitecture::X86_64,
-            packages: PACKAGES,
-        }
-    }
-
-    fn known_build(native: &native::NativeBuildFacts) -> BuildIdentity<'_> {
-        BuildIdentity {
-            revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            target: "target",
-            profile: "parent-inputs",
-            declared_features: "declared-inputs",
-            source_kind: "path",
-            source_root: "/native",
-            source_state: "clean",
-            source_content: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            native_build: Some(native),
-        }
-    }
-
     #[test]
-    fn capabilities_qualification_matches_every_build_input() {
-        let native = known_native_build();
-        let build = known_build(&native);
-        let records = [Qualification {
-            binding: &build
-                .qualification_identity()
-                .expect("canonical build binding"),
-            lane: LiveLane::KvmX86_64,
-            operations: &[LiveOperation::Pause],
-            evidence: "unit-evidence",
-        }];
-        assert!(qualification_matches(
-            &build,
-            LiveLane::KvmX86_64,
-            LiveOperation::Pause,
-            &records
-        ));
-        for changed in [
-            BuildIdentity {
-                revision: "other",
-                ..build
-            },
-            BuildIdentity {
-                target: "other",
-                ..build
-            },
-            BuildIdentity {
-                profile: "other",
-                ..build
-            },
-            BuildIdentity {
-                declared_features: "other",
-                ..build
-            },
-            BuildIdentity {
-                source_content: "other",
-                ..build
-            },
-            BuildIdentity {
-                source_root: "/other",
-                ..build
-            },
-            BuildIdentity {
-                source_state: "dirty",
-                ..build
-            },
-            BuildIdentity {
-                source_state: "unknown",
-                ..build
-            },
-            BuildIdentity {
-                source_kind: "unknown",
-                ..build
-            },
-            BuildIdentity {
-                native_build: None,
-                ..build
-            },
-        ] {
-            assert!(!qualification_matches(
-                &changed,
-                LiveLane::KvmX86_64,
-                LiveOperation::Pause,
-                &records
-            ));
-        }
-        assert!(!qualification_matches(
-            &build,
-            LiveLane::HvfArm64,
-            LiveOperation::Pause,
-            &records
-        ));
-        assert!(!qualification_matches(
-            &build,
-            LiveLane::KvmX86_64,
-            LiveOperation::Capture,
-            &records
-        ));
-        let no_evidence = [Qualification {
-            binding: &build
-                .qualification_identity()
-                .expect("canonical build binding"),
-            lane: LiveLane::KvmX86_64,
-            operations: &[LiveOperation::Pause],
-            evidence: "",
-        }];
-        assert!(!qualification_matches(
-            &build,
-            LiveLane::KvmX86_64,
-            LiveOperation::Pause,
-            &no_evidence
-        ));
-        let git = BuildIdentity {
-            source_kind: "git",
-            source_root: "",
-            source_state: "revision-bound",
-            ..build
-        };
-        assert!(git.qualification_ready());
-    }
-
-    const fn partial_packages(case: usize) -> [native::PackageBuildFacts; 9] {
-        let baseline = known_native_build();
-        let mut packages = [baseline.packages[0]; 9];
-        let mut index = 0;
-        while index < packages.len() {
-            packages[index] = baseline.packages[index];
-            index += 1;
-        }
-        match case {
-            0 => packages[0].features = None,
-            1 => packages[0].settings = &[],
-            2 => packages[0].settings_observed = false,
-            3 => packages[0].source.worktree = native::WorktreeState::Dirty,
-            4 => packages[0].source.worktree = native::WorktreeState::Unknown,
-            5 => packages[0].source.revision = None,
-            6 => packages[0].features = Some(&["CARGO_FEATURE_BLK"]),
-            8 => packages[2].features = Some(&["CARGO_FEATURE_TEE"]),
-            9 => packages[2].features = Some(&["CARGO_FEATURE_AMD_SEV"]),
-            10 => packages[2].features = Some(&["CARGO_FEATURE_TDX"]),
-            11 => packages[2].features = Some(&["CARGO_FEATURE_AWS_NITRO"]),
-            _ => packages[0].rustc_version = Some("another-rustc"),
-        }
-        packages
-    }
-
-    #[test]
-    fn capabilities_authoritative_native_lane_preserves_exclusions_and_unknown_inventory() {
+    fn capabilities_native_lanes_and_monitor_identity_are_not_source_bound() {
         for (native, public) in [
             (native::NativeLane::KvmX86_64, LiveLane::KvmX86_64),
             (native::NativeLane::KvmArm64GicV3, LiveLane::KvmArm64GicV3),
@@ -1069,209 +656,19 @@ mod tests {
         ] {
             assert_eq!(native_lane(native), Ok(public));
         }
-        const EXCLUDED: &[&[native::PackageBuildFacts]] = &[
-            &partial_packages(8),
-            &partial_packages(9),
-            &partial_packages(10),
-            &partial_packages(11),
-            &partial_packages(0),
-            &[],
-        ];
-        for packages in EXCLUDED {
-            let build = native::NativeBuildFacts {
-                packages,
-                ..known_native_build()
-            };
-            assert_eq!(build.backend, native::NativeBackend::Kvm);
-            assert_eq!(build.architecture, native::NativeArchitecture::X86_64);
-            let lane = native::NativeLane::from_build(&build);
-            assert_eq!(lane, native::NativeLane::Unsupported);
-            assert_eq!(native_lane(lane), Err(UnsupportedNativeLane));
-        }
-    }
-
-    #[test]
-    fn capabilities_partial_native_facts_never_qualify_even_matching_records() {
-        const PARTIAL: &[[native::PackageBuildFacts; 9]] = &[
-            partial_packages(0),
-            partial_packages(1),
-            partial_packages(2),
-            partial_packages(3),
-            partial_packages(4),
-            partial_packages(5),
-        ];
-        let baseline = known_native_build();
-        let variants = [
-            native::NativeBuildFacts {
-                query_abi: 0,
-                ..known_native_build()
-            },
-            native::NativeBuildFacts {
-                control_abi: None,
-                ..known_native_build()
-            },
-        ];
-        for native in
-            variants
-                .into_iter()
-                .chain(PARTIAL.iter().map(|packages| native::NativeBuildFacts {
-                    packages,
-                    ..known_native_build()
-                }))
-        {
-            let build = known_build(&native);
-            let records = [Qualification {
-                binding: &build
-                    .qualification_identity()
-                    .expect("canonical build binding"),
-                lane: LiveLane::KvmX86_64,
-                operations: &LiveOperation::ALL,
-                evidence: "cannot-override-partial-facts",
-            }];
-            assert!(!build.qualification_ready());
-            assert!(!qualification_matches(
-                &build,
-                LiveLane::KvmX86_64,
-                LiveOperation::Pause,
-                &records
-            ));
-            assert_ne!(
-                native_build_digest(Some(&native)).expect("canonical partial facts"),
-                native_build_digest(Some(&baseline)).expect("canonical complete facts")
-            );
-        }
-    }
-
-    #[test]
-    fn capabilities_binding_digest_changes_with_native_facts_and_path_content() {
-        const ALTERNATE: &[[native::PackageBuildFacts; 9]] =
-            &[partial_packages(6), partial_packages(7)];
-        let native = known_native_build();
-        let baseline = known_build(&native);
-        let identity = baseline
-            .qualification_identity()
-            .expect("baseline identity");
-        let records = [Qualification {
-            binding: &identity,
-            lane: LiveLane::KvmX86_64,
-            operations: &LiveOperation::ALL,
-            evidence: "unit-evidence",
-        }];
-        for packages in ALTERNATE {
-            let changed = native::NativeBuildFacts {
-                packages,
-                ..known_native_build()
-            };
-            let build = known_build(&changed);
-            assert!(build.qualification_ready());
-            assert_ne!(
-                build
-                    .qualification_identity()
-                    .expect("changed native binding"),
-                identity
-            );
-            assert!(!qualification_matches(
-                &build,
-                LiveLane::KvmX86_64,
-                LiveOperation::Pause,
-                &records
-            ));
-        }
-        for changed in [
-            BuildIdentity {
-                source_content: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                ..baseline
-            },
-            BuildIdentity {
-                source_state: "dirty",
-                ..baseline
-            },
-            BuildIdentity {
-                profile: "other-profile",
-                ..baseline
-            },
-            BuildIdentity {
-                declared_features: "other-declaration",
-                ..baseline
-            },
-        ] {
-            assert_ne!(
-                changed.qualification_identity().expect("changed binding"),
-                identity
-            );
-        }
-    }
-
-    #[test]
-    fn capabilities_phase24_record_admits_only_the_exact_build_and_lane() {
-        let binding = "v2:native=659b7f3e192ede9ced9c8c77e9ac173fc34a7de9ebc9b2b458fc6c56ff24b986:binding=1abf26fa6638c4f0c81f40ee2f192b79c40d789fa1f5088b4e388740b3a1586d:eligible=true";
-        assert_eq!(QUALIFICATIONS.len(), 1);
-        assert_eq!(QUALIFICATIONS[0].binding, binding);
-        assert_eq!(QUALIFICATIONS[0].operations, &LiveOperation::ALL);
-        for operation in LiveOperation::ALL {
-            assert!(crate::capabilities::qualification_matches(
-                binding,
-                true,
-                LiveLane::KvmX86_64,
-                operation,
-                QUALIFICATIONS
-            ));
-            for (identity, eligible, lane) in [
-                ("other-build", true, LiveLane::KvmX86_64),
-                (binding, false, LiveLane::KvmX86_64),
-                (binding, true, LiveLane::KvmArm64GicV3),
-                (binding, true, LiveLane::HvfArm64),
-            ] {
-                assert!(!crate::capabilities::qualification_matches(
-                    identity,
-                    eligible,
-                    lane,
-                    operation,
-                    QUALIFICATIONS
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn capabilities_linked_native_facts_are_observed_without_host_access() {
-        let compiled = compiled_build();
-        assert_eq!(compiled.native_build, Some(native::compiled_live_build()));
-        assert_eq!(native::compiled_live_build().query_abi, 1);
-        let identity = compiled
-            .qualification_identity()
-            .expect("canonical build binding");
-        let production_qualified =
-            compiled.qualification_ready() && identity == QUALIFICATIONS[0].binding;
-        let records = [Qualification {
-            binding: &compiled
-                .qualification_identity()
-                .expect("canonical build binding"),
-            lane: LiveLane::KvmX86_64,
-            operations: &LiveOperation::ALL,
-            evidence: "not-production-evidence",
-        }];
-        let lane = native::NativeLane::from_build(native::compiled_live_build());
-        let operations = native::NativeLiveOperations::for_lane(lane);
-        for operation in LiveOperation::ALL {
-            assert_eq!(
-                native_primitive(operation, &operations),
-                lane == native::NativeLane::KvmX86_64
-                    || (operation == LiveOperation::Pause
-                        && lane != native::NativeLane::Unsupported)
-            );
-            assert_eq!(
-                qualification_matches(&compiled, LiveLane::KvmX86_64, operation, QUALIFICATIONS),
-                production_qualified
-            );
-            assert_eq!(
-                qualification_matches(&compiled, LiveLane::KvmX86_64, operation, &records),
-                compiled.qualification_ready()
-            );
-        }
-        assert!(!identity.contains("native=unobserved"));
-        assert!(identity.len() <= 256);
-        assert!(compiled.public_identity().len() <= 256);
+        assert_eq!(
+            native_lane(native::NativeLane::Unsupported),
+            Err(UnsupportedNativeLane)
+        );
+        assert_eq!(
+            build_identity(),
+            format!(
+                "v1:silo:{}:{}",
+                env!("SILO_BUILD_TARGET"),
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(native::LIVE_STATE_SCHEMA, "silo.live-state/1");
     }
 
     #[test]
@@ -1308,7 +705,6 @@ mod tests {
                     backend_allowed: true,
                     native: false,
                     delivered: false,
-                    qualified: false,
                     host,
                 })
                 .expect("undelivered public result")
@@ -1371,8 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_native_primitives_do_not_grant_public_admission() {
-        let compiled = compiled_build();
+    fn capabilities_native_primitives_support_delivered_operations_on_admitted_hosts() {
         for lane in [
             native::NativeLane::KvmX86_64,
             native::NativeLane::KvmArm64GicV3,
@@ -1384,19 +779,11 @@ mod tests {
                 if !native {
                     continue;
                 }
-                let qualified = qualification_matches(
-                    &compiled,
-                    native_lane(lane).expect("recognized native lane"),
-                    operation,
-                    &[],
-                );
-                assert!(!qualified);
                 for host in [admitted(), HostAdmission::not_evaluated()] {
                     let capability = evaluate(EvaluationFacts {
                         backend_allowed: true,
                         native,
                         delivered: false,
-                        qualified,
                         host,
                     })
                     .expect("delivery refusal precedes host admission");
@@ -1413,14 +800,11 @@ mod tests {
                         backend_allowed: true,
                         native,
                         delivered: true,
-                        qualified,
                         host: admitted(),
                     })
-                    .expect("known host is still unqualified")
+                    .expect("known host supports native operation")
                     .availability,
-                    LiveAvailability::Unsupported {
-                        reason: LiveUnsupportedReason::new(LiveReasonCode::LaneNotQualified),
-                    }
+                    LiveAvailability::Supported
                 );
             }
         }

@@ -28,7 +28,6 @@ named_enum!(LiveScope { Host => "host", Machine => "machine" });
 named_enum!(LiveReasonCode {
     BackendExcluded => "backend-excluded",
     HostOsBelowFloor => "host-os-below-floor",
-    LaneNotQualified => "lane-not-qualified",
     HypervisorUnavailable => "hypervisor-unavailable",
     BuildExcluded => "build-excluded",
     NotDelivered => "not-delivered",
@@ -320,7 +319,6 @@ pub struct LiveHostReport {
     pub lane: LiveLane,
     pub live: LiveCapabilityVector,
     pub build_identity: String,
-    pub qualification_identity: String,
     pub scenario_digest: Option<String>,
 }
 
@@ -337,7 +335,6 @@ struct RawHostReport {
     lane: LiveLane,
     live: LiveCapabilityVector,
     build_identity: String,
-    qualification_identity: String,
     #[serde(deserialize_with = "required_option")]
     scenario_digest: Option<String>,
 }
@@ -352,7 +349,6 @@ impl TryFrom<RawHostReport> for LiveHostReport {
             lane: raw.lane,
             live: raw.live,
             build_identity: raw.build_identity,
-            qualification_identity: raw.qualification_identity,
             scenario_digest: raw.scenario_digest,
         };
         value.validate()?;
@@ -366,7 +362,6 @@ impl LiveHostReport {
             return Err("invalid host report schema/scope".into());
         }
         validate_identity(&self.build_identity)?;
-        validate_identity(&self.qualification_identity)?;
         if let Some(digest) = &self.scenario_digest {
             if digest.len() != 64
                 || !digest
@@ -471,7 +466,7 @@ fn canonical_uuid(value: &str) -> bool {
 
 fn validate_identity(value: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 256 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
-        return Err("build/qualification identity must be 1..256 printable ASCII bytes".into());
+        return Err("build identity must be 1..256 printable ASCII bytes".into());
     }
     Ok(())
 }
@@ -611,14 +606,13 @@ impl Serialize for LiveCapability {
 impl Serialize for LiveHostReport {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(S::Error::custom)?;
-        let mut value = serializer.serialize_struct("LiveHostReport", 8)?;
+        let mut value = serializer.serialize_struct("LiveHostReport", 7)?;
         value.serialize_field("schemaVersion", &self.schema_version)?;
         value.serialize_field("scope", &self.scope)?;
         value.serialize_field("backend", &self.backend)?;
         value.serialize_field("lane", &self.lane)?;
         value.serialize_field("live", &self.live)?;
         value.serialize_field("buildIdentity", &self.build_identity)?;
-        value.serialize_field("qualificationIdentity", &self.qualification_identity)?;
         value.serialize_field("scenarioDigest", &self.scenario_digest)?;
         value.end()
     }
@@ -665,7 +659,6 @@ mod tests {
             lane: LiveLane::KvmX86_64,
             live: LiveCapabilityVector::all_unsupported(LiveReasonCode::NotDelivered),
             build_identity: "test-revision".into(),
-            qualification_identity: "empty".into(),
             scenario_digest: None,
         }
     }
@@ -674,6 +667,7 @@ mod tests {
     fn live_capabilities_host_strict_roundtrip() {
         let report = host();
         let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 7);
         assert_eq!(
             serde_json::from_value::<LiveHostReport>(value.clone()).unwrap(),
             report
@@ -685,7 +679,6 @@ mod tests {
             "lane",
             "live",
             "buildIdentity",
-            "qualificationIdentity",
             "scenarioDigest",
         ] {
             let mut missing = value.clone();
@@ -715,7 +708,6 @@ mod tests {
         for code in [
             LiveReasonCode::BackendExcluded,
             LiveReasonCode::HostOsBelowFloor,
-            LiveReasonCode::LaneNotQualified,
             LiveReasonCode::HypervisorUnavailable,
             LiveReasonCode::BuildExcluded,
             LiveReasonCode::NotDelivered,

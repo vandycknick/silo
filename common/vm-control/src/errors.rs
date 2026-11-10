@@ -904,7 +904,6 @@ mod tests {
         let reasons = [
             LiveUnsupportedReason::new(LiveReasonCode::BackendExcluded),
             LiveUnsupportedReason::new(LiveReasonCode::HostOsBelowFloor),
-            LiveUnsupportedReason::new(LiveReasonCode::LaneNotQualified),
             LiveUnsupportedReason::new(LiveReasonCode::HypervisorUnavailable),
             LiveUnsupportedReason::new(LiveReasonCode::BuildExcluded),
             LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),

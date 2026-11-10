@@ -1,4 +1,4 @@
-"""Phase 20 functional gates, not production qualification or timing budgets."""
+"""Phase 20 functional gates against the staged runtime, not timing budgets."""
 from __future__ import annotations
 
 import json
@@ -24,7 +24,7 @@ def create(silo: Silo, image: str, *, start: bool = True) -> None:
                 "--vsock", "--network", "none")
     if start:
         silo.start(SOURCE)
-        incremental.require_candidate(silo.wait_ready(SOURCE))
+        silo.wait_ready(SOURCE)
 
 
 def test_incremental_fork_preserves_pause_and_child_baseline(
@@ -211,7 +211,7 @@ def test_full_request_lowered_crossover_and_new_worker_invalidate_baseline(
     incremental.pages_at_cut(silo, reused, pages)
     stopped.stop(silo, SOURCE, require_clean=False)
     silo.start(SOURCE)
-    incremental.require_candidate(silo.wait_ready(SOURCE))
+    silo.wait_ready(SOURCE)
     cold = restore.checkpoint(silo, SOURCE, alias="selection-new-worker", policy="incremental")
     assert cold.source_info["run_id"] != reused.source_info["run_id"]
     incremental.authenticated_map(silo, cold, mode="full", reason="no-baseline")
@@ -254,7 +254,7 @@ def test_capture_dirty_union_and_coverage_recovery(
             started = shutdown.until(lambda: record("capture-traced-start.json"), timeout=90,
                                      description="traced incremental source did not start")
             assert started["code"] == 0
-            incremental.require_candidate(silo.wait_ready(SOURCE))
+            silo.wait_ready(SOURCE)
             initial = incremental.witness(silo, SOURCE, "start")
             baseline = restore.checkpoint(silo, SOURCE, alias="abandon-baseline", policy="incremental")
             incremental.authenticated_map(silo, baseline, mode="full", reason="no-baseline")

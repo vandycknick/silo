@@ -61,8 +61,6 @@ class Candidate:
             manifest = json.loads((Path(fixture_root) / fault / "fault-manifest.json").read_text())
             assert manifest["fault"] == fault
             assert manifest["validationUnchanged"] and manifest["uniqueAttachmentKeysUnchanged"]
-            assert manifest["declaredNativeBaseline"] == overlay.APPROVED_NATIVE_REVISION
-            revision = manifest["nativePin"]
             self.monitor = Path(manifest["binary"])
             assert overlay.digest(self.monitor) == manifest["binarySha256"]
             assert manifest["productionEngineSha256"] == overlay.digest(REPO / "virt/vmm/src/krun/engine.rs"), "fault fixture source stale"
@@ -74,12 +72,9 @@ class Candidate:
             assert overlay.digest(monitor_snapshot) == manifest["binarySha256"]
         self.monitor = monitor_snapshot
         native_capabilities = overlay.native_capabilities(self.monitor)
-        identity = overlay.native_source_identity(native_capabilities)
+        overlay.monitor_build_identity(native_capabilities)
         if copied_native:
-            assert native_capabilities["buildIdentity"] == manifest["nativeBuildIdentity"], "actual fault binary source/content identity mismatch"
-        else:
-            assert identity.kind == "path" and identity.state == "clean", "candidate requires a clean production-path native build"
-            revision = identity.revision
+            assert native_capabilities["buildIdentity"] == manifest["monitorBuildIdentity"], "fault binary informational identity mismatch"
         if not copied_native:
             stage = json.loads((silo.ws.config.runtime_dir / "runtime-manifest.json").read_text())
             assert stage["managedOverlayCandidate"]["nativeExecutableDigest"] == "sha256:" + overlay.digest(self.monitor)
@@ -265,7 +260,6 @@ class Candidate:
         self.config = self.root / "spec.json"
         self.config.write_text(json.dumps(self.spec))
         self.identities = {"kernelSha256": overlay.digest(kernel_snapshot), "initramfsSha256": hashlib.sha256(base_bytes).hexdigest(), "compositeInitramfsSha256": overlay.digest(composite), "monitorWorkerSha256": overlay.digest(self.monitor), "hostSystem": platform.system(), "hostArchitecture": platform.machine(), "hostKernelRelease": platform.release(), "hostLane": "linux-kvm" if platform.system() == "Linux" else "macos-hvf", "rootProfile": overlay.PROFILE, "upperProfile": "silo-upper-ext4-v1", "renderingAbi": "linux-overlayfs-mountinfo-v1", "attachmentFamily": "krun-virtio-blk-v1", "candidateOnly": True}
-        self.identities["nativeRevision"] = revision
         self.identities["actualNativeCapabilities"] = native_capabilities
         self.identities["logicalLowerBytes"] = self.logical_lower_bytes
         self.identities["lowerOccurrences"] = [{"path": str(path), "lengthBytes": path.stat().st_size, "sha256": self.occurrence_digests[path]} for path in self.occurrences]

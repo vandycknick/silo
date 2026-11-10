@@ -479,8 +479,8 @@ pub(crate) mod tests {
                 regions: 1,
                 ram_stream: objects[0].identity,
                 binding: CaptureStateBinding {
-                    native_producer: "unit-test-state-producer".to_string(),
-                    silo_producer: digest,
+                    live_state_schema: "silo.live-state/1".to_string(),
+                    architecture: std::env::consts::ARCH.into(),
                     profile: digest,
                     topology: digest,
                     ram_layout: digest,

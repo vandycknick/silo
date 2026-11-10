@@ -15,7 +15,6 @@ from silo_smoke import capture, incremental, overlay, pause, procs, restore, shu
 from silo_smoke.cli import ROOT_PROFILES, Result, RootProfile, Silo
 from silo_smoke.restore import restore_image, restore_irq_fixture  # noqa: F401, pytest fixtures
 
-# Admission is compiled into Main's isolated candidate, not production policy.
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 
 
@@ -294,7 +293,6 @@ def refused_before_allocation(silo: Silo, reference: str, name: str, *,
 def checkpoint_for_policy(silo: Silo, policy: str) -> restore.Checkpoint:
     if policy == "full":
         return restore.checkpoint(silo, "restore-source")
-    incremental.require_candidate(silo.info("restore-source"))
     baseline = restore.checkpoint(silo, "restore-source", alias="restore-baseline")
     silo.run("resume", "restore-source")
     silo.exec("restore-source", "sh", "-eu", "-c", "printf incremental >/dev/shm/incremental-negative", user="root")
@@ -382,7 +380,7 @@ def test_restore_corrupt_real_closure_refuses_before_child_allocation(
 
 
 @pytest.mark.parametrize("policy", ["full", "incremental"])
-@pytest.mark.parametrize("mutation", ["cpu", "profile", "producer", "xsave", "tsc-rate", "msr"])
+@pytest.mark.parametrize("mutation", ["cpu", "profile", "schema", "architecture", "xsave", "tsc-rate", "msr"])
 def test_restore_real_native_incompatibility_refuses_before_child_allocation(
     silo: Silo, restore_image: str, mutation: str, policy: str, restore_processes: list[shutdown.Process],
 ) -> None:
@@ -393,7 +391,7 @@ def test_restore_real_native_incompatibility_refuses_before_child_allocation(
     shutdown.storage_tool(silo, "prune")
     with restore.incompatible_checkpoint(silo, saved, mutation) as (reference, subject):
         result = refused_before_allocation(silo, reference, "restore-incompatible-" + mutation)
-        pin = {"cpu": "cpu.cpuid", "profile": "host-build", "producer": "native-producer",
+        pin = {"cpu": "cpu.cpuid", "profile": "host-build", "schema": "live-state-schema", "architecture": "architecture",
                "xsave": "cpu.xsave", "tsc-rate": "clock.tsc-rate", "msr": "cpu.msr-inventory"}[mutation]
         for required in ("restore-preflight", "pin " + pin, "expected ", "destination ",
                          "no execution child was started"):
@@ -416,14 +414,17 @@ def test_restore_selected_vz_backend_rejects_before_any_operational_allocation(
     assert "backend-excluded" in result.stderr and "vz" in result.stderr.lower(), result.stderr
 
 
+@pytest.mark.skip(reason=(
+    "IRQ restore requires an explicitly staged diagnostic monitor; "
+    "the staged runtime has no IRQ probe transport"
+))
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_restore_pending_hardware_irq_continues_exactly_once(
     silo: Silo, restore_image: str, restore_irq_fixture: Path,
     profile: RootProfile, restore_processes: list[shutdown.Process],
 ) -> None:
-    # This gate needs the separate --restore --irq-probe candidate. Linux keeps
-    # CPUs 0/1; only the one-time native source bootstrap starts reserved AP2.
-    # AP3 remains genuinely unstarted in both captured and restored execution.
+    # Linux keeps CPUs 0/1; only the one-time native source bootstrap starts
+    # reserved AP2. AP3 stays unstarted in captured and restored execution.
     restore.create_source(
         silo, restore_image, "--kernel-arg", "maxcpus=2",
         "--kernel-arg", "memmap=16M$448M", "--kernel-arg", "memmap=64K$448K",
@@ -513,5 +514,5 @@ def test_restore_pending_hardware_irq_continues_exactly_once(
         "sourceCheckpoint": saved.snapshot, "childCheckpoint": recaptured.snapshot,
         "original": original, "restoredDelivery": delivered, "sustained": final,
         "recapturedCompletion": completed, "sourceDelivery": source_delivered,
-        "candidateScope": "diagnostic feature only, not production qualification",
+        "scope": "diagnostic feature only",
     }, sort_keys=True) + "\n")

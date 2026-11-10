@@ -983,10 +983,8 @@ impl SnapshotStore {
                     execution: take(CaptureRole::Execution)?,
                     devices: take(CaptureRole::Devices)?,
                     compatibility_profile: SnapshotCompatibilityProfile {
-                        native_producer: memory_evidence.binding.native_producer.clone(),
-                        silo_producer: ObjectDigest::from_sha256(
-                            *memory_evidence.binding.silo_producer.as_bytes(),
-                        ),
+                        live_state_schema: memory_evidence.binding.live_state_schema.clone(),
+                        architecture: memory_evidence.binding.architecture.clone(),
                         profile: ObjectDigest::from_sha256(
                             *memory_evidence.binding.profile.as_bytes(),
                         ),
@@ -2212,6 +2210,7 @@ fn check_entries(
 pub(crate) struct Layout {
     pub(crate) architecture: String,
     kind: String,
+    magic: String,
     packed_length: u64,
     pub(crate) page_granule: u32,
     pub(crate) regions: Vec<Region>,
@@ -2237,6 +2236,7 @@ pub(crate) fn validate_layout(
     let layout: Layout = serde_json::from_value(value).map_err(invalid)?;
     if layout.schema != 1
         || layout.kind != "ram-layout"
+        || layout.magic != "KRUNRAML"
         || !matches!(layout.architecture.as_str(), "x86_64" | "aarch64")
         || !layout.topology.is_object()
         || layout.packed_length != memory.packed_length
@@ -2902,14 +2902,11 @@ pub(crate) mod tests {
             bytes.extend_from_slice(&1u32.to_le_bytes());
             bytes.push(1);
         }
-        bytes.extend_from_slice(&(binding.native_producer.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(binding.native_producer.as_bytes());
-        for digest in [
-            binding.silo_producer,
-            binding.profile,
-            binding.topology,
-            binding.ram_layout,
-        ] {
+        bytes.extend_from_slice(&(binding.live_state_schema.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(binding.live_state_schema.as_bytes());
+        bytes.extend_from_slice(&(binding.architecture.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(binding.architecture.as_bytes());
+        for digest in [binding.profile, binding.topology, binding.ram_layout] {
             bytes.extend_from_slice(digest.as_bytes());
         }
         bytes.extend_from_slice(
@@ -2977,7 +2974,7 @@ pub(crate) mod tests {
         let request = record.plan.canonical_bytes().unwrap();
         directory.write_file("request.json", &request).unwrap();
         let layout = serde_json::to_vec(&serde_json::json!({
-            "architecture": "x86_64", "kind": "ram-layout", "packedLength": 4096, "pageGranule": 4096,
+            "architecture": "x86_64", "kind": "ram-layout", "magic": "KRUNRAML", "packedLength": 4096, "pageGranule": 4096,
             "regions": [{"guestPhysicalAddress": 0, "length": 4096, "streamOffset": 0}],
             "schema": 1, "topology": {"firmwareAddress": 0, "initrdAddress": 0, "ramAboveGap": 0, "ramBelowGap": 4096, "ramLastAddress": 4095, "shmStartAddress": 0}
         })).unwrap();
@@ -2985,8 +2982,8 @@ pub(crate) mod tests {
         let ram_map = StreamHasher::new().hash_reader(Cursor::new(&ram)).unwrap();
         let ram_map_bytes = ram_map.canonical_bytes().unwrap();
         let binding = CaptureStateBinding {
-            native_producer: "unit-file-format".into(),
-            silo_producer: Sha256Digest::of_bytes(b"silo"),
+            live_state_schema: "silo.live-state/1".into(),
+            architecture: "x86_64".into(),
             profile: Sha256Digest::of_bytes(b"profile"),
             topology: record.plan.configuration_digest,
             ram_layout: Sha256Digest::of_bytes(&layout),
@@ -3209,7 +3206,7 @@ pub(crate) mod tests {
         };
         execution
             .compatibility_profile
-            .native_producer
+            .live_state_schema
             .push_str("-different");
         assert!(fixture
             .snapshots
@@ -3842,30 +3839,49 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn checkpoint_native_headers_reject_corruption_foreign_bindings_and_geometry_even_with_valid_sha(
     ) {
-        let producer_len = "unit-file-format".len();
+        let schema_len = "silo.live-state/1".len();
+        let architecture_len = "x86_64".len();
+        let execution_binding = 19 + schema_len + 4 + architecture_len;
+        let devices_binding = execution_binding - 5;
         for (fault, role, offset) in [
             ("execution-version", CaptureRole::Execution, 8),
             ("execution-abi", CaptureRole::Execution, 10),
             ("execution-lane", CaptureRole::Execution, 14),
-            ("producer", CaptureRole::Execution, 19),
-            ("silo-producer", CaptureRole::Execution, 19 + producer_len),
-            ("profile", CaptureRole::Execution, 51 + producer_len),
-            ("topology", CaptureRole::Execution, 83 + producer_len),
-            ("layout-binding", CaptureRole::Execution, 115 + producer_len),
-            ("source-run", CaptureRole::Execution, 147 + producer_len),
+            ("schema", CaptureRole::Execution, 19),
+            ("architecture", CaptureRole::Execution, 23 + schema_len),
+            ("profile", CaptureRole::Execution, execution_binding),
+            ("topology", CaptureRole::Execution, execution_binding + 32),
+            (
+                "layout-binding",
+                CaptureRole::Execution,
+                execution_binding + 64,
+            ),
+            ("source-run", CaptureRole::Execution, execution_binding + 96),
             (
                 "pause-generation",
                 CaptureRole::Execution,
-                163 + producer_len,
+                execution_binding + 112,
             ),
-            ("capture-id", CaptureRole::Execution, 171 + producer_len),
-            ("cpu-count", CaptureRole::Execution, 187 + producer_len),
-            ("page-granule", CaptureRole::Execution, 200 + producer_len),
-            ("guest-region", CaptureRole::Execution, 208 + producer_len),
-            ("block-id", CaptureRole::Execution, 236 + producer_len),
+            (
+                "capture-id",
+                CaptureRole::Execution,
+                execution_binding + 120,
+            ),
+            ("cpu-count", CaptureRole::Execution, execution_binding + 136),
+            (
+                "page-granule",
+                CaptureRole::Execution,
+                execution_binding + 149,
+            ),
+            (
+                "guest-region",
+                CaptureRole::Execution,
+                execution_binding + 157,
+            ),
+            ("block-id", CaptureRole::Execution, execution_binding + 185),
             ("devices-version", CaptureRole::Devices, 8),
-            ("devices-profile", CaptureRole::Devices, 46 + producer_len),
-            ("devices-count", CaptureRole::Devices, 182 + producer_len),
+            ("devices-profile", CaptureRole::Devices, devices_binding),
+            ("devices-count", CaptureRole::Devices, devices_binding + 136),
             ("truncated", CaptureRole::Execution, 0),
         ] {
             let fixture = fixture().await;

@@ -1841,7 +1841,6 @@ mod tests {
 
     fn digests() -> CaptureDigests {
         CaptureDigests {
-            silo_producer: Digest32([1; 32]),
             profile: Digest32([2; 32]),
             topology: Digest32([3; 32]),
         }
@@ -2077,8 +2076,8 @@ mod tests {
         assert_eq!(binding.source_run, machine.run_id);
         assert_eq!(binding.pause_generation, cut.generation);
         assert_eq!(
-            binding.native_producer,
-            crate::virt::backend::mock::native::SCENARIO_PRODUCER
+            binding.live_state_schema,
+            crate::virt::backend::mock::native::SCENARIO_STATE_SCHEMA
         );
         assert_eq!(execution.identity(), outputs.execution);
         assert_eq!(devices.identity(), outputs.devices);

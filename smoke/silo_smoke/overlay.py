@@ -33,7 +33,6 @@ from .workspace import Workspace
 SPLIT = 2 * 1024**3
 PROBE = "/usr/local/bin/overlay-probe"
 PROFILE = "linux-erofs-overlay-v1"
-APPROVED_NATIVE_REVISION = "58253c00580bda34f5ea9fc4e0fccaf1e09a83d4"
 OVERLAYFS_SUPER_MAGIC = 0x794C7630
 EROFS_SUPER_MAGIC = 0xE0F5E1E2
 TMPFS_MAGIC = 0x01021994
@@ -48,28 +47,17 @@ def native_capabilities(monitor: Path, *, diagnostic: Path | None = None) -> dic
 
 
 @dataclass(frozen=True)
-class NativeSourceIdentity:
-    kind: str
-    state: str
-    revision: str
-    content: str
-    inputs: str
+class MonitorBuildIdentity:
+    target: str
+    version: str
 
 
-def native_source_identity(report: dict) -> NativeSourceIdentity:
-    """Decode only the current truthful source binding, never an old pin label."""
+def monitor_build_identity(report: dict) -> MonitorBuildIdentity:
+    """Decode informational Silo metadata, never native format compatibility."""
     parts = report["buildIdentity"].split(":")
-    if len(parts) != 6 or parts[0] != "v2" or not parts[4].startswith("content=") or not parts[5].startswith("inputs="):
-        raise ValueError("Expected current native source/content build identity")
-    _, kind, state, revision, content, inputs = parts
-    if (kind == "path" and state not in {"clean", "dirty", "unknown"}) or (kind == "git" and state != "revision-bound") or kind not in {"path", "git"}:
-        raise ValueError("Invalid native source kind/state")
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision) and not (revision == "unknown" and state == "unknown"):
-        raise ValueError("Invalid native source revision observation")
-    content, inputs = content.removeprefix("content="), inputs.removeprefix("inputs=")
-    if not re.fullmatch(r"[0-9a-f]{64}", inputs) or (not re.fullmatch(r"[0-9a-f]{64}", content) and not (content == "unknown" and state == "unknown")):
-        raise ValueError("Invalid native source/input content fingerprints")
-    return NativeSourceIdentity(kind, state, revision, content, inputs)
+    if len(parts) != 4 or parts[:2] != ["v1", "silo"] or not all(parts[2:]):
+        raise ValueError("Expected v1:silo:<target>:<version> monitor identity")
+    return MonitorBuildIdentity(parts[2], parts[3])
 
 
 def digest(path: Path, length: int | None = None) -> str:

@@ -41,13 +41,6 @@ def incremental_image(config: SmokeConfig, registry: LoopbackRegistry,
     return registry.publish(images.build(spec, images.fetch_alpine(config.cache_dir)), "incremental-memory")
 
 
-def require_candidate(info: dict) -> None:
-    restore.require_restore_candidate(info)
-    capability = info["lifecycle"]["report"]["live"]["incremental"]
-    assert capability == {"native": True, "availability": {"status": "supported"}}, (
-        "select Main's exact-input --restore --incremental candidate", capability)
-
-
 def witness(silo: Silo, name: str, operation: str = "read", *, previous: dict | None = None) -> dict:
     value = json.loads(silo.exec(name, PROBE, operation, user="root").stdout)
     assert value["pageSize"] > 0 and len(value["pages"]) == 4
@@ -94,6 +87,11 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
     assert (saved.staging / "vm.capture.json").stat().st_size <= 1024 * 1024
     assert (saved.staging / "request.json").stat().st_size <= 1024 * 1024
     evidence = saved.seal["memory"]
+    binding = evidence["binding"]
+    assert binding["liveStateSchema"] == "silo.live-state/1"
+    layout = json.loads((saved.staging / "memory-layout.json").read_bytes())
+    assert binding["architecture"] == layout["architecture"]
+    assert layout["magic"] == "KRUNRAML" and layout["schema"] == 1
     assert (evidence["mode"], evidence["fullReason"]) == (mode, reason), evidence
     expected_baseline = baseline.seal["memory"]["ramStream"] if baseline is not None else None
     assert evidence["baseline"] == expected_baseline, evidence

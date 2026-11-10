@@ -29,7 +29,7 @@ longterm 6.18.48 production roots passed boot/lifecycle and kernel-mutated
 flatten export followed by raw boot. Independent umoci extraction used the prior
 raw reference environment; a separate readonly EROFS traversal matched every
 published-corpus row without exclusions. Performance must be remeasured in the
-mandatory Phase 24 sweep; public live lanes remain unqualified. See the
+mandatory Phase 24 sweep. Live support follows native backend/host primitives. See the
 [changeset conformance evidence](../runtime/oci/testdata/changesets/README.md#observed-admission-and-phase-22-default-gates).
 
 ### Controlled EROFS encoder qualification
@@ -59,8 +59,8 @@ The 1024-slot fixture uses structural fsck and guest reads instead of passing
 All other fixtures use `fsck.erofs --extract` to verify file data without
 extracting host special files. Monitor identity, kernel/config digests,
 descriptor backing digests, and guest output are retained. These are
-candidate-only format/attachment checks, not a production-root or live
-qualification grant. Other host/architecture lanes remain pending.
+controlled format/attachment checks, not end-to-end root or live-operation
+evidence. Other host/architecture lanes remain pending.
 
 
 ### Controlled Distribution registry
@@ -106,12 +106,11 @@ uv run --project smoke pytest smoke/tests/test_artifact_stopped.py
 ```
 
 `test_artifact_live.py` is a functional slow selection, not a performance
-qualification. Use the exact-input isolated capture/restore candidate's
-`SILO_SMOKE_BIN_DIR` and `SILO_SMOKE_RUNTIME_DIR`; production admission must
-remain unchanged. It publishes a real matched-cut checkpoint, pulls into a
-fresh home, removes source/registry dependencies, and exercises exact restore
+budget. Use the staged runtime selected by `SILO_SMOKE_BIN_DIR` and
+`SILO_SMOKE_RUNTIME_DIR`. It publishes a real matched-cut checkpoint, pulls into
+a fresh home, removes source/registry dependencies, and exercises exact restore
 or incompatible-producer refusal. The destination has its own private runtime.
-The Linux candidate gate passed all three cases
+The Linux gate passed all three cases
 (`artifact-live-exact-binding.xml`, 159.89 s). Restored machines preserve
 the complete captured boot binding and independently verified boot bytes,
 not a hardcoded ABI version.
@@ -197,37 +196,31 @@ resuming; the gate waits for the actual owners and checks storage-lease release.
 The image-owned-init negative gate rejects before allocating a live command.
 
 `live_acceptance` is a standalone Rust public-API consumer, not a VM-starting
-Cargo test. Only the supervisor-verified immutable build/lane qualification
-grants public pause. Runtime files or environment variables cannot grant it.
+Cargo test. Live support follows the backend and host's native primitives;
+runtime files and environment variables do not grant capabilities.
 
 ### Full live capture (Phase 14)
 
-`tests/test_capture.py` uses an isolated test-only capture candidate.
-Phase 24 admits production capture only for the exact compiled Linux KVM
-x86_64 build; no runtime file grants it.
-Build with `python -m silo_smoke.capture_candidate --destination PATH --runtime
-STAGED_RUNTIME` through `uv run --project smoke` with `PYTHONPATH=smoke`.
-The destination must be outside the repository and staged runtime, with matching
-Cargo ancestor depth and build environment. The builder checks native/build
-identity equality and leaves the production stage unchanged.
+`tests/test_capture.py` runs directly against the staged runtime. Every live
+operation is supported when the backend and host provide its native primitive.
+The monitor's `buildIdentity` is informational `v1:silo:<target>:<version>` metadata.
+Checkpoint compatibility uses `liveStateSchema` and guest `architecture` only;
+restore refuses mismatches in those fields, not different source or build inputs.
 
-Phase 15 restore gates use the same builder with `--restore`. The requested
-operations must be delivered and native, but production may already qualify
-them. The builder admits only pause, capture and restore in the copied
-compilation, leaving unrequested operations unqualified and the production
-record and stage untouched. This is test isolation, not production
-qualification; use the resulting private CLI and runtime together.
+`test_native_capabilities.py` checks the selected staged monitor using ordinary,
+launch-environment and mutable-grant queries without starting a machine. Native
+live operations must report `supported`; mutable files cannot change the result.
 
-`test_native_capabilities.py` checks the **production** qualification policy,
-not the candidate's deliberately admitted operation set. For a mixed candidate
-suite, set `SILO_SMOKE_PRODUCTION_RUNTIME_DIR` to the staged production runtime
-so its `bin/silo-vmm` receives the ordinary, launch-environment and mutable-grant
-queries. Without that override, these production-only cases explicitly skip a
-candidate only when its adjacent `candidate-manifest.json` binds the selected
-runtime and monitor hash. A `supported` report alone never permits a skip.
+Stage and select the release runtime once for capture, restore, fork,
+incremental and budget suites:
 
-Point `SILO_SMOKE_BIN_DIR` and `SILO_SMOKE_RUNTIME_DIR` at the candidate's `bin`
-and `runtime` directories, then run:
+```sh
+make stage PROFILE=release
+export SILO_SMOKE_BIN_DIR=target/release
+export SILO_SMOKE_RUNTIME_DIR=target/silo-runtime/linux-amd64-gnu/release
+```
+
+Then run:
 
 ```sh
 uv run --project smoke pytest smoke/tests/test_capture.py smoke/tests/test_capture_multidisk.py smoke/tests/test_capture_lifecycle.py -m slow --keep
@@ -290,41 +283,42 @@ The timerfd/signal events are kernel-event witnesses, not hardware IRQ proof.
 
 Corruption cases alter real captured RAM, disks, state/layout/maps, boot assets
 and provenance. Compatibility cases use the public native execution codec to
-alter a real CPU/profile/producer/XSAVE envelope, then rebuild the object digests,
-canonical checkpoint identity, dependency edges and authenticated local seal.
-Only the precise native refusal subject satisfies those cases. Producer refusal
-is intentionally checked before device decoding; its original device binding is
-retained explicitly. All rejections require no child/catalog/budget leak.
+alter a real CPU/profile/schema/architecture/XSAVE envelope, then rebuild the
+object digests, canonical checkpoint identity, dependency edges and
+authenticated local seal. Only the precise native refusal subject satisfies
+those cases. Schema and architecture refusal is intentionally checked before
+device decoding; the original device binding is retained explicitly. All
+rejections require no child/catalog/budget leak.
 Verification consumers may leave an unlocked stable lease inode by pool design;
 unsupported selected-backend refusal may not acquire even that consumer.
-The helper `native-live-api` must be staged with the selected candidate.
+The live suites expect the release helper binaries next to the CLI: build them
+once with `cargo build --release -p libvm -p silo-vmm --examples` and point
+`SILO_SMOKE_NATIVE_LIVE_API` at `target/release/examples/native-live-api`.
 Foreign-lane compatibility still requires a real foreign-lane checkpoint, not a
 synthetic mixed-architecture envelope.
 
-The genuine hardware IRQ case uses a separate `capture_candidate --restore
---irq-probe` runtime and is **not** a production-lane qualification:
+The genuine hardware IRQ case is explicitly skipped because it depended on the
+removed isolated-build diagnostic-producer source mutation. The staged runtime
+does not perform that producer swap, so running against it cannot establish the
+hardware IRQ proof.
+
+The witness assembly can still be staged independently from the libkrun checkout
+resolved by `cargo metadata`:
 
 ```sh
-uv run --project smoke pytest smoke/tests/test_restore.py -m slow -k pending_hardware_irq --keep
+PYTHONPATH=smoke uv run --project smoke python -m silo_smoke.irq_fixture \
+  --runtime "$SILO_SMOKE_RUNTIME_DIR"
 ```
 
-It requires the exact candidate-bound `assets/restore-irq-witness` manifest and
-immutable assembly inputs staged by that builder. Four virtual CPUs retain
-ordinary Linux on CPUs 0/1, with the source-only privileged AP2 witness and a
-never-started AP3 in explicitly reserved memory. The compile-gated native probe
-only constructs AP2 during a user pause; restored initialization must refuse.
-The test captures a real vector-224 LAPIC IRR with IF=0, independently decodes
-the sealed execution envelope and reads its guest RAM publication, then restores
-through the normal CLI activation path. Only the restored AP2's own guest STI
-releases the pending interrupt. Exactly one interrupt and EOI, sustained progress,
-preserved GPR/x87/SSE/YMM state, empty IRR/ISR on recapture and independent source
-delivery are required. No host IRQ injection or post-restore CPU reseeding is
-used. Normal builds have no probe endpoint; select the non-probe suite separately.
+This builds `assets/restore-irq-witness` using `as`, `ld`, `objcopy` and `nm`,
+recording the resolved source, assembly/binary/symbol digests, and the staged
+monitor's SHA-256 and `buildIdentity`. It does not mutate monitor source, rebuild
+the monitor, or enable the diagnostic endpoint.
 
 ### Restore activation lifecycle (Phase 15)
 
-`tests/test_restore_lifecycle.py` uses the same `--restore` candidate and
-selection. Its VM cases are `slow`; the host-only oracle cases are not:
+`tests/test_restore_lifecycle.py` uses the same staged runtime.
+Its VM cases are `slow`; the host-only oracle cases are not:
 
 ```sh
 uv run --project smoke pytest smoke/tests/test_restore_lifecycle.py -m slow --keep
@@ -386,13 +380,8 @@ fail, never skip.
 
 ### Live fork acceptance, crash and sharing gates (Phase 16)
 
-`tests/test_fork.py` needs an isolated candidate that also admits delivered
-live fork: `python -m silo_smoke.capture_candidate --destination PATH --runtime
-STAGED_RUNTIME --restore --fork`. It requires production fork to be delivered
-and native, whether already qualified or not, admits pause, capture, restore
-and fork only in the private compiled copy, and leaves the production
-qualification record and stage unchanged.
-Point `SILO_SMOKE_BIN_DIR`/`SILO_SMOKE_RUNTIME_DIR` at it, then run:
+`tests/test_fork.py` runs delivered native fork directly against the same staged
+runtime selected by `SILO_SMOKE_BIN_DIR` and `SILO_SMOKE_RUNTIME_DIR`:
 
 ```sh
 uv run --project smoke pytest smoke/tests/test_fork.py -m slow --keep
@@ -540,8 +529,8 @@ generation, checksum and upload steps instead allow 120 s per GiB, with a
 120 s minimum (1440 s for the 12 GiB layer); slow setup is not a prepare-budget
 failure and never shrinks the corpus.
 
-Use the same candidate/environment as the fork budget and an existing durable
-evidence directory. The pinned Distribution binary is reused from the smoke
+Use the same staged runtime/environment as the fork budget and an existing
+durable evidence directory. The pinned Distribution binary is reused from the smoke
 cache, or its verified release is downloaded during fixture setup. `bash`,
 `head`, `tee`, `sha256sum`, `curl` and `gzip` must be installed. The shared
 storage acceptance example must be built
@@ -564,25 +553,20 @@ unmeasured claim about the ADR's XFS/APFS reference hosts.
 ### Live fork budget cohorts (Phase 16)
 
 `tests/test_fork_budget.py` measures ADR 0021 full capture interruption,
-restore to Running and four-child fork to Running. Use the same `--fork`
-candidate, durable workspace storage (tmpfs is refused) and a durable evidence
+restore to Running and four-child fork to Running. Use the staged release
+runtime, durable workspace storage (tmpfs is refused) and a durable evidence
 directory outside the workspace. `SILO_SMOKE_BUDGET_DIR` selects a mounted
 workspace parent; sockets and runtime locks then use a separately owned short
 runtime directory, never the RAM or disk bytes. Without it, `TMPDIR` selects
 the workspace as usual and must be short enough for Unix socket paths:
 
-The isolated candidate builder accepts `--profile debug|release` (default
-`debug`) and records the selected profile in its manifest. For optimized budget
-qualification, stage an unqualified release runtime with `make stage
-PROFILE=release`, then build the `--fork --restore --profile release` candidate
-against that runtime. The exact production/candidate qualification-identity
-check still applies; a release candidate cannot reuse a debug runtime's binding.
-Keep failed debug measurements as evidence of that build, not release results.
-The candidate's direct Cargo invocation must also receive the staged release
-environment from `xtask/src/release.rs::configure_command`. On Linux this pins
-the system compiler/linker and target rustflags and removes the listed Nix
-compiler variables. Selecting `--release` alone does not reproduce those inputs;
-the identity check rejects that mismatch before granting candidate admission.
+For optimized budget measurements, run `make stage PROFILE=release` and select
+`SILO_SMOKE_BIN_DIR=target/release` and
+`SILO_SMOKE_RUNTIME_DIR=target/silo-runtime/linux-amd64-gnu/release`.
+Reference-host evidence records the staged monitor's SHA-256 and its
+`buildIdentity` from `silo-vmm capabilities --backend krun --json`, alongside
+the other runtime inputs. Keep failed debug measurements as evidence of that
+build, not release results.
 
 ```sh
 SILO_SMOKE_BUDGET_EVIDENCE=$PWD/.tmp/plan/evidence/phase-16 \
@@ -593,7 +577,7 @@ SILO_SMOKE_BUDGET_DIR=/home/$USER/sm/phase16-ext4 TMPDIR=/home/$USER/sm \
 Allowance, gate, writeback and small-file hash-probe unit tests (no guest):
 
 ```sh
-uv run --project smoke pytest smoke/tests/test_fork_budget.py -m '' -k 'budget_gate or hash_rate or quiesce or copy_allowance'
+uv run --project smoke pytest smoke/tests/test_fork_budget.py -m '' -k 'budget_gate or copy_allowance or hash_rate or quiesce'
 ```
 
 The exact fixture, cache method and boundaries are in
@@ -654,8 +638,8 @@ rate, not a read-bound cold rate, becomes `sequentialHash.bytesPerSecond`
 removed after probing.
 
 Restore is dispatch to CLI exit with the child Running and ready. Samples, the
-reference-host record (CPU, memory, kernel, filesystem, input hashes, candidate
-manifest, reflink probe result and errno, measured rates) and
+reference-host record (CPU, memory, kernel, filesystem, input hashes, monitor
+SHA-256 and build identity, reflink probe result and errno, measured rates) and
 `summary.json`/`summary.md` are written before assertions. Recompute a summary
 with `python -m silo_smoke.fork_budget DIRECTORY`. A running source keeps its
 accepted capture baseline, so every successful fork sample stops and removes
@@ -670,9 +654,8 @@ A median over its target fails the gate and blocks admission.
 
 The additional performance-only cohorts in `tests/test_fork_budget.py` use the
 same `SILO_SMOKE_BIN_DIR`, `SILO_SMOKE_RUNTIME_DIR`, `SILO_SMOKE_BUDGET_DIR`
-and `SILO_SMOKE_BUDGET_EVIDENCE` candidate/workspace selection above. They do
-not change product qualification or capabilities. Use an exact-input candidate
-with incremental capture and restore support for the incremental cohort.
+and `SILO_SMOKE_BUDGET_EVIDENCE` staged-runtime/workspace selection above.
+The incremental cohort requires native incremental capture and restore support.
 All three use `SCHEDULE`: five cold samples, one discarded warm-up and five
 warm samples. Cold means per-file eviction of `owned_inputs(silo)` with
 residency evidence, not an empty prepared-image pool. A partially evicted
@@ -807,37 +790,18 @@ uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow \
 
 ### Incremental capture and named disk recovery (Phase 20)
 
-These are maintained **functional** gates, not performance qualification. Use
-the same clean, exact-input KVM x86_64 runtime and VM-generation-aware workload
-kernel required by the restore gates. Production capture, restore, fork and
-incremental capability tables remain unchanged. Build a separate private
-candidate, outside both the repository and production runtime, with matching
-Cargo ancestor depth, build environment and profile:
+These are maintained **functional** gates, not timing budgets. Use the same
+staged KVM x86_64 runtime and VM-generation-aware workload kernel as the restore
+gates. The CLI, monitor and helper examples must be staged together:
 
 ```sh
-PYTHONPATH=smoke uv run --project smoke python -m silo_smoke.capture_candidate \
-  --destination /absolute/private/phase20-candidate \
-  --runtime /absolute/production/staged-runtime --restore --incremental --profile release
-export SILO_SMOKE_BIN_DIR=/absolute/private/phase20-candidate/bin
-export SILO_SMOKE_RUNTIME_DIR=/absolute/private/phase20-candidate/runtime
+export SILO_SMOKE_BIN_DIR=target/release
+export SILO_SMOKE_RUNTIME_DIR=target/silo-runtime/linux-amd64-gnu/release
 uv run --project smoke pytest smoke/tests/test_incremental.py -m slow --keep
 uv run --project smoke pytest smoke/tests/test_artifact_live.py -m slow --keep
 uv run --project smoke pytest smoke/tests/test_restore.py -m slow \
   -k 'corrupt_real_closure or real_native_incompatibility' --keep
 ```
-
-The builder refuses missing/dirty native provenance, mismatched build identity
-and IRQ diagnostic candidates. Production may already qualify the requested
-operations; its qualification record and staged executable must stay untouched.
-`--incremental` requires `--restore`; `--fork` may additionally admit the local
-fork functional gates in the same isolated compilation. The resulting CLI,
-monitor and helper examples must be used together. No runtime flag grants
-production capability support.
-
-For Linux release stages, match `xtask/src/release.rs`'s system compiler/linker
-environment, including `CARGO_TARGET_DIR`, target linker and target Rust flags.
-`--profile debug` is appropriate only for a debug production stage. A mismatch
-is an evidence failure, not a reason to weaken the builder's identity check.
 
 Prerequisites are `/dev/kvm`, a static C toolchain (`CC`, default `cc`), `debugfs`,
 `sqlite3`, the restore fixture kernel/agent/initramfs and loopback TLS support.
@@ -1418,24 +1382,20 @@ make smoke SMOKE_ARGS="-k 'overlay_native or overlay_injected_request' --keep"
 ```
 
 The destination must be new and outside the repository and native source tree.
-The controller refuses changed source anchors and archives the clean, signed
-production HEAD reported by the current monitor, after checking its signed commit
-and the retained `overlay.APPROVED_NATIVE_REVISION` prerequisite ancestry. It
-refuses a dirty source or a monitor/source HEAD mismatch; it never archives the
-active working tree. This is fixture provenance, not a production admission grant.
-The manifest records the actual native HEAD, declared baseline, full archive
-digest, original/mutated source hashes, replacement text, commands and binary
-hashes. The COPY uses its own explicit native path patch and the unchanged build
-observer. Its `buildIdentity` binds the copied source content with unknown Git
-provenance; no synthetic revision label or old baseline identity is substituted.
-After each build, the actual binary must answer `capabilities --backend krun
---json` with this content-bound, qualification-ineligible identity. The exact
-identity and stdout/stderr/exit status are retained in the manifest and
-`capabilities.log`. Old fixture manifests are historical evidence, never migrated
-or silently reused for new monitor bytes.
+The controller refuses changed source anchors and makes a private copy of the
+selected native working tree, excluding Git metadata and build outputs. It does
+not ask the monitor to attest a source revision or require a clean checkout.
+The manifest records original/mutated source hashes and replacement text as
+experiment evidence, plus commands and binary hashes. The COPY uses its own
+explicit native path patch. Its informational `buildIdentity` remains
+`v1:silo:<target>:<version>` and is not source compatibility evidence.
+After each build, the actual binary's `capabilities --backend krun --json`
+stdout/stderr/exit status are retained in the manifest and `capabilities.log`.
+Old fixture manifests are historical evidence, never migrated or silently reused
+for new monitor bytes.
 Production validators, dependency/cache/pin and stage remain untouched. Rebuild
-fixtures after production source changes; never add observer/fault binary
-hashes to the production admission table.
+fixtures after production source changes; never install observer/fault binaries
+into the shared staged runtime.
 
 Missing/truncated/swapped serial fixtures alter only the copied native
 `build_disk_image_id` response construction. Duplicate uses a third real raw
@@ -1548,7 +1508,7 @@ the original bytes on EOPNOTSUPP; ramfs must actually report EOPNOTSUPP.
 The first lane uses the unmodified corrected staged CLI/libvm/monitor/worker,
 checks actual worker writable handles to that same device/inode, guest zero
 reads, every host byte inside/outside the range, unchanged logical length,
-stop/reopen, capacity and guest reads after restart. A separate unqualified
+stop/reopen, capacity and guest reads after restart. A separate diagnostic
 COPY-only monitor then logs actual parsed native requests, correlates their
 device object with that real Data device's GET_ID, and requires exact range
 coverage by the requested opcode **and actual parsed flags**. `zero` uses the
@@ -1902,8 +1862,8 @@ Ordinary fork and snapshot capture require a stopped source and admit opaque raw
 and EROFS-overlay roots subject to their boot/backend admission. Layered
 snapshot/restore artifacts retain the exact fsmeta, ordered pack and metadata
 graph, not a flattened lower or a requirement to regenerate from OCI. Obsolete
-flat profiles are rejected before effects. Live execution operations remain
-separate and publicly unqualified, not implicit stop/cold-boot fallbacks. An
+flat profiles are rejected before effects. Live execution operations require
+their native backend/host primitives, not implicit stop/cold-boot fallbacks. An
 exact checkpoint preserves configured secrets, guest credentials, dirty journals
 and deleted-data remnants. It is neither sanitization nor application-consistency
 certification.
@@ -2097,13 +2057,11 @@ and writer-closure checks guard that deferred seal; the deadline is not renewed.
 `--enospc-directory` naming a new empty mountpoint inside a private user/mount
 namespace (`unshare --user --map-root-user --mount`). Its bounded tmpfs
 exercises actual ENOSPC; do not substitute host disk exhaustion or `/dev/full`.
-Run `capabilities` last, with `--monitor "$STAGED_RUNTIME/bin/silo-vmm"`,
-only after the exercised native lane's support declarations have been approved.
-Phase 24 admits pause, capture, restore, fork and incremental for the exact
-production Linux KVM x86_64 build recorded in
-[silo-vmm qualification](../docs/architecture/silo-vmm.md#qualification).
-Other builds and lanes remain unqualified. Standalone native proofs grant
-no additional public capability.
+Run `capabilities` last, with `--monitor "$STAGED_RUNTIME/bin/silo-vmm"`.
+On KVM x86_64, every live operation with a native primitive must report
+`supported`, independent of the workspace's libkrun pin. Standalone native
+proofs do not alter capability declarations. Checkpoint compatibility uses the
+native state schema and guest architecture, never exact producer builds.
 
 `api-report.json`, per-process logs, captured manifests and input identities
 are the evidence. Ordinary successful cohorts require acknowledged native
@@ -2120,7 +2078,7 @@ and confirming that every owner and retained consumer has terminated.
 
 ## Capture-side multiple writable disk gates
 
-After Main stages the explicitly isolated Phase 14 candidate, run:
+After staging the runtime, run:
 
 ```sh
 make smoke SMOKE_ARGS='tests/test_capture_multidisk.py -m slow --keep'
@@ -2155,6 +2113,6 @@ returns zero; its logical length is never reported as physical transferred
 bytes. Host filesystem/device/mount options are observed with `findmnt` in
 `stopped-host-mount.log`. `SILO_SMOKE_CAPTURE_FS` may require an exact filesystem
 type; durable `TMPDIR` selects the workspace parent. An image filesystem or a
-directory name never establishes a host storage lane. These tests do not grant
-production qualification or establish the APFS/non-reflink matrix, restored
-children, sibling divergence, restore-time journal ordering or recapture.
+directory name never establishes a host storage lane. These tests do not
+establish the APFS/non-reflink matrix, restored children, sibling divergence,
+restore-time journal ordering or recapture.

@@ -1247,7 +1247,7 @@ mod tests {
         let pause = |request| command(LiveCommandKind::Pause, request, 0);
         let mut journal = Journal::new(id(MACHINE), id(RUN));
         let mut unsupported_view = view(VmLifecycleState::Running);
-        let reason = unsupported(LiveOperation::Pause, LiveReasonCode::LaneNotQualified);
+        let reason = unsupported(LiveOperation::Pause, LiveReasonCode::BuildExcluded);
         unsupported_view.pause = Err(reason.clone());
         let result = ready(journal.admit(&pause(0x20), &unsupported_view, Eligibility::Eligible));
         assert_eq!(
@@ -1311,7 +1311,7 @@ mod tests {
                 AdmissionView {
                     capture: Err(unsupported(
                         LiveOperation::Capture,
-                        LiveReasonCode::LaneNotQualified,
+                        LiveReasonCode::BuildExcluded,
                     )),
                     ..running.clone()
                 },

@@ -29,10 +29,9 @@ from silo_smoke import restore_lifecycle as lifecycle
 from silo_smoke.cli import Silo
 from silo_smoke.restore_lifecycle import restore_network_image  # noqa: F401  session fixture
 
-# VM cases use Main's explicit isolated capture+restore candidate
-# (SILO_SMOKE_BIN_DIR and SILO_SMOKE_RUNTIME_DIR, like the capture gates),
-# independently of Phase 24 production qualification. They are slow; the
-# host-only oracle tests below use real bytes, sockets and files, no VM.
+# VM cases use the staged runtime selected by SILO_SMOKE_BIN_DIR and
+# SILO_SMOKE_RUNTIME_DIR. They are slow; the host-only oracle tests below
+# use real bytes, sockets and files, no VM.
 pytestmark = [pytest.mark.linux_only]
 SOURCE = "restore-net-source"
 UNIX_FORWARD = f"host:unix:svc.sock=guest:tcp:127.0.0.1:{lifecycle.LISTEN_PORT}"

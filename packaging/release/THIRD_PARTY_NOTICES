@@ -4,7 +4,7 @@ libkrun
 Copyright 2020-2026 The libkrun authors
 https://github.com/vandycknick/libkrun
 
-@LIBKRUN_SOURCE_BINDING@
+Silo includes libkrun, the native virtual-machine runtime.
 
 libkrun is licensed under the Apache License, Version 2.0. The complete
 license text is distributed at LICENSES/APACHE-2.0.txt.

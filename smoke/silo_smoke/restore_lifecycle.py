@@ -634,7 +634,6 @@ def create_source(silo: Silo, image: str, name: str, *flags: str) -> dict:
         os.fsync(disk.fileno())
     silo.start(name)
     info = silo.wait_ready(name)
-    restore.require_restore_candidate(info)
     return info
 
 

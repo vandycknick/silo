@@ -38,8 +38,8 @@ use crate::virt::lifecycle::{
     OutputReceipt, ProviderDevice, VirtioKind,
 };
 
-/// The modeled native execution-state producer.
-pub(crate) const SCENARIO_PRODUCER: &str = "silo-scenario-native;execution-v1";
+/// State format of the scenario backend.
+pub(crate) const SCENARIO_STATE_SCHEMA: &str = "silo.scenario-state/1";
 const PAGE: u64 = 4096;
 const WRITE_CHUNK: usize = 64 * 1024;
 
@@ -294,7 +294,7 @@ impl ScenarioNative {
     fn layout_bytes(&self) -> Vec<u8> {
         let length = self.ram_bytes();
         format!(
-            "{{\"architecture\":\"x86_64\",\"kind\":\"ram-layout\",\"packedLength\":{length},\
+            "{{\"architecture\":\"x86_64\",\"kind\":\"ram-layout\",\"magic\":\"KRUNRAML\",\"packedLength\":{length},\
              \"pageGranule\":{PAGE},\"regions\":[{{\"guestPhysicalAddress\":0,\"length\":{length},\
              \"streamOffset\":0}}],\"schema\":1,\"topology\":{{\"firmwareAddress\":0,\
              \"initrdAddress\":{length},\"ramAboveGap\":0,\"ramBelowGap\":{length},\
@@ -435,13 +435,9 @@ impl Encoder {
     }
     /// Native `StateBinding` encoding order.
     fn binding(&mut self, binding: &CaptureStateBinding) {
-        self.bytes(binding.native_producer.as_bytes());
-        for digest in [
-            &binding.silo_producer,
-            &binding.profile,
-            &binding.topology,
-            &binding.ram_layout,
-        ] {
+        self.bytes(binding.live_state_schema.as_bytes());
+        self.bytes(binding.architecture.as_bytes());
+        for digest in [&binding.profile, &binding.topology, &binding.ram_layout] {
             self.fixed(&digest.0);
         }
         self.fixed(binding.source_run.as_bytes());
@@ -838,8 +834,12 @@ impl NativeLifecycle for ScenarioNative {
         Vec::new()
     }
 
-    fn native_producer(&self) -> Result<String, NativeFailure> {
-        Ok(SCENARIO_PRODUCER.to_string())
+    fn live_state_schema(&self) -> Result<String, NativeFailure> {
+        Ok(SCENARIO_STATE_SCHEMA.to_string())
+    }
+
+    fn architecture(&self) -> &'static str {
+        "x86_64"
     }
 
     fn ram_layout_digest(&self, deadline: Instant) -> Result<Digest32, NativeFailure> {
@@ -884,7 +884,7 @@ impl NativeLifecycle for ScenarioNative {
         if !current_token(&model, token) || binding.pause_generation.get() != token.generation {
             return Err(NativeFailure::new(NativeFailureKind::InvalidToken));
         }
-        if binding.native_producer != SCENARIO_PRODUCER
+        if binding.live_state_schema != SCENARIO_STATE_SCHEMA
             || binding.ram_layout.0 != <[u8; 32]>::from(sha2::Sha256::digest(self.layout_bytes()))
         {
             return Err(participant(

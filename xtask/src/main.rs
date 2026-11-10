@@ -20,8 +20,6 @@ mod changesets;
 mod command;
 mod components;
 mod coverage;
-#[path = "../../virt/vmm/dependency_source.rs"]
-mod dependency_source;
 mod go_sdk;
 mod initramfs;
 mod kernel;

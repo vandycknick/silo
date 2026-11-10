@@ -178,13 +178,11 @@ pub fn stage(context: &BuildContext<'_>) -> Result<(), RuntimeError> {
         }
         create_directory(&temporary.join("LICENSES"))?;
         let notices = temporary.join("THIRD_PARTY_NOTICES");
-        fs::write(
-            &notices,
-            release_notices(context.workspace_root, &bin.join("silo-vmm"))?,
-        )
-        .map_err(|source| RuntimeError::Metadata {
-            path: notices.clone(),
-            source,
+        fs::write(&notices, release_notices(context.workspace_root)?).map_err(|source| {
+            RuntimeError::Metadata {
+                path: notices.clone(),
+                source,
+            }
         })?;
         set_mode(&notices, 0o644)?;
         copy_regular_file(
@@ -314,9 +312,9 @@ pub fn validate_stage_against_adjacent(
         path: notices_path,
         source,
     })?;
-    if notices != release_notices(context.workspace_root, &stage.join("bin/silo-vmm"))? {
+    if notices != release_notices(context.workspace_root)? {
         return Err(RuntimeError::Invalid(
-            "runtime notices do not match resolved sources and compiled monitor binding".into(),
+            "runtime notices do not match the packaged license notices".into(),
         ));
     }
     compare_regular_files(
@@ -359,137 +357,10 @@ pub fn validate_stage_against_adjacent(
     Ok(())
 }
 
-fn release_notices(workspace: &Path, monitor: &Path) -> Result<Vec<u8>, RuntimeError> {
-    let read = |name: &str| {
-        fs::read_to_string(workspace.join(name)).map_err(|source| RuntimeError::Metadata {
-            path: workspace.join(name),
-            source,
-        })
-    };
-    let manifest = read("Cargo.toml")?;
-    let lock = read("Cargo.lock")?;
-    let source = crate::dependency_source::resolve_dependency(&manifest, &lock)
-        .map_err(|error| RuntimeError::Invalid(error.into()))?;
-    let identity = match source {
-        crate::dependency_source::DependencySource::Git { .. } => None,
-        crate::dependency_source::DependencySource::Path { .. } => {
-            // VZ is explicitly excluded by capability discovery. It returns
-            // immutable linked build facts without opening KVM or loading HVF.
-            let mut command = std::process::Command::new(monitor);
-            command
-                .args(["capabilities", "--backend", "vz", "--json"])
-                .stdin(std::process::Stdio::null());
-            let output = crate::command::output(command)?;
-            let report: serde_json::Value = serde_json::from_slice(&output.stdout)
-                .map_err(|error| RuntimeError::Invalid(error.to_string()))?;
-            if report["schemaVersion"] != 1
-                || report["scope"] != "host"
-                || report["backend"] != "vz"
-            {
-                return Err(RuntimeError::Invalid(
-                    "invalid build-only monitor capability report".into(),
-                ));
-            }
-            Some(
-                report["buildIdentity"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        RuntimeError::Invalid("monitor lacks compiled build identity".into())
-                    })?
-                    .to_owned(),
-            )
-        }
-    };
-    render_release_notices(workspace, source, identity.as_deref())
-}
-
-struct PathSourceNotice<'a> {
-    state: &'a str,
-    revision: &'a str,
-    content: &'a str,
-    inputs: &'a str,
-}
-
-fn path_source_notice(identity: &str) -> Result<PathSourceNotice<'_>, RuntimeError> {
-    let invalid = || RuntimeError::Invalid("invalid compiled native path source binding".into());
-    let mut parts = identity.split(':');
-    if parts.next() != Some("v2") || parts.next() != Some("path") {
-        return Err(invalid());
-    }
-    let state = parts.next().ok_or_else(invalid)?;
-    let revision = parts.next().ok_or_else(invalid)?;
-    let content = parts
-        .next()
-        .and_then(|value| value.strip_prefix("content="))
-        .ok_or_else(invalid)?;
-    let inputs = parts
-        .next()
-        .and_then(|value| value.strip_prefix("inputs="))
-        .ok_or_else(invalid)?;
-    let hex = |value: &str, length: usize| {
-        value.len() == length
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    };
-    if parts.next().is_some()
-        || !matches!(state, "clean" | "dirty" | "unknown")
-        || !(hex(revision, 40)
-            || hex(revision, 64)
-            || (state == "unknown" && revision == "unknown"))
-        || !(hex(content, 64) || (state == "unknown" && content == "unknown"))
-        || !hex(inputs, 64)
-    {
-        return Err(invalid());
-    }
-    Ok(PathSourceNotice {
-        state,
-        revision,
-        content,
-        inputs,
-    })
-}
-
-fn render_release_notices(
-    workspace: &Path,
-    source: crate::dependency_source::DependencySource<'_>,
-    compiled_identity: Option<&str>,
-) -> Result<Vec<u8>, RuntimeError> {
-    let binding = match source {
-        crate::dependency_source::DependencySource::Git { revision } => {
-            format!(
-                "Silo builds libkrun from the source revision pinned in Cargo.lock:\n{revision}."
-            )
-        }
-        crate::dependency_source::DependencySource::Path { crate_path } => {
-            let identity = compiled_identity.ok_or_else(|| {
-                RuntimeError::Invalid(
-                    "path-source notices require compiled monitor identity".into(),
-                )
-            })?;
-            let observed = path_source_notice(identity)?;
-            format!(
-                "Silo builds libkrun from an explicitly resolved local source checkout.\n\
-                 Workspace-resolved source path: {crate_path}\n\
-                 Compiled source HEAD observation: {}\n\
-                 Compiled worktree state: {}\n\
-                 Compiled source-content fingerprint: {}\n\
-                 Compiled monitor-input fingerprint: {}\n\
-                 HEAD is not an attestation of dirty/unknown bytes or live qualification.",
-                observed.revision, observed.state, observed.content, observed.inputs,
-            )
-        }
-    };
+fn release_notices(workspace: &Path) -> Result<Vec<u8>, RuntimeError> {
     let path = workspace.join("packaging/release/THIRD_PARTY_NOTICES");
-    let template =
+    let mut notices =
         fs::read_to_string(&path).map_err(|source| RuntimeError::Metadata { path, source })?;
-    const MARKER: &str = "@LIBKRUN_SOURCE_BINDING@";
-    if template.matches(MARKER).count() != 1 {
-        return Err(RuntimeError::Invalid(
-            "libkrun notice template must contain one source binding marker".into(),
-        ));
-    }
-    let mut notices = template.replacen(MARKER, &binding, 1);
     if workspace
         .join("vendor/signal-hook-registry/LICENSE-APACHE")
         .is_file()
@@ -1016,102 +887,22 @@ mod tests {
     }
 
     #[test]
-    fn notices_use_locked_git_revision_without_executing_monitor() {
+    fn notices_do_not_observe_native_sources_or_execute_monitor() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         std::fs::create_dir_all(root.join("packaging/release")).unwrap();
-        let revision = "0123456789abcdef0123456789abcdef01234567";
-        std::fs::write(root.join("Cargo.toml"), format!(
-            "[workspace.dependencies]\nlibkrun = {{ git = \"https://github.com/vandycknick/libkrun.git\", rev = \"{revision}\" }}\n"
-        )).unwrap();
-        std::fs::write(root.join("Cargo.lock"), format!(
-            "[[package]]\nname = \"libkrun\"\nsource = \"git+https://github.com/vandycknick/libkrun.git?rev={revision}#{revision}\"\n"
-        )).unwrap();
-        std::fs::write(
-            root.join("packaging/release/THIRD_PARTY_NOTICES"),
-            "License heading\n@LIBKRUN_SOURCE_BINDING@\nLicense tail\n",
-        )
-        .unwrap();
-        let absent_monitor = root.join("not-an-executable");
-        let notices =
-            String::from_utf8(crate::runtime::release_notices(root, &absent_monitor).unwrap())
-                .unwrap();
-        assert_eq!(notices, format!(
-            "License heading\nSilo builds libkrun from the source revision pinned in Cargo.lock:\n{revision}.\nLicense tail\n"
-        ));
-        std::fs::write(root.join("Cargo.lock"), "").unwrap();
-        assert!(crate::runtime::release_notices(root, &absent_monitor).is_err());
-    }
-
-    #[test]
-    fn notices_bind_compiled_path_revision_content_and_unknown_state_without_old_pin() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        std::fs::create_dir_all(root.join("packaging/release")).unwrap();
-        let baseline = "a".repeat(40);
-        let manifest = format!(
-            "[workspace.dependencies]\nlibkrun = {{ git = \"https://github.com/vandycknick/libkrun.git\", rev = \"{baseline}\" }}\n\
-             [patch.\"https://github.com/vandycknick/libkrun.git\"]\nlibkrun = {{ path = \"/production/src/libkrun\" }}\n"
+        let template = "libkrun\nApache license remains unchanged.\n";
+        std::fs::write(root.join("packaging/release/THIRD_PARTY_NOTICES"), template).unwrap();
+        assert_eq!(
+            crate::runtime::release_notices(root).unwrap(),
+            template.as_bytes()
         );
-        let source = crate::dependency_source::resolve_dependency(
-            &manifest,
-            "[[package]]\nname = \"libkrun\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("packaging/release/THIRD_PARTY_NOTICES"),
-            "@LIBKRUN_SOURCE_BINDING@\nApache license remains unchanged.\n",
-        )
-        .unwrap();
-        let content = "c".repeat(64);
-        let inputs = "d".repeat(64);
-        let mut observed = Vec::new();
-        for state in ["clean", "dirty", "unknown"] {
-            let revision = if state == "unknown" {
-                "unknown".into()
-            } else {
-                "b".repeat(40)
-            };
-            let identity = format!("v2:path:{state}:{revision}:content={content}:inputs={inputs}");
-            let notices =
-                crate::runtime::render_release_notices(root, source, Some(&identity)).unwrap();
-            let text = String::from_utf8(notices.clone()).unwrap();
-            assert!(text.contains("Workspace-resolved source path: /production/src/libkrun"));
-            assert!(text.contains(&format!("Compiled source HEAD observation: {revision}")));
-            assert!(text.contains(&format!("Compiled worktree state: {state}")));
-            assert!(text.contains(&format!("Compiled source-content fingerprint: {content}")));
-            assert!(text.contains("not an attestation"));
-            assert!(text.ends_with("Apache license remains unchanged.\n"));
-            assert!(!text.contains(&baseline));
-            assert!(!text.contains("pinned in Cargo.lock"));
-            observed.push(notices);
-        }
-        assert_ne!(observed[0], observed[1]);
-        assert_ne!(observed[1], observed[2]);
-        let changed = format!(
-            "v2:path:clean:{}:content={}:inputs={inputs}",
-            "b".repeat(40),
-            "e".repeat(64)
+        // Neither Cargo metadata nor a monitor executable is required for notices.
+        std::fs::write(root.join("Cargo.toml"), "not Cargo metadata").unwrap();
+        assert_eq!(
+            crate::runtime::release_notices(root).unwrap(),
+            template.as_bytes()
         );
-        assert_ne!(
-            crate::runtime::render_release_notices(root, source, Some(&changed)).unwrap(),
-            observed[0]
-        );
-        assert!(crate::runtime::render_release_notices(root, source, None).is_err());
-        for invalid in [
-            format!("{baseline}:old-build"),
-            format!("v2:git:revision-bound:{baseline}:content={content}:inputs={inputs}"),
-            format!("v2:path:clean:unknown:content={content}:inputs={inputs}"),
-        ] {
-            assert!(crate::runtime::render_release_notices(root, source, Some(&invalid)).is_err());
-        }
-        for template in [
-            "no source marker",
-            "@LIBKRUN_SOURCE_BINDING@\n@LIBKRUN_SOURCE_BINDING@",
-        ] {
-            std::fs::write(root.join("packaging/release/THIRD_PARTY_NOTICES"), template).unwrap();
-            assert!(crate::runtime::render_release_notices(root, source, Some(&changed)).is_err());
-        }
     }
     #[test]
     fn manifest_hashes_current_components_and_rejects_symlinks() {

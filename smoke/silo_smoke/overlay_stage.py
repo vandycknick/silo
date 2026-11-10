@@ -34,7 +34,7 @@ def replacement(silo: Silo, reference: str) -> None:
     fixture_root = os.environ.get('SILO_SMOKE_FAULT_MONITORS')
     assert fixture_root, 'build fresh COPY-only reordered fixture first'
     fixture = json.loads((Path(fixture_root) / 'reordered/fault-manifest.json').read_text())
-    assert fixture['fault'] == 'reordered' and fixture['declaredNativeBaseline'] == overlay.APPROVED_NATIVE_REVISION
+    assert fixture['fault'] == 'reordered'
     assert fixture['validationUnchanged'] and fixture['uniqueAttachmentKeysUnchanged']
     assert overlay.digest(Path(fixture['binary'])) == fixture['binarySha256']
     shutil.copyfile(fixture['binary'], successor / 'bin/silo-vmm')

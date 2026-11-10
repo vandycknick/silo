@@ -269,12 +269,12 @@ pub(crate) fn verify_portable_binding(
     let profile = &execution.compatibility_profile;
     let pins = [
         (
-            memory.binding.native_producer == profile.native_producer,
-            "native producer",
+            memory.binding.live_state_schema == profile.live_state_schema,
+            "live state schema",
         ),
         (
-            same(&memory.binding.silo_producer, &profile.silo_producer),
-            "Silo producer",
+            memory.binding.architecture == profile.architecture,
+            "architecture",
         ),
         (
             same(&memory.binding.profile, &profile.profile),
@@ -671,7 +671,7 @@ mod tests {
                 "native producer pin",
                 reencode(&published.evidence, |evidence| {
                     if let Some(memory) = &mut evidence.memory {
-                        memory.binding.native_producer.push('x');
+                        memory.binding.live_state_schema.push('x');
                     }
                 }),
             ),

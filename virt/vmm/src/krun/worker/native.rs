@@ -325,29 +325,12 @@ impl NativeLifecycle for KrunNative {
         self.protected.clone()
     }
 
-    /// A `restore-irq-probe` candidate binds captures to native's explicit
-    /// diagnostic producer, the exact one its envelopes carry. It is never
-    /// the ordinary producer, so no normal build restores or relabels it.
-    fn native_producer(&self) -> Result<String, NativeFailure> {
-        #[cfg(all(
-            feature = "restore-irq-probe",
-            target_os = "linux",
-            target_arch = "x86_64"
-        ))]
-        {
-            libkrun::capabilities::diagnostic_execution_producer()
-                .map_err(|error| NativeFailure::with_detail(NativeFailureKind::Unsupported, error))
-        }
-        #[cfg(not(all(
-            feature = "restore-irq-probe",
-            target_os = "linux",
-            target_arch = "x86_64"
-        )))]
-        {
-            libkrun::capabilities::compiled_live_build()
-                .execution_producer()
-                .map_err(|error| NativeFailure::with_detail(NativeFailureKind::Unsupported, error))
-        }
+    fn live_state_schema(&self) -> Result<String, NativeFailure> {
+        Ok(libkrun::capabilities::LIVE_STATE_SCHEMA.to_string())
+    }
+
+    fn architecture(&self) -> &'static str {
+        std::env::consts::ARCH
     }
 
     fn ram_layout_digest(&self, deadline: Instant) -> Result<Digest32, NativeFailure> {
@@ -710,8 +693,8 @@ fn native_exposure(snapshot: &libkrun::live::LiveSnapshot) -> NativeExposure {
 
 fn state_binding(binding: &CaptureStateBinding) -> StateBinding {
     StateBinding {
-        native_producer: binding.native_producer.clone(),
-        silo_producer: binding.silo_producer.0,
+        live_state_schema: binding.live_state_schema.clone(),
+        architecture: binding.architecture.clone(),
         profile: binding.profile.0,
         topology: binding.topology.0,
         ram_layout: binding.ram_layout.0,
@@ -727,8 +710,8 @@ fn capture_binding(native: &StateBinding) -> Result<CaptureStateBinding, NativeF
             NativeFailure::with_detail(NativeFailureKind::Unexpected, "binding generation zero")
         })?;
     Ok(CaptureStateBinding {
-        native_producer: native.native_producer.clone(),
-        silo_producer: Digest32(native.silo_producer),
+        live_state_schema: native.live_state_schema.clone(),
+        architecture: native.architecture.clone(),
         profile: Digest32(native.profile),
         topology: Digest32(native.topology),
         ram_layout: Digest32(native.ram_layout),

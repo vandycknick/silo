@@ -34,9 +34,8 @@ The owner-approved privileged umoci v0.6.0 published-builder namespace gate
 also matched actual readonly EROFS traversals without excluded fields.
 Production-root boot/lifecycle and kernel-mutated flatten gates passed on
 Linux x86_64 with stable 7.2.2 and longterm 6.18.48. Phase 24 separately records
-exact-build Linux KVM x86_64 live qualification, including the mandatory btrfs
-and ext4 budget sweep, as described under
-[backend capabilities](#backend-capabilities-and-early-rejection). Original
+Linux KVM x86_64 runtime evidence, including the mandatory btrfs and ext4
+budget sweep. Original
 containerd differential evidence and the absolute-path Nix negative remain
 intact; see [ADR 0014's gate exception](0014-layered-oci-image-storage.md#filesystem-and-linux-gates).
 
@@ -45,18 +44,15 @@ the explicit record step after the cut, structural trust of local monitor
 receipts, `constructed` → `durable` children with joined durability barriers,
 the non-CoW copy and capture/incremental disk-sealing allowances, reflink
 seeding of incremental RAM, and a Linux 6.6 kernel floor instead of exact
-boot-tuple qualification. The production qualification record admits all
-five live operations on `kvm-x86_64` for libkrun `0d21bf7` and identity:
+boot-tuple qualification. Measured budgets and retained failures are recorded
+in the [performance tracker](../architecture/live-operation-performance.md),
+backed by `.tmp/plan/evidence/phase-24/`.
 
-```text
-v2:native=659b7f3e192ede9ced9c8c77e9ac173fc34a7de9ebc9b2b458fc6c56ff24b986:binding=1abf26fa6638c4f0c81f40ee2f192b79c40d789fa1f5088b4e388740b3a1586d:eligible=true
-```
-
-Measured budgets, admitted-lane evidence and retained failures are recorded
-in [silo-vmm qualification](../architecture/silo-vmm.md#qualification)
-and the [performance tracker](../architecture/live-operation-performance.md),
-backed by `.tmp/plan/evidence/phase-24/`. Acceptance is not qualification
-of the pending foreign lanes or a claim that every recorded suite passed.
+The owner decision of 2026-11-10 removes build-specific live admission and
+exact-build checkpoint compatibility. Any pinned libkrun reference supplies its
+native live operations subject to the existing host and machine checks.
+Checkpoints record the live state format schema and guest architecture; restore
+refuses those mismatches, not a different build.
 
 ## The Problem
 
@@ -850,72 +846,37 @@ Every backend reports a **live capability vector**: `pause`, `capture`,
 `restore`, `fork` and `incremental`, each `supported` or `unsupported` with
 one typed reason. The reasons are closed: `backend-excluded` (VZ, mock
 without a scenario grant), `host-os-below-floor` (macOS 14 for HVF),
-`lane-not-qualified` (a libkrun lane without a passing gate record for the
-shipped revision), `hypervisor-unavailable` (no `/dev/kvm`, no
+`hypervisor-unavailable` (no `/dev/kvm`, no
 Hypervisor.framework entitlement), `build-excluded` (the live ABI not compiled
 in), `not-delivered` (the stage that admits this operation has not shipped in
 this release) and, at machine level only, `device-profile-rejected` naming
 the device (virtiofs, Rosetta, TAP, GPU, nested, TEE) or the guest profile.
 
-A bit is `supported` only as the intersection of four facts: the libkrun
-fork's native primitive exists on this lane (the fork's own query, commit 1
-of the series below), the guest, monitor and manager pieces for that
-operation have shipped (the stage that delivers it), the lane has a passing
-gate record for the shipped revision, and the host passes its runtime
-checks. The first fact alone is never shown to a user as support; it is
-reported separately as `native` for diagnostics.
+A delivered operation is `supported` when the libkrun backend provides its
+native primitive for this lane and the host passes its runtime checks.
+The `native` diagnostic reports that primitive independently of host and
+machine-profile refusals. Support does not depend on a build allowlist, a
+source tree being clean, or a previous local test result. Positive mock
+scenarios exercise transport, not native execution.
 
-The qualification record is compiled into the shipped executable, tied to the
-actual resolved libkrun revision, target/build profile, ABI/features, lane and
-operation. It is never granted by mutable installation files, database state,
-environment flags or a previous local test result. Phase 9 exposes the implemented
-native pause primitive on recognized lanes, but the delivered and qualified public
-operation sets remain empty. Positive mock scenarios test transport and do not
-qualify a production lane or authorize undelivered manager execution.
+The informational `buildIdentity` is `v1:silo:<target>:<package-version>`, using
+only Silo's Cargo environment. It is useful alongside binary digests in system
+information and smoke evidence, but it does not participate in restore admission.
+Builds do not inspect source checkouts, Git metadata or source fingerprints.
 
-Cargo's debug/release `PROFILE` inheritance label is diagnostic, not a complete
-effective-build identity. Observable compiler/profile/configuration inputs are
-fingerprinted separately from declared manifest feature inputs. Neither proves
-the actual compiled dependency ABI/features or every dependency-package override.
-The native provider supplies dependency-local query/control ABI, actual normalized
-features, compiler/settings and source observations. The monitor binds their
-canonical digest separately from its own input fingerprint. During the local
-production-path cutover, the declared Git pin remains a baseline, not the identity
-of patched bytes: the build observes the production checkout's actual HEAD,
-clean/dirty/unknown state and source-content fingerprint, and watches source and
-Git metadata for rebuilds. Git-resolved builds bind the full lockfile revision
-after the temporary patch is removed. Missing or inconsistent native/source facts,
-dirty or unknown trees and absent control ABI are qualification-ineligible even
-for an otherwise matching evidenced record. The bounded `buildIdentity` and
-`qualificationIdentity` strings carry these observations without changing the
-public vector schema; an observed native digest is not a qualification grant.
+Capture receipts and checkpoint compatibility profiles carry `liveStateSchema`
+and `architecture`. The native capabilities API exports `LIVE_STATE_SCHEMA`
+(`silo.live-state/1`); bump that summary whenever any component's state magic or
+schema changes. Each encoder owns its magic and schema constant, and its decoder
+checks both. Restore compatibility refuses only schema or guest-architecture
+mismatches, with typed expected/found diagnostics, never a different build,
+compiler, checkout, feature fingerprint or source revision. Existing checks of
+captured hashes, topology, device inventories and host resource readiness remain
+integrity and execution-safety checks, not producer identity policy.
+
 Machine-less native host queries supply operation and host facts without creating
 a VM. Unknown VM/GIC admission remains unknown, and neither API access nor optional
-HVF symbol presence grants public live availability. In Phase 9, native pause is
-true on recognized implemented lanes; native capture, restore, fork and incremental
-remain not implemented. Primitive support is not lane qualification: unrun KVM
-arm64 and HVF lanes remain pending. At that stage public operations remain
-`not-delivered`, and the shipped qualification set is empty. Host and
-effective-profile admission requirements are unchanged.
-
-Phase 13 delivered public pause/resume with a supervisor-verified Linux KVM
-x86_64 qualification record. Its real guest gate covers native pause,
-ClockOnly acknowledgement, exact thaw, retained sessions, durable manager
-reconciliation and stop without resume.
-
-Phase 24 replaces that pause-only record with exact-build Linux KVM x86_64
-qualification for `pause`, `capture`, `restore`, `fork` and `incremental`.
-The admitted libkrun revision is `0d21bf7cadfbfe3721a2ada1b4feca7822685e8f`;
-the complete native/build binding and evidence are recorded in
-[silo-vmm qualification](../architecture/silo-vmm.md#qualification).
-Functional evidence is `phase-24/wrapup-live-suites-3.log` on the isolated
-candidate of this build (208 passed, 5 failed, not an all-green suite).
-`phase-24/batch4d-{btrfs,ext4}` cover capture, fork4 and incremental budgets;
-`phase-24/batch4c-{btrfs,ext4}` cover restore and boot budgets with the same
-restore monitor except parallel seal. Host workspace evidence is
-`phase-24/batch4d-host-workspace-nextest.log`. These paths are relative to
-`.tmp/plan/evidence/`. The record does not qualify other builds or lanes,
-and does not bypass runtime host checks or machine-profile rejection.
+HVF symbol presence bypasses runtime host or effective-profile checks.
 
 The native query's lane is authoritative, including build-feature and unknown
 inventory exclusions. Because the current public schema requires an explicit
@@ -926,7 +887,7 @@ The vector has two sources with distinct scope:
 
 | Source | Scope | How it is obtained |
 | --- | --- | --- |
-| `silo-vmm capabilities --backend <kind> [--scenario <path>] --json` | Host and selected backend: everything that can be known without a machine | A subprocess with no machine, no sockets and no data directory; the monitor evaluates the lane, OS floor, hypervisor access, build features, delivered stages and the gate record it ships with. libvm runs it with the same backend selection and mock scenario it would put in a start request, at runtime open, and caches the result keyed by `silo-vmm` executable identity, host boot, backend kind and scenario digest. |
+| `silo-vmm capabilities --backend <kind> [--scenario <path>] --json` | Host and selected backend: everything that can be known without a machine | A subprocess with no machine, no sockets and no data directory; the monitor evaluates the native primitive, lane, OS floor, hypervisor access, build features and delivered stages. libvm runs it with the same backend selection and mock scenario it would put in a start request, at runtime open, and caches the result keyed by `silo-vmm` executable identity, host boot, backend kind and scenario digest. |
 | Monitor status API, `live` object | Machine: the host vector narrowed by the running machine's attached devices and guest profile | Reported for every run from startup; refreshed when a device is attached. |
 
 libvm exposes the host vector as `Runtime::live_capabilities()` and the
@@ -1290,16 +1251,15 @@ Stages ship independently. Pause and resume may ship before capture; local
 capture and fork before publication. The public capability vector flips one
 operation per stage: `pause` at the end of stage 4, `capture`, `restore` and
 `fork` at the end of stage 5, `incremental` at the end of stage 6, and each
-only on a lane whose gates for that operation have passed; until then the
-bit reports `not-delivered` or `lane-not-qualified`. What may not ship early
-is the claim: a machine is `Paused`, a checkpoint is `coherent`, a child is
-`Running` and an artifact is published only when the corresponding gate has
-passed.
+when its native primitive and host checks permit it; until delivery the bit
+reports `not-delivered`. A machine is `Paused`, a checkpoint is `coherent`,
+a child is `Running` and an artifact is published only when the corresponding
+runtime contract has been satisfied.
 
 ## Conformance Requirements
 
-Each gate passes per admitted lane (KVM x86_64, KVM arm64 GICv3, HVF arm64 on
-macOS 15 or later) before that lane admits the capability.
+Conformance tests cover each implemented lane (KVM x86_64, KVM arm64 GICv3,
+HVF arm64 on macOS 15 or later); their results do not grant runtime support.
 
 - **Pause linearization.** A busy multi-vCPU guest with active block, network,
   console and vsock traffic: the token arrives only after every vCPU has
@@ -1417,9 +1377,9 @@ macOS 15 or later) before that lane admits the capability.
 - Each child costs a private raw copy of every writable disk and, on
   non-CoW hosts, the bytes to make it. Memory sharing is between children,
   not with the still-running source.
-- Execution portability is narrow: same host class, exact producer build at
-  first. A macOS update or a Silo upgrade can make a stored checkpoint
-  unrunnable; it stays inspectable and recoverable as disks.
+- Execution portability requires the same state schema and guest architecture.
+  Native decoders still validate payloads and host execution prerequisites.
+  Unrunnable checkpoints stay inspectable and recoverable as disks.
 - macOS 14 hosts never gain the capability.
 - Checkpoints carry secrets and the guest's duplicated userspace state;
   users must treat them as credentials.

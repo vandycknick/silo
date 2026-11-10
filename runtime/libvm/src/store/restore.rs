@@ -502,14 +502,13 @@ impl SnapshotStore {
                     "RAM stream/geometry",
                 ),
                 (
-                    memory.binding.native_producer
-                        == execution.compatibility_profile.native_producer,
-                    "native producer",
+                    memory.binding.live_state_schema
+                        == execution.compatibility_profile.live_state_schema,
+                    "live state schema",
                 ),
                 (
-                    memory.binding.silo_producer.as_bytes()
-                        == execution.compatibility_profile.silo_producer.as_bytes(),
-                    "Silo producer",
+                    memory.binding.architecture == execution.compatibility_profile.architecture,
+                    "architecture",
                 ),
                 (
                     memory.binding.profile.as_bytes()

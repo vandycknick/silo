@@ -47,8 +47,8 @@ pub struct SnapshotExecution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotCompatibilityProfile {
-    pub native_producer: String,
-    pub silo_producer: ObjectDigest,
+    pub live_state_schema: String,
+    pub architecture: String,
     pub profile: ObjectDigest,
     pub topology: ObjectDigest,
     pub ram_layout: ObjectDigest,
@@ -517,9 +517,17 @@ impl SnapshotRecord {
                 .check(execution.memory.length)
                 .map_err(crate::storage::StorageError::from)?;
             if execution.memory.length == 0
-                || execution.compatibility_profile.native_producer.is_empty()
-                || execution.compatibility_profile.native_producer.len()
-                    > vm_spec::capture::MAX_NATIVE_PRODUCER_BYTES
+                || execution.compatibility_profile.live_state_schema.is_empty()
+                || execution.compatibility_profile.live_state_schema.len()
+                    > vm_spec::capture::MAX_LIVE_STATE_SCHEMA_BYTES
+                || execution
+                    .compatibility_profile
+                    .live_state_schema
+                    .contains('\0')
+                || execution.compatibility_profile.architecture.is_empty()
+                || execution.compatibility_profile.architecture.len()
+                    > vm_spec::capture::MAX_ARCHITECTURE_BYTES
+                || execution.compatibility_profile.architecture.contains('\0')
             {
                 return Err(invalid("invalid execution memory or compatibility profile"));
             }
@@ -1292,8 +1300,8 @@ pub(crate) mod tests {
                 execution: digest,
                 devices: digest,
                 compatibility_profile: SnapshotCompatibilityProfile {
-                    native_producer: "producer".into(),
-                    silo_producer: digest,
+                    live_state_schema: "silo.live-state/1".into(),
+                    architecture: "x86_64".into(),
                     profile: digest,
                     topology: digest,
                     ram_layout: digest,

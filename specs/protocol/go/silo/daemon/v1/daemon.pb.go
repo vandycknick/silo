@@ -4830,7 +4830,6 @@ const (
 	LiveReasonCode_LIVE_REASON_CODE_UNSPECIFIED             LiveReasonCode = 0
 	LiveReasonCode_LIVE_REASON_CODE_BACKEND_EXCLUDED        LiveReasonCode = 1
 	LiveReasonCode_LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR     LiveReasonCode = 2
-	LiveReasonCode_LIVE_REASON_CODE_LANE_NOT_QUALIFIED      LiveReasonCode = 3
 	LiveReasonCode_LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE  LiveReasonCode = 4
 	LiveReasonCode_LIVE_REASON_CODE_BUILD_EXCLUDED          LiveReasonCode = 5
 	LiveReasonCode_LIVE_REASON_CODE_NOT_DELIVERED           LiveReasonCode = 6
@@ -4843,7 +4842,6 @@ var (
 		0: "LIVE_REASON_CODE_UNSPECIFIED",
 		1: "LIVE_REASON_CODE_BACKEND_EXCLUDED",
 		2: "LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR",
-		3: "LIVE_REASON_CODE_LANE_NOT_QUALIFIED",
 		4: "LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE",
 		5: "LIVE_REASON_CODE_BUILD_EXCLUDED",
 		6: "LIVE_REASON_CODE_NOT_DELIVERED",
@@ -4853,7 +4851,6 @@ var (
 		"LIVE_REASON_CODE_UNSPECIFIED":             0,
 		"LIVE_REASON_CODE_BACKEND_EXCLUDED":        1,
 		"LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR":     2,
-		"LIVE_REASON_CODE_LANE_NOT_QUALIFIED":      3,
 		"LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE":  4,
 		"LIVE_REASON_CODE_BUILD_EXCLUDED":          5,
 		"LIVE_REASON_CODE_NOT_DELIVERED":           6,
@@ -19392,14 +19389,14 @@ func (x *LiveCaptureRequest) GetDirtyCrossoverPercent() uint32 {
 
 type CaptureStateBinding struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
-	NativeProducer  string                 `protobuf:"bytes,1,opt,name=native_producer,json=nativeProducer,proto3" json:"native_producer,omitempty"`
-	SiloProducer    string                 `protobuf:"bytes,2,opt,name=silo_producer,json=siloProducer,proto3" json:"silo_producer,omitempty"`
 	Profile         string                 `protobuf:"bytes,3,opt,name=profile,proto3" json:"profile,omitempty"`
 	Topology        string                 `protobuf:"bytes,4,opt,name=topology,proto3" json:"topology,omitempty"`
 	RamLayout       string                 `protobuf:"bytes,5,opt,name=ram_layout,json=ramLayout,proto3" json:"ram_layout,omitempty"`
 	SourceRun       string                 `protobuf:"bytes,6,opt,name=source_run,json=sourceRun,proto3" json:"source_run,omitempty"`
 	PauseGeneration uint64                 `protobuf:"varint,7,opt,name=pause_generation,json=pauseGeneration,proto3" json:"pause_generation,omitempty"`
 	Capture         string                 `protobuf:"bytes,8,opt,name=capture,proto3" json:"capture,omitempty"`
+	LiveStateSchema string                 `protobuf:"bytes,9,opt,name=live_state_schema,json=liveStateSchema,proto3" json:"live_state_schema,omitempty"`
+	Architecture    string                 `protobuf:"bytes,10,opt,name=architecture,proto3" json:"architecture,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -19432,20 +19429,6 @@ func (x *CaptureStateBinding) ProtoReflect() protoreflect.Message {
 // Deprecated: Use CaptureStateBinding.ProtoReflect.Descriptor instead.
 func (*CaptureStateBinding) Descriptor() ([]byte, []int) {
 	return file_daemon_proto_rawDescGZIP(), []int{189}
-}
-
-func (x *CaptureStateBinding) GetNativeProducer() string {
-	if x != nil {
-		return x.NativeProducer
-	}
-	return ""
-}
-
-func (x *CaptureStateBinding) GetSiloProducer() string {
-	if x != nil {
-		return x.SiloProducer
-	}
-	return ""
 }
 
 func (x *CaptureStateBinding) GetProfile() string {
@@ -19486,6 +19469,20 @@ func (x *CaptureStateBinding) GetPauseGeneration() uint64 {
 func (x *CaptureStateBinding) GetCapture() string {
 	if x != nil {
 		return x.Capture
+	}
+	return ""
+}
+
+func (x *CaptureStateBinding) GetLiveStateSchema() string {
+	if x != nil {
+		return x.LiveStateSchema
+	}
+	return ""
+}
+
+func (x *CaptureStateBinding) GetArchitecture() string {
+	if x != nil {
+		return x.Architecture
 	}
 	return ""
 }
@@ -22309,17 +22306,16 @@ func (x *LiveCapabilityVector) GetIncremental() *LiveCapability {
 }
 
 type LiveHostReport struct {
-	state                 protoimpl.MessageState `protogen:"open.v1"`
-	SchemaVersion         *uint32                `protobuf:"varint,1,opt,name=schema_version,json=schemaVersion,proto3,oneof" json:"schema_version,omitempty"`
-	Scope                 *LiveScope             `protobuf:"varint,2,opt,name=scope,proto3,enum=silo.daemon.v1.LiveScope,oneof" json:"scope,omitempty"`
-	Backend               *LiveBackend           `protobuf:"varint,3,opt,name=backend,proto3,enum=silo.daemon.v1.LiveBackend,oneof" json:"backend,omitempty"`
-	Lane                  *LiveLane              `protobuf:"varint,4,opt,name=lane,proto3,enum=silo.daemon.v1.LiveLane,oneof" json:"lane,omitempty"`
-	Live                  *LiveCapabilityVector  `protobuf:"bytes,5,opt,name=live,proto3" json:"live,omitempty"`
-	BuildIdentity         *string                `protobuf:"bytes,6,opt,name=build_identity,json=buildIdentity,proto3,oneof" json:"build_identity,omitempty"`
-	QualificationIdentity *string                `protobuf:"bytes,7,opt,name=qualification_identity,json=qualificationIdentity,proto3,oneof" json:"qualification_identity,omitempty"`
-	ScenarioDigest        *string                `protobuf:"bytes,8,opt,name=scenario_digest,json=scenarioDigest,proto3,oneof" json:"scenario_digest,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	SchemaVersion  *uint32                `protobuf:"varint,1,opt,name=schema_version,json=schemaVersion,proto3,oneof" json:"schema_version,omitempty"`
+	Scope          *LiveScope             `protobuf:"varint,2,opt,name=scope,proto3,enum=silo.daemon.v1.LiveScope,oneof" json:"scope,omitempty"`
+	Backend        *LiveBackend           `protobuf:"varint,3,opt,name=backend,proto3,enum=silo.daemon.v1.LiveBackend,oneof" json:"backend,omitempty"`
+	Lane           *LiveLane              `protobuf:"varint,4,opt,name=lane,proto3,enum=silo.daemon.v1.LiveLane,oneof" json:"lane,omitempty"`
+	Live           *LiveCapabilityVector  `protobuf:"bytes,5,opt,name=live,proto3" json:"live,omitempty"`
+	BuildIdentity  *string                `protobuf:"bytes,6,opt,name=build_identity,json=buildIdentity,proto3,oneof" json:"build_identity,omitempty"`
+	ScenarioDigest *string                `protobuf:"bytes,8,opt,name=scenario_digest,json=scenarioDigest,proto3,oneof" json:"scenario_digest,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *LiveHostReport) Reset() {
@@ -22390,13 +22386,6 @@ func (x *LiveHostReport) GetLive() *LiveCapabilityVector {
 func (x *LiveHostReport) GetBuildIdentity() string {
 	if x != nil && x.BuildIdentity != nil {
 		return *x.BuildIdentity
-	}
-	return ""
-}
-
-func (x *LiveHostReport) GetQualificationIdentity() string {
-	if x != nil && x.QualificationIdentity != nil {
-		return *x.QualificationIdentity
 	}
 	return ""
 }
@@ -23948,10 +23937,8 @@ const file_daemon_proto_rawDesc = "" +
 	"\rresume_policy\x18\x03 \x01(\x0e2#.silo.daemon.v1.CaptureResumePolicyR\fresumePolicy\x125\n" +
 	"\x06policy\x18\x04 \x01(\x0e2\x1d.silo.daemon.v1.CapturePolicyR\x06policy\x126\n" +
 	"\x17dirty_crossover_percent\x18\x05 \x01(\rR\x15dirtyCrossoverPercentB\a\n" +
-	"\x05_name\"\x9c\x02\n" +
-	"\x13CaptureStateBinding\x12'\n" +
-	"\x0fnative_producer\x18\x01 \x01(\tR\x0enativeProducer\x12#\n" +
-	"\rsilo_producer\x18\x02 \x01(\tR\fsiloProducer\x12\x18\n" +
+	"\x05_name\"\xaa\x02\n" +
+	"\x13CaptureStateBinding\x12\x18\n" +
 	"\aprofile\x18\x03 \x01(\tR\aprofile\x12\x1a\n" +
 	"\btopology\x18\x04 \x01(\tR\btopology\x12\x1d\n" +
 	"\n" +
@@ -23959,7 +23946,10 @@ const file_daemon_proto_rawDesc = "" +
 	"\n" +
 	"source_run\x18\x06 \x01(\tR\tsourceRun\x12)\n" +
 	"\x10pause_generation\x18\a \x01(\x04R\x0fpauseGeneration\x12\x18\n" +
-	"\acapture\x18\b \x01(\tR\acapture\"\xce\x05\n" +
+	"\acapture\x18\b \x01(\tR\acapture\x12*\n" +
+	"\x11live_state_schema\x18\t \x01(\tR\x0fliveStateSchema\x12\"\n" +
+	"\farchitecture\x18\n" +
+	" \x01(\tR\farchitectureJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03\"\xce\x05\n" +
 	"\x12CaptureMemoryStats\x12#\n" +
 	"\rlogical_bytes\x18\x01 \x01(\x04R\flogicalBytes\x12&\n" +
 	"\x0flive_bytes_read\x18\x02 \x01(\x04R\rliveBytesRead\x12.\n" +
@@ -24197,24 +24187,22 @@ const file_daemon_proto_rawDesc = "" +
 	"\acapture\x18\x02 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\acapture\x128\n" +
 	"\arestore\x18\x03 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\arestore\x122\n" +
 	"\x04fork\x18\x04 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\x04fork\x12@\n" +
-	"\vincremental\x18\x05 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\vincremental\"\xa5\x04\n" +
+	"\vincremental\x18\x05 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\vincremental\"\xd4\x03\n" +
 	"\x0eLiveHostReport\x12*\n" +
 	"\x0eschema_version\x18\x01 \x01(\rH\x00R\rschemaVersion\x88\x01\x01\x124\n" +
 	"\x05scope\x18\x02 \x01(\x0e2\x19.silo.daemon.v1.LiveScopeH\x01R\x05scope\x88\x01\x01\x12:\n" +
 	"\abackend\x18\x03 \x01(\x0e2\x1b.silo.daemon.v1.LiveBackendH\x02R\abackend\x88\x01\x01\x121\n" +
 	"\x04lane\x18\x04 \x01(\x0e2\x18.silo.daemon.v1.LiveLaneH\x03R\x04lane\x88\x01\x01\x128\n" +
 	"\x04live\x18\x05 \x01(\v2$.silo.daemon.v1.LiveCapabilityVectorR\x04live\x12*\n" +
-	"\x0ebuild_identity\x18\x06 \x01(\tH\x04R\rbuildIdentity\x88\x01\x01\x12:\n" +
-	"\x16qualification_identity\x18\a \x01(\tH\x05R\x15qualificationIdentity\x88\x01\x01\x12,\n" +
-	"\x0fscenario_digest\x18\b \x01(\tH\x06R\x0escenarioDigest\x88\x01\x01B\x11\n" +
+	"\x0ebuild_identity\x18\x06 \x01(\tH\x04R\rbuildIdentity\x88\x01\x01\x12,\n" +
+	"\x0fscenario_digest\x18\b \x01(\tH\x05R\x0escenarioDigest\x88\x01\x01B\x11\n" +
 	"\x0f_schema_versionB\b\n" +
 	"\x06_scopeB\n" +
 	"\n" +
 	"\b_backendB\a\n" +
 	"\x05_laneB\x11\n" +
-	"\x0f_build_identityB\x19\n" +
-	"\x17_qualification_identityB\x12\n" +
-	"\x10_scenario_digest\"\xa5\x04\n" +
+	"\x0f_build_identityB\x12\n" +
+	"\x10_scenario_digestJ\x04\b\a\x10\b\"\xa5\x04\n" +
 	"\x11LiveMachineReport\x12*\n" +
 	"\x0eschema_version\x18\x01 \x01(\rH\x00R\rschemaVersion\x88\x01\x01\x124\n" +
 	"\x05scope\x18\x02 \x01(\x0e2\x19.silo.daemon.v1.LiveScopeH\x01R\x05scope\x88\x01\x01\x12\"\n" +
@@ -24821,16 +24809,15 @@ const file_daemon_proto_rawDesc = "" +
 	"\tLiveScope\x12\x1a\n" +
 	"\x16LIVE_SCOPE_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fLIVE_SCOPE_HOST\x10\x01\x12\x16\n" +
-	"\x12LIVE_SCOPE_MACHINE\x10\x02*\xd0\x02\n" +
+	"\x12LIVE_SCOPE_MACHINE\x10\x02*\xad\x02\n" +
 	"\x0eLiveReasonCode\x12 \n" +
 	"\x1cLIVE_REASON_CODE_UNSPECIFIED\x10\x00\x12%\n" +
 	"!LIVE_REASON_CODE_BACKEND_EXCLUDED\x10\x01\x12(\n" +
-	"$LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR\x10\x02\x12'\n" +
-	"#LIVE_REASON_CODE_LANE_NOT_QUALIFIED\x10\x03\x12+\n" +
+	"$LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR\x10\x02\x12+\n" +
 	"'LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE\x10\x04\x12#\n" +
 	"\x1fLIVE_REASON_CODE_BUILD_EXCLUDED\x10\x05\x12\"\n" +
 	"\x1eLIVE_REASON_CODE_NOT_DELIVERED\x10\x06\x12,\n" +
-	"(LIVE_REASON_CODE_DEVICE_PROFILE_REJECTED\x10\a*\x9f\x01\n" +
+	"(LIVE_REASON_CODE_DEVICE_PROFILE_REJECTED\x10\a\"\x04\b\x03\x10\x03*\x9f\x01\n" +
 	"\x11LiveEvidenceState\x12#\n" +
 	"\x1fLIVE_EVIDENCE_STATE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17LIVE_EVIDENCE_STATE_RUN\x10\x01\x12#\n" +

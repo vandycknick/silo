@@ -13,8 +13,6 @@ from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.config import SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 
-# These gates require the explicitly isolated Phase14 candidate, not a runtime
-# grant. No restore/children or production host-lane qualification is implied.
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 
 
@@ -42,7 +40,7 @@ def running(silo: Silo, name: str, trace: multidisk.Trace) -> tuple[dict, str, d
     assert trace.wait("capture-traced-start.json")["code"] == 0
     info = silo.wait_ready(name)
     availability = info["lifecycle"]["report"]["live"]["capture"]["availability"]
-    assert availability == {"status": "supported"}, "use the isolated Phase14 candidate"
+    assert availability == {"status": "supported"}, availability
     multidisk.mount_sources(silo, name)
     boot_id = silo.exec(name, "cat", "/proc/sys/kernel/random/boot_id").stdout
     return info, boot_id, pause.generation(silo, name)

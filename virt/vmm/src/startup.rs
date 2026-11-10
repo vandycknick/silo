@@ -649,20 +649,15 @@ pub async fn init(
     // The run's capture identity: the same path-free configuration projection
     // libvm computes from this spec, bound to the inherited launch lease.
     let capture_context = machine_config.config.storage_launch().and_then(|launch| {
-        crate::capabilities::capture_producer()
-            .map_err(|error| error.to_string())
-            .and_then(|producer| {
-                crate::live::coordinator::capture::CaptureContext::new(
-                    runtime.dir().to_path_buf(),
-                    &spec,
-                    launch,
-                    producer,
-                    host_live.backend,
-                    host_live.lane,
-                )
-            })
-            .map_err(|error| tracing::warn!(%error, "live capture cannot bind plans for this run"))
-            .ok()
+        crate::live::coordinator::capture::CaptureContext::new(
+            runtime.dir().to_path_buf(),
+            &spec,
+            launch,
+            host_live.backend,
+            host_live.lane,
+        )
+        .map_err(|error| tracing::warn!(%error, "live capture cannot bind plans for this run"))
+        .ok()
     });
     if let (Some(context), Some(restore)) = (&capture_context, machine_config.config.restore()) {
         context

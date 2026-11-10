@@ -1,6 +1,6 @@
 """Phase 18: a real live execution checkpoint crosses a real registry exactly.
 
-    source home (restore candidate)          controlled Distribution 3.1.2
+    source home (staged runtime)            controlled Distribution 3.1.2
     ---------------------------------        -----------------------------
     guest witness -> snapshot --live  --push (acknowledged)-->  index/children/blobs
                                                                    | offline GC, tag kept
@@ -13,9 +13,9 @@
 
 Ownership: `silo` (conftest) is the source home, `destination` below is a
 second fresh home and `distribution` a private registry root; each is created
-and released by exactly one fixture. Admission is compiled into Main's isolated
-capture+restore candidate (SILO_SMOKE_BIN_DIR/SILO_SMOKE_RUNTIME_DIR); no
-capability or trust is granted here. Digest approval is integrity consent,
+and released by exactly one fixture. The staged runtime is selected through
+SILO_SMOKE_BIN_DIR/SILO_SMOKE_RUNTIME_DIR; no capability or trust is granted
+here. Digest approval is integrity consent,
 never publisher authentication.
 """
 from __future__ import annotations
@@ -42,7 +42,6 @@ from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.restore import restore_image  # noqa: F401, pytest fixture
 from silo_smoke.workspace import Workspace
 
-# Admission is compiled into Main's isolated candidate, not production policy.
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 
 REPOSITORY = "silo-smoke/live-checkpoint"
@@ -469,7 +468,6 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
     assert armed["timerPending"] == armed["signalPending"] == 1
     saved = restore.checkpoint(silo, SOURCE, alias="artifact-checkpoint")
     if policy == "incremental":
-        incremental.require_candidate(saved.source_info)
         incremental.authenticated_map(silo, saved, mode="full", reason="requested")
         baseline = saved
         silo.run("resume", SOURCE)

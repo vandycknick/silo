@@ -1005,6 +1005,7 @@ pub(crate) struct LayoutGeometry {
 struct RawLayout {
     architecture: String,
     kind: String,
+    magic: String,
     packed_length: u64,
     page_granule: u32,
     regions: Vec<RawRegion>,
@@ -1031,6 +1032,7 @@ pub(crate) fn parse_layout(bytes: &[u8]) -> io::Result<LayoutGeometry> {
         .map_err(|error| invalid(format!("invalid RAM layout: {error}")))?;
     if layout.kind != "ram-layout"
         || layout.schema != 1
+        || layout.magic != "KRUNRAML"
         || !matches!(layout.architecture.as_str(), "x86_64" | "aarch64")
         || layout.regions.is_empty()
         || !layout.page_granule.is_power_of_two()
@@ -1377,13 +1379,14 @@ mod tests {
 
     #[test]
     fn layout_geometry_is_validated() {
-        let valid = br#"{"architecture":"x86_64","kind":"ram-layout","packedLength":12288,"pageGranule":4096,"regions":[{"guestPhysicalAddress":0,"length":4096,"streamOffset":0},{"guestPhysicalAddress":4096,"length":8192,"streamOffset":4096}],"schema":1,"topology":{"ramBelowGap":12288}}"#;
+        let valid = br#"{"architecture":"x86_64","kind":"ram-layout","magic":"KRUNRAML","packedLength":12288,"pageGranule":4096,"regions":[{"guestPhysicalAddress":0,"length":4096,"streamOffset":0},{"guestPhysicalAddress":4096,"length":8192,"streamOffset":4096}],"schema":1,"topology":{"ramBelowGap":12288}}"#;
         let geometry = parse_layout(valid).unwrap();
         assert_eq!(geometry.packed_length, 12288);
         assert_eq!(geometry.page_granule, 4096);
         assert_eq!(geometry.regions, 2);
         let text = std::str::from_utf8(valid).unwrap();
         for bad in [
+            text.replace("KRUNRAML", "FOREIGN!"),
             text.replace("\"packedLength\":12288", "\"packedLength\":8192"),
             text.replace("\"streamOffset\":4096", "\"streamOffset\":8192"),
             text.replace(
