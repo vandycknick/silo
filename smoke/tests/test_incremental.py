@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-from silo_smoke import capture, fork, incremental, overlay, pause, procs, restore, shutdown, stopped
+from silo_smoke import capture, fork, incremental, overlay, pause, procs, reclaim, restore, shutdown, stopped
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO
 from silo_smoke.incremental import incremental_image  # noqa: F401, pytest fixture
@@ -113,6 +113,7 @@ def test_observed_console_vsock_and_balloon_writes_match_frozen_full_ram(
     silo: Silo, incremental_image: str,  # noqa: F811
 ) -> None:
     create(silo, incremental_image)
+    reclaim.settled(silo, SOURCE)
     base = restore.checkpoint(silo, SOURCE, alias="host-writers-baseline", policy="full")
     incremental.authenticated_map(silo, base, mode="full", reason="requested")
     baseline_reports = incremental.balloon_report_queue(silo, base)
