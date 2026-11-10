@@ -80,12 +80,7 @@ def test_boot_restore_reclaim_zero_and_incremental_frozen_full(
             <= reclaim.REWRITE_BYTES + reclaim.COW_MARGIN),
         description="rewriting 1 GiB did not grow RssAnon by 1 GiB +/- 256 MiB")
     reclaim.free(silo, RESTORED)
-    # The full baseline capture above read all of b's RAM, mapping every clean
-    # checkpoint page (shared page cache, not private memory). Freeing x must
-    # drop x's file pages and the rewritten private half, not that remainder.
-    after_capture = reclaim.Rss(lazy.rss.anonymous,
-                                before_write.rss.file - reclaim.PAYLOAD_BYTES, lazy.rss.total)
-    reclaim.freed(silo, RESTORED, written, after_capture, "restored-private", file_drop=True)
+    reclaim.freed(silo, RESTORED, written, lazy.rss, "restored-private", file_drop=True)
 
     # No guest allocations between reclaim and this capture. The incremental
     # dirty union must include discarded bytes, not silently reuse x's pattern.
