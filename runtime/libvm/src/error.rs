@@ -24,6 +24,13 @@ pub enum LibVmError {
     /// by its run. The capture identity, reservation and staging are retained.
     #[error("live capture {capture_id}: {message}")]
     LiveCapture { capture_id: String, message: String },
+    #[error("image alias {alias} already names a different artifact")]
+    ImageAliasConflict { alias: String },
+    #[error("image alias {alias} already names a different artifact; checkpoint {checkpoint} retained without the requested alias")]
+    CaptureAliasConflict {
+        alias: String,
+        checkpoint: crate::storage::identity::SnapshotId,
+    },
     #[error("live fork {operation_id}: {message}")]
     LiveFork {
         operation_id: String,
@@ -116,6 +123,10 @@ pub enum LibVmError {
 
     #[error("image removal would invalidate machine {machine} dependency {path}")]
     CacheDependency { machine: String, path: PathBuf },
+
+    /// The SQL commit remains available for idempotent command replay.
+    #[error("catalog transaction committed but is not yet confirmed power-loss durable after 5 seconds; retrying the command is safe")]
+    DurabilityPending,
 
     #[error("incompatible state database; reinstall Silo and explicitly wipe its state before retrying: {source}")]
     StateDatabaseIncompatible {
@@ -362,6 +373,8 @@ impl LibVmError {
     /// cannot silently degrade a binding to message parsing or an unknown kind.
     pub fn variant(&self) -> &'static str {
         match self {
+            Self::ImageAliasConflict { .. } => "ImageAliasConflict",
+            Self::CaptureAliasConflict { .. } => "CaptureAliasConflict",
             Self::Handoff(_) => "Handoff",
             Self::LiveOperationUnsupported { .. } => "LiveOperationUnsupported",
             Self::LiveDiscovery { .. } => "LiveDiscovery",
@@ -398,6 +411,7 @@ impl LibVmError {
             Self::Task(_) => "Task",
             Self::InvalidStorageRecord { .. } => "InvalidStorageRecord",
             Self::CacheDependency { .. } => "CacheDependency",
+            Self::DurabilityPending => "DurabilityPending",
             Self::StateDatabaseIncompatible { .. } => "StateDatabaseIncompatible",
             Self::SecretResolution { .. } => "SecretResolution",
             Self::MissingNetworkSecrets { .. } => "MissingNetworkSecrets",

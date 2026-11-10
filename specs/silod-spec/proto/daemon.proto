@@ -570,7 +570,7 @@ message CaptureMemoryEvidence {
  repeated bytes chunk_digests = 11;
 }
 message LiveCaptureSummary { string capture_id = 1; string machine_id = 2; string run_id = 3; CaptureResumePolicy resume_policy = 4; CapturePauseDisposition pause = 5; CaptureSourceOutcome source_outcome = 6; optional string source_error = 7; bool released = 8; string staging = 9; CaptureMemoryEvidence memory = 10; }
-message LiveSnapshotInfo { StorageSnapshotInfo snapshot = 1; LiveCaptureSummary capture = 2; }
+message LiveSnapshotInfo { StorageSnapshotInfo snapshot = 1; LiveCaptureSummary capture = 2; optional string alias_conflict = 3; }
 enum MachineCaptureStage { MACHINE_CAPTURE_STAGE_UNSPECIFIED = 0; MACHINE_CAPTURE_STAGE_RESERVED = 1; MACHINE_CAPTURE_STAGE_SEALED = 2; MACHINE_CAPTURE_STAGE_PUBLISHED = 3; }
 // A retained, not yet released capture of this machine. source_outcome is
 // UNSPECIFIED until the continuation is recorded.

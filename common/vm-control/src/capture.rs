@@ -369,6 +369,9 @@ pub fn live_snapshot_to_wire(
     let result = w::LiveSnapshotInfo {
         snapshot: Some(crate::stopped::info_to_wire(&value.snapshot)?),
         capture: Some(summary_to_wire(&value.capture)?),
+        alias_conflict: value.naming_outcome.as_ref().map(|outcome| match outcome {
+            libvm::CaptureNamingOutcome::AliasConflict { alias } => alias.clone(),
+        }),
     };
     live_snapshot_from_wire(result.clone())?;
     Ok(result)
@@ -395,7 +398,24 @@ pub fn live_snapshot_from_wire(
             "checkpoint lacks this capture's provenance",
         ));
     }
-    Ok(libvm::LiveSnapshot { snapshot, capture })
+    let naming_outcome = value
+        .alias_conflict
+        .map(|alias| {
+            let alias = crate::stopped::alias(&alias)?;
+            if !snapshot.retained || snapshot.aliases.contains(&alias) {
+                return Err(invalid(
+                    "live.alias_conflict",
+                    "conflicting checkpoint must be retained without the requested alias",
+                ));
+            }
+            Ok(libvm::CaptureNamingOutcome::AliasConflict { alias })
+        })
+        .transpose()?;
+    Ok(libvm::LiveSnapshot {
+        snapshot,
+        capture,
+        naming_outcome,
+    })
 }
 
 fn stage_to_wire(value: libvm::MachineCaptureStage) -> i32 {
@@ -544,6 +564,7 @@ mod tests {
     fn live() -> libvm::LiveSnapshot {
         libvm::LiveSnapshot {
             snapshot: snapshot(),
+            naming_outcome: None,
             capture: libvm::LiveCaptureSummary {
                 capture_id: LiveId::parse(CAPTURE).unwrap(),
                 machine_id: LiveId::parse(MACHINE).unwrap(),
@@ -573,6 +594,39 @@ mod tests {
                 crossover
             );
         }
+    }
+
+    #[test]
+    fn capture_alias_conflict_round_trips_and_reports_retained_checkpoint() {
+        let mut value = live();
+        value.snapshot.retained = true;
+        value.naming_outcome = Some(libvm::CaptureNamingOutcome::AliasConflict {
+            alias: "taken".into(),
+        });
+        let wire = live_snapshot_to_wire(&value).unwrap();
+        assert_eq!(wire.alias_conflict.as_deref(), Some("taken"));
+        let decoded = live_snapshot_from_wire(wire.clone()).unwrap();
+        assert_eq!(decoded, value);
+        assert!(matches!(
+            decoded.require_requested_name(),
+            Err(libvm::LibVmError::CaptureAliasConflict { alias, checkpoint })
+                if alias == "taken" && checkpoint == value.snapshot.id
+        ));
+        let mut invalid = wire.clone();
+        invalid.alias_conflict = Some("bad alias".into());
+        assert!(live_snapshot_from_wire(invalid).is_err());
+        let mut invalid = wire.clone();
+        invalid.snapshot.as_mut().unwrap().retained = Some(false);
+        assert!(live_snapshot_from_wire(invalid).is_err());
+        let mut invalid = wire;
+        invalid
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .aliases
+            .push("taken".into());
+        assert!(live_snapshot_from_wire(invalid).is_err());
+        assert!(live().require_requested_name().is_ok());
     }
 
     #[test]

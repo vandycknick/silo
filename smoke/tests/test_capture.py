@@ -467,3 +467,60 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
             controller.stdin.close()
             for process in owned:
                 process.close()
+
+
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
+def test_capture_taken_alias_refuses_before_pause_and_new_name_succeeds(
+    silo: Silo, capture_image: str, profile: RootProfile,
+) -> None:
+    for name in ("alias-owner", "alias-contender"):
+        silo.create(name, silo.root_image(capture_image, profile), "--cpus", "1",
+                    "--memory", "512mib", "--disk-size", "512mib", "--vsock",
+                    "--network", "none")
+        silo.start(name)
+        silo.wait_ready(name)
+    first = json.loads(silo.run("snapshot", "create", "alias-owner", "--live",
+                               "--name", "taken", timeout=240).stdout)
+    contender = silo.info("alias-contender")
+    counter = capture.Counter(silo, "alias-contender", PROBE)
+    try:
+        counter.advances()
+        before_generation = pause.generation(silo, "alias-contender")
+        commands = procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command")
+        records = procs.query(silo.ws.state_db(),
+                              "SELECT operation_id FROM storage_operation WHERE kind='capture'")
+        machine = silo.ws.silo_home / "machines" / UUID(contender["id"]).hex
+        before_staging = set((machine / "captures").glob("*"))
+        refused = silo.run("snapshot", "create", "alias-contender", "--live",
+                           "--name", "taken", expect=None)
+        assert refused.returncode != 0
+        assert "image alias already names a different artifact" in refused.stderr
+        assert "taken" in refused.stderr
+        # No Capture intent can reach the monitor, so a freeze-and-resume
+        # cannot hide behind an eventual Running state.
+        assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command") == commands
+        assert procs.query(silo.ws.state_db(),
+                           "SELECT operation_id FROM storage_operation WHERE kind='capture'") == records
+        assert set((machine / "captures").glob("*")) == before_staging
+        assert pause.generation(silo, "alias-contender") == before_generation
+        counter.advances()
+        current = silo.info("alias-contender")
+        assert current["state"] == "running" and current["run_id"] == contender["run_id"]
+
+        retry = json.loads(silo.run("snapshot", "create", "alias-contender", "--live",
+                                   "--name", "available", timeout=240).stdout)
+        assert retry["capture"]["released"] is True
+        assert retry["capture"]["sourceOutcome"] == "resumed"
+        assert UUID(retry["capture"]["machineId"]).hex == UUID(contender["id"]).hex
+        assert retry["namingOutcome"] is None
+        for _ in range(3):
+            listed = silo.run("snapshot", "list")
+            assert "retained uncertainty" not in listed.stderr
+            by_id = {snapshot["id"]: snapshot for snapshot in json.loads(listed.stdout)}
+            assert "taken" in by_id[first["snapshot"]["id"]]["aliases"]
+            assert "available" in by_id[retry["snapshot"]["id"]]["aliases"]
+        assert not procs.query(silo.ws.state_db(),
+                               "SELECT operation_id FROM storage_operation "
+                               "WHERE kind='capture' AND state='staging'")
+    finally:
+        counter.close()

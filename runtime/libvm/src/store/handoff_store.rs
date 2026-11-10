@@ -684,7 +684,7 @@ mod tests {
         MachineConfig, MachineNetworkConfig, MachineRuntimeState, MachineState,
     };
     use crate::store::{MachineStore, Store};
-    use crate::{MachineId, MachineOwnership};
+    use crate::{LibVmError, MachineId, MachineOwnership};
 
     async fn catalog() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -1470,28 +1470,21 @@ mod tests {
             publication.commit().await
         };
         let (commit, abort) = tokio::join!(commit, b.abort_handoff_destination(&intent));
-        // Competing PASSIVE checkpoints may be busy even after the decision
-        // commits. Replay after both competitors finish must stabilize that
-        // same decision, never replace it.
+        // A contended durability boundary can time out after the decision
+        // commits. Replay stabilizes that same decision, never replaces it.
         let stable = b.abort_handoff_destination(&intent).await.unwrap();
         match abort {
             Ok(receipt) => assert_eq!(receipt, stable),
-            Err(error) => assert!(
-                error
-                    .to_string()
-                    .contains("catalog WAL checkpoint is incomplete"),
-                "{error}"
-            ),
+            Err(error) => {
+                assert!(matches!(error, LibVmError::DurabilityPending), "{error}");
+            }
         }
         match stable.decision {
             HandoffDecision::Committed => match commit {
                 Ok(receipt) => assert_eq!(receipt, stable),
-                Err(error) => assert!(
-                    error
-                        .to_string()
-                        .contains("catalog WAL checkpoint is incomplete"),
-                    "{error}"
-                ),
+                Err(error) => {
+                    assert!(matches!(error, LibVmError::DurabilityPending), "{error}");
+                }
             },
             HandoffDecision::Aborted => {
                 assert!(commit.is_err());

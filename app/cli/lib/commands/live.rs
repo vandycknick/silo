@@ -144,6 +144,7 @@ impl Snapshot {
                     .await?;
                 crate::ui::warn(EXACT_BYTES_WARNING);
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                snapshot.require_requested_name()?;
                 Ok(())
             }
             SnapshotCommand::Create {

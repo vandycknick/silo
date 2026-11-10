@@ -23,6 +23,13 @@ pub(crate) fn execution_exit_code(error: &Report) -> Option<i32> {
     error.downcast_ref::<ExecutionExit>().map(|exit| exit.code)
 }
 
+pub(crate) fn exit_code(error: &Report) -> std::process::ExitCode {
+    execution_exit_code(error)
+        .and_then(|code| u8::try_from(code).ok())
+        .map(std::process::ExitCode::from)
+        .unwrap_or(std::process::ExitCode::FAILURE)
+}
+
 pub fn print(error: &Report, verbose: u8) {
     if let Some(libvm::LibVmError::LiveOperationUnsupported {
         operation,
@@ -101,5 +108,26 @@ mod tests {
         assert!(line.contains("silo stop"));
         assert!(line.contains("stopped-storage snapshot"));
         assert!(!line.contains("silo snapshot"));
+    }
+
+    #[test]
+    fn capture_alias_conflict_names_retained_checkpoint_and_uses_failure_exit() {
+        let checkpoint: libvm::SnapshotId = format!("sha256:{}", "c".repeat(64)).parse().unwrap();
+        let error: eyre::Report = libvm::LibVmError::CaptureAliasConflict {
+            alias: "web-cp".into(),
+            checkpoint,
+        }
+        .into();
+        let rendered = error.to_string();
+        assert!(rendered.contains("web-cp"));
+        assert!(rendered.contains(&checkpoint.to_string()));
+        assert!(rendered.contains("retained without the requested alias"));
+        assert_eq!(rendered.lines().count(), 1);
+        // The CLI's normal error path defaults to failure, not a guest exit.
+        assert_eq!(execution_exit_code(&error), None);
+        assert_eq!(
+            crate::errors::exit_code(&error),
+            std::process::ExitCode::FAILURE
+        );
     }
 }

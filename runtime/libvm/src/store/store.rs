@@ -15,6 +15,48 @@ use crate::LibVmError;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// PASSIVE incompleteness is ordinary contention, not a failed transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogCheckpointOutcome {
+    Complete,
+    Incomplete {
+        busy: bool,
+        logged: i64,
+        checkpointed: i64,
+    },
+}
+
+impl CatalogCheckpointOutcome {
+    fn from_counts((busy, logged, checkpointed): (i64, i64, i64)) -> Self {
+        if busy == 0 && logged == checkpointed {
+            Self::Complete
+        } else {
+            Self::Incomplete {
+                busy: busy != 0,
+                logged,
+                checkpointed,
+            }
+        }
+    }
+
+    pub(crate) fn deferral(self) -> Option<crate::store::models::CacheCleanupDeferral> {
+        match self {
+            Self::Complete => None,
+            Self::Incomplete {
+                busy,
+                logged,
+                checkpointed,
+            } => Some(
+                crate::store::models::CacheCleanupDeferral::CatalogCheckpoint {
+                    busy,
+                    logged,
+                    checkpointed,
+                },
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
     pub(super) pool: SqlitePool,
@@ -103,7 +145,10 @@ impl Store {
                     match deferred {
                         // A held lease belongs to a live producer, e.g. every
                         // running machine's launch. That is steady state, not news.
-                        crate::store::models::CacheCleanupDeferral::ActiveLease { .. } => {
+                        crate::store::models::CacheCleanupDeferral::ActiveLease { .. }
+                        | crate::store::models::CacheCleanupDeferral::CatalogCheckpoint {
+                            ..
+                        } => {
                             tracing::debug!(
                                 ?deferred,
                                 "image cache cleanup deferred; bytes and pending jobs retained"
@@ -179,18 +224,52 @@ impl Store {
         Ok(pool)
     }
 
-    /// Complete a power-loss durability boundary after the catalog commit.
-    pub(crate) async fn checkpoint_catalog(&self) -> Result<(), LibVmError> {
-        let (busy, logged, checkpointed): (i64, i64, i64) =
-            sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
-                .fetch_one(&self.pool)
-                .await?;
-        // PASSIVE can report success while an older reader prevents copying
-        // every frame. Only a completed checkpoint proves the boundary stable.
-        if busy != 0 || logged != checkpointed {
-            return Err(std::io::Error::other("catalog WAL checkpoint is incomplete").into());
+    /// Try maintenance without waiting. Incomplete work never authorizes unlink.
+    pub(crate) async fn try_checkpoint_catalog(
+        &self,
+    ) -> Result<CatalogCheckpointOutcome, LibVmError> {
+        #[cfg(test)]
+        if let Some(hook) = &self.layer_hook {
+            hook.hit(crate::store::layer_store::tests::WorkerPoint::CatalogCheckpoint)?;
         }
-        Ok(())
+        let counts = sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(CatalogCheckpointOutcome::from_counts(counts))
+    }
+
+    /// Complete a required power-loss durability boundary after catalog commit.
+    /// The five-second deadline covers pool acquisition and all FULL attempts.
+    pub(crate) async fn checkpoint_catalog(&self) -> Result<(), LibVmError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut connection = tokio::time::timeout_at(deadline, self.pool.acquire())
+            .await
+            .map_err(|_| LibVmError::DurabilityPending)??;
+        let result = tokio::time::timeout_at(deadline, async {
+            loop {
+                let counts = sqlx::query_as("PRAGMA wal_checkpoint(FULL)")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                if CatalogCheckpointOutcome::from_counts(counts)
+                    == CatalogCheckpointOutcome::Complete
+                {
+                    return Ok::<_, LibVmError>(());
+                }
+                // The checkpoint lock bypasses SQLite's busy handler, even for
+                // FULL. Yield before retrying it; never spin behind a peer.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                // An SQLite worker may still be finishing its bounded busy
+                // wait. Do not return that connection to another pool user.
+                connection.close_on_drop();
+                Err(LibVmError::DurabilityPending)
+            }
+        }
     }
 
     fn sqlite_options(path: &Path) -> SqliteConnectOptions {
@@ -1112,16 +1191,152 @@ pub(crate) mod tests {
             .fetch_one(&mut *reader)
             .await
             .unwrap();
-        let error = db.remove_machine(&config).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("catalog WAL checkpoint is incomplete"),
-            "{error}"
-        );
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            db.remove_machine(&config),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert!(matches!(error, LibVmError::DurabilityPending), "{error}");
+        assert!(error.to_string().contains("retrying the command is safe"));
         assert!(db.machine_config(id).await.unwrap().is_none());
         reader.rollback().await.unwrap();
         db.remove_machine(&config).await.unwrap();
+    }
+
+    async fn pin_catalog_wal(db: &Store) -> sqlx::Transaction<'static, sqlx::Sqlite> {
+        db.execute_test_sql(
+            "CREATE TABLE checkpoint_probe(value INTEGER NOT NULL); INSERT INTO checkpoint_probe VALUES(0)",
+        )
+        .await
+        .unwrap();
+        db.checkpoint_catalog().await.unwrap();
+        let mut reader = db.pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT value FROM checkpoint_probe")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        db.execute_test_sql("UPDATE checkpoint_probe SET value=1")
+            .await
+            .unwrap();
+        reader
+    }
+
+    #[tokio::test]
+    async fn required_checkpoint_waits_for_reader_then_completes() {
+        use std::time::Duration;
+
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let reader = pin_catalog_wal(&db).await;
+        assert!(matches!(
+            db.try_checkpoint_catalog().await.unwrap(),
+            crate::store::storage::CatalogCheckpointOutcome::Incomplete { .. }
+        ));
+        let boundary = db.checkpoint_catalog();
+        tokio::pin!(boundary);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut boundary)
+                .await
+                .is_err()
+        );
+        reader.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), boundary)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.try_checkpoint_catalog().await.unwrap(),
+            crate::store::storage::CatalogCheckpointOutcome::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn required_checkpoint_retries_a_competing_checkpointer() {
+        use std::time::Duration;
+
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let reader = pin_catalog_wal(&db).await;
+        let competitor = db.clone();
+        let competing = tokio::spawn(async move { competitor.checkpoint_catalog().await });
+        // Witness SQLite's checkpoint lock, not merely a task being scheduled.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    db.try_checkpoint_catalog().await.unwrap(),
+                    crate::store::storage::CatalogCheckpointOutcome::Incomplete { busy: true, .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let boundary = db.checkpoint_catalog();
+        tokio::pin!(boundary);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut boundary)
+                .await
+                .is_err()
+        );
+        reader.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), boundary)
+            .await
+            .unwrap()
+            .unwrap();
+        competing.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_checkpoint_times_out_behind_a_competing_checkpointer() {
+        use std::time::Duration;
+
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let reader = pin_catalog_wal(&db).await;
+        let mut connection = db.pool.acquire().await.unwrap();
+        // Keep the competing checkpoint lock beyond our five-second deadline.
+        // The connection is discarded so this test-local timeout cannot leak.
+        connection.close_on_drop();
+        sqlx::query("PRAGMA busy_timeout=10000")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let competing = tokio::spawn(async move {
+            sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(FULL)")
+                .fetch_one(&mut *connection)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    db.try_checkpoint_catalog().await.unwrap(),
+                    crate::store::storage::CatalogCheckpointOutcome::Incomplete { busy: true, .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(7), db.checkpoint_catalog())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, LibVmError::DurabilityPending), "{error}");
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        reader.rollback().await.unwrap();
+        let (busy, logged, checkpointed) = competing.await.unwrap().unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(logged, checkpointed);
+        db.checkpoint_catalog().await.unwrap();
     }
 
     #[tokio::test]

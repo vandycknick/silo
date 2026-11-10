@@ -105,13 +105,31 @@ pub(crate) struct OciImageRecord {
 /// belong here. Corruption, unsafe ownership and failed transactions are errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CacheCleanupDeferral {
-    ExternalDependency { machine: String, path: PathBuf },
-    ActiveLease { operation_id: uuid::Uuid },
+    ExternalDependency {
+        machine: String,
+        path: PathBuf,
+    },
+    ActiveLease {
+        operation_id: uuid::Uuid,
+    },
+    CatalogCheckpoint {
+        busy: bool,
+        logged: i64,
+        checkpointed: i64,
+    },
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct CacheRecoveryReport {
     pub deferred: Vec<CacheCleanupDeferral>,
+}
+
+impl CacheRecoveryReport {
+    pub(crate) fn checkpoint_deferred(&self) -> bool {
+        self.deferred
+            .iter()
+            .any(|reason| matches!(reason, CacheCleanupDeferral::CatalogCheckpoint { .. }))
+    }
 }
 
 /// Immutable reusable raw image semantics, distinct from captured machines.

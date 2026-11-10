@@ -126,6 +126,21 @@ pub struct LiveCaptureSummary {
 pub struct LiveSnapshot {
     pub snapshot: SnapshotInfo,
     pub capture: LiveCaptureSummary,
+    pub naming_outcome: Option<crate::CaptureNamingOutcome>,
+}
+
+impl LiveSnapshot {
+    /// Naming failure is reported only after capture settlement, not as
+    /// publication uncertainty. The checkpoint remains independently retained.
+    pub fn require_requested_name(&self) -> Result<(), LibVmError> {
+        if let Some(crate::CaptureNamingOutcome::AliasConflict { alias }) = &self.naming_outcome {
+            return Err(LibVmError::CaptureAliasConflict {
+                alias: alias.clone(),
+                checkpoint: self.snapshot.id,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Durable stage of a retained capture, independent of the monitor's
@@ -1103,6 +1118,7 @@ async fn finished(
     Ok(CaptureProgress::Finished(Box::new(LiveSnapshot {
         snapshot: info,
         capture: summary(runtime, record)?,
+        naming_outcome: record.naming_outcome.clone(),
     })))
 }
 
@@ -1237,7 +1253,13 @@ pub(crate) async fn reconcile_captures(
                 tracing::debug!(capture = %record.capture_id, stage, "capture remains owned by its run");
             }
             Ok(CaptureProgress::Finished(snapshot)) => {
-                tracing::info!(capture = %record.capture_id, snapshot = %snapshot.snapshot.id, "reconciled live capture");
+                if let Some(crate::CaptureNamingOutcome::AliasConflict { alias }) =
+                    &snapshot.naming_outcome
+                {
+                    tracing::info!(capture = %record.capture_id, snapshot = %snapshot.snapshot.id, alias, "reconciled live capture retained without conflicting alias");
+                } else {
+                    tracing::info!(capture = %record.capture_id, snapshot = %snapshot.snapshot.id, "reconciled live capture");
+                }
             }
             Ok(CaptureProgress::Local) => {}
             Ok(CaptureProgress::Abandoned(reason)) => {

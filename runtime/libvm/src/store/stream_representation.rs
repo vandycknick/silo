@@ -879,8 +879,9 @@ impl Store {
         &self,
         pool: &StoragePool,
         pressure: bool,
-    ) -> Result<u64, LibVmError> {
+    ) -> Result<(u64, crate::store::models::CacheRecoveryReport), LibVmError> {
         let mut removed = 0u64;
+        let mut recovery = crate::store::models::CacheRecoveryReport::default();
         for kind in [CacheKind::SourceBlob, CacheKind::Transport] {
             let mut cursor = String::new();
             let cutoff = chrono::Utc::now().timestamp().saturating_sub(kind.ttl());
@@ -915,7 +916,10 @@ impl Store {
                     tx.commit().await?;
                     // Persist this observed pin absence before unlink, then
                     // recheck admission under a fresh SQLite writer fence.
-                    self.checkpoint_catalog().await?;
+                    if let Some(deferred) = self.try_checkpoint_catalog().await?.deferral() {
+                        recovery.deferred.push(deferred);
+                        return Ok((removed, recovery));
+                    }
                     let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                     let eligible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_cache_entry e WHERE kind=?1 AND digest=?2 AND (?3 OR last_used_at<=?4) AND NOT EXISTS(SELECT 1 FROM storage_operation_cache p WHERE p.kind=e.kind AND p.digest=e.digest))")
                         .bind(kind.as_str()).bind(&value).bind(pressure).bind(cutoff).fetch_one(&mut *tx).await?;
@@ -957,7 +961,7 @@ impl Store {
             }
         }
         let _ = pool;
-        Ok(removed)
+        Ok((removed, recovery))
     }
 }
 
@@ -1337,7 +1341,10 @@ pub(crate) mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
-        assert_eq!(store.prune_transport_caches(&pool, true).await.unwrap(), 0);
+        assert_eq!(
+            store.prune_transport_caches(&pool, true).await.unwrap().0,
+            0
+        );
         assert!(path.exists());
         let mut reader = store.pool.begin().await.unwrap();
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM storage_cache_entry")
@@ -1349,19 +1356,21 @@ pub(crate) mod tests {
             .retire_abandoned_storage_operations(&pool)
             .await
             .unwrap();
-        let error = store
-            .prune_transport_caches(&pool, false)
+        let (removed, recovery) = store.prune_transport_caches(&pool, false).await.unwrap();
+        assert_eq!(removed, 0);
+        assert!(recovery.checkpoint_deferred(), "{recovery:?}");
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_cache_entry")
+            .fetch_one(&store.pool)
             .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("catalog WAL checkpoint is incomplete"),
-            "{error}"
-        );
+            .unwrap();
+        assert_eq!(retained, 1);
+        let _reopened = Store::open(&store.home.join("state.db")).await.unwrap();
         assert!(path.exists());
         reader.rollback().await.unwrap();
-        assert_eq!(store.prune_transport_caches(&pool, false).await.unwrap(), 6);
+        assert_eq!(
+            store.prune_transport_caches(&pool, false).await.unwrap().0,
+            6
+        );
         assert!(!path.exists());
         assert!(pool.object_path(&canonical).exists());
         for (kind, age, expired) in [
@@ -1542,9 +1551,7 @@ pub(crate) mod tests {
             .unwrap();
         let error = store.evict_flat_materializations().await.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("catalog WAL checkpoint is incomplete"),
+            matches!(error, crate::LibVmError::DurabilityPending),
             "{error}"
         );
         assert!(path.exists());
