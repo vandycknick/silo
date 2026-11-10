@@ -873,14 +873,7 @@ pub(crate) async fn insert_alias(
 ) -> Result<(), LibVmError> {
     validate_alias(alias)?;
     refuse_cross_kind(connection, &target_string(target)).await?;
-    if let Some(row) = sqlx::query("SELECT image_id,snapshot_id FROM image_alias WHERE name=?1")
-        .bind(alias)
-        .fetch_optional(&mut *connection)
-        .await?
-    {
-        if alias_target(&row)? != target {
-            return Err(invalid("image alias already names a different artifact"));
-        }
+    if check_alias_available(connection, alias, Some(target)).await? {
         return Ok(());
     }
     let (image, snapshot) = match target {
@@ -894,6 +887,36 @@ pub(crate) async fn insert_alias(
         .execute(connection)
         .await?;
     Ok(())
+}
+
+async fn alias_binding(
+    connection: &mut sqlx::SqliteConnection,
+    alias: &str,
+) -> Result<Option<ManagedSourceId>, LibVmError> {
+    sqlx::query("SELECT image_id,snapshot_id FROM image_alias WHERE name=?1")
+        .bind(alias)
+        .fetch_optional(connection)
+        .await?
+        .as_ref()
+        .map(alias_target)
+        .transpose()
+}
+
+/// Admission has no content-derived target yet; an exact publication may
+/// reuse its own typed artifact binding. Returns whether that binding exists.
+pub(crate) async fn check_alias_available(
+    connection: &mut sqlx::SqliteConnection,
+    alias: &str,
+    target: Option<ManagedSourceId>,
+) -> Result<bool, LibVmError> {
+    validate_alias(alias)?;
+    let existing = alias_binding(connection, alias).await?;
+    if existing.is_some_and(|existing| Some(existing) != target) {
+        return Err(LibVmError::ImageAliasConflict {
+            alias: alias.to_owned(),
+        });
+    }
+    Ok(existing.is_some())
 }
 
 /// SQL guards keep oversized persisted values out of SQLx-owned allocations.
@@ -2190,5 +2213,61 @@ pub(crate) mod tests {
                 "{table}: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn alias_admission_refuses_managed_image_but_exact_typed_publication_replays() {
+        let (_temp, images, record, operation, lease) = fixture().await;
+        let image = images
+            .publish_owned(
+                record,
+                operation,
+                lease,
+                Some("occupied".into()),
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut tx = images
+            .store
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        let error =
+            crate::store::managed_image_store::check_alias_available(&mut tx, "occupied", None)
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::LibVmError::ImageAliasConflict { alias } if alias == "occupied"
+        ));
+        assert!(crate::store::managed_image_store::check_alias_available(
+            &mut tx,
+            "occupied",
+            Some(ManagedSourceId::Image(image.id)),
+        )
+        .await
+        .unwrap());
+        crate::store::managed_image_store::insert_alias(
+            &mut tx,
+            "occupied",
+            ManagedSourceId::Image(image.id),
+        )
+        .await
+        .unwrap();
+        // Identical digest bytes with a different artifact kind are not replay.
+        let snapshot = image.id.to_string().parse().unwrap();
+        assert!(matches!(
+            crate::store::managed_image_store::check_alias_available(
+                &mut tx,
+                "occupied",
+                Some(ManagedSourceId::Snapshot(snapshot)),
+            )
+            .await,
+            Err(crate::LibVmError::ImageAliasConflict { .. })
+        ));
+        tx.commit().await.unwrap();
     }
 }

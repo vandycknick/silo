@@ -273,7 +273,13 @@ impl ImageStore for Store {
         // whole graph: artifact ─► composition ─► layers ─► objects ─► packs.
         let artifacts = self.retire_image_artifacts().await?;
         self.retire_layer_cache().await?;
-        self.recover_layer_objects().await?;
+        if self.recover_layer_objects().await?.checkpoint_deferred() {
+            return Ok(ImagePruneReport {
+                references_removed: 0,
+                artifacts_removed: artifacts,
+                bytes_removed: 0,
+            });
+        }
         let (mut report, _) = self.prune_image_cache(true).await?;
         report.artifacts_removed = report.artifacts_removed.saturating_add(artifacts);
         Ok(report)
@@ -394,12 +400,16 @@ impl Store {
             Err(error) => return Err(error.into()),
         }
         let recovered = async {
-            self.recover_layer_objects().await?;
-            self.prune_image_cache(false).await
+            let recovery = self.recover_layer_objects().await?;
+            if recovery.checkpoint_deferred() {
+                return Ok::<_, LibVmError>(recovery);
+            }
+            let (_, recovery) = self.prune_image_cache(false).await?;
+            Ok(recovery)
         }
         .await;
         match recovered {
-            Ok((_, recovery)) => Ok(recovery),
+            Ok(recovery) => Ok(recovery),
             Err(LibVmError::CacheDependency { machine, path }) => Ok(CacheRecoveryReport {
                 deferred: vec![CacheCleanupDeferral::ExternalDependency { machine, path }],
             }),
@@ -427,7 +437,15 @@ impl Store {
         prune_unreferenced: bool,
     ) -> Result<(ImagePruneReport, CacheRecoveryReport), LibVmError> {
         let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
-        let recovery = self.retire_abandoned_storage_operations(&pool).await?;
+        let mut recovery = self.retire_abandoned_storage_operations(&pool).await?;
+        let mut report = ImagePruneReport {
+            references_removed: 0,
+            artifacts_removed: 0,
+            bytes_removed: 0,
+        };
+        if recovery.checkpoint_deferred() {
+            return Ok((report, recovery));
+        }
         // Keep only one temporary directory/lease open, and never discover
         // directory entries while holding roots.
         for candidate in pool.abandoned_temporary()? {
@@ -456,7 +474,10 @@ impl Store {
             .await?;
             tx.commit().await?;
             // Stabilize the observed absence, not an earlier catalog snapshot.
-            self.checkpoint_catalog().await?;
+            if let Some(deferred) = self.try_checkpoint_catalog().await?.deferral() {
+                recovery.deferred.push(deferred);
+                return Ok((report, recovery));
+            }
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let retained_capture: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('capture','live-fork'))")
                 .bind(name).fetch_one(&mut *tx).await?;
@@ -473,21 +494,20 @@ impl Store {
             candidate.remove()?;
             tx.commit().await?;
         }
-        let mut report = ImagePruneReport {
-            references_removed: 0,
-            artifacts_removed: 0,
-            bytes_removed: 0,
-        };
         crate::store::stream_representation::check_catalog(self).await?;
         if prune_unreferenced {
             report.bytes_removed = report
                 .bytes_removed
                 .saturating_add(self.evict_flat_materializations().await?);
         }
-        report.bytes_removed = report.bytes_removed.saturating_add(
-            self.prune_transport_caches(&pool, prune_unreferenced)
-                .await?,
-        );
+        let (transport_bytes, transport_recovery) = self
+            .prune_transport_caches(&pool, prune_unreferenced)
+            .await?;
+        report.bytes_removed = report.bytes_removed.saturating_add(transport_bytes);
+        recovery.deferred.extend(transport_recovery.deferred);
+        if recovery.checkpoint_deferred() {
+            return Ok((report, recovery));
+        }
         let mut scan = pool.scan_streams()?;
         let mut pending_cursor = String::new();
         loop {
@@ -544,7 +564,16 @@ impl Store {
             // Publish retryable deletion intent before touching bytes. A crash
             // must not resurrect a catalog row naming an already unlinked file.
             tx.commit().await?;
-            self.checkpoint_catalog().await?;
+            if deletions.is_empty() {
+                if scan_finished && pending_count < 256 {
+                    break;
+                }
+                continue;
+            }
+            if let Some(deferred) = self.try_checkpoint_catalog().await?.deferral() {
+                recovery.deferred.push(deferred);
+                return Ok((report, recovery));
+            }
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             crate::store::ensure_cache_paths_unreferenced(
                 &mut tx,
@@ -1016,7 +1045,7 @@ mod tests {
         ImageCompositionArtifactRecord, ImageConfigRecord, ImageManifestRecord, ImageRefRecord,
         OciImageRecord,
     };
-    use crate::store::{ImageStore, Store};
+    use crate::store::{ImageStore, MachineStore, Store};
 
     /// A real retained composition with no image rows; its lease roots it.
     async fn lower(db: &Store, names: &[&str]) -> HeldComposition {
@@ -1709,28 +1738,72 @@ mod tests {
                 .unwrap();
             drop(owner);
             drop(lease);
-            let error = if kind == "object" {
-                db.recover_layer_objects().await.unwrap_err()
-            } else {
-                db.prune_image_cache(false).await.unwrap_err()
-            };
-            assert!(
-                error
-                    .to_string()
-                    .contains("catalog WAL checkpoint is incomplete"),
-                "{kind}: {error}"
-            );
+            let recovery = db.recover_image_cache().await.unwrap();
+            assert!(recovery.checkpoint_deferred(), "{kind}: {recovery:?}");
+            let reopened = Store::open(&db.home.join("state.db")).await.unwrap();
+            assert!(reopened.list_machine_configs().await.unwrap().is_empty());
             assert!(
                 path.exists(),
                 "{kind} bytes were removed before the barrier"
             );
             reader.rollback().await.unwrap();
-            if kind == "object" {
-                db.recover_layer_objects().await.unwrap();
-            } else {
-                db.prune_image_cache(false).await.unwrap();
-            }
+            let _reopened = Store::open(&db.home.join("state.db")).await.unwrap();
             assert!(!path.exists(), "{kind} collection did not resume");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_deletion_recovery_skips_checkpoint_with_a_pinned_reader() {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+
+        for retained_count in [0_u64, 257] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = LocalPaths::new(temp.path().join("home"));
+            let mut db = Store::new(&paths).await.unwrap();
+            let pool = StoragePool::open(&db.images_dir).unwrap();
+            let (operation, _lease) = db
+                .begin_stopped_operation("import", &[], &[])
+                .await
+                .unwrap();
+            let source = temp.path().join("source");
+            let mut retained = Vec::new();
+            for value in 0..retained_count {
+                fs::write(&source, value.to_le_bytes()).unwrap();
+                let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+                db.pin_published_storage_dependencies(operation, &[stream.id], &[])
+                    .await
+                    .unwrap();
+                retained.push(stream.path);
+                drop(roots);
+            }
+            db.checkpoint_catalog().await.unwrap();
+            let mut reader = db.pool.begin().await.unwrap();
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM storage_operation")
+                .fetch_one(&mut *reader)
+                .await
+                .unwrap();
+            let (_later_operation, _later_lease) = db
+                .begin_stopped_operation("import", &[], &[])
+                .await
+                .unwrap();
+            assert!(db
+                .try_checkpoint_catalog()
+                .await
+                .unwrap()
+                .deferral()
+                .is_some());
+            let (hook, mut entered, _release) =
+                WorkerHook::new(WorkerPoint::CatalogCheckpoint, true);
+            db.layer_hook = Some(hook);
+            let recovery = db.recover_image_cache().await.unwrap();
+            assert!(!recovery.checkpoint_deferred(), "{recovery:?}");
+            assert!(
+                entered.try_recv().is_err(),
+                "zero-deletion recovery checkpointed"
+            );
+            let _reopened = Store::open(&paths.state_db_path()).await.unwrap();
+            assert!(retained.iter().all(|path| path.exists()));
+            reader.rollback().await.unwrap();
         }
     }
 

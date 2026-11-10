@@ -68,7 +68,8 @@ pub use crate::store::models::storage::{
 };
 pub use crate::store::models::{MachineId, MachineIdParseError};
 pub use crate::store::snapshot_store::{
-    SnapshotCaptureKindName, SnapshotCaptureProvenance, SnapshotInfo, SnapshotRef, SnapshotStore,
+    CaptureNamingOutcome, SnapshotCaptureKindName, SnapshotCaptureProvenance, SnapshotInfo,
+    SnapshotRef, SnapshotStore,
 };
 pub use vm_spec::restore::{RestoreEnvironmentVariable, RestoreHook};
 pub use vm_spec::{live, BlockId, DiskFormat};

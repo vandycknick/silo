@@ -75,6 +75,13 @@ pub struct SnapshotInfo {
     pub created_at: i64,
 }
 
+/// A checkpoint is retained even when its optional requested name loses a race.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CaptureNamingOutcome {
+    AliasConflict { alias: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CaptureReservationRequest {
@@ -138,6 +145,7 @@ pub(crate) struct CaptureRecord {
     pub plan: vm_spec::capture::CapturePlan,
     pub state: CaptureState,
     pub source_outcome: Option<CaptureSourceOutcome>,
+    pub naming_outcome: Option<CaptureNamingOutcome>,
     pub configuration: crate::machine::stopped::SnapshotConfiguration,
     pub storage: crate::MachineStorageRecord,
     pub disk_charges: Vec<CaptureSpaceCharge>,
@@ -536,13 +544,21 @@ impl SnapshotStore {
                     .bind(id.to_string()).bind(object.to_string()).execute(&mut *tx).await?;
             }
         }
+        let mut naming_outcome = None;
         if let Some(alias) = alias {
-            crate::store::managed_image_store::insert_alias(
+            match crate::store::managed_image_store::insert_alias(
                 &mut tx,
                 alias,
                 crate::image::import_types::ManagedSourceId::Snapshot(id),
             )
-            .await?;
+            .await
+            {
+                Ok(()) => {}
+                Err(LibVmError::ImageAliasConflict { alias }) if capture.is_some() => {
+                    naming_outcome = Some(CaptureNamingOutcome::AliasConflict { alias });
+                }
+                Err(error) => return Err(error),
+            }
         }
         if let Some((evidence_digest, evidence)) = capture {
             let json: String = sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
@@ -575,6 +591,7 @@ impl SnapshotStore {
             if capture.candidate != Some(id) {
                 return Err(invalid("capture candidate changed before commit"));
             }
+            capture.naming_outcome = naming_outcome;
             capture.state = match capture.state {
                 CaptureState::Sealed => CaptureState::Published { snapshot: id },
                 CaptureState::Published { snapshot } if snapshot == id => capture.state,
@@ -2605,9 +2622,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("catalog WAL checkpoint is incomplete"),
+                matches!(error, crate::LibVmError::DurabilityPending),
                 "{error}"
             );
         }

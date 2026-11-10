@@ -20,6 +20,15 @@
   and restored or forked private mappings without changing checkpoint files.
   `silo info` and daemon status report reclaim state and mapping-limit skips;
   macOS/HVF behavior is unchanged.
+- Live snapshots refuse occupied names before pausing the guest. If a name
+  is taken after admission, the checkpoint is retained without that alias
+  and capture continuation completes; the CLI prints its checkpoint ID and
+  exits nonzero. Reconciliation also settles sealed captures blocked by a
+  conflicting name instead of retrying publication on every command.
+- Catalog cleanup defers deletion rather than failing commands when another
+  reader holds the WAL, and skips checkpoints when there is nothing to delete.
+  Required durability boundaries wait up to five seconds, then report a typed
+  committed-but-durability-pending error that is safe to retry.
 - Cross-home resource admission now reclaims charges from deleted or replaced
   Silo homes using versioned home anchors, preventing orphaned reservations
   from permanently consuming the same user's RAM and disk budget.

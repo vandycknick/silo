@@ -39,10 +39,7 @@ pub async fn run() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             errors::print(&error, verbose);
-            errors::execution_exit_code(&error)
-                .and_then(|code| u8::try_from(code).ok())
-                .map(ExitCode::from)
-                .unwrap_or(ExitCode::FAILURE)
+            errors::exit_code(&error)
         }
     }
 }

@@ -323,6 +323,7 @@ impl SnapshotStore {
             plan,
             state: CaptureState::Reserved,
             source_outcome: None,
+            naming_outcome: None,
             configuration,
             storage,
             disk_charges,
@@ -384,6 +385,9 @@ impl SnapshotStore {
             drop(_roots);
             self.store.reserve_capture_inventory(&existing).await?;
             return Ok(CaptureReservation { record: existing, _lease: lease });
+        }
+        if let Some(alias) = &record.alias {
+            crate::store::managed_image_store::check_alias_available(&mut tx, alias, None).await?;
         }
         let current: Option<String> =
             sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
@@ -454,7 +458,7 @@ impl SnapshotStore {
         let mut cursor = String::new();
         let mut records = Vec::new();
         loop {
-            let rows = sqlx::query("SELECT operation_id,json(record_json) AS record_json FROM storage_operation WHERE kind='capture' AND operation_id>?1 AND (?2 IS NULL OR machine_id=?2) ORDER BY operation_id LIMIT 256").bind(&cursor).bind(machine.map(|id| id.to_string())).fetch_all(&self.store.pool).await?;
+            let rows = sqlx::query("SELECT operation_id,json(record_json) AS record_json FROM storage_operation WHERE kind='capture' AND state='staging' AND operation_id>?1 AND (?2 IS NULL OR machine_id=?2) ORDER BY operation_id LIMIT 256").bind(&cursor).bind(machine.map(|id| id.to_string())).fetch_all(&self.store.pool).await?;
             if rows.is_empty() {
                 break;
             }
@@ -1192,6 +1196,20 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
             ))
         }
         _ => {}
+    }
+    if let Some(crate::store::snapshot_store::CaptureNamingOutcome::AliasConflict { alias }) =
+        &record.naming_outcome
+    {
+        if record.alias.as_ref() != Some(alias)
+            || !matches!(
+                record.state,
+                CaptureState::Published { .. } | CaptureState::Released { snapshot: Some(_) }
+            )
+        {
+            return Err(invalid(
+                "capture naming outcome contradicts publication intent",
+            ));
+        }
     }
     if let Some(bytes) = &record.evidence {
         let evidence = CaptureEvidence::decode(bytes.as_bytes()).map_err(invalid)?;
@@ -4452,19 +4470,35 @@ pub(crate) mod tests {
             .unwrap();
         drop(fixture.reservation);
         drop(fixture.launch);
-        let error = fixture
-            .snapshots
-            .store
+        let recovery = fixture.snapshots.store.recover_image_cache().await.unwrap();
+        assert!(recovery.checkpoint_deferred(), "{recovery:?}");
+        let cleaning: String =
+            sqlx::query_scalar("SELECT state FROM storage_operation WHERE operation_id=?1")
+                .bind(capture.to_string())
+                .fetch_one(&fixture.snapshots.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(cleaning, "cleaning");
+        let reopened = crate::store::Store::open(&fixture.snapshots.store.home.join("state.db"))
+            .await
+            .unwrap();
+        assert!(reopened
             .recover_image_cache()
             .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("catalog WAL checkpoint is incomplete"),
-            "{error}"
-        );
+            .unwrap()
+            .checkpoint_deferred());
         assert!(directory.path().exists());
+        let archive = fixture
+            .snapshots
+            .store
+            .home
+            .join("capture-evidence")
+            .join(capture.to_string());
+        assert!(archive.join("owner.json").is_file());
+        assert_eq!(
+            std::fs::read(archive.join("vm.capture.json")).unwrap(),
+            std::fs::read(directory.path().join("vm.capture.json")).unwrap()
+        );
         reader.rollback().await.unwrap();
         fixture.snapshots.store.recover_image_cache().await.unwrap();
         assert!(!directory.path().exists());
@@ -5828,5 +5862,565 @@ pub(crate) mod tests {
                 0
             );
         }
+    }
+
+    async fn publish_fixture(fixture: &Fixture) -> crate::SnapshotInfo {
+        let (directory, _) = seal(fixture);
+        fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn release_fixture(fixture: &Fixture) {
+        let capture = fixture.reservation.record.capture_id;
+        fixture
+            .snapshots
+            .record_capture_source(capture, CaptureSourceOutcome::Unknown)
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .finish_capture_release(capture, true)
+            .await
+            .unwrap();
+    }
+
+    async fn reserve_next_fixture(fixture: &mut Fixture, alias: &str) {
+        let mut request = fixture.reservation.record.request.clone();
+        request.capture_id = Uuid::new_v4();
+        request.alias = Some(alias.into());
+        fixture.reservation = fixture.snapshots.reserve_capture(&request).await.unwrap();
+        fixture
+            .snapshots
+            .bind_capture_boot(
+                request.capture_id,
+                fixture.launch.storage_record().boot.clone(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn bind_fixture_alias(
+        snapshots: &SnapshotStore,
+        alias: &str,
+        target: crate::storage::identity::SnapshotId,
+    ) {
+        let mut tx = snapshots
+            .store
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        crate::store::managed_image_store::insert_alias(
+            &mut tx,
+            alias,
+            crate::image::import_types::ManagedSourceId::Snapshot(target),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn capture_runtime(snapshots: &SnapshotStore) -> crate::Runtime {
+        let paths = LocalPaths::new(snapshots.store.home_path().to_path_buf());
+        let components = crate::runtime::components::test_components(paths.home());
+        crate::Runtime::from_store(
+            paths,
+            snapshots.store.clone(),
+            crate::RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
+            components,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capture_admission_refuses_taken_alias_without_rows_pins_budget_or_staging() {
+        let fixture = fixture().await;
+        let original = publish_fixture(&fixture).await;
+        bind_fixture_alias(&fixture.snapshots, "checkpoint", original.id).await;
+        bind_fixture_alias(&fixture.snapshots, "checkpoint", original.id).await;
+        // Exact replay still joins its own reservation after its alias is bound.
+        let replay = fixture
+            .snapshots
+            .reserve_capture(&fixture.reservation.record.request)
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.record.capture_id,
+            fixture.reservation.record.capture_id
+        );
+        drop(replay);
+        release_fixture(&fixture).await;
+
+        // A second admitted machine shares the same alias namespace.
+        let paths = LocalPaths::new(fixture.snapshots.store.home_path().to_path_buf());
+        let mut other = fixture.config.clone();
+        other.id = MachineId::new();
+        other.name = "other-capture-source".into();
+        let parent = paths.create_machine_data_dir(other.id).unwrap();
+        let directory = parent.open_dir(&other.id.to_string()).unwrap().unwrap();
+        directory.write_file("root.raw", &[0x51; 512]).unwrap();
+        other.machine_dir = directory.path().to_path_buf();
+        let mut state = fixture
+            .snapshots
+            .store
+            .machine_state(fixture.config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        state.machine_id = other.id;
+        let run = Uuid::new_v4();
+        state.run_id = Some(run.to_string());
+        fixture
+            .snapshots
+            .store
+            .add_machine(&other, &state)
+            .await
+            .unwrap();
+        let storage = fixture
+            .snapshots
+            .store
+            .machine_storage(other.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let launch = fixture
+            .snapshots
+            .store
+            .register_launch_storage(other.id, run, &storage, &other.spec)
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .store
+            .mark_launch_storage_admitted(launch.operation_id())
+            .await
+            .unwrap();
+
+        for (machine, run) in [
+            (fixture.config.id, fixture.reservation.record.run_id),
+            (other.id, run),
+        ] {
+            let mut request = fixture.reservation.record.request.clone();
+            request.capture_id = Uuid::new_v4();
+            request.machine_id = machine;
+            request.run_id = run;
+            let error = match fixture.snapshots.reserve_capture(&request).await {
+                Ok(_) => panic!("occupied capture alias admitted"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                crate::LibVmError::ImageAliasConflict { alias } if alias == "checkpoint"
+            ));
+            for query in [
+                "SELECT count(*) FROM storage_operation WHERE operation_id=?1",
+                "SELECT count(*) FROM storage_operation_stream WHERE operation_id=?1",
+                "SELECT count(*) FROM storage_operation_object WHERE operation_id=?1",
+                "SELECT count(*) FROM storage_operation_layer WHERE operation_id=?1",
+                "SELECT count(*) FROM storage_operation_lower WHERE operation_id=?1",
+                "SELECT count(*) FROM capture_resource_reservation WHERE operation_id=?1",
+            ] {
+                let count: i64 = sqlx::query_scalar(query)
+                    .bind(request.capture_id.to_string())
+                    .fetch_one(&fixture.snapshots.store.pool)
+                    .await
+                    .unwrap();
+                assert_eq!(count, 0, "{query}");
+            }
+            assert!(!fixture
+                .snapshots
+                .store
+                .images_dir
+                .join("tmp")
+                .join(request.capture_id.to_string())
+                .exists());
+            assert!(!crate::paths::machine_data_dir_in(
+                fixture.snapshots.store.home_path(),
+                machine
+            )
+            .join("captures")
+            .join(request.capture_id.to_string())
+            .exists());
+        }
+        assert_eq!(
+            fixture
+                .snapshots
+                .inspect(&SnapshotRef::Image("checkpoint".into()))
+                .await
+                .unwrap()
+                .id,
+            original.id
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_alias_race_retains_unaliased_checkpoint_and_publication_replays_skip_bytes() {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+        let mut fixture = fixture().await;
+        let original = publish_fixture(&fixture).await;
+        release_fixture(&fixture).await;
+        reserve_next_fixture(&mut fixture, "racing").await;
+        bind_fixture_alias(&fixture.snapshots, "racing", original.id).await;
+        let captured = publish_fixture(&fixture).await;
+        assert_ne!(captured.id, original.id);
+        assert!(captured.retained);
+        assert!(captured.aliases.is_empty());
+        let capture = fixture.reservation.record.capture_id;
+        let record = fixture
+            .snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.state,
+            CaptureState::Published {
+                snapshot: captured.id
+            }
+        );
+        assert_eq!(
+            record.naming_outcome,
+            Some(crate::CaptureNamingOutcome::AliasConflict {
+                alias: "racing".into()
+            })
+        );
+        assert_eq!(record.alias.as_deref(), Some("racing"));
+        assert_eq!(captured.provenance[0].capture_id, capture);
+        assert_eq!(
+            fixture
+                .snapshots
+                .inspect(&SnapshotRef::Image("racing".into()))
+                .await
+                .unwrap()
+                .id,
+            original.id
+        );
+
+        let (hook, mut entered, _release) = WorkerHook::new(WorkerPoint::Preparing, true);
+        let mut worker = fixture.snapshots.store.as_ref().clone();
+        worker.layer_hook = Some(hook);
+        let snapshots = SnapshotStore::from_store(Arc::new(worker));
+        let staging = fixture.config.machine_dir.join(record.plan.directory());
+        assert_eq!(
+            snapshots
+                .publish_capture(capture, &staging, record.alias.clone())
+                .await
+                .unwrap(),
+            captured
+        );
+        assert!(
+            entered.try_recv().is_err(),
+            "Published replay reached byte preparation"
+        );
+        let mut state = fixture
+            .snapshots
+            .store
+            .machine_state(fixture.config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let running = state.clone();
+        state.status = MachineRuntimeState::Stopped;
+        state.run_id = None;
+        snapshots.store.save_machine_state(&state).await.unwrap();
+        let runtime = capture_runtime(&snapshots).await;
+        let result = crate::Machine::new(runtime, fixture.config.id)
+            .complete_capture(capture)
+            .await
+            .unwrap();
+        assert!(result.capture.released);
+        assert_eq!(result.snapshot.id, captured.id);
+        assert!(matches!(
+            result.require_requested_name(),
+            Err(crate::LibVmError::CaptureAliasConflict { alias, checkpoint })
+                if alias == "racing" && checkpoint == captured.id
+        ));
+        assert!(snapshots.pending_captures(None).await.unwrap().is_empty());
+        assert_eq!(
+            snapshots
+                .publish_capture(capture, &staging, record.alias.clone())
+                .await
+                .unwrap(),
+            captured
+        );
+        assert!(
+            entered.try_recv().is_err(),
+            "Released replay reached byte preparation"
+        );
+        // Removing the competing binding cannot make replay acquire the name.
+        snapshots.remove_alias("racing").await.unwrap();
+        assert!(snapshots
+            .publish_capture(capture, &staging, record.alias)
+            .await
+            .unwrap()
+            .aliases
+            .is_empty());
+        assert!(snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .unwrap()
+            .naming_outcome
+            .is_some());
+        snapshots.store.save_machine_state(&running).await.unwrap();
+        reserve_next_fixture(&mut fixture, "retry").await;
+    }
+
+    #[tokio::test]
+    async fn capture_reconciliation_repairs_persisted_sealed_alias_conflict_once() {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+        let mut fixture = fixture().await;
+        let original = publish_fixture(&fixture).await;
+        release_fixture(&fixture).await;
+        reserve_next_fixture(&mut fixture, "stuck").await;
+        let prepared = publish_fixture(&fixture).await;
+        let capture = fixture.reservation.record.capture_id;
+        let mut record = fixture
+            .snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        // Recreate the pre-fix commit boundary: authenticated/pinned outputs
+        // and candidate survive, but snapshot, alias and provenance rolled back.
+        let mut tx = fixture
+            .snapshots
+            .store
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM image_alias WHERE name='stuck'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM storage_snapshot WHERE id=?1")
+            .bind(prepared.id.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        record.state = CaptureState::Sealed;
+        crate::store::capture::write_record(&mut tx, &record)
+            .await
+            .unwrap();
+        // The owner's existing record predates the optional naming result.
+        sqlx::query("UPDATE storage_operation SET record_json=jsonb_remove(record_json,'$.namingOutcome') WHERE operation_id=?1")
+            .bind(capture.to_string()).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        bind_fixture_alias(&fixture.snapshots, "stuck", original.id).await;
+        let mut state = fixture
+            .snapshots
+            .store
+            .machine_state(fixture.config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        state.status = MachineRuntimeState::Stopped;
+        state.run_id = None;
+        fixture
+            .snapshots
+            .store
+            .save_machine_state(&state)
+            .await
+            .unwrap();
+
+        let reopened = SnapshotStore::open(fixture.snapshots.store.home_path())
+            .await
+            .unwrap();
+        let runtime = capture_runtime(&reopened).await;
+        runtime.reconcile_captures().await.unwrap();
+        let repaired = reopened
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repaired.state,
+            CaptureState::Released {
+                snapshot: Some(prepared.id)
+            }
+        );
+        assert_eq!(
+            repaired.naming_outcome,
+            Some(crate::CaptureNamingOutcome::AliasConflict {
+                alias: "stuck".into()
+            })
+        );
+        assert!(reopened.pending_captures(None).await.unwrap().is_empty());
+        assert_eq!(
+            reopened
+                .inspect(&SnapshotRef::Image("stuck".into()))
+                .await
+                .unwrap()
+                .id,
+            original.id
+        );
+        let retained = reopened
+            .inspect(&SnapshotRef::Id(prepared.id))
+            .await
+            .unwrap();
+        assert!(retained.retained && retained.aliases.is_empty());
+        assert_eq!(retained.provenance[0].capture_id, capture);
+
+        let (hook, mut entered, _release) = WorkerHook::new(WorkerPoint::Preparing, true);
+        let mut worker = reopened.store.as_ref().clone();
+        worker.layer_hook = Some(hook);
+        let snapshots = SnapshotStore::from_store(Arc::new(worker));
+        let runtime = capture_runtime(&snapshots).await;
+        runtime.reconcile_captures().await.unwrap();
+        assert!(
+            entered.try_recv().is_err(),
+            "terminal capture was re-authenticated"
+        );
+        state.status = MachineRuntimeState::Running;
+        state.run_id = Some(record.run_id.to_string());
+        snapshots.store.save_machine_state(&state).await.unwrap();
+        reserve_next_fixture(&mut fixture, "after-repair").await;
+    }
+
+    #[tokio::test]
+    async fn capture_alias_sql_failure_is_not_a_naming_conflict() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        sqlx::raw_sql("CREATE TRIGGER reject_capture_alias BEFORE INSERT ON image_alias BEGIN SELECT RAISE(ABORT,'capture alias SQL failure'); END;")
+            .execute(&fixture.snapshots.store.pool).await.unwrap();
+        let capture = fixture.reservation.record.capture_id;
+        let error = fixture
+            .snapshots
+            .publish_capture(
+                capture,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("capture alias SQL failure"));
+        let record = fixture
+            .snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, CaptureState::Sealed);
+        assert!(record.naming_outcome.is_none());
+        let snapshots: i64 = sqlx::query_scalar("SELECT count(*) FROM storage_snapshot")
+            .fetch_one(&fixture.snapshots.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(snapshots, 0);
+    }
+
+    #[tokio::test]
+    async fn capture_admission_refuses_alias_owned_by_managed_image() {
+        let fixture = fixture().await;
+        let snapshot = publish_fixture(&fixture).await;
+        release_fixture(&fixture).await;
+        let consumer = fixture
+            .snapshots
+            .consume(&SnapshotRef::Id(snapshot.id))
+            .await
+            .unwrap();
+        let record = crate::ImageRecord {
+            schema: 1,
+            kind: crate::ImageRecordKind::Image,
+            root: consumer.record.root.clone(),
+            boot: consumer.record.boot.clone(),
+            process: crate::ProcessConfig::default(),
+        };
+        let (streams, objects) = record.content_dependencies().unwrap();
+        let (operation, lease) = fixture
+            .snapshots
+            .store
+            .begin_stopped_operation(
+                "import",
+                &streams.into_iter().collect::<Vec<_>>(),
+                &objects.into_iter().collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
+        pool.create_operation_with_lease(operation, lease.duplicate().unwrap())
+            .unwrap();
+        let images = crate::store::managed_image_store::ManagedImageStore::from_store(
+            fixture.snapshots.store.clone(),
+        );
+        let image = images
+            .publish_owned(
+                record,
+                operation,
+                lease,
+                Some("managed".into()),
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut request = fixture.reservation.record.request.clone();
+        request.capture_id = Uuid::new_v4();
+        request.alias = Some("managed".into());
+        let error = match fixture.snapshots.reserve_capture(&request).await {
+            Ok(_) => panic!("managed-image alias admitted for a new capture"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, crate::LibVmError::ImageAliasConflict { alias } if alias == "managed")
+        );
+        assert!(fixture
+            .snapshots
+            .capture_reservation(request.capture_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            images
+                .resolve(&crate::image::import_types::ManagedSourceRef::Alias(
+                    "managed".into()
+                ))
+                .await
+                .unwrap(),
+            crate::image::import_types::ManagedSourceId::Image(image.id),
+        );
+        fixture
+            .snapshots
+            .store
+            .finish_stopped_operation(consumer.operation_id)
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .store
+            .finish_stopped_operation(operation)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_captures_ignores_terminal_history_before_decoding() {
+        let fixture = fixture().await;
+        publish_fixture(&fixture).await;
+        release_fixture(&fixture).await;
+        // A terminal row is not recovery input, even if its historical JSON
+        // cannot be decoded. This distinguishes SQL selection from post-filtering.
+        sqlx::query("UPDATE storage_operation SET record_json=jsonb('{}') WHERE operation_id=?1")
+            .bind(fixture.reservation.record.capture_id.to_string())
+            .execute(&fixture.snapshots.store.pool)
+            .await
+            .unwrap();
+        assert!(fixture
+            .snapshots
+            .pending_captures(None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

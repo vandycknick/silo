@@ -890,7 +890,9 @@ impl Store {
             Ok::<_,LibVmError>(())
         })).await?
     }
-    pub(crate) async fn recover_layer_objects(&self) -> Result<(), LibVmError> {
+    pub(crate) async fn recover_layer_objects(
+        &self,
+    ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
         let store = self.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
@@ -901,7 +903,11 @@ impl Store {
             // catalog/immutable-pool snapshots that deliberately omit them.
             // Read-side load/find_recipe retain their noncreating opener.
             let pool = StoragePool::open(&store.images_dir)?;
-            runtime.block_on(store.retire_abandoned_storage_operations(&pool))?;
+            let mut recovery =
+                runtime.block_on(store.retire_abandoned_storage_operations(&pool))?;
+            if recovery.checkpoint_deferred() {
+                return Ok(recovery);
+            }
             runtime.block_on(crate::store::artifact_store::retire_unrooted_managed(
                 &store, &pool,
             ))?;
@@ -928,7 +934,7 @@ impl Store {
                     &store,
                 ))?;
                 let _roots = pool.lock_roots()?;
-                runtime.block_on(async {
+                let deferred = runtime.block_on(async {
                     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
                     let mut orphaned = Vec::new();
                     for digest in batch {
@@ -944,7 +950,7 @@ impl Store {
                     // second writer transaction on every runtime open.
                     if orphaned.is_empty() {
                         tx.commit().await?;
-                        return Ok::<_, LibVmError>(());
+                        return Ok::<_, LibVmError>(None);
                     }
                     let candidates = orphaned
                         .iter()
@@ -959,7 +965,9 @@ impl Store {
                     tx.commit().await?;
                     // Stabilize the observed root removals before unlink, then
                     // recheck after reacquiring the SQLite writer fence.
-                    store.checkpoint_catalog().await?;
+                    if let Some(deferred) = store.try_checkpoint_catalog().await?.deferral() {
+                        return Ok(Some(deferred));
+                    }
                     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
                     crate::store::ensure_cache_paths_unreferenced(
                         &mut tx,
@@ -978,10 +986,14 @@ impl Store {
                         pool.remove_object(&digest)?;
                     }
                     tx.commit().await?;
-                    Ok::<_, LibVmError>(())
+                    Ok::<_, LibVmError>(None)
                 })?;
+                if let Some(deferred) = deferred {
+                    recovery.deferred.push(deferred);
+                    return Ok(recovery);
+                }
             }
-            Ok::<_, LibVmError>(())
+            Ok::<_, LibVmError>(recovery)
         })
         .await?
     }
@@ -1002,6 +1014,7 @@ pub(crate) mod tests {
         BeforeRoots,
         Cleanup,
         RecoveryDelete,
+        CatalogCheckpoint,
         CandidateAuthorized,
         CandidateDetached,
         CandidateDirectoryVerified,

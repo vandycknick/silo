@@ -18226,6 +18226,8 @@ type SystemStatus struct {
 	LiveSchemaVersion                    *uint32                `protobuf:"varint,25,opt,name=live_schema_version,json=liveSchemaVersion,proto3,oneof" json:"live_schema_version,omitempty"`
 	HostMemoryReclaimBacking             *string                `protobuf:"bytes,26,opt,name=host_memory_reclaim_backing,json=hostMemoryReclaimBacking,proto3,oneof" json:"host_memory_reclaim_backing,omitempty"`
 	HostMemoryReclaimReason              *string                `protobuf:"bytes,27,opt,name=host_memory_reclaim_reason,json=hostMemoryReclaimReason,proto3,oneof" json:"host_memory_reclaim_reason,omitempty"`
+	HostMemoryReclaimMappingLimitSkips   *uint64                `protobuf:"varint,28,opt,name=host_memory_reclaim_mapping_limit_skips,json=hostMemoryReclaimMappingLimitSkips,proto3,oneof" json:"host_memory_reclaim_mapping_limit_skips,omitempty"`
+	HostMemoryReclaimReplacedIslands     *uint64                `protobuf:"varint,29,opt,name=host_memory_reclaim_replaced_islands,json=hostMemoryReclaimReplacedIslands,proto3,oneof" json:"host_memory_reclaim_replaced_islands,omitempty"`
 	unknownFields                        protoimpl.UnknownFields
 	sizeCache                            protoimpl.SizeCache
 }
@@ -18447,6 +18449,20 @@ func (x *SystemStatus) GetHostMemoryReclaimReason() string {
 		return *x.HostMemoryReclaimReason
 	}
 	return ""
+}
+
+func (x *SystemStatus) GetHostMemoryReclaimMappingLimitSkips() uint64 {
+	if x != nil && x.HostMemoryReclaimMappingLimitSkips != nil {
+		return *x.HostMemoryReclaimMappingLimitSkips
+	}
+	return 0
+}
+
+func (x *SystemStatus) GetHostMemoryReclaimReplacedIslands() uint64 {
+	if x != nil && x.HostMemoryReclaimReplacedIslands != nil {
+		return *x.HostMemoryReclaimReplacedIslands
+	}
+	return 0
 }
 
 type LiveMachineRequest struct {
@@ -19880,6 +19896,7 @@ type LiveSnapshotInfo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Snapshot      *StorageSnapshotInfo   `protobuf:"bytes,1,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
 	Capture       *LiveCaptureSummary    `protobuf:"bytes,2,opt,name=capture,proto3" json:"capture,omitempty"`
+	AliasConflict *string                `protobuf:"bytes,3,opt,name=alias_conflict,json=aliasConflict,proto3,oneof" json:"alias_conflict,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -19926,6 +19943,13 @@ func (x *LiveSnapshotInfo) GetCapture() *LiveCaptureSummary {
 		return x.Capture
 	}
 	return nil
+}
+
+func (x *LiveSnapshotInfo) GetAliasConflict() string {
+	if x != nil && x.AliasConflict != nil {
+		return *x.AliasConflict
+	}
+	return ""
 }
 
 // A retained, not yet released capture of this machine. source_outcome is
@@ -23807,7 +23831,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\x05agent\x18\a \x01(\v2\x1b.silo.daemon.v1.AgentStatusR\x05agent\x125\n" +
 	"\x04live\x18\b \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x04live\x12;\n" +
 	"\tlifecycle\x18\t \x01(\v2\x1d.silo.daemon.v1.LiveLifecycleR\tlifecycleB\t\n" +
-	"\a_run_id\"\xa9\x10\n" +
+	"\a_run_id\"\xad\x12\n" +
 	"\fSystemStatus\x121\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x1b.silo.daemon.v1.SystemPhaseR\x05phase\x12\"\n" +
 	"\n" +
@@ -23839,7 +23863,9 @@ const file_daemon_proto_rawDesc = "" +
 	"\x10prospective_live\x18\x18 \x01(\v2\x1e.silo.daemon.v1.LiveHostReportR\x0fprospectiveLive\x123\n" +
 	"\x13live_schema_version\x18\x19 \x01(\rH\x10R\x11liveSchemaVersion\x88\x01\x01\x12B\n" +
 	"\x1bhost_memory_reclaim_backing\x18\x1a \x01(\tH\x11R\x18hostMemoryReclaimBacking\x88\x01\x01\x12@\n" +
-	"\x1ahost_memory_reclaim_reason\x18\x1b \x01(\tH\x12R\x17hostMemoryReclaimReason\x88\x01\x01B\r\n" +
+	"\x1ahost_memory_reclaim_reason\x18\x1b \x01(\tH\x12R\x17hostMemoryReclaimReason\x88\x01\x01\x12X\n" +
+	"'host_memory_reclaim_mapping_limit_skips\x18\x1c \x01(\x04H\x13R\"hostMemoryReclaimMappingLimitSkips\x88\x01\x01\x12S\n" +
+	"$host_memory_reclaim_replaced_islands\x18\x1d \x01(\x04H\x14R hostMemoryReclaimReplacedIslands\x88\x01\x01B\r\n" +
 	"\v_machine_idB\t\n" +
 	"\a_run_idB\x0f\n" +
 	"\r_image_digestB\x13\n" +
@@ -23858,7 +23884,9 @@ const file_daemon_proto_rawDesc = "" +
 	"&_host_memory_reclaim_failed_operationsB\x16\n" +
 	"\x14_live_schema_versionB\x1e\n" +
 	"\x1c_host_memory_reclaim_backingB\x1d\n" +
-	"\x1b_host_memory_reclaim_reason\"J\n" +
+	"\x1b_host_memory_reclaim_reasonB*\n" +
+	"(_host_memory_reclaim_mapping_limit_skipsB'\n" +
+	"%_host_memory_reclaim_replaced_islands\"J\n" +
 	"\x12LiveMachineRequest\x124\n" +
 	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\"w\n" +
 	"\n" +
@@ -23998,10 +24026,12 @@ const file_daemon_proto_rawDesc = "" +
 	"\astaging\x18\t \x01(\tR\astaging\x12=\n" +
 	"\x06memory\x18\n" +
 	" \x01(\v2%.silo.daemon.v1.CaptureMemoryEvidenceR\x06memoryB\x0f\n" +
-	"\r_source_error\"\x91\x01\n" +
+	"\r_source_error\"\xd0\x01\n" +
 	"\x10LiveSnapshotInfo\x12?\n" +
 	"\bsnapshot\x18\x01 \x01(\v2#.silo.daemon.v1.StorageSnapshotInfoR\bsnapshot\x12<\n" +
-	"\acapture\x18\x02 \x01(\v2\".silo.daemon.v1.LiveCaptureSummaryR\acapture\"\xa7\x03\n" +
+	"\acapture\x18\x02 \x01(\v2\".silo.daemon.v1.LiveCaptureSummaryR\acapture\x12*\n" +
+	"\x0ealias_conflict\x18\x03 \x01(\tH\x00R\raliasConflict\x88\x01\x01B\x11\n" +
+	"\x0f_alias_conflict\"\xa7\x03\n" +
 	"\x0eMachineCapture\x12\x1d\n" +
 	"\n" +
 	"capture_id\x18\x01 \x01(\tR\tcaptureId\x12\x15\n" +
@@ -26102,6 +26132,7 @@ func file_daemon_proto_init() {
 	file_daemon_proto_msgTypes[188].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[191].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[192].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[193].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[194].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[195].OneofWrappers = []any{
 		(*StorageSnapshotRef_Id)(nil),

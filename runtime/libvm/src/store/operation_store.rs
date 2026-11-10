@@ -1214,7 +1214,10 @@ impl Store {
                         sqlx::query("UPDATE storage_operation SET state='cleaning' WHERE operation_id=?1 AND kind='capture'")
                             .bind(&cursor).execute(&mut *tx).await?;
                         tx.commit().await?;
-                        self.checkpoint_catalog().await?;
+                        if let Some(deferred) = self.try_checkpoint_catalog().await?.deferral() {
+                            report.deferred.push(deferred);
+                            return Ok(report);
+                        }
                         #[cfg(test)]
                         if let Some(hook) = &self.layer_hook {
                             hook.hit(
@@ -1289,7 +1292,10 @@ impl Store {
                     if let Some((machine, cleanup)) = removed_machine {
                         let candidate_json: String = row.try_get("record_json")?;
                         tx.commit().await?;
-                        self.checkpoint_catalog().await?;
+                        if let Some(deferred) = self.try_checkpoint_catalog().await?.deferral() {
+                            report.deferred.push(deferred);
+                            return Ok(report);
+                        }
                         #[cfg(test)]
                         if let Some(hook) = &self.layer_hook {
                             hook.hit(
@@ -1885,25 +1891,25 @@ mod tests {
             .await
             .unwrap();
         drop(lease);
-        let error = store
+        let recovery = store
             .retire_abandoned_storage_operations(&pool)
             .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("catalog WAL checkpoint is incomplete"),
-            "{error}"
-        );
+            .unwrap();
+        assert!(recovery.checkpoint_deferred(), "{recovery:?}");
+        let cleaning: String =
+            sqlx::query_scalar("SELECT state FROM storage_operation WHERE operation_id=?1")
+                .bind(operation.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(cleaning, "cleaning");
+        let _reopened = Store::open(&store.home.join("state.db")).await.unwrap();
         assert_eq!(
             std::fs::read(directory.join("root.raw")).unwrap(),
             b"private candidate"
         );
         reader.rollback().await.unwrap();
-        store
-            .retire_abandoned_storage_operations(&pool)
-            .await
-            .unwrap();
+        let _reopened = Store::open(&store.home.join("state.db")).await.unwrap();
         assert!(!directory.exists());
     }
 

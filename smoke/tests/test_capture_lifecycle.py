@@ -399,6 +399,8 @@ def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
             process.wait()
         assert not shutdown.lease_busy(run.lease)
         run.ended_silently()
+        # Keep this before manager completion and without CLI retries: concurrent
+        # catalog readers may defer cleanup, but must never make info fail.
         assert silo.info(NAME)["state"] == "stopped"
         # The racing manager may be refused with monitor-stopping; recorded only.
         manager_result = run.trace.wait("capture-manager-result.json")
