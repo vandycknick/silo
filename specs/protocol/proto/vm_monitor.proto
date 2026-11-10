@@ -219,6 +219,10 @@ message HostMemoryReclaim {
   // Structural inhibition: none, tracked-capture, restored-private-mapping.
   // Required whenever this report exists, even when the reason is none.
   optional string reason = 11;
+  // Discards skipped at the host mapping-count bound, including ENOMEM.
+  optional uint64 mapping_limit_skips = 12;
+  // Current anonymous replacement islands in restored RAM.
+  optional uint64 replaced_islands = 13;
 }
 
 enum LiveOperation {

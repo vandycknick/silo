@@ -346,14 +346,7 @@ impl DaemonStatusView {
                 ));
                 rows.push((
                     "Host memory reclaim".to_string(),
-                    format_host_memory_reclaim(
-                        status.host_memory_reclaim_requested,
-                        status.host_memory_reclaim_effective,
-                        status.host_memory_reclaim_qualification.as_deref(),
-                        status.host_memory_reclaim_released_bytes,
-                        status.host_memory_reclaim_backing.as_deref(),
-                        status.host_memory_reclaim_reason.as_deref(),
-                    ),
+                    format_host_memory_reclaim(status),
                 ));
             }
             if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&status.updated_at) {
@@ -456,35 +449,44 @@ fn format_guest_reclaim(
     format!("; last idle {mode} reclaim in the guest {outcome} {when}{reclaimed}")
 }
 
-fn format_host_memory_reclaim(
-    requested: bool,
-    effective: Option<bool>,
-    qualification: Option<&str>,
-    released_bytes: Option<u64>,
-    backing: Option<&str>,
-    reason: Option<&str>,
-) -> String {
-    let requested = if requested { "auto" } else { "off" };
-    let effective_text = match effective {
+fn format_host_memory_reclaim(status: &silod_spec::status::SystemStatus) -> String {
+    let requested = if status.host_memory_reclaim_requested {
+        "auto"
+    } else {
+        "off"
+    };
+    let effective_text = match status.host_memory_reclaim_effective {
         Some(true) => "on",
         Some(false) => "off",
         None => "unknown (not yet reported by the VM backend)",
     };
     let mut text = format!("requested {requested}; effective {effective_text}");
-    if let Some(qualification) = qualification {
+    if let Some(qualification) = &status.host_memory_reclaim_qualification {
         text.push_str(&format!(" (probe {qualification})"));
     }
-    if let Some(backing) = backing {
+    if let Some(backing) = &status.host_memory_reclaim_backing {
         text.push_str(&format!("; backing {backing}"));
     }
-    if let Some(reason) = reason {
+    if let Some(reason) = &status.host_memory_reclaim_reason {
         text.push_str(&format!("; reason {reason}"));
     }
-    if let (Some(_), Some(bytes)) = (effective, released_bytes) {
+    if let (Some(_), Some(bytes)) = (
+        status.host_memory_reclaim_effective,
+        status.host_memory_reclaim_released_bytes,
+    ) {
         text.push_str(&format!(
-            "; {} advised free since VM start",
+            "; {} released since VM start",
             crate::ui::human_bytes(Some(bytes))
         ));
+    }
+    if let Some(skips) = status
+        .host_memory_reclaim_mapping_limit_skips
+        .filter(|skips| *skips != 0)
+    {
+        text.push_str(&format!("; {skips} skipped at mapping limit"));
+    }
+    if let Some(islands) = status.host_memory_reclaim_replaced_islands {
+        text.push_str(&format!("; {islands} replaced islands"));
     }
     text
 }

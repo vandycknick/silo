@@ -53,6 +53,8 @@ pub struct MachineView {
     pub live: Option<vm_spec::live::LiveMachineReport>,
     pub prospective_live: Option<vm_spec::live::LiveHostReport>,
     pub lifecycle: Option<libvm::MachineLifecycle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_memory_reclaim: Option<HostMemoryReclaimView>,
     pub default: bool,
     pub template_name: Option<String>,
     pub retention: String,
@@ -77,6 +79,73 @@ pub struct MachineView {
     pub spec: VmSpec,
     /// Pinned direct-boot meaning; start never switches bundles implicitly.
     pub boot: Option<MachineBootView>,
+}
+
+/// Presentation of the current monitor report, never persisted machine state.
+#[derive(Debug, Clone, Serialize)]
+pub struct HostMemoryReclaimView {
+    pub backing: &'static str,
+    pub reason: &'static str,
+    pub requested: bool,
+    pub effective: bool,
+    pub qualification: &'static str,
+    pub released_bytes: u64,
+    pub released_extents: u64,
+    pub skipped_reports: u64,
+    pub failed_operations: u64,
+    pub mapping_limit_skips: u64,
+    pub replaced_islands: u64,
+}
+
+impl HostMemoryReclaimView {
+    pub fn new(report: &libvm::MachineHostMemoryReclaim) -> Self {
+        Self {
+            backing: match report.backing {
+                libvm::MachineHostMemoryReclaimBacking::Boot => "boot",
+                libvm::MachineHostMemoryReclaimBacking::RestoredPrivate => "restored-private",
+            },
+            reason: match report.reason {
+                libvm::MachineHostMemoryReclaimReason::None => "none",
+                libvm::MachineHostMemoryReclaimReason::TrackedCapture => "tracked-capture",
+                libvm::MachineHostMemoryReclaimReason::RestoredPrivateMapping => {
+                    "restored-private-mapping"
+                }
+            },
+            requested: report.requested,
+            effective: report.effective,
+            qualification: match report.qualification {
+                libvm::MachineHostMemoryReclaimQualification::NotRun => "not-run",
+                libvm::MachineHostMemoryReclaimQualification::Passed => "passed",
+                libvm::MachineHostMemoryReclaimQualification::Failed => "failed",
+                libvm::MachineHostMemoryReclaimQualification::Inconclusive => "inconclusive",
+            },
+            released_bytes: report.released_bytes,
+            released_extents: report.released_extents,
+            skipped_reports: report.skipped_reports,
+            failed_operations: report.failed_operations,
+            mapping_limit_skips: report.mapping_limit_skips,
+            replaced_islands: report.replaced_islands,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        if !self.effective {
+            return format!("inhibited ({})", self.reason);
+        }
+        let mut text = format!(
+            "effective ({}), {} released in {} extents",
+            self.backing,
+            crate::ui::human_bytes(Some(self.released_bytes)),
+            self.released_extents,
+        );
+        if self.mapping_limit_skips != 0 {
+            text.push_str(&format!(
+                ", {} skipped at mapping limit",
+                self.mapping_limit_skips
+            ));
+        }
+        text
+    }
 }
 
 /// The machine's pinned boot bundle and platform, plus a newer locally
@@ -250,6 +319,7 @@ impl MachineView {
             live: data.live.clone(),
             prospective_live: data.prospective_live.clone(),
             lifecycle: data.lifecycle.clone(),
+            host_memory_reclaim: None,
             default,
             template_name: data.template_name.clone(),
             retention: retention_label(data.retention).to_string(),
@@ -403,6 +473,109 @@ mod tests {
     use libvm::{MachineAgent, MachineRetention};
 
     use crate::view::{agent_label, retention_label};
+
+    fn reclaim_report(
+        backing: libvm::MachineHostMemoryReclaimBacking,
+    ) -> libvm::MachineHostMemoryReclaim {
+        libvm::MachineHostMemoryReclaim {
+            backing,
+            reason: libvm::MachineHostMemoryReclaimReason::None,
+            requested: true,
+            qualification: libvm::MachineHostMemoryReclaimQualification::NotRun,
+            effective: true,
+            released_bytes: 1_073_741_824,
+            released_extents: 340,
+            retried_faults: 0,
+            skipped_reports: 0,
+            failed_operations: 0,
+            mapping_limit_skips: 0,
+            replaced_islands: 0,
+            observed_at: std::time::UNIX_EPOCH,
+        }
+    }
+
+    fn machine_view() -> crate::view::MachineView {
+        crate::view::MachineView::new(
+            &libvm::MachineData::new(
+                "00000000-0000-4000-8000-000000000001".into(),
+                "dev".into(),
+                vm_spec::VmSpec::current(),
+            ),
+            false,
+        )
+    }
+
+    #[test]
+    fn info_reclaim_view_renders_effective_boot_json_and_plain() {
+        let report = reclaim_report(libvm::MachineHostMemoryReclaimBacking::Boot);
+        let reclaim = crate::view::HostMemoryReclaimView::new(&report);
+        assert_eq!(
+            reclaim.summary(),
+            format!(
+                "effective (boot), {} released in 340 extents",
+                crate::ui::human_bytes(Some(report.released_bytes))
+            )
+        );
+        let mut view = machine_view();
+        view.host_memory_reclaim = Some(reclaim);
+        let json = serde_json::to_value(view).expect("serialize info");
+        assert_eq!(
+            json["host_memory_reclaim"],
+            serde_json::json!({
+                "backing": "boot", "reason": "none", "requested": true,
+                "effective": true, "qualification": "not-run",
+                "released_bytes": 1_073_741_824_u64, "released_extents": 340,
+                "skipped_reports": 0, "failed_operations": 0,
+                "mapping_limit_skips": 0, "replaced_islands": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn info_reclaim_view_renders_effective_restored_with_mapping_skips() {
+        let mut report = reclaim_report(libvm::MachineHostMemoryReclaimBacking::RestoredPrivate);
+        report.mapping_limit_skips = 3;
+        report.skipped_reports = 3;
+        report.replaced_islands = 7;
+        let reclaim = crate::view::HostMemoryReclaimView::new(&report);
+        assert_eq!(
+            reclaim.summary(),
+            format!(
+                "effective (restored-private), {} released in 340 extents, 3 skipped at mapping limit",
+                crate::ui::human_bytes(Some(report.released_bytes))
+            )
+        );
+        let mut view = machine_view();
+        view.host_memory_reclaim = Some(reclaim);
+        let json = serde_json::to_value(view).expect("serialize info");
+        assert_eq!(json["host_memory_reclaim"]["backing"], "restored-private");
+        assert_eq!(json["host_memory_reclaim"]["effective"], true);
+        assert_eq!(json["host_memory_reclaim"]["mapping_limit_skips"], 3);
+        assert_eq!(json["host_memory_reclaim"]["replaced_islands"], 7);
+        assert_eq!(json["host_memory_reclaim"]["skipped_reports"], 3);
+    }
+
+    #[test]
+    fn info_reclaim_view_omits_absent_metrics() {
+        let view = machine_view();
+        assert!(view.host_memory_reclaim.is_none());
+        let json = serde_json::to_value(view).expect("serialize info");
+        assert!(json.get("host_memory_reclaim").is_none());
+    }
+
+    #[test]
+    fn info_reclaim_view_renders_inhibition_reason() {
+        let mut report = reclaim_report(libvm::MachineHostMemoryReclaimBacking::RestoredPrivate);
+        report.reason = libvm::MachineHostMemoryReclaimReason::RestoredPrivateMapping;
+        report.requested = false;
+        report.effective = false;
+        report.released_bytes = 0;
+        report.released_extents = 0;
+        assert_eq!(
+            crate::view::HostMemoryReclaimView::new(&report).summary(),
+            "inhibited (restored-private-mapping)"
+        );
+    }
 
     #[test]
     fn unavailable_inventory_preserves_identity_and_diagnostics_in_json() {

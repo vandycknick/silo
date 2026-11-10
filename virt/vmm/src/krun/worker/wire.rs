@@ -438,7 +438,9 @@ mod tests {
                 "released_extents": 0,
                 "retried_faults": 0,
                 "skipped_reports": 1,
-                "failed_operations": 0
+                "failed_operations": 0,
+                "mapping_limit_skips": 0,
+                "replaced_islands": 0
             }
         });
         decode::<Event>(&serde_json::to_vec(&report).expect("JSON"))
@@ -460,6 +462,46 @@ mod tests {
                 assert!(decode::<Event>(&serde_json::to_vec(&malformed).expect("JSON")).is_err());
             }
         }
+        for field in ["mapping_limit_skips", "replaced_islands"] {
+            let mut missing = report.clone();
+            missing["status"]
+                .as_object_mut()
+                .expect("status")
+                .remove(field);
+            assert!(decode::<Event>(&serde_json::to_vec(&missing).expect("JSON")).is_err());
+        }
+        let mut unknown = report;
+        unknown["status"]["unknown"] = serde_json::json!(0);
+        assert!(decode::<Event>(&serde_json::to_vec(&unknown).expect("JSON")).is_err());
+    }
+
+    #[test]
+    fn reclaim_event_round_trips_mapping_counters() {
+        let status = crate::krun::HostMemoryReclaimStatus {
+            backing: crate::krun::HostMemoryReclaimBacking::RestoredPrivate,
+            reason: crate::krun::HostMemoryReclaimReason::None,
+            requested: true,
+            qualification: crate::krun::HostMemoryReclaimQualification::NotRun,
+            effective: true,
+            released_bytes: 4_194_304,
+            released_extents: 2,
+            retried_faults: 0,
+            skipped_reports: 3,
+            failed_operations: 0,
+            mapping_limit_skips: 3,
+            replaced_islands: 7,
+        };
+        let bytes = encode(&Event::HostMemoryReclaim { status }, MAX_EVENT).expect("encode event");
+        assert_eq!(
+            frame_length(bytes[..4].try_into().expect("frame header"), MAX_EVENT).expect("length"),
+            bytes.len() - 4
+        );
+        let Event::HostMemoryReclaim { status: decoded } =
+            decode::<Event>(&bytes[4..]).expect("decode event")
+        else {
+            panic!("reclaim event");
+        };
+        assert_eq!(decoded, status);
     }
 
     #[test]

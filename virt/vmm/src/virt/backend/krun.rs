@@ -552,6 +552,8 @@ fn host_memory_reclaim_report(
         retried_faults: status.retried_faults,
         skipped_reports: status.skipped_reports,
         failed_operations: status.failed_operations,
+        mapping_limit_skips: status.mapping_limit_skips,
+        replaced_islands: status.replaced_islands,
         observed_at: SystemTime::now(),
     }
 }

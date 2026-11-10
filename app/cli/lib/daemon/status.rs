@@ -239,6 +239,8 @@ fn system_wire(s: &SystemStatus) -> eyre::Result<w::SystemStatus> {
         host_memory_reclaim_failed_operations: s.host_memory_reclaim_failed_operations,
         host_memory_reclaim_backing: s.host_memory_reclaim_backing.clone(),
         host_memory_reclaim_reason: s.host_memory_reclaim_reason.clone(),
+        host_memory_reclaim_mapping_limit_skips: s.host_memory_reclaim_mapping_limit_skips,
+        host_memory_reclaim_replaced_islands: s.host_memory_reclaim_replaced_islands,
     })
 }
 
@@ -246,6 +248,19 @@ fn system_wire(s: &SystemStatus) -> eyre::Result<w::SystemStatus> {
 mod tests {
     use crate::daemon::status::*;
     use std::sync::Arc;
+
+    #[test]
+    fn system_wire_preserves_reclaim_mapping_counters() {
+        let mut status = crate::daemon::supervisor::initial_status(std::path::Path::new(
+            "/tmp/silo-test-docker.sock",
+        ))
+        .expect("initial status");
+        status.host_memory_reclaim_mapping_limit_skips = Some(3);
+        status.host_memory_reclaim_replaced_islands = Some(7);
+        let wire = system_wire(&status).expect("status wire");
+        assert_eq!(wire.host_memory_reclaim_mapping_limit_skips, Some(3));
+        assert_eq!(wire.host_memory_reclaim_replaced_islands, Some(7));
+    }
 
     #[test]
     fn component_updates_share_one_root_identity_and_api_snapshot() {

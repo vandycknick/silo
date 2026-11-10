@@ -601,6 +601,28 @@ page must read as zero afterwards, never as the baseline's old bytes. The
 same requirement applies to balloon-driven discard on both hosts. Disabling an
 optimization is never a reason to omit memory from a capture.
 
+**Amendment, 2026-11-10 (Linux/KVM host reclaim).** Linux boot anonymous RAM,
+including capture-tracked snapshot sources, reclaims guest-reported free ranges
+with `MADV_DONTNEED`. Restored file-private RAM retains lazy private COW sharing
+and reclaims by replacing only the reported range with fresh anonymous
+read/write memory at the same address (`MAP_FIXED | MAP_PRIVATE |
+MAP_ANONYMOUS | MAP_NORESERVE`). File-private RAM never receives
+`MADV_DONTNEED`, which could resurrect checkpoint bytes. Both discard paths
+mark the range dirty through the host-writer memory domain before changing it;
+marking failure prevents discard. Freed ranges read zero, checkpoint RAM files
+remain unchanged, and other VMs' mappings are unaffected.
+
+Adjacent reports are coalesced. Anonymous replacement islands are bounded
+against the host mapping limit with a fixed VMM reserve. At the bound, or on
+`ENOMEM`, acknowledge without discarding and count `mapping_limit_skips`;
+never fail the VM or fall back to file-private advice. Status also reports the
+current `replaced_islands` count. These counters are process-local and are not
+captured balloon device state. Reports are drained and quiesced before a
+capture cut. Incremental capture writes discarded dirty pages as explicit zero
+overlays; full capture may omit zero pages as holes. Linux tracked and restored
+RAM report effective reclaim with reason `none`. The macOS/HVF inhibition and
+qualification contract above are unchanged.
+
 ## Restore
 
 ### Inputs

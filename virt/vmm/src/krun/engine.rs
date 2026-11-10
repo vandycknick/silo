@@ -678,6 +678,8 @@ fn host_memory_reclaim_status(handle: &libkrun::VmmHandle) -> crate::krun::HostM
         retried_faults: status.retried_faults,
         skipped_reports: status.skipped_reports,
         failed_operations: status.failed_operations,
+        mapping_limit_skips: status.mapping_limit_skips,
+        replaced_islands: status.replaced_islands,
     }
 }
 

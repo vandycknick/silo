@@ -8,7 +8,7 @@ and Mach APIs, with no older-macOS private-trap compatibility branch.
 | Component | Responsibility | Owner |
 | --- | --- | --- |
 | `FreePageReporter` | Reports guest-free pages through the negotiated virtio-balloon reporting queue. | Guest kernel and balloon device |
-| `HostMemoryReclaimer` | Makes reported backing reclaimable while the guest report owns the pages. | libkrun HVF `ReclaimState` |
+| `HostMemoryReclaimer` | Releases reported backing while the guest report owns the pages. | libkrun Linux balloon discard path or HVF `ReclaimState` |
 | `HostMemoryRemapper` | Removes stale host translations/accounting using content-preserving self-remapping. | libkrun guest-memory lifecycle/event loop |
 | `GuestCacheReclaimer` | Turns cold guest file cache into free memory during idle periods. | Managed guest agent |
 
@@ -32,30 +32,78 @@ This is not a promise of traditional inflate/deflate functionality beyond what
 libkrun already implements.
 
 Qualification failure is a capability fallback, not a VM-start failure. Errors
-that prevent safe cleanup of a qualification probe remain fatal. Linux retains
-its existing reporting implementation.
+that prevent safe cleanup of a qualification probe remain fatal.
 
-Capture-tracked boot RAM and restored file-private RAM are structurally
-inhibited: reports can complete, but neither destructive advice nor the HVF
-periodic remapper runs. Restores preserve negotiated device features without
-inheriting permission to discard their new backing. A successful acknowledge-only
-report is not discard-to-zero qualification.
+On Linux/KVM, boot anonymous RAM (including capture-tracked RAM) and restored
+file-private RAM both permit host reclaim. Both report `requested=true`,
+`effective=true`, `reason=none` and qualification `not-run`: Linux does not use
+the HVF qualification probe. See the Linux discard paths below.
 
-Native status and `daemon status` expose actual `backing` (`boot` or
+On macOS/HVF, capture-tracked boot RAM and restored file-private RAM remain
+structurally inhibited: reports can complete, but neither destructive advice nor
+the HVF periodic remapper runs. Restores preserve negotiated device features
+without inheriting permission to discard their new backing. A successful
+acknowledge-only report is not discard-to-zero qualification.
+
+Native status, `daemon status` and `silo info` expose actual `backing` (`boot` or
 `restored-private`) and inhibition `reason` (`none`, `tracked-capture`, or
 `restored-private-mapping`). Inhibited RAM reports requested/effective false,
-qualification `not-run`, and zero advised bytes/extents. Fields remain absent
-until the first native report. Ordinary untracked Linux RAM can report
-qualification `not-run` with effective reclaim: its existing Linux advice path
-does not depend on the HVF probe.
+qualification `not-run`, and zero released bytes/extents. Reports remain absent
+until the first native report. `silo info` observes the running machine's monitor
+in both local and daemon modes; unavailable metrics omit the row and JSON field
+instead of failing inspection. JSON follows the existing snake_case convention:
+`host_memory_reclaim` contains `backing`, `reason`, `requested`, `effective`,
+`qualification`, `released_bytes`, `released_extents`, `skipped_reports`,
+`failed_operations`, `mapping_limit_skips`, and `replaced_islands`.
 
 Counters belong to the current host process, not a captured device generation.
-Released bytes/extents count successful advice, including repeated ranges, not
-physical savings. Inhibited skipped reports count completed operations only
-after successful used-ring publication; malformed or failed publications do not
-count as successful skips.
+Released bytes/extents count successful discards, including repeated ranges, not
+physical savings. `mapping_limit_skips` counts discards skipped at the Linux
+mapping bound; `replaced_islands` is the current count of anonymous replacement
+islands in restored RAM. Inhibited skipped reports count completed operations
+only after successful used-ring publication; malformed or failed publications
+do not count as successful skips.
 
-## HostMemoryReclaimer
+## Linux/KVM discard paths
+
+The guest holds reported free pages out of allocation until acknowledgement.
+The host admits each range through the guest-memory write domain, marking it
+dirty before discarding it. A marking failure prevents discard. Only whole,
+aligned host pages in one registered RAM region are discarded, never gaps,
+unreported live pages or ranges crossing region boundaries.
+
+- **Boot anonymous RAM:** `madvise(MADV_DONTNEED)` releases backing immediately,
+  whether dirty tracking is enabled or disabled. Subsequent reads return zero.
+- **Restored file-private RAM:** replace the reported range at the same address
+  with `MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE` read/write
+  memory. Reads return zero, private COW pages are released and checkpoint-file
+  pages leave this VM's mapping. The checkpoint RAM file is never modified and
+  other VMs retain their independent mappings and shared page-cache pages.
+  `MADV_DONTNEED` is never applied to file-private RAM because it would expose
+  old checkpoint bytes again.
+
+Capturing a restored VM reads all of its RAM, which maps every clean
+checkpoint page the guest has not written into the VMM. Those pages are shared
+page cache (`RssFile`), not private memory, and the host can evict them under
+pressure. The guest does not report pages that were already free again, so
+they stay mapped until eviction or until the guest reuses and frees them.
+
+Adjacent reports are coalesced before replacement. Each disjoint replacement
+island can add two host mappings; adjacent anonymous islands merge. The runtime
+bounds islands using `vm.max_map_count` and the current mapping count with a
+fixed reserve for the VMM's own mappings. If that bound would be exceeded, or
+replacement returns `ENOMEM`, it skips the discard, acknowledges the report
+and increments `mapping_limit_skips`. It neither fails the VM nor falls back to
+file-private advice.
+
+Report processing is drained and quiesced before the capture cut, so no discard
+can race between pause and seal. Dirty marking makes an incremental capture
+read the live zeros and write an explicit zero overlay over the baseline.
+A full capture reads zeros and can omit them as holes. Reclaim counters are
+process-local observations, not captured balloon device state; they do not
+change `silo.live-state/1` or a device envelope.
+
+## macOS/HVF HostMemoryReclaimer
 
 The guest kernel holds reported pages out of allocation until the host completes
 the report. For eligible ordinary private-anonymous RAM on HVF, the host:
@@ -78,7 +126,7 @@ The qualification probe checks guest-written page state and subsequent safe
 reuse. It remains Silo/libkrun safety policy, not a claim about OrbStack's checks.
 Successful advice is lazy and does not prove physical eviction under pressure.
 
-## HostMemoryRemapper
+## macOS/HVF HostMemoryRemapper
 
 Eligible ordinary guest-memory setup creates this component independently of
 balloon attachment, reporting qualification, and guest EL2. Incompatible

@@ -231,6 +231,17 @@ impl AppMachine {
             })
     }
 
+    /// Best-effort monitor observation, identical for local and daemon sessions.
+    pub(crate) async fn host_memory_reclaim(&self) -> Option<libvm::MachineHostMemoryReclaim> {
+        self.session_machine()
+            .await
+            .ok()?
+            .metrics()
+            .await
+            .ok()?
+            .host_memory_reclaim
+    }
+
     pub(crate) async fn shell(
         &self,
         user: Option<&str>,

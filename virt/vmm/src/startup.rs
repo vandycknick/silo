@@ -1117,6 +1117,8 @@ fn publish_host_memory_reclaim(machine: &VirtualMachine, store: &Arc<InstanceSto
                     retried_faults: Some(report.retried_faults),
                     skipped_reports: Some(report.skipped_reports),
                     failed_operations: Some(report.failed_operations),
+                    mapping_limit_skips: Some(report.mapping_limit_skips),
+                    replaced_islands: Some(report.replaced_islands),
                     observed_at: Some(prost_types::Timestamp::from(report.observed_at)),
                     backing: Some(report.backing.to_string()),
                     reason: Some(report.reason.to_string()),

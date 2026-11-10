@@ -131,6 +131,8 @@ pub(crate) fn initial_status(docker_socket: &Path) -> eyre::Result<SystemStatus>
         host_memory_reclaim_failed_operations: None,
         host_memory_reclaim_backing: None,
         host_memory_reclaim_reason: None,
+        host_memory_reclaim_mapping_limit_skips: None,
+        host_memory_reclaim_replaced_islands: None,
     })
 }
 
@@ -764,7 +766,9 @@ fn apply_host_memory_reclaim(
         || status.host_memory_reclaim_effective != Some(report.effective)
         || status.host_memory_reclaim_qualification.as_deref() != Some(qualification)
         || status.host_memory_reclaim_released_bytes != Some(report.released_bytes)
-        || status.host_memory_reclaim_failed_operations != Some(report.failed_operations);
+        || status.host_memory_reclaim_failed_operations != Some(report.failed_operations)
+        || status.host_memory_reclaim_mapping_limit_skips != Some(report.mapping_limit_skips)
+        || status.host_memory_reclaim_replaced_islands != Some(report.replaced_islands);
     if changed {
         status.host_memory_reclaim_requested = report.requested;
         status.host_memory_reclaim_backing = Some(backing.to_string());
@@ -773,6 +777,8 @@ fn apply_host_memory_reclaim(
         status.host_memory_reclaim_qualification = Some(qualification.to_string());
         status.host_memory_reclaim_released_bytes = Some(report.released_bytes);
         status.host_memory_reclaim_failed_operations = Some(report.failed_operations);
+        status.host_memory_reclaim_mapping_limit_skips = Some(report.mapping_limit_skips);
+        status.host_memory_reclaim_replaced_islands = Some(report.replaced_islands);
     }
     changed
 }
@@ -851,6 +857,53 @@ mod tests {
         apply_guest_memory_reclaim, describe_guest_memory_reclaim, error_causes, error_summary,
         initial_host_memory_reclaim_effective, startup_retry_delay, LifetimeLock,
     };
+
+    #[test]
+    fn host_reclaim_updates_mapping_counters_without_policy_changes() {
+        let mut status = crate::daemon::supervisor::initial_status(std::path::Path::new(
+            "/tmp/silo-test-docker.sock",
+        ))
+        .expect("initial status");
+        let mut report = libvm::MachineHostMemoryReclaim {
+            backing: libvm::MachineHostMemoryReclaimBacking::RestoredPrivate,
+            reason: libvm::MachineHostMemoryReclaimReason::None,
+            requested: true,
+            qualification: libvm::MachineHostMemoryReclaimQualification::NotRun,
+            effective: true,
+            released_bytes: 4_194_304,
+            released_extents: 2,
+            retried_faults: 0,
+            skipped_reports: 0,
+            failed_operations: 0,
+            mapping_limit_skips: 0,
+            replaced_islands: 2,
+            observed_at: std::time::UNIX_EPOCH,
+        };
+        assert!(!crate::daemon::supervisor::apply_host_memory_reclaim(
+            &mut status,
+            None
+        ));
+        assert!(crate::daemon::supervisor::apply_host_memory_reclaim(
+            &mut status,
+            Some(&report)
+        ));
+        assert!(!crate::daemon::supervisor::apply_host_memory_reclaim(
+            &mut status,
+            Some(&report)
+        ));
+        report.mapping_limit_skips = 3;
+        report.replaced_islands = 7;
+        assert!(crate::daemon::supervisor::apply_host_memory_reclaim(
+            &mut status,
+            Some(&report)
+        ));
+        assert_eq!(status.host_memory_reclaim_mapping_limit_skips, Some(3));
+        assert_eq!(status.host_memory_reclaim_replaced_islands, Some(7));
+        let json = serde_json::to_value(&status).expect("status JSON");
+        let decoded: SystemStatus = serde_json::from_value(json).expect("decode status JSON");
+        assert_eq!(decoded.host_memory_reclaim_mapping_limit_skips, Some(3));
+        assert_eq!(decoded.host_memory_reclaim_replaced_islands, Some(7));
+    }
 
     #[test]
     fn manager_detach_preserves_the_vm_generation_without_a_runtime() {

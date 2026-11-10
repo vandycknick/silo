@@ -19,9 +19,27 @@ pub struct Cmd {
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let name = context.resolve_machine_name(self.name.as_deref())?;
-        let data = context.app_api().await?.inspect_inventory(&name).await?;
+        let api = context.app_api().await?;
+        let data = api.inspect_inventory(&name).await?;
+        let reclaim = if data
+            .data
+            .as_ref()
+            .is_some_and(|machine| machine.is_running())
+        {
+            match api.machine(&data.id).await {
+                Ok(machine) => machine.host_memory_reclaim().await,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let default = context.config()?.default_machine() == Some(data.name.as_str());
-        let view = InventoryView::new(&data, default);
+        let mut view = InventoryView::new(&data, default);
+        if let InventoryView::Available(machine) = &mut view {
+            machine.host_memory_reclaim = reclaim
+                .as_ref()
+                .map(crate::view::HostMemoryReclaimView::new);
+        }
 
         match self.format {
             OutputFormat::Json => ui::print_json(&view),
@@ -76,6 +94,9 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
         ),
     ];
 
+    if let Some(reclaim) = &view.host_memory_reclaim {
+        rows.push(("Host memory reclaim".to_string(), reclaim.summary()));
+    }
     if !view.image.is_empty() {
         rows.push(("Image".to_string(), view.image.clone()));
     }

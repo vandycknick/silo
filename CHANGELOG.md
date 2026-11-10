@@ -16,6 +16,10 @@
   including each fork child's private disks, are charged by allocated bytes
   rather than logical length. A plain capture reserves only scratch host RAM,
   not a resident guest-RAM baseline.
+- Linux/KVM reclaims guest-reported free RAM from capture-tracked boot VMs
+  and restored or forked private mappings without changing checkpoint files.
+  `silo info` and daemon status report reclaim state and mapping-limit skips;
+  macOS/HVF behavior is unchanged.
 - Cross-home resource admission now reclaims charges from deleted or replaced
   Silo homes using versioned home anchors, preventing orphaned reservations
   from permanently consuming the same user's RAM and disk budget.

@@ -75,4 +75,8 @@ pub struct HostMemoryReclaimStatus {
     /// Skipped operations, not a universal count of queue heads or pages.
     pub skipped_reports: u64,
     pub failed_operations: u64,
+    /// Discards skipped to stay within the host mapping-count bound.
+    pub mapping_limit_skips: u64,
+    /// Current anonymous replacement islands in restored RAM.
+    pub replaced_islands: u64,
 }

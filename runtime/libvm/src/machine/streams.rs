@@ -448,6 +448,10 @@ pub struct MachineHostMemoryReclaim {
     /// Skipped operations, not a universal count of queue heads or pages.
     pub skipped_reports: u64,
     pub failed_operations: u64,
+    /// Discards skipped at the host mapping-count bound.
+    pub mapping_limit_skips: u64,
+    /// Current anonymous replacement islands in restored RAM.
+    pub replaced_islands: u64,
     pub observed_at: SystemTime,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1622,8 +1626,19 @@ impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
         };
         let requested = required(value.requested, "host_memory_reclaim.requested")?;
         let effective = required(value.effective, "host_memory_reclaim.effective")?;
-        let released_bytes = value.released_bytes.unwrap_or_default();
-        let released_extents = value.released_extents.unwrap_or_default();
+        let released_bytes = required(value.released_bytes, "host_memory_reclaim.released_bytes")?;
+        let released_extents = required(
+            value.released_extents,
+            "host_memory_reclaim.released_extents",
+        )?;
+        let mapping_limit_skips = required(
+            value.mapping_limit_skips,
+            "host_memory_reclaim.mapping_limit_skips",
+        )?;
+        let replaced_islands = required(
+            value.replaced_islands,
+            "host_memory_reclaim.replaced_islands",
+        )?;
         let backing_matches_reason = matches!(
             (backing, reason),
             (
@@ -1632,6 +1647,9 @@ impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
             ) | (
                 MachineHostMemoryReclaimBacking::Boot,
                 MachineHostMemoryReclaimReason::TrackedCapture
+            ) | (
+                MachineHostMemoryReclaimBacking::RestoredPrivate,
+                MachineHostMemoryReclaimReason::None
             ) | (
                 MachineHostMemoryReclaimBacking::RestoredPrivate,
                 MachineHostMemoryReclaimReason::RestoredPrivateMapping
@@ -1647,7 +1665,9 @@ impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
                 || effective
                 || qualification != MachineHostMemoryReclaimQualification::NotRun
                 || released_bytes != 0
-                || released_extents != 0)
+                || released_extents != 0
+                || mapping_limit_skips != 0
+                || replaced_islands != 0)
         {
             return Err(
                 "silo-vmm response has contradictory inhibited host_memory_reclaim state".into(),
@@ -1661,9 +1681,17 @@ impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
             effective,
             released_bytes,
             released_extents,
-            retried_faults: value.retried_faults.unwrap_or_default(),
-            skipped_reports: value.skipped_reports.unwrap_or_default(),
-            failed_operations: value.failed_operations.unwrap_or_default(),
+            retried_faults: required(value.retried_faults, "host_memory_reclaim.retried_faults")?,
+            skipped_reports: required(
+                value.skipped_reports,
+                "host_memory_reclaim.skipped_reports",
+            )?,
+            failed_operations: required(
+                value.failed_operations,
+                "host_memory_reclaim.failed_operations",
+            )?,
+            mapping_limit_skips,
+            replaced_islands,
             observed_at: timestamp(value.observed_at, "host_memory_reclaim.observed_at")?,
         })
     }
@@ -2310,6 +2338,8 @@ mod tests {
             retried_faults: Some(0),
             skipped_reports: Some(3),
             failed_operations: Some(0),
+            mapping_limit_skips: Some(0),
+            replaced_islands: Some(0),
             observed_at: Some(timestamp()),
         }
     }
@@ -2330,12 +2360,30 @@ mod tests {
                 assert!(error.contains(field), "{field}: {error}");
             }
         }
-        for field in ["requested", "effective", "observed_at"] {
+        for field in [
+            "requested",
+            "effective",
+            "observed_at",
+            "released_bytes",
+            "released_extents",
+            "retried_faults",
+            "skipped_reports",
+            "failed_operations",
+            "mapping_limit_skips",
+            "replaced_islands",
+        ] {
             let mut report = host_reclaim_report();
             match field {
                 "requested" => report.requested = None,
                 "effective" => report.effective = None,
                 "observed_at" => report.observed_at = None,
+                "released_bytes" => report.released_bytes = None,
+                "released_extents" => report.released_extents = None,
+                "retried_faults" => report.retried_faults = None,
+                "skipped_reports" => report.skipped_reports = None,
+                "failed_operations" => report.failed_operations = None,
+                "mapping_limit_skips" => report.mapping_limit_skips = None,
+                "replaced_islands" => report.replaced_islands = None,
                 _ => unreachable!(),
             }
             let error = MachineHostMemoryReclaim::try_from(report).expect_err(field);
@@ -2359,6 +2407,8 @@ mod tests {
                 "qualification",
                 "released_bytes",
                 "released_extents",
+                "mapping_limit_skips",
+                "replaced_islands",
             ] {
                 let mut contradictory = valid.clone();
                 match field {
@@ -2367,6 +2417,8 @@ mod tests {
                     "qualification" => contradictory.qualification = Some("passed".into()),
                     "released_bytes" => contradictory.released_bytes = Some(4096),
                     "released_extents" => contradictory.released_extents = Some(1),
+                    "mapping_limit_skips" => contradictory.mapping_limit_skips = Some(1),
+                    "replaced_islands" => contradictory.replaced_islands = Some(1),
                     _ => unreachable!(),
                 }
                 assert!(
@@ -2376,7 +2428,6 @@ mod tests {
             }
         }
         for (backing, reason) in [
-            ("restored-private", "none"),
             ("restored-private", "tracked-capture"),
             ("boot", "restored-private-mapping"),
         ] {
@@ -2395,6 +2446,29 @@ mod tests {
         ordinary.released_bytes = Some(8192);
         ordinary.released_extents = Some(2);
         assert!(MachineHostMemoryReclaim::try_from(ordinary).is_ok());
+    }
+
+    #[test]
+    fn host_reclaim_restored_effective_preserves_counters() {
+        let mut report = host_reclaim_report();
+        report.reason = Some("none".into());
+        report.requested = Some(true);
+        report.effective = Some(true);
+        report.released_bytes = Some(4_194_304);
+        report.released_extents = Some(2);
+        report.mapping_limit_skips = Some(3);
+        report.replaced_islands = Some(7);
+        let converted = MachineHostMemoryReclaim::try_from(report).expect("effective restored RAM");
+        assert_eq!(
+            converted.backing,
+            MachineHostMemoryReclaimBacking::RestoredPrivate
+        );
+        assert_eq!(converted.reason, MachineHostMemoryReclaimReason::None);
+        assert!(converted.requested && converted.effective);
+        assert_eq!(converted.released_bytes, 4_194_304);
+        assert_eq!(converted.released_extents, 2);
+        assert_eq!(converted.mapping_limit_skips, 3);
+        assert_eq!(converted.replaced_islands, 7);
     }
     #[test]
     fn status_conversion_preserves_nested_agent_observation() {
@@ -2501,6 +2575,8 @@ mod tests {
                 retried_faults: Some(1),
                 skipped_reports: Some(0),
                 failed_operations: Some(0),
+                mapping_limit_skips: Some(3),
+                replaced_islands: Some(7),
                 observed_at: Some(timestamp()),
             }),
             monitor: Some(v1::MonitorSnapshot {
@@ -2595,6 +2671,8 @@ mod tests {
         );
         assert_eq!(reclaim.released_bytes, 4_194_304);
         assert_eq!(reclaim.retried_faults, 1);
+        assert_eq!(reclaim.mapping_limit_skips, 3);
+        assert_eq!(reclaim.replaced_islands, 7);
         let snapshot = metrics
             .metrics
             .map(|metrics| metrics.report.snapshot)

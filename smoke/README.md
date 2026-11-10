@@ -799,6 +799,88 @@ uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow \
   -k 'copy_allowance or reflink_probe or budget_gate'
 ```
 
+### Host memory reclaim (Phase 26)
+
+`tests/test_reclaim.py` runs the host memory reclaim scenarios against real Linux/KVM
+workers. It uses the same `linux_only` and `slow` markers as capture, restore,
+fork and incremental suites, and parametrizes both raw and layered guest roots.
+The ordinary workspace is the default Btrfs lane. To exercise ext4, point the
+stopped-lane variables at an actual mounted writable ext4 directory;
+all machine disks, checkpoint RAM and catalog bytes stay on that mount, while
+generated sockets use a short `/tmp` runtime directory. `findmnt` verifies the
+requested filesystem in the test process's namespace.
+
+```sh
+export SILO_SMOKE_BIN_DIR=target/release
+export SILO_SMOKE_RUNTIME_DIR=target/silo-runtime/linux-amd64-gnu/release
+export SILO_SMOKE_KERNEL_CONFIG="$KERNEL_BUILD/.config"
+uv run --project smoke pytest smoke/tests/test_reclaim.py -m slow --keep
+
+SILO_SMOKE_STOPPED_DIR="$MOUNT" SILO_SMOKE_STOPPED_FS=ext4 \
+  uv run --project smoke pytest smoke/tests/test_reclaim.py -m slow --keep
+```
+
+Use the same staged x86_64 live-capable workload kernel, agent and initramfs as
+the restore suites, with `/dev/kvm`, `sqlite3`, `findmnt`, a static C toolchain
+(`CC`, default `cc`) and the matching `native-live-api inspect-devices` example.
+`SILO_SMOKE_KERNEL_CONFIG` is mandatory and must identify that staged kernel's
+actual emitted config. Missing `CONFIG_PAGE_REPORTING=y` or
+`CONFIG_VIRTIO_BALLOON=y` fails with the missing options named. The test also
+decodes a real saved balloon device to require negotiated free-page reporting.
+An arbitrary config file is not proof that it built the tested kernel; retain
+the staging/build provenance with the run.
+
+The fixture uses the existing pinned BASIC Alpine image, whose `/sbin/init` is
+removed, plus a small statically compiled C workload. Create explicitly passes
+`--kernel-arg init=` so the agent remains PID 1. No Python/compiler is required
+inside the guest. A dedicated 3 GiB tmpfs under `/dev/shm/reclaim` holds exactly
+2 GiB of `0x5a`; rewriting changes the first 1 GiB to `0xa5`. Host and guest
+SHA-256 checks cover every payload byte. A writable `MAP_POPULATE` anonymous
+mapping then allocates and scans every byte of a fresh 2 GiB for zero, rather
+than merely reading the guest's shared zero page.
+
+Named bounds in `silo_smoke/reclaim.py` are intentionally fixed:
+
+- `BASELINE_MARGIN = 512 MiB`: boot `RssAnon` must return within this margin of
+  its pre-allocation baseline. A 2 GiB allocation/read and each free must move
+  at least 1.5 GiB of residency/released-byte evidence where applicable.
+- `COW_MARGIN = 256 MiB`: a 1 GiB rewrite must grow `RssAnon` by 768-1280 MiB.
+  Freeing restored memory must drop at least 768 MiB each of `RssAnon` and
+  `RssFile`, and return each within 512 MiB of the lazy-restore baseline.
+  These tolerances admit kernel/agent/allocator metadata without accepting a
+  missing gigabyte of reclaim.
+- `RESTORE_RSS_DIVISOR = 4`: immediate restored RSS must be at most one quarter
+  of the populated source's RSS, distinguishing lazy COW restore from copying.
+- `RECLAIM_TIMEOUT = 60 s`, `POLL_INTERVAL = 0.5 s`: bounded monotonic polling
+  checks actual `/proc/<krun-worker-pid>/status` values and public monitor
+  counters. Elapsed time alone never passes a reclaim assertion.
+
+Worker discovery follows the existing monitor-child helper, not the CLI's
+monitor RSS. Every sample records worker PID, `RssAnon`, `RssFile`, `VmRSS`,
+monotonic observation time and the snake_case `silo info --format json`
+`host_memory_reclaim` object. Boot/restored-private backing, requested/effective
+true, reason `none`, zero `mapping_limit_skips` and zero failed operations are
+required; `released_bytes` must grow after every tested free.
+
+The first scenario checks boot reclaim before and after capture, lazy restore,
+shared reads, private rewrites, anonymous zero reuse, unchanged staging and
+published checkpoint RAM hashes, and a second restore of the original seeded
+payload. After the restored child frees its payload, a genuine incremental
+capture is authenticated and compared byte-for-byte with the existing
+frozen-full oracle at the identical pause, then restored and scanned again.
+A child-local full baseline before the rewrite prevents activation-time reports
+of inherited free pages from hiding that check behind dirty-crossover fallback.
+The second scenario live-forks two children, gives each private COW pages and
+frees them separately: the sibling's private residency and exact bytes and the
+source's seeded bytes must survive the other's reclaim.
+
+These are 4 GiB VM tests with real 2 GiB resident payloads and multiple retained
+4 GiB logical RAM artifacts. Provision host memory/disk space accordingly and
+run sequentially, not with pytest-xdist. All registered VMs stop on teardown.
+Successful ordinary runs remove their workspace/checkpoints; `--keep` or a
+failure retains stopped VM and checkpoint evidence, including
+`reclaim-samples.log`, checkpoint hashes and kernel-config provenance.
+
 ### Incremental capture and named disk recovery (Phase 20)
 
 These are maintained **functional** gates, not timing budgets. Use the same
