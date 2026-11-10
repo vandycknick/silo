@@ -177,6 +177,7 @@ impl SnapshotStore {
             .and_then(|bytes| bytes.checked_add(2 * map_bytes))
             .ok_or_else(|| invalid("capture publication budget overflow"))?;
         let mut disks = Vec::new();
+        let mut disk_allocations = BTreeMap::new();
         let mut read_only_inputs = Vec::new();
         let mut source_inodes = Vec::new();
         for (index, attachment) in request.configuration.attachments.iter().enumerate() {
@@ -223,18 +224,21 @@ impl SnapshotStore {
                     return Err(invalid("capture writable source roles alias one inode"));
                 }
                 source_inodes.push(identity);
+                let allocated = metadata
+                    .blocks()
+                    .checked_mul(512)
+                    .ok_or_else(|| invalid("capture allocation overflow"))?;
+                disk_allocations.insert(index as u32, allocated);
                 stage = stage
-                    .checked_add(
-                        metadata
-                            .blocks()
-                            .checked_mul(512)
-                            .ok_or_else(|| invalid("capture allocation overflow"))?,
-                    )
+                    .checked_add(allocated)
                     .ok_or_else(|| invalid("capture staging overflow"))?;
-                // Pool publication uses an independently verified sparse copy.
-                // Reserve its conservative logical bound, not clone metadata.
+                // Pool publication sparsely copies the sealed staging allocation.
+                // Guest growth before sealing can underestimate this peak: ENOSPC
+                // fails the whole capture under ADR 0021's failure table, via
+                // LiveCoordinator::stage_disks/unwind and libvm's abandon_failed;
+                // operation_store's CaptureCleanup removes staging after release.
                 publication = publication
-                    .checked_add(metadata.len())
+                    .checked_add(allocated)
                     .ok_or_else(|| invalid("capture publication overflow"))?;
                 let name = match attachment.role {
                     vm_spec::DiskRole::Root => "silo-root".into(),
@@ -253,11 +257,8 @@ impl SnapshotStore {
                 });
             }
         }
-        let local_fork = self
-            .store
-            .fork_for_capture(request.capture_id)
-            .await?
-            .is_some();
+        let fork_operation_id = self.store.fork_for_capture(request.capture_id).await?;
+        let local_fork = fork_operation_id.is_some();
         if local_fork && machine_stat.st_dev == images_stat.st_dev {
             // A local cut is renamed into the operation namespace. No durable
             // stream/object publication or second RAM materialization occurs.
@@ -313,6 +314,7 @@ impl SnapshotStore {
         }
         let mut record = CaptureRecord {
             capture_id: request.capture_id,
+            fork_operation_id,
             machine_id: request.machine_id,
             run_id: request.run_id,
             launch_operation_id: launch.operation_id,
@@ -324,15 +326,19 @@ impl SnapshotStore {
             configuration,
             storage,
             disk_charges,
+            disk_allocations,
             reservation_bytes,
-            reservation_memory_bytes: ram
-                .checked_mul(if local_fork && machine_stat.st_dev != images_stat.st_dev {
+            reservation_memory_bytes: if local_fork {
+                ram.checked_mul(if machine_stat.st_dev != images_stat.st_dev {
                     2
                 } else {
                     1
                 })
                 .and_then(|bytes| bytes.checked_add(CAPTURE_SCRATCH_BYTES))
-                .ok_or_else(|| invalid("capture memory budget overflow"))?,
+                .ok_or_else(|| invalid("capture memory budget overflow"))?
+            } else {
+                CAPTURE_SCRATCH_BYTES
+            },
             candidate: None,
             captured_boot: None,
             source_inodes,
@@ -1020,7 +1026,7 @@ impl SnapshotStore {
         let result = self
             .publish_authenticated(&snapshot, capture, name.as_deref(), Some(&verified))
             .await?;
-        self.store.complete_capture_peak(capture).await?;
+        self.store.complete_capture_peak(&record).await?;
         drop(lease);
         Ok(result)
     }
@@ -1093,10 +1099,42 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
     record
         .storage
         .validate_for_machine(record.machine_id.into())?;
+    let expected_staging = record.disk_allocations.values().try_fold(
+        record
+            .plan
+            .ram_bytes
+            .checked_add(vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
+            .ok_or_else(|| invalid("capture staging overflow"))?,
+        |bytes, allocated| {
+            bytes
+                .checked_add(*allocated)
+                .ok_or_else(|| invalid("capture staging overflow"))
+        },
+    )?;
+    let expected_memory = if let Some(operation) = record.fork_operation_id {
+        if operation.is_nil() || operation == record.capture_id {
+            return Err(invalid("capture fork operation identity is invalid"));
+        }
+        record
+            .plan
+            .ram_bytes
+            .checked_mul(if record.disk_charges.len() == 2 { 2 } else { 1 })
+            .and_then(|bytes| bytes.checked_add(CAPTURE_SCRATCH_BYTES))
+            .ok_or_else(|| invalid("capture memory budget overflow"))?
+    } else {
+        CAPTURE_SCRATCH_BYTES
+    };
     if record.request.configuration != record.plan.configuration
         || record.request.policy != record.plan.policy
         || record.request.resume_policy != record.plan.resume_policy
         || record.request.pause != record.plan.pause
+        || record.disk_allocations.len() != record.plan.disks.len()
+        || record
+            .plan
+            .disks
+            .iter()
+            .any(|disk| !record.disk_allocations.contains_key(&disk.attachment_index))
+        || record.plan.reservation.staging_bytes != expected_staging
         || record.disk_charges.is_empty()
         || record.disk_charges.len() > 2
         || record
@@ -1112,7 +1150,7 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
             .try_fold(0u64, |total, charge| total.checked_add(charge.bytes))
             != Some(record.reservation_bytes)
         || record.reservation_bytes < record.plan.reservation.staging_bytes
-        || record.reservation_memory_bytes < record.plan.ram_bytes
+        || record.reservation_memory_bytes != expected_memory
     {
         return Err(invalid(
             "capture reservation charges or immutable request contradict the plan",
@@ -1591,7 +1629,7 @@ const CAPTURE_VERIFICATION_LANE_BYTES: u64 =
 const CAPTURE_RAM_MAP_SCRATCH_BYTES: u64 = 32 << 20;
 /// Charged before staging: byte-copy scratch, complete map ownership and the
 /// explicit second verification lane. No full map enters a control record.
-const CAPTURE_SCRATCH_BYTES: u64 =
+pub(crate) const CAPTURE_SCRATCH_BYTES: u64 =
     (16 << 20) + CAPTURE_RAM_MAP_SCRATCH_BYTES + CAPTURE_VERIFICATION_LANE_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2658,7 +2696,7 @@ pub(crate) mod tests {
         fixture_source(include_data, false, CapturePolicy::Full).await
     }
 
-    async fn fork_fixture() -> Fixture {
+    pub(crate) async fn fork_fixture() -> Fixture {
         fixture_source(false, true, CapturePolicy::Full).await
     }
 
@@ -2766,6 +2804,15 @@ pub(crate) mod tests {
     }
 
     async fn fixture_source(include_data: bool, fork: bool, policy: CapturePolicy) -> Fixture {
+        fixture_source_with_disk_length(include_data, fork, policy, 512).await
+    }
+
+    pub(crate) async fn fixture_source_with_disk_length(
+        include_data: bool,
+        fork: bool,
+        policy: CapturePolicy,
+        disk_length: u64,
+    ) -> Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temporary.path().join("home"));
         let store = Store::new(&paths).await.unwrap();
@@ -2773,6 +2820,12 @@ pub(crate) mod tests {
         let parent = paths.create_machine_data_dir(id).unwrap();
         let directory = parent.open_dir(&id.to_string()).unwrap().unwrap();
         directory.write_file("root.raw", &[0x51; 512]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("root.raw"))
+            .unwrap()
+            .set_len(disk_length)
+            .unwrap();
         let mut spec = vm_spec::VmSpec::current();
         spec.hardware = Some(vm_spec::Hardware {
             cpus: Some(1),
@@ -2786,7 +2839,7 @@ pub(crate) mod tests {
                 role: vm_spec::DiskRole::Root,
                 format: vm_spec::DiskFormat::Raw,
                 geometry: vm_spec::DiskGeometry {
-                    length: 512,
+                    length: disk_length,
                     logical_sector_size: 512,
                 },
                 block_id: vm_spec::BlockId::new("exact-native-root-id").unwrap(),
@@ -3093,6 +3146,121 @@ pub(crate) mod tests {
             .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
             .unwrap();
         (directory, evidence)
+    }
+
+    #[tokio::test]
+    async fn sparse_capture_reserves_allocated_disk_bytes_for_staging_and_publication() {
+        let length = 100 << 30;
+        let fixture =
+            fixture_source_with_disk_length(false, false, CapturePolicy::Full, length).await;
+        let metadata = std::fs::metadata(fixture.config.machine_dir.join("root.raw")).unwrap();
+        let allocated = metadata.blocks().checked_mul(512).unwrap();
+        assert_eq!(metadata.len(), length);
+        assert!(allocated > 0 && allocated < length / 1000);
+        let record = &fixture.reservation.record;
+        let maps = [record.plan.ram_bytes, length]
+            .into_iter()
+            .map(|bytes| {
+                let chunks = bytes.div_ceil(crate::storage::limits::CHUNK_SIZE as u64);
+                let pages = chunks.div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
+                chunks * 74 + pages * 330 + 256
+            })
+            .sum::<u64>();
+        let state = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
+        assert_eq!(
+            record.plan.reservation.staging_bytes,
+            record.plan.ram_bytes + allocated + state
+        );
+        assert_eq!(
+            record.reservation_bytes,
+            2 * (record.plan.ram_bytes + allocated) + 3 * state + 2 * maps
+        );
+        assert_eq!(record.disk_charges.len(), 1);
+        assert_eq!(record.disk_charges[0].bytes, record.reservation_bytes);
+        assert_eq!(record.disk_allocations[&0], allocated);
+        assert_eq!(
+            crate::store::capture::decode_record(
+                &crate::store::capture::encode_record(record).unwrap()
+            )
+            .unwrap()
+            .disk_allocations,
+            record.disk_allocations
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_disk_allocations_reject_missing_foreign_overflowing_and_changed_samples() {
+        use crate::store::capture::encode_record;
+
+        let fixture = fixture_with_external_data(true).await;
+        let original = &fixture.reservation.record;
+        for fault in ["missing", "foreign", "overflow", "changed"] {
+            let mut record = original.clone();
+            match fault {
+                "missing" => {
+                    record.disk_allocations.remove(&0);
+                }
+                "foreign" => {
+                    let bytes = record.disk_allocations.remove(&0).unwrap();
+                    record.disk_allocations.insert(99, bytes);
+                }
+                "overflow" => {
+                    record.disk_allocations.insert(0, u64::MAX);
+                }
+                "changed" => {
+                    *record.disk_allocations.get_mut(&0).unwrap() += 512;
+                }
+                _ => unreachable!(),
+            }
+            assert!(encode_record(&record).is_err(), "{fault}");
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_memory_validation_matches_plain_and_fork_ownership() {
+        use crate::store::capture::{decode_record, encode_record};
+
+        for fork in [false, true] {
+            let fixture = if fork {
+                fork_fixture().await
+            } else {
+                fixture().await
+            };
+            let mut record = fixture.reservation.record.clone();
+            assert!(decode_record(&encode_record(&record).unwrap()).is_ok());
+            record.reservation_memory_bytes = if fork {
+                CAPTURE_SCRATCH_BYTES
+            } else {
+                record.plan.ram_bytes + CAPTURE_SCRATCH_BYTES
+            };
+            assert!(encode_record(&record).is_err());
+            record = fixture.reservation.record.clone();
+            record.fork_operation_id = if fork { None } else { Some(Uuid::new_v4()) };
+            let error = fixture
+                .snapshots
+                .store
+                .reserve_capture_inventory(&record)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("capture fork owner contradicts its reservation"),
+                "{error}"
+            );
+            let error = fixture
+                .snapshots
+                .store
+                .complete_capture_peak(&record)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("capture fork owner contradicts its reservation"),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3981,10 +4149,7 @@ pub(crate) mod tests {
         let record = &sealed.reservation.record;
         // Complete map ownership and the second lane are charged before effects.
         assert_eq!(CAPTURE_SCRATCH_BYTES, 50 << 20);
-        assert_eq!(
-            record.reservation_memory_bytes,
-            record.plan.ram_bytes + CAPTURE_SCRATCH_BYTES
-        );
+        assert_eq!(record.reservation_memory_bytes, CAPTURE_SCRATCH_BYTES);
         let (directory, evidence) = seal(&sealed);
         {
             let disks = CaptureAuthentication::Bytes;
@@ -5156,6 +5321,21 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn incremental_complete_map_publishes_without_parent_retention() {
         let fixture = fixture_source(false, false, CapturePolicy::Incremental).await;
+        assert_eq!(
+            fixture.reservation.record.reservation_memory_bytes,
+            CAPTURE_SCRATCH_BYTES
+        );
+        let inventory: crate::store::restore::CaptureBudgetInventory = serde_json::from_str(
+            &fixture
+                .snapshots
+                .store
+                .capture_budget_document(fixture.reservation.record.capture_id)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inventory.capture_memory, CAPTURE_SCRATCH_BYTES);
+        assert!(inventory.baseline.is_none());
         let (directory, mut evidence) = seal(&fixture);
         let memory = evidence.memory.as_mut().unwrap();
         memory.mode = CapturePolicy::Incremental;

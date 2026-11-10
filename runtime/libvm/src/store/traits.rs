@@ -118,13 +118,18 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
     async fn machine_config_by_name(&self, name: &str)
         -> Result<Option<MachineConfig>, LibVmError>;
 
-    /// Looks up machine configs by normalized lowercase hex ID prefix.
+    /// Checks only exact names and full IDs, without decoding configurations.
+    async fn machine_name_in_use(&self, name: &str) -> Result<bool, LibVmError>;
+
+    /// Looks up an exact, case-sensitive name before a lowercase hex ID prefix.
     ///
-    /// `prefix` must be 3-32 lowercase hex characters. Public reference parsing
-    /// handles user-facing normalization before reaching the store.
+    /// When `name` exists, only that config is returned. Otherwise all prefix
+    /// matches are returned so callers can reject ambiguity.
+    /// `prefix` must be 3-32 lowercase hex characters.
     async fn machine_configs_by_id_prefix(
         &self,
         prefix: &str,
+        name: &str,
     ) -> Result<Vec<MachineConfig>, LibVmError>;
 
     /// Lists all machine configs sorted by machine name.

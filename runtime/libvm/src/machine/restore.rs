@@ -312,7 +312,7 @@ async fn restore_consumer(
             });
         }
     }
-    let disk_peak = restore_disk_peak(runtime, &sources, &consumer.record)?;
+    let disk_peak = restore_disk_peak(runtime.local_images_dir(), &sources, &consumer.record)?;
     let memory = snapshots
         .reserve_restore_resources(
             consumer,
@@ -952,14 +952,21 @@ pub(crate) fn storage_from_snapshot(
 }
 
 fn restore_disk_peak(
-    runtime: &Runtime,
+    images_dir: &Path,
     sources: &[PrivateSource],
     record: &SnapshotRecord,
 ) -> Result<u64, LibVmError> {
     let mut required = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
     for source in sources {
         required = required
-            .checked_add(source.length())
+            .checked_add(
+                source
+                    .file()
+                    .metadata()?
+                    .blocks()
+                    .checked_mul(512)
+                    .ok_or_else(|| invalid("restore disk allocation overflow"))?,
+            )
             .ok_or_else(|| invalid("restore disk peak overflow"))?;
     }
     if let crate::BootProfile::LinuxDirect {
@@ -973,7 +980,7 @@ fn restore_disk_peak(
         ..
     } = &record.boot
     {
-        let pool = StoragePool::open(runtime.local_images_dir())?;
+        let pool = StoragePool::open(images_dir)?;
         for object in [base_initramfs, kernel].into_iter().chain(agent.iter()) {
             required = required
                 .checked_add(std::fs::metadata(pool.object_path(object))?.len())
@@ -1629,6 +1636,41 @@ mod tests {
             ObjectDigest::of_bytes(b"map"),
             ObjectDigest::of_bytes(b"kernel"),
         )
+    }
+
+    #[test]
+    fn standalone_restore_reserves_sparse_disk_allocation_and_boot_objects() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+
+        use crate::machine::restore::restore_disk_peak;
+        use crate::machine::stopped::PrivateSource;
+        use crate::storage::stream::{AuthenticatedStream, StreamHasher};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let images = temporary.path().join("images");
+        let pool = crate::storage::pool::StoragePool::open(&images).unwrap();
+        let kernel = temporary.path().join("kernel");
+        std::fs::write(&kernel, b"kernel").unwrap();
+        pool.publish_object(&kernel).unwrap();
+        let source = temporary.path().join("upper.raw");
+        let mut file = std::fs::File::create(&source).unwrap();
+        let length = 100 << 30;
+        file.set_len(length).unwrap();
+        file.write_all(&[0x51; 512]).unwrap();
+        file.sync_all().unwrap();
+        let allocated = file.metadata().unwrap().blocks().checked_mul(512).unwrap();
+        assert!(allocated > 0 && allocated < length / 1000);
+        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let sources = [PrivateSource::Authenticated {
+            path: crate::PrivatePath::new("upper.raw").unwrap(),
+            stream: AuthenticatedStream::from_receipt(std::fs::File::open(&source).unwrap(), map)
+                .unwrap(),
+        }];
+        assert_eq!(
+            restore_disk_peak(&images, &sources, &snapshot()).unwrap(),
+            vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES + allocated + 2 * b"kernel".len() as u64
+        );
     }
 
     fn attachment(role: vm_spec::DiskRole, id: &str, read_only: bool) -> vm_spec::Disk {

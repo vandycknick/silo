@@ -2,9 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};
 use eyre::{ensure, Context as _};
-use libvm::handoff::plan::{
-    ApprovedPlan, DestinationRequest, HandoffPlan, HandoffProposal, PayloadDescriptor,
-};
+use libvm::handoff::plan::{ApprovedPlan, DestinationRequest, HandoffProposal, PayloadDescriptor};
 use libvm::handoff::types::{OperationId, RuntimeId};
 use silo_vm_control::handoff as convert;
 use silo_vm_control::transport::{self, Admission};
@@ -412,7 +410,11 @@ impl Cmd {
                         "approval does not match this operation's saved plan"
                     );
                     saved.plan().validate_request(&request)?;
-                    validate_source_selector(&plan.machine, saved.plan())?;
+                    validate_source_selector(
+                        &plan.machine,
+                        saved.plan().source_machine(),
+                        saved.plan().source_name(),
+                    )?;
                     saved
                 } else {
                     let proposal = sessions.propose(&plan.machine, &request).await?;
@@ -497,15 +499,20 @@ impl Cmd {
     }
 }
 
-fn validate_source_selector(selector: &str, plan: &HandoffPlan) -> eyre::Result<()> {
+fn validate_source_selector(
+    selector: &str,
+    source_machine: libvm::MachineId,
+    source_name: &str,
+) -> eyre::Result<()> {
     let reference = libvm::MachineRef::parse(selector)?;
-    let id = uuid::Uuid::from(plan.source_machine());
+    let id = uuid::Uuid::from(source_machine);
     let matches = if let Some(expected) = reference.id_uuid() {
         expected == id
     } else if let Some(name) = reference.name() {
-        name == plan.source_name()
+        name == source_name
     } else if let Some(prefix) = reference.id_prefix() {
-        id.simple().to_string().starts_with(prefix)
+        reference.id_prefix_name() == Some(source_name)
+            || id.simple().to_string().starts_with(prefix)
     } else {
         false
     };
@@ -725,4 +732,20 @@ struct Completion {
 fn print_json(value: &impl serde::Serialize) -> eyre::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::commands::handoff::validate_source_selector;
+
+    #[test]
+    fn saved_source_selector_accepts_hex_names_and_id_prefixes() {
+        let id: libvm::MachineId = "12345678123442348234123456789abc".parse().unwrap();
+        assert!(validate_source_selector("def", id, "def").is_ok());
+        assert!(validate_source_selector("DeF", id, "DeF").is_ok());
+        assert!(validate_source_selector("DEF", id, "def").is_err());
+        assert!(validate_source_selector("1234", id, "def").is_ok());
+        assert!(validate_source_selector(&id.to_string(), id, "def").is_ok());
+        assert!(validate_source_selector("cafe", id, "def").is_err());
+    }
 }

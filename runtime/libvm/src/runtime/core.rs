@@ -752,20 +752,39 @@ impl Runtime {
         }
     }
 
+    /// Checks exact names and full IDs without reserving ID prefixes.
+    pub async fn ensure_name_available(&self, name: &str) -> Result<(), LibVmError> {
+        MachineRef::parse_exact(name)?;
+        if self.store.machine_name_in_use(name).await? {
+            return Err(LibVmError::MachineAlreadyExists {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     async fn inventory_record(
         &self,
         reference: &MachineRef,
     ) -> Result<crate::store::machine_store::InventoryRecord, LibVmError> {
-        let mut records = self
-            .store
-            .machine_inventory()
-            .await?
-            .into_iter()
-            .filter(|record| match reference.kind() {
-                MachineRefKind::Id(id) => record.id == id.to_string(),
-                MachineRefKind::IdPrefix(prefix) => record.id.starts_with(prefix),
-                MachineRefKind::Name(name) => &record.name == name,
-            });
+        let records = self.store.machine_inventory().await?;
+        let name_match = match reference.kind() {
+            MachineRefKind::IdPrefix { name, .. } => {
+                records.iter().any(|record| &record.name == name)
+            }
+            _ => false,
+        };
+        let mut records = records.into_iter().filter(|record| match reference.kind() {
+            MachineRefKind::Id(id) => record.id == id.to_string(),
+            MachineRefKind::IdPrefix { name, prefix } => {
+                if name_match {
+                    &record.name == name
+                } else {
+                    record.id.starts_with(prefix)
+                }
+            }
+            MachineRefKind::Name(name) => &record.name == name,
+        });
         let record = records.next().ok_or_else(|| LibVmError::MachineNotFound {
             reference: format!("{reference:?}"),
         })?;
@@ -1083,8 +1102,11 @@ impl Runtime {
                 .ok_or_else(|| LibVmError::MachineNotFound {
                     reference: name.clone(),
                 }),
-            MachineRefKind::IdPrefix(prefix) => {
-                let matches = self.store.machine_configs_by_id_prefix(prefix).await?;
+            MachineRefKind::IdPrefix { name, prefix } => {
+                let matches = self
+                    .store
+                    .machine_configs_by_id_prefix(prefix, name)
+                    .await?;
                 match matches.len() {
                     0 => Err(LibVmError::MachineNotFound {
                         reference: prefix.clone(),
@@ -4250,18 +4272,20 @@ pub(crate) mod tests {
         let id = MachineId::new();
         let config = sample_machine_config(&paths, id, "devbox");
         let prefix = id.to_string()[..8].to_string();
+        let input = prefix.to_ascii_uppercase();
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         let expected_prefix = prefix.clone();
+        let expected_name = input.clone();
         store
             .expect_machine_configs_by_id_prefix()
-            .withf(move |prefix| prefix == expected_prefix)
+            .withf(move |prefix, name| prefix == expected_prefix && name == expected_name)
             .once()
-            .return_once(move |_| Ok(vec![config.clone()]));
+            .return_once(move |_, _| Ok(vec![config.clone()]));
         let runtime = runtime_with_mock_store(paths, store).await;
 
         let found = runtime
-            .resolve_machine_config(&MachineRef::parse(prefix).expect("valid id prefix"))
+            .resolve_machine_config(&MachineRef::parse(input).expect("valid id prefix"))
             .await
             .expect("prefix should resolve");
 
@@ -4280,9 +4304,9 @@ pub(crate) mod tests {
         expect_empty_refresh(&mut store);
         store
             .expect_machine_configs_by_id_prefix()
-            .withf(|prefix| prefix == "deadbeef")
+            .withf(|prefix, name| prefix == "deadbeef" && name == "deadbeef")
             .once()
-            .return_once(move |_| Ok(vec![first, second]));
+            .return_once(move |_, _| Ok(vec![first, second]));
         let runtime = runtime_with_mock_store(paths, store).await;
 
         let err = runtime
@@ -4294,6 +4318,111 @@ pub(crate) mod tests {
             err,
             LibVmError::AmbiguousIdPrefix { ref prefix, count: 2 } if prefix == "deadbeef"
         ));
+    }
+
+    #[tokio::test]
+    async fn hex_references_and_exact_availability_agree_with_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .unwrap();
+        let store = runtime.native_store().unwrap();
+        let named_id: MachineId = "11111111111141118111111111111111".parse().unwrap();
+        let first_id: MachineId = "def00000000040008000000000000001".parse().unwrap();
+        let second_id: MachineId = "def00000000040008000000000000002".parse().unwrap();
+        for (id, name) in [
+            (named_id, "def"),
+            (first_id, "first"),
+            (second_id, "second"),
+        ] {
+            let config = sample_machine_config(&paths, id, name);
+            store
+                .add_machine(&config, &stopped_state(id))
+                .await
+                .unwrap();
+            assert!(runtime.ensure_name_available("def0").await.is_ok());
+            assert!(matches!(
+                runtime.ensure_name_available("def").await,
+                Err(LibVmError::MachineAlreadyExists { .. })
+            ));
+            assert!(matches!(
+                runtime.ensure_name_available(&id.to_string()).await,
+                Err(LibVmError::MachineAlreadyExists { .. })
+            ));
+            let reference = MachineRef::parse("def").unwrap();
+            assert_eq!(
+                runtime.resolve_machine_config(&reference).await.unwrap().id,
+                named_id
+            );
+            assert_eq!(
+                runtime.inventory_record(&reference).await.unwrap().id,
+                named_id.to_string()
+            );
+            let exact = MachineRef::parse_exact("def0").unwrap();
+            assert!(matches!(
+                runtime.get_machine(&exact).await,
+                Err(LibVmError::MachineNotFound { .. })
+            ));
+            assert!(matches!(
+                runtime.inventory_record(&exact).await,
+                Err(LibVmError::MachineNotFound { .. })
+            ));
+            let prefix = MachineRef::parse("DeF0").unwrap();
+            match name {
+                "def" => assert!(matches!(
+                    runtime.resolve_machine_config(&prefix).await,
+                    Err(LibVmError::MachineNotFound { .. })
+                )),
+                "first" => {
+                    assert_eq!(
+                        runtime.resolve_machine_config(&prefix).await.unwrap().id,
+                        first_id
+                    );
+                    assert_eq!(
+                        runtime.inventory_record(&prefix).await.unwrap().id,
+                        first_id.to_string()
+                    );
+                }
+                _ => {
+                    assert!(matches!(
+                        runtime.resolve_machine_config(&prefix).await,
+                        Err(LibVmError::AmbiguousIdPrefix { count: 2, .. })
+                    ));
+                    assert!(matches!(
+                        runtime.inventory_record(&prefix).await,
+                        Err(LibVmError::AmbiguousIdPrefix { count: 2, .. })
+                    ));
+                }
+            }
+        }
+        let occupied = MachineRef::parse_exact("def").unwrap();
+        assert!(runtime.get_machine(&occupied).await.is_ok());
+        assert_eq!(
+            runtime.inventory_record(&occupied).await.unwrap().id,
+            named_id.to_string()
+        );
+        let full_id = MachineRef::parse_exact(first_id.to_string()).unwrap();
+        assert_eq!(
+            runtime.resolve_machine_config(&full_id).await.unwrap().id,
+            first_id
+        );
+        assert_eq!(
+            runtime.inventory_record(&full_id).await.unwrap().id,
+            first_id.to_string()
+        );
+        let id_shaped_name = "33333333333343338333333333333333";
+        assert!(runtime.ensure_name_available(id_shaped_name).await.is_ok());
+        let config = sample_machine_config(&paths, MachineId::new(), id_shaped_name);
+        store
+            .add_machine(&config, &stopped_state(config.id))
+            .await
+            .unwrap();
+        assert!(matches!(
+            runtime.ensure_name_available(id_shaped_name).await,
+            Err(LibVmError::MachineAlreadyExists { .. })
+        ));
+        assert!(runtime.ensure_name_available("bad/name").await.is_err());
     }
 
     #[tokio::test]

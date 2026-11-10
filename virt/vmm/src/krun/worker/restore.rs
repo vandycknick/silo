@@ -65,35 +65,74 @@ fn same(file: &File, device: u64, inode: u64, length: u64) -> eyre::Result<()> {
 pub(crate) fn validate(config: &KrunConfig, request: &RestoreRequest) -> eyre::Result<bool> {
     request.validate().map_err(invalid)?;
     let captured = &request.configuration;
-    let disks_match = config.disks.len() == captured.attachments.len()
-        && config
-            .disks
-            .iter()
-            .zip(&captured.attachments)
-            .all(|(disk, attachment)| {
-                disk.block_id == attachment.block_id
-                    && disk.role == attachment.role
-                    && disk.format == attachment.format
-                    && disk.geometry == attachment.geometry
-                    && disk.read_only == attachment.read_only
-            });
-    if config.cpus != captured.cpus
-        || config.memory_mib != captured.memory_mib
-        || captured.nested_virtualization
-        || captured.rosetta
-        || !captured.shares.is_empty()
-        || !captured.vsock
-        || !disks_match
-        || !config.mounts.is_empty()
-        || config.rosetta.is_some()
-        || config.vsock_cid.is_some()
-        || !config.vsock_mux
-        || !config.stdio_console
-        || !config.balloon
-    {
+    if config.cpus != captured.cpus {
+        return Err(invalid("restore launch cpus differ from the captured cut"));
+    }
+    if config.memory_mib != captured.memory_mib {
         return Err(invalid(
-            "restore launch configuration differs from the captured cut",
+            "restore launch memory differs from the captured cut",
         ));
+    }
+    if captured.nested_virtualization {
+        return Err(invalid(
+            "restore does not support captured nested virtualization",
+        ));
+    }
+    if captured.rosetta {
+        return Err(invalid("restore does not support captured rosetta"));
+    }
+    if !captured.shares.is_empty() {
+        return Err(invalid("restore does not support captured shares"));
+    }
+    if config.disks.len() != captured.attachments.len() {
+        return Err(invalid(
+            "restore launch disk attachment count differs from the captured cut",
+        ));
+    }
+    for (index, (disk, attachment)) in config.disks.iter().zip(&captured.attachments).enumerate() {
+        let mismatch = |field| {
+            invalid(format!(
+                "restore launch disk attachment {index} {field} differs from the captured cut"
+            ))
+        };
+        if disk.block_id != attachment.block_id {
+            return Err(mismatch("block_id"));
+        }
+        if disk.role != attachment.role {
+            return Err(mismatch("role"));
+        }
+        if disk.format != attachment.format {
+            return Err(mismatch("format"));
+        }
+        if disk.geometry.length != attachment.geometry.length {
+            return Err(mismatch("geometry.length"));
+        }
+        if disk.geometry.logical_sector_size != attachment.geometry.logical_sector_size {
+            return Err(mismatch("geometry.logical_sector_size"));
+        }
+        if disk.read_only != attachment.read_only {
+            return Err(mismatch("read_only"));
+        }
+    }
+    if !config.mounts.is_empty() {
+        return Err(invalid("restore launch mounts must be empty"));
+    }
+    if config.rosetta.is_some() {
+        return Err(invalid("restore launch rosetta must be disabled"));
+    }
+    if config.vsock_cid.is_some() {
+        return Err(invalid(
+            "restore launch standalone vsock CID must be absent",
+        ));
+    }
+    if !config.vsock_mux {
+        return Err(invalid("restore launch vsock mux must be enabled"));
+    }
+    if !config.stdio_console {
+        return Err(invalid("restore launch stdio console must be enabled"));
+    }
+    if !config.balloon {
+        return Err(invalid("restore launch balloon must be enabled"));
     }
     match (&config.network, &request.network) {
         (Network::None, None) => Ok(false),
@@ -595,50 +634,180 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn restore_config_needs_no_kernel_and_rejects_destination_drift() {
-        let request = request();
-        let base = config(request.clone());
-        validate(&base, &request).unwrap();
-        crate::krun::validate_config(&base).unwrap();
-        for invalid in [
-            KrunConfig {
-                cpus: 2,
-                ..base.clone()
-            },
-            KrunConfig {
-                memory_mib: 256,
-                ..base.clone()
-            },
-            KrunConfig {
-                vsock_mux: false,
-                ..base.clone()
-            },
-            KrunConfig {
-                balloon: false,
-                ..base.clone()
-            },
-            KrunConfig {
-                stdio_console: false,
-                ..base.clone()
-            },
-            KrunConfig {
-                network: crate::krun::Network::Unixgram(crate::krun::NetUnixgram {
-                    peer_path: "/tmp/destination.sock".into(),
-                    mac: [2, 0, 0, 0, 0, 1],
-                }),
-                ..base.clone()
-            },
-        ] {
-            assert!(crate::krun::validate_config(&invalid).is_err());
+    fn restore_config_needs_no_kernel_with_or_without_public_vsock() {
+        for vsock in [false, true] {
+            let mut request = request();
+            request.configuration.vsock = vsock;
+            request.evidence.configuration_digest = request.configuration.digest().unwrap();
+            let destination = config(request.clone());
+            assert!(!validate(&destination, &request).unwrap());
+            crate::krun::validate_config(&destination).unwrap();
+            let cold = KrunConfig {
+                restore: None,
+                ..destination
+            };
+            assert!(
+                crate::krun::validate_config(&cold).is_err(),
+                "cold launch still needs a kernel"
+            );
         }
-        let cold = KrunConfig {
-            restore: None,
-            ..base
-        };
-        assert!(
-            crate::krun::validate_config(&cold).is_err(),
-            "cold launch still needs a kernel"
-        );
+    }
+
+    #[test]
+    fn restore_config_reports_each_destination_mismatch() {
+        let mut request = request();
+        let mut destination = config(request.clone());
+        destination.disks = vec![
+            vm_spec::Disk {
+                path: "/tmp/root.raw".into(),
+                block_id: vm_spec::BlockId::new("root").unwrap(),
+                role: vm_spec::DiskRole::Root,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length: 64 << 20,
+                    logical_sector_size: 512,
+                },
+                read_only: false,
+            },
+            vm_spec::Disk {
+                path: "/tmp/data.raw".into(),
+                block_id: vm_spec::BlockId::new("data").unwrap(),
+                role: vm_spec::DiskRole::Data,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length: 64 << 20,
+                    logical_sector_size: 512,
+                },
+                read_only: false,
+            },
+        ];
+        request.configuration.attachments = destination
+            .disks
+            .iter()
+            .map(|disk| vm_spec::capture::CaptureAttachment {
+                block_id: disk.block_id.clone(),
+                role: disk.role,
+                format: disk.format,
+                geometry: disk.geometry,
+                read_only: disk.read_only,
+            })
+            .collect();
+        request.evidence.configuration_digest = request.configuration.digest().unwrap();
+        validate(&destination, &request).unwrap();
+
+        type Change = fn(&mut KrunConfig, &mut RestoreRequest);
+        let cases: [(&str, Change); 20] = [
+            (
+                "restore launch cpus differ from the captured cut",
+                |config, _| config.cpus += 1,
+            ),
+            (
+                "restore launch memory differs from the captured cut",
+                |config, _| config.memory_mib += 1,
+            ),
+            (
+                "restore does not support captured nested virtualization",
+                |_, request| request.configuration.nested_virtualization = true,
+            ),
+            ("restore does not support captured rosetta", |_, request| {
+                request.configuration.rosetta = true;
+            }),
+            ("restore does not support captured shares", |_, request| {
+                request.configuration.shares.push(vm_spec::capture::CaptureShare {
+                    tag: "shared".into(),
+                    read_only: true,
+                });
+            }),
+            (
+                "restore launch disk attachment count differs from the captured cut",
+                |config, _| {
+                    config.disks.pop();
+                },
+            ),
+            (
+                "restore launch disk attachment count differs from the captured cut",
+                |config, _| {
+                    config.disks.push(config.disks[1].clone());
+                },
+            ),
+            (
+                "restore launch disk attachment 1 block_id differs from the captured cut",
+                |config, _| {
+                    config.disks[1].block_id = vm_spec::BlockId::new("other").unwrap();
+                },
+            ),
+            (
+                "restore launch disk attachment 1 role differs from the captured cut",
+                |config, _| config.disks[1].role = vm_spec::DiskRole::Root,
+            ),
+            (
+                "restore launch disk attachment 1 format differs from the captured cut",
+                |config, _| config.disks[1].format = vm_spec::DiskFormat::Vmdk,
+            ),
+            (
+                "restore launch disk attachment 1 geometry.length differs from the captured cut",
+                |config, _| config.disks[1].geometry.length *= 2,
+            ),
+            (
+                "restore launch disk attachment 1 geometry.logical_sector_size differs from the captured cut",
+                |config, _| config.disks[1].geometry.logical_sector_size = 4096,
+            ),
+            (
+                "restore launch disk attachment 1 read_only differs from the captured cut",
+                |config, _| config.disks[1].read_only = true,
+            ),
+            ("restore launch mounts must be empty", |config, _| {
+                config.mounts.push(crate::krun::Mount {
+                    tag: "shared".into(),
+                    path: "/tmp/shared".into(),
+                    read_only: true,
+                });
+            }),
+            ("restore launch rosetta must be disabled", |config, _| {
+                config.rosetta = Some(
+                    crate::krun::RosettaLaunchConfig::new(
+                        "/Library/Apple/RosettaLinux".into(),
+                        [0; 32],
+                        0,
+                        [0; 1024],
+                    )
+                    .unwrap(),
+                );
+            }),
+            (
+                "restore launch standalone vsock CID must be absent",
+                |config, _| config.vsock_cid = Some(3),
+            ),
+            ("restore launch vsock mux must be enabled", |config, _| {
+                config.vsock_mux = false;
+            }),
+            (
+                "restore launch stdio console must be enabled",
+                |config, _| config.stdio_console = false,
+            ),
+            ("restore launch balloon must be enabled", |config, _| {
+                config.balloon = false;
+            }),
+            (
+                "restore launch network differs from the destination binding",
+                |config, _| {
+                    config.network = crate::krun::Network::Unixgram(crate::krun::NetUnixgram {
+                        peer_path: "/tmp/destination.sock".into(),
+                        mac: [2, 0, 0, 0, 0, 1],
+                    });
+                },
+            ),
+        ];
+        for (message, change) in cases {
+            let mut destination = destination.clone();
+            let mut request = request.clone();
+            change(&mut destination, &mut request);
+            request.evidence.configuration_digest = request.configuration.digest().unwrap();
+            assert_eq!(
+                validate(&destination, &request).unwrap_err().to_string(),
+                message,
+            );
+        }
     }
 
     #[test]

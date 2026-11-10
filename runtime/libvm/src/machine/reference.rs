@@ -6,7 +6,9 @@ use crate::LibVmError;
 
 /// Reference used to resolve a machine.
 ///
-/// A reference can be a machine name, full machine ID, or unambiguous ID prefix.
+/// Full IDs select an immutable identity. Other hex-looking inputs first select
+/// an exact name, preserving its case, then an unambiguous lowercase ID prefix.
+/// Other inputs select an exact name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MachineRef {
     kind: MachineRefKind,
@@ -15,7 +17,7 @@ pub struct MachineRef {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum MachineRefKind {
     Id(MachineId),
-    IdPrefix(String),
+    IdPrefix { name: String, prefix: String },
     Name(String),
 }
 
@@ -29,10 +31,28 @@ impl MachineRef {
 
         if looks_like_id_prefix(&input) {
             return Ok(Self {
-                kind: MachineRefKind::IdPrefix(input.to_lowercase()),
+                kind: MachineRefKind::IdPrefix {
+                    prefix: input.to_ascii_lowercase(),
+                    name: input,
+                },
             });
         }
 
+        validate_machine_name(&input)?;
+        Ok(Self {
+            kind: MachineRefKind::Name(input),
+        })
+    }
+
+    /// Parses a full ID or exact name without falling back to an ID prefix.
+    ///
+    /// Availability checks should use [`crate::Runtime::ensure_name_available`]
+    /// to check both the exact name and full ID.
+    pub fn parse_exact(input: impl Into<String>) -> Result<Self, LibVmError> {
+        let input = input.into();
+        if let Ok(id) = MachineId::from_str(&input) {
+            return Ok(Self::id(id));
+        }
         validate_machine_name(&input)?;
         Ok(Self {
             kind: MachineRefKind::Name(input),
@@ -58,7 +78,15 @@ impl MachineRef {
     /// Normalized ID prefix selected by the native parser.
     pub fn id_prefix(&self) -> Option<&str> {
         match &self.kind {
-            MachineRefKind::IdPrefix(prefix) => Some(prefix),
+            MachineRefKind::IdPrefix { prefix, .. } => Some(prefix),
+            _ => None,
+        }
+    }
+
+    /// Case-preserving exact name tried before an ID prefix.
+    pub fn id_prefix_name(&self) -> Option<&str> {
+        match &self.kind {
+            MachineRefKind::IdPrefix { name, .. } => Some(name),
             _ => None,
         }
     }
@@ -107,7 +135,7 @@ mod tests {
 
     #[test]
     fn new_names_are_exact_dns_labels_while_legacy_references_remain_readable() {
-        for name in ["dev", "0", "a-b", &"a".repeat(63)] {
+        for name in ["dev", "def", "cafe", "abc1", "0", "a-b", &"a".repeat(63)] {
             crate::machine::reference::validate_new_machine_name(name).unwrap();
         }
         for name in [
@@ -141,8 +169,31 @@ mod tests {
 
         assert_eq!(
             machine_ref.kind(),
-            &MachineRefKind::IdPrefix("a1b2c3d4".to_string())
+            &MachineRefKind::IdPrefix {
+                name: "a1b2c3d4".to_string(),
+                prefix: "a1b2c3d4".to_string(),
+            }
         );
+    }
+
+    #[test]
+    fn parse_preserves_hex_name_case_and_normalizes_prefix() {
+        let reference = MachineRef::parse("DeF").unwrap();
+        assert_eq!(reference.id_prefix_name(), Some("DeF"));
+        assert_eq!(reference.id_prefix(), Some("def"));
+    }
+
+    #[test]
+    fn parse_exact_never_selects_a_prefix() {
+        let reference = MachineRef::parse_exact("def").unwrap();
+        assert_eq!(reference.name(), Some("def"));
+        assert_eq!(reference.id_prefix(), None);
+        let id = MachineId::new();
+        assert_eq!(
+            MachineRef::parse_exact(id.to_string()).unwrap().kind(),
+            &MachineRefKind::Id(id)
+        );
+        assert!(MachineRef::parse_exact("bad/name").is_err());
     }
 
     #[test]

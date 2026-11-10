@@ -129,6 +129,7 @@ pub(crate) struct CaptureSpaceCharge {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CaptureRecord {
     pub capture_id: Uuid,
+    pub fork_operation_id: Option<Uuid>,
     pub machine_id: crate::store::models::MachineId,
     pub run_id: Uuid,
     pub launch_operation_id: Uuid,
@@ -140,6 +141,8 @@ pub(crate) struct CaptureRecord {
     pub configuration: crate::machine::stopped::SnapshotConfiguration,
     pub storage: crate::MachineStorageRecord,
     pub disk_charges: Vec<CaptureSpaceCharge>,
+    /// Allocated bytes sampled from each writable source, keyed by attachment index.
+    pub disk_allocations: BTreeMap<u32, u64>,
     pub reservation_bytes: u64,
     pub reservation_memory_bytes: u64,
     pub candidate: Option<SnapshotId>,

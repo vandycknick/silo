@@ -601,6 +601,7 @@ fn references_use_native_id_name_and_prefix_semantics() {
     for (text, kind) in [
         ("ab", 2),
         ("a1b2c3", 3),
+        ("DeF", 3),
         ("12345678-1234-4234-8234-123456789abc", 1),
         ("Legacy_name", 2),
     ] {
@@ -614,10 +615,20 @@ fn references_use_native_id_name_and_prefix_semantics() {
         ));
         assert_eq!(lifecycle::reference_from_wire(wire).unwrap(), native);
     }
-    assert!(lifecycle::reference_from_wire(w::MachineRef {
-        reference: Some(w::machine_ref::Reference::Name("a1b2c3".into()))
-    })
-    .is_err());
+    let exact = libvm::MachineRef::parse_exact("a1b2c3").unwrap();
+    let wire = lifecycle::reference_to_wire(&exact).unwrap();
+    assert!(matches!(
+        &wire.reference,
+        Some(w::machine_ref::Reference::Name(name)) if name == "a1b2c3"
+    ));
+    assert_eq!(lifecycle::reference_from_wire(wire).unwrap(), exact);
+    let mixed_case = libvm::MachineRef::parse("DeF").unwrap();
+    let wire = lifecycle::reference_to_wire(&mixed_case).unwrap();
+    assert!(matches!(
+        &wire.reference,
+        Some(w::machine_ref::Reference::IdPrefix(name)) if name == "DeF"
+    ));
+    assert_eq!(lifecycle::reference_from_wire(wire).unwrap(), mixed_case);
     assert!(lifecycle::reference_from_wire(w::MachineRef {
         reference: Some(w::machine_ref::Reference::IdPrefix("ab".into()))
     })

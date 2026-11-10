@@ -12,6 +12,20 @@
   contract: every captured record carries a magic and schema (`silo.live-state/1`)
   and restore refuses a checkpoint whose live-state schema or architecture
   differs. See [ADR 0021](docs/adr/0021-live-snapshots-and-forks.md).
+- Corrected live capture, fork and restore admission: writable disk copies,
+  including each fork child's private disks, are charged by allocated bytes
+  rather than logical length. A plain capture reserves only scratch host RAM,
+  not a resident guest-RAM baseline.
+- Cross-home resource admission now reclaims charges from deleted or replaced
+  Silo homes using versioned home anchors, preventing orphaned reservations
+  from permanently consuming the same user's RAM and disk budget.
+- Live checkpoints of machines created without `--vsock` (the default) now
+  restore and fork. Restore required the public hybrid vsock surface instead
+  of only the internal agent channel; each remaining launch mismatch now
+  refuses with the item it names.
+- Machine names made only of hex characters (`def`, `cafe`) resolve by name:
+  references resolve exact ID, then exact name, then a unique ID prefix, and
+  name availability checks exact names and IDs only.
 - **Hard breaking release: fresh state required.** Existing `~/.silo` or other
   Silo home state is not migrated. The initial schema
   (`runtime/libvm/migrations/0001_initial.sql`) was edited in place, with no
