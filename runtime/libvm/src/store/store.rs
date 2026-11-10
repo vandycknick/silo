@@ -100,10 +100,24 @@ impl Store {
         match store.recover_image_cache().await {
             Ok(report) => {
                 for deferred in report.deferred {
-                    tracing::warn!(
-                        ?deferred,
-                        "image cache cleanup deferred; bytes and pending jobs retained"
-                    );
+                    match deferred {
+                        // A held lease belongs to a live producer, e.g. every
+                        // running machine's launch. That is steady state, not news.
+                        crate::store::models::CacheCleanupDeferral::ActiveLease { .. } => {
+                            tracing::debug!(
+                                ?deferred,
+                                "image cache cleanup deferred; bytes and pending jobs retained"
+                            );
+                        }
+                        crate::store::models::CacheCleanupDeferral::ExternalDependency {
+                            ..
+                        } => {
+                            tracing::warn!(
+                                ?deferred,
+                                "image cache cleanup deferred; bytes and pending jobs retained"
+                            );
+                        }
+                    }
                 }
             }
             Err(error) => {
