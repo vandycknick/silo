@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import re
 import subprocess
 import sys
 from uuid import uuid4
@@ -137,15 +136,10 @@ def test_observed_console_vsock_and_balloon_writes_match_frozen_full_ram(
     payload = (uuid4().hex + "-vsock-bidirectional\\n") * 4096
     reply = silo.exec(SOURCE, "cat", stdin=payload, timeout=60)
     assert reply.stdout == payload, "vsock echo changed guest payload bytes"
-    # CLI reconciliation diagnostics share stderr with the guest stream. An
-    # active capture/launch lease legitimately defers collection; no other
-    # stderr, including guest errors, is allowed in this byte-exact echo gate.
-    cleanup_warning = re.compile(
-        r"\d{4}-\d\d-\d\dT[\d:.]+Z\s+WARN image cache cleanup deferred; "
-        r"bytes and pending jobs retained deferred=ActiveLease \{ operation_id: "
-        r"[0-9a-f-]{36} \}"
-    )
-    assert all(cleanup_warning.fullmatch(line) for line in reply.stderr.splitlines()), reply.stderr
+    # CLI diagnostics share stderr with the guest stream. An active
+    # capture/launch lease defers collection silently; no stderr at all,
+    # including guest errors, is allowed in this byte-exact echo gate.
+    assert reply.stderr == "", reply.stderr
     # The admitted workload kernel must actually negotiate free-page reporting.
     # Free previously allocated pages to make new reports, then allow its normal
     # delayed worker to return their real descriptor heads to the host.

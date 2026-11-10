@@ -605,14 +605,14 @@ impl LocalVmService {
                 let resolved = runtime
                     .images()
                     .resolve_with(
-                        reference.clone(),
+                        reference,
                         ImageResolveOptions {
                             policy: Some(runtime_pull),
                             platform: options.platform.clone(),
                         },
                     )
                     .await?;
-                let plan_image = oci_plan_image(reference, &resolved, plan_pull);
+                let plan_image = oci_plan_image(&resolved, plan_pull);
                 Ok(SourceResolution {
                     plan_image,
                     is_positional,
@@ -664,9 +664,9 @@ impl LocalVmService {
                 let (runtime_pull, plan_pull) =
                     pull.unwrap_or((ImagePullPolicy::IfMissing, PullPolicy::IfMissing));
                 let resolved = runtime
-                    .resolve_oci_image(reference.clone(), runtime_pull, options.platform.as_ref())
+                    .resolve_oci_image(reference, runtime_pull, options.platform.as_ref())
                     .await?;
-                oci_plan_image(reference, &resolved, plan_pull)
+                oci_plan_image(&resolved, plan_pull)
             }
         };
         Ok(ReadOnlyCreationResolution {
@@ -893,14 +893,13 @@ pub(crate) fn disk_resolution(
     })
 }
 
-fn oci_plan_image(
-    requested_reference: String,
-    resolved: &libvm::ResolvedOciImage,
-    pull_policy: PullPolicy,
-) -> ResolvedImage {
+/// The plan records libvm's canonical requested reference (`docker.io/library/alpine:3.20`),
+/// never the user's spelling (`alpine:3.20`): the source check compares the plan
+/// against the canonical reference carried by the resolved image.
+fn oci_plan_image(resolved: &libvm::ResolvedOciImage, pull_policy: PullPolicy) -> ResolvedImage {
     ResolvedImage::Oci {
         identity: planning::OciImageIdentity {
-            requested_reference,
+            requested_reference: resolved.requested_reference.clone(),
             selected_reference: resolved.selected_reference.clone(),
             platform: resolved.platform.clone(),
             manifest_digest: resolved.manifest_digest.clone(),
