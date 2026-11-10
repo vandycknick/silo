@@ -763,7 +763,8 @@ impl SnapshotStore {
         let directory = capture_directory(&self.store, &record)?
             .ok_or_else(|| invalid("capture staging is missing"))?;
         settle_capture_seal(&directory)?;
-        let verified = verify_capture_bytes(&directory, &record)?;
+        // RAM is authenticated while copying into the pool, not before it.
+        let mut verified = verify_capture(&directory, &record, CaptureAuthentication::Publication)?;
         let boot = record
             .captured_boot
             .clone()
@@ -793,8 +794,14 @@ impl SnapshotStore {
             payload.recheck()?;
             match payload.role {
                 CaptureRole::Ram => {
-                    let (id, roots) =
+                    let (proof, roots) =
                         pool.publish_sealed_ram_for_catalog(payload.file(), &verified.ram_map)?;
+                    let id = proof.stream().map().id();
+                    tracing::debug!(
+                        bytes_read = proof.copy_stats().bytes_read,
+                        logical_bytes_hashed = proof.copy_stats().logical_bytes_hashed,
+                        "authenticated RAM publication copy"
+                    );
                     self.store
                         .pin_published_storage_dependencies(capture, &[id], &[])
                         .await?;
@@ -807,6 +814,7 @@ impl SnapshotStore {
                     )
                     .await?;
                     streams.insert(payload.role.relative_path(), content);
+                    verified.published_ram = Some(proof);
                 }
                 CaptureRole::Disk(_) => {
                     let (published, roots) = pool.publish_stream_file_for_catalog(
@@ -1027,6 +1035,10 @@ impl SnapshotStore {
         let current = capture_directory(&self.store, &record)?
             .ok_or_else(|| invalid("capture directory disappeared before publication"))?;
         verified.recheck_directory(&current)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.store.layer_hook {
+            hook.hit(crate::store::layer_store::tests::WorkerPoint::AfterObject)?;
+        }
         let result = self
             .publish_authenticated(&snapshot, capture, name.as_deref(), Some(&verified))
             .await?;
@@ -1653,6 +1665,8 @@ pub(crate) const CAPTURE_SCRATCH_BYTES: u64 =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureAuthentication {
     Receipt,
+    /// RAM bytes are authenticated by the map-checked pool copy.
+    Publication,
     Bytes,
 }
 
@@ -1698,10 +1712,19 @@ pub(crate) struct VerifiedCapture {
     evidence_bytes: Vec<u8>,
     files: Vec<VerifiedPayload>,
     ram_map: crate::storage::stream::StreamMap,
+    published_ram: Option<crate::storage::pool::VerifiedRamPublication>,
     directory_identity: (u64, u64),
     control_fingerprints: Vec<(&'static str, SourceFingerprint)>,
 }
 impl VerifiedCapture {
+    pub(crate) fn published_ram(
+        &self,
+    ) -> Result<&crate::storage::pool::VerifiedRamPublication, LibVmError> {
+        self.published_ram
+            .as_ref()
+            .ok_or_else(|| invalid("capture RAM has no authenticated pool publication"))
+    }
+
     pub(crate) fn recheck_registered(
         &self,
         store: &Store,
@@ -1797,7 +1820,8 @@ pub(crate) fn validate_receipt(
     verify_capture(directory, record, CaptureAuthentication::Receipt)
 }
 
-/// Fully authenticate stream chunks at publication, export or handoff.
+#[cfg(test)]
+/// Independent full-byte oracle for capture corruption tests.
 pub(crate) fn verify_capture_bytes(
     directory: &OwnedDirectory,
     record: &CaptureRecord,
@@ -1946,10 +1970,18 @@ fn verify_capture(
         admitted.insert(ram_index, ram);
         let mut buffer = vec![0u8; AUTHENTICATION_BUFFER_BYTES];
         let stop = AtomicBool::new(false);
+        let mut hasher = None;
         admitted
             .into_iter()
             .map(|payload| {
-                verify_payload(payload, authentication, &mut buffer, &mut None, &stop)?
+                let authentication = if authentication == CaptureAuthentication::Publication
+                    && payload.entry.role != CaptureRole::Ram
+                {
+                    CaptureAuthentication::Bytes
+                } else {
+                    authentication
+                };
+                verify_payload(payload, authentication, &mut buffer, &mut hasher, &stop)?
                     .ok_or_else(|| invalid("receipt validation was interrupted"))
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -2091,6 +2123,7 @@ fn verify_capture(
         evidence,
         evidence_bytes,
         ram_map,
+        published_ram: None,
         files,
         directory_identity: (stat.st_dev as u64, stat.st_ino as u64),
         control_fingerprints,
@@ -2122,7 +2155,11 @@ fn verify_payload(
         return Ok(None);
     }
     let bytes = match (&entry.role, authentication) {
-        (CaptureRole::Disk(_) | CaptureRole::Ram, CaptureAuthentication::Bytes) => {
+        (
+            CaptureRole::Disk(_),
+            CaptureAuthentication::Bytes | CaptureAuthentication::Publication,
+        )
+        | (CaptureRole::Ram, CaptureAuthentication::Bytes) => {
             let stream = hasher
                 .get_or_insert_with(crate::storage::stream::StreamHasher::new)
                 .authenticate(file, entry.length)?;
@@ -2134,7 +2171,8 @@ fn verify_payload(
             }
             VerifiedBytes::Stream(stream)
         }
-        (CaptureRole::Disk(_) | CaptureRole::Ram, CaptureAuthentication::Receipt) => {
+        (CaptureRole::Disk(_), CaptureAuthentication::Receipt)
+        | (CaptureRole::Ram, CaptureAuthentication::Receipt | CaptureAuthentication::Publication) => {
             VerifiedBytes::Digest { file, fingerprint }
         }
         _ => {
@@ -6422,5 +6460,168 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ram_publication_uses_only_the_authenticated_copy_pass() {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+        use crate::store::models::snapshot::SnapshotCaptureKind;
+        use crate::store::snapshot_store::tests::{observed_stream_read, watch_stream_reads};
+
+        let fixture = fixture().await;
+        let (directory, evidence) = seal(&fixture);
+        let staged = directory.path().join(CaptureRole::Ram.relative_path());
+        let source_reads = watch_stream_reads(&staged);
+        let receipt = verify_capture(
+            &directory,
+            &fixture.reservation.record,
+            CaptureAuthentication::Publication,
+        )
+        .unwrap();
+        assert!(
+            !observed_stream_read(&source_reads),
+            "receipt validation must not read RAM"
+        );
+        drop(receipt);
+
+        let (hook, mut entered, release) = WorkerHook::new(WorkerPoint::AfterObject, false);
+        let mut worker = fixture.snapshots.store.as_ref().clone();
+        worker.layer_hook = Some(hook);
+        let publisher = SnapshotStore::from_store(Arc::new(worker));
+        let capture = fixture.reservation.record.capture_id;
+        let staging = directory.path().to_path_buf();
+        let alias = fixture.reservation.record.alias.clone();
+        let waiter =
+            tokio::spawn(async move { publisher.publish_capture(capture, &staging, alias).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            observed_stream_read(&source_reads),
+            "the copy authenticates staged RAM"
+        );
+        let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
+        let id = crate::storage::identity::StreamId::from_sha256(
+            *evidence.memory.as_ref().unwrap().ram_stream.as_bytes(),
+        );
+        let output_reads = watch_stream_reads(&pool.stream_path(&id));
+        release.send(()).unwrap();
+        let published = waiter.await.unwrap().unwrap();
+        assert!(
+            !observed_stream_read(&source_reads),
+            "no post-copy staging authentication"
+        );
+        assert!(
+            !observed_stream_read(&output_reads),
+            "closure validation must consume the copy proof"
+        );
+        let consumer = fixture
+            .snapshots
+            .consume_shape(&SnapshotRef::Id(published.id))
+            .await
+            .unwrap();
+        let SnapshotCaptureKind::LiveExecution { execution } = &consumer.record.capture else {
+            panic!("live checkpoint");
+        };
+        assert_eq!(execution.memory.stream, id);
+        assert_eq!(
+            std::fs::read(pool.stream_path(&id)).unwrap(),
+            vec![0x32; 4096]
+        );
+    }
+
+    #[tokio::test]
+    async fn ram_publication_refuses_staged_swap_after_copy_proof() {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let (hook, mut entered, release) = WorkerHook::new(WorkerPoint::AfterObject, false);
+        let mut worker = fixture.snapshots.store.as_ref().clone();
+        worker.layer_hook = Some(hook);
+        let publisher = SnapshotStore::from_store(Arc::new(worker));
+        let capture = fixture.reservation.record.capture_id;
+        let staging = directory.path().to_path_buf();
+        let alias = fixture.reservation.record.alias.clone();
+        let waiter =
+            tokio::spawn(async move { publisher.publish_capture(capture, &staging, alias).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let path = directory.path().join(CaptureRole::Ram.relative_path());
+        std::fs::rename(&path, directory.path().join("replaced-ram")).unwrap();
+        std::fs::write(&path, vec![0x32; 4096]).unwrap();
+        release.send(()).unwrap();
+        assert!(
+            waiter.await.unwrap().is_err(),
+            "even identical replacement bytes are not the held staged inode"
+        );
+        let snapshots: i64 = sqlx::query_scalar("SELECT count(*) FROM storage_snapshot")
+            .fetch_one(&fixture.snapshots.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(snapshots, 0);
+    }
+
+    #[tokio::test]
+    async fn interrupted_ram_publication_reauthenticates_staging_on_replay() {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let (hook, mut entered, release) = WorkerHook::new(WorkerPoint::AfterObject, false);
+        let mut worker = fixture.snapshots.store.as_ref().clone();
+        worker.layer_hook = Some(hook);
+        let publisher = SnapshotStore::from_store(Arc::new(worker));
+        let capture = fixture.reservation.record.capture_id;
+        let staging = directory.path().to_path_buf();
+        let alias = fixture.reservation.record.alias.clone();
+        let waiter =
+            tokio::spawn(async move { publisher.publish_capture(capture, &staging, alias).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(release);
+        assert!(waiter.await.unwrap().is_err());
+        let path = directory.path().join(CaptureRole::Ram.relative_path());
+        std::fs::write(&path, vec![0xa7; 4096]).unwrap();
+        assert!(
+            fixture
+                .snapshots
+                .publish_capture(
+                    capture,
+                    directory.path(),
+                    fixture.reservation.record.alias.clone(),
+                )
+                .await
+                .is_err(),
+            "a previous in-memory proof cannot authorize replay"
+        );
+        std::fs::write(&path, vec![0x32; 4096]).unwrap();
+        let published = fixture
+            .snapshots
+            .publish_capture(
+                capture,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .snapshots
+                .capture_reservation(capture)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            CaptureState::Published {
+                snapshot: published.id
+            },
+        );
     }
 }

@@ -24,6 +24,29 @@ pub struct PublishedStream {
     pub map: StreamMap,
 }
 
+/// Process-local authority for RAM copied against the sealed canonical map.
+/// The held pool inode, not a pathname or content ID alone, carries the proof.
+pub(crate) struct VerifiedRamPublication {
+    stream: AuthenticatedStream,
+    copy_stats: crate::storage::stream::StreamStats,
+}
+
+impl VerifiedRamPublication {
+    pub(crate) fn stream(&self) -> &AuthenticatedStream {
+        &self.stream
+    }
+
+    pub(crate) fn copy_stats(&self) -> crate::storage::stream::StreamStats {
+        self.copy_stats
+    }
+
+    pub(crate) fn recheck(&self, pool: &StoragePool) -> Result<(), StorageError> {
+        self.stream
+            .reopen(pool.open_stream(&self.stream.map().id())?)?;
+        Ok(())
+    }
+}
+
 pub struct PublishedObject {
     pub digest: ObjectDigest,
     pub length: u64,
@@ -841,16 +864,15 @@ impl StoragePool {
         &self,
         input: &File,
         map: &StreamMap,
-    ) -> Result<(StreamId, StorageLock), StorageError> {
+    ) -> Result<(VerifiedRamPublication, StorageLock), StorageError> {
         let before = SourceFingerprint::new(&input.metadata()?);
         if input.metadata()?.len() != map.length() {
             return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
         }
         let (staging, file) = self.stage()?;
         let mut hasher = StreamHasher::new();
-        if hasher.copy_file_and_hash(input, map.length(), &file)?.map != *map
-            || SourceFingerprint::new(&input.metadata()?) != before
-        {
+        let scan = hasher.copy_file_and_hash(input, map.length(), &file)?;
+        if scan.map != *map || SourceFingerprint::new(&input.metadata()?) != before {
             return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
         }
         seal(&file)?;
@@ -861,20 +883,38 @@ impl StoragePool {
             &format!("stream-{name}.lock"),
             FlockArg::LockExclusive,
         )?;
-        let verified = if let Some(existing) = existing(&self.streams, &name)? {
-            let fingerprint = SourceFingerprint::new(&existing.metadata()?);
-            if existing.metadata()?.len() != map.length()
-                || hasher.hash_open_file(&existing, map.length())?.map != *map
-                || SourceFingerprint::new(&existing.metadata()?) != fingerprint
-            {
+        let (mut stream, verified) = if let Some(existing) = existing(&self.streams, &name)? {
+            // A dedup hit is not verified-on-write authority: authenticate the
+            // existing inode independently before trusting it.
+            let stream = hasher.authenticate(existing, map.length())?;
+            if stream.map() != map {
                 return Err(StorageError::ContentMismatch(self.stream_path(&id)));
             }
-            Some(fingerprint)
+            let fingerprint = stream.fingerprint();
+            (stream, Some(fingerprint))
         } else {
-            None
+            let fingerprint = SourceFingerprint::new(&file.metadata()?);
+            (
+                AuthenticatedStream::from_verified_fingerprint(
+                    file,
+                    std::sync::Arc::new(scan.map),
+                    fingerprint,
+                )?,
+                None,
+            )
         };
         let roots = self.finish_publication(&self.streams, &staging, &name, verified)?;
-        Ok((id, roots))
+        // Only our rename may change ctime. Contents, inode, length and mtime
+        // must still match the descriptor authenticated above.
+        if verified.is_none() {
+            stream.refresh_after_owned_metadata_change()?;
+        }
+        let proof = VerifiedRamPublication {
+            stream,
+            copy_stats: scan.stats,
+        };
+        proof.recheck(self)?;
+        Ok((proof, roots))
     }
 
     #[cfg(test)]
@@ -1207,6 +1247,7 @@ fn copy_object(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::sync::Arc;
 
@@ -1698,8 +1739,9 @@ mod tests {
             .unwrap();
         drop(roots);
         std::fs::remove_file(&baseline.path).unwrap();
-        assert_eq!(pool.verify_stream(&published).unwrap(), map);
-        assert_eq!(std::fs::read(pool.stream_path(&published)).unwrap(), old);
+        let id = published.stream().map().id();
+        assert_eq!(pool.verify_stream(&id).unwrap(), map);
+        assert_eq!(std::fs::read(pool.stream_path(&id)).unwrap(), old);
         assert_eq!(map.chunks()[1], Chunk::Zero);
         let forged = StreamMap::new(map.length(), vec![Chunk::Zero; map.chunks().len()]).unwrap();
         assert!(pool
@@ -1745,6 +1787,62 @@ mod tests {
                 .unwrap()
                 .count(),
             0,
+        );
+    }
+
+    #[test]
+    fn sealed_ram_copy_authenticates_each_dense_byte_once() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let bytes = vec![0x39; 2 * crate::storage::limits::CHUNK_SIZE + 3];
+        let source = temporary.path().join("ram");
+        std::fs::write(&source, &bytes).unwrap();
+        let expected = StreamHasher::new().hash_reader(bytes.as_slice()).unwrap();
+        let (proof, _roots) = pool
+            .publish_sealed_ram_for_catalog(&File::open(&source).unwrap(), &expected)
+            .unwrap();
+        assert_eq!(proof.copy_stats().bytes_read, bytes.len() as u64);
+        assert_eq!(proof.copy_stats().logical_bytes_hashed, bytes.len() as u64);
+        assert_eq!(proof.copy_stats().whole_bytes_hashed, 0);
+        assert_eq!(proof.stream().map(), &expected);
+        assert_eq!(proof.stream().map().id(), expected.id());
+        assert_eq!(
+            std::fs::read(pool.stream_path(&expected.id())).unwrap(),
+            bytes
+        );
+        proof.recheck(&pool).unwrap();
+    }
+
+    #[test]
+    fn sealed_ram_dedup_authenticates_existing_stream_and_proof_rejects_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let source = temporary.path().join("ram");
+        std::fs::write(&source, b"sealed RAM").unwrap();
+        let map = StreamHasher::new()
+            .hash_reader(b"sealed RAM".as_slice())
+            .unwrap();
+        let (proof, roots) = pool
+            .publish_sealed_ram_for_catalog(&File::open(&source).unwrap(), &map)
+            .unwrap();
+        drop(roots);
+        let path = pool.stream_path(&map.id());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, b"broken RAM").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(proof.recheck(&pool).is_err());
+        assert!(
+            pool.publish_sealed_ram_for_catalog(&File::open(&source).unwrap(), &map)
+                .is_err(),
+            "a dedup hit must authenticate the preexisting bytes"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"sealed RAM").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            proof.recheck(&pool).is_err(),
+            "identical bytes on a new inode are not this proof"
         );
     }
 }
