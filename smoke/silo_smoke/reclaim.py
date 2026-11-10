@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from . import images, overlay, restore, stopped
+from . import fork, images, overlay, restore, stopped
 from .cli import TIMINGS_PROPERTY, Silo, release
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
@@ -106,6 +106,28 @@ class Sample:
     pid: int
     rss: Rss
     status: dict | None
+    # Bytes of anonymous replacement islands inside restored file-private RAM.
+    islands: int = 0
+
+
+def island_bytes(pid: int) -> int:
+    """Anonymous VMAs that host reclaim mapped over freed restored RAM.
+
+    Restored RAM is the largest writable private file mapping; reclaim replaces
+    freed ranges inside its span with anonymous memory. RssFile is not used:
+    it also counts clean checkpoint pages faulted by captures and readahead.
+    """
+    mappings = fork.smaps(pid)
+    files: dict[int, list[dict]] = {}
+    for mapping in mappings:
+        if mapping["inode"] != 0 and mapping["permissions"] == "rw-p":
+            files.setdefault(mapping["inode"], []).append(mapping)
+    assert files, f"worker {pid} has no private file-backed RAM mapping"
+    ram = max(files.values(), key=lambda vmas: sum(m["end"] - m["start"] for m in vmas))
+    start, end = min(m["start"] for m in ram), max(m["end"] for m in ram)
+    return sum(m["end"] - m["start"] for m in mappings
+               if m["inode"] == 0 and not m["name"] and m["permissions"] == "rw-p"
+               and start <= m["start"] and m["end"] <= end)
 
 
 def rss(pid: int) -> Rss:
@@ -135,7 +157,8 @@ def sample(silo: Silo, name: str, pid: int, backing: str, *, timeout: float = 10
         assert type(status[key]) is int and status[key] >= 0, (key, status)
     assert status["mapping_limit_skips"] == 0, status
     assert status["failed_operations"] == 0, status
-    measured = Sample(pid, rss(pid), status)
+    islands = island_bytes(pid) if backing == "restored-private" else 0
+    measured = Sample(pid, rss(pid), status, islands)
     silo.ws.record("reclaim-samples", json.dumps({"machine": name, "monotonic": time.monotonic(),
                                                 **asdict(measured)}, sort_keys=True) + "\n")
     return measured
@@ -227,8 +250,8 @@ def freed(silo: Silo, name: str, before: Sample, baseline: Rss, backing: str,
                 MIN_COW_RESIDENCY if file_drop else MIN_PAYLOAD_RESIDENCY)
             and current.status["released_bytes"] - before.status["released_bytes"] >= MIN_PAYLOAD_RESIDENCY
             and (not file_drop or (
-                current.rss.file <= baseline.file + BASELINE_MARGIN
-                and before.rss.file - current.rss.file >= MIN_COW_RESIDENCY))),
+                current.islands - before.islands >= MIN_PAYLOAD_RESIDENCY
+                and current.rss.file <= before.rss.file))),
         description="2 GiB free did not release RSS and advance released_bytes within 60s")
 
 
