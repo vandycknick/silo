@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
 
 #[cfg(test)]
 use crate::paths::LocalPaths;
@@ -239,37 +239,46 @@ impl Store {
     }
 
     /// Complete a required power-loss durability boundary after catalog commit.
-    /// The five-second deadline covers pool acquisition and all FULL attempts.
+    ///
+    /// PASSIVE syncs the database when every WAL frame has been checkpointed:
+    /// <https://www.sqlite.org/c3ref/wal_checkpoint_v2.html>. Requiring that
+    /// completed outcome retains the durability proof without FULL's pending
+    /// writer lock, which can starve unrelated child-durability commits.
+    /// A dedicated guarded connection also leaves every Store pool slot free.
     pub(crate) async fn checkpoint_catalog(&self) -> Result<(), LibVmError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut connection = tokio::time::timeout_at(deadline, self.pool.acquire())
-            .await
-            .map_err(|_| LibVmError::DurabilityPending)??;
-        let result = tokio::time::timeout_at(deadline, async {
+        let options = self
+            .pool
+            .connect_options()
+            .as_ref()
+            .clone()
+            .create_if_missing(false)
+            .busy_timeout(Duration::ZERO);
+        tokio::time::timeout_at(deadline, async {
+            // Cloned options retain the catalog guard's native collation.
+            // As with pool setup, database-touching PRAGMAs run only after
+            // that capability is installed on the new SQLite connection.
+            let mut connection = SqliteConnection::connect_with(&options).await?;
+            sqlx::raw_sql("PRAGMA synchronous = NORMAL; PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;")
+                .execute(&mut connection)
+                .await?;
             loop {
-                let counts = sqlx::query_as("PRAGMA wal_checkpoint(FULL)")
-                    .fetch_one(&mut *connection)
+                let counts = sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+                    .fetch_one(&mut connection)
                     .await?;
                 if CatalogCheckpointOutcome::from_counts(counts)
                     == CatalogCheckpointOutcome::Complete
                 {
                     return Ok::<_, LibVmError>(());
                 }
-                // The checkpoint lock bypasses SQLite's busy handler, even for
-                // FULL. Yield before retrying it; never spin behind a peer.
+                // Neither readers, writers nor competing checkpointers are
+                // waited on inside SQLite. Retry without holding a writer
+                // lock or a pooled connection, and yield between attempts.
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await;
-        match result {
-            Ok(result) => result,
-            Err(_) => {
-                // An SQLite worker may still be finishing its bounded busy
-                // wait. Do not return that connection to another pool user.
-                connection.close_on_drop();
-                Err(LibVmError::DurabilityPending)
-            }
-        }
+        .await
+        .map_err(|_| LibVmError::DurabilityPending)?
     }
 
     fn sqlite_options(path: &Path) -> SqliteConnectOptions {
@@ -1261,8 +1270,17 @@ pub(crate) mod tests {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.unwrap();
         let reader = pin_catalog_wal(&db).await;
-        let competitor = db.clone();
-        let competing = tokio::spawn(async move { competitor.checkpoint_catalog().await });
+        let mut connection = db.pool.acquire().await.unwrap();
+        connection.close_on_drop();
+        sqlx::query("PRAGMA busy_timeout=10000")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let competing = tokio::spawn(async move {
+            sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(FULL)")
+                .fetch_one(&mut *connection)
+                .await
+        });
         // Witness SQLite's checkpoint lock, not merely a task being scheduled.
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -1289,7 +1307,9 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
-        competing.await.unwrap().unwrap();
+        let (busy, logged, checkpointed) = competing.await.unwrap().unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(logged, checkpointed);
     }
 
     #[tokio::test]
@@ -1337,6 +1357,114 @@ pub(crate) mod tests {
         assert_eq!(busy, 0);
         assert_eq!(logged, checkpointed);
         db.checkpoint_catalog().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_checkpoint_leaves_single_connection_writers_unblocked() {
+        use std::time::Duration;
+
+        let (_dir, paths) = temp_paths();
+        let mut db = Store::new(&paths).await.unwrap();
+        let options = db.pool.connect_options().as_ref().clone();
+        let single = db
+            .pool
+            .options()
+            .clone()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        db.pool.close().await;
+        db.pool = single;
+        db.execute_test_sql(
+            "CREATE TABLE checkpoint_probe(value INTEGER NOT NULL); INSERT INTO checkpoint_probe VALUES(0)",
+        )
+        .await
+        .unwrap();
+        db.checkpoint_catalog().await.unwrap();
+        let readers = Store::connect(&paths.state_db_path()).await.unwrap();
+        let mut pinned = readers.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT value FROM checkpoint_probe")
+            .fetch_one(&mut *pinned)
+            .await
+            .unwrap();
+        db.execute_test_sql("UPDATE checkpoint_probe SET value=1")
+            .await
+            .unwrap();
+
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let sampling_pool = readers.clone();
+        let sampler = tokio::spawn(async move {
+            let mut ready = Some(ready);
+            let mut samples = 0;
+            loop {
+                let mut reader = sampling_pool.begin().await.unwrap();
+                sqlx::query_scalar::<_, i64>("SELECT value FROM checkpoint_probe")
+                    .fetch_one(&mut *reader)
+                    .await
+                    .unwrap();
+                reader.rollback().await.unwrap();
+                samples += 1;
+                if let Some(ready) = ready.take() {
+                    ready.send(()).unwrap();
+                }
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+            }
+            samples
+        });
+        tokio::time::timeout(Duration::from_millis(500), started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let checkpoint_store = db.clone();
+        let mut boundary = tokio::spawn(async move { checkpoint_store.checkpoint_catalog().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut boundary)
+                .await
+                .is_err()
+        );
+        // This fails both if the barrier checks out the only pool connection
+        // and if it holds FULL's database-wide writer lock behind the reader.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            db.execute_test_sql("UPDATE checkpoint_probe SET value=2"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut boundary)
+                .await
+                .is_err()
+        );
+        pinned.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), boundary)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // NOOP observes the completed durability proof without making any
+        // checkpoint progress itself.
+        let (busy, logged, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(NOOP)")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(logged, checkpointed);
+        let committed: i64 = sqlx::query_scalar("SELECT value FROM checkpoint_probe")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(committed, 2);
+        stop.send(()).unwrap();
+        assert!(sampler.await.unwrap() > 1);
+        readers.close().await;
     }
 
     #[tokio::test]
