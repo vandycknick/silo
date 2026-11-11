@@ -83,6 +83,7 @@ rprobe = { path = "../../guest/rprobe" }
 vz = { path = "../../virt/vz" }
 
 [dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util"] }
 # Native guest fixture: whole-disk ext4 root and its schema-2 launch bootstrap,
 # composed with the same newc crate as libvm.
 cpio = "0.4.1"

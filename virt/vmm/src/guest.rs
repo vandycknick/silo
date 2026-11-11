@@ -3,6 +3,7 @@ pub(crate) mod shutdown;
 #[path = "guest/ssh.rs"]
 pub(crate) mod ssh;
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -190,7 +191,8 @@ async fn status_stream(
     reset: &mut tokio::sync::watch::Receiver<u64>,
     discovery_started_at: Instant,
 ) -> Result<(), (tonic::Status, bool)> {
-    let response = tokio::time::timeout(
+    let response = running_timeout(
+        store.subscribe_agent_parked(),
         FIRST_STATUS_DEADLINE,
         client.watch_status(WatchAgentStatusRequest {
             heartbeat_interval: Some(duration(HEARTBEAT)),
@@ -215,7 +217,8 @@ async fn status_stream(
                     return Err((tonic::Status::aborted("metric identity mismatch"), received_snapshot));
                 }
             }
-            message = tokio::time::timeout(
+            message = running_timeout(
+                store.subscribe_agent_parked(),
                 if received_snapshot { HEARTBEAT * 3 } else { FIRST_STATUS_DEADLINE },
                 stream.message(),
             ) => {
@@ -241,7 +244,8 @@ async fn metrics_stream(
     mut client: GuestAgentServiceClient<Channel>,
     store: &InstanceStore,
 ) -> Result<(), (tonic::Status, bool)> {
-    let response = tokio::time::timeout(
+    let response = running_timeout(
+        store.subscribe_agent_parked(),
         METRICS_INTERVAL * 3,
         client.watch_metrics(WatchAgentMetricsRequest {
             interval: Some(duration(METRICS_INTERVAL)),
@@ -259,21 +263,25 @@ async fn metrics_stream(
     let mut stream = response.into_inner();
     let mut received_snapshot = false;
     loop {
-        let metrics = tokio::time::timeout(METRICS_INTERVAL * 3, stream.message())
-            .await
-            .map_err(|_| {
-                (
-                    tonic::Status::deadline_exceeded("guest metrics stream became silent"),
-                    received_snapshot,
-                )
-            })?
-            .map_err(|error| (error, received_snapshot))?
-            .ok_or_else(|| {
-                (
-                    tonic::Status::unavailable("guest metrics stream ended"),
-                    received_snapshot,
-                )
-            })?;
+        let metrics = running_timeout(
+            store.subscribe_agent_parked(),
+            METRICS_INTERVAL * 3,
+            stream.message(),
+        )
+        .await
+        .map_err(|_| {
+            (
+                tonic::Status::deadline_exceeded("guest metrics stream became silent"),
+                received_snapshot,
+            )
+        })?
+        .map_err(|error| (error, received_snapshot))?
+        .ok_or_else(|| {
+            (
+                tonic::Status::unavailable("guest metrics stream ended"),
+                received_snapshot,
+            )
+        })?;
         let agent_instance_id = metrics.agent_instance_id.clone();
         store
             .observe_metrics(metrics, METRICS_INTERVAL * 3)
@@ -284,6 +292,33 @@ async fn metrics_stream(
             }
         }
         received_snapshot = true;
+    }
+}
+
+/// A native park is not guest silence. Keep the same RPC alive while parked
+/// and grant it a full response budget after release, including when both
+/// transitions were coalesced before this task was scheduled again.
+async fn running_timeout<F: Future>(
+    mut parked: tokio::sync::watch::Receiver<bool>,
+    timeout: Duration,
+    future: F,
+) -> Result<F::Output, ()> {
+    let timer = tokio::time::sleep(timeout);
+    tokio::pin!(timer);
+    tokio::pin!(future);
+    loop {
+        let is_parked = *parked.borrow_and_update();
+        tokio::select! {
+            biased;
+            changed = parked.changed() => {
+                if changed.is_err() {
+                    return Err(());
+                }
+                timer.as_mut().reset(tokio::time::Instant::now() + timeout);
+            }
+            result = &mut future => return Ok(result),
+            _ = &mut timer, if !is_parked => return Err(()),
+        }
     }
 }
 
@@ -455,6 +490,107 @@ mod tests {
         RetryPhase, RetrySchedule, FAST_DISCOVERY_RETRY, FAST_DISCOVERY_WINDOW, INITIAL_BACKOFF,
         MAX_BACKOFF,
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn parked_status_wait_keeps_the_same_request_alive_across_long_pauses() {
+        for pause in [
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(86_400),
+        ] {
+            let (park, parked) = tokio::sync::watch::channel(false);
+            let (respond, response) = tokio::sync::oneshot::channel();
+            let wait =
+                crate::guest::running_timeout(parked, crate::guest::STATUS_FRESHNESS, response);
+            tokio::pin!(wait);
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            tokio::time::advance(crate::guest::STATUS_FRESHNESS - Duration::from_millis(1)).await;
+
+            park.send_replace(true);
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            tokio::time::advance(pause).await;
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+
+            park.send_replace(false);
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            tokio::time::advance(crate::guest::HEARTBEAT).await;
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            respond.send(42).unwrap();
+            assert_eq!(wait.await, Ok(Ok(42)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_park_and_release_reset_an_expired_host_timer() {
+        let (park, parked) = tokio::sync::watch::channel(false);
+        let wait = crate::guest::running_timeout(
+            parked,
+            crate::guest::STATUS_FRESHNESS,
+            std::future::pending::<()>(),
+        );
+        tokio::pin!(wait);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+
+        park.send_replace(true);
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        park.send_replace(false);
+        // The waiter was not polled while parked. The final bool is unchanged,
+        // but watch's version still records that its old timer is obsolete.
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        tokio::time::advance(crate::guest::STATUS_FRESHNESS - Duration::from_millis(1)).await;
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(wait.await, Err(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn genuinely_silent_agent_times_out_while_running_and_after_release() {
+        for initially_parked in [false, true] {
+            let (park, parked) = tokio::sync::watch::channel(initially_parked);
+            let wait = crate::guest::running_timeout(
+                parked,
+                crate::guest::FIRST_STATUS_DEADLINE,
+                std::future::pending::<()>(),
+            );
+            tokio::pin!(wait);
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            if initially_parked {
+                tokio::time::advance(Duration::from_secs(86_400)).await;
+                assert!(futures::poll!(wait.as_mut()).is_pending());
+                park.send_replace(false);
+                assert!(futures::poll!(wait.as_mut()).is_pending());
+            }
+            tokio::time::advance(crate::guest::FIRST_STATUS_DEADLINE).await;
+            assert_eq!(wait.await, Err(()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parked_wait_still_delivers_pending_guest_responses() {
+        let (_park, parked) = tokio::sync::watch::channel(true);
+        let (respond, response) = tokio::sync::oneshot::channel();
+        let wait =
+            crate::guest::running_timeout(parked, crate::guest::FIRST_STATUS_DEADLINE, response);
+        tokio::pin!(wait);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        respond.send(42).unwrap();
+        assert_eq!(wait.await, Ok(Ok(42)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_park_watch_ends_the_wait_without_spinning() {
+        let (park, parked) = tokio::sync::watch::channel(true);
+        let wait = crate::guest::running_timeout(
+            parked,
+            crate::guest::FIRST_STATUS_DEADLINE,
+            std::future::pending::<()>(),
+        );
+        tokio::pin!(wait);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        drop(park);
+        assert_eq!(wait.await, Err(()));
+    }
 
     #[test]
     fn initial_discovery_retries_are_bounded_during_fast_window() {
