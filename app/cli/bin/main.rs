@@ -1,6 +1,5 @@
 use std::process::ExitCode;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
-    cli::run().await
+fn main() -> ExitCode {
+    cli::main()
 }
