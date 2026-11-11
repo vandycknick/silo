@@ -33,8 +33,10 @@ TRACK_SHA256 := $(KERNEL_TRACK_$(TRACK)_SHA256)
 
 ifeq ($(KERNEL_ARCH),arm64)
 KERNEL_BUILD_TARGET := Image
+KERNEL_IMAGE_FILE := arch/arm64/boot/Image
 else ifeq ($(KERNEL_ARCH),x86_64)
 KERNEL_BUILD_TARGET := vmlinux
+KERNEL_IMAGE_FILE := vmlinux
 endif
 
 RESOURCE_ROOT ?= $(abspath $(CURDIR)/..)
@@ -166,10 +168,9 @@ kernel-image: kernel-config
 		ARCH="$(KERNEL_ARCH)" \
 		-j"$(JOBS)" "$(KERNEL_BUILD_TARGET)"
 	@set -eu; if [ -n "$(KERNEL_IMAGE_OUTPUT)" ]; then \
-		test "$(KERNEL_ARCH)" = arm64 || exit 1; \
 		temporary=$$(mktemp "$(KERNEL_IMAGE_OUTPUT).XXXXXX"); \
 		trap 'rm -f "$$temporary"' EXIT HUP INT TERM; \
-		install -m 644 "$(KERNEL_BUILD_DIR)/arch/arm64/boot/Image" "$$temporary"; \
+		install -m 644 "$(KERNEL_BUILD_DIR)/$(KERNEL_IMAGE_FILE)" "$$temporary"; \
 		mv "$$temporary" "$(KERNEL_IMAGE_OUTPUT)"; \
 	fi
 
