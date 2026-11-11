@@ -37,6 +37,22 @@ impl Management {
             .into_inner())
     }
 
+    pub(crate) async fn secret_scope(
+        &self,
+        reference: &str,
+    ) -> Result<libvm::SecretScopePolicy, Status> {
+        let reference =
+            libvm::MachineRef::parse(reference).map_err(crate::daemon::control::native)?;
+        self.runtime()
+            .await?
+            .get_machine(&reference)
+            .await
+            .map_err(crate::daemon::control::native)?
+            .secret_scope()
+            .await
+            .map_err(crate::daemon::control::native)
+    }
+
     pub(crate) async fn create(
         &self,
         configuration: w::NormalizedMachineCreate,
@@ -47,6 +63,7 @@ impl Management {
             .create_machine(Request::new(w::CreateMachineRequest {
                 configuration: Some(configuration),
                 source: Some(w::create_machine_request::Source::Oci(source)),
+                secret_scope: w::SecretScopePolicy::MachineOnly as i32,
             }))
             .await?
             .into_inner();
@@ -447,6 +464,46 @@ mod tests {
         assert!(std::mem::size_of_val(&management.runtime()) < 1024);
     }
 
+    #[tokio::test]
+    async fn secret_scope_omission_is_rejected_before_runtime_initialization() {
+        use w::machine_service_server::MachineService;
+
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let management = Management::new(state.clone());
+        let policy = management
+            .normalize_policy(w::NormalizePolicyRequest {
+                input: Some(w::normalize_policy_request::Input::Empty(())),
+            })
+            .await
+            .unwrap();
+        for scope in [w::SecretScopePolicy::Unspecified as i32, -1, 99] {
+            let error = management
+                .0
+                .create_machine(tonic::Request::new(w::CreateMachineRequest {
+                    secret_scope: scope,
+                    ..Default::default()
+                }))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("secret_scope"));
+            let error = management
+                .check_policy_secrets(w::CheckPolicySecretsRequest {
+                    policy_json: policy.canonical_json.clone(),
+                    secret_scope: scope,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("secret_scope"));
+        }
+        assert!(state.runtime.get().is_none());
+        assert!(state.components.get().is_none());
+    }
+
     impl Management {
         pub(crate) fn for_test_runtime(
             root: &std::path::Path,
@@ -579,6 +636,7 @@ mod tests {
             .check_policy_secrets(w::CheckPolicySecretsRequest {
                 policy_json: policy.canonical_json,
                 machine_id: None,
+                secret_scope: w::SecretScopePolicy::MachineOnly as i32,
             })
             .await
             .unwrap();

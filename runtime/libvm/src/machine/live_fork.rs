@@ -1319,6 +1319,7 @@ mod tests {
 
     fn configuration() -> crate::SnapshotConfiguration {
         crate::SnapshotConfiguration {
+            secret_scope: crate::SecretScopePolicy::default(),
             spec: vm_spec::VmSpec::current(),
             retention: crate::MachineRetention::Persistent,
             process: crate::ProcessConfig::default(),

@@ -269,8 +269,7 @@ impl Service {
                 }
             }
         };
-        let operation = operation(token.clone());
-        tokio::pin!(operation);
+        let mut operation = Box::pin(operation(token.clone()));
         tokio::select! {
             biased;
             result = reauthorize => {

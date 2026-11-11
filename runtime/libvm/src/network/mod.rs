@@ -367,6 +367,7 @@ mod tests {
         network: ModelMachineNetworkConfig,
     ) -> MachineConfig {
         MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: LockId::from(0),
             name: name.to_string(),

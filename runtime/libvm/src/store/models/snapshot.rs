@@ -1088,6 +1088,7 @@ pub(crate) mod tests {
             disks: Vec::new(),
             platform_files: Vec::new(),
             configuration: SnapshotConfiguration {
+                secret_scope: crate::SecretScopePolicy::default(),
                 spec: vm_spec::VmSpec::current(),
                 retention: crate::MachineRetention::Persistent,
                 process: crate::ProcessConfig::default(),

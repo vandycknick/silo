@@ -61,7 +61,7 @@ mod tests {
         let policy = crate::NetworkPolicy::from_hcl_str("endpoint \"https\" \"api\" { hosts = [\"example.com\"] }\ncredential \"bearer_token\" \"key\" { endpoint = https.api }\ntailscale \"vm\" {}").unwrap();
         let empty = crate::EgressCredentials::default();
         match runtime
-            .check_policy_secrets(&policy, None, &empty)
+            .check_policy_secrets(&policy, None, crate::SecretScopePolicy::default(), &empty)
             .await
             .unwrap()
         {
@@ -78,7 +78,7 @@ mod tests {
         }
         std::fs::write(home.path().join("secrets.json"), "corrupt-secret-content").unwrap();
         let result = runtime
-            .check_policy_secrets(&policy, None, &empty)
+            .check_policy_secrets(&policy, None, crate::SecretScopePolicy::default(), &empty)
             .await
             .unwrap();
         assert!(
@@ -92,6 +92,7 @@ mod tests {
                 .check_policy_secrets(
                     &policy,
                     None,
+                    crate::SecretScopePolicy::default(),
                     &empty.secret("key.token", "synthetic-override")
                 )
                 .await

@@ -858,6 +858,7 @@ where
     let result = check(w::CheckPolicySecretsRequest {
         policy_json: policy.canonical_json.clone(),
         machine_id: None,
+        secret_scope: w::SecretScopePolicy::MachineOnly as i32,
     })
     .await?;
     validate_secret_result(&result)

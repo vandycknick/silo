@@ -23,19 +23,54 @@ import (
 	"github.com/vandycknick/silo/app/tsgate/internal/wire"
 	"golang.org/x/sys/unix"
 	"tailscale.com/client/local"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
 
+const (
+	maxConnections      = 256
+	maxConnectionsPerIP = 32
+)
+
+// connectionCounts is protected by session.mu and shared by both listeners.
+type connectionCounts struct {
+	total int
+	perIP map[netip.Addr]int
+}
+
+func (c *connectionCounts) acquire(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if c.total >= maxConnections || c.perIP[ip] >= maxConnectionsPerIP {
+		return false
+	}
+	if c.perIP == nil {
+		c.perIP = make(map[netip.Addr]int)
+	}
+	c.total++
+	c.perIP[ip]++
+	return true
+}
+
+func (c *connectionCounts) release(ip netip.Addr) {
+	ip = ip.Unmap()
+	c.total--
+	c.perIP[ip]--
+	if c.perIP[ip] == 0 {
+		delete(c.perIP, ip)
+	}
+}
+
 type session struct {
-	writer    *wire.Writer
-	server    *tsnet.Server
-	mu        sync.Mutex
-	stopping  bool
-	listeners []net.Listener
-	streams   map[net.Conn]struct{}
-	copies    sync.WaitGroup
+	writer      *wire.Writer
+	server      *tsnet.Server
+	mu          sync.Mutex
+	stopping    bool
+	listeners   []net.Listener
+	streams     map[net.Conn]struct{}
+	connections connectionCounts
+	copies      sync.WaitGroup
 }
 
 // Run takes ownership of control. Owner loss always interrupts startup and live
@@ -237,6 +272,8 @@ func (s *session) serve(ctx context.Context, b wire.Bootstrap, commands <-chan w
 		logf(format, args...)
 	}
 	s.mu.Unlock()
+	// tsnet's logtail transport must never upload internal logs.
+	envknob.SetNoLogsNoSupport()
 	err = s.server.Start()
 	defer s.server.Close()
 	if err != nil {
@@ -414,7 +451,7 @@ func (s *session) accept(ctx context.Context, l net.Listener, name string) {
 		if err != nil {
 			return
 		}
-		a, b, err := wire.SocketPair()
+		remote, err := netip.ParseAddrPort(conn.RemoteAddr().String())
 		if err != nil {
 			conn.Close()
 			continue
@@ -423,9 +460,19 @@ func (s *session) accept(ctx context.Context, l net.Listener, name string) {
 		if s.stopping {
 			s.mu.Unlock()
 			conn.Close()
-			a.Close()
-			b.Close()
 			return
+		}
+		if !s.connections.acquire(remote.Addr()) {
+			s.mu.Unlock()
+			conn.Close()
+			continue
+		}
+		a, b, err := wire.SocketPair()
+		if err != nil {
+			s.connections.release(remote.Addr())
+			s.mu.Unlock()
+			conn.Close()
+			continue
 		}
 		s.streams[conn] = struct{}{}
 		s.streams[a] = struct{}{}
@@ -433,9 +480,15 @@ func (s *session) accept(ctx context.Context, l net.Listener, name string) {
 		s.mu.Unlock()
 		go func() {
 			defer s.copies.Done()
-			defer conn.Close()
-			defer a.Close()
-			defer func() { s.mu.Lock(); delete(s.streams, conn); delete(s.streams, a); s.mu.Unlock() }()
+			defer func() {
+				conn.Close()
+				a.Close()
+				s.mu.Lock()
+				delete(s.streams, conn)
+				delete(s.streams, a)
+				s.connections.release(remote.Addr())
+				s.mu.Unlock()
+			}()
 			fd, err := b.File()
 			b.Close()
 			if err != nil {

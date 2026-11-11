@@ -694,6 +694,7 @@ mod tests {
     }
     fn config(store: &Store, id: MachineId) -> MachineConfig {
         MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: crate::lock_manager::LockId::from(0),
             name: "handoff-test".into(),

@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::Notify,
+    sync::{oneshot, watch, Notify},
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
@@ -111,6 +111,10 @@ impl Shared {
             peer: peer.to_owned(),
         })
     }
+
+    pub(crate) fn channel_limit(&self) -> u64 {
+        self.per_peer
+    }
 }
 
 pub(crate) struct Permit {
@@ -145,11 +149,84 @@ impl Drop for ConnectionGuard {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Activity {
+    last: Instant,
+    empty_since: Option<Instant>,
+    idle_timeout: Duration,
+    channel_timeout: Duration,
+    running: usize,
+}
+
+impl Activity {
+    pub(crate) fn client(&mut self) {
+        self.last = Instant::now();
+    }
+
+    pub(crate) fn channels(&mut self, empty: bool) {
+        self.client();
+        self.empty_since = if empty { Some(self.last) } else { None };
+    }
+
+    fn deadline(self) -> Option<Instant> {
+        if self.running > 0 && self.empty_since.is_none() {
+            return None;
+        }
+        let idle = self.last + self.idle_timeout;
+        Some(
+            self.empty_since
+                .map_or(idle, |empty| idle.min(empty + self.channel_timeout)),
+        )
+    }
+}
+pub(crate) struct RunningCommand(watch::Sender<Activity>);
+
+impl RunningCommand {
+    pub(crate) fn new(activity: &watch::Sender<Activity>) -> Self {
+        activity.send_modify(|activity| activity.running += 1);
+        Self(activity.clone())
+    }
+}
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        self.0.send_modify(|activity| {
+            activity.running -= 1;
+            if activity.running == 0 {
+                activity.last = Instant::now();
+            }
+        });
+    }
+}
+
+async fn idle_deadline(mut activity: watch::Receiver<Activity>) {
+    loop {
+        let deadline = activity.borrow_and_update().deadline();
+        tokio::select! {
+            biased;
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => return,
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    // The handler is gone; let the transport report its own end.
+                    std::future::pending::<()>().await;
+                }
+            },
+        }
+    }
+}
+
 pub(crate) struct Server {
     config: Arc<russh::server::Config>,
     identity: IdentitySource,
     dispatcher: Arc<dyn Dispatcher>,
     shared: Arc<Shared>,
+    idle_timeout: Duration,
+    channel_timeout: Duration,
 }
 
 impl Server {
@@ -189,13 +266,17 @@ impl Server {
             maximum_packet_size: 16384,
             channel_buffer_size: 8,
             event_buffer_size: 16,
-            inactivity_timeout: None,
+            inactivity_timeout: Some(Duration::from_secs(600)),
+            keepalive_interval: Some(Duration::from_secs(60)),
+            keepalive_max: 3,
             auth_rejection_time: Duration::from_secs(1),
             ..Default::default()
         };
         Ok(Self {
             config: Arc::new(config),
             identity,
+            idle_timeout: Duration::from_secs(600),
+            channel_timeout: Duration::from_secs(60),
             dispatcher,
             shared: Arc::new(Shared {
                 counts: Mutex::new(Counts::default()),
@@ -233,20 +314,51 @@ impl Server {
             _ = cancel.cancelled() => return Ok(()),
             peer = tokio::time::timeout(Duration::from_secs(15), resolve()) => peer.ok().and_then(Result::ok).filter(Peer::valid),
         };
-        let caller = initial.map(|peer| Caller::new(peer, resolve));
+        let Some(peer) = initial else {
+            return Ok(());
+        };
+        let caller = Caller::new(peer, resolve);
+        let (activity, idle) = watch::channel(Activity {
+            last: Instant::now(),
+            empty_since: Some(Instant::now()),
+            idle_timeout: self.idle_timeout,
+            channel_timeout: self.channel_timeout,
+            running: 0,
+        });
+        let (authenticated, authentication) = oneshot::channel();
         let handler = Handler::new(
             caller,
             self.dispatcher.clone(),
             self.shared.clone(),
             cancel.clone(),
+            authenticated,
+            activity,
         );
         let stream = CancelStream {
             inner: stream,
             cancelled: Box::pin(cancel.cancelled_owned()),
         };
-        russh::server::run_stream(self.config.clone(), stream, handler)
-            .await?
-            .await
+        let connection = async {
+            let run = async {
+                russh::server::run_stream(self.config.clone(), stream, handler)
+                    .await?
+                    .await
+            };
+            tokio::select! {
+                result = run => result,
+                _ = idle_deadline(idle) => Err(io::Error::new(io::ErrorKind::TimedOut, "SSH client activity deadline expired").into()),
+            }
+        };
+        tokio::pin!(connection);
+        tokio::select! {
+            result = &mut connection => result,
+            authenticated = tokio::time::timeout(Duration::from_secs(15), authentication) => {
+                if !matches!(authenticated, Ok(Ok(()))) {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "SSH authentication deadline expired").into());
+                }
+                connection.await
+            }
+        }
     }
 
     /// Stop admission, allow existing connections to drain, then cancel their I/O.
@@ -657,16 +769,11 @@ mod tests {
         let (c, ct) = connect(server.clone(), "c").await;
         let first = a.channel_open_session().await.unwrap();
         first.exec(true, "wait").await.unwrap();
-        let mut denied = a.channel_open_session().await.unwrap();
-        denied.exec(true, "whoami").await.unwrap();
-        let (code, _, stderr) = collect(&mut denied).await;
-        assert_eq!(code, 6);
-        assert!(String::from_utf8(stderr)
-            .unwrap()
-            .contains("session limit reached"));
+        assert!(a.channel_open_session().await.is_err());
         let second = b.channel_open_session().await.unwrap();
         second.exec(true, "wait").await.unwrap();
         let mut denied = c.channel_open_session().await.unwrap();
+        assert!(c.channel_open_session().await.is_err());
         denied.exec(true, "whoami").await.unwrap();
         assert_eq!(collect(&mut denied).await.0, 6);
         assert!(server
@@ -741,19 +848,177 @@ mod tests {
             )
             .unwrap(),
         );
-        let (client, task) = connect(denied, "node").await;
-        let mut channel = client.channel_open_session().await.unwrap();
-        channel.exec(true, "whoami").await.unwrap();
-        let (code, _, stderr) = collect(&mut channel).await;
-        assert_eq!(code, 4);
-        assert!(String::from_utf8(stderr)
+        let (stream, mut client) = UnixStream::pair().unwrap();
+        timeout(Duration::from_secs(3), denied.serve_stream("node", stream))
+            .await
             .unwrap()
-            .contains("identity unavailable"));
-        timeout(Duration::from_secs(3), task)
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut bytes)
+            .await
+            .unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    fn short_deadlines(home: &std::path::Path) -> Arc<Server> {
+        let mut server = server(home, (8, 4));
+        let inner = Arc::get_mut(&mut server).unwrap();
+        inner.idle_timeout = Duration::from_millis(300);
+        inner.channel_timeout = Duration::from_millis(150);
+        let config = Arc::get_mut(&mut inner.config).unwrap();
+        config.keepalive_interval = Some(Duration::from_millis(40));
+        server
+    }
+
+    struct NotifyingCommands(AtomicUsize);
+
+    impl Dispatcher for NotifyingCommands {
+        fn dispatch<'a>(
+            &'a self,
+            caller: &'a Caller,
+            line: &'a str,
+            io: &'a mut SessionIo,
+            extras: &'a SessionExtras,
+        ) -> BoxFuture<'a, i32> {
+            Box::pin(async move { Commands.dispatch(caller, line, io, extras).await })
+        }
+
+        fn notices<'a>(
+            &'a self,
+            _peer: &'a Peer,
+        ) -> BoxFuture<'a, crate::lobby::failure::Outcome<Vec<crate::lobby::ssh::notices::Notice>>>
+        {
+            let revision = self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(vec![crate::lobby::ssh::notices::Notice {
+                    id: "vm".into(),
+                    name: "vm".into(),
+                    url: format!("https://approval.test/{revision}"),
+                }])
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn keepalive_replies_and_server_output_do_not_extend_client_idle_deadline() {
+        let home = tempfile::tempdir().unwrap();
+        let mut server = short_deadlines(home.path());
+        let inner = Arc::get_mut(&mut server).unwrap();
+        inner.idle_timeout = Duration::from_millis(2500);
+        inner.dispatcher = Arc::new(NotifyingCommands(AtomicUsize::new(0)));
+        let (client, task) = connect(server.clone(), "node").await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+        let output = timeout(Duration::from_secs(4), async {
+            let mut output = Vec::new();
+            while let Some(message) = channel.wait().await {
+                if let ChannelMsg::ExtendedData { data, .. } | ChannelMsg::Data { data } = message {
+                    output.extend_from_slice(&data);
+                }
+            }
+            String::from_utf8(output).unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(output.contains("https://approval.test/0"), "{output}");
+        assert!(timeout(Duration::from_secs(2), task)
             .await
             .unwrap()
             .unwrap()
+            .is_err());
+        assert_eq!(server.shared.counts.lock().connections, 0);
+    }
+
+    #[tokio::test]
+    async fn client_channel_data_resets_idle_deadline() {
+        let home = tempfile::tempdir().unwrap();
+        let server = short_deadlines(home.path());
+        let (client, task) = connect(server, "node").await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
             .unwrap();
+        channel.request_shell(true).await.unwrap();
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            channel.data(&b"whoami\r"[..]).await.unwrap();
+            assert!(until(&mut channel, "node").await.contains("node"));
+            assert!(!task.is_finished());
+        }
+        assert!(timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_connection_without_channels_expires_despite_keepalives() {
+        let home = tempfile::tempdir().unwrap();
+        let server = short_deadlines(home.path());
+        let (client, task) = connect(server.clone(), "node").await;
+        assert!(timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert_eq!(server.shared.counts.lock().connections, 0);
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn admitted_running_command_outlives_the_application_idle_deadline() {
+        let home = tempfile::tempdir().unwrap();
+        let server = short_deadlines(home.path());
+        let (client, task) = connect(server, "node").await;
+        let channel = client.channel_open_session().await.unwrap();
+        channel.exec(true, "wait").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert!(!task.is_finished());
+        disconnect(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn handshake_and_authentication_have_deadlines() {
+        let home = tempfile::tempdir().unwrap();
+        let server = server(home.path(), (8, 4));
+        assert_eq!(
+            server.config.inactivity_timeout,
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            server.config.keepalive_interval,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(server.config.keepalive_max, 3);
+        let (silent_stream, mut silent_client) = UnixStream::pair().unwrap();
+        let silent_server = server.clone();
+        let silent =
+            tokio::spawn(async move { silent_server.serve_stream("node", silent_stream).await });
+        let (stream, client_stream) = UnixStream::pair().unwrap();
+        let auth_server = server.clone();
+        let auth = tokio::spawn(async move { auth_server.serve_stream("node", stream).await });
+        let client =
+            client::connect_stream(Arc::new(client::Config::default()), client_stream, Client)
+                .await
+                .unwrap();
+        timeout(Duration::from_secs(20), async {
+            assert!(silent.await.unwrap().is_err());
+            assert!(auth.await.unwrap().is_err());
+        })
+        .await
+        .unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut silent_client, &mut bytes)
+            .await
+            .unwrap();
+        assert!(bytes.starts_with(b"SSH-2.0-"));
+        assert_eq!(server.shared.counts.lock().connections, 0);
         drop(client);
     }
 
@@ -910,6 +1175,79 @@ mod tests {
         channel.data(&b"exit\r"[..]).await.unwrap();
         assert_eq!(collect(&mut channel).await.0, 0);
         disconnect(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn ungranted_repl_flood_is_limited_while_granted_commands_are_not() {
+        use crate::lobby::{identity::Action, service::testing};
+        let fixture = testing::fixture().await;
+        let source: IdentitySource = Arc::new(|remote| {
+            let caller = if remote == "ungranted" {
+                testing::caller("user:1", &[])
+            } else {
+                testing::caller("user:2", &[Action::Read])
+            };
+            Arc::new(move || {
+                let caller = caller.clone();
+                Box::pin(async move { caller.fresh().await })
+            })
+        });
+        let server = Arc::new(
+            Server::new(
+                &fixture.root.path().join("home"),
+                &Default::default(),
+                source,
+                Arc::new(fixture.service.clone()),
+            )
+            .unwrap(),
+        );
+        for (remote, expect_throttle) in [("ungranted", true), ("granted", false)] {
+            let (client, task) = connect(server.clone(), remote).await;
+            let mut channel = client.channel_open_session().await.unwrap();
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            channel.request_shell(true).await.unwrap();
+            until(&mut channel, "silo> ").await;
+            let mut throttled = false;
+            for _ in 0..60 {
+                channel.data(&b"whoami --json\r"[..]).await.unwrap();
+                let response = timeout(Duration::from_secs(3), async {
+                    let mut bytes = Vec::new();
+                    loop {
+                        match channel.wait().await.expect("REPL closed before replying") {
+                            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                                bytes.extend_from_slice(&data)
+                            }
+                            _ => {}
+                        }
+                        let text = String::from_utf8_lossy(&bytes);
+                        let result = text
+                            .find("\"ok\":true")
+                            .or_else(|| text.find("Error: node audit rate limit reached"));
+                        if result.is_some_and(|result| {
+                            text.rfind("silo> ").is_some_and(|prompt| prompt > result)
+                        }) {
+                            break text.into_owned();
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                let limited = response.contains("node audit rate limit reached");
+                if !expect_throttle {
+                    assert!(!limited, "{response}");
+                    assert!(response.contains("\"ok\":true"), "{response}");
+                }
+                throttled |= limited;
+            }
+            assert_eq!(throttled, expect_throttle);
+            channel.data(&b"exit\r"[..]).await.unwrap();
+            assert_eq!(collect(&mut channel).await.0, 0);
+            disconnect(client, task).await;
+        }
+        fixture.service.config().audit.close().await.unwrap();
     }
 
     #[tokio::test]

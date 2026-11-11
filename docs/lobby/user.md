@@ -23,6 +23,18 @@ Bracketed paste cannot submit a command by itself. Each command refreshes
 WhoIs; idle PTY sessions also refresh identity every 30 seconds. The service
 does not provide a host shell, SFTP/SCP subsystems, port, X11 or agent forwarding.
 
+SSH authentication must complete within 15 seconds after initial identity
+resolution. SSH closes idle connections after 10 minutes without client channel
+data or channel requests; keepalive replies and server output do not extend that
+deadline. It pauses while an admitted command is running (including exec, shell,
+followed logs and copies), but not while a REPL waits for input. Connections
+without an open channel close after 60 seconds. Tsgate admits at most 256
+concurrent connections, 32 per remote IP, across SSH and HTTPS.
+Silod additionally counts both address families together by verified node ID
+after WhoIs resolution. Each SSH connection's open channels are bounded by
+`daemon.tailscale.sessions.per-peer` (default 8). Excess connections or channels
+can be refused before a command runs.
+
 ## Command language
 
 Commands are one line, with single/double quotes and backslash escapes. Empty
@@ -150,6 +162,8 @@ SSH session does not roll back or cancel an admitted job. Reconnect and inspect
 to one VM, refresh authorization before execution and retain completed records
 for 24 hours. All operation records disappear on daemon restart, but not on a
 tsgate-only restart. A successful query of a failed operation exits 0.
+Each principal can have at most 16 queued plus active operations; further
+submissions fail with exit 6 (`limit`) until capacity is released.
 
 ### Shell and exec
 
@@ -274,6 +288,11 @@ and no `tunnel`. See the [HTTPS example](tailnet-policy.md#guest-service-access)
 Editing/removing a policy reports visible `bound_vms` but never changes those
 VMs. Apply a replacement explicitly with `stop`, `set VM policy=NAME`, `start`.
 
+VMs created by the lobby resolve policy secrets only from their own Machine
+scope, never the host Home store. Remote-policy checks do not read Home or
+reveal Home secret names/presence; missing-policy-secret diagnostics describe
+the submitted policy's requirements, not the host's secret inventory.
+
 ## JSON and exit codes
 
 For supported commands, `--json` writes one UTF-8 object and newline to stdout;
@@ -339,11 +358,21 @@ and tier. Secret metadata contains names/requirements, never secret values.
 | 3 | Missing/invisible VM, document or operation: `not_found` |
 | 4 | Capability/identity denial: `forbidden` |
 | 5 | State or naming conflict: `conflict` |
-| 6 | Resource/session/admission limit: `limit` |
+| 6 | Resource/session/admission limit, including 16 queued/active operations per principal: `limit` |
 | 7 | VM/image operation failure: `operation_failed`, `image` |
 | 8 | Enrollment approval pending, failed or expired: `pending_approval`, `expired` |
-| 9 | Unavailable runtime or state: `unavailable` |
+| 9 | Unavailable runtime, state or audit writer/queue: `unavailable` |
 | 255 | Lost SSH/execution transport: `disconnected`, or SSH's own failure |
+
+Authorization audit records use a background writer with group commits about
+every 100 ms. A full audit queue or writer failure denies new requests with exit 9.
+Admission does not wait for durable commit: a crash or writer failure can lose
+audit records for already-allowed actions. Transient writer failures are retried
+with backoff. Audited denials (including identity-validation failures), plus
+successful `identity`/`whoami` checks from peers with no granted actions, share a
+per-node limit of 20 per second with a burst of 40. Excess requests return exit 6
+without throttling other nodes. Allowed decisions for granted callers never
+consume this budget.
 
 Shell/exec pass guest exit status through, so it can overlap lobby categories.
 Signal exits use `128 + signal`, capped at 255. Missing guest programs use 127;

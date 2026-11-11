@@ -331,7 +331,9 @@ enum CacheState { CACHE_STATE_UNSPECIFIED = 0; CACHE_STATE_COMPLETE = 1; CACHE_S
 message OciIdentity { string requested_reference = 1; string selected_reference = 2; string platform = 3; string manifest_digest = 4; string config_digest = 5; PullPolicy pull_policy = 6; }
 message ResolvedImage { OciIdentity identity = 1; CacheState cache_state = 2; string oci_config_json = 3; }
 // Absent rosetta is no explicit intent; false is an explicit disable.
-message CreateMachineRequest { NormalizedMachineCreate configuration = 1; oneof source { OciIdentity oci = 2; DiskImportRequest disk = 3; ManagedSourceRef managed = 4; } }
+// Callers must explicitly select the credential lookup authority.
+enum SecretScopePolicy { SECRET_SCOPE_POLICY_UNSPECIFIED = 0; SECRET_SCOPE_POLICY_MACHINE_THEN_HOME = 1; SECRET_SCOPE_POLICY_MACHINE_ONLY = 2; }
+message CreateMachineRequest { NormalizedMachineCreate configuration = 1; oneof source { OciIdentity oci = 2; DiskImportRequest disk = 3; ManagedSourceRef managed = 4; } SecretScopePolicy secret_scope = 5; }
 enum GuestArchitecture { GUEST_ARCHITECTURE_UNSPECIFIED = 0; GUEST_ARCHITECTURE_AMD64 = 1; GUEST_ARCHITECTURE_ARM64 = 2; }
 message LinuxPlatform { GuestArchitecture architecture = 1; optional string variant = 2; }
 // Request-only selection. auto_gpt is never persisted; GUIDs are canonical
@@ -437,7 +439,8 @@ message SecretAlternative { repeated string slots = 1; }
 message SecretRequirement { string owner = 1; repeated SecretAlternative alternatives = 2; }
 message SecretSlot { string name = 1; bool required = 2; SecretKind kind = 3; string key = 4; SecretField field = 5; }
 message PolicyDocument { string canonical_json = 1; string hcl = 2; repeated SecretSlot secret_slots = 3; repeated SecretRequirement secret_requirements = 4; }
-message CheckPolicySecretsRequest { string policy_json = 1; optional string machine_id = 2; }
+// An existing machine's persisted scope can be tightened by this request, never widened.
+message CheckPolicySecretsRequest { string policy_json = 1; optional string machine_id = 2; SecretScopePolicy secret_scope = 3; }
 enum PolicySecretsState { POLICY_SECRETS_STATE_UNSPECIFIED = 0; POLICY_SECRETS_STATE_READY = 1; POLICY_SECRETS_STATE_MISSING = 2; POLICY_SECRETS_STATE_UNAVAILABLE = 3; }
 message SecretDiagnostic { string slot = 1; optional string key = 2; string code = 3; }
 message PolicySecretsResult { PolicySecretsState state = 1; repeated SecretDiagnostic diagnostics = 2; repeated SecretRequirement requirements = 3; repeated SecretSlot slots = 4; }

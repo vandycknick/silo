@@ -117,6 +117,15 @@ pub(crate) fn caller(principal: &str, actions: &[Action]) -> Caller {
     )
 }
 pub(crate) async fn stopped_vm(fixture: &Fixture, name: &str, owner: &str) -> w::MachineSnapshot {
+    stopped_vm_with_scope(fixture, name, owner, libvm::SecretScopePolicy::MachineOnly).await
+}
+
+pub(crate) async fn stopped_vm_with_scope(
+    fixture: &Fixture,
+    name: &str,
+    owner: &str,
+    scope: libvm::SecretScopePolicy,
+) -> w::MachineSnapshot {
     let runtime = fixture.management.runtime().await.unwrap();
     let disk = fixture.root.path().join(format!("{name}.raw"));
     disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
@@ -124,6 +133,7 @@ pub(crate) async fn stopped_vm(fixture: &Fixture, name: &str, owner: &str) -> w:
         .unwrap();
     let machine = runtime
         .machine()
+        .secret_scope(scope)
         .name(name)
         .cpus(2)
         .memory(libvm::Memory::gibibytes(4))

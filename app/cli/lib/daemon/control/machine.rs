@@ -297,7 +297,7 @@ impl w::machine_service_server::MachineService for Service {
         &self,
         r: Request<w::CreateMachineRequest>,
     ) -> Result<Response<Self::CreateMachineStream>, Status> {
-        let (config, source) =
+        let (config, source, secret_scope) =
             requests::create_request_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
@@ -346,7 +346,7 @@ impl w::machine_service_server::MachineService for Service {
                 }
             };
             let machine = config
-                .apply_to_builder(builder)
+                .apply_to_builder(builder.secret_scope(secret_scope))
                 .map_err(native)?
                 .create()
                 .await

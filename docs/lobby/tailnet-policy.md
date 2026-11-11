@@ -40,6 +40,10 @@ rules do not replace application grants for this listener. Direct SSH to a VM
 has its own node/network and guest-authentication requirements. Verified peers
 with network access but no app grant can use `whoami`, `help` and `version`,
 not VM operations. HTTPS `/healthz` and `/metrics` require `vm.read`.
+`/metrics` additionally requires the requesting peer to hold the configured
+`daemon.tailscale.tag` (default `tag:silo`). `/healthz` has no tag requirement.
+Do not give users the service tag merely to enable metrics; keep tag assignment
+under operator control.
 
 ## Own-scope grants
 
@@ -111,7 +115,7 @@ per principal; `cpus`, `memory` and `disk` limit each VM, not aggregate usage.
 | Action | Commands |
 | --- | --- |
 | `vm.create` | `create` |
-| `vm.read` | `ls`, `show`, `ops`, document list/show/validate, HTTPS health/metrics |
+| `vm.read` | `ls`, `show`, `ops`, document list/show/validate, HTTPS health; metrics also requires the configured lobby tag |
 | `vm.start` | `start` |
 | `vm.stop` | `stop` |
 | `vm.delete` | `rm` |
@@ -232,5 +236,9 @@ report configuration, not certificate, listener or backend health.
 Remote policies may use this `self` selector only with dedicated per-VM
 attachments. They cannot declare nodes, explicit tunnels, host/cross-VM
 forwards or reserved lobby identity metadata. The lobby owns node binding.
+VMs created by the lobby resolve policy secrets only from Machine scope, never
+the host Home store. Remote-policy checks do not read Home, reveal Home secret
+names or distinguish their presence. An app grant cannot authorize Home-secret
+access through a remote policy.
 See [operator enrollment](operator.md#vm-node-enrollment) and the
 [user command reference](user.md).

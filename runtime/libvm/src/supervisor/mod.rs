@@ -107,6 +107,7 @@ mod tests {
 
     fn rosetta_machine_config() -> MachineConfig {
         MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id: MachineId::new(),
             lock_id: crate::lock_manager::LockId::from(0),
             name: "rosetta-test".to_string(),

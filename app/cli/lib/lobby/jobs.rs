@@ -10,6 +10,8 @@ use crate::lobby::failure::{Code, Failure, Outcome};
 use crate::lobby::identity::{Peer, Principal};
 use crate::lobby::metrics::Metrics;
 
+const PER_PRINCIPAL_LIMIT: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OperationState {
@@ -83,6 +85,7 @@ struct VmLock {
 struct State {
     closing: bool,
     active: usize,
+    principals: HashMap<Principal, usize>,
     entries: HashMap<String, Entry>,
     locks: HashMap<String, VmLock>,
 }
@@ -192,6 +195,12 @@ impl Registry {
                     "operation admission limit reached",
                 ));
             }
+            if state.principals.get(&owner).copied().unwrap_or_default() >= PER_PRINCIPAL_LIMIT {
+                return Err(Failure::new(
+                    Code::Limit,
+                    "principal operation admission limit reached",
+                ));
+            }
             let now = Utc::now();
             let id = new_id(now)?;
             prune(&mut state, now);
@@ -222,12 +231,17 @@ impl Registry {
                 },
             );
             state.active += 1;
+            *state
+                .principals
+                .entry(operation.principal.clone())
+                .or_default() += 1;
             self.inner.metrics.job(1);
             self.inner.active.send_replace(state.active);
             (operation, reservation)
         };
         let inner = self.inner.clone();
         let id = operation.id.clone();
+        let owner = operation.principal.clone();
         let started = std::time::Instant::now();
         tokio::spawn(async move {
             let cancel = inner.cancel.child_token();
@@ -295,6 +309,12 @@ impl Registry {
                 entry.changed.send_replace(());
             }
             state.active -= 1;
+            if let Some(count) = state.principals.get_mut(&owner) {
+                *count -= 1;
+                if *count == 0 {
+                    state.principals.remove(&owner);
+                }
+            }
             inner.metrics.job(-1);
             inner.active.send_replace(state.active);
         });
@@ -799,5 +819,51 @@ mod tests {
         release_tx.send(()).unwrap();
         task.await.unwrap();
         assert!(registry.inner.state.lock().locks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn principal_cap_includes_queued_jobs_and_releases_after_completion() {
+        let registry = Registry::new(
+            CancellationToken::new(),
+            1024,
+            Arc::new(crate::lobby::metrics::Metrics::new()),
+        );
+        let release = CancellationToken::new();
+        let mut operations = Vec::new();
+        for _ in 0..16 {
+            let release = release.clone();
+            operations.push(
+                submit(
+                    &registry,
+                    "restart",
+                    "vm",
+                    owner(),
+                    move |_, _| async move {
+                        release.cancelled().await;
+                        Ok(())
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let error =
+            submit(&registry, "restart", "vm", owner(), |_, _| async { Ok(()) }).unwrap_err();
+        assert_eq!(error.code, Code::Limit);
+        assert_eq!(error.exit, 6);
+        let other = Principal::parse("user:2").unwrap();
+        submit(&registry, "start", "other-vm", other, |_, _| async {
+            Ok(())
+        })
+        .unwrap();
+        release.cancel();
+        for operation in operations {
+            assert_eq!(
+                finished(&registry, &operation.id).await.state,
+                OperationState::Succeeded
+            );
+        }
+        submit(&registry, "start", "vm", owner(), |_, _| async { Ok(()) }).unwrap();
+        registry.drained().await;
+        assert!(registry.inner.state.lock().principals.is_empty());
     }
 }

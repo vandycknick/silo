@@ -1432,6 +1432,7 @@ store for both CA entries, including an external FileStore or custom filename.
 The reserved names are `silo.tls_ca.certificate` and `silo.tls_ca.private_key`.
 Non-intercepting starts do not create or import a TLS CA.
 
+
 Resolution, validation and paired writes share one atomic scope transaction.
 Partial, malformed, mismatched, expired or not-yet-valid material fails without
 replacement. Each input contains exactly one PEM block. Certificates require
@@ -1460,6 +1461,15 @@ The old exported `ensure_certificate_authority` and path-bearing
 or operator import instead. netd no longer accepts TLS CA file flags or session
 file paths; TLS-terminating sessions validate their Static source before
 opening listeners.
+
+Policy credentials normally resolve in Machine scope first, then Home scope.
+`MachineBuilder::secret_scope(SecretScopePolicy::MachineOnly)` permanently
+restricts a machine to its own scope. The restriction survives policy and label
+updates, snapshots, forks and handoff. The lobby sets it for every VM it creates.
+Prospective lobby policy checks also use Machine-only semantics: missing slots
+are reported without reading Home, even before a machine exists. Machine-scoped
+Tailscale auth keys continue to resolve normally; locally created VMs retain
+Machine-then-Home fallback by default.
 
 ## Runtime Components
 

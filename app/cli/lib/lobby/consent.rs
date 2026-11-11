@@ -9,6 +9,7 @@ use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use tokio::{sync::oneshot, time::Instant};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use crate::config::tailscale::EnrollmentMode;
 use crate::lobby::{
@@ -186,7 +187,7 @@ pub(crate) struct Callback {
 pub(crate) struct OAuth {
     registry: Arc<Registry>,
     client_id: String,
-    secret: String,
+    secret: Zeroizing<String>,
     redirect: String,
     endpoint: reqwest::Url,
     client: reqwest::Client,
@@ -196,7 +197,7 @@ impl OAuth {
     /// The optional base changes only the token endpoint, never the consent URL.
     pub(crate) fn new(
         registry: Arc<Registry>,
-        secret: String,
+        secret: Zeroizing<String>,
         redirect: String,
         base: Option<&str>,
     ) -> Outcome<Self> {
@@ -537,12 +538,27 @@ mod tests {
         Arc::new(
             OAuth::new(
                 registry,
-                SECRET.into(),
+                SECRET.to_owned().into(),
                 "https://lobby.tail.test/oauth/callback".into(),
                 base,
             )
             .unwrap(),
         )
+    }
+    #[test]
+    fn oauth_retains_the_zeroizing_secret_allocation() {
+        let secret = zeroize::Zeroizing::new(SECRET.to_owned());
+        let allocation = secret.as_ptr();
+        let oauth = OAuth::new(
+            Arc::new(Registry::new()),
+            secret,
+            "https://lobby.tail.test/oauth/callback".into(),
+            None,
+        )
+        .unwrap();
+        let stored: &zeroize::Zeroizing<String> = &oauth.secret;
+        assert_eq!(stored.as_ptr(), allocation);
+        assert_eq!(stored.as_str(), SECRET);
     }
 
     fn manager(oauth: Arc<OAuth>) -> Arc<Manager> {

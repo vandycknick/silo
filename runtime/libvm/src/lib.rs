@@ -17,6 +17,7 @@ mod paths;
 pub mod planning;
 mod runtime;
 mod secrets;
+pub use crate::secrets::SecretScopePolicy;
 mod ssh_ca;
 pub mod storage;
 mod store;

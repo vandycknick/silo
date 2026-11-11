@@ -48,6 +48,7 @@ tempfile = "3.27.0"
 russh = "0.62.4"
 hyper = { version = "1.11.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
+zeroize = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 tower = "0.5.3"

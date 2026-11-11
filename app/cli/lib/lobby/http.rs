@@ -164,6 +164,18 @@ async fn route(
                     )
                 }
             };
+            if request.uri().path() == "/metrics"
+                && !peer
+                    .principals
+                    .iter()
+                    .any(|principal| principal.as_str() == service.config().settings.tag())
+            {
+                return response(
+                    StatusCode::FORBIDDEN,
+                    "text/plain; charset=utf-8",
+                    "forbidden\n".into(),
+                );
+            }
             match service.health(&peer).await {
                 Ok(_) if request.uri().path() == "/metrics" => {
                     let mut text = String::from("lobby_runtime_ready 1\nlobby_tailnet_ready 1\n");
@@ -363,7 +375,10 @@ mod tests {
 
     fn peer(read: bool) -> Peer {
         Peer {
-            principals: vec![Principal::parse("user:1").unwrap()],
+            principals: vec![
+                Principal::parse("user:1").unwrap(),
+                Principal::parse("tag:silo").unwrap(),
+            ],
             node_id: "actual-node".into(),
             observed_at: chrono::Utc::now(),
             permissions: Permissions {
@@ -449,6 +464,40 @@ mod tests {
             )
             .await;
             assert!(output.starts_with("HTTP/1.1 404 "), "{output}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_requires_the_configured_lobby_tag_but_health_does_not() {
+        let fixture = testing::fixture().await;
+        let service = Arc::new(fixture.service.clone());
+        for (tag, metrics_status) in [
+            (None, 403),
+            (Some("tag:other"), 403),
+            (Some("tag:silo"), 200),
+        ] {
+            let source: IdentitySource = Arc::new(move |_| {
+                Arc::new(move || {
+                    let mut peer = peer(true);
+                    peer.principals = vec![Principal::parse("user:1").unwrap()];
+                    if let Some(tag) = tag {
+                        peer.principals.push(Principal::parse(tag).unwrap());
+                    }
+                    Box::pin(async move { Ok(peer) })
+                })
+            });
+            for (path, status) in [("/healthz", 200), ("/metrics", metrics_status)] {
+                let output = request(
+                    service.clone(),
+                    source.clone(),
+                    &format!("GET {path} HTTP/1.1\r\nHost: lobby\r\nConnection: close\r\n\r\n"),
+                )
+                .await;
+                assert!(
+                    output.starts_with(&format!("HTTP/1.1 {status} ")),
+                    "{output}"
+                );
+            }
         }
     }
 
@@ -622,7 +671,7 @@ mod tests {
         let oauth = Arc::new(
             OAuth::new(
                 Arc::new(Registry::new()),
-                "tskey-app-id-fixture-secret".into(),
+                String::from("tskey-app-id-fixture-secret").into(),
                 "https://lobby.tail.test/oauth/callback".into(),
                 Some(&base),
             )

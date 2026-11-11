@@ -10,6 +10,9 @@ reserved for redacted logs. `tsgate version` prints the protocol implementation
 version. Other descriptor numbers are supported; no environment credentials or
 additional CLI configuration are accepted. Ambient `TS_`, `TSNET_`, and
 `SILO_NET_` variables are cleared before Tailscale package initialization.
+Tsgate always disables tsnet log upload, including uploads to `log.tailscale.com`;
+this policy cannot be overridden by ambient environment variables. Redacted
+local stderr logs remain enabled.
 
 The first length-prefixed JSON frame is version-1 `bootstrap`. The private wire
 contract lives in `.tmp/plan/tsgate-L2-wire.md`. tsgate owns enrollment, a private
@@ -19,6 +22,10 @@ control identity pin can accept connections. Persisted hostname, advertised tag,
 profile identity and node key determine whether enrollment needs another key;
 this local check does not replace live tag verification. SCM_RIGHTS forwards one
 Unix stream per tailnet connection, preserving bidirectional half-close.
+Both listeners share a cap of 256 concurrent proxied connections and 32 per
+remote IP, regardless of port. Excess connections are closed before allocating
+a forwarding socketpair or notifying silod; slots are released when the relay
+ends, including failures to hand off the stream.
 Owner loss interrupts all streams immediately; explicit shutdown allows up to
 four seconds to drain before forced cleanup, with a five-second total limit.
 WhoIs lookups run concurrently, capped at 32 in flight; excess requests receive
