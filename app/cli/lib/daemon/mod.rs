@@ -3,7 +3,7 @@
 pub(crate) mod docker;
 pub(crate) mod service;
 
-mod control;
+pub(crate) mod control;
 mod engine;
 mod provision;
 mod record;
