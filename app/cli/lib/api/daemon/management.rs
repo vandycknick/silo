@@ -544,6 +544,25 @@ impl DaemonVmService {
                 .into_inner(),
         )?)
     }
+    pub(crate) async fn update_kernel_args(
+        &self,
+        value: &str,
+        clear: bool,
+        append: Vec<String>,
+    ) -> eyre::Result<MachineData> {
+        Ok(snapshots::snapshot_from_wire(
+            self.machines
+                .clone()
+                .update_kernel_args(w::UpdateKernelArgsRequest {
+                    machine: Some(reference(value)?),
+                    clear,
+                    append,
+                })
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
     pub(crate) async fn ensure_name_available(&self, name: &str) -> eyre::Result<()> {
         self.machines
             .clone()

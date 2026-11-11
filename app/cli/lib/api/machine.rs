@@ -82,7 +82,7 @@ impl AppMachine {
 
     pub(crate) async fn inspect(&self) -> Result<MachineData, libvm::LibVmError> {
         match self {
-            Self::Local { native, .. } => native.inspect().await,
+            Self::Local { native, .. } => Box::pin(native.inspect()).await,
             Self::Daemon { id, service, .. } => service.inspect(id).await,
         }
     }
@@ -93,9 +93,7 @@ impl AppMachine {
     ) -> eyre::Result<MachineStart> {
         let result = match self {
             Self::Local { native, home } => {
-                native
-                    .start_with_options(options.into_native(home, &native.id())?)
-                    .await
+                Box::pin(native.start_with_options(options.into_native(home, &native.id())?)).await
             }
             Self::Daemon { id, service, .. } => service.start_with_options(id, options).await,
         };
@@ -110,6 +108,21 @@ impl AppMachine {
             Self::Local { native, .. } => native.wait_ready(timeout).await,
             Self::Daemon { id, service, .. } => service.wait_ready(id, timeout).await,
         }
+    }
+
+    pub(crate) fn serial_log_path(&self) -> std::path::PathBuf {
+        self.home()
+            .join("logs/machines")
+            .join(self.id())
+            .join("serial.log")
+    }
+
+    pub(crate) fn readiness_failure(&self, readiness: &MachineReadiness) -> eyre::Report {
+        crate::api::readiness_failure(
+            readiness.outcome,
+            readiness.status.vm.message.as_deref(),
+            &self.serial_log_path(),
+        )
     }
 
     pub(crate) async fn stop_run(

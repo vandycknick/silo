@@ -220,6 +220,15 @@ pub fn sleep(seconds: u32) {
     }
 }
 
+pub fn sync() {
+    unsafe { libc::sync() }
+}
+
+pub fn power_off() {
+    // This no_std init uses libc wrappers throughout; nix requires std.
+    unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
+}
+
 pub fn exit(code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }

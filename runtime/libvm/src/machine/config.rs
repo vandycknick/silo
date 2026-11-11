@@ -11,6 +11,34 @@ use crate::utils::now_unix;
 use crate::LibVmError;
 
 impl Machine {
+    /// Appends user kernel arguments, optionally clearing previous user arguments.
+    ///
+    /// The builder-owned root marker is preserved. The stopped configuration
+    /// replacement path still admits every argument and refuses reserved selectors.
+    pub async fn update_kernel_args(
+        &self,
+        clear: bool,
+        append: Vec<String>,
+    ) -> Result<MachineData, LibVmError> {
+        if !clear && append.is_empty() {
+            return Err(LibVmError::InvalidMachineUpdate {
+                reference: self.id(),
+                reason: "at least one kernel argument or an explicit clear is required".to_owned(),
+            });
+        }
+        let mut spec = self.inspect().await?.spec;
+        let kernel = spec
+            .boot
+            .as_mut()
+            .and_then(|boot| boot.kernel.as_mut())
+            .ok_or_else(|| LibVmError::InvalidMachineUpdate {
+                reference: self.id(),
+                reason: "kernel arguments require direct kernel boot".to_owned(),
+            })?;
+        update_kernel_cmdline(&mut kernel.cmdline, clear, append);
+        self.replace_config(spec).await
+    }
+
     /// Replaces the VM spec for a stopped machine.
     pub async fn replace_config(&self, mut spec: VmSpec) -> Result<MachineData, LibVmError> {
         let kernel = spec.boot.as_ref().and_then(|boot| boot.kernel.as_ref());
@@ -569,6 +597,13 @@ impl Machine {
     }
 }
 
+fn update_kernel_cmdline(cmdline: &mut Vec<String>, clear: bool, append: Vec<String>) {
+    if clear {
+        cmdline.retain(|argument| argument == crate::machine::root_storage::ROOT_MARKER);
+    }
+    cmdline.extend(append);
+}
+
 fn reject_boot_path_change(
     current: &VmSpec,
     replacement: &VmSpec,
@@ -696,6 +731,66 @@ mod tests {
             .await
             .unwrap();
         (home, runtime, machine)
+    }
+
+    #[test]
+    fn kernel_argument_clear_preserves_only_the_builder_root_marker() {
+        use crate::machine::config::update_kernel_cmdline;
+        use crate::machine::root_storage::ROOT_MARKER;
+
+        for initial in [
+            Vec::new(),
+            vec!["quiet".to_owned()],
+            vec![ROOT_MARKER.to_owned(), "quiet".to_owned()],
+        ] {
+            let mut args = initial.clone();
+            update_kernel_cmdline(&mut args, false, vec!["silo.rescue=on-failure".into()]);
+            assert_eq!(&args[..initial.len()], initial);
+            assert_eq!(args.last().unwrap(), "silo.rescue=on-failure");
+            update_kernel_cmdline(&mut args, true, vec!["silo.rescue=always".into()]);
+            let expected = if initial
+                .first()
+                .is_some_and(|argument| argument == ROOT_MARKER)
+            {
+                vec![ROOT_MARKER, "silo.rescue=always"]
+            } else {
+                vec!["silo.rescue=always"]
+            };
+            assert_eq!(args, expected);
+            update_kernel_cmdline(&mut args, true, Vec::new());
+            assert!(args.iter().all(|argument| argument == ROOT_MARKER));
+        }
+    }
+
+    #[tokio::test]
+    async fn kernel_argument_updates_use_existing_configuration_admission() {
+        let (_home, _runtime, machine) = stopped_storage_machine("kernel-args-update").await;
+        let original = machine.inspect().await.unwrap().spec;
+        assert!(machine.update_kernel_args(false, Vec::new()).await.is_err());
+        machine
+            .update_kernel_args(false, vec!["quiet".into()])
+            .await
+            .unwrap();
+        let accepted = machine.inspect().await.unwrap().spec;
+        for reserved in [
+            "rdinit=/bin/sh",
+            "root=/dev/vdb",
+            "rootfstype=ext4",
+            "rootflags=ro",
+        ] {
+            let error = machine
+                .update_kernel_args(true, vec![reserved.into()])
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::LibVmError::InvalidKernelArguments { reason }
+                    if reason.contains("reserved") && !reason.contains("/bin/sh") && !reason.contains("/dev/vdb")
+            ));
+            assert_eq!(machine.inspect().await.unwrap().spec, accepted);
+        }
+        let cleared = machine.update_kernel_args(true, Vec::new()).await.unwrap();
+        assert_eq!(cleared.spec, original);
     }
 
     #[tokio::test]

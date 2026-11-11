@@ -34,6 +34,8 @@ const SETTINGS: &[(&str, &str)] = &[
         "user=none|auto|NAME:UID:GID:HOME",
         "Experimental: configure guest-user provisioning",
     ),
+    ("kernel-arg=ARG", "Append a direct-boot kernel argument; repeatable, stopped VMs only"),
+    ("kernel-args=", "Clear user kernel arguments; stopped VMs only"),
     (
         "boot-assets=packaged|sha256:HEX|files",
         "Explicitly replace the pinned boot bundle of a stopped VM; never combined with other settings",
@@ -49,6 +51,7 @@ const EXAMPLES: &[&str] = &[
     "silo set dev name=ubuntu disk=64G",
     "silo set dev network=private rosetta=true",
     "silo set dev boot-assets=packaged",
+    "silo set dev kernel-arg=silo.rescue=on-failure",
 ];
 
 #[derive(Debug, Args)]
@@ -78,6 +81,16 @@ impl Cmd {
         let parsed = ParsedSet::parse(&self.args)?;
         let reference = context.resolve_machine_name(parsed.machine.as_deref())?;
         let update = match parsed.operation {
+            SetOperation::KernelArgs { clear, append } => {
+                let data = context
+                    .app_api()
+                    .await?
+                    .update_kernel_args(&reference, clear, append)
+                    .await
+                    .map_err(stopped_hint)?;
+                ui::success(format!("updated kernel arguments of {}", data.name));
+                return Ok(());
+            }
             SetOperation::BootAssets(update) => {
                 let data = context
                     .app_api()
@@ -126,11 +139,12 @@ fn stopped_hint(err: eyre::Report) -> eyre::Report {
     }
 }
 
-/// Ordinary settings form one atomic update; a boot-bundle replacement is its
-/// own explicit operation and is never mixed with them.
+/// Ordinary settings form one atomic update; boot-bundle and kernel-argument
+/// replacements use their own explicit operations.
 enum SetOperation {
     Update(Box<MachineUpdate>),
     BootAssets(libvm::BootAssetsUpdate),
+    KernelArgs { clear: bool, append: Vec<String> },
 }
 
 struct ParsedSet {
@@ -157,6 +171,8 @@ impl ParsedSet {
         let mut update = MachineUpdate::new();
         let mut seen = Vec::new();
         let mut boot = BootSettings::default();
+        let mut clear_kernel_args = false;
+        let mut kernel_args = Vec::new();
         for setting in settings {
             let (key, value) = setting
                 .split_once('=')
@@ -164,11 +180,11 @@ impl ParsedSet {
             if key.is_empty() {
                 eyre::bail!("invalid setting {setting:?}; key cannot be empty");
             }
-            if value.is_empty() {
+            let key = normalize_key(key)?;
+            if value.is_empty() && key != "kernel-args" {
                 eyre::bail!("invalid setting {setting:?}; value cannot be empty");
             }
-            let key = normalize_key(key)?;
-            if seen.contains(&key) {
+            if key != "kernel-arg" && seen.contains(&key) {
                 eyre::bail!("setting {key:?} specified more than once");
             }
             seen.push(key);
@@ -215,6 +231,16 @@ impl ParsedSet {
                         ),
                     };
                 }
+                "kernel-arg" => kernel_args.push(value.to_owned()),
+                "kernel-args" => {
+                    if !value.is_empty() {
+                        eyre::bail!(
+                            "kernel-args only accepts an empty value to clear user arguments"
+                        );
+                    }
+                    clear_kernel_args = true;
+                    kernel_args.clear();
+                }
                 "boot-assets" => boot.assets = Some(value.to_owned()),
                 "boot-kernel" => boot.kernel = Some(host_file(value)?),
                 "boot-initramfs" => boot.initramfs = Some(host_file(value)?),
@@ -229,7 +255,18 @@ impl ParsedSet {
         }
 
         let boot_keys = seen.iter().filter(|key| key.starts_with("boot-")).count();
-        let operation = if boot_keys == 0 {
+        let kernel_keys = seen.iter().filter(|key| key.starts_with("kernel-")).count();
+        let operation = if kernel_keys != 0 {
+            if kernel_keys != seen.len() {
+                eyre::bail!(
+                    "kernel arguments replace boot configuration; apply other settings separately"
+                );
+            }
+            SetOperation::KernelArgs {
+                clear: clear_kernel_args,
+                append: kernel_args,
+            }
+        } else if boot_keys == 0 {
             SetOperation::Update(Box::new(update))
         } else if boot_keys != seen.len() {
             eyre::bail!(
@@ -306,12 +343,14 @@ fn normalize_key(key: &str) -> eyre::Result<&'static str> {
         "rosetta" => Ok("rosetta"),
         "agent" => Ok("agent"),
         "user" => Ok("user"),
+        "kernel-arg" => Ok("kernel-arg"),
+        "kernel-args" => Ok("kernel-args"),
         "boot-assets" => Ok("boot-assets"),
         "boot-kernel" => Ok("boot-kernel"),
         "boot-initramfs" => Ok("boot-initramfs"),
         "boot-agent" => Ok("boot-agent"),
         _ => Err(eyre::eyre!(
-            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, tmpfs-size, network, nested-virtualization, rosetta, agent, user, boot-assets, boot-kernel, boot-initramfs, boot-agent"
+            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, tmpfs-size, network, nested-virtualization, rosetta, agent, user, kernel-arg, kernel-args, boot-assets, boot-kernel, boot-initramfs, boot-agent"
         )),
     }
 }
@@ -366,6 +405,7 @@ mod tests {
         match ParsedSet::parse(&args).expect("parse set args").operation {
             SetOperation::Update(update) => *update,
             SetOperation::BootAssets(_) => panic!("expected an ordinary update"),
+            SetOperation::KernelArgs { .. } => panic!("expected an ordinary update"),
         }
     }
 
@@ -374,6 +414,56 @@ mod tests {
         match ParsedSet::parse(&args)?.operation {
             SetOperation::BootAssets(update) => Ok(update.selection),
             SetOperation::Update(_) => panic!("expected a boot-assets operation"),
+            SetOperation::KernelArgs { .. } => panic!("expected a boot-assets operation"),
+        }
+    }
+
+    #[test]
+    fn kernel_arguments_append_and_clear_in_command_order() {
+        let parsed = ParsedSet::parse(&[
+            "dev".into(),
+            "kernel-arg=quiet".into(),
+            "kernel-arg=silo.rescue=on-failure".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.machine.as_deref(), Some("dev"));
+        let SetOperation::KernelArgs { clear, append } = parsed.operation else {
+            panic!("expected kernel arguments");
+        };
+        assert!(!clear);
+        assert_eq!(append, ["quiet", "silo.rescue=on-failure"]);
+
+        let parsed = ParsedSet::parse(&[
+            "kernel-arg=discarded".into(),
+            "kernel-args=".into(),
+            "kernel-arg=silo.rescue=always".into(),
+        ])
+        .unwrap();
+        let SetOperation::KernelArgs { clear, append } = parsed.operation else {
+            panic!("expected kernel arguments");
+        };
+        assert!(clear);
+        assert_eq!(append, ["silo.rescue=always"]);
+        assert!(matches!(
+            ParsedSet::parse(&["kernel-args=".into()]).unwrap().operation,
+            SetOperation::KernelArgs { clear: true, append } if append.is_empty()
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_or_mixed_kernel_argument_updates() {
+        for settings in [
+            vec!["kernel-arg="],
+            vec!["kernel-args=quiet"],
+            vec!["kernel-args=", "kernel-args="],
+            vec!["kernel-arg=quiet", "cpus=2"],
+            vec!["kernel-args=", "boot-assets=packaged"],
+        ] {
+            let args: Vec<String> = settings
+                .iter()
+                .map(|setting| (*setting).to_owned())
+                .collect();
+            assert!(ParsedSet::parse(&args).is_err(), "{settings:?}");
         }
     }
 

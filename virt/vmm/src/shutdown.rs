@@ -101,12 +101,12 @@ pub async fn run(
                 errors.push(error.to_string());
             }
             match wait_for_machine_stop(&ctx.machine).await {
-                Ok(info) => record_stop(&ctx, info, &mut errors),
+                Ok(info) => record_stop(&ctx.store, info, false, &mut errors),
                 Err(error) => errors.push(error.to_string()),
             }
         }
         ShutdownTrigger::Backend(info) => {
-            record_stop(&ctx, info, &mut errors);
+            record_stop(&ctx.store, info, true, &mut errors);
             if let Err(error) = ctx.machine.stop().await {
                 errors.push(error.to_string());
             }
@@ -134,13 +134,57 @@ pub async fn run(
     }
 }
 
-fn record_stop(ctx: &DaemonContext, info: VmStopInfo, errors: &mut Vec<String>) {
-    if let Err(error) = ctx.store.set_vm_state(VmState::Stopped, info.message) {
+fn record_stop(
+    store: &crate::state::InstanceStore,
+    mut info: VmStopInfo,
+    guest_initiated: bool,
+    errors: &mut Vec<String>,
+) {
+    if guest_initiated {
+        match store.has_been_ready() {
+            Ok(false) if info.error.is_none() && !info.forced => {
+                info.state = VmState::Failed;
+                info.message = BOOT_POWER_OFF_MESSAGE.to_string();
+                info.error = Some(info.message.clone());
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if let Err(error) = store.set_vm_state(info.state, info.message) {
         errors.push(error.to_string());
     }
     if let Some(error) = info.error {
-        errors.push(format!("virtual machine exited with error: {error}"));
+        errors.push(error);
     }
+}
+
+pub(crate) const BOOT_POWER_OFF_MESSAGE: &str = "guest powered off during boot; see serial log";
+
+pub(crate) fn backend_exit_error(
+    store: &crate::state::InstanceStore,
+    exit: Result<VmExit, crate::virt::VirtError>,
+) -> eyre::Report {
+    let mut errors = Vec::new();
+    match exit {
+        Ok(exit) => record_stop(store, vm_stop_info(exit), true, &mut errors),
+        Err(error) => errors.push(error.to_string()),
+    }
+    if errors.is_empty() {
+        eyre::eyre!("guest exited before startup completed")
+    } else {
+        eyre::eyre!(errors.join("; "))
+    }
+}
+
+pub(crate) async fn ensure_boot_alive(
+    machine: &crate::virt::VirtualMachine,
+    store: &crate::state::InstanceStore,
+) -> eyre::Result<()> {
+    if let Some(exit) = machine.try_wait().await? {
+        return Err(backend_exit_error(store, Ok(exit)));
+    }
+    Ok(())
 }
 
 enum ShutdownTrigger {
@@ -291,6 +335,8 @@ async fn drain_result_task(
 }
 
 struct VmStopInfo {
+    state: VmState,
+    forced: bool,
     message: String,
     error: Option<String>,
 }
@@ -309,7 +355,12 @@ fn vm_stop_info(exit: VmExit) -> VmStopInfo {
         None if exit.forced() => "machine force-stopped".to_string(),
         None => "machine stopped".to_string(),
     };
-    VmStopInfo { message, error }
+    VmStopInfo {
+        state: VmState::Stopped,
+        forced: exit.forced(),
+        message,
+        error,
+    }
 }
 
 async fn cleanup(_runtime: &RuntimeContext, ctx: &DaemonContext) -> eyre::Result<()> {
@@ -348,5 +399,88 @@ mod tests {
 
         assert_eq!(info.message, "machine stopped");
         assert_eq!(info.error, None);
+    }
+
+    #[cfg(feature = "mock-backend")]
+    #[tokio::test]
+    async fn guest_boot_poweroff_fails_but_host_stop_remains_stopped() {
+        use crate::shutdown::{record_stop, wait_for_machine_stop, BOOT_POWER_OFF_MESSAGE};
+        use crate::virt::{BackendKind, VirtualMachine, VmConfig};
+        use protocol::v1::VmState;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        for (guest_initiated, expected) in [(true, VmState::Failed), (false, VmState::Stopped)] {
+            let root = std::env::temp_dir().join(format!("boot-poweroff-{}", uuid::Uuid::new_v4()));
+            let mut config = VmConfig::builder("boot-poweroff")
+                .base_directory(&root)
+                .kernel("/mock-kernel")
+                .build();
+            config.set_resolved_mock_scenario(Arc::new(test_utils::Scenario {
+                run: test_utils::RunScenario {
+                    power_off_after_ms: guest_initiated.then_some(10),
+                    ..Default::default()
+                },
+                agent: test_utils::AgentScenario {
+                    never_ready: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+            let machine = VirtualMachine::with_backend(BackendKind::Mock, config).unwrap();
+            let store = crate::state::new_instance_store(
+                uuid::Uuid::new_v4().to_string(),
+                "boot-poweroff".into(),
+                true,
+            );
+            machine.start().await.unwrap();
+            store.set_vm_state(VmState::Running, "running").unwrap();
+            if !guest_initiated {
+                machine.stop().await.unwrap();
+            }
+            let info =
+                tokio::time::timeout(Duration::from_secs(2), wait_for_machine_stop(&machine))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut errors = Vec::new();
+            record_stop(&store, info, guest_initiated, &mut errors);
+            let vm = store.status().unwrap().vm.unwrap();
+            assert_eq!(vm.state, Some(expected as i32));
+            if guest_initiated {
+                assert_eq!(vm.message.as_deref(), Some(BOOT_POWER_OFF_MESSAGE));
+                assert_eq!(errors, [BOOT_POWER_OFF_MESSAGE]);
+            } else {
+                assert_eq!(vm.message.as_deref(), Some("machine stopped"));
+                assert!(errors.is_empty());
+            }
+            machine.stop().await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn guest_poweroff_after_first_readiness_is_not_a_boot_failure() {
+        use protocol::v1::VmState;
+        let store = crate::state::new_instance_store(
+            uuid::Uuid::new_v4().to_string(),
+            "ready-once".into(),
+            false,
+        );
+        store.set_vm_state(VmState::Running, "running").unwrap();
+        assert!(store.has_been_ready().unwrap());
+        store.set_vm_state(VmState::Stopping, "stopping").unwrap();
+        let mut errors = Vec::new();
+        crate::shutdown::record_stop(
+            &store,
+            crate::shutdown::vm_stop_info(VmExit::stopped(StartupStage::Started)),
+            true,
+            &mut errors,
+        );
+        assert_eq!(
+            store.status().unwrap().vm.unwrap().state,
+            Some(VmState::Stopped as i32)
+        );
+        assert!(errors.is_empty());
     }
 }

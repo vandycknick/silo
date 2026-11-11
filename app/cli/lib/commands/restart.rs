@@ -62,7 +62,7 @@ impl Cmd {
         let started = context
             .app_api()
             .await?
-            .start_machine(&name, timeout)
+            .start_machine(&name, timeout, true)
             .await?;
 
         spinner.step("Ready", &started.name);

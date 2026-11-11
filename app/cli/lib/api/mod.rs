@@ -32,6 +32,20 @@ pub(crate) enum AppApi {
     Daemon(daemon::DaemonVmService),
 }
 
+pub(crate) fn readiness_failure(
+    outcome: libvm::MachineReadinessOutcome,
+    message: Option<&str>,
+    serial_log: &std::path::Path,
+) -> eyre::Report {
+    let reason = if outcome == libvm::MachineReadinessOutcome::Terminal {
+        message.map(str::to_owned)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| format!("guest readiness check ended with {outcome:?}"));
+    eyre::eyre!("{reason}\nserial log: {}", serial_log.display())
+}
+
 impl AppApi {
     pub(crate) fn local(config: RuntimeConfig) -> Self {
         Self::Local(local::LocalVmService::new(config))
@@ -353,6 +367,18 @@ impl AppApi {
         }
     }
 
+    pub(crate) async fn update_kernel_args(
+        &mut self,
+        reference: &str,
+        clear: bool,
+        append: Vec<String>,
+    ) -> eyre::Result<MachineData> {
+        match self {
+            Self::Local(service) => service.update_kernel_args(reference, clear, append).await,
+            Self::Daemon(service) => service.update_kernel_args(reference, clear, append).await,
+        }
+    }
+
     pub(crate) async fn list_machines(
         &mut self,
     ) -> eyre::Result<Vec<libvm::MachineInventoryEntry>> {
@@ -383,16 +409,17 @@ impl AppApi {
         &mut self,
         reference: &str,
         readiness_timeout: Duration,
+        wait_ready: bool,
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
         let before = machine.inspect().await?;
         crate::commands::start::ensure_startable(&before)?;
         let options = AppStartOptions::new();
         let start = machine.start_with_options(options).await?;
-        if crate::commands::start::requires_guest_readiness(&start.machine) {
+        if wait_ready && crate::commands::start::requires_guest_readiness(&start.machine) {
             let readiness = machine.wait_ready(readiness_timeout).await?;
             if readiness.outcome != libvm::MachineReadinessOutcome::Ready {
-                eyre::bail!("guest readiness check ended with {:?}", readiness.outcome);
+                return Err(machine.readiness_failure(&readiness));
             }
         }
         Ok(start.machine)
@@ -600,6 +627,18 @@ mod tests {
 
     use crate::api::AppApi;
 
+    #[test]
+    fn terminal_readiness_error_preserves_reason_and_serial_path() {
+        let message = crate::api::readiness_failure(
+            libvm::MachineReadinessOutcome::Terminal,
+            Some("guest powered off during boot; see serial log"),
+            Path::new("/silo/logs/machines/vm/serial.log"),
+        )
+        .to_string();
+        assert!(message.contains("guest powered off during boot; see serial log"));
+        assert!(message.contains("/silo/logs/machines/vm/serial.log"));
+    }
+
     #[tokio::test]
     async fn local_api_uses_only_its_explicit_disposable_roots() {
         let temp = tempfile::tempdir().expect("create disposable application roots");
@@ -750,7 +789,7 @@ mod tests {
             .await
             .unwrap();
         let message = api
-            .start_machine("secret-hint", std::time::Duration::from_secs(1))
+            .start_machine("secret-hint", std::time::Duration::from_secs(1), true)
             .await
             .unwrap_err()
             .to_string();
@@ -774,6 +813,150 @@ mod tests {
             libvm::MachineStatus::Stopped
         );
         created.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_no_wait_returns_for_an_agent_that_never_becomes_ready() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let scenario = temp.path().join("scenario.json");
+        test_utils::Scenario {
+            agent: test_utils::AgentScenario {
+                never_ready: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .write_to(&scenario)
+        .unwrap();
+        let config = isolated_runtime_config(temp.path(), &temp.path().join("home"))
+            .with_mock_vmm(&scenario);
+        let mut api = AppApi::local(config);
+        let machine = create_idle_fixture(&mut api, temp.path(), "no-wait").await;
+        let result = api.start_machine("no-wait", Duration::ZERO, false).await;
+        let observed = Box::pin(machine.inspect()).await.unwrap();
+        Box::pin(
+            machine.kill_with(libvm::MachineKillOptions::new().timeout(Duration::from_secs(10))),
+        )
+        .await
+        .unwrap();
+        let data = result.expect("no-wait must not wait for guest readiness");
+        assert!(data.is_running());
+        assert!(!observed.status.ready());
+
+        let result = api.start_machine("no-wait", Duration::ZERO, true).await;
+        Box::pin(
+            machine.kill_with(libvm::MachineKillOptions::new().timeout(Duration::from_secs(10))),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "ordinary start must still wait for readiness"
+        );
+        machine.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn kernel_arguments_use_stopped_config_admission() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut api = AppApi::local(isolated_runtime_config(
+            temp.path(),
+            &temp.path().join("home"),
+        ));
+        let machine = create_idle_fixture(&mut api, temp.path(), "kernel-args").await;
+        let original = Box::pin(machine.inspect()).await.unwrap().spec;
+        let data = api
+            .update_kernel_args("kernel-args", false, vec!["quiet".into()])
+            .await
+            .unwrap();
+        assert_eq!(cmdline(&data), ["quiet"]);
+        let data = api
+            .update_kernel_args(
+                "kernel-args",
+                false,
+                vec!["silo.rescue=on-failure".into(), "debug".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(cmdline(&data), ["quiet", "silo.rescue=on-failure", "debug"]);
+        let accepted = data.spec;
+        for reserved in [
+            "rdinit=/bin/sh",
+            "root=/dev/vdb",
+            "rootfstype=ext4",
+            "rootflags=ro",
+            "\"rdinit=/bin/sh\"",
+            "quiet root=/dev/vdb",
+        ] {
+            assert!(
+                api.update_kernel_args("kernel-args", false, vec![reserved.into()])
+                    .await
+                    .is_err(),
+                "{reserved}"
+            );
+            assert_eq!(Box::pin(machine.inspect()).await.unwrap().spec, accepted);
+        }
+        let cleared = api
+            .update_kernel_args("kernel-args", true, Vec::new())
+            .await
+            .unwrap();
+        assert!(cmdline(&cleared).is_empty());
+        assert_eq!(cleared.spec, original);
+        api.start_machine("kernel-args", Duration::from_secs(10), true)
+            .await
+            .unwrap();
+        let result = api
+            .update_kernel_args("kernel-args", false, vec!["debug".into()])
+            .await;
+        let current = Box::pin(machine.inspect()).await.unwrap().spec;
+        Box::pin(
+            machine.kill_with(libvm::MachineKillOptions::new().timeout(Duration::from_secs(10))),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<libvm::LibVmError>(),
+            Some(libvm::LibVmError::MachineAlreadyRunning { .. })
+        ));
+        assert_eq!(current, original);
+        machine.remove().await.unwrap();
+    }
+
+    fn cmdline(data: &libvm::MachineData) -> &[String] {
+        &data
+            .spec
+            .boot
+            .as_ref()
+            .unwrap()
+            .kernel
+            .as_ref()
+            .unwrap()
+            .cmdline
+    }
+
+    async fn create_idle_fixture(api: &mut AppApi, root: &Path, name: &str) -> libvm::Machine {
+        let disk = root.join(format!("{name}.img"));
+        disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+            .and_then(|formatter| formatter.close())
+            .unwrap();
+        let AppApi::Local(service) = api else {
+            panic!("explicit local fixture");
+        };
+        let builder = service
+            .runtime()
+            .await
+            .unwrap()
+            .machine()
+            .name(name)
+            .image_source(libvm::ImageSource::Disk(
+                crate::commands::create::disk_create_request(disk, &Default::default()).unwrap(),
+            ))
+            .network(|network| network.none());
+        Box::pin(builder.create()).await.unwrap()
     }
 
     fn executable_fixture(parent: &Path, name: &str) -> std::path::PathBuf {

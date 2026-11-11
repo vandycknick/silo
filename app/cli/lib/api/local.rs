@@ -45,8 +45,10 @@ impl LocalVmService {
                 .take()
                 .ok_or_else(|| eyre::eyre!("local runtime configuration was not initialized"))?;
             let runtime = match query.get() {
-                Some(query) => Runtime::new_with_capability_query(config, query.clone()).await,
-                None => Runtime::new(config).await,
+                Some(query) => {
+                    Box::pin(Runtime::new_with_capability_query(config, query.clone())).await
+                }
+                None => Box::pin(Runtime::new(config)).await,
             }
             .context("initialize local libvm adapter")?;
             let provider = libvm::HostCommand::new(
@@ -420,7 +422,8 @@ impl LocalVmService {
     }
 
     pub(crate) async fn inspect_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
-        Ok(self.machine(reference).await?.inspect().await?)
+        let machine = self.machine(reference).await?;
+        Ok(Box::pin(machine.inspect()).await?)
     }
 
     pub(crate) async fn stop_machine(
@@ -457,6 +460,16 @@ impl LocalVmService {
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
         machine.update(update).await.map_err(Into::into)
+    }
+
+    pub(crate) async fn update_kernel_args(
+        &mut self,
+        reference: &str,
+        clear: bool,
+        append: Vec<String>,
+    ) -> eyre::Result<MachineData> {
+        let machine = self.machine(reference).await?;
+        Ok(Box::pin(machine.update_kernel_args(clear, append)).await?)
     }
 
     pub(crate) async fn list_networks(&mut self) -> eyre::Result<Vec<NetworkDefinition>> {

@@ -169,6 +169,28 @@ async fn invalid_mutations_fail_before_runtime_or_admission() {
     );
     assert_eq!(
         service
+            .update_kernel_args(Request::new(w::UpdateKernelArgsRequest::default()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
+            .update_kernel_args(Request::new(w::UpdateKernelArgsRequest {
+                machine: Some(w::MachineRef {
+                    reference: Some(w::machine_ref::Reference::Name("vm".into())),
+                }),
+                clear: false,
+                append: Vec::new(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
             .set_machine_secret(Request::new(w::SetMachineSecretRequest::default()))
             .await
             .unwrap_err()
@@ -907,6 +929,148 @@ async fn handoff_rejects_malformed_streams_over_private_socket_without_native_ef
     assert!(owner.components.get().is_none());
     owner.wait_for_mutations().await.unwrap();
     assert_eq!(owner.capacity.available_permits(), 64);
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn kernel_argument_updates_cross_the_daemon_socket_and_keep_host_admission() {
+    use w::machine_service_client::MachineServiceClient;
+
+    let root = tempfile::tempdir().unwrap();
+    let binary = test_utils::mock_vmm_binary();
+    for name in ["kernel", "initramfs", "agent"] {
+        let bytes = if name == "kernel" {
+            test_utils::direct_kernel::host_kernel("kernel-args-api")
+        } else {
+            b"fixture".to_vec()
+        };
+        let path = root.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let components = libvm::ResolvedRuntimeComponents::from_paths(
+        binary.to_path_buf(),
+        binary.to_path_buf(),
+        root.path().join("kernel"),
+        root.path().join("initramfs"),
+        root.path().join("agent"),
+        root.path().to_path_buf(),
+    )
+    .unwrap();
+    let config = libvm::RuntimeConfig::local(root.path().join("home"))
+        .with_run_root(root.path().join("run"))
+        .with_runtime_components(components.clone())
+        .with_virt_backend(libvm::VirtBackendOverride::Mock { scenario: None });
+    let runtime = libvm::Runtime::new(config.clone()).await.unwrap();
+    let disk = root.path().join("root.raw");
+    disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+        .and_then(|formatter| formatter.close())
+        .unwrap();
+    let machine = runtime
+        .machine()
+        .name("kernel-args-api")
+        .image_source(libvm::ImageSource::Disk(
+            crate::commands::create::disk_create_request(disk, &Default::default()).unwrap(),
+        ))
+        .network(|network| network.none())
+        .create()
+        .await
+        .unwrap();
+    let original = machine.inspect().await.unwrap().spec;
+    let mut owner = state(root.path());
+    Arc::get_mut(&mut owner).unwrap().config = config;
+    assert!(owner.runtime.set(runtime).is_ok());
+    assert!(owner.components.set(components).is_ok());
+    let control = root.path().join("control");
+    let server = socket::BoundServer::bind_at(owner, control.clone()).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let socket = control.join("control.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let mut daemon = MachineServiceClient::new(channel);
+    let reference = w::MachineRef {
+        reference: Some(w::machine_ref::Reference::Name("kernel-args-api".into())),
+    };
+    for argument in ["quiet", "silo.rescue=on-failure"] {
+        daemon
+            .update_kernel_args(w::UpdateKernelArgsRequest {
+                machine: Some(reference.clone()),
+                clear: false,
+                append: vec![argument.into()],
+            })
+            .await
+            .unwrap();
+    }
+    let accepted = machine.inspect().await.unwrap().spec;
+    assert_eq!(
+        accepted
+            .boot
+            .as_ref()
+            .unwrap()
+            .kernel
+            .as_ref()
+            .unwrap()
+            .cmdline,
+        ["quiet", "silo.rescue=on-failure"]
+    );
+    for reserved in [
+        "rdinit=/bin/sh",
+        "root=/dev/vdb",
+        "rootfstype=ext4",
+        "rootflags=ro",
+    ] {
+        let error = daemon
+            .update_kernel_args(w::UpdateKernelArgsRequest {
+                machine: Some(reference.clone()),
+                clear: true,
+                append: vec![reserved.into()],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(
+            silo_vm_control::errors::status_to_native_error(&error).unwrap(),
+            libvm::LibVmError::InvalidKernelArguments { reason } if reason.contains("reserved")
+        ));
+        assert!(error.message().contains("reserved"), "{error}");
+        assert_eq!(machine.inspect().await.unwrap().spec, accepted);
+    }
+    daemon
+        .update_kernel_args(w::UpdateKernelArgsRequest {
+            machine: Some(reference.clone()),
+            clear: true,
+            append: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(machine.inspect().await.unwrap().spec, original);
+    machine.start().await.unwrap();
+    let error = daemon
+        .update_kernel_args(w::UpdateKernelArgsRequest {
+            machine: Some(reference),
+            clear: false,
+            append: vec!["debug".into()],
+        })
+        .await
+        .unwrap_err();
+    machine
+        .kill_with(libvm::MachineKillOptions::new().timeout(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert!(error.message().contains("running"), "{error}");
+    assert_eq!(machine.inspect().await.unwrap().spec, original);
+    machine.remove().await.unwrap();
     shutdown.cancel();
     task.await.unwrap().unwrap();
 }

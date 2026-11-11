@@ -130,6 +130,7 @@ struct State {
     vm_state: VmState,
     vm_changed_at: SystemTime,
     running_since: Option<SystemTime>,
+    ever_ready: bool,
     vm_code: Option<String>,
     vm_message: Option<String>,
     agent_enabled: bool,
@@ -211,6 +212,7 @@ impl InstanceStore {
             vm_state: VmState::Starting,
             vm_changed_at: now,
             running_since: None,
+            ever_ready: false,
             vm_code: None,
             vm_message: Some("vm starting".to_string()),
             agent_enabled,
@@ -305,6 +307,13 @@ impl InstanceStore {
         self.state
             .lock()
             .map(|state| readiness(&state, Instant::now()))
+            .map_err(|_| StoreError::Poisoned)
+    }
+
+    pub(crate) fn has_been_ready(&self) -> Result<bool, StoreError> {
+        self.state
+            .lock()
+            .map(|state| state.ever_ready)
             .map_err(|_| StoreError::Poisoned)
     }
 
@@ -678,6 +687,7 @@ impl InstanceStore {
                 self.agent_parked.send_replace(parked);
             }
             let after = state_log_snapshot(&state, Instant::now());
+            state.ever_ready |= after.ready;
             state.last_log_snapshot = Some(after.clone());
             (before, after)
         };

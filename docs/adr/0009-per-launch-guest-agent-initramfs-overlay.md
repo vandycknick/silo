@@ -285,10 +285,12 @@ reports the machine and relevant host path without configuration contents.
 If injection is disabled, `/agent` is absent from the generated overlay and
 ADR 0008 guest-agent readiness is not required. The base remains independently
 bootable. If `/agent` exists, both payload files are mandatory.
-Any missing, invalid, or uncopyable binary or configuration enters the
-`silo-init` rescue shell before the deferred root transition. There is no
-partial payload preparation and no fallback to an older agent or configuration
-source.
+Any missing, invalid, or uncopyable binary or configuration fails boot before
+the deferred root transition. Init prints a diagnostic, synchronizes filesystems
+and powers off by default. Explicit `silo.rescue=on-failure` or
+`silo.rescue=always` selects the console rescue shell; leaving it powers off.
+There is no partial payload preparation and no fallback to an older agent or
+configuration source.
 
 An agent that cannot parse or validate the copied JSON fails managed boot before
 proceeding beyond configuration validation, writes a bounded diagnostic to the
@@ -357,7 +359,8 @@ Unit and integration tests cover:
 - Explicit custom-initramfs composition.
 - Launch failure before `silo-vmm` starts when generation fails.
 - Copying both payloads into the early `/run` mount.
-- Rescue behavior for each missing, invalid, and failed-copy payload.
+- Default poweroff and explicitly selected rescue behavior for each missing,
+  invalid, and failed-copy payload.
 - Agent configuration parsing and validation when invoked with
   `--config=/run/agent/config.json` by the later handoff contract.
 - Absence of configuration bytes from logs and errors.

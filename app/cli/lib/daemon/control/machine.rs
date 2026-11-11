@@ -480,6 +480,31 @@ impl w::machine_service_server::MachineService for Service {
             .await?,
         ))
     }
+    async fn update_kernel_args(
+        &self,
+        r: Request<w::UpdateKernelArgsRequest>,
+    ) -> Result<Response<w::MachineSnapshot>, Status> {
+        let request = r.into_inner();
+        let reference = reference(request.machine)?;
+        if !request.clear && request.append.is_empty() {
+            return Err(Status::invalid_argument(
+                "at least one kernel argument or an explicit clear is required",
+            ));
+        }
+        let state = self.clone();
+        Ok(Response::new(
+            self.mutate(async move {
+                let machine = state.machine(&reference).await?;
+                snapshot(
+                    &machine
+                        .update_kernel_args(request.clear, request.append)
+                        .await
+                        .map_err(native)?,
+                )
+            })
+            .await?,
+        ))
+    }
     /// Explicit stopped boot-bundle replacement under the machine's own
     /// configuration lock; root bytes and userspace platform never change.
     async fn update_boot_assets(

@@ -590,7 +590,7 @@ pub async fn start_services(
     let mut guest_monitor = if ctx.guest_services_enabled {
         let guest_start = tokio::select! {
             biased;
-            exit = ctx.machine.wait() => Err(eyre::eyre!("primary VM exited during guest service startup: {exit:?}")),
+            exit = ctx.machine.wait() => Err(crate::shutdown::backend_exit_error(&ctx.store, exit)),
             () = startup_cancel.cancelled() => Err(eyre::eyre!("guest service startup cancelled")),
             result = tokio::time::timeout_at(
                 startup_deadline,
@@ -737,7 +737,7 @@ pub async fn start_services(
                     Ok(Err(_)) => Err(eyre::eyre!("startup command supervisor ended before reporting Started")),
                     Err(_) => Err(eyre::eyre!("startup command launch exceeded the original startup deadline")),
                 },
-                exit = ctx.machine.wait() => Err(eyre::eyre!("primary VM exited before startup command readiness: {exit:?}")),
+                exit = ctx.machine.wait() => Err(crate::shutdown::backend_exit_error(&ctx.store, exit)),
                 () = startup_cancel.cancelled() => Err(eyre::eyre!("startup command launch cancelled")),
             };
             match started {
@@ -797,7 +797,7 @@ pub async fn start_services(
             "startup deadline elapsed before readiness publication"
         ))
     } else {
-        ctx.machine.ensure_alive().await.map_err(eyre::Report::from)
+        crate::shutdown::ensure_boot_alive(&ctx.machine, &ctx.store).await
     };
     if let Err(error) = ready {
         cleanup_failed_service_start(
@@ -856,12 +856,17 @@ async fn wait_for_required_guest_ready(
 ) -> eyre::Result<()> {
     let mut changed = ctx.store.subscribe();
     loop {
-        ctx.machine.ensure_alive().await?;
+        crate::shutdown::ensure_boot_alive(&ctx.machine, &ctx.store).await?;
         match ctx.store.readiness()? {
             WaitOutcome::Ready => return Ok(()),
             WaitOutcome::Terminal => {
                 return Err(eyre::eyre!(
-                    "required guest translation bootstrap or workload readiness failed"
+                    "{}",
+                    ctx.store
+                        .status()?
+                        .vm
+                        .and_then(|vm| vm.message)
+                        .unwrap_or_else(|| "required guest readiness failed".to_string())
                 ));
             }
             WaitOutcome::TimedOut => {}
@@ -873,7 +878,7 @@ async fn wait_for_required_guest_ready(
                     .map_err(|_| eyre::eyre!("required guest readiness owner stopped"))?;
             }
             exit = ctx.machine.wait() => {
-                return Err(eyre::eyre!("primary VM exited before required guest readiness: {:?}", exit?));
+                return Err(crate::shutdown::backend_exit_error(&ctx.store, exit));
             }
             () = cancelled.cancelled() => return Err(eyre::eyre!("required guest readiness cancelled")),
         }

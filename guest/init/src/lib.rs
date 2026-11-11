@@ -4,6 +4,7 @@
 extern crate alloc;
 
 pub mod boot_args;
+pub mod boot_policy;
 #[cfg(target_os = "linux")]
 pub mod handoff;
 pub mod overlay_verify;

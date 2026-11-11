@@ -1729,7 +1729,11 @@ unknown and missing members, members of the other root kind, other schema
 versions, malformed or overflowing integers/UUIDs, nil GUIDs, invalid slots or
 geometry, bytes over 64 KiB and trailing content reject. There is no schema-1
 reader. Managed bootstrap failure never falls back to raw, `/dev/vda` or an
-automatic writable rescue shell.
+automatic writable rescue shell. All root types print diagnostics, sync and
+power off on bootstrap failure by default. Explicit `silo.rescue=on-failure`
+enables console rescue on any failure, including managed EROFS overlay roots;
+`silo.rescue=always` also opens rescue immediately before successful handoff.
+Leaving the shell powers off.
 
 An enabled Rosetta mode makes init mount the reserved `rosetta` virtio-fs share
 read-only, nosuid and nodev (never noexec) at `/run/silo/rosetta`, admit
@@ -2733,8 +2737,9 @@ Missing dependencies are acquisition failures, not permission to mount a
 replacement lower. Failed forks leave no published child. Failed snapshots leave
 no complete snapshot root. Failed conversions leave the old representation.
 Failed relocations after fencing leave a diagnosable non-startable source until
-ownership is resolved. Guest root failures enter the initramfs diagnostic/rescue
-path and never boot an unrelated flat disk.
+ownership is resolved. Guest root failures print initramfs diagnostics and power
+off, unless the user explicitly selects console rescue with `silo.rescue`;
+they never boot an unrelated flat disk.
 
 ## Responsibilities And Subsystem Boundaries
 
