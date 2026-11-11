@@ -121,7 +121,7 @@ impl AppMachine {
         crate::api::readiness_failure(
             readiness.outcome,
             readiness.status.vm.message.as_deref(),
-            &self.serial_log_path(),
+            &readiness.status.name,
         )
     }
 

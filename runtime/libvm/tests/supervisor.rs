@@ -2690,7 +2690,7 @@ async fn wait_ready_returns_terminal_boot_poweroff_reason_promptly() {
     assert_eq!(readiness.status.vm.state, libvm::MachineVmState::Failed);
     assert_eq!(
         readiness.status.vm.message.as_deref(),
-        Some("guest powered off during boot; see serial log"),
+        Some("guest powered off during boot"),
     );
     let exit = machine.wait().await.expect("wait for monitor cleanup");
     assert!(matches!(exit.outcome, MachineExitOutcome::Error { .. }));
