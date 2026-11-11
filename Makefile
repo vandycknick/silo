@@ -34,6 +34,17 @@ $(error KERNEL_OFFLINE must be 0 or 1)
 endif
 endif
 
+# Local kernel builds (make kernel)
+include $(CURDIR)/resources/kernels/sources.mk
+##? TRACK=stable|longterm|longterm5: Select the kernel source track built by make kernel (default: stable).
+TRACK ?= stable
+ifeq ($(strip $(KERNEL_TRACK_$(TRACK)_VERSION)),)
+$(error TRACK must name a track in resources/kernels/sources.mk, got '$(TRACK)')
+endif
+##? KERNEL_SHELL=command: Toolchain prefix for make kernel (default: nix develop .#kernel --command; empty uses the current environment).
+KERNEL_SHELL ?= nix develop .\#kernel --command
+LOCAL_KERNEL := $(CARGO_TARGET_DIR)/kernel-$(TRACK)
+
 # Rosetta probe acquisition (Apple Silicon macOS builds)
 ##? RPROBE_REFERENCE=reference: Select the rprobe OCI reference.
 RPROBE_REFERENCE ?= ghcr.io/vandycknick/silo/rprobe:stable
@@ -115,6 +126,16 @@ build: ## Build the complete adjacent runtime, CLI and daemon.
 stage: ## Build and assemble the portable runtime stage.
 	$(XTASK) stage --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
+##@ Kernel
+.PHONY: kernel
+kernel: ## Build a workload kernel from resources/kernels (TRACK) to use as KERNEL_PATH.
+ifneq ($(HOST_OS),Linux)
+	@printf 'make kernel needs Linux on the target architecture; on macOS run it inside a Linux VM (see resources/kernels/README.md)\n' >&2; exit 1
+endif
+	@mkdir -p "$(dir $(LOCAL_KERNEL))"
+	$(KERNEL_SHELL) $(MAKE) -C resources/kernels kernel-image TRACK="$(TRACK)" KERNEL_IMAGE_OUTPUT="$(LOCAL_KERNEL)"
+	@printf '\nBuilt %s\nBake it into a Silo build with:\n  make build KERNEL_PATH=%s\n' "$(LOCAL_KERNEL)" "$(LOCAL_KERNEL)"
+
 ##@ Distribution
 .PHONY: archive runtime-archive portable-archive app package install
 archive: ## Build release runtime and product archives.
@@ -188,9 +209,6 @@ qualify-changesets: ## Compare against real containerd extraction, retaining JSO
 	$(XTASK) qualify-changesets $(CHANGESET_ARGS)
 
 # Internal targets
-.PHONY: cli silo-vmm netd agent portd init initramfs rprobe kernel
+.PHONY: cli silo-vmm netd agent portd init initramfs rprobe
 cli silo-vmm netd agent portd init initramfs rprobe:
 	$(XTASK) component $@ --profile "$(PROFILE)"
-
-kernel:
-	$(XTASK) kernel $(KERNEL_ARGS)

@@ -21,12 +21,26 @@ build or a track name is not managed-root or live-generation qualification; see
 
 ## Building
 
-The flake's `kernel` development shell provides the complete kernel and OCI
-toolchain. Enter it on Linux before building:
+On Linux, build a workload kernel from the repository root:
 
 ```bash
-nix develop .#kernel
-make kernel TRACK=stable
+make kernel                  # TRACK=stable by default
+make kernel TRACK=longterm
+```
+
+`make kernel` runs the build inside the flake's `kernel` development shell
+(`nix develop .#kernel`), which provides the complete kernel toolchain, so it
+works from any shell. It writes the bare kernel to
+`target/kernel-<track>` and prints the `make build KERNEL_PATH=...`
+command that bakes it into a Silo build. Set `KERNEL_SHELL=` to use the current
+environment's toolchain instead of Nix.
+
+The targets below run in this directory and expect the kernel shell, so wrap
+them in `nix develop .#kernel --command`. `make -C resources/kernels kernel`
+builds the full OCI layout that CI publishes:
+
+```bash
+nix develop .#kernel --command make -C resources/kernels kernel TRACK=stable
 ```
 
 `KERNEL_PROFILE` is `workload` by default. The isolated acquisition-probe
@@ -43,7 +57,7 @@ embeds it into the kernel. The only installed probe asset is
 For a local OCI layout of that appliance, use the shared kernel target:
 
 ```bash
-make -C resources/kernels KERNEL_PROFILE=rprobe \
+nix develop .#kernel --command make -C resources/kernels KERNEL_PROFILE=rprobe \
   KERNEL_INITRAMFS="$PWD/target/release/rprobe-build/initramfs.cpio.gz" kernel
 ```
 
@@ -53,11 +67,12 @@ argument.
 Resolve and validate a config without compiling or packaging the kernel with:
 
 ```bash
-make -C resources/kernels kernel-config TRACK=stable
+nix develop .#kernel --command make -C resources/kernels kernel-config TRACK=stable
 ```
 
 Kernel compilation must run on the target architecture. On macOS, run the
-native build inside a Linux VM:
+native build inside a Linux VM; use `KERNEL_SHELL=` there if the VM provides the
+toolchain without Nix:
 
 ```bash
 silo exec arch -- make kernel TRACK=stable
@@ -123,8 +138,20 @@ tag downloads nothing. Whatever is published as `stable` must work; keeping that
 true is the publishing side's job, so the build performs no compatibility checks
 on the artifact metadata.
 
-`make KERNEL_PATH=/absolute/path/to/kernel` selects a local regular kernel file
-instead. `make KERNEL_OFFLINE=1` permits no registry access and reuses only the
+`make KERNEL_PATH=path/to/kernel` selects a local regular kernel file instead.
+It must be the host's direct-boot format: `vmlinux` on x86_64, an uncompressed
+`Image` on arm64. `make kernel` produces exactly that:
+
+```bash
+make kernel
+make build PROFILE=release KERNEL_PATH=target/kernel-stable
+```
+
+To try a kernel without rebuilding Silo, pass it to a new machine with
+`silo create --kernel <path>`, or replace a stopped machine's boot files with
+`silo set <machine> boot-assets=files boot-kernel=<path> boot-initramfs=<path> boot-agent=<path>|none`.
+
+`make KERNEL_OFFLINE=1` permits no registry access and reuses only the
 last resolved digest-addressed content. The resolved index, platform manifest,
 config, kernel layer descriptor and artifact config are written outside the
 runtime payload under `$CARGO_TARGET_DIR/kernel-provenance/<target>/<profile>.json`.

@@ -452,10 +452,13 @@ The default kernel reference can be replaced with another OCI reference:
 make archive KERNEL_REFERENCE=registry.example/silo/kernel:stable
 ```
 
-Use an absolute path to package a local architecture-matched kernel:
+Package a local architecture-matched kernel with `KERNEL_PATH`. On Linux,
+`make kernel` builds one from `resources/kernels` (inside the Nix kernel shell)
+and prints the path:
 
 ```sh
-make archive KERNEL_PATH=/absolute/path/to/kernel
+make kernel
+make archive KERNEL_PATH=target/kernel-stable
 ```
 
 Every build follows the reference to whatever is currently published; content
