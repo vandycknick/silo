@@ -339,6 +339,8 @@ pub struct BootScenario {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct RunScenario {
+    /// Simulate the guest powering itself off after boot, without a host stop.
+    pub power_off_after_ms: Option<u64>,
     /// Simulate a VMM crash this many milliseconds after boot:
     /// `wait()` resolves with a stopped-with-error exit.
     pub crash_after_ms: Option<u64>,

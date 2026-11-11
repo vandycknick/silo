@@ -320,6 +320,26 @@ VM without starting an application workload. Image process settings are retained
 with the machine and provide the default command for `silo exec dev` when no
 command follows `--`.
 
+`start` normally waits for guest readiness. Use `silo start --no-wait dev` to
+return once the VM is running, for example before attaching to a rescue console.
+On a stopped VM, repeat `silo set dev kernel-arg=ARG` to append direct-boot kernel
+arguments; `silo set dev kernel-args=` clears user arguments. Kernel arguments
+cannot be mixed with other settings in the same `set` command.
+
+Boot failures print diagnostics, sync filesystems and power off by default,
+including raw and layered roots. To inspect a failure interactively:
+
+```bash
+silo set dev kernel-arg=silo.rescue=on-failure
+silo start --no-wait dev
+silo shell --attach serial dev
+```
+
+`silo.rescue=always` opens the same shell before successful handoff as well as
+on failure. Leaving the shell powers off. See the
+[boot diagnostics guide](docs/run-lifecycle.md#boot-diagnostics-and-rescue)
+for argument restrictions and failure reporting.
+
 Copy regular files to and from a running VM:
 
 ```bash

@@ -24,40 +24,32 @@ struct BootConfig {
     init_explicit: bool,
 }
 
-/// What a failure before image execution may expose on the console.
-#[derive(Clone, Copy)]
-enum Failure {
-    /// The trusted root contract governs this boot: no workload, no shell.
-    FailClosed(&'static str),
-    /// A verified raw root and effective Rosetta are in place; only payload
-    /// or handoff preparation failed. The initramfs shell may diagnose it.
-    Rescue,
+struct BootPolicy {
+    label: &'static str,
+    rescue: Option<::init::boot_args::Rescue>,
 }
 
 pub(crate) fn init(_argc: i32, _argv: *const *const u8) -> i32 {
-    // Every boot is governed by the mandatory bootstrap until it is verified.
-    let mut failure = Failure::FailClosed("root");
-    if let Err(message) = run_init(&mut failure) {
+    let mut policy = BootPolicy {
+        label: "root",
+        rescue: None,
+    };
+    if let Err(message) = run_init(&mut policy) {
         io::write(io::STDERR, "init: ");
         io::write(io::STDERR, message);
         io::write(io::STDERR, "\n");
-        match failure {
-            Failure::FailClosed(label) => {
-                io::write(io::STDERR, "init: ");
-                io::write(io::STDERR, label);
-                io::write(io::STDERR, ": boot failed; workload prohibited\n");
-                // PID 1 must not return (kernel panic) or expose a rescue shell.
-                loop {
-                    io::sleep(3600);
-                }
-            }
-            Failure::Rescue => rescue_shell(),
+        io::write(io::STDERR, "init: ");
+        io::write(io::STDERR, policy.label);
+        io::write(io::STDERR, ": boot failed; workload prohibited\n");
+        if ::init::boot_policy::action(policy.rescue, true) == ::init::boot_policy::Action::Rescue {
+            rescue_shell();
         }
+        power_off();
     }
     0
 }
 
-fn run_init(failure: &mut Failure) -> Result<(), &'static str> {
+fn run_init(policy: &mut BootPolicy) -> Result<(), &'static str> {
     if io::getpid() != 1 {
         return Err("refusing to run init outside PID 1");
     }
@@ -76,13 +68,14 @@ fn run_init(failure: &mut Failure) -> Result<(), &'static str> {
 
     let cmdline = read_cmdline();
     let args = ::init::boot_args::parse(&cmdline)?;
+    policy.rescue = args.rescue;
     if args.marker.is_some() {
-        *failure = Failure::FailClosed("overlay");
+        policy.label = "overlay";
     }
     let bootstrap = crate::bootstrap::load()?;
     match bootstrap.root {
         rootfs_spec::Root::ErofsOverlay(root) => {
-            *failure = Failure::FailClosed("overlay");
+            policy.label = "overlay";
             if args.marker != Some(::init::boot_args::RootMarker::ErofsOverlay) {
                 return Err("overlay: missing managed kernel marker");
             }
@@ -97,9 +90,6 @@ fn run_init(failure: &mut Failure) -> Result<(), &'static str> {
     }
     // Before either switch_root branch, with or without an injected agent.
     crate::rosetta::prepare(bootstrap.rosetta)?;
-    if matches!(bootstrap.root, rootfs_spec::Root::Raw(_)) {
-        *failure = Failure::Rescue;
-    }
     let config = BootConfig {
         init: args.init.unwrap_or(DEFAULT_INIT).to_vec(),
         init_explicit: args.init.is_some(),
@@ -113,6 +103,7 @@ fn run_init(failure: &mut Failure) -> Result<(), &'static str> {
             AGENT_INIT_ARG,
             handoff_arg.as_slice(),
         ];
+        rescue_before_handoff(policy);
         if do_switch_root(MNT_ROOT, AGENT_RUN_BINARY, &init_argv) != 0 {
             return Err("switch_root failed");
         }
@@ -132,6 +123,7 @@ fn run_init(failure: &mut Failure) -> Result<(), &'static str> {
         }
 
         let init_argv = [config.init.as_slice()];
+        rescue_before_handoff(policy);
         if do_switch_root(MNT_ROOT, &config.init, &init_argv) != 0 {
             return Err("switch_root failed");
         }
@@ -391,20 +383,47 @@ fn c_string(input: &[u8]) -> Vec<u8> {
     out
 }
 
-fn rescue_shell() -> ! {
-    io::write(io::STDERR, "init: starting rescue shell\n");
-    loop {
-        exec_shell_once();
-        let sh = *b"sh\0";
-        let interactive = *b"-i\0";
-        let argv = [
-            sh.as_ptr().cast::<u8>(),
-            interactive.as_ptr().cast::<u8>(),
-            core::ptr::null(),
-        ];
-        applets::run_applet(b"sh", 2, argv.as_ptr());
-        io::sleep(1);
+fn rescue_before_handoff(policy: &BootPolicy) {
+    if ::init::boot_policy::action(policy.rescue, false) == ::init::boot_policy::Action::Rescue {
+        rescue_shell();
     }
+}
+
+fn power_off() -> ! {
+    io::sync();
+    io::power_off();
+    // PID 1 cannot return if the backend did not handle poweroff.
+    loop {
+        io::sleep(3600);
+    }
+}
+
+fn rescue_shell() -> ! {
+    io::setsid();
+    let console = io::open(b"/dev/console", libc::O_RDWR, 0);
+    if console >= 0 {
+        let attached = io::dup2(console, io::STDIN) >= 0
+            && io::dup2(console, io::STDOUT) >= 0
+            && io::dup2(console, io::STDERR) >= 0;
+        if console > io::STDERR {
+            io::close(console);
+        }
+        if !attached {
+            power_off();
+        }
+    } else {
+        power_off();
+    }
+    io::write(io::STDERR, "init: starting rescue shell\n");
+    let sh = *b"sh\0";
+    let interactive = *b"-i\0";
+    let argv = [
+        sh.as_ptr().cast::<u8>(),
+        interactive.as_ptr().cast::<u8>(),
+        core::ptr::null(),
+    ];
+    applets::run_applet(b"sh", 2, argv.as_ptr());
+    power_off();
 }
 
 pub(crate) fn exec_shell_once() {

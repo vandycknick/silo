@@ -126,21 +126,26 @@ pub(crate) fn validate_spec(
 /// `rootflags=` or `rdinit=` past admission. `init=` stays the image handoff
 /// input. Only the overlay consistency marker is permitted.
 pub(crate) fn validate_root_arguments(args: &[String], overlay: bool) -> Result<(), LibVmError> {
+    let invalid_arguments = |reason: &str| LibVmError::InvalidKernelArguments {
+        reason: reason.to_owned(),
+    };
     // The kernel command line is a C string; a NUL would silently cut it.
     if args.iter().any(|arg| arg.contains('\0')) {
-        return Err(invalid("kernel arguments cannot contain NUL bytes"));
+        return Err(invalid_arguments(
+            "kernel arguments cannot contain NUL bytes",
+        ));
     }
     let cmdline = args.join(" ");
     let mut markers = 0;
     for param in rootfs_spec::kernel_cmdline::params(cmdline.as_bytes()) {
         match param.reserved() {
             Some(rootfs_spec::kernel_cmdline::Reserved::RootSelection) => {
-                return Err(invalid(
+                return Err(invalid_arguments(
                     "root-selection kernel arguments are reserved for the trusted bootstrap",
                 ));
             }
             Some(rootfs_spec::kernel_cmdline::Reserved::InitialExecutable) => {
-                return Err(invalid(
+                return Err(invalid_arguments(
                     "rdinit= is reserved; the trusted /init is the initial executable",
                 ));
             }
@@ -151,7 +156,7 @@ pub(crate) fn validate_root_arguments(args: &[String], overlay: bool) -> Result<
         };
         if param.is(b"silo.rootfs") {
             if !overlay || value != ROOT_MARKER_VALUE.as_bytes() {
-                return Err(invalid(
+                return Err(invalid_arguments(
                     "root profile marker conflicts with the persisted root",
                 ));
             }
@@ -159,7 +164,9 @@ pub(crate) fn validate_root_arguments(args: &[String], overlay: bool) -> Result<
         }
     }
     if overlay && markers != 1 {
-        return Err(invalid("overlay requires exactly one root profile marker"));
+        return Err(invalid_arguments(
+            "overlay requires exactly one root profile marker",
+        ));
     }
     Ok(())
 }

@@ -2355,6 +2355,7 @@ async fn machine_wait_reconciles_vmm_crash_and_marks_machine_stopped() {
         run: test_utils::RunScenario {
             crash_after_ms: Some(500),
             crash_message: Some("scripted vmm crash".to_string()),
+            ..Default::default()
         },
         ..Scenario::default()
     };
@@ -2651,6 +2652,48 @@ async fn wait_ready_times_out_without_stopping_a_running_machine() {
     );
 
     machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn wait_ready_returns_terminal_boot_poweroff_reason_promptly() {
+    let scenario = Scenario {
+        agent: test_utils::AgentScenario {
+            never_ready: true,
+            ..Default::default()
+        },
+        run: test_utils::RunScenario {
+            power_off_after_ms: Some(1000),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let env = test_env("boot-poweroff", &scenario).await;
+    let machine = env
+        .runtime
+        .machine()
+        .name("boot-poweroff")
+        .image_source(ImageSource::disk(env.disk.clone()))
+        .network(|network| network.none())
+        .create()
+        .await
+        .expect("create machine");
+    machine.start().await.expect("start machine");
+    let readiness = tokio::time::timeout(
+        Duration::from_secs(5),
+        machine.wait_ready(Duration::from_secs(60)),
+    )
+    .await
+    .expect("terminal exit must not wait for readiness timeout")
+    .expect("terminal readiness response");
+    assert_eq!(readiness.outcome, MachineReadinessOutcome::Terminal);
+    assert_eq!(readiness.status.vm.state, libvm::MachineVmState::Failed);
+    assert_eq!(
+        readiness.status.vm.message.as_deref(),
+        Some("guest powered off during boot; see serial log"),
+    );
+    let exit = machine.wait().await.expect("wait for monitor cleanup");
+    assert!(matches!(exit.outcome, MachineExitOutcome::Error { .. }));
     machine.remove().await.expect("remove machine");
 }
 

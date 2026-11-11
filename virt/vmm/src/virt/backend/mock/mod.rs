@@ -295,6 +295,20 @@ impl VirtBackend for MockBackend {
             });
         }
 
+        if let Some(delay_ms) = self.scenario.run.power_off_after_ms {
+            let exit = self.exit.clone();
+            let notify = self.exit_notify.clone();
+            let shutdown = self.shutdown.clone();
+            let native = self.native.clone();
+            let endpoint = self.worker_endpoint.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                cache_exit_in(&exit, &notify, VmExit::stopped(StartupStage::Started));
+                shutdown.send_replace(true);
+                terminate_worker(&native, &endpoint);
+            });
+        }
+
         *running = Some(RunningGuest { incoming_tx });
         tracing::info!(machine = self.config.name(), "mock machine started");
         Ok(())

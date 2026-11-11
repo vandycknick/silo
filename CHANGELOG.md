@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Guest bootstrap failures now print diagnostics, sync and power off for every
+  root type. Explicit `silo.rescue=on-failure` and `silo.rescue=always` kernel
+  arguments enable console rescue; exiting rescue powers off. Poweroff before
+  first readiness is reported as a failed boot, with its reason and serial log
+  path, rather than a normal stop.
+- `silo set VM kernel-arg=ARG` appends repeatable direct-boot kernel arguments
+  and `kernel-args=` clears user arguments on stopped VMs through normal host
+  admission. `silo start --no-wait` skips guest readiness waiting so a serial
+  rescue console can be attached immediately. Reserved kernel arguments return
+  typed invalid-argument errors with their diagnostic through daemon management,
+  rather than generic internal failures.
+- Local CLI management keeps large native initialization, inspection and start
+  futures off caller stacks, avoiding stack overflows during kernel-argument
+  updates and subsequent starts.
 - The lobby returns inside silod with the pure-Go `tsgate` gateway. Labels use
   `io.silo.lobby.*`, the capability key is `github.com/vandycknick/silo`, and state
   lives in `<Home>/lobby/` and `<Home>/tsgate/`. Lobby VMs use Machine-only policy

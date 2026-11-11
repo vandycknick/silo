@@ -297,6 +297,9 @@ pub enum LibVmError {
     #[error("invalid machine configuration for {reference:?}: {reason}")]
     InvalidMachineConfig { reference: String, reason: String },
 
+    #[error("invalid kernel arguments: {reason}")]
+    InvalidKernelArguments { reason: String },
+
     #[error("unsupported host architecture {arch:?}")]
     UnsupportedHostArchitecture { arch: String },
 
@@ -363,6 +366,7 @@ impl LibVmError {
                 | Self::MonitorConnection { .. }
                 | Self::MonitorProtocol { .. }
                 | Self::InvalidMachineConfig { .. }
+                | Self::InvalidKernelArguments { .. }
                 | Self::Database(sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_))
         )
     }
@@ -454,6 +458,7 @@ impl LibVmError {
             Self::InvalidCreateRequest { .. } => "InvalidCreateRequest",
             Self::InvalidMachineUpdate { .. } => "InvalidMachineUpdate",
             Self::InvalidMachineConfig { .. } => "InvalidMachineConfig",
+            Self::InvalidKernelArguments { .. } => "InvalidKernelArguments",
             Self::UnsupportedHostArchitecture { .. } => "UnsupportedHostArchitecture",
             Self::CorruptState { .. } => "CorruptState",
             Self::VmSpecSerializeFailed { .. } => "VmSpecSerializeFailed",

@@ -19,6 +19,7 @@ service MachineService {
  rpc StopMachine(StopMachineRequest) returns (MachineSnapshot);
  rpc RemoveMachine(RemoveMachineRequest) returns (google.protobuf.Empty);
  rpc UpdateMachine(UpdateMachineRequest) returns (MachineSnapshot);
+ rpc UpdateKernelArgs(UpdateKernelArgsRequest) returns (MachineSnapshot);
  rpc WaitReady(WaitReadyRequest) returns (MachineReadiness);
  rpc StopRun(StopRunRequest) returns (MachineSnapshot);
  rpc KillRun(KillRunRequest) returns (MachineExit);
@@ -395,6 +396,7 @@ message PublicationUpdate { oneof update { PublishBind set = 1; google.protobuf.
 message UserUpdate { oneof update { User set = 1; google.protobuf.Empty clear = 2; } }
 message MachineUpdate { optional string name = 1; StringMap labels = 2; optional uint32 cpus = 3; optional uint64 memory_bytes = 4; optional uint64 root_disk_size_bytes = 5; optional bool nested_virtualization = 6; optional bool rosetta = 7; ForwardList forwards = 8; Vsock vsock = 9; ResolvedNetwork network = 10; PolicyUpdate policy = 11; PublicationUpdate publication = 12; GuestConfig guest = 13; UserUpdate user = 14; TemporaryDirectoryPolicy temporary_directory = 15; }
 message UpdateMachineRequest { MachineRef machine = 1; MachineUpdate update = 2; }
+message UpdateKernelArgsRequest { MachineRef machine = 1; bool clear = 2; repeated string append = 3; }
 message WaitReadyRequest { string id = 1; optional string expected_run = 2; google.protobuf.Duration timeout = 3; }
 message StopRunRequest { MachineRunRef machine = 1; google.protobuf.Duration timeout = 2; optional google.protobuf.Duration force_after = 3; }
 message KillRunRequest { MachineRunRef machine = 1; google.protobuf.Duration timeout = 2; }

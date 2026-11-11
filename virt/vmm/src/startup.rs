@@ -754,8 +754,8 @@ pub async fn init(
     if let Err(error) = start_result {
         return Err(cleanup_primary_start_failure(&machine, &forwards, error).await);
     }
-    if let Err(error) = machine.ensure_alive().await {
-        return Err(cleanup_primary_start_failure(&machine, &forwards, error.into()).await);
+    if let Err(error) = crate::shutdown::ensure_boot_alive(&machine, &store).await {
+        return Err(cleanup_primary_start_failure(&machine, &forwards, error).await);
     }
     if let Some(activation) = activation {
         // The backend returned at the native prepared barrier: installed,
@@ -788,7 +788,7 @@ pub async fn init(
         Some(prepared) => {
             let activation = tokio::select! {
                 biased;
-                exit = machine.wait() => Err(eyre::eyre!("primary VM exited during vsock activation: {exit:?}")),
+                exit = machine.wait() => Err(crate::shutdown::backend_exit_error(&store, exit)),
                 () = startup_cancel.cancelled() => Err(eyre::eyre!("vsock activation cancelled")),
                 () = tokio::time::sleep_until(startup_deadline) => Err(eyre::eyre!("vsock activation exceeded startup deadline")),
                 result = prepared.activate(machine.clone(), forwards.clone()) => result,
@@ -804,9 +804,9 @@ pub async fn init(
     };
     forwards.activate(machine.clone());
     publish_host_memory_reclaim(&machine, &store);
-    if let Err(error) = machine.ensure_alive().await {
+    if let Err(error) = crate::shutdown::ensure_boot_alive(&machine, &store).await {
         drop(vsock_surface);
-        return Err(cleanup_primary_start_failure(&machine, &forwards, error.into()).await);
+        return Err(cleanup_primary_start_failure(&machine, &forwards, error).await);
     }
     if let Err(error) = store.set_vm_state(VmState::Running, "vm running") {
         drop(vsock_surface);

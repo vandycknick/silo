@@ -353,6 +353,11 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
                 tonic::Code::InvalidArgument
             }
         },
+        E::InvalidKernelArguments { reason } => {
+            d.kind = 1;
+            d.safe_message = reason.clone();
+            tonic::Code::InvalidArgument
+        }
         E::InvalidMachineName { .. }
         | E::InvalidMachineIdPrefix { .. }
         | E::InvalidCreateRequest { .. }
@@ -609,6 +614,11 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
             }
         }
         7 => match required(d.native_variant, "error.native_variant")?.as_str() {
+            "InvalidKernelArguments" if v.code() == tonic::Code::InvalidArgument && d.kind == 1 => {
+                E::InvalidKernelArguments {
+                    reason: d.safe_message,
+                }
+            }
             "LiveDiscovery" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
                 E::LiveDiscovery {
                     message: d.safe_message,
@@ -908,6 +918,39 @@ mod tests {
     use prost::Message;
     use silod_spec::daemon::v1 as w;
     use vm_spec::live::*;
+
+    #[test]
+    fn kernel_argument_rejections_preserve_the_typed_safe_reason() {
+        for reason in [
+            "root-selection kernel arguments are reserved for the trusted bootstrap",
+            "rdinit= is reserved; the trusted /init is the initial executable",
+        ] {
+            let error = libvm::LibVmError::InvalidKernelArguments {
+                reason: reason.into(),
+            };
+            let status_value = native_error_to_status(&error);
+            assert_eq!(status_value.code(), tonic::Code::InvalidArgument);
+            assert_eq!(status_value.message(), reason);
+            assert!(matches!(
+                status_to_native_error(&status_value).unwrap(),
+                libvm::LibVmError::InvalidKernelArguments { reason: actual } if actual == reason
+            ));
+            let envelope = RpcStatus::decode(status_value.details()).unwrap();
+            let detail = w::ErrorDetail::decode(envelope.details[0].value.as_slice()).unwrap();
+            assert_eq!(
+                detail.native_variant.as_deref(),
+                Some("InvalidKernelArguments")
+            );
+            assert!(
+                status_to_native_error(&status(detail.clone(), tonic::Code::Internal)).is_err()
+            );
+            let mut wrong_kind = detail;
+            wrong_kind.kind = 8;
+            assert!(
+                status_to_native_error(&status(wrong_kind, tonic::Code::InvalidArgument)).is_err()
+            );
+        }
+    }
 
     #[test]
     fn live_failed_precondition_roundtrips_every_operation_reason_and_subject() {

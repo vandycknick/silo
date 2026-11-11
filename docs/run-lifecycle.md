@@ -92,6 +92,48 @@ silo shell dev
 `create` stores the image process settings but leaves the VM stopped. `start`
 boots it in idle mode, and `exec` or `shell` starts work inside it later.
 
+By default `start` waits for guest agent readiness (unless the agent is disabled).
+`silo start --no-wait dev` returns once the VM is running without waiting for
+the agent. It does not certify a successful guest boot or change later failure
+handling.
+
+## Boot diagnostics and rescue
+
+Any guest bootstrap failure before handoff prints its diagnostic on the serial
+console, synchronizes filesystems and powers off the VM. This applies to every
+root type, including raw disks and managed EROFS overlay roots. A guest poweroff
+before its first readiness is a failed boot, not a normal stop: readiness waits
+end immediately with `guest powered off during boot; see serial log` and the
+serial log path. `silo logs dev --stream serial` reads those diagnostics.
+
+Configure user arguments on a stopped VM with `silo set dev kernel-arg=ARG`.
+The setting may be repeated and appends to the existing direct-boot command
+line. `kernel-args=` clears the user arguments; arguments after that setting
+are appended to the empty list:
+
+```bash
+silo set dev kernel-args= kernel-arg=silo.rescue=on-failure
+silo start --no-wait dev
+silo shell --attach serial dev
+```
+
+`silo.rescue=on-failure` opens a rescue shell on any bootstrap failure instead
+of immediately powering off. `silo.rescue=always` opens the shell just before
+handoff after successful assembly, and also on failure. The shell sees the root
+assembled as far as boot reached and runs on the console, not through the guest
+agent. Leaving it synchronizes filesystems and powers off, never resumes boot.
+Only one `silo.rescue` selector is accepted; duplicate selectors and values
+other than `on-failure` or `always` are boot errors.
+
+Kernel-argument settings cannot be mixed with ordinary settings or boot-bundle
+replacements in a single command. Both local and daemon updates use the stopped
+configuration replacement path. Host admission still rejects `rdinit=`, `root=`,
+`rootfstype=` and `rootflags=` arguments; clearing user arguments never removes
+Silo's generated root selectors. Remove rescue mode with `silo set dev
+kernel-args=` before the next normal boot, re-adding any other desired user
+arguments.
+
+
 ## Output
 
 Detached `run` writes progress and lifecycle guidance to stderr, then writes

@@ -17,11 +17,18 @@ pub enum RootMarker {
     ErofsOverlay,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rescue {
+    OnFailure,
+    Always,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BootArgs<'a> {
     /// Explicit image init, an execution-policy input, never a device selector.
     pub init: Option<&'a [u8]>,
     pub marker: Option<RootMarker>,
+    pub rescue: Option<Rescue>,
 }
 
 pub fn parse(cmdline: &[u8]) -> Result<BootArgs<'_>, &'static str> {
@@ -50,6 +57,15 @@ pub fn parse(cmdline: &[u8]) -> Result<BootArgs<'_>, &'static str> {
             if args.marker.replace(RootMarker::ErofsOverlay).is_some() {
                 return Err("duplicate silo.rootfs= argument");
             }
+        } else if param.is(b"silo.rescue") {
+            let rescue = match value {
+                b"on-failure" => Rescue::OnFailure,
+                b"always" => Rescue::Always,
+                _ => return Err("unknown silo.rescue= policy"),
+            };
+            if args.rescue.replace(rescue).is_some() {
+                return Err("duplicate silo.rescue= argument");
+            }
         }
     }
     Ok(args)
@@ -57,7 +73,7 @@ pub fn parse(cmdline: &[u8]) -> Result<BootArgs<'_>, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::boot_args::{parse, BootArgs, RootMarker};
+    use crate::boot_args::{parse, BootArgs, Rescue, RootMarker};
 
     #[test]
     fn plain_and_overlay_command_lines_parse_exactly() {
@@ -67,6 +83,7 @@ mod tests {
             Ok(BootArgs {
                 init: Some(b"/sbin/candidate-init".as_slice()),
                 marker: Some(RootMarker::ErofsOverlay),
+                rescue: None,
             })
         );
         // Similar names and quoted text are unrelated keys, as in the kernel.
@@ -83,6 +100,7 @@ mod tests {
             Ok(BootArgs {
                 init: Some(b"/sbin/my init".as_slice()),
                 marker: Some(RootMarker::ErofsOverlay),
+                rescue: None,
             })
         );
         assert!(parse(b"init=/a \"init=/b\"").is_err());
@@ -142,6 +160,33 @@ mod tests {
                 parse(cmdline).is_err(),
                 "{:?}",
                 core::str::from_utf8(cmdline)
+            );
+        }
+    }
+
+    #[test]
+    fn rescue_policy_parse_table() {
+        for (cmdline, expected) in [
+            (b"".as_slice(), Ok(None)),
+            (b"silo.rescue=on-failure", Ok(Some(Rescue::OnFailure))),
+            (b"silo.rescue=always", Ok(Some(Rescue::Always))),
+            (b"\"silo.rescue=always\"", Ok(Some(Rescue::Always))),
+            (b"silo.rescue=\"on-failure\"", Ok(Some(Rescue::OnFailure))),
+            (
+                b"silo.rescue=always silo.rescue=always",
+                Err("duplicate silo.rescue= argument"),
+            ),
+            (
+                b"silo.rescue=on-failure silo.rescue=always",
+                Err("duplicate silo.rescue= argument"),
+            ),
+            (b"silo.rescue=", Err("unknown silo.rescue= policy")),
+            (b"silo.rescue=never", Err("unknown silo.rescue= policy")),
+        ] {
+            assert_eq!(
+                parse(cmdline).map(|args| args.rescue),
+                expected,
+                "{cmdline:?}"
             );
         }
     }
