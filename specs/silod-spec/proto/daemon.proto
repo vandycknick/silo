@@ -613,7 +613,7 @@ message ForkChildOutcome { oneof outcome { google.protobuf.Empty pending = 1; go
 // Durability is independent from the historical Running completion receipt.
 enum MachineDurability { MACHINE_DURABILITY_UNSPECIFIED = 0; MACHINE_DURABILITY_CONSTRUCTED = 1; MACHINE_DURABILITY_DURABLE = 2; }
 message ForkChildResult { uint32 index = 1; string name = 2; string machine_id = 3; string run_id = 4; ForkChildOutcome outcome = 5; optional MachineDurability durability = 6; }
-message LiveForkResult { string operation_id = 1; string source_machine_id = 2; string source_run_id = 3; string capture_id = 4; ForkStage stage = 5; bool cancellation_requested = 6; ForkCaptureOutcome capture = 7; ForkSourceOutcome source = 8; repeated ForkChildResult children = 10; }
+message LiveForkResult { string operation_id = 1; string source_machine_id = 2; string source_run_id = 3; string capture_id = 4; ForkStage stage = 5; bool cancellation_requested = 6; ForkCaptureOutcome capture = 7; ForkSourceOutcome source = 8; repeated ForkChildResult children = 10; CaptureResumePolicy resume_policy = 11; }
 enum StorageCaptureKind { STORAGE_CAPTURE_KIND_UNSPECIFIED = 0; STORAGE_CAPTURE_KIND_STOPPED_STORAGE = 1; STORAGE_CAPTURE_KIND_LIVE_EXECUTION = 2; }
 // Capture provenance is catalog metadata outside snapshot identity.
 message SnapshotCaptureProvenance { string capture_id = 1; string machine_id = 2; string run_id = 3; string evidence_digest = 4; }

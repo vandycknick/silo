@@ -88,8 +88,8 @@ enum SnapshotCommand {
         /// Request live execution capture, never fall back to stopped storage.
         #[arg(long, conflicts_with = "external_requirements")]
         live: bool,
-        /// Keep the source paused after a live capture (user-owned pause). Required when
-        /// the source is already paused; without it a running source is resumed.
+        /// Keep a running source paused after capture. An already user-paused source
+        /// always stays paused, with or without this flag.
         #[arg(long, requires = "live")]
         preserve: bool,
         #[command(flatten)]
@@ -214,8 +214,8 @@ pub struct Fork {
     /// Explicit live fan-out maximum (default 16). It is a bound, never a child count.
     #[arg(long, value_name = "N", requires = "live")]
     max_children: Option<std::num::NonZeroU32>,
-    /// Keep the source paused after the capture (user-owned pause). Required when the source is
-    /// already paused; without it a running source is resumed.
+    /// Keep a running source paused after capture. An already user-paused source
+    /// always stays paused, with or without this flag.
     #[arg(long, requires = "live")]
     preserve: bool,
     #[command(flatten)]
@@ -342,15 +342,29 @@ impl Fork {
             }
             ForkMode::Live { machine, options } => {
                 let operation_id = options.operation_id;
-                let resume_policy = options.resume_policy;
-                let result = api
-                    .fork_live(&machine, options)
-                    .await
-                    .inspect_err(|error| unconfirmed_fork_note(error, operation_id))?;
+                let result = match api.fork_live(&machine, options).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if !fork_rejected_before_acceptance(&error)
+                            && !matches!(
+                                error.downcast_ref::<libvm::LibVmError>(),
+                                Some(libvm::LibVmError::LiveOperationUnsupported { .. })
+                            )
+                        {
+                            let observation = api.inspect_fork(operation_id).await;
+                            if let Some(note) =
+                                fork_confirmation_note(&error, operation_id, &observation)
+                            {
+                                crate::ui::warn(note);
+                            }
+                        }
+                        return Err(error);
+                    }
+                };
                 crate::ui::warn(EXACT_BYTES_WARNING);
                 // The complete result precedes any failure status.
                 println!("{}", serde_json::to_string_pretty(&result)?);
-                live_fork_status(&result, resume_policy)
+                live_fork_status(&result)
             }
             ForkMode::Inspect(operation_id) => {
                 let result = api.inspect_fork(operation_id).await?;
@@ -371,28 +385,64 @@ impl Fork {
     }
 }
 
-/// Past validation the operation may have been admitted even when the reply
-/// was lost; it stays discoverable by the ID the CLI chose before submission.
-fn unconfirmed_fork_note(error: &eyre::Report, operation_id: uuid::Uuid) {
-    if matches!(
-        error.downcast_ref::<libvm::LibVmError>(),
-        Some(libvm::LibVmError::LiveOperationUnsupported { .. })
-    ) {
-        return;
+/// A completed rejection and an authoritative absent operation rule out
+/// acceptance. After transport loss an absent lookup may race admission.
+fn fork_confirmation_note(
+    submission_error: &eyre::Report,
+    operation_id: uuid::Uuid,
+    observation: &eyre::Result<libvm::LiveForkResult>,
+) -> Option<String> {
+    if fork_rejected_before_acceptance(submission_error) {
+        return None;
     }
-    crate::ui::warn(format!(
-        "live fork operation {operation_id} was not confirmed; if it was accepted, observe it with `silo fork --operation {operation_id}`"
-    ));
+    match observation {
+        Ok(_) => Some(format!(
+            "live fork operation {operation_id} was accepted; observe it with `silo fork --operation {operation_id}`"
+        )),
+        Err(error)
+            if definitive_fork_reply(submission_error)
+                && matches!(
+                    error.downcast_ref::<libvm::LibVmError>(),
+                    Some(libvm::LibVmError::LiveForkNotFound { .. })
+                ) => None,
+        Err(_) => Some(format!(
+            "live fork operation {operation_id} was not confirmed; if it was accepted, observe it with `silo fork --operation {operation_id}`"
+        )),
+    }
+}
+
+fn fork_rejected_before_acceptance(error: &eyre::Report) -> bool {
+    error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+        status
+            .metadata()
+            .get("x-silo-mutation-rejected")
+            .is_some_and(|value| value == "true")
+    })
+}
+
+fn definitive_fork_reply(error: &eyre::Report) -> bool {
+    if let Some(native) = error.downcast_ref::<libvm::LibVmError>() {
+        return !matches!(native, libvm::LibVmError::Io(_));
+    }
+    error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+        matches!(
+            status.code(),
+            tonic::Code::InvalidArgument
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::ResourceExhausted
+                | tonic::Code::PermissionDenied
+                | tonic::Code::Unauthenticated
+                | tonic::Code::NotFound
+                | tonic::Code::AlreadyExists
+        )
+    })
 }
 
 /// Success means a finished, uncancelled operation with every child running
 /// and the source continuation the policy requested. Anything else is a
 /// failure status after the full result is printed, never a rollback.
-fn live_fork_status(
-    result: &libvm::LiveForkResult,
-    resume_policy: vm_spec::lifecycle::CaptureResumePolicy,
-) -> eyre::Result<()> {
-    let source_satisfied = match resume_policy {
+fn live_fork_status(result: &libvm::LiveForkResult) -> eyre::Result<()> {
+    let source_satisfied = match result.resume_policy {
         vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired => {
             matches!(result.source, libvm::ForkSourceOutcome::Resumed)
         }
@@ -1163,6 +1213,7 @@ mod tests {
             source_run_id: "00000000-0000-4000-8000-0000000000cc".parse().unwrap(),
             capture_id: vm_spec::lifecycle::LiveId::parse("00000000-0000-4000-8000-0000000000bb")
                 .unwrap(),
+            resume_policy: CaptureResumePolicy::ResumeIfAcquired,
             stage: libvm::ForkStage::Finished,
             cancellation_requested: false,
             capture: libvm::ForkCaptureOutcome::Sealed {
@@ -1198,12 +1249,10 @@ mod tests {
             "constructed"
         );
         silo_vm_control::fork::validate_result(&ok).unwrap();
-        live_fork_status(&ok, CaptureResumePolicy::ResumeIfAcquired).unwrap();
-        live_fork_status(
-            &result(Source::Preserved, running()),
-            CaptureResumePolicy::Preserve,
-        )
-        .unwrap();
+        live_fork_status(&ok).unwrap();
+        let mut preserved = result(Source::Preserved, running());
+        preserved.resume_policy = CaptureResumePolicy::Preserve;
+        live_fork_status(&preserved).unwrap();
 
         let diagnostic = || vm_spec::lifecycle::Diagnostic::new("failed");
         let mut failures = vec![
@@ -1256,12 +1305,84 @@ mod tests {
         let mut cancelled = result(Source::Resumed, running());
         cancelled.cancellation_requested = true;
         failures.push((cancelled, CaptureResumePolicy::ResumeIfAcquired));
-        for (result, policy) in failures {
+        for (mut result, policy) in failures {
+            result.resume_policy = policy;
             silo_vm_control::fork::validate_result(&result).unwrap();
-            let error = live_fork_status(&result, policy).unwrap_err().to_string();
+            let error = live_fork_status(&result).unwrap_err().to_string();
             assert!(error.contains(OPERATION), "{error}");
             assert!(error.contains("running children are retained"), "{error}");
         }
+    }
+
+    #[test]
+    fn paused_live_fork_succeeds_with_resolved_policy_not_requested_default() {
+        let (_, requested) = live(&["vm", "--live", "--name", "child"]);
+        assert_eq!(
+            requested.resume_policy,
+            CaptureResumePolicy::ResumeIfAcquired
+        );
+        let mut completed = result(
+            libvm::ForkSourceOutcome::Preserved,
+            [
+                libvm::ForkChildOutcome::Running,
+                libvm::ForkChildOutcome::Running,
+            ],
+        );
+        completed.resume_policy = CaptureResumePolicy::Preserve;
+        let wire = silo_vm_control::fork::result_to_wire(&completed).unwrap();
+        let observed = silo_vm_control::fork::result_from_wire(wire).unwrap();
+        live_fork_status(&observed).unwrap();
+    }
+
+    #[test]
+    fn fork_confirmation_distinguishes_rejection_acceptance_and_lost_observation() {
+        use crate::commands::live::fork_confirmation_note;
+        let operation = OPERATION.parse().unwrap();
+        let absent = libvm::LibVmError::LiveForkNotFound {
+            operation_id: OPERATION.into(),
+        };
+        let status = silo_vm_control::errors::native_error_to_status(&absent);
+        let daemon_absent = silo_vm_control::errors::status_to_native_error(&status).unwrap();
+        let rejected: eyre::Report = libvm::LibVmError::LiveProtocol {
+            message: "capture admission refused".into(),
+        }
+        .into();
+        for error in [absent, daemon_absent] {
+            assert!(fork_confirmation_note(&rejected, operation, &Err(error.into())).is_none());
+        }
+        let accepted = result(
+            libvm::ForkSourceOutcome::Resumed,
+            [
+                libvm::ForkChildOutcome::Running,
+                libvm::ForkChildOutcome::Running,
+            ],
+        );
+        let note = fork_confirmation_note(&rejected, operation, &Ok(accepted)).unwrap();
+        assert!(note.contains("was accepted"), "{note}");
+        assert!(!note.contains("was not confirmed"), "{note}");
+        let lost = eyre::eyre!("connection lost");
+        let note =
+            fork_confirmation_note(&lost, operation, &Err(eyre::eyre!("connection lost"))).unwrap();
+        assert!(note.contains("was not confirmed"), "{note}");
+        let absent = Err(libvm::LibVmError::LiveForkNotFound {
+            operation_id: OPERATION.into(),
+        }
+        .into());
+        let note = fork_confirmation_note(&lost, operation, &absent).unwrap();
+        assert!(note.contains("was not confirmed"), "{note}");
+        let rejected = tonic::Status::failed_precondition("host shutdown admission sealed").into();
+        assert!(fork_confirmation_note(&rejected, operation, &absent).is_none());
+        let mut sealed = tonic::Status::unavailable("mutation admission sealed");
+        sealed.metadata_mut().insert(
+            "x-silo-mutation-rejected",
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+        let rejected = sealed.into();
+        assert!(
+            fork_confirmation_note(&rejected, operation, &Err(eyre::eyre!("offline"))).is_none()
+        );
+        let lost = tonic::Status::unavailable("connection lost").into();
+        assert!(fork_confirmation_note(&lost, operation, &absent).is_some());
     }
 
     #[test]

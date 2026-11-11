@@ -44,7 +44,7 @@ CHILD_PHASES = ("constructing", "prepared", "activating", "running")
 # Durability completes in the background after `prepared`; it is ordered
 # against nothing but its own child's construction and the call window.
 CHILD_BACKGROUND_PHASES = ("durable",)
-RESULT_KEYS = {"operationId", "sourceMachineId", "sourceRunId", "captureId", "stage",
+RESULT_KEYS = {"operationId", "sourceMachineId", "sourceRunId", "captureId", "resumePolicy", "stage",
                "cancellationRequested", "capture", "source", "children"}
 CHILD_KEYS = {"index", "name", "machineId", "runId", "outcome", "durability"}
 CHILD_DURABILITY = {None, "constructed", "durable"}
@@ -78,6 +78,9 @@ def validate(result: object, *, operation: str, names: list[str]) -> dict:
         _uuid(result[key], key)
     assert result["stage"] in STAGES, result["stage"]
     assert isinstance(result["cancellationRequested"], bool)
+    assert result["resumePolicy"] in ("resume-if-acquired", "preserve"), result["resumePolicy"]
+    if result["source"].get("kind") == "preserved":
+        assert result["resumePolicy"] == "preserve", result
     capture = _outcome(result["capture"], CAPTURE_KINDS, "capture")
     if capture == "sealed":
         cut = result["capture"].get("cutId")

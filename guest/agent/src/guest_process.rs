@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -12,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::signal::Signal;
 use nix::unistd::{getgrouplist, Gid};
 use protocol::v1::guest_process_event::Event;
@@ -734,12 +737,106 @@ struct RunningProcess {
     stdin: ProcessInput,
     outputs: Vec<(OutputKind, Box<dyn Read + Send>)>,
     pty_resize: Option<File>,
+    pty_exited: Option<Arc<AtomicBool>>,
+}
+
+struct PtyOutputReader {
+    master: File,
+    exited: Arc<AtomicBool>,
+    remaining: usize,
+}
+
+impl Read for PtyOutputReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let draining = self.exited.load(Ordering::Acquire);
+            if draining && self.remaining == 0 {
+                return Ok(0);
+            }
+            // A zero-time poll after exit drains only buffered output, even
+            // while a descendant retains the slave.
+            let mut descriptors = [PollFd::new(self.master.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut descriptors, if draining { 0_u16 } else { 10_u16 }) {
+                Ok(0) if draining => return Ok(0),
+                Ok(0) => continue,
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let limit = if draining {
+                buffer.len().min(self.remaining)
+            } else {
+                buffer.len()
+            };
+            return match self.master.read(&mut buffer[..limit]) {
+                Ok(read) => {
+                    if draining {
+                        self.remaining -= read;
+                    }
+                    Ok(read)
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if draining {
+                        Ok(0)
+                    } else {
+                        continue;
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(nix::errno::Errno::EIO as i32) => Ok(0),
+                result => result,
+            };
+        }
+    }
+}
+
+struct PtyInputWriter {
+    master: File,
+    exited: Arc<AtomicBool>,
+}
+
+impl PtyInputWriter {
+    fn new(master: File, exited: Arc<AtomicBool>) -> io::Result<Self> {
+        let flags = OFlag::from_bits_truncate(fcntl(&master, FcntlArg::F_GETFL)?);
+        fcntl(&master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(Self { master, exited })
+    }
+}
+
+impl Write for PtyInputWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.exited.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            let mut descriptors = [PollFd::new(self.master.as_fd(), PollFlags::POLLOUT)];
+            match poll(&mut descriptors, 10_u16) {
+                Ok(0) => continue,
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            match self.master.write(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.master.flush()
+    }
 }
 
 enum ProcessInput {
     Null,
     Pipe(Option<ChildStdin>),
-    Pty(File),
+    Pty(PtyInputWriter),
 }
 
 enum InputCommand {
@@ -749,7 +846,21 @@ enum InputCommand {
 enum ActiveInput {
     Null,
     Pipe(Option<std_mpsc::SyncSender<InputCommand>>),
-    Pty(std_mpsc::SyncSender<InputCommand>),
+    Pty {
+        sender: std_mpsc::SyncSender<InputCommand>,
+        writer: Option<thread::JoinHandle<()>>,
+    },
+}
+
+impl ActiveInput {
+    fn close(self) {
+        if let Self::Pty { sender, writer } = self {
+            drop(sender);
+            if let Some(writer) = writer {
+                let _ = writer.join();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -819,6 +930,7 @@ fn spawn_process(
                     (OutputKind::Stderr, Box::new(stderr)),
                 ],
                 pty_resize: None,
+                pty_exited: None,
             })
         }
         ProcessStdio::Pty { size } => {
@@ -827,7 +939,12 @@ fn spawn_process(
             })?;
             let master = File::from(pty.master);
             let reader = master.try_clone().map_err(LaunchFailure::spawn)?;
-            let writer = master.try_clone().map_err(LaunchFailure::spawn)?;
+            let exited = Arc::new(AtomicBool::new(false));
+            let writer = PtyInputWriter::new(
+                master.try_clone().map_err(LaunchFailure::spawn)?,
+                Arc::clone(&exited),
+            )
+            .map_err(LaunchFailure::spawn)?;
             let resize = master.try_clone().map_err(LaunchFailure::spawn)?;
             attach_pty_slave(&mut command, pty.slave).map_err(LaunchFailure::spawn)?;
             prepare_pty_child(&mut command);
@@ -840,8 +957,16 @@ fn spawn_process(
                 guard,
                 process_group,
                 stdin: ProcessInput::Pty(writer),
-                outputs: vec![(OutputKind::Terminal, Box::new(reader))],
+                outputs: vec![(
+                    OutputKind::Terminal,
+                    Box::new(PtyOutputReader {
+                        master: reader,
+                        exited: Arc::clone(&exited),
+                        remaining: crate::ssh::agent::PTY_EXIT_DRAIN_LIMIT,
+                    }),
+                )],
                 pty_resize: Some(resize),
+                pty_exited: Some(exited),
             })
         }
     }
@@ -973,10 +1098,15 @@ fn drive_process(
             }
         }
     };
-    drop(input);
+    if let Some(exited) = &process.pty_exited {
+        exited.store(true, Ordering::Release);
+    }
+    input.close();
     for reader in readers {
         let _ = reader.join();
     }
+    // Release the last resize master before publishing the terminal event.
+    drop(process.pty_resize.take());
     drop(process.guard);
 
     if disconnected.load(Ordering::Acquire) || *cancellation.borrow() {
@@ -999,12 +1129,13 @@ fn start_input_writer(
             let Some(writer) = writer else {
                 return ActiveInput::Pipe(None);
             };
-            ActiveInput::Pipe(Some(spawn_input_writer(
-                writer, worker, runtime, retirement,
-            )))
+            let (sender, _) = spawn_input_writer(writer, worker, runtime, retirement, None);
+            ActiveInput::Pipe(Some(sender))
         }
         ProcessInput::Pty(writer) => {
-            ActiveInput::Pty(spawn_input_writer(writer, worker, runtime, retirement))
+            let exited = Some(Arc::clone(&writer.exited));
+            let (sender, writer) = spawn_input_writer(writer, worker, runtime, retirement, exited);
+            ActiveInput::Pty { sender, writer }
         }
     }
 }
@@ -1014,12 +1145,16 @@ fn spawn_input_writer<W>(
     worker: Option<crate::pid1::InternalWriterGuard>,
     runtime: Arc<crate::lifecycle::RuntimeContext>,
     retirement: Option<watch::Receiver<u64>>,
-) -> std_mpsc::SyncSender<InputCommand>
+    exited: Option<Arc<AtomicBool>>,
+) -> (
+    std_mpsc::SyncSender<InputCommand>,
+    Option<thread::JoinHandle<()>>,
+)
 where
     W: Write + Send + 'static,
 {
     let (sender, receiver) = std_mpsc::sync_channel(QUEUE_CAPACITY);
-    let _ = thread::Builder::new()
+    let writer = thread::Builder::new()
         .name("silo-guest-process-stdin".to_string())
         .spawn(move || {
             let _worker = worker;
@@ -1028,6 +1163,12 @@ where
                 match command {
                     InputCommand::Data(data) => {
                         let _mutation = loop {
+                            if exited
+                                .as_ref()
+                                .is_some_and(|exited| exited.load(Ordering::Acquire))
+                            {
+                                return;
+                            }
                             if retirement
                                 .as_ref()
                                 .is_some_and(|receiver| receiver.has_changed().unwrap_or(true))
@@ -1048,8 +1189,9 @@ where
                     }
                 }
             }
-        });
-    sender
+        })
+        .ok();
+    (sender, writer)
 }
 
 fn spawn_output_reader(
@@ -1133,7 +1275,7 @@ fn write_stdin(input: &mut ActiveInput, data: Bytes) -> Result<(), Status> {
                 "stdin is already closed",
             )));
         }
-        ActiveInput::Pty(sender) => sender,
+        ActiveInput::Pty { sender, .. } => sender,
         ActiveInput::Null => {
             return Err(protocol::detailed_status(Status::failed_precondition(
                 "this process has no stdin pipe",
@@ -1164,7 +1306,7 @@ fn close_stdin(input: &mut ActiveInput) -> Result<(), Status> {
         ActiveInput::Pipe(None) => Err(protocol::detailed_status(Status::failed_precondition(
             "stdin is already closed",
         ))),
-        ActiveInput::Pty(_) => Err(protocol::detailed_status(Status::failed_precondition(
+        ActiveInput::Pty { .. } => Err(protocol::detailed_status(Status::failed_precondition(
             "PTY stdin cannot be half-closed",
         ))),
         ActiveInput::Null => Err(protocol::detailed_status(Status::failed_precondition(
@@ -1327,8 +1469,8 @@ mod tests {
         reader
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();
-        let sender =
-            crate::guest_process::spawn_input_writer(writer, None, runtime, Some(retirement));
+        let (sender, writer) =
+            crate::guest_process::spawn_input_writer(writer, None, runtime, Some(retirement), None);
         sender
             .send(crate::guest_process::InputCommand::Data(
                 b"must-not-write".to_vec(),
@@ -1337,6 +1479,7 @@ mod tests {
         let mut output = Vec::new();
         reader.read_to_end(&mut output).unwrap();
         assert!(output.is_empty());
+        writer.unwrap().join().unwrap();
     }
 
     #[test]
@@ -1524,6 +1667,16 @@ mod tests {
     ) {
         let plan = ProcessPlan::from_spec(spec).expect("valid test process plan");
         let running = spawn_process(plan, &ProcessSupervisor::default()).expect("spawn test child");
+        start_running(running)
+    }
+
+    fn start_running(
+        running: crate::guest_process::RunningProcess,
+    ) -> (
+        mpsc::Sender<GuestProcessInput>,
+        mpsc::Receiver<Result<protocol::v1::GuestProcessEvent, tonic::Status>>,
+        thread::JoinHandle<()>,
+    ) {
         let (controls, control_receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (events, event_receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (_cancel, cancel_receiver) = watch::channel(false);
@@ -1788,6 +1941,98 @@ mod tests {
             .any(|event| matches!(&event.event, Some(Event::Exited(_)))));
     }
 
+    struct KillTestGroup(nix::unistd::Pid);
+
+    impl Drop for KillTestGroup {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+
+    // Real PTYs/processes exercise the driver without requiring setgroups.
+    fn rootless_pty(script: &str) -> (crate::guest_process::RunningProcess, KillTestGroup) {
+        let pty = crate::ssh::agent::open_process_pty(80, 24, 0, 0).unwrap();
+        let master = std::fs::File::from(pty.master);
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        crate::ssh::agent::attach_pty_slave(&mut command, pty.slave).unwrap();
+        crate::ssh::agent::prepare_pty_child(&mut command);
+        let (child, guard) = ProcessSupervisor::default()
+            .spawn_session_child(&mut command, "guest process PTY exit test")
+            .unwrap();
+        let group = i32::try_from(child.id()).unwrap();
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = crate::guest_process::PtyOutputReader {
+            master: master.try_clone().unwrap(),
+            exited: Arc::clone(&exited),
+            remaining: crate::ssh::agent::PTY_EXIT_DRAIN_LIMIT,
+        };
+        (
+            crate::guest_process::RunningProcess {
+                child,
+                guard,
+                process_group: group,
+                stdin: crate::guest_process::ProcessInput::Pty(
+                    crate::guest_process::PtyInputWriter::new(
+                        master.try_clone().unwrap(),
+                        Arc::clone(&exited),
+                    )
+                    .unwrap(),
+                ),
+                outputs: vec![(crate::guest_process::OutputKind::Terminal, Box::new(reader))],
+                pty_resize: Some(master),
+                pty_exited: Some(exited),
+            },
+            KillTestGroup(nix::unistd::Pid::from_raw(group)),
+        )
+    }
+
+    async fn check_pty_exit(script: &str, expected: &[u8]) {
+        let (running, cleanup) = rootless_pty(script);
+        let (controls, mut events, task) = start_running(running);
+        drop(controls);
+        let events = tokio::time::timeout(Duration::from_secs(5), collect(&mut events))
+            .await
+            .expect("PTY driver must finish while a descendant holds the slave");
+        task.join().expect("PTY driver");
+        let mut output = Vec::new();
+        let mut exited = false;
+        for event in events {
+            match event.event {
+                Some(Event::TerminalOutput(data)) => {
+                    assert!(!exited, "PTY output after exit event");
+                    output.extend_from_slice(&data.data);
+                }
+                Some(Event::Exited(status)) => {
+                    assert_eq!(status.code, Some(0));
+                    exited = true;
+                }
+                other => panic!("unexpected PTY event: {other:?}"),
+            }
+        }
+        assert!(exited);
+        assert_eq!(output, expected);
+        assert!(
+            nix::sys::signal::killpg(cleanup.0, None).is_ok(),
+            "PTY completion must leave the background job running"
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_exit_delivers_final_output_with_background_slave_holder() {
+        check_pty_exit("trap '' HUP; sleep 600 & echo done", b"done\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn pty_exit_preserves_large_trailing_output_with_background_slave_holder() {
+        let mut expected = b"0123456789abcdef".repeat(16384);
+        expected.extend_from_slice(b"done\r\n");
+        check_pty_exit(
+            "trap '' HUP; sleep 600 & i=0; while [ \"$i\" -lt 16384 ]; do printf '0123456789abcdef'; i=$((i+1)); done; echo done",
+            &expected,
+        ).await;
+    }
+
     #[tokio::test]
     async fn pty_combines_output_supports_resize_and_signal_is_terminal_signal() {
         if !privileged() {
@@ -1873,5 +2118,52 @@ mod tests {
             &event.event,
             Some(Event::Signaled(signal)) if signal.signal == Some(nix::libc::SIGTERM as u32)
         )));
+    }
+
+    #[test]
+    fn pty_exit_cancels_a_backpressured_input_writer() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pty = crate::ssh::agent::open_process_pty(80, 24, 0, 0).unwrap();
+        let mut termios = nix::sys::termios::tcgetattr(&pty.slave).unwrap();
+        nix::sys::termios::cfmakeraw(&mut termios);
+        nix::sys::termios::tcsetattr(&pty.slave, nix::sys::termios::SetArg::TCSANOW, &termios)
+            .unwrap();
+        let exited = Arc::new(AtomicBool::new(false));
+        let mut writer = crate::guest_process::PtyInputWriter::new(
+            std::fs::File::from(pty.master),
+            Arc::clone(&exited),
+        )
+        .unwrap();
+        let mut saturated = false;
+        for _ in 0..1024 {
+            match writer.master.write(&[0_u8; 8192]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    saturated = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("fill real PTY input queue: {error}"),
+            }
+        }
+        assert!(saturated, "real PTY input queue must be backpressured");
+        let (started, running) = std::sync::mpsc::channel();
+        let (completed, result) = std::sync::mpsc::channel();
+        let pending = vec![0_u8; 1024 * 1024];
+        let task = thread::spawn(move || {
+            started.send(()).unwrap();
+            completed.send(writer.write_all(&pending)).unwrap();
+        });
+        running.recv_timeout(Duration::from_secs(1)).unwrap();
+        exited.store(true, Ordering::Release);
+        let error = result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        task.join().unwrap();
+        drop(pty.slave);
     }
 }

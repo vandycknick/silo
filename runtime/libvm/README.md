@@ -674,6 +674,11 @@ UUID and ordered unique child names. The default maximum is 16, not a request
 for sixteen children. A higher explicit maximum does not bypass resource
 admission. Replaying an operation ID requires exactly the original inputs.
 
+An already user-paused source is borrowed and stays paused, including with the
+default `ResumeIfAcquired` policy. Admission resolves that policy to `Preserve`
+in the immutable capture plan; fork results report the resolved `resumePolicy`
+separately from the original replay inputs.
+
 One authenticated operation-owned local cut supplies all children. RAM is not
 published as a named checkpoint or copied once per child: every child maps the
 same immutable inode privately. Writable disks remain independent qualified

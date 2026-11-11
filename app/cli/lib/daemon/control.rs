@@ -329,7 +329,13 @@ impl ControlState {
         T: Send + 'static,
         F: Future<Output = Result<T, Status>> + Send + 'static,
     {
-        let permit = self.admit(request, protected).await?;
+        let permit = self.admit(request, protected).await.map_err(|mut status| {
+            status.metadata_mut().insert(
+                "x-silo-mutation-rejected",
+                tonic::metadata::MetadataValue::from_static("true"),
+            );
+            status
+        })?;
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let result = work.await;

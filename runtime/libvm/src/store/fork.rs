@@ -389,6 +389,10 @@ impl Store {
             source_machine_id: source,
             source_run_id: run,
             capture_id: vm_spec::lifecycle::LiveId::parse(&capture.to_string()).map_err(invalid)?,
+            resume_policy: crate::machine::live_capture::resolve_resume_policy(
+                options.resume_policy,
+                observation,
+            )?,
             stage: ForkStage::Admitted,
             cancellation_requested: false,
             capture: ForkCaptureOutcome::Pending,

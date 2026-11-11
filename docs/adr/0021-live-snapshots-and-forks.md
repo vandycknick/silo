@@ -146,10 +146,12 @@ sequenceDiagram
     end
 ```
 
-The same flow without the loop is a live snapshot. A capture of a
-user-paused source carries `resumePolicy: preserve` and leaves it paused. A
-user pause alone is `FreezeWorkloads` and `Pause`; its resume is `Resume`
-followed by `Thaw`.
+The same flow without the loop is a live snapshot. At admission, a capture of
+a user-paused source resolves the default `resume-if-acquired` policy to
+`preserve`, persists that policy in the plan and leaves the source paused.
+Neither a live snapshot nor a live fork needs `--preserve` to borrow a user
+pause. A user pause alone is `FreezeWorkloads` and `Pause`; its resume is
+`Resume` followed by `Thaw`.
 
 ## Decision
 
