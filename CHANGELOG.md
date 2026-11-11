@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- PTY shell and exec sessions drain buffered final output and close promptly when their main process exits, without waiting for background jobs to release the terminal.
+- Live snapshots and forks borrow an existing user pause without requiring `--preserve`, persist the resolved preserve policy, and no longer warn of uncertain acceptance after a definitive rejection.
 - Guest agent status and metrics deadlines suspend during native pause and
   restart on resume without replacing the healthy stream. Delayed reconnect
   attempts no longer revoke an agent session restored by the resume handshake.

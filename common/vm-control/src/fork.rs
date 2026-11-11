@@ -527,6 +527,7 @@ pub fn result_to_wire(value: &LiveForkResult) -> Result<w::LiveForkResult, Conve
         source_machine_id: value.source_machine_id.to_string(),
         source_run_id: value.source_run_id.to_string(),
         capture_id: value.capture_id.to_string(),
+        resume_policy: crate::capture::resume_policy_to_wire(value.resume_policy),
         stage: stage_to_wire(value.stage),
         cancellation_requested: value.cancellation_requested,
         capture: Some(capture_to_wire(&value.capture)),
@@ -542,6 +543,7 @@ pub fn result_from_wire(value: w::LiveForkResult) -> Result<LiveForkResult, Conv
         source_run_id: run_id(&value.source_run_id, "fork.source_run_id")?,
         capture_id: LiveId::parse(&value.capture_id)
             .map_err(|_| invalid("fork.capture_id", "noncanonical or nil UUID"))?,
+        resume_policy: crate::capture::resume_policy_from_wire(value.resume_policy)?,
         stage: stage_from_wire(value.stage)?,
         cancellation_requested: value.cancellation_requested,
         capture: capture_from_wire(required(value.capture, "fork.capture")?)?,
@@ -657,6 +659,7 @@ mod tests {
             source_machine_id: SOURCE.parse().unwrap(),
             source_run_id: SOURCE_RUN.parse().unwrap(),
             capture_id: LiveId::parse(CAPTURE).unwrap(),
+            resume_policy: CaptureResumePolicy::ResumeIfAcquired,
             stage: ForkStage::Finished,
             cancellation_requested: false,
             capture: ForkCaptureOutcome::Sealed { cut_id: cut() },
@@ -766,6 +769,24 @@ mod tests {
         assert_eq!(decoded, result);
         validate_creation(&decoded, &options()).unwrap();
         validate_observation(&decoded, OPERATION.parse().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn resolved_preserve_policy_round_trips_for_default_request() {
+        let mut result = partial();
+        result.resume_policy = CaptureResumePolicy::Preserve;
+        result.source = ForkSourceOutcome::Preserved;
+        let wire = result_to_wire(&result).unwrap();
+        let decoded = result_from_wire(wire.clone()).unwrap();
+        assert_eq!(decoded, result);
+        assert_eq!(
+            options().resume_policy,
+            CaptureResumePolicy::ResumeIfAcquired
+        );
+        validate_creation(&decoded, &options()).unwrap();
+        let mut invalid = wire;
+        invalid.resume_policy = w::CaptureResumePolicy::Unspecified as i32;
+        assert!(result_from_wire(invalid).is_err());
     }
 
     #[test]

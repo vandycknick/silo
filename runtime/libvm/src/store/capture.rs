@@ -2606,7 +2606,7 @@ pub(crate) mod tests {
         CapturePauseAuthority, CapturePauseDisposition, CaptureRecordOutcome, CaptureRole,
         CaptureStateBinding, Sha256Digest,
     };
-    use vm_spec::lifecycle::{CapturePolicy, CaptureResumePolicy, PauseOwner, PauseToken};
+    use vm_spec::lifecycle::{CapturePolicy, CaptureResumePolicy, LiveId, PauseOwner, PauseToken};
 
     use crate::lock_manager::LockId;
     use crate::paths::{LocalPaths, OwnedDirectory};
@@ -3202,6 +3202,113 @@ pub(crate) mod tests {
                     .contains("capture fork owner contradicts its reservation"),
                 "{error}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_capture_persists_resolved_preserve_policy_for_snapshots_and_forks() {
+        use crate::machine::live::MachineLiveObservation;
+        use vm_spec::lifecycle::{
+            CurrentPause, LiveLifecycle, PauseOwner, PauseToken, VmLifecycleState,
+        };
+
+        for fork in [false, true] {
+            let fixture = fixture().await;
+            let mut request = fixture.reservation.record.request.clone();
+            fixture
+                .snapshots
+                .abandon_capture(request.capture_id)
+                .await
+                .unwrap();
+            request.capture_id = Uuid::new_v4();
+            request.alias = None;
+            let base = crate::store::fork::tests::observation(request.machine_id, request.run_id);
+            let mut report = base.report().clone();
+            report.live.capture = vm_spec::live::LiveCapability {
+                native: true,
+                availability: vm_spec::live::LiveAvailability::Supported,
+            };
+            let current = CurrentPause {
+                operation_id: LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+                token: PauseToken {
+                    machine_id: LiveId::parse(&Uuid::from(request.machine_id).to_string()).unwrap(),
+                    run_id: LiveId::parse(&request.run_id.to_string()).unwrap(),
+                    generation: NonZeroU64::new(3).unwrap(),
+                    owner: PauseOwner::User,
+                },
+                freeze_epoch: NonZeroU64::new(4).unwrap(),
+            };
+            let observation = MachineLiveObservation::for_test(
+                report,
+                VmLifecycleState::Paused,
+                LiveLifecycle {
+                    current_pause: Some(current.clone()),
+                    ..Default::default()
+                },
+            );
+            let (pause, resume_policy) =
+                crate::machine::live_capture::admission(&observation, request.resume_policy)
+                    .unwrap();
+            assert_eq!(request.resume_policy, CaptureResumePolicy::ResumeIfAcquired);
+            assert_eq!(resume_policy, CaptureResumePolicy::Preserve);
+            request.pause = pause;
+            request.resume_policy = resume_policy;
+            let _fork_owner = if fork {
+                let options = crate::store::fork::tests::options(&["borrowed-pause-child"]);
+                let (result, owner) = fixture
+                    .snapshots
+                    .store
+                    .admit_fork(
+                        request.machine_id,
+                        &observation,
+                        &options,
+                        request.capture_id,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.resume_policy, CaptureResumePolicy::Preserve);
+                assert_eq!(
+                    fixture
+                        .snapshots
+                        .store
+                        .fork_options(options.operation_id)
+                        .await
+                        .unwrap(),
+                    options,
+                );
+                assert_eq!(
+                    fixture
+                        .snapshots
+                        .store
+                        .fork_result(options.operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    result,
+                );
+                Some(owner)
+            } else {
+                None
+            };
+            let _reservation = fixture.snapshots.reserve_capture(&request).await.unwrap();
+            let stored = fixture
+                .snapshots
+                .capture_reservation(request.capture_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.plan.resume_policy, CaptureResumePolicy::Preserve);
+            assert_eq!(
+                stored.plan.pause,
+                CapturePauseAuthority::Borrow {
+                    pause_operation_id: current.operation_id,
+                    token: current.token,
+                },
+            );
+            stored.plan.validate().unwrap();
+            let mut invalid = stored.plan;
+            invalid.resume_policy = CaptureResumePolicy::ResumeIfAcquired;
+            assert!(invalid.validate().is_err());
         }
     }
 

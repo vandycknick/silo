@@ -98,6 +98,8 @@ pub struct LiveForkResult {
     pub source_machine_id: MachineId,
     pub source_run_id: MachineRunId,
     pub capture_id: LiveId,
+    /// Effective continuation policy resolved from source pause ownership at admission.
+    pub resume_policy: CaptureResumePolicy,
     pub stage: ForkStage,
     pub cancellation_requested: bool,
     pub capture: ForkCaptureOutcome,
@@ -385,8 +387,10 @@ async fn create_fork(
             .await?;
         return runtime.inspect_fork(operation).await;
     }
+    let mut capture_options = options.capture_options();
+    capture_options.resume_policy = result.resume_policy;
     match source
-        .submit_capture(&observation, capture, options.capture_options())
+        .submit_capture(&observation, capture, capture_options)
         .await
     {
         Ok(vm_spec::lifecycle::LiveCommandResult::Capture(

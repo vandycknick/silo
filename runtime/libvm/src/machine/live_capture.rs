@@ -61,8 +61,8 @@ const MAX_LAUNCH_SPEC_BYTES: usize = 4 << 20;
 pub struct LiveSnapshotOptions {
     /// Optional `image:` alias for the published checkpoint.
     pub name: Option<String>,
-    /// `resume-if-acquired` needs a Running source; a Paused source requires
-    /// `preserve` and borrows the user pause without ever resuming it.
+    /// Resume only a pause acquired by this capture. A user-paused source
+    /// resolves to `preserve` and borrows the pause without ever resuming it.
     pub resume_policy: CaptureResumePolicy,
     /// Prefer incremental capture when admitted; otherwise use full capture.
     pub policy: CapturePolicy,
@@ -105,6 +105,19 @@ pub(crate) fn resolve_policy(
     } else {
         policy
     }
+}
+
+/// Resolve source continuation before recording immutable capture inputs.
+/// Admission separately verifies that a paused source has user-owned authority.
+pub(crate) fn resolve_resume_policy(
+    policy: CaptureResumePolicy,
+    observation: &MachineLiveObservation,
+) -> Result<CaptureResumePolicy, LibVmError> {
+    Ok(if observation.state()? == VmLifecycleState::Paused {
+        CaptureResumePolicy::Preserve
+    } else {
+        policy
+    })
 }
 
 /// Source continuation as libvm knows it. `Unknown` means the run ended
@@ -233,12 +246,12 @@ fn snapshot_store(runtime: &Runtime) -> Result<SnapshotStore, LibVmError> {
 pub(crate) fn admission(
     observation: &MachineLiveObservation,
     resume_policy: CaptureResumePolicy,
-) -> Result<CapturePauseAuthority, LibVmError> {
+) -> Result<(CapturePauseAuthority, CaptureResumePolicy), LibVmError> {
     require_live_operation(observation, LiveOperation::Capture)?;
     let state = observation.state()?;
-    match (state, resume_policy) {
-        (VmLifecycleState::Running, _) => Ok(CapturePauseAuthority::Acquire),
-        (VmLifecycleState::Paused, CaptureResumePolicy::Preserve) => {
+    let pause = match state {
+        VmLifecycleState::Running => CapturePauseAuthority::Acquire,
+        VmLifecycleState::Paused => {
             let current = observation
                 .lifecycle()?
                 .current_pause
@@ -248,18 +261,18 @@ pub(crate) fn admission(
                     "only a user-owned pause can be borrowed by a capture",
                 ));
             }
-            Ok(CapturePauseAuthority::Borrow {
+            CapturePauseAuthority::Borrow {
                 pause_operation_id: current.operation_id,
                 token: current.token,
-            })
+            }
         }
-        (VmLifecycleState::Paused, CaptureResumePolicy::ResumeIfAcquired) => Err(protocol(
-            "a paused source is captured only with preserve; capture never resumes a user pause",
-        )),
-        (state, _) => Err(protocol(format!(
-            "capture is not admitted in state {state}"
-        ))),
-    }
+        state => {
+            return Err(protocol(format!(
+                "capture is not admitted in state {state}"
+            )))
+        }
+    };
+    Ok((pause, resolve_resume_policy(resume_policy, observation)?))
 }
 
 impl Machine {
@@ -313,7 +326,13 @@ impl Machine {
             let reservation = snapshot_store(runtime)?
                 .capture_reservation(request_id)
                 .await?;
-            if command.plan.resume_policy != options.resume_policy
+            let resume_policy =
+                if matches!(command.plan.pause, CapturePauseAuthority::Borrow { .. }) {
+                    CaptureResumePolicy::Preserve
+                } else {
+                    options.resume_policy
+                };
+            if command.plan.resume_policy != resume_policy
                 || command.plan.policy != options.policy
                 || command.plan.dirty_crossover_percent != options.dirty_crossover_percent
                 || reservation.is_none_or(|record| record.alias != options.name)
@@ -324,13 +343,15 @@ impl Machine {
                 .live_command(observation, existing.intent.command)
                 .await;
         }
-        let pause = admission(observation, options.resume_policy)?;
+        let (pause, resume_policy) = admission(observation, options.resume_policy)?;
+        options.resume_policy = resume_policy;
         let (reservation, intent) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
             require_same_observation(observation, &fresh)?;
             options.policy = resolve_policy(options.policy, &fresh);
-            if admission(&fresh, options.resume_policy)? != pause {
+            let (fresh_pause, fresh_resume_policy) = admission(&fresh, options.resume_policy)?;
+            if fresh_pause != pause || fresh_resume_policy != options.resume_policy {
                 return Err(protocol("pause authority changed since capture admission"));
             }
             if let Some(operation) = store.fork_for_capture(request_id).await? {
@@ -1502,41 +1523,57 @@ mod tests {
                     policy,
                 )
                 .unwrap(),
-                CapturePauseAuthority::Acquire
+                (CapturePauseAuthority::Acquire, policy)
+            );
+            assert_eq!(
+                crate::machine::live_capture::resolve_resume_policy(
+                    policy,
+                    &observed(true, VmLifecycleState::Running, LiveLifecycle::default()),
+                )
+                .unwrap(),
+                policy,
             );
         }
     }
 
     #[test]
-    fn capture_admission_borrows_exact_user_pause_only_with_preserve() {
-        let borrowed = admission(
-            &observed(true, VmLifecycleState::Paused, paused(PauseOwner::User)),
-            CaptureResumePolicy::Preserve,
-        )
-        .unwrap();
-        assert_eq!(
-            borrowed,
-            CapturePauseAuthority::Borrow {
-                pause_operation_id: id(9),
-                token: token(PauseOwner::User),
-            }
-        );
-        assert!(admission(
-            &observed(true, VmLifecycleState::Paused, paused(PauseOwner::User)),
+    fn capture_admission_borrows_exact_user_pause_and_resolves_both_policies_to_preserve() {
+        for policy in [
             CaptureResumePolicy::ResumeIfAcquired,
-        )
-        .is_err());
-        assert!(admission(
-            &observed(
-                true,
-                VmLifecycleState::Paused,
-                paused(PauseOwner::Capture {
-                    operation_id: id(7)
-                })
-            ),
             CaptureResumePolicy::Preserve,
-        )
-        .is_err());
+        ] {
+            let observation = observed(true, VmLifecycleState::Paused, paused(PauseOwner::User));
+            assert_eq!(
+                admission(&observation, policy).unwrap(),
+                (
+                    CapturePauseAuthority::Borrow {
+                        pause_operation_id: id(9),
+                        token: token(PauseOwner::User),
+                    },
+                    CaptureResumePolicy::Preserve,
+                )
+            );
+            assert_eq!(
+                crate::machine::live_capture::resolve_resume_policy(policy, &observation).unwrap(),
+                CaptureResumePolicy::Preserve,
+            );
+            assert!(admission(
+                &observed(
+                    true,
+                    VmLifecycleState::Paused,
+                    paused(PauseOwner::Capture {
+                        operation_id: id(7)
+                    })
+                ),
+                policy,
+            )
+            .is_err());
+            assert!(admission(
+                &observed(true, VmLifecycleState::Paused, LiveLifecycle::default()),
+                policy,
+            )
+            .is_err());
+        }
     }
 
     #[test]

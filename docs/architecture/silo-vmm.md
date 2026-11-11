@@ -245,8 +245,9 @@ the recorded continuation policy. This accounting is not a filesystem quota.
 
 A running source acquires capture-owned pause authority. `resume-if-acquired`
 continues that source; `preserve` transfers authority to the user. Capturing an
-already user-paused source requires `preserve` and borrows its exact token,
-never resumes it. Cancellation before sealing abandons the cut and applies
+already user-paused source resolves the default policy to `preserve` at
+admission, records it in the capture plan and borrows its exact token, never
+resumes it. Cancellation before sealing abandons the cut and applies
 the continuation policy; cancellation after sealing cannot discard the cut.
 `vm.capture-source.json` records continuation separately from capture success.
 

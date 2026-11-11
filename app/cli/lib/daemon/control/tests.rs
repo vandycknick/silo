@@ -127,6 +127,29 @@ async fn stale_helper_and_public_stopping_requests_rejected() {
 }
 
 #[tokio::test]
+async fn mutation_rejection_metadata_marks_only_work_that_was_never_admitted() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let error = state
+        .mutate(&Request::new(()), false, async {
+            Err::<(), _>(Status::unavailable("work failed after admission"))
+        })
+        .await
+        .unwrap_err();
+    assert!(error.metadata().get("x-silo-mutation-rejected").is_none());
+    state.seal_mutations().await;
+    let error = state
+        .mutate(&Request::new(()), false, async { Ok::<_, Status>(()) })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        error.metadata().get("x-silo-mutation-rejected").unwrap(),
+        "true",
+    );
+}
+
+#[tokio::test]
 async fn invalid_mutations_fail_before_runtime_or_admission() {
     use w::{
         machine_service_server::MachineService, network_service_server::NetworkService,

@@ -157,7 +157,12 @@ impl DaemonVmService {
                 .clone()
                 .fork_execution(request)
                 .await
-                .map_err(native_status)?
+                .map_err(
+                    |status| match silo_vm_control::errors::status_to_native_error(&status) {
+                        Ok(error) => eyre::Report::new(error),
+                        Err(_) => eyre::Report::new(status),
+                    },
+                )?
                 .into_inner(),
         )?)
     }
