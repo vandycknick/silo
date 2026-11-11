@@ -156,10 +156,6 @@ impl LocalVmService {
             .transpose()?;
         self.require_machine_live(reference, vm_spec::live::LiveOperation::Capture)
             .await?;
-        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
-            self.require_machine_live(reference, vm_spec::live::LiveOperation::Incremental)
-                .await?;
-        }
         let reference = MachineRef::parse(reference)?;
         let observation = self.observe_machine_live(&reference).await?;
         let machine = self.runtime().await?.get_machine(&reference).await?;
@@ -179,10 +175,6 @@ impl LocalVmService {
         options.validate()?;
         self.require_machine_live(reference, vm_spec::live::LiveOperation::Fork)
             .await?;
-        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
-            self.require_machine_live(reference, vm_spec::live::LiveOperation::Incremental)
-                .await?;
-        }
         let observation = self.observe_machine_live(&machine_ref).await?;
         let machine = self.runtime().await?.get_machine(&machine_ref).await?;
         Ok(machine.fork_live(&observation, options).await?)
@@ -1490,7 +1482,6 @@ mod tests {
                         name: Some(name.into()),
                         external_resources: ExternalResourcePolicy::Reject,
                         activation_hook: None,
-                        resources: Default::default(),
                     },
                 )
                 .await

@@ -7,15 +7,10 @@ cut, monitor traces, `/proc` and the guest, using the staged runtime.
 """
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass
-from decimal import Decimal
-import fcntl
 import json
-import math
 import os
 from pathlib import Path
-import re
 import signal
 from uuid import UUID
 
@@ -23,11 +18,8 @@ import pytest
 
 from silo_smoke import capture, fork, pause, procs, restore, shutdown, stopped
 from silo_smoke import restore_lifecycle as lifecycle
-from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo, TIMINGS_PROPERTY, release
-from silo_smoke.config import SmokeConfig
-from silo_smoke.registry import LoopbackRegistry
+from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.restore import restore_image  # noqa: F401, pytest fixture
-from silo_smoke.workspace import Workspace
 
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 
@@ -37,15 +29,8 @@ FORWARD = f"host:unix:fork.sock=guest:tcp:127.0.0.1:{lifecycle.LISTEN_PORT}"
 BLOB = 128 * fork.MIB
 DIRTY_MIB = 32
 MIB = fork.MIB
-# ADR 0021 restore reservation: per-child private allowance rounded to the
-# granule, plus ceil(RAM/512) and the 64 MiB state reserve; baseline once.
-STATE_RESERVE = 64 * MIB
 FAILING_HOOK = {"argv": ["/bin/sh", "-c", "exit 7"], "environment": [], "workingDirectory": "/",
                 "timeoutMs": 5000}
-HUMAN_SIZE = r"(\d+(?:\.\d+)?(?:GiB|MiB|B))"
-BUDGET_REFUSAL = re.compile(
-    rf"RAM budget requires {HUMAN_SIZE}, available {HUMAN_SIZE} \(short by {HUMAN_SIZE}\)"
-)
 
 
 @dataclass(frozen=True)
@@ -447,12 +432,12 @@ def staged_lines(silo: Silo, machine_id: str) -> int:
 
 
 def ledger(silo: Silo) -> dict[str, bytes]:
-    """This home's charge records in the same-euid cross-home restore ledger.
+    """This home's charge records in the same-euid cross-home resource ledger.
 
     libvm names each record `<state.db device>-<state.db inode>-<id>.json`; the
     `<device>-<inode>-home.json` anchor only proves the home exists.
     """
-    directory = Path(f"/tmp/silo-restore-budget-{os.geteuid()}")
+    directory = Path(f"/tmp/silo-resource-budget-{os.geteuid()}")
     metadata = silo.ws.state_db().stat()
     prefix = f"{metadata.st_dev}-{metadata.st_ino}-"
     if not directory.is_dir():
@@ -460,77 +445,6 @@ def ledger(silo: Silo) -> dict[str, bytes]:
     return {path.name: path.read_bytes() for path in sorted(directory.iterdir())
             if path.name.startswith(prefix) and path.name.endswith(".json")
             and path.name != f"{prefix}home.json" and path.is_file()}
-
-
-def budget_memory(directory: Path) -> int:
-    """Same-euid reserved RAM, deduplicating bound baselines by real inode."""
-    if not directory.is_dir():
-        return 0
-    memory = 0
-    baselines: dict[tuple[int, int], int] = {}
-
-    def baseline(device: int, inode: int, length: int) -> None:
-        nonlocal memory
-        identity = (device, inode)
-        if identity in baselines:
-            assert baselines[identity] == length, "baseline inode has contradictory lengths"
-        else:
-            baselines[identity] = length
-            memory += length
-
-    def restore_charge(charge: dict) -> None:
-        nonlocal memory
-        memory += charge["privateBytes"] + charge["overheadBytes"]
-        baseline(charge["baselineDevice"], charge["baselineInode"], charge["baselineBytes"])
-
-    # Production serializes every ledger publish/release with this same flock.
-    with (directory / "admission.lock").open("rb") as lock:
-        fcntl.flock(lock, fcntl.LOCK_SH)
-        for path in sorted(directory.glob("*.json")):
-            # `<dev>-<ino>-home.json` anchors prove a home exists; they charge nothing.
-            if path.name.endswith("-home.json"):
-                continue
-            document = json.loads(path.read_bytes())
-            if "captureId" not in document:
-                restore_charge(document)
-                continue
-            memory += document["captureMemory"]
-            saved = document["baseline"]
-            if saved is not None:
-                if saved["kind"] == "pending":
-                    memory += saved["bytes"]
-                else:
-                    assert saved["kind"] == "bound", saved
-                    baseline(saved["device"], saved["inode"], saved["bytes"])
-            memory += sum(child["privateBytes"] + child["overheadBytes"] for child in document["pending"])
-            for child in document["bound"]:
-                restore_charge(child)
-    return memory
-
-
-def test_fork_budget_memory_counts_existing_charges_and_shared_baselines(tmp_path: Path) -> None:
-    assert budget_memory(tmp_path / "absent") == 0
-    (tmp_path / "admission.lock").touch()
-    first = {"baselineDevice": 1, "baselineInode": 2, "baselineBytes": 100,
-             "privateBytes": 20, "overheadBytes": 3}
-    second = {**first, "privateBytes": 30, "overheadBytes": 4}
-    bound = {**first, "baselineInode": 3, "baselineBytes": 200, "privateBytes": 50, "overheadBytes": 6}
-    shared = {**first, "privateBytes": 60, "overheadBytes": 8}
-    records = [first, second, {
-        "captureId": "bound-cut", "captureMemory": 7,
-        "baseline": {"kind": "bound", "device": 1, "inode": 2, "bytes": 100},
-        "pending": [{"privateBytes": 40, "overheadBytes": 5}], "bound": [bound],
-    }, {
-        "captureId": "pending-cut", "captureMemory": 11,
-        "baseline": {"kind": "pending", "captureId": "pending-cut", "bytes": 300},
-        "pending": [], "bound": [shared],
-    }]
-    for index, record in enumerate(records):
-        (tmp_path / f"{index}.json").write_text(json.dumps(record))
-    assert budget_memory(tmp_path) == 844
-    (tmp_path / "1.json").write_text(json.dumps({**second, "baselineBytes": 101}))
-    with pytest.raises(AssertionError, match="contradictory lengths"):
-        budget_memory(tmp_path)
 
 
 def refused_before_freeze(silo: Silo, prepared: Prepared, names: list[str], *flags: str,
@@ -569,158 +483,16 @@ def refusal_diagnostic(call: fork.Call) -> str:
     return call.stderr
 
 
-def mem_available() -> int:
-    for line in Path("/proc/meminfo").read_text().splitlines():
-        if line.startswith("MemAvailable:"):
-            value, unit = line.split()[1:]
-            assert unit == "kB"
-            return int(value) * 1024
-    raise AssertionError("kernel omitted MemAvailable")
-
-
-def batch_bytes(ram: int, children: int, percent: int = 100) -> int:
-    granule = os.sysconf("SC_PAGE_SIZE")
-    private = math.ceil(ram * percent / 100 / granule) * granule
-    return ram + children * (private + math.ceil(ram / 512) + STATE_RESERVE)
-
-
-def size_interval(text: str) -> tuple[int, int]:
-    """Inclusive byte bounds for the formatter's nearest-hundredth units."""
-    for suffix, unit in [("GiB", 1024 * MIB), ("MiB", MIB), ("B", 1)]:
-        if text.endswith(suffix):
-            value = Decimal(text[:-len(suffix)]) * unit
-            tolerance = Decimal(unit) / 200 if unit > 1 else Decimal(0)
-            return max(0, math.ceil(value - tolerance)), math.floor(value + tolerance)
-    raise AssertionError(f"invalid human-readable size: {text}")
-
-
-def budget_refusal(diagnostic: str) -> tuple[tuple[int, int], tuple[int, int]]:
-    match = BUDGET_REFUSAL.search(diagnostic)
-    assert match is not None, diagnostic
-    required, available, shortfall = (size_interval(value) for value in match.groups())
-    assert shortfall[0] > 0, diagnostic
-    # A displayed equality is still a refusal if a positive shortfall explains it.
-    assert required[1] > available[0], diagnostic
-    assert required[0] - available[1] <= shortfall[1], diagnostic
-    assert required[1] - available[0] >= shortfall[0], diagnostic
-    return required, available
-
-
-@pytest.mark.parametrize("text, value", [
-    ("0B", 0), ("1B", 1), ("1048575B", MIB - 1),
-    ("1MiB", MIB), ("1.01MiB", MIB + MIB // 100),
-    ("1024MiB", 1024 * MIB - 1), ("1GiB", 1024 * MIB + 1),
-])
-def test_size_interval_includes_formatter_rounding(text: str, value: int) -> None:
-    lower, upper = size_interval(text)
-    assert lower <= value <= upper
-
-
-def test_budget_refusal_accepts_equal_rounded_sizes_with_positive_shortfall() -> None:
-    required, available = budget_refusal(
-        "restore RAM budget requires 1GiB, available 1GiB (short by 1B)")
-    assert required[0] <= 1024 * MIB + 1 <= required[1]
-    assert available[0] <= 1024 * MIB <= available[1]
-
-
-def children_for(ram: int, target: int) -> int:
-    return max(1, math.ceil((target - ram) / (batch_bytes(ram, 1) - ram)))
-
-
-def test_fork_refuses_count_memory_and_descriptor_budgets_before_freeze(
+def test_fork_refuses_count_and_descriptor_budgets_before_freeze(
     silo: Silo, restore_image: str,  # noqa: F811
 ) -> None:
-    ram = 1024 * MIB
     prepared = prepare(silo, restore_image, profile="layered", memory="1gib")
     # Count: 17 children exceed the default maximum of 16 without an explicit flag.
     refused_before_freeze(silo, prepared, [f"count-{index}" for index in range(17)])
-    # Memory: the whole batch at 100% private allowance is twice MemAvailable.
-    count = children_for(ram, 2 * mem_available())
-    call = refused_before_freeze(silo, prepared, [f"m{index}" for index in range(count)],
-                                 "--max-children", str(count), "--private-write-percent", "100")
-    diagnostic = refusal_diagnostic(call)
-    required, available = budget_refusal(diagnostic)
-    assert required[1] >= batch_bytes(ram, count) > available[1], diagnostic
     # Descriptors: the manager's own RLIMIT_NOFILE cannot hold sixteen handoffs.
     call = refused_before_freeze(silo, prepared, [f"fd-{index}" for index in range(16)], nofile=48)
     diagnostic = refusal_diagnostic(call)
     assert "file descriptor budget requires" in diagnostic, diagnostic
-    stopped.stop(silo, SOURCE, require_clean=False)
-
-
-@pytest.fixture
-def other_silo(config: SmokeConfig, registry: LoopbackRegistry,
-               request: pytest.FixtureRequest) -> Iterator[Silo]:
-    """A second same-user home sharing only the per-euid restore ledger."""
-    instance = Workspace(config, registry.ca_path)
-    try:
-        yield Silo(instance)
-    finally:
-        release(instance, failed=request.session.testsfailed > 0,
-                publish=lambda summary: request.node.user_properties.append(
-                    (TIMINGS_PROPERTY + "-other-home", summary)))
-
-
-def test_fork_whole_batch_refusal_counts_another_homes_admitted_batch_then_pre_seal_cancel(
-    silo: Silo, other_silo: Silo, restore_image: str,  # noqa: F811
-) -> None:
-    ram = 1024 * MIB
-    prepared = prepare(silo, restore_image, profile="layered", memory="1gib")
-    create(other_silo, restore_image, profile="layered", memory="1gib")
-    available = mem_available()
-    reserved = budget_memory(Path(f"/tmp/silo-restore-budget-{os.geteuid()}"))
-    headroom = available - reserved
-    other_count = children_for(ram, int(0.6 * headroom))
-    count = children_for(ram, int(0.6 * headroom))
-    alone = batch_bytes(ram, count)
-    assert alone < headroom and alone + batch_bytes(ram, other_count) > headroom, (
-        "host lacks room for two individually admissible batches", available, reserved)
-    other_names = [f"b{index}" for index in range(other_count)]
-    traced = fork.TracedSource(other_silo, SOURCE, other_names, "capture-execution-write",
-                               "--max-children", str(other_count), "--private-write-percent", "100")
-    try:
-        other = witness_source(other_silo)
-        other_run = other.info["run_id"]
-        traced.fork()
-        # Home B's whole batch is admitted and its capture is held before the seal.
-        stamps = fork.events(other_silo, traced.operation)
-        assert (None, "admission_committed") in stamps and (None, "seal_authenticated") not in stamps, stamps
-        assert ledger(other_silo), "admitted batch is not visible in the cross-home ledger"
-        call = refused_before_freeze(silo, prepared, [f"a{index}" for index in range(count)],
-                                     "--max-children", str(count), "--private-write-percent", "100")
-        diagnostic = refusal_diagnostic(call)
-        required, reported = budget_refusal(diagnostic)
-        assert required[1] >= reserved + alone + batch_bytes(ram, other_count), diagnostic
-        assert reserved + alone < reported[0], "home A alone would not have fit; refusal proves nothing about B"
-
-        cancelled = fork.observe(other_silo, traced.operation, cancel=True)
-        assert cancelled["cancellationRequested"] is True and cancelled["stage"] != "finished", cancelled
-        shutdown.until(lambda: "live cancellation admitted" in fork.source_trace(
-            other_silo, other.info["id"]).read_text(errors="replace"), timeout=60,
-            description="source monitor never admitted the pre-seal capture cancellation")
-        traced.release()
-        code, result = traced.manager_exit()
-        assert code == 1 and result is not None and result["stage"] == "finished", (code, result)
-        assert result["capture"]["kind"] in {"failed", "abandoned"}, result
-        assert result["source"] == {"kind": "unchanged"}, result
-        for child in result["children"]:
-            outcome = child["outcome"]
-            assert outcome["kind"] == "cancelled" or (
-                outcome["kind"] == "failed" and outcome["phase"] == "capture"), child
-            fork.absent(other_silo, child)
-        assert not fork.cut_directory(other_silo, traced.operation).exists()
-        assert not ledger(other_silo), "cancelled batch kept its cross-home charge"
-        current = other_silo.info(SOURCE)
-        assert current["state"] == "running" and current["run_id"] == other_run, current
-        restore.advances(other_silo, SOURCE, restore.witness(other_silo, SOURCE))
-        other_silo.ws.record("fork-pre-seal-cancel", json.dumps({
-            "operation": traced.operation, "result": result, "refusal": diagnostic,
-            "available": available, "existingReservations": reserved,
-            "homeA": alone, "homeB": batch_bytes(ram, other_count),
-        }, sort_keys=True) + "\n")
-        traced.finish()
-    finally:
-        traced.close()
     stopped.stop(silo, SOURCE, require_clean=False)
 
 

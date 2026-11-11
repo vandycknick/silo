@@ -84,69 +84,11 @@ pub struct SnapshotOptions {
     pub external_resources: ExternalResourcePolicy,
 }
 
-/// Fraction of configured RAM reserved for this child's private writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "u32", into = "u32")]
-pub struct PrivateWriteAllowance(u8);
-
-impl Default for PrivateWriteAllowance {
-    fn default() -> Self {
-        Self(25)
-    }
-}
-
-impl TryFrom<u32> for PrivateWriteAllowance {
-    type Error = LibVmError;
-
-    fn try_from(percent: u32) -> Result<Self, Self::Error> {
-        if percent > 100 {
-            return Err(invalid(
-                "private-write allowance must be between 0 and 100 percent",
-            ));
-        }
-        Ok(Self(percent as u8))
-    }
-}
-
-impl From<PrivateWriteAllowance> for u32 {
-    fn from(value: PrivateWriteAllowance) -> Self {
-        u32::from(value.0)
-    }
-}
-
-impl PrivateWriteAllowance {
-    pub(crate) fn reservation(self, bytes: u64, granule: u64) -> Result<u64, LibVmError> {
-        if granule == 0 || !granule.is_power_of_two() {
-            return Err(invalid("invalid native RAM granule"));
-        }
-        // Widen before multiplication so even the largest input cannot wrap.
-        let bytes = (u128::from(bytes) * u128::from(self.0)).div_ceil(100);
-        let rounded = bytes.div_ceil(u128::from(granule)) * u128::from(granule);
-        u64::try_from(rounded).map_err(|_| invalid("restore private-write reservation overflow"))
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RestoreMemoryPolicy {
-    #[default]
-    Reserved,
-    AllowOvercommit,
-}
-
-/// Per-child admission intent, retained for the lifetime of the restore run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RestoreResourcePolicy {
-    pub private_write_allowance: PrivateWriteAllowance,
-    pub memory: RestoreMemoryPolicy,
-}
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {
     pub name: Option<String>,
     pub external_resources: ExternalResourcePolicy,
     pub activation_hook: Option<vm_spec::restore::RestoreHook>,
-    pub resources: RestoreResourcePolicy,
 }
 
 /// Explicit cold-boot recovery, never execution restore or a restore fallback.
@@ -1334,11 +1276,6 @@ async fn restore_owned(
     if options.activation_hook.is_some() {
         return Err(invalid(
             "activation hooks require a live execution checkpoint",
-        ));
-    }
-    if options.resources != RestoreResourcePolicy::default() {
-        return Err(invalid(
-            "restore resource policies require a live execution checkpoint",
         ));
     }
     check_policy(&preview.external_requirements, &options.external_resources)?;

@@ -11,10 +11,7 @@ use vm_spec::lifecycle::{CaptureResumePolicy, Diagnostic, LiveId};
 use crate::machine::live::MachineLiveObservation;
 use crate::machine::root_storage::invalid;
 use crate::store::MachineStore;
-use crate::{
-    GuestPublish, LibVmError, Machine, MachineId, MachineRunId, RestoreHook, RestoreResourcePolicy,
-    Runtime,
-};
+use crate::{GuestPublish, LibVmError, Machine, MachineId, MachineRunId, RestoreHook, Runtime};
 
 pub const DEFAULT_LIVE_FORK_MAX_CHILDREN: NonZeroU32 = NonZeroU32::MIN.saturating_add(15);
 
@@ -27,7 +24,6 @@ pub struct LiveForkOptions {
     pub resume_policy: CaptureResumePolicy,
     pub policy: vm_spec::lifecycle::CapturePolicy,
     pub dirty_crossover_percent: u8,
-    pub resources: RestoreResourcePolicy,
 }
 
 impl LiveForkOptions {
@@ -106,7 +102,6 @@ pub struct LiveForkResult {
     pub cancellation_requested: bool,
     pub capture: ForkCaptureOutcome,
     pub source: ForkSourceOutcome,
-    pub resources: RestoreResourcePolicy,
     pub children: Vec<ForkChildResult>,
 }
 
@@ -248,7 +243,7 @@ impl Machine {
     pub async fn fork_live(
         &self,
         observation: &MachineLiveObservation,
-        options: LiveForkOptions,
+        mut options: LiveForkOptions,
     ) -> Result<LiveForkResult, LibVmError> {
         let entered = monotonic_ns()?;
         if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
@@ -258,9 +253,7 @@ impl Machine {
             });
         }
         options.validate()?;
-        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
-            crate::require_live_operation(observation, vm_spec::live::LiveOperation::Incremental)?;
-        }
+        options.policy = crate::machine::live_capture::resolve_policy(options.policy, observation);
         if let Some(existing) = self
             .runtime()
             .native_store()?
@@ -317,7 +310,7 @@ async fn create_fork(
     runtime: Runtime,
     machine: MachineId,
     observation: MachineLiveObservation,
-    options: LiveForkOptions,
+    mut options: LiveForkOptions,
     entered: i64,
 ) -> Result<LiveForkResult, LibVmError> {
     let store = runtime.native_store()?;
@@ -342,9 +335,7 @@ async fn create_fork(
             .await?;
         crate::machine::live_operations::require_same_observation(&observation, &fresh)?;
         crate::require_live_operation(&fresh, vm_spec::live::LiveOperation::Fork)?;
-        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
-            crate::require_live_operation(&fresh, vm_spec::live::LiveOperation::Incremental)?;
-        }
+        options.policy = crate::machine::live_capture::resolve_policy(options.policy, &fresh);
         crate::machine::live_capture::admission(&fresh, options.resume_policy)?;
         let storage = runtime.machine_storage_record(machine).await?;
         if !config.spec.mounts.is_empty() || !storage.external_requirements.is_empty() {

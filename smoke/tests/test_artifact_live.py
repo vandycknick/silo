@@ -32,7 +32,7 @@ from urllib.request import urlopen
 
 import pytest
 
-from silo_smoke import capture, incremental, overlay, procs, restore, shutdown, stopped
+from silo_smoke import capture, incremental, overlay, procs, reclaim, restore, shutdown, stopped
 from silo_smoke.cli import ROOT_PROFILES, TIMINGS_PROPERTY, Result, RootProfile, Silo, release
 from silo_smoke.config import SmokeConfig
 from silo_smoke.distribution_registry import (
@@ -466,7 +466,9 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
     initial = restore.start_witness(silo, SOURCE)
     armed = restore.witness(silo, SOURCE, "arm")
     assert armed["timerPending"] == armed["signalPending"] == 1
-    saved = restore.checkpoint(silo, SOURCE, alias="artifact-checkpoint")
+    if policy == "incremental":
+        reclaim.settled(silo, SOURCE)
+    saved = restore.checkpoint(silo, SOURCE, alias="artifact-checkpoint", policy="full")
     if policy == "incremental":
         incremental.authenticated_map(silo, saved, mode="full", reason="requested")
         baseline = saved
@@ -726,7 +728,7 @@ def test_incompatible_imported_execution_refuses_before_child_allocation(
         assert storage["root"]["kind"] == ("opaque-raw" if profile == "raw" else "linux-overlay"), storage["root"]
         assert storage["snapshot"] == forged and storage["stopOutcome"] == "unknown"
         assert storage["boot"] == json.loads(bytes.fromhex(imported_record[0][0]))["boot"]
-        assert count(destination, "SELECT count(*) FROM restore_memory_reservation") == 0
+        assert count(destination, "SELECT count(*) FROM restore_resource_reservation") == 0
         directory = overlay.machine_dir(destination, recovered)
         assert not any(path.name in {"memory.ram", "execution.state", "devices.state"}
                        for path in directory.rglob("*")), "disk recovery installed execution inputs"

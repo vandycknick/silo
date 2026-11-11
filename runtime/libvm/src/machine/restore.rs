@@ -313,14 +313,8 @@ async fn restore_consumer(
         }
     }
     let disk_peak = restore_disk_peak(runtime.local_images_dir(), &sources, &consumer.record)?;
-    let memory = snapshots
-        .reserve_restore_resources(
-            consumer,
-            &request,
-            disk_peak,
-            descriptor_peak,
-            options.resources,
-        )
+    let resources = snapshots
+        .reserve_restore_resources(consumer, disk_peak, descriptor_peak)
         .await?;
     let _names = runtime.lock_machine_names().await?;
     let name =
@@ -332,7 +326,7 @@ async fn restore_consumer(
         },
         consumer_operation: consumer.operation_id,
         request: request.clone(),
-        memory,
+        resources,
         inspected_executable,
         inspection,
         network_attachment: network,
@@ -1582,7 +1576,7 @@ pub(crate) async fn restore_reserved_fork_child(
         },
         consumer_operation: child.consumer_id,
         request: request.clone(),
-        memory: store.fork_child_charge(child.consumer_id).await?,
+        resources: store.fork_child_charge(child.consumer_id).await?,
         inspected_executable,
         inspection,
         network_attachment: network,

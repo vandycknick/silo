@@ -31,12 +31,12 @@ def test_incremental_fork_preserves_pause_and_child_baseline(
 ) -> None:
     create(silo, incremental_image)
     initial = incremental.witness(silo, SOURCE, "start")
+    reclaim.settled(silo, SOURCE)
     baseline = restore.checkpoint(silo, SOURCE, alias="fork-baseline")
-    baseline_map = incremental.authenticated_map(silo, baseline, mode="full", reason="requested")["map"]
+    baseline_map = incremental.authenticated_map(silo, baseline, mode="full", reason="no-baseline")["map"]
     source = silo.info(SOURCE)
     child = "incremental-fork-child"
-    call = fork.run(silo, SOURCE, [child], "--preserve", "--capture-policy", "incremental",
-                    "--dirty-crossover-percent", "60", expect=0)
+    call = fork.run(silo, SOURCE, [child], "--preserve", expect=0)
     assert fork.outcomes(call.result) == ["running"]
     assert silo.info(SOURCE)["lifecycle"]["lifecycle"]["currentPause"] == source["lifecycle"]["lifecycle"]["currentPause"]
     cut = fork.cut(silo, call, source, baseline.boot_id, baseline.generation)
@@ -47,7 +47,7 @@ def test_incremental_fork_preserves_pause_and_child_baseline(
     assert json.loads((cut.staging / "memory.map.json").read_bytes()) == baseline_map
     assert incremental.witness(silo, child, previous=initial) == initial
     changed = incremental.witness(silo, child, "first", previous=initial)
-    saved = restore.checkpoint(silo, child, alias="fork-child-incremental", policy="incremental")
+    saved = restore.checkpoint(silo, child, alias="fork-child-incremental")
     incremental.authenticated_map(silo, saved, mode="incremental", baseline=cut, baseline_map=baseline_map)
     incremental.pages_at_cut(silo, saved, changed)
 
@@ -59,13 +59,14 @@ def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
     initial = incremental.witness(silo, SOURCE, "start")
     execution = restore.start_witness(silo, SOURCE)
     restore.witness(silo, SOURCE, "arm")
-    base = restore.checkpoint(silo, SOURCE, alias="incremental-base", policy="incremental")
+    reclaim.settled(silo, SOURCE)
+    base = restore.checkpoint(silo, SOURCE, alias="incremental-base")
     incremental.authenticated_map(silo, base, mode="full", reason="no-baseline")
     incremental.pages_at_cut(silo, base, initial)
     silo.run("resume", SOURCE)
 
     first_pages = incremental.witness(silo, SOURCE, "first", previous=initial)
-    first = restore.checkpoint(silo, SOURCE, alias="incremental-first", policy="incremental")
+    first = restore.checkpoint(silo, SOURCE, alias="incremental-first")
     facts = incremental.authenticated_map(silo, first, mode="incremental", baseline=base)
     # CPU stores and O_DIRECT block DMA into the two exact pinned pages both
     # changed independently read RAM bytes, not merely receipt counters.
@@ -76,13 +77,13 @@ def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
     restore.resumed(silo, SOURCE, execution, cut)
 
     second_pages = incremental.witness(silo, SOURCE, "second", previous=initial)
-    second = restore.checkpoint(silo, SOURCE, alias="incremental-second", policy="incremental")
+    second = restore.checkpoint(silo, SOURCE, alias="incremental-second")
     facts = incremental.authenticated_map(silo, second, mode="incremental", baseline=first)
     assert incremental.pages_at_cut(silo, second, {**second_pages, "pages": second_pages["pages"][:2]}) <= facts["affected"]
     silo.run("resume", SOURCE)
     restore.witness(silo, SOURCE, "arm")
     zero_pages = incremental.witness(silo, SOURCE, "zero", previous=second_pages)
-    zero = restore.checkpoint(silo, SOURCE, alias="incremental-zero", policy="incremental")
+    zero = restore.checkpoint(silo, SOURCE, alias="incremental-zero")
     facts = incremental.authenticated_map(silo, zero, mode="incremental", baseline=second)
     zero_chunk = incremental.pages_at_cut(silo, zero, {**zero_pages, "pages": zero_pages["pages"][2:3]})
     assert zero_chunk <= facts["affected"]
@@ -100,7 +101,7 @@ def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
     assert inherited_pages == zero_pages
     restore.advances(silo, child, restore.witness(silo, child))
     child_pages = incremental.witness(silo, child, "first", previous=zero_pages)
-    recaptured = restore.checkpoint(silo, child, alias="incremental-child-first", policy="incremental")
+    recaptured = restore.checkpoint(silo, child, alias="incremental-child-first")
     child_facts = incremental.authenticated_map(silo, recaptured, mode="incremental", baseline=zero)
     changed = incremental.pages_at_cut(silo, recaptured, {**child_pages, "pages": child_pages["pages"][:2]})
     assert changed <= child_facts["affected"]
@@ -190,24 +191,25 @@ def test_full_request_lowered_crossover_and_new_worker_invalidate_baseline(
 ) -> None:
     create(silo, incremental_image)
     initial = incremental.witness(silo, SOURCE, "start")
+    reclaim.settled(silo, SOURCE)
     base = restore.checkpoint(silo, SOURCE, alias="selection-full", policy="full")
     incremental.authenticated_map(silo, base, mode="full", reason="requested")
     silo.run("resume", SOURCE)
     pages = incremental.witness(silo, SOURCE, "crossover", previous=initial)
-    crossed = restore.checkpoint(silo, SOURCE, alias="selection-crossover", policy="incremental",
+    crossed = restore.checkpoint(silo, SOURCE, alias="selection-crossover",
                                  dirty_crossover_percent=1)
     incremental.authenticated_map(silo, crossed, mode="full", reason="dirty-crossover")
     incremental.pages_at_cut(silo, crossed, pages)
     silo.run("resume", SOURCE)
     # A subsequent small write must reuse the newly accepted FULL baseline.
     pages = incremental.witness(silo, SOURCE, "first", previous=pages)
-    reused = restore.checkpoint(silo, SOURCE, alias="selection-reenabled", policy="incremental")
+    reused = restore.checkpoint(silo, SOURCE, alias="selection-reenabled")
     incremental.authenticated_map(silo, reused, mode="incremental", baseline=crossed)
     incremental.pages_at_cut(silo, reused, pages)
     stopped.stop(silo, SOURCE, require_clean=False)
     silo.start(SOURCE)
     silo.wait_ready(SOURCE)
-    cold = restore.checkpoint(silo, SOURCE, alias="selection-new-worker", policy="incremental")
+    cold = restore.checkpoint(silo, SOURCE, alias="selection-new-worker")
     assert cold.source_info["run_id"] != reused.source_info["run_id"]
     incremental.authenticated_map(silo, cold, mode="full", reason="no-baseline")
 
@@ -251,6 +253,7 @@ def test_capture_dirty_union_and_coverage_recovery(
             assert started["code"] == 0
             silo.wait_ready(SOURCE)
             initial = incremental.witness(silo, SOURCE, "start")
+            reclaim.settled(silo, SOURCE)
             baseline = restore.checkpoint(silo, SOURCE, alias="abandon-baseline", policy="incremental")
             incremental.authenticated_map(silo, baseline, mode="full", reason="no-baseline")
             silo.run("resume", SOURCE)

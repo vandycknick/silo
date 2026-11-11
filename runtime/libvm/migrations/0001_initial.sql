@@ -382,7 +382,7 @@ CREATE INDEX storage_operation_machine_idx ON storage_operation(machine_id);
 CREATE TRIGGER handoff_payload_roots_retained BEFORE DELETE ON storage_operation
 WHEN EXISTS(SELECT 1 FROM handoff_operation h WHERE h.operation_id=OLD.operation_id AND h.terminal=0)
 BEGIN SELECT RAISE(ABORT, 'unresolved handoff payload roots cannot be deleted'); END;
-CREATE TABLE restore_memory_reservation (
+CREATE TABLE restore_resource_reservation (
     operation_id TEXT PRIMARY KEY NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
     budget_id TEXT UNIQUE NOT NULL,
     charge_json BLOB NOT NULL,

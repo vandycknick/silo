@@ -11,7 +11,8 @@ enum CapturePolicyArgument {
 
 #[derive(Debug, Args)]
 struct CapturePolicyArgs {
-    /// RAM capture policy (default full). Incremental requires an admitted backend.
+    /// RAM capture policy (default incremental). Uses full capture without an admitted
+    /// incremental backend or valid baseline; full always forces a complete capture.
     #[arg(long, requires = "live", value_enum)]
     capture_policy: Option<CapturePolicyArgument>,
     /// Fall back to full RAM capture at this dirty percentage (1..=60, default 60).
@@ -22,10 +23,10 @@ struct CapturePolicyArgs {
 impl CapturePolicyArgs {
     fn policy(&self) -> vm_spec::lifecycle::CapturePolicy {
         match self.capture_policy {
-            Some(CapturePolicyArgument::Incremental) => {
+            Some(CapturePolicyArgument::Incremental) | None => {
                 vm_spec::lifecycle::CapturePolicy::Incremental
             }
-            Some(CapturePolicyArgument::Full) | None => vm_spec::lifecycle::CapturePolicy::Full,
+            Some(CapturePolicyArgument::Full) => vm_spec::lifecycle::CapturePolicy::Full,
         }
     }
 
@@ -219,13 +220,6 @@ pub struct Fork {
     preserve: bool,
     #[command(flatten)]
     capture: CapturePolicyArgs,
-    /// Reserve this percentage of RAM per child for private writes (0..=100, default 25),
-    /// rounded up to native pages.
-    #[arg(long, value_name = "PERCENT", requires = "live", value_parser = private_write_allowance)]
-    private_write_percent: Option<libvm::PrivateWriteAllowance>,
-    /// Explicitly allow memory overcommit for every child. Disk/FD/closure gates still apply.
-    #[arg(long, requires = "live")]
-    memory_overcommit: bool,
     /// Caller-selected live fork operation UUID. Repeating identical options replays the same
     /// operation; changed options conflict. Generated when omitted.
     #[arg(long, value_name = "UUID", requires = "live", value_parser = operation_id)]
@@ -237,7 +231,7 @@ pub struct Fork {
         value_parser = operation_id,
         conflicts_with_all = [
             "machine", "name", "live", "children_json", "max_children", "preserve",
-            "private_write_percent", "memory_overcommit", "operation_id",
+            "operation_id",
             "external_requirements", "map_disk", "map_share",
             "capture_policy", "dirty_crossover_percent",
         ]
@@ -247,7 +241,7 @@ pub struct Fork {
     /// children settle normally and running children are never stopped.
     #[arg(long, requires = "operation", conflicts_with_all = [
         "machine", "name", "live", "children_json", "max_children", "preserve",
-        "private_write_percent", "memory_overcommit", "operation_id",
+        "operation_id",
         "external_requirements", "map_disk", "map_share",
         "capture_policy", "dirty_crossover_percent",
     ])]
@@ -318,7 +312,6 @@ impl Fork {
                 })
                 .collect(),
         };
-        let defaults = libvm::RestoreResourcePolicy::default();
         let options = libvm::LiveForkOptions {
             operation_id: self.operation_id.unwrap_or_else(uuid::Uuid::new_v4),
             children,
@@ -331,16 +324,6 @@ impl Fork {
                 vm_spec::lifecycle::CaptureResumePolicy::Preserve
             } else {
                 vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired
-            },
-            resources: libvm::RestoreResourcePolicy {
-                private_write_allowance: self
-                    .private_write_percent
-                    .unwrap_or(defaults.private_write_allowance),
-                memory: if self.memory_overcommit {
-                    libvm::RestoreMemoryPolicy::AllowOvercommit
-                } else {
-                    libvm::RestoreMemoryPolicy::Reserved
-                },
             },
         };
         options.validate()?;
@@ -465,35 +448,16 @@ pub struct Restore {
     /// Bounded RestoreHook JSON (argv, environment, workingDirectory, timeoutMs).
     #[arg(long, value_name = "JSON", value_parser = activation_hook)]
     activation_hook: Option<libvm::RestoreHook>,
-    /// Reserve this percentage of RAM for private writes (0..=100), rounded up to native pages.
-    #[arg(long, default_value = "25", value_parser = private_write_allowance)]
-    private_write_percent: libvm::PrivateWriteAllowance,
-    /// Explicitly allow memory overcommit for this restore. Disk/FD/closure gates still apply.
-    #[arg(long)]
-    memory_overcommit: bool,
     #[command(flatten)]
     external: ExternalResources,
 }
 impl Restore {
-    fn resource_policy(&self) -> libvm::RestoreResourcePolicy {
-        libvm::RestoreResourcePolicy {
-            private_write_allowance: self.private_write_percent,
-            memory: if self.memory_overcommit {
-                libvm::RestoreMemoryPolicy::AllowOvercommit
-            } else {
-                libvm::RestoreMemoryPolicy::Reserved
-            },
-        }
-    }
-
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let api = context.app_api().await?;
-        let resources = self.resource_policy();
         let options = libvm::RestoreOptions {
             name: self.name,
             external_resources: self.external.policy()?,
             activation_hook: self.activation_hook,
-            resources,
         };
         let machine = api.restore_snapshot(&self.checkpoint, options).await?;
         crate::ui::warn(EXACT_BYTES_WARNING);
@@ -528,13 +492,6 @@ impl RecoverDisks {
         println!("{}", machine.id);
         Ok(())
     }
-}
-
-fn private_write_allowance(value: &str) -> Result<libvm::PrivateWriteAllowance, String> {
-    let percent: u32 = value
-        .parse()
-        .map_err(|error: std::num::ParseIntError| error.to_string())?;
-    libvm::PrivateWriteAllowance::try_from(percent).map_err(|error| error.to_string())
 }
 
 fn activation_hook(value: &str) -> Result<libvm::RestoreHook, String> {
@@ -860,6 +817,38 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_and_fork_default_to_incremental_with_explicit_full_override() {
+        use crate::commands::live::SnapshotCommand;
+        use vm_spec::lifecycle::CapturePolicy;
+
+        for (flags, expected) in [
+            (vec![], CapturePolicy::Incremental),
+            (
+                vec!["--capture-policy", "incremental"],
+                CapturePolicy::Incremental,
+            ),
+            (vec!["--capture-policy", "full"], CapturePolicy::Full),
+        ] {
+            let prefix = ["silo", "snapshot", "create", "vm", "--live"];
+            let cli = Cli::try_parse_from(prefix.iter().chain(flags.iter()).copied()).unwrap();
+            let Command::Snapshot(snapshot) = cli.command else {
+                panic!("expected snapshot");
+            };
+            let SnapshotCommand::Create { capture, .. } = snapshot.command else {
+                panic!("expected create");
+            };
+            assert_eq!(capture.policy(), expected);
+            assert_eq!(capture.crossover(), 60);
+
+            let mut args = vec!["vm", "--live", "--name", "child"];
+            args.extend(flags);
+            let (_, options) = live(&args);
+            assert_eq!(options.policy, expected);
+            assert_eq!(options.dirty_crossover_percent, 60);
+        }
+    }
+
+    #[test]
     fn incremental_options_require_live_mode_and_bounded_crossover() {
         for command in ["snapshot", "fork"] {
             let prefix = if command == "snapshot" {
@@ -952,9 +941,6 @@ mod tests {
                 "--max-children",
                 "32",
                 "--preserve",
-                "--private-write-percent",
-                "0",
-                "--memory-overcommit",
                 "--operation-id",
                 OPERATION,
             ],
@@ -1048,7 +1034,6 @@ mod tests {
         assert_eq!(options.max_children, libvm::DEFAULT_LIVE_FORK_MAX_CHILDREN);
         assert_eq!(options.max_children.get(), 16);
         assert_eq!(options.resume_policy, CaptureResumePolicy::ResumeIfAcquired);
-        assert_eq!(options.resources, libvm::RestoreResourcePolicy::default());
         assert!(!options.operation_id.is_nil());
         let (_, single) = live(&["vm", "--live", "--name", "a"]);
         assert_eq!(single.children.len(), 1);
@@ -1065,20 +1050,12 @@ mod tests {
             "--max-children",
             "32",
             "--preserve",
-            "--private-write-percent",
-            "0",
-            "--memory-overcommit",
             "--operation-id",
             "00000000-0000-4000-8000-0000000000AA",
         ]);
         assert_eq!(explicit.operation_id.to_string(), OPERATION);
         assert_eq!(explicit.max_children.get(), 32);
         assert_eq!(explicit.resume_policy, CaptureResumePolicy::Preserve);
-        assert_eq!(u32::from(explicit.resources.private_write_allowance), 0);
-        assert_eq!(
-            explicit.resources.memory,
-            libvm::RestoreMemoryPolicy::AllowOvercommit
-        );
         let wire = silo_vm_control::fork::request_to_wire(
             &libvm::MachineRef::parse("vm").unwrap(),
             &explicit,
@@ -1192,7 +1169,6 @@ mod tests {
                 cut_id: format!("sha256:{}", "e".repeat(64)).parse().unwrap(),
             },
             source,
-            resources: libvm::RestoreResourcePolicy::default(),
             children: outcomes
                 .into_iter()
                 .enumerate()
@@ -1289,49 +1265,18 @@ mod tests {
     }
 
     #[test]
-    fn restore_cli_resource_policy_defaults_boundaries_and_opt_in_reach_daemon_types() {
-        let cli = Cli::try_parse_from(["silo", "restore", "checkpoint"]).unwrap();
-        let Command::Restore(command) = cli.command else {
-            panic!("restore command")
-        };
-        assert_eq!(
-            command.resource_policy(),
-            libvm::RestoreResourcePolicy::default()
-        );
-        for percent in ["0", "1", "25", "33", "100"] {
-            let cli = Cli::try_parse_from([
-                "silo",
-                "restore",
-                "checkpoint",
-                "--private-write-percent",
-                percent,
-                "--memory-overcommit",
-            ])
-            .unwrap();
-            let Command::Restore(command) = cli.command else {
-                panic!("restore command")
-            };
-            let policy = command.resource_policy();
-            assert_eq!(
-                u32::from(policy.private_write_allowance),
-                percent.parse::<u32>().unwrap()
-            );
-            assert_eq!(policy.memory, libvm::RestoreMemoryPolicy::AllowOvercommit);
-            let wire = silo_vm_control::stopped::restore_resources_to_wire(policy);
-            assert_eq!(
-                silo_vm_control::stopped::restore_resources_from_wire(Some(wire)).unwrap(),
-                policy
-            );
-        }
-        for percent in ["-1", "101", "4294967296", "1.5", ""] {
-            assert!(Cli::try_parse_from([
-                "silo",
-                "restore",
-                "checkpoint",
-                "--private-write-percent",
-                percent
-            ])
-            .is_err());
+    fn restore_and_fork_reject_removed_ram_policy_flags() {
+        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint"]).is_ok());
+        for flags in [
+            vec!["--memory-overcommit"],
+            vec!["--private-write-percent", "25"],
+        ] {
+            let mut restore = vec!["silo", "restore", "checkpoint"];
+            restore.extend_from_slice(&flags);
+            assert!(Cli::try_parse_from(restore).is_err());
+            let mut fork = vec!["silo", "fork", "vm", "--live", "--name", "child"];
+            fork.extend_from_slice(&flags);
+            assert!(Cli::try_parse_from(fork).is_err());
         }
     }
 }

@@ -14,7 +14,9 @@ use crate::storage::identity::{parse_hex, ObjectDigest, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
 use crate::storage::limits::Resource;
 use crate::storage::locks::{self, StorageLock};
-use crate::storage::stream::{open_regular_source, AuthenticatedStream, StreamHasher, StreamMap};
+use crate::storage::stream::{
+    open_regular_source, AuthenticatedStream, StreamHasher, StreamMap, StreamStats,
+};
 use crate::storage::StorageError;
 
 pub struct PublishedStream {
@@ -24,11 +26,11 @@ pub struct PublishedStream {
     pub map: StreamMap,
 }
 
-/// Process-local authority for RAM copied against the sealed canonical map.
+/// Process-local authority for RAM published against the sealed canonical map.
 /// The held pool inode, not a pathname or content ID alone, carries the proof.
 pub(crate) struct VerifiedRamPublication {
     stream: AuthenticatedStream,
-    copy_stats: crate::storage::stream::StreamStats,
+    authentication_stats: StreamStats,
 }
 
 impl VerifiedRamPublication {
@@ -36,8 +38,8 @@ impl VerifiedRamPublication {
         &self.stream
     }
 
-    pub(crate) fn copy_stats(&self) -> crate::storage::stream::StreamStats {
-        self.copy_stats
+    pub(crate) fn authentication_stats(&self) -> StreamStats {
+        self.authentication_stats
     }
 
     pub(crate) fn recheck(&self, pool: &StoragePool) -> Result<(), StorageError> {
@@ -865,14 +867,31 @@ impl StoragePool {
         input: &File,
         map: &StreamMap,
     ) -> Result<(VerifiedRamPublication, StorageLock), StorageError> {
-        let before = SourceFingerprint::new(&input.metadata()?);
-        if input.metadata()?.len() != map.length() {
+        let metadata = input.metadata()?;
+        let before = SourceFingerprint::new(&metadata);
+        if metadata.len() != map.length() {
             return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
         }
         let (staging, file) = self.stage()?;
         let mut hasher = StreamHasher::new();
-        let scan = hasher.copy_file_and_hash(input, map.length(), &file)?;
-        if scan.map != *map || SourceFingerprint::new(&input.metadata()?) != before {
+        let (staging, file, scan) = if try_clone_ram(input, &file)? {
+            // Authenticate the private clone, not the staged source. A later
+            // source write must not hide corruption already cloned into it.
+            let scan = self.authenticate_cloned_ram(&mut hasher, &file, map)?;
+            (staging, file, scan)
+        } else {
+            // An unsupported ioctl may have partially changed the destination.
+            // Preserve the existing copy+hash path with a fresh empty inode.
+            drop(file);
+            drop(staging);
+            let (staging, file) = self.stage()?;
+            let scan = hasher.copy_file_and_hash(input, map.length(), &file)?;
+            if scan.map != *map {
+                return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
+            }
+            (staging, file, scan)
+        };
+        if SourceFingerprint::new(&input.metadata()?) != before {
             return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
         }
         seal(&file)?;
@@ -911,10 +930,25 @@ impl StoragePool {
         }
         let proof = VerifiedRamPublication {
             stream,
-            copy_stats: scan.stats,
+            authentication_stats: scan.stats,
         };
         proof.recheck(self)?;
         Ok((proof, roots))
+    }
+
+    fn authenticate_cloned_ram(
+        &self,
+        hasher: &mut StreamHasher,
+        file: &File,
+        map: &StreamMap,
+    ) -> Result<crate::storage::stream::StreamScan, StorageError> {
+        // Scan every data extent, including those in map-zero chunks. The
+        // scanner also checks the exact length and fingerprints across the read.
+        let scan = hasher.hash_open_file(file, map.length())?;
+        if scan.map != *map {
+            return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
+        }
+        Ok(scan)
     }
 
     #[cfg(test)]
@@ -1171,6 +1205,49 @@ pub(crate) fn rename_component_no_replace(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn try_clone_ram(source: &File, destination: &File) -> Result<bool, StorageError> {
+    use std::os::unix::fs::MetadataExt;
+
+    use nix::fcntl::{fcntl, FcntlArg};
+
+    let source_metadata = source.metadata()?;
+    let destination_metadata = destination.metadata()?;
+    let source_flags = OFlag::from_bits_truncate(fcntl(source, FcntlArg::F_GETFL)?);
+    let destination_flags = OFlag::from_bits_truncate(fcntl(destination, FcntlArg::F_GETFL)?);
+    // Qualify whole-file EINVAL as unsupported only for readable regular source
+    // and writable, empty, distinct regular destination with no append mode.
+    if !source_metadata.is_file()
+        || !destination_metadata.is_file()
+        || destination_metadata.len() != 0
+        || (source_metadata.dev(), source_metadata.ino())
+            == (destination_metadata.dev(), destination_metadata.ino())
+        || source_flags & OFlag::O_ACCMODE == OFlag::O_WRONLY
+        || destination_flags & OFlag::O_ACCMODE == OFlag::O_RDONLY
+        || source_flags.contains(OFlag::O_APPEND)
+        || destination_flags.contains(OFlag::O_APPEND)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "RAM clone requires a readable source and distinct empty writable destination",
+        )
+        .into());
+    }
+    if source_metadata.dev() != destination_metadata.dev() {
+        return Ok(false);
+    }
+    match crate::storage::clone::try_reflink(source, destination) {
+        Ok(()) => Ok(true),
+        Err(error) if crate::storage::clone::clone_error_allows_fallback(&error, true) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_clone_ram(_source: &File, _destination: &File) -> Result<bool, StorageError> {
+    Ok(false)
+}
+
 fn seal(file: &File) -> Result<(), StorageError> {
     fchmod(file, Mode::S_IRUSR)?;
     file.sync_all()?;
@@ -1248,13 +1325,34 @@ fn copy_object(
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::FileExt;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::sync::Arc;
 
     use crate::storage::identity::ObjectDigest;
     use crate::storage::pool::StoragePool;
-    use crate::storage::stream::StreamHasher;
+    use crate::storage::stream::{StreamHasher, StreamMap};
     use crate::storage::StorageError;
+
+    fn ram_tempdir() -> tempfile::TempDir {
+        match std::env::var_os("SILO_TEST_COPY_DIR") {
+            Some(path) => tempfile::tempdir_in(path).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reflink_or_skip(source: &File, destination: &File) -> bool {
+        let cloned = crate::storage::pool::try_clone_ram(source, destination).unwrap();
+        if !cloned {
+            eprintln!(
+                "SKIPPED RAM reflink test: test tmpdir does not support whole-file reflinks; \
+                 set SILO_TEST_COPY_DIR to a reflink-enabled Btrfs or XFS directory"
+            );
+        }
+        cloned
+    }
 
     #[test]
     fn publishes_distinct_immutable_forms_with_exact_bytes_and_permissions() {
@@ -1791,8 +1889,8 @@ mod tests {
     }
 
     #[test]
-    fn sealed_ram_copy_authenticates_each_dense_byte_once() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn sealed_ram_publication_authenticates_each_dense_byte_once() {
+        let temporary = ram_tempdir();
         let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
         let bytes = vec![0x39; 2 * crate::storage::limits::CHUNK_SIZE + 3];
         let source = temporary.path().join("ram");
@@ -1801,9 +1899,12 @@ mod tests {
         let (proof, _roots) = pool
             .publish_sealed_ram_for_catalog(&File::open(&source).unwrap(), &expected)
             .unwrap();
-        assert_eq!(proof.copy_stats().bytes_read, bytes.len() as u64);
-        assert_eq!(proof.copy_stats().logical_bytes_hashed, bytes.len() as u64);
-        assert_eq!(proof.copy_stats().whole_bytes_hashed, 0);
+        assert_eq!(proof.authentication_stats().bytes_read, bytes.len() as u64);
+        assert_eq!(
+            proof.authentication_stats().logical_bytes_hashed,
+            bytes.len() as u64
+        );
+        assert_eq!(proof.authentication_stats().whole_bytes_hashed, 0);
         assert_eq!(proof.stream().map(), &expected);
         assert_eq!(proof.stream().map().id(), expected.id());
         assert_eq!(
@@ -1844,5 +1945,256 @@ mod tests {
             proof.recheck(&pool).is_err(),
             "identical bytes on a new inode are not this proof"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_ram_reflink_authenticates_destination_once() {
+        let temporary = ram_tempdir();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let bytes = vec![0x39; 2 * crate::storage::limits::CHUNK_SIZE + 3];
+        let source = temporary.path().join("ram");
+        std::fs::write(&source, &bytes).unwrap();
+        let input = File::open(&source).unwrap();
+        let map = StreamHasher::new().hash_reader(bytes.as_slice()).unwrap();
+        let (staging, destination) = pool.stage().unwrap();
+        if !reflink_or_skip(&input, &destination) {
+            return;
+        }
+        assert_ne!(
+            input.metadata().unwrap().ino(),
+            destination.metadata().unwrap().ino()
+        );
+        let scan = pool
+            .authenticate_cloned_ram(&mut StreamHasher::new(), &destination, &map)
+            .unwrap();
+        assert_eq!(scan.map, map);
+        assert_eq!(scan.stats.bytes_read, bytes.len() as u64);
+        assert_eq!(scan.stats.logical_bytes_hashed, bytes.len() as u64);
+        assert_eq!(scan.stats.whole_bytes_hashed, 0);
+        drop(destination);
+        drop(staging);
+        let (proof, roots) = pool.publish_sealed_ram_for_catalog(&input, &map).unwrap();
+        assert_eq!(proof.stream().map(), &map);
+        assert_eq!(proof.authentication_stats().bytes_read, bytes.len() as u64);
+        assert_eq!(std::fs::read(pool.stream_path(&map.id())).unwrap(), bytes);
+        assert_eq!(
+            proof.stream().file().metadata().unwrap().mode() & 0o777,
+            0o400
+        );
+        proof.recheck(&pool).unwrap();
+        drop(roots);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_ram_reflink_refuses_destination_corruption_after_clone() {
+        let temporary = ram_tempdir();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let source = temporary.path().join("ram");
+        std::fs::write(&source, b"sealed RAM").unwrap();
+        let input = File::open(&source).unwrap();
+        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let (staging, destination) = pool.stage().unwrap();
+        if !reflink_or_skip(&input, &destination) {
+            return;
+        }
+        destination.write_all_at(b"broken RAM", 0).unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"sealed RAM");
+        assert!(matches!(
+            pool.authenticate_cloned_ram(&mut StreamHasher::new(), &destination, &map),
+            Err(StorageError::ContentMismatch(_))
+        ));
+        assert!(!pool.stream_path(&map.id()).exists());
+        drop(destination);
+        drop(staging);
+        assert_eq!(std::fs::read_dir(pool.temporary.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_ram_reflink_refuses_corrupt_clone_after_staged_source_is_repaired() {
+        let temporary = ram_tempdir();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let source = temporary.path().join("ram");
+        std::fs::write(&source, b"sealed RAM").unwrap();
+        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let input = File::options()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        input.write_all_at(b"broken RAM", 0).unwrap();
+        let (_staging, destination) = pool.stage().unwrap();
+        if !reflink_or_skip(&input, &destination) {
+            return;
+        }
+        input.write_all_at(b"sealed RAM", 0).unwrap();
+        assert_eq!(StreamHasher::new().hash_file(&source).unwrap(), map);
+        assert!(matches!(
+            pool.authenticate_cloned_ram(&mut StreamHasher::new(), &destination, &map),
+            Err(StorageError::ContentMismatch(_))
+        ));
+        assert!(!pool.stream_path(&map.id()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_ram_reflink_refuses_data_in_zero_chunk() {
+        let temporary = ram_tempdir();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let source = temporary.path().join("ram");
+        let input = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        let length = crate::storage::limits::CHUNK_SIZE as u64 + 3;
+        input.set_len(length).unwrap();
+        let map = StreamMap::new(length, vec![crate::storage::stream::Chunk::Zero; 2]).unwrap();
+        let (_staging, destination) = pool.stage().unwrap();
+        if !reflink_or_skip(&input, &destination) {
+            return;
+        }
+        destination.write_all_at(&[1], length - 1).unwrap();
+        assert!(matches!(
+            pool.authenticate_cloned_ram(&mut StreamHasher::new(), &destination, &map),
+            Err(StorageError::ContentMismatch(_))
+        ));
+        assert_eq!(StreamHasher::new().hash_file(&source).unwrap(), map);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_ram_reflink_refuses_bytes_beyond_sealed_map() {
+        let temporary = ram_tempdir();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let source = temporary.path().join("ram");
+        std::fs::write(&source, b"sealed RAM").unwrap();
+        let input = File::open(&source).unwrap();
+        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let (_staging, destination) = pool.stage().unwrap();
+        if !reflink_or_skip(&input, &destination) {
+            return;
+        }
+        destination.write_all_at(&[1], map.length()).unwrap();
+        assert!(pool
+            .authenticate_cloned_ram(&mut StreamHasher::new(), &destination, &map)
+            .is_err());
+        assert!(!pool.stream_path(&map.id()).exists());
+    }
+
+    #[test]
+    fn sealed_ram_copy_fallback_authenticates_and_cleans_staging() {
+        let temporary = ram_tempdir();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let source = temporary.path().join("ram");
+        std::fs::write(&source, b"sealed RAM").unwrap();
+        let input = File::open(&source).unwrap();
+        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let (staging, destination) = pool.stage().unwrap();
+        if crate::storage::pool::try_clone_ram(&input, &destination).unwrap() {
+            eprintln!(
+                "SKIPPED RAM copy fallback test: test tmpdir supports reflinks; \
+                 set SILO_TEST_COPY_DIR to an ext4 directory"
+            );
+            return;
+        }
+        drop(destination);
+        drop(staging);
+        let (proof, roots) = pool.publish_sealed_ram_for_catalog(&input, &map).unwrap();
+        assert_eq!(proof.stream().map(), &map);
+        assert_eq!(proof.authentication_stats().bytes_read, map.length());
+        assert_eq!(
+            std::fs::read(pool.stream_path(&map.id())).unwrap(),
+            b"sealed RAM"
+        );
+        assert_eq!(
+            proof.stream().file().metadata().unwrap().mode() & 0o777,
+            0o400
+        );
+        proof.recheck(&pool).unwrap();
+        drop(roots);
+        std::fs::write(&source, b"broken RAM").unwrap();
+        assert!(pool.publish_sealed_ram_for_catalog(&input, &map).is_err());
+        let zero_map =
+            StreamMap::new(map.length(), vec![crate::storage::stream::Chunk::Zero]).unwrap();
+        assert!(pool
+            .publish_sealed_ram_for_catalog(&input, &zero_map)
+            .is_err());
+        assert_eq!(std::fs::read_dir(pool.temporary.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires SILO_TEST_COPY_DIR and SILO_TEST_COPY_CROSS_DIR on different mounted filesystems"]
+    fn sealed_ram_cross_filesystem_uses_copy_fallback() {
+        let source_parent =
+            std::env::var_os("SILO_TEST_COPY_DIR").expect("explicit source filesystem");
+        let destination_parent =
+            std::env::var_os("SILO_TEST_COPY_CROSS_DIR").expect("explicit other filesystem");
+        let source_dir = tempfile::tempdir_in(source_parent).unwrap();
+        let destination_dir = tempfile::tempdir_in(destination_parent).unwrap();
+        let pool = StoragePool::open(&destination_dir.path().join("images")).unwrap();
+        let source = source_dir.path().join("ram");
+        std::fs::write(&source, b"cross-filesystem RAM").unwrap();
+        let input = File::open(&source).unwrap();
+        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let (staging, destination) = pool.stage().unwrap();
+        assert_ne!(
+            input.metadata().unwrap().dev(),
+            destination.metadata().unwrap().dev()
+        );
+        assert!(!crate::storage::pool::try_clone_ram(&input, &destination).unwrap());
+        drop(destination);
+        drop(staging);
+        let (proof, _roots) = pool.publish_sealed_ram_for_catalog(&input, &map).unwrap();
+        assert_eq!(proof.stream().map(), &map);
+        assert_eq!(proof.authentication_stats().bytes_read, map.length());
+        assert_eq!(
+            std::fs::read(pool.stream_path(&map.id())).unwrap(),
+            b"cross-filesystem RAM"
+        );
+        proof.recheck(&pool).unwrap();
+        assert_eq!(std::fs::read_dir(pool.temporary.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn sealed_ram_publication_preserves_empty_stream_identity() {
+        let temporary = ram_tempdir();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let source = temporary.path().join("ram");
+        std::fs::write(&source, []).unwrap();
+        let map = StreamMap::new(0, Vec::new()).unwrap();
+        let (proof, _roots) = pool
+            .publish_sealed_ram_for_catalog(&File::open(&source).unwrap(), &map)
+            .unwrap();
+        assert_eq!(proof.stream().map(), &map);
+        assert_eq!(proof.authentication_stats().bytes_read, 0);
+        assert_eq!(proof.stream().file().metadata().unwrap().len(), 0);
+        proof.recheck(&pool).unwrap();
+        assert_eq!(std::fs::read_dir(pool.temporary.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_ram_clone_invalid_destination_is_fatal_not_fallback() {
+        let temporary = ram_tempdir();
+        let source = temporary.path().join("ram");
+        let destination = temporary.path().join("readonly");
+        std::fs::write(&source, b"sealed RAM").unwrap();
+        std::fs::write(&destination, []).unwrap();
+        let error = crate::storage::pool::try_clone_ram(
+            &File::open(&source).unwrap(),
+            &File::open(&destination).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&source).unwrap(), b"sealed RAM");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"");
     }
 }

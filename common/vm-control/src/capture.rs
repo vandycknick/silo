@@ -581,6 +581,16 @@ mod tests {
     }
 
     #[test]
+    fn capture_policy_round_trips_default_preference_and_full_override() {
+        let default = libvm::LiveSnapshotOptions::default().policy;
+        assert_eq!(default, vm_spec::lifecycle::CapturePolicy::Incremental);
+        for policy in [default, vm_spec::lifecycle::CapturePolicy::Full] {
+            let wire = crate::capture::policy_to_wire(policy);
+            assert_eq!(crate::capture::policy_from_wire(wire).unwrap(), policy);
+        }
+    }
+
+    #[test]
     fn capture_policy_and_crossover_reject_unspecified_or_out_of_range_requests() {
         for policy in [0, -1, 3, i32::MAX] {
             assert!(crate::capture::policy_from_wire(policy).is_err());

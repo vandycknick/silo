@@ -251,9 +251,6 @@ impl DaemonVmService {
                         .as_ref()
                         .map(silo_vm_control::stopped::hook_to_wire)
                         .transpose()?,
-                    resources: Some(silo_vm_control::stopped::restore_resources_to_wire(
-                        options.resources,
-                    )),
                 })
                 .await
                 .map_err(native_status)?

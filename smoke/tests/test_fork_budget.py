@@ -21,7 +21,7 @@ from uuid import UUID
 
 import pytest
 
-from silo_smoke import fork, fork_budget, incremental, overlay, restore, shutdown, stopped
+from silo_smoke import fork, fork_budget, incremental, overlay, reclaim, restore, shutdown, stopped
 from silo_smoke import restore_lifecycle as lifecycle
 from silo_smoke.cli import RootProfile, Silo, TIMINGS_PROPERTY, release
 from silo_smoke.config import RUN_ROOT_PARENT, SmokeConfig
@@ -347,6 +347,7 @@ def test_fork_budget_incremental_ten_percent_dirty(
               + dirty_command, user="root", timeout=240)
     rate = fork_budget.sequential_copy_rate(silo, upper)
     alias = "budget-incremental-baseline"
+    reclaim.settled(silo, SOURCE)
     previous = json.loads(silo.run(
         "snapshot", "create", SOURCE, "--live", "--capture-policy", "incremental",
         "--name", alias, timeout=240).stdout)

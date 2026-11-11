@@ -329,17 +329,6 @@ impl SnapshotStore {
             disk_charges,
             disk_allocations,
             reservation_bytes,
-            reservation_memory_bytes: if local_fork {
-                ram.checked_mul(if machine_stat.st_dev != images_stat.st_dev {
-                    2
-                } else {
-                    1
-                })
-                .and_then(|bytes| bytes.checked_add(CAPTURE_SCRATCH_BYTES))
-                .ok_or_else(|| invalid("capture memory budget overflow"))?
-            } else {
-                CAPTURE_SCRATCH_BYTES
-            },
             candidate: None,
             captured_boot: None,
             source_inodes,
@@ -763,7 +752,7 @@ impl SnapshotStore {
         let directory = capture_directory(&self.store, &record)?
             .ok_or_else(|| invalid("capture staging is missing"))?;
         settle_capture_seal(&directory)?;
-        // RAM is authenticated while copying into the pool, not before it.
+        // RAM is authenticated during pool publication, not before it.
         let mut verified = verify_capture(&directory, &record, CaptureAuthentication::Publication)?;
         let boot = record
             .captured_boot
@@ -798,9 +787,9 @@ impl SnapshotStore {
                         pool.publish_sealed_ram_for_catalog(payload.file(), &verified.ram_map)?;
                     let id = proof.stream().map().id();
                     tracing::debug!(
-                        bytes_read = proof.copy_stats().bytes_read,
-                        logical_bytes_hashed = proof.copy_stats().logical_bytes_hashed,
-                        "authenticated RAM publication copy"
+                        bytes_read = proof.authentication_stats().bytes_read,
+                        logical_bytes_hashed = proof.authentication_stats().logical_bytes_hashed,
+                        "authenticated RAM publication"
                     );
                     self.store
                         .pin_published_storage_dependencies(capture, &[id], &[])
@@ -1127,19 +1116,11 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
                 .ok_or_else(|| invalid("capture staging overflow"))
         },
     )?;
-    let expected_memory = if let Some(operation) = record.fork_operation_id {
+    if let Some(operation) = record.fork_operation_id {
         if operation.is_nil() || operation == record.capture_id {
             return Err(invalid("capture fork operation identity is invalid"));
         }
-        record
-            .plan
-            .ram_bytes
-            .checked_mul(if record.disk_charges.len() == 2 { 2 } else { 1 })
-            .and_then(|bytes| bytes.checked_add(CAPTURE_SCRATCH_BYTES))
-            .ok_or_else(|| invalid("capture memory budget overflow"))?
-    } else {
-        CAPTURE_SCRATCH_BYTES
-    };
+    }
     if record.request.configuration != record.plan.configuration
         || record.request.policy != record.plan.policy
         || record.request.resume_policy != record.plan.resume_policy
@@ -1166,7 +1147,6 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
             .try_fold(0u64, |total, charge| total.checked_add(charge.bytes))
             != Some(record.reservation_bytes)
         || record.reservation_bytes < record.plan.reservation.staging_bytes
-        || record.reservation_memory_bytes != expected_memory
     {
         return Err(invalid(
             "capture reservation charges or immutable request contradict the plan",
@@ -1464,74 +1444,6 @@ fn open_relative(root: &OwnedDirectory, path: &Path) -> Result<File, LibVmError>
     Err(invalid("capture role path is empty"))
 }
 
-pub(crate) fn available_memory() -> Result<u64, LibVmError> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut text = String::new();
-        File::open("/proc/meminfo")?
-            .take(64 << 10)
-            .read_to_string(&mut text)?;
-        let value = text
-            .lines()
-            .find_map(|line| line.strip_prefix("MemAvailable:"))
-            .ok_or_else(|| invalid("kernel omitted MemAvailable"))?;
-        let mut fields = value.split_whitespace();
-        let bytes = fields
-            .next()
-            .ok_or_else(|| invalid("empty MemAvailable"))?
-            .parse::<u64>()
-            .map_err(invalid)?
-            .checked_mul(1024)
-            .ok_or_else(|| invalid("MemAvailable overflow"))?;
-        if fields.next() != Some("kB") || fields.next().is_some() {
-            return Err(invalid("malformed MemAvailable"));
-        }
-        Ok(bytes)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("/usr/bin/vm_stat").output()?;
-        if !output.status.success() {
-            return Err(invalid("host memory accounting query failed"));
-        }
-        let text = std::str::from_utf8(&output.stdout).map_err(invalid)?;
-        let first = text
-            .lines()
-            .next()
-            .ok_or_else(|| invalid("empty host memory accounting"))?;
-        let granule = first
-            .split("page size of ")
-            .nth(1)
-            .and_then(|part| part.split_whitespace().next())
-            .ok_or_else(|| invalid("host memory page size missing"))?
-            .parse::<u64>()
-            .map_err(invalid)?;
-        let mut pages = 0u64;
-        for label in ["Pages free:", "Pages inactive:", "Pages speculative:"] {
-            let count = text
-                .lines()
-                .find_map(|line| line.strip_prefix(label))
-                .ok_or_else(|| invalid("host memory accounting field missing"))?
-                .trim()
-                .trim_end_matches('.')
-                .parse::<u64>()
-                .map_err(invalid)?;
-            pages = pages
-                .checked_add(count)
-                .ok_or_else(|| invalid("host page accounting overflow"))?;
-        }
-        pages
-            .checked_mul(granule)
-            .ok_or_else(|| invalid("host memory accounting overflow"))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        Err(invalid(
-            "capture memory accounting is unavailable on this host",
-        ))
-    }
-}
-
 fn new_input(
     store: &Store,
     capture: Uuid,
@@ -1642,30 +1554,11 @@ const AUTHENTICATION_BUFFER_BYTES: usize = 1 << 20;
 /// Explicit stack of the one extra verification thread. Its body is a fixed
 /// read/hash loop over heap scratch: no recursion and no large stack arrays.
 const AUTHENTICATION_LANE_STACK_BYTES: usize = 1 << 20;
-/// The second verification lane's input-independent allocations: its read
-/// buffer and full stack mapping (which on glibc also hosts the thread's TCB
-/// and static TLS). Monitor staging verification adds the same two bounds.
-/// The two stages never overlap: libvm verifies only the coherent seal the
-/// monitor writes after joining its own lanes, so one delta covers either.
-/// Remaining fixed-size thread bookkeeping (std `Thread`/packet `Arc`s, the
-/// moved closure and a fixed-size result) is input-independent metadata of
-/// the general capture scratch, not of this delta.
-const CAPTURE_VERIFICATION_LANE_BYTES: u64 =
-    (AUTHENTICATION_BUFFER_BYTES + AUTHENTICATION_LANE_STACK_BYTES) as u64;
-/// At 1 TiB, five simultaneous decoded maps cost at most 20.625 MiB
-/// (retained/candidate monitor maps and manager codec/adapter ownership), and
-/// one bounded canonical encoding costs under 9.3 MiB. Reserve the rounded
-/// bound separately from byte-copy buffers and verification lane scratch.
-const CAPTURE_RAM_MAP_SCRATCH_BYTES: u64 = 32 << 20;
-/// Charged before staging: byte-copy scratch, complete map ownership and the
-/// explicit second verification lane. No full map enters a control record.
-pub(crate) const CAPTURE_SCRATCH_BYTES: u64 =
-    (16 << 20) + CAPTURE_RAM_MAP_SCRATCH_BYTES + CAPTURE_VERIFICATION_LANE_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureAuthentication {
     Receipt,
-    /// RAM bytes are authenticated by the map-checked pool copy.
+    /// RAM bytes are authenticated by the map-checked pool publication.
     Publication,
     Bytes,
 }
@@ -2723,7 +2616,7 @@ pub(crate) mod tests {
     use crate::store::capture::{
         authenticate_lanes, capture_directory, validate_layout, verify_capture, verify_payload,
         AdmittedPayload, CaptureAuthentication, VerifiedBytes, VerifiedPayload,
-        AUTHENTICATION_BUFFER_BYTES, CAPTURE_SCRATCH_BYTES,
+        AUTHENTICATION_BUFFER_BYTES,
     };
 
     use crate::store::models::{
@@ -3273,7 +3166,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn capture_memory_validation_matches_plain_and_fork_ownership() {
+    async fn capture_validation_matches_plain_and_fork_ownership() {
         use crate::store::capture::{decode_record, encode_record};
 
         for fork in [false, true] {
@@ -3284,13 +3177,6 @@ pub(crate) mod tests {
             };
             let mut record = fixture.reservation.record.clone();
             assert!(decode_record(&encode_record(&record).unwrap()).is_ok());
-            record.reservation_memory_bytes = if fork {
-                CAPTURE_SCRATCH_BYTES
-            } else {
-                record.plan.ram_bytes + CAPTURE_SCRATCH_BYTES
-            };
-            assert!(encode_record(&record).is_err());
-            record = fixture.reservation.record.clone();
             record.fork_operation_id = if fork { None } else { Some(Uuid::new_v4()) };
             let error = fixture
                 .snapshots
@@ -3491,7 +3377,7 @@ pub(crate) mod tests {
             "failed byte authentication leaked an operation root"
         );
         let reservations: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM restore_memory_reservation")
+            sqlx::query_scalar("SELECT count(*) FROM restore_resource_reservation")
                 .fetch_one(&fixture.snapshots.store.pool)
                 .await
                 .unwrap();
@@ -4190,22 +4076,10 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn complete_ram_map_peak_is_charged_at_the_one_tib_boundary() {
-        let chunks = vm_spec::capture::MAX_CAPTURE_RAM_BYTES
-            .div_ceil(crate::storage::limits::CHUNK_SIZE as u64);
-        let decoded = 5 * chunks * std::mem::size_of::<Option<Sha256Digest>>() as u64;
-        let encoded = chunks * 74 + 256;
-        assert!(decoded + encoded <= crate::store::capture::CAPTURE_RAM_MAP_SCRATCH_BYTES);
-    }
-
     #[tokio::test]
     async fn checkpoint_lanes_keep_inventory_order_and_held_inodes_and_reject_either_lane() {
         let sealed = fixture().await;
         let record = &sealed.reservation.record;
-        // Complete map ownership and the second lane are charged before effects.
-        assert_eq!(CAPTURE_SCRATCH_BYTES, 50 << 20);
-        assert_eq!(record.reservation_memory_bytes, CAPTURE_SCRATCH_BYTES);
         let (directory, evidence) = seal(&sealed);
         {
             let disks = CaptureAuthentication::Bytes;
@@ -5213,8 +5087,8 @@ pub(crate) mod tests {
             serde_json::from_str(&store.capture_budget_document(operation).await.unwrap()).unwrap();
         assert_eq!(before.bound.len(), 2);
         assert!(
-            before.baseline.is_none(),
-            "retired source owns no remaining baseline charge"
+            before.capture_disks.is_empty(),
+            "retired source released its disk peak"
         );
         store
             .set_fork_child(
@@ -5393,21 +5267,6 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn incremental_complete_map_publishes_without_parent_retention() {
         let fixture = fixture_source(false, false, CapturePolicy::Incremental).await;
-        assert_eq!(
-            fixture.reservation.record.reservation_memory_bytes,
-            CAPTURE_SCRATCH_BYTES
-        );
-        let inventory: crate::store::restore::CaptureBudgetInventory = serde_json::from_str(
-            &fixture
-                .snapshots
-                .store
-                .capture_budget_document(fixture.reservation.record.capture_id)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(inventory.capture_memory, CAPTURE_SCRATCH_BYTES);
-        assert!(inventory.baseline.is_none());
         let (directory, mut evidence) = seal(&fixture);
         let memory = evidence.memory.as_mut().unwrap();
         memory.mode = CapturePolicy::Incremental;
@@ -6464,7 +6323,7 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn ram_publication_uses_only_the_authenticated_copy_pass() {
+    async fn ram_publication_reuses_authenticated_inode_without_post_publication_reads() {
         use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
         use crate::store::models::snapshot::SnapshotCaptureKind;
         use crate::store::snapshot_store::tests::{observed_stream_read, watch_stream_reads};
@@ -6498,10 +6357,9 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            observed_stream_read(&source_reads),
-            "the copy authenticates staged RAM"
-        );
+        // Copying reads staging, whereas reflinking authenticates the private
+        // destination. Either may emit source access events; drain them here.
+        let _ = observed_stream_read(&source_reads);
         let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
         let id = crate::storage::identity::StreamId::from_sha256(
             *evidence.memory.as_ref().unwrap().ram_stream.as_bytes(),
@@ -6511,11 +6369,11 @@ pub(crate) mod tests {
         let published = waiter.await.unwrap().unwrap();
         assert!(
             !observed_stream_read(&source_reads),
-            "no post-copy staging authentication"
+            "no post-publication staging authentication"
         );
         assert!(
             !observed_stream_read(&output_reads),
-            "closure validation must consume the copy proof"
+            "closure validation must consume the publication proof"
         );
         let consumer = fixture
             .snapshots
@@ -6533,7 +6391,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn ram_publication_refuses_staged_swap_after_copy_proof() {
+    async fn ram_publication_refuses_staged_swap_after_publication_proof() {
         use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
 
         let fixture = fixture().await;

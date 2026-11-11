@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from silo_smoke import capture, incremental, overlay, pause, procs, restore, shutdown, stopped
+from silo_smoke import capture, incremental, overlay, pause, procs, reclaim, restore, shutdown, stopped
 from silo_smoke.cli import ROOT_PROFILES, Result, RootProfile, Silo
 from silo_smoke.restore import restore_image, restore_irq_fixture  # noqa: F401, pytest fixtures
 
@@ -293,6 +293,7 @@ def refused_before_allocation(silo: Silo, reference: str, name: str, *,
 def checkpoint_for_policy(silo: Silo, policy: str) -> restore.Checkpoint:
     if policy == "full":
         return restore.checkpoint(silo, "restore-source")
+    reclaim.settled(silo, "restore-source")
     baseline = restore.checkpoint(silo, "restore-source", alias="restore-baseline")
     silo.run("resume", "restore-source")
     silo.exec("restore-source", "sh", "-eu", "-c", "printf incremental >/dev/shm/incremental-negative", user="root")

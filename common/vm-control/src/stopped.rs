@@ -290,42 +290,6 @@ pub fn hook_from_wire(
     Ok(hook)
 }
 
-pub fn restore_resources_to_wire(value: libvm::RestoreResourcePolicy) -> w::RestoreResourcePolicy {
-    w::RestoreResourcePolicy {
-        private_write_percent: value.private_write_allowance.into(),
-        memory: match value.memory {
-            libvm::RestoreMemoryPolicy::Reserved => w::RestoreMemoryPolicy::Reserved,
-            libvm::RestoreMemoryPolicy::AllowOvercommit => w::RestoreMemoryPolicy::AllowOvercommit,
-        } as i32,
-    }
-}
-
-pub fn restore_resources_from_wire(
-    value: Option<w::RestoreResourcePolicy>,
-) -> Result<libvm::RestoreResourcePolicy, ConversionError> {
-    let Some(value) = value else {
-        return Ok(libvm::RestoreResourcePolicy::default());
-    };
-    Ok(libvm::RestoreResourcePolicy {
-        private_write_allowance: libvm::PrivateWriteAllowance::try_from(
-            value.private_write_percent,
-        )
-        .map_err(|_| invalid("resources.private_write_percent", "expected 0..=100"))?,
-        memory: match w::RestoreMemoryPolicy::try_from(value.memory) {
-            Ok(w::RestoreMemoryPolicy::Reserved) => libvm::RestoreMemoryPolicy::Reserved,
-            Ok(w::RestoreMemoryPolicy::AllowOvercommit) => {
-                libvm::RestoreMemoryPolicy::AllowOvercommit
-            }
-            _ => {
-                return Err(invalid(
-                    "resources.memory",
-                    "expected an explicit restore memory policy",
-                ))
-            }
-        },
-    })
-}
-
 pub fn info_to_wire(value: &SnapshotInfo) -> Result<w::StorageSnapshotInfo, ConversionError> {
     let result = w::StorageSnapshotInfo {
         id: value.id.to_string(),
@@ -603,37 +567,5 @@ mod tests {
         let mut oversized = wire;
         oversized.timeout_ms = Some(30_001);
         assert!(crate::stopped::hook_from_wire(oversized).is_err());
-    }
-
-    #[test]
-    fn restore_resource_wire_defaults_require_explicit_valid_policy_when_present() {
-        use crate::stopped::{restore_resources_from_wire, restore_resources_to_wire};
-        assert_eq!(
-            restore_resources_from_wire(None).unwrap(),
-            libvm::RestoreResourcePolicy::default()
-        );
-        for percent in [0, 25, 33, 100] {
-            for memory in [
-                libvm::RestoreMemoryPolicy::Reserved,
-                libvm::RestoreMemoryPolicy::AllowOvercommit,
-            ] {
-                let policy = libvm::RestoreResourcePolicy {
-                    private_write_allowance: libvm::PrivateWriteAllowance::try_from(percent)
-                        .unwrap(),
-                    memory,
-                };
-                assert_eq!(
-                    restore_resources_from_wire(Some(restore_resources_to_wire(policy))).unwrap(),
-                    policy
-                );
-            }
-        }
-        for (percent, memory) in [(101, 1), (u32::MAX, 2), (25, 0), (25, 3), (25, -1)] {
-            assert!(restore_resources_from_wire(Some(w::RestoreResourcePolicy {
-                private_write_percent: percent,
-                memory,
-            }))
-            .is_err());
-        }
     }
 }

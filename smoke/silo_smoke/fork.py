@@ -45,7 +45,7 @@ CHILD_PHASES = ("constructing", "prepared", "activating", "running")
 # against nothing but its own child's construction and the call window.
 CHILD_BACKGROUND_PHASES = ("durable",)
 RESULT_KEYS = {"operationId", "sourceMachineId", "sourceRunId", "captureId", "stage",
-               "cancellationRequested", "capture", "source", "resources", "children"}
+               "cancellationRequested", "capture", "source", "children"}
 CHILD_KEYS = {"index", "name", "machineId", "runId", "outcome", "durability"}
 CHILD_DURABILITY = {None, "constructed", "durable"}
 FORK_TIMEOUT = 600
@@ -83,7 +83,6 @@ def validate(result: object, *, operation: str, names: list[str]) -> dict:
         cut = result["capture"].get("cutId")
         assert isinstance(cut, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", cut), result["capture"]
     _outcome(result["source"], SOURCE_KINDS, "source")
-    assert isinstance(result["resources"], dict), result["resources"]
     children = result["children"]
     assert isinstance(children, list) and len(children) == len(names), (children, names)
     machines, runs = set(), set()

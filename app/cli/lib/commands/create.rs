@@ -323,7 +323,6 @@ impl Cmd {
                     name: requested_name,
                     external_resources: libvm::ExternalResourcePolicy::Reject,
                     activation_hook: None,
-                    resources: Default::default(),
                 };
                 return context
                     .app_api()

@@ -85,9 +85,8 @@ pub use start::{
 pub use stopped::{
     preflight_recover_checkpoint_disks, preflight_restore_snapshot, preflight_stopped,
     ExternalResourceKey, ExternalResourceMapping, ExternalResourcePolicy,
-    ExternalResourceRequirement, ForkOptions, PrivateWriteAllowance, RecoverDisksOptions,
-    RestoreMemoryPolicy, RestoreOptions, RestoreResourcePolicy, SnapshotConfiguration,
-    SnapshotOptions,
+    ExternalResourceRequirement, ForkOptions, RecoverDisksOptions, RestoreOptions,
+    SnapshotConfiguration, SnapshotOptions,
 };
 pub use streams::{
     FileWriteDisposition, MachineAgentConnection, MachineAgentConnectionState,

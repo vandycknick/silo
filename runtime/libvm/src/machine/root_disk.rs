@@ -8,6 +8,9 @@ use nix::sys::stat::{fchmod, fstatat, Mode};
 use nix::unistd::{geteuid, unlinkat, UnlinkatFlags};
 
 use crate::paths::OwnedDirectory;
+use crate::storage::clone::clone_error_allows_fallback;
+#[cfg(target_os = "linux")]
+use crate::storage::clone::try_reflink;
 use crate::storage::identity::StreamId;
 use crate::storage::identity_file::{FileIdentity, SourceFingerprint};
 use crate::storage::stream::{AuthenticatedStream, StreamHasher, StreamScan, StreamStats};
@@ -481,24 +484,6 @@ enum CloneAttempt {
     Unsupported,
 }
 
-fn clone_error_allows_fallback(error: &io::Error, valid_whole_file: bool) -> bool {
-    let Some(errno) = error.raw_os_error() else {
-        return false;
-    };
-    if errno == libc::EOPNOTSUPP || errno == libc::ENOTSUP || errno == libc::EXDEV {
-        return true;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        errno == libc::ENOTTY || (errno == libc::EINVAL && valid_whole_file)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = valid_whole_file;
-        errno == libc::ENOSYS
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn clone_attempt(
     source: &File,
@@ -896,23 +881,6 @@ fn try_clonefile(source: &File, destination: &OwnedDirectory, name: &str) -> io:
     }
 }
 
-#[cfg(target_os = "linux")]
-fn try_reflink(source: &File, destination: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    const FICLONE: libc::c_ulong = 0x4004_9409;
-
-    // nix does not expose a safe wrapper for the Linux FICLONE ioctl.
-    // SAFETY: ioctl only reads the source file descriptor value and applies it
-    // to the destination fd for the duration of this call.
-    let rc = unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
@@ -921,10 +889,11 @@ mod tests {
     use std::path::Path;
 
     use crate::machine::root_disk::{
-        clone_error_allows_fallback, copy_private, resize_raw_disk, CloneDiskMethod,
-        CopyQualification, CopySource, RootDiskError, RootDiskResizeOutcome,
+        copy_private, resize_raw_disk, CloneDiskMethod, CopyQualification, CopySource,
+        RootDiskError, RootDiskResizeOutcome,
     };
     use crate::paths::OwnedDirectory;
+    use crate::storage::clone::clone_error_allows_fallback;
 
     fn copy_tempdir() -> tempfile::TempDir {
         match std::env::var_os("SILO_TEST_COPY_DIR") {
@@ -1716,7 +1685,7 @@ mod tests {
         fs::write(&destination, b"unchanged").unwrap();
         let input = File::open(&source).unwrap();
         let read_only_output = File::open(&destination).unwrap();
-        let error = crate::machine::root_disk::try_reflink(&input, &read_only_output).unwrap_err();
+        let error = crate::storage::clone::try_reflink(&input, &read_only_output).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
         assert!(!clone_error_allows_fallback(&error, true));
         assert_eq!(fs::read(destination).unwrap(), b"unchanged");

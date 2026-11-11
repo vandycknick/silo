@@ -268,7 +268,6 @@ impl Store {
         if operation.is_nil()
             || result.operation_id != operation
             || options.operation_id != operation
-            || result.resources != options.resources
             || result.children.len() != options.children.len()
             || result.capture_id.as_str() != capture
             || Uuid::from(result.source_machine_id).to_string() != observation.machine_id
@@ -394,7 +393,6 @@ impl Store {
             cancellation_requested: false,
             capture: ForkCaptureOutcome::Pending,
             source: ForkSourceOutcome::Pending,
-            resources: options.resources,
             children,
         };
         let mut header = result.clone();
@@ -1138,7 +1136,6 @@ pub(crate) mod tests {
             resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
             policy: vm_spec::lifecycle::CapturePolicy::Full,
             dirty_crossover_percent: 60,
-            resources: crate::RestoreResourcePolicy::default(),
         }
     }
 

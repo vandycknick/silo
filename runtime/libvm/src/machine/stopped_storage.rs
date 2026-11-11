@@ -474,7 +474,6 @@ mod tests {
                     name: Some("unresolved".into()),
                     external_resources: ExternalResourcePolicy::RequireMappings,
                     activation_hook: None,
-                    resources: Default::default(),
                 },
             )
             .await
@@ -501,50 +500,6 @@ mod tests {
             .get_machine(&MachineRef::parse("refused-fork").expect("name"))
             .await
             .is_err());
-    }
-
-    #[tokio::test]
-    async fn stopped_restore_rejects_live_resource_policy_without_allocating_a_child() {
-        let fixture = Fixture::new(false, false).await;
-        let info = fixture
-            .source
-            .snapshot_stopped(SnapshotOptions::default())
-            .await
-            .unwrap();
-        let before = crate::machine::stopped_storage::live_catalog::snapshot(&fixture.home).await;
-        for resources in [
-            crate::RestoreResourcePolicy {
-                memory: crate::RestoreMemoryPolicy::AllowOvercommit,
-                ..Default::default()
-            },
-            crate::RestoreResourcePolicy {
-                private_write_allowance: crate::PrivateWriteAllowance::try_from(33).unwrap(),
-                ..Default::default()
-            },
-        ] {
-            let error = fixture
-                .runtime
-                .restore_snapshot(
-                    SnapshotRef::Id(info.id),
-                    RestoreOptions {
-                        name: Some("live-policy".into()),
-                        resources,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("require a live execution checkpoint"),
-                "{error}"
-            );
-            assert_eq!(
-                crate::machine::stopped_storage::live_catalog::snapshot(&fixture.home).await,
-                before
-            );
-        }
     }
 
     #[tokio::test]

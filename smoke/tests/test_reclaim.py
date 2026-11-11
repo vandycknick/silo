@@ -67,6 +67,7 @@ def test_boot_restore_reclaim_zero_and_incremental_frozen_full(
     # Establish a child-local full baseline after activation/reporting and the
     # read. Otherwise early reporting of already-free inherited pages can make
     # the 60% dirty-crossover choose full, hiding the incremental discard test.
+    reclaim.settled(silo, RESTORED, "restored-private")
     baseline = restore.checkpoint(silo, RESTORED, alias="reclaim-b-baseline", policy="full")
     incremental.authenticated_map(silo, baseline, mode="full", reason="requested")
     incremental.balloon_report_queue(silo, baseline)

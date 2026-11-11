@@ -365,7 +365,7 @@ capture possible.
 
 Capture also requires that the machine is not mid-resize, that no other
 capture, stop or relocation is in flight for the run, and that libvm has
-reserved the staging space, RAM accounting and lease budget for the result.
+reserved the staging space and descriptor budget and retained the result's leases.
 
 ### Ordering
 
@@ -457,6 +457,22 @@ depend on the source's request file.
 
 ### Incremental capture
 
+Live snapshots and live forks default to `--capture-policy incremental`: reuse
+the valid retained baseline, including the checkpoint inherited by a restored
+child, without requiring an opt-in. `--capture-policy full` explicitly forces
+a full capture. The two existing values are sufficient: incremental is a
+preference, not a requirement to reject otherwise valid captures. If the
+exact backend/host report does not admit incremental capture, libvm resolves
+the preference to full before reserving or journaling the capture. Normal
+Capture/Fork capability admission still applies; unsupported live operations
+do not become available through this fallback.
+
+On an admitted incremental backend, a first capture of a booted VM selects
+full with `no-baseline`, not `requested`. Invalidated baseline coverage,
+changed topology or tokens, and dirty crossover keep their existing automatic
+full fallbacks and reported reasons. Explicit full reports `requested`.
+`--dirty-crossover-percent` accepts `1..=60`, defaulting to 60.
+
 The worker tracks dirty pages after a capture is accepted: KVM slot dirty
 logging on Linux, second-stage write protection with first-write faults on
 HVF, and a separate host-writer bitmap for every VMM and device write on both.
@@ -537,12 +553,15 @@ presented as remote lazy restore.
 
 ### Accounting
 
-A capture alone writes RAM to a file and reserves only its bounded capture
-scratch memory, never a resident baseline. The baseline is reserved once,
-deduplicated by backing inode, when the first restore or fork child that maps
-it is admitted. A live fork admits its children with the capture, so its
-pending baseline and per-child charges are reserved before freeze and bound
-to the sealed RAM inode afterwards.
+**Amendment, 2026-11-11 (restore/capture resource model).** Restore, fork and
+live capture do not reserve or admit host RAM. Restored and forked RAM uses
+lazy `MAP_PRIVATE` mappings, aligned with Firecracker's `File` backend and
+microsandbox's `PrivateMemoryBacking` restore model. Booted VMs were never
+RAM-admitted either. Configured RAM is not resident RAM, and capturing a
+restored VM must not charge its baseline a second time. RAM baseline, private
+write, page-table/native-state and capture-scratch charges and their policy
+flags are removed. Host memory pressure is handled by the host's ordinary
+virtual-memory behavior, not a Silo RAM reservation ledger.
 
 Private disk construction for both restore and fork reserves the allocated
 bytes of each writable disk, not its logical capacity, plus state reserves
@@ -556,22 +575,11 @@ fail the operation under the failure semantics below.
 Physical memory for a source and N children is approximately the source's
 resident set plus the clean baseline pages any child touches once plus every
 child's private written pages, plus page tables and VMM overhead. Per-process
-RSS double-counts shared pages and is not the accounting unit. libvm admits a
-fork against a budget that reserves, per child, a private-write allowance
-(default 25 percent of the machine's RAM, configurable per machine) and
-reserves the baseline once; the default maximum fan-out of one fork call is
-16. Memory overcommit beyond this reservation requires an explicit per-call
-flag and is reported as such. Refusal happens before the source is frozen.
-
-Execution restore exposes that per-child allowance as an integer percentage
-from 0 through 100 (`RestoreOptions::resources.private_write_allowance`, CLI
-`--private-write-percent`, default 25). It rounds the selected fraction upward
-to the native RAM granule without truncating fractional bytes. Zero explicitly
-reserves no private writes; the baseline and page-table/native-state charge
-remain mandatory. `RestoreMemoryPolicy::AllowOvercommit` / CLI
-`--memory-overcommit` is an explicit per-restore opt-in, off by default, and
-never bypasses disk, descriptor, closure or compatibility admission. Selected
-policy is durable intent, validated with its charge throughout reconciliation.
+RSS double-counts shared pages and is not the accounting unit. The default
+maximum fan-out of one fork call remains 16. Whole-batch count, disk-peak and
+descriptor admission happens before the source is frozen. The same-euid
+cross-home ledger retains only disk and descriptor charges; compatibility and
+closure authentication remain mandatory.
 
 The same-euid cross-home restore ledger publishes only complete records:
 private staging, file fsync, atomic rename, then directory fsync. SQL ownership
@@ -592,6 +600,16 @@ reclamation. An anchor proves only existence, so an invalid anchor does not
 retain charges; malformed authoritative charges of a live home still refuse
 admission. Live homes' charges remain governed by their SQL journal receipts,
 never by PID or lock observations.
+The resource-only ledger is `/tmp/silo-resource-budget-<euid>` (`/private/tmp`
+on macOS), a clean namespace cutover from older builds'
+`silo-restore-budget-<euid>` directory. New builds never read old-namespace
+documents, so old homes, including ones with old-build VMs still running, cannot
+block admission in a fresh home. The old directory may be deleted once no
+old-build Silo processes remain. No compatibility reader is provided.
+Charge documents in the new namespace reject unknown fields; live-home
+malformed-charge refusals and orphan-prefix reclamation apply unchanged.
+Refusals identify the owning home and ledger directory with removal guidance.
+
 
 ### Reclaim
 
@@ -1193,8 +1211,6 @@ machine, who paused it.
 | --- | --- |
 | RAM per captured machine | [ADR 0014](0014-layered-oci-image-storage.md)'s per-stream limits apply; 1 TiB logical. |
 | Children per fork call | 16 by default; higher with an explicit flag, still within budget. |
-| Private-write reservation per child | 25 percent of machine RAM by default; per-machine configurable. |
-| Memory overcommit | Off by default; explicit per-call opt-in. |
 | Capture staging | Reserved before freeze by libvm: staging (RAM image + allocated bytes of each writable disk + state reserves), plus the publication peak (RAM image copy + allocated bytes of each writable disk + map and state reserves) when the pool shares the filesystem. On separate filesystems, publication is charged to the pool's filesystem instead. A same-filesystem local fork cut is renamed, so it needs no publication copy. |
 | Restore/fork child disk construction | Per child: allocated bytes of every writable disk + state reserves + pinned boot-object copies. Live forks use the allocation sample retained by capture planning; standalone restores measure their held immutable source files. |
 | Activation deadlines | VM generation acknowledgement 5 s; agent `Activate` 30 s; both configurable. |

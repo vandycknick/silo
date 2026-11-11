@@ -70,7 +70,7 @@ class Checkpoint:
 
 
 def checkpoint(silo: Silo, name: str, *, alias: str = "restore-checkpoint",
-               borrowed: bool = False, policy: str = "full",
+               borrowed: bool = False, policy: str | None = None,
                dirty_crossover_percent: int = 60) -> Checkpoint:
     """Capture a real guest, preserving acquired or borrowed pause authority.
 
@@ -85,7 +85,7 @@ def checkpoint(silo: Silo, name: str, *, alias: str = "restore-checkpoint",
         silo.run("pause", name)
         original_pause = silo.info(name)["lifecycle"]["lifecycle"]["currentPause"]
     result = silo.run("snapshot", "create", name, "--live", "--preserve", "--name", alias,
-                      "--capture-policy", policy,
+                      *(["--capture-policy", policy] if policy is not None else []),
                       "--dirty-crossover-percent", str(dirty_crossover_percent), timeout=240)
     value = json.loads(result.stdout)
     summary = value["capture"]

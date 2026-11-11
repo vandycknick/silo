@@ -263,8 +263,6 @@ impl w::runtime_service_server::RuntimeService for Service {
                 .map(silo_vm_control::stopped::hook_from_wire)
                 .transpose()
                 .map_err(conversion)?,
-            resources: silo_vm_control::stopped::restore_resources_from_wire(value.resources)
-                .map_err(conversion)?,
         };
         let query = match self.runtime.get() {
             Some(runtime) => runtime.live_capability_query(),
