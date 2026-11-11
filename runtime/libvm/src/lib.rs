@@ -40,9 +40,8 @@ pub use crate::machine::live_fork::{
 pub use crate::machine::{
     preflight_recover_checkpoint_disks, preflight_restore_snapshot, preflight_stopped,
     validate_new_machine_name, ExternalResourceKey, ExternalResourceMapping,
-    ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions, PrivateWriteAllowance,
-    RecoverDisksOptions, RestoreMemoryPolicy, RestoreOptions, RestoreResourcePolicy,
-    SnapshotConfiguration, SnapshotOptions,
+    ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions, RecoverDisksOptions,
+    RestoreOptions, SnapshotConfiguration, SnapshotOptions,
 };
 pub use crate::machine::{
     require_live_operation, LiveCaptureSource, LiveCaptureSummary, LiveObservationReader,

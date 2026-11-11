@@ -137,7 +137,6 @@ pub fn request_to_wire(
         resume_policy: crate::capture::resume_policy_to_wire(value.resume_policy),
         policy: crate::capture::policy_to_wire(value.policy),
         dirty_crossover_percent: u32::from(value.dirty_crossover_percent),
-        resources: Some(crate::stopped::restore_resources_to_wire(value.resources)),
     };
     request_from_wire(request.clone())?;
     Ok(request)
@@ -179,10 +178,6 @@ pub fn request_from_wire(
         dirty_crossover_percent: crate::capture::crossover_from_wire(
             value.dirty_crossover_percent,
         )?,
-        resources: crate::stopped::restore_resources_from_wire(Some(required(
-            value.resources,
-            "fork.resources",
-        )?))?,
     };
     options
         .validate()
@@ -489,18 +484,12 @@ pub fn validate_result(value: &LiveForkResult) -> Result<(), ConversionError> {
 }
 
 /// A creation result answers exactly this request: same operation, every
-/// requested child by name in request order, and the requested resources.
+/// requested child by name in request order.
 pub fn validate_creation(
     result: &LiveForkResult,
     request: &LiveForkOptions,
 ) -> Result<(), ConversionError> {
     validate_observation(result, request.operation_id)?;
-    if result.resources != request.resources {
-        return Err(invalid(
-            "fork.resources",
-            "result does not echo the requested resource policy",
-        ));
-    }
     if result.children.len() != request.children.len()
         || !result
             .children
@@ -542,7 +531,6 @@ pub fn result_to_wire(value: &LiveForkResult) -> Result<w::LiveForkResult, Conve
         cancellation_requested: value.cancellation_requested,
         capture: Some(capture_to_wire(&value.capture)),
         source: Some(source_to_wire(&value.source)),
-        resources: Some(crate::stopped::restore_resources_to_wire(value.resources)),
         children: value.children.iter().map(child_result_to_wire).collect(),
     })
 }
@@ -558,10 +546,6 @@ pub fn result_from_wire(value: w::LiveForkResult) -> Result<LiveForkResult, Conv
         cancellation_requested: value.cancellation_requested,
         capture: capture_from_wire(required(value.capture, "fork.capture")?)?,
         source: source_from_wire(required(value.source, "fork.source")?)?,
-        resources: crate::stopped::restore_resources_from_wire(Some(required(
-            value.resources,
-            "fork.resources",
-        )?))?,
         children: value
             .children
             .into_iter()
@@ -648,10 +632,6 @@ mod tests {
             ],
             max_children: NonZeroU32::new(16).unwrap(),
             resume_policy: CaptureResumePolicy::ResumeIfAcquired,
-            resources: libvm::RestoreResourcePolicy {
-                private_write_allowance: libvm::PrivateWriteAllowance::try_from(33).unwrap(),
-                memory: libvm::RestoreMemoryPolicy::AllowOvercommit,
-            },
         }
     }
 
@@ -681,7 +661,6 @@ mod tests {
             cancellation_requested: false,
             capture: ForkCaptureOutcome::Sealed { cut_id: cut() },
             source: ForkSourceOutcome::Resumed,
-            resources: options().resources,
             children: vec![
                 child(0, "child-a", ForkChildOutcome::Running),
                 child(
@@ -741,9 +720,6 @@ mod tests {
             .unwrap()
             .timeout_ms = None;
         cases.push(("hook without timeout", case));
-        let mut case = valid.clone();
-        case.resources = None;
-        cases.push(("implicit resources", case));
         let mut case = valid.clone();
         case.resume_policy = w::CaptureResumePolicy::Unspecified as i32;
         cases.push(("unspecified resume policy", case));
@@ -902,9 +878,6 @@ mod tests {
         case.source = Some(w::ForkSourceOutcome { outcome: None });
         cases.push(("empty source oneof", case));
         let mut case = valid.clone();
-        case.resources = None;
-        cases.push(("missing resource echo", case));
-        let mut case = valid.clone();
         case.children[0].outcome = None;
         cases.push(("missing child outcome", case));
         let mut case = valid.clone();
@@ -1033,9 +1006,6 @@ mod tests {
         let mut renamed = options();
         renamed.children[1].name = "child-c".into();
         assert!(validate_creation(&result, &renamed).is_err());
-        let mut resources = options();
-        resources.resources = libvm::RestoreResourcePolicy::default();
-        assert!(validate_creation(&result, &resources).is_err());
     }
 
     #[test]

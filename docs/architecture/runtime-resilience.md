@@ -74,7 +74,7 @@ silo pause <VM>
 silo snapshot create <VM> --live [--name <NAME>]
           [--capture-policy full|incremental] [--dirty-crossover-percent 1..60]
 silo fork <VM> --live --name <CHILD> [--name <CHILD>...] [--preserve]
-          [--max-children <N>] [--private-write-percent <P>] [--memory-overcommit]
+          [--max-children <N>]
           [--operation-id <UUID>]
           [--capture-policy full|incremental] [--dirty-crossover-percent 1..60]
 silo fork <VM> --live --children-json '<JSON array>'
@@ -88,12 +88,17 @@ They never stop a machine, capture only its disks, or cold boot as a fallback.
 For VZ the ordinary alternative is to use `silo stop`, then the stopped-storage
 snapshot workflow, not an execution checkpoint.
 
-Live snapshot and fork requests default to full capture and a 60 percent dirty
-crossover. Incremental requests require their own capability admission before
-freezing. They reuse authenticated clean-chunk identities, but publish complete
-RAM maps and full-file SHA evidence. Missing baselines, changed epochs, uncertain
-coverage and the selected dirty threshold cause an explicitly reported full
-capture, never an incomplete delta chain.
+Live snapshot and fork requests default to incremental capture and a 60 percent
+dirty crossover. `--capture-policy full` forces full capture; the existing
+`incremental` value expresses the default preference without a new policy mode.
+Before reservation, libvm resolves that preference to full when the exact
+backend/host report does not admit incremental capture. Normal Capture/Fork
+admission still applies. Incremental captures reuse authenticated clean-chunk
+identities, but publish complete RAM maps and full-file SHA evidence. Missing
+baselines, changed topology or epochs, uncertain coverage and the selected dirty
+threshold cause an explicitly reported full capture, never an incomplete delta
+chain. A booted VM's first default capture reports `no-baseline`; restored and
+forked children inherit their checkpoint as their first baseline.
 
 Execution portability refusal names the exact pin, expected and destination
 values, and `restore-preflight` stage before child allocation. `recover-disks`

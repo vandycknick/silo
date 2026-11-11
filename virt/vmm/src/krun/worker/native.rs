@@ -104,6 +104,22 @@ impl KrunNative {
     }
 }
 
+fn memory_capture_request(
+    policy: vm_spec::lifecycle::CapturePolicy,
+    dirty_crossover_percent: u8,
+    baseline: Option<libkrun::live::BaselineToken>,
+) -> MemoryCaptureRequest {
+    MemoryCaptureRequest {
+        baseline,
+        // A missing baseline is still an incremental request: libkrun reports
+        // NoBaseline, not Requested, when it selects the initial full capture.
+        full_at_dirty_percent: match policy {
+            vm_spec::lifecycle::CapturePolicy::Full => 0,
+            vm_spec::lifecycle::CapturePolicy::Incremental => dirty_crossover_percent,
+        },
+    }
+}
+
 #[cfg(all(
     feature = "restore-irq-probe",
     target_os = "linux",
@@ -423,16 +439,11 @@ impl NativeLifecycle for KrunNative {
             .control
             .capture_memory(
                 capture,
-                MemoryCaptureRequest {
-                    baseline: token,
-                    full_at_dirty_percent: if preparation.policy
-                        == vm_spec::lifecycle::CapturePolicy::Full
-                    {
-                        0
-                    } else {
-                        preparation.dirty_crossover_percent
-                    },
-                },
+                memory_capture_request(
+                    preparation.policy,
+                    preparation.dirty_crossover_percent,
+                    token,
+                ),
                 MemoryOutputs { ram, layout },
                 OperationId(operation.get()),
                 deadline,
@@ -949,6 +960,23 @@ mod tests {
         generation_failure, provider_device, recoverable_memory_cut,
     };
     use crate::virt::lifecycle::{GenerationFailureKind, ProviderDevice, VirtioKind};
+
+    #[test]
+    fn first_capture_keeps_native_no_baseline_fallback_instead_of_forcing_full() {
+        use vm_spec::lifecycle::CapturePolicy;
+
+        let request = crate::krun::worker::native::memory_capture_request(
+            CapturePolicy::Incremental,
+            60,
+            None,
+        );
+        assert!(request.baseline.is_none());
+        assert_eq!(request.full_at_dirty_percent, 60);
+        let full =
+            crate::krun::worker::native::memory_capture_request(CapturePolicy::Full, 60, None);
+        assert!(full.baseline.is_none());
+        assert_eq!(full.full_at_dirty_percent, 0);
+    }
 
     #[test]
     fn memory_cut_recovery_selects_only_typed_uncertain_dirty_failures() {

@@ -109,10 +109,6 @@ impl w::machine_service_server::MachineService for Service {
         // Capability refusal precedes every lock, reservation and journal row.
         self.require_machine_live(&reference, vm_spec::live::LiveOperation::Capture)
             .await?;
-        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
-            self.require_machine_live(&reference, vm_spec::live::LiveOperation::Incremental)
-                .await?;
-        }
         let observation = self.observe_machine_live(&reference).await?;
         let state = self.clone();
         let result = self
@@ -139,10 +135,6 @@ impl w::machine_service_server::MachineService for Service {
         // Capability refusal precedes every lock, reservation and journal row.
         self.require_machine_live(&reference, vm_spec::live::LiveOperation::Fork)
             .await?;
-        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
-            self.require_machine_live(&reference, vm_spec::live::LiveOperation::Incremental)
-                .await?;
-        }
         let observation = self.observe_machine_live(&reference).await?;
         let state = self.clone();
         // The spawned mutation owns the operation: a client disconnect is not cancellation.

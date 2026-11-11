@@ -64,6 +64,7 @@ pub struct LiveSnapshotOptions {
     /// `resume-if-acquired` needs a Running source; a Paused source requires
     /// `preserve` and borrows the user pause without ever resuming it.
     pub resume_policy: CaptureResumePolicy,
+    /// Prefer incremental capture when admitted; otherwise use full capture.
     pub policy: CapturePolicy,
     pub dirty_crossover_percent: u8,
 }
@@ -73,7 +74,7 @@ impl Default for LiveSnapshotOptions {
         Self {
             name: None,
             resume_policy: CaptureResumePolicy::ResumeIfAcquired,
-            policy: CapturePolicy::Full,
+            policy: CapturePolicy::Incremental,
             dirty_crossover_percent: 60,
         }
     }
@@ -85,6 +86,24 @@ impl LiveSnapshotOptions {
             return Err(protocol("dirty crossover percent must be between 1 and 60"));
         }
         Ok(())
+    }
+}
+
+/// Resolve the preference before persisting a plan. Incremental availability
+/// must never prevent a capture that the full-capture capability admits.
+pub(crate) fn resolve_policy(
+    policy: CapturePolicy,
+    observation: &MachineLiveObservation,
+) -> CapturePolicy {
+    if policy == CapturePolicy::Incremental
+        && !matches!(
+            observation.report().live.incremental.availability,
+            vm_spec::live::LiveAvailability::Supported
+        )
+    {
+        CapturePolicy::Full
+    } else {
+        policy
     }
 }
 
@@ -272,16 +291,14 @@ impl Machine {
         &self,
         observation: &MachineLiveObservation,
         request_id: Uuid,
-        options: LiveSnapshotOptions,
+        mut options: LiveSnapshotOptions,
     ) -> Result<LiveCommandResult, LibVmError> {
         options.validate()?;
         if request_id.is_nil() {
             return Err(protocol("nil capture identity"));
         }
         self.require_observation(observation)?;
-        if options.policy == CapturePolicy::Incremental {
-            require_live_operation(observation, LiveOperation::Incremental)?;
-        }
+        options.policy = resolve_policy(options.policy, observation);
         let runtime = self.runtime();
         let store = runtime.native_store()?;
         let run = Uuid::parse_str(&observation.report().run_id)
@@ -312,9 +329,7 @@ impl Machine {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
             require_same_observation(observation, &fresh)?;
-            if options.policy == CapturePolicy::Incremental {
-                require_live_operation(&fresh, LiveOperation::Incremental)?;
-            }
+            options.policy = resolve_policy(options.policy, &fresh);
             if admission(&fresh, options.resume_policy)? != pause {
                 return Err(protocol("pause authority changed since capture admission"));
             }
@@ -1382,7 +1397,10 @@ mod tests {
     #[test]
     fn capture_options_validate_crossover_before_any_operation() {
         let mut options = crate::LiveSnapshotOptions::default();
-        assert_eq!(options.policy, vm_spec::lifecycle::CapturePolicy::Full);
+        assert_eq!(
+            options.policy,
+            vm_spec::lifecycle::CapturePolicy::Incremental
+        );
         assert_eq!(options.dirty_crossover_percent, 60);
         for policy in [
             vm_spec::lifecycle::CapturePolicy::Full,
@@ -1396,6 +1414,49 @@ mod tests {
             for percent in [0, 61, u8::MAX] {
                 options.dirty_crossover_percent = percent;
                 assert!(options.validate().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn default_capture_policy_uses_incremental_only_when_admitted() {
+        use vm_spec::lifecycle::CapturePolicy;
+
+        for (backend, lane) in [
+            (LiveBackend::Krun, LiveLane::KvmX86_64),
+            (LiveBackend::Krun, LiveLane::KvmArm64GicV3),
+            (LiveBackend::Krun, LiveLane::HvfArm64),
+            (LiveBackend::Vz, LiveLane::NotApplicable),
+        ] {
+            for supported in [false, true] {
+                let mut report = report(true);
+                report.backend = backend;
+                report.lane = lane;
+                if supported {
+                    report.live.incremental = LiveCapability {
+                        native: true,
+                        availability: LiveAvailability::Supported,
+                    };
+                }
+                let observation = MachineLiveObservation::for_test(
+                    report,
+                    VmLifecycleState::Running,
+                    LiveLifecycle::default(),
+                );
+                let options = crate::LiveSnapshotOptions::default();
+                assert_eq!(
+                    crate::machine::live_capture::resolve_policy(options.policy, &observation),
+                    if supported {
+                        CapturePolicy::Incremental
+                    } else {
+                        CapturePolicy::Full
+                    },
+                );
+                assert_eq!(
+                    crate::machine::live_capture::resolve_policy(CapturePolicy::Full, &observation),
+                    CapturePolicy::Full,
+                );
+                assert!(admission(&observation, options.resume_policy).is_ok());
             }
         }
     }

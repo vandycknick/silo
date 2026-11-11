@@ -87,9 +87,15 @@ restoration, preserving captured configuration and included disks rather than
 copying only its root. Snapshot creation accepts a new name; other nondefault
 create settings are refused and require explicit stopped updates after restore.
 
-`LiveSnapshotOptions` defaults to `CapturePolicy::Full`. Explicit incremental
-capture (including live-fork capture) accepts `dirty_crossover_percent` in
-`1..=60`, with 60 as the default. Normal capability admission still applies.
+`LiveSnapshotOptions` defaults to `CapturePolicy::Incremental`, a preference
+shared by live-fork capture. An exact machine report without incremental
+capability resolves that preference to full before admission of the capture
+plan; normal Capture/Fork admission still applies. `CapturePolicy::Full` forces
+full capture. On incremental backends, missing or invalidated baselines,
+topology changes and dirty crossover retain their automatic full fallbacks;
+a booted VM's first default capture reports `no-baseline`. Restored children
+inherit their checkpoint baseline. `dirty_crossover_percent` accepts `1..=60`,
+with 60 as the default.
 Successful capture summaries carry actual mode, baseline identity, fallback
 reason, affected identity chunks and separate native I/O/whole-file hashing
 facts. Each checkpoint owns a complete canonical RAM map and complete closure;
@@ -714,15 +720,14 @@ exact storage operations. A live detached worker therefore still blocks reuse
 and abandonment.
 
 The native source may retain the accepted RAM baseline after releasing capture
-result ownership. Its exact run lease therefore keeps the cut and baseline
-charge alive until that run ends; stopping only the last child is not sufficient
-for collection while the source still maps the cut. Every child independently
-retains its own generation roots and charges. Same-filesystem relocation keeps
-one RAM inode; a qualified cross-filesystem publication charges both actual
-source and final baseline inodes.
+result ownership. Its exact run lease therefore keeps the cut alive until that
+run ends; stopping only the last child is not sufficient for collection while
+the source still maps the cut. Every child independently retains its own
+generation roots. Same-filesystem relocation keeps one RAM inode; a qualified
+cross-filesystem publication retains both source and final baseline inodes.
 
 Capture, snapshot restore and live-fork batches share cross-home admission.
-The entire batch reserves memory, disk construction peaks and manager-local
+The entire batch reserves disk construction peaks and manager-local
 descriptor capacity before capture dispatch. Stable reservation ownership moves
 to exact child generations atomically with their launch dependency closure.
 Construction is parallel within that pre-admitted inventory, not subject to a
@@ -740,15 +745,14 @@ Seal verification (publication and local-cut retention) first admits every
 role's geometry, hardlink, cross-role and writable-source alias bounds, then
 authenticates in exactly two lanes: RAM on one extra thread with an explicit
 1 MiB stack and 1 MiB read buffer, every other role in inventory order on the
-caller. The capture reservation charges that 2 MiB delta on top of the general
-16 MiB capture scratch before any effect; monitor staging verification uses
-the same delta and never overlaps libvm's, which needs the sealed evidence. A
+caller. Monitor staging verification uses the same bounded scratch and never
+overlaps libvm's, which needs the sealed evidence. A
 lane that fails or unwinds stops its sibling at the next read or role
 boundary; both are joined before verification returns (a panicked RAM lane is
 a typed error), so no lane outlives the caller's
 descriptors, staging or lease. Results keep the evidence inventory order.
-Restore consumer verification stays one serial lane: it precedes the restore
-ledger reservation, so a second 8 MiB stream lane would be unadmitted.
+Restore closure verification falls back to serial operation when the additional
+lane's descriptor budget does not fit.
 
 ### Execution restore
 
@@ -790,35 +794,34 @@ not copied. An optional bounded activation hook is selected with
 `argv`, `environment`, `workingDirectory` and `timeoutMs` (at most 30,000).
 Stopped snapshots reject activation hooks rather than ignoring them.
 
-Memory admission reserves the immutable RAM baseline once per device/inode and
-private writes per child (25% by default), rounded up to the captured native
-granule, plus a separate page-table/native-state allowance. Select a per-child
-integer allowance from 0 through 100% with `RestoreOptions::resources` /
-`PrivateWriteAllowance::try_from(percent)` or `--private-write-percent PERCENT`.
-Zero explicitly reserves no private writes, not zero baseline or overhead.
-`RestoreMemoryPolicy::AllowOvercommit` / `--memory-overcommit` explicitly opts
-this restore into memory overcommit; the default is `Reserved` (no overcommit).
-The exact allowance and memory policy are retained and validated in the journal
-and shared ledger, including across reconciliation. Actual memory overcommit is
-also reported in the manager log. Nondefault resource policies, like activation
-hooks, require a live execution checkpoint.
+Restore, fork and live capture do not reserve or admit host RAM. Restore and
+fork map immutable RAM lazily with `MAP_PRIVATE`; configured memory is not a
+resident-memory charge. There is no private-write percentage or memory
+overcommit policy, and snapshotting a restored VM does not charge its baseline.
+Ordinary host virtual-memory behavior governs memory pressure.
 
 Full private-copy/provenance disk peaks are reserved even when a clone may
-succeed. Explicit memory overcommit never bypasses disk, descriptor, closure
-authentication or compatibility checks. Memory and disk reservations are
-serialized across runtime homes under one authenticated user's private
-`/tmp/silo-restore-budget-<euid>` ledger (`/private/tmp` on macOS). This is not
-cross-user or host-global authority. There is no fixed concurrent-restore limit,
-and admission never implicitly overcommits. Charges survive caller loss.
+succeed. Disk and descriptor admission, closure authentication and compatibility
+checks remain mandatory. Resource reservations are serialized across runtime
+homes under one authenticated user's private `/tmp/silo-resource-budget-<euid>`
+ledger (`/private/tmp` on macOS). This is not cross-user or host-global authority.
+There is no fixed concurrent-restore limit. Charges survive caller loss.
+The resource-only ledger uses a distinct namespace from older builds' RAM-aware
+`silo-restore-budget-<euid>` ledger. New builds never read that old directory,
+so incompatible homes cannot block a fresh home's admission. The old directory
+may be deleted once no old-build Silo processes remain.
 Each ledger record is published by private staging, file fsync, atomic rename
 and directory fsync, after its SQL owner is committed. Readers see only complete
 old/new charges; abandoned `.atomic-write` staging is non-authoritative and is
 reclaimed under the admission lock. Malformed authoritative records still
 refuse admission. An interrupted construction-completion update conservatively
 retains the old disk peak until the owning home reconciles its committed charge.
-Construction disk peaks are released only after the exact run's durable Running
-receipt; shared-baseline and private-write charges remain until existing
-operation/lifecycle reconciliation proves holder and lease retirement.
+Construction disk peaks and manager-local descriptors are released only after
+the exact run's durable Running receipt. Existing holder and lease retirement
+still protect mapped files independently of admission charges. Charge documents
+reject unknown fields through the existing invalid-document handling, without
+compatibility readers. Malformed documents in the new namespace still refuse
+admission with the owning home path and ledger cleanup guidance.
 
 `restorePrepared` is not success. The manager waits for `started` only after
 fresh-generation acknowledgement, destination activation/thaw and final fence
@@ -922,6 +925,20 @@ Catalog callers use `publish_stream_for_catalog` or `publish_object_for_catalog`
 and keep the returned root guard through the SQLite retention commit. Copying
 and full content verification happen before root coordination; final publication
 rechecks the verified inode so concurrent pruning cannot create a dangling row.
+
+Captured RAM publication first tries a whole-file reflink on Linux Btrfs/XFS.
+It authenticates the private pool destination in one extent-aware read against
+the sealed RAM map, including zero chunks and the exact final length, before
+the usual mode change, fsync and no-replace publication. Capture therefore writes
+staged RAM bytes once; reflink publication never rewrites them. Unsupported
+clones and cross-filesystem publication use the existing copy-and-hash pass
+with a fresh destination inode. Dedup hits still independently authenticate the
+existing pool file. Both paths carry the held-inode proof into closure
+publication without another RAM scan, preserving identities and durability.
+RAM publication tests honor `SILO_TEST_COPY_DIR` for Btrfs/XFS and ext4 lanes;
+filesystem-conditional tests print a reason when the selected tmpdir cannot
+exercise their path. The ignored cross-filesystem case additionally requires
+`SILO_TEST_COPY_CROSS_DIR` on a different mounted filesystem.
 
 `open_existing` and `verify_stream` support read-only reuse without creating
 directories or lock files. Verification opens relative to the validated stream

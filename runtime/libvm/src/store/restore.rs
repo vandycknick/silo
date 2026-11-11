@@ -39,7 +39,7 @@ pub(crate) struct RestoreIntent {
     pub checkpoint: RestoreIdentity,
     pub consumer_operation: Uuid,
     pub request: vm_spec::restore::RestoreRequest,
-    pub memory: RestoreMemoryCharge,
+    pub resources: RestoreResourceCharge,
     pub inspected_executable: crate::storage::identity::ObjectDigest,
     pub inspection: vm_spec::restore::RestoreInspectionReport,
     pub network_attachment: bool,
@@ -71,15 +71,7 @@ impl DescriptorOwner {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct RestoreMemoryCharge {
-    pub baseline_device: u64,
-    pub baseline_inode: u64,
-    pub baseline_bytes: u64,
-    pub configured_bytes: u64,
-    pub granule: u64,
-    pub private_bytes: u64,
-    pub overhead_bytes: u64,
-    pub policy: crate::RestoreResourcePolicy,
+pub(crate) struct RestoreResourceCharge {
     pub disk_device: u64,
     pub disk_bytes: u64,
     pub construction_complete: bool,
@@ -87,28 +79,12 @@ pub(crate) struct RestoreMemoryCharge {
     pub descriptors: u64,
 }
 
-impl RestoreMemoryCharge {
+impl RestoreResourceCharge {
     fn validate(&self) -> Result<(), LibVmError> {
         validate_descriptor_charge(self.descriptor_owner, self.descriptors)?;
-        if self.baseline_inode == 0
-            || self.baseline_bytes == 0
-            || self.baseline_bytes > self.configured_bytes
-            || self.configured_bytes > vm_spec::capture::MAX_CAPTURE_RAM_BYTES
-            || self.granule == 0
-            || !self.granule.is_power_of_two()
-            || self.private_bytes
-                != self
-                    .policy
-                    .private_write_allowance
-                    .reservation(self.configured_bytes, self.granule)?
-            || self.overhead_bytes
-                != self.configured_bytes.div_ceil(512)
-                    + vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES
-            || (if self.construction_complete {
-                self.disk_bytes != 0
-            } else {
-                self.disk_bytes < vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES
-            })
+        if (self.construction_complete && self.disk_bytes != 0)
+            || (!self.construction_complete
+                && self.disk_bytes < vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
         {
             return Err(invalid(
                 "restore resource reservation is malformed or undercharged",
@@ -122,35 +98,17 @@ impl RestoreMemoryCharge {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PendingForkCharge {
     pub consumer_id: Uuid,
-    pub configured_bytes: u64,
-    pub private_bytes: u64,
-    pub overhead_bytes: u64,
     pub disk_device: u64,
     pub disk_bytes: u64,
-    pub policy: crate::RestoreResourcePolicy,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub(crate) enum CaptureBaseline {
-    Pending { capture_id: Uuid, bytes: u64 },
-    Bound { device: u64, inode: u64, bytes: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CaptureBudgetInventory {
     pub capture_id: Uuid,
-    pub capture_memory: u64,
-    pub baseline: Option<CaptureBaseline>,
     pub capture_disks: Vec<crate::store::snapshot_store::CaptureSpaceCharge>,
     pub pending: Vec<PendingForkCharge>,
-    pub bound: Vec<RestoreMemoryCharge>,
+    pub bound: Vec<RestoreResourceCharge>,
     pub descriptor_owner: Option<DescriptorOwner>,
     pub descriptors: u64,
 }
@@ -158,47 +116,20 @@ pub(crate) struct CaptureBudgetInventory {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum BudgetDocument {
-    Restore(RestoreMemoryCharge),
+    Restore(RestoreResourceCharge),
     Capture(CaptureBudgetInventory),
 }
 #[derive(Default)]
 struct RestoreBudget {
-    memory: u64,
-    baselines: std::collections::BTreeMap<(u64, u64), u64>,
     disks: std::collections::BTreeMap<u64, u64>,
     manager: Option<DescriptorOwner>,
     descriptors: u64,
 }
 
 impl RestoreBudget {
-    fn add(&mut self, charge: &RestoreMemoryCharge) -> Result<(), LibVmError> {
+    fn add(&mut self, charge: &RestoreResourceCharge) -> Result<(), LibVmError> {
         charge.validate()?;
         self.add_descriptors(charge.descriptor_owner, charge.descriptors)?;
-        self.memory = self
-            .memory
-            .checked_add(charge.private_bytes)
-            .and_then(|n| n.checked_add(charge.overhead_bytes))
-            .ok_or_else(|| invalid("restore memory reservation overflow"))?;
-        match self
-            .baselines
-            .entry((charge.baseline_device, charge.baseline_inode))
-        {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(charge.baseline_bytes);
-                self.memory = self
-                    .memory
-                    .checked_add(charge.baseline_bytes)
-                    .ok_or_else(|| invalid("restore baseline charge overflow"))?;
-            }
-            std::collections::btree_map::Entry::Occupied(entry)
-                if *entry.get() != charge.baseline_bytes =>
-            {
-                return Err(invalid(
-                    "one restore baseline inode has contradictory lengths",
-                ));
-            }
-            _ => {}
-        }
         let disk = self.disks.entry(charge.disk_device).or_default();
         *disk = disk
             .checked_add(charge.disk_bytes)
@@ -233,13 +164,17 @@ impl RestoreBudget {
                 .ok_or_else(|| invalid("restore budget record disappeared"))?;
             bytes.clear();
             file.take((16 << 20) + 1).read_to_end(&mut bytes)?;
-            if bytes.len() > 16 << 20 {
-                return Err(invalid("resource budget inventory exceeds 16 MiB"));
-            }
-            match serde_json::from_slice::<BudgetDocument>(&bytes).map_err(invalid)? {
-                BudgetDocument::Restore(charge) => budget.add(&charge)?,
-                BudgetDocument::Capture(inventory) => budget.add_capture(&inventory)?,
-            }
+            let admission = if bytes.len() > 16 << 20 {
+                Err(invalid("resource budget inventory exceeds 16 MiB"))
+            } else {
+                serde_json::from_slice::<BudgetDocument>(&bytes)
+                    .map_err(invalid)
+                    .and_then(|document| match document {
+                        BudgetDocument::Restore(charge) => budget.add(&charge),
+                        BudgetDocument::Capture(inventory) => budget.add_capture(&inventory),
+                    })
+            };
+            admission.map_err(|error| budget_document_error(directory, &name, error))?;
         }
         Ok(budget)
     }
@@ -249,59 +184,6 @@ impl RestoreBudget {
         if inventory.capture_id.is_nil() {
             return Err(invalid("capture budget identity is nil"));
         }
-        // Released captures may retain pending child charges until cancellation
-        // reconciliation retires them, but an active fork must own its baseline.
-        if inventory.baseline.is_none()
-            && !inventory.pending.is_empty()
-            && (inventory.capture_memory != 0 || !inventory.capture_disks.is_empty())
-        {
-            return Err(invalid("active fork capture has no reserved baseline"));
-        }
-        self.memory = self
-            .memory
-            .checked_add(inventory.capture_memory)
-            .ok_or_else(|| invalid("capture budget overflow"))?;
-        match inventory.baseline {
-            Some(CaptureBaseline::Pending { capture_id, bytes }) => {
-                if capture_id != inventory.capture_id
-                    || bytes == 0
-                    || bytes > vm_spec::capture::MAX_CAPTURE_RAM_BYTES
-                {
-                    return Err(invalid("pending capture baseline identity is malformed"));
-                }
-                self.memory = self
-                    .memory
-                    .checked_add(bytes)
-                    .ok_or_else(|| invalid("pending capture baseline overflow"))?;
-            }
-            Some(CaptureBaseline::Bound {
-                device,
-                inode,
-                bytes,
-            }) => {
-                if inode == 0 || bytes == 0 || bytes > vm_spec::capture::MAX_CAPTURE_RAM_BYTES {
-                    return Err(invalid("capture baseline identity is invalid"));
-                }
-                match self.baselines.entry((device, inode)) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(bytes);
-                        self.memory = self
-                            .memory
-                            .checked_add(bytes)
-                            .ok_or_else(|| invalid("capture baseline overflow"))?;
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if *entry.get() != bytes =>
-                    {
-                        return Err(invalid(
-                            "capture baseline geometry contradicts a generation",
-                        ))
-                    }
-                    _ => {}
-                }
-            }
-            None => {}
-        }
         for disk in &inventory.capture_disks {
             let total = self.disks.entry(disk.device).or_default();
             *total = total
@@ -310,25 +192,10 @@ impl RestoreBudget {
         }
         for child in &inventory.pending {
             if child.consumer_id.is_nil()
-                || child.configured_bytes == 0
-                || child.configured_bytes > vm_spec::capture::MAX_CAPTURE_RAM_BYTES
-                || child.private_bytes
-                    != child
-                        .policy
-                        .private_write_allowance
-                        .reservation(child.configured_bytes, 65536)?
-                || child.overhead_bytes
-                    != child.configured_bytes.div_ceil(512)
-                        + vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES
                 || child.disk_bytes < vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES
             {
                 return Err(invalid("pending fork reservation is malformed"));
             }
-            self.memory = self
-                .memory
-                .checked_add(child.private_bytes)
-                .and_then(|n| n.checked_add(child.overhead_bytes))
-                .ok_or_else(|| invalid("fork memory budget overflow"))?;
             let total = self.disks.entry(child.disk_device).or_default();
             *total = total
                 .checked_add(child.disk_bytes)
@@ -360,35 +227,12 @@ impl RestoreBudget {
             .map_err(crate::storage::StorageError::from)?;
         Ok(())
     }
-
-    fn admit_memory(
-        &self,
-        policy: crate::RestoreMemoryPolicy,
-        available: u64,
-    ) -> Result<(), LibVmError> {
-        if self.memory > available {
-            if policy == crate::RestoreMemoryPolicy::Reserved {
-                return Err(crate::storage::StorageError::RestoreBudget {
-                    resource: "RAM",
-                    required: self.memory,
-                    available,
-                }
-                .into());
-            }
-            tracing::warn!(
-                required = self.memory,
-                available,
-                "explicit restore memory overcommit"
-            );
-        }
-        Ok(())
-    }
 }
 
 impl RestoreIntent {
     pub(crate) fn validate(&self) -> Result<(), LibVmError> {
         self.request.validate().map_err(invalid)?;
-        self.memory.validate()?;
+        self.resources.validate()?;
         let mut inspected = self.request.clone();
         inspected.network = None;
         inspected.ssh_trusted_ca = None;
@@ -401,17 +245,10 @@ impl RestoreIntent {
         self.inspection
             .validate_against(&bytes, &inspected)
             .map_err(invalid)?;
-        let ram = &self.request.objects[0];
         if self.consumer_operation.is_nil()
             || self.checkpoint.digest() != self.request.checkpoint.as_bytes()
-            || self.memory.baseline_device != ram.file_device
-            || self.memory.baseline_inode != ram.file_inode
-            || self.memory.baseline_bytes != ram.length
-            || self.memory.configured_bytes != self.request.configuration.ram_bytes()
         {
-            return Err(invalid(
-                "restore intent contradicts authenticated RAM or checkpoint",
-            ));
+            return Err(invalid("restore intent contradicts checkpoint identity"));
         }
         Ok(())
     }
@@ -577,28 +414,12 @@ impl SnapshotStore {
             .await
     }
 
-    #[allow(clippy::unnecessary_cast)]
     pub(crate) async fn reserve_restore_resources(
         &self,
         consumer: &SnapshotConsumer,
-        request: &vm_spec::restore::RestoreRequest,
         disk_peak: u64,
         descriptor_peak: u64,
-        policy: crate::RestoreResourcePolicy,
-    ) -> Result<RestoreMemoryCharge, LibVmError> {
-        let ram = &request.objects[0];
-        let bytes = request.configuration.ram_bytes();
-        let granule = u64::from(
-            request
-                .evidence
-                .memory
-                .as_ref()
-                .ok_or_else(|| invalid("missing RAM granule"))?
-                .page_granule,
-        );
-        if granule == 0 || !granule.is_power_of_two() {
-            return Err(invalid("invalid native RAM granule"));
-        }
+    ) -> Result<RestoreResourceCharge, LibVmError> {
         // Imported checkpoints can be restored before this home has ever owned a
         // machine. Create only the private container, not a child or disk, before
         // measuring and reserving space on its actual filesystem.
@@ -606,18 +427,12 @@ impl SnapshotStore {
             .ok_or_else(|| invalid("restore destination home disappeared"))?;
         let disk = home.ensure_dir("machines")?;
         let disk_stat = nix::sys::stat::fstat(disk.fd()).map_err(std::io::Error::from)?;
-        let charge = RestoreMemoryCharge {
-            baseline_device: ram.file_device,
-            baseline_inode: ram.file_inode,
-            baseline_bytes: ram.length,
-            configured_bytes: bytes,
-            granule,
-            private_bytes: policy.private_write_allowance.reservation(bytes, granule)?,
-            // A separate conservative page-table plus bounded native-state
-            // allowance. This is reservation policy, not a measured RSS claim.
-            overhead_bytes: bytes.div_ceil(512) + vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES,
-            policy,
-            disk_device: disk_stat.st_dev as u64,
+        #[cfg(target_os = "macos")]
+        let disk_device = disk_stat.st_dev as u64;
+        #[cfg(not(target_os = "macos"))]
+        let disk_device = disk_stat.st_dev;
+        let charge = RestoreResourceCharge {
+            disk_device,
             disk_bytes: disk_peak,
             construction_complete: false,
             descriptor_owner: Some(DescriptorOwner::current()?),
@@ -639,7 +454,7 @@ impl crate::store::Store {
     async fn reserve_restore_charge(
         &self,
         operation: Uuid,
-        charge: &RestoreMemoryCharge,
+        charge: &RestoreResourceCharge,
         disk: &crate::paths::OwnedDirectory,
         directory: &crate::paths::OwnedDirectory,
     ) -> Result<(), LibVmError> {
@@ -650,7 +465,7 @@ impl crate::store::Store {
     async fn reserve_restore_charge_with(
         &self,
         operation: Uuid,
-        charge: &RestoreMemoryCharge,
+        charge: &RestoreResourceCharge,
         disk: &crate::paths::OwnedDirectory,
         directory: &crate::paths::OwnedDirectory,
         checkpoint: impl FnMut(crate::paths::AtomicWritePhase),
@@ -663,10 +478,6 @@ impl crate::store::Store {
         let mut budget = RestoreBudget::read(self, directory)?;
         budget.add(charge)?;
         budget.admit_descriptors()?;
-        budget.admit_memory(
-            charge.policy.memory,
-            crate::store::capture::available_memory()?,
-        )?;
         let disk_required = budget
             .disks
             .get(&charge.disk_device)
@@ -678,8 +489,7 @@ impl crate::store::Store {
             .checked_mul(filesystem.fragment_size())
             .ok_or_else(|| invalid("restore disk availability overflow"))?;
         if disk_required > available {
-            return Err(crate::storage::StorageError::RestoreBudget {
-                resource: "disk",
+            return Err(crate::storage::StorageError::RestoreDiskBudget {
                 required: disk_required,
                 available,
             }
@@ -689,7 +499,7 @@ impl crate::store::Store {
         let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("INSERT INTO restore_memory_reservation(operation_id,budget_id,charge_json) VALUES(?1,?1,jsonb(?2))")
+        sqlx::query("INSERT INTO restore_resource_reservation(operation_id,budget_id,charge_json) VALUES(?1,?1,jsonb(?2))")
             .bind(operation.to_string()).bind(&json).execute(&mut *tx).await?;
         publish_budget(
             self,
@@ -737,8 +547,6 @@ impl crate::store::Store {
         let stat = nix::sys::stat::fstat(disk.fd()).map_err(std::io::Error::from)?;
         let inventory = CaptureBudgetInventory {
             capture_id: operation,
-            capture_memory: 0,
-            baseline: None,
             capture_disks: vec![crate::store::snapshot_store::CaptureSpaceCharge {
                 device: stat.st_dev as u64,
                 bytes,
@@ -830,15 +638,19 @@ fn budget_directory(
         return crate::paths::OwnedDirectory::open_root(directory);
     }
     let _ = store;
+    crate::paths::OwnedDirectory::open_root(&user_budget_directory_path())
+}
+
+fn user_budget_directory_path() -> std::path::PathBuf {
     let parent = if cfg!(target_os = "macos") {
         "/private/tmp"
     } else {
         "/tmp"
     };
-    crate::paths::OwnedDirectory::open_root(&Path::new(parent).join(format!(
-        "silo-restore-budget-{}",
+    Path::new(parent).join(format!(
+        "silo-resource-budget-{}",
         nix::unistd::geteuid().as_raw()
-    )))
+    ))
 }
 
 fn budget_prefix(store: &crate::store::Store) -> Result<String, LibVmError> {
@@ -908,6 +720,27 @@ fn read_budget_file(
     let mut bytes = Vec::new();
     file.take((16 << 20) + 1).read_to_end(&mut bytes)?;
     Ok(Some(bytes))
+}
+
+fn budget_document_error(
+    directory: &crate::paths::OwnedDirectory,
+    name: &str,
+    error: LibVmError,
+) -> LibVmError {
+    let anchor = budget_file_prefix(name)
+        .and_then(|prefix| {
+            read_budget_file(directory, &format!("{prefix}home.json"))?
+                .ok_or_else(|| invalid("resource budget home anchor is missing"))
+        })
+        .and_then(|bytes| serde_json::from_slice::<BudgetHomeAnchor>(&bytes).map_err(invalid));
+    let owner = match anchor {
+        Ok(anchor) => format!("Silo home {}", anchor.home.display()),
+        Err(_) => format!("home owning ledger record {name}"),
+    };
+    invalid(format!(
+        "resource budget record {name} for {owner} is malformed: {error}; remove that home, or delete its stale budget files under {}",
+        directory.path().display(),
+    ))
 }
 
 fn budget_home_is_live(directory: &crate::paths::OwnedDirectory, prefix: &str) -> bool {
@@ -983,7 +816,6 @@ fn reclaim_budget_orphans(
         directory.sync()?;
         // Corrupt orphan charges cannot veto reclamation or supply an exact
         // released-byte total. Report unknown rather than inventing a zero.
-        let memory_bytes = (malformed_charges == 0).then_some(released.memory);
         let disk_bytes = (malformed_charges == 0).then(|| {
             released
                 .disks
@@ -991,17 +823,12 @@ fn reclaim_budget_orphans(
                 .map(|bytes| u128::from(*bytes))
                 .sum::<u128>()
         });
-        let bytes_released = memory_bytes
-            .zip(disk_bytes)
-            .map(|(memory, disk)| u128::from(memory) + disk);
         tracing::info!(
             %prefix,
             entries = names.len(),
             charges,
             malformed_charges,
-            ?memory_bytes,
             ?disk_bytes,
-            ?bytes_released,
             "reclaimed resource budget for a missing home"
         );
     }
@@ -1079,7 +906,7 @@ impl crate::store::Store {
         crate::storage::limits::Resource::MetadataPageBytes
             .check(json.len() as u64)
             .map_err(crate::storage::StorageError::from)?;
-        let result = sqlx::query("UPDATE restore_memory_reservation SET construction_json=jsonb(?2) WHERE operation_id=?1 AND construction_json IS NULL")
+        let result = sqlx::query("UPDATE restore_resource_reservation SET construction_json=jsonb(?2) WHERE operation_id=?1 AND construction_json IS NULL")
             .bind(construction.intent.consumer_operation.to_string())
             .bind(json).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
@@ -1103,7 +930,7 @@ impl crate::store::Store {
         let _roots = pool.lock_roots()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT json(o.record_json),r.budget_id,r.batch_id FROM storage_operation o JOIN restore_memory_reservation r ON r.operation_id=o.operation_id JOIN machine_state s ON s.machine_id=o.machine_id WHERE o.operation_id=?1 AND o.run_id=?2 AND o.kind='launch' AND s.status='running' AND json_extract(s.state_json,'$.runId')=?2"
+            "SELECT json(o.record_json),r.budget_id,r.batch_id FROM storage_operation o JOIN restore_resource_reservation r ON r.operation_id=o.operation_id JOIN machine_state s ON s.machine_id=o.machine_id WHERE o.operation_id=?1 AND o.run_id=?2 AND o.kind='launch' AND s.status='running' AND json_extract(s.state_json,'$.runId')=?2"
         ).bind(operation.to_string()).bind(run.to_string()).fetch_optional(&mut *tx).await?;
         let Some((json, budget_id, batch)) = row else {
             return Ok(());
@@ -1119,11 +946,11 @@ impl crate::store::Store {
             .restore
             .as_mut()
             .ok_or_else(|| invalid("restore completion has no execution intent"))?;
-        intent.memory.construction_complete = true;
-        intent.memory.disk_bytes = 0;
-        intent.memory.descriptor_owner = None;
-        intent.memory.descriptors = 0;
-        let charge = serde_json::to_string(&intent.memory).map_err(invalid)?;
+        intent.resources.construction_complete = true;
+        intent.resources.disk_bytes = 0;
+        intent.resources.descriptor_owner = None;
+        intent.resources.descriptors = 0;
+        let charge = serde_json::to_string(&intent.resources).map_err(invalid)?;
         let encoded = crate::store::operation_store::encode(&record)?;
         sqlx::query("UPDATE storage_operation SET record_json=jsonb(?2) WHERE operation_id=?1")
             .bind(operation.to_string())
@@ -1131,7 +958,7 @@ impl crate::store::Store {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "UPDATE restore_memory_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+            "UPDATE restore_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
         )
         .bind(operation.to_string())
         .bind(&charge)
@@ -1157,7 +984,7 @@ impl crate::store::Store {
         // construction disk peak; mapping/private-write charges remain owned.
         loop {
             let completed: Vec<(String, String)> = sqlx::query_as(
-                "SELECT o.operation_id,o.run_id FROM storage_operation o JOIN restore_memory_reservation r ON r.operation_id=o.operation_id JOIN machine_state s ON s.machine_id=o.machine_id WHERE o.kind='launch' AND json_extract(o.record_json,'$.restore') IS NOT NULL AND json_extract(o.record_json,'$.restore.memory.constructionComplete')=0 AND s.status='running' AND json_extract(s.state_json,'$.runId')=o.run_id ORDER BY o.operation_id LIMIT 256"
+                "SELECT o.operation_id,o.run_id FROM storage_operation o JOIN restore_resource_reservation r ON r.operation_id=o.operation_id JOIN machine_state s ON s.machine_id=o.machine_id WHERE o.kind='launch' AND json_extract(o.record_json,'$.restore') IS NOT NULL AND json_extract(o.record_json,'$.restore.resources.constructionComplete')=0 AND s.status='running' AND json_extract(s.state_json,'$.runId')=o.run_id ORDER BY o.operation_id LIMIT 256"
             ).fetch_all(&self.pool).await?;
             if completed.is_empty() {
                 break;
@@ -1186,9 +1013,9 @@ impl crate::store::Store {
         let prefix = budget_prefix(self)?;
         write_budget_anchor(self, directory)?;
         let mut authoritative = std::collections::BTreeSet::new();
-        let standalone:Vec<(String,String)>=sqlx::query_as("SELECT budget_id,json(charge_json) FROM restore_memory_reservation WHERE batch_id IS NULL").fetch_all(&self.pool).await?;
+        let standalone:Vec<(String,String)>=sqlx::query_as("SELECT budget_id,json(charge_json) FROM restore_resource_reservation WHERE batch_id IS NULL").fetch_all(&self.pool).await?;
         for (id, json) in standalone {
-            let charge: RestoreMemoryCharge = serde_json::from_str(&json).map_err(invalid)?;
+            let charge: RestoreResourceCharge = serde_json::from_str(&json).map_err(invalid)?;
             charge.validate()?;
             let name = budget_name(self, Uuid::parse_str(&id).map_err(invalid)?)?;
             directory.write_file_atomic(&name, json.as_bytes())?;
@@ -1325,48 +1152,25 @@ impl crate::store::Store {
         }
         let mut inventory = CaptureBudgetInventory {
             capture_id: record.capture_id,
-            capture_memory: if fork.is_some() {
-                record
-                    .reservation_memory_bytes
-                    .checked_sub(record.plan.ram_bytes)
-                    .ok_or_else(|| invalid("capture scratch reservation underflow"))?
-            } else {
-                record.reservation_memory_bytes
-            },
-            baseline: fork.map(|_| CaptureBaseline::Pending {
-                capture_id: record.capture_id,
-                bytes: record.plan.ram_bytes,
-            }),
             capture_disks: record.disk_charges.clone(),
             pending: Vec::new(),
             bound: Vec::new(),
             descriptor_owner: Some(DescriptorOwner::current()?),
             descriptors: record.plan.configuration.attachments.len() as u64 * 3 + 12,
         };
-        let mut policy = crate::RestoreMemoryPolicy::Reserved;
         if let Some(operation) = fork {
             let options = self.fork_options(operation).await?;
-            policy = options.resources.memory;
             let parent =
                 crate::paths::OwnedDirectory::open_existing_root(&self.home.join("machines"))?
                     .ok_or_else(|| invalid("fork destination parent missing"))?;
             let stat = nix::sys::stat::fstat(parent.fd()).map_err(std::io::Error::from)?;
             let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
             let disk = fork_disk_peak(record, &record.storage.boot, &pool)?;
-            let configured = record.plan.ram_bytes;
             for child in self.fork_children(operation).await? {
                 inventory.pending.push(PendingForkCharge {
                     consumer_id: child.consumer_id,
-                    configured_bytes: configured,
-                    private_bytes: options
-                        .resources
-                        .private_write_allowance
-                        .reservation(configured, 65536)?,
-                    overhead_bytes: configured.div_ceil(512)
-                        + vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES,
                     disk_device: stat.st_dev as u64,
                     disk_bytes: disk,
-                    policy: options.resources,
                 });
             }
             let roles = record.plan.configuration.attachments.len() as u64;
@@ -1399,7 +1203,6 @@ impl crate::store::Store {
         let mut budget = RestoreBudget::read(self, &directory)?;
         budget.add_capture(&inventory)?;
         budget.admit_descriptors()?;
-        budget.admit_memory(policy, crate::store::capture::available_memory()?)?;
         for path in [&self.images_dir, &self.home.join("machines")] {
             let disk = crate::paths::OwnedDirectory::open_existing_root(path)?
                 .ok_or_else(|| invalid("capture budget filesystem disappeared"))?;
@@ -1416,8 +1219,7 @@ impl crate::store::Store {
                 .copied()
                 .unwrap_or_default();
             if required > available {
-                return Err(crate::storage::StorageError::RestoreBudget {
-                    resource: "disk",
+                return Err(crate::storage::StorageError::RestoreDiskBudget {
                     required,
                     available,
                 }
@@ -1450,7 +1252,7 @@ impl crate::store::Store {
     }
 
     /// The caller holds admission.lock. Replay transfers only the manager-local
-    /// FD charge; RAM, disk, and resource policy remain durably reserved.
+    /// FD charge; disk reservations remain durable.
     async fn replay_capture_inventory(
         &self,
         owner: Uuid,
@@ -1495,11 +1297,9 @@ impl crate::store::Store {
         let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
         let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('capture','import'))").bind(inventory.capture_id.to_string()).fetch_one(&self.pool).await?;
         if !retained {
-            inventory.capture_memory = 0;
-            inventory.baseline = None;
             inventory.capture_disks.clear();
         }
-        let rows:Vec<String>=sqlx::query_scalar("SELECT json(charge_json) FROM restore_memory_reservation WHERE batch_id=?1 ORDER BY budget_id").bind(owner.to_string()).fetch_all(&self.pool).await?;
+        let rows:Vec<String>=sqlx::query_scalar("SELECT json(charge_json) FROM restore_resource_reservation WHERE batch_id=?1 ORDER BY budget_id").bind(owner.to_string()).fetch_all(&self.pool).await?;
         inventory.bound = rows
             .iter()
             .map(|json| serde_json::from_str(json).map_err(invalid))
@@ -1519,7 +1319,6 @@ impl crate::store::Store {
         cut: &crate::store::fork::VerifiedRestoreCut,
     ) -> Result<(), LibVmError> {
         let operation = cut.record.operation_id;
-        let options = self.fork_options(operation).await?;
         let directory = budget_directory(self)?;
         let _admission = crate::storage::locks::blocking(
             &directory,
@@ -1536,18 +1335,6 @@ impl crate::store::Store {
         .fetch_one(&mut *tx)
         .await?;
         let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
-        let memory = cut
-            .record
-            .evidence
-            .memory
-            .as_ref()
-            .ok_or_else(|| invalid("fork cut lacks RAM evidence"))?;
-        let ram = cut
-            .record
-            .files
-            .iter()
-            .find(|file| file.role == vm_spec::capture::CaptureRole::Ram)
-            .ok_or_else(|| invalid("fork cut lacks RAM role"))?;
         for pending in &inventory.pending {
             let lease = pool.lease_deferred(pending.consumer_id)?;
             let (device, inode) = lease.file_identity()?;
@@ -1557,31 +1344,7 @@ impl crate::store::Store {
             sqlx::query("INSERT INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO storage_operation_cut(operation_id,cut_id) SELECT ?1,cut_id FROM storage_operation_cut WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
-            let granule = u64::from(memory.page_granule);
-            if !(4096..=65536).contains(&granule)
-                || !granule.is_power_of_two()
-                || options
-                    .resources
-                    .private_write_allowance
-                    .reservation(pending.configured_bytes, granule)?
-                    > pending.private_bytes
-            {
-                return Err(invalid(
-                    "sealed RAM granule exceeds the admitted private-memory reservation",
-                ));
-            }
-            let charge = RestoreMemoryCharge {
-                baseline_device: ram.device,
-                baseline_inode: ram.inode,
-                baseline_bytes: ram.length,
-                configured_bytes: pending.configured_bytes,
-                granule,
-                private_bytes: options
-                    .resources
-                    .private_write_allowance
-                    .reservation(pending.configured_bytes, granule)?,
-                overhead_bytes: pending.overhead_bytes,
-                policy: options.resources,
+            let charge = RestoreResourceCharge {
                 disk_device: pending.disk_device,
                 disk_bytes: pending.disk_bytes,
                 construction_complete: false,
@@ -1589,17 +1352,9 @@ impl crate::store::Store {
                 descriptors: 0,
             };
             charge.validate()?;
-            sqlx::query("INSERT INTO restore_memory_reservation(operation_id,budget_id,charge_json,batch_id) VALUES(?1,?1,jsonb(?2),?3)").bind(pending.consumer_id.to_string()).bind(serde_json::to_string(&charge).map_err(invalid)?).bind(operation.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO restore_resource_reservation(operation_id,budget_id,charge_json,batch_id) VALUES(?1,?1,jsonb(?2),?3)").bind(pending.consumer_id.to_string()).bind(serde_json::to_string(&charge).map_err(invalid)?).bind(operation.to_string()).execute(&mut *tx).await?;
         }
         inventory.pending.clear();
-        // Capture scratch remains separate; the final RAM baseline is charged
-        // once by the inode-deduplicated generation charges.
-        inventory.capture_memory = 16 << 20;
-        inventory.baseline = Some(CaptureBaseline::Bound {
-            device: cut.record.source_ram.device,
-            inode: cut.record.source_ram.inode,
-            bytes: cut.record.source_ram.length,
-        });
         inventory.capture_disks.clear();
         sqlx::query(
             "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
@@ -1618,14 +1373,14 @@ impl crate::store::Store {
     pub(crate) async fn fork_child_charge(
         &self,
         consumer: Uuid,
-    ) -> Result<RestoreMemoryCharge, LibVmError> {
+    ) -> Result<RestoreResourceCharge, LibVmError> {
         let json: String = sqlx::query_scalar(
-            "SELECT json(charge_json) FROM restore_memory_reservation WHERE operation_id=?1",
+            "SELECT json(charge_json) FROM restore_resource_reservation WHERE operation_id=?1",
         )
         .bind(consumer.to_string())
         .fetch_one(&self.pool)
         .await?;
-        let charge: RestoreMemoryCharge = serde_json::from_str(&json).map_err(invalid)?;
+        let charge: RestoreResourceCharge = serde_json::from_str(&json).map_err(invalid)?;
         charge.validate()?;
         Ok(charge)
     }
@@ -1739,8 +1494,7 @@ impl crate::store::Store {
             .copied()
             .unwrap_or_default();
         if required > available {
-            return Err(crate::storage::StorageError::RestoreBudget {
-                resource: "disk",
+            return Err(crate::storage::StorageError::RestoreDiskBudget {
                 required,
                 available,
             }
@@ -1837,7 +1591,7 @@ impl crate::store::Store {
         };
         let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
         let bound: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM restore_memory_reservation WHERE batch_id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM restore_resource_reservation WHERE batch_id=?1)",
         )
         .bind(owner.to_string())
         .fetch_one(&mut *tx)
@@ -1847,8 +1601,6 @@ impl crate::store::Store {
                 "unsubmitted capture contradicts bound child generations",
             ));
         }
-        inventory.capture_memory = 0;
-        inventory.baseline = None;
         inventory.capture_disks.clear();
         inventory.descriptor_owner = None;
         inventory.descriptors = 0;
@@ -1871,8 +1623,20 @@ impl crate::store::Store {
 
 #[cfg(test)]
 mod tests {
-    use crate::store::restore::{RestoreBudget, RestoreMemoryCharge};
+    use crate::store::restore::{RestoreBudget, RestoreResourceCharge};
     use crate::store::MachineStore;
+
+    #[test]
+    fn resource_only_ledger_uses_a_distinct_namespace() {
+        let path = crate::store::restore::user_budget_directory_path();
+        let uid = nix::unistd::geteuid().as_raw();
+        assert_eq!(
+            path.file_name().unwrap(),
+            std::ffi::OsStr::new(&format!("silo-resource-budget-{uid}"))
+        );
+        let old_path = path.with_file_name(format!("silo-restore-budget-{uid}"));
+        assert_ne!(path, old_path);
+    }
 
     struct CheckpointRequestFixture {
         capture: crate::store::capture::tests::Fixture,
@@ -1987,15 +1751,11 @@ mod tests {
         let CheckpointRequestFixture {
             capture: fixture,
             consumer,
-            request,
+            request: _request,
             _files,
         } = checkpoint_request_fixture().await;
         let snapshots = &fixture.snapshots;
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
-        let policy = crate::RestoreResourcePolicy {
-            memory: crate::RestoreMemoryPolicy::AllowOvercommit,
-            ..Default::default()
-        };
         let disk_peak = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES + 512;
 
         // Keep the source intact but unavailable at the destination path. Every
@@ -2006,63 +1766,60 @@ mod tests {
         let external = tempfile::tempdir().unwrap();
         symlink(external.path(), &machines).unwrap();
         assert!(snapshots
-            .reserve_restore_resources(&consumer, &request, disk_peak, 32, policy)
+            .reserve_restore_resources(&consumer, disk_peak, 32)
             .await
             .is_err());
         assert!(std::fs::read_dir(external.path()).unwrap().next().is_none());
         std::fs::remove_file(&machines).unwrap();
         std::fs::write(&machines, b"not a directory").unwrap();
         assert!(snapshots
-            .reserve_restore_resources(&consumer, &request, disk_peak, 32, policy)
+            .reserve_restore_resources(&consumer, disk_peak, 32)
             .await
             .is_err());
         std::fs::remove_file(&machines).unwrap();
         std::fs::create_dir(&machines).unwrap();
         std::fs::set_permissions(&machines, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(snapshots
-            .reserve_restore_resources(&consumer, &request, disk_peak, 32, policy)
+            .reserve_restore_resources(&consumer, disk_peak, 32)
             .await
             .is_err());
         assert_eq!(std::fs::metadata(&machines).unwrap().mode() & 0o7777, 0o755);
         std::fs::remove_dir(&machines).unwrap();
 
         let error = snapshots
-            .reserve_restore_resources(&consumer, &request, u64::MAX / 2, 32, policy)
+            .reserve_restore_resources(&consumer, u64::MAX / 2, 32)
             .await
             .unwrap_err();
         assert!(matches!(
             error,
-            crate::LibVmError::Storage(crate::storage::StorageError::RestoreBudget {
-                resource: "disk",
-                ..
-            })
+            crate::LibVmError::Storage(crate::storage::StorageError::RestoreDiskBudget { .. })
         ));
         let metadata = std::fs::metadata(&machines).unwrap();
         assert_eq!(metadata.mode() & 0o7777, 0o700);
         assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
         assert!(std::fs::read_dir(&machines).unwrap().next().is_none());
-        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM restore_memory_reservation")
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM restore_resource_reservation")
             .fetch_one(&snapshots.store.pool)
             .await
             .unwrap();
         assert_eq!(rows, 0, "unsafe paths and disk refusal publish no charge");
 
         let charge = snapshots
-            .reserve_restore_resources(&consumer, &request, disk_peak, 32, policy)
+            .reserve_restore_resources(&consumer, disk_peak, 32)
             .await
             .unwrap();
         assert_eq!(charge.disk_device, metadata.dev());
         assert_eq!(charge.disk_bytes, disk_peak);
         assert_eq!(std::fs::metadata(&machines).unwrap().ino(), metadata.ino());
         let json: String = sqlx::query_scalar(
-            "SELECT json(charge_json) FROM restore_memory_reservation WHERE operation_id=?1",
+            "SELECT json(charge_json) FROM restore_resource_reservation WHERE operation_id=?1",
         )
         .bind(consumer.operation_id.to_string())
         .fetch_one(&snapshots.store.pool)
         .await
         .unwrap();
         assert_eq!(
-            serde_json::from_str::<RestoreMemoryCharge>(&json).unwrap(),
+            serde_json::from_str::<RestoreResourceCharge>(&json).unwrap(),
             charge
         );
         std::fs::remove_dir(&machines).unwrap();
@@ -2232,17 +1989,8 @@ mod tests {
         assert_eq!(rows, 0);
     }
 
-    fn charge(inode: u64, disk_device: u64) -> RestoreMemoryCharge {
-        let bytes = 1 << 20;
-        RestoreMemoryCharge {
-            baseline_device: 1,
-            baseline_inode: inode,
-            baseline_bytes: bytes,
-            configured_bytes: bytes,
-            granule: 4096,
-            private_bytes: bytes / 4,
-            overhead_bytes: bytes.div_ceil(512) + vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES,
-            policy: Default::default(),
+    fn charge(disk_device: u64) -> RestoreResourceCharge {
+        RestoreResourceCharge {
             disk_device,
             disk_bytes: vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES,
             construction_complete: false,
@@ -2251,22 +1999,64 @@ mod tests {
         }
     }
 
-    fn capture_inventory(
-        input: &RestoreMemoryCharge,
-    ) -> crate::store::restore::CaptureBudgetInventory {
+    fn capture_inventory() -> crate::store::restore::CaptureBudgetInventory {
         crate::store::restore::CaptureBudgetInventory {
             capture_id: uuid::Uuid::new_v4(),
-            capture_memory: 16 << 20,
-            baseline: Some(crate::store::restore::CaptureBaseline::Bound {
-                device: input.baseline_device,
-                inode: input.baseline_inode,
-                bytes: input.baseline_bytes,
-            }),
             capture_disks: Vec::new(),
             pending: Vec::new(),
             bound: Vec::new(),
             descriptor_owner: None,
             descriptors: 0,
+        }
+    }
+
+    #[test]
+    fn resource_documents_exclude_ram_and_reject_stale_ram_fields() {
+        use crate::store::restore::{BudgetDocument, PendingForkCharge};
+
+        let restore = serde_json::to_value(charge(3)).unwrap();
+        assert_eq!(restore.as_object().unwrap().len(), 5);
+        for field in [
+            "baselineDevice",
+            "baselineInode",
+            "baselineBytes",
+            "configuredBytes",
+            "granule",
+            "privateBytes",
+            "overheadBytes",
+            "policy",
+        ] {
+            let mut stale = restore.clone();
+            stale[field] = serde_json::json!(1);
+            assert!(
+                serde_json::from_value::<BudgetDocument>(stale).is_err(),
+                "{field}"
+            );
+        }
+        let capture = serde_json::to_value(capture_inventory()).unwrap();
+        assert_eq!(capture.as_object().unwrap().len(), 6);
+        for field in ["captureMemory", "baseline"] {
+            let mut stale = capture.clone();
+            stale[field] = serde_json::json!(null);
+            assert!(
+                serde_json::from_value::<BudgetDocument>(stale).is_err(),
+                "{field}"
+            );
+        }
+        let pending = PendingForkCharge {
+            consumer_id: uuid::Uuid::new_v4(),
+            disk_device: 3,
+            disk_bytes: vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES,
+        };
+        let pending = serde_json::to_value(pending).unwrap();
+        assert_eq!(pending.as_object().unwrap().len(), 3);
+        for field in ["configuredBytes", "privateBytes", "overheadBytes", "policy"] {
+            let mut stale = pending.clone();
+            stale[field] = serde_json::json!(1);
+            assert!(
+                serde_json::from_value::<PendingForkCharge>(stale).is_err(),
+                "{field}"
+            );
         }
     }
 
@@ -2358,15 +2148,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_capture_reserves_only_scratch_without_a_baseline_through_replay() {
-        use crate::store::capture::CAPTURE_SCRATCH_BYTES;
+    async fn plain_capture_reserves_disk_and_descriptors_through_replay() {
         use crate::store::restore::{budget_directory, budget_name, CaptureBudgetInventory};
 
         let fixture = crate::store::capture::tests::fixture().await;
         let store = &fixture.snapshots.store;
         let record = &fixture.reservation.record;
         assert!(record.fork_operation_id.is_none());
-        assert_eq!(record.reservation_memory_bytes, CAPTURE_SCRATCH_BYTES);
         let ledger = budget_directory(store).unwrap();
         for _ in 0..2 {
             store.reserve_capture_inventory(record).await.unwrap();
@@ -2377,18 +2165,10 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(inventory.capture_memory, CAPTURE_SCRATCH_BYTES);
-            assert!(inventory.baseline.is_none());
             assert!(inventory.pending.is_empty());
             assert!(inventory.bound.is_empty());
             let mut budget = RestoreBudget::default();
             budget.add_capture(&inventory).unwrap();
-            assert_eq!(budget.memory, CAPTURE_SCRATCH_BYTES);
-            assert!(budget.baselines.is_empty());
-            assert_eq!(
-                RestoreBudget::read(store, &ledger).unwrap().memory,
-                budget.memory
-            );
         }
         store.complete_capture_peak(record).await.unwrap();
         let inventory: CaptureBudgetInventory = serde_json::from_str(
@@ -2398,26 +2178,17 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(inventory.capture_memory, CAPTURE_SCRATCH_BYTES);
-        assert!(inventory.baseline.is_none());
         assert!(inventory.capture_disks.is_empty());
     }
 
     #[tokio::test]
-    async fn live_fork_capture_reserves_one_baseline_and_each_child_through_binding() {
-        use crate::store::capture::CAPTURE_SCRATCH_BYTES;
-        use crate::store::restore::{
-            budget_directory, budget_name, CaptureBaseline, CaptureBudgetInventory,
-        };
+    async fn live_fork_capture_reserves_each_child_disk_through_binding() {
+        use crate::store::restore::{budget_directory, budget_name, CaptureBudgetInventory};
 
         let fixture = crate::store::capture::tests::fork_fixture().await;
         let store = &fixture.snapshots.store;
         let record = &fixture.reservation.record;
         let operation = record.fork_operation_id.unwrap();
-        assert_eq!(
-            record.reservation_memory_bytes,
-            record.plan.ram_bytes + CAPTURE_SCRATCH_BYTES
-        );
         let ledger = budget_directory(store).unwrap();
         for _ in 0..2 {
             store.reserve_capture_inventory(record).await.unwrap();
@@ -2428,33 +2199,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(inventory.capture_memory, CAPTURE_SCRATCH_BYTES);
-            assert!(matches!(
-                inventory.baseline,
-                Some(CaptureBaseline::Pending { capture_id, bytes })
-                    if capture_id == record.capture_id && bytes == record.plan.ram_bytes
-            ));
             assert_eq!(inventory.pending.len(), 2);
-            let children = inventory
-                .pending
-                .iter()
-                .map(|child| child.private_bytes + child.overhead_bytes)
-                .sum::<u64>();
-            let mut budget = RestoreBudget::default();
-            budget.add_capture(&inventory).unwrap();
-            assert_eq!(
-                budget.memory,
-                CAPTURE_SCRATCH_BYTES + record.plan.ram_bytes + children
-            );
-            assert_eq!(
-                RestoreBudget::read(store, &ledger).unwrap().memory,
-                budget.memory
-            );
-            let mut missing_baseline = inventory;
-            missing_baseline.baseline = None;
-            assert!(RestoreBudget::default()
-                .add_capture(&missing_baseline)
-                .is_err());
         }
         crate::store::capture::tests::seal(&fixture);
         let (_, retained) = fixture
@@ -2474,21 +2219,13 @@ mod tests {
         for child in &inventory.bound {
             assert_eq!(child.disk_bytes, expected_disk);
         }
-        assert!(matches!(
-            inventory.baseline,
-            Some(CaptureBaseline::Bound { .. })
-        ));
         let children = inventory
             .bound
             .iter()
-            .map(|child| child.private_bytes + child.overhead_bytes)
+            .map(|child| child.disk_bytes)
             .sum::<u64>();
         let budget = RestoreBudget::read(store, &ledger).unwrap();
-        assert_eq!(budget.baselines.len(), 1);
-        assert_eq!(
-            budget.memory,
-            inventory.capture_memory + inventory.bound[0].baseline_bytes + children
-        );
+        assert_eq!(budget.disks.values().sum::<u64>(), children);
     }
 
     #[tokio::test]
@@ -2516,22 +2253,15 @@ mod tests {
             pid: current.pid,
             started_at: current.started_at + 1,
         };
-        let input = charge(10, 3);
-        let mut inventory = capture_inventory(&input);
+        let input = charge(3);
+        let mut inventory = capture_inventory();
         inventory.capture_id = operation;
         inventory.descriptor_owner = Some(previous);
         inventory.descriptors = 1;
         inventory.pending.push(PendingForkCharge {
             consumer_id: uuid::Uuid::new_v4(),
-            configured_bytes: input.configured_bytes,
-            private_bytes: input.private_bytes,
-            overhead_bytes: input.overhead_bytes,
             disk_device: input.disk_device,
             disk_bytes: input.disk_bytes,
-            policy: crate::RestoreResourcePolicy {
-                memory: crate::RestoreMemoryPolicy::AllowOvercommit,
-                ..input.policy
-            },
         });
         let name = crate::store::restore::budget_name(&store, operation).unwrap();
         let _admission = crate::storage::locks::blocking(
@@ -2575,7 +2305,6 @@ mod tests {
         assert_eq!(serde_json::to_value(published).unwrap(), expected);
         let after = RestoreBudget::read(&store, &ledger).unwrap();
         assert_eq!(after.descriptors, 1);
-        assert_eq!(after.memory, before.memory);
         assert_eq!(after.disks, before.disks);
 
         // A same-birth replay at the exact limit must replace its old charge.
@@ -2602,7 +2331,6 @@ mod tests {
             inventory.descriptors
         );
 
-        // Even explicit RAM overcommit cannot bypass this manager's FD limit.
         // Exceed the hard limit, since production admission may raise the soft limit.
         inventory.descriptor_owner = Some(previous);
         inventory.descriptors = hard
@@ -2648,21 +2376,13 @@ mod tests {
     #[test]
     fn fork_batch_transfer_preserves_shared_admission_without_reacquiring_child_capacity() {
         use crate::store::restore::PendingForkCharge;
-        let input = charge(10, 3);
-        let mut inventory = capture_inventory(&input);
+        let input = charge(3);
+        let mut inventory = capture_inventory();
         inventory.pending = (0..17)
             .map(|_| PendingForkCharge {
                 consumer_id: uuid::Uuid::new_v4(),
-                configured_bytes: input.configured_bytes,
-                private_bytes: input
-                    .policy
-                    .private_write_allowance
-                    .reservation(input.configured_bytes, 65536)
-                    .unwrap(),
-                overhead_bytes: input.overhead_bytes,
                 disk_device: input.disk_device,
                 disk_bytes: input.disk_bytes,
-                policy: input.policy,
             })
             .collect();
         let mut admitted = RestoreBudget::default();
@@ -2671,88 +2391,33 @@ mod tests {
         inventory.bound = vec![input.clone(); 17];
         let mut bound = RestoreBudget::default();
         bound.add_capture(&inventory).unwrap();
-        assert_eq!(bound.memory, admitted.memory);
         assert_eq!(bound.disks, admitted.disks);
-        assert_eq!(bound.baselines.len(), 1);
         inventory.bound.pop();
         let mut retired = RestoreBudget::default();
         retired.add_capture(&inventory).unwrap();
-        assert_eq!(
-            bound.memory - retired.memory,
-            input.private_bytes + input.overhead_bytes
-        );
-        assert_eq!(
-            retired.baselines.len(),
-            1,
-            "source and remaining children still own the baseline"
-        );
+        assert_eq!(bound.disks[&3] - retired.disks[&3], input.disk_bytes);
     }
 
     #[test]
-    fn capture_and_standalone_restore_share_one_baseline_and_cross_device_copies_charge_two() {
-        let input = charge(10, 3);
-        let inventory = capture_inventory(&input);
-        let mut shared = RestoreBudget::default();
-        shared.add_capture(&inventory).unwrap();
-        shared.add(&input).unwrap();
-        assert_eq!(
-            shared.memory,
-            inventory.capture_memory
-                + input.baseline_bytes
-                + input.private_bytes
-                + input.overhead_bytes
-        );
-        let mut copied = input.clone();
-        copied.baseline_device += 1;
-        shared.add(&copied).unwrap();
-        assert_eq!(shared.baselines.len(), 2);
-        assert_eq!(
-            shared.memory,
-            inventory.capture_memory
-                + 2 * (input.baseline_bytes + input.private_bytes + input.overhead_bytes)
-        );
-        let mut source_gone = RestoreBudget::default();
-        source_gone.add(&input).unwrap();
-        assert_eq!(
-            source_gone.baselines.len(),
-            1,
-            "a child owns its baseline independently of the source"
-        );
-    }
-
-    #[test]
-    fn pending_fork_inventory_rejects_undercharge_and_unknown_baseline_identity() {
-        use crate::store::restore::{CaptureBaseline, PendingForkCharge};
-        let input = charge(10, 3);
-        let mut inventory = capture_inventory(&input);
+    fn pending_fork_inventory_rejects_disk_undercharge_and_nil_identity() {
+        use crate::store::restore::PendingForkCharge;
+        let input = charge(3);
+        let mut inventory = capture_inventory();
         inventory.pending.push(PendingForkCharge {
             consumer_id: uuid::Uuid::new_v4(),
-            configured_bytes: input.configured_bytes,
-            private_bytes: input.private_bytes - 1,
-            overhead_bytes: input.overhead_bytes,
             disk_device: input.disk_device,
-            disk_bytes: input.disk_bytes,
-            policy: input.policy,
+            disk_bytes: input.disk_bytes - 1,
         });
         assert!(RestoreBudget::default().add_capture(&inventory).is_err());
-        inventory.pending.clear();
-        inventory.baseline = Some(CaptureBaseline::Pending {
-            capture_id: uuid::Uuid::new_v4(),
-            bytes: input.baseline_bytes,
-        });
-        assert!(RestoreBudget::default().add_capture(&inventory).is_err());
-        inventory.baseline = Some(CaptureBaseline::Bound {
-            device: 1,
-            inode: 0,
-            bytes: input.baseline_bytes,
-        });
+        inventory.pending[0].disk_bytes = input.disk_bytes;
+        inventory.pending[0].consumer_id = uuid::Uuid::nil();
         assert!(RestoreBudget::default().add_capture(&inventory).is_err());
     }
 
     #[test]
     fn descriptor_budget_is_scoped_to_the_exact_manager_birth_not_all_homes() {
         let owner = crate::store::restore::DescriptorOwner::current().unwrap();
-        let mut inventory = capture_inventory(&charge(10, 3));
+        let mut inventory = capture_inventory();
         inventory.descriptor_owner = Some(owner);
         inventory.descriptors = 100;
         let mut manager = RestoreBudget {
@@ -2778,126 +2443,40 @@ mod tests {
     }
 
     #[test]
-    fn restore_started_releases_construction_peak_without_releasing_mapping_memory() {
-        let mut input = charge(10, 3);
+    fn restore_started_releases_construction_peak() {
+        let mut input = charge(3);
         let mut before = RestoreBudget::default();
         before.add(&input).unwrap();
+        assert_eq!(before.disks[&3], input.disk_bytes);
         input.construction_complete = true;
         input.disk_bytes = 0;
         let mut after = RestoreBudget::default();
         after.add(&input).unwrap();
-        assert_eq!(before.memory, after.memory);
         assert_eq!(after.disks[&3], 0);
         input.construction_complete = false;
         assert!(input.validate().is_err());
     }
 
     #[test]
-    fn restore_budget_charges_shared_baseline_once_and_private_writes_per_generation() {
-        let input = charge(10, 3);
-        let mut budget = RestoreBudget::default();
-        budget.add(&input).unwrap();
-        budget.add(&input).unwrap();
-        assert_eq!(
-            budget.memory,
-            input.baseline_bytes + 2 * (input.private_bytes + input.overhead_bytes)
-        );
-        assert_eq!(budget.disks[&3], 2 * input.disk_bytes);
-        let other = charge(11, 4);
-        budget.add(&other).unwrap();
-        assert_eq!(
-            budget.memory,
-            2 * input.baseline_bytes + 3 * (input.private_bytes + input.overhead_bytes)
-        );
-        assert_eq!(budget.disks[&4], other.disk_bytes);
-    }
-
-    #[test]
-    fn restore_budget_rejects_undercharge_and_replaced_baseline_geometry() {
-        let input = charge(10, 3);
-        let mut changed = input.clone();
-        changed.private_bytes -= 1;
-        assert!(RestoreBudget::default().add(&changed).is_err());
-        changed = input.clone();
-        changed.baseline_bytes -= 4096;
-        let mut budget = RestoreBudget::default();
-        budget.add(&input).unwrap();
-        assert!(budget.add(&changed).is_err());
-    }
-
-    #[test]
     fn restore_budget_rejects_arithmetic_overflow() {
-        let mut input = charge(10, 3);
+        let mut input = charge(3);
         input.disk_bytes = u64::MAX;
         let mut budget = RestoreBudget::default();
         budget.add(&input).unwrap();
         assert!(budget.add(&input).is_err());
     }
 
-    #[test]
-    fn restore_private_reservation_rounds_up_without_undercharging() {
-        for percent in [0, 1, 25, 33, 99, 100] {
-            let allowance = crate::PrivateWriteAllowance::try_from(percent).unwrap();
-            for bytes in [0_u64, 1, 4096, (1 << 20) + 1, 1 << 40] {
-                let charge = allowance.reservation(bytes, 4096).unwrap();
-                assert!(
-                    u128::from(charge) >= (u128::from(bytes) * u128::from(percent)).div_ceil(100)
-                );
-                assert_eq!(charge % 4096, 0);
-                assert!(
-                    u128::from(charge)
-                        < (u128::from(bytes) * u128::from(percent)).div_ceil(100) + 4096
-                );
-            }
-        }
-        assert!(crate::PrivateWriteAllowance::try_from(101).is_err());
-        assert!(crate::PrivateWriteAllowance::try_from(u32::MAX).is_err());
-        let allowance = crate::PrivateWriteAllowance::try_from(100).unwrap();
-        assert!(allowance.reservation(u64::MAX, 4096).is_err());
-        assert!(allowance.reservation(1, 0).is_err());
-        assert!(allowance.reservation(1, 3).is_err());
-    }
-
-    #[test]
-    fn restore_memory_overcommit_requires_explicit_policy_and_keeps_all_charges() {
-        let input = charge(10, 3);
-        assert_eq!(u32::from(input.policy.private_write_allowance), 25);
-        assert_eq!(input.policy.memory, crate::RestoreMemoryPolicy::Reserved);
-        let mut budget = RestoreBudget::default();
-        budget.add(&input).unwrap();
-        let required = budget.memory;
-        assert!(budget
-            .admit_memory(input.policy.memory, required - 1)
-            .is_err());
-        budget.admit_memory(input.policy.memory, required).unwrap();
-        budget
-            .admit_memory(crate::RestoreMemoryPolicy::AllowOvercommit, 0)
-            .unwrap();
-        assert_eq!(budget.memory, required);
-        assert_eq!(budget.disks[&3], input.disk_bytes);
-    }
-
-    fn backed_charge(
-        root: &std::path::Path,
-        disk: &crate::paths::OwnedDirectory,
-    ) -> RestoreMemoryCharge {
+    fn backed_charge(disk: &crate::paths::OwnedDirectory) -> RestoreResourceCharge {
         use std::os::unix::fs::MetadataExt;
-        let ram = std::fs::metadata(root.join("ram")).unwrap();
-        let mut input = charge(ram.ino(), std::fs::metadata(disk.path()).unwrap().dev());
-        input.baseline_device = ram.dev();
-        input.baseline_bytes = ram.len();
-        input
+
+        charge(std::fs::metadata(disk.path()).unwrap().dev())
     }
 
     #[tokio::test]
-    async fn restore_policy_survives_journal_reconciliation_and_never_bypasses_disk_admission() {
+    async fn restore_charge_survives_journal_reconciliation_and_disk_admission() {
         use crate::paths::OwnedDirectory;
         let root = tempfile::tempdir().unwrap();
         let home = OwnedDirectory::open_root(&root.path().join("home")).unwrap();
-        std::fs::File::create(root.path().join("ram"))
-            .unwrap()
-            .set_len(1 << 20)
-            .unwrap();
         let ledger = OwnedDirectory::open_root(&root.path().join("ledger")).unwrap();
         let store = crate::store::Store::open(&home.path().join("state.db"))
             .await
@@ -2906,49 +2485,40 @@ mod tests {
             .begin_stopped_operation("import", &[], &[])
             .await
             .unwrap();
-        let mut input = backed_charge(root.path(), &home);
-        input.policy = crate::RestoreResourcePolicy {
-            private_write_allowance: crate::PrivateWriteAllowance::try_from(33).unwrap(),
-            memory: crate::RestoreMemoryPolicy::AllowOvercommit,
-        };
-        input.private_bytes = input
-            .policy
-            .private_write_allowance
-            .reservation(input.configured_bytes, input.granule)
-            .unwrap();
+        let mut input = backed_charge(&home);
         store
             .reserve_restore_charge(operation, &input, &home, &ledger)
             .await
             .unwrap();
         let json: String = sqlx::query_scalar(
-            "SELECT json(charge_json) FROM restore_memory_reservation WHERE operation_id=?1",
+            "SELECT json(charge_json) FROM restore_resource_reservation WHERE operation_id=?1",
         )
         .bind(operation.to_string())
         .fetch_one(&store.pool)
         .await
         .unwrap();
         assert_eq!(
-            serde_json::from_str::<RestoreMemoryCharge>(&json).unwrap(),
+            serde_json::from_str::<RestoreResourceCharge>(&json).unwrap(),
             input
         );
         let name = crate::store::restore::budget_name(&store, operation).unwrap();
-        // Reconciliation restores the authoritative journal policy, not defaults.
+        // Reconciliation restores the authoritative journal charge.
         ledger
             .write_file_atomic(
                 &name,
-                &serde_json::to_vec(&charge(input.baseline_inode, input.disk_device)).unwrap(),
+                &serde_json::to_vec(&charge(input.disk_device + 1)).unwrap(),
             )
             .unwrap();
         store.reconcile_restore_budget_in(&ledger).await.unwrap();
-        let restored: RestoreMemoryCharge =
+        let restored: RestoreResourceCharge =
             serde_json::from_reader(ledger.open_file(&name).unwrap().unwrap()).unwrap();
         assert_eq!(restored, input);
         restored.validate().unwrap();
         let mut malformed = serde_json::to_value(&restored).unwrap();
-        malformed["policy"]["privateWriteAllowance"] = serde_json::json!(101);
-        assert!(serde_json::from_value::<RestoreMemoryCharge>(malformed).is_err());
+        malformed["privateBytes"] = serde_json::json!(4096);
+        assert!(serde_json::from_value::<RestoreResourceCharge>(malformed).is_err());
         let mut undercharged = input.clone();
-        undercharged.private_bytes -= 4096;
+        undercharged.disk_bytes -= 1;
         assert!(undercharged.validate().is_err());
         let (other, _other_lease) = store
             .begin_stopped_operation("import", &[], &[])
@@ -2960,7 +2530,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("disk"), "{error}");
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM restore_memory_reservation")
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM restore_resource_reservation")
             .fetch_one(&store.pool)
             .await
             .unwrap();
@@ -3004,7 +2574,7 @@ mod tests {
             .begin_stopped_operation("import", &[], &[])
             .await
             .unwrap();
-        let mut input = backed_charge(&root, &home);
+        let mut input = backed_charge(&home);
         let checkpoint = |observed| {
             if observed == phase {
                 let mut ready =
@@ -3033,7 +2603,7 @@ mod tests {
             // first, then the same atomic publisher replaces the old full charge.
             let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
             sqlx::query(
-                "UPDATE restore_memory_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+                "UPDATE restore_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
             )
             .bind(operation.to_string())
             .bind(&json)
@@ -3067,10 +2637,6 @@ mod tests {
         for update in [false, true] {
             for boundary in ["staged", "synced", "published"] {
                 let root = tempfile::tempdir().unwrap();
-                std::fs::File::create(root.path().join("ram"))
-                    .unwrap()
-                    .set_len(1 << 20)
-                    .unwrap();
                 let home = OwnedDirectory::open_root(&root.path().join("home-b")).unwrap();
                 let ledger = OwnedDirectory::open_root(&root.path().join("ledger")).unwrap();
                 let store = crate::store::Store::open(&home.path().join("state.db"))
@@ -3121,7 +2687,7 @@ mod tests {
                 assert_eq!(byte, [1]);
                 child.0.kill().unwrap();
                 assert!(!child.0.wait().unwrap().success());
-                let input = backed_charge(root.path(), &home);
+                let input = backed_charge(&home);
                 let visible = update || boundary == "published";
                 let before = {
                     let _admission = crate::storage::locks::blocking(
@@ -3132,14 +2698,6 @@ mod tests {
                     .unwrap();
                     RestoreBudget::read(&store, &ledger).unwrap()
                 };
-                assert_eq!(
-                    before.memory,
-                    if visible {
-                        input.baseline_bytes + input.private_bytes + input.overhead_bytes
-                    } else {
-                        0
-                    }
-                );
                 let old_disk = if update && boundary != "published" {
                     input.disk_bytes
                 } else if update || !visible {
@@ -3179,11 +2737,6 @@ mod tests {
                     .unwrap();
                     RestoreBudget::read(&store, &ledger).unwrap()
                 };
-                assert_eq!(
-                    after.memory,
-                    input.baseline_bytes
-                        + (1 + u64::from(visible)) * (input.private_bytes + input.overhead_bytes)
-                );
                 assert_eq!(after.disks[&input.disk_device], old_disk + input.disk_bytes);
                 store.close().await;
             }
@@ -3195,7 +2748,7 @@ mod tests {
         a: crate::store::Store,
         b: crate::store::Store,
         ledger: crate::paths::OwnedDirectory,
-        input: RestoreMemoryCharge,
+        input: RestoreResourceCharge,
         operation: uuid::Uuid,
         _lease: crate::storage::locks::StorageLock,
     }
@@ -3208,10 +2761,6 @@ mod tests {
             let home_a = OwnedDirectory::open_root(&root.path().join("home-a")).unwrap();
             let home_b = OwnedDirectory::open_root(&root.path().join("home-b")).unwrap();
             let ledger = OwnedDirectory::open_root(&root.path().join("ledger")).unwrap();
-            std::fs::File::create(root.path().join("ram"))
-                .unwrap()
-                .set_len(1 << 20)
-                .unwrap();
             let mut a = crate::store::Store::open(&home_a.path().join("state.db"))
                 .await
                 .unwrap();
@@ -3222,7 +2771,7 @@ mod tests {
             b.resource_budget_directory = Some(ledger.path().to_path_buf());
             a.reconcile_restore_budget().await.unwrap();
             b.reconcile_restore_budget().await.unwrap();
-            let input = backed_charge(root.path(), &home_a);
+            let input = backed_charge(&home_a);
             let (operation, lease) = a.begin_stopped_operation("import", &[], &[]).await.unwrap();
             a.reserve_restore_charge(operation, &input, &home_a, &ledger)
                 .await
@@ -3275,10 +2824,6 @@ mod tests {
                 "reclamation must remove both charges and the home anchor"
             );
             let budget = self.read_b();
-            assert_eq!(
-                budget.memory,
-                self.input.baseline_bytes + self.input.private_bytes + self.input.overhead_bytes
-            );
             assert_eq!(budget.disks[&self.input.disk_device], self.input.disk_bytes);
         }
     }
@@ -3319,11 +2864,6 @@ mod tests {
         fixture.a.pool.close().await;
         fixture.admit_b().await;
         let budget = fixture.read_b();
-        assert_eq!(
-            budget.memory,
-            fixture.input.baseline_bytes
-                + 2 * (fixture.input.private_bytes + fixture.input.overhead_bytes)
-        );
         assert_eq!(
             budget.disks[&fixture.input.disk_device],
             2 * fixture.input.disk_bytes
@@ -3394,24 +2934,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_budget_refuses_malformed_charge_of_other_live_home() {
-        let fixture = CrossHomeBudgetFixture::new().await;
-        let name = crate::store::restore::budget_name(&fixture.a, fixture.operation).unwrap();
-        fixture.ledger.write_file_atomic(&name, b"{").unwrap();
-        let (operation, _lease) = fixture
-            .b
-            .begin_stopped_operation("import", &[], &[])
-            .await
-            .unwrap();
-        let home = crate::paths::OwnedDirectory::open_existing_root(&fixture.b.home)
-            .unwrap()
-            .unwrap();
-        assert!(fixture
-            .b
-            .reserve_restore_charge(operation, &fixture.input, &home, &fixture.ledger)
-            .await
-            .is_err());
-        assert!(fixture.ledger.path().join(name).exists());
+    async fn restore_budget_refuses_malformed_or_stale_ram_charge_with_owning_home_guidance() {
+        for stale_ram in [false, true] {
+            let fixture = CrossHomeBudgetFixture::new().await;
+            let name = crate::store::restore::budget_name(&fixture.a, fixture.operation).unwrap();
+            let bytes = if stale_ram {
+                let mut stale = serde_json::to_value(&fixture.input).unwrap();
+                stale["baselineBytes"] = serde_json::json!(1 << 20);
+                serde_json::to_vec(&stale).unwrap()
+            } else {
+                b"{".to_vec()
+            };
+            fixture.ledger.write_file_atomic(&name, &bytes).unwrap();
+            let (operation, _lease) = fixture
+                .b
+                .begin_stopped_operation("import", &[], &[])
+                .await
+                .unwrap();
+            let home = crate::paths::OwnedDirectory::open_existing_root(&fixture.b.home)
+                .unwrap()
+                .unwrap();
+            let error = fixture
+                .b
+                .reserve_restore_charge(operation, &fixture.input, &home, &fixture.ledger)
+                .await
+                .unwrap_err()
+                .to_string();
+            let owning_home = std::fs::canonicalize(&fixture.a.home).unwrap();
+            assert!(
+                error.contains(&owning_home.display().to_string()),
+                "{error}"
+            );
+            assert!(
+                error.contains(&fixture.ledger.path().display().to_string()),
+                "{error}"
+            );
+            assert!(error.contains("is malformed"), "{error}");
+            assert!(error.contains("remove that home"), "{error}");
+            assert!(error.contains("delete its stale budget files"), "{error}");
+            assert_eq!(
+                std::fs::read(fixture.ledger.path().join(name)).unwrap(),
+                bytes
+            );
+        }
     }
 
     #[tokio::test]
@@ -3440,9 +3005,8 @@ mod tests {
         assert_eq!(anchor.home, std::fs::canonicalize(moved_path).unwrap());
         fixture.admit_b().await;
         assert_eq!(
-            fixture.read_b().memory,
-            fixture.input.baseline_bytes
-                + 2 * (fixture.input.private_bytes + fixture.input.overhead_bytes)
+            fixture.read_b().disks[&fixture.input.disk_device],
+            2 * fixture.input.disk_bytes
         );
         moved.close().await;
     }
@@ -3509,9 +3073,8 @@ mod tests {
         );
         fixture.admit_b().await;
         assert_eq!(
-            fixture.read_b().memory,
-            fixture.input.baseline_bytes
-                + 2 * (fixture.input.private_bytes + fixture.input.overhead_bytes)
+            fixture.read_b().disks[&fixture.input.disk_device],
+            2 * fixture.input.disk_bytes
         );
     }
 
@@ -3550,7 +3113,7 @@ mod tests {
         let CheckpointRequestFixture {
             capture: fixture,
             consumer: initial_consumer,
-            request,
+            request: _request,
             _files,
         } = checkpoint_request_fixture().await;
         let snapshots = &fixture.snapshots;
@@ -3621,13 +3184,8 @@ mod tests {
             snapshots
                 .reserve_restore_resources(
                     &consumer,
-                    &request,
                     vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES + root.geometry.length,
                     descriptor_peak,
-                    crate::RestoreResourcePolicy {
-                        memory: crate::RestoreMemoryPolicy::AllowOvercommit,
-                        ..Default::default()
-                    },
                 )
                 .await
                 .unwrap();
@@ -3678,7 +3236,7 @@ mod tests {
             assert_eq!(children, 0);
             let retained: i64 = sqlx::query_scalar(
                 "SELECT (SELECT count(*) FROM storage_operation WHERE operation_id=?1) +
-                        (SELECT count(*) FROM restore_memory_reservation WHERE operation_id=?1)",
+                        (SELECT count(*) FROM restore_resource_reservation WHERE operation_id=?1)",
             )
             .bind(operation.to_string())
             .fetch_one(&snapshots.store.pool)

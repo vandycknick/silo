@@ -882,10 +882,10 @@ def assert_destroyed(silo: Silo, name: str, machine_hex: str | None) -> None:
                 " AND state NOT IN ('committed','aborted')", (machine_hex,)).fetchone()[0]
             assert pending == 0, "failed restore retained an unfinished generation/launch operation"
             charged = connection.execute(
-                "SELECT COUNT(*) FROM restore_memory_reservation r JOIN storage_operation o"
+                "SELECT COUNT(*) FROM restore_resource_reservation r JOIN storage_operation o"
                 " ON o.operation_id=r.operation_id WHERE replace(o.machine_id,'-','')=?",
                 (machine_hex,)).fetchone()[0]
-            assert charged == 0, "failed restore retained its memory reservation"
+            assert charged == 0, "failed restore retained its resource reservation"
     if machine_hex is not None:
         assert not (silo.ws.run_root / "machines" / machine_hex / "vm.pid").exists()
 

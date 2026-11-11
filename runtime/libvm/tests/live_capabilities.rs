@@ -714,7 +714,6 @@ fn fork_options() -> libvm::LiveForkOptions {
         resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
         policy: vm_spec::lifecycle::CapturePolicy::Full,
         dirty_crossover_percent: 60,
-        resources: libvm::RestoreResourcePolicy::default(),
     }
 }
 

@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from silo_smoke import capture, images, overlay, pause, procs, shutdown, stopped
+from silo_smoke import capture, images, overlay, pause, procs, reclaim, shutdown, stopped
 from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
@@ -270,6 +270,7 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
             assert started["code"] == 0
             running = silo.wait_ready(name)
             if capture_policy == "incremental":
+                reclaim.settled(silo, name)
                 baseline = json.loads(silo.run(
                     "snapshot", "create", name, "--live", "--name", "crash-baseline",
                     "--capture-policy", "incremental", timeout=120,

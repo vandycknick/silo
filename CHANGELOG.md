@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Restore, fork and live capture no longer reserve or refuse host RAM. Lazy
+  file-private RAM mappings use ordinary host virtual memory; private-write
+  percentages, memory-overcommit flags and RAM policy/result fields are removed.
+  Disk-peak, descriptor and fork-count limits and their cross-home ledger remain.
+  The resource-only ledger uses a new namespace, so older builds' RAM-aware
+  ledger documents cannot block admission in fresh homes.
+- Live snapshots and live forks now prefer incremental RAM capture by default,
+  including a restored child's first capture against its inherited checkpoint.
+  Missing or invalidated baselines, topology changes and dirty crossover still
+  select full capture automatically. Hosts without incremental capability use
+  full capture, and `--capture-policy full` remains an explicit override.
 - User-facing size errors use human-readable storage units. Resource refusals
   report required and available capacity plus the shortfall, including when
   rounded sizes would otherwise look equal.
@@ -17,8 +28,7 @@
   differs. See [ADR 0021](docs/adr/0021-live-snapshots-and-forks.md).
 - Corrected live capture, fork and restore admission: writable disk copies,
   including each fork child's private disks, are charged by allocated bytes
-  rather than logical length. A plain capture reserves only scratch host RAM,
-  not a resident guest-RAM baseline.
+  rather than logical length.
 - Linux/KVM reclaims guest-reported free RAM from capture-tracked boot VMs
   and restored or forked private mappings without changing checkpoint files.
   `silo info` and daemon status report reclaim state and mapping-limit skips;
@@ -37,14 +47,19 @@
   data to two hashing and writing workers, with output bytes and checkpoint
   identities unchanged. On a 30 GiB guest with 8 GiB of dense data the pause
   drops from about 16 s to about 9.5 s.
-- Live checkpoint publication authenticates RAM once while copying it into the
-  content-addressed pool, then carries held-inode verification into closure
+- Live checkpoint publication authenticates RAM once while publishing it into
+  the content-addressed pool, then carries held-inode verification into closure
   publication instead of scanning the bytes twice more. Deduplicated RAM is
   independently verified, changed files are refused, and interrupted publication
   authenticates again on replay without changing checkpoint identities.
+- Captured RAM publication uses reflinks on Linux Btrfs/XFS and authenticates
+  the private pool destination in one read, so staged bytes are written once
+  by capture and never rewritten by publication. Unsupported or cross-filesystem
+  clones retain copy-and-hash publication with identical checkpoint identities
+  and durability.
 - Cross-home resource admission now reclaims charges from deleted or replaced
   Silo homes using versioned home anchors, preventing orphaned reservations
-  from permanently consuming the same user's RAM and disk budget.
+  from permanently consuming the same user's disk and descriptor budget.
 - Live checkpoints of machines created without `--vsock` (the default) now
   restore and fork. Restore required the public hybrid vsock surface instead
   of only the internal agent channel; each remaining launch mismatch now

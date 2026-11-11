@@ -152,7 +152,6 @@ pub(crate) struct CaptureRecord {
     /// Allocated bytes sampled from each writable source, keyed by attachment index.
     pub disk_allocations: BTreeMap<u32, u64>,
     pub reservation_bytes: u64,
-    pub reservation_memory_bytes: u64,
     pub candidate: Option<SnapshotId>,
     pub captured_boot: Option<crate::BootProfile>,
     pub source_inodes: Vec<(u64, u64)>,
@@ -1483,8 +1482,8 @@ fn verify_closure(
     )
 }
 
-/// Reuse only the pool-copy proof from this owned publication. Recovery creates
-/// a fresh proof by authenticating the staged bytes again; no proof is durable.
+/// Reuse only the pool-inode proof from this owned publication. Recovery creates
+/// a fresh proof by authenticating publication bytes again; no proof is durable.
 fn verify_publication_closure(
     pool: &StoragePool,
     record: &SnapshotRecord,
@@ -1516,7 +1515,7 @@ fn verify_publication_closure(
     )?;
     if shape.stream_map(&execution.memory.stream)? != stream.map() {
         return Err(invalid(
-            "RAM publication map differs from authenticated copy",
+            "RAM publication map differs from authenticated pool bytes",
         ));
     }
     let warm = BTreeMap::from([(execution.memory.stream, stream.fingerprint())]);
@@ -1803,19 +1802,15 @@ pub(crate) fn verify_artifact_closure(
 }
 
 const CLOSURE_LANE_STACK_BYTES: usize = 1 << 20;
-const CLOSURE_LANE_SCRATCH_BYTES: u64 =
-    (crate::storage::limits::CHUNK_SIZE + CLOSURE_LANE_STACK_BYTES) as u64;
 
 fn closure_lane_budget_fits(
     held_descriptors: u64,
     limits: crate::storage::limits::FileDescriptorLimits,
-    available_memory: u64,
 ) -> bool {
     let Some(descriptors) = held_descriptors.checked_add(2) else {
         return false;
     };
     crate::storage::limits::check_fd_budget(descriptors, limits.soft, limits.hard).is_ok()
-        && available_memory >= CLOSURE_LANE_SCRATCH_BYTES
 }
 
 fn admit_closure_lane(held_descriptors: u64) -> bool {
@@ -1825,11 +1820,7 @@ fn admit_closure_lane(held_descriptors: u64) -> bool {
             .ok_or_else(|| invalid("closure lane descriptor budget overflow"))?;
         let limits = crate::storage::limits::preflight_fd_budget(descriptors)
             .map_err(crate::storage::StorageError::from)?;
-        Ok(closure_lane_budget_fits(
-            held_descriptors,
-            limits,
-            crate::store::capture::available_memory()?,
-        ))
+        Ok(closure_lane_budget_fits(held_descriptors, limits))
     })();
     match admission {
         Ok(admitted) => admitted,
@@ -3851,7 +3842,6 @@ pub(crate) mod tests {
         use crate::storage::StorageError;
         use crate::store::snapshot_store::{
             closure_lane_budget_fits, publish_map, verify_artifact_closure,
-            CLOSURE_LANE_SCRATCH_BYTES,
         };
 
         let (temp, snapshots, record, operation, _lease) = fixture("snapshot").await;
@@ -3879,9 +3869,7 @@ pub(crate) mod tests {
             hard: required,
             required,
         };
-        let parallel = closure_lane_budget_fits(held, limits, CLOSURE_LANE_SCRATCH_BYTES);
-        let memory_fallback =
-            closure_lane_budget_fits(held, limits, CLOSURE_LANE_SCRATCH_BYTES - 1);
+        let parallel = closure_lane_budget_fits(held, limits);
         let descriptor_fallback = closure_lane_budget_fits(
             held,
             FileDescriptorLimits {
@@ -3889,17 +3877,11 @@ pub(crate) mod tests {
                 hard: required - 1,
                 required: required - 1,
             },
-            CLOSURE_LANE_SCRATCH_BYTES,
         );
         assert!(parallel);
-        assert!(!memory_fallback);
         assert!(!descriptor_fallback);
-        assert!(!closure_lane_budget_fits(
-            u64::MAX,
-            limits,
-            CLOSURE_LANE_SCRATCH_BYTES,
-        ));
-        for mode in [parallel, memory_fallback, descriptor_fallback] {
+        assert!(!closure_lane_budget_fits(u64::MAX, limits,));
+        for mode in [parallel, descriptor_fallback] {
             let closure =
                 authenticate_test_closure(&pool, &[upper, &ram, &ram], &objects, ram.stream, mode)
                     .unwrap();
@@ -3945,7 +3927,7 @@ pub(crate) mod tests {
                     })
                     .unwrap();
                 let expected = StorageError::ContentMismatch(pool.stream_path(&first_bad.stream));
-                for mode in [parallel, memory_fallback, descriptor_fallback] {
+                for mode in [parallel, descriptor_fallback] {
                     let error =
                         authenticate_test_closure(&pool, &contents, &objects, ram.stream, mode)
                             .err()

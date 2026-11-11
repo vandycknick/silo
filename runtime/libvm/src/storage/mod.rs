@@ -2,6 +2,7 @@
 //!
 //! Byte-object digests and logical stream IDs deliberately occupy different types
 //! and directories. These primitives do not assign image or snapshot semantics.
+pub(crate) mod clone;
 pub mod composition;
 pub mod identity;
 pub mod identity_file;
@@ -24,18 +25,8 @@ pub enum StorageError {
     Bound(#[from] limits::BoundViolation),
     #[error(transparent)]
     FileDescriptorBudget(#[from] limits::FileDescriptorBudgetError),
-    #[error("capture {resource} budget requires {}, available {} (short by {})", utils::format_storage_size(*required), utils::format_storage_size(*available), utils::format_storage_size(required.saturating_sub(*available)))]
-    CaptureBudget {
-        resource: &'static str,
-        required: u64,
-        available: u64,
-    },
-    #[error("restore {resource} budget requires {}, available {} (short by {})", utils::format_storage_size(*required), utils::format_storage_size(*available), utils::format_storage_size(required.saturating_sub(*available)))]
-    RestoreBudget {
-        resource: &'static str,
-        required: u64,
-        available: u64,
-    },
+    #[error("restore disk budget requires {}, available {} (short by {})", utils::format_storage_size(*required), utils::format_storage_size(*available), utils::format_storage_size(required.saturating_sub(*available)))]
+    RestoreDiskBudget { required: u64, available: u64 },
     #[error("invalid owned storage path: {0}")]
     InvalidPath(String),
     #[error("stream map has {actual} chunks, expected {expected} for its length")]
@@ -66,25 +57,16 @@ mod tests {
 
     #[test]
     fn byte_budgets_show_sizes_and_shortfall_even_when_rounded_equal() {
-        for error in [
-            StorageError::CaptureBudget {
-                resource: "RAM",
-                required: (1 << 30) + 1,
-                available: 1 << 30,
-            },
-            StorageError::RestoreBudget {
-                resource: "RAM",
-                required: (1 << 30) + 1,
-                available: 1 << 30,
-            },
-        ] {
-            assert!(error
-                .to_string()
-                .ends_with("RAM budget requires 1.0GiB, available 1GiB (short by 1B)"));
-        }
         assert_eq!(
-            StorageError::RestoreBudget {
-                resource: "disk",
+            StorageError::RestoreDiskBudget {
+                required: (1 << 30) + 1,
+                available: 1 << 30,
+            }
+            .to_string(),
+            "restore disk budget requires 1.0GiB, available 1GiB (short by 1B)"
+        );
+        assert_eq!(
+            StorageError::RestoreDiskBudget {
                 required: 0,
                 available: 0,
             }

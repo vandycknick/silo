@@ -947,7 +947,7 @@ impl Store {
             .fetch_one(&mut **tx)
             .await?;
             MachineStorageRecord::decode(&json)?.validate_for_machine(machine.into())?;
-            let construction: Option<String> = sqlx::query_scalar("SELECT json(construction_json) FROM restore_memory_reservation WHERE operation_id=?1 AND construction_json IS NOT NULL")
+            let construction: Option<String> = sqlx::query_scalar("SELECT json(construction_json) FROM restore_resource_reservation WHERE operation_id=?1 AND construction_json IS NOT NULL")
                 .bind(operation.to_string()).fetch_optional(&mut **tx).await?;
             let construction = construction
                 .as_deref()
@@ -1503,15 +1503,15 @@ impl Store {
                 .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2")
                 .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
-            let charged:String=sqlx::query_scalar("SELECT json(charge_json) FROM restore_memory_reservation WHERE operation_id=?1 AND construction_json IS NOT NULL").bind(restore.consumer_operation.to_string()).fetch_one(&mut *tx).await?;
-            let charged: crate::store::restore::RestoreMemoryCharge =
+            let charged:String=sqlx::query_scalar("SELECT json(charge_json) FROM restore_resource_reservation WHERE operation_id=?1 AND construction_json IS NOT NULL").bind(restore.consumer_operation.to_string()).fetch_one(&mut *tx).await?;
+            let charged: crate::store::restore::RestoreResourceCharge =
                 serde_json::from_str(&charged).map_err(invalid)?;
-            if charged != restore.memory {
+            if charged != restore.resources {
                 return Err(invalid(
                     "generation transfer changed its pre-admitted resource charge",
                 ));
             }
-            let reservation = sqlx::query("UPDATE restore_memory_reservation SET operation_id=?1 WHERE operation_id=?2 AND construction_json IS NOT NULL")
+            let reservation = sqlx::query("UPDATE restore_resource_reservation SET operation_id=?1 WHERE operation_id=?2 AND construction_json IS NOT NULL")
                 .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             if reservation.rows_affected() != 1 {
                 return Err(invalid(
