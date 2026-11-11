@@ -12,7 +12,7 @@ is built.
 ## Process Model
 
 ```text
-libvm / CLI / SDK
+CLI -> libvm
   -> silo-vmm                      daemonized, one per generation
        Tokio, control API, guest services, forwards, finalization
        |

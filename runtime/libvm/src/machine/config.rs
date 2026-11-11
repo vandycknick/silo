@@ -879,7 +879,7 @@ mod tests {
             .update(MachineUpdate::new().clear_network_policy())
             .await
             .unwrap();
-        let labels = BTreeMap::from([("io.silo.taild.name".into(), "renamed".into())]);
+        let labels = BTreeMap::from([("io.silo.lobby.name".into(), "renamed".into())]);
         let data = machine
             .update(MachineUpdate::new().name("renamed").labels(labels.clone()))
             .await

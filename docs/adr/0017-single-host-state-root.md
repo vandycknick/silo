@@ -6,6 +6,10 @@ Date: 2026-09-24
 
 Accepted
 
+Amended by [ADR 0022](0022-lobby-in-silod-and-tsgate.md): lobby state lives in
+`<Home>/lobby/` and tsnet state in `<Home>/tsgate/`; the Go SDK runtime and
+bridge-cache layout no longer applies.
+
 Supersedes the "On-disk Layout" section of
 [ADR 0004](0004-daemonless-architecture.md) and the XDG ownership table and
 run-root order of [ADR 0012](0012-cross-platform-runtime-and-sdk-packaging.md).

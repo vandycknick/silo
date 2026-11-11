@@ -148,7 +148,7 @@ not a Cargo test and not a new production control route:
 ```sh
 cargo build -p silo-vmm --example guest-lifecycle-controller
 make stage
-make smoke SMOKE_ARGS='-k "freeze_real_kernel or freeze_refuses_uncontained" -m "not sdk"'
+make smoke SMOKE_ARGS='-k "freeze_real_kernel or freeze_refuses_uncontained"'
 ```
 
 `SILO_SMOKE_GUEST_LIFECYCLE_CONTROLLER` selects an absolute helper path for
@@ -973,7 +973,7 @@ when unset the log records that this cross-check was not exercised.
 
 ```sh
 make stage
-make smoke SMOKE_ARGS='tests/test_cloud_disk.py -m "linux_only and not sdk"'
+make smoke SMOKE_ARGS='tests/test_cloud_disk.py -m linux_only'
 make smoke SMOKE_ARGS='tests/test_cloud_disk.py --backend vz'   # macOS VZ lane only
 ```
 
@@ -1026,8 +1026,8 @@ make stage
 export SILO_NATIVE_ROOT=/home/nickvd/Projects/worktrees/libkrun/silo-production
 export SILO_SMOKE_KERNEL_CONFIG="$KERNEL_BUILD/.config"   # staged kernel's emitted config
 export CC=/usr/bin/gcc                                     # needs static libc for the guest probe
-make smoke SMOKE_ARGS='-m "not slow and not sdk" -k "freeze or generation or activation" --keep'
-make smoke SMOKE_ARGS='-m "slow and not sdk" -k activation --keep'
+make smoke SMOKE_ARGS='-m "not slow" -k "freeze or generation or activation" --keep'
+make smoke SMOKE_ARGS='-m slow -k activation --keep'
 ```
 
 `SILO_SMOKE_NATIVE_LIVE_API` overrides the entry path; `SILO_SMOKE_RESTORED_EVIDENCE`
@@ -1086,14 +1086,13 @@ Home and never removes machines from another Home.
 Host targets are `linux-amd64-gnu`, `linux-arm64-gnu` and `darwin-arm64`.
 
 Markers: `daemon` starts a private daemon; `system` needs the appliance image;
-`sdk` runs Go/Node examples; `linux_only` and `macos_only` select host-specific
+`linux_only` and `macos_only` select host-specific
 checks. The default selection excludes `slow`; `make smoke SMOKE_ARGS='-m slow'`
 overrides it to run extended checks. An explicit marker expression replaces the
 default, so use `-m 'not daemon and not slow'` to retain the fast selection while
 excluding daemon tests. `live` tests require explicit selection with `-m live`.
 
-The SDK lane skips when Go, Node, the built Node SDK or the Go FFI library is
-missing. The system and distro lanes pull their published default images from
+The system and distro lanes pull their published default images from
 ghcr.io; `SILO_SMOKE_SYSTEM_IMAGE= SILO_SMOKE_DISTRO_IMAGES= make smoke` runs
 fully offline. Pulled images are kept under `<cache>/image-catalog/<schema-hash>`:
 each embedded initial schema gets a separate fixture cache. It contains immutable
@@ -1111,7 +1110,7 @@ select vz.
 ### Default-suite cost strategy
 
 The Phase 7 baseline in `.tmp/phase07-default-qualified.xml` ran the complete
-73-case non-slow/non-SDK/non-live selection in 966.09 seconds. The inode ENOSPC
+73-case baseline selection in 966.09 seconds. The inode ENOSPC
 case alone took 82.141 seconds. Its guest workload now creates empty files until
 the actual create returns ENOSPC, then performs one checked `syncfs` before
 reporting that errno. Committing the journal after every empty inode was setup
@@ -1257,7 +1256,7 @@ and run the complete unchanged selection:
 
 ```sh
 make stage
-make smoke SMOKE_ARGS='-m "not slow and not sdk and not live" --junitxml=../.tmp/phase10-default-qualified.xml --durations=20'
+make smoke SMOKE_ARGS='-m "not slow and not live" --junitxml=../.tmp/phase10-default-qualified.xml --durations=20'
 ```
 
 Compare the full wall time and the six affected call durations against the
@@ -1712,8 +1711,8 @@ Exact-tail growth uses the existing public Rust `storage_acceptance` consumer,
 built with `cargo build -p libvm --example storage_acceptance`. Its
 `set-root-capacity MACHINE BYTES` action calls `Machine::update` with the exact
 byte count against the same private Home/runtime and checks the returned
-published capacity. No retiring SDK, parser expansion or production shim is
-involved. Whole-MiB growth retains the accepted CLI `disk=NMiB` grammar.
+published capacity. No parser expansion or production shim is involved.
+Whole-MiB growth retains the accepted CLI `disk=NMiB` grammar.
 The fixture records runtime output. Dirty recovery captures the exact run's
 SIGKILL terminal artifact and waits for both owned monitor/worker PIDs to be
 gone; a terminal Error label is not confused with a live process or rewritten
@@ -1772,13 +1771,13 @@ This keeps the default lane bounded; Main records actual elapsed time and
 must keep the complete default selection below 15 minutes.
 
 The extended controllers are all explicitly `slow`, use normal staged
-CLI → libvm → monitor → worker launches and introduce no SDK consumer:
+CLI → libvm → monitor → worker launches:
 
 ```sh
 make stage
 cargo build -p libvm --examples
-make smoke SMOKE_ARGS='-m "not slow and not sdk" -k lifecycle'
-make smoke SMOKE_ARGS='-m "slow and not sdk" -k shutdown'
+make smoke SMOKE_ARGS='-m "not slow" -k lifecycle'
+make smoke SMOKE_ARGS='-m slow -k shutdown'
 ```
 
 `storage_acceptance` is a standalone consumer of the public Rust image
@@ -1924,7 +1923,7 @@ or resolve optional HVF symbols, so it belongs to smoke rather than Cargo tests:
 
 ```sh
 make stage
-make smoke SMOKE_ARGS='tests/test_native_capabilities.py -m "not slow and not sdk"'
+make smoke SMOKE_ARGS='tests/test_native_capabilities.py -m "not slow"'
 ```
 
 

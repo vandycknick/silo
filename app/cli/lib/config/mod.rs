@@ -327,6 +327,13 @@ pub(crate) struct FeatureSelection {
     pub(crate) tailscale: bool,
 }
 
+impl FeatureSelection {
+    pub(crate) fn validate(self) -> eyre::Result<()> {
+        eyre::ensure!(!self.tailscale, "the lobby is not available in this build");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -335,8 +342,43 @@ mod tests {
 
     use libvm::{HostPaths, RegistryAction, RegistryPolicy, RegistryRule};
 
-    use crate::config::tailscale::EnrollmentMode;
     use crate::config::{parse_global_config, FeatureOverrides, GlobalConfig};
+
+    #[test]
+    fn unavailable_lobby_is_refused_for_explicit_and_persisted_features() {
+        for (document, tailscale) in [
+            ("{}", Some(true)),
+            (
+                "daemon:\n  version: '1'\n  tailscale:\n    enabled: true\n",
+                None,
+            ),
+        ] {
+            let config = parse_global_config(document).unwrap();
+            let selected = config.resolve_features(
+                FeatureOverrides {
+                    system: Some(false),
+                    tailscale,
+                },
+                false,
+            );
+            assert_eq!(
+                selected.validate().unwrap_err().to_string(),
+                "the lobby is not available in this build"
+            );
+            let disabled = config.resolve_features(
+                FeatureOverrides {
+                    system: Some(false),
+                    tailscale: Some(false),
+                },
+                false,
+            );
+            disabled.validate().unwrap();
+        }
+        GlobalConfig::default()
+            .resolve_features(FeatureOverrides::default(), false)
+            .validate()
+            .unwrap();
+    }
 
     #[test]
     fn daemon_overrides_are_empty_without_a_config_file_or_section() {
@@ -514,28 +556,7 @@ mod tests {
                 .resolve_features(FeatureOverrides::default(), true)
                 .system
         );
-        let c = config.tailscale();
-        assert_eq!(c.hostname(), "silo");
-        assert_eq!(c.tag(), "tag:silo");
-        assert_eq!(c.control_url(), "");
-        assert_eq!(c.enrollment_mode(), EnrollmentMode::OauthApp);
-        assert!(!c.disable_key_expiry());
         assert_eq!(config.images(), &libvm::RegistryPolicy::default());
-        assert_eq!(c.vm().defaults().cpus(), 2);
-        assert_eq!(c.vm().defaults().memory(), 4 << 30);
-        assert_eq!(c.vm().defaults().disk(), 20 << 30);
-        assert_eq!(c.vm().ceilings().cpus(), 8);
-        assert_eq!(c.vm().ceilings().memory(), 32 << 30);
-        assert_eq!(c.vm().ceilings().disk(), 200 << 30);
-        assert_eq!(c.vm().ceilings().vms_per_principal(), 5);
-        assert_eq!(c.sessions().global(), 64);
-        assert_eq!(c.sessions().per_peer(), 8);
-        assert_eq!(c.disk_reserve(), 1 << 30);
-        assert_eq!(
-            c.shutdown().stop_budget(),
-            std::time::Duration::from_secs(4)
-        );
-        assert_eq!(c.shutdown().margin(), std::time::Duration::from_millis(250));
     }
     #[test]
     fn strict_validation_rejects_unknown_fields_units_and_limits() {
@@ -547,9 +568,6 @@ mod tests {
             "tag: user:1",
             "disk-reserve: 1.5GiB",
             "disk-reserve: 18446744073709551615TiB",
-            "shutdown: {margin: 250}",
-            "shutdown: {stop-budget: 61s}",
-            "shutdown: {margin: 0s}",
             "sessions: {per-peer: 65}",
             "sessions: {global: 0}",
             "vm: {ceilings: {cpus: 256}}",
@@ -578,7 +596,10 @@ mod tests {
             assert!(load(yaml).is_err(), "accepted {yaml}");
         }
         for mode in ["oauth-app", "interactive", "none"] {
-            assert!(load(&format!("daemon: {{version: '1', tailscale: {{enrollment: {{mode: {mode}}}, shutdown: {{stop-budget: 1m, margin: 0.25s}}}}}}" )).is_ok());
+            assert!(load(&format!(
+                "daemon: {{version: '1', tailscale: {{enrollment: {{mode: {mode}}}}}}}"
+            ))
+            .is_ok());
         }
     }
     #[test]

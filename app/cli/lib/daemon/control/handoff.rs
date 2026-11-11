@@ -102,10 +102,10 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<w::HandoffReceiveRequest>,
     ) -> Result<Response<w::HandoffStatus>, Status> {
-        let plan = c::receive_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let plan = c::receive_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let value = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let value = state
                     .handoff_backend()
                     .await?
@@ -122,10 +122,10 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<w::HandoffCaptureRequest>,
     ) -> Result<Response<w::HandoffCaptureOffer>, Status> {
-        let (plan, stop) = c::capture_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let (plan, stop) = c::capture_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let value = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let value = state
                     .handoff_backend()
                     .await?
@@ -142,10 +142,10 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<w::HandoffReceiveRequest>,
     ) -> Result<Response<w::HandoffStatus>, Status> {
-        let plan = c::receive_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let plan = c::receive_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let value = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let value = state
                     .handoff_backend()
                     .await?
@@ -162,10 +162,10 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<w::HandoffCaptureOffer>,
     ) -> Result<Response<w::HandoffStatus>, Status> {
-        let offer = c::offer_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let offer = c::offer_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let value = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let value = state
                     .handoff_backend()
                     .await?
@@ -211,7 +211,7 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<tonic::Streaming<w::HandoffWriteRequest>>,
     ) -> Result<Response<w::HandoffPayloadReceipt>, Status> {
-        let permit = self.admit(&r, true).await?;
+        let permit = self.admit().await?;
         let mut stream = r.into_inner();
         let shutdown = self.stream_shutdown.clone();
         let first = next_message(&mut stream, &shutdown)
@@ -276,10 +276,10 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<w::HandoffBinding>,
     ) -> Result<Response<w::HandoffPreparedReceipt>, Status> {
-        let binding = c::binding_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let binding = c::binding_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let value = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let value = state
                     .handoff_backend()
                     .await?
@@ -296,10 +296,10 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<w::HandoffPreparedReceipt>,
     ) -> Result<Response<w::HandoffCommitAuthorization>, Status> {
-        let receipt = c::prepared_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let receipt = c::prepared_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let value = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let value = state
                     .handoff_backend()
                     .await?
@@ -316,10 +316,10 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<w::HandoffCommitAuthorization>,
     ) -> Result<Response<w::HandoffTerminalReceipt>, Status> {
-        let authorization = c::authorization_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let authorization = c::authorization_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let value = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let value = state
                     .handoff_backend()
                     .await?
@@ -336,10 +336,10 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<w::HandoffIntent>,
     ) -> Result<Response<w::HandoffTerminalReceipt>, Status> {
-        let intent = c::intent_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let intent = c::intent_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let value = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let value = state
                     .handoff_backend()
                     .await?
@@ -356,10 +356,10 @@ impl w::handoff_service_server::HandoffService for Service {
         &self,
         r: Request<w::HandoffTerminalReceipt>,
     ) -> Result<Response<w::HandoffStatus>, Status> {
-        let receipt = c::terminal_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let receipt = c::terminal_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let value = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let value = state
                     .handoff_backend()
                     .await?

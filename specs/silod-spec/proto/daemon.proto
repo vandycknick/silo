@@ -1,6 +1,5 @@
 syntax = "proto3";
 package silo.daemon.v1;
-option go_package = "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1;daemonv1";
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
@@ -8,8 +7,6 @@ import "google/protobuf/duration.proto";
 service DaemonService {
  rpc GetStatus(google.protobuf.Empty) returns (DaemonStatus);
  rpc GetRuntimeInfo(google.protobuf.Empty) returns (RuntimeInfo);
- rpc ReportTailscaleStatus(TailscaleStatusReport) returns (google.protobuf.Empty);
- rpc DrainMutations(DrainMutationsRequest) returns (google.protobuf.Empty);
  rpc GetLiveCapabilities(google.protobuf.Empty) returns (LiveHostReport);
 }
 service MachineService {
@@ -470,20 +467,9 @@ message NodeObservation { string machine_id = 1; google.protobuf.Timestamp obser
 enum NetworkObservationIssue { NETWORK_OBSERVATION_ISSUE_UNSPECIFIED = 0; NETWORK_OBSERVATION_ISSUE_MISSING = 1; NETWORK_OBSERVATION_ISSUE_UNSAFE = 2; NETWORK_OBSERVATION_ISSUE_INVALID = 3; NETWORK_OBSERVATION_ISSUE_STALE = 4; NETWORK_OBSERVATION_ISSUE_WRONG_GENERATION = 5; NETWORK_OBSERVATION_ISSUE_UNAVAILABLE = 6; }
 message NetworkObservation { NodeStatus live = 1; NodeObservation historical = 2; repeated NetworkObservationIssue issues = 3; }
 enum CorePhase { CORE_PHASE_UNSPECIFIED = 0; CORE_PHASE_STARTING = 1; CORE_PHASE_READY = 2; CORE_PHASE_STOPPING = 3; CORE_PHASE_STOPPED = 4; CORE_PHASE_FAILED = 5; }
-enum ComponentState { COMPONENT_STATE_UNSPECIFIED = 0; COMPONENT_STATE_DISABLED = 1; COMPONENT_STATE_STARTING = 2; COMPONENT_STATE_NEEDS_AUTH = 3; COMPONENT_STATE_READY = 4; COMPONENT_STATE_DEGRADED = 5; COMPONENT_STATE_FAILED = 6; }
-enum ShutdownProtection { SHUTDOWN_PROTECTION_UNSPECIFIED = 0; SHUTDOWN_PROTECTION_ACTIVE = 1; SHUTDOWN_PROTECTION_UNAVAILABLE = 2; SHUTDOWN_PROTECTION_UNSUPPORTED = 3; }
-message ComponentStatus { bool enabled = 1; ComponentState state = 2; optional string diagnostic = 3; optional string approval_url = 4; optional string dns_name = 5; uint64 restart_count = 6; ShutdownProtection shutdown_protection = 7; }
-message DaemonStatus { string product_version = 1; uint32 protocol_major = 2; string generation = 3; bytes home = 4; bytes config_dir = 5; CorePhase core = 6; SystemStatus system = 7; ComponentStatus tailscale = 8; uint32 schema = 9; uint32 pid = 10; string process_start = 11; bytes control_endpoint = 12; google.protobuf.Timestamp updated_at = 13; optional string last_error = 14; LiveHostReport manager_live = 15; LiveHostReport appliance_live = 16; optional uint32 live_schema_version = 17; }
+message DaemonStatus { string product_version = 1; uint32 protocol_major = 2; string generation = 3; bytes home = 4; bytes config_dir = 5; CorePhase core = 6; SystemStatus system = 7; uint32 schema = 9; uint32 pid = 10; string process_start = 11; bytes control_endpoint = 12; google.protobuf.Timestamp updated_at = 13; optional string last_error = 14; LiveHostReport manager_live = 15; LiveHostReport appliance_live = 16; optional uint32 live_schema_version = 17; }
 message RuntimeComponents { bytes supervisor_path = 1; bytes netd_path = 2; bytes kernel_path = 3; bytes initramfs_path = 4; bytes agent_path = 5; bytes asset_dir = 6; }
 message RuntimeInfo { string generation = 1; bytes home = 2; RuntimeComponents components = 3; }
-message TailscaleStatusReport { string helper_generation = 1; ComponentStatus status = 2; optional string instance = 3; }
-message DrainMutationsRequest { string expected_generation = 1; }
-message ResourceDefaults { uint32 cpus = 1; uint64 memory_bytes = 2; uint64 disk_bytes = 3; }
-message ResourceCeilings { uint32 cpus = 1; uint64 memory_bytes = 2; uint64 disk_bytes = 3; uint64 vms_per_principal = 4; }
-enum EnrollmentMode { ENROLLMENT_MODE_UNSPECIFIED = 0; ENROLLMENT_MODE_OAUTH_APP = 1; ENROLLMENT_MODE_INTERACTIVE = 2; ENROLLMENT_MODE_NONE = 3; }
-message TailscaleSettings { reserved 6, 7; reserved "default_image", "allowed_registries"; string hostname = 1; string tag = 2; string control_url = 3; EnrollmentMode enrollment_mode = 4; bool disable_key_expiry = 5; ResourceDefaults defaults = 8; ResourceCeilings ceilings = 9; uint64 sessions_global = 10; uint64 sessions_per_peer = 11; uint64 disk_reserve_bytes = 12; google.protobuf.Duration stop_budget = 13; google.protobuf.Duration shutdown_margin = 14; uint64 file_transfer_limit_bytes = 15; }
-// Credentials are one-use bootstrap inputs, never status or configuration output.
-message HelperBootstrap { uint32 protocol_major = 1; string product_version = 2; string daemon_generation = 3; string helper_generation = 4; bytes control_endpoint = 5; bytes home = 6; bytes config_dir = 7; optional bytes templates_dir = 8; optional bytes policies_dir = 9; RuntimeComponents runtime_components = 10; bytes native_bridge_path = 11; TailscaleSettings settings = 12; optional bytes client_secret = 13; optional bytes oauth_app_secret = 14; optional bytes api_token = 15; }
 
 enum VmState { VM_STATE_UNSPECIFIED = 0; VM_STATE_STARTING = 1; VM_STATE_RUNNING = 2; VM_STATE_STOPPING = 3; VM_STATE_STOPPED = 4; VM_STATE_FAILED = 5; VM_STATE_PAUSING = 6; VM_STATE_PAUSED = 7; VM_STATE_CAPTURING = 8; VM_STATE_RESTORING = 9; VM_STATE_ACTIVATING = 10; VM_STATE_ACTIVATION_FAILED = 11; VM_STATE_ERROR = 12; }
 enum ReadinessReason { READINESS_REASON_UNSPECIFIED = 0; READINESS_REASON_VM_STARTING = 1; READINESS_REASON_VM_STOPPING = 2; READINESS_REASON_VM_STOPPED = 3; READINESS_REASON_VM_FAILED = 4; READINESS_REASON_AGENT_NOT_REQUIRED = 5; READINESS_REASON_AGENT_UNAVAILABLE = 6; READINESS_REASON_AGENT_STATUS_STALE = 7; READINESS_REASON_GUEST_STARTING = 8; READINESS_REASON_GUEST_FAILED = 9; READINESS_REASON_GUEST_REPORTED_READY = 10; READINESS_REASON_VM_PAUSING = 11; READINESS_REASON_VM_PAUSED = 12; READINESS_REASON_VM_CAPTURING = 13; READINESS_REASON_VM_RESTORING = 14; READINESS_REASON_VM_ACTIVATING = 15; READINESS_REASON_VM_ACTIVATION_FAILED = 16; READINESS_REASON_VM_ERROR = 17; }

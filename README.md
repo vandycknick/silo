@@ -173,10 +173,6 @@ With `CI=true`, nextest uses the `ci` profile and writes JUnit results under
 `target/nextest/ci/junit.xml` (under `CARGO_TARGET_DIR` when overridden).
 Real-VM qualification is separate; see the [smoke suite](smoke/README.md).
 
-Taild admission tests run on Linux and macOS. Their successful fixture-registry
-pull subtests run only on Linux: macOS registry verification uses the keychain,
-not the fixture's `SSL_CERT_FILE`. Pre-pull rejection checks still run on both.
-
 ## CLI
 
 Tracing diagnostics go to stderr, separately from command results on stdout.
@@ -383,12 +379,10 @@ See the [system daemon operator guide](docs/system-daemon.md) for setup,
 security implications, lifecycle, upgrades, recovery, and deliberate v1
 limitations.
 
-## SDK
+## Rust library
 
 Use `libvm` when you want to create and manage machines directly from Rust. See
-the [libvm guide](runtime/libvm/README.md), [Node SDK guide](sdk/node/README.md), and
-[Go SDK guide](sdk/go/README.md) for lifecycle and process details. The Go SDK includes an
-explicit, digest-verified installer for the exact matching runtime archive.
+the [libvm guide](runtime/libvm/README.md) for lifecycle and process details.
 
 ```rust
 use libvm::{LibVmError, Memory, Runtime};

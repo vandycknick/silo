@@ -21,7 +21,7 @@ import (
 )
 
 // IdentityMetadata is host-injected policy metadata, never a guest assertion.
-const IdentityMetadata = "io.silo.taild.node"
+const IdentityMetadata = "io.silo.lobby.node"
 
 type ExpectedIdentity struct {
 	Tags             []string `json:"tags,omitempty"`
@@ -143,7 +143,7 @@ func (n *Node) VerifyAccess(ctx context.Context) error {
 }
 
 // Snapshot is a versioned observation, not a durable claim of connectivity.
-// taild reads it only for the matching live VM run and within its freshness bound.
+// The lobby reads it only for the matching live VM run and within its freshness bound.
 type Snapshot struct {
 	LastKnown      *Observation `json:"last_known,omitempty"`
 	Tags           []string     `json:"tags,omitempty"`

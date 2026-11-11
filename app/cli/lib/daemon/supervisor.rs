@@ -921,15 +921,10 @@ mod tests {
         status.machine_id = Some("existing-vm".into());
         status.run_id = Some("existing-run".into());
         let host = libvm::HostPaths::new(paths.home().to_path_buf(), temp.path().join("config"));
-        let features = crate::config::FeatureSelection {
-            system: true,
-            tailscale: false,
-        };
         let publisher = std::sync::Arc::new(
             crate::daemon::status::StatusPublisher::new(
                 &host,
                 uuid::Uuid::new_v4(),
-                features,
                 "test".into(),
                 Some(status.clone()),
             )
@@ -1148,10 +1143,6 @@ mod tests {
         let publisher = crate::daemon::status::StatusPublisher::new(
             &host,
             uuid::Uuid::new_v4(),
-            crate::config::FeatureSelection {
-                system: true,
-                tailscale: false,
-            },
             "test".into(),
             Some(status.clone()),
         )

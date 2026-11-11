@@ -255,10 +255,6 @@ where
         let components = resolve_required_portable_root(ENV_RUNTIME_DIR, &root)?;
         return Ok(overrides.apply_to(components));
     }
-    if let Some(root) = config.bundled_runtime_root.as_deref() {
-        let components = resolve_required_portable_root("bundled_runtime_root", root)?;
-        return Ok(overrides.apply_to(components));
-    }
 
     let mut attempted_adjacent = false;
     if let Some(executable) = canonical_executable {
@@ -983,7 +979,6 @@ mod tests {
         let snapshot = exact(paths.clone());
         let config = RuntimeConfig::default()
             .with_runtime_root("/missing/old-root")
-            .with_bundled_runtime_root("/missing/bundled-root")
             .with_supervisor_path("/missing/old-supervisor")
             .with_netd_path("/missing/old-netd")
             .with_kernel_path("/missing/old-kernel")
@@ -992,7 +987,6 @@ mod tests {
             .with_runtime_components(snapshot.clone());
         assert!(config.runtime_root.is_none());
         assert!(config.supervisor_path.is_none());
-        assert!(config.bundled_runtime_root.is_none());
         assert!(config.netd_path.is_none());
         assert!(config.kernel_path.is_none());
         assert!(config.initramfs_path.is_none());
@@ -1097,7 +1091,6 @@ mod tests {
         let config = RuntimeConfig::default().with_runtime_components(exact(portable(temp.path())));
         for changed in [
             config.clone().with_runtime_root("/new/root"),
-            config.clone().with_bundled_runtime_root("/new/bundled"),
             config.clone().with_supervisor_path("/new/vmm"),
             config.clone().with_netd_path("/new/netd"),
             config.clone().with_kernel_path("/new/kernel"),
@@ -1163,30 +1156,6 @@ mod tests {
         .expect("resolve environment runtime root");
 
         assert_eq!(resolved.netd, netd.canonicalize().expect("canonical netd"));
-    }
-
-    #[test]
-    fn bundled_runtime_precedes_executable_relative_discovery() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let bundled = temp.path().join("bundled");
-        let portable_root = temp.path().join("portable");
-        portable(&bundled);
-        portable(&portable_root);
-        let executable = portable_root.join("bin/silo");
-        write_file(&executable, true);
-
-        let resolved = resolve(
-            &RuntimeConfig::default().with_bundled_runtime_root(&bundled),
-            &mut TestEnvironment::default(),
-            executable,
-            vec![],
-        )
-        .expect("resolve bundled runtime");
-
-        assert_eq!(
-            resolved.agent,
-            bundled.join("assets/agent").canonicalize().expect("agent")
-        );
     }
 
     #[test]

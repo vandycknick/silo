@@ -20,7 +20,7 @@ The slot accepts only a literal ASCII `tskey-auth-...` enrollment key (or no
 key). Constructor validation rejects OAuth/client secrets, WIF/JWT material,
 URLs, query attributes and whitespace before constructing tsnet. Pinned
 tsnet.Start otherwise resolves OAuth under its own shutdown context, outside
-the caller's Up budget. netd never mints keys; taild/enrollment supplies them.
+the caller's Up budget. netd never mints keys; the caller supplies them.
 Qualification tests mint literal keys separately with bounded HTTP calls.
 Rust strips TS_/TSNET_ before exec. Standalone binaries and node consumers import
 the os-only bootenv guard before upstream environment registration; main-time
@@ -88,6 +88,5 @@ guest stack closes. Session drain precedes forced connection closure.
 
 Local regressions use real TCP/TLS sockets and gVisor guests. Generated test
 certificates establish transport behavior only. Real managed certificates,
-backend cancellation, restart identity, and denied-peer access require the
-credential-gated `TestLiveTailnetPolicyForwards` in taild; a skipped or
-prerequisite-failed live test does not qualify them.
+backend cancellation, restart identity, and denied-peer access require
+credential-gated live-tailnet qualification; local tests do not qualify them.

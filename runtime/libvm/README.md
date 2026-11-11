@@ -1340,7 +1340,7 @@ cancels transport and waits for acknowledgement that the actual wire was
 released. That acknowledgement has no wall-clock guarantee under a stalled
 executor. Dropping the Rust future only requests cancellation; it cannot await
 task joins. The caller's cancellation token is observed, never canceled by
-libvm. A blocked caller sink must cooperate with cancellation in SDK adapters.
+libvm. A blocked caller sink must cooperate with cancellation.
 
 Run `cargo run -p libvm --example execution -- <vm> <mode>` with `exec`,
 `script`, `spawn`, `shell` or `embedded-shell` for runnable versions. The
@@ -1360,17 +1360,15 @@ Machine conveniences
         guest vsock 22: independently selected SSH listener
     session/host.rs: optional local input/resize/signals/detach policy
       host_input.rs + utils::terminal: byte reader and raw-termios ownership
-SDK adapters: bounded native byte/control pipes, cooperative caller I/O
 CLI RPC terminal adapter: spawn events + CLI-owned input/terminal policy
 ```
 
 New RPC controls belong in session/control ownership and the appropriate
 host/guest protocol envelope. Common payloads do not erase distinct identity
-fences. SSH features belong in the shared SSH client, not a second SDK client.
-Local terminal policy belongs in the host adapter, not in the SSH transport or
-caller-supplied streams. SSH must not emit agent execution events; wire DTOs
-must not become a universal domain model. SDK adapters own cross-language
-buffers and task lifetimes, not a second authentication/relay implementation.
+fences. libvm is the only client of the VM monitor. SSH features belong in its
+shared SSH client. Local terminal policy belongs in the host adapter, not in the
+SSH transport or caller-supplied streams. SSH must not emit agent execution events;
+wire DTOs must not become a universal domain model.
 
 This API cutover requires all consumers and native libraries to restart
 together. It introduces no compatibility aliases, version bump, state reset or

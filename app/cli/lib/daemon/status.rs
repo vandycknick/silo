@@ -15,7 +15,6 @@ impl StatusPublisher {
     pub(crate) fn new(
         host: &libvm::HostPaths,
         generation: uuid::Uuid,
-        features: crate::config::FeatureSelection,
         configuration_identity: String,
         system: Option<SystemStatus>,
     ) -> eyre::Result<Self> {
@@ -36,23 +35,6 @@ impl StatusPublisher {
                 configuration_identity,
                 manager_live: None,
                 appliance_live: None,
-                tailscale: ComponentStatus {
-                    enabled: features.tailscale,
-                    state: if features.tailscale {
-                        ComponentState::Starting
-                    } else {
-                        ComponentState::Disabled
-                    },
-                    diagnostic: None,
-                    approval_url: None,
-                    dns_name: None,
-                    restart_count: 0,
-                    shutdown_protection: if cfg!(target_os = "macos") {
-                        ShutdownProtection::Unsupported
-                    } else {
-                        ShutdownProtection::Unavailable
-                    },
-                },
             }),
         };
         publisher.update(|_| {})?;
@@ -98,22 +80,6 @@ impl StatusPublisher {
             }
         })
     }
-    pub(crate) fn set_tailscale(&self, mut component: ComponentStatus) -> eyre::Result<()> {
-        if cfg!(target_os = "macos") {
-            component.shutdown_protection = ShutdownProtection::Unsupported;
-        }
-        self.update(|s| s.tailscale = component)
-    }
-    pub(crate) fn report_tailscale(&self, mut component: ComponentStatus) -> eyre::Result<()> {
-        if cfg!(target_os = "macos") {
-            component.shutdown_protection = ShutdownProtection::Unsupported;
-        }
-        self.update(|status| {
-            component.restart_count = status.tailscale.restart_count;
-            component.enabled = status.tailscale.enabled;
-            status.tailscale = component;
-        })
-    }
     pub(crate) fn wire(&self) -> eyre::Result<w::DaemonStatus> {
         let s = self
             .status
@@ -150,7 +116,6 @@ impl StatusPublisher {
                 .map(silo_vm_control::live::host_to_wire)
                 .transpose()?,
             system: s.system.as_ref().map(system_wire).transpose()?,
-            tailscale: Some(component_wire(&s.tailscale)),
         })
     }
 }
@@ -161,28 +126,6 @@ fn timestamp(s: &str) -> Option<prost_types::Timestamp> {
             seconds: t.timestamp(),
             nanos: t.timestamp_subsec_nanos() as i32,
         })
-}
-fn component_wire(s: &ComponentStatus) -> w::ComponentStatus {
-    w::ComponentStatus {
-        enabled: s.enabled,
-        state: match s.state {
-            ComponentState::Disabled => w::ComponentState::Disabled,
-            ComponentState::Starting => w::ComponentState::Starting,
-            ComponentState::NeedsAuth => w::ComponentState::NeedsAuth,
-            ComponentState::Ready => w::ComponentState::Ready,
-            ComponentState::Degraded => w::ComponentState::Degraded,
-            ComponentState::Failed => w::ComponentState::Failed,
-        } as i32,
-        diagnostic: s.diagnostic.clone(),
-        approval_url: s.approval_url.clone(),
-        dns_name: s.dns_name.clone(),
-        restart_count: s.restart_count.into(),
-        shutdown_protection: match s.shutdown_protection {
-            ShutdownProtection::Active => w::ShutdownProtection::Active,
-            ShutdownProtection::Unavailable => w::ShutdownProtection::Unavailable,
-            ShutdownProtection::Unsupported => w::ShutdownProtection::Unsupported,
-        } as i32,
-    }
 }
 fn system_wire(s: &SystemStatus) -> eyre::Result<w::SystemStatus> {
     Ok(w::SystemStatus {
@@ -263,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn component_updates_share_one_root_identity_and_api_snapshot() {
+    fn system_updates_share_one_root_identity_and_api_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
         let generation = uuid::Uuid::new_v4();
@@ -273,10 +216,6 @@ mod tests {
             StatusPublisher::new(
                 &host,
                 generation,
-                crate::config::FeatureSelection {
-                    system: true,
-                    tailscale: true,
-                },
                 "effective-config".into(),
                 Some(system.clone()),
             )
@@ -294,17 +233,7 @@ mod tests {
             }
         });
         for _ in 0..10 {
-            publisher
-                .set_tailscale(ComponentStatus {
-                    enabled: true,
-                    state: ComponentState::NeedsAuth,
-                    diagnostic: None,
-                    approval_url: Some("https://login.tailscale.com/a/test".into()),
-                    dns_name: None,
-                    restart_count: 2,
-                    shutdown_protection: ShutdownProtection::Unavailable,
-                })
-                .unwrap();
+            publisher.set_core(CorePhase::Ready, None).unwrap();
         }
         thread.join().unwrap();
         let disk: DaemonStatus = serde_json::from_slice(
@@ -323,11 +252,6 @@ mod tests {
         assert_eq!(disk.configuration_identity, "effective-config");
         assert_eq!(disk.system.as_ref().unwrap().phase, SystemPhase::Retrying);
         assert_eq!(api.system.unwrap().phase, w::SystemPhase::Retrying as i32);
-        assert_eq!(disk.tailscale.state, ComponentState::NeedsAuth);
-        assert_eq!(
-            api.tailscale.unwrap().approval_url,
-            disk.tailscale.approval_url
-        );
         publisher.fail_system("supervisor exited".into()).unwrap();
         assert_eq!(
             publisher
@@ -346,17 +270,8 @@ mod tests {
     fn failed_publication_does_not_advance_api_state() {
         let root = tempfile::tempdir().unwrap();
         let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
-        let publisher = StatusPublisher::new(
-            &host,
-            uuid::Uuid::new_v4(),
-            crate::config::FeatureSelection {
-                system: false,
-                tailscale: false,
-            },
-            "test".into(),
-            None,
-        )
-        .unwrap();
+        let publisher =
+            StatusPublisher::new(&host, uuid::Uuid::new_v4(), "test".into(), None).unwrap();
         std::fs::remove_file(&publisher.path).unwrap();
         std::fs::create_dir(&publisher.path).unwrap();
         assert!(publisher.set_core(CorePhase::Ready, None).is_err());

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 def _system_trust_bundle() -> bytes:
-    """The host's CA bundle, so netd and SDK builds can still reach public TLS endpoints.
+    """The host's CA bundle, so netd builds can still reach public TLS endpoints.
 
     The suite CA is appended to it: `SSL_CERT_FILE` replaces the trust store for Go and
     rustls-native-certs consumers instead of extending it.

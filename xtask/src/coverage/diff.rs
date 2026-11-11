@@ -254,36 +254,28 @@ pub fn parse_go_total(input: &str) -> Result<f64, CoverageError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {
     Rust,
-    Node,
     Netd,
-    Taild,
-    SdkGo,
 }
 
 impl Lane {
     fn name(self) -> &'static str {
         match self {
             Self::Rust => "rust",
-            Self::Node => "node",
             Self::Netd => "netd",
-            Self::Taild => "taild",
-            Self::SdkGo => "sdk-go",
         }
     }
 
     fn excludes_function(self, file: &str, symbol: &str) -> bool {
         match self {
             Self::Rust => symbol.contains("::tests::"),
-            Self::Node => file.split(['/', '\\']).any(|part| part == "tests"),
-            Self::Netd | Self::Taild | Self::SdkGo => file.ends_with("_test.go"),
+            Self::Netd => file.ends_with("_test.go"),
         }
     }
 
     fn load(self, directory: &Path) -> Result<Option<CoverageFiles>, CoverageError> {
         let lcov = match self {
             Self::Rust => Some("rust.lcov"),
-            Self::Node => Some("node/lcov.info"),
-            _ => None,
+            Self::Netd => None,
         };
         if let Some(relative) = lcov {
             let path = directory.join(relative);
@@ -424,7 +416,7 @@ pub fn coverage_diff(
         }
     }
     let mut rows = Vec::new();
-    for lane in [Lane::Rust, Lane::Node, Lane::Netd, Lane::Taild, Lane::SdkGo] {
+    for lane in [Lane::Rust, Lane::Netd] {
         let old = lane.load(baseline)?;
         let new = lane.load(current)?;
         if let Some(old) = old {
@@ -518,16 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn lcov_preserves_node_function_names() {
-        let files = parse_lcov("SF:src/runtime.ts\nFNDA:3,runtimeOptionsToNative\n").unwrap();
-        assert_eq!(files["src/runtime.ts"].functions.len(), 1);
-        assert_eq!(
-            files["src/runtime.ts"].functions["runtimeOptionsToNative"],
-            3
-        );
-    }
-
-    #[test]
     fn lcov_rejects_overflow_when_aggregating_mangled_instances() {
         let input = format!(
             "SF:utils.rs\nFNDA:{},_ZN5utils10format_mac17h0123456789abcdefE\nFNDA:1,_RNvCs7ssUw5X5CQd_5utils10format_mac\n",
@@ -597,18 +579,13 @@ mod tests {
                 "utils.rs",
                 "_ZN5utils5tests11formats_mac28_$u7b$$u7b$closure$u7d$$u7d$17h0123456789abcdefE",
             ),
-            (Lane::Node, "sdk/node/tests/test.ts", "helper"),
-            (Lane::Node, "tests/test.ts", "helper"),
             (Lane::Netd, "a_test.go", "helper"),
-            (Lane::Taild, "a_test.go", "helper"),
-            (Lane::SdkGo, "a_test.go", "helper"),
         ] {
             let old = parse_lcov(&format!("SF:{file}\nFNDA:1,{symbol}\n")).unwrap();
             let new = parse_lcov(&format!("SF:{file}\nFNDA:0,{symbol}\n")).unwrap();
             assert!(compare_lane(lane, &old, Some(&new), &[]).is_empty());
             assert!(compare_lane(lane, &old, Some(&Default::default()), &[]).is_empty());
         }
-        assert!(!Lane::Node.excludes_function("src/tests-helper.ts", "f"));
         assert!(!Lane::Rust.excludes_function("a.rs", "crate::test_helper"));
         assert!(!Lane::Netd.excludes_function("test.go", "f"));
     }
@@ -637,13 +614,13 @@ mod tests {
     #[test]
     fn missing_lanes_can_be_explicitly_allowed() {
         let old = parse_lcov("SF:a.rs\nDA:1,1\n").unwrap();
-        let rows = compare_lane(Lane::Node, &old, None, &[]);
+        let rows = compare_lane(Lane::Netd, &old, None, &[]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "lane-missing");
         assert!(rows[0].fail);
-        assert!(compare_lane(Lane::Node, &old, None, &["node".to_owned()]).is_empty());
+        assert!(compare_lane(Lane::Netd, &old, None, &["netd".to_owned()]).is_empty());
         assert_eq!(
-            compare_lane(Lane::Node, &old, None, &["rust".to_owned()]).len(),
+            compare_lane(Lane::Netd, &old, None, &["rust".to_owned()]).len(),
             1
         );
     }
@@ -654,20 +631,12 @@ mod tests {
         let new = tempfile::tempdir().unwrap();
         for dir in [old.path(), new.path()] {
             std::fs::write(dir.join("rust.lcov"), "SF:a.rs\nFNDA:1,f\nDA:1,1\n").unwrap();
-            std::fs::create_dir(dir.join("node")).unwrap();
-            std::fs::write(dir.join("node/lcov.info"), "SF:a.ts\nFNDA:1,f\nDA:1,1\n").unwrap();
-            for lane in ["netd", "taild", "sdk-go"] {
-                std::fs::write(
-                    dir.join(format!("{lane}.cover")),
-                    "mode: atomic\na.go:1.1,2.1 1 1\n",
-                )
-                .unwrap();
-                std::fs::write(
-                    dir.join(format!("{lane}.func.txt")),
-                    "a.go:1:\tf\t100.0%\ntotal:\t(statements)\t100.0%\n",
-                )
-                .unwrap();
-            }
+            std::fs::write(dir.join("netd.cover"), "mode: atomic\na.go:1.1,2.1 1 1\n").unwrap();
+            std::fs::write(
+                dir.join("netd.func.txt"),
+                "a.go:1:\tf\t100.0%\ntotal:\t(statements)\t100.0%\n",
+            )
+            .unwrap();
         }
         coverage_diff(old.path(), new.path(), &[]).unwrap();
         std::fs::write(new.path().join("rust.lcov"), "SF:a.rs\nFNDA:0,f\nDA:1,0\n").unwrap();

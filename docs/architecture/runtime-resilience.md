@@ -168,7 +168,6 @@ normal mutation readiness and drain admission, including when live refusal
 would be permitted. Read-only preflight rejects unsupported root, boot,
 resource or artifact kinds before writable initialization where possible;
 the library repeats authoritative checks under its runtime locks.
-The separate shutdown-only service retains its restrictive RPC allowlist.
 Daemon capability reports and typed refusals are validated before encoding.
 Invalid outbound evidence is a protocol failure, never a substitute
 `unsupported` reason or a successful response.

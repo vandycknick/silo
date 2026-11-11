@@ -25,11 +25,11 @@ impl w::machine_service_server::MachineService for Service {
         r: Request<w::ExportRawDiskRequest>,
     ) -> Result<Response<w::RawDiskExport>, Status> {
         let (reference, options) =
-            silo_vm_control::stopped::raw_export_request_from_wire(r.get_ref().clone())
+            silo_vm_control::stopped::raw_export_request_from_wire(r.into_inner())
                 .map_err(conversion)?;
         let state = self.clone();
         let result = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let report = state
                     .machine(&reference)
                     .await?
@@ -59,7 +59,7 @@ impl w::machine_service_server::MachineService for Service {
         observation.require_pause_submission().map_err(native)?;
         let state = self.clone();
         let result = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let machine = state.machine(&reference).await?;
                 machine.pause(&observation).await.map_err(native)?;
                 snapshot(&machine.inspect().await.map_err(native)?)
@@ -76,7 +76,7 @@ impl w::machine_service_server::MachineService for Service {
         let observation = self.observe_machine_live(&reference).await?;
         let state = self.clone();
         let result = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let machine = state.machine(&reference).await?;
                 machine.resume(&observation).await.map_err(native)?;
                 snapshot(&machine.inspect().await.map_err(native)?)
@@ -89,7 +89,7 @@ impl w::machine_service_server::MachineService for Service {
         &self,
         r: Request<w::LiveCaptureRequest>,
     ) -> Result<Response<w::LiveSnapshotInfo>, Status> {
-        let value = r.get_ref().clone();
+        let value = r.into_inner();
         let reference = reference(value.machine)?;
         let options = libvm::LiveSnapshotOptions {
             name: value
@@ -112,7 +112,7 @@ impl w::machine_service_server::MachineService for Service {
         let observation = self.observe_machine_live(&reference).await?;
         let state = self.clone();
         let result = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let snapshot = state
                     .machine(&reference)
                     .await?
@@ -130,7 +130,7 @@ impl w::machine_service_server::MachineService for Service {
         r: Request<w::LiveForkRequest>,
     ) -> Result<Response<w::LiveForkResult>, Status> {
         let (reference, options) =
-            silo_vm_control::fork::request_from_wire(r.get_ref().clone()).map_err(conversion)?;
+            silo_vm_control::fork::request_from_wire(r.into_inner()).map_err(conversion)?;
         options.validate().map_err(native)?;
         // Capability refusal precedes every lock, reservation and journal row.
         self.require_machine_live(&reference, vm_spec::live::LiveOperation::Fork)
@@ -139,7 +139,7 @@ impl w::machine_service_server::MachineService for Service {
         let state = self.clone();
         // The spawned mutation owns the operation: a client disconnect is not cancellation.
         let result = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let result = state
                     .machine(&reference)
                     .await?
@@ -156,7 +156,7 @@ impl w::machine_service_server::MachineService for Service {
         &self,
         r: Request<w::StoppedForkRequest>,
     ) -> Result<Response<w::MachineSnapshot>, Status> {
-        let value = r.get_ref().clone();
+        let value = r.into_inner();
         let reference = reference(value.machine)?;
         let options = libvm::ForkOptions {
             name: silo_vm_control::stopped::name(value.name).map_err(conversion)?,
@@ -170,7 +170,7 @@ impl w::machine_service_server::MachineService for Service {
             .map_err(native)?;
         let state = self.clone();
         let result = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let child = state
                     .machine(&reference)
                     .await?
@@ -187,7 +187,7 @@ impl w::machine_service_server::MachineService for Service {
         &self,
         r: Request<w::CreateStorageSnapshotRequest>,
     ) -> Result<Response<w::StorageSnapshotInfo>, Status> {
-        let value = r.get_ref().clone();
+        let value = r.into_inner();
         let reference = reference(value.machine)?;
         let options = libvm::SnapshotOptions {
             name: value
@@ -207,7 +207,7 @@ impl w::machine_service_server::MachineService for Service {
             .map_err(native)?;
         let state = self.clone();
         let result = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let info = state
                     .machine(&reference)
                     .await?
@@ -298,12 +298,12 @@ impl w::machine_service_server::MachineService for Service {
         r: Request<w::CreateMachineRequest>,
     ) -> Result<Response<Self::CreateMachineStream>, Status> {
         let (config, source) =
-            requests::create_request_from_wire(r.get_ref().clone()).map_err(conversion)?;
+            requests::create_request_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let tx_terminal = tx.clone();
         let (progress, mut events) = libvm::ImageProgressSender::channel(8);
-        let permit = self.admit(&r, true).await?;
+        let permit = self.admit().await?;
         let tx_error = tx.clone();
         // Forward progress concurrently; losing the consumer must not abandon native creation.
         let forwarding = tokio::spawn(async move {
@@ -369,12 +369,12 @@ impl w::machine_service_server::MachineService for Service {
         &self,
         r: Request<w::StartMachineRequest>,
     ) -> Result<Response<w::MachineStart>, Status> {
-        let v = r.get_ref().clone();
+        let v = r.into_inner();
         let reference = reference(v.machine)?;
         let opts = lifecycle::start_options_from_wire(required(v.options)?).map_err(conversion)?;
         let state = self.clone();
         let out = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let m = state.machine(&reference).await?;
                 let mut options = libvm::MachineStartOptions::new().credentials(opts.credentials);
                 if let Some(e) = opts.entrypoint {
@@ -403,13 +403,13 @@ impl w::machine_service_server::MachineService for Service {
         &self,
         r: Request<w::StopMachineRequest>,
     ) -> Result<Response<w::MachineSnapshot>, Status> {
-        let v = r.get_ref().clone();
+        let v = r.into_inner();
         let reference = reference(v.machine)?;
         let timeout = v.timeout.map(|value| duration(Some(value))).transpose()?;
         let expected = v.expected_run.as_deref().map(run).transpose()?;
         let state = self.clone();
         Ok(Response::new(
-            self.mutate(&r, false, async move {
+            self.mutate(async move {
                 let m = state.machine(&reference).await?;
                 if v.force {
                     let mut options = libvm::MachineKillOptions::new();
@@ -447,7 +447,7 @@ impl w::machine_service_server::MachineService for Service {
     ) -> Result<Response<()>, Status> {
         let reference = reference(r.get_ref().machine.clone())?;
         let state = self.clone();
-        self.mutate(&r, false, async move {
+        self.mutate(async move {
             state
                 .machine(&reference)
                 .await?
@@ -467,7 +467,7 @@ impl w::machine_service_server::MachineService for Service {
             updates::update_from_wire(required(r.get_ref().update.clone())?).map_err(conversion)?;
         let state = self.clone();
         Ok(Response::new(
-            self.mutate(&r, true, async move {
+            self.mutate(async move {
                 snapshot(
                     &state
                         .machine(&reference)
@@ -487,11 +487,11 @@ impl w::machine_service_server::MachineService for Service {
         r: Request<w::UpdateBootAssetsRequest>,
     ) -> Result<Response<w::MachineSnapshot>, Status> {
         let (reference, update) =
-            silo_vm_control::boot::update_boot_assets_from_wire(r.get_ref().clone())
+            silo_vm_control::boot::update_boot_assets_from_wire(r.into_inner())
                 .map_err(conversion)?;
         let state = self.clone();
         Ok(Response::new(
-            self.mutate(&r, true, async move {
+            self.mutate(async move {
                 snapshot(
                     &state
                         .machine(&reference)
@@ -561,7 +561,7 @@ impl w::machine_service_server::MachineService for Service {
         }
         let state = self.clone();
         Ok(Response::new(
-            self.mutate(&r, false, async move {
+            self.mutate(async move {
                 snapshot(
                     &state
                         .machine(&reference)
@@ -582,7 +582,7 @@ impl w::machine_service_server::MachineService for Service {
         let options = libvm::MachineKillOptions::new().timeout(duration(r.get_ref().timeout)?);
         let state = self.clone();
         Ok(Response::new(
-            self.mutate(&r, false, async move {
+            self.mutate(async move {
                 lifecycle::exit_to_wire(
                     &state
                         .machine(&reference)
@@ -616,9 +616,9 @@ impl w::machine_service_server::MachineService for Service {
         ))
     }
     async fn remove_after_run(&self, r: Request<w::MachineRunRef>) -> Result<Response<()>, Status> {
-        let (reference, run) = run_ref(Some(r.get_ref().clone()))?;
+        let (reference, run) = run_ref(Some(r.into_inner()))?;
         let state = self.clone();
-        self.mutate(&r, false, async move {
+        self.mutate(async move {
             state
                 .machine(&reference)
                 .await?
@@ -634,10 +634,10 @@ impl w::machine_service_server::MachineService for Service {
         r: Request<w::SetMachineSecretRequest>,
     ) -> Result<Response<()>, Status> {
         requests::validate_machine_secret(r.get_ref()).map_err(conversion)?;
-        let v = r.get_ref().clone();
+        let v = r.into_inner();
         let reference = id(&v.id)?;
         let state = self.clone();
-        self.mutate(&r, false, async move {
+        self.mutate(async move {
             state
                 .machine(&reference)
                 .await?

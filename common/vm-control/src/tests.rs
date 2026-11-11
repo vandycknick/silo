@@ -547,16 +547,7 @@ fn immutable_image_verification_ignores_cache_warming_but_not_identity() {
 }
 
 #[test]
-fn bootstrap_and_secret_debug_never_include_values() {
-    let bootstrap = w::HelperBootstrap {
-        client_secret: Some(b"never-show-this".to_vec()),
-        oauth_app_secret: Some(b"never-show-this".to_vec()),
-        api_token: Some(b"never-show-this".to_vec()),
-        ..Default::default()
-    };
-    assert!(!format!("{bootstrap:?}").contains("never-show-this"));
-    assert!(format!("{bootstrap:?}").contains("<redacted>"));
-    assert!(!format!("{bootstrap:?}").contains(&format!("{:?}", b"never-show-this".to_vec())));
+fn secret_debug_never_includes_values() {
     let request = w::SetMachineSecretRequest {
         id: "12345678-1234-4234-8234-123456789abc".into(),
         name: "tailscale.vm.auth_key".into(),

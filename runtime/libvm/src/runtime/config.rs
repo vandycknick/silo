@@ -36,8 +36,6 @@ pub struct RuntimeConfig {
     /// Explicit generated-state root, overriding `SILO_RUN_ROOT`.
     /// Must be absolute and short enough for machine Unix socket paths.
     pub run_root: Option<PathBuf>,
-    /// Portable runtime root bundled by an SDK frontend.
-    pub bundled_runtime_root: Option<PathBuf>,
     /// Exact component selection; use `with_runtime_components` to set it.
     pub(crate) runtime_components: Option<ResolvedRuntimeComponents>,
     /// Explicit override of silo-vmm's virtualization backend.
@@ -143,13 +141,6 @@ impl RuntimeConfig {
         self
     }
 
-    /// Sets a portable runtime root bundled by an SDK frontend.
-    pub fn with_bundled_runtime_root(mut self, bundled_runtime_root: impl Into<PathBuf>) -> Self {
-        self.runtime_components = None;
-        self.bundled_runtime_root = Some(bundled_runtime_root.into());
-        self
-    }
-
     /// Resolves native components without opening a runtime or its state store.
     pub fn resolve_components(&self) -> Result<ResolvedRuntimeComponents, LibVmError> {
         resolve_components(self)
@@ -164,7 +155,6 @@ impl RuntimeConfig {
         self.initramfs_path = None;
         self.agent_path = None;
         self.runtime_root = None;
-        self.bundled_runtime_root = None;
         self.runtime_components = Some(components);
         self
     }

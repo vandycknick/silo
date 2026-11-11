@@ -1,4 +1,4 @@
-"""Explicit real-guest controller fixtures, with no SDK or production sidechannel."""
+"""Explicit real-guest controller fixtures, with no production sidechannel."""
 from __future__ import annotations
 
 import json
