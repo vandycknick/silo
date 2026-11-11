@@ -58,6 +58,31 @@ impl TailscaleConfig {
     pub(crate) fn hostname(&self) -> &str {
         &self.hostname
     }
+    pub(crate) fn control_url(&self) -> &str {
+        &self.control_url
+    }
+    pub(crate) fn enrollment_mode(&self) -> EnrollmentMode {
+        self.enrollment.mode
+    }
+    pub(crate) fn disable_key_expiry(&self) -> bool {
+        self.enrollment.disable_key_expiry
+    }
+    /// `(cpus, memory, disk)` applied when a create request omits them.
+    pub(crate) fn vm_defaults(&self) -> (u64, u64, u64) {
+        let d = &self.vm.defaults;
+        (d.cpus, d.memory, d.disk)
+    }
+    /// `(vms_per_principal, cpus, memory, disk)` bounding every principal.
+    pub(crate) fn vm_ceilings(&self) -> (u64, u64, u64, u64) {
+        let c = &self.vm.ceilings;
+        (c.vms_per_principal, c.cpus, c.memory, c.disk)
+    }
+    pub(crate) fn disk_reserve(&self) -> u64 {
+        self.disk_reserve
+    }
+    pub(crate) fn file_transfer_limit(&self) -> u64 {
+        self.file_transfer_limit
+    }
     pub(super) fn validate(&self) -> eyre::Result<()> {
         let name = self.hostname.as_bytes();
         if name.is_empty()

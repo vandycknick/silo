@@ -10,6 +10,7 @@ use tokio::sync::{oneshot, OnceCell, Semaphore};
 use tonic::Status;
 mod daemon;
 mod handoff;
+pub(crate) mod lobby;
 mod machine;
 mod network;
 mod runtime;

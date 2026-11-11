@@ -398,7 +398,12 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
     let encoded = rich.encode_to_vec();
     tonic::Status::with_details(code, rich.message, encoded.into())
 }
-pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, ConversionError> {
+/// Decodes and validates the typed error detail of a daemon status. `None`
+/// when the status carries no rich details at all (plain tonic statuses).
+pub fn status_error_detail(v: &tonic::Status) -> Result<Option<w::ErrorDetail>, ConversionError> {
+    if v.details().is_empty() {
+        return Ok(None);
+    }
     let rich = RpcStatus::decode(v.details())
         .map_err(|_| invalid("error.status", "missing or malformed rich status"))?;
     if rich.code != v.code() as i32 {
@@ -414,8 +419,13 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
     if details.next().is_some() {
         return Err(invalid("error.detail", "ambiguous typed details"));
     }
-    let d = w::ErrorDetail::decode(detail.value.as_slice())
-        .map_err(|_| invalid("error.detail", "malformed typed detail"))?;
+    w::ErrorDetail::decode(detail.value.as_slice())
+        .map(Some)
+        .map_err(|_| invalid("error.detail", "malformed typed detail"))
+}
+pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, ConversionError> {
+    let d = status_error_detail(v)?
+        .ok_or_else(|| invalid("error.status", "missing or malformed rich status"))?;
     if !(1..=8).contains(&d.kind) {
         return Err(invalid("error.kind", "invalid enum"));
     }
