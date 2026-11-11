@@ -48,6 +48,28 @@ pub enum Resource {
 }
 
 impl Resource {
+    fn format_value(self, value: u64) -> String {
+        match self {
+            Self::GuestPathBytes
+            | Self::ComponentBytes
+            | Self::EncodedXattrBytes
+            | Self::RegularFileBytes
+            | Self::ExpandedLayerBytes
+            | Self::LogicalLowerBytes
+            | Self::FsmetaBytes
+            | Self::VirtualDiskBytes
+            | Self::CapturedRamBytes
+            | Self::ArtifactStreamBytes
+            | Self::MetadataPageBytes
+            | Self::RootBootstrapBytes
+            | Self::OciManifestBytes
+            | Self::TransferChunkBytes
+            | Self::ZstdWindowBytes
+            | Self::VmdkDescriptorBytes => utils::format_storage_size(value),
+            _ => value.to_string(),
+        }
+    }
+
     pub const fn maximum(self) -> u64 {
         match self {
             Self::LayerOccurrences => oci::changeset::limits::FORMAT_LIMITS.max_layers,
@@ -113,7 +135,7 @@ impl Resource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BoundViolation {
-    #[error("{resource:?} is {actual}, exceeding v1 maximum {maximum}")]
+    #[error("{resource:?} is {}, exceeding v1 maximum {}", resource.format_value(*actual), resource.format_value(*maximum))]
     Exceeded {
         resource: Resource,
         actual: u64,
@@ -122,10 +144,11 @@ pub enum BoundViolation {
     #[error("{resource:?} arithmetic overflow")]
     Overflow { resource: Resource },
     #[error(
-        "virtual disk length {length} must be positive and aligned to 512-byte logical sectors"
+        "virtual disk length {} must be positive and aligned to 512-byte logical sectors",
+        utils::format_storage_size(*length)
     )]
     DiskGeometry { length: u64 },
-    #[error("upper length {length} must be at least 64 MiB and aligned to 4096 bytes")]
+    #[error("upper length {} must be at least 64 MiB and aligned to 4096 bytes", utils::format_storage_size(*length))]
     UpperGeometry { length: u64 },
 }
 
@@ -251,6 +274,28 @@ mod tests {
         check_fd_budget, validate_disk_length, validate_mtime, validate_upper_length,
         BoundViolation, FileDescriptorBudgetError, Resource,
     };
+
+    #[test]
+    fn byte_bounds_use_storage_units_but_counts_do_not() {
+        assert_eq!(
+            BoundViolation::Exceeded {
+                resource: Resource::CapturedRamBytes,
+                actual: 2 << 30,
+                maximum: 1 << 30,
+            }
+            .to_string(),
+            "CapturedRamBytes is 2GiB, exceeding v1 maximum 1GiB"
+        );
+        assert_eq!(
+            BoundViolation::Exceeded {
+                resource: Resource::LayerEntries,
+                actual: 2_000_000,
+                maximum: 1_000_000,
+            }
+            .to_string(),
+            "LayerEntries is 2000000, exceeding v1 maximum 1000000"
+        );
+    }
 
     #[test]
     fn every_admission_boundary_matches_explicit_adr_values() {

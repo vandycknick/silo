@@ -67,7 +67,7 @@ const MAX_LOG_BLOCK_SIZE: u32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Ext4Rejection {
-    #[error("selected root range of {length} bytes cannot hold an ext4 superblock")]
+    #[error("selected root range of {} cannot hold an ext4 superblock", utils::format_storage_size(*length))]
     RangeTooSmall { length: u64 },
     #[error("selected root range is not ext4 (superblock magic {magic:#06x})")]
     NotExt4 { magic: u16 },
@@ -84,7 +84,7 @@ pub enum Ext4Rejection {
     },
     #[error("ext4 first data block {first_data_block} contradicts the block size")]
     FirstDataBlock { first_data_block: u32 },
-    #[error("ext4 inode size {inode_size} is not a power of two between 128 and the block size")]
+    #[error("ext4 inode size {} is not a power of two between 128 and the block size", utils::format_storage_size(u64::from(*inode_size)))]
     InodeSize { inode_size: u16 },
     #[error("ext4 incompatible features {features:#x} are not supported by the admitted kernel")]
     IncompatibleFeatures { features: u32 },
@@ -103,7 +103,9 @@ pub enum Ext4Rejection {
     #[error("ext4 superblock checksum {stored:#010x} does not match {computed:#010x}")]
     Checksum { stored: u32, computed: u32 },
     #[error(
-        "ext4 declares {filesystem_bytes} bytes, larger than its {range_bytes}-byte root range"
+        "ext4 declares {}, larger than its {} root range",
+        utils::format_storage_size(*filesystem_bytes),
+        utils::format_storage_size(*range_bytes)
     )]
     Truncated {
         filesystem_bytes: u64,

@@ -88,8 +88,9 @@ impl FormatOptions {
 fn validate_label(label: &str) -> FormatResult<()> {
     if label.len() > VOLUME_NAME_LEN {
         return Err(FormatError::InvalidLabel(format!(
-            "label {label:?} is {} bytes, ext4 limit is {VOLUME_NAME_LEN}",
-            label.len()
+            "label {label:?} is {}, ext4 limit is {}",
+            utils::format_storage_size(label.len() as u64),
+            utils::format_storage_size(VOLUME_NAME_LEN as u64)
         )));
     }
     if label.contains('\0') {

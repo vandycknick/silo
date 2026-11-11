@@ -76,7 +76,7 @@ pub enum OciError {
         actual: String,
     },
 
-    #[error("cached OCI layer {digest} at {path} has {actual} bytes; expected {expected}")]
+    #[error("cached OCI layer {digest} at {path} has {}; expected {}", utils::format_storage_size(*actual), utils::format_storage_size(*expected))]
     LayerSizeMismatch {
         digest: String,
         path: PathBuf,
@@ -117,7 +117,10 @@ pub enum OciError {
     ImageConfig { reference: String, message: String },
 
     #[error(
-        "{content} for {reference:?} has {actual} bytes; expected {expected:?}, maximum {limit}"
+        "{content} for {reference:?} has {}; expected {}, maximum {}",
+        utils::format_storage_size(*actual),
+        expected.map(utils::format_storage_size).unwrap_or_else(|| "unspecified".to_string()),
+        utils::format_storage_size(*limit)
     )]
     MetadataSize {
         reference: String,
@@ -301,6 +304,25 @@ mod tests {
     };
 
     use crate::OciError;
+
+    #[test]
+    fn metadata_size_errors_format_known_and_unknown_expected_sizes() {
+        for (expected, text) in [(Some(1 << 20), "1MiB"), (None, "unspecified")] {
+            assert_eq!(
+                OciError::MetadataSize {
+                    reference: "example:latest".into(),
+                    content: "OCI manifest",
+                    expected,
+                    actual: 2 << 20,
+                    limit: 4 << 20,
+                }
+                .to_string(),
+                format!(
+                    "OCI manifest for \"example:latest\" has 2MiB; expected {text}, maximum 4MiB"
+                )
+            );
+        }
+    }
 
     #[test]
     fn manifest_unknown_reports_missing_tag() {

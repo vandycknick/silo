@@ -100,9 +100,9 @@ pub(crate) fn load_record<T: DeserializeOwned>(path: &Path) -> eyre::Result<Opti
     let length = file.metadata()?.len();
     if length > MAX_RECORD_BYTES {
         bail!(
-            "record {} exceeds {} bytes",
+            "record {} exceeds {}",
             path.display(),
-            MAX_RECORD_BYTES
+            crate::ui::human_bytes(Some(MAX_RECORD_BYTES))
         );
     }
     let mut bytes = Vec::with_capacity(length as usize);
@@ -120,7 +120,10 @@ pub(crate) fn write_record<T: Serialize>(path: &Path, value: &T) -> eyre::Result
     set_private_directory(parent)?;
     let bytes = serde_json::to_vec_pretty(value).context("serialize system record")?;
     if bytes.len() as u64 > MAX_RECORD_BYTES {
-        bail!("serialized record exceeds {} bytes", MAX_RECORD_BYTES);
+        bail!(
+            "serialized record exceeds {}",
+            crate::ui::human_bytes(Some(MAX_RECORD_BYTES))
+        );
     }
     let temporary = parent.join(format!(
         ".{}.{}.tmp",

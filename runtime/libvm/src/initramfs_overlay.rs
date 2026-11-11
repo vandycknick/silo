@@ -40,8 +40,8 @@ pub(crate) fn write_composite(
     if let Some((_, config)) = agent_payload {
         if config.len() > MAX_AGENT_CONFIG_SIZE_BYTES {
             eyre::bail!(
-                "serialized agent config exceeds {} byte limit",
-                MAX_AGENT_CONFIG_SIZE_BYTES
+                "serialized agent config exceeds {} limit",
+                utils::format_storage_size(MAX_AGENT_CONFIG_SIZE_BYTES as u64)
             );
         }
     }

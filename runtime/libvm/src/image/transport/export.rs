@@ -406,7 +406,12 @@ fn check_transport_streams(
     if total > budget {
         return Err(invalid(
             "stream table",
-            format!("complete transport closure of {total} bytes exceeds the {budget}-byte artifact stream budget"),
+            format!(
+                "complete transport closure of {} exceeds the {} artifact stream budget (short by {})",
+                utils::format_storage_size(total),
+                utils::format_storage_size(budget),
+                utils::format_storage_size(total.saturating_sub(budget))
+            ),
         ));
     }
     Ok(total)

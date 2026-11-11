@@ -1707,7 +1707,7 @@ async fn live_capture_exceeding_the_reserved_total_fails_before_its_seal() {
         assert_eq!(failure.stage, LiveStage::CaptureVerify);
         let message = failure.message.as_ref().unwrap().to_string();
         assert!(
-            message.contains(&plan.reservation.staging_bytes.to_string()),
+            message.contains(&utils::format_storage_size(plan.reservation.staging_bytes)),
             "{message}"
         );
         let directory = harness.capture_dir(&request);

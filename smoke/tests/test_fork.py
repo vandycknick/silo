@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from decimal import Decimal
 import fcntl
 import json
 import math
@@ -41,7 +42,10 @@ MIB = fork.MIB
 STATE_RESERVE = 64 * MIB
 FAILING_HOOK = {"argv": ["/bin/sh", "-c", "exit 7"], "environment": [], "workingDirectory": "/",
                 "timeoutMs": 5000}
-BUDGET_REFUSAL = re.compile(r"RAM budget requires (\d+) bytes, available (\d+) bytes")
+HUMAN_SIZE = r"(\d+(?:\.\d+)?(?:GiB|MiB|B))"
+BUDGET_REFUSAL = re.compile(
+    rf"RAM budget requires {HUMAN_SIZE}, available {HUMAN_SIZE} \(short by {HUMAN_SIZE}\)"
+)
 
 
 @dataclass(frozen=True)
@@ -580,6 +584,45 @@ def batch_bytes(ram: int, children: int, percent: int = 100) -> int:
     return ram + children * (private + math.ceil(ram / 512) + STATE_RESERVE)
 
 
+def size_interval(text: str) -> tuple[int, int]:
+    """Inclusive byte bounds for the formatter's nearest-hundredth units."""
+    for suffix, unit in [("GiB", 1024 * MIB), ("MiB", MIB), ("B", 1)]:
+        if text.endswith(suffix):
+            value = Decimal(text[:-len(suffix)]) * unit
+            tolerance = Decimal(unit) / 200 if unit > 1 else Decimal(0)
+            return max(0, math.ceil(value - tolerance)), math.floor(value + tolerance)
+    raise AssertionError(f"invalid human-readable size: {text}")
+
+
+def budget_refusal(diagnostic: str) -> tuple[tuple[int, int], tuple[int, int]]:
+    match = BUDGET_REFUSAL.search(diagnostic)
+    assert match is not None, diagnostic
+    required, available, shortfall = (size_interval(value) for value in match.groups())
+    assert shortfall[0] > 0, diagnostic
+    # A displayed equality is still a refusal if a positive shortfall explains it.
+    assert required[1] > available[0], diagnostic
+    assert required[0] - available[1] <= shortfall[1], diagnostic
+    assert required[1] - available[0] >= shortfall[0], diagnostic
+    return required, available
+
+
+@pytest.mark.parametrize("text, value", [
+    ("0B", 0), ("1B", 1), ("1048575B", MIB - 1),
+    ("1MiB", MIB), ("1.01MiB", MIB + MIB // 100),
+    ("1024MiB", 1024 * MIB - 1), ("1GiB", 1024 * MIB + 1),
+])
+def test_size_interval_includes_formatter_rounding(text: str, value: int) -> None:
+    lower, upper = size_interval(text)
+    assert lower <= value <= upper
+
+
+def test_budget_refusal_accepts_equal_rounded_sizes_with_positive_shortfall() -> None:
+    required, available = budget_refusal(
+        "restore RAM budget requires 1GiB, available 1GiB (short by 1B)")
+    assert required[0] <= 1024 * MIB + 1 <= required[1]
+    assert available[0] <= 1024 * MIB <= available[1]
+
+
 def children_for(ram: int, target: int) -> int:
     return max(1, math.ceil((target - ram) / (batch_bytes(ram, 1) - ram)))
 
@@ -596,9 +639,8 @@ def test_fork_refuses_count_memory_and_descriptor_budgets_before_freeze(
     call = refused_before_freeze(silo, prepared, [f"m{index}" for index in range(count)],
                                  "--max-children", str(count), "--private-write-percent", "100")
     diagnostic = refusal_diagnostic(call)
-    match = BUDGET_REFUSAL.search(diagnostic)
-    assert match is not None, diagnostic
-    assert int(match.group(1)) >= batch_bytes(ram, count) > int(match.group(2)), diagnostic
+    required, available = budget_refusal(diagnostic)
+    assert required[1] >= batch_bytes(ram, count) > available[1], diagnostic
     # Descriptors: the manager's own RLIMIT_NOFILE cannot hold sixteen handoffs.
     call = refused_before_freeze(silo, prepared, [f"fd-{index}" for index in range(16)], nofile=48)
     diagnostic = refusal_diagnostic(call)
@@ -647,11 +689,9 @@ def test_fork_whole_batch_refusal_counts_another_homes_admitted_batch_then_pre_s
         call = refused_before_freeze(silo, prepared, [f"a{index}" for index in range(count)],
                                      "--max-children", str(count), "--private-write-percent", "100")
         diagnostic = refusal_diagnostic(call)
-        match = BUDGET_REFUSAL.search(diagnostic)
-        assert match is not None, diagnostic
-        required, reported = int(match.group(1)), int(match.group(2))
-        assert required >= reserved + alone + batch_bytes(ram, other_count) and required > reported, diagnostic
-        assert reserved + alone < reported, "home A alone would not have fit; refusal proves nothing about B"
+        required, reported = budget_refusal(diagnostic)
+        assert required[1] >= reserved + alone + batch_bytes(ram, other_count), diagnostic
+        assert reserved + alone < reported[0], "home A alone would not have fit; refusal proves nothing about B"
 
         cancelled = fork.observe(other_silo, traced.operation, cancel=True)
         assert cancelled["cancellationRequested"] is True and cancelled["stage"] != "finished", cancelled

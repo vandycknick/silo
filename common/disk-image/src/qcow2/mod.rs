@@ -194,7 +194,7 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
-    #[error("{region:?} at byte {offset} (+{length}) ends past the {source_len}-byte source")]
+    #[error("{region:?} at byte {offset} (+{}) ends past the {} source", utils::format_storage_size(*length), utils::format_storage_size(*source_len))]
     Truncated {
         region: Region,
         offset: u64,
@@ -209,7 +209,7 @@ pub enum Error {
     Forbidden(Forbidden),
     #[error("malformed qcow2 image: {0:?}")]
     Malformed(Malformed),
-    #[error("qcow2 virtual size {0} is not a positive multiple of 512 bytes up to 1 TiB")]
+    #[error("qcow2 virtual size {} is not a positive multiple of 512 bytes up to 1 TiB", utils::format_storage_size(*.0))]
     VirtualSize(u64),
     #[error("qcow2 source no longer matches its admission")]
     SourceChanged,

@@ -25,11 +25,11 @@ pub enum ChangesetError {
     Invalid(String),
     #[error("unsupported changeset feature: {0}")]
     Unsupported(String),
-    #[error("host resource reservation requires {required} bytes but only {available} bytes are available")]
+    #[error("host resource reservation requires {} but only {} is available (short by {})", utils::format_storage_size(*required), utils::format_storage_size(*available), utils::format_storage_size(required.saturating_sub(*available)))]
     Resource { required: u64, available: u64 },
     #[error("metadata allocation failed: {0}")]
     Allocation(String),
-    #[error("{resource} is {actual}, exceeding maximum {maximum}")]
+    #[error("{resource} is {}, exceeding maximum {}", format_limit_value(resource, *actual), format_limit_value(resource, *maximum))]
     Limit {
         resource: &'static str,
         actual: u64,
@@ -41,6 +41,14 @@ pub enum ChangesetError {
     Json(#[from] serde_json::Error),
 }
 pub type ChangesetResult<T> = Result<T, ChangesetError>;
+
+fn format_limit_value(resource: &str, value: u64) -> String {
+    if resource.ends_with("bytes") || resource == "pack length" {
+        utils::format_storage_size(value)
+    } else {
+        value.to_string()
+    }
+}
 
 /// Structural acceptance never resolves a path against a lower namespace.
 pub fn validate_layer(layer: &LayerChangeset, limits: &ChangesetLimits) -> ChangesetResult<()> {
@@ -220,4 +228,45 @@ pub fn validate_layer(layer: &LayerChangeset, limits: &ChangesetLimits) -> Chang
         return Err(ChangesetError::Invalid("unreferenced pack suffix".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::changeset::ChangesetError;
+
+    #[test]
+    fn byte_limits_use_storage_units_but_counts_do_not() {
+        for resource in ["expanded layer bytes", "pack length"] {
+            assert_eq!(
+                ChangesetError::Limit {
+                    resource,
+                    actual: 2 << 30,
+                    maximum: 1 << 30,
+                }
+                .to_string(),
+                format!("{resource} is 2GiB, exceeding maximum 1GiB")
+            );
+        }
+        assert_eq!(
+            ChangesetError::Limit {
+                resource: "layer entries",
+                actual: 2_000_000,
+                maximum: 1_000_000,
+            }
+            .to_string(),
+            "layer entries is 2000000, exceeding maximum 1000000"
+        );
+    }
+
+    #[test]
+    fn resource_refusal_shows_shortfall_when_sizes_round_equal() {
+        let error = ChangesetError::Resource {
+            required: (1 << 30) + 1,
+            available: 1 << 30,
+        };
+        assert_eq!(
+            error.to_string(),
+            "host resource reservation requires 1.0GiB but only 1GiB is available (short by 1B)"
+        );
+    }
 }

@@ -28,7 +28,8 @@ pub(crate) fn parse_env(value: Option<&std::ffi::OsStr>) -> eyre::Result<Vec<Raw
         .ok_or_else(|| eyre::eyre!("restore descriptor list is not UTF-8"))?;
     eyre::ensure!(
         value.len() <= MAX_ENV_BYTES,
-        "restore descriptor list exceeds {MAX_ENV_BYTES} bytes"
+        "restore descriptor list exceeds {}",
+        utils::format_storage_size(MAX_ENV_BYTES as u64)
     );
     let fds: Vec<RawFd> = serde_json::from_str(value)
         .map_err(|error| eyre::eyre!("invalid restore descriptor list: {error}"))?;

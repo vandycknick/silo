@@ -160,9 +160,9 @@ pub(crate) fn encode_start_request(request: &VmmStartRequest) -> io::Result<Vec<
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "silo-vmm start request is {} bytes; maximum is {} bytes including newline",
-                encoded.len(),
-                VMM_START_REQUEST_MAX_BYTES
+                "silo-vmm start request is {}; maximum is {} including newline",
+                utils::format_storage_size(encoded.len() as u64),
+                utils::format_storage_size(VMM_START_REQUEST_MAX_BYTES as u64)
             ),
         ));
     }
