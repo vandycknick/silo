@@ -16,6 +16,7 @@ pub enum Component {
     Cli,
     SiloVmm,
     Netd,
+    Tsgate,
     Agent,
     Portd,
     Init,
@@ -57,6 +58,7 @@ pub fn build_runtime(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         Component::Cli,
         Component::SiloVmm,
         Component::Netd,
+        Component::Tsgate,
         Component::Agent,
         Component::Init,
     ] {
@@ -72,7 +74,8 @@ pub fn build_component(
     match component {
         Component::Cli => build_cargo_package(context, "cli"),
         Component::SiloVmm => build_vmm(context),
-        Component::Netd => build_netd(context),
+        Component::Netd => build_go_program(context, "net/netd", "netd", false),
+        Component::Tsgate => build_go_program(context, "app/tsgate", "tsgate", true),
         Component::Agent => build_guest_agent(context),
         Component::Portd => build_guest_portd(context),
         Component::Init => build_guest_init(context),
@@ -86,21 +89,25 @@ pub fn format(workspace_root: &Path, target_dir: &Path) -> Result<(), command::C
     cargo.args(["fmt", "--all", "--", "--check"]);
     command::run(cargo)?;
 
-    let mut gofmt = Command::new("gofmt");
-    gofmt
-        .current_dir(workspace_root.join("net/netd"))
-        .args(["-l", "."]);
-    let output = command::output(gofmt)?;
-    if output.stdout.is_empty() {
-        Ok(())
-    } else {
-        Err(command::CommandError::FailedWithStderr {
-            program: "gofmt".to_string(),
-            status: "unformatted files".to_string(),
-            stderr: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        })
+    for module in GO_MODULES {
+        let mut gofmt = Command::new("gofmt");
+        gofmt
+            .current_dir(workspace_root.join(module))
+            .args(["-l", "."]);
+        let output = command::output(gofmt)?;
+        if !output.stdout.is_empty() {
+            return Err(command::CommandError::FailedWithStderr {
+                program: "gofmt".to_string(),
+                status: "unformatted files".to_string(),
+                stderr: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            });
+        }
     }
+    Ok(())
 }
+
+/// Go modules that ship in the product; each is formatted, vetted and tested.
+const GO_MODULES: [&str; 2] = ["net/netd", "app/tsgate"];
 
 // Native diagnostic probes are qualified separately and must never change the
 // production lane exercised by the ordinary host suite.
@@ -190,16 +197,14 @@ fn run_tests(
         ]);
         command::run(build)?;
     }
-    // Real-process tests build private netd copies. Warm Go's build cache once
-    // before parallel nextest workers compete to compile the same cold graph.
-    let mut netd = Command::new("go");
-    netd.current_dir(workspace_root.join("net/netd")).args([
-        "build",
-        "-o",
-        "/dev/null",
-        "./cmd/netd",
-    ]);
-    command::run(netd)?;
+    // Real-process tests build private netd and tsgate copies. Warm Go's build
+    // cache once before parallel nextest workers compete for the cold graph.
+    for (module, package) in [("net/netd", "./cmd/netd"), ("app/tsgate", "./...")] {
+        let mut warm = Command::new("go");
+        warm.current_dir(workspace_root.join(module))
+            .args(["build", "-o", "/dev/null", package]);
+        command::run(warm)?;
+    }
 
     command::run(workspace_test_command(
         workspace_root,
@@ -220,15 +225,17 @@ fn run_tests(
         }
     }
     if !matches!(suite, TestSuite::Unit) {
-        let mut go = Command::new("go");
-        go.current_dir(workspace_root.join("net/netd")).arg("test");
-        // The darwin/arm64 race runtime slows netd's gVisor stack by orders of
-        // magnitude, past every real-time budget; Linux hosts carry the race lane.
-        if host != HostTarget::MacosArm64 {
-            go.arg("-race");
+        for module in GO_MODULES {
+            let mut go = Command::new("go");
+            go.current_dir(workspace_root.join(module)).arg("test");
+            // The darwin/arm64 race runtime slows gVisor-based stacks by orders
+            // of magnitude, past every real-time budget; Linux carries the race lane.
+            if host != HostTarget::MacosArm64 {
+                go.arg("-race");
+            }
+            go.arg("./...");
+            command::run(go)?;
         }
-        go.arg("./...");
-        command::run(go)?;
     }
     Ok(())
 }
@@ -316,7 +323,14 @@ fn build_vmm(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     Ok(())
 }
 
-fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+/// Builds one Go command adjacent to the Rust binaries. `pure` forces
+/// `CGO_ENABLED=0` in every profile (tsgate never links C).
+fn build_go_program(
+    context: &BuildContext<'_>,
+    module: &str,
+    name: &str,
+    pure: bool,
+) -> Result<(), ComponentError> {
     let output_dir = context.target_dir.join(context.profile.directory());
     fs::create_dir_all(&output_dir).map_err(|source| ComponentError::CreateOutputDirectory {
         path: output_dir.clone(),
@@ -326,7 +340,7 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     let go_program = release::tool("go")?;
     let (goos, goarch) = context.host.go_target();
     let mut go = Command::new(&go_program);
-    go.current_dir(context.workspace_root.join("net/netd"))
+    go.current_dir(context.workspace_root.join(module))
         .env("CARGO_TARGET_DIR", context.target_dir)
         .env("GOOS", goos)
         .env("GOARCH", goarch)
@@ -339,8 +353,11 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     )?;
     go.env("CARGO_TARGET_DIR", context.target_dir);
     context.profile.apply_go(&mut go);
-    let output = output_dir.join("netd");
-    go.args(["-o"]).arg(&output).arg("./cmd/netd");
+    if pure {
+        go.env("CGO_ENABLED", "0");
+    }
+    let output = output_dir.join(name);
+    go.args(["-o"]).arg(&output).arg(format!("./cmd/{name}"));
     command::run(go)?;
     if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
         release::set_macos_build_version(&output)?;
@@ -514,6 +531,7 @@ mod tests {
                 "cli",
                 "silo-vmm",
                 "netd",
+                "tsgate",
                 "agent",
                 "portd",
                 "init",
