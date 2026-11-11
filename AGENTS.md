@@ -50,6 +50,7 @@
 
 - I HATE MOCK tests, either do unit or e2e, nothing inbetween. Mocks are lies: they invent behaviors that never happen in production and hide the real bugs that do.
 - Test `EVERYTHING`. Tests must be rigorous. Our intent is ensuring a new person contributing to the same code base cannot break our stuff and that nothing slips by. We love rigour.
+- **Exception: `xtask/` gets NO tests.** It is a build script, not product code; tests there pin build plumbing and slow down changing it. Never add unit tests, integration tests, fixtures, or `#[cfg(test)]` modules to `xtask`. Verify xtask changes by running the actual `make` target. This exception covers only `xtask/`; everything else in the repo still gets unit tests wherever possible.
 - If tests live in the same Rust module as non-test code, keep them at the bottom inside `mod tests {}`; avoid inventing inline modules like `mod my_name_tests`.
 - Unless the user asks otherwise, run only the tests you added or modified instead of the entire suite to avoid wasting time.
 

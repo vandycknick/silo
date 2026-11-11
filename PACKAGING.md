@@ -458,11 +458,12 @@ Use an absolute path to package a local architecture-matched kernel:
 make archive KERNEL_PATH=/absolute/path/to/kernel
 ```
 
-Control registry access and cache refresh explicitly:
+Every build follows the reference to whatever is currently published; content
+is cached by digest, so an unchanged tag downloads nothing. Disable registry
+access entirely with:
 
 ```sh
 make archive KERNEL_OFFLINE=1
-make archive KERNEL_REFRESH=1
 ```
 
 The same kernel options apply to `make build`, `make stage`, `make app`, and
@@ -470,10 +471,10 @@ The same kernel options apply to `make build`, `make stage`, `make app`, and
 see the [kernel documentation](resources/kernels/README.md).
 
 Apple Silicon macOS builds also resolve and include the Rosetta probe from
-`ghcr.io/vandycknick/silo/rprobe:stable`. It uses the same verification and cache
-mechanism as the kernel, with separate `rprobe-cache` and `rprobe-provenance`
-directories. Override it with `RPROBE_REFERENCE` or `RPROBE_PATH`; control cache
-use with `RPROBE_OFFLINE=1` and `RPROBE_REFRESH=1`. For a fully offline build,
+`ghcr.io/vandycknick/silo/rprobe:stable`. It uses the same cache mechanism as the
+kernel, with separate `rprobe-cache` and `rprobe-provenance` directories. Override
+it with `RPROBE_REFERENCE` or `RPROBE_PATH`, or disable registry access with
+`RPROBE_OFFLINE=1`. For a fully offline build,
 set both `KERNEL_OFFLINE=1` and `RPROBE_OFFLINE=1`. Existing adjacent probe files
 are not an implicit override. Linux runtime builds do not download the probe.
 
