@@ -140,15 +140,7 @@ fn main() -> eyre::Result<()> {
     let trace_file = secure_file::open_append(&args.trace_log)?;
 
     let (writer, _guard) = tracing_appender::non_blocking(trace_file);
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_level(true)
-        .with_writer(writer)
-        .try_init()
+    utils::logging::init(utils::logging::Profile::Monitor, writer)
         .map_err(|err| eyre::eyre!("initialize silo-vmm tracing: {err}"))?;
 
     tracing::info!(

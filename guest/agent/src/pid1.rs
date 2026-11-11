@@ -1073,7 +1073,7 @@ mod tests {
             shutting_down: AtomicBool::new(false),
             shutdown_worker_started: AtomicBool::new(false),
             storage: Mutex::new(None),
-            diagnostics: crate::diagnostics::Diagnostics::new(std::io::stdout()),
+            diagnostics: crate::diagnostics::Diagnostics::new(std::io::stderr()),
         });
         supervisor.request_shutdown("unit shutdown request".to_string());
         assert!(*supervisor.shutdown_tx.subscribe().borrow());

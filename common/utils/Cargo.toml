@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 ssh-key = { version = "0.7.0-rc.11", default-features = false, features = ["ed25519", "std"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["feature", "fs", "term"] }

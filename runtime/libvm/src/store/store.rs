@@ -3750,4 +3750,110 @@ pub(crate) mod tests {
             .await
             .is_err());
     }
+
+    #[tokio::test]
+    async fn restored_child_cold_start_atomically_retires_completed_binding() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "restored".into(), paths.machine(id).dir());
+        config.image_ref = "execution-restore".into();
+        let restored_run = uuid::Uuid::new_v4().to_string();
+        let mut state = machine_state(id, MachineRuntimeState::Restoring);
+        state.run_id = Some(restored_run.clone());
+        db.add_machine(&config, &state).await.unwrap();
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        storage.snapshot = Some(crate::storage::identity::SnapshotId::from_sha256([7; 32]));
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        state.status = MachineRuntimeState::Running;
+        db.save_machine_state(&state).await.unwrap();
+        for terminal in [MachineRuntimeState::Stopped, MachineRuntimeState::Error] {
+            state.status = terminal;
+            state.run_id = None;
+            db.save_machine_state(&state).await.unwrap();
+            db.preflight_restored_cold_start(id).await.unwrap();
+        }
+        let mut next = machine_state(id, MachineRuntimeState::Starting);
+        next.run_id = Some(uuid::Uuid::new_v4().to_string());
+        db.start_restored_machine(&config, &next).await.unwrap();
+
+        assert_eq!(db.machine_state(id).await.unwrap(), Some(next));
+        assert_eq!(
+            db.machine_config(id).await.unwrap().unwrap().image_ref,
+            "stopped-storage"
+        );
+        let mut expected_storage = storage;
+        expected_storage.snapshot = None;
+        assert_eq!(
+            db.machine_storage(id).await.unwrap(),
+            Some(expected_storage)
+        );
+        let binding: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM machine_restore_binding WHERE machine_id=?1)",
+        )
+        .bind(id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!binding);
+    }
+
+    #[tokio::test]
+    async fn restored_child_cold_start_refuses_incomplete_and_unreconciled_runs() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "unfinished".into(), paths.machine(id).dir());
+        config.image_ref = "execution-restore".into();
+        let restored_run = uuid::Uuid::new_v4();
+        let mut state = machine_state(id, MachineRuntimeState::Restoring);
+        state.run_id = Some(restored_run.to_string());
+        db.add_machine(&config, &state).await.unwrap();
+        let mut next = machine_state(id, MachineRuntimeState::Starting);
+        next.run_id = Some(uuid::Uuid::new_v4().to_string());
+
+        // A different run's readiness must not complete this restore.
+        state.status = MachineRuntimeState::Running;
+        state.run_id = Some(uuid::Uuid::new_v4().to_string());
+        db.save_machine_state(&state).await.unwrap();
+        state.status = MachineRuntimeState::Stopped;
+        state.run_id = None;
+        db.save_machine_state(&state).await.unwrap();
+        assert!(db.start_restored_machine(&config, &next).await.is_err());
+        assert_eq!(db.machine_state(id).await.unwrap(), Some(state.clone()));
+        assert_eq!(db.machine_config(id).await.unwrap(), Some(config.clone()));
+
+        state.status = MachineRuntimeState::Running;
+        state.run_id = Some(restored_run.to_string());
+        db.save_machine_state(&state).await.unwrap();
+        // Observing a late monitor after a terminal state is not activation.
+        state.status = MachineRuntimeState::Stopped;
+        state.run_id = None;
+        db.save_machine_state(&state).await.unwrap();
+        assert!(db.preflight_restored_cold_start(id).await.is_err());
+        state.status = MachineRuntimeState::Restoring;
+        state.run_id = Some(restored_run.to_string());
+        db.save_machine_state(&state).await.unwrap();
+        state.status = MachineRuntimeState::Running;
+        db.save_machine_state(&state).await.unwrap();
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let lease = db
+            .register_launch_storage(id, restored_run, &storage, &config.spec)
+            .await
+            .unwrap();
+        state.status = MachineRuntimeState::Stopped;
+        state.run_id = None;
+        db.save_machine_state(&state).await.unwrap();
+        assert!(db.preflight_restored_cold_start(id).await.is_err());
+        assert!(db.start_restored_machine(&config, &next).await.is_err());
+        assert_eq!(db.machine_state(id).await.unwrap(), Some(state));
+        assert_eq!(db.machine_config(id).await.unwrap(), Some(config));
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        drop(lease);
+    }
 }

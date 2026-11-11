@@ -115,18 +115,8 @@ fn main() -> eyre::Result<()> {
 }
 
 fn init_tracing() -> eyre::Result<crate::diagnostics::Diagnostics> {
-    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
-        Ok(filter) => filter,
-        Err(_) => tracing_subscriber::EnvFilter::new("info"),
-    };
-
-    let diagnostics = crate::diagnostics::Diagnostics::new(std::io::stdout());
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_level(true)
-        .with_writer(diagnostics.clone())
-        .try_init()
+    let diagnostics = crate::diagnostics::Diagnostics::new(std::io::stderr());
+    utils::logging::init(utils::logging::Profile::Guest, diagnostics.clone())
         .map_err(|error| eyre::eyre!("install owned agent tracing sink: {error}"))?;
     Ok(diagnostics)
 }

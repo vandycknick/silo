@@ -1773,7 +1773,13 @@ impl Runtime {
             now_unix(),
         )
         .map_err(transition_error)?;
-        self.store.save_machine_state(&next).await
+        if config.image_ref == "execution-restore" {
+            self.native_store()?
+                .start_restored_machine(config, &next)
+                .await
+        } else {
+            self.store.save_machine_state(&next).await
+        }
     }
 
     pub(crate) async fn mark_machine_monitor_ready(
@@ -7679,5 +7685,76 @@ pub(crate) mod tests {
             .unwrap()
             .is_empty());
         assert!(pool.try_exclusive_lease(operation_id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn restored_child_start_admission_requires_completed_reconciled_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, mut config, storage) = shutdown_storage_fixture(&temp).await;
+        config.image_ref = "execution-restore".into();
+        runtime
+            .save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        let store = runtime.native_store().unwrap();
+        let sql = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(runtime.paths.state_db_path()),
+        )
+        .await
+        .unwrap();
+        let restored_run = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO machine_restore_binding(machine_id,run_id) VALUES(?1,?2)")
+            .bind(config.id.to_string())
+            .bind(restored_run.to_string())
+            .execute(&sql)
+            .await
+            .unwrap();
+        let cold_run = uuid::Uuid::new_v4();
+        assert!(runtime
+            .request_machine_start(&config, &cold_run.to_string())
+            .await
+            .is_err());
+        assert_eq!(
+            runtime.machine_state(config.id).await.unwrap().status,
+            MachineRuntimeState::Stopped
+        );
+
+        let mut restored = runtime.machine_state(config.id).await.unwrap();
+        restored.status = MachineRuntimeState::Restoring;
+        restored.run_id = Some(restored_run.to_string());
+        store.save_machine_state(&restored).await.unwrap();
+        runtime
+            .mark_machine_monitor_ready(config.id, restored_run.to_string(), i32::MAX, 1)
+            .await
+            .unwrap();
+        restored.status = MachineRuntimeState::Stopped;
+        restored.run_id = None;
+        store.save_machine_state(&restored).await.unwrap();
+        store
+            .preflight_restored_cold_start(config.id)
+            .await
+            .unwrap();
+        let lease = runtime
+            .register_launch_storage(&config, cold_run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .request_machine_start(&config, &cold_run.to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.machine_state(config.id).await.unwrap().run_id,
+            Some(cold_run.to_string())
+        );
+        assert_eq!(
+            store
+                .machine_config(config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .image_ref,
+            "stopped-storage"
+        );
+        drop(lease);
     }
 }

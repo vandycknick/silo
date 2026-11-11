@@ -832,9 +832,26 @@ admission with the owning home path and ledger cleanup guidance.
 fresh-generation acknowledgement, destination activation/thaw and final fence
 release. Failure uses the existing exact-generation stop/reap and holder/lease
 reconciliation, retaining uncertain ownership rather than launching again.
-An execution-restore child cannot be cold-started with `silo start`; retry the
-checkpoint with a fresh restore run. Inspection exposes `Restoring`, `Activating`
-and `ActivationFailed` without declaring readiness.
+After a restore or live fork reaches Running, stopping it leaves ordinary
+machine-owned disks: a clean stop is clean, and a killed guest is
+crash-consistent, just like any other stopped VM. Its next `silo start` admits
+a fresh cold boot, atomically retiring the exact-run execution-restore binding
+and snapshot provenance with the new Starting state. Inspection then reports
+an ordinary `stopped-storage` machine. The checkpoint remains independently
+retained and garbage-collected; its RAM is not loaded on this start.
+An unfinished activation cannot cold boot, even after its processes die:
+retry the retained checkpoint with a fresh restore run. Holder and lease
+reconciliation must finish before a completed child can cold boot.
+Inspection exposes `Restoring`, `Activating` and `ActivationFailed` without
+declaring readiness.
+
+Cold boot keeps the child's private raw disk or ext4 overlay upper and the
+retained immutable lower, including the captured upper UUID. It regenerates
+per-launch initramfs configuration, shutdown identity and agent session from
+the child's machine/run identity, provisions its current network/MAC and
+hostname, and starts a fresh vsock transport. Its persistent guest SSH host key
+and machine-owned SSH CA remain valid across the reboot. No captured agent
+generation, RAM mapping or source process is a boot dependency.
 
 After launch-request handoff, the restore manager waits for startup outside the
 machine mutation lock, while retaining its lifetime lock and storage lease.

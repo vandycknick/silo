@@ -14,6 +14,65 @@ use tokio::task::JoinHandle;
 
 const BRAILLE_TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠋"];
 
+/// One stderr sink and progress renderer per CLI subscriber, shared through
+/// tracing's existing dispatch context rather than a second global registry.
+pub(crate) struct LogWriter {
+    progress: MultiProgress,
+    output: std::io::Stderr,
+}
+
+impl LogWriter {
+    pub(crate) fn new() -> Self {
+        Self {
+            progress: MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10)),
+            output: std::io::stderr(),
+        }
+    }
+}
+
+pub(crate) struct LogLineWriter<'a> {
+    writer: &'a LogWriter,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = LogLineWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogLineWriter { writer: self }
+    }
+}
+
+impl Write for LogLineWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writer
+            .progress
+            .suspend(|| self.writer.output.lock().write(bytes))
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.writer
+            .progress
+            .suspend(|| self.writer.output.lock().write_all(bytes))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer
+            .progress
+            .suspend(|| self.writer.output.lock().flush())
+    }
+}
+
+fn progress_renderer() -> MultiProgress {
+    tracing::dispatcher::get_default(|dispatch| {
+        dispatch
+            .downcast_ref::<LogWriter>()
+            .map(|writer| writer.progress.clone())
+            .unwrap_or_else(|| {
+                MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10))
+            })
+    })
+}
+
 pub fn clap_styles() -> Styles {
     Styles::styled()
         .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
@@ -71,6 +130,7 @@ pub fn print_json(value: &impl Serialize) -> eyre::Result<()> {
 #[derive(Debug)]
 pub struct Spinner {
     pb: Option<ProgressBar>,
+    mp: Option<MultiProgress>,
     start: Instant,
     target: String,
     quiet: bool,
@@ -104,22 +164,24 @@ impl Spinner {
     pub fn start(label: &str, target: impl Into<String>) -> Self {
         let target = target.into();
         let is_tty = stderr_is_interactive();
-        let (pb, echo_guard) = if is_tty {
+        let (pb, mp, echo_guard) = if is_tty {
             let template = format!("   {{spinner}} {label:<12} {{msg}}");
             let style = ProgressStyle::default_spinner()
                 .tick_strings(BRAILLE_TICKS)
                 .template(&template)
                 .unwrap_or_else(|_| ProgressStyle::default_spinner());
-            let pb = ProgressBar::new_spinner().with_style(style);
+            let mp = progress_renderer();
+            let pb = mp.add(ProgressBar::new_spinner().with_style(style));
             pb.set_message(target.clone());
             pb.enable_steady_tick(Duration::from_millis(80));
-            (Some(pb), EchoGuard::acquire())
+            (Some(pb), Some(mp), EchoGuard::acquire())
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         Self {
             pb,
+            mp,
             start: Instant::now(),
             target,
             quiet: false,
@@ -130,6 +192,7 @@ impl Spinner {
     pub fn quiet() -> Self {
         Self {
             pb: None,
+            mp: None,
             start: Instant::now(),
             target: String::new(),
             quiet: true,
@@ -153,9 +216,7 @@ impl Spinner {
     }
 
     pub fn finish_success(mut self, past_tense: &str) {
-        if let Some(pb) = self.pb.take() {
-            pb.finish_and_clear();
-        }
+        self.clear();
 
         if !self.quiet {
             print_success(past_tense, &self.target, self.start.elapsed());
@@ -171,8 +232,15 @@ impl Spinner {
     }
 
     pub fn finish_clear(mut self) {
+        self.clear();
+    }
+
+    fn clear(&mut self) {
         if let Some(pb) = self.pb.take() {
             pb.finish_and_clear();
+            if let Some(mp) = &self.mp {
+                mp.remove(&pb);
+            }
         }
     }
 }
@@ -232,9 +300,7 @@ pub(crate) async fn with_delayed_spinner<T, E>(
 
 impl Drop for Spinner {
     fn drop(&mut self) {
-        if let Some(pb) = self.pb.take() {
-            pb.finish_and_clear();
-        }
+        self.clear();
     }
 }
 
@@ -290,12 +356,11 @@ impl PullProgressDisplay {
 
     fn new_inner(reference: &str, quiet: bool) -> Self {
         let is_tty = !quiet && stderr_is_interactive();
-        let mp = MultiProgress::new();
-        if is_tty {
-            mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+        let mp = if is_tty {
+            progress_renderer()
         } else {
-            mp.set_draw_target(ProgressDrawTarget::hidden());
-        }
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        };
 
         let header = mp.add(ProgressBar::new_spinner());
         header.set_style(
@@ -453,7 +518,6 @@ impl PullProgressDisplay {
 
     pub fn finish(mut self) {
         self.finish_current_applying_layer();
-        let _ = self.mp.clear();
     }
 
     fn ensure_layer_bars(&mut self, layer_count: usize) {
@@ -486,6 +550,17 @@ impl PullProgressDisplay {
             pb.set_message(format!("{}", style("✓").green()));
             pb.tick();
         }
+    }
+}
+
+impl Drop for PullProgressDisplay {
+    fn drop(&mut self) {
+        for pb in &self.layer_bars {
+            pb.finish_and_clear();
+            self.mp.remove(pb);
+        }
+        self.header.finish_and_clear();
+        self.mp.remove(&self.header);
     }
 }
 
@@ -800,6 +875,39 @@ mod tests {
     use libvm::ImageProgress;
 
     use crate::ui::{relative_time, short_id, with_delayed_spinner, PullProgressDisplay};
+
+    #[cfg(unix)]
+    #[test]
+    fn tracing_writer_owns_stderr_not_stdout() {
+        use std::os::fd::AsRawFd;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let writer = crate::ui::LogWriter::new();
+        let event_writer = writer.make_writer();
+        assert_eq!(
+            event_writer.writer.output.as_raw_fd(),
+            std::io::stderr().as_raw_fd()
+        );
+        assert_ne!(
+            event_writer.writer.output.as_raw_fd(),
+            std::io::stdout().as_raw_fd()
+        );
+    }
+
+    #[test]
+    fn progress_renderer_is_owned_by_the_current_subscriber() {
+        let writer = crate::ui::LogWriter::new();
+        let progress = writer.progress.clone();
+        let subscriber =
+            utils::logging::subscriber(utils::logging::Profile::Cli { verbosity: 0 }, writer);
+        tracing::subscriber::with_default(subscriber, || {
+            // Removing a bar through another renderer only works if both
+            // handles point at the same actual indicatif state.
+            let bar = crate::ui::progress_renderer().add(indicatif::ProgressBar::new_spinner());
+            progress.remove(&bar);
+            assert!(bar.is_hidden());
+        });
+    }
 
     #[test]
     fn confirmation_accepts_explicit_choices_and_defaults_to_no() {

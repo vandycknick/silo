@@ -82,6 +82,22 @@ CREATE TABLE machine_state (
     state_json          BLOB NOT NULL
 );
 
+-- One-shot execution restore authority. Completion survives terminal runtime
+-- reconciliation; only an admitted cold start retires the binding.
+CREATE TABLE machine_restore_binding (
+    machine_id TEXT PRIMARY KEY NOT NULL REFERENCES machine_config(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL CHECK(length(run_id) = 36),
+    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0,1))
+);
+-- Merely observing a late monitor after Stopped must not certify activation.
+CREATE TRIGGER machine_restore_completed AFTER UPDATE ON machine_state
+WHEN NEW.status = 'running' AND OLD.status IN ('restoring','activating')
+     AND json_extract(OLD.state_json,'$.runId') = json_extract(NEW.state_json,'$.runId')
+BEGIN
+    UPDATE machine_restore_binding SET completed=1
+    WHERE machine_id=NEW.machine_id AND run_id=json_extract(NEW.state_json,'$.runId');
+END;
+
 -- Local-only authentication receipts. Transport always authenticates bytes anew.
 CREATE TABLE verified_object (
     stream_sha256 TEXT PRIMARY KEY NOT NULL,

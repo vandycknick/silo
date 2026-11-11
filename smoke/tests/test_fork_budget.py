@@ -292,9 +292,11 @@ def test_fork_budget_restore_to_running(
 
 def budget_dispatch(silo: Silo, *args: str,
                     clock: Callable[[], int] = time.monotonic_ns,
-                    stderr_path: Path | None = None) -> tuple[str, int, int]:
+                    stderr_path: Path | None = None,
+                    env: dict[str, str] | None = None) -> tuple[str, int, int]:
     """Exact CLI dispatch/exit stamps in the selected host clock, excluding evidence."""
-    command, environment = [str(silo.ws.config.silo), *args], silo.ws.env()
+    command = [str(silo.ws.config.silo), *args]
+    environment = silo.ws.env() if env is None else env
     dispatched = clock()
     completed = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=240)
     exited = clock()
@@ -530,7 +532,8 @@ def test_fork_budget_boot_layered_within_raw(
             caches[profile] = fork_budget.cache_state(silo, cohort)
             start_trace = evidence.directory / f"{name}-start.trace.log"
             _, dispatched, exited = budget_dispatch(
-                silo, "start", name, clock=time.time_ns, stderr_path=start_trace)
+                silo, "start", name, clock=time.time_ns, stderr_path=start_trace,
+                env=silo.ws.env(RUST_LOG="info,libvm::runtime::start_timeline=debug"))
             # Liveness only: the timed endpoint is the product's own trace,
             # not this later CLI observation (nor its polling cadence).
             info = silo.wait_ready(name, poll_interval=0.02)
@@ -1051,7 +1054,7 @@ def test_reflink_probe_rejects_missing_workspace(tmp_path: Path) -> None:
 # The production formatter's UTC, no-target, no-ANSI structured line shape.
 # Timing values are a deterministic parser fixture, not benchmark measurements.
 START_TIMELINE_SAMPLE = (
-    f"1970-01-01T00:00:01.090000Z  INFO machine start timeline machine_id={BOOT_MACHINE_ID} "
+    f"1970-01-01T00:00:01.090000Z DEBUG machine start timeline machine_id={BOOT_MACHINE_ID} "
     'run_id="run" runtime_discovery_ms=10.25 catalog_open_recovery_ms=20.5 '
     "lifecycle_admission_ms=5.0 lower_resolve_authentication_ms=4.25 secrets_netd_ms=30.0 "
     "launch_publication_ms=5.0 durability_barrier_ms=10.0 admit_spawn_ms=4.0 total_ms=90.0"
