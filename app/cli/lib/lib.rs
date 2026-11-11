@@ -20,7 +20,25 @@ use std::process::ExitCode;
 
 use app::Cli;
 
-pub async fn run() -> ExitCode {
+/// Process entry point. The runtime and the top-level future are built here,
+/// not in `bin/main.rs`, so the whole async state machine is code-generated in
+/// this crate's parallel codegen units instead of serially in the binary crate.
+pub fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let error = eyre::eyre!("start the async runtime: {error}");
+            errors::print(&error, 0);
+            return errors::exit_code(&error);
+        }
+    };
+    runtime.block_on(run())
+}
+
+async fn run() -> ExitCode {
     let cli = Cli::parse();
     let verbose = cli.verbose;
     if let Err(error) = utils::logging::init(
