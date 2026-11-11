@@ -146,7 +146,26 @@ impl Service {
             .await
             .map_err(|status| categorize(&status))?;
         self.authorize(peer, action, Some(&machine))?;
+        if !matches!(action, Action::Read | Action::Logs) {
+            self.ensure_secret_scope(&machine).await?;
+        }
         Ok(machine)
+    }
+    pub(crate) async fn ensure_secret_scope(&self, machine: &w::MachineSnapshot) -> Outcome<()> {
+        if machine.labels.contains_key(INSTANCE_LABEL)
+            && self
+                .management()
+                .secret_scope(&machine.id)
+                .await
+                .map_err(|status| categorize(&status))?
+                != libvm::SecretScopePolicy::MachineOnly
+        {
+            return Err(Failure::new(
+                Code::Conflict,
+                "lobby VM requires Machine-only secret scope",
+            ));
+        }
+        Ok(())
     }
     pub(crate) async fn list(&self, peer: &Peer) -> Outcome<Vec<VmView>> {
         self.authorize(peer, Action::Read, None)?;
@@ -281,5 +300,211 @@ mod tests {
                 .exit,
             4
         );
+    }
+
+    #[tokio::test]
+    async fn lobby_secret_scope_invariant_refuses_legacy_and_permissive_machines() {
+        use crate::lobby::service::lifecycle::{RemoveRequest, SetRequest, StopRequest};
+        use crate::lobby::service::{
+            files::CopyRequest,
+            streams::{tests::captured_io, ExecRequest},
+        };
+        use crate::lobby::session::SessionExtras;
+
+        let fixture = testing::fixture().await;
+        let caller = testing::caller(
+            "user:1",
+            &[
+                Action::Read,
+                Action::Create,
+                Action::Start,
+                Action::Stop,
+                Action::Delete,
+                Action::Update,
+                Action::Shell,
+                Action::Exec,
+                Action::Files,
+            ],
+        );
+        for legacy in [false, true] {
+            let machine = testing::stopped_vm_with_scope(
+                &fixture,
+                if legacy { "legacy" } else { "permissive" },
+                "user:1",
+                libvm::SecretScopePolicy::MachineThenHome,
+            )
+            .await;
+            if legacy {
+                let pool = sqlx::SqlitePool::connect(&format!(
+                    "sqlite://{}",
+                    fixture.root.path().join("home/state.db").display()
+                ))
+                .await
+                .unwrap();
+                let result = sqlx::query(
+                    "UPDATE machine_config SET config_json = jsonb_remove(config_json, '$.secretScope') WHERE id = ?",
+                )
+                .bind(&machine.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+                assert_eq!(result.rows_affected(), 1);
+                pool.close().await;
+            }
+            assert!(fixture
+                .service
+                .show(&caller.peer, &machine.id)
+                .await
+                .is_ok());
+            assert_eq!(
+                fixture
+                    .service
+                    .start(&caller, &machine.id)
+                    .await
+                    .unwrap_err()
+                    .exit,
+                5
+            );
+            assert_eq!(
+                fixture
+                    .service
+                    .restart(&caller, &machine.id)
+                    .await
+                    .unwrap_err()
+                    .exit,
+                5
+            );
+            assert_eq!(
+                fixture
+                    .service
+                    .stop(&caller, &machine.id, StopRequest::default())
+                    .await
+                    .unwrap_err()
+                    .exit,
+                5
+            );
+            assert_eq!(
+                fixture
+                    .service
+                    .remove(&caller, &machine.id, RemoveRequest::default())
+                    .await
+                    .unwrap_err()
+                    .exit,
+                5
+            );
+            assert_eq!(
+                fixture
+                    .service
+                    .set(
+                        &caller,
+                        &machine.id,
+                        SetRequest {
+                            cpus: Some(3),
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .unwrap_err()
+                    .exit,
+                5
+            );
+            for action in [Action::Create, Action::Shell, Action::Exec, Action::Files] {
+                let error = fixture
+                    .service
+                    .inspect_for(&caller.peer, &machine.id, action)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, Code::Conflict, "{action}");
+                assert_eq!(error.exit, 5, "{action}");
+            }
+            let mut captured = captured_io(Vec::new(), true);
+            let shell = fixture
+                .service
+                .shell(
+                    &caller,
+                    &machine.id,
+                    "",
+                    &mut captured.io,
+                    &SessionExtras {
+                        prompt: None,
+                        approval_shown: None,
+                    },
+                )
+                .await
+                .unwrap_err();
+            let exec = fixture
+                .service
+                .exec(
+                    &caller,
+                    &machine.id,
+                    ExecRequest {
+                        program: "/bin/true".into(),
+                        ..Default::default()
+                    },
+                    &mut captured.io,
+                )
+                .await
+                .unwrap_err();
+            let upload = fixture
+                .service
+                .copy_to_vm(
+                    &caller,
+                    CopyRequest {
+                        vm: machine.id.clone(),
+                        path: "/tmp/file".into(),
+                        upload: true,
+                        ..Default::default()
+                    },
+                    &mut captured.io,
+                )
+                .await
+                .unwrap_err();
+            let download = fixture
+                .service
+                .copy_from_vm(
+                    &caller,
+                    CopyRequest {
+                        vm: machine.id.clone(),
+                        path: "/tmp/file".into(),
+                        ..Default::default()
+                    },
+                    &mut captured.io,
+                )
+                .await
+                .unwrap_err();
+            for error in [shell, exec, upload, download] {
+                assert_eq!(error.exit, 5);
+                assert_eq!(error.message, "lobby VM requires Machine-only secret scope");
+            }
+            let foreign = testing::caller("user:2", &[Action::Start]);
+            assert_eq!(
+                fixture
+                    .service
+                    .inspect_for(&foreign.peer, &machine.id, Action::Start)
+                    .await
+                    .unwrap_err()
+                    .exit,
+                3
+            );
+        }
+        let safe = testing::stopped_vm(&fixture, "safe", "user:1").await;
+        for action in [
+            Action::Start,
+            Action::Stop,
+            Action::Delete,
+            Action::Update,
+            Action::Shell,
+            Action::Exec,
+            Action::Files,
+        ] {
+            assert!(
+                fixture
+                    .service
+                    .inspect_for(&caller.peer, &safe.id, action)
+                    .await
+                    .is_ok(),
+                "{action}"
+            );
+        }
     }
 }

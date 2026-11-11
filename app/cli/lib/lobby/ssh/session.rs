@@ -5,7 +5,7 @@ use russh::{
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     io::AsyncWriteExt,
-    sync::{mpsc, watch, Mutex},
+    sync::{mpsc, oneshot, watch, Mutex},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -18,7 +18,7 @@ use crate::lobby::{
         input::{Editor, Line, SharedInput, Writer},
         notices::Notices,
         output::HumanWriter,
-        server::{Dispatcher, Permit, Shared},
+        server::{Activity, Dispatcher, Permit, RunningCommand, Shared},
     },
 };
 
@@ -40,19 +40,23 @@ impl Drop for ChannelState {
 }
 
 pub(crate) struct Handler {
-    caller: Option<Caller>,
+    caller: Caller,
     dispatcher: Arc<dyn Dispatcher>,
     shared: Arc<Shared>,
     cancel: CancellationToken,
     channels: HashMap<ChannelId, ChannelState>,
+    authenticated: Option<oneshot::Sender<()>>,
+    activity: watch::Sender<Activity>,
 }
 
 impl Handler {
     pub(crate) fn new(
-        caller: Option<Caller>,
+        caller: Caller,
         dispatcher: Arc<dyn Dispatcher>,
         shared: Arc<Shared>,
         cancel: CancellationToken,
+        authenticated: oneshot::Sender<()>,
+        activity: watch::Sender<Activity>,
     ) -> Self {
         Self {
             caller,
@@ -60,6 +64,8 @@ impl Handler {
             shared,
             cancel,
             channels: HashMap::new(),
+            authenticated: Some(authenticated),
+            activity,
         }
     }
 
@@ -85,13 +91,14 @@ impl Handler {
         let signals = state.signal_rx.take();
         let cancel = state.cancel.clone();
         let permit = state.permit.take();
+        let activity = self.activity.clone();
         tokio::spawn(async move {
             let code = if let Some((code, message)) = denied {
                 let _ = handle
                     .extended_data(id, 1, format!("Error: {message}\n"))
                     .await;
                 code
-            } else if let (Some(caller), Some(signals)) = (caller, signals) {
+            } else if let Some(signals) = signals {
                 let run = run(
                     channel,
                     caller,
@@ -101,6 +108,7 @@ impl Handler {
                     signals,
                     cancel.clone(),
                     line,
+                    activity,
                 );
                 tokio::select! { biased; code = run => code, _ = cancel.cancelled() => 255 }
             } else {
@@ -111,15 +119,6 @@ impl Handler {
                 let _ = handle.exit_status_request(id, code).await;
                 let _ = handle.eof(id).await;
                 let _ = handle.close(id).await;
-                if denied.is_some_and(|(code, _)| code == 4) {
-                    let _ = handle
-                        .disconnect(
-                            russh::Disconnect::ByApplication,
-                            "exit 4: identity unavailable or node not tagged".into(),
-                            "en".into(),
-                        )
-                        .await;
-                }
             };
             let _ = tokio::time::timeout(Duration::from_secs(2), finish).await;
         });
@@ -134,19 +133,50 @@ impl russh::server::Handler for Handler {
         Ok(Auth::Accept)
     }
 
+    async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
+        if let Some(authenticated) = self.authenticated.take() {
+            let _ = authenticated.send(());
+        }
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        _channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if !data.is_empty() {
+            self.activity.send_modify(Activity::client);
+        }
+        Ok(())
+    }
+
+    async fn extended_data(
+        &mut self,
+        _channel: ChannelId,
+        _code: u32,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if !data.is_empty() {
+            self.activity.send_modify(Activity::client);
+        }
+        Ok(())
+    }
+
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let permit = self
-            .caller
-            .as_ref()
-            .and_then(|caller| self.shared.admit(&caller.peer.node_id));
-        let denied = if self.caller.is_none() {
-            Some((4, "identity unavailable or node not tagged"))
-        } else if permit.is_none() {
+        self.activity.send_modify(Activity::client);
+        if self.channels.len() as u64 >= self.shared.channel_limit() {
+            return Ok(());
+        }
+        let permit = self.shared.admit(&self.caller.peer.node_id);
+        let denied = if permit.is_none() {
             Some((6, "session limit reached"))
         } else {
             None
@@ -167,6 +197,8 @@ impl russh::server::Handler for Handler {
                 denied,
             },
         );
+        self.activity
+            .send_modify(|activity| activity.channels(false));
         reply.accept().await;
         Ok(())
     }
@@ -177,6 +209,8 @@ impl russh::server::Handler for Handler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.channels.remove(&channel);
+        self.activity
+            .send_modify(|activity| activity.channels(self.channels.is_empty()));
         Ok(())
     }
 
@@ -191,6 +225,7 @@ impl russh::server::Handler for Handler {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.activity.send_modify(Activity::client);
         match (
             self.channels.get_mut(&channel),
             window(
@@ -219,6 +254,7 @@ impl russh::server::Handler for Handler {
         _pix_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.activity.send_modify(Activity::client);
         if let (Some(state), Some(size)) = (self.channels.get_mut(&channel), window(columns, rows))
         {
             state.window.send_replace(size);
@@ -232,6 +268,7 @@ impl russh::server::Handler for Handler {
         signal: Sig,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.activity.send_modify(Activity::client);
         let signal = match signal {
             Sig::INT => Signal::Int,
             Sig::TERM => Signal::Term,
@@ -256,6 +293,7 @@ impl russh::server::Handler for Handler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.activity.send_modify(Activity::client);
         if data.len() > 16384 {
             return session.channel_failure(channel);
         }
@@ -270,6 +308,7 @@ impl russh::server::Handler for Handler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.activity.send_modify(Activity::client);
         self.start(channel, None, session)
     }
 
@@ -279,6 +318,7 @@ impl russh::server::Handler for Handler {
         _name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.activity.send_modify(Activity::client);
         session.channel_failure(channel)
     }
 
@@ -287,6 +327,7 @@ impl russh::server::Handler for Handler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        self.activity.send_modify(Activity::client);
         session.channel_failure(channel)?;
         Ok(false)
     }
@@ -300,6 +341,7 @@ impl russh::server::Handler for Handler {
         _screen: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.activity.send_modify(Activity::client);
         session.channel_failure(channel)
     }
 
@@ -310,6 +352,7 @@ impl russh::server::Handler for Handler {
         _value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.activity.send_modify(Activity::client);
         session.channel_failure(channel)
     }
 }
@@ -330,6 +373,7 @@ async fn run(
     signals: mpsc::Receiver<Signal>,
     cancel: CancellationToken,
     line: Option<String>,
+    activity: watch::Sender<Activity>,
 ) -> u32 {
     let pty = term.is_some();
     let stdout = channel.make_writer();
@@ -376,6 +420,7 @@ async fn run(
         let code = if let Some(line) = line {
             match caller.fresh().await {
                 Ok(peer) => {
+                    let _running = RunningCommand::new(&activity);
                     dispatcher
                         .dispatch(
                             &Caller::new(peer, fresh_resolver(&caller)),
@@ -397,7 +442,10 @@ async fn run(
             let _ = io.stderr.write_all(help::help().as_bytes()).await;
             2
         } else {
-            repl(&caller, dispatcher, &mut io, &extras, editor, notices).await
+            repl(
+                &caller, dispatcher, &mut io, &extras, editor, notices, &activity,
+            )
+            .await
         };
         let _ = io.stdout.flush().await;
         let _ = io.stderr.flush().await;
@@ -439,6 +487,7 @@ async fn repl(
     extras: &SessionExtras,
     editor: Arc<Mutex<Editor>>,
     notices: Arc<Notices>,
+    activity: &watch::Sender<Activity>,
 ) -> u32 {
     loop {
         let (send, receive) = mpsc::channel(8);
@@ -481,6 +530,7 @@ async fn repl(
             Err(_) => return 4,
         };
         let caller = Caller::new(peer, fresh_resolver(caller));
+        let _running = RunningCommand::new(activity);
         if dispatcher.dispatch(&caller, line, io, extras).await == 255 {
             return 255;
         }

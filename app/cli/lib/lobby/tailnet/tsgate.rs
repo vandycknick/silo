@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,10 +57,17 @@ impl Tsgate {
         binary: &Path,
         bootstrap: Bootstrap,
     ) -> Result<(Self, mpsc::Receiver<Connection>), TailnetError> {
+        let executable = open_helper(binary)?;
+        #[cfg(target_os = "linux")]
+        let exec_path = PathBuf::from(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+        #[cfg(not(target_os = "linux"))]
+        let exec_path = binary;
         let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
         // Command dup2()s the socket onto fd 0, which clears close-on-exec for
         // the child only; our copies keep CLOEXEC from UnixStream::pair.
-        let child = Command::new(binary)
+        let mut command = Command::new(exec_path);
+        command.as_std_mut().arg0(binary);
+        let child = command
             .args(["--control-fd", "0"])
             .env_clear()
             .stdin(Stdio::from(OwnedFd::from(theirs)))
@@ -66,6 +75,7 @@ impl Tsgate {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()?;
+        drop(executable);
         ours.set_nonblocking(true)?;
         let (read, write) = UnixStream::from_std(ours)?.into_split();
         let (state_tx, state) = watch::channel(NodeState::starting());
@@ -286,15 +296,76 @@ fn helper_for_executable(exe: &Path) -> io::Result<PathBuf> {
         let contents = dir.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "bundle has no Contents directory")
         })?;
-        return Ok(contents.join("Helpers/tsgate"));
+        validated_helper(&contents.join("Helpers"))
+    } else {
+        validated_helper(dir)
     }
-    Ok(dir.join("tsgate"))
+}
+
+fn validated_helper(dir: &Path) -> io::Result<PathBuf> {
+    let dir = dir.canonicalize()?;
+    let helper = dir.join("tsgate");
+    open_helper(&helper)?;
+    Ok(helper)
+}
+
+fn trusted_ancestor(uid: u32, gid: u32, mode: u32, euid: u32) -> bool {
+    if uid != 0 && uid != euid {
+        return false;
+    }
+    if mode & 0o022 == 0 {
+        return true;
+    }
+    uid == 0
+        && (mode & 0o1000 != 0
+            || (mode & 0o002 == 0 && (gid == 0 || (cfg!(target_os = "macos") && gid == 80))))
+}
+
+pub(crate) fn open_helper(helper: &Path) -> io::Result<std::fs::File> {
+    let dir = helper
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tsgate has no directory"))?
+        .canonicalize()?;
+    for ancestor in dir.ancestors() {
+        let metadata = std::fs::metadata(ancestor)?;
+        if !metadata.is_dir()
+            || !trusted_ancestor(
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode(),
+                nix::unistd::geteuid().as_raw(),
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tsgate package ancestors must have trusted ownership and permissions",
+            ));
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC).bits())
+        .open(helper)?;
+    let metadata = file.metadata()?;
+    let euid = nix::unistd::geteuid().as_raw();
+    if !metadata.is_file()
+        || (metadata.uid() != euid && metadata.uid() != 0)
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "tsgate must be a trusted executable in the package directory",
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::{IoSlice, Read, Write};
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -319,16 +390,136 @@ mod tests {
         ] {
             std::fs::write(&exe, b"executable").unwrap();
             std::fs::write(&helper, b"helper").unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert_eq!(
                 crate::lobby::tailnet::tsgate::helper_for_executable(&exe).unwrap(),
                 helper
             );
         }
         let ordinary = root.path().join("not-a-bundle/Contents/MacOS/silo");
+        std::fs::create_dir_all(ordinary.parent().unwrap()).unwrap();
+        let helper = ordinary.parent().unwrap().join("tsgate");
+        std::fs::write(&helper, b"helper").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             crate::lobby::tailnet::tsgate::helper_for_executable(&ordinary).unwrap(),
-            ordinary.parent().unwrap().join("tsgate")
+            helper
         );
+    }
+
+    #[test]
+    fn helpers_reject_symlinks_group_writes_and_non_executables() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("silo");
+        let helper = root.path().join("tsgate");
+        let target = root.path().join("target");
+        std::fs::write(&target, b"helper").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &helper).unwrap();
+        assert!(crate::lobby::tailnet::tsgate::helper_for_executable(&exe).is_err());
+        std::fs::remove_file(&helper).unwrap();
+        std::fs::write(&helper, b"helper").unwrap();
+        for mode in [0o775, 0o757, 0o644] {
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(crate::lobby::tailnet::tsgate::helper_for_executable(&exe).is_err());
+        }
+    }
+    #[test]
+    fn ancestor_permissions_allow_only_platform_root_equivalent_groups() {
+        use crate::lobby::tailnet::tsgate::trusted_ancestor;
+        assert!(trusted_ancestor(0, 0, 0o775, 1000));
+        assert!(trusted_ancestor(0, 0, 0o2775, 1000));
+        assert_eq!(
+            trusted_ancestor(0, 80, 0o775, 1000),
+            cfg!(target_os = "macos")
+        );
+        assert!(!trusted_ancestor(0, 50, 0o2775, 1000));
+        assert!(!trusted_ancestor(0, 0, 0o777, 1000));
+        assert!(trusted_ancestor(0, 50, 0o1777, 1000));
+        assert!(!trusted_ancestor(1000, 0, 0o775, 1000));
+    }
+
+    #[test]
+    fn ancestor_ownership_must_be_root_or_the_daemon_user() {
+        use crate::lobby::tailnet::tsgate::trusted_ancestor;
+        assert!(trusted_ancestor(0, 123, 0o755, 1000));
+        assert!(trusted_ancestor(1000, 123, 0o755, 1000));
+        assert!(!trusted_ancestor(1001, 123, 0o755, 1000));
+        assert!(!trusted_ancestor(1001, 0, 0o1777, 1000));
+    }
+
+    #[test]
+    fn helpers_reject_writable_package_directories_and_ancestors() {
+        use crate::lobby::tailnet::tsgate::open_helper;
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        std::fs::create_dir(&package).unwrap();
+        let helper = package.join("tsgate");
+        std::fs::write(&helper, b"helper").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(open_helper(&helper).is_ok());
+        for unsafe_dir in [&package, &root.path().to_path_buf()] {
+            for mode in [0o775, 0o777, 0o1777] {
+                if nix::unistd::geteuid().is_root() && matches!(mode, 0o775 | 0o1777) {
+                    continue;
+                }
+                std::fs::set_permissions(unsafe_dir, std::fs::Permissions::from_mode(mode))
+                    .unwrap();
+                assert!(open_helper(&helper).is_err());
+            }
+            std::fs::set_permissions(unsafe_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_revalidates_a_previously_validated_helper() {
+        use crate::lobby::tailnet::{
+            tsgate::{helper_for_executable, Tsgate},
+            wire::Bootstrap,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let helper = root.path().join("tsgate");
+        std::fs::write(&helper, b"not executed").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = helper_for_executable(&root.path().join("silo")).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let bootstrap = Bootstrap {
+            version: 1,
+            hostname: "test".into(),
+            tag: "tag:silo".into(),
+            control_url: String::new(),
+            state_dir: String::new(),
+            capability: String::new(),
+            client_secret: None,
+            api_base_url: None,
+        };
+        let error = Tsgate::spawn(&binary, bootstrap).await.err().unwrap();
+        assert!(error.to_string().contains("trusted executable"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd_exec_uses_the_validated_inode_after_path_replacement() {
+        use crate::lobby::tailnet::tsgate::open_helper;
+        let root = tempfile::tempdir().unwrap();
+        let helper = root.path().join("tsgate");
+        std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+        let executable = open_helper(&helper).unwrap();
+        std::fs::rename(&helper, root.path().join("original")).unwrap();
+        std::fs::write(&helper, b"invalid replacement executable").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output =
+            std::process::Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()))
+                .args([
+                    "--list",
+                    "fd_exec_uses_the_validated_inode_after_path_replacement",
+                ])
+                .output()
+                .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("fd_exec_uses_the_validated_inode_after_path_replacement"));
     }
 
     fn frame(json: &str) -> Vec<u8> {

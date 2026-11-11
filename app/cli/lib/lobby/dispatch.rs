@@ -145,6 +145,15 @@ mod tests {
             stderr_read,
         )
     }
+    fn ungranted_node(principal: &str, node: usize) -> crate::lobby::caller::Caller {
+        let mut peer = caller(principal, &[]).peer;
+        peer.node_id.push_str(&format!("-{node}"));
+        let resolved = peer.clone();
+        crate::lobby::caller::Caller::new(
+            peer,
+            std::sync::Arc::new(move || Box::pin(std::future::ready(Ok(resolved.clone())))),
+        )
+    }
 
     #[tokio::test]
     async fn success_and_failure_envelopes_are_exact() {
@@ -314,7 +323,7 @@ mod tests {
             approval_shown: None,
         };
         let mut mismatches = Vec::new();
-        for (line, expected) in [
+        for (node, (line, expected)) in [
             ("", 2), ("unknown", 2), ("ls | cat", 2), ("--json --json ls", 2), ("--yes ls", 2), ("ls --json", 4),
             ("rm vm --yes --yes", 2), ("stop vm -- x", 2), ("ls -- x", 2),
             ("rm vm --yes --yes=false", 2), ("rm vm --yes=false --yes", 2), ("--yes rm vm --yes=false", 2), ("--yes=false rm vm --yes", 2),
@@ -347,7 +356,8 @@ mod tests {
             ("logs vm --follow --stream network-audit --output stderr", 4),
             ("template", 2), ("template bogus", 2), ("template show", 2), ("template ls extra", 2), ("template ls --owner", 2), ("template ls --owner tag:ci --owner tag:ci", 2),
             ("template ls", 4), ("template show name --owner tag:ci", 4), ("template create name", 4), ("template validate", 4), ("policy rm name", 4), ("policy validate --owner tag:ci", 4),
-        ] {
+        ].into_iter().enumerate() {
+            let caller = ungranted_node("tag:ci", node);
             let (mut streams, mut stdout, mut stderr) = streams();
             let (_, window) = tokio::sync::watch::channel(Window::default());
             streams.terminal = Some(Terminal { term: "dumb".into(), window });
@@ -460,7 +470,7 @@ mod tests {
             prompt: None,
             approval_shown: None,
         };
-        for command in crate::lobby::grammar::help::COMMANDS {
+        for (node, command) in crate::lobby::grammar::help::COMMANDS.iter().enumerate() {
             for topic in std::iter::once(None).chain(command.subcommands.iter().copied().map(Some))
             {
                 let path = topic.map_or_else(
@@ -469,6 +479,7 @@ mod tests {
                 );
                 let mut rendered = Vec::new();
                 for line in [format!("help {path}"), format!("{path} --help")] {
+                    let caller = ungranted_node("user:123", node);
                     let (mut streams, stdout, mut stderr) = streams();
                     assert_eq!(
                         dispatch_session(&fixture.service, &caller, &line, &mut streams, &extras)

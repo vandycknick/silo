@@ -293,9 +293,36 @@ mod tests {
     };
     use parking_lot::Mutex;
     use sha2::{Digest, Sha256};
-    use std::sync::Arc;
+    use std::{future::Future, sync::Arc};
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn copy_futures_fit_the_default_task_stack() {
+        fn size<F: Future>(_: impl FnOnce() -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let fixture = crate::lobby::service::testing::fixture().await;
+        let caller = crate::lobby::service::testing::caller("user:1", &[]);
+        let mut io = crate::lobby::service::streams::tests::captured_io(Vec::new(), false);
+        let upload = size(|| {
+            fixture
+                .service
+                .copy_to_vm(&caller, CopyRequest::default(), &mut io.io)
+        });
+        let download = size(|| {
+            fixture
+                .service
+                .copy_from_vm(&caller, CopyRequest::default(), &mut io.io)
+        });
+        let machine = size(|| fixture.service.guest_machine("machine"));
+        assert!(upload < 16 * 1024, "upload future is {upload} bytes");
+        assert!(download < 16 * 1024, "download future is {download} bytes");
+        assert!(
+            machine < 4 * 1024,
+            "guest machine future is {machine} bytes"
+        );
+    }
 
     #[test]
     fn endpoints_only_allow_vm_absolute_paths() {

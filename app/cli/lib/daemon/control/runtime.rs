@@ -576,6 +576,8 @@ impl w::runtime_service_server::RuntimeService for Service {
         r: Request<w::CheckPolicySecretsRequest>,
     ) -> Result<Response<w::PolicySecretsResult>, Status> {
         let v = r.into_inner();
+        let secret_scope = silo_vm_control::requests::secret_scope_from_wire(v.secret_scope)
+            .map_err(conversion)?;
         let policy = values::policy_from_wire(&v.policy_json).map_err(conversion)?;
         let reference = v.machine_id.as_deref().map(id).transpose()?;
         let result = self
@@ -584,6 +586,7 @@ impl w::runtime_service_server::RuntimeService for Service {
             .check_policy_secrets(
                 &policy,
                 reference.as_ref(),
+                secret_scope,
                 &libvm::EgressCredentials::new(),
             )
             .await

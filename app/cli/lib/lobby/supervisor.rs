@@ -1,16 +1,23 @@
 //! Owns the lobby for one daemon lifetime, independently of gateway generations.
 use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use eyre::WrapErr;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use silo_secrets::{FileStore, Secret, SecretName, SecretScope, SecretStore};
 use silod_spec::status::{LobbyPhase, LobbyStatus};
-use tokio::{task::JoinSet, time::Instant};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use crate::{
     config::tailscale::TailscaleConfig,
@@ -63,11 +70,11 @@ impl LobbyContext {
 }
 
 struct Credentials {
-    client_secret: Option<String>,
-    oauth_app_secret: Option<String>,
+    client_secret: Option<Zeroizing<String>>,
+    oauth_app_secret: Option<Zeroizing<String>>,
 }
 
-fn credential(store: &FileStore, name: &str) -> eyre::Result<Option<String>> {
+fn credential(store: &FileStore, name: &str) -> eyre::Result<Option<Zeroizing<String>>> {
     match store
         .get(&SecretScope::Home, &SecretName::new(name)?)
         .map_err(|_| eyre::eyre!("cannot read lobby credential {name}"))?
@@ -78,11 +85,11 @@ fn credential(store: &FileStore, name: &str) -> eyre::Result<Option<String>> {
                 value.as_bytes().len() <= SECRET_LIMIT,
                 "lobby credential {name} exceeds 16KiB"
             );
-            Ok(Some(
+            Ok(Some(Zeroizing::new(
                 std::str::from_utf8(value.as_bytes())
                     .wrap_err_with(|| format!("lobby credential {name} is not UTF-8"))?
                     .to_owned(),
-            ))
+            )))
         }
         Some(_) => eyre::bail!("lobby credential {name} must be plain"),
     }
@@ -124,6 +131,19 @@ fn lobby_status(state: &NodeState, restarts: u32) -> LobbyStatus {
         restart_count: restarts,
         updated_at: chrono::Utc::now().to_rfc3339(),
     }
+}
+fn audited_status(state: &NodeState, restarts: u32, audit_error: Option<&str>) -> LobbyStatus {
+    let mut status = lobby_status(state, restarts);
+    if let Some(error) = audit_error {
+        if status.phase == LobbyPhase::Ready {
+            status.phase = LobbyPhase::Degraded;
+        }
+        status.diagnostic = Some(match status.diagnostic {
+            Some(diagnostic) => format!("{diagnostic}; audit writer: {error}"),
+            None => format!("audit writer: {error}"),
+        });
+    }
+    status
 }
 
 fn failed(diagnostic: String, restarts: u32) -> LobbyStatus {
@@ -172,6 +192,102 @@ struct Frontends {
 struct Storage {
     instance: String,
     audit: Audit,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum ConnectionPeer {
+    Address(IpAddr),
+    Node(String),
+}
+
+struct ConnectionLimits {
+    global: Arc<Semaphore>,
+    peers: Mutex<HashMap<ConnectionPeer, Arc<Semaphore>>>,
+    per_ip: usize,
+}
+
+struct ConnectionPermit {
+    limits: Arc<ConnectionLimits>,
+    key: ConnectionPeer,
+    global: Option<OwnedSemaphorePermit>,
+    peer: Option<OwnedSemaphorePermit>,
+}
+
+impl ConnectionLimits {
+    fn new(sessions: (u64, u64)) -> Arc<Self> {
+        let cap = |value: u64| {
+            usize::try_from(value.saturating_mul(4))
+                .unwrap_or(Semaphore::MAX_PERMITS)
+                .min(Semaphore::MAX_PERMITS)
+        };
+        Arc::new(Self {
+            global: Arc::new(Semaphore::new(cap(sessions.0))),
+            peers: Mutex::new(HashMap::new()),
+            per_ip: cap(sessions.1),
+        })
+    }
+
+    fn admit(self: &Arc<Self>, remote: &str) -> Option<ConnectionPermit> {
+        let ip = remote.parse::<SocketAddr>().ok()?.ip();
+        let key = ConnectionPeer::Address(ip);
+        let global = self.global.clone().try_acquire_owned().ok()?;
+        let mut peers = self.peers.lock();
+        let peer = peers
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.per_ip)))
+            .clone()
+            .try_acquire_owned()
+            .ok()?;
+        Some(ConnectionPermit {
+            limits: self.clone(),
+            key,
+            global: Some(global),
+            peer: Some(peer),
+        })
+    }
+}
+
+impl ConnectionPermit {
+    fn identify(&mut self, node: &str) -> bool {
+        if node.is_empty() {
+            return false;
+        }
+        let key = ConnectionPeer::Node(node.to_owned());
+        let mut peers = self.limits.peers.lock();
+        let Some(permit) = peers
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.limits.per_ip)))
+            .clone()
+            .try_acquire_owned()
+            .ok()
+        else {
+            return false;
+        };
+        self.peer.take();
+        if peers
+            .get(&self.key)
+            .is_some_and(|semaphore| semaphore.available_permits() == self.limits.per_ip)
+        {
+            peers.remove(&self.key);
+        }
+        self.key = key;
+        self.peer = Some(permit);
+        true
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut peers = self.limits.peers.lock();
+        self.peer.take();
+        self.global.take();
+        if peers
+            .get(&self.key)
+            .is_some_and(|semaphore| semaphore.available_permits() == self.limits.per_ip)
+        {
+            peers.remove(&self.key);
+        }
+    }
 }
 
 async fn frontends(
@@ -253,6 +369,24 @@ pub(crate) fn initial_status() -> LobbyStatus {
     lobby_status(&NodeState::starting(), 0)
 }
 
+pub(crate) async fn start(
+    context: eyre::Result<LobbyContext>,
+    publisher: Arc<StatusPublisher>,
+    cancel: CancellationToken,
+) -> eyre::Result<()> {
+    match context {
+        Ok(context) => run(context, cancel).await,
+        Err(error) => {
+            tracing::error!(%error, "lobby initialization failed");
+            publisher.set_lobby(Some(failed(
+                format!("lobby initialization failed: {error:#}"),
+                0,
+            )))?;
+            Err(error)
+        }
+    }
+}
+
 pub(crate) async fn run(ctx: LobbyContext, cancel: CancellationToken) -> eyre::Result<()> {
     let result = run_inner(&ctx, cancel).await;
     if let Err(error) = &result {
@@ -276,6 +410,11 @@ async fn run_inner(ctx: &LobbyContext, cancel: CancellationToken) -> eyre::Resul
         instance: state::instance(ctx.host.home())?,
         audit: Audit::open(ctx.host.home(), 10 << 20, 3)?,
     });
+    let mut audit_state = storage
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("lobby storage unavailable"))?
+        .audit
+        .diagnostic();
     let credentials = tokio::select! {
         _ = cancel.cancelled() => return Ok(()),
         result = tokio::time::timeout(Duration::from_secs(10), credentials(ctx.host.home())) => result.wrap_err("lobby credential read deadline expired")??,
@@ -290,6 +429,7 @@ async fn run_inner(ctx: &LobbyContext, cancel: CancellationToken) -> eyre::Resul
         metrics.clone(),
     ));
     let http_cancel = CancellationToken::new();
+    let connection_limits = ConnectionLimits::new(ctx.settings.session_limits());
     let mut tasks = JoinSet::new();
     let mut fronts: Option<Frontends> = None;
     let mut active = None;
@@ -325,17 +465,19 @@ async fn run_inner(ctx: &LobbyContext, cancel: CancellationToken) -> eyre::Resul
                                 result = frontends(ctx, &state, &credentials, identity.clone(), metrics.clone(), jobs.clone(), storage) => result?,
                             });
                         }
-                        ctx.publisher.set_lobby(Some(lobby_status(&state, restarts)))?;
+                        ctx.publisher.set_lobby(Some(audited_status(&state, restarts, audit_state.borrow_and_update().as_deref())))?;
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => return Ok(()),
                             exit = gate.wait() => break format!("tsgate exited: {}", exit?),
+                            _ = audit_state.changed() => {}
                             changed = node.changed() => {
                                 if changed.is_err() { break "tsgate control seam closed".into(); }
                             }
                             connection = connections.recv() => {
                                 let Some(connection) = connection else { break "tsgate connection stream closed".into(); };
                                 if let Some(fronts) = &fronts {
+                                    let Some(permit) = connection_limits.admit(&connection.remote) else { continue; };
                                     let service = fronts.service.clone();
                                     let ssh = fronts.ssh.clone();
                                     let oauth = fronts.oauth.clone();
@@ -343,6 +485,14 @@ async fn run_inner(ctx: &LobbyContext, cancel: CancellationToken) -> eyre::Resul
                                     let metrics = metrics.clone();
                                     let cancel = http_cancel.clone();
                                     tasks.spawn(async move {
+                                        let mut permit = permit;
+                                        let resolve = identity(&connection.remote);
+                                        let peer = tokio::select! {
+                                            _ = cancel.cancelled() => return,
+                                            peer = tokio::time::timeout(Duration::from_secs(15), resolve()) => peer,
+                                        };
+                                        let Ok(Ok(peer)) = peer else { return; };
+                                        if !peer.valid() || !permit.identify(&peer.node_id) { return; }
                                         match connection.listener {
                                             Listener::Ssh => { if let Err(error) = ssh.serve_stream(&connection.remote, connection.stream).await { tracing::debug!(%error, "lobby SSH connection ended"); } }
                                             Listener::Http => { if let Err(error) = crate::lobby::http::serve_connection(connection.stream, connection.remote, identity, service, metrics, oauth, cancel).await { tracing::debug!(%error, "lobby HTTP connection ended"); } }
@@ -396,7 +546,7 @@ async fn run_inner(ctx: &LobbyContext, cancel: CancellationToken) -> eyre::Resul
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     if let Some(fronts) = fronts {
-        fronts.service.config().audit.close()?;
+        fronts.service.config().audit.close().await?;
     }
     result.and(drained)
 }
@@ -676,10 +826,10 @@ mod tests {
                     Secret::Plain(SecretBytes::new(vec![b'x'; SECRET_LIMIT])),
                 )
                 .unwrap();
-            assert_eq!(
-                credential(&store, key).unwrap().unwrap().len(),
-                SECRET_LIMIT
-            );
+            let mut secret: zeroize::Zeroizing<String> = credential(&store, key).unwrap().unwrap();
+            assert_eq!(secret.len(), SECRET_LIMIT);
+            zeroize::Zeroize::zeroize(&mut secret);
+            assert!(secret.is_empty());
             store
                 .put(
                     &SecretScope::Home,
@@ -707,6 +857,116 @@ mod tests {
         }
         std::fs::write(store.path(), b"corrupt").unwrap();
         assert!(credential(&store, "tailscale.lobby.client_secret").is_err());
+    }
+
+    #[tokio::test]
+    async fn binary_validation_failure_fails_only_the_lobby() {
+        use crate::lobby::supervisor::start;
+        use crate::lobby::tailnet::tsgate::open_helper;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("tsgate");
+        std::fs::write(&binary, b"untrusted executable").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let validation = open_helper(&binary).unwrap_err();
+        let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
+        let publisher = Arc::new(
+            StatusPublisher::new(
+                &host,
+                uuid::Uuid::new_v4(),
+                "binary-validation-test".into(),
+                None,
+            )
+            .unwrap(),
+        );
+        publisher
+            .set_core(silod_spec::status::CorePhase::Ready, None)
+            .unwrap();
+        let task = tokio::spawn(start(
+            Err(validation.into()),
+            publisher.clone(),
+            CancellationToken::new(),
+        ));
+        assert!(task.await.unwrap().is_err());
+        let status = publisher.wire().unwrap();
+        assert_eq!(status.core, silod_spec::daemon::v1::CorePhase::Ready as i32);
+        let lobby = status.lobby.unwrap();
+        assert_eq!(
+            lobby.phase,
+            silod_spec::daemon::v1::LobbyPhase::Failed as i32
+        );
+        assert!(lobby.diagnostic.unwrap().contains("trusted executable"));
+    }
+
+    #[test]
+    fn audit_failure_degrades_status_and_recovery_restores_ready() {
+        use crate::lobby::supervisor::audited_status;
+        let mut state = NodeState::starting();
+        state.phase = Phase::Running;
+        let failed = audited_status(&state, 3, Some("disk full"));
+        assert_eq!(failed.phase, LobbyPhase::Degraded);
+        assert_eq!(
+            failed.diagnostic.as_deref(),
+            Some("audit writer: disk full")
+        );
+        assert_eq!(failed.restart_count, 3);
+        let recovered = audited_status(&state, 3, None);
+        assert_eq!(recovered.phase, LobbyPhase::Ready);
+        assert!(recovered.diagnostic.is_none());
+    }
+
+    #[test]
+    fn verified_node_cap_combines_both_address_families() {
+        use crate::lobby::supervisor::ConnectionLimits;
+        let limits = ConnectionLimits::new((4, 1));
+        let mut permits = Vec::new();
+        for port in 1..=4 {
+            let remote = if port % 2 == 0 {
+                format!("[fd7a:115c:a1e0::1]:{port}")
+            } else {
+                format!("100.64.0.1:{port}")
+            };
+            let mut permit = limits.admit(&remote).unwrap();
+            assert!(permit.identify("same-whois-node"));
+            permits.push(permit);
+        }
+        let mut excess = limits.admit("[fd7a:115c:a1e0::1]:99").unwrap();
+        assert!(!excess.identify("same-whois-node"));
+        let mut other = limits.admit("100.64.0.2:1").unwrap();
+        assert!(other.identify("other-whois-node"));
+        permits.pop();
+        assert!(excess.identify("same-whois-node"));
+        drop(permits);
+        drop(excess);
+        drop(other);
+        assert!(limits.peers.lock().is_empty());
+        assert_eq!(limits.global.available_permits(), 16);
+    }
+
+    #[test]
+    fn connection_admission_caps_global_and_remote_ip_and_releases_permits() {
+        let limits = crate::lobby::supervisor::ConnectionLimits::new((2, 1));
+        assert!(limits.admit("invalid").is_none());
+        let mut first = Vec::new();
+        for port in 1..=4 {
+            first.push(limits.admit(&format!("100.64.0.1:{port}")).unwrap());
+        }
+        assert!(limits.admit("100.64.0.1:99").is_none());
+        let mut second = Vec::new();
+        for port in 1..=4 {
+            second.push(
+                limits
+                    .admit(&format!("[fd7a:115c:a1e0::1]:{port}"))
+                    .unwrap(),
+            );
+        }
+        assert!(limits.admit("100.64.0.2:1").is_none());
+        first.pop();
+        assert!(limits.admit("100.64.0.1:99").is_some());
+        drop(first);
+        drop(second);
+        assert!(limits.peers.lock().is_empty());
+        assert_eq!(limits.global.available_permits(), 8);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

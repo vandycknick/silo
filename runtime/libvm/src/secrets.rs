@@ -11,6 +11,26 @@ use crate::machine::SecretProvider;
 use crate::store::models::{MachineId, MachineNetworkConfig};
 use crate::{EgressCredentials, HostCommand, LibVmError};
 
+/// Persisted authority for resolving policy credentials, fixed at machine creation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretScopePolicy {
+    #[default]
+    MachineThenHome,
+    MachineOnly,
+}
+
+impl crate::Machine {
+    /// Returns the persisted credential lookup authority, including legacy defaults.
+    pub async fn secret_scope(&self) -> Result<SecretScopePolicy, LibVmError> {
+        let (_lock, config) = self
+            .runtime()
+            .lock_machine_config(self.machine_id())
+            .await?;
+        Ok(config.secret_scope)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResolvedSecrets {
     pub(crate) credentials: EgressCredentials,
@@ -61,35 +81,24 @@ fn refreshable_oauth_prefixes(provenance: &[Provenance]) -> std::collections::BT
         .collect()
 }
 
-pub(crate) fn resolve_for_start(
-    store: &dyn SecretStore,
-    network: &MachineNetworkConfig,
-    machine_id: MachineId,
-    run: &str,
-    explicit: &EgressCredentials,
-    provider: Option<&HostCommand>,
-    reference: &str,
-) -> Result<ResolvedSecrets, LibVmError> {
-    resolve_for_scope(
-        store,
-        network,
-        Some(machine_id),
-        run,
-        explicit,
-        provider,
-        reference,
-    )
+pub(crate) struct ResolutionScope {
+    pub(crate) machine_id: Option<MachineId>,
+    pub(crate) policy: SecretScopePolicy,
 }
 
 pub(crate) fn resolve_for_scope(
     store: &dyn SecretStore,
     network: &MachineNetworkConfig,
-    machine_id: Option<MachineId>,
+    scope: ResolutionScope,
     run: &str,
     explicit: &EgressCredentials,
     provider: Option<&HostCommand>,
     reference: &str,
 ) -> Result<ResolvedSecrets, LibVmError> {
+    let ResolutionScope {
+        machine_id,
+        policy: scope_policy,
+    } = scope;
     let error = |message| LibVmError::NetworkRuntime {
         reference: reference.into(),
         message,
@@ -135,12 +144,9 @@ pub(crate) fn resolve_for_scope(
             continue;
         }
         let mut selected = None;
-        for (index, scope) in machine
-            .as_ref()
-            .map(|scope| (0, scope))
-            .into_iter()
-            .chain(std::iter::once((1, &SecretScope::Home)))
-        {
+        for (index, scope) in machine.as_ref().map(|scope| (0, scope)).into_iter().chain(
+            (scope_policy == SecretScopePolicy::MachineThenHome).then_some((1, &SecretScope::Home)),
+        ) {
             for (key, field) in [
                 (SecretName::legacy(&slot.name), SecretField::Value),
                 (slot.source.key.clone(), slot.source.field),
@@ -293,7 +299,7 @@ pub(crate) fn resolve_for_scope(
 
 #[cfg(test)]
 mod tests {
-    use crate::secrets::resolve_for_start;
+    use crate::secrets::resolve_for_scope;
     use crate::store::models::{MachineId, MachineNetworkConfig};
     use crate::{EgressCredentials, HostCommand, LibVmError, NetworkPolicy};
     use silo_secrets::{
@@ -389,10 +395,13 @@ mod tests {
         network: &MachineNetworkConfig,
         explicit: &EgressCredentials,
     ) -> Result<crate::secrets::ResolvedSecrets, LibVmError> {
-        resolve_for_start(
+        resolve_for_scope(
             store,
             network,
-            ID.parse::<MachineId>().unwrap(),
+            crate::secrets::ResolutionScope {
+                machine_id: Some(ID.parse::<MachineId>().unwrap()),
+                policy: crate::SecretScopePolicy::default(),
+            },
             "run-123",
             explicit,
             Some(&HostCommand::new("/usr/bin/silo").args(["secret", "provide"])),
@@ -409,8 +418,86 @@ mod tests {
             .clone()
     }
 
+    #[tokio::test]
+    async fn machine_only_secrets_never_fall_back_and_preserve_machine_auth() {
+        use crate::policy_secrets::PolicySecretsCheck;
+        use crate::SecretScopePolicy;
+
+        let (_fixture, _, network) = fixture("bearer_token");
+        for scope in [
+            SecretScopePolicy::MachineOnly,
+            SecretScopePolicy::MachineThenHome,
+        ] {
+            let (_dir, runtime, config) = runtime_machine(&network, scope).await;
+            assert_eq!(config.secret_scope, scope);
+            assert_eq!(
+                crate::SnapshotConfiguration::capture(&config)
+                    .unwrap()
+                    .secret_scope,
+                scope
+            );
+            let store = FileStore::new(runtime.local_home());
+            let key = "bearer_token.personal.token";
+            put(&store, &SecretScope::Home, key, plain("home-only"));
+            let reference = crate::MachineRef::id(config.id);
+            let MachineNetworkConfig::Private {
+                policy: Some(policy),
+                ..
+            } = &network
+            else {
+                panic!("private policy")
+            };
+            let check = runtime
+                .check_policy_secrets(
+                    policy,
+                    Some(&reference),
+                    SecretScopePolicy::MachineThenHome,
+                    &EgressCredentials::new(),
+                )
+                .await
+                .unwrap();
+            let resolved =
+                runtime.resolve_machine_secrets(&config, "scoped-run", &EgressCredentials::new());
+            if scope == SecretScopePolicy::MachineOnly {
+                assert!(matches!(check, PolicySecretsCheck::Missing { .. }));
+                assert!(matches!(
+                    resolved,
+                    Err(LibVmError::MissingNetworkSecrets { .. })
+                ));
+                let machine = runtime.get_machine(&reference).await.unwrap();
+                assert!(matches!(
+                    machine.start().await,
+                    Err(LibVmError::MissingNetworkSecrets { .. })
+                ));
+            } else {
+                assert!(matches!(check, PolicySecretsCheck::Ready));
+                assert_eq!(value(&resolved.unwrap(), "personal.token"), b"home-only");
+            }
+            let machine = runtime.get_machine(&reference).await.unwrap();
+            assert_eq!(machine.secret_scope().await.unwrap(), scope);
+            machine
+                .set_secret(key, b"machine-token".to_vec())
+                .await
+                .unwrap();
+            machine
+                .set_secret("tailscale.work.auth_key", b"machine-auth".to_vec())
+                .await
+                .unwrap();
+            let resolved = runtime
+                .resolve_machine_secrets(&config, "scoped-run", &EgressCredentials::new())
+                .unwrap();
+            assert_eq!(value(&resolved, "personal.token"), b"machine-token");
+            assert_eq!(value(&resolved, "work.tailscale.auth_key"), b"machine-auth");
+            assert!(resolved
+                .provenance
+                .iter()
+                .all(|p| matches!(p.scope, SecretScope::Machine { .. })));
+        }
+    }
+
     async fn runtime_machine(
         network: &MachineNetworkConfig,
+        scope: crate::SecretScopePolicy,
     ) -> (
         tempfile::TempDir,
         crate::Runtime,
@@ -433,6 +520,7 @@ mod tests {
         let machine = runtime
             .machine()
             .name("external-store")
+            .secret_scope(scope)
             .vsock(true)
             .image_source(disk_without_agent(&runtime, disk))
             .network(|network| network.private().policy(policy.clone()))
@@ -449,7 +537,8 @@ mod tests {
     #[tokio::test]
     async fn tls_home_resolution_is_lazy_and_reserved_material_stays_out_of_grants() {
         let (_fixture, _, network) = fixture("openai_codex_oauth");
-        let (_dir, runtime, mut config) = runtime_machine(&network).await;
+        let (_dir, runtime, mut config) =
+            runtime_machine(&network, crate::SecretScopePolicy::default()).await;
         let store = FileStore::new(runtime.local_home());
         assert!(!store.path().exists());
         let saved = config.network.clone();
@@ -506,7 +595,8 @@ mod tests {
     #[tokio::test]
     async fn injected_external_home_resolves_without_machine_directory() {
         let (_fixture, _, network) = fixture("bearer_token");
-        let (_runtime_dir, runtime, config) = runtime_machine(&network).await;
+        let (_runtime_dir, runtime, config) =
+            runtime_machine(&network, crate::SecretScopePolicy::default()).await;
         let home = tempfile::tempdir().unwrap();
         let store = FileStore::new(home.path());
         put(
@@ -563,7 +653,8 @@ mod tests {
     #[tokio::test]
     async fn injected_external_oauth_grant_and_provider_use_actual_store_file() {
         let (_fixture, _, network) = fixture("openai_codex_oauth");
-        let (_runtime_dir, runtime, config) = runtime_machine(&network).await;
+        let (_runtime_dir, runtime, config) =
+            runtime_machine(&network, crate::SecretScopePolicy::default()).await;
         let key = "openai_codex_oauth.personal.oauth";
         let mut runtime_record = oauth();
         if let Secret::OAuth(record) = &mut runtime_record {
@@ -670,10 +761,13 @@ mod tests {
         assert!(erased.descriptor().is_none());
         let provider = HostCommand::new("/usr/bin/provider");
         let resolve = |store: &dyn SecretStore, network: &MachineNetworkConfig, provider| {
-            resolve_for_start(
+            resolve_for_scope(
                 store,
                 network,
-                ID.parse().unwrap(),
+                crate::secrets::ResolutionScope {
+                    machine_id: Some(ID.parse().unwrap()),
+                    policy: crate::SecretScopePolicy::default(),
+                },
                 "run",
                 &EgressCredentials::new(),
                 provider,
@@ -1031,10 +1125,13 @@ mod tests {
             "openai_codex_oauth.personal.oauth",
             oauth(),
         );
-        let no_provider = resolve_for_start(
+        let no_provider = resolve_for_scope(
             &store,
             &network,
-            ID.parse().unwrap(),
+            crate::secrets::ResolutionScope {
+                machine_id: Some(ID.parse().unwrap()),
+                policy: crate::SecretScopePolicy::default(),
+            },
             "run",
             &EgressCredentials::new(),
             None,
@@ -1043,10 +1140,13 @@ mod tests {
         .unwrap();
         assert!(no_provider.oauth_refresh_hook.is_none());
         let command = HostCommand::new("/usr/bin/silo").args(["space argument", "quote\"argument"]);
-        let provider = resolve_for_start(
+        let provider = resolve_for_scope(
             &store,
             &network,
-            ID.parse().unwrap(),
+            crate::secrets::ResolutionScope {
+                machine_id: Some(ID.parse().unwrap()),
+                policy: crate::SecretScopePolicy::default(),
+            },
             "run",
             &EgressCredentials::new(),
             Some(&command),
@@ -1057,20 +1157,26 @@ mod tests {
         .unwrap();
         assert_eq!(provider.args, ["space argument", "quote\"argument"]);
         let command = HostCommand::new("/bin/true").arg("nul\0argument");
-        assert!(resolve_for_start(
+        assert!(resolve_for_scope(
             &store,
             &network,
-            ID.parse().unwrap(),
+            crate::secrets::ResolutionScope {
+                machine_id: Some(ID.parse().unwrap()),
+                policy: crate::SecretScopePolicy::default(),
+            },
             "run",
             &EgressCredentials::new(),
             Some(&command),
             "test"
         )
         .is_err());
-        assert!(resolve_for_start(
+        assert!(resolve_for_scope(
             &store,
             &network,
-            ID.parse().unwrap(),
+            crate::secrets::ResolutionScope {
+                machine_id: Some(ID.parse().unwrap()),
+                policy: crate::SecretScopePolicy::default(),
+            },
             "run",
             &EgressCredentials::new(),
             Some(&HostCommand::new("relative")),
@@ -1082,10 +1188,13 @@ mod tests {
             use std::os::unix::ffi::OsStringExt;
             let command =
                 HostCommand::new("/bin/true").arg(std::ffi::OsString::from_vec(vec![255]));
-            assert!(resolve_for_start(
+            assert!(resolve_for_scope(
                 &store,
                 &network,
-                ID.parse().unwrap(),
+                crate::secrets::ResolutionScope {
+                    machine_id: Some(ID.parse().unwrap()),
+                    policy: crate::SecretScopePolicy::default(),
+                },
                 "run",
                 &EgressCredentials::new(),
                 Some(&command),

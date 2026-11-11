@@ -14,6 +14,7 @@ use std::fmt;
 use std::os::fd::OwnedFd;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 pub(crate) const MAX_FRAME: usize = 64 * 1024;
 const HEADER: usize = 4;
@@ -59,7 +60,7 @@ pub(crate) struct Bootstrap {
     pub(crate) state_dir: String,
     pub(crate) capability: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) client_secret: Option<String>,
+    pub(crate) client_secret: Option<Zeroizing<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) api_base_url: Option<String>,
 }
@@ -182,15 +183,24 @@ pub(crate) enum Event {
     },
 }
 
-pub(crate) fn encode(request: &Request) -> Result<Vec<u8>, WireError> {
-    let body = serde_json::to_vec(request).map_err(|e| WireError::Malformed(e.to_string()))?;
-    if body.len() > MAX_FRAME {
-        return Err(WireError::Oversize(body.len()));
+pub(crate) fn encode(request: &Request) -> Result<Zeroizing<Vec<u8>>, WireError> {
+    let mut frame = Zeroizing::new(Vec::with_capacity(HEADER + MAX_FRAME));
+    frame.extend_from_slice(&[0; HEADER]);
+    // A bounded slice cannot reallocate, including when an oversized secret
+    // needs JSON escaping. Every byte written stays in the zeroizing buffer.
+    frame.resize(HEADER + MAX_FRAME, 0);
+    let mut body = &mut frame[HEADER..];
+    if let Err(error) = serde_json::to_writer(&mut body, request) {
+        return Err(if error.is_io() {
+            WireError::Oversize(MAX_FRAME + 1)
+        } else {
+            WireError::Malformed(error.to_string())
+        });
     }
-    let len = u32::try_from(body.len()).map_err(|_| WireError::Oversize(body.len()))?;
-    let mut frame = Vec::with_capacity(HEADER + body.len());
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(&body);
+    let len = MAX_FRAME - body.len();
+    let len_header = u32::try_from(len).map_err(|_| WireError::Oversize(len))?;
+    frame[..HEADER].copy_from_slice(&len_header.to_be_bytes());
+    frame.truncate(HEADER + len);
     Ok(frame)
 }
 
@@ -335,11 +345,46 @@ mod tests {
                 .unwrap();
         assert!(plain.get("client_secret").is_none());
         assert_eq!(plain["type"], "bootstrap");
-        bootstrap.client_secret = Some("tskey-client-secret".into());
+        bootstrap.client_secret = Some(String::from("tskey-client-secret").into());
         assert!(!format!("{bootstrap:?}").contains("tskey-client-secret"));
-        let with: serde_json::Value =
-            serde_json::from_slice(&encode(&Request::Bootstrap(bootstrap)).unwrap()[4..]).unwrap();
+        let mut frame: zeroize::Zeroizing<Vec<u8>> =
+            encode(&Request::Bootstrap(bootstrap)).unwrap();
+        let with: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
         assert_eq!(with["client_secret"], "tskey-client-secret");
+        zeroize::Zeroize::zeroize(&mut frame);
+        assert!(frame.is_empty());
+        assert_eq!(frame.capacity(), 4 + MAX_FRAME);
+    }
+    #[test]
+    fn bootstrap_encoding_is_bounded_even_when_secrets_expand() {
+        let mut bootstrap = Bootstrap {
+            version: 1,
+            hostname: "silo".into(),
+            tag: "tag:silo".into(),
+            control_url: String::new(),
+            state_dir: String::new(),
+            capability: String::new(),
+            client_secret: Some("\0".repeat(MAX_FRAME).into()),
+            api_base_url: None,
+        };
+        assert!(matches!(
+            encode(&Request::Bootstrap(bootstrap.clone())),
+            Err(WireError::Oversize(_))
+        ));
+        bootstrap.client_secret = None;
+        let overhead = encode(&Request::Bootstrap(bootstrap.clone()))
+            .unwrap()
+            .len()
+            - 4;
+        bootstrap.hostname = "x".repeat(MAX_FRAME - overhead + 4);
+        let frame = encode(&Request::Bootstrap(bootstrap.clone())).unwrap();
+        assert_eq!(frame.len(), MAX_FRAME + 4);
+        assert_eq!(frame.capacity(), MAX_FRAME + 4);
+        bootstrap.hostname.push('x');
+        assert!(matches!(
+            encode(&Request::Bootstrap(bootstrap)),
+            Err(WireError::Oversize(_))
+        ));
     }
 
     #[test]

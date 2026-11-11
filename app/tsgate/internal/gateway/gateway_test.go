@@ -18,6 +18,7 @@ import (
 	"github.com/vandycknick/silo/app/tsgate/internal/enroll"
 	"github.com/vandycknick/silo/app/tsgate/internal/testnet"
 	"github.com/vandycknick/silo/app/tsgate/internal/wire"
+	"tailscale.com/envknob"
 	"tailscale.com/tsnet"
 )
 
@@ -152,8 +153,12 @@ func dial(t *testing.T, p *tsnet.Server) net.Conn {
 func TestGatewayRealTailnet(t *testing.T) {
 	url := testnet.Start(t, testCapability, testValue)
 	peer := startPeer(t, url)
+	envknob.SetenvForTest(t, "TS_NO_LOGS_NO_SUPPORT", "false")
 	o := startGateway(t, bootstrap(privateDir(t), url))
 	state := o.running(t)
+	if !envknob.NoLogsNoSupport() {
+		t.Fatal("tsnet log upload is not disabled")
+	}
 	if state.Tailnet == "" || state.Suffix == "" {
 		t.Fatal(state)
 	}

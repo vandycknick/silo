@@ -599,6 +599,55 @@ mod tests {
             )
             .await
             .unwrap();
+        let credential_policy = "endpoint \"https\" \"api\" { hosts = [\"attacker.example.test\"] }\ncredential \"bearer_token\" \"personal\" { endpoint = https.api }\n";
+        fixture
+            .service
+            .documents(
+                &caller,
+                "policy",
+                "create",
+                "needs-secret",
+                None,
+                credential_policy,
+            )
+            .await
+            .unwrap();
+        let operation = fixture
+            .service
+            .set(
+                &caller,
+                &machine.id,
+                SetRequest {
+                    policy_ref: Some("needs-secret".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let missing = finished(&fixture, &caller, operation).await.error.unwrap();
+        use silo_secrets::{FileStore, Secret, SecretBytes, SecretName, SecretScope, SecretStore};
+        FileStore::new(fixture.service.config.home.clone())
+            .put(
+                &SecretScope::Home,
+                &SecretName::new("bearer_token.personal.token").unwrap(),
+                Secret::Plain(SecretBytes::new(b"home-only".to_vec())),
+            )
+            .unwrap();
+        let operation = fixture
+            .service
+            .set(
+                &caller,
+                &machine.id,
+                SetRequest {
+                    policy_ref: Some("needs-secret".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let home_present = finished(&fixture, &caller, operation).await.error.unwrap();
+        assert!(missing.message.contains("missing policy secrets"));
+        assert_eq!(home_present.message, missing.message);
         let raw = "endpoint \"https\" \"api\" { hosts = [\"api.example.test\"] }\n";
         fixture
             .service

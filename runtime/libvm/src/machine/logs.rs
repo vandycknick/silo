@@ -541,6 +541,7 @@ mod tests {
         let id = MachineId::new();
         let lock = runtime.allocate_machine_lock().expect("allocate lock");
         let config = MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: lock.id(),
             name: "logs-test".to_string(),

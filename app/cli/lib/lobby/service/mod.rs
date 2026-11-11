@@ -28,7 +28,7 @@ use crate::lobby::{
 };
 use futures::future::BoxFuture;
 use silod_spec::daemon::v1 as w;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 pub(crate) struct ServiceConfig {
     pub(crate) home: PathBuf,
@@ -51,6 +51,33 @@ pub(crate) struct ServiceConfig {
 struct Admission {
     names: HashMap<String, Principal>,
     disks: HashMap<String, u64>,
+    audit: HashMap<String, AuditBucket>,
+}
+
+struct AuditBucket {
+    tokens: f64,
+    updated: Instant,
+}
+
+impl Admission {
+    fn audit(&mut self, node: &str, now: Instant) -> bool {
+        if !self.audit.contains_key(node) {
+            self.audit
+                .retain(|_, bucket| now.duration_since(bucket.updated).as_secs() < 2);
+        }
+        let bucket = self.audit.entry(node.to_owned()).or_insert(AuditBucket {
+            tokens: 40.0,
+            updated: now,
+        });
+        bucket.tokens =
+            (bucket.tokens + now.duration_since(bucket.updated).as_secs_f64() * 20.0).min(40.0);
+        bucket.updated = now;
+        if bucket.tokens < 1.0 {
+            return false;
+        }
+        bucket.tokens -= 1.0;
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -108,6 +135,11 @@ impl Service {
     }
 
     fn decision(&self, peer: &Peer, action: &str, result: Outcome<()>) -> Outcome<()> {
+        let limited = result.is_err()
+            || (peer.permissions.actions.is_empty() && matches!(action, "identity" | "whoami"));
+        if limited && !self.admission.lock().audit(&peer.node_id, Instant::now()) {
+            return Err(Failure::new(Code::Limit, "node audit rate limit reached"));
+        }
         self.config
             .audit
             .append(Decision {
@@ -364,6 +396,87 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn flooding_node_is_limited_without_blocking_another_node() {
+        let fixture = testing::fixture().await;
+        let flood = testing::caller("user:1", &[]);
+        for _ in 0..40 {
+            assert_eq!(
+                fixture
+                    .service
+                    .authorize(&flood.peer, Action::Read, None)
+                    .unwrap_err()
+                    .exit,
+                4
+            );
+        }
+        assert_eq!(
+            fixture
+                .service
+                .check_identity(&flood.peer)
+                .unwrap_err()
+                .exit,
+            6
+        );
+        let mut invalid = flood.peer.clone();
+        invalid.principals.clear();
+        assert_eq!(
+            fixture.service.check_identity(&invalid).unwrap_err().exit,
+            6
+        );
+        assert_eq!(
+            fixture
+                .service
+                .authorize(&flood.peer, Action::Read, None)
+                .unwrap_err()
+                .exit,
+            6
+        );
+        let mut other = testing::caller("user:2", &[Action::Read]).peer;
+        other.node_id = "another-node".into();
+        assert!(fixture.service.check_identity(&other).is_ok());
+        assert!(fixture
+            .service
+            .authorize(&other, Action::Read, None)
+            .is_ok());
+        fixture.service.config().audit.close().await.unwrap();
+        let records =
+            std::fs::read_to_string(fixture.root.path().join("home/lobby/audit.log")).unwrap();
+        assert_eq!(records.lines().count(), 42);
+    }
+
+    #[tokio::test]
+    async fn granted_node_can_issue_more_than_forty_rapid_allowed_commands() {
+        let fixture = testing::fixture().await;
+        let granted = testing::caller("user:1", &[Action::Read]);
+        for _ in 0..100 {
+            assert!(fixture.service.check_identity(&granted.peer).is_ok());
+            assert!(fixture.service.whoami(&granted.peer).is_ok());
+            assert!(fixture
+                .service
+                .authorize(&granted.peer, Action::Read, None)
+                .is_ok());
+        }
+        fixture.service.config().audit.close().await.unwrap();
+        let records =
+            std::fs::read_to_string(fixture.root.path().join("home/lobby/audit.log")).unwrap();
+        assert_eq!(records.lines().count(), 300);
+    }
+
+    #[test]
+    fn audit_bucket_refills_and_expires_inactive_nodes() {
+        let mut admission = crate::lobby::service::Admission::default();
+        let now = std::time::Instant::now();
+        for _ in 0..40 {
+            assert!(admission.audit("first", now));
+        }
+        assert!(!admission.audit("first", now));
+        assert!(admission.audit("first", now + std::time::Duration::from_millis(50)));
+        assert!(!admission.audit("first", now + std::time::Duration::from_millis(50)));
+        assert!(admission.audit("second", now + std::time::Duration::from_secs(3)));
+        assert!(!admission.audit.contains_key("first"));
+    }
+
+    #[tokio::test]
     async fn identity_audit_and_health_use_real_services() {
         let fixture = testing::fixture().await;
         let caller = testing::caller("user:1", &[]);
@@ -389,6 +502,7 @@ mod tests {
                 .exit,
             4
         );
+        fixture.service.config().audit.close().await.unwrap();
         let audit =
             std::fs::read_to_string(fixture.root.path().join("home/lobby/audit.log")).unwrap();
         let records: Vec<serde_json::Value> = audit
@@ -399,6 +513,14 @@ mod tests {
         assert_eq!(records[2]["allowed"], false);
         assert_eq!(records[2]["code"], "forbidden");
         assert_eq!(fixture.service.versions().tailscale, "1.102.5");
+        assert_eq!(
+            fixture
+                .service
+                .check_identity(&caller.peer)
+                .unwrap_err()
+                .code,
+            crate::lobby::failure::Code::Unavailable
+        );
     }
 
     #[test]

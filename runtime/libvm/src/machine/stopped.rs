@@ -111,6 +111,8 @@ pub struct SnapshotConfiguration {
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
     pub(crate) network: crate::store::models::MachineNetworkConfig,
+    #[serde(default)]
+    pub secret_scope: crate::SecretScopePolicy,
 }
 
 impl SnapshotConfiguration {
@@ -155,6 +157,7 @@ impl SnapshotConfiguration {
             labels: config.labels.clone(),
             metadata: config.metadata.clone(),
             network: config.network.clone(),
+            secret_scope: config.secret_scope,
         })
     }
 }

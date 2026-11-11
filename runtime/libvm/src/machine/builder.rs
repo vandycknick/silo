@@ -59,6 +59,7 @@ struct MachineCreateRequest {
     process: ProcessConfig,
     template_name: Option<String>,
     agent_mode: Option<MachineAgent>,
+    secret_scope: crate::SecretScopePolicy,
 }
 
 fn snapshot_creation_has_overrides(request: &MachineCreateRequest) -> bool {
@@ -83,6 +84,7 @@ fn snapshot_creation_has_overrides(request: &MachineCreateRequest) -> bool {
         || request.guest != MachineGuestConfig::default()
         || request.retention != MachineRetention::Persistent
         || request.process != ProcessConfig::default()
+        || request.secret_scope != crate::SecretScopePolicy::default()
         || request.template_name.is_some()
         || request
             .agent_mode
@@ -109,6 +111,7 @@ struct MachineCreatePlan {
     process: ProcessConfig,
     template_name: Option<String>,
     agent_mode: Option<MachineAgent>,
+    secret_scope: crate::SecretScopePolicy,
 }
 
 struct MachineCreateGuard {
@@ -125,6 +128,7 @@ struct MachineCreateGuard {
     process: ProcessConfig,
     template_name: Option<String>,
     agent_mode: Option<MachineAgent>,
+    secret_scope: crate::SecretScopePolicy,
     machine_parent: Option<OwnedDirectory>,
     preserve: bool,
     secret_store: std::sync::Arc<dyn silo_secrets::SecretStore>,
@@ -197,6 +201,7 @@ impl MachineBuilder {
                 process: ProcessConfig::default(),
                 template_name: None,
                 agent_mode: None,
+                secret_scope: crate::SecretScopePolicy::default(),
             },
         }
     }
@@ -250,6 +255,12 @@ impl MachineBuilder {
     /// Sets an explicit machine name.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.request.name = Some(name.into());
+        self
+    }
+
+    /// Fixes the policy-secret lookup authority for the lifetime of this machine.
+    pub fn secret_scope(mut self, scope: crate::SecretScopePolicy) -> Self {
+        self.request.secret_scope = scope;
         self
     }
 
@@ -972,6 +983,7 @@ async fn create_machine_config_with_name(
             process: request.process,
             template_name: request.template_name,
             agent_mode: request.agent_mode,
+            secret_scope: request.secret_scope,
         },
         None,
         crate::MachineDurability::Durable,
@@ -1323,6 +1335,7 @@ async fn create_machine_guard(
         process,
         template_name,
         agent_mode,
+        secret_scope,
     } = plan;
 
     validate_machine_name(&name)?;
@@ -1359,6 +1372,7 @@ async fn create_machine_guard(
         process,
         template_name,
         agent_mode,
+        secret_scope,
         machine_parent: None,
         preserve: false,
         secret_store: runtime.secret_store_arc(),
@@ -1615,6 +1629,7 @@ impl MachineCreateGuard {
                 message: "machine create guard has no allocated lock".to_string(),
             })?;
         Ok(MachineConfig {
+            secret_scope: self.secret_scope,
             id: self.id,
             lock_id: lock.id(),
             name: self.name.clone(),
@@ -1767,6 +1782,7 @@ async fn publish_checkpoint_child(
             process: configuration.process,
             template_name: configuration.template_name,
             agent_mode: configuration.agent_mode,
+            secret_scope: configuration.secret_scope,
         },
         Some(operation_id),
         durability,
@@ -2395,6 +2411,7 @@ mod tests {
                 process: ProcessConfig::default(),
                 template_name: None,
                 agent_mode: None,
+                secret_scope: crate::SecretScopePolicy::default(),
             },
             None,
             crate::MachineDurability::Durable,
@@ -2414,6 +2431,7 @@ mod tests {
         std::fs::write(&initramfs, b"unit-test packaged boot asset").expect("write initramfs");
 
         MachineCreateRequest {
+            secret_scope: crate::SecretScopePolicy::default(),
             image_source: Some(ImageSource::disk(base_rootfs_path)),
             resolved_oci_image: None,
             platform: None,
@@ -2651,6 +2669,7 @@ mod tests {
             .expect("machine config exists");
         let seeded_id = MachineId::new();
         let seeded_config = crate::store::models::MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id: seeded_id,
             lock_id: crate::lock_manager::LockId::from(42),
             name: "reopen-stage-two".to_string(),

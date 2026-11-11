@@ -430,6 +430,7 @@ mod tests {
             updated_at: 10,
         };
         let config = MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id: machine,
             lock_id: crate::lock_manager::LockId::from(1),
             name: "pause-store".into(),

@@ -38,6 +38,8 @@ pub(crate) struct MachineConfig {
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
     pub network: MachineNetworkConfig,
+    #[serde(default)]
+    pub secret_scope: crate::SecretScopePolicy,
 }
 
 #[non_exhaustive]
@@ -184,6 +186,7 @@ mod tests {
     #[test]
     fn default_guest_config_is_omitted_but_custom_selection_is_persisted() {
         let mut config = MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id: MachineId::new(),
             lock_id: LockId::from(1),
             name: "test".to_string(),
@@ -217,6 +220,7 @@ mod tests {
     #[test]
     fn durable_machine_config_requires_retention() {
         let config = MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id: MachineId::new(),
             lock_id: LockId::from(1),
             name: "test".to_string(),

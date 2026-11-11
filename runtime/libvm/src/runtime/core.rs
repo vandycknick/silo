@@ -457,23 +457,37 @@ impl Runtime {
         machine: Option<&MachineRef>,
     ) -> Result<bool, LibVmError> {
         Ok(matches!(
-            self.check_policy_secrets(policy, machine, &EgressCredentials::default())
-                .await?,
+            self.check_policy_secrets(
+                policy,
+                machine,
+                crate::SecretScopePolicy::default(),
+                &EgressCredentials::default(),
+            )
+            .await?,
             crate::policy_secrets::PolicySecretsCheck::Ready
         ))
     }
 
-    /// Resolves prospective Home or existing Machine/Home secrets without mutation.
+    /// Resolves prospective or persisted policy-secret scopes without mutation.
     /// Missing alternatives and unavailable/corrupt projections are distinct, redacted results.
     pub async fn check_policy_secrets(
         &self,
         policy: &silo_policy::NetworkPolicy,
         machine: Option<&MachineRef>,
+        scope_policy: crate::SecretScopePolicy,
         explicit: &EgressCredentials,
     ) -> Result<crate::policy_secrets::PolicySecretsCheck, LibVmError> {
-        let id = match machine {
-            Some(reference) => Some(self.get_machine(reference).await?.machine_id()),
-            None => None,
+        let (id, scope_policy) = match machine {
+            Some(reference) => {
+                let config = self.resolve_machine_config(reference).await?;
+                let scope = if config.secret_scope == crate::SecretScopePolicy::MachineOnly {
+                    crate::SecretScopePolicy::MachineOnly
+                } else {
+                    scope_policy
+                };
+                (Some(config.id), scope)
+            }
+            None => (None, scope_policy),
         };
         let network = ModelMachineNetworkConfig::Private {
             policy: Some(policy.clone()),
@@ -482,7 +496,10 @@ impl Runtime {
         crate::policy_secrets::diagnostic(crate::secrets::resolve_for_scope(
             self.secret_store(),
             &network,
-            id,
+            crate::secrets::ResolutionScope {
+                machine_id: id,
+                policy: scope_policy,
+            },
             "readiness",
             explicit,
             None,
@@ -574,10 +591,13 @@ impl Runtime {
         run_id: &str,
         explicit: &EgressCredentials,
     ) -> Result<crate::secrets::ResolvedSecrets, LibVmError> {
-        crate::secrets::resolve_for_start(
+        crate::secrets::resolve_for_scope(
             self.secret_store(),
             &config.network,
-            config.id,
+            crate::secrets::ResolutionScope {
+                machine_id: Some(config.id),
+                policy: config.secret_scope,
+            },
             run_id,
             explicit,
             self.secret_provider.as_ref(),
@@ -3178,6 +3198,7 @@ pub(crate) mod tests {
 
     fn sample_machine_config(paths: &LocalPaths, id: MachineId, name: &str) -> MachineConfig {
         MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: LockId::from(0),
             name: name.to_string(),
@@ -3784,6 +3805,7 @@ pub(crate) mod tests {
 
             let now = now_unix();
             let config = MachineConfig {
+                secret_scope: crate::SecretScopePolicy::default(),
                 id,
                 lock_id: lock.id(),
                 name: self.name,

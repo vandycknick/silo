@@ -3291,6 +3291,7 @@ pub(crate) mod tests {
             read_only: false,
         });
         crate::store::models::MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: crate::lock_manager::LockId::from(1),
             name: "cleanup-reference".into(),

@@ -1733,6 +1733,7 @@ async fn publish(
     let (root, length) = crate::machine::stopped::root_private(storage);
     let now = crate::utils::now_unix();
     let config = MachineConfig {
+        secret_scope: body.configuration.secret_scope,
         id: machine,
         lock_id,
         name: body.destination_name.clone(),

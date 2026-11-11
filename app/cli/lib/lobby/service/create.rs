@@ -398,6 +398,7 @@ impl Service {
                         service.admit_create(&peer, &owner, 0, true).await?;
                         service.management().create(spec, source).await.map_err(|status| categorize(&status))?
                     };
+                    service.ensure_secret_scope(&machine).await?;
                     if request.tailscale { service.store_node_credentials(&caller, Action::Create, &machine, key.as_ref().map(secrets::SecretBytes::as_bytes)).await?; }
                     held.release(); progress(format!("VM created: {}", request.name));
                     let mut completion = Completion { vm_id: machine.id.clone(), name: request.name.clone(), image: request.image.clone(), user: request.guest_user.as_ref().map_or_else(|| "root".into(), |user| user.name.clone()), node_state: if request.tailscale && request.no_start { "enrollment starts on boot" } else { "none" }.into(), ..Default::default() };
@@ -761,6 +762,47 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.exit, 2);
         assert!(failure.message.contains("missing policy secrets"));
+        use secrets::SecretStore;
+        use silo_secrets as secrets;
+        let store = secrets::FileStore::new(fixture.service.config.home.clone());
+        let key = secrets::SecretName::new("bearer_token.personal.token").unwrap();
+        for value in [
+            secrets::Secret::Plain(secrets::SecretBytes::new(b"home-only-secret".to_vec())),
+            secrets::Secret::Plain(secrets::SecretBytes::new(Vec::new())),
+        ] {
+            store.put(&secrets::SecretScope::Home, &key, value).unwrap();
+            let home_present = fixture
+                .service
+                .create(
+                    &caller,
+                    CreateRequest {
+                        image: "must-not-be-pulled".into(),
+                        name: "missing-secret".into(),
+                        policy_ref: "needs-secret".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(home_present.code, failure.code);
+            assert_eq!(home_present.message, failure.message);
+            assert!(!home_present.message.contains("home-only-secret"));
+        }
+        std::fs::write(store.path(), b"malformed Home store").unwrap();
+        let malformed_home = fixture
+            .service
+            .create(
+                &caller,
+                CreateRequest {
+                    image: "must-not-be-pulled".into(),
+                    name: "missing-secret".into(),
+                    policy_ref: "needs-secret".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(malformed_home.message, failure.message);
         assert!(fixture.service.jobs().list(&caller.peer).is_empty());
         assert!(fixture.service.admission.lock().names.is_empty());
         assert!(fixture.management.inventory().await.unwrap().is_empty());

@@ -1298,6 +1298,7 @@ netd log: /tmp/silo/netd.log";
         let store = Store::new(&paths).await.expect("open store");
         let machine_id = MachineId::new();
         let metadata = MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id: machine_id,
             lock_id: LockId::from(0),
             name: "netd-resolved-path".to_string(),
@@ -1500,6 +1501,7 @@ netd log: /tmp/silo/netd.log";
             let machine_id = MachineId::new();
             let policy = oauth_policy();
             let metadata = MachineConfig {
+                secret_scope: crate::SecretScopePolicy::default(),
                 id: machine_id,
                 lock_id: LockId::from(0),
                 name: "transport-test".into(),

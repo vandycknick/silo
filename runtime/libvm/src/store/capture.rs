@@ -2811,6 +2811,7 @@ pub(crate) mod tests {
             });
         }
         let config = MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: LockId::from(0),
             name: "checkpoint-source".into(),

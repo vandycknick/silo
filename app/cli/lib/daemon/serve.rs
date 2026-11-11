@@ -197,10 +197,11 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
             lobby_settings,
             control::lobby::Management::new(state.clone()),
             publisher.clone(),
-        )?;
+        );
         publisher.set_lobby(Some(crate::lobby::supervisor::initial_status()))?;
-        Some(tokio::spawn(crate::lobby::supervisor::run(
+        Some(tokio::spawn(crate::lobby::supervisor::start(
             context,
+            publisher.clone(),
             lobby_shutdown.clone(),
         )))
     } else {

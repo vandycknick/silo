@@ -439,6 +439,7 @@ pub(crate) mod tests {
 
     fn machine_from_path(id: MachineId, name: String, machine_dir: &Path) -> MachineConfig {
         MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: LockId::from(0),
             name,
@@ -1072,6 +1073,7 @@ pub(crate) mod tests {
         metadata.insert("silo.note".to_string(), "test value".to_string());
 
         let machine = MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: LockId::from(42),
             name: "jsonb-test".to_string(),

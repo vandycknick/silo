@@ -9,6 +9,15 @@ it does not manage VMs. See [ADR 0022](../adr/0022-lobby-in-silod-and-tsgate.md)
 
 Install matching Silo runtime assets and the adjacent `tsgate` executable from
 the same product build. The macOS app supplies it in `Contents/Helpers`.
+Silod revalidates tsgate before every spawn: it must be a regular, non-symlink
+executable owned by the daemon user or root, without group/other write access.
+The package directory and every ancestor must be owned by the daemon user or
+root. Group/other writes are refused except in root-owned sticky directories
+(such as `/tmp`), or root-owned directories writable only by a root-equivalent
+group (gid 0, plus macOS `admin`, gid 80). Root-owned Linux `staff` directories
+are not exempt. Linux executes the validated open file through `/proc/self/fd`;
+macOS executes its revalidated package path. Validation failure marks only the
+lobby failed, with a diagnostic; the daemon's core API and VMs remain available.
 There is no separate service account, gateway configuration file or SDK runtime.
 
 ```sh
@@ -107,6 +116,16 @@ corrupt, unreadable or wrong-kind values fail lobby setup. Only the client secre
 is sent to tsgate, through the private bootstrap socket, never argv or environment.
 Restart the daemon after changing startup credentials or configuration.
 
+These are enrollment credentials, not a policy-secret fallback. Every VM created
+by the lobby resolves policy secrets from its own Machine scope only, never the
+host Home store. This restriction persists across policy/label updates,
+snapshots, forks and handoff. Prospective remote-policy checks also skip Home:
+they report requirements from the submitted policy without revealing Home
+secret names or whether those secrets exist. The lobby refuses to start, change
+or open guest sessions on a lobby-labelled VM whose persisted scope is not
+Machine-only (exit 5); reads, listing and logs still work. The control API
+rejects requests that leave the secret scope unspecified.
+
 The lobby node is independent of VM enrollment mode. Tsgate reuses valid persisted
 node state without minting another key. If enrollment is needed and a client
 secret exists, it mints a short-lived auth key for the configured lobby tag.
@@ -114,6 +133,8 @@ Without that secret, follow the approval URL in local daemon status and assign
 the configured tag. The OAuth client needs auth-key creation authority for that
 tag. MagicDNS and HTTPS certificates must be enabled for the lobby's TLS listener.
 Tsgate pins the verified control server, tailnet and DNS suffix in its state.
+Tsgate disables tsnet log upload, including `log.tailscale.com`, regardless of
+ambient environment variables. Redacted local stderr logging remains enabled.
 
 ## Status and restart behavior
 
@@ -146,10 +167,12 @@ restart. There is no host-shutdown inhibitor or guaranteed guest shutdown window
 Keep the native service's process-only termination policy; do not repair the
 service by killing its whole cgroup. See [daemon operation](../system-daemon.md).
 
-On tailnet HTTPS, `GET /healthz` and `GET /metrics` require fresh WhoIs and
-own-scope `vm.read`. They are not public host listeners and do not use forwarded
-identity headers. `/oauth/callback` instead requires a valid one-use consent
-nonce. There is no Funnel listener.
+On tailnet HTTPS, `GET /healthz` requires fresh WhoIs and own-scope `vm.read`.
+`GET /metrics` additionally requires the peer to carry the lobby's configured
+`daemon.tailscale.tag` (default `tag:silo`). Ordinary users with `vm.read` do
+not gain metrics access. These are not public host listeners and do not use
+forwarded identity headers. `/oauth/callback` instead requires a valid one-use
+consent nonce. There is no Funnel listener.
 
 ## State and documents
 
@@ -168,6 +191,25 @@ Principal directory names use URL-safe unpadded base64. State directories are
 mode 0700. Retain state across stop/start to preserve identity and SSH host pins.
 Deleting `lobby/instance` does not adopt existing VMs into a new instance.
 This release requires reinstall/reset, with no import of prior lobby state.
+
+Authorization audit records go to `<Home>/lobby/audit.log` through a background
+writer with a 1024-record queue. Group commits run about every 100 ms, or after
+64 records, draining the whole queued backlog before syncing. Audited denials
+(including identity-validation failures), plus successful `identity`/`whoami`
+checks from peers with no granted actions, share a per-node token bucket
+(20 per second, burst 40). Excess requests return exit 6 (`limit`) without
+consuming another node's budget. Allowed decisions for granted callers never
+consume this budget.
+A full queue or writer failure denies new requests with exit 9 (`unavailable`).
+Writer failures are logged and reported as degraded lobby status with a diagnostic;
+the writer retries with backoff and clears the diagnostic on recovery. Admission
+does not wait for durable commit: a crash or writer failure can lose records for
+already-allowed actions. Ordinary shutdown drains and commits queued records
+before joining the writer, or reports a write failure.
+Rotation retries resume at the failed step. If a partial record cannot be
+truncated, the writer preserves that log under a unique `audit.log.damaged.N`
+name using no-replace semantics, then opens a fresh log before writing another
+record. Later quarantines never replace earlier evidence.
 
 Operator documents live in `<config_dir>/templates/NAME.yaml` and
 `<config_dir>/policies/NAME.hcl`, next to Silo's `config.yaml`. Missing directories
@@ -224,6 +266,23 @@ across the Home, with no owner prefix or automatic suffix. The surface accepts
 OCI images, restricted templates and named policies, never host paths, host
 mounts, arbitrary node declarations or cross-VM forwards. User labels cannot
 use the reserved `io.silo.` prefix.
+
+Tsgate shares a fixed cap of 256 concurrent tailnet connections across SSH and
+HTTPS, with at most 32 per remote IP. Excess connections close before stream
+forwarding. Silod independently caps these connections at four times
+`sessions.global` overall and four times `sessions.per-peer` per verified WhoIs
+node ID (256 and 32 with defaults), counting IPv4 and IPv6 together. Before
+identity resolves, the same per-peer cap applies by remote IP. SSH session caps
+still apply by verified node ID; each SSH connection also allows at most
+`sessions.per-peer` open channels. Initial WhoIs resolution and SSH authentication
+each have a 15-second deadline. SSH closes idle connections after 10 minutes
+without client channel data or channel requests, even if clients answer
+keepalives or receive server output. This deadline pauses while an admitted
+command is running, including exec, shell, followed logs and file transfers;
+it resumes when the command finishes. Idle REPLs remain subject to the deadline.
+Connections without an open channel close after 60 seconds.
+At most 16 queued plus active operations are admitted per principal; excess
+operation submissions return exit 6 (`limit`).
 
 Commands and interactive lines are bounded to 16 KiB. Userdata is an inline
 shebang script up to 16 KiB. Stdin document/userdata reads have a 30-second
