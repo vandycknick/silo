@@ -70,7 +70,7 @@ jobs:
       - name: Check Go formatting
         if: ${{ matrix.primary }}
         run: |
-          files="$(nix develop .#ci --command gofmt -l net/netd)"
+          files="$(nix develop .#ci --command gofmt -l net/netd app/tsgate)"
           if [ -n "$files" ]; then
             printf '%s\n' "$files"
             exit 1
@@ -85,7 +85,8 @@ jobs:
 
       # Cargo integration discovery includes tests/krun_worker.rs on both hosts.
       # These real-process boundary tests need no successful hypervisor admission.
-      # make test also tests net/netd (race-enabled on Linux); make fmt gofmt-checks it.
+      # make test also tests net/netd and app/tsgate (race-enabled on Linux);
+      # make fmt gofmt-checks both.
       - name: Run host-aware tests, including the private silo-vmm worker boundary
         run: nix develop .#ci --command make test
 
@@ -94,6 +95,13 @@ jobs:
           GOTOOLCHAIN: auto
           GOFLAGS: -mod=readonly
         run: nix develop .#ci --command go -C net/netd vet ./...
+
+      - name: Vet tsgate
+        env:
+          CGO_ENABLED: '0'
+          GOTOOLCHAIN: auto
+          GOFLAGS: -mod=readonly
+        run: nix develop .#ci --command go -C app/tsgate vet ./...
 
   summary:
     name: Summary

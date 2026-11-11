@@ -7,6 +7,7 @@ mod daemon;
 pub mod environment;
 pub mod errors;
 pub mod help;
+mod lobby;
 pub mod machine_defaults;
 mod network_policy;
 pub mod planning;
