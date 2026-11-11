@@ -45,9 +45,11 @@ futures = "0.3.33"
 prost-types = "0.14.4"
 parking_lot = "0.12.5"
 tempfile = "3.27.0"
+russh = "0.62.4"
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 
 [dev-dependencies]
-hyper-util = "0.1.20"
 tower = "0.5.3"
 test-utils = { path = "../../runtime/test-utils" }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite"] }
