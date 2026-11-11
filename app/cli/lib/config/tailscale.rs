@@ -77,6 +77,10 @@ impl TailscaleConfig {
         let c = &self.vm.ceilings;
         (c.vms_per_principal, c.cpus, c.memory, c.disk)
     }
+    /// `(global, per_peer)` concurrent SSH session caps.
+    pub(crate) fn session_limits(&self) -> (u64, u64) {
+        (self.sessions.global, self.sessions.per_peer)
+    }
     pub(crate) fn disk_reserve(&self) -> u64 {
         self.disk_reserve
     }
