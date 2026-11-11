@@ -41,10 +41,7 @@ impl fmt::Display for WireError {
             Self::UnexpectedFd => f.write_str("file descriptor attached to a non-conn frame"),
             Self::TooManyFds(n) => write!(f, "{n} file descriptors in one control message"),
             Self::InvalidReply(id) => {
-                write!(
-                    f,
-                    "reply {id} must carry exactly one of whois, status, error"
-                )
+                write!(f, "reply {id} must carry exactly one of whois, error")
             }
         }
     }
@@ -89,7 +86,6 @@ impl fmt::Debug for Bootstrap {
 pub(crate) enum Request {
     Bootstrap(Bootstrap),
     Whois { id: u64, remote: String },
-    Status { id: u64 },
     Shutdown,
 }
 
@@ -157,17 +153,10 @@ pub(crate) enum Listener {
     Http,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ReplyBody {
-    Whois(Whois),
-    Status(NodeState),
-}
-
 #[derive(Deserialize)]
 struct RawReply {
     id: u64,
     whois: Option<Whois>,
-    status: Option<NodeState>,
     error: Option<String>,
 }
 
@@ -189,7 +178,7 @@ pub(crate) enum Event {
     },
     Reply {
         id: u64,
-        result: Result<ReplyBody, String>,
+        result: Result<Whois, String>,
     },
 }
 
@@ -251,10 +240,9 @@ impl Decoder {
             }
             Incoming::Reply(reply) => Event::Reply {
                 id: reply.id,
-                result: match (reply.whois, reply.status, reply.error) {
-                    (Some(whois), None, None) => Ok(ReplyBody::Whois(whois)),
-                    (None, Some(status), None) => Ok(ReplyBody::Status(status)),
-                    (None, None, Some(error)) => Err(error),
+                result: match (reply.whois, reply.error) {
+                    (Some(whois), None) => Ok(whois),
+                    (None, Some(error)) => Err(error),
                     _ => return Err(WireError::InvalidReply(reply.id)),
                 },
             },
@@ -289,8 +277,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use crate::lobby::tailnet::wire::{
-        encode, Bootstrap, Decoder, Event, Listener, Phase, ReplyBody, Request, WireError,
-        MAX_FRAME,
+        encode, Bootstrap, Decoder, Event, Listener, Phase, Request, WireError, MAX_FRAME,
     };
 
     fn frame(json: &str) -> Vec<u8> {
@@ -410,7 +397,7 @@ mod tests {
         match &events[1] {
             Event::Reply {
                 id: 1,
-                result: Ok(ReplyBody::Whois(whois)),
+                result: Ok(whois),
             } => {
                 assert_eq!(whois.tags, vec!["tag:peer".to_string()]);
                 assert_eq!(
@@ -509,7 +496,9 @@ mod tests {
             ),
             (
                 "reply with two bodies",
-                frame(r#"{"type":"reply","id":5,"error":"x","status":{"phase":"running"}}"#),
+                frame(
+                    r#"{"type":"reply","id":5,"error":"x","whois":{"node_id":"n","node_name":"peer","user_id":1,"login_name":"user"}}"#,
+                ),
                 0,
                 WireError::InvalidReply(5),
             ),

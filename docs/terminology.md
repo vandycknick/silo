@@ -303,6 +303,22 @@ It owns product-level lifecycle semantics, persisted state, image handling, laun
 
 Its role is similar in spirit to how libpod sits above lower-level container runtime pieces.
 
+### Lobby
+
+The lobby is the optional tailnet VM-management service inside silod, implemented
+in Rust under `app/cli/lib/lobby/`. It owns SSH commands, authorization, jobs,
+documents, consent and HTTP handling, and calls management functions and libvm
+in process. Enable it with `silo daemon up --tailscale`. Its private state is
+`<Home>/lobby/`. See the [operator guide](lobby/operator.md).
+
+### `tsgate`
+
+`tsgate` is silod's same-user, pure-Go tailnet transport child. It owns the
+lobby's tsnet node, enrollment, TCP 22, TLS termination on TCP 443 and stream
+forwarding to silod over a private inherited Unix socket. It does not manage
+VMs. Its node state is `<Home>/tsgate/`; netd separately owns each VM's node.
+See [ADR 0022](adr/0022-lobby-in-silod-and-tsgate.md).
+
 ### Guest Agent
 
 The guest agent is software running inside the guest VM.

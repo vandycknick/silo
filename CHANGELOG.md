@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Removed the Go and Node SDKs, taild, and host-shutdown protection; `silo daemon up --tailscale` is refused until the lobby returns inside silod with a `tsgate` gateway process.
+- The lobby returns inside silod with the pure-Go `tsgate` gateway. Labels use `io.silo.lobby.*`, the capability key is `github.com/vandycknick/silo`, and state lives in `<Home>/lobby/` and `<Home>/tsgate/`. The Go/Node SDKs and host-shutdown protection are removed; there is no migration from taild.
 - Stopped restore and live-fork children can cold boot from their own disks after completed activation and holder reconciliation; the first admitted start retires their restore binding without deleting the independently retained checkpoint.
 - Shared tracing setup keeps CLI diagnostics at warn by default, enables debug/trace with verbosity or `RUST_LOG`, and suspends stderr progress displays while writing logs; machine start timelines are debug-only diagnostics.
 - PTY shell and exec sessions drain buffered final output and close promptly when their main process exits, without waiting for background jobs to release the terminal.

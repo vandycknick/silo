@@ -99,8 +99,11 @@ jobs:
       - name: Build release archives
         run: nix develop .#release --command make archive
 
-      - name: Smoke test release CLI
-        run: target/release/silo --help
+      - name: Accept packaged product
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: nix develop .#release --command scripts/accept-packaged-product.sh "target/packages/$VERSION/$PLATFORM"
 
       - name: Build macOS package
         if: ${{ matrix.create_dmg }}

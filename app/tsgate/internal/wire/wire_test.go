@@ -29,7 +29,7 @@ func TestRoundTrip(t *testing.T) {
 	r := &Reader{Conn: b}
 	defer r.Close()
 	w := &Writer{Conn: a}
-	messages := []Message{Bootstrap{Type: "bootstrap", Version: 1, Hostname: "lobby", Tag: "tag:lobby", StateDir: "/tmp/state", Capability: "example/cap"}, WhoIsRequest{Type: "whois", ID: ^uint64(0), Remote: "100.64.0.1:123"}, StatusRequest{Type: "status", ID: 0}, Shutdown{Type: "shutdown"}, State{Type: "state", Phase: "running", Tags: []string{}}, Reply{Type: "reply", ID: 1, Status: &Status{Phase: "running", Tags: []string{}}}, Reply{Type: "reply", ID: 2, WhoIs: &WhoIs{Tags: []string{}, Capability: []json.RawMessage{json.RawMessage(`{"x":1}`)}}}}
+	messages := []Message{Bootstrap{Type: "bootstrap", Version: 1, Hostname: "lobby", Tag: "tag:lobby", StateDir: "/tmp/state", Capability: "example/cap"}, WhoIsRequest{Type: "whois", ID: ^uint64(0), Remote: "100.64.0.1:123"}, Shutdown{Type: "shutdown"}, State{Type: "state", Phase: "running", Tags: []string{}}, Reply{Type: "reply", ID: 2, WhoIs: &WhoIs{Tags: []string{}, Capability: []json.RawMessage{json.RawMessage(`{"x":1}`)}}}}
 	for _, m := range messages {
 		if e := w.Send(m, nil); e != nil {
 			t.Fatal(e)
@@ -72,7 +72,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 func TestDecodeRejects(t *testing.T) {
-	cases := []string{"", `null`, `[]`, `1`, `"x"`, `{}`, `{"type":1}`, `{"type":null}`, `{"type":"unknown"}`, `{"type":"status","id":-1}`, `{"type":"status","id":1.5}`, `{"type":"status","id":18446744073709551616}`, `{"type":"status","id":null}`, `{"type":"conn","listener":"other"}`, `{"type":"reply","id":1}`, `{"type":"reply","id":1,"status":{},"error":"bad"}`, `{"type":"reply","whois":{},"status":{}}`, `{"type":"state","phase":"other"}`, `{"type":"state","phase":"running","tags":1}`, `{"type":"shutdown"} {}`}
+	cases := []string{"", `null`, `[]`, `1`, `"x"`, `{}`, `{"type":1}`, `{"type":null}`, `{"type":"unknown"}`, `{"type":"status","id":1}`, `{"type":"whois","id":-1}`, `{"type":"whois","id":1.5}`, `{"type":"whois","id":18446744073709551616}`, `{"type":"whois","id":null}`, `{"type":"conn","listener":"other"}`, `{"type":"reply","id":1}`, `{"type":"reply","id":1,"whois":{},"error":"bad"}`, `{"type":"reply","id":1,"status":{}}`, `{"type":"state","phase":"other"}`, `{"type":"state","phase":"running","tags":1}`, `{"type":"shutdown"} {}`}
 	for _, s := range cases {
 		t.Run(s, func(t *testing.T) {
 			if _, e := Decode([]byte(s)); e == nil {
@@ -198,7 +198,7 @@ func TestCoalescedFramesAndFragmentation(t *testing.T) {
 func TestUnknownFieldsRemainLenient(t *testing.T) {
 	for _, body := range []string{
 		`{"type":"shutdown","future":null,"id":null}`,
-		`{"type":"status","id":1,"future":{"any":[1,true,null]}}`,
+		`{"type":"whois","id":1,"remote":"100.64.0.1:123","future":{"any":[1,true,null]}}`,
 	} {
 		if _, err := Decode([]byte(body)); err != nil {
 			t.Fatal(body, err)

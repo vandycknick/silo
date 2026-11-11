@@ -2,8 +2,9 @@
 
 ## Integrated native product packages
 
-`make build` produces the CLI (which contains the daemon) alongside the ordinary
-runtime assets on native Linux and macOS. Netd uses `CGO_ENABLED=0`.
+`make build` produces the CLI (which contains the daemon), the pure-Go `tsgate`
+lobby gateway helper, and the ordinary runtime assets on native Linux and macOS.
+Netd and tsgate use `CGO_ENABLED=0`.
 
 `make archive` stages the release runtime and produces runtime-only and portable
 CLI archives. Cross compilation is not native runtime qualification.
@@ -15,8 +16,11 @@ inventory mapped to lowercase SHA-256 digests; manifest metadata is never a
 made-up constant. Stage validation rejects unexpected entries/symlinks and
 verifies manifest bytes against current components and VERSION.
 
-Portable archives include `bin/silo` alongside the VMM/netd/guest assets.
-Runtime-only archives contain those runtime assets without the CLI.
+Portable archives include `bin/silo` and `bin/tsgate` alongside the
+VMM/netd/guest assets. Runtime-only archives exclude both product executables.
+Release tsgate builds generate Go dependency notices from the exact target's
+import graph into `target/release/share/licenses/tsgate/`; portable archives
+ship them at `share/licenses/tsgate/`, including the `modules.json` inventory.
 Review the notices, SBOM and provenance before distributing either archive.
 Runtime notices retain the exact locked libkrun revision for Git sources.
 For an explicit local native patch, staging reuses the native build's dependency
@@ -40,7 +44,8 @@ Debug archives use `target/packages-debug`, separate from release outputs,
 with build profile recorded in provenance.
 
 On native macOS, `make app` packages the CLI under `Contents/MacOS`, runtime
-helpers under `Contents/Helpers`, and complete notices under `Contents/Resources`.
+helpers (including tsgate) under `Contents/Helpers`, and complete notices under
+`Contents/Resources` (tsgate's Go notices are under `LICENSES/tsgate`).
 Executables are signed before the outer app, all with the selected identity.
 Only silo-vmm receives virtualization entitlements; library validation is not
 disabled. Nested certificate identity is checked, and `Silo.app.provenance.json`
@@ -199,8 +204,8 @@ target/silo-runtime/<target>/release/
        +----------------------+--------------------------+
        |                      |                          |
        v                      v                          v
-Runtime archive       Portable CLI archive       macOS application package
-runtime + notices     runtime + CLI + notices    Silo.app / optional DMG
+Runtime archive       Portable product archive   macOS application package
+runtime + notices     runtime + silo + tsgate    Silo.app / optional DMG
        |                      |                          |
        |                      |                          |
        v                      v                          v
@@ -222,8 +227,8 @@ target/silo-runtime/<target>/release/
 ```
 
 The stage deliberately excludes the public `silo` frontend (and with it the
-appliance daemon). Product packagers add the CLI without rebuilding or replacing
-the staged runtime files.
+appliance daemon) and `tsgate`. Product packagers add both executables and
+tsgate's dependency notices without rebuilding or replacing staged runtime files.
 
 ## Archive Types
 
@@ -250,10 +255,10 @@ silo-runtime-<version>-<target>/
     APACHE-2.0.txt
 ```
 
-The portable CLI archive contains the same files plus `bin/silo`, which is both
-the CLI and the daemon (`silo daemon run`). `Silo.app` places it at
-`Contents/MacOS/silo` and signs it without virtualization entitlements (the VMM
-owns virtualization):
+The portable product archive contains the same files plus `bin/silo`, which is
+both the CLI and the daemon (`silo daemon run`), `bin/tsgate`, and tsgate's Go
+dependency notices. `Silo.app` places the CLI at `Contents/MacOS/silo` and tsgate
+at `Contents/Helpers/tsgate`. Neither receives virtualization entitlements:
 
 ```text
 silo-<version>-<target>/
@@ -261,6 +266,7 @@ silo-<version>-<target>/
     silo
     silo-vmm
     netd
+    tsgate
   assets/
     kernel-default
     initramfs
@@ -268,6 +274,9 @@ silo-<version>-<target>/
   THIRD_PARTY_NOTICES
   LICENSES/
     APACHE-2.0.txt
+  share/licenses/tsgate/
+    modules.json
+    <module>/<version>/LICENSE...
 ```
 
 Each archive has an adjacent SHA-256 checksum, SPDX JSON SBOM, and provenance
@@ -292,6 +301,13 @@ make archive
 canonical stage, and produces both archives, checksums, SBOMs, and provenance
 documents. Successful construction in the qualified native release environment
 is the release correctness signal.
+
+The Linux ELF audit covers tsgate and accepts a static executable only when it
+has neither an ELF interpreter nor `DT_NEEDED` dependencies. Release Tip runs
+`scripts/accept-packaged-product.sh PACKAGE_DIRECTORY` after archiving: it extracts
+both archives, runs the packaged CLI and gateway version commands, and starts,
+observes ready status, and stops the packaged daemon with system and Tailscale
+features disabled, using an isolated temporary Home and the extracted runtime.
 
 ## Packaging macOS
 

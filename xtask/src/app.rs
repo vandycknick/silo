@@ -15,9 +15,10 @@ use crate::targets::HostTarget;
 const APP_NAME: &str = "Silo.app";
 const BUNDLE_IDENTIFIER: &str = "sh.silo.app";
 const MINIMUM_SYSTEM_VERSION: &str = "26.0";
-const HELPERS: [(&str, u32, Option<&str>); 2] = [
+const HELPERS: [(&str, u32, Option<&str>); 3] = [
     ("silo-vmm", 0o755, Some("virt/vmm/silo-vmm.entitlements")),
     ("netd", 0o755, None),
+    ("tsgate", 0o755, None),
 ];
 const ASSETS: [(&str, u32); 3] = [
     ("kernel-default", 0o644),
@@ -110,9 +111,13 @@ pub fn assemble(
         )?;
         copy_regular_file(&release.join("silo"), &macos.join("silo"), 0o755)?;
         for (name, mode, _) in HELPERS {
-            copy_regular_file(&stage.join("bin").join(name), &helpers.join(name), mode)?;
+            copy_regular_file(
+                &helper_source(&release, &stage, name),
+                &helpers.join(name),
+                mode,
+            )?;
         }
-        copy_notices(&stage, &resources)?;
+        copy_notices(&stage, &release.join("share/licenses/tsgate"), &resources)?;
         for (name, mode) in ASSETS {
             copy_regular_file(&stage.join("assets").join(name), &assets.join(name), mode)?;
         }
@@ -327,11 +332,19 @@ fn generate_icon(workspace_root: &Path, bundle: &Path, destination: &Path) -> Re
     result
 }
 
+fn helper_source(release: &Path, stage: &Path, name: &str) -> PathBuf {
+    if name == "tsgate" {
+        release.join(name)
+    } else {
+        stage.join("bin").join(name)
+    }
+}
+
 fn verify_unsigned_copies(release: &Path, stage: &Path, bundle: &Path) -> Result<(), AppError> {
     compare_files(&release.join("silo"), &bundle.join("Contents/MacOS/silo"))?;
     for (name, _, _) in HELPERS {
         compare_files(
-            &stage.join("bin").join(name),
+            &helper_source(release, stage, name),
             &bundle.join("Contents/Helpers").join(name),
         )?;
     }
@@ -349,7 +362,11 @@ fn verify_unsigned_copies(release: &Path, stage: &Path, bundle: &Path) -> Result
             )?;
         }
     }
-    compare_notices(stage, &bundle.join("Contents/Resources"))?;
+    compare_notices(
+        stage,
+        &release.join("share/licenses/tsgate"),
+        &bundle.join("Contents/Resources"),
+    )?;
     Ok(())
 }
 
@@ -805,7 +822,7 @@ fn validate_bundle_filesystem(bundle: &Path, signed: bool) -> Result<(), AppErro
 
 fn validate_payload_layout(contents: &Path) -> Result<(), AppError> {
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm", "tsgate"])?;
     validate_directory_entries(
         &contents.join("Resources"),
         ["Silo.icns", "assets", "THIRD_PARTY_NOTICES", "LICENSES"],
@@ -827,8 +844,9 @@ fn validate_payload_layout(contents: &Path) -> Result<(), AppError> {
     validate_regular_file(&contents.join("Resources/Silo.icns"), None)?;
     let resources = contents.join("Resources");
     validate_regular_file(&resources.join("THIRD_PARTY_NOTICES"), Some(0o644))?;
-    validate_directory_entries(&resources.join("LICENSES"), ["APACHE-2.0.txt"])?;
+    validate_directory_entries(&resources.join("LICENSES"), ["APACHE-2.0.txt", "tsgate"])?;
     validate_regular_file(&resources.join("LICENSES/APACHE-2.0.txt"), Some(0o644))?;
+    go_notice_inventory(&resources.join("LICENSES/tsgate"))?;
     Ok(())
 }
 
@@ -883,7 +901,88 @@ fn regular_tree(root: &Path) -> Result<BTreeSet<PathBuf>, AppError> {
     Ok(files)
 }
 
-fn copy_notices(stage: &Path, resources: &Path) -> Result<(), AppError> {
+fn safe_notice_path(root: &Path, value: &str) -> Result<PathBuf, AppError> {
+    if value.is_empty()
+        || value.contains('\\')
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || Path::new(value).is_absolute()
+    {
+        return invalid(root, format!("unsafe notice path {value:?}"));
+    }
+    Ok(PathBuf::from(value))
+}
+
+pub(crate) fn go_notice_inventory(root: &Path) -> Result<BTreeSet<PathBuf>, AppError> {
+    let actual = regular_tree(root)?;
+    let manifest = root.join("modules.json");
+    validate_regular_file(&manifest, Some(0o644))?;
+    let bytes = fs::read(&manifest).map_err(|source| AppError::Io {
+        action: "read Go notice manifest",
+        path: manifest.clone(),
+        source,
+    })?;
+    let modules: Vec<serde_json::Value> =
+        serde_json::from_slice(&bytes).map_err(|error| AppError::Invalid {
+            path: manifest.clone(),
+            reason: format!("parse Go notices: {error}"),
+        })?;
+    if modules.is_empty() {
+        return invalid(&manifest, "Go notice manifest has no dependencies".into());
+    }
+    let mut expected = BTreeSet::from([PathBuf::from("modules.json")]);
+    let mut seen = BTreeSet::new();
+    for module in &modules {
+        let name = module["module"].as_str().ok_or_else(|| AppError::Invalid {
+            path: manifest.clone(),
+            reason: "notice entry has no module name".into(),
+        })?;
+        let module_path = safe_notice_path(&manifest, name)?;
+        let version = match &module["version"] {
+            serde_json::Value::Null => "local",
+            serde_json::Value::String(value) => value,
+            _ => return invalid(&manifest, format!("invalid version for {name:?}")),
+        };
+        let version = safe_notice_path(&manifest, version)?;
+        let notices = module["notices"]
+            .as_array()
+            .ok_or_else(|| AppError::Invalid {
+                path: manifest.clone(),
+                reason: format!("module {name:?} has no notice array"),
+            })?;
+        if version.components().count() != 1 || !seen.insert(name) || notices.is_empty() {
+            return invalid(
+                &manifest,
+                "invalid version, duplicate module or empty notices".into(),
+            );
+        }
+        let prefix = module_path.join(version);
+        for notice in notices {
+            let notice = notice.as_str().ok_or_else(|| AppError::Invalid {
+                path: manifest.clone(),
+                reason: "notice path is not a string".into(),
+            })?;
+            let relative = safe_notice_path(&manifest, notice)?;
+            if relative.parent() != Some(prefix.as_path()) || !expected.insert(relative.clone()) {
+                return invalid(
+                    &manifest,
+                    format!("unexpected or duplicate notice {notice:?}"),
+                );
+            }
+            validate_regular_file(&root.join(relative), Some(0o644))?;
+        }
+    }
+    if actual != expected {
+        return invalid(
+            root,
+            format!("notice files are {actual:?}, expected {expected:?}"),
+        );
+    }
+    Ok(actual)
+}
+
+fn copy_notices(stage: &Path, tsgate: &Path, resources: &Path) -> Result<(), AppError> {
     copy_regular_file(
         &stage.join("THIRD_PARTY_NOTICES"),
         &resources.join("THIRD_PARTY_NOTICES"),
@@ -896,12 +995,29 @@ fn copy_notices(stage: &Path, resources: &Path) -> Result<(), AppError> {
         &resources.join("LICENSES/APACHE-2.0.txt"),
         0o644,
     )?;
+    let destination = resources.join("LICENSES/tsgate");
+    create_directory(&destination)?;
+    for relative in go_notice_inventory(tsgate)? {
+        let output = destination.join(&relative);
+        if let Some(parent) = output.parent() {
+            create_directory(parent)?;
+        }
+        copy_regular_file(&tsgate.join(relative), &output, 0o644)?;
+    }
     Ok(())
 }
 
-fn compare_notices(stage: &Path, resources: &Path) -> Result<(), AppError> {
+fn compare_notices(stage: &Path, tsgate: &Path, resources: &Path) -> Result<(), AppError> {
     for relative in ["THIRD_PARTY_NOTICES", "LICENSES/APACHE-2.0.txt"] {
         compare_files(&stage.join(relative), &resources.join(relative))?;
+    }
+    let destination = resources.join("LICENSES/tsgate");
+    let source_files = go_notice_inventory(tsgate)?;
+    if source_files != go_notice_inventory(&destination)? {
+        return invalid(&destination, "notice inventory differs from source".into());
+    }
+    for relative in source_files {
+        compare_files(&tsgate.join(&relative), &destination.join(relative))?;
     }
     Ok(())
 }
@@ -1149,15 +1265,24 @@ mod tests {
     use std::path::Path;
 
     use crate::app::{
-        compare_notices, copy_notices, copy_regular_file, ensure_same_identity, signed_code_paths,
-        signed_file_hashes, validate_bundle_filesystem, verify_unsigned_copies, SignatureIdentity,
-        ASSETS, HELPERS,
+        compare_notices, copy_notices, copy_regular_file, ensure_same_identity,
+        go_notice_inventory, helper_source, signed_code_paths, signed_file_hashes,
+        validate_bundle_filesystem, verify_unsigned_copies, SignatureIdentity, ASSETS, HELPERS,
     };
 
     fn file(path: &Path, bytes: &[u8], mode: u32) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn notices(root: &Path) {
+        file(
+            &root.join("example.org/dependency/v1.2.3/LICENSE"),
+            b"dependency license",
+            0o644,
+        );
+        file(&root.join("modules.json"), br#"[{"module":"example.org/dependency","version":"v1.2.3","notices":["example.org/dependency/v1.2.3/LICENSE"]}]"#, 0o644);
     }
 
     fn fixture(root: &Path) -> std::path::PathBuf {
@@ -1175,7 +1300,7 @@ mod tests {
         fs::create_dir_all(contents.join("MacOS")).unwrap();
         copy_regular_file(&release.join("silo"), &contents.join("MacOS/silo"), 0o755).unwrap();
         for (name, mode, _) in HELPERS {
-            let source = stage.join("bin").join(name);
+            let source = helper_source(&release, &stage, name);
             file(&source, format!("actual input {name}").as_bytes(), mode);
             let output = contents.join("Helpers").join(name);
             fs::create_dir_all(output.parent().unwrap()).unwrap();
@@ -1198,7 +1323,13 @@ mod tests {
             b"Apache license",
             0o644,
         );
-        copy_notices(&stage, &contents.join("Resources")).unwrap();
+        notices(&release.join("share/licenses/tsgate"));
+        copy_notices(
+            &stage,
+            &release.join("share/licenses/tsgate"),
+            &contents.join("Resources"),
+        )
+        .unwrap();
         bundle
     }
 
@@ -1215,10 +1346,15 @@ mod tests {
         .unwrap();
         assert!(root.path().join("release/silo").is_file());
         for (name, _, _) in HELPERS {
-            assert!(root.path().join("stage/bin").join(name).is_file());
+            assert!(helper_source(
+                &root.path().join("release"),
+                &root.path().join("stage"),
+                name
+            )
+            .is_file());
         }
         file(
-            &bundle.join("Contents/Helpers/netd"),
+            &bundle.join("Contents/Helpers/tsgate"),
             b"changed helper",
             0o755,
         );
@@ -1274,7 +1410,12 @@ mod tests {
             b"changed license",
             0o644,
         );
-        assert!(compare_notices(&root.path().join("stage"), &resources).is_err());
+        assert!(compare_notices(
+            &root.path().join("stage"),
+            &root.path().join("release/share/licenses/tsgate"),
+            &resources
+        )
+        .is_err());
         let original = resources.join("LICENSES");
         let outside = root.path().join("outside");
         fs::rename(&original, &outside).unwrap();
@@ -1287,12 +1428,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bundle = fixture(root.path());
         let paths = signed_code_paths(&bundle);
-        for name in ["netd", "silo-vmm"] {
+        for name in ["netd", "silo-vmm", "tsgate"] {
             assert!(paths.contains(&bundle.join("Contents/Helpers").join(name)));
         }
         assert!(paths.contains(&bundle.join("Contents/MacOS/silo")));
         let before = signed_file_hashes(&bundle).unwrap();
-        let relative = "Contents/Helpers/netd".to_string();
+        let relative = "Contents/Helpers/tsgate".to_string();
         file(&bundle.join(&relative), b"post-signing bytes", 0o755);
         let after = signed_file_hashes(&bundle).unwrap();
         assert_ne!(before[&relative], after[&relative]);
@@ -1301,6 +1442,50 @@ mod tests {
             crate::archive::sha256(&bundle.join(relative)).unwrap()
         );
         assert!(after.contains_key("Contents/Resources/LICENSES/APACHE-2.0.txt"));
+        assert!(after.contains_key("Contents/Resources/LICENSES/tsgate/modules.json"));
+    }
+
+    #[test]
+    fn notices_reject_unlisted_missing_unsafe_and_symlink_material() {
+        let root = tempfile::tempdir().unwrap();
+        notices(root.path());
+        go_notice_inventory(root.path()).unwrap();
+        file(&root.path().join("unlisted"), b"unlisted", 0o644);
+        assert!(go_notice_inventory(root.path()).is_err());
+        fs::remove_file(root.path().join("unlisted")).unwrap();
+        let notice = root.path().join("example.org/dependency/v1.2.3/LICENSE");
+        fs::remove_file(&notice).unwrap();
+        assert!(go_notice_inventory(root.path()).is_err());
+        symlink("/etc/passwd", &notice).unwrap();
+        assert!(go_notice_inventory(root.path()).is_err());
+        fs::remove_file(&notice).unwrap();
+        file(&notice, b"license", 0o644);
+        for path in [
+            "../LICENSE",
+            "/etc/passwd",
+            "example.org/dependency/v1.2.3/../LICENSE",
+            "example.org//dependency/v1.2.3/LICENSE",
+        ] {
+            file(
+                &root.path().join("modules.json"),
+                serde_json::to_vec(&serde_json::json!([{
+                    "module": "example.org/dependency", "version": "v1.2.3", "notices": [path],
+                }]))
+                .unwrap()
+                .as_slice(),
+                0o644,
+            );
+            assert!(go_notice_inventory(root.path()).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn gateway_helper_has_no_virtualization_entitlement() {
+        assert!(HELPERS
+            .iter()
+            .any(|(name, mode, entitlement)| *name == "tsgate"
+                && *mode == 0o755
+                && entitlement.is_none()));
     }
 
     #[test]
@@ -1335,6 +1520,7 @@ mod tests {
         for relative in [
             "Contents/Helpers/netd",
             "Contents/Helpers/silo-vmm",
+            "Contents/Helpers/tsgate",
             "Contents/Resources/assets/kernel-default",
         ] {
             let path = bundle.join(relative);

@@ -232,12 +232,15 @@ verify_extracted_layouts() {
     local root="$QUALIFICATION_ROOT/$target/silo-$VERSION-$target"
     require_directory "$root"
 
-    for name in silo silo-vmm netd; do
+    for name in silo silo-vmm netd tsgate; do
       assert_mode "$root/bin/$name" 755
     done
     assert_mode "$root/assets/agent" 755
     assert_mode "$root/assets/kernel-default" 644
     assert_mode "$root/assets/initramfs" 644
+    assert_mode "$root/share/licenses/tsgate/modules.json" 644
+    jq -e 'type == "array" and length > 0 and all(.[]; (.notices | length) > 0)' \
+      "$root/share/licenses/tsgate/modules.json" >/dev/null
 
     printf '%s: extracted layout and modes are correct\n' "$target"
   done
@@ -266,7 +269,7 @@ inspect_linux_target() {
   local loader="$3"
   local root="$QUALIFICATION_ROOT/$target/silo-$VERSION-$target"
   local dynamic_binaries=("$root/bin/silo" "$root/bin/silo-vmm")
-  local static_binaries=("$root/bin/netd" "$root/assets/agent" "$root/initramfs-unpacked/init")
+  local static_binaries=("$root/bin/netd" "$root/bin/tsgate" "$root/assets/agent" "$root/initramfs-unpacked/init")
 
   section "Linux Binary Inspection: $target"
 
@@ -294,23 +297,37 @@ inspect_linux_target() {
     if objdump -p "$binary" | grep -q 'NEEDED'; then
       die "$binary has an unexpected dynamic dependency"
     fi
+    if objdump -p "$binary" | grep -q 'INTERP'; then
+      die "$binary has an unexpected ELF interpreter"
+    fi
   done
 
   printf '%s: native loader and static guest checks passed\n' "$target"
 }
 
-verify_extracted_cli_hashes() {
-  section "Extracted CLI Provenance"
+verify_extracted_product_hashes() {
+  section "Extracted Product Provenance"
 
   for target in "${TARGETS[@]}"; do
     local root="$QUALIFICATION_ROOT/$target/silo-$VERSION-$target"
     local provenance="$PACKAGE_ROOT/$VERSION/$target/silo-$VERSION-$target.provenance.json"
     local actual expected
 
-    actual="$(shasum -a 256 "$root/bin/silo" | cut -d ' ' -f 1)"
-    expected="$(jq -er '.file_hashes["bin/silo"]' "$provenance")"
-    [[ "$actual" == "$expected" ]] || die "$target extracted silo does not match provenance"
-    printf '%s: extracted CLI matches provenance\n' "$target"
+    for name in silo tsgate; do
+      actual="$(shasum -a 256 "$root/bin/$name" | cut -d ' ' -f 1)"
+      expected="$(jq -er --arg path "bin/$name" '.file_hashes[$path]' "$provenance")"
+      [[ "$actual" == "$expected" ]] || die "$target extracted $name does not match provenance"
+      printf '%s: extracted %s matches provenance\n' "$target" "$name"
+    done
+    while IFS= read -r relative; do
+      [[ "$relative" == share/licenses/tsgate/* && "$relative" != *'..'* ]] ||
+        die "unsafe tsgate notice provenance path: $relative"
+      require_file "$root/$relative"
+      actual="$(shasum -a 256 "$root/$relative" | cut -d ' ' -f 1)"
+      expected="$(jq -er --arg path "$relative" '.file_hashes[$path]' "$provenance")"
+      [[ "$actual" == "$expected" ]] || die "$target tsgate notice $relative does not match provenance"
+    done < <(jq -r '.file_hashes | keys[] | select(startswith("share/licenses/tsgate/"))' "$provenance")
+    jq -e '.file_hashes["share/licenses/tsgate/modules.json"] | type == "string"' "$provenance" >/dev/null
   done
 }
 
@@ -318,7 +335,7 @@ inspect_darwin_binaries() {
   section "Darwin Binary Inspection"
 
   local root="$QUALIFICATION_ROOT/darwin-arm64/silo-$VERSION-darwin-arm64"
-  local binaries=("$root/bin/silo" "$root/bin/silo-vmm" "$root/bin/netd")
+  local binaries=("$root/bin/silo" "$root/bin/silo-vmm" "$root/bin/netd" "$root/bin/tsgate")
 
   for binary in "${binaries[@]}"; do
     local description
@@ -336,6 +353,7 @@ inspect_darwin_binaries() {
 
   "$root/bin/silo" --help >/dev/null
   "$root/bin/silo" daemon run --help >/dev/null
+  "$root/bin/tsgate" version
   printf 'darwin-arm64: Apple linkage and CLI startup checks passed\n'
 }
 
@@ -354,11 +372,20 @@ verify_dmg() {
   for executable in \
     "$app/Contents/MacOS/silo" \
     "$app/Contents/Helpers/silo-vmm" \
-    "$app/Contents/Helpers/netd"
+    "$app/Contents/Helpers/netd" \
+    "$app/Contents/Helpers/tsgate"
   do
+    assert_mode "$executable" 755
     codesign --verify --strict --verbose=4 "$executable"
   done
   codesign --verify --strict --verbose=4 "$app"
+  local entitlements
+  entitlements="$(codesign --display --entitlements :- "$app/Contents/Helpers/tsgate")"
+  if grep -Eq 'com\.apple\.security\.(hypervisor|virtualization)' <<<"$entitlements"; then
+    die "tsgate must not have virtualization entitlements"
+  fi
+  assert_mode "$app/Contents/Resources/LICENSES/tsgate/modules.json" 644
+  "$app/Contents/Helpers/tsgate" version
 
   [[ -L "$applications" ]] || die "$applications is not a symlink"
   [[ "$(readlink "$applications")" == /Applications ]] ||
@@ -384,7 +411,7 @@ verify_extracted_layouts
 extract_linux_initramfs
 inspect_linux_target linux-amd64-gnu x86-64 /lib64/ld-linux-x86-64.so.2
 inspect_linux_target linux-arm64-gnu 'ARM aarch64' /lib/ld-linux-aarch64.so.1
-verify_extracted_cli_hashes
+verify_extracted_product_hashes
 inspect_darwin_binaries
 verify_dmg
 

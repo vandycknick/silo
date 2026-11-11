@@ -40,26 +40,12 @@ type WhoIsRequest struct {
 
 func (WhoIsRequest) message() {}
 
-type StatusRequest struct {
-	Type string `json:"type"`
-	ID   uint64 `json:"id"`
-}
-
-func (StatusRequest) message() {}
-
 type Shutdown struct {
 	Type string `json:"type"`
 }
 
 func (Shutdown) message() {}
 
-type Status struct {
-	Phase   string   `json:"phase"`
-	DNSName string   `json:"dns_name"`
-	Tailnet string   `json:"tailnet"`
-	Suffix  string   `json:"suffix"`
-	Tags    []string `json:"tags"`
-}
 type State struct {
 	Type        string   `json:"type"`
 	Phase       string   `json:"phase"`
@@ -71,8 +57,7 @@ type State struct {
 	Error       string   `json:"error,omitempty"`
 }
 
-func (State) message()         {}
-func (s State) Status() Status { return Status{s.Phase, s.DNSName, s.Tailnet, s.Suffix, s.Tags} }
+func (State) message() {}
 
 type Conn struct {
 	Type     string `json:"type"`
@@ -92,11 +77,10 @@ type WhoIs struct {
 	Capability  []json.RawMessage `json:"capability"`
 }
 type Reply struct {
-	Type   string  `json:"type"`
-	ID     uint64  `json:"id"`
-	WhoIs  *WhoIs  `json:"whois,omitempty"`
-	Status *Status `json:"status,omitempty"`
-	Error  *string `json:"error,omitempty"`
+	Type  string  `json:"type"`
+	ID    uint64  `json:"id"`
+	WhoIs *WhoIs  `json:"whois,omitempty"`
+	Error *string `json:"error,omitempty"`
 }
 
 func (Reply) message() {}
@@ -122,9 +106,6 @@ func Decode(body []byte) (Message, error) {
 	case "whois":
 		m = &WhoIsRequest{}
 		known = []string{"id", "remote"}
-	case "status":
-		m = &StatusRequest{}
-		known = []string{"id"}
 	case "shutdown":
 		m = &Shutdown{}
 	case "state":
@@ -135,7 +116,7 @@ func Decode(body []byte) (Message, error) {
 		known = []string{"listener", "remote"}
 	case "reply":
 		m = &Reply{}
-		known = []string{"id", "whois", "status", "error"}
+		known = []string{"id", "whois", "error"}
 	default:
 		return nil, fmt.Errorf("unknown message type %q", typ)
 	}
@@ -163,9 +144,6 @@ func Decode(body []byte) (Message, error) {
 	case *Reply:
 		n := 0
 		if v.WhoIs != nil {
-			n++
-		}
-		if v.Status != nil {
 			n++
 		}
 		if v.Error != nil {

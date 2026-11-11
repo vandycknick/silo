@@ -31,17 +31,17 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::lobby::tailnet::wire::{
-    encode, Bootstrap, Decoder, Event, NodeState, Phase, ReplyBody, Request, Whois, MAX_FRAME,
+    encode, Bootstrap, Decoder, Event, NodeState, Phase, Request, Whois, MAX_FRAME,
 };
 use crate::lobby::tailnet::{Connection, TailnetError};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<ReplyBody, String>>>>>;
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Whois, String>>>>>;
 
 pub(crate) struct Tsgate {
-    child: Child,
+    child: tokio::sync::Mutex<Child>,
     writer: tokio::sync::Mutex<OwnedWriteHalf>,
     pending: Pending,
     next_id: AtomicU64,
@@ -73,7 +73,7 @@ impl Tsgate {
         let pending: Pending = Arc::default();
         tokio::spawn(read_loop(read, state_tx, conn_tx, pending.clone()));
         let gate = Self {
-            child,
+            child: tokio::sync::Mutex::new(child),
             writer: tokio::sync::Mutex::new(write),
             pending,
             next_id: AtomicU64::new(1),
@@ -88,49 +88,34 @@ impl Tsgate {
     }
 
     pub(crate) async fn whois(&self, remote: &str) -> Result<Whois, TailnetError> {
-        match self
-            .request(|id| Request::Whois {
-                id,
-                remote: remote.to_string(),
-            })
-            .await?
-        {
-            ReplyBody::Whois(whois) => Ok(whois),
-            ReplyBody::Status(_) => Err(TailnetError::Protocol(
-                "status reply to a whois request".into(),
-            )),
-        }
-    }
-
-    pub(crate) async fn status(&self) -> Result<NodeState, TailnetError> {
-        match self.request(|id| Request::Status { id }).await? {
-            ReplyBody::Status(status) => Ok(status),
-            ReplyBody::Whois(_) => Err(TailnetError::Protocol(
-                "whois reply to a status request".into(),
-            )),
-        }
+        self.request(|id| Request::Whois {
+            id,
+            remote: remote.to_owned(),
+        })
+        .await
     }
 
     /// Asks tsgate to stop, then waits for it, killing it after the grace
     /// period. Returns the child's exit status.
-    pub(crate) async fn shutdown(mut self) -> io::Result<std::process::ExitStatus> {
+    pub(crate) async fn shutdown(&self) -> io::Result<std::process::ExitStatus> {
         // A closed seam already means tsgate is on its way out.
         let _ = self.send(&Request::Shutdown).await;
-        match tokio::time::timeout(SHUTDOWN_GRACE, self.child.wait()).await {
+        let mut child = self.child.lock().await;
+        match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
             Ok(status) => status,
             Err(_) => {
-                self.child.kill().await?;
-                self.child.wait().await
+                child.kill().await?;
+                child.wait().await
             }
         }
     }
 
     /// Waits for tsgate to exit on its own (crash, fatal state, owner loss).
-    pub(crate) async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+    pub(crate) async fn wait(&self) -> io::Result<std::process::ExitStatus> {
+        self.child.lock().await.wait().await
     }
 
-    async fn request(&self, build: impl FnOnce(u64) -> Request) -> Result<ReplyBody, TailnetError> {
+    async fn request(&self, build: impl FnOnce(u64) -> Request) -> Result<Whois, TailnetError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(id, tx);
@@ -280,12 +265,29 @@ fn into_tokio(fd: OwnedFd) -> io::Result<UnixStream> {
     UnixStream::from_std(stream)
 }
 
-/// Locates tsgate next to the running executable.
+/// Locates tsgate in the portable archive or Silo.app helper directory.
 pub(crate) fn adjacent_binary() -> io::Result<PathBuf> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    helper_for_executable(&std::env::current_exe()?.canonicalize()?)
+}
+
+fn helper_for_executable(exe: &Path) -> io::Result<PathBuf> {
     let dir = exe
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "executable has no directory"))?;
+    if exe.file_name().is_some_and(|name| name == "silo")
+        && dir.file_name().is_some_and(|name| name == "MacOS")
+        && dir.parent().is_some_and(|contents| {
+            contents.file_name().is_some_and(|name| name == "Contents")
+                && contents
+                    .parent()
+                    .is_some_and(|bundle| bundle.file_name().is_some_and(|name| name == "Silo.app"))
+        })
+    {
+        let contents = dir.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "bundle has no Contents directory")
+        })?;
+        return Ok(contents.join("Helpers/tsgate"));
+    }
     Ok(dir.join("tsgate"))
 }
 
@@ -302,6 +304,32 @@ mod tests {
 
     use crate::lobby::tailnet::tsgate::{pump, Pending};
     use crate::lobby::tailnet::wire::{NodeState, Phase};
+
+    #[test]
+    fn helpers_follow_portable_and_app_bundle_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        let portable = root.path().join("bin");
+        let contents = root.path().join("Silo.app/Contents");
+        std::fs::create_dir_all(&portable).unwrap();
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::create_dir_all(contents.join("Helpers")).unwrap();
+        for (exe, helper) in [
+            (portable.join("silo"), portable.join("tsgate")),
+            (contents.join("MacOS/silo"), contents.join("Helpers/tsgate")),
+        ] {
+            std::fs::write(&exe, b"executable").unwrap();
+            std::fs::write(&helper, b"helper").unwrap();
+            assert_eq!(
+                crate::lobby::tailnet::tsgate::helper_for_executable(&exe).unwrap(),
+                helper
+            );
+        }
+        let ordinary = root.path().join("not-a-bundle/Contents/MacOS/silo");
+        assert_eq!(
+            crate::lobby::tailnet::tsgate::helper_for_executable(&ordinary).unwrap(),
+            ordinary.parent().unwrap().join("tsgate")
+        );
+    }
 
     fn frame(json: &str) -> Vec<u8> {
         let mut out = (json.len() as u32).to_be_bytes().to_vec();
@@ -476,7 +504,7 @@ mod tests {
         .expect("lobby node running in time")
         .unwrap();
         assert_eq!(state.borrow().tags, vec!["tag:silo".to_string()]);
-        assert_eq!(gate.status().await.unwrap().phase, Phase::Running);
+        assert_eq!(gate.state().borrow().phase, Phase::Running);
 
         net_in
             .write_all(b"probe lobby hello-lobby\n")
@@ -512,10 +540,9 @@ mod tests {
         assert_eq!(probe["received"], "reply-after-eof");
 
         // Owner loss: close our end without a shutdown request.
-        let Tsgate {
-            mut child, writer, ..
-        } = gate;
+        let Tsgate { child, writer, .. } = gate;
         drop(writer);
+        let mut child = child.into_inner();
         let exit = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .expect("tsgate exits within five seconds of owner loss")

@@ -327,13 +327,6 @@ pub(crate) struct FeatureSelection {
     pub(crate) tailscale: bool,
 }
 
-impl FeatureSelection {
-    pub(crate) fn validate(self) -> eyre::Result<()> {
-        eyre::ensure!(!self.tailscale, "the lobby is not available in this build");
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -345,7 +338,7 @@ mod tests {
     use crate::config::{parse_global_config, FeatureOverrides, GlobalConfig};
 
     #[test]
-    fn unavailable_lobby_is_refused_for_explicit_and_persisted_features() {
+    fn lobby_can_be_selected_explicitly_or_from_persisted_features() {
         for (document, tailscale) in [
             ("{}", Some(true)),
             (
@@ -361,10 +354,8 @@ mod tests {
                 },
                 false,
             );
-            assert_eq!(
-                selected.validate().unwrap_err().to_string(),
-                "the lobby is not available in this build"
-            );
+            assert!(selected.tailscale);
+            assert!(!selected.system);
             let disabled = config.resolve_features(
                 FeatureOverrides {
                     system: Some(false),
@@ -372,12 +363,13 @@ mod tests {
                 },
                 false,
             );
-            disabled.validate().unwrap();
+            assert!(!disabled.tailscale);
         }
-        GlobalConfig::default()
-            .resolve_features(FeatureOverrides::default(), false)
-            .validate()
-            .unwrap();
+        assert!(
+            !GlobalConfig::default()
+                .resolve_features(FeatureOverrides::default(), false)
+                .tailscale
+        );
     }
 
     #[test]

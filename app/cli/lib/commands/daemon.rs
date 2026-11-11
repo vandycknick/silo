@@ -91,7 +91,6 @@ impl Cmd {
                 let features = context
                     .config()?
                     .resolve_features(selection, existing_installation);
-                features.validate()?;
                 let socket = paths.docker_socket();
                 let live = service::status(&paths)?.is_some();
                 if features.system {
@@ -131,6 +130,11 @@ impl Cmd {
                 let identity = persisted.daemon_identity(features)?;
                 service::up(&service, &identity, features.system, &mut spinner).await?;
                 spinner.finish_success("Started");
+                if features.tailscale {
+                    if let Some(status) = service::status(&paths)? {
+                        report_lobby(&status);
+                    }
+                }
                 if features.system {
                     crate::daemon::docker::integrate(&socket, !command.no_switch_context)?;
                     crate::ui::hint(format!("Docker endpoint: unix://{}", socket.display()));
@@ -208,6 +212,10 @@ impl DaemonStatusView {
     }
 
     fn print_human(&self) -> eyre::Result<()> {
+        crate::ui::print_detail_rows(&self.human_rows())
+    }
+
+    fn human_rows(&self) -> Vec<(String, String)> {
         let mut rows: Vec<(String, String)> = Vec::new();
         rows.push(("Core".to_string(), self.state.to_string()));
         rows.push((
@@ -244,6 +252,29 @@ impl DaemonStatusView {
                     .map(|system| format!("{:?}", system.phase))
                     .unwrap_or_else(|| "disabled".into()),
             ));
+            rows.push((
+                "Lobby".to_string(),
+                daemon
+                    .lobby
+                    .as_ref()
+                    .map(|lobby| lobby.phase.to_string())
+                    .unwrap_or_else(|| "disabled".into()),
+            ));
+            if let Some(lobby) = &daemon.lobby {
+                if let Some(dns_name) = &lobby.dns_name {
+                    rows.push(("Lobby DNS".to_string(), dns_name.clone()));
+                }
+                if let Some(approval_url) = &lobby.approval_url {
+                    rows.push(("Lobby login".to_string(), approval_url.clone()));
+                }
+                if let Some(diagnostic) = &lobby.diagnostic {
+                    rows.push(("Lobby diagnostic".to_string(), diagnostic.clone()));
+                }
+                rows.push((
+                    "Lobby restarts".to_string(),
+                    lobby.restart_count.to_string(),
+                ));
+            }
             if let Some(error) = &daemon.last_error {
                 rows.push(("Core error".to_string(), error.clone()));
             }
@@ -334,7 +365,17 @@ impl DaemonStatusView {
                 rows.push(("Error".to_string(), error.clone()));
             }
         }
-        crate::ui::print_detail_rows(&rows)
+        rows
+    }
+}
+
+/// Show the lobby's current phase and any approval action after starting the daemon.
+pub(crate) fn report_lobby(status: &DaemonStatus) {
+    if let Some(lobby) = &status.lobby {
+        crate::ui::hint(format!("Lobby: {}", lobby.phase));
+        if let Some(approval_url) = &lobby.approval_url {
+            crate::ui::hint(format!("Lobby login: {approval_url}"));
+        }
     }
 }
 
@@ -461,7 +502,103 @@ async fn follow_logs(path: &std::path::Path) -> eyre::Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use crate::commands::daemon::format_update_check;
+    use crate::commands::daemon::{format_update_check, DaemonStatusView};
+    use silod_spec::status::{LobbyPhase, LobbyStatus};
+
+    fn status_view(lobby: Option<LobbyStatus>) -> DaemonStatusView {
+        let daemon = serde_json::from_value(serde_json::json!({
+            "schema": 2, "generation": "00000000-0000-4000-8000-000000000004",
+            "pid": 1, "process_start": "1", "core": "ready", "home": "/tmp/home",
+            "control_endpoint": "/tmp/control", "updated_at": "2026-11-11T00:00:00Z",
+            "last_error": null, "system": null, "lobby": lobby,
+            "configuration_identity": "test", "manager_live": null, "appliance_live": null,
+        }))
+        .unwrap();
+        DaemonStatusView {
+            state: "ready",
+            autostart: Some(true),
+            linger: None,
+            endpoint: None,
+            memory_bytes: None,
+            daemon: Some(daemon),
+        }
+    }
+
+    #[test]
+    fn lobby_status_rows_render_all_phases_and_details() {
+        for phase in [
+            LobbyPhase::Starting,
+            LobbyPhase::NeedsLogin,
+            LobbyPhase::NeedsTag,
+            LobbyPhase::Ready,
+            LobbyPhase::Degraded,
+            LobbyPhase::Failed,
+        ] {
+            let view = status_view(Some(LobbyStatus {
+                phase,
+                dns_name: Some("lobby.example.ts.net".into()),
+                approval_url: Some("https://login.tailscale.com/a/example".into()),
+                diagnostic: Some("waiting for approval".into()),
+                restart_count: 3,
+                updated_at: "2026-11-11T00:00:00Z".into(),
+            }));
+            let rows: Vec<_> = view
+                .human_rows()
+                .into_iter()
+                .filter(|(key, _)| key.starts_with("Lobby"))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    ("Lobby".into(), phase.to_string()),
+                    ("Lobby DNS".into(), "lobby.example.ts.net".into()),
+                    (
+                        "Lobby login".into(),
+                        "https://login.tailscale.com/a/example".into()
+                    ),
+                    ("Lobby diagnostic".into(), "waiting for approval".into()),
+                    ("Lobby restarts".into(), "3".into()),
+                ]
+            );
+            let json = serde_json::to_value(&view).unwrap();
+            assert_eq!(
+                json["daemon"]["lobby"],
+                serde_json::to_value(view.daemon.as_ref().unwrap().lobby.as_ref()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn lobby_status_rows_omit_unavailable_details_and_mark_disabled() {
+        let view = status_view(None);
+        let rows: Vec<_> = view
+            .human_rows()
+            .into_iter()
+            .filter(|(key, _)| key.starts_with("Lobby"))
+            .collect();
+        assert_eq!(rows, vec![("Lobby".into(), "disabled".into())]);
+        assert!(serde_json::to_value(&view).unwrap()["daemon"]["lobby"].is_null());
+        let view = status_view(Some(LobbyStatus {
+            phase: LobbyPhase::Starting,
+            dns_name: None,
+            approval_url: None,
+            diagnostic: None,
+            restart_count: 0,
+            updated_at: "2026-11-11T00:00:00Z".into(),
+        }));
+        let rows: Vec<_> = view
+            .human_rows()
+            .into_iter()
+            .filter(|(key, _)| key.starts_with("Lobby"))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Lobby".into(), "starting".into()),
+                ("Lobby restarts".into(), "0".into()),
+            ]
+        );
+    }
 
     #[test]
     fn feature_flags_distinguish_omitted_enabled_and_disabled() {

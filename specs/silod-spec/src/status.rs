@@ -42,6 +42,7 @@ pub struct DaemonStatus {
     pub updated_at: String,
     pub last_error: Option<String>,
     pub system: Option<SystemStatus>,
+    pub lobby: Option<LobbyStatus>,
     pub configuration_identity: String,
     #[serde(deserialize_with = "required_option")]
     pub manager_live: Option<vm_spec::live::LiveHostReport>,
@@ -57,6 +58,40 @@ pub enum CorePhase {
     Stopping,
     Stopped,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LobbyPhase {
+    Starting,
+    NeedsLogin,
+    NeedsTag,
+    Ready,
+    Degraded,
+    Failed,
+}
+
+impl std::fmt::Display for LobbyPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Starting => "starting",
+            Self::NeedsLogin => "needs_login",
+            Self::NeedsTag => "needs_tag",
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyStatus {
+    pub phase: LobbyPhase,
+    pub dns_name: Option<String>,
+    pub approval_url: Option<String>,
+    pub diagnostic: Option<String>,
+    pub restart_count: u32,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,7 +282,7 @@ pub enum MemoryReclaimOutcome {
 
 #[cfg(test)]
 mod tests {
-    use crate::status::{SystemPhase, SystemStatus};
+    use crate::status::{DaemonStatus, LobbyPhase, LobbyStatus, SystemPhase, SystemStatus};
     use vm_spec::live::{
         LiveBackend, LiveCapabilityVector, LiveLane, LiveMachineReport, LiveReasonCode, LiveScope,
     };
@@ -280,6 +315,61 @@ mod tests {
             "last_error": null, "system": system, "configuration_identity": "unit",
             "manager_live": null, "appliance_live": null,
         })
+    }
+
+    #[test]
+    fn lobby_status_json_round_trip_preserves_every_phase_and_field() {
+        for (phase, name) in [
+            (LobbyPhase::Starting, "starting"),
+            (LobbyPhase::NeedsLogin, "needs_login"),
+            (LobbyPhase::NeedsTag, "needs_tag"),
+            (LobbyPhase::Ready, "ready"),
+            (LobbyPhase::Degraded, "degraded"),
+            (LobbyPhase::Failed, "failed"),
+        ] {
+            let lobby = LobbyStatus {
+                phase,
+                dns_name: Some("lobby.example.ts.net".into()),
+                approval_url: Some("https://login.tailscale.com/a/example".into()),
+                diagnostic: Some("waiting for tag approval".into()),
+                restart_count: u32::MAX,
+                updated_at: "2026-11-11T00:00:00Z".into(),
+            };
+            let mut daemon = daemon_json(serde_json::Value::Null);
+            daemon["lobby"] = serde_json::to_value(&lobby).unwrap();
+            assert_eq!(daemon["lobby"]["phase"], name);
+            assert_eq!(phase.to_string(), name);
+            let parsed: DaemonStatus = serde_json::from_value(daemon).unwrap();
+            assert_eq!(parsed.lobby.as_ref(), Some(&lobby));
+            let encoded = serde_json::to_vec(&parsed).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<DaemonStatus>(&encoded).unwrap(),
+                parsed
+            );
+        }
+    }
+
+    #[test]
+    fn lobby_status_json_accepts_disabled_and_optional_details() {
+        let mut daemon = daemon_json(serde_json::Value::Null);
+        let missing: DaemonStatus = serde_json::from_value(daemon.clone()).unwrap();
+        assert!(missing.lobby.is_none());
+        assert!(serde_json::to_value(&missing).unwrap()["lobby"].is_null());
+        daemon["lobby"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<DaemonStatus>(daemon.clone())
+            .unwrap()
+            .lobby
+            .is_none());
+        daemon["lobby"] = serde_json::json!({
+            "phase": "starting", "restart_count": 0, "updated_at": "2026-11-11T00:00:00Z",
+        });
+        let parsed: DaemonStatus = serde_json::from_value(daemon.clone()).unwrap();
+        let lobby = parsed.lobby.unwrap();
+        assert!(lobby.dns_name.is_none());
+        assert!(lobby.approval_url.is_none());
+        assert!(lobby.diagnostic.is_none());
+        daemon["lobby"]["phase"] = "unknown".into();
+        assert!(serde_json::from_value::<DaemonStatus>(daemon).is_err());
     }
 
     #[test]

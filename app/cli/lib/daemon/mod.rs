@@ -9,7 +9,7 @@ mod provision;
 mod record;
 mod runtime;
 pub(crate) mod serve;
-mod status;
+pub(crate) mod status;
 mod storage;
 mod supervisor;
 mod system_config;

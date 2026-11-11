@@ -69,7 +69,6 @@ pub(crate) fn validate(host: &libvm::HostPaths, features: FeatureOverrides) -> e
         features,
         configuration(DaemonRecord::load(&paths))?.is_some(),
     );
-    configuration(features.validate())?;
     if features.system {
         configuration(desired_system(&paths, &overrides))?;
     }
@@ -132,7 +131,6 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
         },
         configuration(DaemonRecord::load(&paths))?.is_some(),
     );
-    configuration(features.validate())?;
     let desired = if features.system {
         Some(configuration(desired_system(&paths, &overrides))?)
     } else {
@@ -156,6 +154,8 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let registry_policy = global.images().clone();
+    let lobby_host = host.clone();
+    let lobby_settings = global.tailscale().clone();
     let state = std::sync::Arc::new(control::ControlState::new(
         host,
         global,
@@ -190,6 +190,22 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
     } else {
         None
     };
+    let lobby_shutdown = tokio_util::sync::CancellationToken::new();
+    let mut lobby_task = if features.tailscale {
+        let context = crate::lobby::supervisor::LobbyContext::new(
+            lobby_host,
+            lobby_settings,
+            control::lobby::Management::new(state.clone()),
+            publisher.clone(),
+        )?;
+        publisher.set_lobby(Some(crate::lobby::supervisor::initial_status()))?;
+        Some(tokio::spawn(crate::lobby::supervisor::run(
+            context,
+            lobby_shutdown.clone(),
+        )))
+    } else {
+        None
+    };
     publisher.set_core(silod_spec::status::CorePhase::Ready, None)?;
     let api_result = loop {
         tokio::select! {
@@ -214,14 +230,34 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
                 }
                 // Optional integration failure does not take away a working core API.
             }
+            result = async {
+                match lobby_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                lobby_task = None;
+                if let Err(error) = result {
+                    tracing::error!(%error, "lobby supervisor task failed");
+                    publisher.set_lobby(Some(silod_spec::status::LobbyStatus {
+                        phase: silod_spec::status::LobbyPhase::Failed,
+                        dns_name: None, approval_url: None, diagnostic: Some(format!("lobby supervisor task failed: {error}")),
+                        restart_count: 0, updated_at: supervisor::now(),
+                    }))?;
+                }
+            }
         }
     };
     state.begin_stopping().await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(87);
     system_shutdown.cancel();
+    lobby_shutdown.cancel();
     let drained = tokio::time::timeout_at(deadline, async {
         state.wait_for_mutations().await?;
         if let Some(task) = system_task {
+            task.await??;
+        }
+        if let Some(task) = lobby_task {
             task.await??;
         }
         Ok::<(), eyre::Report>(())
