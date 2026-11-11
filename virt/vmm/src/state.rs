@@ -173,6 +173,7 @@ pub(crate) struct InstanceStore {
     state: Mutex<State>,
     generation: watch::Sender<u64>,
     identity_reset: watch::Sender<u64>,
+    agent_parked: watch::Sender<bool>,
     ready_agent_identity: watch::Sender<Option<ReadyAgentIdentity>>,
 }
 
@@ -186,6 +187,7 @@ impl InstanceStore {
         let now = SystemTime::now();
         let (generation, _) = watch::channel(0);
         let (identity_reset, _) = watch::channel(0);
+        let (agent_parked, _) = watch::channel(false);
         let (ready_agent_identity, _) = watch::channel(None);
         let monitor_id = uuid::Uuid::new_v4().to_string();
         let live = LiveMachineReport {
@@ -235,6 +237,7 @@ impl InstanceStore {
             state: Mutex::new(state),
             generation,
             identity_reset,
+            agent_parked,
             ready_agent_identity,
         })
     }
@@ -245,6 +248,10 @@ impl InstanceStore {
 
     pub(crate) fn subscribe_identity_reset(&self) -> watch::Receiver<u64> {
         self.identity_reset.subscribe()
+    }
+
+    pub(crate) fn subscribe_agent_parked(&self) -> watch::Receiver<bool> {
+        self.agent_parked.subscribe()
     }
 
     pub(crate) fn ready_agent_identity(&self) -> Result<ReadyAgentIdentity, StoreError> {
@@ -506,11 +513,16 @@ impl InstanceStore {
     }
 
     pub(crate) fn agent_connecting(&self) -> Result<(), StoreError> {
-        self.mutate(|state| {
-            if state.agent_enabled {
-                state.connection.state = Some(AgentConnectionState::Connecting as i32);
+        self.mutate_if(|state| {
+            // Resume barriers can restore responsiveness while a reconnect
+            // backoff is still sleeping. That retry is no longer evidence of loss.
+            if !state.agent_enabled
+                || state.connection.state != Some(AgentConnectionState::Unresponsive as i32)
+            {
+                return Ok(false);
             }
-            Ok(())
+            state.connection.state = Some(AgentConnectionState::Connecting as i32);
+            Ok(true)
         })
     }
 
@@ -654,10 +666,17 @@ impl InstanceStore {
                 .last_log_snapshot
                 .clone()
                 .unwrap_or_else(|| state_log_snapshot(&state, Instant::now()));
+            let was_parked = state.parked_since.is_some();
             if !update(&mut state)? {
                 return Ok(());
             }
             refresh_ssh_verification(&mut state, Instant::now())?;
+            let parked = state.parked_since.is_some();
+            if parked != was_parked {
+                // Publish under the state lock so rapid park/release transitions
+                // cannot reorder. Watch versions retain even coalesced transitions.
+                self.agent_parked.send_replace(parked);
+            }
             let after = state_log_snapshot(&state, Instant::now());
             state.last_log_snapshot = Some(after.clone());
             (before, after)
@@ -2285,7 +2304,10 @@ mod tests {
             store.complete_ssh_verification(&target, Ok(())).unwrap();
             match transition {
                 0 => store.agent_failure("connection lost").unwrap(),
-                1 => store.agent_connecting().unwrap(),
+                1 => {
+                    store.agent_failure("connection lost").unwrap();
+                    store.agent_connecting().unwrap();
+                }
                 2 => store.set_vm_state(VmState::Stopping, "stopping").unwrap(),
                 3 => {
                     let mut status = ssh_status(1);
@@ -2334,6 +2356,40 @@ mod tests {
             store.agent_failure("still unavailable").unwrap();
             assert_eq!(store.state.lock().expect("state lock").ssh_epoch, epoch);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_reconnect_cannot_revoke_a_resumed_agent_session() {
+        let store = ssh_store();
+        store.agent_failure("status stream became silent").unwrap();
+        let reconnect = async {
+            tokio::time::sleep(Duration::from_millis(1750)).await;
+            store.agent_connecting().unwrap();
+        };
+        tokio::pin!(reconnect);
+        assert!(futures::poll!(reconnect.as_mut()).is_pending());
+        store
+            .observe_status(ssh_status(1), Duration::from_secs(300))
+            .unwrap();
+        let target = store.ssh_verification_target().unwrap().unwrap();
+        store.complete_ssh_verification(&target, Ok(())).unwrap();
+        let mut sessions = store.subscribe_ready_agent_identity();
+        let identity = sessions.borrow_and_update().clone();
+        assert!(identity.is_some());
+        let generation = store.subscribe();
+
+        // The pre-pause reconnect backoff wakes after the resume barrier.
+        tokio::time::advance(Duration::from_millis(1750)).await;
+        reconnect.await;
+
+        assert_eq!(*sessions.borrow(), identity);
+        assert!(!sessions.has_changed().unwrap());
+        assert!(!generation.has_changed().unwrap());
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::Ready);
+        assert!(Arc::ptr_eq(
+            &target,
+            &store.ssh_verification_target().unwrap().unwrap()
+        ));
     }
 
     #[test]
@@ -2923,6 +2979,47 @@ mod tests {
             parked,
             readiness_probe: false,
         }
+    }
+
+    #[test]
+    fn agent_deadlines_follow_native_park_and_release_not_status_updates() {
+        let store = live_store();
+        let mut parked = store.subscribe_agent_parked();
+        assert!(!*parked.borrow_and_update());
+        assert!(store.publish_live(paused_transition(&store, true)).unwrap());
+        assert!(parked.has_changed().unwrap());
+        assert!(*parked.borrow_and_update());
+
+        // A capture preserving an existing pause must not restart its clock.
+        assert!(store.publish_live(paused_transition(&store, true)).unwrap());
+        store
+            .observe_status(
+                live_status("00000000-0000-4000-8000-000000000002", Some(true)),
+                Duration::from_secs(15),
+            )
+            .unwrap();
+        assert!(!parked.has_changed().unwrap());
+
+        assert!(store
+            .publish_live(crate::state::LiveTransition {
+                state: VmLifecycleState::Running,
+                lifecycle: LiveLifecycle::default(),
+                message: "running".into(),
+                held_identity: None,
+                parked: false,
+                readiness_probe: false,
+            })
+            .unwrap());
+        assert!(parked.has_changed().unwrap());
+        assert!(!*parked.borrow_and_update());
+
+        // Even a park/release pair coalesced into the same final bool is seen.
+        assert!(store.publish_live(paused_transition(&store, true)).unwrap());
+        store.set_vm_state(VmState::Stopping, "stop").unwrap();
+        assert!(parked.has_changed().unwrap());
+        assert!(!*parked.borrow_and_update());
+        assert!(!store.publish_live(paused_transition(&store, true)).unwrap());
+        assert!(!parked.has_changed().unwrap());
     }
 
     #[test]

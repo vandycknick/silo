@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Guest agent status and metrics deadlines suspend during native pause and
+  restart on resume without replacing the healthy stream. Delayed reconnect
+  attempts no longer revoke an agent session restored by the resume handshake.
 - Restore, fork and live capture no longer reserve or refuse host RAM. Lazy
   file-private RAM mappings use ordinary host virtual memory; private-write
   percentages, memory-overcommit flags and RAM policy/result fields are removed.
