@@ -18,6 +18,7 @@ qcow2 = ["dep:imago"]
 [dependencies]
 rootfs-spec = { path = "../../specs/rootfs-spec" }
 thiserror = "2.0.19"
+utils = { path = "../utils" }
 uuid = { version = "1.24.0", features = ["v4"] }
 imago = { version = "0.2.6", default-features = false, features = ["sync"], optional = true }
 

@@ -1407,7 +1407,7 @@ mod tests {
             Vec::new(),
         )
         .await;
-        assert!(oversized_error.contains("exceeds 16777216 bytes"));
+        assert!(oversized_error.contains("exceeds 16MiB"));
         assert!(!oversized_error.contains("read vm spec"));
     }
 

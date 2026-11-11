@@ -69,7 +69,8 @@ pub(crate) fn scenario_digest(bytes: &[u8]) -> String {
 pub(crate) fn validate_scenario_bytes(bytes: &[u8], expected_digest: &str) -> eyre::Result<()> {
     eyre::ensure!(
         bytes.len() <= MAX_SCENARIO_BYTES,
-        "scenario exceeds {MAX_SCENARIO_BYTES} bytes"
+        "scenario exceeds {}",
+        utils::format_storage_size(MAX_SCENARIO_BYTES as u64)
     );
     eyre::ensure!(
         scenario_digest(bytes) == expected_digest,
@@ -89,7 +90,8 @@ fn read_scenario(path: &std::path::Path) -> eyre::Result<String> {
         .read_to_end(&mut bytes)?;
     eyre::ensure!(
         bytes.len() <= MAX_SCENARIO_BYTES,
-        "scenario exceeds {MAX_SCENARIO_BYTES} bytes"
+        "scenario exceeds {}",
+        utils::format_storage_size(MAX_SCENARIO_BYTES as u64)
     );
     Ok(String::from_utf8(bytes)?)
 }
@@ -134,7 +136,8 @@ impl ResolvedSelection {
         if let Some(json) = json {
             eyre::ensure!(
                 json.len() <= MAX_SCENARIO_BYTES,
-                "scenario exceeds {MAX_SCENARIO_BYTES} bytes"
+                "scenario exceeds {}",
+                utils::format_storage_size(MAX_SCENARIO_BYTES as u64)
             );
         }
         #[cfg(feature = "mock-backend")]

@@ -73,7 +73,7 @@ pub enum DiskImportError {
         path: PathBuf,
         container: ForeignContainer,
     },
-    #[error("raw disk image {} has {length} bytes; expected a positive multiple of 512 up to 1 TiB", path.display())]
+    #[error("raw disk image {} has {}; expected a positive multiple of 512 up to 1 TiB", path.display(), utils::format_storage_size(*length))]
     RawGeometry { path: PathBuf, length: u64 },
     #[error("qcow2 disk image {} is not admitted", path.display())]
     Qcow2 {
@@ -83,7 +83,7 @@ pub enum DiskImportError {
     },
     #[error("disk image {} changed during import; quiesce every writer and retry", path.display())]
     SourceChanged { path: PathBuf },
-    #[error("decoded disk has {length} bytes, outside the admitted partition geometry")]
+    #[error("decoded disk has {}, outside the admitted partition geometry", utils::format_storage_size(*length))]
     DecodedGeometry { length: u64 },
     #[error("decoded disk partition table is not admitted")]
     PartitionTable(#[source] disk_partition::Error<std::io::Error>),
@@ -91,9 +91,9 @@ pub enum DiskImportError {
     DirectTable(#[from] disk_partition::DirectTableError),
     #[error(transparent)]
     RootFilesystem(#[from] crate::image::ext4_admission::Ext4Rejection),
-    #[error("decoded disk stream has {actual} bytes, expected exactly {expected}")]
+    #[error("decoded disk stream has {}, expected exactly {}", utils::format_storage_size(*actual), utils::format_storage_size(*expected))]
     OutputLength { expected: u64, actual: u64 },
-    #[error("owned disk copy space requires {required} bytes, available {available} bytes")]
+    #[error("owned disk copy space requires {}, available {} (short by {})", utils::format_storage_size(*required), utils::format_storage_size(*available), utils::format_storage_size(required.saturating_sub(*available)))]
     Capacity { required: u64, available: u64 },
 }
 
@@ -762,6 +762,30 @@ pub(crate) mod tests {
     const ROOT_GUID: Uuid = Uuid::from_u128(0x01234567_89ab_4def_8123_456789abcdef);
     const OTHER_GUID: Uuid = Uuid::from_u128(0x99999999_8888_4777_8666_555555555555);
     const ROOT_LBA: u64 = 4096;
+
+    #[test]
+    fn import_size_errors_are_human_readable() {
+        assert_eq!(
+            DiskImportError::Capacity {
+                required: (1 << 30) + 1,
+                available: 1 << 30,
+            }
+            .to_string(),
+            "owned disk copy space requires 1.0GiB, available 1GiB (short by 1B)"
+        );
+        assert_eq!(
+            DiskImportError::OutputLength {
+                expected: 2 << 20,
+                actual: 1 << 20,
+            }
+            .to_string(),
+            "decoded disk stream has 1MiB, expected exactly 2MiB"
+        );
+        assert_eq!(
+            DiskImportError::DecodedGeometry { length: 0 }.to_string(),
+            "decoded disk has 0B, outside the admitted partition geometry"
+        );
+    }
 
     fn put(bytes: &mut [u8], offset: u64, data: &[u8]) {
         let at = offset as usize;

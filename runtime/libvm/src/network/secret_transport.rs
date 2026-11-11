@@ -22,7 +22,9 @@ impl Serialize for Base64Bytes<'_> {
             .ok_or_else(|| serde::ser::Error::custom("secret encoding exceeds limit"))?;
         if length > JSON_LIMIT {
             return Err(serde::ser::Error::custom(format!(
-                "secret encoding size {length} exceeds limit {JSON_LIMIT}"
+                "secret encoding size {} exceeds limit {}",
+                utils::format_storage_size(length as u64),
+                utils::format_storage_size(JSON_LIMIT as u64)
             )));
         }
         let mut encoded = Zeroizing::new(vec![0u8; length]);
@@ -66,8 +68,9 @@ impl Write for BoundedJson {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > JSON_LIMIT.saturating_sub(self.0.len()) {
             return Err(io::Error::other(format!(
-                "netd secret JSON size at least {} exceeds limit {JSON_LIMIT}",
-                self.0.len().saturating_add(bytes.len())
+                "netd secret JSON size at least {} exceeds limit {}",
+                utils::format_storage_size(self.0.len().saturating_add(bytes.len()) as u64),
+                utils::format_storage_size(JSON_LIMIT as u64)
             )));
         }
         self.0.extend_from_slice(bytes);

@@ -364,7 +364,10 @@ impl SpaceDemand {
 fn admit_space(required: u64, available: u64) -> Result<(), LibVmError> {
     if required > available {
         return Err(invalid(format!(
-            "destination needs {required} bytes but has {available} available"
+            "destination needs {} but has {} available (short by {})",
+            utils::format_storage_size(required),
+            utils::format_storage_size(available),
+            utils::format_storage_size(required.saturating_sub(available))
         )));
     }
     Ok(())

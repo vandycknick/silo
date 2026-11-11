@@ -49,8 +49,9 @@ impl Storage for HeldSource {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "read of {length} bytes at {offset} ends past the {}-byte qcow2 source",
-                    self.len
+                    "read of {} at {offset} ends past the {} qcow2 source",
+                    utils::format_storage_size(length),
+                    utils::format_storage_size(self.len)
                 ),
             ));
         }
@@ -97,7 +98,11 @@ impl Storage for HeldSource {
 
 impl fmt::Display for HeldSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "held qcow2 source ({} bytes)", self.len)
+        write!(
+            f,
+            "held qcow2 source ({})",
+            utils::format_storage_size(self.len)
+        )
     }
 }
 

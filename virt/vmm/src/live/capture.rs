@@ -2622,8 +2622,13 @@ fn staging_budget(reserved: u64, staged: u64) -> Result<u64, LiveFailure> {
             LiveFailureCode::StagingBudgetExceeded,
             LiveStage::CaptureVerify,
             format!(
-                "sealed staging needs {total} bytes ({staged} staged, {records} bounded \
-                 control records), the reservation holds {reserved}"
+                "sealed staging needs {} ({} staged, {} bounded \
+                 control records), the reservation holds {} (short by {})",
+                utils::format_storage_size(total),
+                utils::format_storage_size(staged),
+                utils::format_storage_size(records),
+                utils::format_storage_size(reserved),
+                utils::format_storage_size(total.saturating_sub(reserved))
             ),
         ));
     }
@@ -2985,8 +2990,15 @@ mod tests {
         assert_eq!(refused.code, LiveFailureCode::StagingBudgetExceeded);
         assert_eq!(refused.stage, LiveStage::CaptureVerify);
         let message = refused.message.unwrap().to_string();
-        assert!(message.contains(&exact.to_string()), "{message}");
-        assert!(message.contains(&(exact - 1).to_string()), "{message}");
+        assert!(
+            message.contains(&utils::format_storage_size(exact)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&utils::format_storage_size(exact - 1)),
+            "{message}"
+        );
+        assert!(message.ends_with("(short by 1B)"), "{message}");
     }
 
     #[test]

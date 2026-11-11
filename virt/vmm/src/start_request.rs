@@ -170,8 +170,8 @@ fn decode_start_request(
     }
     if encoded.len() > VMM_START_REQUEST_MAX_BYTES {
         return Err(invalid_data(format!(
-            "silo-vmm start request exceeds {} bytes",
-            VMM_START_REQUEST_MAX_BYTES
+            "silo-vmm start request exceeds {}",
+            utils::format_storage_size(VMM_START_REQUEST_MAX_BYTES as u64)
         )));
     }
     if encoded.last() != Some(&b'\n') {

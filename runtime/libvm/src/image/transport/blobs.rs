@@ -156,8 +156,10 @@ impl StagedBlobs {
             return Err(invalid(
                 "payload",
                 format!(
-                    "{} descriptor size {} contradicts its authenticated {length} cached bytes",
-                    payload.digest, payload.size
+                    "{} descriptor size {} contradicts its authenticated {} cached size",
+                    payload.digest,
+                    utils::format_storage_size(payload.size),
+                    utils::format_storage_size(length)
                 ),
             ));
         }

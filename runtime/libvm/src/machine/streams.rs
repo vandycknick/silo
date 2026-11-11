@@ -78,8 +78,9 @@ fn poll_chunk(
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "{label} returned a {} byte chunk, maximum is {ACCEPTED_CHUNK_BYTES}",
-                            data.len()
+                            "{label} returned a {} chunk, maximum is {}",
+                            utils::format_storage_size(data.len() as u64),
+                            utils::format_storage_size(ACCEPTED_CHUNK_BYTES as u64)
                         ),
                     )));
                 }
@@ -1031,8 +1032,8 @@ fn validate_path(path: String) -> Result<String, LibVmError> {
         || path.as_bytes().contains(&0)
     {
         return Err(request_error(format!(
-            "path must be an absolute non-NUL UTF-8 string no longer than {} bytes",
-            protocol::MAX_PATH_BYTES
+            "path must be an absolute non-NUL UTF-8 string no longer than {}",
+            utils::format_storage_size(protocol::MAX_PATH_BYTES as u64)
         )));
     }
     if path != "/"
@@ -1075,8 +1076,8 @@ fn validate_page(limit: Option<u32>, cursor: Option<&[u8]>) -> Result<(), LibVmE
     }
     if cursor.is_some_and(|value| value.len() > protocol::MAX_CURSOR_BYTES) {
         return Err(request_error(format!(
-            "directory cursor must be no longer than {} bytes",
-            protocol::MAX_CURSOR_BYTES
+            "directory cursor must be no longer than {}",
+            utils::format_storage_size(protocol::MAX_CURSOR_BYTES as u64)
         )));
     }
     Ok(())

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- User-facing size errors use human-readable storage units. Resource refusals
+  report required and available capacity plus the shortfall, including when
+  rounded sizes would otherwise look equal.
 - Layered OCI storage is the Linux/libkrun default: shared immutable payload
   packs and EROFS metadata with a private ext4 upper per machine. Raw/qcow2
   import, explicit raw conversion, stopped snapshots, publication and handoff

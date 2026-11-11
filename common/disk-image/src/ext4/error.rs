@@ -22,7 +22,7 @@ pub enum ReadError {
     Unsupported(Unsupported),
     #[error("corrupt ext4 filesystem: {0}")]
     Corrupt(Corruption),
-    #[error("read of {length} bytes at offset {offset} exceeds inode {inode} size {size}")]
+    #[error("read of {} at offset {offset} exceeds inode {inode} size {}", utils::format_storage_size(*length), utils::format_storage_size(*size))]
     OutOfRange {
         inode: u32,
         offset: u64,
@@ -101,17 +101,17 @@ pub enum Unsupported {
     CreatorOs(u32),
     #[error("log block size {0} (only 4096-byte blocks)")]
     BlockSize(u32),
-    #[error("inode size {0} (only 256-byte inodes)")]
+    #[error("inode size {} (only 256-byte inodes)", utils::format_storage_size(u64::from(*.0)))]
     InodeSize(u16),
     #[error("external or non-inode-8 journal")]
     ExternalJournal,
     #[error("inode {inode} uses inode flags {flags:#x}")]
     InodeFlags { inode: u32, flags: u32 },
-    #[error("inode {inode} has extra inode size {extra_isize} (only 32)")]
+    #[error("inode {inode} has extra inode size {} (only 32B)", utils::format_storage_size(u64::from(*extra_isize)))]
     InodeExtraSize { inode: u32, extra_isize: u16 },
     #[error("inode {0} uses indirect block maps instead of extents")]
     BlockMappedInode(u32),
-    #[error("inode {inode} size {size} exceeds the 1 TiB reader bound")]
+    #[error("inode {inode} size {} exceeds the 1 TiB reader bound", utils::format_storage_size(*size))]
     FileTooLarge { inode: u32, size: u64 },
     #[error("inode {inode} has more than {limit} extents")]
     TooManyExtents { inode: u32, limit: usize },
@@ -179,7 +179,7 @@ pub enum FormatError {
     UnsupportedFiletype,
     #[error("maximum links exceeded for path: {0}")]
     MaximumLinksExceeded(PathBuf),
-    #[error("{0} exceeds max file size (1 TiB)")]
+    #[error("{} exceeds max file size (1 TiB)", utils::format_storage_size(*.0))]
     FileTooBig(u64),
     #[error("'{0}' is an invalid link")]
     InvalidLink(PathBuf),
@@ -191,9 +191,9 @@ pub enum FormatError {
     InsufficientSpaceForGroupDescriptorBlocks,
     #[error("cannot create hard links to directory target: {0}")]
     CannotHardlinkDirectory(PathBuf),
-    #[error("unsupported block size {0} (only 4096 is supported)")]
+    #[error("unsupported block size {} (only 4096B is supported)", utils::format_storage_size(u64::from(*.0)))]
     UnsupportedBlockSize(u32),
-    #[error("invalid filesystem size {size}: {reason}")]
+    #[error("invalid filesystem size {}: {reason}", utils::format_storage_size(*size))]
     InvalidSize { size: u64, reason: &'static str },
     #[error("invalid volume label: {0}")]
     InvalidLabel(String),
@@ -201,7 +201,7 @@ pub enum FormatError {
     CannotTruncateFile(PathBuf),
     #[error("cannot create sparse file at {0}")]
     CannotCreateSparseFile(PathBuf),
-    #[error("cannot resize fs to {0} bytes")]
+    #[error("cannot resize fs to {}", utils::format_storage_size(*.0))]
     CannotResizeFs(u64),
     #[error("cannot fit xattr for inode {0}")]
     XattrInsufficientSpace(u32),
@@ -215,7 +215,7 @@ pub enum FormatError {
     DuplicateXattr,
     #[error("device ID is outside Linux's 12-bit major / 20-bit minor encoding")]
     InvalidDevice,
-    #[error("symlink target length {length} exceeds the ext4 maximum {maximum} bytes")]
+    #[error("symlink target length {} exceeds the ext4 maximum {}", utils::format_storage_size(*length), utils::format_storage_size(*maximum))]
     SymlinkTargetTooLong { length: u64, maximum: u64 },
     #[error("invalid inode metadata or content: {0}")]
     InvalidMetadata(&'static str),
@@ -240,7 +240,7 @@ pub enum ResizeError {
     Unsupported(&'static str),
     #[error("invalid or corrupt ext4 filesystem: {0}")]
     Corrupt(&'static str),
-    #[error("resize target {0} is not aligned to the 4096-byte filesystem block size")]
+    #[error("resize target {} is not aligned to the 4096-byte filesystem block size", utils::format_storage_size(*.0))]
     UnalignedSize(u64),
     #[error(
         "refusing to shrink ext4 filesystem from {current_blocks} to {requested_blocks} blocks"
@@ -281,3 +281,38 @@ impl ResizeError {
 pub type ReadResult<T> = std::result::Result<T, ReadError>;
 pub type FormatResult<T> = std::result::Result<T, FormatError>;
 pub type ResizeResult<T> = std::result::Result<T, ResizeError>;
+
+#[cfg(test)]
+mod tests {
+    use crate::ext4::{FormatError, ReadError, ResizeError};
+
+    #[test]
+    fn filesystem_size_errors_use_storage_units() {
+        assert_eq!(
+            FormatError::InvalidSize {
+                size: 1 << 30,
+                reason: "not admitted",
+            }
+            .to_string(),
+            "invalid filesystem size 1GiB: not admitted"
+        );
+        assert_eq!(
+            FormatError::CannotResizeFs(2 << 30).to_string(),
+            "cannot resize fs to 2GiB"
+        );
+        assert_eq!(
+            ResizeError::UnalignedSize((1 << 30) + 1).to_string(),
+            "resize target 1.0GiB is not aligned to the 4096-byte filesystem block size"
+        );
+        assert_eq!(
+            ReadError::OutOfRange {
+                inode: 7,
+                offset: 0,
+                length: 2 << 20,
+                size: 1 << 20,
+            }
+            .to_string(),
+            "read of 2MiB at offset 0 exceeds inode 7 size 1MiB"
+        );
+    }
+}

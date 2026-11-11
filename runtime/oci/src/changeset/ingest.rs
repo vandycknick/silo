@@ -116,8 +116,8 @@ pub fn ingest_layer(
     if metadata.len() != input.size_bytes {
         return Err(ChangesetError::Invalid(format!(
             "descriptor size mismatch: expected {}, actual {}",
-            input.size_bytes,
-            metadata.len()
+            utils::format_storage_size(input.size_bytes),
+            utils::format_storage_size(metadata.len())
         )));
     }
     let staging = StagingDir::create(staging_root, operation).map_err(|error| match error {
@@ -155,7 +155,8 @@ fn ingest_staged(
     if transport.length != input.size_bytes {
         return Err(ChangesetError::Invalid(format!(
             "descriptor size mismatch: expected {}, consumed {}",
-            input.size_bytes, transport.length
+            utils::format_storage_size(input.size_bytes),
+            utils::format_storage_size(transport.length)
         )));
     }
     let actual_transport = digest(transport.hash);
