@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Stopped restore and live-fork children can cold boot from their own disks after completed activation and holder reconciliation; the first admitted start retires their restore binding without deleting the independently retained checkpoint.
+- Shared tracing setup keeps CLI diagnostics at warn by default, enables debug/trace with verbosity or `RUST_LOG`, and suspends stderr progress displays while writing logs; machine start timelines are debug-only diagnostics.
 - PTY shell and exec sessions drain buffered final output and close promptly when their main process exits, without waiting for background jobs to release the terminal.
 - Live snapshots and forks borrow an existing user pause without requiring `--preserve`, persist the resolved preserve policy, and no longer warn of uncertain acceptance after a definitive rejection.
 - Guest agent status and metrics deadlines suspend during native pause and

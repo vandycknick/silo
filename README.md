@@ -179,6 +179,20 @@ not the fixture's `SSL_CERT_FILE`. Pre-pull rejection checks still run on both.
 
 ## CLI
 
+Tracing diagnostics go to stderr, separately from command results on stdout.
+The CLI defaults to warnings and errors, including calls into libvm. Use `-v`
+for debug diagnostics (including the machine start timeline), or `-vv` for
+trace diagnostics and full error chains. A valid, nonempty `RUST_LOG` filter
+overrides verbosity, for example
+`RUST_LOG=warn,libvm::runtime::start_timeline=debug silo start archy`.
+Missing, empty or invalid filters fall back to the verbosity/default policy.
+Tracing temporarily clears and redraws active spinners and pull progress so
+diagnostics cannot split their lines. `silo daemon run` uses the same policy;
+native service managers retain their existing stderr capture. Monitor and
+guest-agent logs keep their info default and their owned trace/serial sinks.
+Rust entrypoints that use tracing install it through `utils::logging`;
+libraries only emit events and never replace the process subscriber.
+
 Build the CLI locally:
 
 ```bash

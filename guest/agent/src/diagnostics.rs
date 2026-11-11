@@ -2,7 +2,7 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub(crate) struct Diagnostics<W = io::Stdout> {
+pub(crate) struct Diagnostics<W = io::Stderr> {
     state: Arc<Mutex<State<W>>>,
 }
 
@@ -124,5 +124,18 @@ mod tests {
             .unwrap();
         worker.join().unwrap();
         assert!(crate::diagnostics::lock(&diagnostics.state).closed);
+    }
+
+    #[test]
+    fn default_diagnostic_writer_owns_stderr() {
+        use std::os::fd::AsRawFd;
+
+        let diagnostics: crate::diagnostics::Diagnostics =
+            crate::diagnostics::Diagnostics::new(std::io::stderr());
+        let writer = diagnostics.make_writer();
+        assert_eq!(
+            writer.state.output.as_raw_fd(),
+            std::io::stderr().as_raw_fd()
+        );
     }
 }

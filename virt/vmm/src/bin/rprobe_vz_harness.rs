@@ -159,13 +159,7 @@ mod macos {
 
     pub fn main() -> Result<()> {
         let args = Args::parse();
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .with_writer(std::io::stderr)
-            .try_init()
+        utils::logging::init(utils::logging::Profile::Harness, std::io::stderr)
             .map_err(|error| eyre!("initialize harness tracing: {error}"))?;
         if !args.kernel.is_file() {
             return Err(eyre!("kernel is not a regular file"));

@@ -12,7 +12,7 @@ const HELP_TEMPLATE: &str = "{about}\n\n{usage-heading} {usage}\n\n{all-args}{af
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Increase diagnostic output. Repeat for full error chains.
+    /// Increase diagnostics (-v: debug, -vv: trace and full error chains). RUST_LOG overrides logging.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 

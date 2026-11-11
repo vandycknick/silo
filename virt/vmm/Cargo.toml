@@ -65,7 +65,6 @@ thiserror = "2.0.19"
 tracing = "0.1.44"
 russh = "0.62.4"
 tracing-appender = "0.2.5"
-tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 test-utils = { path = "../../runtime/test-utils", optional = true }
 libkrun = { workspace = true }

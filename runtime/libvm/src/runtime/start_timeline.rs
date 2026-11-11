@@ -42,7 +42,7 @@ impl StartTimeline {
 
     pub(crate) fn emit(&self, machine_id: MachineId, run_id: &str) {
         let milliseconds = |duration: Duration| duration.as_secs_f64() * 1000.0;
-        tracing::info!(
+        tracing::debug!(
             parent: None,
             machine_id = %uuid::Uuid::from(machine_id),
             run_id,
@@ -74,6 +74,7 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(false)
+            .with_max_level(tracing::Level::DEBUG)
             .with_writer(captured.reopen().unwrap())
             .finish();
         let machine_id = MachineId::new();
@@ -84,6 +85,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || timeline.emit(machine_id, "test-run"));
         let line = std::fs::read_to_string(captured.path()).unwrap();
         assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.contains("DEBUG machine start timeline"), "{line}");
         let (_, fields) = line.split_once("machine start timeline ").expect(&line);
         let fields: BTreeMap<_, _> = fields
             .split_whitespace()

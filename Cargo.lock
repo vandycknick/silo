@@ -76,6 +76,7 @@ dependencies = [
  "tonic-reflection",
  "tracing",
  "tracing-subscriber",
+ "utils",
  "uuid",
 ]
 
@@ -4765,7 +4766,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-appender",
- "tracing-subscriber",
  "utils",
  "uuid",
  "vm-spec",
@@ -5816,6 +5816,8 @@ dependencies = [
  "nix 0.31.3",
  "ssh-key",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

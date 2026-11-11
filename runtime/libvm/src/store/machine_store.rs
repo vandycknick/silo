@@ -427,6 +427,87 @@ impl MachineStore for Store {
 }
 
 impl Store {
+    pub(crate) async fn preflight_restored_cold_start(
+        &self,
+        machine: MachineId,
+    ) -> Result<(), LibVmError> {
+        let mut connection = self.pool.acquire().await?;
+        Self::ensure_restored_cold_start(&mut connection, machine, None).await
+    }
+
+    async fn ensure_restored_cold_start(
+        connection: &mut sqlx::SqliteConnection,
+        machine: MachineId,
+        new_run: Option<&str>,
+    ) -> Result<(), LibVmError> {
+        let safe: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM machine_restore_binding b
+                JOIN machine_state s ON s.machine_id=b.machine_id
+                JOIN machine_config c ON c.id=b.machine_id
+                WHERE b.machine_id=?1 AND b.completed=1
+                AND (?2 IS NULL OR b.run_id != ?2)
+                AND s.status IN ('stopped','error')
+                AND json_extract(s.state_json,'$.vmmonPid') IS NULL
+                AND json_extract(s.state_json,'$.runId') IS NULL
+                AND json_extract(c.config_json,'$.imageRef')='execution-restore'
+                AND NOT EXISTS(
+                    SELECT 1 FROM storage_operation o WHERE o.kind='launch'
+                    AND o.machine_id=b.machine_id AND o.run_id IS NOT ?2)
+            )",
+        )
+        .bind(machine.to_string())
+        .bind(new_run)
+        .fetch_one(connection)
+        .await?;
+        if !safe {
+            return Err(crate::machine::root_storage::invalid(
+                "an incomplete or unreconciled execution-restore child cannot cold boot; retry the retained checkpoint under a new restore run",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Retire one-shot restore authority in the same transaction as cold-start
+    /// admission. The independently retained checkpoint is never deleted.
+    pub(crate) async fn start_restored_machine(
+        &self,
+        config: &MachineConfig,
+        next: &MachineState,
+    ) -> Result<(), LibVmError> {
+        let invalid = crate::machine::root_storage::invalid;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::ensure_restored_cold_start(&mut tx, config.id, next.run_id.as_deref()).await?;
+        if next.machine_id != config.id
+            || next.status != crate::store::models::MachineRuntimeState::Starting
+            || next.run_id.is_none()
+        {
+            return Err(invalid(
+                "restore retirement requires this machine's new start generation",
+            ));
+        }
+        sqlx::query("UPDATE machine_config SET config_json=jsonb(json_set(config_json,'$.imageRef','stopped-storage')) WHERE id=?1")
+            .bind(config.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE machine_storage SET record_json=jsonb(json_set(record_json,'$.snapshot',NULL)) WHERE machine_id=?1")
+            .bind(config.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE machine_state SET status=?2,state_json=jsonb(?3) WHERE machine_id=?1")
+            .bind(config.id.to_string())
+            .bind(next.status.as_str())
+            .bind(Self::serialize("machine_state.state_json", next)?)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM machine_restore_binding WHERE machine_id=?1")
+            .bind(config.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub(crate) async fn machine_durability(
         &self,
         machine: MachineId,
@@ -759,6 +840,21 @@ impl Store {
         .bind(Self::serialize("machine_state.state_json", initial_state)?)
         .execute(&mut **tx)
         .await?;
+        if config.image_ref == "execution-restore" {
+            let run = initial_state.run_id.as_deref().ok_or_else(|| {
+                crate::machine::root_storage::invalid("restore child has no construction run")
+            })?;
+            if initial_state.status != crate::store::models::MachineRuntimeState::Restoring {
+                return Err(crate::machine::root_storage::invalid(
+                    "restore child must begin in its restoring generation",
+                ));
+            }
+            sqlx::query("INSERT INTO machine_restore_binding(machine_id,run_id) VALUES(?1,?2)")
+                .bind(config.id.to_string())
+                .bind(run)
+                .execute(&mut **tx)
+                .await?;
+        }
         Ok(())
     }
 

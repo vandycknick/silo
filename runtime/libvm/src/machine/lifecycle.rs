@@ -67,17 +67,8 @@ impl Machine {
         let supervisor = runtime.supervisor();
         let mut timeline = crate::runtime::start_timeline::StartTimeline::new(runtime.open_timing);
         let (config, run_id) = {
-            let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
-            if config.image_ref == "execution-restore" {
-                return Err(crate::machine::root_storage::invalid(
-                    "an execution-restore child cannot cold boot; retry the retained checkpoint under a new restore run",
-                ));
-            }
-            let lower_started = std::time::Instant::now();
-            let storage = runtime.validate_machine_storage_for_launch(&config).await?;
-            let qualification = runtime.open_machine_boot(&config, &storage)?;
-            timeline.lower_resolve_authentication += lower_started.elapsed();
             let _node_state = crate::node_state::acquire(&config).await?;
             let machine_paths = runtime.machine_paths(config.id);
             let pid_path = machine_paths.vmm_pid_path();
@@ -103,6 +94,16 @@ impl Machine {
                     reference: config.name.clone(),
                 });
             }
+            if config.image_ref == "execution-restore" {
+                runtime
+                    .native_store()?
+                    .preflight_restored_cold_start(config.id)
+                    .await?;
+            }
+            let lower_started = std::time::Instant::now();
+            let storage = runtime.validate_machine_storage_for_launch(&config).await?;
+            let qualification = runtime.open_machine_boot(&config, &storage)?;
+            timeline.lower_resolve_authentication += lower_started.elapsed();
 
             let run_uuid = Uuid::new_v4();
             let run_id = run_uuid.to_string();
@@ -112,6 +113,9 @@ impl Machine {
                 .register_launch_storage(&config, run_uuid, &storage)
                 .await?;
             runtime.request_machine_start(&config, &run_id).await?;
+            if config.image_ref == "execution-restore" {
+                config.image_ref = "stopped-storage".to_owned();
+            }
             timeline.lifecycle_admission = timeline
                 .elapsed()
                 .saturating_sub(timeline.lower_resolve_authentication);

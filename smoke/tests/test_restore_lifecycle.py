@@ -26,8 +26,9 @@ import pytest
 
 from silo_smoke import procs, restore, shutdown, stopped
 from silo_smoke import restore_lifecycle as lifecycle
-from silo_smoke.cli import Silo
+from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.restore_lifecycle import restore_network_image  # noqa: F401  session fixture
+from silo_smoke.restore import restore_image  # noqa: F401  session fixture
 
 # VM cases use the staged runtime selected by SILO_SMOKE_BIN_DIR and
 # SILO_SMOKE_RUNTIME_DIR. They are slow; the host-only oracle tests below
@@ -194,6 +195,66 @@ def test_follower_keeps_new_files_after_unlink_and_ignores_existing(tmp_path: Pa
     finally:
         follower.close()
     assert (tmp_path / "copies/child__vm.trace.log").read_bytes() == b"first\nsecond\n"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
+@pytest.mark.parametrize("construction", ["restore", "fork"])
+@pytest.mark.parametrize("termination", ["stop", "worker-crash"])
+def test_restored_child_cold_start_keeps_its_own_disk_writes(
+    silo: Silo, restore_image: str, profile: RootProfile, construction: str, termination: str,  # noqa: F811
+) -> None:
+    source, child = "cold-start-source", "cold-start-child"
+    restore.create_source(silo, restore_image, profile=profile, name=source, network="private")
+    silo.exec(source, "sh", "-eu", "-c",
+              "printf source-cut >/var/lib/cold-start-marker; sync", user="root")
+    saved = None
+    if construction == "restore":
+        saved = restore.checkpoint(silo, source, alias="cold-start-checkpoint")
+        restored = restore.restore_child(silo, saved, child)
+    else:
+        silo.ws.register_machine(child)
+        result = json.loads(silo.run("fork", source, "--live", "--name", child, timeout=240).stdout)
+        assert result["children"][0]["outcome"]["kind"] == "running", result
+        restored = silo.wait_ready(child)
+    assert silo.exec(child, "cat", "/var/lib/cold-start-marker").stdout == "source-cut"
+    old_boot = silo.exec(child, "cat", "/proc/sys/kernel/random/boot_id").stdout
+    disk_before = stopped.writable_paths(silo, child)
+    silo.exec(child, "sh", "-eu", "-c",
+              "printf child-only >/var/lib/cold-start-marker; "
+              "printf memory-only >/dev/shm/cold-start-memory; sync", user="root")
+    if termination == "stop":
+        silo.stop(child)
+    else:
+        holders, _ = shutdown.holder(silo, child)
+        with ExitStack() as processes:
+            owners = [(entry["role"], processes.enter_context(closing(shutdown.Process(entry["pid"]))))
+                      for entry in holders["holders"]]
+            worker = next(process for role, process in owners if role == "krun-worker")
+            worker.send(signal.SIGKILL)
+            for _, process in owners:
+                process.wait()
+        # Do not inspect first: start must reconcile the dead restore run itself.
+    silo.start(child)
+    cold = silo.wait_ready(child)
+    assert cold["id"] == restored["id"] and cold["run_id"] != restored["run_id"]
+    assert silo.exec(child, "cat", "/proc/sys/kernel/random/boot_id").stdout != old_boot
+    assert silo.exec(child, "cat", "/var/lib/cold-start-marker").stdout == "child-only"
+    silo.exec(child, "test", "!", "-e", "/dev/shm/cold-start-memory")
+    assert stopped.writable_paths(silo, child) == disk_before
+    assert stopped.record(silo, child)["snapshot"] is None
+    assert cold["image"] == "stopped-storage"
+    listed = next(machine for machine in silo.ls() if machine["id"] == cold["id"])
+    assert listed["image"] == "stopped-storage"
+    if saved is not None:
+        assert json.loads(silo.run("snapshot", "inspect", saved.reference).stdout)["retained"] is True
+        silo.run("resume", source)
+    assert silo.exec(source, "cat", "/var/lib/cold-start-marker").stdout == "source-cut"
+    # Subsequent starts use the ordinary stopped-machine path too.
+    silo.stop(child)
+    silo.start(child)
+    silo.wait_ready(child)
+    assert silo.exec(child, "cat", "/var/lib/cold-start-marker").stdout == "child-only"
 
 
 @pytest.mark.slow

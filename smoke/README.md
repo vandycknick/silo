@@ -753,12 +753,14 @@ observed phases from unavailable kernel-start, initramfs and root-switch
 timestamps; none is invented from polling or guest uptime.
 
 Prelaunch attribution comes from one additional CLI stderr line emitted just
-after successful monitor exec: `INFO machine start timeline machine_id=<uuid>
+after successful monitor exec: `DEBUG machine start timeline machine_id=<uuid>
 run_id=<run> runtime_discovery_ms=<n> catalog_open_recovery_ms=<n>
 lifecycle_admission_ms=<n> lower_resolve_authentication_ms=<n> secrets_netd_ms=<n>
 launch_publication_ms=<n> durability_barrier_ms=<n> admit_spawn_ms=<n> total_ms=<n>`.
-The CLI installs a scoped, no-ANSI/no-target tracing formatter; the default filter
-enables this event even without `RUST_LOG`. Boot samples preserve stderr as
+The CLI uses the shared, no-ANSI/no-target tracing formatter with progress-safe
+stderr output. Normal invocations default to warnings and errors. Boot samples
+explicitly set `RUST_LOG=info,libvm::runtime::start_timeline=debug` to collect
+this diagnostic without raising monitor verbosity. Samples preserve stderr as
 `<machine-name>-start.trace.log` alongside the monitor trace and require exactly
 one timeline with the matching machine and run. Each profile records it under
 `startTimeline`, including `stagesMilliseconds`, `totalMilliseconds` and the
