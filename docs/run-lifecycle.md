@@ -103,8 +103,8 @@ Any guest bootstrap failure before handoff prints its diagnostic on the serial
 console, synchronizes filesystems and powers off the VM. This applies to every
 root type, including raw disks and managed EROFS overlay roots. A guest poweroff
 before its first readiness is a failed boot, not a normal stop: readiness waits
-end immediately with `guest powered off during boot; see serial log` and the
-serial log path. `silo logs dev --stream serial` reads those diagnostics.
+end immediately with "guest powered off during boot" and point at
+`silo logs dev --stream serial`, which shows the init diagnostic.
 
 Configure user arguments on a stopped VM with `silo set dev kernel-arg=ARG`.
 The setting may be repeated and appends to the existing direct-boot command

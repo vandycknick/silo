@@ -159,7 +159,7 @@ fn record_stop(
     }
 }
 
-pub(crate) const BOOT_POWER_OFF_MESSAGE: &str = "guest powered off during boot; see serial log";
+pub(crate) const BOOT_POWER_OFF_MESSAGE: &str = "guest powered off during boot";
 
 pub(crate) fn backend_exit_error(
     store: &crate::state::InstanceStore,

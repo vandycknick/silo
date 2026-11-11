@@ -32,10 +32,12 @@ pub(crate) enum AppApi {
     Daemon(daemon::DaemonVmService),
 }
 
+/// A guest boot diagnostic lives on the serial console; point at the command
+/// that shows it rather than at the file.
 pub(crate) fn readiness_failure(
     outcome: libvm::MachineReadinessOutcome,
     message: Option<&str>,
-    serial_log: &std::path::Path,
+    machine: &str,
 ) -> eyre::Report {
     let reason = if outcome == libvm::MachineReadinessOutcome::Terminal {
         message.map(str::to_owned)
@@ -43,7 +45,7 @@ pub(crate) fn readiness_failure(
         None
     }
     .unwrap_or_else(|| format!("guest readiness check ended with {outcome:?}"));
-    eyre::eyre!("{reason}\nserial log: {}", serial_log.display())
+    eyre::eyre!("{reason}; check `silo logs {machine} --stream serial`")
 }
 
 impl AppApi {
@@ -628,15 +630,17 @@ mod tests {
     use crate::api::AppApi;
 
     #[test]
-    fn terminal_readiness_error_preserves_reason_and_serial_path() {
+    fn terminal_readiness_error_keeps_reason_and_points_at_serial_logs() {
         let message = crate::api::readiness_failure(
             libvm::MachineReadinessOutcome::Terminal,
-            Some("guest powered off during boot; see serial log"),
-            Path::new("/silo/logs/machines/vm/serial.log"),
+            Some("guest powered off during boot"),
+            "archy",
         )
         .to_string();
-        assert!(message.contains("guest powered off during boot; see serial log"));
-        assert!(message.contains("/silo/logs/machines/vm/serial.log"));
+        assert_eq!(
+            message,
+            "guest powered off during boot; check `silo logs archy --stream serial`"
+        );
     }
 
     #[tokio::test]
