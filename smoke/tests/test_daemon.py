@@ -26,12 +26,14 @@ def test_daemon_ready_status_and_cli_routing(
     assert status["control_endpoint"] == str(daemon.control_sock)
     assert status["home"] == str(workspace.silo_home)
     assert status["system"] is None
+    assert status.get("lobby") is None
     socket_stat = daemon.control_sock.stat()
     assert stat.S_ISSOCK(socket_stat.st_mode)
     assert stat.S_IMODE(socket_stat.st_mode) == 0o600
     routed = silo.json("daemon", "status")
     assert routed["state"] == "ready"
     assert routed["daemon"]["generation"] == status["generation"]
+    assert routed["daemon"].get("lobby") is None
     second = Daemon(workspace)
     started = time.monotonic()
     proc = second.start_raw("--system-enabled=false", "--tailscale-enabled=false", label="second-daemon")

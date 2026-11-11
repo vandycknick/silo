@@ -75,7 +75,7 @@ func Run(ctx context.Context, control *net.UnixConn) error {
 				return
 			}
 			switch m.(type) {
-			case *wire.WhoIsRequest, *wire.StatusRequest, *wire.Shutdown:
+			case *wire.WhoIsRequest, *wire.Shutdown:
 			default:
 				readDone <- errors.New("unexpected control message")
 				return
@@ -305,11 +305,6 @@ func (s *session) serve(ctx context.Context, b wire.Bootstrap, commands <-chan w
 			return err
 		case m := <-commands:
 			switch v := m.(type) {
-			case *wire.StatusRequest:
-				st := state.Status()
-				if err = s.writer.Send(wire.Reply{Type: "reply", ID: v.ID, Status: &st}, nil); err != nil {
-					return err
-				}
 			case *wire.WhoIsRequest:
 				running := state.Phase == "running"
 				reply := wire.Reply{Type: "reply", ID: v.ID}

@@ -23,6 +23,13 @@ which `silo daemon up` registers with the native service manager; ordinary CLI
 commands never run the daemon loop. Direct CLI VM operations continue to use
 libvm in process.
 
+Enable the optional tailnet lobby with `silo daemon up --tailscale`. The lobby
+runs inside silod; its pure-Go `tsgate` child handles Tailscale enrollment and
+transport. Connect with `ssh -t silo` to manage owned VMs. See the
+[operator guide](docs/lobby/operator.md),
+[user command reference](docs/lobby/user.md) and
+[tailnet policy](docs/lobby/tailnet-policy.md).
+
 Each running VM is supervised by one `silo-vmm` process, Silo's virtual machine
 monitor (VMM). It manages VM configuration, execution, and lifecycle across
 virtualization backends.

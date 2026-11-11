@@ -16,8 +16,6 @@ use tonic::{Request, Status};
 pub(crate) struct Management(Service);
 
 impl Management {
-    // The lobby supervisor constructs it once silod starts the lobby.
-    #[allow(dead_code)]
     pub(crate) fn new(state: Arc<ControlState>) -> Self {
         Self(Service(state))
     }

@@ -47,6 +47,19 @@ class AuditTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "glibc requirement"):
             validate(Elf(self.binary, None, (), (), (2, 40)), loader_for(self.target))
 
+    def test_static_executable(self) -> None:
+        source = Path(self.temporary.name) / "static.go"
+        source.write_text("package main\nfunc main() {}\n")
+        subprocess.run(["go", "build", "-o", str(self.binary), str(source)], check=True, env={**os.environ, "CGO_ENABLED": "0", "GOTOOLCHAIN": "local", "GO111MODULE": "off"}, timeout=60)
+        elf = audit(self.binary, self.target)
+        self.assertIsNone(elf.interpreter)
+        self.assertEqual(elf.needed, ())
+        subprocess.run([str(self.binary)], check=True)
+
+    def test_no_interpreter_with_needed_is_not_static(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "no ELF interpreter"):
+            validate(Elf(self.binary, None, ("libc.so.6",), (), (2, 39)), loader_for(self.target))
+
     def test_rootless_nix_hiding_preserves_uid(self) -> None:
         result = subprocess.run(["/usr/bin/python3", str(Path(__file__).with_name("no_nix.py")), "--", "/usr/bin/python3", "-c", f"import os; assert not os.path.exists('/nix/store'); assert os.getuid() == {os.getuid()}"], capture_output=True, text=True)
         if result.returncode != 0: self.skipTest("rootless mount isolation unavailable: " + result.stderr)

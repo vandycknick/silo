@@ -362,6 +362,23 @@ fn build_go_program(
     if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
         release::set_macos_build_version(&output)?;
     }
+    if name == "tsgate" && context.profile == Profile::Release {
+        let mut notices = Command::new("python3");
+        notices
+            .arg(
+                context
+                    .workspace_root
+                    .join("packaging/release/go_licenses.py"),
+            )
+            .arg(context.workspace_root.join(module))
+            .arg(output_dir.join("share/licenses/tsgate"))
+            .arg("--go")
+            .arg(&go_program)
+            .env("GOOS", goos)
+            .env("GOARCH", goarch)
+            .env("CGO_ENABLED", "0");
+        command::run(notices)?;
+    }
     Ok(())
 }
 

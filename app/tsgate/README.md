@@ -1,5 +1,9 @@
 # tsgate
 
+Architecture: [ADR 0022](../../docs/adr/0022-lobby-in-silod-and-tsgate.md).
+Deployment, credentials, state and restart behavior:
+[lobby operator guide](../../docs/lobby/operator.md).
+
 Pure-Go lobby transport for silod. Production invokes `tsgate --control-fd 0`
 with an inherited Unix stream socket as stdin, stdout discarded, and stderr
 reserved for redacted logs. `tsgate version` prints the protocol implementation
@@ -18,7 +22,8 @@ Unix stream per tailnet connection, preserving bidirectional half-close.
 Owner loss interrupts all streams immediately; explicit shutdown allows up to
 four seconds to drain before forced cleanup, with a five-second total limit.
 WhoIs lookups run concurrently, capped at 32 in flight; excess requests receive
-`WhoIs busy`. Status replies and admission-state polling do not wait for lookups.
+`WhoIs busy`. Admission-state polling does not wait for lookups; state changes
+are pushed to silod without a separate status RPC.
 
 Build and checks (Go automatically selects the pinned toolchain):
 

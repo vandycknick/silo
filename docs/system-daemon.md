@@ -396,7 +396,7 @@ working core API into a failed daemon.
 
 
 `--format json` returns the view with the schema-2 record under `daemon`.
-`daemon.core` is independent of optional `daemon.system` and `daemon.tailscale`.
+`daemon.core` is independent of optional `daemon.system` and `daemon.lobby`.
 One publisher merges component updates for the status file and gRPC API.
 
 The appliance ships no OpenSSH server. `silo shell silo-system` and
@@ -488,5 +488,18 @@ Common failures are actionable:
 
 ## Tailscale lobby
 
-`silo daemon up --tailscale` and persisted Tailscale enablement are refused because the lobby is temporarily unavailable; it will return inside silod with a `tsgate` gateway process.
+Enable the optional lobby with `silo daemon up --tailscale`, or add
+`--system=false` to run it without the system appliance. The Rust lobby runs
+inside silod and manages owned VMs through libvm; silod supervises the pure-Go
+`tsgate` child for tailnet SSH transport and HTTPS termination.
+
+Core readiness does not imply lobby readiness. `silo daemon status` reports the
+lobby DNS name, pending approval URL and gateway restart state separately.
+Gateway restarts drop lobby connections without stopping VMs; ordinary daemon
+stop/restart is not a VM-stop request. No host-shutdown protection is provided.
+
+- [Operator guide](lobby/operator.md): configuration, credentials, enrollment,
+  state, limits and restart behavior.
+- [User reference](lobby/user.md): SSH usage, commands, file transfer and JSON.
+- [Tailnet policy](lobby/tailnet-policy.md): tags, application grants and ACLs.
 

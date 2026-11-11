@@ -1,9 +1,11 @@
 //! The lobby: SSH-reachable VM management for tailnet peers, served by silod.
 //! tsgate (Go) owns the tailnet node; everything else lives here.
-// The silod supervisor arrives in the next commit; until then nothing
-// outside tests reaches this module.
-#![allow(dead_code)]
-
+//!
+//! Consent results and cancellation are checked against a unique creation attempt
+//! and verified owner. SSH channels and queued/running jobs share the HTTP metrics
+//! registry. Native-handle gauges count lobby-owned runtime/machine references and
+//! active exec/shell/log attachments, released by RAII on failure or cancellation.
+//! Node status arrives through pushed gate state, not a separate status RPC.
 pub(crate) mod audit;
 pub(crate) mod caller;
 pub(crate) mod consent;
@@ -20,6 +22,7 @@ pub(crate) mod service;
 pub(crate) mod session;
 pub(crate) mod ssh;
 pub(crate) mod state;
+pub(crate) mod supervisor;
 pub(crate) mod tailnet;
 pub(crate) mod units;
 pub(crate) mod views;

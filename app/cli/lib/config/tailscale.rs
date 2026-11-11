@@ -54,9 +54,11 @@ impl TailscaleConfig {
     pub(crate) fn enabled(&self) -> Option<bool> {
         self.enabled
     }
-    #[cfg(test)]
     pub(crate) fn hostname(&self) -> &str {
         &self.hostname
+    }
+    pub(crate) fn tag(&self) -> &str {
+        &self.tag
     }
     pub(crate) fn control_url(&self) -> &str {
         &self.control_url

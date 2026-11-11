@@ -103,25 +103,6 @@ func (o *owner) connection(t *testing.T) (*wire.Conn, *net.UnixConn) {
 		}
 	}
 }
-func (o *owner) reply(t *testing.T, id uint64) *wire.Reply {
-	t.Helper()
-	for {
-		m, fd, e := o.reader.Receive()
-		if fd != nil {
-			fd.Close()
-			t.Fatal("unexpected fd")
-		}
-		if e != nil {
-			t.Fatal(e)
-		}
-		if r, ok := m.(*wire.Reply); ok {
-			if r.ID != id {
-				t.Fatal(r.ID, id)
-			}
-			return r
-		}
-	}
-}
 func (o *owner) stop(t *testing.T) {
 	t.Helper()
 	o.conn.Close()
@@ -253,12 +234,6 @@ func TestGatewayRealTailnet(t *testing.T) {
 	if err := json.Unmarshal(who.Capability[0], &capValue); err != nil || capValue["role"] != "operator" {
 		t.Fatal(string(who.Capability[0]), err)
 	}
-	if err := o.writer.Send(wire.StatusRequest{Type: "status", ID: 8}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if r := o.reply(t, 8); r.Status == nil || r.Status.Phase != "running" {
-		t.Fatalf("%+v", r)
-	}
 	cw, ok := peerConn.(interface{ CloseWrite() error })
 	if !ok {
 		t.Fatalf("missing CloseWrite: %T", peerConn)
@@ -360,7 +335,7 @@ func TestOwnerLossDuringEnrollment(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("mint did not start")
 	}
-	if err := o.writer.Send(wire.StatusRequest{Type: "status", ID: 99}, nil); err != nil {
+	if err := o.writer.Send(wire.WhoIsRequest{Type: "whois", ID: 99, Remote: "100.64.0.1:123"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	o.stop(t)

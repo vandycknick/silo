@@ -61,6 +61,8 @@ def validate(elf: Elf, loader: Path, *, system_dependency: bool = False) -> None
         raise RuntimeError(f"non-basename DT_NEEDED: {elf.path}: {elf.needed}")
     if elf.glibc > GLIBC_FLOOR:
         raise RuntimeError(f"glibc requirement {elf.glibc} exceeds ADR0012 floor {GLIBC_FLOOR}: {elf.path}")
+    if not system_dependency and elf.interpreter is None and elf.needed:
+        raise RuntimeError(f"dynamic executable has no ELF interpreter: {elf.path}")
 
 
 def loader_for(target: str) -> Path:
@@ -89,7 +91,7 @@ def audit(path: Path, target: str) -> Elf:
     loader = loader_for(target)
     elf = inspect(path)
     validate(elf, loader)
-    if not elf.needed:
+    if elf.interpreter is None and not elf.needed:
         print(f"ELF {path}: static, glibc imports={elf.glibc}")
         return elf
     output = subprocess.check_output([str(loader), "--inhibit-cache", "--library-path", library_path(), "--list", str(path)], text=True, stderr=subprocess.STDOUT, env=environment())

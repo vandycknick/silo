@@ -32,6 +32,7 @@ impl StatusPublisher {
                 updated_at: now(),
                 last_error: None,
                 system,
+                lobby: None,
                 configuration_identity,
                 manager_live: None,
                 appliance_live: None,
@@ -70,6 +71,9 @@ impl StatusPublisher {
             s.appliance_live = system.prospective_live.clone();
             s.system = Some(system);
         })
+    }
+    pub(crate) fn set_lobby(&self, lobby: Option<LobbyStatus>) -> eyre::Result<()> {
+        self.update(|s| s.lobby = lobby)
     }
     pub(crate) fn fail_system(&self, error: String) -> eyre::Result<()> {
         self.update(|s| {
@@ -116,6 +120,7 @@ impl StatusPublisher {
                 .map(silo_vm_control::live::host_to_wire)
                 .transpose()?,
             system: s.system.as_ref().map(system_wire).transpose()?,
+            lobby: s.lobby.as_ref().map(lobby_wire),
         })
     }
 }
@@ -126,6 +131,23 @@ fn timestamp(s: &str) -> Option<prost_types::Timestamp> {
             seconds: t.timestamp(),
             nanos: t.timestamp_subsec_nanos() as i32,
         })
+}
+fn lobby_wire(s: &LobbyStatus) -> w::LobbyStatus {
+    w::LobbyStatus {
+        phase: match s.phase {
+            LobbyPhase::Starting => w::LobbyPhase::Starting,
+            LobbyPhase::NeedsLogin => w::LobbyPhase::NeedsLogin,
+            LobbyPhase::NeedsTag => w::LobbyPhase::NeedsTag,
+            LobbyPhase::Ready => w::LobbyPhase::Ready,
+            LobbyPhase::Degraded => w::LobbyPhase::Degraded,
+            LobbyPhase::Failed => w::LobbyPhase::Failed,
+        } as i32,
+        dns_name: s.dns_name.clone(),
+        approval_url: s.approval_url.clone(),
+        diagnostic: s.diagnostic.clone(),
+        restart_count: s.restart_count,
+        updated_at: timestamp(&s.updated_at),
+    }
 }
 fn system_wire(s: &SystemStatus) -> eyre::Result<w::SystemStatus> {
     Ok(w::SystemStatus {
@@ -192,6 +214,91 @@ mod tests {
     use crate::daemon::status::*;
     use std::sync::Arc;
 
+    fn lobby_status(phase: LobbyPhase) -> LobbyStatus {
+        LobbyStatus {
+            phase,
+            dns_name: Some("lobby.example.ts.net".into()),
+            approval_url: Some("https://login.tailscale.com/a/example".into()),
+            diagnostic: Some("waiting for approval".into()),
+            restart_count: 3,
+            updated_at: "2026-11-11T00:00:00.123Z".into(),
+        }
+    }
+
+    #[test]
+    fn lobby_wire_preserves_all_phases_and_details() {
+        for (phase, wire_phase) in [
+            (LobbyPhase::Starting, w::LobbyPhase::Starting),
+            (LobbyPhase::NeedsLogin, w::LobbyPhase::NeedsLogin),
+            (LobbyPhase::NeedsTag, w::LobbyPhase::NeedsTag),
+            (LobbyPhase::Ready, w::LobbyPhase::Ready),
+            (LobbyPhase::Degraded, w::LobbyPhase::Degraded),
+            (LobbyPhase::Failed, w::LobbyPhase::Failed),
+        ] {
+            let status = lobby_status(phase);
+            let wire = lobby_wire(&status);
+            assert_eq!(wire.phase, wire_phase as i32);
+            assert_eq!(wire.dns_name, status.dns_name);
+            assert_eq!(wire.approval_url, status.approval_url);
+            assert_eq!(wire.diagnostic, status.diagnostic);
+            assert_eq!(wire.restart_count, status.restart_count);
+            assert_eq!(
+                wire.updated_at,
+                Some(prost_types::Timestamp {
+                    seconds: 1_794_355_200,
+                    nanos: 123_000_000,
+                })
+            );
+        }
+        let status = LobbyStatus {
+            dns_name: None,
+            approval_url: None,
+            diagnostic: None,
+            ..lobby_status(LobbyPhase::Starting)
+        };
+        let wire = lobby_wire(&status);
+        assert!(wire.dns_name.is_none());
+        assert!(wire.approval_url.is_none());
+        assert!(wire.diagnostic.is_none());
+    }
+
+    #[test]
+    fn lobby_updates_and_disablement_share_disk_and_api_state() {
+        let root = tempfile::tempdir().unwrap();
+        let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
+        let publisher =
+            StatusPublisher::new(&host, uuid::Uuid::new_v4(), "test".into(), None).unwrap();
+        assert!(publisher.wire().unwrap().lobby.is_none());
+        let lobby = lobby_status(LobbyPhase::NeedsLogin);
+        publisher.set_lobby(Some(lobby.clone())).unwrap();
+        let disk: DaemonStatus =
+            serde_json::from_slice(&std::fs::read(&publisher.path).unwrap()).unwrap();
+        assert_eq!(disk.lobby, Some(lobby.clone()));
+        assert_eq!(publisher.wire().unwrap().lobby, Some(lobby_wire(&lobby)));
+        publisher.set_lobby(None).unwrap();
+        let disk: DaemonStatus =
+            serde_json::from_slice(&std::fs::read(&publisher.path).unwrap()).unwrap();
+        assert!(disk.lobby.is_none());
+        assert!(publisher.wire().unwrap().lobby.is_none());
+    }
+
+    #[test]
+    fn failed_lobby_publication_does_not_advance_api_state() {
+        let root = tempfile::tempdir().unwrap();
+        let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
+        let publisher =
+            StatusPublisher::new(&host, uuid::Uuid::new_v4(), "test".into(), None).unwrap();
+        let lobby = lobby_status(LobbyPhase::Ready);
+        publisher.set_lobby(Some(lobby.clone())).unwrap();
+        std::fs::remove_file(&publisher.path).unwrap();
+        std::fs::create_dir(&publisher.path).unwrap();
+        assert!(publisher
+            .set_lobby(Some(lobby_status(LobbyPhase::Failed)))
+            .is_err());
+        assert_eq!(publisher.wire().unwrap().lobby, Some(lobby_wire(&lobby)));
+        assert!(publisher.set_lobby(None).is_err());
+        assert_eq!(publisher.wire().unwrap().lobby, Some(lobby_wire(&lobby)));
+    }
     #[test]
     fn system_wire_preserves_reclaim_mapping_counters() {
         let mut status = crate::daemon::supervisor::initial_status(std::path::Path::new(

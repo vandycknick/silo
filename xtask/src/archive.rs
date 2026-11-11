@@ -59,7 +59,8 @@ impl ArchiveKind {
     }
 }
 
-const PRODUCT_FILES: [&str; 1] = ["silo"];
+const PRODUCT_FILES: [&str; 2] = ["silo", "tsgate"];
+const PRODUCT_LICENSES: &str = "share/licenses/tsgate";
 
 pub fn produce_runtime(
     workspace_root: &Path,
@@ -204,6 +205,10 @@ fn create_tar(
             "--transform",
             &format!("s,^silo$,{root}/bin/silo,"),
             "--transform",
+            &format!("s,^tsgate$,{root}/bin/tsgate,"),
+            "--transform",
+            &format!("s,^share/,{root}/share/,"),
+            "--transform",
             &format!("s,^{stage_name}$,{root},"),
             "--transform",
             &format!("s,^{stage_name}/,{root}/,"),
@@ -219,6 +224,7 @@ fn create_tar(
             .args(["--directory"])
             .arg(target_dir.join("release"))
             .args(PRODUCT_FILES);
+        command.arg(PRODUCT_LICENSES);
     }
     command::run(command)?;
     Ok(())
@@ -337,6 +343,13 @@ fn archive_file_hashes(
             files.insert(
                 format!("bin/{name}"),
                 sha256(&target_dir.join("release").join(name))?,
+            );
+        }
+        let licenses = target_dir.join("release").join(PRODUCT_LICENSES);
+        for relative in product_notice_inventory(&licenses)? {
+            files.insert(
+                format!("{PRODUCT_LICENSES}/{}", relative.display()),
+                sha256(&licenses.join(relative))?,
             );
         }
     }
@@ -488,19 +501,19 @@ fn validate_stage(stage: &Path) -> Result<(), ArchiveError> {
 
 fn validate_product(target_dir: &Path) -> Result<(), ArchiveError> {
     for name in PRODUCT_FILES {
-        let path = target_dir.join("release").join(name);
-        if !fs::symlink_metadata(&path)
-            .map_err(|source| ArchiveError::Io {
-                action: "read archive file metadata",
-                path: path.clone(),
-                source,
-            })?
-            .is_file()
-        {
-            return invalid(&path, "is not a regular file".into());
-        }
+        validate_regular_file(&target_dir.join("release").join(name), 0o755)?;
     }
+    product_notice_inventory(&target_dir.join("release").join(PRODUCT_LICENSES))?;
     Ok(())
+}
+
+fn product_notice_inventory(
+    root: &Path,
+) -> Result<std::collections::BTreeSet<PathBuf>, ArchiveError> {
+    crate::app::go_notice_inventory(root).map_err(|error| ArchiveError::Invalid {
+        path: root.to_path_buf(),
+        reason: error.to_string(),
+    })
 }
 
 fn has_rprobe_assets(stage: &Path) -> Result<bool, ArchiveError> {
@@ -641,7 +654,20 @@ mod tests {
             }
             for name in PRODUCT_FILES {
                 fs::write(root.join("release").join(name), name).unwrap();
+                fs::set_permissions(
+                    root.join("release").join(name),
+                    fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
             }
+            let licenses = root.join("release").join(PRODUCT_LICENSES);
+            fs::create_dir_all(licenses.join("example.org/dependency/v1.2.3")).unwrap();
+            fs::write(
+                licenses.join("example.org/dependency/v1.2.3/LICENSE"),
+                "dependency license",
+            )
+            .unwrap();
+            fs::write(licenses.join("modules.json"), br#"[{"module":"example.org/dependency","version":"v1.2.3","notices":["example.org/dependency/v1.2.3/LICENSE"]}]"#).unwrap();
             Self { root, stage }
         }
 
@@ -694,6 +720,10 @@ mod tests {
             assert_eq!(fixture.inventory(ArchiveKind::Runtime), runtime_inventory());
             let mut expected = runtime_inventory();
             expected.extend(PRODUCT_FILES.map(|name| format!("product/bin/{name}")));
+            expected.extend(
+                ["modules.json", "example.org/dependency/v1.2.3/LICENSE"]
+                    .map(|path| format!("product/{PRODUCT_LICENSES}/{path}")),
+            );
             assert_eq!(fixture.inventory(ArchiveKind::Portable), expected);
         }
     }
@@ -715,6 +745,20 @@ mod tests {
                     sha256(&fixture.root.join("release").join(name)).unwrap()
                 );
             }
+            let license = format!("{PRODUCT_LICENSES}/example.org/dependency/v1.2.3/LICENSE");
+            assert_eq!(
+                hashes[&license],
+                sha256(&fixture.root.join("release").join(&license)).unwrap()
+            );
+            fs::write(
+                fixture.root.join("release").join(&license),
+                "changed license",
+            )
+            .unwrap();
+            let changed =
+                archive_file_hashes(&fixture.root, host, Profile::Release, ArchiveKind::Portable)
+                    .unwrap();
+            assert_ne!(hashes[&license], changed[&license]);
             for name in PRODUCT_FILES {
                 fs::write(
                     fixture.root.join("release").join(name),
@@ -750,16 +794,28 @@ mod tests {
     }
 
     #[test]
-    fn product_admission_rejects_missing_or_symlink_cli() {
+    fn product_admission_rejects_missing_or_symlink_components_and_notices() {
         let host = HostTarget::LinuxX86_64;
         let fixture = Fixture::new("admission", host);
-        let cli = fixture.root.join("release/silo");
-        fs::remove_file(&cli).unwrap();
+        for name in PRODUCT_FILES {
+            let binary = fixture.root.join("release").join(name);
+            fs::remove_file(&binary).unwrap();
+            assert!(validate_product(&fixture.root).is_err());
+            symlink(fixture.stage.join("bin/silo-vmm"), &binary).unwrap();
+            assert!(validate_product(&fixture.root).is_err());
+            fs::remove_file(&binary).unwrap();
+            fs::write(&binary, name).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+            validate_product(&fixture.root).unwrap();
+        }
+        fs::remove_file(
+            fixture
+                .root
+                .join("release")
+                .join(PRODUCT_LICENSES)
+                .join("modules.json"),
+        )
+        .unwrap();
         assert!(validate_product(&fixture.root).is_err());
-        symlink(fixture.stage.join("bin/silo-vmm"), &cli).unwrap();
-        assert!(validate_product(&fixture.root).is_err());
-        fs::remove_file(&cli).unwrap();
-        fs::write(&cli, "cli").unwrap();
-        validate_product(&fixture.root).unwrap();
     }
 }
