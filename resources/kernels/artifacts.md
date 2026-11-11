@@ -144,26 +144,6 @@ contract rather than a filename heuristic.
 
 ## Managed Root Kernel Compatibility
 
-Workload artifact metadata additionally carries a `rootRuntime` object:
-
-```json
-{
-  "opaqueRaw": true,
-  "managedOverlay": {
-    "eligible": true,
-    "minimumKernelVersion": "6.6",
-    "rootProfile": "linux-erofs-overlay-v1",
-    "upperProfile": "silo-upper-ext4-v1",
-    "overlayProfile": "silo-overlay-v1",
-    "renderingAbi": "linux-overlayfs-mountinfo-v1",
-    "attachmentFamily": "krun-virtio-blk-v1",
-    "qualification": "kernel-config-build-gate"
-  }
-}
-```
-
-`eligible` records the numeric Linux >=6.6 prerequisite for workload kernels.
-`longterm5` is opaque-raw-only, and `rprobe` is not a workload root candidate.
 Overlay compatibility is a kernel-config property verified by the kernel track's
 gate at build time, not per boot. Resolved config validation pins built-in EROFS
 and ext4, ACL/security support, OverlayFS and its module defaults.

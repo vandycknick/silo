@@ -210,8 +210,8 @@ and driver. This does not enable GPU live snapshots.
 
 On Apple Silicon macOS, this also downloads and verifies the prebuilt Rosetta
 probe, so no Linux builder is needed for normal development. Use
-`RPROBE_PATH=/absolute/path/to/rprobe` to override it with a locally built probe,
-or `RPROBE_REFRESH=1` to refresh the cached registry reference. See the
+`RPROBE_PATH=/absolute/path/to/rprobe` to override it with a locally built probe.
+See the
 [probe guide](guest/rprobe/README.md#development-builds-and-publication).
 
 Run a temporary workload from an image:

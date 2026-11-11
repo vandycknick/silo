@@ -117,25 +117,27 @@ fork without changing runtime discovery:
 make KERNEL_REFERENCE=registry.example/silo/kernel:stable
 ```
 
-`make KERNEL_PATH=/absolute/path/to/kernel` selects and validates a local
-regular architecture-matched kernel file instead. `make KERNEL_OFFLINE=1`
-permits no registry access and reuses only verified digest-addressed content already below
-`$CARGO_TARGET_DIR/kernel-cache/sha256`. The resolved index, platform manifest,
-config, and complete layer descriptor set are written outside the runtime payload under
-`$CARGO_TARGET_DIR/kernel-provenance/<target>/<profile>.json`.
-For OCI kernels this provenance also retains the authenticated artifact config,
-whose exact kernel and resolved `.config` identities must match the manifest
-descriptors. Staging adds `managedOverlayCandidate` to `runtime-manifest.json`
+Every build follows the reference to whatever is published right now. Content is
+cached by digest below `$CARGO_TARGET_DIR/kernel-cache/sha256`, so an unchanged
+tag downloads nothing. Whatever is published as `stable` must work; keeping that
+true is the publishing side's job, so the build performs no compatibility checks
+on the artifact metadata.
+
+`make KERNEL_PATH=/absolute/path/to/kernel` selects a local regular kernel file
+instead. `make KERNEL_OFFLINE=1` permits no registry access and reuses only the
+last resolved digest-addressed content. The resolved index, platform manifest,
+config, kernel layer descriptor and artifact config are written outside the
+runtime payload under `$CARGO_TARGET_DIR/kernel-provenance/<target>/<profile>.json`.
+Staging adds `managedOverlayCandidate` to `runtime-manifest.json`
 with the actual staged kernel/base-initramfs/native-executable digests, guest
 architecture and fixed profile/rendering/attachment contract. This is evidence
 inventory, not an admission grant. A local `KERNEL_PATH` has no inferred configuration identity:
 the candidate metadata reports configuration evidence unavailable until the
 actual build's resolved `.config` is supplied to the controlled qualification.
 
-The resolver uses ORAS only for OCI registry and digest transport. It validates
-the Silo index, exact `linux/amd64` or `linux/arm64` platform manifest, artifact
-contract, descriptor media types, SHA-256 digests, and sizes before it copies
-only the kernel layer into `assets/kernel-default`.
+The resolver uses ORAS only for OCI registry and digest transport. It selects the
+`linux/amd64` or `linux/arm64` platform manifest, checks SHA-256 digests and
+sizes, and downloads only the config and kernel layer into the cache.
 
 ## Configuration Model
 

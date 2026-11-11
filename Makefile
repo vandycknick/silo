@@ -27,17 +27,10 @@ KERNEL_REFERENCE ?= ghcr.io/vandycknick/silo/kernel:stable
 KERNEL_PATH ?=
 ##? KERNEL_OFFLINE=0|1: Disable network access during kernel resolution.
 KERNEL_OFFLINE ?= 0
-##? KERNEL_REFRESH=0|1: Refresh the cached kernel reference.
-KERNEL_REFRESH ?= 0
 
 ifneq ($(KERNEL_OFFLINE),0)
 ifneq ($(KERNEL_OFFLINE),1)
 $(error KERNEL_OFFLINE must be 0 or 1)
-endif
-endif
-ifneq ($(KERNEL_REFRESH),0)
-ifneq ($(KERNEL_REFRESH),1)
-$(error KERNEL_REFRESH must be 0 or 1)
 endif
 endif
 
@@ -48,17 +41,10 @@ RPROBE_REFERENCE ?= ghcr.io/vandycknick/silo/rprobe:stable
 RPROBE_PATH ?=
 ##? RPROBE_OFFLINE=0|1: Disable network access during probe resolution.
 RPROBE_OFFLINE ?= 0
-##? RPROBE_REFRESH=0|1: Refresh the cached probe reference.
-RPROBE_REFRESH ?= 0
 
 ifneq ($(RPROBE_OFFLINE),0)
 ifneq ($(RPROBE_OFFLINE),1)
 $(error RPROBE_OFFLINE must be 0 or 1)
-endif
-endif
-ifneq ($(RPROBE_REFRESH),0)
-ifneq ($(RPROBE_REFRESH),1)
-$(error RPROBE_REFRESH must be 0 or 1)
 endif
 endif
 
@@ -102,18 +88,12 @@ endif
 ifeq ($(KERNEL_OFFLINE),1)
 KERNEL_ARGS += --offline
 endif
-ifeq ($(KERNEL_REFRESH),1)
-KERNEL_ARGS += --refresh
-endif
 RPROBE_ARGS := --rprobe-reference "$(RPROBE_REFERENCE)"
 ifneq ($(strip $(RPROBE_PATH)),)
 RPROBE_ARGS += --rprobe-path "$(abspath $(RPROBE_PATH))"
 endif
 ifeq ($(RPROBE_OFFLINE),1)
 RPROBE_ARGS += --rprobe-offline
-endif
-ifeq ($(RPROBE_REFRESH),1)
-RPROBE_ARGS += --rprobe-refresh
 endif
 RUNTIME_ARGS := $(KERNEL_ARGS) $(RPROBE_ARGS)
 APP_ARGS := $(strip $(if $(strip $(BUILD_NUMBER)),--build-number "$(BUILD_NUMBER)") $(if $(strip $(DEVELOPER_ID_APPLICATION)),--developer-id-application "$(DEVELOPER_ID_APPLICATION)"))
