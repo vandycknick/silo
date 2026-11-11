@@ -21,18 +21,6 @@ pub mod daemon {
     }
 }
 
-impl std::fmt::Debug for daemon::v1::HelperBootstrap {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HelperBootstrap")
-            .field("protocol_major", &self.protocol_major)
-            .field("product_version", &self.product_version)
-            .field("daemon_generation", &self.daemon_generation)
-            .field("helper_generation", &self.helper_generation)
-            .field("credentials", &"<redacted>")
-            .finish_non_exhaustive()
-    }
-}
-
 impl std::fmt::Debug for daemon::v1::EgressSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EgressSecret")

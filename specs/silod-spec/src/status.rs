@@ -42,7 +42,6 @@ pub struct DaemonStatus {
     pub updated_at: String,
     pub last_error: Option<String>,
     pub system: Option<SystemStatus>,
-    pub tailscale: ComponentStatus,
     pub configuration_identity: String,
     #[serde(deserialize_with = "required_option")]
     pub manager_live: Option<vm_spec::live::LiveHostReport>,
@@ -58,36 +57,6 @@ pub enum CorePhase {
     Stopping,
     Stopped,
     Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComponentState {
-    Disabled,
-    Starting,
-    NeedsAuth,
-    Ready,
-    Degraded,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShutdownProtection {
-    Active,
-    Unavailable,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ComponentStatus {
-    pub enabled: bool,
-    pub state: ComponentState,
-    pub diagnostic: Option<String>,
-    pub approval_url: Option<String>,
-    pub dns_name: Option<String>,
-    pub restart_count: u32,
-    pub shutdown_protection: ShutdownProtection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,11 +279,6 @@ mod tests {
             "control_endpoint": "/tmp/control", "updated_at": "2026-01-01T00:00:00Z",
             "last_error": null, "system": system, "configuration_identity": "unit",
             "manager_live": null, "appliance_live": null,
-            "tailscale": {
-                "enabled": false, "state": "disabled", "diagnostic": null,
-                "approval_url": null, "dns_name": null, "restart_count": 0,
-                "shutdown_protection": "unsupported",
-            },
         })
     }
 

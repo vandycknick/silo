@@ -18,9 +18,14 @@ fn temporary_home() -> tempfile::TempDir {
 }
 
 fn command(home: &std::path::Path) -> Command {
+    let mut command = silo_command(home);
+    command.args(["daemon", "run"]);
+    command
+}
+
+fn silo_command(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_silo"));
     command
-        .args(["daemon", "run"])
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
@@ -83,6 +88,58 @@ fn invalid_system_configuration_exits_two_before_startup() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("at least 128MiB"));
     assert!(!root.path().join("runtime-home").exists());
+}
+
+#[test]
+fn unavailable_lobby_is_refused_before_daemon_or_service_state_changes() {
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    for persisted in [false, true] {
+        for mode in ["service", "foreground", "run"] {
+            let root = temporary_home();
+            let config_path = root.path().join(".config/silo/config.yaml");
+            let config = b"daemon:\n  version: '1'\n  system:\n    enabled: false\n  tailscale:\n    enabled: true\n";
+            if persisted {
+                std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+                std::fs::write(&config_path, config).unwrap();
+            }
+            let mut command = silo_command(root.path());
+            if mode == "run" {
+                command.args(["daemon", "run", "--system-enabled=false"]);
+                if !persisted {
+                    command.arg("--tailscale-enabled=true");
+                }
+            } else {
+                command.args(["daemon", "up", "--system=false"]);
+                if mode == "foreground" {
+                    command.arg("--foreground");
+                }
+                if !persisted {
+                    command.arg("--tailscale");
+                }
+            }
+            let output = command.output().expect("lobby refusal");
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("the lobby is not available in this build"),
+                "{output:?}"
+            );
+            if mode == "run" {
+                assert_eq!(output.status.code(), Some(2));
+            }
+            if persisted {
+                assert_eq!(std::fs::read(&config_path).unwrap(), config);
+            } else {
+                assert!(!config_path.exists());
+            }
+            assert!(!root.path().join("runtime-home").exists());
+            assert!(!root.path().join("run").exists());
+            assert!(!root.path().join(".config/systemd").exists());
+            assert!(!root.path().join("Library/LaunchAgents").exists());
+        }
+    }
 }
 
 #[test]

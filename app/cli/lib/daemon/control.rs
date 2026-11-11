@@ -1,14 +1,13 @@
 //! Same-user management boundary. Sessions deliberately remain native and direct.
 // Accepted native mutations own their semaphore permit independently of RPC waiters.
-// Sealing admission precedes draining; native sessions are outside this tracker.
+// Native sessions are outside this tracker.
 use crate::config::GlobalConfig;
 use libvm::{HostPaths, ResolvedRuntimeComponents, Runtime, RuntimeConfig};
 use parking_lot::Mutex;
 use silod_spec::daemon::v1 as w;
-use std::os::unix::fs::MetadataExt;
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, OnceCell, Semaphore};
-use tonic::{Request, Status};
+use tonic::Status;
 mod daemon;
 mod handoff;
 mod machine;
@@ -55,12 +54,6 @@ pub(super) fn run(v: &str) -> Result<libvm::MachineRunId, Status> {
     v.parse()
         .map_err(|_| Status::invalid_argument("invalid run ID"))
 }
-struct Admission {
-    sealed: bool,
-    stopping: bool,
-    helper: Option<String>,
-    instance: Option<String>,
-}
 #[derive(Debug)]
 pub(super) struct MutationPermit {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -76,13 +69,12 @@ pub(crate) struct ControlState {
     pub(super) host: HostPaths,
     config: RuntimeConfig,
     pub(super) generation: uuid::Uuid,
-    pub(super) shutdown_only: bool,
     components: OnceCell<ResolvedRuntimeComponents>,
     runtime: OnceCell<Runtime>,
     handoff: OnceCell<libvm::handoff::service::HandoffService>,
     live_query: OnceCell<libvm::LiveCapabilityQuery>,
     publisher: Arc<crate::daemon::status::StatusPublisher>,
-    admission: Mutex<Admission>,
+    stopping: Mutex<bool>,
     capacity: Arc<Semaphore>,
     settled: Arc<tokio::sync::Notify>,
     stream_shutdown: tokio_util::sync::CancellationToken,
@@ -101,51 +93,16 @@ impl ControlState {
             host,
             config,
             generation,
-            shutdown_only: false,
             components: OnceCell::new(),
             runtime: OnceCell::new(),
             handoff: OnceCell::new(),
             live_query: OnceCell::new(),
             publisher,
-            admission: Mutex::new(Admission {
-                sealed: false,
-                stopping: false,
-                helper: None,
-                instance: None,
-            }),
+            stopping: Mutex::new(false),
             capacity: Arc::new(Semaphore::new(64)),
             settled: Arc::new(tokio::sync::Notify::new()),
             stream_shutdown: tokio_util::sync::CancellationToken::new(),
         }
-    }
-    #[cfg(target_os = "linux")]
-    pub(crate) fn shutdown_only(
-        host: HostPaths,
-        global: GlobalConfig,
-        generation: uuid::Uuid,
-        publisher: Arc<crate::daemon::status::StatusPublisher>,
-    ) -> Self {
-        let mut state = Self::new(host, global, generation, publisher);
-        state.shutdown_only = true;
-        state
-    }
-    // Missing means open; every other result (including unsafe/unreadable
-    // marker paths) seals protected admission and authorizes a safe drain.
-    pub(super) fn marker_sealed(&self) -> bool {
-        let directory = self.host.home().join("taild");
-        match std::fs::symlink_metadata(&directory) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-            Ok(m)
-                if m.is_dir()
-                    && !m.file_type().is_symlink()
-                    && m.uid() == nix::unistd::geteuid().as_raw()
-                    && m.mode() & 0o022 == 0 => {}
-            _ => return true,
-        }
-        !matches!(
-            std::fs::symlink_metadata(directory.join("shutdown")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-        )
     }
     pub(super) fn response_stream<T: Send + 'static>(
         &self,
@@ -162,27 +119,12 @@ impl ControlState {
             .wire()
             .map_err(|_| Status::internal("cannot read daemon status"))
     }
-    pub(crate) fn check_helper(&self, request: Request<()>) -> Result<Request<()>, Status> {
-        if let Some(tag) = request.metadata().get("x-silo-helper-generation") {
-            let admission = self.admission.lock();
-            if tag.to_str().ok().is_none() || tag.to_str().ok() != admission.helper.as_deref() {
-                return Err(Status::failed_precondition("stale helper generation"));
-            }
-        }
-        Ok(request)
-    }
-    pub(crate) async fn set_helper_generation(&self, generation: Option<uuid::Uuid>) {
-        self.admission.lock().helper = generation.map(|v| v.to_string());
-    }
     pub(crate) async fn begin_stopping(&self) -> eyre::Result<()> {
-        self.admission.lock().stopping = true;
+        *self.stopping.lock() = true;
         self.publisher
             .set_core(silod_spec::status::CorePhase::Stopping, None)
     }
-    pub(crate) async fn seal_mutations(&self) {
-        self.admission.lock().sealed = true;
-    }
-    pub(crate) async fn drain_mutations(&self) -> Result<(), Status> {
+    pub(crate) async fn wait_for_mutations(&self) -> Result<(), Status> {
         loop {
             let settled = self.settled.notified();
             tokio::pin!(settled);
@@ -284,30 +226,10 @@ impl ControlState {
     pub(super) async fn machine(&self, r: &libvm::MachineRef) -> Result<libvm::Machine, Status> {
         self.runtime().await?.get_machine(r).await.map_err(native)
     }
-    pub(super) async fn admit(
-        &self,
-        request: &Request<impl Sized>,
-        protected: bool,
-    ) -> Result<MutationPermit, Status> {
-        let admission = self.admission.lock();
-        let tag = request.metadata().get("x-silo-helper-generation");
-        let helper = tag
-            .map(|v| v.to_str())
-            .transpose()
-            .map_err(|_| Status::failed_precondition("stale helper generation"))?;
-        if tag.is_some() && helper != admission.helper.as_deref() {
-            return Err(Status::failed_precondition("stale helper generation"));
-        }
-        if admission.sealed
-            || (admission.stopping && helper != admission.helper.as_deref())
-            || (admission.stopping && helper.is_none())
-        {
-            return Err(Status::unavailable("mutation admission sealed"));
-        }
-        if protected && self.marker_sealed() {
-            return Err(Status::failed_precondition(
-                "host shutdown admission sealed",
-            ));
+    pub(super) async fn admit(&self) -> Result<MutationPermit, Status> {
+        let stopping = self.stopping.lock();
+        if *stopping {
+            return Err(Status::unavailable("daemon is stopping"));
         }
         let permit = self
             .capacity
@@ -319,17 +241,12 @@ impl ControlState {
             settled: self.settled.clone(),
         })
     }
-    pub(super) async fn mutate<T, F>(
-        &self,
-        request: &Request<impl Sized>,
-        protected: bool,
-        work: F,
-    ) -> Result<T, Status>
+    pub(super) async fn mutate<T, F>(&self, work: F) -> Result<T, Status>
     where
         T: Send + 'static,
         F: Future<Output = Result<T, Status>> + Send + 'static,
     {
-        let permit = self.admit(request, protected).await.map_err(|mut status| {
+        let permit = self.admit().await.map_err(|mut status| {
             status.metadata_mut().insert(
                 "x-silo-mutation-rejected",
                 tonic::metadata::MetadataValue::from_static("true"),

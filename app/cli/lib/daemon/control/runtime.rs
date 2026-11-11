@@ -16,16 +16,15 @@ fn image_reference(value: &str) -> Result<(), Status> {
 impl Service {
     /// Runs one managed-image publication to completion independently of the
     /// response consumer: progress first, then exactly one terminal image.
-    async fn managed_image_operation<R, F, Fut>(
+    async fn managed_image_operation<F, Fut>(
         &self,
-        r: &Request<R>,
         work: F,
     ) -> Result<Response<Stream<w::ManagedImageEvent>>, Status>
     where
         F: FnOnce(Service, libvm::ImageProgressSender) -> Fut + Send + 'static,
         Fut: Future<Output = Result<libvm::ManagedImageInfo, Status>> + Send + 'static,
     {
-        let permit = self.admit(r, true).await?;
+        let permit = self.admit().await?;
         let state = self.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let (progress, mut events) = libvm::ImageProgressSender::channel(8);
@@ -82,9 +81,9 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         r: Request<w::AcquireArtifactRequest>,
     ) -> Result<Response<w::ArtifactAcquireReport>, Status> {
-        let request = silo_vm_control::artifacts::acquire_from_wire(r.get_ref().clone())
-            .map_err(conversion)?;
-        let permit = self.admit(&r, true).await?;
+        let request =
+            silo_vm_control::artifacts::acquire_from_wire(r.into_inner()).map_err(conversion)?;
+        let permit = self.admit().await?;
         let state = self.clone();
         // The task retains the mutation permit and operation even if the RPC disappears.
         let result = tokio::spawn(async move {
@@ -109,9 +108,9 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         r: Request<w::PublishArtifactRequest>,
     ) -> Result<Response<w::ArtifactPublishReport>, Status> {
-        let request = silo_vm_control::artifacts::publish_from_wire(r.get_ref().clone())
-            .map_err(conversion)?;
-        let permit = self.admit(&r, true).await?;
+        let request =
+            silo_vm_control::artifacts::publish_from_wire(r.into_inner()).map_err(conversion)?;
+        let permit = self.admit().await?;
         let state = self.clone();
         let result = tokio::spawn(async move {
             let _permit = permit;
@@ -135,9 +134,9 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         r: Request<w::DiskImportRequest>,
     ) -> Result<Response<Self::ImportImageStream>, Status> {
-        let request = silo_vm_control::boot::import_request_from_wire(r.get_ref().clone())
-            .map_err(conversion)?;
-        self.managed_image_operation(&r, move |state, progress| async move {
+        let request =
+            silo_vm_control::boot::import_request_from_wire(r.into_inner()).map_err(conversion)?;
+        self.managed_image_operation(move |state, progress| async move {
             let admitted = request.admit().await.map_err(native)?;
             let runtime = state.runtime().await?.with_image_progress(progress);
             runtime
@@ -156,10 +155,10 @@ impl w::runtime_service_server::RuntimeService for Service {
         r: Request<w::ConvertImageRequest>,
     ) -> Result<Response<Self::ConvertImageStream>, Status> {
         let (identity, options) =
-            images::convert_request_from_wire(r.get_ref().clone()).map_err(conversion)?;
+            images::convert_request_from_wire(r.into_inner()).map_err(conversion)?;
         image_reference(&identity.selected_reference)?;
         let resolve = identity.resolve_options().map_err(conversion)?;
-        self.managed_image_operation(&r, move |state, progress| async move {
+        self.managed_image_operation(move |state, progress| async move {
             let runtime = state.runtime().await?.with_image_progress(progress);
             let images = runtime
                 .with_image_pull_policy(identity.pull_policy)
@@ -228,9 +227,9 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         r: Request<w::ManagedSourceRef>,
     ) -> Result<Response<()>, Status> {
-        let reference = images::managed_ref_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let reference = images::managed_ref_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
-        self.mutate(&r, true, async move {
+        self.mutate(async move {
             state
                 .runtime()
                 .await?
@@ -247,7 +246,7 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         r: Request<w::RestoreStorageSnapshotRequest>,
     ) -> Result<Response<w::MachineSnapshot>, Status> {
-        let value = r.get_ref().clone();
+        let value = r.into_inner();
         let reference = silo_vm_control::stopped::reference_from_wire(
             crate::daemon::control::required(value.snapshot)?,
         )
@@ -284,7 +283,7 @@ impl w::runtime_service_server::RuntimeService for Service {
         .map_err(native)?;
         let state = self.clone();
         let result = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let machine = state
                     .runtime()
                     .await?
@@ -304,7 +303,7 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         r: Request<w::RecoverCheckpointDisksRequest>,
     ) -> Result<Response<w::MachineSnapshot>, Status> {
-        let value = r.get_ref().clone();
+        let value = r.into_inner();
         let reference = silo_vm_control::stopped::reference_from_wire(
             crate::daemon::control::required(value.snapshot)?,
         )
@@ -325,7 +324,7 @@ impl w::runtime_service_server::RuntimeService for Service {
         .map_err(native)?;
         let state = self.clone();
         let result = self
-            .mutate(&r, true, async move {
+            .mutate(async move {
                 let machine = state
                     .runtime()
                     .await?
@@ -382,10 +381,10 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         r: Request<w::StorageSnapshotRef>,
     ) -> Result<Response<()>, Status> {
-        let reference = silo_vm_control::stopped::reference_from_wire(r.get_ref().clone())
-            .map_err(conversion)?;
+        let reference =
+            silo_vm_control::stopped::reference_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
-        self.mutate(&r, true, async move {
+        self.mutate(async move {
             let runtime = state.runtime().await?;
             libvm::SnapshotStore::open(runtime.local_home())
                 .await
@@ -404,7 +403,7 @@ impl w::runtime_service_server::RuntimeService for Service {
     async fn remove_image_alias(&self, r: Request<w::Name>) -> Result<Response<()>, Status> {
         let alias = silo_vm_control::stopped::alias(&r.get_ref().name).map_err(conversion)?;
         let state = self.clone();
-        self.mutate(&r, true, async move {
+        self.mutate(async move {
             state
                 .runtime()
                 .await?
@@ -436,17 +435,16 @@ impl w::runtime_service_server::RuntimeService for Service {
         ))
     }
 
-    /// Durable cancellation intent. Like stop/kill it stays admitted while
-    /// host shutdown seals new protected work.
+    /// Durable cancellation intent.
     async fn cancel_fork(
         &self,
         r: Request<w::ForkOperationRef>,
     ) -> Result<Response<w::LiveForkResult>, Status> {
         let operation_id =
-            silo_vm_control::fork::operation_from_wire(r.get_ref().clone()).map_err(conversion)?;
+            silo_vm_control::fork::operation_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         let result = self
-            .mutate(&r, false, async move {
+            .mutate(async move {
                 let result = state
                     .runtime()
                     .await?
@@ -463,13 +461,13 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         r: Request<w::ResolveImageRequest>,
     ) -> Result<Response<Self::ResolveImageStream>, Status> {
-        let v = r.get_ref().clone();
+        let v = r.into_inner();
         image_reference(&v.reference)?;
         let options = images::resolve_options_from_wire(&v).map_err(conversion)?;
         let policy = images::pull_policy_from_wire(v.pull_policy).map_err(conversion)?;
         // Resolution can fetch/cache artifacts. It has the same lifetime and admission
         // rules as other mutations, even when the progress consumer disconnects.
-        let permit = self.admit(&r, false).await?;
+        let permit = self.admit().await?;
         let state = self.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let (progress, mut events) = libvm::ImageProgressSender::channel(8);
@@ -514,7 +512,7 @@ impl w::runtime_service_server::RuntimeService for Service {
     ) -> Result<Response<Self::PullImageStream>, Status> {
         let reference = r.get_ref().reference.clone();
         image_reference(&reference)?;
-        let permit = self.admit(&r, false).await?;
+        let permit = self.admit().await?;
         let state = self.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let (progress, mut events) = libvm::ImageProgressSender::channel(8);

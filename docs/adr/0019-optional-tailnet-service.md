@@ -4,7 +4,7 @@ Date: 2026-10-01
 
 ## Status
 
-Accepted
+Superseded by [ADR 0022](0022-lobby-in-silod-and-tsgate.md).
 
 ## Context
 

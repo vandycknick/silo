@@ -1370,14 +1370,14 @@ mod tests {
         .into());
         let note = fork_confirmation_note(&lost, operation, &absent).unwrap();
         assert!(note.contains("was not confirmed"), "{note}");
-        let rejected = tonic::Status::failed_precondition("host shutdown admission sealed").into();
+        let rejected = tonic::Status::failed_precondition("live operation unavailable").into();
         assert!(fork_confirmation_note(&rejected, operation, &absent).is_none());
-        let mut sealed = tonic::Status::unavailable("mutation admission sealed");
-        sealed.metadata_mut().insert(
+        let mut stopping = tonic::Status::unavailable("daemon is stopping");
+        stopping.metadata_mut().insert(
             "x-silo-mutation-rejected",
             tonic::metadata::MetadataValue::from_static("true"),
         );
-        let rejected = sealed.into();
+        let rejected = stopping.into();
         assert!(
             fork_confirmation_note(&rejected, operation, &Err(eyre::eyre!("offline"))).is_none()
         );

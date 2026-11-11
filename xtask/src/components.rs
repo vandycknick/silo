@@ -21,8 +21,6 @@ pub enum Component {
     Init,
     Initramfs,
     Rprobe,
-    GoFfi,
-    Taild,
 }
 
 pub struct BuildContext<'a> {
@@ -52,13 +50,6 @@ pub enum ComponentError {
     MissingVmmBinary { path: std::path::PathBuf },
     #[error("rprobe must be built natively on Linux ARM64")]
     UnsupportedRprobeHost,
-    #[error(transparent)]
-    Version(#[from] crate::version::VersionError),
-}
-
-pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    build_runtime(context)?;
-    build_component(Component::Taild, context)
 }
 
 pub fn build_runtime(context: &BuildContext<'_>) -> Result<(), ComponentError> {
@@ -87,8 +78,6 @@ pub fn build_component(
         Component::Init => build_guest_init(context),
         Component::Initramfs => build_initramfs(context),
         Component::Rprobe => build_rprobe(context),
-        Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
-        Component::Taild => build_taild(context),
     }
 }
 
@@ -374,66 +363,6 @@ fn build_guest_agent(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     Ok(())
 }
 
-fn build_taild(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    crate::version::check(context.workspace_root)?;
-    build_component(Component::GoFfi, context)?;
-
-    let source = context.workspace_root.join("app/taild");
-    let output_dir = context.target_dir.join(context.profile.directory());
-    fs::create_dir_all(&output_dir).map_err(|source| ComponentError::CreateOutputDirectory {
-        path: output_dir.clone(),
-        source,
-    })?;
-    let output = output_dir.join("taild");
-    let go_program = release::tool("go")?;
-    let (goos, goarch) = context.host.go_target();
-    let mut go = Command::new(&go_program);
-    go.current_dir(&source)
-        .args(["build", "-mod=readonly", "-trimpath", "-buildvcs=false"]);
-    release::configure_command(
-        &mut go,
-        context.profile == Profile::Release,
-        context.workspace_root,
-        context.target_dir,
-    )?;
-    go.env("CGO_ENABLED", "1")
-        .env("GOOS", goos)
-        .env("GOARCH", goarch)
-        .env_remove("SILO_GO_FFI_PATH");
-    if context.profile == Profile::Release {
-        go.args(["-ldflags", "-s -w"]);
-    }
-    go.arg("-o").arg(&output).arg("./cmd/taild");
-    command::run(go)?;
-    if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
-        release::set_macos_build_version(&output)?;
-    }
-
-    let mut notices = Command::new("python3");
-    notices
-        .arg(
-            context
-                .workspace_root
-                .join("packaging/silo-taild/licenses.py"),
-        )
-        .arg(&source)
-        .arg(context.target_dir.join("taild-licenses"))
-        .arg(go_program);
-    release::configure_command(
-        &mut notices,
-        context.profile == Profile::Release,
-        context.workspace_root,
-        context.target_dir,
-    )?;
-    notices
-        .env("CGO_ENABLED", "1")
-        .env("GOOS", goos)
-        .env("GOARCH", goarch)
-        .env_remove("SILO_GO_FFI_PATH");
-    command::run(notices)?;
-    Ok(())
-}
-
 fn build_guest_portd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     let mut cargo = cargo_command(context)?;
     cargo.args([
@@ -566,11 +495,33 @@ pub(crate) fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -
 mod tests {
     use crate::components::{
         build_rprobe, guest_library_test_command, rprobe_cargo_command, workspace_test_command,
-        BuildContext, ComponentError, TestSuite,
+        BuildContext, Component, ComponentError, TestSuite,
     };
     use crate::profiles::Profile;
     use crate::targets::HostTarget;
+    use clap::ValueEnum;
     use std::path::Path;
+
+    #[test]
+    fn components_match_supported_build_targets() {
+        let names: Vec<_> = Component::value_variants()
+            .iter()
+            .map(|component| component.to_possible_value().unwrap().get_name().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "cli",
+                "silo-vmm",
+                "netd",
+                "agent",
+                "portd",
+                "init",
+                "initramfs",
+                "rprobe"
+            ]
+        );
+    }
 
     #[test]
     fn probe_build_requires_native_linux_arm64() {

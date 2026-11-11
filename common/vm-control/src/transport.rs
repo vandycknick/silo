@@ -264,7 +264,7 @@ fn canonical_selected(path: &Path) -> eyre::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{admit_status, probe_at, Admission};
+    use crate::transport::{admit_status, probe_at, Admission};
     use libvm::HostPaths;
     use silod_spec::daemon::v1::{
         self as w,
@@ -300,20 +300,6 @@ mod tests {
             &self,
             _: tonic::Request<()>,
         ) -> Result<tonic::Response<w::RuntimeInfo>, tonic::Status> {
-            Err(tonic::Status::unimplemented("fixture status only"))
-        }
-
-        async fn report_tailscale_status(
-            &self,
-            _: tonic::Request<w::TailscaleStatusReport>,
-        ) -> Result<tonic::Response<()>, tonic::Status> {
-            Err(tonic::Status::unimplemented("fixture status only"))
-        }
-
-        async fn drain_mutations(
-            &self,
-            _: tonic::Request<w::DrainMutationsRequest>,
-        ) -> Result<tonic::Response<()>, tonic::Status> {
             Err(tonic::Status::unimplemented("fixture status only"))
         }
     }

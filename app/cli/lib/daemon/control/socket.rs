@@ -106,46 +106,32 @@ impl BoundServer {
             }
         });
         let limit = 16 * 1024 * 1024;
-        let state = self.state.clone();
-        let interceptor = move |request| state.check_helper(request);
         tonic::transport::Server::builder()
-            .layer(tower::layer::layer_fn({
-                let shutdown_only = self.state.shutdown_only;
-                move |inner| ShutdownFilter {
-                    inner,
-                    shutdown_only,
-                }
-            }))
-            .add_service(tonic::service::interceptor::InterceptedService::new(
+            .add_service(
                 w::daemon_service_server::DaemonServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),
-                interceptor.clone(),
-            ))
-            .add_service(tonic::service::interceptor::InterceptedService::new(
+            )
+            .add_service(
                 w::machine_service_server::MachineServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),
-                interceptor.clone(),
-            ))
-            .add_service(tonic::service::interceptor::InterceptedService::new(
+            )
+            .add_service(
                 w::network_service_server::NetworkServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),
-                interceptor.clone(),
-            ))
-            .add_service(tonic::service::interceptor::InterceptedService::new(
+            )
+            .add_service(
                 w::handoff_service_server::HandoffServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),
-                interceptor.clone(),
-            ))
-            .add_service(tonic::service::interceptor::InterceptedService::new(
+            )
+            .add_service(
                 w::runtime_service_server::RuntimeServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),
-                interceptor,
-            ))
+            )
             .serve_with_incoming_shutdown(incoming, async {
                 shutdown.cancelled().await;
                 self.state.stream_shutdown.cancel();
@@ -164,51 +150,6 @@ impl Drop for BoundServer {
     }
 }
 
-fn shutdown_allowed(path: &str) -> bool {
-    matches!(
-        path,
-        "/silo.daemon.v1.DaemonService/GetStatus"
-            | "/silo.daemon.v1.DaemonService/GetLiveCapabilities"
-            | "/silo.daemon.v1.DaemonService/DrainMutations"
-            | "/silo.daemon.v1.MachineService/ListMachines"
-            | "/silo.daemon.v1.MachineService/InspectInventory"
-            | "/silo.daemon.v1.MachineService/InspectMachine"
-            | "/silo.daemon.v1.MachineService/StopMachine"
-    )
-}
-
-#[derive(Clone)]
-struct ShutdownFilter<S> {
-    inner: S,
-    shutdown_only: bool,
-}
-impl<S, B> tower::Service<tonic::codegen::http::Request<B>> for ShutdownFilter<S>
-where
-    S: tower::Service<
-        tonic::codegen::http::Request<B>,
-        Response = tonic::codegen::http::Response<tonic::body::Body>,
-    >,
-    S::Future: Send + 'static,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future =
-        futures::future::Either<std::future::Ready<Result<Self::Response, Self::Error>>, S::Future>;
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-    fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
-        if self.shutdown_only && !shutdown_allowed(request.uri().path()) {
-            return futures::future::Either::Left(std::future::ready(Ok(
-                tonic::Status::permission_denied("shutdown-only control service").into_http(),
-            )));
-        }
-        futures::future::Either::Right(self.inner.call(request))
-    }
-}
 fn private_directory(path: &std::path::Path) -> eyre::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     match std::fs::DirBuilder::new().mode(0o700).create(path) {

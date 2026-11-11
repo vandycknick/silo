@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use eyre::{bail, Context as _};
 use nix::fcntl::{Flock, FlockArg};
 use silod_spec::paths::DaemonPaths;
-use silod_spec::status::{ComponentState, CorePhase, DaemonStatus, SystemPhase, SystemStatus};
+use silod_spec::status::{CorePhase, DaemonStatus, SystemPhase, SystemStatus};
 
 use crate::ui::Spinner;
 
@@ -160,7 +160,6 @@ pub(crate) async fn up(
     service: &ServiceConfig,
     configuration_identity: &str,
     system_enabled: bool,
-    explicit_tailscale: bool,
     spinner: &mut Spinner,
 ) -> eyre::Result<DaemonStatus> {
     reject_root()?;
@@ -182,7 +181,6 @@ pub(crate) async fn up(
                 chrono::Utc::now(),
                 configuration_identity,
                 system_enabled,
-                explicit_tailscale,
                 Duration::from_secs(120),
                 spinner,
             )
@@ -207,7 +205,6 @@ pub(crate) async fn up(
         started,
         configuration_identity,
         system_enabled,
-        explicit_tailscale,
         Duration::from_secs(120),
         spinner,
     )
@@ -449,7 +446,6 @@ async fn wait_ready(
     since: chrono::DateTime<chrono::Utc>,
     identity: &str,
     system_enabled: bool,
-    explicit_tailscale: bool,
     timeout: Duration,
     spinner: &mut Spinner,
 ) -> eyre::Result<DaemonStatus> {
@@ -485,7 +481,7 @@ async fn wait_ready(
                         }
                     }
                     let components_ready = if core_ready {
-                        readiness.observe_components(&status, system_enabled, explicit_tailscale)?
+                        readiness.observe_components(&status, system_enabled)?
                     } else {
                         false
                     };
@@ -584,18 +580,7 @@ impl StartupReadiness {
         &mut self,
         status: &DaemonStatus,
         system_enabled: bool,
-        explicit_tailscale: bool,
     ) -> eyre::Result<bool> {
-        if explicit_tailscale && status.tailscale.state == ComponentState::Failed {
-            bail!(
-                "Tailscale failed: {}; the core daemon is running and remains available",
-                status
-                    .tailscale
-                    .diagnostic
-                    .as_deref()
-                    .unwrap_or("unknown helper failure")
-            );
-        }
         if !system_enabled {
             return Ok(true);
         }
@@ -880,7 +865,6 @@ fn render_native(
     arguments: &[OsString],
 ) -> eyre::Result<Vec<u8>> {
     let mut command = format!("{} daemon run", systemd_executable(&service.executable)?);
-    let stop_command = format!("{command} --host-shutdown");
     for argument in arguments {
         command.push(' ');
         command.push_str(&systemd_arg(Path::new(argument))?);
@@ -895,8 +879,7 @@ fn render_native(
         .collect::<eyre::Result<Vec<_>>>()?
         .concat();
     Ok(format!(
-        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo daemon\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\nSyslogIdentifier=silo-daemon\n{environment}ExecStart={}\nExecStop={}\nRestart=on-failure\nRestartPreventExitStatus=2\nRestartSec=5\nKillMode=process\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
-        command, stop_command
+        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo daemon\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\nSyslogIdentifier=silo-daemon\n{environment}ExecStart={command}\nRestart=on-failure\nRestartPreventExitStatus=2\nRestartSec=5\nKillMode=process\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
     ).into_bytes())
 }
 
@@ -1269,11 +1252,6 @@ mod tests {
             "last_error": null,
             "system": null,
             "manager_live": null, "appliance_live": null,
-            "tailscale": {
-                "enabled": false, "state": "disabled", "diagnostic": null,
-                "approval_url": null, "dns_name": null, "restart_count": 0,
-                "shutdown_protection": "unsupported"
-            },
             "configuration_identity": "fixture"
         })
     }
@@ -1313,37 +1291,18 @@ mod tests {
     }
 
     #[test]
-    fn optional_authentication_does_not_block_core_and_explicit_failure_preserves_it() {
-        let mut status: silod_spec::status::DaemonStatus = serde_json::from_value(
-            live_status_value(std::path::Path::new("/tmp/silo-status-test")),
-        )
+    fn core_readiness_does_not_require_a_system_vm() {
+        let status: silod_spec::status::DaemonStatus = serde_json::from_value(live_status_value(
+            std::path::Path::new("/tmp/silo-status-test"),
+        ))
         .expect("status");
         let mut wait = StartupReadiness::new(std::time::Duration::from_secs(120));
-        for state in [
-            silod_spec::status::ComponentState::Disabled,
-            silod_spec::status::ComponentState::Starting,
-            silod_spec::status::ComponentState::NeedsAuth,
-        ] {
-            status.tailscale.state = state;
-            assert!(wait
-                .observe_components(&status, false, true)
-                .expect("core available"));
-            assert!(!wait
-                .observe_components(&status, true, true)
-                .expect("system missing"));
-        }
-        status.tailscale.state = silod_spec::status::ComponentState::Failed;
-        status.tailscale.diagnostic = Some("helper executable is missing".into());
         assert!(wait
-            .observe_components(&status, false, false)
-            .expect("implicit failure does not stop core"));
-        let error = wait
-            .observe_components(&status, false, true)
-            .expect_err("explicit failure")
-            .to_string();
-        assert!(error.contains("helper executable is missing"));
-        assert!(error.contains("core daemon is running"));
-        assert_eq!(status.core, silod_spec::status::CorePhase::Ready);
+            .observe_components(&status, false)
+            .expect("core available"));
+        assert!(!wait
+            .observe_components(&status, true)
+            .expect("system missing"));
     }
 
     #[test]
@@ -1352,19 +1311,13 @@ mod tests {
         let paths = DaemonPaths::new(temp.path());
         std::fs::create_dir_all(paths.status().parent().expect("status parent"))
             .expect("directory");
-        let mut value = live_status_value(temp.path());
-        value["tailscale"]["enabled"] = true.into();
-        value["tailscale"]["state"] = "needs_auth".into();
+        let value = live_status_value(temp.path());
         std::fs::write(paths.status(), serde_json::to_vec(&value).expect("JSON"))
             .expect("status file");
         let status = crate::daemon::service::status(&paths)
             .expect("foreground status")
             .expect("live");
         assert_eq!(status.core, silod_spec::status::CorePhase::Ready);
-        assert_eq!(
-            status.tailscale.state,
-            silod_spec::status::ComponentState::NeedsAuth
-        );
         assert!(status.system.is_none());
         assert!(!paths.docker_socket().exists());
     }
@@ -1522,8 +1475,6 @@ mod tests {
         let text = String::from_utf8(bytes).expect("utf8");
         #[cfg(target_os = "linux")]
         assert!(text.contains("ExecStart=\"/opt/silo/bin/silo\" daemon run \"--system-cpus\""));
-        #[cfg(target_os = "linux")]
-        assert!(text.contains("ExecStop=\"/opt/silo/bin/silo\" daemon run --host-shutdown\n"));
         #[cfg(target_os = "macos")]
         assert!(text.contains("<string>/opt/silo/bin/silo</string>\n\t\t<string>daemon</string>\n\t\t<string>run</string>\n\t\t<string>--system-cpus</string>"));
         assert!(text.contains("--system-cpus"));
@@ -1623,109 +1574,6 @@ mod tests {
         assert_eq!(logs(&paths, 2).expect("logs"), "two\nthree");
     }
 
-    /// Opt-in: exercises systemd's parser and execution, not unit-template wording.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn systemd_execstop_uses_selected_executable_and_same_environment() {
-        use std::os::unix::fs::PermissionsExt as _;
-        use std::process::Command;
-        if std::env::var("SILO_TEST_USER_SYSTEMD").as_deref() != Ok("1") {
-            eprintln!(
-                "SKIPPED: SILO_TEST_USER_SYSTEMD=1 and a live user systemd manager are required"
-            );
-            return;
-        }
-        fn systemctl(arguments: &[&std::ffi::OsStr]) {
-            let output = Command::new("systemctl")
-                .arg("--user")
-                .args(arguments)
-                .output()
-                .expect("systemctl");
-            assert!(
-                output.status.success(),
-                "systemctl failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        struct RegisteredUnit(String);
-        impl Drop for RegisteredUnit {
-            fn drop(&mut self) {
-                // Only this fixture's unique unit is stopped and unlinked.
-                let _ = Command::new("systemctl")
-                    .args(["--user", "disable", "--now", &self.0])
-                    .output();
-                let _ = Command::new("systemctl")
-                    .args(["--user", "reset-failed", &self.0])
-                    .output();
-                let _ = Command::new("systemctl")
-                    .args(["--user", "daemon-reload"])
-                    .output();
-            }
-        }
-        let temp = tempfile::tempdir().expect("temp");
-        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
-        let executable = root.join("silo space$literal%");
-        let record = root.join("stop-record");
-        let start_record = root.join("start-record");
-        let script = format!(
-            "#!/bin/sh\nif [ \"$3\" = --host-shutdown ]; then\nprintf '%s\\n' \"$@\" \"$HOME\" \"$SILO_HOME\" \"$XDG_CONFIG_HOME\" > {}\nelse\nprintf '%s\\n' \"$@\" \"$HOME\" \"$SILO_HOME\" \"$XDG_CONFIG_HOME\" > {}\nexec /bin/sleep 60\nfi\n",
-            crate::daemon::service::shell_word(record.to_str().unwrap()),
-            crate::daemon::service::shell_word(start_record.to_str().unwrap()),
-        );
-        std::fs::write(&executable, script).expect("fixture executable");
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-            .expect("executable mode");
-        let mut service = service(
-            &root.join("home space$literal%\"quote"),
-            executable.to_str().unwrap(),
-        );
-        let name = format!("silo-execstop-test-{}.service", uuid::Uuid::new_v4());
-        service.native_service_path = root.join(&name);
-        std::fs::write(
-            &service.native_service_path,
-            render_native(
-                &service,
-                "execstop-fixture",
-                &[
-                    "--system-cpus".into(),
-                    "9".into(),
-                    "literal $percent%\"quote\\slash".into(),
-                ],
-            )
-            .expect("render"),
-        )
-        .expect("unit file");
-        systemctl(&["link".as_ref(), service.native_service_path.as_os_str()]);
-        let _registration = RegisteredUnit(name.clone());
-        systemctl(&["daemon-reload".as_ref()]);
-        systemctl(&["start".as_ref(), name.as_ref()]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !start_record.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fixture did not execute"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        systemctl(&["stop".as_ref(), name.as_ref()]);
-        let environment = [
-            service.environment.user_home.to_str().unwrap(),
-            service.environment.silo_home.to_str().unwrap(),
-            service.environment.config_home.to_str().unwrap(),
-        ]
-        .join("\n");
-        assert_eq!(
-            std::fs::read_to_string(start_record).expect("start arguments/environment"),
-            format!(
-                "daemon\nrun\n--system-cpus\n9\nliteral $percent%\"quote\\slash\n{environment}\n"
-            )
-        );
-        assert_eq!(
-            std::fs::read_to_string(record).expect("stop arguments/environment"),
-            format!("daemon\nrun\n--host-shutdown\n{environment}\n")
-        );
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
     fn rejects_executable_paths_systemd_cannot_represent() {
@@ -1755,7 +1603,7 @@ mod tests {
             std::fs::write(
                 paths.status(),
                 format!(
-                    r#"{{"schema":2,"generation":"d823458f-090b-48c3-87d4-33daf76c0000","pid":1,"process_start":"test","core":"{phase}","home":"/tmp","control_endpoint":"/tmp/control.sock","configuration_identity":"test","system":null,"manager_live":null,"appliance_live":null,"tailscale":{{"enabled":false,"state":"disabled","diagnostic":null,"approval_url":null,"dns_name":null,"restart_count":0,"shutdown_protection":"unsupported"}},"updated_at":"{updated_at}","last_error":"boom"}}"#
+                    r#"{{"schema":2,"generation":"d823458f-090b-48c3-87d4-33daf76c0000","pid":1,"process_start":"test","core":"{phase}","home":"/tmp","control_endpoint":"/tmp/control.sock","configuration_identity":"test","system":null,"manager_live":null,"appliance_live":null,"updated_at":"{updated_at}","last_error":"boom"}}"#
                 ),
             )
             .expect("status");

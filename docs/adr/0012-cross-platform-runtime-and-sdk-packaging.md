@@ -13,6 +13,9 @@ layout is defined by [ADR 0017](0017-single-host-state-root.md). Historical roll
 and verification notes below describe their original revisions, not current
 standalone-helper requirements.
 
+Amended by [ADR 0022](0022-lobby-in-silod-and-tsgate.md): the Go and Node SDKs
+and their native bridges, packaging and qualification requirements are dropped.
+
 ## The Problem
 
 Silo is not one executable. A working installation combines a frontend, private

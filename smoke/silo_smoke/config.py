@@ -30,10 +30,6 @@ def runtime_target() -> str:
     raise SmokeEnvironmentError(f"Unsupported smoke host: {system} {machine}")
 
 
-def go_ffi_library() -> str:
-    return "libsilo_go_ffi.dylib" if platform.system() == "Darwin" else "libsilo_go_ffi.so"
-
-
 @dataclass(frozen=True)
 class SmokeConfig:
     bin_dir: Path

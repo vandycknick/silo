@@ -64,7 +64,7 @@ impl w::network_service_server::NetworkService for Service {
         let value = network::definition_from_wire(required(r.get_ref().definition.clone())?)
             .map_err(conversion)?;
         let state = self.clone();
-        self.mutate(&r, false, async move {
+        self.mutate(async move {
             state
                 .runtime()
                 .await?
@@ -82,7 +82,7 @@ impl w::network_service_server::NetworkService for Service {
         let n = r.get_ref().name.clone();
         name(&n)?;
         let state = self.clone();
-        self.mutate(&r, false, async move {
+        self.mutate(async move {
             state
                 .runtime()
                 .await?
@@ -105,7 +105,7 @@ impl w::network_service_server::NetworkService for Service {
         .map_err(conversion)?;
         let state = self.clone();
         Ok(Response::new(
-            self.mutate(&r, true, async move {
+            self.mutate(async move {
                 silo_vm_control::snapshots::snapshot_to_wire(
                     &state
                         .machine(&reference)

@@ -26,7 +26,6 @@ def test_daemon_ready_status_and_cli_routing(
     assert status["control_endpoint"] == str(daemon.control_sock)
     assert status["home"] == str(workspace.silo_home)
     assert status["system"] is None
-    assert status["tailscale"]["state"] == "disabled"
     socket_stat = daemon.control_sock.stat()
     assert stat.S_ISSOCK(socket_stat.st_mode)
     assert stat.S_IMODE(socket_stat.st_mode) == 0o600

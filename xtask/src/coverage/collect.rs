@@ -24,59 +24,34 @@ pub fn coverage(
 
     rust_lane(workspace_root, target_dir, host, &output_dir)?;
 
-    let binary_dir = target_dir.join("debug");
-    let bridge = binary_dir.join(host.go_ffi_library());
-    let runtime_dir = target_dir
-        .join("silo-runtime")
-        .join(host.runtime_target())
-        .join("debug");
     let mut go_summary = Map::new();
-    for (module, name, needs_stage) in [
-        ("net/netd", "netd", false),
-        ("app/taild", "taild", true),
-        ("sdk/go", "sdk-go", true),
-    ] {
-        if needs_stage && (!bridge.is_file() || !runtime_dir.is_dir()) {
-            println!("coverage: skipping {module} (run make stage)");
-            continue;
-        }
-        let profile = output_dir.join(format!("{name}.cover"));
-        let mut go = Command::new("go");
-        go.current_dir(workspace_root.join(module))
-            .args(["test", "-count=1", "-covermode=atomic"])
-            .arg(format!("-coverprofile={}", profile.display()));
-        if host != HostTarget::MacosArm64 {
-            go.arg("-race");
-        }
-        if needs_stage {
-            go.env("CGO_ENABLED", "1")
-                .env("SILO_GO_FFI_PATH", &bridge)
-                .env("SILO_TEST_RUNTIME_ROOT", &runtime_dir)
-                .env("SILO_RUNTIME_DIR", &runtime_dir)
-                .env("SILO_TEST_BIN_DIR", &binary_dir)
-                .env("SILO_TEST_CLI", binary_dir.join("silo"));
-        }
-        go.arg("./...");
-        command::run(go)?;
-        let mut functions = Command::new("go");
-        functions
-            .current_dir(workspace_root.join(module))
-            .args(["tool", "cover"])
-            .arg(format!("-func={}", profile.display()));
-        let functions = command::output(functions)?;
-        let functions_path = output_dir.join(format!("{name}.func.txt"));
-        let text =
-            std::str::from_utf8(&functions.stdout).map_err(|source| CoverageError::Utf8 {
-                path: functions_path.clone(),
-                source,
-            })?;
-        fs::write(&functions_path, text)
-            .map_err(|error| CoverageError::io(&functions_path, error))?;
-        go_summary.insert(
-            name.to_owned(),
-            json!({"statements_pct": parse_go_total(text).map_err(|error| error.with_path(&functions_path))?}),
-        );
+    let module = workspace_root.join("net/netd");
+    let profile = output_dir.join("netd.cover");
+    let mut go = Command::new("go");
+    go.current_dir(&module)
+        .args(["test", "-count=1", "-covermode=atomic"])
+        .arg(format!("-coverprofile={}", profile.display()));
+    if host != HostTarget::MacosArm64 {
+        go.arg("-race");
     }
+    go.arg("./...");
+    command::run(go)?;
+    let mut functions = Command::new("go");
+    functions
+        .current_dir(&module)
+        .args(["tool", "cover"])
+        .arg(format!("-func={}", profile.display()));
+    let functions = command::output(functions)?;
+    let functions_path = output_dir.join("netd.func.txt");
+    let text = std::str::from_utf8(&functions.stdout).map_err(|source| CoverageError::Utf8 {
+        path: functions_path.clone(),
+        source,
+    })?;
+    fs::write(&functions_path, text).map_err(|error| CoverageError::io(&functions_path, error))?;
+    go_summary.insert(
+        "netd".to_owned(),
+        json!({"statements_pct": parse_go_total(text).map_err(|error| error.with_path(&functions_path))?}),
+    );
 
     let mut summary = Map::new();
     summary.insert(
@@ -84,23 +59,6 @@ pub fn coverage(
         read_lcov_summary(&output_dir.join("rust.lcov"))?,
     );
     summary.insert("go".to_owned(), Value::Object(go_summary));
-    if workspace_root.join("sdk/node/node_modules").is_dir() {
-        let node_output = output_dir.join("node");
-        let mut node = Command::new("npm");
-        node.current_dir(workspace_root)
-            .args(["--prefix", "sdk/node", "run", "test:coverage", "--"])
-            .arg(format!(
-                "--coverage.reportsDirectory={}",
-                node_output.display()
-            ));
-        command::run(node)?;
-        summary.insert(
-            "node".to_owned(),
-            read_lcov_summary(&node_output.join("lcov.info"))?,
-        );
-    } else {
-        println!("coverage: skipping sdk/node (run npm --prefix sdk/node ci)");
-    }
     let summary = Value::Object(summary);
     let summary_path = output_dir.join("summary.json");
     fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)
@@ -219,7 +177,7 @@ fn gather_stray_profiles(
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if file_type.is_dir() {
-                if !matches!(&*name, "target" | ".git" | "node_modules" | ".venv") {
+                if !matches!(&*name, "target" | ".git" | ".venv") {
                     pending.push(path);
                 }
             } else if file_type.is_file()
@@ -332,14 +290,12 @@ fn print_summary(summary: &Value) {
         "{:<12} {:<12} {:>12} {:>12}",
         "Lane", "Metric", "Covered", "Total"
     );
-    for lane in ["rust", "node"] {
-        if let Some(metrics) = summary.get(lane) {
-            for metric in ["lines", "functions"] {
-                println!(
-                    "{lane:<12} {metric:<12} {:>12} {:>12}",
-                    metrics[metric]["covered"], metrics[metric]["total"]
-                );
-            }
+    if let Some(metrics) = summary.get("rust") {
+        for metric in ["lines", "functions"] {
+            println!(
+                "{:<12} {metric:<12} {:>12} {:>12}",
+                "rust", metrics[metric]["covered"], metrics[metric]["total"]
+            );
         }
     }
     if let Some(modules) = summary.get("go").and_then(Value::as_object) {

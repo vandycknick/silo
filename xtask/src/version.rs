@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::Path;
 
-use serde_json::Value;
 use thiserror::Error;
 
 const RUST_PRODUCT_MANIFESTS: &[&str] = &[
@@ -11,13 +10,7 @@ const RUST_PRODUCT_MANIFESTS: &[&str] = &[
     "guest/agent/Cargo.toml",
     "guest/init/Cargo.toml",
     "guest/portd/Cargo.toml",
-    "sdk/node/Cargo.toml",
-    "sdk/go/native/Cargo.toml",
 ];
-const NODE_PRODUCT_MANIFEST: &str = "sdk/node/package.json";
-const GO_PRODUCT_VERSION: &str = "sdk/go/version.go";
-const GO_NATIVE_ABI: &str = "sdk/go/native/src/abi.rs";
-const NODE_PRODUCT_LOCKFILE: &str = "sdk/node/package-lock.json";
 
 #[derive(Debug, Error)]
 pub enum VersionError {
@@ -26,12 +19,6 @@ pub enum VersionError {
         path: String,
         #[source]
         source: std::io::Error,
-    },
-    #[error("failed to parse JSON in {path}")]
-    ParseJson {
-        path: String,
-        #[source]
-        source: serde_json::Error,
     },
     #[error("VERSION must contain a semantic version, found {version:?}")]
     InvalidAuthority { version: String },
@@ -56,51 +43,6 @@ pub fn check(workspace_root: &Path) -> Result<(), VersionError> {
     for manifest in RUST_PRODUCT_MANIFESTS {
         check_declaration(workspace_root, manifest, "version =", &authority)?;
     }
-    check_json_version(
-        workspace_root,
-        NODE_PRODUCT_MANIFEST,
-        &["version"],
-        &authority,
-    )?;
-    check_json_version(
-        workspace_root,
-        NODE_PRODUCT_LOCKFILE,
-        &["version"],
-        &authority,
-    )?;
-    check_json_version(
-        workspace_root,
-        NODE_PRODUCT_LOCKFILE,
-        &["packages", "", "version"],
-        &authority,
-    )?;
-    check_declaration(
-        workspace_root,
-        "sdk/go/internal/bundle/bundle.go",
-        "const sdkVersion =",
-        &authority,
-    )?;
-    check_declaration(
-        workspace_root,
-        GO_PRODUCT_VERSION,
-        "const Version =",
-        &authority,
-    )?;
-    let go_abi = unquoted_declaration(
-        workspace_root,
-        GO_PRODUCT_VERSION,
-        "const NativeABIVersion uint32 =",
-    )?;
-    let native_abi =
-        unquoted_declaration(workspace_root, GO_NATIVE_ABI, "const ABI_VERSION: u32 =")?;
-    if go_abi != native_abi {
-        return Err(VersionError::Mismatch {
-            path: GO_NATIVE_ABI.to_string(),
-            expected: go_abi,
-            actual: native_abi,
-        });
-    }
-
     println!("version-check: {authority}");
     Ok(())
 }
@@ -122,53 +64,6 @@ fn check_declaration(
             path: relative_path.to_string(),
             expected: expected.to_string(),
             actual,
-        });
-    }
-    Ok(())
-}
-
-fn unquoted_declaration(
-    workspace_root: &Path,
-    relative_path: &str,
-    prefix: &str,
-) -> Result<String, VersionError> {
-    let contents = read(&workspace_root.join(relative_path))?;
-    contents
-        .lines()
-        .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim))
-        .map(|value| value.trim_end_matches(';').trim())
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| VersionError::MissingDeclaration {
-            path: relative_path.to_string(),
-        })
-}
-
-fn check_json_version(
-    workspace_root: &Path,
-    relative_path: &str,
-    fields: &[&str],
-    expected: &str,
-) -> Result<(), VersionError> {
-    let path = workspace_root.join(relative_path);
-    let contents = read(&path)?;
-    let json: Value =
-        serde_json::from_str(&contents).map_err(|source| VersionError::ParseJson {
-            path: relative_path.to_string(),
-            source,
-        })?;
-    let actual = fields
-        .iter()
-        .try_fold(&json, |value, field| value.get(*field))
-        .and_then(Value::as_str)
-        .ok_or_else(|| VersionError::MissingDeclaration {
-            path: format!("{relative_path} ({})", fields.join(".")),
-        })?;
-    if actual != expected {
-        return Err(VersionError::Mismatch {
-            path: format!("{relative_path} ({})", fields.join(".")),
-            expected: expected.to_string(),
-            actual: actual.to_string(),
         });
     }
     Ok(())

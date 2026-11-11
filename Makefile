@@ -11,8 +11,6 @@ endif
 
 ##? CARGO_TARGET_DIR=path: Set the Cargo output directory (default: ./target).
 CARGO_TARGET_DIR ?= $(CURDIR)/target
-##? EXAMPLE=name: Select the Go SDK example for `make go-sdk-example` (default: basic).
-EXAMPLE ?= basic
 ##? SMOKE_ARGS=...: Extra pytest arguments for make smoke.
 SMOKE_ARGS ?=
 ##? CHANGESET_ARGS=...: Extra arguments for explicit OCI fixture/acquisition/qualification commands.
@@ -130,28 +128,22 @@ help: ## Show public targets and configurable options.
 		END { printf "\nOptions:\n"; for (i = 1; i <= option_count; i++) printf "  %-36s %s\n", options[i], option_help[i] }' $(MAKEFILE_LIST)
 
 ##@ Build
-.PHONY: build stage go-sdk-example
-build: ## Build the complete adjacent runtime, CLI, daemon, native taild and Go bridge.
+.PHONY: build stage
+build: ## Build the complete adjacent runtime, CLI and daemon.
 	$(XTASK) build --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
-stage: ## Build and assemble the portable runtime stage, without desktop or SDK builds.
+stage: ## Build and assemble the portable runtime stage.
 	$(XTASK) stage --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
-go-sdk-example: ## Build the runtime and Go bridge, then run EXAMPLE (default: basic).
-	$(XTASK) go-sdk-example "$(EXAMPLE)" --profile "$(PROFILE)" $(RUNTIME_ARGS)
-
 ##@ Distribution
-.PHONY: archive runtime-archive portable-archive qualify-go-bridge app package assemble-go-sdk install
-archive: ## Build release runtime and product archives, qualifying the bridge for standalone SDK assembly.
+.PHONY: archive runtime-archive portable-archive app package install
+archive: ## Build release runtime and product archives.
 	$(XTASK) archive $(RUNTIME_ARGS)
 
 runtime-archive: ## Archive an already-built PROFILE runtime stage with checksum, SBOM and provenance.
 	$(XTASK) runtime-archive --profile "$(PROFILE)"
 
-qualify-go-bridge: ## Hash an already-built native bridge into target-local package inputs.
-	$(XTASK) qualify-go-bridge --profile "$(PROFILE)"
-
-portable-archive: ## Archive an already-built release runtime, CLI, native taild and Go bridge.
+portable-archive: ## Archive an already-built release runtime and CLI.
 	$(XTASK) portable-archive
 
 app: ## Build and sign the macOS release application.
@@ -159,9 +151,6 @@ app: ## Build and sign the macOS release application.
 
 package: ## Build the macOS release package (use DMG=1 for a DMG).
 	$(XTASK) package $(if $(filter 1,$(DMG)),--dmg) $(APP_ARGS) $(RUNTIME_ARGS)
-
-assemble-go-sdk: ## Assemble Go SDK release source from all qualified target artifacts (release-only).
-	$(XTASK) assemble-go-sdk
 
 install: ## Install the macOS release application and CLI symlink.
 	$(XTASK) install --appdir "$(APPDIR)" --bindir "$(BINDIR)" $(APP_ARGS) $(RUNTIME_ARGS)
@@ -174,13 +163,6 @@ fmt: ## Format workspace source code.
 clippy: ## Lint all host-supported workspace components.
 	$(XTASK) clippy
 
-.PHONY: protocol-go protocol-go-check
-protocol-go: ## Generate pinned Go daemon management bindings.
-	$(XTASK) protocol-go
-
-protocol-go-check: ## Check committed Go management bindings for drift.
-	$(XTASK) protocol-go --check
-
 test: ## Run unit and integration tests for all host-supported workspace components.
 	$(XTASK) test
 
@@ -191,7 +173,7 @@ test-integration: ## Run integration tests for all host-supported workspace comp
 	$(XTASK) test-integration
 
 .PHONY: coverage coverage-baseline coverage-diff
-coverage: ## Collect Rust/Go/Node coverage into target/coverage.
+coverage: ## Collect Rust/Go coverage into target/coverage.
 	$(XTASK) coverage
 
 coverage-baseline: ## Snapshot coverage as the reduction baseline.
@@ -226,8 +208,8 @@ qualify-changesets: ## Compare against real containerd extraction, retaining JSO
 	$(XTASK) qualify-changesets $(CHANGESET_ARGS)
 
 # Internal targets
-.PHONY: cli silo-vmm netd agent portd init initramfs rprobe go-ffi taild kernel
-cli silo-vmm netd agent portd init initramfs rprobe go-ffi taild:
+.PHONY: cli silo-vmm netd agent portd init initramfs rprobe kernel
+cli silo-vmm netd agent portd init initramfs rprobe:
 	$(XTASK) component $@ --profile "$(PROFILE)"
 
 kernel:

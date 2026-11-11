@@ -27,17 +27,14 @@ image/policy operations. Rust adapters in `common/vm-control` preserve native
 snapshots, run identities, errors, byte-valued host paths and absent-versus-empty
 updates. Local creation uses the same normalized builder application.
 
-Committed Go clients live in `specs/protocol/go`; regenerate with
-`make protocol-go` and verify drift with `make protocol-go-check`. Both commands
-use pinned Go generators and vendored protoc. Guest execution and secret reads
-are deliberately absent from this management protocol. Session transport stays
-in libvm and its SDK bindings.
+Guest execution and secret reads are deliberately absent from this management
+protocol. Session transport stays in libvm.
 
 The foreground daemon serves management on
 `<HostPaths::run_root()>/silod/control.sock`, with a private 0700 directory,
 0600 socket, same-UID peer admission, and one active daemon per UID. Core status
 does not open the VM store. Ordinary runtime initialization is lazy and retryable;
-its exact six-component selection is shared with native SDK sessions.
+its exact six-component selection is shared with native libvm sessions.
 
 Accepted native mutations remain tracked after a client disconnects. Admission
 is bounded to 64 active mutations; shutdown seals admission and drains actual
@@ -92,14 +89,18 @@ in-process, so invalid configuration does not replace the service.
 overrides without persisting feature choices.
 Every `--system-*` argument configures the system appliance, not defaults for
 ordinary VMs. The daemon implements the local management API through libvm;
-guest execution remains a direct libvm/SDK session, not a daemon stream relay.
+guest execution remains a direct libvm session, not a daemon stream relay.
 
-`make build` produces the CLI, taild and native bridge together. Portable
-installations keep them in `bin/`; macOS bundles keep `silo` in
-`Contents/MacOS/` and place taild and the bridge under `Contents/Helpers/`.
+`make build` produces the CLI and runtime assets together. Portable installations
+keep `silo` in `bin/`; macOS bundles keep it in `Contents/MacOS/`.
 The service definition points at the `silo` executable that registered it.
 Rebuilding alone does not replace a running process; `silo daemon up` restarts
 the service when its definition changed.
+
+Linux service executable paths may contain spaces, dollar signs and percent
+signs; quotes, backslashes and control characters are rejected before installing
+an invalid unit. Executable and argument escaping differ under
+[systemd command-line rules](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Command%20Lines).
 
 ## Prerequisites
 
@@ -484,37 +485,8 @@ Common failures are actionable:
 - No root daemon, global socket takeover, automatic host-tool installation or
   Kubernetes service is included. Management RPC is private and same-user only.
   Image upgrades are automatic; there is no switch to pin the running image yet.
-## Optional tailnet helper
 
-`silo daemon up --tailscale` enables the same-user `taild` child. It is not a
-remote host-login interface. The existing user service owns the daemon, and the daemon owns
-the helper through a private bootstrap/lifetime pipe. Core readiness remains
-independent of tailnet enrollment and reports pending authentication separately.
+## Tailscale lobby
 
-The helper uses normal Silo Home/config paths and exact manager-selected native
-assets. Its stable identity, pins and audit remain under `<Home>/taild`; optional
-frontend credentials come from plain Home-scope secrets. See the
-[operator guide](taild/operator.md) for setup and authorization.
+`silo daemon up --tailscale` and persisted Tailscale enablement are refused because the lobby is temporarily unavailable; it will return inside silod with a `tsgate` gateway process.
 
-Helper crashes get bounded restart backoff. Normal daemon termination drains and
-reaps the helper; owner-pipe EOF after an unexpected parent death cancels it
-within five seconds. Neither event stops VMs. `KillMode=process` preserves VM
-descendants while the daemon explicitly owns helper cleanup.
-
-Linux `ExecStop` uses `silo daemon run --host-shutdown`, not a VM-stop request on ordinary
-service termination. The adjacent shutdown-only helper authorizes stops only
-after real `systemctl` state is `stopping`, existing ownership is read and the
-helper lease is held. A live manager remains authoritative; proven absence
-permits a temporary, doubly locked API restricted to inspection, draining and
-run-fenced stops. No SDK/bridge/assets or frontend enrollment are required.
-Actual native drain and a fresh final inventory protect against late creations.
-macOS reports shutdown protection as unsupported.
-
-Linux service executable paths may contain spaces, dollar signs and percent
-signs; quotes, backslashes and control characters are rejected before installing
-an invalid unit. Executable and argument escaping differ under
-[systemd command-line rules](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Command%20Lines).
-
-Real logind/systemd survival, live tailnet authentication, native macOS/HVF and
-soak qualification require their corresponding hosts/credentials; Linux fixture
-results do not establish those gates.

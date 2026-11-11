@@ -14,7 +14,6 @@ addopts = "-ra --strict-markers -m 'not slow'"
 markers = [
   "daemon: starts a private Silo daemon",
   "system: needs SILO_SMOKE_SYSTEM_IMAGE",
-  "sdk: runs SDK example programs",
   "linux_only: requires Linux",
   "macos_only: requires macOS",
   "slow: extended real-VM qualification",

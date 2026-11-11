@@ -6,7 +6,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.boxed(".silo.daemon.v1.CreateMachineEvent.event.machine");
     config.boxed(".silo.daemon.v1.AgentStatus.status.enabled");
     config.skip_debug([
-        ".silo.daemon.v1.HelperBootstrap",
         ".silo.daemon.v1.EgressSecret",
         ".silo.daemon.v1.SetMachineSecretRequest",
     ]);

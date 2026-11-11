@@ -9,7 +9,6 @@ let
   releasePackages = [
     rustToolchain
     portableGo
-    pkgs.nodejs_26
     zig
     pkgs.cargo-zigbuild
     pkgs.git
@@ -26,7 +25,6 @@ let
   ciPackages = [
       rustToolchain
       pkgs.go
-      pkgs.nodejs_26
       pkgs.cargo-nextest
       pkgs.git
       pkgs.gnumake

@@ -359,15 +359,7 @@ pub fn validate_stage_against_adjacent(
 
 fn release_notices(workspace: &Path) -> Result<Vec<u8>, RuntimeError> {
     let path = workspace.join("packaging/release/THIRD_PARTY_NOTICES");
-    let mut notices =
-        fs::read_to_string(&path).map_err(|source| RuntimeError::Metadata { path, source })?;
-    if workspace
-        .join("vendor/signal-hook-registry/LICENSE-APACHE")
-        .is_file()
-    {
-        notices.push_str("\nsignal-hook-registry\nCopyright (c) 2017 tokio-jsonrpc developers\nhttps://github.com/vorner/signal-hook\nSilo includes its vendored signal-interoperability patch. The original is licensed\nunder Apache-2.0 OR MIT; this binary distribution selects Apache-2.0.\nThe complete text is distributed at LICENSES/APACHE-2.0.txt.\n");
-    }
-    Ok(notices.into_bytes())
+    fs::read(&path).map_err(|source| RuntimeError::Metadata { path, source })
 }
 
 fn manifest_bytes(context: &BuildContext<'_>, stage: &Path) -> Result<Vec<u8>, RuntimeError> {

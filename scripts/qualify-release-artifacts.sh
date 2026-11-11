@@ -307,11 +307,9 @@ verify_extracted_cli_hashes() {
     local provenance="$PACKAGE_ROOT/$VERSION/$target/silo-$VERSION-$target.provenance.json"
     local actual expected
 
-    for name in silo taild; do
-      actual="$(shasum -a 256 "$root/bin/$name" | cut -d ' ' -f 1)"
-      expected="$(jq -er --arg path "bin/$name" '.file_hashes[$path]' "$provenance")"
-      [[ "$actual" == "$expected" ]] || die "$target extracted $name does not match provenance"
-    done
+    actual="$(shasum -a 256 "$root/bin/silo" | cut -d ' ' -f 1)"
+    expected="$(jq -er '.file_hashes["bin/silo"]' "$provenance")"
+    [[ "$actual" == "$expected" ]] || die "$target extracted silo does not match provenance"
     printf '%s: extracted CLI matches provenance\n' "$target"
   done
 }

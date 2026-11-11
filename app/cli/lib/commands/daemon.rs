@@ -91,9 +91,7 @@ impl Cmd {
                 let features = context
                     .config()?
                     .resolve_features(selection, existing_installation);
-                let mut arguments = context.config()?.daemon_overrides()?.to_args();
-                arguments.push(format!("--system-enabled={}", features.system).into());
-                arguments.push(format!("--tailscale-enabled={}", features.tailscale).into());
+                features.validate()?;
                 let socket = paths.docker_socket();
                 let live = service::status(&paths)?.is_some();
                 if features.system {
@@ -111,7 +109,6 @@ impl Cmd {
                         system_enabled: selected.system,
                         tailscale_enabled: selected.tailscale,
                         stop: false,
-                        host_shutdown: false,
                     })
                     .await;
                 }
@@ -132,16 +129,8 @@ impl Cmd {
                 let features =
                     persisted.resolve_features(Default::default(), existing_installation);
                 let identity = persisted.daemon_identity(features)?;
-                let status = service::up(
-                    &service,
-                    &identity,
-                    features.system,
-                    command.tailscale == Some(true),
-                    &mut spinner,
-                )
-                .await?;
+                service::up(&service, &identity, features.system, &mut spinner).await?;
                 spinner.finish_success("Started");
-                report_tailscale(&status);
                 if features.system {
                     crate::daemon::docker::integrate(&socket, !command.no_switch_context)?;
                     crate::ui::hint(format!("Docker endpoint: unix://{}", socket.display()));
@@ -247,27 +236,6 @@ impl DaemonStatusView {
                 "Control endpoint".to_string(),
                 daemon.control_endpoint.display().to_string(),
             ));
-            rows.push((
-                "Tailscale".to_string(),
-                component_state(daemon.tailscale.state).to_string(),
-            ));
-            rows.push((
-                "Tailscale shutdown protection".to_string(),
-                format!("{:?}", daemon.tailscale.shutdown_protection).to_lowercase(),
-            ));
-            rows.push((
-                "Tailscale restarts".to_string(),
-                daemon.tailscale.restart_count.to_string(),
-            ));
-            if let Some(url) = &daemon.tailscale.approval_url {
-                rows.push(("Tailscale login".to_string(), url.clone()));
-            }
-            if let Some(diagnostic) = &daemon.tailscale.diagnostic {
-                rows.push(("Tailscale diagnostic".to_string(), diagnostic.clone()));
-            }
-            if let Some(dns) = &daemon.tailscale.dns_name {
-                rows.push(("Tailscale DNS".to_string(), dns.clone()));
-            }
             rows.push((
                 "System".to_string(),
                 daemon
@@ -386,33 +354,6 @@ fn format_update_check(status: &SystemStatus) -> String {
     match &status.update_error {
         Some(error) => format!("{checked}; {error}"),
         None => checked,
-    }
-}
-
-fn component_state(state: silod_spec::status::ComponentState) -> &'static str {
-    use silod_spec::status::ComponentState;
-    match state {
-        ComponentState::Disabled => "disabled",
-        ComponentState::Starting => "starting (lobby readiness not established)",
-        ComponentState::NeedsAuth => "needs authentication (lobby not ready)",
-        ComponentState::Ready => "ready",
-        ComponentState::Degraded => "degraded",
-        ComponentState::Failed => "failed",
-    }
-}
-
-fn report_tailscale(status: &DaemonStatus) {
-    if status.tailscale.enabled {
-        crate::ui::hint(format!(
-            "Tailscale: {}",
-            component_state(status.tailscale.state)
-        ));
-        if let Some(url) = &status.tailscale.approval_url {
-            crate::ui::hint(format!("Tailscale login: {url}"));
-        }
-        if let Some(diagnostic) = &status.tailscale.diagnostic {
-            crate::ui::hint(format!("Tailscale: {diagnostic}"));
-        }
     }
 }
 
@@ -547,23 +488,6 @@ mod tests {
         assert_eq!(reversed.up.tailscale, Some(false));
         assert!(Options::try_parse_from(["up", "--foreground", "--linger"]).is_err());
         assert!(Options::try_parse_from(["up", "--system=invalid"]).is_err());
-    }
-
-    #[test]
-    fn pending_authentication_never_claims_lobby_readiness() {
-        use silod_spec::status::ComponentState;
-        assert!(
-            crate::commands::daemon::component_state(ComponentState::Starting)
-                .contains("not established")
-        );
-        assert!(
-            crate::commands::daemon::component_state(ComponentState::NeedsAuth)
-                .contains("lobby not ready")
-        );
-        assert_eq!(
-            crate::commands::daemon::component_state(ComponentState::Ready),
-            "ready"
-        );
     }
 
     #[test]

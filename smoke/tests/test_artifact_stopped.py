@@ -2,7 +2,7 @@
 
 All producer and consumer Homes are private. Registry oracles inspect actual OCI
 edges and bytes; local catalog observations are independent read-only queries.
-No hosted registry, SDK, fake server or guest-executing Cargo test is involved.
+No hosted registry, fake server or guest-executing Cargo test is involved.
 """
 from __future__ import annotations
 

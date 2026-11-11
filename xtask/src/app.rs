@@ -15,12 +15,9 @@ use crate::targets::HostTarget;
 const APP_NAME: &str = "Silo.app";
 const BUNDLE_IDENTIFIER: &str = "sh.silo.app";
 const MINIMUM_SYSTEM_VERSION: &str = "26.0";
-const BRIDGE: &str = "libsilo_go_ffi.dylib";
-const HELPERS: [(&str, u32, Option<&str>); 4] = [
-    (BRIDGE, 0o644, None),
+const HELPERS: [(&str, u32, Option<&str>); 2] = [
     ("silo-vmm", 0o755, Some("virt/vmm/silo-vmm.entitlements")),
     ("netd", 0o755, None),
-    ("taild", 0o755, None),
 ];
 const ASSETS: [(&str, u32); 3] = [
     ("kernel-default", 0o644),
@@ -113,14 +110,9 @@ pub fn assemble(
         )?;
         copy_regular_file(&release.join("silo"), &macos.join("silo"), 0o755)?;
         for (name, mode, _) in HELPERS {
-            let source = helper_source(&release, &stage, name);
-            if name == BRIDGE {
-                copy_bridge(&source, &helpers.join(name))?;
-            } else {
-                copy_regular_file(&source, &helpers.join(name), mode)?;
-            }
+            copy_regular_file(&stage.join("bin").join(name), &helpers.join(name), mode)?;
         }
-        copy_notices(&stage, &target_dir.join("taild-licenses"), &resources)?;
+        copy_notices(&stage, &resources)?;
         for (name, mode) in ASSETS {
             copy_regular_file(&stage.join("assets").join(name), &assets.join(name), mode)?;
         }
@@ -140,13 +132,8 @@ pub fn assemble(
             }
         })?;
 
-        // The library must be sealed before any executable that loads it.
-        sign(&helpers.join(BRIDGE), None, signing)?;
         sign(&macos.join("silo"), None, signing)?;
         for (name, _, entitlement) in HELPERS {
-            if name == BRIDGE {
-                continue;
-            }
             let entitlement = entitlement.map(|path| workspace_root.join(path));
             sign(&helpers.join(name), entitlement.as_deref(), signing)?;
         }
@@ -340,18 +327,11 @@ fn generate_icon(workspace_root: &Path, bundle: &Path, destination: &Path) -> Re
     result
 }
 
-fn helper_source(release: &Path, stage: &Path, name: &str) -> PathBuf {
-    match name {
-        "silo-vmm" | "netd" => stage.join("bin").join(name),
-        _ => release.join(name),
-    }
-}
-
 fn verify_unsigned_copies(release: &Path, stage: &Path, bundle: &Path) -> Result<(), AppError> {
     compare_files(&release.join("silo"), &bundle.join("Contents/MacOS/silo"))?;
     for (name, _, _) in HELPERS {
         compare_files(
-            &helper_source(release, stage, name),
+            &stage.join("bin").join(name),
             &bundle.join("Contents/Helpers").join(name),
         )?;
     }
@@ -369,17 +349,7 @@ fn verify_unsigned_copies(release: &Path, stage: &Path, bundle: &Path) -> Result
             )?;
         }
     }
-    compare_notices(
-        stage,
-        &release
-            .parent()
-            .ok_or_else(|| AppError::Invalid {
-                path: release.to_path_buf(),
-                reason: "release directory has no parent".to_string(),
-            })?
-            .join("taild-licenses"),
-        &bundle.join("Contents/Resources"),
-    )?;
+    compare_notices(stage, &bundle.join("Contents/Resources"))?;
     Ok(())
 }
 
@@ -835,10 +805,7 @@ fn validate_bundle_filesystem(bundle: &Path, signed: bool) -> Result<(), AppErro
 
 fn validate_payload_layout(contents: &Path) -> Result<(), AppError> {
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(
-        &contents.join("Helpers"),
-        [BRIDGE, "netd", "silo-vmm", "taild"],
-    )?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm"])?;
     validate_directory_entries(
         &contents.join("Resources"),
         ["Silo.icns", "assets", "THIRD_PARTY_NOTICES", "LICENSES"],
@@ -860,9 +827,8 @@ fn validate_payload_layout(contents: &Path) -> Result<(), AppError> {
     validate_regular_file(&contents.join("Resources/Silo.icns"), None)?;
     let resources = contents.join("Resources");
     validate_regular_file(&resources.join("THIRD_PARTY_NOTICES"), Some(0o644))?;
-    validate_directory_entries(&resources.join("LICENSES"), ["APACHE-2.0.txt", "taild"])?;
+    validate_directory_entries(&resources.join("LICENSES"), ["APACHE-2.0.txt"])?;
     validate_regular_file(&resources.join("LICENSES/APACHE-2.0.txt"), Some(0o644))?;
-    taild_notice_inventory(&resources.join("LICENSES/taild"))?;
     Ok(())
 }
 
@@ -917,98 +883,7 @@ fn regular_tree(root: &Path) -> Result<BTreeSet<PathBuf>, AppError> {
     Ok(files)
 }
 
-fn safe_notice_path(root: &Path, value: &str) -> Result<PathBuf, AppError> {
-    if value.is_empty()
-        || value
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        || value.contains('\\')
-        || Path::new(value).is_absolute()
-    {
-        return invalid(root, format!("unsafe notice path {value:?}"));
-    }
-    Ok(PathBuf::from(value))
-}
-
-fn taild_notice_inventory(root: &Path) -> Result<BTreeSet<PathBuf>, AppError> {
-    let actual = regular_tree(root)?;
-    let manifest = root.join("modules.json");
-    validate_regular_file(&manifest, Some(0o644))?;
-    let bytes = fs::read(&manifest).map_err(|source| AppError::Io {
-        action: "read taild notice manifest",
-        path: manifest.clone(),
-        source,
-    })?;
-    let modules: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|error| AppError::Invalid {
-            path: manifest.clone(),
-            reason: format!("parse taild notices: {error}"),
-        })?;
-    let modules = modules.as_array().ok_or_else(|| AppError::Invalid {
-        path: manifest.clone(),
-        reason: "taild notice manifest is not an array".to_string(),
-    })?;
-    if modules.is_empty() {
-        return invalid(
-            &manifest,
-            "taild notice manifest has no dependencies".to_string(),
-        );
-    }
-    let mut expected = BTreeSet::from([PathBuf::from("modules.json")]);
-    let mut seen = BTreeSet::new();
-    for module in modules {
-        let name = module["module"].as_str().ok_or_else(|| AppError::Invalid {
-            path: manifest.clone(),
-            reason: "notice entry has no module name".to_string(),
-        })?;
-        let module_path = safe_notice_path(&manifest, name)?;
-        if !seen.insert(name) {
-            return invalid(&manifest, format!("duplicate module {name:?}"));
-        }
-        let version = match &module["version"] {
-            serde_json::Value::Null => "local",
-            serde_json::Value::String(value) => value,
-            _ => return invalid(&manifest, format!("invalid version for {name:?}")),
-        };
-        let version_path = safe_notice_path(&manifest, version)?;
-        if version_path.components().count() != 1 {
-            return invalid(&manifest, format!("invalid version for {name:?}"));
-        }
-        let prefix = module_path.join(version_path);
-        let notices = module["notices"]
-            .as_array()
-            .ok_or_else(|| AppError::Invalid {
-                path: manifest.clone(),
-                reason: format!("module {name:?} has no notice array"),
-            })?;
-        if notices.is_empty() {
-            return invalid(&manifest, format!("module {name:?} has no notices"));
-        }
-        for notice in notices {
-            let notice = notice.as_str().ok_or_else(|| AppError::Invalid {
-                path: manifest.clone(),
-                reason: "notice path is not a string".to_string(),
-            })?;
-            let relative = safe_notice_path(&manifest, notice)?;
-            if relative.parent() != Some(prefix.as_path()) || !expected.insert(relative.clone()) {
-                return invalid(
-                    &manifest,
-                    format!("unexpected or duplicate notice {notice:?}"),
-                );
-            }
-            validate_regular_file(&root.join(relative), Some(0o644))?;
-        }
-    }
-    if actual != expected {
-        return invalid(
-            root,
-            format!("notice files are {actual:?}, expected {expected:?}"),
-        );
-    }
-    Ok(actual)
-}
-
-fn copy_notices(stage: &Path, taild: &Path, resources: &Path) -> Result<(), AppError> {
+fn copy_notices(stage: &Path, resources: &Path) -> Result<(), AppError> {
     copy_regular_file(
         &stage.join("THIRD_PARTY_NOTICES"),
         &resources.join("THIRD_PARTY_NOTICES"),
@@ -1021,48 +896,18 @@ fn copy_notices(stage: &Path, taild: &Path, resources: &Path) -> Result<(), AppE
         &resources.join("LICENSES/APACHE-2.0.txt"),
         0o644,
     )?;
-    let destination = resources.join("LICENSES/taild");
-    create_directory(&destination)?;
-    for relative in taild_notice_inventory(taild)? {
-        let output = destination.join(&relative);
-        if let Some(parent) = output.parent() {
-            create_directory(parent)?;
-        }
-        copy_regular_file(&taild.join(relative), &output, 0o644)?;
-    }
     Ok(())
 }
 
-fn compare_notices(stage: &Path, taild: &Path, resources: &Path) -> Result<(), AppError> {
+fn compare_notices(stage: &Path, resources: &Path) -> Result<(), AppError> {
     for relative in ["THIRD_PARTY_NOTICES", "LICENSES/APACHE-2.0.txt"] {
         compare_files(&stage.join(relative), &resources.join(relative))?;
-    }
-    let destination = resources.join("LICENSES/taild");
-    let source_files = taild_notice_inventory(taild)?;
-    if source_files != taild_notice_inventory(&destination)? {
-        return invalid(
-            &destination,
-            "notice inventory differs from source".to_string(),
-        );
-    }
-    for relative in source_files {
-        compare_files(&taild.join(&relative), &destination.join(relative))?;
     }
     Ok(())
 }
 
 fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<(), AppError> {
     validate_regular_file(source, Some(mode))?;
-    copy_validated_file(source, destination, mode)
-}
-
-fn copy_bridge(source: &Path, destination: &Path) -> Result<(), AppError> {
-    // Cargo's shared-library output can be executable; the bundled dylib is data.
-    validate_regular_file(source, None)?;
-    copy_validated_file(source, destination, 0o644)
-}
-
-fn copy_validated_file(source: &Path, destination: &Path, mode: u32) -> Result<(), AppError> {
     fs::copy(source, destination).map_err(|source_error| AppError::Io {
         action: "copy app input",
         path: destination.to_path_buf(),
@@ -1304,25 +1149,15 @@ mod tests {
     use std::path::Path;
 
     use crate::app::{
-        compare_notices, copy_bridge, copy_notices, copy_regular_file, ensure_same_identity,
-        helper_source, signed_code_paths, signed_file_hashes, taild_notice_inventory,
-        validate_bundle_filesystem, verify_unsigned_copies, SignatureIdentity, ASSETS, BRIDGE,
-        HELPERS,
+        compare_notices, copy_notices, copy_regular_file, ensure_same_identity, signed_code_paths,
+        signed_file_hashes, validate_bundle_filesystem, verify_unsigned_copies, SignatureIdentity,
+        ASSETS, HELPERS,
     };
 
     fn file(path: &Path, bytes: &[u8], mode: u32) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    }
-
-    fn notices(root: &Path) {
-        file(
-            &root.join("example.org/dependency/v1.2.3/LICENSE"),
-            b"dependency license",
-            0o644,
-        );
-        file(&root.join("modules.json"), br#"[{"module":"example.org/dependency","version":"v1.2.3","notices":["example.org/dependency/v1.2.3/LICENSE"]}]"#, 0o644);
     }
 
     fn fixture(root: &Path) -> std::path::PathBuf {
@@ -1340,7 +1175,7 @@ mod tests {
         fs::create_dir_all(contents.join("MacOS")).unwrap();
         copy_regular_file(&release.join("silo"), &contents.join("MacOS/silo"), 0o755).unwrap();
         for (name, mode, _) in HELPERS {
-            let source = helper_source(&release, &stage, name);
+            let source = stage.join("bin").join(name);
             file(&source, format!("actual input {name}").as_bytes(), mode);
             let output = contents.join("Helpers").join(name);
             fs::create_dir_all(output.parent().unwrap()).unwrap();
@@ -1363,18 +1198,12 @@ mod tests {
             b"Apache license",
             0o644,
         );
-        notices(&root.join("taild-licenses"));
-        copy_notices(
-            &stage,
-            &root.join("taild-licenses"),
-            &contents.join("Resources"),
-        )
-        .unwrap();
+        copy_notices(&stage, &contents.join("Resources")).unwrap();
         bundle
     }
 
     #[test]
-    fn integrated_app_copies_release_frontends_bridge_and_complete_notices() {
+    fn integrated_app_copies_cli_helpers_and_complete_notices() {
         let root = tempfile::tempdir().unwrap();
         let bundle = fixture(root.path());
         validate_bundle_filesystem(&bundle, false).unwrap();
@@ -1384,12 +1213,12 @@ mod tests {
             &bundle,
         )
         .unwrap();
-        assert!(root.path().join("release/taild").is_file());
-        assert!(root.path().join("release").join(BRIDGE).is_file());
-        assert!(!root.path().join("stage/bin/taild").exists());
-        assert!(!root.path().join("stage/bin").join(BRIDGE).exists());
+        assert!(root.path().join("release/silo").is_file());
+        for (name, _, _) in HELPERS {
+            assert!(root.path().join("stage/bin").join(name).is_file());
+        }
         file(
-            &bundle.join("Contents/Helpers/taild"),
+            &bundle.join("Contents/Helpers/netd"),
             b"changed helper",
             0o755,
         );
@@ -1417,12 +1246,12 @@ mod tests {
             assert!(validate_bundle_filesystem(&bundle, true).is_err());
         }
         fs::set_permissions(&bundle, fs::Permissions::from_mode(0o755)).unwrap();
-        let bridge = bundle.join("Contents/Helpers").join(BRIDGE);
-        for mode in [0o755, 0o600, 0o4644] {
-            fs::set_permissions(&bridge, fs::Permissions::from_mode(mode)).unwrap();
+        let helper = bundle.join("Contents/Helpers/netd");
+        for mode in [0o644, 0o600, 0o4755] {
+            fs::set_permissions(&helper, fs::Permissions::from_mode(mode)).unwrap();
             assert!(validate_bundle_filesystem(&bundle, true).is_err());
         }
-        fs::set_permissions(&bridge, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
         file(&bundle.join("Contents/Helpers/unexpected"), b"extra", 0o755);
         assert!(validate_bundle_filesystem(&bundle, true).is_err());
         fs::remove_file(bundle.join("Contents/Helpers/unexpected")).unwrap();
@@ -1436,59 +1265,17 @@ mod tests {
     }
 
     #[test]
-    fn notices_reject_unlisted_missing_unsafe_and_symlink_material() {
-        let root = tempfile::tempdir().unwrap();
-        notices(root.path());
-        taild_notice_inventory(root.path()).unwrap();
-        file(&root.path().join("unlisted"), b"unlisted", 0o644);
-        assert!(taild_notice_inventory(root.path()).is_err());
-        fs::remove_file(root.path().join("unlisted")).unwrap();
-        let notice = root.path().join("example.org/dependency/v1.2.3/LICENSE");
-        fs::remove_file(&notice).unwrap();
-        assert!(taild_notice_inventory(root.path()).is_err());
-        symlink("/etc/passwd", &notice).unwrap();
-        assert!(taild_notice_inventory(root.path()).is_err());
-        fs::remove_file(&notice).unwrap();
-        file(&notice, b"license", 0o644);
-        fs::set_permissions(&notice, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(taild_notice_inventory(root.path()).is_err());
-        fs::set_permissions(&notice, fs::Permissions::from_mode(0o644)).unwrap();
-        for path in [
-            "../LICENSE",
-            "/etc/passwd",
-            "example.org/dependency/v1.2.3/../LICENSE",
-            "example.org//dependency/v1.2.3/LICENSE",
-        ] {
-            file(
-                &root.path().join("modules.json"),
-                serde_json::to_vec(&serde_json::json!([{
-                    "module": "example.org/dependency", "version": "v1.2.3", "notices": [path],
-                }]))
-                .unwrap()
-                .as_slice(),
-                0o644,
-            );
-            assert!(taild_notice_inventory(root.path()).is_err(), "{path}");
-        }
-    }
-
-    #[test]
     fn notice_copy_comparison_and_directory_validation_detect_tampering() {
         let root = tempfile::tempdir().unwrap();
         let bundle = fixture(root.path());
         let resources = bundle.join("Contents/Resources");
         file(
-            &resources.join("LICENSES/taild/example.org/dependency/v1.2.3/LICENSE"),
+            &resources.join("LICENSES/APACHE-2.0.txt"),
             b"changed license",
             0o644,
         );
-        assert!(compare_notices(
-            &root.path().join("stage"),
-            &root.path().join("taild-licenses"),
-            &resources
-        )
-        .is_err());
-        let original = resources.join("LICENSES/taild/example.org");
+        assert!(compare_notices(&root.path().join("stage"), &resources).is_err());
+        let original = resources.join("LICENSES");
         let outside = root.path().join("outside");
         fs::rename(&original, &outside).unwrap();
         symlink(&outside, &original).unwrap();
@@ -1500,20 +1287,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bundle = fixture(root.path());
         let paths = signed_code_paths(&bundle);
-        for name in ["taild", BRIDGE, "netd", "silo-vmm"] {
+        for name in ["netd", "silo-vmm"] {
             assert!(paths.contains(&bundle.join("Contents/Helpers").join(name)));
         }
         assert!(paths.contains(&bundle.join("Contents/MacOS/silo")));
         let before = signed_file_hashes(&bundle).unwrap();
-        let relative = format!("Contents/Helpers/{BRIDGE}");
-        file(&bundle.join(&relative), b"post-signing bytes", 0o644);
+        let relative = "Contents/Helpers/netd".to_string();
+        file(&bundle.join(&relative), b"post-signing bytes", 0o755);
         let after = signed_file_hashes(&bundle).unwrap();
         assert_ne!(before[&relative], after[&relative]);
         assert_eq!(
             after[&relative],
             crate::archive::sha256(&bundle.join(relative)).unwrap()
         );
-        assert!(after.contains_key("Contents/Resources/LICENSES/taild/modules.json"));
+        assert!(after.contains_key("Contents/Resources/LICENSES/APACHE-2.0.txt"));
     }
 
     #[test]
@@ -1524,38 +1311,21 @@ mod tests {
             authorities: vec!["Developer ID Application: selected".to_string()],
             ad_hoc: false,
         };
-        ensure_same_identity(Path::new("library"), &identity, &identity).unwrap();
+        ensure_same_identity(Path::new("netd"), &identity, &identity).unwrap();
         let other = SignatureIdentity {
             certificate_sha256: Some("other certificate".to_string()),
             team_identifier: identity.team_identifier.clone(),
             authorities: identity.authorities.clone(),
             ad_hoc: false,
         };
-        assert!(ensure_same_identity(Path::new("library"), &identity, &other).is_err());
+        assert!(ensure_same_identity(Path::new("netd"), &identity, &other).is_err());
         let ad_hoc = SignatureIdentity {
             certificate_sha256: None,
             team_identifier: None,
             authorities: vec![],
             ad_hoc: true,
         };
-        assert!(ensure_same_identity(Path::new("taild"), &identity, &ad_hoc).is_err());
-    }
-
-    #[test]
-    fn library_copy_normalizes_cargo_mode_and_rejects_symlinks() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join(BRIDGE);
-        let destination = root.path().join("bundled.dylib");
-        file(&source, b"cargo shared library", 0o755);
-        copy_bridge(&source, &destination).unwrap();
-        assert_eq!(
-            fs::metadata(&destination).unwrap().permissions().mode() & 0o7777,
-            0o644
-        );
-        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
-        fs::remove_file(&source).unwrap();
-        symlink(&destination, &source).unwrap();
-        assert!(copy_bridge(&source, &root.path().join("other.dylib")).is_err());
+        assert!(ensure_same_identity(Path::new("netd"), &identity, &ad_hoc).is_err());
     }
 
     #[test]
@@ -1563,8 +1333,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bundle = fixture(root.path());
         for relative in [
-            "Contents/Helpers/taild",
-            "Contents/Helpers/libsilo_go_ffi.dylib",
+            "Contents/Helpers/netd",
+            "Contents/Helpers/silo-vmm",
             "Contents/Resources/assets/kernel-default",
         ] {
             let path = bundle.join(relative);
