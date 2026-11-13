@@ -79,7 +79,6 @@ struct Fixture {
     machine_id: String,
     run_id: String,
     root: vm_spec::Disk,
-    expect_unsupported: bool,
 }
 
 fn main() -> eyre::Result<std::process::ExitCode> {
@@ -237,13 +236,21 @@ async fn read(channel: &Channel, path: &str) -> eyre::Result<Vec<u8>> {
     Ok(bytes)
 }
 async fn frozen(channel: &Channel) -> eyre::Result<bool> {
-    let bytes = read(channel, "/sys/fs/cgroup/silo/workloads/cgroup.events").await?;
-    let text = std::str::from_utf8(&bytes)?;
-    match text.lines().find_map(|line| line.strip_prefix("frozen ")) {
-        Some("1") => Ok(true),
-        Some("0") => Ok(false),
-        _ => eyre::bail!("missing/malformed kernel frozen event"),
+    let guest = attach::observe::Guest::new(channel.clone());
+    let observation = guest.cgroup(attach::observe::CgroupGroup::Workloads).await;
+    match observation.frozen {
+        Some(frozen) => Ok(frozen),
+        None => eyre::bail!("missing/malformed kernel frozen event: {observation:?}"),
     }
+}
+
+async fn global_membership(channel: &Channel, pid_path: &str) -> eyre::Result<String> {
+    let bytes = read(channel, pid_path).await?;
+    let pid = std::str::from_utf8(&bytes)?.trim().parse::<u32>()?;
+    ensure!(pid > 0, "invalid process PID in {pid_path}");
+    Ok(String::from_utf8(
+        read(channel, &format!("/proc/{pid}/cgroup")).await?,
+    )?)
 }
 async fn counter(channel: &Channel) -> eyre::Result<u64> {
     counter_at(channel, "/lifecycle-counter").await
@@ -326,7 +333,17 @@ async fn ssh_counter(
         "SSH CA authentication failed"
     );
     let channel = client.channel_open_session().await?;
-    channel.exec(true, "cat /proc/self/cgroup >/lifecycle-ssh-membership; while :; do printf x >>/lifecycle-ssh-counter; sleep 0.02; done").await?;
+    let agent_pid = status
+        .report
+        .as_ref()
+        .and_then(|report| report.boot.as_ref())
+        .and_then(|boot| boot.agent_pid)
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| eyre::eyre!("missing agent PID"))?;
+    let command = format!(
+        r#"set -eu; test "$(readlink /proc/self/ns/cgroup)" != "$(readlink /proc/{agent_pid}/ns/cgroup)"; echo $$ >/lifecycle-ssh.pid; cat /proc/self/cgroup >/lifecycle-ssh-membership; while :; do printf x >>/lifecycle-ssh-counter; sleep 0.02; done"#
+    );
+    channel.exec(true, command).await?;
     Ok((client, channel))
 }
 
@@ -349,37 +366,32 @@ async fn checks(machine: &virt::VirtualMachine, fixture: &Fixture) -> eyre::Resu
         freeze_ref: Some(reference.clone()),
         deadline_ms: Some(5000),
     };
-    if fixture.expect_unsupported {
-        let error = client
-            .freeze_workloads(freeze)
-            .await
-            .err()
-            .ok_or_else(|| eyre::eyre!("image-owned profile unexpectedly froze"))?;
-        ensure!(
-            error.code() == tonic::Code::FailedPrecondition
-                && error.message().contains("InitChild"),
-            "unnamed profile refusal: {error}"
-        );
-        ensure!(
-            !frozen(&channel).await?,
-            "unsupported profile changed kernel freeze"
-        );
-        println!(
-            "{}",
-            serde_json::json!({"result":"unsupported-profile-refused", "reason":error.message()})
-        );
-        return Ok(());
-    }
     let boot = initial
         .report
         .as_ref()
         .and_then(|report| report.boot.as_ref())
         .ok_or_else(|| eyre::eyre!("missing boot report"))?;
+    let agent_pid = boot
+        .agent_pid
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| eyre::eyre!("missing agent PID"))?;
     ensure!(
-        boot.agent_is_pid1 == Some(true),
-        "positive smoke requires AgentPid1"
+        matches!(
+            (
+                boot.mode
+                    .and_then(|mode| v1::GuestBootMode::try_from(mode).ok()),
+                boot.agent_is_pid1
+            ),
+            (Some(v1::GuestBootMode::AgentPid1), Some(true))
+                | (Some(v1::GuestBootMode::ContainedInit), Some(false))
+        ),
+        "positive smoke requires AgentPid1 or ContainedInit"
     );
-    // An empty workload subtree must still establish the real kernel barrier.
+    attach::observe::Guest::new(channel.clone())
+        .prepare_cgroup_observation()
+        .await
+        .map_err(|error| eyre::eyre!("prepare cgroup observation: {error:?}"))?;
+    // Establish the real kernel barrier before launching the counter sessions.
     let empty = client.freeze_workloads(freeze.clone()).await?.into_inner();
     ensure!(
         empty.status.as_ref().map(|status| status.state) == Some(LiveState::Frozen as i32)
@@ -397,16 +409,50 @@ async fn checks(machine: &virt::VirtualMachine, fixture: &Fixture) -> eyre::Resu
     let userdata_membership =
         String::from_utf8(read(&channel, "/lifecycle-userdata-membership").await?)?;
     ensure!(
-        userdata_membership
-            .lines()
-            .any(|line| line == "0::/silo/workloads"),
+        userdata_membership.lines().any(|line| line == "0::/"),
         "userdata escaped containment: {userdata_membership}"
     );
     let (ssh, _ssh_channel) = ssh_counter(machine, fixture, &initial).await?;
 
     let (sender, receiver) = tokio::sync::mpsc::channel(4);
-    let start = v1::StartGuestProcess { execution_id: uuid::Uuid::new_v4().to_string(), expected_agent_instance_id: identity.agent_instance_id.clone(), expected_agent_boot_id: identity.boot_id.clone(),
-        process: Some(v1::ProcessSpec { argv: vec!["/bin/sh".into(), "-c".into(), r#"cat /proc/self/cgroup >/lifecycle-membership; ( ( /bin/sh -c 'mkdir -p /sys/fs/cgroup/silo/workloads/nested; echo 0 >/sys/fs/cgroup/silo/workloads/nested/cgroup.procs; cat /proc/self/cgroup >/lifecycle-descendant-membership; while :; do printf x >>/lifecycle-descendant-counter; sleep 0.02; done' </dev/null >/dev/null 2>&1 & ) & ); : >/lifecycle-counter; while :; do printf x >>/lifecycle-counter; sleep 0.02; done"#.into()], working_directory: Some("/".into()), user: Some("root".into()), environment: Vec::new(), stdio: Some(v1::process_spec::Stdio::Pipes(v1::PipeStdio { stdin: false })) }) };
+    let start = v1::StartGuestProcess {
+        execution_id: uuid::Uuid::new_v4().to_string(),
+        expected_agent_instance_id: identity.agent_instance_id.clone(),
+        expected_agent_boot_id: identity.boot_id.clone(),
+        process: Some(v1::ProcessSpec {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    r#"set -eu
+test "$(readlink /proc/self/ns/cgroup)" != "$(readlink /proc/{agent_pid}/ns/cgroup)"
+echo $$ >/lifecycle.pid
+cat /proc/self/cgroup >/lifecycle-membership
+( ( unshare -m /bin/sh -c '
+set -eu
+mount --make-rprivate /
+root=/run/lifecycle-exec-cgroup
+mkdir -p "$root"
+mount -t cgroup2 -o nsdelegate,memory_recursiveprot none "$root"
+mkdir -p "$root/nested"
+echo 0 >"$root/nested/cgroup.procs"
+echo $$ >/lifecycle-descendant.pid
+cat /proc/self/cgroup >/lifecycle-descendant-membership
+while :; do printf x >>/lifecycle-descendant-counter; sleep 0.02; done
+' </dev/null >/dev/null 2>&1 & ) & )
+: >/lifecycle-counter
+while :; do printf x >>/lifecycle-counter; sleep 0.02; done
+"#
+                ),
+            ],
+            working_directory: Some("/".into()),
+            user: Some("root".into()),
+            environment: Vec::new(),
+            stdio: Some(v1::process_spec::Stdio::Pipes(v1::PipeStdio {
+                stdin: false,
+            })),
+        }),
+    };
     sender
         .send(v1::GuestProcessInput {
             message: Some(v1::guest_process_input::Message::Start(start)),
@@ -444,8 +490,13 @@ async fn checks(machine: &virt::VirtualMachine, fixture: &Fixture) -> eyre::Resu
     let advancing = growing(&channel, before).await?;
     let membership = String::from_utf8(read(&channel, "/lifecycle-membership").await?)?;
     ensure!(
-        membership.lines().any(|line| line == "0::/silo/workloads"),
+        membership.lines().any(|line| line == "0::/"),
         "native exec escaped containment: {membership}"
+    );
+    let global_membership = global_membership(&channel, "/lifecycle.pid").await?;
+    ensure!(
+        global_membership.trim() == "0::/silo/workloads/exec",
+        "native exec escaped global workload containment: {global_membership}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
@@ -468,16 +519,25 @@ async fn checks(machine: &virt::VirtualMachine, fixture: &Fixture) -> eyre::Resu
     let descendant_membership =
         String::from_utf8(read(&channel, "/lifecycle-descendant-membership").await?)?;
     ensure!(
-        ssh_membership
-            .lines()
-            .any(|line| line == "0::/silo/workloads"),
+        ssh_membership.lines().any(|line| line == "0::/"),
         "SSH escaped containment"
     );
     ensure!(
         descendant_membership
             .lines()
-            .any(|line| line == "0::/silo/workloads/nested"),
+            .any(|line| line == "0::/nested"),
         "double-fork descendant escaped nested workload containment"
+    );
+    let ssh_global_membership = crate::global_membership(&channel, "/lifecycle-ssh.pid").await?;
+    let descendant_global_membership =
+        crate::global_membership(&channel, "/lifecycle-descendant.pid").await?;
+    ensure!(
+        ssh_global_membership.trim() == "0::/silo/workloads/exec",
+        "SSH escaped global workload containment: {ssh_global_membership}"
+    );
+    ensure!(
+        descendant_global_membership.trim() == "0::/silo/workloads/exec/nested",
+        "double-fork descendant escaped global containment: {descendant_global_membership}"
     );
     let ssh_before = counter_at(&channel, "/lifecycle-ssh-counter").await?;
     growing_at(&channel, "/lifecycle-ssh-counter", ssh_before).await?;
@@ -648,6 +708,8 @@ async fn checks(machine: &virt::VirtualMachine, fixture: &Fixture) -> eyre::Resu
         serde_json::json!({"result":"cold-freeze-thaw", "machineId":identity.machine_id, "runId":identity.run_id,
         "bootId":identity.boot_id, "agentInstanceId":identity.agent_instance_id, "membership":membership,
         "sshMembership":ssh_membership, "userdataMembership":userdata_membership, "descendantMembership":descendant_membership,
+        "globalMembership":global_membership, "sshGlobalMembership":ssh_global_membership,
+        "descendantGlobalMembership":descendant_global_membership,
         "counterBefore":before, "counterAdvancing":advancing, "counterFrozen":stopped, "counterResumed":resumed,
         "counterRecoveryFrozen":recovered, "counterFinal":final_counter, "recoveryEpoch":recovery.status.and_then(|status| status.freeze_ref).and_then(|reference| reference.freeze_epoch),
         "lostThawReply":"intentionally-discarded-after-independent-kernel-observation", "restoreGenerationEvidence":"not-exercised"})

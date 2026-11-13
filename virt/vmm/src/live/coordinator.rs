@@ -212,6 +212,17 @@ fn failure(code: LiveFailureCode, stage: LiveStage, message: impl Into<String>) 
     LiveFailure::new(code, stage, message)
 }
 
+fn guest_freeze_refusal(status: &tonic::Status, stage: LiveStage) -> LiveFailure {
+    let code = if status.code() == tonic::Code::FailedPrecondition
+        && status.message().starts_with("guest-containment-escaped:")
+    {
+        LiveFailureCode::GuestContainmentEscaped
+    } else {
+        LiveFailureCode::FreezeFailed
+    };
+    failure(code, stage, status.message())
+}
+
 fn native_detail(failure: &NativeFailure) -> String {
     failure.to_string()
 }
@@ -1644,7 +1655,11 @@ impl LiveCoordinator {
             Err(GuestError::Stopped) => return Continued::Stopped,
             Err(GuestError::Refused(error) | GuestError::Unknown(error)) => {
                 let recovery = LiveFailure {
-                    code: LiveFailureCode::RecoveryFreezeFailed,
+                    code: if error.code == LiveFailureCode::GuestContainmentEscaped {
+                        error.code
+                    } else {
+                        LiveFailureCode::RecoveryFreezeFailed
+                    },
                     ..error
                 };
                 return Continued::Failed {
@@ -2003,13 +2018,13 @@ impl LiveCoordinator {
                     ));
                 }
                 GuestCall::Refused(status) => {
-                    // Busy (an earlier thaw still settling) or a definitive
-                    // refusal: retry the identical request inside the budget.
-                    last = Some(failure(
-                        LiveFailureCode::FreezeFailed,
-                        stage,
-                        status.message(),
-                    ));
+                    let cause = guest_freeze_refusal(&status, stage);
+                    if cause.code == LiveFailureCode::GuestContainmentEscaped {
+                        return Err(GuestError::Refused(cause));
+                    }
+                    // Busy (an earlier thaw still settling) or another refusal
+                    // may settle inside the original request budget.
+                    last = Some(cause);
                 }
                 GuestCall::Transport(message) => {
                     last = Some(failure(LiveFailureCode::FreezeTimedOut, stage, message));
@@ -2495,6 +2510,39 @@ mod tests {
 
     use crate::live::coordinator::{observe_status_barrier, GuestError, StatusBarrier};
     use crate::state::{new_instance_store, InstanceStore, ReadyAgentIdentity};
+
+    #[test]
+    fn containment_freeze_refusal_has_stable_code_and_preserves_diagnostic() {
+        let detail = "guest-containment-escaped: pid=42 tid=43 comm=worker cgroup=/";
+        for stage in [LiveStage::GuestFreeze, LiveStage::RecoveryFreeze] {
+            let failure = crate::live::coordinator::guest_freeze_refusal(
+                &tonic::Status::failed_precondition(detail),
+                stage,
+            );
+            assert_eq!(failure.code, LiveFailureCode::GuestContainmentEscaped);
+            assert_eq!(failure.stage, stage);
+            assert_eq!(failure.message.as_ref().unwrap().as_str(), detail);
+            assert_eq!(
+                failure.to_string(),
+                format!("guest-containment-escaped during {stage}: {detail}")
+            );
+        }
+    }
+
+    #[test]
+    fn containment_freeze_refusal_requires_exact_prefix_and_status_code() {
+        for status in [
+            tonic::Status::failed_precondition("guest-containment-escaped"),
+            tonic::Status::failed_precondition("other: guest-containment-escaped: pid=42"),
+            tonic::Status::failed_precondition("workload freeze unavailable"),
+            tonic::Status::internal("guest-containment-escaped: pid=42"),
+        ] {
+            let failure =
+                crate::live::coordinator::guest_freeze_refusal(&status, LiveStage::GuestFreeze);
+            assert_eq!(failure.code, LiveFailureCode::FreezeFailed);
+            assert_eq!(failure.message.as_ref().unwrap().as_str(), status.message());
+        }
+    }
 
     fn source() -> (InstanceStore, ReadyAgentIdentity, AgentStatus) {
         let identity = ReadyAgentIdentity {

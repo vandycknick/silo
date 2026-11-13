@@ -347,6 +347,10 @@ pub(crate) async fn freeze(
     operation: &FreezeOperation,
     checks: &mut Checks,
 ) -> eyre::Result<LifecycleOutput> {
+    guest
+        .prepare_cgroup_observation()
+        .await
+        .map_err(|error| eyre::eyre!("{error:?}"))?;
     let request = operation.request.to_wire();
     let started = monotonic_ns()?;
     let result = guest.agent().freeze_workloads(request.clone()).await;

@@ -646,6 +646,25 @@ mod tests {
     };
 
     #[test]
+    fn contained_init_status_dto_preserves_boot_profile() {
+        let status = protocol::v1::AgentStatus {
+            report: Some(protocol::v1::AgentStatusReport {
+                boot: Some(protocol::v1::GuestBootReport {
+                    mode: Some(protocol::v1::GuestBootMode::ContainedInit as i32),
+                    agent_is_pid1: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dto = crate::attach::dto::Status::from(&status);
+        let boot = dto.boot.unwrap();
+        assert_eq!(boot.mode.as_deref(), Some("contained_init"));
+        assert_eq!(boot.agent_is_pid1, Some(false));
+    }
+
+    #[test]
     fn hex_round_trips_and_rejects_malformed_text() {
         let bytes = [0_u8, 1, 0x7f, 0x80, 0xff];
         assert_eq!(hex(&bytes), "00017f80ff");

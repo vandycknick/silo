@@ -206,6 +206,7 @@ fn guest_boot_mode_to(v: libvm::MachineGuestBootMode) -> i32 {
         libvm::MachineGuestBootMode::Standard => 1,
         libvm::MachineGuestBootMode::AgentPid1 => 2,
         libvm::MachineGuestBootMode::InitChild => 3,
+        libvm::MachineGuestBootMode::ContainedInit => 4,
     }
 }
 fn guest_boot_mode_from(v: i32) -> Result<libvm::MachineGuestBootMode, ConversionError> {
@@ -213,6 +214,7 @@ fn guest_boot_mode_from(v: i32) -> Result<libvm::MachineGuestBootMode, Conversio
         1 => Ok(libvm::MachineGuestBootMode::Standard),
         2 => Ok(libvm::MachineGuestBootMode::AgentPid1),
         3 => Ok(libvm::MachineGuestBootMode::InitChild),
+        4 => Ok(libvm::MachineGuestBootMode::ContainedInit),
         _ => Err(invalid("guest_boot_mode", "invalid enum")),
     }
 }

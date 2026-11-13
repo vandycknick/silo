@@ -2,7 +2,7 @@
 
 Date: 2026-10-25
 
-Updated: 2026-11-09
+Updated: 2026-11-13
 
 ## Status
 
@@ -209,11 +209,12 @@ separately admitted profile with its own compatibility contract.
    sockets, network identities and leases. Nothing host-bound crosses from
    the source: no descriptor, socket path, listener, session, forward, netd
    publication or secret authorization.
-5. Guest identity inside the image (hostname, machine-id, boot ID, SSH host
-   keys, filesystem UUIDs) is preserved. The kernel is notified of the clone
-   through the VM generation protocol and reseeds its entropy pool; userspace
-   state is not sanitized. A checkpoint is privileged executable state and is
-   treated as such.
+5. Guest hostname, boot ID, SSH host keys and filesystem UUIDs are preserved.
+   During activation, a non-empty existing `/etc/machine-id` is replaced with
+   the child's Silo machine ID and `/run/silo/generation` records its run ID.
+   The VM generation protocol reseeds the kernel entropy pool before thaw;
+   userspace RNG state and other cached identities are not sanitized. A
+   checkpoint is privileged executable state and is treated as such.
 6. Source continuation and capture success are separate outcomes. A sealed
    capture survives a source that fails to resume; a source that resumes does
    not validate a capture that failed to seal.
@@ -368,6 +369,104 @@ capture possible.
 Capture also requires that the machine is not mid-resize, that no other
 capture, stop or relocation is in flight for the run, and that libvm has
 reserved the staging space and descriptor budget and retained the result's leases.
+
+### Guest profiles and contained image init
+
+Two guest profiles admit live operations:
+
+- `AgentPid1`: the Silo agent is PID 1.
+- `ContainedInit` (`contained-init` in the boot report): the image's init is
+  PID 1 inside a cgroup namespace rooted at `silo/workloads/image`. This is
+  the default handoff for stock systemd, busybox and OpenRC images; no
+  `init=` kernel override is needed.
+
+A handoff without observed containment reports `InitChild` (`init-child`)
+and refuses live operations with `guest-init-not-contained`. Other unsupported
+profiles use `guest-profile-unsupported`. PID 1 ownership alone is not the
+admission criterion.
+
+Both admitted profiles use this cgroup v2 layout:
+
+```text
+/sys/fs/cgroup                 initial namespace, retained agent descriptors
+└── silo                       cpu, memory, io and pids delegated
+    ├── control                agent threads only
+    ├── activation             bounded activation hooks
+    └── workloads              freezer switch, no direct processes
+        ├── image              image init's namespace root and services
+        └── exec               Silo exec, shell and SSH sessions
+```
+
+The split avoids cgroup v2's no-internal-process rule and systemd's
+single-writer ownership of its own subtree. Every agent-spawned session enters
+`exec`, then gets its own cgroup namespace rooted there. There is no
+login-session integration with the image init (owner decision O3).
+
+Before handing PID 1 to the image, the single-threaded handoff parent enters
+`image`, unshares its cgroup namespace, detaches the old `/sys/fs/cgroup`
+mount and mounts a fresh cgroup2 view. Silo mounts cgroup2 with
+`nsdelegate,memory_recursiveprot`; mounts from the initial namespace must
+preserve both options. The parent reports setup status through a close-on-exec
+pipe, closes inherited descriptors and execs the image init. Setup failure
+still execs init so PID 1 does not exit, but cannot qualify `ContainedInit`.
+The agent observes the distinct PID 1 namespace, image-rooted cgroup mount and
+PID 1 membership before reporting containment. It stays in `control` and uses
+retained cgroup and procfs descriptors after the image replaces mount views.
+
+The agent has `oom_score_adj=-1000`, 16 MiB `memory.min` protection on `silo`
+and `control`, `cpu.weight=1000` on `control`, and a workload `pids.max` that
+leaves an agent reserve. Spawned commands reset their OOM adjustment to zero.
+These protections are not protection against deliberately hostile guest root.
+
+After every workload freeze, before acknowledging it, the agent verifies the
+real cgroup structure and walks userspace tasks and threads through retained
+procfs descriptors. Only agent threads may occupy `control`; hooks may occupy
+`activation` only during activation; all other live userspace belongs under
+`workloads`. Unexpected groups must be empty. Descriptor-relative task reads
+avoid mixing reused PIDs; vanished tasks are ignored and mounts hiding proc
+entries fail closed. Activation checks containment on entry, after hook
+cleanup before publishing `ActivatedFrozen`, and on a cached activation reply.
+An escape refuses pause, snapshot or fork with `guest-containment-escaped`,
+including PID, TID, command and cgroup diagnostics. The source is thawed and
+keeps running. A child fails activation and never reaches `Running`.
+
+#### Threat model and accepted residuals
+
+The guarantee is that no image userspace runs in a child before kernel RNG
+reseed, identity rotation, network replacement and `Thaw`, and no capture is
+acknowledged while image userspace runs outside the frozen subtree. It applies
+to images that do not use privileged interfaces to leave containment.
+Deliberately malicious guest root is out of scope: it can use `setns`,
+ptrace, hidden proc mounts or forged agent replies. The containment scan is a
+tripwire for accidents and naive escapes, not an adversary detector. The host
+still owns native pause authority, admission, network and vsock fences.
+The guest kernel has no modules, `/dev/mem` or kexec and forces confidentiality
+lockdown, but guest root retains privileged capabilities.
+
+Owner decision O1 accepts kernel usermode helpers without changing the kernel
+configuration or suppressing core dumps. Systemd can install a piped
+`core_pattern`; coredump and request-key helpers can start in the real root
+cgroup. During the restore window this requires an agent or activation-hook
+failure. The activation containment check fails that child closed; a helper
+present during capture makes capture refuse. These failures are retryable,
+not permission to run an uncontained child. A crashing hook can also block on
+frozen systemd-coredump until its deadline.
+
+Owner decision D1 accepts that guest root's `kill -9 -1` can kill the child
+agent even with its resource protections. The VM can remain running but
+unmanageable; host `silo stop` still terminates it.
+
+Owner decision D2 makes activation replace whatever an image network manager
+placed on the managed interface. Entry validation checks link identity and
+MAC, not the source's exact routes or addresses; strict post-apply validation
+remains. Systemd-networkd may reacquire DHCP after thaw. This is a one-shot
+activation operation, not continuous network reconciliation.
+
+Owner decision D3 requires the agent to call `sync()` before the host's force
+stop when the image owns PID 1. This preserves writes made before ordinary
+`silo stop` without calling a particular init system. It does not turn force
+stop into an orderly image-service shutdown or certify clean storage.
+
 
 ### Ordering
 
@@ -733,10 +832,11 @@ retry under a new run ID.
    public SSH CA, the guest-side listeners for the machine-scoped forwards
    the monitor will open, and the selected activation hook if any. The agent
    rotates its runtime instance identity, drains inherited sessions, replaces
-   the source SSH CA for both native SSH and OpenSSH, applies the network
-   configuration to the captured interface (located by its stable index, not
-   by its replaced MAC), flushes neighbor caches, registers the named guest
-   listeners and runs the hook. It acknowledges with its new identity.
+   the source SSH CA for both native SSH and OpenSSH, rotates an existing
+   non-empty machine-id, and atomically replaces `/run/silo/generation`.
+   It replaces the managed interface's network configuration (located by its
+   stable index, not its replaced MAC), flushes neighbor caches, registers the
+   named guest listeners and runs the hook. It acknowledges with its new identity.
 5. The monitor, still fenced, binds every host listener for the
    machine-scoped forwards it authorized and the machine's public endpoints,
    without accepting a connection on any of them. A bind failure is an
@@ -775,6 +875,35 @@ controller and pending timer state in backend order, and applies one common
 counter displacement across vCPUs; the agent steps wall time forward to the
 host's sampled time during `Activate`. Timer progress after activation is a
 conformance gate, not an assumption.
+
+#### Guest identity reactions after thaw
+
+Owner decision O2 rotates `/etc/machine-id` to the child's Silo machine ID,
+formatted as 32 lowercase hexadecimal characters, only if the file exists and
+is non-empty. Missing and empty files keep their image first-boot semantics.
+On every restore or fork activation, the agent atomically renames a new file
+containing the child run ID into `/run/silo/generation`. It never creates this
+file at cold boot. The source's identity and generation file are unchanged.
+
+The agent does not restart image services. Images opt in with their own init's
+file watch, for example a systemd `.path` unit with
+`PathChanged=/run/silo/generation` that starts a oneshot service to restart
+journald, networkd or applications with cached identity. The queued file event
+is delivered after `Thaw`, including when the file is first created. See the
+[user example](../../README.md#live-operations-with-stock-images).
+Activation hooks run before `Thaw`, while the image init is frozen. They must
+not invoke `systemctl` or otherwise depend on image services: such a call
+blocks until the hook deadline and fails activation.
+
+This separates hypervisor entropy handling from guest identity policy, as
+VMGenID hypervisors do. VMware guest customization, Lambda SnapStart runtime
+hooks and guest tooling for Cloud Hypervisor and Firecracker address
+application identity separately; a kernel RNG reseed is not a universal
+identity reset. The upstream vmgenid userspace uevent was reverted in 2024.
+Userspace PRNGs, including OpenSSL daemon state, still duplicate ephemeral
+keys, ticket keys and nonces until reseeded. Restart affected units after
+thaw where necessary; neither admitted guest profile sanitizes that state.
+
 
 ### Native KVM timer precision limitation
 
@@ -895,7 +1024,9 @@ not the fragments.
 | Silo machine, run, monitor, worker, sockets | New. |
 | Agent instance identity | Rotated by the agent during `Activate`; the captured boot ID is provenance. |
 | MAC, IP, routes, DNS | Fresh destination network reservation, applied by the agent during `Activate`. MACs are distinct; numeric IPs may repeat across separate private networks, each with its own netd instance and data socket (ADR 0010). |
-| Hostname, machine-id, filesystem UUIDs, partition GUIDs, SSH host keys | Preserved. An explicitly selected activation hook may change what it supports; there is no universal live generalizer. |
+| Machine-id | Existing, non-empty `/etc/machine-id` is rotated before thaw to the child's Silo machine ID (32 lowercase hex). Missing or empty files are left alone. Image-service caches require guest reactions. |
+| `/run/silo/generation` | Atomically replaced before thaw on every restore/fork with the child run ID; absent at cold boot. Image file watchers react after thaw. |
+| Hostname, filesystem UUIDs, partition GUIDs, SSH host keys | Preserved. An explicitly selected activation hook may change what it supports; there is no universal live generalizer. |
 | Kernel entropy pool | Reseeded through the VM generation protocol before the workload runs. |
 | Userspace RNG state, tokens, nonces, cached credentials | Duplicated. Disclosed in the checkpoint description; not sanitized. |
 | TCP connections, vsock streams, exec sessions, forwards, publications | Dropped. Recreated from configuration where configured. |

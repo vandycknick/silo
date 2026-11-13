@@ -127,6 +127,7 @@ wire_enum!(LiveFailureCode <=> LiveFailureCode {
     GuestUnavailable = GuestUnavailable,
     GuestIdentityMismatch = GuestIdentityMismatch,
     FreezeFailed = FreezeFailed,
+    GuestContainmentEscaped = GuestContainmentEscaped,
     FreezeTimedOut = FreezeTimedOut,
     NativePauseFailed = NativePauseFailed,
     NativeUncertain = NativeUncertain,
@@ -1206,6 +1207,30 @@ mod tests {
                 *state
             );
         }
+    }
+
+    #[test]
+    fn containment_failure_preserves_reason_and_diagnostic_on_wire_and_json() {
+        let detail = "guest-containment-escaped: pid=42 tid=43 comm=worker cgroup=/";
+        let failure = domain::LiveFailure::new(
+            domain::LiveFailureCode::GuestContainmentEscaped,
+            domain::LiveStage::GuestFreeze,
+            detail,
+        );
+        let wire = wire::LiveFailure::from(failure.clone());
+        assert_eq!(
+            wire.code,
+            Some(wire::LiveFailureCode::GuestContainmentEscaped as i32)
+        );
+        assert_eq!(wire.message.as_deref(), Some(detail));
+        assert_eq!(domain::LiveFailure::try_from(wire).unwrap(), failure);
+        let json = serde_json::to_value(&failure).unwrap();
+        assert_eq!(json["code"], "guest-containment-escaped");
+        assert_eq!(json["message"], detail);
+        assert_eq!(
+            failure.to_string(),
+            format!("guest-containment-escaped during guest-freeze: {detail}")
+        );
     }
 
     #[test]

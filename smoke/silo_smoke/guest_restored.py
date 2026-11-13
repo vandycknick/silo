@@ -543,7 +543,7 @@ class Cohort:
                             [USERDATA_INVOCATIONS, USERDATA_MEMBERSHIP, WITNESS_PID, WITNESS_MEMBERSHIP])
         require(values[USERDATA_INVOCATIONS] == b"x", "cold userdata must run exactly once")
         for path in (USERDATA_MEMBERSHIP, WITNESS_MEMBERSHIP):
-            require(b"0::/silo/workloads" in values[path].splitlines(), f"{path} escaped workload containment")
+            require(values[path].splitlines() == [b"0::/"], f"{path} did not use its isolated exec namespace")
         witness_pid = int(values[WITNESS_PID])
         stat = self.files(source, "witness-stat", [f"/proc/{witness_pid}/stat", "/proc/net/tcp", "/proc/net/tcp6"])
         witness_starttime = proc_starttime(stat[f"/proc/{witness_pid}/stat"])
@@ -569,7 +569,7 @@ class Cohort:
                          "topology-alias")
             setup = self.probe_json(source, identity, [PROBE, "observe", str(ifindex)], "topology-observe")
             require(any(entry.get("address") == TOPOLOGY_ALIAS for entry in setup["addresses"]),
-                    "unsupported alias topology was not installed before capture")
+                    "extra managed-link address was not installed before capture")
         record["network_before_freeze"] = {"original_name": name, "setup": setup,
                                            "seeded": {"ordinary": ordinary, "proxy": proxy}}
         record["source_wire_positive"] = source.relay.probe_address(SOURCE, label="source-positive")
@@ -759,8 +759,8 @@ class Cohort:
         return {"ifindex": ifindex, "addresses": addresses, "resolv_conf": resolver,
                 "seeded_removed": sorted(seeded)}
 
-    def positive_child(self, cut: Cut, index: int) -> dict:
-        child = self.restore(cut, f"child-{index}", destination(index))
+    def positive_child(self, cut: Cut, index: int, *, child: Child | None = None) -> dict:
+        child = child or self.restore(cut, f"child-{index}", destination(index))
         session, record = child.session, child.record
         token = secrets.token_hex(16)
         session.forward.register("restored-forward", token)
@@ -799,8 +799,8 @@ class Cohort:
         require(groups["workloads"]["frozen"] and groups["activation"]["populated"] is False,
                 "workloads thawed or hook descendants survived activation")
         hook_observation = json.loads(files[HOOK_OBSERVATION])
-        require(b"0::/silo/activation" in bytes.fromhex(hook_observation["self_cgroup_hex"]).splitlines(),
-                "selected hook did not run in the activation sibling")
+        require(bytes.fromhex(hook_observation["self_cgroup_hex"]).splitlines() == [b"0::/"],
+                "selected hook did not use its isolated activation namespace")
         record["network_after_activate"] = self.replaced_network(cut, child, hook_observation)
         status_addresses = observation["status"]["status"]["system"]["ip_addresses"]
         require(child.role.network.ipv4 in status_addresses and SOURCE.ipv4 not in status_addresses,
@@ -1017,12 +1017,10 @@ class Cohort:
         unchanged = self.observe(child.session, "presence-mismatch-no-effects", expect={
             "identity": cut.identity, "lifecycle_state": "frozen", "freeze_ref": cut.freeze_ref},
             cgroups=["workloads"])
-        request = self.activation_request(cut, child, hook=None, listeners=[])
-        failure = self.failed_activation(cut, child, request, "network-topology")
-        child.record.update({"presence_mismatch": rejected["output"]["rpc"],
-                             "presence_unchanged": unchanged["output"], "failure": failure})
-        self.retire(child.session)
-        return child.record
+        record = self.positive_child(cut, 0, child=child)
+        record.update({"presence_mismatch": rejected["output"]["rpc"],
+                       "presence_unchanged": unchanged["output"]})
+        return record
 
 
 def run(silo: Silo, image: str, case: str, probe: Path) -> dict:

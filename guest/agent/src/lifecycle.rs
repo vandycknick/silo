@@ -464,6 +464,11 @@ impl Lifecycle {
                                 "cached freeze no longer matches kernel state",
                             ));
                         }
+                        if let Err(error) = self.controller.check_containment() {
+                            return Ok(self.begin_containment_rollback(
+                                &mut owner, &request, reference, error,
+                            ));
+                        }
                         return Ok(completed(v1::FreezeWorkloadsResponse {
                             status: Some(current),
                         }));
@@ -482,6 +487,11 @@ impl Lifecycle {
                     return Err(Status::failed_precondition(
                         "activated workload root is no longer frozen",
                     ));
+                }
+                if let Err(error) = self.controller.check_containment() {
+                    return Ok(
+                        self.begin_containment_rollback(&mut owner, &request, reference, error)
+                    );
                 }
                 return Ok(completed(v1::FreezeWorkloadsResponse {
                     status: Some(current),
@@ -546,6 +556,53 @@ impl Lifecycle {
         };
         Ok(receiver)
     }
+    fn begin_containment_rollback(
+        self: &Arc<Self>,
+        owner: &mut Coordinator,
+        request: &v1::FreezeWorkloadsRequest,
+        reference: v1::FreezeRef,
+        error: Status,
+    ) -> CompletionReceiver<v1::FreezeWorkloadsResponse> {
+        let (completion, receiver) = watch::channel(None);
+        owner.busy = true;
+        owner.freeze = Some((request.clone(), completion.clone()));
+        let lifecycle = self.clone();
+        tokio::spawn(async move {
+            lifecycle.rollback_freeze(&reference, &error).await;
+            lock(&lifecycle.coordinator).busy = false;
+            completion.send_replace(Some(Err(error)));
+        });
+        receiver
+    }
+
+    async fn rollback_freeze(&self, reference: &v1::FreezeRef, error: &Status) {
+        let observed = self.controller.is_frozen().unwrap_or(false);
+        let rollback_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let rollback = match self.controller.thaw(rollback_deadline).await {
+            Ok(()) => self.controller.open_spawn_admission(),
+            Err(error) => Err(error),
+        };
+        let succeeded = rollback.is_ok();
+        if succeeded {
+            self.runtime.open();
+        }
+        let diagnostic = match rollback {
+            Ok(()) => error.to_string(),
+            Err(rollback) => format!("{error}; rollback failed: {rollback:#}"),
+        };
+        self.publish(
+            if succeeded {
+                State::FreezeFailed
+            } else {
+                State::Faulted
+            },
+            reference,
+            observed,
+            Some(diagnostic),
+            Some(succeeded),
+        );
+    }
+
     async fn perform_freeze(
         &self,
         reference: &v1::FreezeRef,
@@ -553,7 +610,8 @@ impl Lifecycle {
     ) -> Result<v1::FreezeWorkloadsResponse, Status> {
         let result = async {
             self.runtime.drain(deadline).await?;
-            self.controller.freeze(deadline).await.map_err(internal)
+            self.controller.freeze(deadline).await.map_err(internal)?;
+            self.controller.check_containment()
         }
         .await;
         match result {
@@ -572,31 +630,10 @@ impl Lifecycle {
                 self.publish(State::Frozen, reference, true, None, None);
             }
             Err(error) => {
-                let observed = self.controller.is_frozen().unwrap_or(false);
-                let rollback_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                let rollback = match self.controller.thaw(rollback_deadline).await {
-                    Ok(()) => self.controller.open_spawn_admission(),
-                    Err(error) => Err(error),
-                };
-                let succeeded = rollback.is_ok();
-                if succeeded {
-                    self.runtime.open();
+                self.rollback_freeze(reference, &error).await;
+                if error.message().starts_with("guest-containment-escaped:") {
+                    return Err(error);
                 }
-                let diagnostic = match rollback {
-                    Ok(()) => error.to_string(),
-                    Err(rollback) => format!("{error}; rollback failed: {rollback:#}"),
-                };
-                self.publish(
-                    if succeeded {
-                        State::FreezeFailed
-                    } else {
-                        State::Faulted
-                    },
-                    reference,
-                    observed,
-                    Some(diagnostic),
-                    Some(succeeded),
-                );
             }
         }
         Ok(v1::FreezeWorkloadsResponse {
@@ -813,6 +850,7 @@ impl Lifecycle {
         deadline: tokio::time::Instant,
     ) -> Result<v1::ActivateResponse, Status> {
         let result = tokio::time::timeout_at(deadline, async {
+            self.controller.check_containment()?;
             self.runtime.drain(deadline).await?;
             let mut retained = self.network.lock().await;
             self.forwards.reset_for_activation().await?;
@@ -840,6 +878,11 @@ impl Lifecycle {
                 *retained = Some(replacement);
             }
             drop(retained);
+            crate::activation_identity::publish(
+                &request.destination_machine_id,
+                &request.destination_run_id,
+            )
+            .map_err(internal)?;
             let listeners = self
                 .forwards
                 .register_activation(&request.listeners)
@@ -869,6 +912,7 @@ impl Lifecycle {
             .controller
             .kill_activation(tokio::time::Instant::now() + Duration::from_secs(5))
             .await;
+        self.controller.check_containment()?;
         cleanup.map_err(internal)?;
         let mut response =
             result.map_err(|_| Status::deadline_exceeded("activation deadline exceeded"))??;

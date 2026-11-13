@@ -7,6 +7,7 @@ fn boot_to(v: libvm::MachineBootMode) -> i32 {
         libvm::MachineBootMode::Standard => 1,
         libvm::MachineBootMode::AgentPid1 => 2,
         libvm::MachineBootMode::InitChild => 3,
+        libvm::MachineBootMode::ContainedInit => 4,
     }
 }
 fn boot_from(v: i32) -> Result<libvm::MachineBootMode, ConversionError> {
@@ -15,6 +16,7 @@ fn boot_from(v: i32) -> Result<libvm::MachineBootMode, ConversionError> {
         1 => Ok(libvm::MachineBootMode::Standard),
         2 => Ok(libvm::MachineBootMode::AgentPid1),
         3 => Ok(libvm::MachineBootMode::InitChild),
+        4 => Ok(libvm::MachineBootMode::ContainedInit),
         _ => Err(invalid("boot", "invalid enum")),
     }
 }

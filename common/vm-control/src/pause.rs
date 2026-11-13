@@ -125,7 +125,8 @@ enumeration!(
         AbandonFailed,
         SourceRecordFailed,
         ReleaseFailed,
-        StagingBudgetExceeded
+        StagingBudgetExceeded,
+        GuestContainmentEscaped
     ]
 );
 enumeration!(

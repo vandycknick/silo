@@ -115,6 +115,8 @@ enum GuestBootMode {
   GUEST_BOOT_MODE_STANDARD = 1;
   GUEST_BOOT_MODE_AGENT_PID1 = 2;
   GUEST_BOOT_MODE_INIT_CHILD = 3;
+  // Image init is PID 1 in the Silo cgroup namespace under the workload freeze switch.
+  GUEST_BOOT_MODE_CONTAINED_INIT = 4;
 }
 
 message GuestBootReport {

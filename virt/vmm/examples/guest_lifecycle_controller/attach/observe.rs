@@ -1,5 +1,8 @@
 //! Bounded, independent guest observations through ordinary agent RPCs.
 //! Files are read to EOF by DownloadFile (sysfs sizes are never trusted).
+//! Guest-wide cgroup files are read through directory descriptors retained by
+//! the agent. A short pre-freeze exec discovers them once; the captured paths
+//! remain usable while workloads are frozen and in restored children.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -23,6 +26,8 @@ const MAX_LISTING_PAGES: usize = 64;
 const MAX_GENERATION_RECORD_BYTES: usize = 4096;
 const GENERATION_DEVICE_ID: &[u8] = b"0x5347\n";
 const VIRTIO_DEVICES: &str = "/sys/bus/virtio/devices";
+// Outside /run/silo: the agent treats that directory as its retained root state.
+const CGROUP_DESCRIPTORS: &str = "/run/lifecycle-cgroup-descriptors";
 /// Field order emitted by `generation_state_show` in the Silo vmgenid patch.
 const GENERATION_FIELDS: [&str; 21] = [
     "version",
@@ -165,9 +170,88 @@ impl Guest {
         }
     }
 
+    pub(crate) async fn prepare_cgroup_observation(&self) -> Result<CgroupDescriptors, Failure> {
+        match self.download(CGROUP_DESCRIPTORS, 256).await {
+            Ok(bytes) => return CgroupDescriptors::parse(&bytes).map_err(Failure::harness),
+            Err(error) if error.not_found() => {}
+            Err(error) => return Err(error),
+        }
+        let status = self
+            .agent()
+            .get_status(v1::GetAgentStatusRequest {})
+            .await
+            .map_err(Failure::rpc)?
+            .into_inner();
+        let report = status
+            .report
+            .as_ref()
+            .ok_or_else(|| Failure::harness("cgroup discovery lacks agent report"))?;
+        if report.lifecycle.as_ref().is_some_and(|lifecycle| {
+            !matches!(
+                v1::GuestLifecycleState::try_from(lifecycle.state),
+                Ok(v1::GuestLifecycleState::Running | v1::GuestLifecycleState::Thawed)
+            )
+        }) {
+            return Err(Failure::harness(
+                "cgroup descriptors must be discovered before freeze",
+            ));
+        }
+        let agent_pid = report
+            .boot
+            .as_ref()
+            .and_then(|boot| boot.agent_pid)
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| Failure::harness("cgroup discovery lacks agent PID"))?;
+        let identity = status
+            .identity
+            .as_ref()
+            .ok_or_else(|| Failure::harness("cgroup discovery lacks agent identity"))?;
+        let start = crate::attach::session::ProcessStart {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            expected_agent_instance_id: identity
+                .instance_id
+                .clone()
+                .ok_or_else(|| Failure::harness("cgroup discovery lacks agent instance"))?,
+            expected_agent_boot_id: identity
+                .boot_id
+                .clone()
+                .ok_or_else(|| Failure::harness("cgroup discovery lacks boot ID"))?,
+            argv: vec!["/bin/sh".into(), "-c".into(), descriptor_command(agent_pid)],
+            working_directory: Some("/".into()),
+            user: Some("root".into()),
+            environment: Vec::new(),
+        };
+        let operation = crate::attach::session::ExecOperation {
+            start,
+            stdin_hex: None,
+            timeout_ms: 5000,
+            max_output_bytes: 4096,
+            expect_rpc: crate::attach::dto::ExpectRpc::Ok,
+            expect_exit_code: Some(0),
+        };
+        let mut checks = Checks::default();
+        let output = crate::attach::session::exec(self, &operation, &mut checks)
+            .await
+            .map_err(|error| Failure::harness(format!("cgroup discovery: {error:#}")))?;
+        if !checks.passed() {
+            return Err(Failure::harness(format!(
+                "cgroup discovery failed: {output:?}"
+            )));
+        }
+        CgroupDescriptors::parse(&self.download(CGROUP_DESCRIPTORS, 256).await?)
+            .map_err(Failure::harness)
+    }
+
     pub(crate) async fn cgroup(&self, group: CgroupGroup) -> CgroupObservation {
-        let path = group.events_path();
-        match self.download(path, 4096).await {
+        let mut path = CGROUP_DESCRIPTORS.to_string();
+        let result = match self.prepare_cgroup_observation().await {
+            Ok(descriptors) => {
+                path = descriptors.events_path(group);
+                self.download(&path, 4096).await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(bytes) => {
                 let raw = Content::new(&bytes);
                 match parse_events(&bytes) {
@@ -299,6 +383,11 @@ impl Guest {
 
     /// Takes one complete observation, then optional repeated samples.
     pub(crate) async fn observe(&self, request: &Observe) -> eyre::Result<Observation> {
+        if !request.cgroups.is_empty() {
+            self.prepare_cgroup_observation()
+                .await
+                .map_err(|error| eyre::eyre!("prepare cgroup observation: {error:?}"))?;
+        }
         let monotonic = monotonic_ns()?;
         let status = self.status().await;
         let mut cgroups = Vec::with_capacity(request.cgroups.len());
@@ -368,6 +457,82 @@ fn advanced(initial: &[CounterObservation], sample: &[CounterObservation]) -> bo
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CgroupDescriptors {
+    agent_pid: u32,
+    workloads_fd: u32,
+    activation_fd: u32,
+}
+
+impl CgroupDescriptors {
+    fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+        let (mut agent_pid, mut workloads_fd, mut activation_fd) = (None, None, None);
+        for line in text.lines() {
+            let (name, value) = line
+                .split_once(' ')
+                .ok_or_else(|| format!("malformed cgroup descriptor record: {line:?}"))?;
+            let value = value
+                .parse::<u32>()
+                .map_err(|error| format!("invalid cgroup descriptor number: {error}"))?;
+            let field = match name {
+                "agent_pid" if value > 0 => &mut agent_pid,
+                "workloads" => &mut workloads_fd,
+                "activation" => &mut activation_fd,
+                _ => return Err(format!("invalid cgroup descriptor field: {name:?}")),
+            };
+            if field.replace(value).is_some() {
+                return Err(format!("duplicate cgroup descriptor field: {name:?}"));
+            }
+        }
+        match (agent_pid, workloads_fd, activation_fd) {
+            (Some(agent_pid), Some(workloads_fd), Some(activation_fd))
+                if workloads_fd != activation_fd =>
+            {
+                Ok(Self {
+                    agent_pid,
+                    workloads_fd,
+                    activation_fd,
+                })
+            }
+            _ => Err("missing or aliased cgroup directory descriptors".into()),
+        }
+    }
+
+    fn events_path(self, group: CgroupGroup) -> String {
+        let descriptor = match group {
+            CgroupGroup::Workloads => self.workloads_fd,
+            CgroupGroup::Activation => self.activation_fd,
+        };
+        format!("/proc/{}/fd/{descriptor}/cgroup.events", self.agent_pid)
+    }
+}
+
+fn descriptor_command(agent_pid: u32) -> String {
+    // readlink prints the path through the agent's original cgroup2 mount
+    // (/sys/fs/cgroup/... for AgentPid1); match the stable layout suffix.
+    format!(
+        r#"set -eu
+workloads=
+activation=
+for fd in /proc/{agent_pid}/fd/*; do
+    [ -d "$fd" ] || continue
+    target=$(readlink "$fd") || continue
+    case "$target" in
+        */silo/workloads) [ -n "$workloads" ] || workloads=${{fd##*/}} ;;
+        */silo/activation) [ -n "$activation" ] || activation=${{fd##*/}} ;;
+    esac
+done
+test -n "$workloads"
+test -n "$activation"
+temporary={CGROUP_DESCRIPTORS}.$$
+trap 'rm -f "$temporary"' EXIT
+printf 'agent_pid %s\nworkloads %s\nactivation %s\n' {agent_pid} "$workloads" "$activation" >"$temporary"
+mv "$temporary" {CGROUP_DESCRIPTORS}
+"#
+    )
+}
+
 /// cgroup v2 `cgroup.events`: both `populated` and `frozen` are required.
 pub(crate) fn parse_events(bytes: &[u8]) -> Result<(bool, bool), String> {
     let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
@@ -428,15 +593,6 @@ pub(crate) fn generation_schema_matches(fields: &BTreeMap<String, String>) -> bo
 pub(crate) enum CgroupGroup {
     Workloads,
     Activation,
-}
-
-impl CgroupGroup {
-    pub(crate) fn events_path(self) -> &'static str {
-        match self {
-            Self::Workloads => "/sys/fs/cgroup/silo/workloads/cgroup.events",
-            Self::Activation => "/sys/fs/cgroup/silo/activation/cgroup.events",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -535,7 +691,7 @@ pub(crate) struct StatusObservation {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CgroupObservation {
     pub(crate) group: CgroupGroup,
-    pub(crate) path: &'static str,
+    pub(crate) path: String,
     pub(crate) raw: Option<Content>,
     pub(crate) populated: Option<bool>,
     pub(crate) frozen: Option<bool>,
@@ -702,6 +858,45 @@ mod tests {
     };
 
     const RECORD: &[u8] = b"version=1 request_sequence=2 request_id=000102030405060708090a0b0c0d0e0f request_flags=1 completed_sequence=2 completed_id=000102030405060708090a0b0c0d0e0f completed_flags=1 rng_ready_before_call=1 reseed_count=3 reseed_sequence=2 reseed_id=000102030405060708090a0b0c0d0e0f reseed_return_order=4 clock_complete_order=5 ack_sequence=2 ack_id=000102030405060708090a0b0c0d0e0f ack_write_count=1 ack_write_order=6 ack_accessor_returned=1 ack_return_order=7 error=0 event_order=7\n";
+
+    #[test]
+    fn cgroup_descriptors_preserve_agent_pid_and_distinct_directory_fds() {
+        use crate::attach::observe::CgroupDescriptors;
+
+        let descriptors =
+            CgroupDescriptors::parse(b"agent_pid 42\nworkloads 12\nactivation 15\n").unwrap();
+        assert_eq!(
+            descriptors.events_path(CgroupGroup::Workloads),
+            "/proc/42/fd/12/cgroup.events"
+        );
+        assert_eq!(
+            descriptors.events_path(CgroupGroup::Activation),
+            "/proc/42/fd/15/cgroup.events"
+        );
+        for invalid in [
+            "".as_bytes(),
+            b"agent_pid 0\nworkloads 12\nactivation 15\n",
+            b"agent_pid -1\nworkloads 12\nactivation 15\n",
+            b"agent_pid 1\nworkloads 12\n",
+            b"agent_pid 1\nworkloads 12\nactivation 12\n",
+            b"agent_pid 1\nworkloads 12\nworkloads 13\nactivation 15\n",
+            b"agent_pid 1\nworkloads 12\nactivation 15\nother 16\n",
+            b"agent_pid 1\nworkloads 4294967296\nactivation 15\n",
+        ] {
+            assert!(CgroupDescriptors::parse(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn descriptor_discovery_matches_only_exact_cgroup_directories() {
+        let command = crate::attach::observe::descriptor_command(42);
+        assert!(command.contains("for fd in /proc/42/fd/*"));
+        assert!(command.contains("[ -d \"$fd\" ] || continue"));
+        assert!(command.contains("*/silo/workloads)"));
+        assert!(command.contains("*/silo/activation)"));
+        assert!(!command.contains("nsenter"));
+        assert!(!command.contains("mount "));
+    }
 
     #[test]
     fn cgroup_events_require_both_kernel_flags() {

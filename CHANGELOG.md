@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Stock image init now supports live pause, snapshot, restore and fork on
+  supported libkrun hosts. Systemd, busybox and OpenRC run in a contained image
+  cgroup namespace with delegated resource controls; exec, shell and SSH use a
+  separate workload subtree. Escaped tasks refuse capture with
+  `guest-containment-escaped` while the source stays running.
+- Restore and fork rotate an existing non-empty `/etc/machine-id` and atomically
+  replace `/run/silo/generation` with the child run ID before thaw. Images can
+  watch that file to refresh cached identity after thaw; activation hooks must
+  not call the frozen image init. Activation replaces image-managed network
+  configuration, including DHCP state. Ordinary stop syncs guest filesystems
+  before force-stopping an image-init VM.
+
 - Guest bootstrap failures now print diagnostics, sync and power off for every
   root type. Explicit `silo.rescue=on-failure` and `silo.rescue=always` kernel
   arguments enable console rescue; exiting rescue powers off. Poweroff before

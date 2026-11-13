@@ -1,8 +1,10 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("silo-agent only supports Linux guests");
 
+mod activation_identity;
 mod clock;
 mod clock_profile;
+mod containment;
 mod diagnostics;
 mod filesystem;
 mod forward;
@@ -53,8 +55,6 @@ const DEV_PTS_DIR: &str = "/dev/pts";
 const DEV_PTS_DIR_MODE: u32 = 0o755;
 const DEV_SHM_DIR: &str = "/dev/shm";
 const DEV_SHM_DIR_MODE: u32 = 0o1777;
-const SYS_FS_CGROUP_DIR: &str = "/sys/fs/cgroup";
-const SYS_FS_CGROUP_DIR_MODE: u32 = 0o755;
 const DEV_FD: &str = "/dev/fd";
 const PROC_SELF_FD: &str = "/proc/self/fd";
 
@@ -188,7 +188,7 @@ async fn run_agent(
 ) -> eyre::Result<()> {
     let runtime = crate::lifecycle::RuntimeContext::new(agent_config.storage_shutdown.clone())?;
     let orderly = crate::orderly_shutdown::OrderlyShutdown::new(runtime.clone());
-    let memory_reclaim = memory_reclaim::start();
+    let memory_reclaim = memory_reclaim::start(&workloads);
     let mut result = crate::root_storage::ShutdownResult::default();
     let mut join_set = tokio::task::JoinSet::new();
     let mut shutdown_handles = Vec::new();
@@ -458,24 +458,9 @@ fn prepare_pid1_environment() -> eyre::Result<()> {
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
     )
     .context("prepare /dev/shm")?;
-    if let Err(err) = prepare_cgroup_mountpoint().and_then(|()| {
-        mount_pseudo_fs(
-            "cgroup2",
-            Path::new(SYS_FS_CGROUP_DIR),
-            "cgroup2",
-            MsFlags::empty(),
-        )
-    }) {
-        tracing::warn!(error = %err, "failed to prepare /sys/fs/cgroup; continuing");
-    }
     ensure_dev_fd_symlink()?;
 
     Ok(())
-}
-
-fn prepare_cgroup_mountpoint() -> eyre::Result<()> {
-    ensure_mountpoint_directory(Path::new(SYS_FS_CGROUP_DIR), SYS_FS_CGROUP_DIR_MODE)
-        .context("prepare /sys/fs/cgroup mountpoint")
 }
 
 fn ensure_directory(path: &Path, mode: u32) -> eyre::Result<()> {
@@ -497,25 +482,6 @@ fn ensure_directory(path: &Path, mode: u32) -> eyre::Result<()> {
 
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .with_context(|| format!("set permissions on {}", path.display()))
-}
-
-fn ensure_mountpoint_directory(path: &Path, mode: u32) -> eyre::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                eyre::bail!("{} must be a directory", path.display());
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(mode);
-            builder
-                .create(path)
-                .with_context(|| format!("create {}", path.display()))
-        }
-        Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
-    }
 }
 
 fn mount_pseudo_fs(source: &str, target: &Path, fstype: &str, flags: MsFlags) -> eyre::Result<()> {

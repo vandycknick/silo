@@ -9,7 +9,7 @@
 mod connection;
 mod dto;
 mod lifecycle;
-mod observe;
+pub(crate) mod observe;
 mod profile;
 mod session;
 

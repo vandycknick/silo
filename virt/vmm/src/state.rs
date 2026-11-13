@@ -815,12 +815,19 @@ fn guest_rejection(state: &State, now: Instant) -> Option<&'static str> {
         return Some("guest-status-stale");
     }
     let report = &status.value;
-    let pid1 = report.boot.as_ref().is_some_and(|boot| {
-        boot.mode == Some(protocol::v1::GuestBootMode::AgentPid1 as i32)
-            && boot.agent_is_pid1 == Some(true)
-    });
-    if !pid1 {
-        return Some("guest-not-agent-pid1");
+    match report
+        .boot
+        .as_ref()
+        .map(|boot| (boot.mode, boot.agent_is_pid1))
+    {
+        Some((Some(mode), Some(true))) if mode == protocol::v1::GuestBootMode::AgentPid1 as i32 => {
+        }
+        Some((Some(mode), Some(false)))
+            if mode == protocol::v1::GuestBootMode::ContainedInit as i32 => {}
+        Some((Some(mode), _)) if mode == protocol::v1::GuestBootMode::InitChild as i32 => {
+            return Some("guest-init-not-contained");
+        }
+        _ => return Some("guest-profile-unsupported"),
     }
     let Some(lifecycle) = report.lifecycle.as_ref() else {
         return Some("guest-lifecycle-unreported");
@@ -3041,7 +3048,7 @@ mod tests {
         store
             .observe_status(ready_status(instance), Duration::from_secs(15))
             .unwrap();
-        assert_eq!(rejection(&store), Some("guest-not-agent-pid1"));
+        assert_eq!(rejection(&store), Some("guest-profile-unsupported"));
         store
             .observe_status(live_status(instance, Some(false)), Duration::from_secs(15))
             .unwrap();
@@ -3068,6 +3075,51 @@ mod tests {
             vm_spec::live::LiveAvailability::Unsupported { ref reason }
                 if reason.code == vm_spec::live::LiveReasonCode::NotDelivered
         ));
+    }
+
+    #[test]
+    fn live_guest_profile_requires_matching_boot_mode_and_pid1_flag() {
+        use protocol::v1::{GuestBootMode, GuestBootReport};
+
+        let instance = "00000000-0000-4000-8000-000000000002";
+        for mode in [
+            None,
+            Some(GuestBootMode::Unspecified as i32),
+            Some(GuestBootMode::Standard as i32),
+            Some(GuestBootMode::AgentPid1 as i32),
+            Some(GuestBootMode::InitChild as i32),
+            Some(GuestBootMode::ContainedInit as i32),
+            Some(i32::MAX),
+        ] {
+            for agent_is_pid1 in [None, Some(false), Some(true)] {
+                let store = live_store();
+                store
+                    .observe_status(live_status(instance, Some(true)), Duration::from_secs(15))
+                    .unwrap();
+                let mut state = store.state.lock().unwrap();
+                state.status.as_mut().unwrap().value.boot = Some(GuestBootReport {
+                    mode,
+                    agent_is_pid1,
+                    ..Default::default()
+                });
+                let now = Instant::now();
+                let expected = match (mode, agent_is_pid1) {
+                    (Some(mode), Some(true)) if mode == GuestBootMode::AgentPid1 as i32 => None,
+                    (Some(mode), Some(false)) if mode == GuestBootMode::ContainedInit as i32 => {
+                        None
+                    }
+                    (Some(mode), _) if mode == GuestBootMode::InitChild as i32 => {
+                        Some("guest-init-not-contained")
+                    }
+                    _ => Some("guest-profile-unsupported"),
+                };
+                assert_eq!(
+                    crate::state::guest_rejection(&state, now),
+                    expected,
+                    "mode={mode:?}, agent_is_pid1={agent_is_pid1:?}"
+                );
+            }
+        }
     }
 
     #[test]

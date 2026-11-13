@@ -1,6 +1,6 @@
 //! One in-memory bridge from the retained PID1 storage shutdown to its RPC.
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use protocol::shutdown::ShutdownIdentity;
 use protocol::v1::{ShutdownCompleted, ShutdownCompletionResult};
@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use tonic::Status;
 
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
+const IMAGE_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct OrderlyShutdown {
     runtime: Arc<crate::lifecycle::RuntimeContext>,
@@ -33,7 +34,7 @@ impl OrderlyShutdown {
         })
     }
 
-    pub(crate) fn admit(
+    pub(crate) async fn admit(
         &self,
         identity: ShutdownIdentity,
         manifest: &protocol::shutdown::StorageManifest,
@@ -56,9 +57,7 @@ impl OrderlyShutdown {
             ));
         }
         if !agent_pid1 {
-            return Err(Status::unimplemented(
-                "image-owned PID1 has no admitted storage shutdown authority",
-            ));
+            return Err(sync_before_image_stop().await);
         }
         let mut attempt = lock(&self.attempt);
         if attempt.is_some() {
@@ -132,6 +131,31 @@ impl OrderlyShutdown {
             self.receipt.notify_all();
         }
     }
+}
+
+async fn sync_before_image_stop() -> Status {
+    let started = Instant::now();
+    let mut worker = tokio::task::spawn_blocking(nix::unistd::sync);
+    let message = match tokio::time::timeout(IMAGE_SYNC_TIMEOUT, &mut worker).await {
+        Ok(Ok(())) => {
+            "image-owned PID1 has no admitted storage shutdown authority; guest filesystems synced before stop"
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "guest filesystem sync worker failed before image-owned stop");
+            "image-owned PID1 has no admitted storage shutdown authority; guest filesystem sync failed"
+        }
+        Err(_) => {
+            // A running sync syscall cannot be cancelled, but must not hold up the host stop.
+            worker.abort();
+            "image-owned PID1 has no admitted storage shutdown authority; guest filesystem sync timed out"
+        }
+    };
+    tracing::info!(
+        duration_ms = started.elapsed().as_millis(),
+        message,
+        "guest filesystem sync before image-owned stop finished"
+    );
+    Status::unimplemented(message)
 }
 
 pub(crate) struct ExchangeGuard(pub(crate) Arc<OrderlyShutdown>);
@@ -211,7 +235,7 @@ mod tests {
         )
     }
 
-    pub(crate) fn admit(
+    pub(crate) async fn admit(
         owner: &crate::orderly_shutdown::OrderlyShutdown,
         identity: &protocol::shutdown::ShutdownIdentity,
     ) -> tokio::sync::watch::Receiver<Option<protocol::v1::ShutdownCompleted>> {
@@ -223,11 +247,12 @@ mod tests {
                 &identity.boot_id,
                 true,
             )
+            .await
             .unwrap()
     }
 
-    #[test]
-    fn activation_rebinds_shutdown_to_destination_and_rejects_source_run() {
+    #[tokio::test]
+    async fn activation_rebinds_shutdown_to_destination_and_rejects_source_run() {
         let (owner, source) = fixture();
         let mut context = owner.runtime.identity().shutdown;
         context.machine_id = uuid::Uuid::new_v4().to_string();
@@ -241,6 +266,7 @@ mod tests {
                 &source.boot_id,
                 true
             )
+            .await
             .is_err());
         let identity = protocol::shutdown::ShutdownIdentity {
             machine_id: destination.machine_id,
@@ -257,11 +283,12 @@ mod tests {
                 &identity.boot_id,
                 true
             )
+            .await
             .is_ok());
     }
 
-    #[test]
-    fn trusted_identity_manifest_and_authority_precede_admission() {
+    #[tokio::test]
+    async fn trusted_identity_manifest_and_authority_precede_admission() {
         let (owner, identity) = fixture();
         let mut wrong = identity.clone();
         wrong.run_id = uuid::Uuid::new_v4().to_string();
@@ -273,6 +300,7 @@ mod tests {
                 &identity.boot_id,
                 true
             )
+            .await
             .is_err());
         assert!(owner
             .admit(
@@ -282,6 +310,7 @@ mod tests {
                 &identity.boot_id,
                 true
             )
+            .await
             .is_err());
         assert!(owner
             .admit(
@@ -291,6 +320,7 @@ mod tests {
                 "other boot",
                 true
             )
+            .await
             .is_err());
         let other = protocol::shutdown::StorageManifest::Unsupported {
             reason: "omitted Data/share inventory".into(),
@@ -303,6 +333,7 @@ mod tests {
                 &identity.boot_id,
                 true
             )
+            .await
             .is_err());
         assert_eq!(
             owner
@@ -313,11 +344,12 @@ mod tests {
                     &identity.boot_id,
                     false
                 )
+                .await
                 .unwrap_err()
                 .code(),
             tonic::Code::Unimplemented
         );
-        let _completion = admit(&owner, &identity);
+        let _completion = admit(&owner, &identity).await;
         assert!(owner
             .admit(
                 identity.clone(),
@@ -326,13 +358,35 @@ mod tests {
                 &identity.boot_id,
                 true
             )
+            .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn image_owned_stop_syncs_without_admitting_pid1_shutdown() {
+        let (owner, identity) = fixture();
+        let error = owner
+            .admit(
+                identity.clone(),
+                &owner.manifest(),
+                &identity.agent_instance_id,
+                &identity.boot_id,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert_eq!(
+            error.message(),
+            "image-owned PID1 has no admitted storage shutdown authority; guest filesystems synced before stop"
+        );
+        assert!(crate::orderly_shutdown::lock(&owner.attempt).is_none());
     }
 
     #[tokio::test]
     async fn completion_is_sticky_and_poweroff_requires_matching_terminal_receipt() {
         let (owner, identity) = fixture();
-        let mut completion = admit(&owner, &identity);
+        let mut completion = admit(&owner, &identity).await;
         assert!(owner.allow_poweroff(&identity).is_err());
         let worker = std::thread::spawn({
             let owner = owner.clone();
@@ -364,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn disconnected_waiter_does_not_cancel_terminal_work_or_create_receipt() {
         let (owner, identity) = fixture();
-        let mut completion = admit(&owner, &identity);
+        let mut completion = admit(&owner, &identity).await;
         let guard = crate::orderly_shutdown::ExchangeGuard(owner.clone());
         let worker = std::thread::spawn({
             let owner = owner.clone();
@@ -386,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn receipt_deadline_never_fabricates_host_observation() {
         let (owner, identity) = fixture();
-        let _completion = admit(&owner, &identity);
+        let _completion = admit(&owner, &identity).await;
         let (done, completed) = tokio::sync::oneshot::channel();
         let worker = std::thread::spawn({
             let owner = owner.clone();
