@@ -745,6 +745,7 @@ impl SnapshotStore {
         // The per-capture publisher owns all copying, not merely final insertion.
         let lease = pool.existing_lease(capture)?;
         check_lease(&self.store, &pool, capture, &lease).await?;
+        self.store.reserve_capture_inventory(&record).await?;
         #[cfg(test)]
         if let Some(hook) = &self.store.layer_hook {
             hook.hit(crate::store::layer_store::tests::WorkerPoint::Preparing)?;
@@ -2326,6 +2327,7 @@ impl SnapshotStore {
             let _publisher=pool.lock_publication(&publication)?;
             let _lease = pool.existing_lease(capture)?;
             check_lease(&this.store,&pool,capture,&_lease).await?;
+            this.store.reserve_capture_inventory(&record).await?;
             let source = capture_directory(&this.store, &record)?.ok_or_else(|| invalid("local capture source disappeared"))?;
             let mut verified_disks = Vec::new();
             let mut cut = match this.store.local_cut(operation).await? {
@@ -2634,7 +2636,7 @@ pub(crate) mod tests {
         pub(crate) snapshots: SnapshotStore,
         config: MachineConfig,
         pub(crate) reservation: CaptureReservation,
-        launch: LaunchStorageLease,
+        pub(crate) launch: LaunchStorageLease,
     }
 
     pub(crate) async fn fixture() -> Fixture {

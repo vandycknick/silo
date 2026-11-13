@@ -187,6 +187,10 @@ async fn test_env_in(temp: tempfile::TempDir, name: &str, scenario: &Scenario) -
     )
     .await
     .expect("open runtime");
+    assert!(
+        runtime.local_home().join("resource-budget").is_dir(),
+        "integration runtimes must not use the user's real resource ledger"
+    );
 
     TestEnv {
         _temp: temp,

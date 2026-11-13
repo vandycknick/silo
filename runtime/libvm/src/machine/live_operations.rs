@@ -27,6 +27,37 @@ fn uuid(value: &LiveId) -> Result<Uuid, LibVmError> {
     Uuid::parse_str(value.as_str()).map_err(|error| protocol(error.to_string()))
 }
 
+pub(crate) fn missing_pause_authority(
+    observation: &MachineLiveObservation,
+    lifecycle: &vm_spec::lifecycle::LiveLifecycle,
+    pending_resume: Result<Option<&LiveId>, &LibVmError>,
+    message: &str,
+) -> LibVmError {
+    let state = observation
+        .state()
+        .map_or("unavailable", VmLifecycleState::as_str);
+    let pending_request = match &pending_resume {
+        Ok(request) => *request,
+        Err(_) => None,
+    }
+    .or_else(|| {
+        lifecycle
+            .activity
+            .as_ref()
+            .filter(|activity| activity.command == vm_spec::lifecycle::LiveCommandKind::Resume)
+            .map(|activity| &activity.request_id)
+    });
+    protocol(format!(
+        "{message}; observed_state={state}; activity={:?}; last_live_error={:?}; machine_id={}; run_id={}; pending_resume_request_id={}; pending_resume_lookup_error={:?}",
+        lifecycle.activity,
+        lifecycle.error,
+        observation.report().machine_id,
+        observation.report().run_id,
+        pending_request.map_or("none", LiveId::as_str),
+        pending_resume.err(),
+    ))
+}
+
 pub(crate) fn envelope(
     observation: &MachineLiveObservation,
     request_id: Uuid,
@@ -224,10 +255,25 @@ impl Machine {
         observation: &MachineLiveObservation,
         request_id: Uuid,
     ) -> Result<LiveCommandResult, LibVmError> {
-        let current = observation
-            .lifecycle()?
-            .current_pause
-            .ok_or_else(|| protocol("machine has no current pause authority"))?;
+        let lifecycle = observation.lifecycle()?;
+        let current = match lifecycle.current_pause {
+            Some(current) => current,
+            None => {
+                let pending = self
+                    .pending_command(observation, vm_spec::lifecycle::LiveCommandKind::Resume)
+                    .await;
+                return Err(missing_pause_authority(
+                    observation,
+                    &lifecycle,
+                    pending.as_ref().map(|command| {
+                        command
+                            .as_ref()
+                            .map(|command| &command.envelope().request_id)
+                    }),
+                    "machine has no current pause authority",
+                ));
+            }
+        };
         self.live_command(
             observation,
             LiveCommand::Resume(ResumeCommand {
@@ -616,4 +662,133 @@ pub(crate) async fn reconcile(runtime: &Runtime, config: &MachineConfig) -> Resu
         save_result(runtime, &store, config, &retained.intent, &result).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use vm_spec::lifecycle::{
+        LiveActivity, LiveCommandKind, LiveFailure, LiveFailureCode, LiveId, LiveLifecycle,
+        LiveStage, VmLifecycleState,
+    };
+    use vm_spec::live::{
+        LiveBackend, LiveCapabilityVector, LiveLane, LiveMachineReport, LiveReasonCode, LiveScope,
+    };
+
+    use crate::machine::live::MachineLiveObservation;
+    use crate::machine::live_operations::missing_pause_authority;
+
+    fn id(last: u8) -> LiveId {
+        LiveId::parse(&format!("00000000-0000-4000-8000-0000000000{last:02x}")).unwrap()
+    }
+
+    fn observed(state: VmLifecycleState, lifecycle: LiveLifecycle) -> MachineLiveObservation {
+        MachineLiveObservation::for_test(
+            LiveMachineReport {
+                schema_version: 1,
+                scope: LiveScope::Machine,
+                machine_id: id(1).to_string(),
+                run_id: id(2).to_string(),
+                monitor_id: id(3).to_string(),
+                backend: LiveBackend::Mock,
+                lane: LiveLane::NotApplicable,
+                topology_revision: 1,
+                live: LiveCapabilityVector::all_unsupported(LiveReasonCode::NotDelivered),
+            },
+            state,
+            lifecycle,
+        )
+    }
+
+    #[test]
+    fn missing_pause_authority_names_the_observed_state_and_capture() {
+        let lifecycle = LiveLifecycle {
+            activity: Some(LiveActivity {
+                operation_id: id(4),
+                request_id: id(5),
+                command: LiveCommandKind::Capture,
+                stage: LiveStage::CaptureSourceRecord,
+            }),
+            ..LiveLifecycle::default()
+        };
+        let observation = observed(VmLifecycleState::Capturing, lifecycle.clone());
+        let message = missing_pause_authority(
+            &observation,
+            &lifecycle,
+            Ok(None),
+            "machine has no current pause authority",
+        )
+        .to_string();
+        for detail in [
+            "machine has no current pause authority",
+            "observed_state=capturing",
+            "CaptureSourceRecord",
+            "00000000-0000-4000-8000-000000000004",
+            "00000000-0000-4000-8000-000000000005",
+            &format!("machine_id={}", id(1)),
+            &format!("run_id={}", id(2)),
+            "pending_resume_request_id=none",
+        ] {
+            assert!(message.contains(detail), "{message}");
+        }
+    }
+
+    #[test]
+    fn missing_pause_authority_includes_live_error_and_pending_resume() {
+        let lifecycle = LiveLifecycle {
+            error: Some(LiveFailure::new(
+                LiveFailureCode::AbandonFailed,
+                LiveStage::CaptureAbandon,
+                "native capture ownership is unresolved",
+            )),
+            ..LiveLifecycle::default()
+        };
+        let observation = observed(VmLifecycleState::Error, lifecycle.clone());
+        let pending = id(6);
+        let message = missing_pause_authority(
+            &observation,
+            &lifecycle,
+            Ok(Some(&pending)),
+            "machine has no current pause authority",
+        )
+        .to_string();
+        assert!(message.contains("observed_state=error"), "{message}");
+        assert!(
+            message.contains("native capture ownership is unresolved"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("pending_resume_request_id={pending}")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn missing_pause_authority_retains_observed_resume_during_lookup_failure() {
+        let lifecycle = LiveLifecycle {
+            activity: Some(LiveActivity {
+                operation_id: id(4),
+                request_id: id(5),
+                command: LiveCommandKind::Resume,
+                stage: LiveStage::ResumeNative,
+            }),
+            ..LiveLifecycle::default()
+        };
+        let observation = observed(VmLifecycleState::Pausing, lifecycle.clone());
+        let lookup_error = crate::LibVmError::LiveProtocol {
+            message: "journal unavailable".into(),
+        };
+        let message = missing_pause_authority(
+            &observation,
+            &lifecycle,
+            Err(&lookup_error),
+            "machine has no current pause authority",
+        )
+        .to_string();
+        assert!(message.contains("observed_state=pausing"), "{message}");
+        assert!(
+            message.contains(&format!("pending_resume_request_id={}", id(5))),
+            "{message}"
+        );
+        assert!(message.contains("journal unavailable"), "{message}");
+    }
 }

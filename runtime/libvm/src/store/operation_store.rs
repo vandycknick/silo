@@ -172,6 +172,94 @@ fn validate_lease_metadata(
     Ok(())
 }
 
+async fn bind_fork_child_handoff(
+    connection: &mut sqlx::SqliteConnection,
+    consumer: Uuid,
+    cut: &vm_spec::capture::Sha256Digest,
+    machine: MachineId,
+    run: Uuid,
+    launch: Uuid,
+) -> Result<(), LibVmError> {
+    let child: Option<(String, i64, String, String, bool)> = sqlx::query_as(
+        "SELECT c.operation_id,c.child_index,c.machine_id,c.run_id,
+                json_extract(f.result_json,'$.cancellationRequested')
+         FROM live_fork_child c JOIN live_fork f ON f.operation_id=c.operation_id
+         JOIN local_cut l ON l.operation_id=f.operation_id
+         WHERE c.consumer_id=?1 AND c.launch_id IS NULL AND c.name_reserved=1
+         AND l.cut_id=?2 AND f.admission_complete=1",
+    )
+    .bind(consumer.to_string())
+    .bind(cut.to_string())
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some((parent, index, reserved_machine, reserved_run, cancelled)) = child else {
+        return Err(invalid(
+            "fork child generation handoff lost its reserved identity",
+        ));
+    };
+    if reserved_machine != machine.to_string() || reserved_run != run.to_string() {
+        return Err(invalid(
+            "fork child generation changed reserved machine/run identity",
+        ));
+    }
+    if cancelled {
+        return Err(LibVmError::ForkChildCancelled {
+            operation_id: Uuid::parse_str(&parent).map_err(invalid)?,
+            child_index: u32::try_from(index).map_err(invalid)?,
+        });
+    }
+    sqlx::query("UPDATE live_fork_child SET launch_id=?3 WHERE operation_id=?1 AND child_index=?2 AND launch_id IS NULL")
+        .bind(parent)
+        .bind(index)
+        .bind(launch.to_string())
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
+async fn admit_fork_child_launch(
+    connection: &mut sqlx::SqliteConnection,
+    launch: Uuid,
+    machine: MachineId,
+    run: Uuid,
+) -> Result<(), LibVmError> {
+    let row: Option<(String, i64, bool, String)> = sqlx::query_as(
+        "SELECT c.operation_id,c.child_index,
+                json_extract(f.result_json,'$.cancellationRequested'),json(c.result_json)
+         FROM live_fork_child c JOIN live_fork f ON f.operation_id=c.operation_id
+         WHERE c.launch_id=?1 AND c.machine_id=?2 AND c.run_id=?3 AND c.submitted=0",
+    )
+    .bind(launch.to_string())
+    .bind(machine.to_string())
+    .bind(run.to_string())
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some((parent, index, cancelled, json)) = row else {
+        return Err(invalid("fork launch lost its exact unsubmitted child slot"));
+    };
+    if cancelled {
+        return Err(LibVmError::ForkChildCancelled {
+            operation_id: Uuid::parse_str(&parent).map_err(invalid)?,
+            child_index: u32::try_from(index).map_err(invalid)?,
+        });
+    }
+    let mut child: crate::ForkChildResult = serde_json::from_str(&json).map_err(invalid)?;
+    child.outcome = crate::ForkChildOutcome::Activating;
+    sqlx::query("UPDATE live_fork_child SET submitted=1,result_json=jsonb(?3) WHERE operation_id=?1 AND child_index=?2")
+        .bind(&parent)
+        .bind(index)
+        .bind(serde_json::to_string(&child).map_err(invalid)?)
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("INSERT OR IGNORE INTO fork_event(operation_id,child_index,phase,monotonic_ns) VALUES(?1,?2,'activating',?3)")
+        .bind(parent)
+        .bind(index)
+        .bind(crate::machine::live_fork::monotonic_ns()?)
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
 /// Record-local launch admission. The layered lower's VMDK resource preflight
 /// needs its leased retained occurrences and runs in `root_storage::prepare`
 /// before any descriptor is encoded or backing opened.
@@ -1422,6 +1510,11 @@ impl Store {
             lowers,
         } = crate::store::cache_paths::storage_pool_dependencies(storage)?;
         let pool = StoragePool::open(&self.images_dir)?;
+        // Preserve the old ledger owner's OFD across the SQL handoff and the
+        // later anchor refresh. Admission need not span the handoff transaction.
+        let consumer_lease = restore
+            .map(|intent| pool.existing_lease(intent.consumer_operation))
+            .transpose()?;
         let _roots = pool.lock_roots()?;
         let lease = pool.lease_deferred(record.operation_id)?;
         let directory = pool.lease_directory()?;
@@ -1492,13 +1585,19 @@ impl Store {
         }
         if let Some(restore) = restore {
             restore.validate()?;
-            let consumer: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='import')")
-                .bind(restore.consumer_operation.to_string()).fetch_one(&mut *tx).await?;
-            if !consumer {
-                return Err(invalid(
-                    "restore verification consumer disappeared before generation handoff",
-                ));
-            }
+            let consumer = sqlx::query(
+                "SELECT file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='import'",
+            )
+            .bind(restore.consumer_operation.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| invalid("restore verification consumer disappeared before generation handoff"))?;
+            validate_lease_identity(
+                &consumer,
+                consumer_lease
+                    .as_ref()
+                    .ok_or_else(|| invalid("restore verification consumer lease is missing"))?,
+            )?;
             sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2")
                 .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2")
@@ -1522,21 +1621,28 @@ impl Store {
             sqlx::query("INSERT OR IGNORE INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT OR IGNORE INTO storage_operation_cut(operation_id,cut_id) SELECT ?1,cut_id FROM storage_operation_cut WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             if let crate::store::restore::RestoreIdentity::LocalCut { id } = &restore.checkpoint {
-                let child:Option<(String,i64,String,String)>=sqlx::query_as("SELECT c.operation_id,c.child_index,c.machine_id,c.run_id FROM live_fork_child c JOIN live_fork f ON f.operation_id=c.operation_id JOIN local_cut l ON l.operation_id=f.operation_id WHERE c.consumer_id=?1 AND c.launch_id IS NULL AND c.name_reserved=1 AND l.cut_id=?2 AND json_extract(f.result_json,'$.cancellationRequested')=0 AND f.admission_complete=1").bind(restore.consumer_operation.to_string()).bind(id.to_string()).fetch_optional(&mut *tx).await?;
-                let Some((parent, index, machine, run)) = child else {
-                    return Err(invalid(
-                        "fork child generation handoff was cancelled or lost its reserved identity",
-                    ));
-                };
-                if machine != machine_id.to_string() || run != run_id.to_string() {
-                    return Err(invalid(
-                        "fork child generation changed reserved machine/run identity",
-                    ));
-                }
-                sqlx::query("UPDATE live_fork_child SET launch_id=?3 WHERE operation_id=?1 AND child_index=?2 AND launch_id IS NULL").bind(parent).bind(index).bind(record.operation_id.to_string()).execute(&mut *tx).await?;
+                bind_fork_child_handoff(
+                    &mut tx,
+                    restore.consumer_operation,
+                    id,
+                    machine_id,
+                    run_id,
+                    record.operation_id,
+                )
+                .await?;
             }
         }
         tx.commit().await?;
+        drop(_roots);
+        if restore.is_some() {
+            let budget_directory = crate::store::restore::budget_directory(self)?;
+            let _admission = crate::storage::locks::blocking(
+                &budget_directory,
+                "admission.lock",
+                nix::fcntl::FlockArg::LockExclusive,
+            )?;
+            crate::store::restore::write_budget_anchor(self, &budget_directory).await?;
+        }
         Ok(LaunchStorageLease {
             record,
             lease,
@@ -1571,18 +1677,13 @@ impl Store {
                     restore.checkpoint,
                     crate::store::restore::RestoreIdentity::LocalCut { .. }
                 ) {
-                    let row:Option<(String,i64,bool,String)>=sqlx::query_as("SELECT c.operation_id,c.child_index,json_extract(f.result_json,'$.cancellationRequested'),json(c.result_json) FROM live_fork_child c JOIN live_fork f ON f.operation_id=c.operation_id WHERE c.launch_id=?1 AND c.machine_id=?2 AND c.run_id=?3 AND c.submitted=0").bind(operation_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_optional(&mut *tx).await?;
-                    let Some((parent, index, cancelled, json)) = row else {
-                        return Err(invalid("fork launch lost its exact unsubmitted child slot"));
-                    };
-                    if cancelled {
-                        return Err(invalid("fork cancellation fences an unsubmitted launch"));
-                    }
-                    let mut child: crate::ForkChildResult =
-                        serde_json::from_str(&json).map_err(invalid)?;
-                    child.outcome = crate::ForkChildOutcome::Activating;
-                    sqlx::query("UPDATE live_fork_child SET submitted=1,result_json=jsonb(?3) WHERE operation_id=?1 AND child_index=?2").bind(&parent).bind(index).bind(serde_json::to_string(&child).map_err(invalid)?).execute(&mut *tx).await?;
-                    sqlx::query("INSERT OR IGNORE INTO fork_event(operation_id,child_index,phase,monotonic_ns) VALUES(?1,?2,'activating',?3)").bind(parent).bind(index).bind(crate::machine::live_fork::monotonic_ns()?).execute(&mut *tx).await?;
+                    admit_fork_child_launch(
+                        &mut tx,
+                        operation_id,
+                        record.machine_id,
+                        record.run_id,
+                    )
+                    .await?;
                 }
             }
         }
@@ -2137,5 +2238,226 @@ mod tests {
         cleanup.remove(temp.path()).unwrap();
         assert!(cleanup.recheck_absence().is_err());
         assert!(reoccupied.path().exists());
+    }
+
+    async fn prepared_fork_handoff() -> (
+        crate::store::capture::tests::Fixture,
+        crate::store::fork::VerifiedRestoreCut,
+    ) {
+        let fixture = crate::store::capture::tests::fork_fixture().await;
+        crate::store::capture::tests::seal(&fixture);
+        let store = &fixture.snapshots.store;
+        let capture = fixture.reservation.record.capture_id;
+        let operation = fixture.reservation.record.fork_operation_id.unwrap();
+        let (_, retained) = fixture
+            .snapshots
+            .retain_local_capture(capture)
+            .await
+            .unwrap();
+        let cut = store.open_local_cut(operation, retained).await.unwrap();
+        store.bind_fork_resources(&cut).await.unwrap();
+        (fixture, cut)
+    }
+
+    #[tokio::test]
+    async fn fork_cancel_before_handoff_releases_only_the_cancelled_child_reservation() {
+        use crate::store::operation_store::{admit_fork_child_launch, bind_fork_child_handoff};
+        use crate::ForkChildOutcome;
+        use uuid::Uuid;
+
+        let (fixture, cut) = prepared_fork_handoff().await;
+        let store = &fixture.snapshots.store;
+        let operation = cut.record.operation_id;
+        let children = store.fork_children(operation).await.unwrap();
+        let submitted = &children[0];
+        let cancelled = &children[1];
+        let submitted_run = Uuid::parse_str(submitted.result.run_id.as_str()).unwrap();
+        let cancelled_run = Uuid::parse_str(cancelled.result.run_id.as_str()).unwrap();
+        let launch = Uuid::new_v4();
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        bind_fork_child_handoff(
+            &mut tx,
+            submitted.consumer_id,
+            &cut.record.cut_id,
+            submitted.result.machine_id,
+            submitted_run,
+            launch,
+        )
+        .await
+        .unwrap();
+        admit_fork_child_launch(&mut tx, launch, submitted.result.machine_id, submitted_run)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // The committed cancel deterministically wins the second child's
+        // handoff, but cannot revoke the first child's submission receipt.
+        store
+            .update_fork(operation, |result| {
+                result.cancellation_requested = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let worker = pool.existing_lease(cancelled.consumer_id).unwrap();
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let error = bind_fork_child_handoff(
+            &mut tx,
+            cancelled.consumer_id,
+            &cut.record.cut_id,
+            cancelled.result.machine_id,
+            cancelled_run,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap_err();
+        tx.rollback().await.unwrap();
+        assert!(matches!(
+            &error,
+            crate::LibVmError::ForkChildCancelled { operation_id, child_index }
+                if *operation_id == operation && *child_index == cancelled.result.index
+        ));
+        store
+            .record_fork_child_failure(cancelled.result.machine_id, cancelled_run, &error)
+            .await
+            .unwrap();
+        store
+            .set_fork_child(
+                operation,
+                cancelled.result.index,
+                ForkChildOutcome::RecoveryPending {
+                    diagnostic: crate::machine::live_fork::diagnostic(&error),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert!(store
+            .fork_child_storage_operations_retained(cancelled.consumer_id, None)
+            .await
+            .unwrap());
+        drop(worker);
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert!(!store
+            .fork_child_storage_operations_retained(cancelled.consumer_id, None)
+            .await
+            .unwrap());
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM restore_resource_reservation WHERE budget_id=?1",
+        )
+        .bind(cancelled.consumer_id.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, 0);
+        let after = store.fork_children(operation).await.unwrap();
+        let outcome = after[1].failure.as_ref().unwrap().outcome();
+        assert_eq!(outcome, ForkChildOutcome::Cancelled);
+        store
+            .set_fork_child(operation, cancelled.result.index, outcome)
+            .await
+            .unwrap();
+        let after = store.fork_children(operation).await.unwrap();
+        assert_eq!(after[1].result.outcome, ForkChildOutcome::Cancelled);
+        assert!(after[1].launch_id.is_none());
+        assert!(!after[1].submitted);
+        assert_eq!(after[0].launch_id, Some(launch));
+        assert!(after[0].submitted);
+        assert_eq!(after[0].result.outcome, ForkChildOutcome::Activating);
+        assert!(after[0].failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn fork_cancel_after_handoff_is_cancelled_but_lost_identity_is_failed() {
+        use crate::store::operation_store::{admit_fork_child_launch, bind_fork_child_handoff};
+        use crate::{ForkChildOutcome, ForkFailurePhase};
+        use uuid::Uuid;
+
+        let (fixture, cut) = prepared_fork_handoff().await;
+        let store = &fixture.snapshots.store;
+        let operation = cut.record.operation_id;
+        let children = store.fork_children(operation).await.unwrap();
+        let child = &children[0];
+        let run = Uuid::parse_str(child.result.run_id.as_str()).unwrap();
+        let launch = Uuid::new_v4();
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        bind_fork_child_handoff(
+            &mut tx,
+            child.consumer_id,
+            &cut.record.cut_id,
+            child.result.machine_id,
+            run,
+            launch,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        store
+            .update_fork(operation, |result| {
+                result.cancellation_requested = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let error = admit_fork_child_launch(&mut tx, launch, child.result.machine_id, run)
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+        assert!(matches!(
+            &error,
+            crate::LibVmError::ForkChildCancelled { operation_id, child_index }
+                if *operation_id == operation && *child_index == child.result.index
+        ));
+        store
+            .record_fork_child_failure(child.result.machine_id, run, &error)
+            .await
+            .unwrap();
+
+        let lost = &children[1];
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let error = bind_fork_child_handoff(
+            &mut tx,
+            lost.consumer_id,
+            &cut.record.cut_id,
+            lost.result.machine_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap_err();
+        tx.rollback().await.unwrap();
+        assert!(matches!(
+            &error,
+            crate::LibVmError::InvalidStorageRecord { .. }
+        ));
+        store
+            .record_fork_child_failure(
+                lost.result.machine_id,
+                Uuid::parse_str(lost.result.run_id.as_str()).unwrap(),
+                &error,
+            )
+            .await
+            .unwrap();
+        let after = store.fork_children(operation).await.unwrap();
+        assert_eq!(
+            after[0].failure.as_ref().unwrap().outcome(),
+            ForkChildOutcome::Cancelled
+        );
+        assert!(!after[0].submitted);
+        assert!(matches!(
+            after[1].failure.as_ref().unwrap().outcome(),
+            ForkChildOutcome::Failed {
+                phase: ForkFailurePhase::Construction,
+                ..
+            }
+        ));
     }
 }

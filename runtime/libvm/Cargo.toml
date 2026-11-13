@@ -3,6 +3,11 @@ name = "libvm"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Dev-dependencies only: isolate every store open, including CLI subprocesses
+# and public store APIs that do not inherit a RuntimeConfig.
+test-isolated-resource-budget = []
+
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
 disk-image = { path = "../../common/disk-image", features = ["qcow2"] }
@@ -54,6 +59,7 @@ nix = { version = "0.31.3", features = ["inotify"] }
 vz = { path = "../../virt/vz" }
 
 [dev-dependencies]
+libvm = { path = ".", features = ["test-isolated-resource-budget"] }
 test-utils = { path = "../test-utils" }
 mockall = "0.15.0"
 tempfile = "3.27.0"

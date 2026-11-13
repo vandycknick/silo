@@ -2617,6 +2617,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hyper-util",
  "libc",
+ "libvm",
  "mockall",
  "nix 0.31.3",
  "oci",

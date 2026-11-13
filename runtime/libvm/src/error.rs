@@ -38,6 +38,12 @@ pub enum LibVmError {
     },
     #[error("live fork {operation_id} was not found")]
     LiveForkNotFound { operation_id: String },
+    /// The exact fork child was fenced before its native submission committed.
+    #[error("live fork {operation_id} child {child_index} was cancelled before submission")]
+    ForkChildCancelled {
+        operation_id: uuid::Uuid,
+        child_index: u32,
+    },
     #[error("checkpoint {checkpoint} refused at {}: pin {} expected {}, destination {}; no execution child was started", .refusal.stage, .refusal.pin, .refusal.expected, .refusal.actual)]
     CheckpointPortability {
         checkpoint: String,
@@ -388,6 +394,7 @@ impl LibVmError {
             Self::CheckpointPortability { .. } => "CheckpointPortability",
             Self::LiveFork { .. } => "LiveFork",
             Self::LiveForkNotFound { .. } => "LiveForkNotFound",
+            Self::ForkChildCancelled { .. } => "ForkChildCancelled",
             Self::Storage(_) => "Storage",
             Self::BootAsset(_) => "BootAsset",
             Self::DirectKernelRejected(_) => "DirectKernelRejected",

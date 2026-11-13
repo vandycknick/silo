@@ -13,6 +13,14 @@
   not call the frozen image init. Activation replaces image-managed network
   configuration, including DHCP state. Ordinary stop syncs guest filesystems
   before force-stopping an image-init VM.
+- Resource admission ignores disk and descriptor charges whose producing
+  process is gone (lease-backed charges), so a crashed restore, fork or import
+  in an abandoned home no longer shrinks every other home's budget. Ledger
+  anchors move to schema 2; running older builds concurrently is unsupported.
+  Host tests use per-home ledgers instead of the user's real one.
+- A live fork child cancelled before its launch reports `cancelled`, not
+  `failed`. A resume refused for missing pause authority names the observed
+  machine state.
 
 - Guest bootstrap failures now print diagnostics, sync and power off for every
   root type. Explicit `silo.rescue=on-failure` and `silo.rescue=always` kernel
