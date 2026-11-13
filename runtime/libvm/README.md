@@ -810,7 +810,25 @@ succeed. Disk and descriptor admission, closure authentication and compatibility
 checks remain mandatory. Resource reservations are serialized across runtime
 homes under one authenticated user's private `/tmp/silo-resource-budget-<euid>`
 ledger (`/private/tmp` on macOS). This is not cross-user or host-global authority.
-There is no fixed concurrent-restore limit. Charges survive caller loss.
+There is no fixed concurrent-restore limit. Charge documents survive caller loss,
+but admission counts only producers with a held kernel lease. Each home anchor
+binds charges to the exact operation-lease device and inode from its journal.
+Readers probe those leases without waiting under `admission.lock`; a free lease
+means that producer cannot write more bytes or retain descriptors. Its existing
+disk allocation is already visible in filesystem free-space measurements, so its
+peak and FD charge are ignored without deleting its document or retiring its
+journal. Reopening that home still performs ordinary journal reconciliation.
+Inherited native launch leases and detached workers remain counted after their
+caller dies. Fork inventories track capture writers and individual bound children
+separately, so a surviving sibling cannot retain dead children's disk peaks.
+Generation handoff retains the old consumer lease through the SQL ownership
+transfer, then takes `admission.lock` only to refresh the lease anchor. Fork
+cancellation fences exact unsubmitted handoffs and submissions; those children
+become cancelled after ownership cleanup, while genuinely lost identities remain
+failures. Already-submitted siblings keep their completion path.
+Resumed capture publication re-admits its disk and descriptor peaks before writing.
+The anchor schema is version 2; do not run older resource-ledger builds against
+the same user's ledger concurrently.
 The resource-only ledger uses a distinct namespace from older builds' RAM-aware
 `silo-restore-budget-<euid>` ledger. New builds never read that old directory,
 so incompatible homes cannot block a fresh home's admission. The old directory
@@ -818,15 +836,25 @@ may be deleted once no old-build Silo processes remain.
 Each ledger record is published by private staging, file fsync, atomic rename
 and directory fsync, after its SQL owner is committed. Readers see only complete
 old/new charges; abandoned `.atomic-write` staging is non-authoritative and is
-reclaimed under the admission lock. Malformed authoritative records still
-refuse admission. An interrupted construction-completion update conservatively
-retains the old disk peak until the owning home reconciles its committed charge.
-Construction disk peaks and manager-local descriptors are released only after
-the exact run's durable Running receipt. Existing holder and lease retirement
+reclaimed under the admission lock. Malformed authoritative records with live
+or unknown lease ownership still refuse admission. An interrupted
+construction-completion update conservatively retains the old disk peak while
+its producer is live, until the owning home reconciles its committed charge.
+Journal charges are released only after the exact run's durable Running receipt
+or the existing operation-retirement rules. Existing holder and lease retirement
 still protect mapped files independently of admission charges. Charge documents
 reject unknown fields through the existing invalid-document handling, without
 compatibility readers. Malformed documents in the new namespace still refuse
 admission with the owning home path and ledger cleanup guidance.
+
+Rust host tests enable libvm's `test-isolated-resource-budget` Cargo feature
+only through dev-dependencies. Every store open then uses
+`<fixture-home>/resource-budget`, including public `SnapshotStore`/`LayerStore`
+opens, CLI subprocesses and daemon-mode runtimes. Separate homes do not touch the
+user's real ledger; cross-home admission unit tests explicitly select one shared
+temporary directory. The feature has no environment-variable switch, is not a
+default feature and is never enabled by normal dependency edges or runtime
+staging/release builds.
 
 `restorePrepared` is not success. The manager waits for `started` only after
 fresh-generation acknowledgement, destination activation/thaw and final fence

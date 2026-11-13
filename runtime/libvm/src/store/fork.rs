@@ -30,20 +30,55 @@ pub(crate) struct ForkChildIdentity {
     pub failure: Option<ForkChildFailure>,
 }
 
-/// The observed restore failure survives deletion of the failed child, while
-/// its public outcome remains recovery-pending until ownership is retired.
+/// An observed refusal survives cleanup while the public outcome remains
+/// recovery-pending until ownership is retired.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ForkChildFailure {
-    pub phase: ForkFailurePhase,
-    pub diagnostic: vm_spec::lifecycle::Diagnostic,
+#[serde(untagged, rename_all_fields = "camelCase", deny_unknown_fields)]
+pub(crate) enum ForkChildFailure {
+    Cancelled {
+        cancellation: ForkChildCancellation,
+    },
+    Failed {
+        phase: ForkFailurePhase,
+        diagnostic: vm_spec::lifecycle::Diagnostic,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ForkChildCancellation {
+    BeforeSubmission,
 }
 
 impl ForkChildFailure {
+    fn from_error(operation: Uuid, index: u32, submitted: bool, error: &LibVmError) -> Self {
+        if matches!(
+            error,
+            LibVmError::ForkChildCancelled { operation_id, child_index }
+                if *operation_id == operation && *child_index == index && !submitted
+        ) {
+            Self::Cancelled {
+                cancellation: ForkChildCancellation::BeforeSubmission,
+            }
+        } else {
+            Self::Failed {
+                phase: if submitted {
+                    ForkFailurePhase::Activation
+                } else {
+                    ForkFailurePhase::Construction
+                },
+                diagnostic: crate::machine::live_fork::diagnostic(error),
+            }
+        }
+    }
+
     pub(crate) fn outcome(&self) -> ForkChildOutcome {
-        ForkChildOutcome::Failed {
-            phase: self.phase,
-            diagnostic: self.diagnostic.clone(),
+        match self {
+            Self::Cancelled { .. } => ForkChildOutcome::Cancelled,
+            Self::Failed { phase, diagnostic } => ForkChildOutcome::Failed {
+                phase: *phase,
+                diagnostic: diagnostic.clone(),
+            },
         }
     }
 }
@@ -473,24 +508,19 @@ impl Store {
         error: &LibVmError,
     ) -> Result<(), LibVmError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let submitted: Option<bool> = sqlx::query_scalar(
-            "SELECT submitted FROM live_fork_child WHERE machine_id=?1 AND run_id=?2",
+        let identity: Option<(String, i64, bool)> = sqlx::query_as(
+            "SELECT operation_id,child_index,submitted FROM live_fork_child WHERE machine_id=?1 AND run_id=?2",
         )
         .bind(machine.to_string())
         .bind(run.to_string())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(submitted) = submitted else {
+        let Some((operation, index, submitted)) = identity else {
             return Ok(());
         };
-        let failure = ForkChildFailure {
-            phase: if submitted {
-                ForkFailurePhase::Activation
-            } else {
-                ForkFailurePhase::Construction
-            },
-            diagnostic: crate::machine::live_fork::diagnostic(error),
-        };
+        let operation = Uuid::parse_str(&operation).map_err(|error| invalid(error.to_string()))?;
+        let index = u32::try_from(index).map_err(|error| invalid(error.to_string()))?;
+        let failure = ForkChildFailure::from_error(operation, index, submitted, error);
         sqlx::query("UPDATE live_fork_child SET failure_json=jsonb(?3) WHERE machine_id=?1 AND run_id=?2 AND failure_json IS NULL AND json_extract(result_json,'$.outcome.kind')!='running'")
             .bind(machine.to_string())
             .bind(run.to_string())
@@ -1604,5 +1634,79 @@ pub(crate) mod tests {
             result.children[1].outcome,
             ForkChildOutcome::Abandoned { .. }
         ));
+    }
+
+    #[test]
+    fn fork_cancellation_classification_requires_exact_unsubmitted_child() {
+        use crate::store::fork::ForkChildFailure;
+
+        let operation = Uuid::new_v4();
+        let index = 3;
+        for (error, submitted, cancelled) in [
+            (
+                crate::LibVmError::ForkChildCancelled {
+                    operation_id: operation,
+                    child_index: index,
+                },
+                false,
+                true,
+            ),
+            (
+                crate::LibVmError::ForkChildCancelled {
+                    operation_id: operation,
+                    child_index: index,
+                },
+                true,
+                false,
+            ),
+            (
+                crate::LibVmError::ForkChildCancelled {
+                    operation_id: Uuid::new_v4(),
+                    child_index: index,
+                },
+                false,
+                false,
+            ),
+            (
+                crate::LibVmError::ForkChildCancelled {
+                    operation_id: operation,
+                    child_index: index + 1,
+                },
+                false,
+                false,
+            ),
+            (
+                crate::LibVmError::InvalidStorageRecord {
+                    record: "storage-operation",
+                    message:
+                        "fork child generation handoff was cancelled or lost its reserved identity"
+                            .into(),
+                },
+                false,
+                false,
+            ),
+        ] {
+            let failure = ForkChildFailure::from_error(operation, index, submitted, &error);
+            let encoded = serde_json::to_vec(&failure).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ForkChildFailure>(&encoded).unwrap(),
+                failure
+            );
+            if cancelled {
+                assert_eq!(failure.outcome(), ForkChildOutcome::Cancelled);
+            } else {
+                assert_eq!(
+                    failure.outcome(),
+                    ForkChildOutcome::Failed {
+                        phase: if submitted {
+                            crate::ForkFailurePhase::Activation
+                        } else {
+                            crate::ForkFailurePhase::Construction
+                        },
+                        diagnostic: crate::machine::live_fork::diagnostic(error),
+                    }
+                );
+            }
+        }
     }
 }

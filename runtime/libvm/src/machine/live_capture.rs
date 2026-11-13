@@ -252,10 +252,18 @@ pub(crate) fn admission(
     let pause = match state {
         VmLifecycleState::Running => CapturePauseAuthority::Acquire,
         VmLifecycleState::Paused => {
-            let current = observation
-                .lifecycle()?
-                .current_pause
-                .ok_or_else(|| protocol("paused machine has no current pause authority"))?;
+            let lifecycle = observation.lifecycle()?;
+            let current = match lifecycle.current_pause {
+                Some(current) => current,
+                None => {
+                    return Err(crate::machine::live_operations::missing_pause_authority(
+                        observation,
+                        &lifecycle,
+                        Ok(None),
+                        "paused machine has no current pause authority",
+                    ));
+                }
+            };
             if current.token.owner != PauseOwner::User {
                 return Err(protocol(
                     "only a user-owned pause can be borrowed by a capture",
@@ -1413,6 +1421,24 @@ mod tests {
             }),
             ..LiveLifecycle::default()
         }
+    }
+
+    #[test]
+    fn capture_without_pause_authority_names_the_observed_state() {
+        let observation = observed(true, VmLifecycleState::Paused, LiveLifecycle::default());
+        let message = admission(&observation, CaptureResumePolicy::Preserve)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("paused machine has no current pause authority"),
+            "{message}"
+        );
+        assert!(message.contains("observed_state=paused"), "{message}");
+        assert!(
+            message.contains(&format!("machine_id={}", id(1))),
+            "{message}"
+        );
+        assert!(message.contains(&format!("run_id={}", id(2))), "{message}");
     }
 
     #[test]

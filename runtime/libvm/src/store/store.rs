@@ -68,7 +68,7 @@ pub(crate) struct Store {
     pub(super) catalog: std::sync::Arc<CatalogGuard>,
     #[cfg(test)]
     pub(super) layer_hook: Option<std::sync::Arc<crate::store::layer_store::tests::WorkerHook>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-isolated-resource-budget"))]
     pub(super) resource_budget_directory: Option<PathBuf>,
 }
 
@@ -136,7 +136,7 @@ impl Store {
             catalog: guard,
             #[cfg(test)]
             layer_hook: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-isolated-resource-budget"))]
             resource_budget_directory: Some(home.join("resource-budget")),
         };
         match store.recover_image_cache().await {
