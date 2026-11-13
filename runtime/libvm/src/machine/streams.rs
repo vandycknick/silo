@@ -378,6 +378,7 @@ pub enum MachineGuestBootMode {
     Standard,
     AgentPid1,
     InitChild,
+    ContainedInit,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineProvisioningReport {
@@ -1199,7 +1200,7 @@ protocol_enum!(connection_state, AgentConnectionState => MachineAgentConnectionS
 protocol_enum!(freshness, Freshness => MachineFreshness, { Fresh => Fresh, Stale => Stale });
 protocol_enum!(stale_reason, StaleReason => MachineStaleReason, { ReceiptAge => ReceiptAge, MonitorStopping => MonitorStopping });
 protocol_enum!(agent_status_state, AgentStatusState => MachineAgentStatusState, { Starting => Starting, Ready => Ready, Failed => Failed });
-protocol_enum!(boot_mode, GuestBootMode => MachineGuestBootMode, { Standard => Standard, AgentPid1 => AgentPid1, InitChild => InitChild });
+protocol_enum!(boot_mode, GuestBootMode => MachineGuestBootMode, { Standard => Standard, AgentPid1 => AgentPid1, InitChild => InitChild, ContainedInit => ContainedInit });
 protocol_enum!(provision_status, ProvisionOverallStatus => MachineProvisionOverallStatus, { Succeeded => Succeeded, Degraded => Degraded, Skipped => Skipped, FailedBoot => FailedBoot });
 protocol_enum!(step_status, ProvisionStepStatus => MachineAgentProvisionStepStatus, { Succeeded => Succeeded, Failed => Failed, Skipped => Skipped, Unsupported => Unsupported });
 protocol_enum!(failure_policy, ProvisionFailurePolicy => MachineAgentProvisionFailurePolicy, { BestEffort => BestEffort, FailBoot => FailBoot });
@@ -2156,6 +2157,14 @@ impl TryFrom<v1::WaitReadyResponse> for MachineReadiness {
 #[cfg(test)]
 mod tests {
     use crate::machine::streams::*;
+
+    #[test]
+    fn contained_init_boot_mode_is_preserved() {
+        assert_eq!(
+            boot_mode(v1::GuestBootMode::ContainedInit as i32, "boot.mode").unwrap(),
+            MachineGuestBootMode::ContainedInit
+        );
+    }
 
     struct ErrorAfterChunk(bool);
 

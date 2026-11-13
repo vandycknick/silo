@@ -148,7 +148,7 @@ not a Cargo test and not a new production control route:
 ```sh
 cargo build -p silo-vmm --example guest-lifecycle-controller
 make stage
-make smoke SMOKE_ARGS='-k "freeze_real_kernel or freeze_refuses_uncontained"'
+make smoke SMOKE_ARGS='-k freeze_real_kernel'
 ```
 
 `SILO_SMOKE_GUEST_LIFECYCLE_CONTROLLER` selects an absolute helper path for
@@ -170,8 +170,7 @@ double-forked descendants in a nested workload group, empty-root freeze,
 responsive status/metrics while frozen, mutation refusal, joined duplicate
 freezes, exact thaw, a deliberately discarded thaw acknowledgement, real
 next-epoch recovery freeze, stale-thaw rejection and unchanged source
-identity. The negative cold profile test verifies that image-owned init is
-named unsupported before the real kernel freeze changes.
+identity. Contained image-init coverage is in `test_contained_init.py` below.
 
 These are cold guest API oracles only. They do not qualify native pause,
 capture, restored generation/reseed ordering, restored network replacement,
@@ -193,11 +192,57 @@ reconciliation, exact replay and GetOperation, stale-token and paused-cancel
 refusal, fenced new execution, unchanged boot/run identity and reseed count,
 and the exact generation acknowledgement. A second pause is stopped without
 resuming; the gate waits for the actual owners and checks storage-lease release.
-The image-owned-init negative gate rejects before allocating a live command.
+An uncontained handoff is rejected before allocating a live command.
 
 `live_acceptance` is a standalone Rust public-API consumer, not a VM-starting
 Cargo test. Live support follows the backend and host's native primitives;
 runtime files and environment variables do not grant capabilities.
+
+### Contained image init (Phase 29)
+
+`tests/test_contained_init.py` is a Linux-only slow real-VM module. It boots
+`ghcr.io/vandycknick/archlinux:latest` with systemd and
+`docker.io/library/alpine:latest` with busybox init. The OpenRC cases install
+`openrc busybox-openrc` into their own Alpine VM, enable cgroups and crond,
+sync, then stop/start. No case overrides `init=` and no machine is shared
+between tests. The ordinary `pulled_images` fixture caches published image
+inputs; workspace teardown owns sources and all restore/fork children.
+
+```sh
+uv run --project smoke pytest smoke/tests/test_contained_init.py -m slow --keep
+```
+
+Public image pulls, OpenRC package installation and the networkd DNS probe
+need working registry/package/network access. Arch probes use systemd tools and
+`/proc`, not optional `ip` or `ps` packages. No ticker compiler or offline disk
+reader is needed.
+
+The raw and default layered-root matrix checks `contained-init`, PID 1 and
+exec namespace membership, pause/resume with an existing counter session,
+live snapshot/restore and fork, retained boot identity, rotated child identity,
+and surviving OpenRC services under the image cgroup. Systemd gates check
+delegated `MemoryMax=` OOM and `CPUQuota=` enforcement, agent resource
+protections, an exec's private cgroup mount, and a running ticker service in children.
+The ticker appends realtime nanoseconds every 50 ms to `/run/silo-contained-ticks`
+on tmpfs, so the child inherits the source prefix through captured RAM. The
+ordering oracle finds the largest gap between consecutive ticks, requires a gap
+of at least 500 ms, and rejects any tick after it that precedes the nanosecond
+mtime of `/run/silo/generation`. A `.path` unit must record the child
+run ID after activation, and the source identity stays unchanged. Busybox
+children must not acquire a machine-id file; an existing empty file must stay empty.
+
+Additional independent cases cover systemd-networkd DHCP after child network
+replacement, a deliberate privileged `setns` escape into `silo/control`
+refused with `guest-containment-escaped` while source exec remains usable,
+successful pause after removing that task, and immediate write/stop/start
+durability without a test-side sync. Every initial-namespace cgroup2 probe
+mount preserves `nsdelegate,memory_recursiveprot` in a private mount namespace.
+Commands, JSON identities, refusal diagnostics, inherited ticks, generation mtime
+and post-thaw reactions are retained by the evidence-recording CLI/workspace.
+
+Run the same selection with private workspaces on Btrfs and ext4; the module
+does not substitute one host filesystem for the other or claim either lane
+has passed merely from collecting it.
 
 ### Full live capture (Phase 14)
 
@@ -1052,9 +1097,10 @@ source identity, relay its selected listener with the destination token, and
 reject the old instance, cursor and listener. The positive test runs two
 children and an ordinary source ClockOnly resume/Thaw. Slow tests cover hook
 failure/timeout/background descendants, listener conflict, lost Activate reply
-replay, lost Thaw with a real next-epoch freeze, and captured-topology refusal;
-failed children stay frozen and fenced and are stopped/reaped by their native
-owner. `restored-report.json`, `attach/`, `wire.jsonl`, native command logs and
+replay, lost Thaw with a real next-epoch freeze, and replacement of captured
+extra managed-link addresses. Network-presence mismatch still rejects without
+effects. Failed children stay frozen and fenced and are stopped/reaped by their
+native owner. `restored-report.json`, `attach/`, `wire.jsonl`, native command logs and
 `inputs.json` under the cohort evidence directory are the evidence.
 Activated status must report the destination IPv4 and no captured source IPv4.
 The agent refreshes kernel-observed system facts once at activation completion

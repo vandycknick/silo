@@ -221,6 +221,7 @@ lifecycle_enum!(LiveFailureCode {
     GuestUnavailable => "guest-unavailable",
     GuestIdentityMismatch => "guest-identity-mismatch",
     FreezeFailed => "freeze-failed",
+    GuestContainmentEscaped => "guest-containment-escaped",
     FreezeTimedOut => "freeze-timed-out",
     NativePauseFailed => "native-pause-failed",
     NativeUncertain => "native-uncertain",

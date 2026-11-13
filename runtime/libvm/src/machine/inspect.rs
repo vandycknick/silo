@@ -387,6 +387,7 @@ pub enum MachineBootMode {
     Standard,
     AgentPid1,
     InitChild,
+    ContainedInit,
 }
 
 impl MachineBootMode {
@@ -396,6 +397,7 @@ impl MachineBootMode {
             GuestBootMode::Standard => Self::Standard,
             GuestBootMode::AgentPid1 => Self::AgentPid1,
             GuestBootMode::InitChild => Self::InitChild,
+            GuestBootMode::ContainedInit => Self::ContainedInit,
         }
     }
 
@@ -405,6 +407,7 @@ impl MachineBootMode {
             Self::Standard => "standard",
             Self::AgentPid1 => "agent-pid1",
             Self::InitChild => "init-child",
+            Self::ContainedInit => "contained-init",
         }
     }
 }
@@ -830,6 +833,47 @@ fn agent_reports_ready(agent: Option<&HostAgent>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn boot_modes_preserve_protocol_values_and_public_labels() {
+        use crate::machine::inspect::MachineBootMode;
+        use protocol::v1::GuestBootMode;
+
+        for (wire, mode, label) in [
+            (
+                GuestBootMode::Unspecified,
+                MachineBootMode::Unspecified,
+                "unspecified",
+            ),
+            (
+                GuestBootMode::Standard,
+                MachineBootMode::Standard,
+                "standard",
+            ),
+            (
+                GuestBootMode::AgentPid1,
+                MachineBootMode::AgentPid1,
+                "agent-pid1",
+            ),
+            (
+                GuestBootMode::InitChild,
+                MachineBootMode::InitChild,
+                "init-child",
+            ),
+            (
+                GuestBootMode::ContainedInit,
+                MachineBootMode::ContainedInit,
+                "contained-init",
+            ),
+        ] {
+            assert_eq!(MachineBootMode::from_protocol(wire as i32), mode);
+            assert_eq!(mode.label(), label);
+        }
+        assert_eq!(
+            MachineBootMode::from_protocol(i32::MAX),
+            MachineBootMode::Unspecified
+        );
+    }
+
     #[test]
     fn retained_guest_ready_does_not_override_stale_current_readiness() {
         let status = MachineStatus::from_protocol(protocol::v1::HostStatus {

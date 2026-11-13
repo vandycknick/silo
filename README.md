@@ -124,6 +124,68 @@ controls and creates a new filesystem UUID/identity. It is not sanitization or
 an exact checkpoint. Export currently requires Linux direct boot; EFI and macOS
 roots are rejected. No EFI layout or provider bootloader is synthesized.
 
+## Live operations with stock images
+
+On supported libkrun hosts, stock systemd, busybox and OpenRC images support
+pause/resume, live snapshots, restore and live fork without an `init=` override.
+The image init remains PID 1 inside a contained cgroup namespace; Silo sessions
+use a separate workload cgroup. `silo info` reports boot mode `contained-init`.
+
+```sh
+silo create ghcr.io/vandycknick/archlinux:latest --name dev --memory 1gib
+silo start dev
+silo pause dev
+silo resume dev
+silo snapshot create dev --live --name dev-checkpoint
+silo restore image:dev-checkpoint --name restored
+silo fork dev --live --name child
+```
+
+Before a restored or forked child runs image services, Silo reseeds the kernel
+RNG, reapplies networking, replaces an existing non-empty `/etc/machine-id` with
+the child's Silo machine ID (32 lowercase hex), and atomically replaces
+`/run/silo/generation` with its run ID. Missing or empty machine-id files stay
+unchanged. The generation file is not written at cold boot or into the source.
+Other guest identities and userspace RNG caches are not automatically reset.
+
+An image can react after thaw using its init's file watch. For systemd, install
+these two files in the guest and run
+`systemctl daemon-reload && systemctl enable --now silo-generation.path`:
+
+```ini
+# /etc/systemd/system/silo-generation.path
+[Unit]
+Description=Watch Silo restore and fork activation
+[Path]
+PathChanged=/run/silo/generation
+Unit=silo-generation.service
+[Install]
+WantedBy=multi-user.target
+```
+
+```ini
+# /etc/systemd/system/silo-generation.service
+[Unit]
+Description=Refresh cached guest identity after Silo activation
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart systemd-journald.service systemd-networkd.service
+```
+
+Adapt the service list to the image and restart applications with cached
+identity or userspace randomness as needed. The file-watch event runs after
+thaw. Do not call `systemctl` from a Silo activation hook: hooks run before
+thaw with the image init frozen, so that call blocks until the hook deadline.
+Activation replaces image-managed network configuration once; network managers
+can resume DHCP afterwards.
+
+Containment checks refuse escaped tasks with `guest-containment-escaped` and
+leave the source running. They detect accidents and naive escapes, not
+malicious guest root. Guest root's `kill -9 -1` can kill the agent; host
+`silo stop` still recovers the VM. With image-owned PID 1, ordinary stop syncs
+guest filesystems before the host force stop, but does not shut down image
+services in an orderly manner. See [ADR 0021](docs/adr/0021-live-snapshots-and-forks.md).
+
 ## Stopped handoff
 
 `silo handoff` coordinates two already-running, same-user daemons selected by

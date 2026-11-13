@@ -13,8 +13,8 @@ RESTORED = "reclaim-b"
 
 
 def create(silo: Silo, image: str, profile: RootProfile) -> reclaim.Sample:
-    # BASIC, as in the restore suites, removes /sbin/init. The explicit empty
-    # init also prevents an image-init handoff from making live capture ineligible.
+    # Keep this memory-accounting fixture in the AgentPid1 profile, as in the
+    # restore suites. Contained image-init coverage lives in test_contained_init.
     silo.create(SOURCE, silo.root_image(image, profile), "--cpus", "2", "--memory", "4gib",
                 "--disk-size", "512mib", "--vsock", "--network", "none", "--kernel-arg", "init=")
     silo.start(SOURCE)

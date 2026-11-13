@@ -302,3 +302,22 @@ fn provision_summary(provision: &crate::view::MachineGuestProvisionReportView) -
         provision.status, provision.step_count, provision.failed_step_count, provision.duration_ms
     )
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn contained_init_summary_distinguishes_image_init_from_agent_pid() {
+        let boot = crate::view::MachineGuestBootReportView {
+            mode: "contained-init".into(),
+            requested_init: Some("/sbin/init".into()),
+            handoff_init_path: Some("/sbin/init".into()),
+            agent_pid: 42,
+            agent_is_pid1: false,
+            message: None,
+        };
+        assert_eq!(
+            crate::commands::info::boot_summary(&boot),
+            "contained-init -> /sbin/init pid=42"
+        );
+    }
+}

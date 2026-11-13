@@ -208,7 +208,7 @@ impl Capacity {
 
 fn root_storage() -> Result<Option<RootStorageMetrics>, String> {
     let Some(observation) =
-        crate::root_storage::retained_root().map_err(|error| error.to_string())?
+        crate::root_storage::retained_root().map_err(|error| format!("{error:#}"))?
     else {
         return Ok(None);
     };

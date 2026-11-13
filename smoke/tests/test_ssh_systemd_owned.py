@@ -92,7 +92,8 @@ def _profile_start(workspace: Workspace, name: str) -> tuple[int, ProcessSample]
         return None
     pid = procs.vmm_pid(workspace, name)
     assert pid is not None
-    assert "silo-vmm" in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[0].decode()
+    # The monitor is exec'd from a retained descriptor, so argv[0] is /proc/self/fd/N.
+    assert Path(f"/proc/{pid}/exe").resolve().name == "silo-vmm"
     return pid, ProcessSample.read(pid)
 
 

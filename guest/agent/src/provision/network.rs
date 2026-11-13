@@ -1,10 +1,10 @@
 //! Static cold provisioning and the single fenced live-activation replacement.
 //!
 //! Cold boot discovers the configured MAC once and retains the actual interface object,
-//! network namespace, ifindex and managed IPv4/default-route/DNS identity. Activation
-//! never discovers by the destination MAC or invokes an external network manager.
-//! It rejects ambiguous aliases/routes, replaces source state on that same object,
-//! deletes normal and proxy neighbour entries, and checks local kernel and DNS readback.
+//! network namespace, ifindex and managed IPv4/DNS identity. Activation never discovers
+//! by the destination MAC or invokes an external network manager. It replaces all
+//! addresses and routes on that same object, deletes normal and proxy neighbour
+//! entries, and strictly checks destination kernel and DNS readback.
 //! Automatic IPv6 link-local state is discarded during replacement; configured IPv6
 //! attachments remain unsupported. No gateway traffic is sent before host fence release.
 //! A failed transaction has no source-identity rollback; lifecycle failure is sticky.
@@ -38,7 +38,6 @@ const LOOPBACK_INTERFACE: &str = "lo";
 pub(crate) struct AppliedNetwork {
     index: u32,
     interface: NetworkInterfaceConfig,
-    default_route: RouteMessage,
     identity: Arc<LinkIdentity>,
 }
 
@@ -112,7 +111,6 @@ pub(crate) async fn activate_network(
     if actual_mac != source_mac && actual_mac != target_mac {
         eyre::bail!("managed interface MAC is neither source nor destination identity");
     }
-    validate_state(&before, applied.index, &applied.interface, true)?;
 
     handle
         .link()
@@ -120,19 +118,7 @@ pub(crate) async fn activate_network(
         .execute()
         .await
         .context("bring retained managed interface down for activation")?;
-    if let Err(error) = handle
-        .route()
-        .del(applied.default_route.clone())
-        .execute()
-        .await
-    {
-        if !already_absent(&error) {
-            return Err(error).context("delete source managed default route");
-        }
-    }
     for address in before.addresses {
-        // The admitted shape includes only the managed IPv4 address and automatic IPv6
-        // link-local addresses. Remove both so no MAC-derived source address survives.
         if let Err(error) = handle.address().del(address).execute().await {
             if !already_absent(&error) {
                 return Err(error).context("delete source managed interface address");
@@ -140,14 +126,14 @@ pub(crate) async fn activate_network(
         }
     }
     let remaining = network_state(handle, applied.index).await?;
-    if remaining
-        .addresses
-        .iter()
-        .any(|address| address.header.family == AddressFamily::Inet)
-        || !remaining.routes.is_empty()
-    {
-        eyre::bail!("source managed IPv4 identity remains after deletion");
+    for route in remaining.routes.into_iter().chain(remaining.ipv6_routes) {
+        if let Err(error) = handle.route().del(route).execute().await {
+            if !already_absent(&error) {
+                return Err(error).context("delete source managed interface route");
+            }
+        }
     }
+    validate_cleared_state(&network_state(handle, applied.index).await?)?;
     handle
         .link()
         .set(
@@ -167,14 +153,13 @@ pub(crate) async fn activate_network(
     if !after.link.header.flags.contains(LinkFlags::Up) || link_mac(&after.link)? != target_mac {
         eyre::bail!("destination managed link readback differs from requested identity");
     }
-    let default_route = validate_state(&after, applied.index, interface, true)?.clone();
+    validate_state(&after, applied.index, interface, true)?;
     let resolver = Path::new("/etc/resolv.conf");
     replace_resolv_conf_at(resolver, &interface.dns)?;
     verify_resolv_conf_at(resolver, &interface.dns)?;
     Ok(AppliedNetwork {
         index: applied.index,
         interface: interface.clone(),
-        default_route,
         identity: Arc::clone(&applied.identity),
     })
 }
@@ -256,7 +241,7 @@ async fn configure_interface(
     if link_mac(&state.link)? != interface.mac_address_bytes()? {
         eyre::bail!("cold-provisioned managed interface MAC changed during setup");
     }
-    let default_route = validate_state(&state, index, interface, false)?.clone();
+    validate_state(&state, index, interface, false)?;
     let identity = LinkIdentity {
         device: File::open(device_path(&state.link)?).context("retain managed network device")?,
         namespace: File::open("/proc/self/ns/net").context("retain managed network namespace")?,
@@ -264,7 +249,6 @@ async fn configure_interface(
     Ok(AppliedNetwork {
         index,
         interface: interface.clone(),
-        default_route,
         identity: Arc::new(identity),
     })
 }
@@ -326,7 +310,7 @@ async fn network_state(handle: &rtnetlink::Handle, index: u32) -> eyre::Result<N
         .context("read managed interface addresses")?;
     let all_routes: Vec<RouteMessage> = handle
         .route()
-        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+        .get(route_dump_message(AddressFamily::Inet))
         .execute()
         .try_collect()
         .await
@@ -337,7 +321,7 @@ async fn network_state(handle: &rtnetlink::Handle, index: u32) -> eyre::Result<N
         .collect();
     let all_ipv6: Vec<RouteMessage> = handle
         .route()
-        .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
+        .get(route_dump_message(AddressFamily::Inet6))
         .execute()
         .try_collect()
         .await
@@ -354,12 +338,25 @@ async fn network_state(handle: &rtnetlink::Handle, index: u32) -> eyre::Result<N
     })
 }
 
+fn route_dump_message(family: AddressFamily) -> RouteMessage {
+    let mut message = RouteMessage::default();
+    message.header.address_family = family;
+    message
+}
+
 fn route_uses_interface(route: &RouteMessage, index: u32) -> bool {
     route.attributes.iter().any(|attribute| match attribute {
         RouteAttribute::Oif(output) => *output == index,
         RouteAttribute::MultiPath(hops) => hops.iter().any(|hop| hop.interface_index == index),
         _ => false,
     })
+}
+
+fn validate_cleared_state(state: &NetworkState) -> eyre::Result<()> {
+    if !state.addresses.is_empty() || !state.routes.is_empty() || !state.ipv6_routes.is_empty() {
+        eyre::bail!("source managed interface addresses or routes remain after deletion");
+    }
+    Ok(())
 }
 
 fn link_mac(link: &LinkMessage) -> eyre::Result<[u8; 6]> {
@@ -438,12 +435,12 @@ fn automatic_ipv6_link_local(address: &AddressMessage) -> bool {
         })
 }
 
-fn validate_state<'a>(
-    state: &'a NetworkState,
+fn validate_state(
+    state: &NetworkState,
     index: u32,
     interface: &NetworkInterfaceConfig,
     strict: bool,
-) -> eyre::Result<&'a RouteMessage> {
+) -> eyre::Result<()> {
     let mut addresses = 0;
     for address in &state.addresses {
         if address.header.index != index {
@@ -476,7 +473,9 @@ fn validate_state<'a>(
     {
         eyre::bail!("managed IPv4 attachment has unsupported IPv6 routes");
     }
-    default.ok_or_else(|| eyre::eyre!("managed default route readback is missing"))
+    default
+        .map(|_| ())
+        .ok_or_else(|| eyre::eyre!("managed default route readback is missing"))
 }
 
 fn route_table(route: &RouteMessage) -> u32 {
@@ -778,10 +777,26 @@ mod tests {
 
     use crate::provision::network::{
         interface_name_for_mac_in, link_mac, link_up_message, render_resolv_conf,
-        replace_resolv_conf, route_uses_interface, same_file, temporary_resolv_path,
-        validate_state, verify_resolv_conf, AppliedNetwork, LinkIdentity, NetworkState,
+        replace_resolv_conf, route_dump_message, route_uses_interface, same_file,
+        temporary_resolv_path, validate_cleared_state, validate_state, verify_resolv_conf,
+        AppliedNetwork, LinkIdentity, NetworkState,
     };
     use crate::provision::ProvisionContext;
+
+    #[test]
+    fn route_dumps_do_not_filter_table_or_protocol() {
+        for family in [
+            rtnetlink::packet_route::AddressFamily::Inet,
+            rtnetlink::packet_route::AddressFamily::Inet6,
+        ] {
+            let message = route_dump_message(family);
+            assert_eq!(message.header.address_family, family);
+            assert_eq!(message.header.table, 0);
+            assert_eq!(message.header.protocol, RouteProtocol::Unspec);
+            assert_eq!(message.header.kind, RouteType::Unspec);
+            assert!(message.attributes.is_empty());
+        }
+    }
 
     #[test]
     fn link_up_message_sets_interface_up() {
@@ -977,6 +992,50 @@ mod tests {
     }
 
     #[test]
+    fn route_selection_includes_dhcp_and_ipv6_in_any_table() {
+        let mut dhcp = RouteMessageBuilder::<Ipv4Addr>::new()
+            .output_interface(7)
+            .protocol(RouteProtocol::Dhcp)
+            .table_id(1000)
+            .build();
+        dhcp.attributes.push(RouteAttribute::Priority(1024));
+        assert!(route_uses_interface(&dhcp, 7));
+        assert!(!route_uses_interface(&dhcp, 8));
+        let ipv6 = RouteMessageBuilder::<Ipv6Addr>::new()
+            .output_interface(7)
+            .table_id(1001)
+            .gateway("fe80::1".parse().unwrap())
+            .build();
+        assert!(route_uses_interface(&ipv6, 7));
+        assert!(!route_uses_interface(&ipv6, 8));
+    }
+
+    #[test]
+    fn cleared_state_requires_no_addresses_or_routes_in_either_family() {
+        let mut state = state(&interface());
+        assert!(validate_cleared_state(&state).is_err());
+        state.addresses.clear();
+        assert!(validate_cleared_state(&state).is_err());
+        state.routes.clear();
+        assert!(validate_cleared_state(&state).is_ok());
+        state.addresses.push(
+            AddressMessageBuilder::<Ipv6Addr>::new()
+                .index(7)
+                .address("fe80::7".parse().unwrap(), 64)
+                .build(),
+        );
+        assert!(validate_cleared_state(&state).is_err());
+        state.addresses.clear();
+        state.ipv6_routes.push(
+            RouteMessageBuilder::<Ipv6Addr>::new()
+                .output_interface(7)
+                .gateway("fe80::1".parse().unwrap())
+                .build(),
+        );
+        assert!(validate_cleared_state(&state).is_err());
+    }
+
+    #[test]
     fn activation_readback_rejects_global_ipv6_but_allows_automatic_link_local() {
         let interface = interface();
         let mut state = state(&interface);
@@ -1025,11 +1084,9 @@ mod tests {
     #[test]
     fn activation_payload_validation_reuses_provisioning_bounds_before_effects() {
         let interface = interface();
-        let state = state(&interface);
         let applied = AppliedNetwork {
             index: 7,
             interface: interface.clone(),
-            default_route: state.routes[0].clone(),
             identity: Arc::new(LinkIdentity {
                 device: File::open("/dev/null").expect("retained descriptor"),
                 namespace: File::open("/proc/self/ns/net").expect("retained namespace"),

@@ -47,6 +47,19 @@ struct AgentState {
     orderly: std::sync::Arc<crate::orderly_shutdown::OrderlyShutdown>,
 }
 
+struct ShutdownAdmission<'a> {
+    runtime: &'a crate::lifecycle::RuntimeContext,
+    committed: bool,
+}
+
+impl Drop for ShutdownAdmission<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.runtime.cancel_shutdown_admission();
+        }
+    }
+}
+
 impl AgentServer {
     pub(crate) async fn start(
         port: u32,
@@ -682,25 +695,28 @@ impl GuestAgentService for AgentService {
             ));
         }
         self.state.runtime.admit_shutdown()?;
-        let current = self.state.runtime.expected();
-        let completion = match self.state.orderly.admit(
-            identity.clone(),
-            &manifest,
-            &current.agent_instance_id,
-            &current.boot_id,
-            self.state.process_supervisor.is_active(),
-        ) {
-            Ok(completion) => completion,
-            Err(error) => {
-                self.state.runtime.cancel_shutdown_admission();
-                return Err(error);
-            }
+        let mut admission = ShutdownAdmission {
+            runtime: &self.state.runtime,
+            committed: false,
         };
+        let current = self.state.runtime.expected();
+        let completion = self
+            .state
+            .orderly
+            .admit(
+                identity.clone(),
+                &manifest,
+                &current.agent_instance_id,
+                &current.boot_id,
+                self.state.process_supervisor.is_active(),
+            )
+            .await?;
         let guard = crate::orderly_shutdown::ExchangeGuard(self.state.orderly.clone());
         self.state
             .process_supervisor
             .request_orderly_shutdown()
             .map_err(|error| Status::internal(error.to_string()))?;
+        admission.committed = true;
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         tokio::spawn(async move {
             let result = shutdown_exchange(input, identity, completion, &sender, &guard).await;
@@ -916,7 +932,26 @@ fn admission(
 mod tests {
     use prost_types::Duration as ProtoDuration;
 
-    fn exchange_fixture() -> (
+    #[test]
+    fn cancelled_shutdown_admission_reopens_runtime() {
+        let runtime = crate::lifecycle::RuntimeContext::for_tests();
+        runtime.admit_shutdown().unwrap();
+        let admission = crate::rpc::ShutdownAdmission {
+            runtime: &runtime,
+            committed: false,
+        };
+        assert!(runtime.admit_shutdown().is_err());
+        drop(admission);
+        runtime.admit_shutdown().unwrap();
+        let admission = crate::rpc::ShutdownAdmission {
+            runtime: &runtime,
+            committed: true,
+        };
+        drop(admission);
+        assert!(runtime.admit_shutdown().is_err());
+    }
+
+    async fn exchange_fixture() -> (
         std::sync::Arc<crate::orderly_shutdown::OrderlyShutdown>,
         protocol::shutdown::ShutdownIdentity,
         tokio::sync::watch::Receiver<Option<protocol::v1::ShutdownCompleted>>,
@@ -951,13 +986,14 @@ mod tests {
                 &identity.boot_id,
                 true,
             )
+            .await
             .unwrap();
         (owner, identity, completion)
     }
 
     #[tokio::test]
     async fn shutdown_exchange_rejects_receipt_before_actual_completion() {
-        let (owner, identity, completion) = exchange_fixture();
+        let (owner, identity, completion) = exchange_fixture().await;
         let (input, incoming) = tokio::sync::mpsc::channel(1);
         let (output, mut outgoing) = tokio::sync::mpsc::channel(2);
         let exchange = tokio::spawn({
@@ -999,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_exchange_delivers_sticky_completion_before_receipt() {
-        let (owner, identity, completion) = exchange_fixture();
+        let (owner, identity, completion) = exchange_fixture().await;
         let (input, incoming) = tokio::sync::mpsc::channel(1);
         let (output, mut outgoing) = tokio::sync::mpsc::channel(2);
         let exchange = tokio::spawn({

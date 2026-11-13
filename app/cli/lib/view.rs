@@ -474,6 +474,26 @@ mod tests {
 
     use crate::view::{agent_label, retention_label};
 
+    #[test]
+    fn contained_init_boot_report_retains_label_and_agent_identity() {
+        let report = libvm::MachineBootReport {
+            mode: libvm::MachineBootMode::ContainedInit,
+            requested_init: Some("/sbin/init".into()),
+            handoff_init_path: Some("/sbin/init".into()),
+            probed_init_paths: Vec::new(),
+            agent_path: Some("/run/agent/silo-agent".into()),
+            agent_pid: 42,
+            agent_is_pid1: false,
+            message: None,
+        };
+        let view = crate::view::MachineGuestBootReportView::new(&report);
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json["mode"], "contained-init");
+        assert_eq!(json["agent_pid"], 42);
+        assert_eq!(json["agent_is_pid1"], false);
+        assert_eq!(json["handoff_init_path"], "/sbin/init");
+    }
+
     fn reclaim_report(
         backing: libvm::MachineHostMemoryReclaimBacking,
     ) -> libvm::MachineHostMemoryReclaim {

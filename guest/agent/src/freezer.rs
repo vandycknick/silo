@@ -1,8 +1,8 @@
 //! Retained cgroup-v2 targets and reversible, pre-exec workload admission.
 //!
-//! This is the Silo-managed AgentPid1 profile, not containment of an arbitrary
-//! image-owned cgroup manager. Epochs, RPC ownership and rollback belong to the
-//! lifecycle coordinator. Dropping a controller never thaws the workload.
+//! Image init and Silo exec sessions share the workloads freeze switch, in
+//! separate image and exec leaves. Retained descriptors survive the image's
+//! cgroup namespace remount. Lifecycle owns epochs and rollback; drop never thaws.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -14,7 +14,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use eyre::Context;
-use nix::fcntl::{openat, OFlag};
+use nix::fcntl::{open, openat, OFlag};
+use nix::sched::{unshare, CloneFlags};
 use nix::sys::stat::Mode;
 use nix::sys::statfs::{fstatfs, CGROUP2_SUPER_MAGIC};
 use tokio::io::unix::AsyncFd;
@@ -71,8 +72,11 @@ impl Drop for SpawnPermit {
 struct Targets {
     root: File,
     silo: File,
+    procfs: File,
     control: Group,
     workloads: Group,
+    image: Group,
+    exec: Group,
     activation: Group,
 }
 
@@ -86,7 +90,10 @@ struct Group {
 impl WorkloadController {
     pub(crate) fn discover() -> Self {
         let (targets, unavailable) = match Targets::open() {
-            Ok(targets) => (Some(targets), None),
+            Ok(targets) => {
+                targets.configure();
+                (Some(targets), None)
+            }
             Err(error) => {
                 tracing::warn!(%error, "live workload containment unavailable; cold boot retained");
                 (
@@ -110,9 +117,9 @@ impl WorkloadController {
 
     pub(crate) fn qualify_profile(&self, boot: &BootMode) {
         let reason = match boot {
-            BootMode::AgentPid1 { .. } => None,
+            BootMode::AgentPid1 { .. } | BootMode::ContainedInit { .. } => None,
             BootMode::InitChild { .. } => Some(
-                "unsupported guest profile InitChild: image-owned cgroup management is not contained"
+                "unsupported guest profile InitChild: image init cgroup containment was not established"
                     .to_owned(),
             ),
             BootMode::Standard => Some(
@@ -172,11 +179,19 @@ impl WorkloadController {
             .workloads
             .set_frozen(true, deadline)
             .await?;
+        // A task killed while frozen (an exec session torn down by its client)
+        // runs only its kernel exit path, but cgroup.events reports frozen 0
+        // until it is gone. Wait for the settled state again instead of
+        // failing; a target that never re-settles still misses the deadline.
+        let workloads = &self.live_targets()?.workloads;
+        let events = workloads.subscribe()?;
+        workloads
+            .wait_event(&events, "frozen", true, deadline)
+            .await
+            .context("workload cgroup did not stay frozen after completion")?;
         // An empty frozen cgroup can be removed. A notification from a retained
         // but unlinked target must never certify a recreated path.
-        if !self.is_frozen()? {
-            eyre::bail!("workload cgroup lost frozen state after completion");
-        }
+        self.live_targets()?;
         Ok(())
     }
 
@@ -197,6 +212,31 @@ impl WorkloadController {
 
     pub(crate) fn activation_populated(&self) -> eyre::Result<bool> {
         Ok(self.live_targets()?.activation.event("populated")?)
+    }
+
+    pub(crate) fn check_containment(&self) -> Result<(), tonic::Status> {
+        let targets = self.live_targets().map_err(|error| {
+            crate::containment::failure(0, 0, "unknown", "unknown", &error.to_string())
+        })?;
+        crate::containment::check(
+            &targets.root,
+            &targets.silo,
+            &targets.control.directory,
+            &targets.activation.directory,
+            &targets.procfs,
+            false,
+        )
+    }
+
+    pub(crate) fn reclaim_directory(&self) -> io::Result<Option<File>> {
+        self.inner
+            .targets
+            .as_ref()
+            .map(|targets| {
+                targets.validate()?;
+                targets.workloads.directory.try_clone()
+            })
+            .transpose()
     }
 
     /// Parent-side placement preparation. No allocation, logging or locking is
@@ -264,21 +304,42 @@ impl WorkloadController {
     }
 
     fn prepare_command(&self, command: &mut Command, role: SpawnRole) -> io::Result<()> {
+        // Only an agent that protected itself (-1000 after handoff) must undo
+        // that for children; lowering an inherited positive value needs
+        // CAP_SYS_RESOURCE, so never write when there is nothing to undo.
+        let reset_oom = agent_oom_protected()?;
         if let Some(targets) = &self.inner.targets {
             targets.validate()?;
             let group = match role {
-                SpawnRole::Workload => &targets.workloads,
+                SpawnRole::Workload => &targets.exec,
                 SpawnRole::ActivationHook => &targets.activation,
             };
             let procs = group.procs.try_clone()?;
             unsafe {
-                command.pre_exec(move || write_current_process(&procs));
+                command.pre_exec(move || {
+                    write_current_process(&procs)?;
+                    // std applies Command::uid before pre_exec. A non-root
+                    // session can neither mount cgroupfs nor migrate tasks,
+                    // so its own cgroup namespace would add nothing (and
+                    // unshare needs CAP_SYS_ADMIN).
+                    if nix::unistd::geteuid().is_root() {
+                        unshare(CloneFlags::CLONE_NEWCGROUP).map_err(io::Error::from)?;
+                    }
+                    if reset_oom {
+                        reset_oom_score_adj()?;
+                    }
+                    Ok(())
+                });
             }
         } else if role == SpawnRole::ActivationHook {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "activation cgroup unavailable",
             ));
+        } else if reset_oom {
+            unsafe {
+                command.pre_exec(reset_oom_score_adj);
+            }
         }
         Ok(())
     }
@@ -286,10 +347,11 @@ impl WorkloadController {
     /// The handoff parent is image PID1, not the agent child. This happens
     /// before the runtime exists; never migrate the multithreaded agent.
     pub(crate) fn place_handoff_parent(&self) -> io::Result<()> {
-        if let Some(targets) = &self.inner.targets {
-            targets.validate()?;
-            write_current_process(&targets.workloads.procs)?;
-        }
+        let targets = self.inner.targets.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "image cgroup unavailable")
+        })?;
+        targets.validate()?;
+        write_current_process(&targets.image.procs)?;
         Ok(())
     }
 
@@ -321,12 +383,20 @@ impl Targets {
             return Err(io::Error::other("workload mount is not cgroup v2"));
         }
         let silo = open_directory(&root, "silo")?;
+        let workloads = Group::open(&silo, "workloads")?;
+        let procfs = OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open("/proc")?;
         let targets = Self {
             control: Group::open(&silo, "control")?,
-            workloads: Group::open(&silo, "workloads")?,
+            image: Group::open(&workloads.directory, "image")?,
+            exec: Group::open(&workloads.directory, "exec")?,
+            workloads,
             activation: Group::open(&silo, "activation")?,
             root,
             silo,
+            procfs,
         };
         targets.validate()?;
         targets.validate_control()?;
@@ -334,15 +404,48 @@ impl Targets {
     }
 
     fn validate(&self) -> io::Result<()> {
-        let current_root = OpenOptions::new()
-            .read(true)
-            .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
-            .open(CGROUP_ROOT)?;
-        same_object(&self.root, &current_root)?;
         same_object(&self.silo, &open_directory(&self.root, "silo")?)?;
         self.control.validate(&self.silo, "control")?;
         self.workloads.validate(&self.silo, "workloads")?;
-        self.activation.validate(&self.silo, "activation")
+        self.activation.validate(&self.silo, "activation")?;
+        self.image.validate(&self.workloads.directory, "image")?;
+        self.exec.validate(&self.workloads.directory, "exec")
+    }
+
+    fn configure(&self) {
+        for (directory, group) in [
+            (&self.root, "/"),
+            (&self.silo, "/silo"),
+            (&self.workloads.directory, "/silo/workloads"),
+        ] {
+            for controller in ["+cpu", "+memory", "+io", "+pids"] {
+                configure_value(directory, group, "cgroup.subtree_control", controller);
+            }
+        }
+        configure_value(&self.silo, "/silo", "memory.min", "16777216");
+        configure_value(
+            &self.control.directory,
+            "/silo/control",
+            "memory.min",
+            "16777216",
+        );
+        configure_value(
+            &self.control.directory,
+            "/silo/control",
+            "cpu.weight",
+            "1000",
+        );
+        let limit = fs::read_to_string("/proc/sys/kernel/pid_max")
+            .and_then(|value| workload_pid_limit(&value));
+        match limit {
+            Ok(limit) => configure_value(
+                &self.workloads.directory,
+                "/silo/workloads",
+                "pids.max",
+                &limit.to_string(),
+            ),
+            Err(error) => tracing::warn!(%error, "failed to determine workload PID limit"),
+        }
     }
 
     fn validate_control(&self) -> io::Result<()> {
@@ -438,7 +541,7 @@ impl Group {
     }
 }
 
-fn parse_event(text: &str, key: &str) -> io::Result<bool> {
+pub(crate) fn parse_event(text: &str, key: &str) -> io::Result<bool> {
     let mut value = None;
     for line in text.lines() {
         let mut fields = line.split_ascii_whitespace();
@@ -476,7 +579,7 @@ fn open_directory(parent: &File, name: &str) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
-fn open_file(parent: &File, name: &str, writable: bool) -> io::Result<File> {
+pub(crate) fn open_file(parent: &File, name: &str, writable: bool) -> io::Result<File> {
     let access = if writable {
         OFlag::O_WRONLY
     } else {
@@ -503,6 +606,29 @@ fn same_object(retained: &File, current: &File) -> io::Result<()> {
     Ok(())
 }
 
+fn workload_pid_limit(value: &str) -> io::Result<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|maximum| maximum.checked_sub(512))
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pid_max cannot reserve 512 agent PIDs",
+            )
+        })
+}
+
+fn configure_value(directory: &File, group: &str, control: &str, value: &str) {
+    if let Err(error) =
+        open_file(directory, control, true).and_then(|file| write_value(&file, value.as_bytes()))
+    {
+        tracing::warn!(group, control, value, %error, "failed to configure cgroup control");
+    }
+}
+
 fn write_value(file: &File, value: &[u8]) -> io::Result<()> {
     if file.write_at(value, 0)? != value.len() {
         return Err(io::Error::new(
@@ -524,6 +650,38 @@ fn write_current_process(procs: &File) -> io::Result<()> {
             Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
         }
     }
+}
+
+fn reset_oom_score_adj() -> io::Result<()> {
+    // The agent is non-dumpable and a uid change keeps that, which makes
+    // /proc/self root-owned; a non-root child could not open its own file.
+    // exec recomputes dumpability anyway.
+    nix::sys::prctl::set_dumpable(true).map_err(io::Error::from)?;
+    let fd = open(
+        c"/proc/self/oom_score_adj",
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let result = loop {
+        match nix::unistd::write(&fd, b"0") {
+            Ok(1) => break Ok(()),
+            Ok(_) => break Err(io::Error::from_raw_os_error(nix::errno::Errno::EIO as i32)),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => break Err(io::Error::from_raw_os_error(error as i32)),
+        }
+    };
+    result.and(nix::unistd::close(fd).map_err(io::Error::from))
+}
+
+/// Parent-side read; the post-fork closure only writes when this is true.
+fn agent_oom_protected() -> io::Result<bool> {
+    let value = fs::read_to_string("/proc/self/oom_score_adj")?;
+    let adjustment = value
+        .trim()
+        .parse::<i32>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(adjustment < 0)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -595,11 +753,35 @@ mod tests {
         controller.qualify_profile(&BootMode::InitChild {
             requested_init: OsString::from("/sbin/init"),
             init_path: "/sbin/init".into(),
+            containment_failure: "test observation failed".to_owned(),
         });
         assert!(controller
             .unsupported_reason()
             .unwrap()
-            .contains("InitChild"));
+            .contains("image init cgroup containment was not established"));
+        for boot in [
+            BootMode::AgentPid1 {
+                requested_init: OsString::new(),
+            },
+            BootMode::ContainedInit {
+                requested_init: OsString::from("/sbin/init"),
+                init_path: "/sbin/init".into(),
+            },
+        ] {
+            controller.qualify_profile(&boot);
+            assert!(lock(&controller.inner.profile).is_none());
+        }
+    }
+
+    #[test]
+    fn workload_pid_reserve_requires_positive_capacity() {
+        assert_eq!(
+            crate::freezer::workload_pid_limit("32768\n").unwrap(),
+            32256
+        );
+        for invalid in ["", "invalid", "-1", "0", "511", "512"] {
+            assert!(crate::freezer::workload_pid_limit(invalid).is_err());
+        }
     }
 
     #[test]

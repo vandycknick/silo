@@ -5,13 +5,19 @@ use crate::{applets, io};
 
 const ROOT: &[u8] = b"/sys/fs/cgroup";
 const CONTROL_PROCS: &[u8] = b"/sys/fs/cgroup/silo/control/cgroup.procs";
-const WORKLOAD_PROCS: &[u8] = b"/sys/fs/cgroup/silo/workloads/cgroup.procs";
+const IMAGE_PROCS: &[u8] = b"/sys/fs/cgroup/silo/workloads/image/cgroup.procs";
 
 pub(crate) fn prepare() -> Result<(), &'static str> {
     if applets::files::mkdir_parents(ROOT, 0o755) != 0 {
         return Err("cannot create cgroup mountpoint");
     }
-    if applets::system::mount_one(b"cgroup2", ROOT, Some(b"cgroup2"), 0, None) != 0
+    if applets::system::mount_one(
+        b"cgroup2",
+        ROOT,
+        Some(b"cgroup2"),
+        0,
+        Some(b"nsdelegate,memory_recursiveprot"),
+    ) != 0
         && io::errno() != libc::EBUSY
     {
         return Err("cannot mount cgroup v2");
@@ -21,6 +27,8 @@ pub(crate) fn prepare() -> Result<(), &'static str> {
         b"/sys/fs/cgroup/silo".as_slice(),
         b"/sys/fs/cgroup/silo/control",
         b"/sys/fs/cgroup/silo/workloads",
+        b"/sys/fs/cgroup/silo/workloads/image",
+        b"/sys/fs/cgroup/silo/workloads/exec",
         b"/sys/fs/cgroup/silo/activation",
     ] {
         if io::mkdir(path, 0o755) != 0 && io::errno() != libc::EEXIST {
@@ -31,7 +39,7 @@ pub(crate) fn prepare() -> Result<(), &'static str> {
 }
 
 pub(crate) fn place_image_init() -> Result<(), &'static str> {
-    place(WORKLOAD_PROCS)
+    place(IMAGE_PROCS)
 }
 
 fn place(path: &[u8]) -> Result<(), &'static str> {

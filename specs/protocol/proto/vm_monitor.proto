@@ -488,6 +488,8 @@ enum LiveFailureCode {
   LIVE_FAILURE_CODE_SOURCE_RECORD_FAILED = 32;
   LIVE_FAILURE_CODE_RELEASE_FAILED = 33;
   LIVE_FAILURE_CODE_STAGING_BUDGET_EXCEEDED = 34;
+  // Workload containment proof failed; the diagnostic identifies escaped guest tasks.
+  LIVE_FAILURE_CODE_GUEST_CONTAINMENT_ESCAPED = 35;
 }
 
 message LiveFailure {

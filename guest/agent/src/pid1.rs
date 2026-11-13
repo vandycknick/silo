@@ -69,9 +69,14 @@ impl ProcessSupervisor {
         workloads: WorkloadController,
     ) -> eyre::Result<Self> {
         if !matches!(boot_mode, BootMode::AgentPid1 { .. }) {
+            let (writer_shutdown, _) = watch::channel(false);
             return Ok(Self {
+                inner: None,
+                writers: Arc::default(),
+                writer_shutdown,
                 workloads,
-                ..Self::default()
+                session: None,
+                retirement: None,
             });
         }
 

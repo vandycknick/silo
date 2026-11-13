@@ -151,7 +151,7 @@ def private_kernel(assets: Path, directory: Path) -> tuple[Path, Path]:
     return kernel, kernel_source
 
 
-def run(silo: Silo, image: str, *, unsupported: bool = False) -> dict:
+def run(silo: Silo, image: str) -> dict:
     executable = controller()
     disk, directory = private_root(silo, image, "guest-lifecycle-")
     machine, run_id = str(uuid4()), str(uuid4())
@@ -165,7 +165,7 @@ def run(silo: Silo, image: str, *, unsupported: bool = False) -> dict:
     composite = composite_initramfs(assets, directory, agent_config, disk)
     kernel, kernel_source = private_kernel(assets, directory)
     fixture = {"kernel": str(kernel), "initramfs": str(composite), "directory": str(directory),
-               "machine_id": machine, "run_id": run_id, "root": disk, "expect_unsupported": unsupported}
+               "machine_id": machine, "run_id": run_id, "root": disk}
     fixture_path = directory / "fixture.json"
     fixture_path.write_text(json.dumps(fixture))
     identities = {"controllerSha256": overlay.digest(executable), "kernelSha256": overlay.digest(kernel),
@@ -183,11 +183,10 @@ def run(silo: Silo, image: str, *, unsupported: bool = False) -> dict:
     records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
     assert len(records) == 1, records
     record = records[0]
-    assert record["result"] == ("unsupported-profile-refused" if unsupported else "cold-freeze-thaw"), record
-    if not unsupported:
-        assert record["recoveryEpoch"] == 3
-        assert record["counterAdvancing"] > record["counterBefore"]
-        assert record["counterResumed"] > record["counterFrozen"]
-        assert record["counterFinal"] > record["counterRecoveryFrozen"]
-        assert record["restoreGenerationEvidence"] == "not-exercised"
+    assert record["result"] == "cold-freeze-thaw", record
+    assert record["recoveryEpoch"] == 3
+    assert record["counterAdvancing"] > record["counterBefore"]
+    assert record["counterResumed"] > record["counterFrozen"]
+    assert record["counterFinal"] > record["counterRecoveryFrozen"]
+    assert record["restoreGenerationEvidence"] == "not-exercised"
     return record
