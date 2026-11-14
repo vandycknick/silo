@@ -38,7 +38,7 @@ import tty
 import uuid
 
 from .guest_activation_network import DatagramRelay, NetworkIdentity
-from .native_live_api import make_session_type, require
+from .native_live_api import BINDING_FIELDS, make_session_type, require
 
 AGENT_PORT = 1027  # forward_spec::GUEST_CONTROL_VSOCK_PORT
 FORWARD_PORT = 1028  # forward_spec::FORWARD_VSOCK_PORT
@@ -46,7 +46,6 @@ SSH_PORT = 22  # agent_spec::SSH_VSOCK_PORT
 MAX_CONTROL_LINE = 64
 MAX_FORWARD_LINE = 512  # forward_spec::MAX_TARGET_LINE_BYTES
 WAIT = 30
-BINDING_FIELDS = ("silo-producer", "profile", "topology", "ram-layout", "source-run", "capture")
 READY = "READY whole-machine-production"
 PREPARED = "PREPARED native-parked-fenced, not BackendStarted"
 
@@ -106,7 +105,7 @@ class CohortArgs:
 
 def write_cold_binding(binding: Path, material: bytes, run_id: str) -> None:
     binding.mkdir(mode=0o700)
-    for name in ("silo-producer", "profile", "topology", "ram-layout"):
+    for name in ("profile", "topology", "ram-layout"):
         (binding / name).write_bytes(hashlib.sha256(name.encode() + material).digest())
     (binding / "source-run").write_bytes(uuid.UUID(run_id).bytes)
     (binding / "capture").write_bytes(os.urandom(16))

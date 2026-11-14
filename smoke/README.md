@@ -2149,10 +2149,10 @@ It does not deliver the monitor's public live commands or qualify other host
 lanes. Native diagnostic controller modules supply guest transport and
 independent validation, not the native operations under test.
 
-Build from clean, revision-bound native source. The production producer
-identity deliberately rejects dirty or unknown native provenance. Do not
-enable diagnostic native features or bypass that check to obtain a passing
-capture. Build the example and stage the runtime before invoking a cohort:
+Checkpoint compatibility uses the native live-state schema and guest architecture,
+not producer build identity. Keep source and input identities as reproduction
+evidence, and keep diagnostic native features separate from production captures.
+Build the example and stage the runtime before invoking a cohort:
 
 ```sh
 cargo build --locked -p silo-vmm --example native-live-api
