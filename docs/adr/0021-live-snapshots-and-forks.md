@@ -389,7 +389,7 @@ Both admitted profiles use this cgroup v2 layout:
 
 ```text
 /sys/fs/cgroup                 initial namespace, retained agent descriptors
-└── silo                       cpu, memory, io and pids delegated
+└── silo                       every available controller delegated
     ├── control                agent threads only
     ├── activation             bounded activation hooks
     └── workloads              freezer switch, no direct processes
