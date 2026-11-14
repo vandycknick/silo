@@ -34,11 +34,7 @@ zeroize = "1.9.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 thiserror = "2.0.19"
 tempfile = "3.27.0"
-libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "7b61232f336112d3d58bfe64c2d9905458bf3924", default-features = false, features = ["blk", "net"] }
+libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "662b359c3abbb840555cc492a23e02fab5f42856", default-features = false, features = ["blk", "net"] }
 
 [profile.dev.package.sha2]
 opt-level = 3
-
-[patch."https://github.com/vandycknick/libkrun.git"]
-libkrun = { path = "/home/nickvd/Projects/worktrees/libkrun/silo-production/src/libkrun" }
-
