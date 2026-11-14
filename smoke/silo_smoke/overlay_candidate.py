@@ -314,6 +314,7 @@ class Candidate:
     def wait(self, *, rejected: bool = False) -> str:
         deadline = time.monotonic() + 90
         while True:
+            self.capture_worker()
             text = bounded_log(self.serial) if self.serial.exists() else ""
             if self.mapping_only:
                 assert not rejected
@@ -343,15 +344,28 @@ class Candidate:
     def logs(self) -> str:
         return "\n".join(bounded_log(path) for path in self.root.glob("*.log"))
 
+    def capture_worker(self) -> None:
+        # A rejected guest powers off right after printing its verdict, so the
+        # worker must be identified while it is still running.
+        if self.process is None or "workerPid" in self.identities or platform.system() != "Linux":
+            return
+        workers = overlay.krun_workers(self.process.pid)
+        if len(workers) != 1:
+            return
+        try:
+            actual = overlay.digest(Path(f"/proc/{workers[0]}/exe"))
+        except FileNotFoundError:
+            return
+        assert actual == self.identities["monitorWorkerSha256"], "worker did not execute captured monitor bytes"
+        self.identities["workerPid"] = workers[0]
+        self.identities["actualWorkerSha256"] = actual
+
     def observe_worker(self) -> None:
         assert self.process is not None
         self.identities["monitorPid"] = self.process.pid
         if platform.system() == "Linux":
-            pid = overlay.worker_pid_of_monitor(self.process.pid)
-            actual = overlay.digest(Path(f"/proc/{pid}/exe"))
-            assert actual == self.identities["monitorWorkerSha256"], "worker did not execute captured monitor bytes"
-            self.identities["workerPid"] = pid
-            self.identities["actualWorkerSha256"] = actual
+            self.capture_worker()
+            assert "workerPid" in self.identities, f"never observed the krun worker of monitor {self.process.pid}"
 
     def close(self) -> None:
         if self.closed:
