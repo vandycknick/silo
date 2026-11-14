@@ -386,15 +386,26 @@ def worker_pid(silo: Silo, name: str) -> int:
     return worker_pid_of_monitor(monitor)
 
 
-def worker_pid_of_monitor(monitor: int) -> int:
+def krun_workers(monitor: int) -> list[int]:
     children: set[str] = set()
     for task in Path(f"/proc/{monitor}/task").iterdir():
         try:
             children.update((task / "children").read_text().split())
         except FileNotFoundError:
             continue
-    workers = [int(pid) for pid in children if Path(f"/proc/{pid}/comm").read_text().strip() == "krun"]
-    assert len(workers) == 1, f"Expected actual krun worker child of {monitor}: {children}"
+    workers = []
+    for pid in children:
+        try:
+            if Path(f"/proc/{pid}/comm").read_text().strip() == "krun":
+                workers.append(int(pid))
+        except FileNotFoundError:
+            continue
+    return workers
+
+
+def worker_pid_of_monitor(monitor: int) -> int:
+    workers = krun_workers(monitor)
+    assert len(workers) == 1, f"Expected actual krun worker child of {monitor}: {workers}"
     return workers[0]
 
 
