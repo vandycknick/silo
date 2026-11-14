@@ -413,13 +413,27 @@ impl Targets {
     }
 
     fn configure(&self) {
+        // Delegate every controller the kernel offers so the image sees the
+        // same set it would as the real root (Docker needs cpuset, for one).
         for (directory, group) in [
             (&self.root, "/"),
             (&self.silo, "/silo"),
             (&self.workloads.directory, "/silo/workloads"),
         ] {
-            for controller in ["+cpu", "+memory", "+io", "+pids"] {
-                configure_value(directory, group, "cgroup.subtree_control", controller);
+            match open_file(directory, "cgroup.controllers", false).and_then(io::read_to_string) {
+                Ok(controllers) => {
+                    for controller in controllers.split_whitespace() {
+                        configure_value(
+                            directory,
+                            group,
+                            "cgroup.subtree_control",
+                            &format!("+{controller}"),
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(group, %error, "failed to read available cgroup controllers");
+                }
             }
         }
         configure_value(&self.silo, "/silo", "memory.min", "16777216");
