@@ -35,6 +35,7 @@ import time
 
 MIB = 1024 * 1024
 CAPTURE_OUTPUTS = ("memory.ram", "memory-layout.json", "execution.state", "devices.state", "memory.map.json")
+BINDING_FIELDS = ("profile", "topology", "ram-layout", "source-run", "capture")
 
 
 def require(condition: bool, explanation: str) -> None:
@@ -217,7 +218,7 @@ def make_session_type():
             record["completed_output_identity"] = output_identities(directory)
             binding = directory / "binding"
             binding.mkdir(mode=0o700)
-            for name in ("silo-producer", "profile", "topology", "ram-layout", "source-run", "capture"):
+            for name in BINDING_FIELDS:
                 (binding / name).write_bytes(bytes(record["binding"][name.replace("-", "_")]))
             if seal:
                 self.seal(directory, record)
@@ -1016,7 +1017,7 @@ def main() -> None:
     identities["partial_patch"]=digest(partial_fixture/"native_generation_partial.patch")
     identities["partial_header"]=digest(partial_fixture/"native_generation_partial.h")
     material=json.dumps(identities,sort_keys=True).encode()
-    for name in ("silo-producer","profile","topology","ram-layout"):
+    for name in ("profile","topology","ram-layout"):
         (args.binding/name).write_bytes(hashlib.sha256(name.encode()+material).digest())
     for name in ("source-run","capture"):(args.binding/name).write_bytes(os.urandom(16))
     args.initramfs=args.evidence/"initramfs.cpio"
