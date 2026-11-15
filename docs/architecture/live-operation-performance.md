@@ -186,6 +186,27 @@ cases are not separately qualified. These changes do not establish the
 end-to-end targets; measured wave-two results must be recorded before claiming
 that a target is met.
 
+### Wave three: graph and map receipts
+
+Local composition graph receipts now bind catalog facts, index/map fingerprints
+and decoded pack maps. Hits on local restore, fork and snapshot paths keep held
+descriptors and skip index decoding and pack-map reconstruction. Stream map
+receipts bind map and authenticated-object fingerprints; local restore reuses
+the canonical RAM-map object rather than serializing, hashing and publishing it
+again. Misses validate exact bytes or rebuild the canonical-map cache, as
+applicable.
+
+Sealed-stream deduplication checks an existing inode and its receipt before
+creating a clone. Local capture keeps each immutable payload's seal `fsync`,
+but batches the four pool-directory barriers before final retention and receipt
+commit; the checked catalog checkpoint still precedes acknowledgement.
+Transport, export, handoff, explicit verification and capture replay without a
+producer capability still authenticate bytes.
+
+This code-path note adds no measurements. Each slice must append its measured
+result before these changes can establish any end-to-end target.
+
+
 ### Runtime opening and recovery
 
 `RuntimeOpenMode::Observation` uses `Store::open_observation`: after connection
@@ -294,9 +315,11 @@ Phase 30 reverses the former no-warm-receipt publication rule: publication of a
 snapshot produced on this host seeds the warm receipt for its first restore.
 Silent local corruption between capture and restore is not detected at restore;
 explicit verification, export and handoff authenticate bytes independently.
-File/directory synchronization and catalog durability are unchanged. Local fork
-RAM restore trusts producer-computed identities and unchanged owned inode facts
-without rehashing RAM. These amendments do not remeasure historical batch results.
+Payload seal synchronization and final catalog durability are unchanged; local
+capture now batches pool-directory barriers before the retention transaction.
+Local fork RAM restore trusts producer-computed identities and unchanged owned
+inode facts without rehashing RAM. These amendments do not remeasure historical
+batch results.
 
 Measured effect on ext4: pause 5.51 → 2.52 s; manager 3.56 → 1.46 s; restore
 7.21 → 3.5–4.3 s. Child construction stayed at about 9 s for four children.

@@ -13,6 +13,9 @@
   after source continuation, retaining accepted RAM on failure or cancellation.
   Sparse RAM capture omits or punches zero runs and skips known-zero anonymous
   boot pages with cut-bound pagemap proof; unsupported cases keep safe fallbacks.
+  Graph/map receipts skip repeated index decoding and reuse canonical RAM maps.
+  Sealed-stream deduplication precedes cloning; capture batches pool-directory
+  barriers without moving the snapshot acknowledgement boundary.
   Performance budgets move to `make perf`; image init stays default.
 - Incremental snapshot publication no longer rereads all RAM on owned reflink
   paths, so RAM identity cost follows changed chunks. The Phase 30 contract

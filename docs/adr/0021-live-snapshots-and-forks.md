@@ -72,7 +72,7 @@ The implemented publication path uses one owned sealed-stream capability for
 RAM and writable disks and seeds their warm receipts in the snapshot publication
 transaction. Existing same-identity streams avoid scanning only with a matching
 `verified_object` fingerprint receipt. Explicit snapshot verification bypasses
-both warm and composition receipts; its stream-chunk and state-object diagnostics
+warm, map and composition receipts; its stream-chunk and state-object diagnostics
 are defined under On-demand verification below.
 
 The Phase 30 wave-two amendment records persistent `IdentityPending` cuts and
@@ -81,6 +81,11 @@ timing rather than charging post-resume work to interruption. It also records
 the implemented sparse zero-run handling and the limited pagemap-backed full
 capture optimization; other backing types and unavailable pagemap metadata
 still require full reads, and swapped/huge-page cases are not separately qualified.
+
+The Phase 30 wave-three amendment records fingerprint-bound graph and map
+receipts, reusable canonical RAM maps, deduplication before clone creation, and
+batched pool-directory barriers. Per-payload seal synchronization and the final
+catalog checkpoint before snapshot acknowledgement remain required.
 
 ## The Problem
 
@@ -781,14 +786,22 @@ clone provenance is not replay authority.
 An independent existing same-identity pool stream is reused without a scan only
 when a `verified_object` receipt matches its current device, inode, length, mode
 and ctime fingerprint. Otherwise its bytes are fully authenticated against the
-recorded map before dedup reuse. Files and parent directories are synchronized
-before the catalog commit and its durability barrier. The snapshot publication
-transaction seeds warm receipts for both RAM and those writable disks from the
-held publication capabilities. This binding is producer/clone provenance, not
-independent read-back proof. First and repeated local restores skip hashing
-those streams while the receipt matches. Silent local corruption between
-capture and restore is not detected at restore under this trust boundary;
-explicit verification, export and handoff authenticate bytes independently.
+recorded map before dedup reuse. This decision occurs under the publication lock
+before creating a clone: an existing stream never needs a throwaway clone.
+New immutable pool payloads retain their seal `fsync`. Local capture batches
+the object, stream, publication-lock and temporary pool-directory barriers once,
+after all publication output and canonical-map cache objects exist but before
+final fingerprint rechecks and the snapshot retention/receipt transaction.
+This does not synchronize monitor/worker capture staging. Acknowledgement still
+requires the committed snapshot catalog's checked durability checkpoint.
+
+The snapshot publication transaction seeds warm receipts for both RAM and those
+writable disks from the held publication capabilities. This binding is
+producer/clone provenance, not independent read-back proof. First and repeated
+local restores skip hashing those streams while the receipt matches. Silent
+local corruption between capture and restore is not detected at restore under
+this trust boundary; explicit verification, export and handoff authenticate
+bytes independently.
 The 1 s incremental budget below is measured on the defined fixture: one
 contiguous 410 MiB dirty region in a 4 GiB guest, under this unchanged 8 MiB
 chunk identity. Scattered dirty placement can legitimately affect every chunk
@@ -929,6 +942,23 @@ its recorded length, role and lineage. A snapshot produced on this host is
 trusted at publication: publication seeds the warm receipt, so neither its
 first nor repeated local restore hashes RAM. Reuse requires the recorded inode,
 length, mode `0400` and change time to match; a mismatch re-authenticates.
+
+`verified_object.map_receipt` caches the validated stream geometry and decoded
+chunks, fingerprints of held map-root/page objects, and the fingerprints of
+authenticated closure objects. A local hit binds these to the current stream
+and held descriptors instead of rereading or decoding the map objects and
+reauthenticating unchanged closure objects. Changed fingerprints take the
+validation path; an unusable receipt never overrides a malformed snapshot.
+
+For RAM the receipt also binds a reusable canonical map object by digest and
+inode fingerprint. Publication seeds that binding; restore pins and passes the
+held canonical map directly, without serializing, hashing and publishing it on
+every restore. If that cache object is absent or its fingerprint changes,
+restore rebuilds it from the validated stream map and refreshes the binding.
+The receipt and cached map are not additional retention roots or transported
+authority. Import, pull, transport, export, handoff, explicit verification and
+capture replay without the producer capability still authenticate bytes.
+
 Imported, pulled or transported snapshots still authenticate every byte;
 required byte authentication runs concurrently with private disk construction.
 A failed authentication rolls the owned child allocation back and reports the
@@ -937,8 +967,8 @@ authentication error, never a construction error.
 Silent local corruption between capture and restore is not detected at restore
 under this trust boundary. The recovery tool is `silo snapshot verify IMAGE`,
 whose exact traversal and diagnostics are defined below. It rereads every RAM,
-state and disk byte without warm or composition receipts. Export and handoff
-also authenticate every byte without warm receipts. Local forks use the
+state and disk byte without warm, map or composition receipts. Export and handoff
+also authenticate every byte without those receipts. Local forks use the
 producer/owned-inode authority described below. libvm creates the child's machine
 directory, private raw copies of every sealed disk, fresh network reservations
 and sockets, the composite initramfs for provenance only, and the leases for
@@ -969,7 +999,7 @@ not a cold boot.
 
 `silo snapshot verify IMAGE` uses `SnapshotStore::verify` to pin the selected
 local snapshot once and authenticate every byte against recorded identities.
-It ignores warm receipts, composition receipts and producer capabilities, and
+It ignores warm, map and composition receipts and producer capabilities, and
 reads and checks recorded-zero chunks, including filesystem holes.
 
 Verification visits RAM first, then state objects in layout, execution and

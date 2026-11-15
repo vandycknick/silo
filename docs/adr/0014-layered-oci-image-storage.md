@@ -47,6 +47,11 @@ and only complete identities permit the unchanged final seal. This record
 survives process crashes, not power loss; staging durability remains libvm's
 publication responsibility.
 
+The Phase 30 wave-three amendment (2026-11-15) adds fingerprint-bound graph and
+map caches, canonical RAM-map reuse and sealed-stream deduplication before
+clone creation. Capture batches pool-directory synchronization, preserving
+payload seal `fsync` and the checked catalog checkpoint before acknowledgement.
+
 ## Implementation status (2026-11-09)
 
 Stages 1–4 are implemented on Linux/libkrun, with `linux-erofs-overlay-v1`
@@ -2135,9 +2140,11 @@ mappings of one immutable RAM file. The separate, explicitly selected fast
 same-host mode has no RAM file and shares source and child memory copy-on-write;
 siblings share physical pages, and children do not survive host crash or reboot.
 Its mechanism details require a Phase 30 design review.
-The source's storage remains private to it and resumes after the seal under the
-operation's policy. The clone, copy and identity-verification rules of this
-section apply equally to sealed captures and child copies.
+The source's storage remains private to it. Under the continuation policy, the
+reflink lane continues after the persistent cut and RAM acceptance, before disk
+identity completion and the final seal; the copy-only lane seals first.
+Children still require the completed seal. The clone, copy and
+identity-verification rules apply equally to sealed captures and child copies.
 
 ### Snapshots and generalization
 
@@ -2456,9 +2463,21 @@ than deleting the source opportunistically after a push.
 ### Publication and crash recovery
 
 Immutable publication stages under a unique operation directory on the final
-filesystem, validates output, synchronizes files, publishes through atomic
-no-replace rename, then synchronizes parent directories. Closed, owned, sealed
-RAM and writable disks use the same `SealedStreamPublication` capability:
+filesystem, validates output, synchronizes payload files and publishes through
+atomic no-replace rename. Local capture publication batches pool-directory
+barriers rather than synchronizing each rename's parents independently:
+`StoragePool::sync_publications` synchronizes `objects/sha256`, `streams/sha256`,
+`locks/publication` and `tmp` once after all capture payload, map, state,
+provenance and snapshot-record publications, including the canonical RAM-map
+cache object. Each newly published immutable payload retains its seal `fsync`;
+this batching does not add synchronization to monitor/worker capture staging.
+The directory barrier precedes final held-inode rechecks and the snapshot
+retention/receipt transaction. After that transaction commits, the checked
+catalog checkpoint still completes before acknowledgement. Other publication
+paths retain their existing barriers.
+
+Closed, owned, sealed RAM and writable disks use the same
+`SealedStreamPublication` capability:
 canonical producer maps, geometry and unchanged held inode facts bind a
 successful reflink without rereading the fresh local payload. Non-reflink
 copies authenticate inline. Recovery and replay have no producer capability and
@@ -2475,16 +2494,18 @@ byte of a local snapshot against recorded identities. RAM and disk mismatches
 name the stream, chunk index and byte range; state-object mismatches name the
 role, whole-object digest and length, not a chunk. Missing, truncated, writable
 or replaced members are structural failures. Recorded-zero chunks are read and
-checked; warm and composition receipts are ignored. Failure exits nonzero.
+checked; warm, map and composition receipts are ignored. Failure exits nonzero.
 Imported, pulled or transported snapshots, export and handoff authenticate
 every byte without this local
 publication exception. Required non-reflink copies hash written bytes inline,
 never through a configured-length scan or another publication pass. Other
 publication output is hashed. A recipe/result record becomes visible only after
 every dependency is durable. Independent same-identity pool streams require a
-matching `verified_object` fingerprint receipt or full authentication. Other
-existing objects still validate; corruption is quarantined under coordination,
-never repaired in place while readers may use it.
+matching `verified_object` fingerprint receipt or full authentication. The
+publication lock and dedup receipt check precede clone creation: an existing
+same-identity stream is reused directly, without creating and discarding a
+clone. Other existing objects still validate; corruption is quarantined under
+coordination, never repaired in place while readers may use it.
 
 Operations have durable IDs and phases in `operations/`. Machine storage is
 published before the database transaction references it. When replacing existing
@@ -2532,10 +2553,10 @@ on a blocking worker. Roots cover final registration; catalog access and
 staging leases survive through actual cleanup. Durability/removal and
 substantial composition work do not run on the async executor.
 
-Source-free load uses non-creating pool access and authenticates recipe/result
-records, all index objects and the complete dependency set. Local lower reuse
-may satisfy payload validation through a matching composition receipt; a miss
-authenticates the exact retained bytes. Missing structure is not recreated by
+Source-free load uses non-creating pool access and checks canonical recipe/result
+records and the complete dependency set. Local lower reuse may satisfy index,
+map and payload validation through matching composition and graph receipts;
+a miss takes the exact validation path. Missing structure is not recreated by
 verification. Page I/O/corruption, semantic rejection and worker failures retain
 their concrete error causes.
 
@@ -2554,6 +2575,20 @@ A matching local receipt lets create, start, restore and fork-child construction
 read no lower payload: canonical metadata and current fingerprints establish the
 hit. A changed fingerprint invalidates reuse and forces exact authentication or
 refusal, never substitution of another lower.
+
+`composition_validation.graph_receipt` additionally binds the canonical catalog
+graph, fingerprints of its authenticated record, index and map objects, and the
+decoded pack maps. A hit checks that graph against current ordered catalog rows
+and dependency edges, opens and retains the metadata/backing descriptors, and
+rechecks their fingerprints. Local restore, fork and snapshot paths then skip
+`load_pinned_layer` index decoding and pack-map reconstruction; those index/map
+checks reduce to fingerprint checks on held descriptors, not payload reads.
+Recipe/result and catalog-graph bindings still apply.
+
+Changed fingerprints or an undecodable cached receipt miss the graph cache and
+take exact validation; corrupt canonical metadata can still fail closed.
+Receipts never permit substituting another graph, ignoring malformed records
+or reopening an unbound descriptor.
 
 Receipts are not retention roots and are not transported authority. Import,
 pull, transport, export, handoff and `silo snapshot verify IMAGE` never honour
@@ -2763,12 +2798,14 @@ envelope with those measurements and may never narrow it silently.
 The raised process-wide soft limit is not restored after start, avoiding races
 between concurrent starts. Admission precedes every lower backing open,
 including content-hash verification. After preflight, a matching composition
-receipt validates held unique backings without reading their payloads; misses
-authenticate exact bytes. Ordered/repeated FLAT records remain distinct for
-descriptor and FD accounting. Receipt metadata and fingerprints scale with
-unique backings and ordered occurrences, not lower payload length. Semantic
-machine storage roots protect retained lower streams from GC; neither receipts
-nor generated descriptors are reachability authorities.
+receipt validates held unique backings and graph-metadata descriptors without
+payload reads or index/map decoding; misses take exact validation. Ordered and
+repeated FLAT records remain distinct for descriptor and FD accounting.
+Preflight includes the held graph metadata descriptors as well as unique lower
+backings. Receipt work scales with graph metadata, decoded chunk-map entries,
+unique backings and ordered occurrences, not a reread of lower payload bytes.
+Semantic machine storage roots protect retained lower streams from GC; neither
+receipts nor generated descriptors are reachability authorities.
 
 
 ### Acceptance budgets
