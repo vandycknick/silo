@@ -70,16 +70,19 @@ impl VmmClient {
     }
 
     pub(crate) async fn status(&self) -> Result<HostStatus, VmmClientError> {
+        const TIMED_OUT: &str = "vm monitor inspection timed out after 2s";
         tokio::time::timeout(INSPECT_TIMEOUT, async {
             let mut client = monitor_client(self.channel().await?);
             client
                 .get_status(timed_request(GetStatusRequest {}, INSPECT_TIMEOUT))
                 .await
                 .map(|response| response.into_inner())
-                .map_err(|error| rpc_error("vm monitor get_status RPC failed", error))
+                .map_err(|error| {
+                    inspect_error("vm monitor get_status RPC failed", TIMED_OUT, error)
+                })
         })
         .await
-        .map_err(|_| VmmClientError::Protocol("vm monitor inspection timed out after 2s".into()))?
+        .map_err(|_| VmmClientError::Protocol(TIMED_OUT.into()))?
     }
 
     /// One exact, already-durable command. A transport timeout never implies
@@ -190,16 +193,19 @@ impl VmmClient {
     }
 
     pub(crate) async fn metrics(&self) -> Result<HostMetrics, VmmClientError> {
+        const TIMED_OUT: &str = "vm monitor metrics timed out after 2s";
         tokio::time::timeout(INSPECT_TIMEOUT, async {
             let mut client = monitor_client(self.channel().await?);
             client
                 .get_metrics(timed_request(GetMetricsRequest {}, INSPECT_TIMEOUT))
                 .await
                 .map(|response| response.into_inner())
-                .map_err(|error| rpc_error("vm monitor get_metrics RPC failed", error))
+                .map_err(|error| {
+                    inspect_error("vm monitor get_metrics RPC failed", TIMED_OUT, error)
+                })
         })
         .await
-        .map_err(|_| VmmClientError::Protocol("vm monitor metrics timed out after 2s".into()))?
+        .map_err(|_| VmmClientError::Protocol(TIMED_OUT.into()))?
     }
 
     pub(crate) async fn get_entry(
@@ -423,6 +429,17 @@ fn timed_request<T>(message: T, timeout: Duration) -> Request<T> {
     let mut request = Request::new(message);
     request.set_timeout(timeout);
     request
+}
+
+/// The request deadline and the surrounding deadline are the same duration, so
+/// either may fire first. Both report the same timeout.
+fn inspect_error(context: &str, timed_out: &str, status: Status) -> VmmClientError {
+    match status.code() {
+        tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => {
+            VmmClientError::Protocol(timed_out.into())
+        }
+        _ => rpc_error(context, status),
+    }
 }
 
 fn rpc_error(context: &str, status: Status) -> VmmClientError {
