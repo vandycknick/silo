@@ -29,20 +29,37 @@ docker exec "$container" timeout 35s sh -c '
 ' || status=$?
 [ "$status" -eq 42 ] || { echo "expected bounded systemd readiness timeout, got $status" >&2; exit 1; }
 
+# Hold the real boot transaction open after the control socket answers.
+docker exec "$container" sh -ec '
+    mkdir -p /etc/systemd/system/multi-user.target.wants
+    printf "%s\n" "[Unit]" "Before=multi-user.target" \
+        "[Service]" "Type=oneshot" \
+        "ExecStart=/bin/sh -c '\''until test -e /run/release-boot; do sleep 0.1; done'\''" \
+        > /etc/systemd/system/silo-readiness-test.service
+    ln -s ../silo-readiness-test.service /etc/systemd/system/multi-user.target.wants/
+'
+
 # Start the real manager only after the readiness waiter has begun.
-docker exec "$container" sh -c '
+docker exec "$container" sh -ec '
     touch /run/waiter-started
-    exec sh /usr/lib/silo-system/wait-systemd
+    sh /usr/lib/silo-system/wait-systemd
+    touch /run/waiter-ready
 ' &
 waiter=$!
-docker exec "$container" timeout 5s sh -c '
+docker exec "$container" timeout 5s sh -ec '
     until [ -e /run/waiter-started ]; do sleep 0.1; done
     sleep 1
     touch /run/start-systemd
+'
+docker exec "$container" timeout 10s sh -ec '
+    until timeout 1s systemctl show --property=Version --value >/dev/null 2>&1; do sleep 0.1; done
+    sleep 1
+    test ! -e /run/waiter-ready
+    touch /run/release-boot
 '
 wait "$waiter"
 waiter=
 
 # An already available manager must also succeed.
 docker exec "$container" sh /usr/lib/silo-system/wait-systemd
-printf 'systemd readiness timeout, delayed startup, and ready-manager tests passed\n'
+printf 'systemd readiness timeout, unfinished boot, delayed startup, and ready-manager tests passed\n'

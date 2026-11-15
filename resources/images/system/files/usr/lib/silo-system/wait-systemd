@@ -1,12 +1,16 @@
 #!/bin/sh
 set -eu
 
-# Agent readiness precedes systemd startup. Probe the manager itself, not
-# is-system-running: a booting or degraded manager can still start units.
-# Bound both the whole wait and each bus call so an unresponsive manager
-# cannot consume the host's entire activation deadline.
+# Agent readiness precedes systemd startup. A Version query can succeed while
+# the manager is still initializing and its control socket is transient.
+# Wait for boot completion, accepting degraded boots as well as healthy ones.
+# Bound both the whole wait and each bus call.
 timeout 30s sh -c '
-    until timeout 1s systemctl show --property=Version --value >/dev/null 2>&1; do
+    while :; do
+        state=$(timeout 1s systemctl is-system-running 2>/dev/null) || :
+        case "$state" in
+            running|degraded) exit 0 ;;
+        esac
         sleep 0.1
     done
 '
