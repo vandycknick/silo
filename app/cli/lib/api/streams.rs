@@ -58,6 +58,7 @@ pub(crate) fn ensure_guest_ready(data: &MachineData) -> eyre::Result<()> {
 
 pub(crate) async fn run_command_streaming(
     machine: &AppMachine,
+    observation: &MachineData,
     user: Option<&str>,
     argv: &[String],
     working_directory: &str,
@@ -67,7 +68,7 @@ pub(crate) async fn run_command_streaming(
     let mut session = machine
         .session_machine()
         .await?
-        .spawn_with(program, |options| {
+        .spawn_observed_with(observation, program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment).stdin_pipe()
         })
         .await?;
@@ -76,6 +77,7 @@ pub(crate) async fn run_command_streaming(
 
 pub(crate) async fn attach_command(
     machine: &AppMachine,
+    observation: &MachineData,
     user: Option<&str>,
     argv: &[String],
     working_directory: &str,
@@ -85,7 +87,7 @@ pub(crate) async fn attach_command(
     let mut session = machine
         .session_machine()
         .await?
-        .spawn_with(program, |options| {
+        .spawn_observed_with(observation, program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment)
                 .stdin_pipe()
                 .tty(true)
@@ -102,9 +104,11 @@ pub(crate) async fn run_process(
     argv: &[String],
     tty: bool,
 ) -> eyre::Result<ExecutionResult> {
+    let observation = machine.inspect().await?;
     if tty {
         return attach_command(
             machine,
+            &observation,
             process.user.as_deref(),
             argv,
             &process.working_directory,
@@ -114,6 +118,7 @@ pub(crate) async fn run_process(
     }
     run_command_streaming(
         machine,
+        &observation,
         process.user.as_deref(),
         argv,
         &process.working_directory,

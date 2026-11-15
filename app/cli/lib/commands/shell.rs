@@ -37,7 +37,7 @@ pub struct Cmd {
 
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let (_reference, machine) = context.machine(self.name.as_deref()).await?;
+        let (_reference, machine) = context.observation_machine(self.name.as_deref()).await?;
         let inspect_data = machine.inspect().await?;
 
         guest::ensure_running(&inspect_data)?;

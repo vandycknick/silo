@@ -23,6 +23,8 @@ which `silo daemon up` registers with the native service manager; ordinary CLI
 commands never run the daemon loop. Direct CLI VM operations continue to use
 libvm in process.
 
+`silo --version` (or `silo -V`) prints the product version without opening a runtime.
+
 Enable the optional tailnet lobby with `silo daemon up --tailscale`. The lobby
 runs inside silod; its pure-Go `tsgate` child handles Tailscale enrollment and
 transport. Connect with `ssh -t silo` to manage owned VMs. See the
@@ -141,6 +143,29 @@ silo restore image:dev-checkpoint --name restored
 silo fork dev --live --name child
 ```
 
+Lifecycle commands show a spinner on a terminal, then a result with the name,
+short ID and elapsed time. Live fork reports every child, any child failures,
+and whether the source resumed or was left paused. Noninteractive output has
+the same final results without spinner control codes. Restore and live fork
+wait for the configured guest agent before reporting success.
+Successful forks omit the operation banner; failures, cancellations and explicit
+`fork --operation UUID` observations include the operation ID. Source outcomes
+use the machine name. Exact-byte copying caveats are documented in command help.
+
+Use `--format json` for scripts, including operation observation and cancellation:
+
+```sh
+silo snapshot create dev --live --name saved --format json | jq .snapshot.id
+silo fork dev --live --name scripted-child --format json | jq .children
+silo fork --operation UUID --format json
+silo fork --operation UUID --cancel --format json
+silo restore image:saved --name scripted-restore --format json | jq .id
+```
+
+Snapshot JSON keeps its full capture result; stopped snapshot creation returns
+snapshot metadata directly. Restore and stopped fork JSON return an object with
+`id` and `name`, not a bare machine ID.
+
 Before a restored or forked child runs image services, Silo reseeds the kernel
 RNG, reapplies networking, replaces an existing non-empty `/etc/machine-id` with
 the child's Silo machine ID (32 lowercase hex), and atomically replaces
@@ -237,6 +262,9 @@ After interruption, use `silo handoff recover "$operation" "${destination[@]}"`.
 source reservation. An unknown or unreachable destination is not an abort.
 Terminal receipts survive payload cleanup and daemon restarts.
 
+Plan, transfer, status, recover and abort print key/value text by default.
+Add `--format json` to the subcommand for its full machine-readable document.
+
 ## Development tests
 
 Run `make test` inside `nix develop` for the host-supported Rust suites and netd
@@ -299,6 +327,8 @@ ephemeral machine and removes it after the workload finishes.
 A `disk:PATH` source is a quiesced regular raw or qcow2 file (never a symlink),
 booted directly with the host-native Linux platform, the whole disk as root and
 the packaged boot assets pinned at creation. The plan shows these assumptions.
+`create --dry-run` and `run --dry-run` print key/value plans by default;
+add `--format json` before piping a plan into JSON tools.
 Select a partitioned root or another userspace explicitly:
 
 ```bash
@@ -325,6 +355,27 @@ silo image list
 silo image remove image:cloud     # removes the alias only
 silo image release image:sha256:HEX  # releases explicit retention only
 ```
+
+`silo image list` and `silo snapshot list` print tables, omitting unavailable
+optional columns. Inspect commands group human-labelled key/value details, with
+readable creation times and comma-separated aliases. Image import, convert, pull
+and push also print key/value results by default. Add `--format json` to any of these commands (including
+`image inspect-remote` and `snapshot inspect`) to select the full JSON document:
+
+```sh
+silo image list --format json | jq .
+silo snapshot list --format json | jq .
+silo image inspect image:cloud --format json | jq .
+```
+
+`silo snapshot verify image:NAME` (or `image:sha256:HEX`) rereads and authenticates
+every RAM, state and disk byte of a local snapshot, ignoring trust receipts. It
+can take as long as reading the whole snapshot. Success reports the snapshot
+identity, stream count and verified bytes. `--format json` returns `snapshot`,
+`streams` and `bytes`; verification failures return an `error` object with the
+role, member or chunk, expected and actual identities, and recovery `guidance`,
+and still exit nonzero. Do not restore a failed snapshot; restore from another
+snapshot or re-create it.
 
 Aliases share one `image:` namespace with snapshots. A snapshot source preserves
 its complete captured configuration; only `--name` applies. Stopped checkpoints

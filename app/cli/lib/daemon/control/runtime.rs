@@ -230,9 +230,8 @@ impl w::runtime_service_server::RuntimeService for Service {
         let reference = images::managed_ref_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
         self.mutate(async move {
-            state
-                .runtime()
-                .await?
+            let runtime = state.runtime().await?;
+            runtime
                 .images()
                 .release_retention(&reference)
                 .await
@@ -358,6 +357,28 @@ impl w::runtime_service_server::RuntimeService for Service {
         ))
     }
 
+    async fn verify_storage_snapshot(
+        &self,
+        r: Request<w::StorageSnapshotRef>,
+    ) -> Result<Response<w::SnapshotVerificationResult>, Status> {
+        let reference =
+            silo_vm_control::stopped::reference_from_wire(r.into_inner()).map_err(conversion)?;
+        let runtime = self.runtime().await?;
+        let result = runtime
+            .snapshots()
+            .map_err(native)?
+            .verify(&reference)
+            .await;
+        let result = match result {
+            Ok(report) => silo_vm_control::snapshots::verification_to_wire(Ok(&report)),
+            Err(libvm::LibVmError::SnapshotVerification(error)) => {
+                silo_vm_control::snapshots::verification_to_wire(Err(&error))
+            }
+            Err(error) => return Err(native(error)),
+        };
+        Ok(Response::new(result))
+    }
+
     async fn list_storage_snapshots(
         &self,
         _: Request<()>,
@@ -386,8 +407,8 @@ impl w::runtime_service_server::RuntimeService for Service {
         let state = self.clone();
         self.mutate(async move {
             let runtime = state.runtime().await?;
-            libvm::SnapshotStore::open(runtime.local_home())
-                .await
+            runtime
+                .snapshots()
                 .map_err(native)?
                 .release_retention(&reference)
                 .await
@@ -404,9 +425,8 @@ impl w::runtime_service_server::RuntimeService for Service {
         let alias = silo_vm_control::stopped::alias(&r.get_ref().name).map_err(conversion)?;
         let state = self.clone();
         self.mutate(async move {
-            state
-                .runtime()
-                .await?
+            let runtime = state.runtime().await?;
+            runtime
                 .images()
                 .remove_alias(&alias)
                 .await
@@ -445,12 +465,8 @@ impl w::runtime_service_server::RuntimeService for Service {
         let state = self.clone();
         let result = self
             .mutate(async move {
-                let result = state
-                    .runtime()
-                    .await?
-                    .cancel_fork(operation_id)
-                    .await
-                    .map_err(native)?;
+                let runtime = state.runtime().await?;
+                let result = runtime.cancel_fork(operation_id).await.map_err(native)?;
                 silo_vm_control::fork::result_to_wire(&result).map_err(conversion)
             })
             .await?;

@@ -1611,4 +1611,30 @@ mod tests {
         assert!(rendered.matches("not-for-output").count() >= 2);
         assert!(!rendered.contains("<redacted>"));
     }
+
+    #[test]
+    fn plain_dry_run_plans_render_fields_instead_of_json() {
+        for (kind, command_tail) in [
+            (PlanKind::Create, Vec::new()),
+            (
+                PlanKind::Run(RunOptions::default()),
+                vec!["/bin/true".to_string()],
+            ),
+        ] {
+            let mut input = request(kind, OciImageConfigMetadata::default());
+            input.command_tail = command_tail;
+            let plan = resolve(input).unwrap();
+            let rows = crate::ui::serialized_detail_rows(&plan).unwrap();
+            let operation = match plan {
+                Plan::Create(_) => "create",
+                Plan::Run(_) => "run",
+            };
+            assert!(rows.contains(&("operation".into(), operation.into())));
+            assert!(rows.iter().any(|(key, _)| key.ends_with("proposedName")));
+            assert!(rows
+                .iter()
+                .any(|(key, _)| key.ends_with("image.requestedReference")));
+            assert!(!rows.iter().any(|(_, value)| value.starts_with('{')));
+        }
+    }
 }

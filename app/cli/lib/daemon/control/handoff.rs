@@ -11,8 +11,22 @@ const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 impl Service {
     async fn handoff_backend(&self) -> Result<&HandoffService, Status> {
         self.handoff
-            .get_or_try_init(|| async { Ok(HandoffService::new(self.runtime().await?)) })
+            .get_or_try_init(|| async {
+                let runtime = match self.runtime.get() {
+                    Some(runtime) => runtime.clone(),
+                    None => {
+                        self.open_runtime(libvm::RuntimeOpenMode::Observation)
+                            .await?
+                    }
+                };
+                Ok(HandoffService::new(runtime))
+            })
             .await
+    }
+
+    async fn handoff_mutation_backend(&self) -> Result<&HandoffService, Status> {
+        self.runtime().await?;
+        self.handoff_backend().await
     }
 }
 
@@ -107,7 +121,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let value = self
             .mutate(async move {
                 let value = state
-                    .handoff_backend()
+                    .handoff_mutation_backend()
                     .await?
                     .begin_source(&plan)
                     .await
@@ -127,7 +141,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let value = self
             .mutate(async move {
                 let value = state
-                    .handoff_backend()
+                    .handoff_mutation_backend()
                     .await?
                     .capture_source(&plan, stop)
                     .await
@@ -147,7 +161,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let value = self
             .mutate(async move {
                 let value = state
-                    .handoff_backend()
+                    .handoff_mutation_backend()
                     .await?
                     .receive(&plan)
                     .await
@@ -167,7 +181,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let value = self
             .mutate(async move {
                 let value = state
-                    .handoff_backend()
+                    .handoff_mutation_backend()
                     .await?
                     .offer_capture(&offer)
                     .await
@@ -184,7 +198,7 @@ impl w::handoff_service_server::HandoffService for Service {
     ) -> Result<Response<w::HandoffNeedsPage>, Status> {
         let (operation, cursor, limit) = c::needs_from_wire(r.into_inner()).map_err(conversion)?;
         let value = self
-            .handoff_backend()
+            .handoff_mutation_backend()
             .await?
             .list_needs(operation, cursor, limit)
             .await
@@ -199,7 +213,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let (operation, descriptor, offset, max_bytes) =
             c::read_from_wire(r.into_inner()).map_err(conversion)?;
         let value = self
-            .handoff_backend()
+            .handoff_mutation_backend()
             .await?
             .read_payload(operation, descriptor, offset, max_bytes)
             .await
@@ -231,7 +245,7 @@ impl w::handoff_service_server::HandoffService for Service {
         c::validate_payload_length(&descriptor, header.length).map_err(conversion)?;
         let mut remaining = header.length;
         let mut writer = self
-            .handoff_backend()
+            .handoff_mutation_backend()
             .await?
             .open_payload(operation, descriptor)
             .await
@@ -281,7 +295,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let value = self
             .mutate(async move {
                 let value = state
-                    .handoff_backend()
+                    .handoff_mutation_backend()
                     .await?
                     .prepare(&binding)
                     .await
@@ -301,7 +315,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let value = self
             .mutate(async move {
                 let value = state
-                    .handoff_backend()
+                    .handoff_mutation_backend()
                     .await?
                     .fence_source(&receipt)
                     .await
@@ -321,7 +335,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let value = self
             .mutate(async move {
                 let value = state
-                    .handoff_backend()
+                    .handoff_mutation_backend()
                     .await?
                     .commit(&authorization)
                     .await
@@ -341,7 +355,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let value = self
             .mutate(async move {
                 let value = state
-                    .handoff_backend()
+                    .handoff_mutation_backend()
                     .await?
                     .abort(&intent)
                     .await
@@ -361,7 +375,7 @@ impl w::handoff_service_server::HandoffService for Service {
         let value = self
             .mutate(async move {
                 let value = state
-                    .handoff_backend()
+                    .handoff_mutation_backend()
                     .await?
                     .resolve_source(&receipt)
                     .await
@@ -412,5 +426,74 @@ mod tests {
         assert_eq!(remaining, 0);
         assert!(accept_frame(&mut remaining, 0).is_err());
         assert!(accept_frame(&mut remaining, FRAME_BYTES + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn cold_handoff_observation_preserves_orphans_until_management_maintenance() {
+        use crate::config::{FeatureSelection, GlobalConfig};
+        use crate::daemon::control::{ControlState, Service};
+        use crate::daemon::status::StatusPublisher;
+        use silod_spec::daemon::v1 as w;
+        use std::sync::Arc;
+        use tonic::Request;
+
+        let root = tempfile::tempdir().unwrap();
+        let binary = test_utils::mock_vmm_binary();
+        let components = libvm::ResolvedRuntimeComponents::from_paths(
+            binary.to_path_buf(),
+            binary.to_path_buf(),
+            binary.to_path_buf(),
+            binary.to_path_buf(),
+            binary.to_path_buf(),
+            root.path().to_path_buf(),
+        )
+        .unwrap();
+        let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
+        let global = GlobalConfig::default();
+        let generation = uuid::Uuid::new_v4();
+        let publisher = Arc::new(
+            StatusPublisher::new(
+                &host,
+                generation,
+                global
+                    .daemon_identity(FeatureSelection {
+                        system: false,
+                        tailscale: false,
+                    })
+                    .unwrap(),
+                None,
+            )
+            .unwrap(),
+        );
+        let mut owner = ControlState::new(host, global, generation, publisher);
+        owner.config = libvm::RuntimeConfig::local(root.path().join("home"))
+            .with_run_root(root.path().join("run"))
+            .with_runtime_components(components)
+            .with_virt_backend(libvm::VirtBackendOverride::Mock { scenario: None });
+        let service = Service(Arc::new(owner));
+        let pool =
+            libvm::storage::pool::StoragePool::open(&root.path().join("home/images")).unwrap();
+        let payload = root.path().join("orphan-payload");
+        std::fs::write(&payload, b"uncatalogued object").unwrap();
+        let (orphan, roots) = pool.publish_object_for_catalog(&payload).unwrap();
+        drop(roots);
+
+        w::handoff_service_server::HandoffService::get_capabilities(&service, Request::new(()))
+            .await
+            .unwrap();
+        w::handoff_service_server::HandoffService::get_status(
+            &service,
+            Request::new(w::HandoffOperationRef {
+                operation: uuid::Uuid::new_v4().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(service.runtime.get().is_none());
+        assert!(orphan.path.exists());
+
+        service.runtime().await.unwrap();
+        assert!(service.runtime.get().is_some());
+        assert!(!orphan.path.exists());
     }
 }

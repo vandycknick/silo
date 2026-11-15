@@ -22,6 +22,9 @@ type Client = HandoffServiceClient<Channel>;
 pub struct Cmd {
     #[command(subcommand)]
     command: Action,
+    /// Output format.
+    #[arg(long, global = true, value_enum, default_value_t = crate::ui::OutputFormat::Plain)]
+    format: crate::ui::OutputFormat,
 }
 
 #[derive(Debug, Subcommand)]
@@ -386,14 +389,17 @@ impl Cmd {
                 let request = args.request()?;
                 let mut sessions = Sessions::connect(&args.destination).await?;
                 let proposal = sessions.propose(&args.machine, &request).await?;
-                print_json(&serde_json::json!({
-                    "operation": args.operation,
-                    "digest": proposal.plan.digest(),
-                    "sourceRuntime": proposal.plan.source_runtime(),
-                    "destinationRuntime": proposal.plan.destination_runtime(),
-                    "plan": serde_json::from_slice::<serde_json::Value>(proposal.plan.document().bytes())?,
-                    "estimate": proposal.estimate,
-                }))
+                print_output(
+                    &serde_json::json!({
+                        "operation": args.operation,
+                        "digest": proposal.plan.digest(),
+                        "sourceRuntime": proposal.plan.source_runtime(),
+                        "destinationRuntime": proposal.plan.destination_runtime(),
+                        "plan": serde_json::from_slice::<serde_json::Value>(proposal.plan.document().bytes())?,
+                        "estimate": proposal.estimate,
+                    }),
+                    self.format,
+                )
             }
             Action::Transfer {
                 mut plan,
@@ -428,11 +434,11 @@ impl Cmd {
                 let operation = plan.operation;
                 let report = sessions.complete(&approved, stop).await
                     .wrap_err_with(|| format!("handoff {operation} interrupted; inspect or recover this same operation, never infer abort from an unavailable peer"))?;
-                print_json(&report)
+                print_output(&report, self.format)
             }
             Action::Status(args) => {
                 let mut sessions = Sessions::connect(&args.destination).await?;
-                print_json(&sessions.status(args.operation).await?)
+                print_output(&sessions.status(args.operation).await?, self.format)
             }
             Action::Recover(args) => {
                 let mut sessions = Sessions::connect(&args.destination).await?;
@@ -448,16 +454,17 @@ impl Cmd {
                             .resolve_source(convert::terminal_to_wire(terminal)?)
                             .await?;
                     }
-                    return print_json(
+                    return print_output(
                         &sessions
                             .completion(args.operation, PayloadCounts::default())
                             .await?,
+                        self.format,
                     );
                 }
                 let plan = sessions.saved_plan(args.operation, &status).await?;
                 let report = sessions.complete(&plan, w::HandoffSourceStop::Require).await
                     .wrap_err_with(|| format!("handoff {} remains unresolved; no source ownership was released without a durable peer decision", args.operation))?;
-                print_json(&report)
+                print_output(&report, self.format)
             }
             Action::Abort(args) => {
                 let mut sessions = Sessions::connect(&args.destination).await?;
@@ -493,7 +500,7 @@ impl Cmd {
                 }
                 // A commit that won the destination CAS is resolved as committed,
                 // not presented as an abort that could allow a source restart.
-                print_json(&sessions.status(args.operation).await?)
+                print_output(&sessions.status(args.operation).await?, self.format)
             }
         }
     }
@@ -729,9 +736,14 @@ struct Completion {
     payload: PayloadCounts,
 }
 
-fn print_json(value: &impl serde::Serialize) -> eyre::Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
+fn print_output(
+    value: &impl serde::Serialize,
+    format: crate::ui::OutputFormat,
+) -> eyre::Result<()> {
+    match format {
+        crate::ui::OutputFormat::Json => crate::ui::print_json(value),
+        crate::ui::OutputFormat::Plain => crate::ui::print_serialized_details(value),
+    }
 }
 
 #[cfg(test)]
@@ -747,5 +759,59 @@ mod tests {
         assert!(validate_source_selector("1234", id, "def").is_ok());
         assert!(validate_source_selector(&id.to_string(), id, "def").is_ok());
         assert!(validate_source_selector("cafe", id, "def").is_err());
+    }
+
+    #[test]
+    fn handoff_actions_default_to_plain_and_accept_explicit_json() {
+        use crate::ui::OutputFormat;
+        use clap::Parser;
+        let operation = "00000000-0000-4000-8000-0000000000aa";
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for action in ["plan", "transfer", "status", "recover", "abort"] {
+            for (flags, expected) in [
+                (vec![], OutputFormat::Plain),
+                (vec!["--format", "json"], OutputFormat::Json),
+            ] {
+                let mut args = vec!["silo", "handoff", action];
+                if matches!(action, "plan" | "transfer") {
+                    args.extend(["vm", "--mode", "fork", "--operation", operation]);
+                } else {
+                    args.push(operation);
+                }
+                if action == "transfer" {
+                    args.extend(["--approve-plan", &digest]);
+                }
+                args.extend([
+                    "--destination-home",
+                    "/state",
+                    "--destination-config",
+                    "/config",
+                    "--destination-run-root",
+                    "/run",
+                ]);
+                args.extend(flags);
+                let cli = crate::app::Cli::try_parse_from(args).unwrap();
+                let crate::commands::Command::Handoff(command) = cli.command else {
+                    panic!("expected handoff");
+                };
+                assert_eq!(command.format, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn plain_handoff_status_preserves_unknown_peer_state() {
+        let status = crate::commands::handoff::OperationStatus {
+            operation: crate::commands::handoff::operation_id(
+                "00000000-0000-4000-8000-0000000000aa",
+            )
+            .unwrap(),
+            source: None,
+            destination: None,
+        };
+        let rows = crate::ui::serialized_detail_rows(&status).unwrap();
+        assert!(rows.contains(&("source".into(), "-".into())));
+        assert!(rows.contains(&("destination".into(), "-".into())));
+        assert!(!rows.iter().any(|(_, value)| value == "aborted"));
     }
 }

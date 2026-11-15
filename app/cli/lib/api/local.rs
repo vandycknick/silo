@@ -28,7 +28,10 @@ pub(crate) enum LocalVmService {
         config: Option<RuntimeConfig>,
         query: tokio::sync::OnceCell<libvm::LiveCapabilityQuery>,
     },
-    Ready(Runtime),
+    Ready {
+        runtime: Runtime,
+        mode: libvm::RuntimeOpenMode,
+    },
 }
 
 impl LocalVmService {
@@ -40,15 +43,33 @@ impl LocalVmService {
     }
 
     pub(crate) async fn runtime(&mut self) -> eyre::Result<&Runtime> {
+        self.runtime_with_mode(libvm::RuntimeOpenMode::Maintenance)
+            .await
+    }
+
+    async fn observation_runtime(&mut self) -> eyre::Result<&Runtime> {
+        self.runtime_with_mode(libvm::RuntimeOpenMode::Observation)
+            .await
+    }
+
+    async fn runtime_with_mode(
+        &mut self,
+        requested: libvm::RuntimeOpenMode,
+    ) -> eyre::Result<&Runtime> {
         if let Self::Uninitialized { config, query } = self {
             let config = config
                 .take()
                 .ok_or_else(|| eyre::eyre!("local runtime configuration was not initialized"))?;
             let runtime = match query.get() {
                 Some(query) => {
-                    Box::pin(Runtime::new_with_capability_query(config, query.clone())).await
+                    Box::pin(Runtime::new_with_capability_query_and_mode(
+                        config,
+                        query.clone(),
+                        requested,
+                    ))
+                    .await
                 }
-                None => Box::pin(Runtime::new(config)).await,
+                None => Box::pin(Runtime::new_with_mode(config, requested)).await,
             }
             .context("initialize local libvm adapter")?;
             let provider = libvm::HostCommand::new(
@@ -58,18 +79,29 @@ impl LocalVmService {
             .arg("provide")
             .arg("--store-file")
             .arg(runtime.local_home().join("secrets.json"));
-            *self = Self::Ready(runtime.with_secret_provider(provider));
+            *self = Self::Ready {
+                runtime: runtime.with_secret_provider(provider),
+                mode: requested,
+            };
         }
 
         match self {
-            Self::Ready(runtime) => Ok(runtime),
+            Self::Ready { runtime, mode } => {
+                if requested == libvm::RuntimeOpenMode::Maintenance
+                    && *mode == libvm::RuntimeOpenMode::Observation
+                {
+                    Box::pin(runtime.recover_maintenance()).await?;
+                    *mode = libvm::RuntimeOpenMode::Maintenance;
+                }
+                Ok(runtime)
+            }
             Self::Uninitialized { .. } => Err(eyre::eyre!("local runtime was not initialized")),
         }
     }
 
     pub(crate) async fn live_capabilities(&self) -> eyre::Result<vm_spec::live::LiveHostReport> {
         match self {
-            Self::Ready(runtime) => Ok(runtime.live_capabilities().await?),
+            Self::Ready { runtime, .. } => Ok(runtime.live_capabilities().await?),
             Self::Uninitialized {
                 config: Some(config),
                 query,
@@ -90,7 +122,7 @@ impl LocalVmService {
         reference: &MachineRef,
     ) -> eyre::Result<libvm::MachineLiveObservation> {
         Ok(match self {
-            Self::Ready(runtime) => runtime.observe_live(reference).await?,
+            Self::Ready { runtime, .. } => runtime.observe_live(reference).await?,
             Self::Uninitialized {
                 config: Some(config),
                 ..
@@ -131,7 +163,11 @@ impl LocalVmService {
         }
         let observation = self.observe_machine_live(&reference).await?;
         observation.require_pause_submission()?;
-        let machine = self.runtime().await?.get_machine(&reference).await?;
+        let machine = self
+            .observation_runtime()
+            .await?
+            .get_machine(&reference)
+            .await?;
         machine.pause(&observation).await?;
         Ok(machine.inspect().await?)
     }
@@ -139,7 +175,11 @@ impl LocalVmService {
     pub(crate) async fn resume_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
         let reference = MachineRef::parse(reference)?;
         let observation = self.observe_machine_live(&reference).await?;
-        let machine = self.runtime().await?.get_machine(&reference).await?;
+        let machine = self
+            .observation_runtime()
+            .await?
+            .get_machine(&reference)
+            .await?;
         machine.resume(&observation).await?;
         Ok(machine.inspect().await?)
     }
@@ -226,7 +266,7 @@ impl LocalVmService {
     ) -> eyre::Result<()> {
         let reference = MachineRef::parse(reference)?;
         let observation = match self {
-            Self::Ready(runtime) => runtime.observe_live(&reference).await?,
+            Self::Ready { runtime, .. } => runtime.observe_live(&reference).await?,
             Self::Uninitialized {
                 config: Some(config),
                 ..
@@ -267,7 +307,7 @@ impl LocalVmService {
             }
             // Already initialized ownership is not new admission; the native API
             // repeats authoritative checks under the source lifecycle locks.
-            Self::Ready(_) => {}
+            Self::Ready { .. } => {}
         }
         Ok(())
     }
@@ -369,29 +409,42 @@ impl LocalVmService {
         &mut self,
         reference: libvm::SnapshotRef,
     ) -> eyre::Result<libvm::SnapshotInfo> {
-        Ok(
-            libvm::SnapshotStore::open(self.runtime().await?.local_home())
-                .await?
-                .inspect(&reference)
-                .await?,
-        )
+        Ok(self
+            .observation_runtime()
+            .await?
+            .snapshots()?
+            .inspect(&reference)
+            .await?)
+    }
+
+    pub(crate) async fn verify_snapshot(
+        &mut self,
+        reference: libvm::SnapshotRef,
+    ) -> eyre::Result<libvm::SnapshotVerificationReport> {
+        Ok(self
+            .observation_runtime()
+            .await?
+            .snapshots()?
+            .verify(&reference)
+            .await?)
     }
 
     pub(crate) async fn list_snapshots(&mut self) -> eyre::Result<Vec<libvm::SnapshotInfo>> {
-        Ok(
-            libvm::SnapshotStore::open(self.runtime().await?.local_home())
-                .await?
-                .list()
-                .await?,
-        )
+        Ok(self
+            .observation_runtime()
+            .await?
+            .snapshots()?
+            .list()
+            .await?)
     }
 
     pub(crate) async fn release_snapshot(
         &mut self,
         reference: libvm::SnapshotRef,
     ) -> eyre::Result<()> {
-        libvm::SnapshotStore::open(self.runtime().await?.local_home())
+        self.runtime()
             .await?
+            .snapshots()?
             .release_retention(&reference)
             .await?;
         Ok(())
@@ -407,7 +460,7 @@ impl LocalVmService {
     pub(crate) async fn list_machines(
         &mut self,
     ) -> eyre::Result<Vec<libvm::MachineInventoryEntry>> {
-        Ok(self.runtime().await?.inventory().await?)
+        Ok(self.observation_runtime().await?.inventory().await?)
     }
 
     pub(crate) async fn inspect_inventory(
@@ -415,14 +468,18 @@ impl LocalVmService {
         reference: &str,
     ) -> eyre::Result<libvm::MachineInventoryEntry> {
         Ok(self
-            .runtime()
+            .observation_runtime()
             .await?
             .inspect_inventory(&MachineRef::parse(reference)?)
             .await?)
     }
 
     pub(crate) async fn inspect_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
-        let machine = self.machine(reference).await?;
+        let machine = self
+            .observation_runtime()
+            .await?
+            .get_machine(&MachineRef::parse(reference)?)
+            .await?;
         Ok(Box::pin(machine.inspect()).await?)
     }
 
@@ -473,14 +530,22 @@ impl LocalVmService {
     }
 
     pub(crate) async fn list_networks(&mut self) -> eyre::Result<Vec<NetworkDefinition>> {
-        Ok(self.runtime().await?.list_network_definitions().await?)
+        Ok(self
+            .observation_runtime()
+            .await?
+            .list_network_definitions()
+            .await?)
     }
 
     pub(crate) async fn inspect_network(
         &mut self,
         name: &str,
     ) -> eyre::Result<Option<NetworkDefinition>> {
-        Ok(self.runtime().await?.get_network_definition(name).await?)
+        Ok(self
+            .observation_runtime()
+            .await?
+            .get_network_definition(name)
+            .await?)
     }
 
     pub(crate) async fn create_network(
@@ -531,6 +596,15 @@ impl LocalVmService {
         ))
     }
 
+    pub(crate) async fn observation_machine_handle(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<AppMachine> {
+        let runtime = self.observation_runtime().await?;
+        let machine = runtime.get_machine(&MachineRef::parse(reference)?).await?;
+        Ok(AppMachine::new(machine, runtime.local_home().to_path_buf()))
+    }
+
     pub(crate) async fn cleanup_local(
         config: RuntimeConfig,
         machine_id: String,
@@ -575,7 +649,7 @@ impl LocalVmService {
         Ok(match spelling {
             ManagedSpelling::Reference(reference) => reference,
             ManagedSpelling::Digest(digest) => silo_vm_control::images::managed_id_to_ref(
-                self.runtime()
+                self.observation_runtime()
                     .await?
                     .images()
                     .resolve_managed_digest(&digest)
@@ -809,7 +883,7 @@ impl LocalVmService {
         reference: &libvm::ManagedSourceRef,
     ) -> eyre::Result<libvm::ManagedSourceInfo> {
         Ok(self
-            .runtime()
+            .observation_runtime()
             .await?
             .images()
             .inspect_managed(reference)
@@ -817,7 +891,12 @@ impl LocalVmService {
     }
 
     pub(crate) async fn list_managed(&mut self) -> eyre::Result<Vec<libvm::ManagedSourceInfo>> {
-        Ok(self.runtime().await?.images().list_managed().await?)
+        Ok(self
+            .observation_runtime()
+            .await?
+            .images()
+            .list_managed()
+            .await?)
     }
 
     pub(crate) async fn release_image(
