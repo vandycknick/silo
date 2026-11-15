@@ -77,6 +77,19 @@ impl CompositionValidation {
         })
     }
 
+    pub(crate) fn check_records(
+        &self,
+        recipe: &CompositionRecipe,
+        result: &CompositionResult,
+    ) -> Result<(), StorageError> {
+        if self.recipe != recipe.canonical_bytes().map_err(invalid)?
+            || self.result != result.canonical_bytes().map_err(invalid)?
+        {
+            return Err(invalid("validation receipt contradicts canonical records"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_file(
         &self,
         backing: crate::storage::vmdk::LowerBacking,

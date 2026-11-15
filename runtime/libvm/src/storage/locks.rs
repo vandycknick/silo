@@ -150,6 +150,19 @@ pub(crate) fn blocking(
     })
 }
 
+pub(crate) fn blocking_deferred(
+    directory: &OwnedDirectory,
+    name: &str,
+    argument: FlockArg,
+) -> Result<StorageLock, StorageError> {
+    acquire_mode(directory, name, argument, true, false, false)?.ok_or_else(|| {
+        StorageError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "blocking storage lock was not acquired",
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use nix::fcntl::FlockArg;

@@ -153,35 +153,49 @@ async fn restore_consumer(
     )
     .map_err(crate::storage::StorageError::from)?;
     let ram = shape.open_stream(&pool, &execution.memory.stream, execution.memory.length)?;
-    let ram_map_bytes = shape
-        .stream_map(&execution.memory.stream)?
-        .canonical_bytes()?;
     let map_stage = crate::machine::stopped::OperationStaging::new_deferred(
         &pool,
         consumer.operation_id,
         &consumer.lease,
     )?;
-    let map_input = crate::store::snapshot_store::RecordInput::new(
-        runtime.local_images_dir(),
-        consumer.operation_id,
-        &ram_map_bytes,
-    )?;
-    let (ram_map, roots) = pool.publish_object_for_catalog(&map_input.path())?;
-    store_ram_map_pin(runtime, consumer.operation_id, ram_map.digest).await?;
-    drop(roots);
+    let roots = pool.lock_roots_shared()?;
+    let (ram_map, ram_map_file) =
+        if let Some(held) = shape.held_restore_map(&pool, execution.memory.stream)? {
+            store_ram_map_pin(runtime, consumer.operation_id, held.0).await?;
+            drop(roots);
+            held
+        } else {
+            drop(roots);
+            let bytes = shape
+                .stream_map(&execution.memory.stream)?
+                .canonical_bytes()?;
+            let input = crate::store::snapshot_store::RecordInput::new(
+                runtime.local_images_dir(),
+                consumer.operation_id,
+                &bytes,
+            )?;
+            let (published, roots) = pool.publish_object_for_catalog(&input.path())?;
+            store_ram_map_pin(runtime, consumer.operation_id, published.digest).await?;
+            snapshots
+                .cache_restore_map(shape, execution.memory.stream, &published)
+                .await?;
+            let file = pool.open_object(&published.digest)?;
+            drop(roots);
+            (published.digest, file)
+        };
     let objects = [
         ram,
         shape.open_object(&pool, &execution.layout)?,
         shape.open_object(&pool, &execution.execution)?,
         shape.open_object(&pool, &execution.devices)?,
-        pool.open_object(&ram_map.digest)?,
+        ram_map_file,
     ];
     let digests = [
         Sha256Digest::from_bytes(*execution.memory.stream.as_bytes()),
         Sha256Digest::from_bytes(*execution.layout.as_bytes()),
         Sha256Digest::from_bytes(*execution.execution.as_bytes()),
         Sha256Digest::from_bytes(*execution.devices.as_bytes()),
-        Sha256Digest::from_bytes(*ram_map.digest.as_bytes()),
+        Sha256Digest::from_bytes(*ram_map.as_bytes()),
     ];
     let mut descriptors = Vec::with_capacity(5);
     for ((file, role), identity) in objects.iter().zip(RestoreObjectRole::ALL).zip(digests) {
@@ -263,13 +277,6 @@ async fn restore_consumer(
         &storage,
         &consumer.record.configuration.spec,
     )?;
-    // The restored child roots its lower by identity. Register the exact
-    // checkpoint graph (authenticated, exact-loaded) under the consumer.
-    if let Some(lower) = consumer.record.lower() {
-        crate::store::layer_store::LayerStore::from_store(runtime.native_store()?)
-            .publish_local_composition(consumer.operation_id, lower)
-            .await?;
-    }
     let transfer_roles = request.objects.len() as u64
         + request
             .lowers

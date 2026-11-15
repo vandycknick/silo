@@ -165,14 +165,8 @@ impl HeldComposition {
         Ok(())
     }
 
-    pub(crate) fn held_backing(
-        &self,
-        backing: LowerBacking,
-    ) -> Result<(File, crate::storage::identity_file::SourceFingerprint), LibVmError> {
-        held_backing(&self.validation, &self.unique, &self.fsmeta, backing)
-    }
-
     pub fn snapshot_composition(&self) -> Result<SnapshotComposition, LibVmError> {
+        self.recheck()?;
         snapshot_graph(&self.retained, &self.unique, &self.occurrences)
     }
 }
@@ -183,14 +177,25 @@ pub struct LaunchLower {
     pub occurrences: Vec<LowerOccurrence>,
     pub retained: RetainedComposition,
     pub(crate) validation: CompositionValidation,
-    unique: Vec<HeldLayer>,
+    graph: SnapshotComposition,
+    unique: Vec<(crate::store::models::snapshot::SnapshotStream, Arc<File>)>,
     fsmeta: File,
+    metadata: Vec<(
+        ObjectDigest,
+        File,
+        crate::storage::identity_file::SourceFingerprint,
+    )>,
+    pub(crate) maps: std::collections::BTreeMap<
+        crate::storage::identity::StreamId,
+        Arc<crate::storage::stream::StreamMap>,
+    >,
     _authority: LowerAuthority,
 }
 
 enum LowerAuthority {
     Launch,
     Consumer { _owner: LayerReadOwner },
+    ExistingRoot,
 }
 
 impl LaunchLower {
@@ -198,28 +203,61 @@ impl LaunchLower {
         &self,
         backing: LowerBacking,
     ) -> Result<(File, crate::storage::identity_file::SourceFingerprint), LibVmError> {
-        held_backing(&self.validation, &self.unique, &self.fsmeta, backing)
+        let file = match backing {
+            LowerBacking::Object(_) => &self.fsmeta,
+            LowerBacking::Stream(id) => {
+                &self
+                    .unique
+                    .iter()
+                    .find(|(stream, _)| stream.stream == id)
+                    .ok_or_else(|| invalid("pack is outside the held composition"))?
+                    .1
+            }
+        };
+        Ok((
+            file.try_clone()?,
+            self.validation.check_file(backing, file)?,
+        ))
     }
-}
 
-fn held_backing(
-    validation: &CompositionValidation,
-    unique: &[HeldLayer],
-    fsmeta: &File,
-    backing: LowerBacking,
-) -> Result<(File, crate::storage::identity_file::SourceFingerprint), LibVmError> {
-    let file = match backing {
-        LowerBacking::Object(_) => fsmeta,
-        LowerBacking::Stream(id) => {
-            &unique
-                .iter()
-                .find(|(layer, _)| layer.pack.stream == id)
-                .ok_or_else(|| invalid("pack is outside the held composition"))?
-                .1
+    pub(crate) fn snapshot_composition(&self) -> &SnapshotComposition {
+        &self.graph
+    }
+
+    pub(crate) fn metadata_states(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            ObjectDigest,
+            crate::storage::identity_file::SourceFingerprint,
+        ),
+    > + '_ {
+        self.metadata
+            .iter()
+            .map(|(digest, _, fingerprint)| (*digest, *fingerprint))
+    }
+
+    pub(crate) fn retained_descriptors(&self) -> u64 {
+        (self.metadata.len() + self.unique.len() + 1) as u64
+    }
+
+    pub(crate) fn recheck(&self) -> Result<(), LibVmError> {
+        self.validation
+            .check_records(&self.retained.recipe, &self.retained.result)?;
+        self.validation
+            .check_file(LowerBacking::Object(self.retained.fsmeta()), &self.fsmeta)?;
+        for (stream, file) in &self.unique {
+            self.validation
+                .check_file(LowerBacking::Stream(stream.stream), file)?;
         }
-    };
-    let fingerprint = validation.check_file(backing, file)?;
-    Ok((file.try_clone()?, fingerprint))
+        for (_, file, expected) in &self.metadata {
+            if crate::storage::identity_file::SourceFingerprint::new(&file.metadata()?) != *expected
+            {
+                return Err(invalid("composition metadata changed after validation"));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn snapshot_graph(
@@ -310,12 +348,276 @@ async fn save_validation(
     id: LowerResultId,
     validation: &CompositionValidation,
 ) -> Result<(), LibVmError> {
-    sqlx::query("INSERT INTO composition_validation(lower_id,schema,receipt) SELECT id,?2,?3 FROM composition_result WHERE id=?1 ON CONFLICT(lower_id,schema) DO UPDATE SET receipt=excluded.receipt")
+    sqlx::query("INSERT INTO composition_validation(lower_id,schema,receipt) SELECT id,?2,?3 FROM composition_result WHERE id=?1 ON CONFLICT(lower_id,schema) DO UPDATE SET graph_receipt=CASE WHEN receipt=excluded.receipt THEN graph_receipt ELSE NULL END,receipt=excluded.receipt")
         .bind(id.to_string())
         .bind(COMPOSITION_VALIDATION_SCHEMA)
         .bind(serde_json::to_vec(validation).map_err(invalid)?)
         .execute(&store.pool).await?;
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphValidation {
+    graph: SnapshotComposition,
+    metadata: Vec<(
+        ObjectDigest,
+        crate::storage::identity_file::SourceFingerprint,
+    )>,
+    maps: Vec<(
+        crate::storage::identity::StreamId,
+        Vec<crate::storage::stream::Chunk>,
+    )>,
+}
+
+fn graph_objects(graph: &SnapshotComposition) -> BTreeSet<ObjectDigest> {
+    graph
+        .objects()
+        .chain(graph.layers.iter().flat_map(|layer| {
+            std::iter::once(layer.pack.map).chain(layer.pack.map_pages.iter().copied())
+        }))
+        .collect()
+}
+
+async fn save_graph_validation(
+    store: &Store,
+    pool: &StoragePool,
+    graph: &SnapshotComposition,
+    validation: &CompositionValidation,
+) -> Result<(), LibVmError> {
+    crate::storage::limits::preflight_fd_budget(
+        (graph_objects(graph).len() + graph.layers.len() + 2) as u64,
+    )
+    .map_err(StorageError::from)?;
+    let mut held = Vec::new();
+    for digest in graph_objects(graph) {
+        let file = pool.open_object(&digest)?;
+        let fingerprint = crate::storage::identity_file::SourceFingerprint::new(&file.metadata()?);
+        held.push((digest, file, fingerprint));
+    }
+    let authenticated =
+        graph.authenticate(|digest, maximum| Ok(pool.read_object(digest, maximum)?))?;
+    validation.check_records(&authenticated.recipe, &authenticated.result)?;
+    let mut maps = std::collections::BTreeMap::new();
+    for layer in &graph.layers {
+        let root = crate::storage::map::StreamMapRoot::decode(&pool.read_object(
+            &layer.pack.map,
+            crate::storage::limits::Resource::MetadataPageBytes.maximum(),
+        )?)?;
+        if root.stream != layer.pack.stream
+            || root.length != layer.pack.length
+            || root.pages != layer.pack.map_pages
+        {
+            return Err(invalid("composition receipt map contradicts its graph"));
+        }
+        maps.insert(layer.pack.stream, root.read_map(pool)?.chunks().to_vec());
+        validation.check_file(
+            LowerBacking::Stream(layer.pack.stream),
+            &pool.open_stream(&layer.pack.stream)?,
+        )?;
+    }
+    validation.check_file(
+        LowerBacking::Object(graph.fsmeta),
+        &pool.open_object(&graph.fsmeta)?,
+    )?;
+    for (_, file, fingerprint) in &held {
+        if crate::storage::identity_file::SourceFingerprint::new(&file.metadata()?) != *fingerprint
+        {
+            return Err(invalid(
+                "composition metadata changed during receipt creation",
+            ));
+        }
+    }
+    let receipt = GraphValidation {
+        graph: graph.clone(),
+        metadata: held
+            .into_iter()
+            .map(|(digest, _, fingerprint)| (digest, fingerprint))
+            .collect(),
+        maps: maps.into_iter().collect(),
+    };
+    sqlx::query("UPDATE composition_validation SET graph_receipt=?3 WHERE lower_id=?1 AND schema=?2 AND receipt=?4")
+        .bind(graph.result.to_string()).bind(COMPOSITION_VALIDATION_SCHEMA)
+        .bind(serde_json::to_vec(&receipt).map_err(invalid)?)
+        .bind(serde_json::to_vec(validation).map_err(invalid)?)
+        .execute(&store.pool).await?;
+    Ok(())
+}
+
+async fn load_graph_validation(
+    store: &Store,
+    pool: &StoragePool,
+    retained: &RetainedComposition,
+    authority: &mut Option<LowerAuthority>,
+) -> Result<Option<LaunchLower>, LibVmError> {
+    let row = sqlx::query(
+        "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=?2",
+    )
+    .bind(retained.id.to_string())
+    .bind(COMPOSITION_VALIDATION_SCHEMA)
+    .fetch_optional(&store.pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let validation =
+        serde_json::from_slice::<CompositionValidation>(&row.try_get::<Vec<u8>, _>("receipt")?);
+    let graph = row
+        .try_get::<Option<Vec<u8>>, _>("graph_receipt")?
+        .and_then(|bytes| serde_json::from_slice::<GraphValidation>(&bytes).ok());
+    let (Ok(validation), Some(receipt)) = (validation, graph) else {
+        return Ok(None);
+    };
+    if validation
+        .check_records(&retained.recipe, &retained.result)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let graph = receipt.graph;
+    if graph.result != retained.id
+        || graph.recipe != retained.recipe_digest
+        || graph.record != retained.record_digest
+        || graph.fsmeta != retained.fsmeta()
+        || graph.layers.len() != retained.layers.len()
+    {
+        return Ok(None);
+    }
+    let rows = sqlx::query("SELECT c.position,c.layer_result_id,r.recipe_id,r.pack_stream,r.pack_length,r.pack_map,r.index_root,r.record_digest,r.record_bytes,p.diff_id,p.record_digest AS recipe_digest,p.record_bytes AS recipe_bytes FROM composition_layer c JOIN layer_result r ON r.id=c.layer_result_id JOIN layer_recipe p ON p.id=r.recipe_id WHERE c.result_id=?1 ORDER BY c.position")
+        .bind(retained.id.to_string()).fetch_all(&store.pool).await?;
+    if rows.len() != graph.layers.len() {
+        return Ok(None);
+    }
+    for (index, (row, layer)) in rows.iter().zip(&graph.layers).enumerate() {
+        let binding = &retained.recipe.layers[index];
+        let recipe_bytes = row.try_get::<Vec<u8>, _>("recipe_bytes")?;
+        let recipe = oci::changeset::LayerRecipe {
+            diff_id: crate::store::models::snapshot::decode_layer_recipe(&recipe_bytes)?,
+        };
+        if row.try_get::<String, _>("recipe_id")? != recipe.id()?.to_string()
+            || row.try_get::<String, _>("diff_id")? != recipe.diff_id.to_string()
+        {
+            return Ok(None);
+        }
+        if row.try_get::<i64, _>("position")? != int(index as u64)?
+            || row.try_get::<String, _>("layer_result_id")? != retained.layers[index].to_string()
+            || row.try_get::<String, _>("record_digest")? != layer.result.to_string()
+            || row.try_get::<String, _>("recipe_digest")? != layer.recipe.to_string()
+            || ObjectDigest::of_bytes(&row.try_get::<Vec<u8>, _>("record_bytes")?) != layer.result
+            || ObjectDigest::of_bytes(&recipe_bytes) != layer.recipe
+            || row.try_get::<String, _>("pack_stream")? != layer.pack.stream.to_string()
+            || row.try_get::<i64, _>("pack_length")? != int(layer.pack.length)?
+            || row.try_get::<String, _>("pack_map")? != layer.pack.map.to_string()
+            || row.try_get::<String, _>("index_root")? != binding.index_root.to_string()
+            || content_object(binding.index_root)? != layer.index_root
+        {
+            return Ok(None);
+        }
+    }
+    let dependencies = sqlx::query("SELECT DISTINCT d.result_id,d.object_digest FROM layer_object_dependency d JOIN composition_layer c ON c.layer_result_id=d.result_id WHERE c.result_id=?1")
+        .bind(retained.id.to_string()).fetch_all(&store.pool).await?;
+    let actual = dependencies
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("result_id")?,
+                row.try_get::<String, _>("object_digest")?,
+            ))
+        })
+        .collect::<Result<BTreeSet<_>, sqlx::Error>>()?;
+    let mut expected_dependencies = BTreeSet::new();
+    for (id, layer) in retained.layers.iter().zip(&graph.layers) {
+        for digest in [layer.recipe, layer.result, layer.index_root, layer.pack.map]
+            .into_iter()
+            .chain(layer.index_pages.iter().copied())
+            .chain(layer.pack.map_pages.iter().copied())
+        {
+            expected_dependencies.insert((id.to_string(), digest.to_string()));
+        }
+    }
+    if actual != expected_dependencies {
+        return Ok(None);
+    }
+    let mut maps = std::collections::BTreeMap::new();
+    for (id, chunks) in receipt.maps {
+        let Some(layer) = graph.layers.iter().find(|layer| layer.pack.stream == id) else {
+            return Ok(None);
+        };
+        let map =
+            crate::storage::stream::StreamMap::from_validated_parts(layer.pack.length, chunks, id)?;
+        if maps.insert(id, Arc::new(map)).is_some() {
+            return Ok(None);
+        }
+    }
+    if maps.len()
+        != graph
+            .layers
+            .iter()
+            .map(|layer| layer.pack.stream)
+            .collect::<BTreeSet<_>>()
+            .len()
+    {
+        return Ok(None);
+    }
+    let expected = graph_objects(&graph);
+    if receipt
+        .metadata
+        .iter()
+        .map(|(digest, _)| *digest)
+        .collect::<BTreeSet<_>>()
+        != expected
+        || receipt.metadata.len() != expected.len()
+    {
+        return Ok(None);
+    }
+    crate::storage::limits::preflight_fd_budget((expected.len() + graph.layers.len() + 1) as u64)
+        .map_err(StorageError::from)?;
+    let mut metadata = Vec::with_capacity(expected.len());
+    for (digest, expected) in receipt.metadata {
+        let file = pool.open_object(&digest)?;
+        if crate::storage::identity_file::SourceFingerprint::new(&file.metadata()?) != expected {
+            return Ok(None);
+        }
+        metadata.push((digest, file, expected));
+    }
+    let fsmeta = pool.open_object(&graph.fsmeta)?;
+    if validation
+        .check_file(LowerBacking::Object(graph.fsmeta), &fsmeta)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let mut unique: Vec<(crate::store::models::snapshot::SnapshotStream, Arc<File>)> = Vec::new();
+    let mut occurrences = vec![pool.lower_object_occurrence(&graph.fsmeta)?];
+    for layer in &graph.layers {
+        if !unique
+            .iter()
+            .any(|(stream, _)| stream.stream == layer.pack.stream)
+        {
+            let file = pool.open_stream(&layer.pack.stream)?;
+            if validation
+                .check_file(LowerBacking::Stream(layer.pack.stream), &file)
+                .is_err()
+            {
+                return Ok(None);
+            }
+            unique.push((layer.pack.clone(), Arc::new(file)));
+        }
+        occurrences.push(pool.lower_occurrence(&layer.pack.stream)?);
+    }
+    let lower = LaunchLower {
+        occurrences,
+        retained: retained.clone(),
+        validation,
+        graph,
+        unique,
+        fsmeta,
+        metadata,
+        maps,
+        _authority: authority
+            .take()
+            .ok_or_else(|| invalid("composition receipt has no retention authority"))?,
+    };
+    lower.recheck()?;
+    Ok(Some(lower))
 }
 
 /// All byte work runs with held descriptors and leases, outside SQL/root locks.
@@ -675,6 +977,23 @@ impl LayerStore {
             }
         };
         drop(layers);
+        if load_graph_validation(
+            store,
+            &pool,
+            &retained,
+            &mut Some(LowerAuthority::ExistingRoot),
+        )
+        .await?
+        .is_none()
+        {
+            save_graph_validation(
+                store,
+                &pool,
+                &snapshot_graph(&retained, &unique, &mapping)?,
+                &validation,
+            )
+            .await?;
+        }
         Ok(HeldComposition {
             retained,
             unique,
@@ -734,6 +1053,23 @@ impl LayerStore {
                     true,
                 )
                 .await?;
+                if load_graph_validation(
+                    &store.store,
+                    &pool,
+                    &retained,
+                    &mut Some(LowerAuthority::ExistingRoot),
+                )
+                .await?
+                .is_none()
+                {
+                    save_graph_validation(
+                        &store.store,
+                        &pool,
+                        &snapshot_graph(&retained, &unique, &mapping)?,
+                        &validation,
+                    )
+                    .await?;
+                }
                 Ok(HeldComposition {
                     retained,
                     unique,
@@ -829,6 +1165,14 @@ impl LayerStore {
         let pool = existing_pool(&self.store)?;
         let retained = read_retained(&self.store, &pool, id).await?;
         retained.check_lower(lower)?;
+        let mut authority = Some(authority);
+        if let Some(resolved) =
+            load_graph_validation(&self.store, &pool, &retained, &mut authority).await?
+        {
+            crate::storage::vmdk::FlatLowerPlan::new(&resolved.occurrences)?
+                .preflight(data_disks)?;
+            return Ok(resolved);
+        }
         let mut resolved = Vec::with_capacity(retained.layers.len() + 1);
         let fsmeta = pool
             .lower_object_occurrence(&retained.fsmeta())
@@ -887,14 +1231,11 @@ impl LayerStore {
             true,
         )
         .await?;
-        Ok(LaunchLower {
-            occurrences: resolved,
-            retained,
-            validation,
-            unique,
-            fsmeta,
-            _authority: authority,
-        })
+        let graph = snapshot_graph(&retained, &unique, &mapping)?;
+        save_graph_validation(&self.store, &pool, &graph, &validation).await?;
+        load_graph_validation(&self.store, &pool, &retained, &mut authority)
+            .await?
+            .ok_or_else(|| invalid("newly validated composition lost its receipt"))
     }
 
     /// Read the explicit closed graph without creating catalog state. The caller
@@ -911,6 +1252,16 @@ impl LayerStore {
             runtime.block_on(async {
                 let pool = existing_pool(&store.store)?;
                 let retained = read_retained(&store.store, &pool, id).await?;
+                if let Some(held) = load_graph_validation(
+                    &store.store,
+                    &pool,
+                    &retained,
+                    &mut Some(LowerAuthority::ExistingRoot),
+                )
+                .await?
+                {
+                    return Ok(held.graph);
+                }
                 let mut unique: Vec<(LayerResultId, PinnedLayer)> = Vec::new();
                 let mut layers = Vec::with_capacity(retained.layers.len());
                 for layer in &retained.layers {
@@ -992,6 +1343,30 @@ impl LayerStore {
         let store = &self.store;
         let pool = existing_pool(store)?;
         let id = lower.result;
+        if local {
+            let cached: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM composition_validation WHERE lower_id=?1 AND schema=?2 AND graph_receipt IS NOT NULL)")
+                .bind(id.to_string()).bind(COMPOSITION_VALIDATION_SCHEMA).fetch_one(&store.pool).await?;
+            if cached {
+                let retained = read_retained(store, &pool, id).await?;
+                if let Some(held) = load_graph_validation(
+                    store,
+                    &pool,
+                    &retained,
+                    &mut Some(LowerAuthority::ExistingRoot),
+                )
+                .await?
+                {
+                    if held.graph != lower {
+                        return Err(invalid(
+                            "local composition graph differs from its validation receipt",
+                        ));
+                    }
+                    store.pin_operation_lowers(operation, &[id]).await?;
+                    held.recheck()?;
+                    return Ok(id);
+                }
+            }
+        }
         let authenticated = lower.authenticate(|digest, maximum| {
             pool.read_object(digest, maximum).map_err(retained(id))
         })?;
@@ -1104,6 +1479,7 @@ impl LayerStore {
         };
         commit_composition(store, &pool, operation, &retained).await?;
         save_validation(store, id, &validation).await?;
+        save_graph_validation(store, &pool, &lower, &validation).await?;
         Ok(id)
     }
 }
@@ -1677,5 +2053,118 @@ mod tests {
                 .unwrap();
         assert_eq!(count, 0);
         assert!(!fsmeta.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn graph_receipt_hits_skip_index_maps_and_payloads_and_misses_revalidate() {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let (_temporary, paths, store, held) = fixture().await;
+        let layers = LayerStore::from_store(store.clone());
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        let graph = held.snapshot_composition().unwrap();
+        let lower = held.retained.overlay_lower();
+        let metadata = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).unwrap();
+        for layer in &graph.layers {
+            for digest in std::iter::once(layer.index_root)
+                .chain(layer.index_pages.iter().copied())
+                .chain(std::iter::once(layer.pack.map))
+                .chain(layer.pack.map_pages.iter().copied())
+            {
+                metadata
+                    .add_watch(&pool.object_path(&digest), AddWatchFlags::IN_ACCESS)
+                    .unwrap();
+            }
+        }
+        let payloads = watch(&held, &pool);
+        let resolved = layers.hold_lower(&lower).await.unwrap();
+        resolved.recheck().unwrap();
+        assert_eq!(resolved.snapshot_composition(), &graph);
+        assert_eq!(
+            layers.snapshot_composition(graph.result).await.unwrap(),
+            graph
+        );
+        layers
+            .publish_local_composition(held._owner.operation, &graph)
+            .await
+            .unwrap();
+        unread(&metadata);
+        unread(&payloads);
+        drop(resolved);
+
+        sqlx::query("UPDATE composition_validation SET graph_receipt=NULL WHERE lower_id=?1")
+            .bind(graph.result.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        layers.hold_lower(&lower).await.unwrap().recheck().unwrap();
+        assert!(!metadata.read_events().unwrap().is_empty());
+        unread(&payloads);
+
+        let index = pool.object_path(&graph.layers[0].index_root);
+        replace(&index);
+        let replaced = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).unwrap();
+        replaced
+            .add_watch(&index, AddWatchFlags::IN_ACCESS)
+            .unwrap();
+        layers.hold_lower(&lower).await.unwrap().recheck().unwrap();
+        assert!(!replaced.read_events().unwrap().is_empty());
+        unread(&payloads);
+
+        replace(&pool.stream_path(&graph.layers[0].pack.stream));
+        let replaced_pack = watch(&held, &pool);
+        layers.hold_lower(&lower).await.unwrap().recheck().unwrap();
+        assert!(!replaced_pack.read_events().unwrap().is_empty());
+        let _ = payloads.read_events();
+
+        sqlx::query("DELETE FROM composition_validation WHERE lower_id=?1")
+            .bind(graph.result.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        layers.hold_lower(&lower).await.unwrap().recheck().unwrap();
+        assert!(!payloads.read_events().unwrap().is_empty());
+        let length = std::fs::metadata(&index).unwrap().len() as usize;
+        std::fs::set_permissions(&index, Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&index, vec![b'x'; length]).unwrap();
+        std::fs::set_permissions(&index, Permissions::from_mode(0o400)).unwrap();
+        assert!(layers.hold_lower(&lower).await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_snapshot_graph_rebuilds_retired_composition_catalog_with_full_authentication() {
+        let (_temporary, paths, store, held) = fixture().await;
+        let layers = LayerStore::from_store(store.clone());
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        let graph = held.snapshot_composition().unwrap();
+        let events = watch(&held, &pool);
+        sqlx::query("DELETE FROM storage_operation_lower WHERE lower_id=?1")
+            .bind(graph.result.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM composition_result WHERE id=?1")
+            .bind(graph.result.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let recovered = layers
+            .publish_local_composition(held._owner.operation, &graph)
+            .await
+            .unwrap();
+        assert_eq!(recovered, graph.result);
+        assert!(!events.read_events().unwrap().is_empty());
+        let lower = layers
+            .hold_lower(&held.retained.overlay_lower())
+            .await
+            .unwrap();
+        assert_eq!(lower.snapshot_composition(), &graph);
+        lower.recheck().unwrap();
+        unread(&events);
     }
 }

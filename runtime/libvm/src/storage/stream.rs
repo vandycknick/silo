@@ -25,7 +25,7 @@ use crate::storage::identity_file::SourceFingerprint;
 use crate::storage::limits::{Resource, CHUNK_SIZE};
 use crate::storage::StorageError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Chunk {
     Zero,
     Data(ObjectDigest),
@@ -53,6 +53,7 @@ pub enum ExpectedMapError {
 pub struct StreamMap {
     length: u64,
     chunks: Vec<Chunk>,
+    id: StreamId,
 }
 
 impl StreamMap {
@@ -65,7 +66,8 @@ impl StreamMap {
                 actual: chunks.len() as u64,
             });
         }
-        Ok(Self { length, chunks })
+        let id = Self::identity(length, &chunks);
+        Ok(Self { length, chunks, id })
     }
 
     pub fn length(&self) -> u64 {
@@ -100,9 +102,31 @@ impl StreamMap {
     }
 
     pub fn id(&self) -> StreamId {
+        self.id
+    }
+
+    /// Reuse only a local receipt whose held inode fingerprints all match.
+    /// The receipt already authenticated this identity and its decoded chunks.
+    pub(crate) fn from_validated_parts(
+        length: u64,
+        chunks: Vec<Chunk>,
+        id: StreamId,
+    ) -> Result<Self, StorageError> {
+        Resource::ArtifactStreamBytes.check(length)?;
+        let expected = length.div_ceil(CHUNK_SIZE as u64);
+        if chunks.len() as u64 != expected {
+            return Err(StorageError::ChunkCount {
+                expected,
+                actual: chunks.len() as u64,
+            });
+        }
+        Ok(Self { length, chunks, id })
+    }
+
+    fn identity(length: u64, chunks: &[Chunk]) -> StreamId {
         let mut identity = vm_spec::capture::StreamIdentity::new();
-        let mut remaining = self.length;
-        for chunk in &self.chunks {
+        let mut remaining = length;
+        for chunk in chunks {
             let digest = match chunk {
                 Chunk::Zero => None,
                 Chunk::Data(digest) => Some(vm_spec::capture::Sha256Digest::from_bytes(
