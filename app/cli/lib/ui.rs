@@ -120,9 +120,11 @@ impl std::fmt::Display for OutputFormat {
 }
 
 pub fn print_json(value: &impl Serialize) -> eyre::Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    serde_json::to_writer_pretty(&mut out, value)?;
+    write_json(&mut std::io::stdout().lock(), value)
+}
+
+pub(crate) fn write_json(out: &mut impl Write, value: &impl Serialize) -> eyre::Result<()> {
+    serde_json::to_writer_pretty(&mut *out, value)?;
     writeln!(out)?;
     Ok(())
 }
@@ -631,6 +633,19 @@ pub fn success(message: impl AsRef<str>) {
     eprintln!("   {check} {}", message.as_ref());
 }
 
+pub(crate) fn result_message(action: &str, target: &str, id: &str, elapsed: Duration) -> String {
+    format!("{action:<12} {target} [{id}] {}", format_duration(elapsed))
+}
+
+pub(crate) fn secondary(message: impl AsRef<str>) {
+    let message = message.as_ref();
+    if should_style_stderr() {
+        eprintln!("     {}", style(message).dim());
+    } else {
+        eprintln!("     {message}");
+    }
+}
+
 pub fn hint(message: impl AsRef<str>) {
     let arrow = if should_style_stderr() {
         style("→").cyan().to_string()
@@ -666,7 +681,7 @@ fn print_success(past_tense: &str, target: &str, elapsed: Duration) {
     }
 }
 
-fn format_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     if duration.as_secs() >= 60 {
         let minutes = duration.as_secs() / 60;
         let seconds = duration.as_secs() % 60;
@@ -695,12 +710,13 @@ impl Table {
     }
 
     pub fn print(&self) -> eyre::Result<()> {
-        let widths = self.column_widths();
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
+        self.write_to(&mut std::io::stdout().lock(), should_style_stdout())
+    }
 
+    pub(crate) fn write_to(&self, out: &mut impl Write, styled: bool) -> eyre::Result<()> {
+        let widths = self.column_widths();
         if !self.headers.is_empty() {
-            let headers = if should_style_stdout() {
+            let headers = if styled {
                 self.headers
                     .iter()
                     .map(|header| style(header).cyan().bold().to_string())
@@ -708,11 +724,11 @@ impl Table {
             } else {
                 self.headers.clone()
             };
-            write_columns(&mut out, &headers, &widths)?;
+            write_columns(out, &headers, &widths)?;
         }
 
         for row in &self.rows {
-            write_columns(&mut out, row, &widths)?;
+            write_columns(out, row, &widths)?;
         }
         Ok(())
     }
@@ -763,6 +779,42 @@ pub fn print_detail_rows(rows: &[(impl AsRef<str>, impl AsRef<str>)]) -> eyre::R
     }
 
     Ok(())
+}
+
+pub(crate) fn print_serialized_details(value: &impl Serialize) -> eyre::Result<()> {
+    print_detail_rows(&serialized_detail_rows(value)?)
+}
+
+pub(crate) fn serialized_detail_rows(
+    value: &impl Serialize,
+) -> eyre::Result<Vec<(String, String)>> {
+    fn append(rows: &mut Vec<(String, String)>, label: String, value: serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) if !fields.is_empty() => {
+                for (key, value) in fields {
+                    let key = if label.is_empty() {
+                        key
+                    } else {
+                        format!("{label}.{key}")
+                    };
+                    append(rows, key, value);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for (index, value) in items.into_iter().enumerate() {
+                    append(rows, format!("{label}[{index}]"), value);
+                }
+            }
+            serde_json::Value::String(value) => rows.push((label, value)),
+            serde_json::Value::Bool(value) => rows.push((label, yes_no(value).into())),
+            serde_json::Value::Number(value) => rows.push((label, value.to_string())),
+            _ => rows.push((label, "-".into())),
+        }
+    }
+
+    let mut rows = Vec::new();
+    append(&mut rows, String::new(), serde_json::to_value(value)?);
+    Ok(rows)
 }
 
 pub fn human_bytes(size: Option<u64>) -> String {

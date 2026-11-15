@@ -9,6 +9,7 @@ const HELP_TEMPLATE: &str = "{about}\n\n{usage-heading} {usage}\n\n{all-args}{af
 #[command(
     name = "silo",
     about = "Silo VM lifecycle control",
+    version = env!("CARGO_PKG_VERSION"),
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -49,6 +50,27 @@ mod tests {
     use crate::commands::Command;
 
     use crate::app::Cli;
+
+    #[test]
+    fn version_flags_report_the_authoritative_product_version_without_a_command() {
+        for flag in ["--version", "-V"] {
+            let error = Cli::try_parse_from(["silo", flag]).expect_err("version exits parsing");
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert_eq!(error.exit_code(), 0);
+            assert!(!error.use_stderr());
+            assert_eq!(
+                error.to_string(),
+                format!("silo {}\n", env!("CARGO_PKG_VERSION"))
+            );
+            let error = Cli::command()
+                .try_get_matches_from(["silo", flag])
+                .expect_err("version exits command parsing");
+            assert_eq!(
+                error.to_string(),
+                format!("silo {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
 
     #[test]
     fn parses_list_alias() {

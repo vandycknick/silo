@@ -55,6 +55,7 @@ service RuntimeService {
  rpc RestoreSnapshot(RestoreStorageSnapshotRequest) returns (MachineSnapshot);
  rpc RecoverCheckpointDisks(RecoverCheckpointDisksRequest) returns (MachineSnapshot);
  rpc InspectStorageSnapshot(StorageSnapshotRef) returns (StorageSnapshotInfo);
+ rpc VerifyStorageSnapshot(StorageSnapshotRef) returns (SnapshotVerificationResult);
  rpc ListStorageSnapshots(google.protobuf.Empty) returns (StorageSnapshotList);
  rpc ReleaseSnapshotRetention(StorageSnapshotRef) returns (google.protobuf.Empty);
  rpc RemoveImageAlias(Name) returns (google.protobuf.Empty);
@@ -612,6 +613,17 @@ enum StorageCaptureKind { STORAGE_CAPTURE_KIND_UNSPECIFIED = 0; STORAGE_CAPTURE_
 message SnapshotCaptureProvenance { string capture_id = 1; string machine_id = 2; string run_id = 3; string evidence_digest = 4; }
 message StorageSnapshotInfo { string id = 1; string record_digest = 2; optional bool retained = 3; repeated string aliases = 4; optional int64 created_at = 5; StorageCaptureKind capture_kind = 6; repeated SnapshotCaptureProvenance provenance = 7; }
 message StorageSnapshotList { repeated StorageSnapshotInfo snapshots = 1; }
+message SnapshotVerificationReport { string snapshot = 1; uint64 streams = 2; uint64 bytes = 3; }
+enum SnapshotVerificationRole { SNAPSHOT_VERIFICATION_ROLE_UNSPECIFIED = 0; SNAPSHOT_VERIFICATION_ROLE_RAM = 1; SNAPSHOT_VERIFICATION_ROLE_LAYOUT = 2; SNAPSHOT_VERIFICATION_ROLE_EXECUTION = 3; SNAPSHOT_VERIFICATION_ROLE_DEVICES = 4; SNAPSHOT_VERIFICATION_ROLE_ROOT_DISK = 5; SNAPSHOT_VERIFICATION_ROLE_DATA_DISK = 6; SNAPSHOT_VERIFICATION_ROLE_DEPENDENCY = 7; }
+message SnapshotVerificationMember { oneof member { string stream = 1; string object = 2; } }
+message VerificationLengths { uint64 expected = 1; uint64 actual = 2; }
+message SnapshotStructuralFailure { oneof failure { google.protobuf.Empty missing = 1; VerificationLengths truncated = 2; VerificationLengths length = 3; uint32 writable = 4; google.protobuf.Empty replaced = 5; string invalid = 6; } }
+message SnapshotStructuralError { SnapshotVerificationMember member = 1; SnapshotStructuralFailure failure = 2; }
+message VerificationChunk { oneof identity { google.protobuf.Empty zero = 1; string data = 2; } }
+message SnapshotChunkMismatch { string stream = 1; uint64 index = 2; uint64 start = 3; uint64 end = 4; VerificationChunk expected = 5; VerificationChunk actual = 6; }
+message SnapshotObjectMismatch { string object = 1; uint64 length = 2; string actual = 3; }
+message SnapshotVerificationError { SnapshotVerificationRole role = 1; optional uint32 disk_order = 2; oneof error { SnapshotStructuralError structural = 3; SnapshotChunkMismatch chunk = 4; SnapshotObjectMismatch object = 5; } }
+message SnapshotVerificationResult { oneof result { SnapshotVerificationReport report = 1; SnapshotVerificationError error = 2; } }
 enum LiveOperation { LIVE_OPERATION_UNSPECIFIED = 0; LIVE_OPERATION_PAUSE = 1; LIVE_OPERATION_CAPTURE = 2; LIVE_OPERATION_RESTORE = 3; LIVE_OPERATION_FORK = 4; LIVE_OPERATION_INCREMENTAL = 5; }
 enum LiveBackend { LIVE_BACKEND_UNSPECIFIED = 0; LIVE_BACKEND_KRUN = 1; LIVE_BACKEND_VZ = 2; LIVE_BACKEND_MOCK = 3; }
 enum LiveLane { LIVE_LANE_UNSPECIFIED = 0; LIVE_LANE_KVM_X86_64 = 1; LIVE_LANE_KVM_ARM64_GIC_V3 = 2; LIVE_LANE_HVF_ARM64 = 3; LIVE_LANE_NOT_APPLICABLE = 4; }

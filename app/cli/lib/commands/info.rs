@@ -26,7 +26,7 @@ impl Cmd {
             .as_ref()
             .is_some_and(|machine| machine.is_running())
         {
-            match api.machine(&data.id).await {
+            match api.observation_machine(&data.id).await {
                 Ok(machine) => machine.host_memory_reclaim().await,
                 Err(_) => None,
             }

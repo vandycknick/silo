@@ -74,4 +74,13 @@ impl Context {
         let machine = self.app_api().await?.machine(&resolved).await?;
         Ok((resolved, machine))
     }
+
+    pub(crate) async fn observation_machine(
+        &mut self,
+        name: Option<&str>,
+    ) -> eyre::Result<(String, AppMachine)> {
+        let resolved = self.resolve_machine_name(name)?;
+        let machine = self.app_api().await?.observation_machine(&resolved).await?;
+        Ok((resolved, machine))
+    }
 }

@@ -84,7 +84,7 @@ impl DaemonVmService {
             )?;
             let mut config = self.session.config.clone().with_runtime_components(components);
             config.home = Some(self.session.home.clone());
-            let runtime = Runtime::new(config).await.context("initialize native daemon-mode session runtime")?;
+            let runtime = Runtime::new_with_mode(config, libvm::RuntimeOpenMode::Observation).await.context("initialize native daemon-mode session runtime")?;
             let provider = libvm::HostCommand::new(std::env::current_exe()?).arg("secret").arg("provide").arg("--store-file").arg(runtime.local_home().join("secrets.json"));
             Ok::<_, eyre::Report>(runtime.with_secret_provider(provider))
         }).await

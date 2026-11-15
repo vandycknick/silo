@@ -197,32 +197,34 @@ impl ControlState {
             .map_err(|_| Status::internal("cannot publish manager capabilities"))
     }
     pub(super) async fn runtime(&self) -> Result<Runtime, Status> {
-        let components = self.components().await?.clone();
         let runtime = self
             .runtime
-            .get_or_try_init(|| async {
-                let command = std::env::current_exe()
-                    .and_then(|path| path.canonicalize())
-                    .map_err(|_| Status::unavailable("silo executable path unavailable"))?;
-                let config = self.config.clone().with_runtime_components(components);
-                let runtime = match self.live_query.get() {
-                    Some(query) => Runtime::new_with_capability_query(config, query.clone()).await,
-                    None => Runtime::new(config).await,
-                }
-                .map_err(native)?;
-                let store = runtime.local_home().join("secrets.json");
-                Ok::<_, Status>(
-                    runtime.with_secret_provider(
-                        libvm::HostCommand::new(command)
-                            .arg("secret")
-                            .arg("provide")
-                            .arg("--store-file")
-                            .arg(store),
-                    ),
-                )
-            })
+            .get_or_try_init(|| self.open_runtime(libvm::RuntimeOpenMode::Maintenance))
             .await?;
         Ok(runtime.clone())
+    }
+
+    async fn open_runtime(&self, mode: libvm::RuntimeOpenMode) -> Result<Runtime, Status> {
+        let components = self.components().await?.clone();
+        let command = std::env::current_exe()
+            .and_then(|path| path.canonicalize())
+            .map_err(|_| Status::unavailable("silo executable path unavailable"))?;
+        let config = self.config.clone().with_runtime_components(components);
+        let runtime = match self.live_query.get() {
+            Some(query) => {
+                Runtime::new_with_capability_query_and_mode(config, query.clone(), mode).await
+            }
+            None => Runtime::new_with_mode(config, mode).await,
+        }
+        .map_err(native)?;
+        let store = runtime.local_home().join("secrets.json");
+        Ok(runtime.with_secret_provider(
+            libvm::HostCommand::new(command)
+                .arg("secret")
+                .arg("provide")
+                .arg("--store-file")
+                .arg(store),
+        ))
     }
     pub(super) async fn machine(&self, r: &libvm::MachineRef) -> Result<libvm::Machine, Status> {
         self.runtime().await?.get_machine(r).await.map_err(native)

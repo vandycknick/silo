@@ -49,7 +49,7 @@ impl Cmd {
             let cwd = std::env::current_dir()?;
             Some(parse_forward(&self.endpoints, self.name, &cwd)?)
         };
-        let (_reference, machine) = context.machine(Some(&self.vm)).await?;
+        let (_reference, machine) = context.observation_machine(Some(&self.vm)).await?;
         let inspect = machine.inspect().await?;
         guest::ensure_running(&inspect)?;
         if self.list {

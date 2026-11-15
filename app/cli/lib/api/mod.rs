@@ -222,6 +222,17 @@ impl AppApi {
         }
     }
 
+    pub(crate) async fn verify_snapshot(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<libvm::SnapshotVerificationReport> {
+        let reference: libvm::SnapshotRef = reference.parse()?;
+        match self {
+            Self::Local(service) => service.verify_snapshot(reference).await,
+            Self::Daemon(service) => service.verify_snapshot(reference).await,
+        }
+    }
+
     pub(crate) async fn list_snapshots(&mut self) -> eyre::Result<Vec<libvm::SnapshotInfo>> {
         match self {
             Self::Local(service) => service.list_snapshots().await,
@@ -594,6 +605,16 @@ impl AppApi {
     pub(crate) async fn machine(&mut self, reference: &str) -> eyre::Result<AppMachine> {
         match self {
             Self::Local(service) => service.machine_handle(reference).await,
+            Self::Daemon(service) => service.machine_handle(reference).await,
+        }
+    }
+
+    pub(crate) async fn observation_machine(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<AppMachine> {
+        match self {
+            Self::Local(service) => service.observation_machine_handle(reference).await,
             Self::Daemon(service) => service.machine_handle(reference).await,
         }
     }

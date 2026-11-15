@@ -621,10 +621,7 @@ pub(crate) fn machine_settings(options: &MachineCliOptions) -> MachineCreationSe
 pub(crate) fn render_plan(plan: &Plan, format: OutputFormat) -> eyre::Result<()> {
     match format {
         OutputFormat::Json => crate::ui::print_json(plan),
-        OutputFormat::Plain => {
-            println!("{}", serde_json::to_string(plan)?);
-            Ok(())
-        }
+        OutputFormat::Plain => crate::ui::print_serialized_details(plan),
     }
 }
 

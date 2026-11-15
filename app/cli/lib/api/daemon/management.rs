@@ -298,6 +298,20 @@ impl DaemonVmService {
         )?)
     }
 
+    pub(crate) async fn verify_snapshot(
+        &self,
+        reference: libvm::SnapshotRef,
+    ) -> eyre::Result<libvm::SnapshotVerificationReport> {
+        let result = self
+            .runtime
+            .clone()
+            .verify_storage_snapshot(silo_vm_control::stopped::reference_to_wire(&reference))
+            .await
+            .map_err(native_status)?
+            .into_inner();
+        Ok(snapshots::verification_from_wire(result)??)
+    }
+
     pub(crate) async fn list_snapshots(&self) -> eyre::Result<Vec<libvm::SnapshotInfo>> {
         self.runtime
             .clone()
