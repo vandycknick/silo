@@ -29,6 +29,91 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const WORKLOAD_ROOT: &str = "/sys/fs/cgroup/silo/workloads";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DelegationGroup {
+    Root,
+    Silo,
+    Workloads,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequiredController {
+    Memory,
+    Cpu,
+    Pids,
+}
+
+impl RequiredController {
+    const ALL: [Self; 3] = [Self::Memory, Self::Cpu, Self::Pids];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Cpu => "cpu",
+            Self::Pids => "pids",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Protection {
+    CgroupTargets,
+    AvailableControllers(DelegationGroup),
+    Delegation(DelegationGroup, RequiredController),
+    SiloMemoryMin,
+    ControlMemoryMin,
+    ControlCpuWeight,
+    WorkloadPidLimit,
+    AgentOomScoreAdj,
+    AgentDumpable,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProtectionFailure {
+    protection: Protection,
+    source: io::Error,
+}
+
+impl ProtectionFailure {
+    pub(crate) fn new(protection: Protection, source: impl Into<io::Error>) -> Self {
+        Self {
+            protection,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProtectionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?}: {}", self.protection, self.source)
+    }
+}
+
+impl std::error::Error for ProtectionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl Protection {
+    pub(crate) fn qualify_value(
+        self,
+        observed: &str,
+        expected: i128,
+    ) -> Result<(), ProtectionFailure> {
+        let value = observed.trim().parse::<i128>().map_err(|error| {
+            ProtectionFailure::new(self, io::Error::new(io::ErrorKind::InvalidData, error))
+        })?;
+        if value != expected {
+            return Err(ProtectionFailure::new(
+                self,
+                io::Error::other(format!("expected {expected}, observed {value}")),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SpawnRole {
     Workload,
     ActivationHook,
@@ -42,6 +127,7 @@ pub(crate) struct WorkloadController {
 struct Controller {
     targets: Option<Targets>,
     unavailable: Option<String>,
+    protection_setup: Result<(), ProtectionFailure>,
     profile: Mutex<Option<String>>,
     // Permits live through Command::spawn's exec-error-pipe acknowledgement.
     // Closing is short and synchronous; waiting for permits is asynchronous.
@@ -89,10 +175,10 @@ struct Group {
 
 impl WorkloadController {
     pub(crate) fn discover() -> Self {
-        let (targets, unavailable) = match Targets::open() {
+        let (targets, unavailable, protection_setup) = match Targets::open() {
             Ok(targets) => {
-                targets.configure();
-                (Some(targets), None)
+                let protection_setup = targets.configure();
+                (Some(targets), None, protection_setup)
             }
             Err(error) => {
                 tracing::warn!(%error, "live workload containment unavailable; cold boot retained");
@@ -101,6 +187,7 @@ impl WorkloadController {
                     Some(format!(
                         "cgroup-v2 workload containment unavailable: {error}"
                     )),
+                    Err(ProtectionFailure::new(Protection::CgroupTargets, error)),
                 )
             }
         };
@@ -108,6 +195,7 @@ impl WorkloadController {
             inner: Arc::new(Controller {
                 targets,
                 unavailable,
+                protection_setup,
                 profile: Mutex::new(Some("guest profile not yet qualified".to_owned())),
                 spawn_gate: Mutex::default(),
                 spawn_idle: Notify::new(),
@@ -134,6 +222,20 @@ impl WorkloadController {
         lock(&self.inner.profile)
             .clone()
             .or_else(|| self.inner.unavailable.clone())
+    }
+
+    pub(crate) fn protection_setup(&self) -> Result<(), &ProtectionFailure> {
+        self.inner.protection_setup.as_ref().copied()
+    }
+
+    pub(crate) fn observe_protections(&self) -> Result<(), ProtectionFailure> {
+        let targets = self.inner.targets.as_ref().ok_or_else(|| {
+            ProtectionFailure::new(
+                Protection::CgroupTargets,
+                io::Error::other("retained cgroup targets unavailable"),
+            )
+        })?;
+        targets.observe_protections()
     }
 
     pub(crate) fn roots(&self) -> Vec<String> {
@@ -412,54 +514,103 @@ impl Targets {
         self.exec.validate(&self.workloads.directory, "exec")
     }
 
-    fn configure(&self) {
-        // Delegate every controller the kernel offers so the image sees the
-        // same set it would as the real root (Docker needs cpuset, for one).
-        for (directory, group) in [
-            (&self.root, "/"),
-            (&self.silo, "/silo"),
-            (&self.workloads.directory, "/silo/workloads"),
-        ] {
-            match open_file(directory, "cgroup.controllers", false).and_then(io::read_to_string) {
-                Ok(controllers) => {
-                    for controller in controllers.split_whitespace() {
-                        configure_value(
-                            directory,
-                            group,
-                            "cgroup.subtree_control",
-                            &format!("+{controller}"),
-                        );
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(group, %error, "failed to read available cgroup controllers");
-                }
-            }
+    fn delegation_groups(&self) -> [(DelegationGroup, &File); 3] {
+        [
+            (DelegationGroup::Root, &self.root),
+            (DelegationGroup::Silo, &self.silo),
+            (DelegationGroup::Workloads, &self.workloads.directory),
+        ]
+    }
+
+    fn configure(&self) -> Result<(), ProtectionFailure> {
+        // Keep configuring independent protections after a failure, but retain
+        // the first required failure for qualification in the agent child.
+        let mut result = Ok(());
+        for (group, directory) in self.delegation_groups() {
+            result = result.and(delegate_controllers(directory, group));
         }
-        configure_value(&self.silo, "/silo", "memory.min", "16777216");
-        configure_value(
-            &self.control.directory,
-            "/silo/control",
-            "memory.min",
-            "16777216",
-        );
-        configure_value(
-            &self.control.directory,
-            "/silo/control",
-            "cpu.weight",
-            "1000",
-        );
-        let limit = fs::read_to_string("/proc/sys/kernel/pid_max")
-            .and_then(|value| workload_pid_limit(&value));
-        match limit {
-            Ok(limit) => configure_value(
-                &self.workloads.directory,
-                "/silo/workloads",
-                "pids.max",
-                &limit.to_string(),
+        for (directory, control, value, protection) in [
+            (
+                &self.silo,
+                "memory.min",
+                "16777216",
+                Protection::SiloMemoryMin,
             ),
-            Err(error) => tracing::warn!(%error, "failed to determine workload PID limit"),
+            (
+                &self.control.directory,
+                "memory.min",
+                "16777216",
+                Protection::ControlMemoryMin,
+            ),
+            (
+                &self.control.directory,
+                "cpu.weight",
+                "1000",
+                Protection::ControlCpuWeight,
+            ),
+        ] {
+            result = result.and(
+                configure_value(directory, control, value)
+                    .map_err(|error| ProtectionFailure::new(protection, error)),
+            );
         }
+        result.and(
+            fs::read_to_string("/proc/sys/kernel/pid_max")
+                .and_then(|value| workload_pid_limit(&value))
+                .and_then(|limit| {
+                    configure_value(&self.workloads.directory, "pids.max", &limit.to_string())
+                })
+                .map_err(|error| ProtectionFailure::new(Protection::WorkloadPidLimit, error)),
+        )
+    }
+
+    fn observe_protections(&self) -> Result<(), ProtectionFailure> {
+        self.validate()
+            .and_then(|()| self.validate_control())
+            .map_err(|error| ProtectionFailure::new(Protection::CgroupTargets, error))?;
+        for (group, directory) in self.delegation_groups() {
+            let enabled = open_file(directory, "cgroup.subtree_control", false)
+                .and_then(io::read_to_string)
+                .map_err(|error| {
+                    ProtectionFailure::new(Protection::AvailableControllers(group), error)
+                })?;
+            qualify_controllers(&enabled, group)?;
+        }
+        let pid_limit = fs::read_to_string("/proc/sys/kernel/pid_max")
+            .and_then(|value| workload_pid_limit(&value))
+            .map_err(|error| ProtectionFailure::new(Protection::WorkloadPidLimit, error))?;
+        for (directory, control, expected, protection) in [
+            (
+                &self.silo,
+                "memory.min",
+                16_777_216,
+                Protection::SiloMemoryMin,
+            ),
+            (
+                &self.control.directory,
+                "memory.min",
+                16_777_216,
+                Protection::ControlMemoryMin,
+            ),
+            (
+                &self.control.directory,
+                "cpu.weight",
+                1000,
+                Protection::ControlCpuWeight,
+            ),
+            (
+                &self.workloads.directory,
+                "pids.max",
+                pid_limit,
+                Protection::WorkloadPidLimit,
+            ),
+        ] {
+            let observed = open_file(directory, control, false)
+                .and_then(io::read_to_string)
+                .map_err(|error| ProtectionFailure::new(protection, error))?;
+            protection.qualify_value(&observed, i128::from(expected))?;
+        }
+        Ok(())
     }
 
     fn validate_control(&self) -> io::Result<()> {
@@ -635,12 +786,55 @@ fn workload_pid_limit(value: &str) -> io::Result<u64> {
         })
 }
 
-fn configure_value(directory: &File, group: &str, control: &str, value: &str) {
-    if let Err(error) =
-        open_file(directory, control, true).and_then(|file| write_value(&file, value.as_bytes()))
-    {
-        tracing::warn!(group, control, value, %error, "failed to configure cgroup control");
+fn qualify_controllers(controllers: &str, group: DelegationGroup) -> Result<(), ProtectionFailure> {
+    for controller in RequiredController::ALL {
+        if !controllers
+            .split_ascii_whitespace()
+            .any(|name| name == controller.name())
+        {
+            return Err(ProtectionFailure::new(
+                Protection::Delegation(group, controller),
+                io::Error::other("required controller is not delegated"),
+            ));
+        }
     }
+    Ok(())
+}
+
+fn delegate_controllers(directory: &File, group: DelegationGroup) -> Result<(), ProtectionFailure> {
+    let controllers = open_file(directory, "cgroup.controllers", false)
+        .and_then(io::read_to_string)
+        .map_err(|error| ProtectionFailure::new(Protection::AvailableControllers(group), error))?;
+    let mut result = qualify_controllers(&controllers, group);
+    // Delegate optional controllers too, so the image retains its normal
+    // resource controls (Docker needs cpuset, for one).
+    for controller in controllers.split_ascii_whitespace() {
+        if let Err(error) = configure_value(
+            directory,
+            "cgroup.subtree_control",
+            &format!("+{controller}"),
+        ) {
+            match RequiredController::ALL
+                .into_iter()
+                .find(|required| required.name() == controller)
+            {
+                Some(required) => {
+                    result = result.and(Err(ProtectionFailure::new(
+                        Protection::Delegation(group, required),
+                        error,
+                    )));
+                }
+                None => {
+                    tracing::warn!(?group, controller, %error, "failed to delegate optional cgroup controller");
+                }
+            }
+        }
+    }
+    result
+}
+
+fn configure_value(directory: &File, control: &str, value: &str) -> io::Result<()> {
+    open_file(directory, control, true).and_then(|file| write_value(&file, value.as_bytes()))
 }
 
 fn write_value(file: &File, value: &[u8]) -> io::Result<()> {
@@ -788,12 +982,82 @@ mod tests {
     }
 
     #[test]
+    fn required_protection_values_reject_missing_malformed_or_changed_observations() {
+        use crate::freezer::Protection;
+
+        for (protection, expected) in [
+            (Protection::SiloMemoryMin, 16_777_216),
+            (Protection::ControlMemoryMin, 16_777_216),
+            (Protection::ControlCpuWeight, 1000),
+            (Protection::WorkloadPidLimit, 32256),
+            (Protection::AgentOomScoreAdj, -1000),
+        ] {
+            protection
+                .qualify_value(&format!("{expected}\n"), expected)
+                .unwrap();
+            for observed in ["", "invalid", "max", "0", "1000 extra"] {
+                let failure = protection.qualify_value(observed, expected).unwrap_err();
+                assert_eq!(failure.protection, protection);
+            }
+            for changed in [expected - 1, expected + 1] {
+                assert_eq!(
+                    protection
+                        .qualify_value(&changed.to_string(), expected)
+                        .unwrap_err()
+                        .protection,
+                    protection,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_requires_memory_cpu_and_pids_at_every_ancestor() {
+        use crate::freezer::{
+            qualify_controllers, DelegationGroup, Protection, RequiredController,
+        };
+
+        for group in [
+            DelegationGroup::Root,
+            DelegationGroup::Silo,
+            DelegationGroup::Workloads,
+        ] {
+            qualify_controllers("cpuset cpu io memory pids\n", group).unwrap();
+            qualify_controllers("memory cpu pids\n", group).unwrap();
+            for (controllers, missing) in [
+                ("cpu pids\n", RequiredController::Memory),
+                ("memory pids\n", RequiredController::Cpu),
+                ("memory cpu\n", RequiredController::Pids),
+            ] {
+                assert_eq!(
+                    qualify_controllers(controllers, group)
+                        .unwrap_err()
+                        .protection,
+                    Protection::Delegation(group, missing),
+                );
+            }
+            for invalid in ["", "cpuset io\n", "memory_hugetlb cpuacct pids_extra\n"] {
+                assert!(qualify_controllers(invalid, group).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn workload_pid_reserve_requires_positive_capacity() {
         assert_eq!(
             crate::freezer::workload_pid_limit("32768\n").unwrap(),
             32256
         );
-        for invalid in ["", "invalid", "-1", "0", "511", "512"] {
+        assert_eq!(crate::freezer::workload_pid_limit("513\n").unwrap(), 1);
+        for invalid in [
+            "",
+            "invalid",
+            "-1",
+            "0",
+            "511",
+            "512",
+            "18446744073709551616",
+        ] {
             assert!(crate::freezer::workload_pid_limit(invalid).is_err());
         }
     }
@@ -805,6 +1069,7 @@ mod tests {
             inner: Arc::new(Controller {
                 targets: None,
                 unavailable: Some("no kernel target in this unit test".to_owned()),
+                protection_setup: Ok(()),
                 profile: Mutex::new(None),
                 spawn_gate: Mutex::default(),
                 spawn_idle: tokio::sync::Notify::new(),
@@ -832,6 +1097,7 @@ mod tests {
             inner: Arc::new(Controller {
                 targets: None,
                 unavailable: Some("no kernel target in this unit test".to_owned()),
+                protection_setup: Ok(()),
                 profile: Mutex::new(None),
                 spawn_gate: Mutex::default(),
                 spawn_idle: tokio::sync::Notify::new(),

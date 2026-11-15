@@ -16,7 +16,7 @@ use nix::sys::signal::{self, SigHandler, SigSet, SigmaskHow, Signal};
 use nix::unistd::{execv, fork, pipe2, setsid, ForkResult};
 use protocol::v1::{GuestBootMode, GuestBootReport};
 
-use crate::freezer::WorkloadController;
+use crate::freezer::{Protection, ProtectionFailure, WorkloadController};
 
 const HANDOFF_AUTO: &str = "auto";
 pub(crate) const HANDOFF_AUTO_CANDIDATES: &[&str] = &[
@@ -82,7 +82,7 @@ impl BootMode {
                 agent_pid: Some(agent_pid),
                 agent_is_pid1: Some(false),
                 message: Some(format!(
-                    "agent handed PID 1 to guest init; containment observation failed: {containment_failure}"
+                    "agent handed PID 1 to guest init; containment qualification failed: {containment_failure}"
                 )),
             },
             Self::ContainedInit {
@@ -234,31 +234,77 @@ fn fork_handoff_init(
             exec_handoff_parent(&init, target, writer)
         }
         ForkResult::Child => {
-            if let Err(error) = fs::write("/proc/self/oom_score_adj", b"-1000") {
-                tracing::warn!(%error, "failed to protect agent child from OOM killer");
-            }
-            if let Err(error) = nix::sys::prctl::set_dumpable(false) {
-                tracing::warn!(%error, "failed to make agent child non-dumpable");
-            }
+            let agent_protection_setup = protect_agent_child();
             drop(writer);
             if let Err(err) = setsid() {
                 tracing::warn!(error = %err, "failed to isolate agent child session");
             }
-            match observe_handoff(&reader) {
-                Ok(()) => Ok(BootMode::ContainedInit {
-                    requested_init: requested_init.to_os_string(),
-                    init_path: target.to_path_buf(),
-                }),
-                Err(containment_failure) => {
-                    tracing::warn!(%containment_failure, "image init containment not established");
-                    Ok(BootMode::InitChild {
-                        requested_init: requested_init.to_os_string(),
-                        init_path: target.to_path_buf(),
-                        containment_failure,
-                    })
-                }
+            let containment = observe_handoff(&reader);
+            let observed_protections =
+                observe_agent_protections().and_then(|()| workloads.observe_protections());
+            let protections = workloads
+                .protection_setup()
+                .and(agent_protection_setup.as_ref().copied())
+                .and(observed_protections.as_ref().copied());
+            if let Err(error) = protections {
+                tracing::error!(%error, "required agent protection failed; live operations refused");
             }
+            if let Err(containment_failure) = &containment {
+                tracing::warn!(%containment_failure, "image init containment not established");
+            }
+            Ok(qualified_handoff_mode(
+                requested_init,
+                target,
+                containment,
+                protections,
+            ))
         }
+    }
+}
+
+fn protect_agent_child() -> Result<(), ProtectionFailure> {
+    let oom = fs::write("/proc/self/oom_score_adj", b"-1000")
+        .map_err(|error| ProtectionFailure::new(Protection::AgentOomScoreAdj, error));
+    let dumpable = nix::sys::prctl::set_dumpable(false)
+        .map_err(|error| ProtectionFailure::new(Protection::AgentDumpable, error));
+    oom.and(dumpable)
+}
+
+fn observe_agent_protections() -> Result<(), ProtectionFailure> {
+    let oom = fs::read_to_string("/proc/self/oom_score_adj")
+        .map_err(|error| ProtectionFailure::new(Protection::AgentOomScoreAdj, error))?;
+    let dumpable = nix::sys::prctl::get_dumpable()
+        .map_err(|error| ProtectionFailure::new(Protection::AgentDumpable, error))?;
+    qualify_agent_protections(&oom, dumpable)
+}
+
+fn qualify_agent_protections(oom: &str, dumpable: bool) -> Result<(), ProtectionFailure> {
+    Protection::AgentOomScoreAdj.qualify_value(oom, -1000)?;
+    if dumpable {
+        return Err(ProtectionFailure::new(
+            Protection::AgentDumpable,
+            io::Error::other("agent remains dumpable"),
+        ));
+    }
+    Ok(())
+}
+
+fn qualified_handoff_mode(
+    requested_init: &OsStr,
+    target: &Path,
+    containment: Result<(), String>,
+    protections: Result<(), &ProtectionFailure>,
+) -> BootMode {
+    match protections.map_err(ToString::to_string).and(containment) {
+        Ok(()) => BootMode::ContainedInit {
+            requested_init: requested_init.to_os_string(),
+            init_path: target.to_path_buf(),
+        },
+        Err(containment_failure) => BootMode::InitChild {
+            requested_init: requested_init.to_os_string(),
+            init_path: target.to_path_buf(),
+            containment_failure,
+        },
     }
 }
 
@@ -594,6 +640,58 @@ mod tests {
             crate::handoff::cgroup_mount_root(&format!("{mounts}{mounts}")),
             None
         );
+    }
+
+    #[test]
+    fn agent_protection_qualification_requires_oom_immunity_and_non_dumpability() {
+        use crate::handoff::qualify_agent_protections;
+
+        qualify_agent_protections("-1000\n", false).unwrap();
+        for oom in ["", "invalid", "-1001", "-999", "-1", "0", "1000"] {
+            assert!(qualify_agent_protections(oom, false).is_err());
+        }
+        assert!(qualify_agent_protections("-1000\n", true).is_err());
+    }
+
+    #[test]
+    fn contained_init_requires_protections_even_when_containment_succeeded() {
+        use crate::freezer::Protection;
+        use crate::handoff::{qualified_handoff_mode, qualify_agent_protections, BootMode};
+
+        let requested_init = OsStr::new("/sbin/init");
+        let target = Path::new("/sbin/init");
+        let qualified = qualified_handoff_mode(requested_init, target, Ok(()), Ok(()));
+        assert!(matches!(qualified, BootMode::ContainedInit { .. }));
+        assert!(matches!(
+            qualified_handoff_mode(
+                requested_init,
+                target,
+                Err("not contained".to_owned()),
+                Ok(())
+            ),
+            BootMode::InitChild { .. },
+        ));
+        for failure in [
+            Protection::SiloMemoryMin.qualify_value("0", 16_777_216),
+            Protection::ControlMemoryMin.qualify_value("0", 16_777_216),
+            Protection::ControlCpuWeight.qualify_value("100", 1000),
+            Protection::WorkloadPidLimit.qualify_value("max", 32256),
+            qualify_agent_protections("0", false),
+            qualify_agent_protections("-1000", true),
+        ] {
+            let error = failure.unwrap_err();
+            let boot = qualified_handoff_mode(requested_init, target, Ok(()), Err(&error));
+            let BootMode::InitChild {
+                containment_failure,
+                ..
+            } = &boot
+            else {
+                panic!("missing protection must not qualify ContainedInit");
+            };
+            assert_eq!(containment_failure, &error.to_string());
+            assert_eq!(boot.report().mode, Some(GuestBootMode::InitChild as i32));
+            assert!(boot.report().message.unwrap().contains(&error.to_string()));
+        }
     }
 
     #[test]

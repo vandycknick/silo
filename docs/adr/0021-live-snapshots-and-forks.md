@@ -426,6 +426,10 @@ retained cgroup and procfs descriptors after the image replaces mount views.
 The agent has `oom_score_adj=-1000`, 16 MiB `memory.min` protection on `silo`
 and `control`, `cpu.weight=1000` on `control`, and a workload `pids.max` that
 leaves an agent reserve. Spawned commands reset their OOM adjustment to zero.
+`ContainedInit` requires successful setup and fresh observation of these
+protections, non-dumpability and memory/cpu/pids delegation; failure logs an error
+and continues cold boot as `InitChild`, refusing live operations with
+`guest-init-not-contained`.
 These protections are not protection against deliberately hostile guest root.
 
 After every workload freeze, before acknowledging it, the agent verifies the
