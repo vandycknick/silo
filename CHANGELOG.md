@@ -3,13 +3,17 @@
 ## Unreleased
 
 - Document Phase 30's agent-ready latency gates, capacity-independent live
-  operations, publication-trusted local restore with on-demand snapshot
-  verification, explicit zero ranges and separately selected non-durable
-  same-host fork. Performance budgets move to `make perf`; image init stays default.
+  operations, explicit zero ranges and separately selected non-durable same-host
+  fork. Local lower validation reuses fingerprint receipts; RAM and sealed disks
+  share publication-trusted restore. On-demand snapshot verification bypasses
+  receipts and distinguishes stream chunks, state objects and structural failures.
+  Every runtime open recovers abandoned pending work; only maintenance performs
+  store-wide recovery. Retention semantics stay unchanged.
+  Performance budgets move to `make perf`; image init stays default.
 - Incremental snapshot publication no longer rereads all RAM on owned reflink
   paths, so RAM identity cost follows changed chunks. The Phase 30 contract
   places local corruption detection in explicit verification, export or handoff;
-  copy and existing-dedup verification remain.
+  copy and receipt-miss dedup verification remain.
 - Monitor metrics use the same bounded inspection deadline as status, so
   `silo info` does not spend another 30 seconds querying an unresponsive VMM.
 - System appliance activation waits for systemd boot completion, including
