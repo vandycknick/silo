@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Incremental snapshot publication no longer rereads all RAM on owned reflink
+  paths, so RAM identity cost follows changed chunks. Corruption detection moves
+  to cold restore or export; copy and existing-dedup verification remain.
+- Monitor metrics use the same bounded inspection deadline as status, so
+  `silo info` does not spend another 30 seconds querying an unresponsive VMM.
+- System appliance activation waits for systemd boot completion, including
+  degraded boots, before starting Docker instead of accepting an early bus probe.
 - Stock image init now supports live pause, snapshot, restore and fork on
   supported libkrun hosts. Systemd, busybox and OpenRC run in a contained image
   cgroup namespace with delegated resource controls; exec, shell and SSH use a
@@ -96,16 +103,6 @@
   data to two hashing and writing workers, with output bytes and checkpoint
   identities unchanged. On a 30 GiB guest with 8 GiB of dense data the pause
   drops from about 16 s to about 9.5 s.
-- Live checkpoint publication authenticates RAM once while publishing it into
-  the content-addressed pool, then carries held-inode verification into closure
-  publication instead of scanning the bytes twice more. Deduplicated RAM is
-  independently verified, changed files are refused, and interrupted publication
-  authenticates again on replay without changing checkpoint identities.
-- Captured RAM publication uses reflinks on Linux Btrfs/XFS and authenticates
-  the private pool destination in one read, so staged bytes are written once
-  by capture and never rewritten by publication. Unsupported or cross-filesystem
-  clones retain copy-and-hash publication with identical checkpoint identities
-  and durability.
 - Cross-home resource admission now reclaims charges from deleted or replaced
   Silo homes using versioned home anchors, preventing orphaned reservations
   from permanently consuming the same user's disk and descriptor budget.

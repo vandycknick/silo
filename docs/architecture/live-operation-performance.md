@@ -62,8 +62,10 @@ Measured effect: capture pause 8.94 → 5.51 s; manager work after the seal
 2. The stream identity (SHA-256 over the ordered chunk-digest list) is the
    identity of RAM and disk streams on every live path. Whole-file digests are
    computed only for blobs that leave the host.
-3. libvm validates a cut structurally at retention; full byte re-read only at
-   publication, export and handoff.
+3. libvm validates a cut structurally at retention. Owned reflink RAM publication
+   binds producer identity and unchanged inode facts without rereading RAM;
+   copies hash inline and independent dedup objects are still verified. Cold
+   durable restore, export and handoff independently authenticate bytes.
 4. A fork is a local branch: the cut is written and closed, not synchronized.
 5. Children hash their private copy as it is written, start at
    `constructed`, and become `durable` in the background; recovery deletes a
@@ -71,6 +73,13 @@ Measured effect: capture pause 8.94 → 5.51 s; manager work after the seal
 6. Restore checks closure shape before allocating, authenticates bytes
    concurrently with the private copy, and reuses previously verified objects
    whose inode metadata is unchanged.
+
+Owned reflink publication creates no warm restore receipt. Corruption between
+capture and publication is detected at cold durable restore or export, not at
+publication; file/directory synchronization and catalog durability are unchanged.
+Local fork RAM restore trusts producer-computed identities and unchanged owned
+inode facts without rehashing RAM. These contracts do not remeasure the historical
+batch results below.
 
 Measured effect on ext4: pause 5.51 → 2.52 s; manager 3.56 → 1.46 s; restore
 7.21 → 3.5–4.3 s. Child construction stayed at about 9 s for four children.

@@ -100,7 +100,7 @@ deliberately onto Silo's fork, not adopted by changing a dependency revision.
 | Pause | Every vCPU parked at an instruction boundary, every device worker stopped at a terminal queue position, every host memory writer drained. Reversible; produces no artifact. |
 | Pause token | `(machineId, runId, pauseGeneration, owner)` identifying one established pause and who may resume it. A resume names the exact token. |
 | Capture | One operation that produces a coherent cut of execution state, RAM and every included writable disk at one pause token. |
-| Execution checkpoint | The immutable, verified closure produced by a capture: RAM stream and layout, execution envelope, device state, sealed disks, boot and configuration provenance, compatibility profile. [ADR 0014](0014-layered-oci-image-storage.md) calls this a snapshot with `captureKind: live-execution`. |
+| Execution checkpoint | The immutable closure bound to producer-computed identities by a capture: RAM stream and layout, execution envelope, device state, sealed disks, boot and configuration provenance, compatibility profile. Cold durable restore and export independently authenticate RAM bytes. [ADR 0014](0014-layered-oci-image-storage.md) calls this a snapshot with `captureKind: live-execution`. |
 | Restore | Construction of a new machine generation whose first guest instruction continues from an execution checkpoint. |
 | Fork | One capture of a running source followed by N restores, with the source resumed under its recorded policy. |
 | Activation | The barrier between a restored guest's first instruction and the moment its workload runs and its endpoints are reachable: fresh VM generation identity acknowledged, agent rebound, network applied, workload thawed. |
@@ -626,20 +626,30 @@ SHA-256 of its ordered chunk-digest list with the stream length, computed
 from the chunk map; it is not the SHA-256 of the file's bytes. The all-zero
 chunk has one constant digest, so hashing a sparse RAM image costs its data
 chunks only, and an incremental capture hashes only the chunks it rewrote.
-A published artifact blob additionally records the whole-file SHA-256 of the
-bytes it transports, computed at publication, never on the pause path. The
+A transported artifact blob additionally records the whole-file SHA-256 of the
+bytes it transports, computed at export, never on the pause path. The
 layout record is identified separately and binds the stream to its
 guest-physical geometry; identical bytes at different addresses are different
 memory.
 
 An incremental checkpoint is published with a complete resolved chunk map that
-reuses unchanged chunk objects from its predecessor. The parent is lineage, not
-a dependency to replay. Before restore, libvm materializes one complete
-immutable RAM file from the map (a reflink of the predecessor plus changed
-chunks where the host supports it, a full write otherwise); that file is the
-mapping target. A changed page costs a rehash of its 8 MiB identity chunk;
-this is accepted hash and transfer amplification, not the dirty-tracking
-granule.
+reuses unchanged chunk identities from its predecessor. The parent is lineage,
+not a dependency to replay. Capture produces one complete immutable RAM file:
+a reflink of the retained baseline plus dirty overlays where supported, a full
+write otherwise. That complete file is the restore mapping target. A changed
+page costs a rehash of its 8 MiB identity chunk; this is accepted hash and
+transfer amplification, not the dirty-tracking granule.
+
+Durable publication of closed, owned, sealed producer RAM validates its canonical
+map, geometry and unchanged source inode facts across a successful reflink,
+without rereading RAM. Thus RAM identity work follows affected chunks rather
+than all populated RAM on the owned reflink path. A non-reflink copy still hashes
+inline, and an independent existing same-ID pool inode is always authenticated
+before dedup reuse. Files and parent directories are still synchronized before
+the catalog commit and its durability barrier. The new publication binding is
+clone provenance, not independently verified bytes, and never seeds a warm
+restore receipt. Corruption between capture and publication is detected by cold
+durable restore or export, not by reflink publication.
 The 1 s incremental budget below is measured on the defined fixture: one
 contiguous 410 MiB dirty region in a 4 GiB guest, under this unchanged 8 MiB
 chunk identity. Scattered dirty placement can legitimately affect every chunk
@@ -648,9 +658,10 @@ and require up to a full-RAM rehash, even at the same dirty-page fraction.
 placement-dependent cost is visible, not hidden by the fixture's target.
 
 Lazy restore through `userfaultfd` is not part of this contract. File-private
-mapping already demand-pages local memory. Every byte of a checkpoint is
-verified locally before restore; a materialization from chunk storage is not
-presented as remote lazy restore.
+mapping already demand-pages local memory. Cold durable restore authenticates
+RAM before the first guest instruction; unchanged-inode warm receipts may skip
+that read, and local forks trust owned producer identity as described below.
+A materialization from chunk storage is not presented as remote lazy restore.
 
 ### Accounting
 
@@ -755,18 +766,18 @@ from eviction while the consumer's operation roots are live.
 libvm verifies the checkpoint closure's shape, trust policy and compatibility
 profile before allocating anything for a child: every member is present with
 its recorded length, role and lineage; already-present stream bytes are not
-read in full yet. Byte authentication of the RAM stream and the sealed disks
-then runs concurrently
-with the construction of the child's private disk copies; a failed
+read in full yet. Cold byte authentication of the RAM stream and sealed disks
+runs concurrently with construction of the child's private disk copies; a failed
 authentication rolls the owned child allocation back and reports the
 authentication error, never a construction error. A content object that
-libvm itself verified and sealed earlier is reused without re-reading when
-its recorded inode, length, mode `0400` and change time still match; a
-mismatch re-authenticates. Silent corruption that preserves inode metadata,
-including the change time, is outside this local warm-reuse trust boundary;
-transport still authenticates every byte. Objects that leave the host
-(publication, export, handoff) are always re-read in full. libvm creates the
-child's machine
+libvm itself independently verified and sealed earlier is reused without
+re-reading when its recorded inode, length, mode `0400` and change time still
+match; a mismatch re-authenticates. Publication alone does not establish this
+warm receipt, so a newly published RAM inode's first durable restore scans it.
+Silent corruption that preserves inode metadata, including the change time, is
+outside this local warm-reuse trust boundary. Export and handoff always
+authenticate every byte, without warm receipts. Local forks instead use the
+producer/owned-inode authority described below. libvm creates the child's machine
 directory, private raw copies of every sealed disk, fresh network reservations
 and sockets, the composite initramfs for provenance only, and the leases for
 the RAM file, lower and boot assets. It passes the resolved restore inputs to
@@ -949,15 +960,17 @@ this timer exception changes neither kernel builds nor the support matrix.
 
 Fork is one capture followed by N restores. libvm performs the capture, pins
 the recorded RAM file and disk cut under a recoverable operation root, then
-restores each child subject to the admitted resource budgets. A local fork
-uses [ADR 0014](0014-layered-oci-image-storage.md)'s qualified clone and copy
-identity rules without computing durable chunk identities first; a named
-checkpoint is not required, an operation root is. libvm validates the cut's
+restores each child subject to the admitted resource budgets. A local fork uses
+[ADR 0014](0014-layered-oci-image-storage.md)'s qualified clone and copy identity
+rules with producer-computed chunk identities; it does not first publish a
+durable checkpoint. An operation root is required. libvm validates the cut's
 receipt structurally (run and configuration correlation, roles, lengths,
-chunk counts, token binding) and does not re-read the cut before
-constructing children; the bytes are authenticated when they are first used
-(the RAM stream on restore, each disk as it is copied). The cut is never
-published as a checkpoint; it exists only until every child is durable.
+chunk counts, token binding) and checks unchanged owned inode facts. Local fork
+RAM restore trusts that producer identity and inode ownership without rehashing
+RAM, including on the first restore. Each disk's private copy is authenticated
+as it is written. Local forks do not promise independent detection of RAM
+corruption that preserves those trusted facts. The cut is never published as a
+checkpoint; it exists only until every child is durable.
 
 Each child's private disk copy is hashed as it is written and compared with
 the cut's identity; a mismatch fails that child. The child's construction is
@@ -1229,10 +1242,12 @@ it permits libvm to complete publication from the sealed files.
 libvm reconciles `vm.capture.json` by validating run and configuration
 correlation and the structural consistency of the inventory (roles, lengths,
 chunk counts, chunk-list identities recomputed from the recorded chunk
-digests) and committing. It re-reads staged bytes in full only when they
-leave the host (publication, export, handoff) or when a consumer first uses
-them. It does not infer capture success from process exit, from a file's
-existence or from an RPC that returned before the seal.
+digests) and committing. Owned reflink RAM publication and local fork restore
+rely on producer identity and unchanged inode facts, not a staged RAM reread.
+Copy publication hashes inline; cold durable restore, export and handoff
+independently authenticate bytes, while warm durable restores may reuse a
+matching receipt. libvm does not infer capture success from process exit, from
+a file's existence or from an RPC that returned before the seal.
 
 ### ADR 0018 additions
 
@@ -1290,10 +1305,12 @@ A missing API resolves to a typed refusal, never fabricated support.
 A checkpoint is executable state with the authority of the machine that
 produced it. Restoring one requires at least the authorization required to run
 its image. Its native-state parsers are host attack surface: the worker
-validates sizes, topology, schema and bounds before any hypervisor call, and
-every chunk and state object is digest-verified before use. Hashing is
-integrity, not authenticity; publisher trust and signatures apply to the OCI
-index under [ADR 0014](0014-layered-oci-image-storage.md)'s trust policy.
+validates sizes, topology, schema and bounds before any hypervisor call.
+Cold durable restore and transport independently verify chunk and state digests;
+unchanged-inode warm receipts and local producer/owned-inode fork authority are
+the explicit local exceptions to RAM rereads. Hashing is integrity, not
+authenticity; publisher trust and signatures apply to the OCI index under
+[ADR 0014](0014-layered-oci-image-storage.md)'s trust policy.
 
 Staging, cache and published RAM objects are protected like process memory:
 0700 directories, 0600 files, included in retention accounting, never world
@@ -1526,11 +1543,12 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
 - **Retention.** Delete the source and every checkpoint alias while children
   run; move `SILO_HOME` while stopped; restore and recapture with original
   paths gone. The full RAM, disk and boot closure survives GC.
-- **Artifact and bounds.** Corrupt every kind of chunk, state and layout
-  object; overlapping and out-of-range guest-physical regions; oversized
-  state; incompatible ABI: each rejects before the first instruction. Export
-  and pull through an admitted registry, delete the source OCI objects, run
-  registry GC, restore the exact closure.
+- **Artifact and bounds.** On cold durable restore, corrupt every kind of chunk,
+  state and layout object; overlapping and out-of-range guest-physical regions;
+  oversized state; incompatible ABI: each rejects before the first instruction.
+  Warm-receipt invalidation and local-fork inode ownership have their separate
+  trust-boundary checks above. Export and pull through an admitted registry,
+  delete the source OCI objects, run registry GC, restore the exact closure.
 - **Portability refusal.** Wrong architecture, hypervisor, CPU feature,
   XSAVE set, timebase, GIC format, host build or kernel identity fails
   preflight with the pin named; disk-only recovery remains available as the

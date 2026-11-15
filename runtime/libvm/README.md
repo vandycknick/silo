@@ -977,14 +977,21 @@ and full content verification happen before root coordination; final publication
 rechecks the verified inode so concurrent pruning cannot create a dangling row.
 
 Captured RAM publication first tries a whole-file reflink on Linux Btrfs/XFS.
-It authenticates the private pool destination in one extent-aware read against
-the sealed RAM map, including zero chunks and the exact final length, before
-the usual mode change, fsync and no-replace publication. Capture therefore writes
-staged RAM bytes once; reflink publication never rewrites them. Unsupported
-clones and cross-filesystem publication use the existing copy-and-hash pass
-with a fresh destination inode. Dedup hits still independently authenticate the
-existing pool file. Both paths carry the held-inode proof into closure
-publication without another RAM scan, preserving identities and durability.
+For closed, owned, sealed producer output with a validated canonical map, it
+checks geometry and unchanged source inode facts across the clone without
+rereading RAM. The held pool inode carries producer identity and clone
+provenance, not independently verified-byte authority. Mode changes, fsync,
+no-replace publication, directory syncs and catalog durability stay unchanged.
+Unsupported clones and cross-filesystem publication copy and hash inline into
+a fresh destination inode. Dedup hits independently authenticate the existing
+pool file. Closure publication consumes this separate RAM binding without
+creating a byte-authenticated RAM proof or a warm `verified_object` receipt.
+The first cold durable restore fully authenticates RAM; later warm restores may
+reuse unchanged-inode receipts, while export and handoff always authenticate.
+Same-length corruption between capture and reflink publication is detected at
+cold durable restore or export, not at publication. Local forks separately trust
+producer-computed identities and unchanged owned inode facts without rehashing
+RAM on restore.
 RAM publication tests honor `SILO_TEST_COPY_DIR` for Btrfs/XFS and ext4 lanes;
 filesystem-conditional tests print a reason when the selected tmpdir cannot
 exercise their path. The ignored cross-filesystem case additionally requires
