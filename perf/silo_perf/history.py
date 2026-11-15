@@ -13,6 +13,8 @@ import statistics
 import subprocess
 from typing import Iterable
 
+from silo_perf.model import Verdict, validate_tolerance
+
 
 @dataclass(frozen=True)
 class Host:
@@ -61,6 +63,8 @@ class Record:
     host: Host
     timestamp: str
     run_id: str
+    verdict: Verdict | None
+    tolerance: float | None
 
     def __post_init__(self) -> None:
         if not self.samples or not all(math.isfinite(value) and value >= 0 for value in self.samples):
@@ -68,6 +72,12 @@ class Record:
         if (self.median, self.minimum, self.maximum) != (
                 statistics.median(self.samples), min(self.samples), max(self.samples)):
             raise ValueError("history summary disagrees with samples")
+        if (self.verdict is None) != (self.tolerance is None):
+            raise ValueError("history verdict and tolerance must both be present or absent")
+        if self.verdict is not None and not isinstance(self.verdict, Verdict):
+            raise ValueError("invalid history verdict")
+        if self.tolerance is not None:
+            validate_tolerance(self.tolerance)
 
     @property
     def key(self) -> tuple[str, str, str, str, str]:
@@ -88,6 +98,8 @@ def parse(text: str) -> list[Record]:
             value = json.loads(line)
             value["host"] = Host(**value["host"])
             value["samples"] = tuple(value["samples"])
+            if value["verdict"] is not None:
+                value["verdict"] = Verdict(value["verdict"])
             value["minimum"] = value.pop("min")
             value["maximum"] = value.pop("max")
             fingerprint = value.pop("host_fingerprint")

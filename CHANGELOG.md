@@ -3,20 +3,33 @@
 ## Unreleased
 
 - Document Phase 30's agent-ready latency gates, capacity-independent live
-  operations, explicit zero ranges and separately selected non-durable same-host
-  fork. Local lower validation reuses fingerprint receipts; RAM and sealed disks
+  operations and explicit zero ranges. Fast same-host fork was admitted and
+  deferred after design review on 2026-11-15; durable fork is the only fork mode.
+  Local lower validation reuses fingerprint receipts; RAM and sealed disks
   share publication-trusted restore. On-demand snapshot verification bypasses
   receipts and distinguishes stream chunks, state objects and structural failures.
   Every runtime open recovers abandoned pending work; only maintenance performs
   store-wide recovery. Retention semantics stay unchanged.
   Reflink captures persist a process-crash recovery cut and complete disk identity
   after source continuation, retaining accepted RAM on failure or cancellation.
+  The first snapshot's one post-resume pass over written disk data and refusal
+  of `pause` while disk identity is pending are accepted limits.
   Sparse RAM capture omits or punches zero runs and skips known-zero anonymous
   boot pages with cut-bound pagemap proof; unsupported cases keep safe fallbacks.
   Graph/map receipts skip repeated index decoding and reuse canonical RAM maps.
   Sealed-stream deduplication precedes cloning; capture batches pool-directory
   barriers without moving the snapshot acknowledgement boundary.
   Performance budgets move to `make perf`; image init stays default.
+  Arch targets (30 GiB RAM, 10 vCPUs, 100 GiB disk): start and create under 1 s;
+  `run -- /bin/true` under 2 s; exec 0.1 s; first or repeated local restore 0.5 s;
+  first fork 2 s, later fork 1.25 s; full snapshot under 3 s; incremental snapshot
+  1.5 s with a 1 s pause. Medians up to 10 percent above target are accepted and
+  reported as within tolerance; beyond that they fail. Fork and incremental
+  targets are not yet met and depend on planned disk write tracking and the map
+  format change. Per-chunk write tracking with inherited maps, a sparse
+  authenticated stream map and a RAM identity unit smaller than 8 MiB are approved
+  directions, not yet implemented. A later cached upper template removes the
+  temporary create-time hash so create must not end up slower.
 - Incremental snapshot publication no longer rereads all RAM on owned reflink
   paths, so RAM identity cost follows changed chunks. The Phase 30 contract
   places local corruption detection in explicit verification, export or handoff;

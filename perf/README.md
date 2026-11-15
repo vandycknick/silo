@@ -90,17 +90,27 @@ The invariant fails the run when exceeded; no disk-copy allowance is subtracted.
 The payload is written and synced outside timing on each fresh source.
 
 `targets.toml` is the sole Phase 30 gate configuration, keyed by
-system/cohort/mode/metric. The approved Arch image-init targets are start 1 s,
-first/repeated restore 0.5 s, first fork 2 s, second fork 1 s, incremental
-snapshot 2 s and every first-exec round trip 0.1 s. A median equal to its target
-passes. `exec` is the shared target for the separately reported `*_exec` metrics.
+system/cohort/mode/metric. The approved Arch image-init targets are start and
+create 1 s, first/repeated restore 0.5 s, first fork 2 s, second fork 1.25 s,
+full snapshot 3 s, incremental snapshot 1.5 s, run-to-exit 2 s and every
+first-exec round trip 0.1 s. `exec` is the shared target for the separately
+reported `*_exec` metrics.
 
-An exceeded target normally reports FAIL and fails the run. All currently unmet
-Arch targets carry `expected_fail = true` plus their Phase 30 slice references,
-and instead report NOT YET (XFAIL-style, nonfatal). A met target reports PASS,
-even while marked. Each qualified fix removes its expected-failure marker;
-never increase a target to hide a regression. Add another keyed target entry to
-extend the gate matrix. msb comparisons are informational, not gates.
+A median at or below its target reports PASS; above target through
+`target * (1 + tolerance)`, inclusive, it reports `PASS (within 10%)` with the
+default tolerance, so restore at 0.504 s against 0.5 s is accepted.
+Above that bound it reports FAIL, or NOT YET when `expected_fail = true`, and
+only FAIL fails the target gate.
+Change the top-level `tolerance = 0.10` in `targets.toml` to adjust the default,
+or add `tolerance` to an individual target table to override it; values must be
+finite and in `[0, 1)`, and the accepted verdict displays the configured percent.
+
+First/second fork and incremental snapshot remain marked `expected_fail = true`
+with slice `30a` until disk tracking and format work qualify them. A target met
+within tolerance passes even while marked, so its marker can be removed.
+Each qualified fix removes its expected-failure marker; never increase a target
+to hide a regression. Add another keyed target entry to extend the gate matrix.
+msb comparisons are informational, not gates.
 
 The original fixed 4 GiB fixture, 1 GiB random upper, cold/warm arithmetic tests
 and OCI 1/4/12 GiB ingest cohorts live in `tests/test_fork_budget.py` and
@@ -121,17 +131,22 @@ Explicit test paths in `PERF_ARGS` replace default scenario collection.
 ## History and trends
 
 Every completed system/cohort/mode/metric appends one JSON line containing the
-samples, median/min/max, commit, Silo/msb versions, timestamp, run ID and host
-fingerprint (CPU model, physical RAM, workspace filesystem/options, kernel and
-architecture). The default file is
+samples, median/min/max, verdict and effective tolerance (both null for ungated
+metrics), commit, Silo/msb versions, timestamp, run ID and host fingerprint
+(CPU model, physical RAM, workspace filesystem/options, kernel and architecture).
+The default file is
 `${XDG_DATA_HOME:-~/.local/share}/silo/perf/history.jsonl`; override `PERF_HISTORY`.
 It is append-only with an exclusive file lock. Invalid or truncated records are
 reported with their line number rather than silently discarded.
+The verdict and tolerance fields are required; use a fresh `PERF_HISTORY` path
+for records predating this format rather than mixing schemas.
 
 The final plain-text table shows each Silo mode, its target verdict, msb median,
 Silo/msb ratios and percent changes from the previous entry with the same host
 and exact system/cohort/mode/metric key. Negative delta is faster. Missing or
 zero previous medians have no relative delta.
+The trend report includes each recorded verdict using its original tolerance,
+independent of subsequent target configuration changes.
 
 ```sh
 nix develop .#perf --command uv run --project perf python -m silo_perf.report

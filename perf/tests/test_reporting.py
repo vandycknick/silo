@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import sqlite3
 import sys
@@ -22,34 +23,62 @@ HOST = Host("unit CPU", 64 * 1024**3, "btrfs", "unit kernel", "x86_64")
 
 
 def record(*, median: float = 2.0, system: str = "silo", mode: str = "image",
-           run_id: str = "current", host: Host = HOST) -> Record:
+           run_id: str = "current", host: Host = HOST, target: Target | None = None) -> Record:
+    verdict = None if target is None else target.evaluate(median)
     return Record(system, "arch-30g", mode, "start", (median,), median, median, median,
-                  "commit", "silo test", "msb test", host, "2026-11-15T00:00:00Z", run_id)
+                  "commit", "silo test", "msb test", host, "2026-11-15T00:00:00Z", run_id,
+                  verdict, None if target is None else target.tolerance)
 
 
-@pytest.mark.parametrize(("seconds", "expected_fail", "verdict"), [
-    (0.5, False, Verdict.PASS), (1.0, False, Verdict.PASS), (1.001, False, Verdict.FAIL),
-    (1.001, True, Verdict.NOT_YET), (1.0, True, Verdict.PASS),
+@pytest.mark.parametrize("expected_fail", [False, True])
+@pytest.mark.parametrize(("seconds", "verdict"), [
+    (0.0, Verdict.PASS), (0.5, Verdict.PASS), (1.0, Verdict.PASS),
+    (1.001, Verdict.WITHIN_TOLERANCE), (1.0 * 1.10, Verdict.WITHIN_TOLERANCE),
+    (math.nextafter(1.0 * 1.10, math.inf), Verdict.FAIL), (1.11, Verdict.FAIL),
 ])
 def test_target_evaluation(seconds: float, expected_fail: bool, verdict: Verdict) -> None:
-    assert Target(1.0, expected_fail, "30g").evaluate(seconds) == verdict
+    expected = Verdict.NOT_YET if expected_fail and verdict == Verdict.FAIL else verdict
+    assert Target(1.0, 0.10, expected_fail, "30g").evaluate(seconds) == expected
+
+
+@pytest.mark.parametrize("tolerance", [0.0, 0.10, 0.25, math.nextafter(1.0, 0.0)])
+def test_target_tolerance_boundary(tolerance: float) -> None:
+    target = Target(0.5, tolerance)
+    bound = target.seconds * (1 + tolerance)
+    assert target.evaluate(target.seconds) == Verdict.PASS
+    expected = Verdict.PASS if tolerance == 0 else Verdict.WITHIN_TOLERANCE
+    assert target.evaluate(bound) == expected
+    assert target.evaluate(math.nextafter(bound, math.inf)) == Verdict.FAIL
+
+
+@pytest.mark.parametrize("tolerance", [-0.01, 1.0, float("nan"), float("inf"), -float("inf")])
+def test_invalid_tolerance(tolerance: float) -> None:
+    with pytest.raises(ValueError, match="tolerance"):
+        Target(1.0, tolerance)
+
+
+@pytest.mark.parametrize(("tolerance", "label"), [(0.10, "10"), (0.125, "12.5"), (0.25, "25")])
+def test_verdict_rendering(tolerance: float, label: str) -> None:
+    assert Verdict.WITHIN_TOLERANCE.render(tolerance) == f"PASS (within {label}%)"
+    for verdict in (Verdict.PASS, Verdict.FAIL, Verdict.NOT_YET):
+        assert verdict.render(tolerance) == verdict.value
 
 
 @pytest.mark.parametrize("seconds", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_target(seconds: float) -> None:
     with pytest.raises(ValueError):
-        Target(seconds)
+        Target(seconds, 0.10)
 
 
 @pytest.mark.parametrize("seconds", [-1.0, float("nan"), float("inf")])
 def test_invalid_measurement(seconds: float) -> None:
     with pytest.raises(ValueError):
-        Target(1.0).evaluate(seconds)
+        Target(1.0, 0.10).evaluate(seconds)
 
 
 def test_expected_failure_requires_slice() -> None:
     with pytest.raises(ValueError, match="slice"):
-        Target(1.0, expected_fail=True)
+        Target(1.0, 0.10, expected_fail=True)
 
 
 def test_checked_in_targets_and_cohorts() -> None:
@@ -59,9 +88,44 @@ def test_checked_in_targets_and_cohorts() -> None:
     assert cohorts["arch-30g"].disks == ("100gb",)
     assert cohorts["disk-invariance"].disks == ("30gib", "500gib")
     targets = load_targets()
-    exec_target = target_for(targets, "silo", "arch-30g", "image", "restore_first_exec")
-    assert exec_target is not None and exec_target.seconds == 0.1
-    assert target_for(targets, "msb", "arch-30g", "default", "start") is None
+    assert targets
+    for (system, cohort, mode, metric), target in targets.items():
+        assert system and cohort in cohorts and mode in {"image", "agent", "default"} and metric
+        assert math.isfinite(target.seconds) and target.seconds > 0
+        assert math.isfinite(target.tolerance) and 0 <= target.tolerance < 1
+        assert not target.expected_fail or target.slice
+
+
+def test_load_targets_inherits_and_overrides_tolerance(tmp_path: Path) -> None:
+    path = tmp_path / "targets.toml"
+    path.write_text('tolerance = 0.10\n'
+                    '[silo.unit.image.start]\nseconds = 1.0\n'
+                    '[silo.unit.image.exec]\nseconds = 0.1\ntolerance = 0.25\n'
+                    '[silo.unit.image.restore_first]\nseconds = 0.5\ntolerance = 0.0\n')
+    targets = load_targets(path)
+    assert targets[("silo", "unit", "image", "start")] == Target(1.0, 0.10)
+    assert target_for(targets, "silo", "unit", "image", "restore_first_exec") == Target(0.1, 0.25)
+    assert targets[("silo", "unit", "image", "restore_first")] == Target(0.5, 0.0)
+    assert target_for(targets, "msb", "unit", "default", "start") is None
+
+
+@pytest.mark.parametrize("value", ["-0.01", "1.0", "nan", "inf", "-inf", "true", '"invalid"'])
+@pytest.mark.parametrize("override", [False, True])
+def test_load_targets_rejects_invalid_tolerance(tmp_path: Path, value: str, override: bool) -> None:
+    path = tmp_path / "targets.toml"
+    path.write_text(f"tolerance = {'0.10' if override else value}\n"
+                    "[silo.unit.image.start]\nseconds = 1.0\n"
+                    + (f"tolerance = {value}\n" if override else ""))
+    with pytest.raises(ValueError, match="tolerance"):
+        load_targets(path)
+
+
+@pytest.mark.parametrize("text", ["", "[silo.unit.image.start]\nseconds = 1.0\n"])
+def test_load_targets_requires_default_tolerance(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "targets.toml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match="tolerance"):
+        load_targets(path)
 
 
 def test_history_append_and_parse(tmp_path: Path) -> None:
@@ -76,6 +140,7 @@ def test_history_append_and_parse(tmp_path: Path) -> None:
     assert value["samples"] == [2.0]
     assert (value["median"], value["min"], value["max"]) == (2.0, 2.0, 2.0)
     assert value["host_fingerprint"] == HOST.fingerprint
+    assert value["verdict"] is None and value["tolerance"] is None
     assert parse("\n" + path.read_text() + "\n") == [first, second]
     assert parse("") == []
 
@@ -122,14 +187,14 @@ def test_delta_matches_host_and_exact_key() -> None:
 def test_render_table_and_history_delta() -> None:
     records = [record(median=2.0), record(median=0.5, mode="agent"),
                record(median=0.25, system="msb", mode="default")]
-    targets = {("silo", "arch-30g", "image", "start"): Target(1.0, True, "30g"),
-               ("silo", "arch-30g", "agent", "start"): Target(0.5)}
+    targets = {("silo", "arch-30g", "image", "start"): Target(1.0, 0.10, True, "30g"),
+               ("silo", "arch-30g", "agent", "start"): Target(0.5, 0.10)}
     table = render(records, [record(median=4.0, run_id="old")], targets)
     assert "Silo image s" in table and "Silo agent s" in table and "msb s" in table
     assert "1 NOT YET" in table and "0.5 PASS" in table
     assert "8.00x / 2.00x" in table and "-50.0% / - / -" in table
     assert "\x1b" not in table
-    assert "FAIL" in render([record()], [], {("silo", "arch-30g", "image", "start"): Target(1.0)})
+    assert "FAIL" in render([record()], [], {("silo", "arch-30g", "image", "start"): Target(1.0, 0.10)})
     assert "Silo image s" in render([], [], {})
     assert "-" in render([record()], [], {})
     extended = render([*records, record(median=0.5, system="boxd", mode="default")], [], targets)
@@ -137,9 +202,67 @@ def test_render_table_and_history_delta() -> None:
 
 
 def test_trend_reports_every_history_entry() -> None:
-    text = trend([record(median=4.0, run_id="old"), record(median=2.0)])
+    text = trend([record(median=4.0, run_id="old", target=Target(1.0, 0.25)),
+                  record(median=2.0, target=Target(2.0, 0.10))])
     assert len(text.splitlines()) == 3
+    assert "verdict" in text and "FAIL" in text and "PASS" in text
     assert "-50.0%" in text and HOST.fingerprint[:12] in text
+
+
+@pytest.mark.parametrize("expected_fail", [False, True])
+@pytest.mark.parametrize(("median", "verdict", "label"), [
+    (0.5, Verdict.PASS, "PASS"), (0.504, Verdict.WITHIN_TOLERANCE, "PASS (within 10%)"),
+    (0.5 * 1.10, Verdict.WITHIN_TOLERANCE, "PASS (within 10%)"),
+    (0.5 * 1.11, Verdict.FAIL, "FAIL"),
+])
+def test_history_preserves_gate_verdict(tmp_path: Path, expected_fail: bool, median: float,
+                                      verdict: Verdict, label: str) -> None:
+    target = Target(0.5, 0.10, expected_fail, "30a")
+    current = replace(record(median=median, target=target), metric="restore_first")
+    if expected_fail and verdict == Verdict.FAIL:
+        verdict, label = Verdict.NOT_YET, "NOT YET"
+    assert current.verdict == verdict
+    path = tmp_path / "history.jsonl"
+    append(path, [current])
+    value = json.loads(path.read_text())
+    assert value["verdict"] == verdict.value and value["tolerance"] == 0.10
+    restored = load(path)
+    assert restored == [current]
+    assert label in trend(restored)
+    assert label in render(restored, [], {("silo", "arch-30g", "image", "restore_first"): target})
+
+
+def test_history_preserves_tolerance_override(tmp_path: Path) -> None:
+    current = record(median=1.2, target=Target(1.0, 0.25))
+    path = tmp_path / "history.jsonl"
+    append(path, [current])
+    assert load(path) == [current]
+    assert "PASS (within 25%)" in trend(load(path))
+
+
+@pytest.mark.parametrize(("verdict", "tolerance"), [
+    (Verdict.PASS.value, None), (None, 0.10), ("unknown", 0.10),
+    (Verdict.PASS.value, -0.1), (Verdict.PASS.value, 1.0),
+    (Verdict.PASS.value, "invalid"),
+])
+def test_history_rejects_invalid_gate_fields(tmp_path: Path, verdict: str | None,
+                                           tolerance: float | str | None) -> None:
+    path = tmp_path / "history.jsonl"
+    append(path, [record()])
+    value = json.loads(path.read_text())
+    value.update(verdict=verdict, tolerance=tolerance)
+    with pytest.raises(ValueError, match="line 1"):
+        parse(json.dumps(value))
+
+
+@pytest.mark.parametrize("field", ["verdict", "tolerance"])
+def test_history_requires_gate_fields(tmp_path: Path, field: str) -> None:
+    path = tmp_path / "history.jsonl"
+    append(path, [record()])
+    value = json.loads(path.read_text())
+    del value[field]
+    with pytest.raises(ValueError, match="line 1"):
+        parse(json.dumps(value))
 
 
 @pytest.mark.parametrize(("first", "second", "expected"), [
