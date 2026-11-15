@@ -850,6 +850,9 @@ fn memory_capture(
             baseline_hole_bytes: stats.baseline_hole_bytes,
             zero_bytes_omitted: stats.zero_bytes_omitted,
             explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
+            zero_run_bytes_covered: stats.zero_run_bytes_covered,
+            zero_bytes_punched: stats.zero_bytes_punched,
+            known_zero_bytes_skipped: stats.known_zero_bytes_skipped,
             extent_queries: stats.extent_queries,
             identity_bytes_hashed,
             ..CaptureMemoryStats::default()

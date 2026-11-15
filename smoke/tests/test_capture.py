@@ -11,9 +11,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from silo_smoke import capture, images, overlay, pause, procs, reclaim, shutdown, stopped
+from silo_smoke import capture, fork, images, overlay, pause, procs, reclaim, restore, shutdown, stopped
 from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.config import REPO, SmokeConfig
+from silo_smoke.filesystem import reflink_probe
 from silo_smoke.registry import LoopbackRegistry
 
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
@@ -521,3 +522,102 @@ def test_capture_taken_alias_refuses_before_pause_and_new_name_succeeds(
                                "WHERE kind='capture' AND state='staging'")
     finally:
         counter.close()
+
+
+@pytest.mark.parametrize("policy", ["resume", "preserve", "borrow"])
+def test_capture_deferred_disk_identity_keeps_sessions_and_pause_authority(
+    silo: Silo, capture_image: str, policy: str,
+) -> None:
+    probe = reflink_probe(silo.ws.silo_home)
+    if not probe["reflink"]:
+        pytest.skip(f"capture clone ordering requires FICLONE: {probe}")
+    source = "identity-source"
+    child = "identity-restored"
+    silo.create(source, capture_image, "--cpus", "1", "--memory", "512mib",
+                "--disk-size", "100gib", "--vsock", "--network", "none")
+    silo.start(source)
+    running = silo.wait_ready(source)
+    silo.exec(source, "sh", "-eu", "-c", "printf cut-content >/identity-witness; sync", user="root")
+    original_pause = None
+    if policy == "borrow":
+        silo.run("pause", source)
+        original_pause = silo.info(source)["lifecycle"]["lifecycle"]["currentPause"]
+    trace = fork.source_trace(silo, running["id"])
+    baseline = len(trace.read_text(errors="replace").splitlines())
+    manager = silo.popen(
+        "snapshot", "create", source, "--live", "--name", "identity-cut", "--format", "json",
+        *(["--preserve"] if policy == "preserve" else []))
+
+    def lines() -> list[str]:
+        return trace.read_text(errors="replace").splitlines()[baseline:]
+
+    def identity_started() -> bool:
+        seen = lines()
+        if any("capture-disk-identity" in line for line in seen):
+            return True
+        assert manager.poll() is None, "snapshot finished without post-continuation disk identity"
+        return False
+
+    try:
+        shutdown.until(identity_started, timeout=60, description="disk identity stage was not observed")
+        assert manager.poll() is None, "identity completion was not observed in flight"
+        during = silo.info(source)
+        if policy == "resume":
+            assert during["state"] == "running" and during["ready"] is True, during
+            assert silo.exec(source, "cat", "/identity-witness", timeout=30).stdout == "cut-content"
+            assert manager.poll() is None, "exec did not complete inside deferred identity/publication"
+        else:
+            assert during["state"] == "paused", during
+            refused = silo.exec(source, "true", expect=None, timeout=10)
+            assert refused.returncode != 0, "paused source admitted a new execution session"
+            if original_pause is not None:
+                assert during["lifecycle"]["lifecycle"]["currentPause"] == original_pause
+        stdout, stderr = manager.communicate(timeout=120)
+        assert manager.returncode == 0, stderr.decode(errors="replace")
+        value = json.loads(stdout)
+        summary = value["capture"]
+        directory = silo.ws.silo_home / summary["staging"]
+        cut = json.loads((directory / "vm.capture-cut.json").read_bytes())
+        assert cut["phase"] == "identity-pending" and cut["disks"]
+        assert not any(entry["role"].startswith("disks/") for entry in cut["evidence"]["inventory"])
+        seen = [line.replace('"', "") for line in lines()]
+
+        def position(needle: str) -> int:
+            matches = [index for index, line in enumerate(seen) if needle in line]
+            assert len(matches) == 1, (needle, matches, seen)
+            return matches[0]
+
+        disks = position("stage=capture-disks")
+        identity = position("stage=capture-disk-identity")
+        sealed = position("capture sealed")
+        continued = position("capture source continued before disk identity")
+        assert disks < continued < identity < sealed
+        assert all("method=Clone" in line for line in seen if "sealed writable disk role" in line)
+        if policy == "resume":
+            assert position("stage=resume-native") < position(fork.PAUSE_RELEASED) < continued
+            assert position("stage=readiness") < continued
+        else:
+            assert all("stage=resume-native" not in line and fork.PAUSE_RELEASED not in line for line in seen)
+            current = silo.info(source)
+            assert current["state"] == "paused" and summary["sourceOutcome"] == "preserved"
+            if original_pause is not None:
+                assert current["lifecycle"]["lifecycle"]["currentPause"] == original_pause
+            silo.run("resume", source)
+        silo.exec(source, "sh", "-eu", "-c", "printf changed-after-cut >/identity-witness; sync", user="root")
+        restore.restore_child(silo, "image:" + value["snapshot"]["id"], child)
+        assert silo.exec(child, "cat", "/identity-witness").stdout == "cut-content"
+        assert silo.exec(source, "cat", "/identity-witness").stdout == "changed-after-cut"
+        silo.ws.record("capture-deferred-disk-identity", json.dumps({
+            "policy": policy, "capture": summary["captureId"], "reflink": probe,
+            "sourceStateDuringIdentity": during["state"], "trace": seen,
+            "restoredDiskWitness": "cut-content",
+        }, sort_keys=True) + "\n")
+        silo.stop(child)
+        silo.stop(source)
+    finally:
+        if manager.poll() is None:
+            manager.kill()
+            manager.wait(timeout=10)
+        for stream in (manager.stdout, manager.stderr):
+            if stream is not None:
+                stream.close()

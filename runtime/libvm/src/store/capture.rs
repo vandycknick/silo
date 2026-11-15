@@ -1785,6 +1785,8 @@ fn verify_capture(
     }
     top.insert(vm_spec::capture::CAPTURE_SOURCE_FILE.to_owned());
     top.insert(vm_spec::capture::CAPTURE_SOURCE_TEMPORARY_FILE.to_owned());
+    top.insert(vm_spec::capture::CAPTURE_CUT_FILE.to_owned());
+    top.insert(vm_spec::capture::CAPTURE_CUT_TEMPORARY_FILE.to_owned());
     check_entries(directory, &top)?;
     let disk_names = record
         .plan

@@ -711,6 +711,14 @@ lanes remain outside this KVM x86_64 fixture, not inferred qualified.
 
 Native `liveBytesRead`, baseline copying, full/overlay writes,
 `identityBytesHashed` and mandatory `wholeFileBytesHashed` are distinct evidence.
+`zeroRunBytesCovered` counts complete zero runs represented in the resolved image,
+whether omitted, punched or written. `zeroBytesPunched` counts zero bytes
+deallocated from a reflink-seeded destination, never the baseline.
+`knownZeroBytesSkipped` counts live boot RAM bytes not read because cut-bound
+pagemap metadata proves zero origin. `explicitZeroBytesWritten` counts only
+zero-valued bytes physically written, including zeros within mixed writes.
+Zero-transition smoke checks use zero-run coverage together with byte comparisons,
+not physical writes, because hole punching also represents zeros correctly.
 The independent smoke oracle deliberately reads immutable output for
 authentication; it does not count that as a live RAM scan. No unchanged timing
 target is relaxed or qualified by these functional cases.

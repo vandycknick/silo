@@ -112,6 +112,7 @@ wire_enum!(LiveStage <=> LiveStage {
     CapturePrepare = CapturePrepare,
     CaptureFlush = CaptureFlush,
     CaptureDisks = CaptureDisks,
+    CaptureDiskIdentity = CaptureDiskIdentity,
     CaptureExecution = CaptureExecution,
     CaptureMemory = CaptureMemory,
     CaptureVerify = CaptureVerify,

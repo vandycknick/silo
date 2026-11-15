@@ -167,11 +167,12 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
             fork_timing = fork_budget.gated_timing(
                 fork_seconds, allocated_bytes=sealed_allocated, bytes_per_second=rate["bytesPerSecond"],
                 reflink=reflink, copies=fork_budget.CHILDREN)
-            interruption = max(product["conservativeSeconds"], observed["hostGapSeconds"])
+            interruption = product["interruptionSeconds"]
             capture_timing = fork_budget.gated_timing(
                 interruption, allocated_bytes=allocated, bytes_per_second=rate["bytesPerSecond"],
                 reflink=reflink, sealed_allocated_bytes=sealed_allocated,
-                hash_bytes_per_second=host["sequentialHash"]["bytesPerSecond"])
+                hash_bytes_per_second=host["sequentialHash"]["bytesPerSecond"],
+                disk_seal_in_interval=product["diskIdentityInPause"])
             evidence.allowance("fork4", fork_timing)
             evidence.allowance("captureInterruption", capture_timing)
             pause_stamp = found[fork.PAUSE_ESTABLISHED][0][0]
@@ -384,14 +385,15 @@ def test_fork_budget_incremental_ten_percent_dirty(
                 assert observed["hostGapSeconds"] + 0.1 >= product["vcpuPausedSeconds"], (observed, product)
             finally:
                 observer.close()
-            interruption = max(product["conservativeSeconds"], observed["hostGapSeconds"])
+            interruption = product["interruptionSeconds"]
             sealed_uppers = list((directory / "disks").glob("*.raw"))
             assert len(sealed_uppers) == 1, "root-only fixture must seal exactly one upper"
             sealed_allocated = sealed_uppers[0].stat().st_blocks * 512
             timing = fork_budget.gated_timing(
                 interruption, allocated_bytes=allocated, bytes_per_second=rate["bytesPerSecond"],
                 reflink=host["reflinkProbe"]["reflink"], sealed_allocated_bytes=sealed_allocated,
-                hash_bytes_per_second=host["sequentialHash"]["bytesPerSecond"])
+                hash_bytes_per_second=host["sequentialHash"]["bytesPerSecond"],
+                disk_seal_in_interval=product["diskIdentityInPause"])
             evidence.allowance("incremental", timing)
             stats = memory["stats"]
             assert stats["seedMethod"] == (
@@ -780,6 +782,31 @@ def test_budget_gate_disk_seal_allowance_not_clamped() -> None:
     assert timing["nonCowAllowanceSeconds"] == 4.0
     assert timing["diskSealAllowanceSeconds"] == 2.0
     assert timing["gatedExcessSeconds"] == -5.0
+
+
+def test_budget_gate_excludes_post_resume_disk_sealing_from_pause_allowance() -> None:
+    timing = fork_budget.gated_timing(
+        1.0, allocated_bytes=1024, bytes_per_second=256.0, reflink=True,
+        sealed_allocated_bytes=512, hash_bytes_per_second=256.0,
+        disk_seal_in_interval=False)
+    assert timing["diskSealAllowanceSeconds"] == 0.0
+    assert timing["diskSealAllowance"]["includedInInterval"] is False
+    assert timing["gatedExcessSeconds"] == 1.0
+
+
+@pytest.mark.parametrize("seal", [2_000_000_000, 5_000_000_000], ids=["inline", "deferred"])
+def test_pause_interval_does_not_include_post_resume_identity(seal: int) -> None:
+    found = {
+        fork.STAGING_WRITTEN: [(1_000_000_000, "staging")],
+        fork.PAUSE_ESTABLISHED: [(1_500_000_000, "pause")],
+        fork.PAUSE_RELEASED: [(3_000_000_000, "resume")],
+        fork.SEALED: [(seal, "seal")],
+        fork.CONTINUATION_FINISHED: [(6_000_000_000, "finished")],
+    }
+    measured = fork.product_interruption(found)
+    assert measured["interruptionSeconds"] == measured["vcpuPausedSeconds"] == 1.5
+    assert measured["pauseToSealSeconds"] == (seal - 1_500_000_000) / 1e9
+    assert measured["diskIdentityInPause"] is (seal <= 3_000_000_000)
 
 
 @pytest.mark.parametrize("seconds", [2.0, 2.0000001], ids=["boundary", "over"])

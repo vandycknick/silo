@@ -3,14 +3,17 @@
 //! ```text
 //!  admit ─► prepare[staging, request.json, 4 outputs + launch-lease pin ─► worker]
 //!        ─► pause[acquire: drain → freeze(e) → native Capture pause | borrow user pause]
-//!        ─► flush[exact cut] ─► disks[clone/copy, chunk map]
-//!        ─► execution+devices ─► RAM receipt ─► verify[inodes, maps, layout, small state]
+//!        ─► flush[exact cut] ─► disks[clone only | sparse copy + inline map]
+//!        ─► execution+devices ─► RAM receipt ─► verify[RAM and completed copy maps]
+//!        ─► reflink lane: IdentityPending cut record ─► accept RAM baseline
+//!             ─► continue[resume-if-acquired | preserve; publish source, open sessions if Running]
+//!             ─► clone identities (new lifecycle operations remain fenced)
 //!        ─► record[cancel/stop linearized; write-once coherent record]
 //!        ═══ capture succeeded ═══ (cancel no longer has effect)
-//!        ─► accept baseline ─► continue[resume-if-acquired | preserve] ─► vm.capture-source.json
+//!        ─► copy-only lane: accept baseline + continue ─► final source projection
 //!
-//!  unsealed failure/cancel ─► abandon native candidate ─► failed vm.capture.json
-//!                          ─► continue under policy (or roll back an unestablished pause)
+//!  unsealed failure/cancel ─► resolve an unaccepted native candidate
+//!       ─► failed vm.capture.json ─► continue once under policy
 //! ```
 //!
 //! Capture success and source continuation are distinct facts: a failed
@@ -28,14 +31,16 @@ use sha2::Digest as _;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vm_spec::capture::{
-    CaptureConfiguration, CaptureContinuation, CaptureDiskCopy, CaptureDiskPlan, CaptureEvidence,
-    CaptureEvidenceReference, CaptureInventoryEntry, CaptureLaunchLease, CaptureMemoryEvidence,
-    CapturePauseAuthority, CapturePauseDisposition, CapturePlan, CaptureRecordOutcome,
-    CaptureReleaseDisposition, CaptureReleaseState, CaptureReleased, CaptureRole, CaptureSealed,
-    CaptureSourceOutcome, CaptureSourceRecord, CaptureStateBinding, Sha256Digest, StreamMap,
-    CAPTURE_CLONE_RESERVE_BYTES, CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE,
-    CAPTURE_LAYOUT_FILE, CAPTURE_RECORD_VERSION, CAPTURE_SOURCE_FILE,
-    CAPTURE_SOURCE_TEMPORARY_FILE, CAPTURE_STATE_RESERVE_BYTES, MAX_CAPTURE_RECORD_BYTES,
+    CaptureConfiguration, CaptureContinuation, CaptureCutPhase, CaptureCutRecord, CaptureDiskCopy,
+    CaptureDiskCut, CaptureDiskPlan, CaptureEvidence, CaptureEvidenceReference,
+    CaptureInventoryEntry, CaptureLaunchLease, CaptureMemoryEvidence, CapturePauseAuthority,
+    CapturePauseDisposition, CapturePlan, CaptureRecordOutcome, CaptureReleaseDisposition,
+    CaptureReleaseState, CaptureReleased, CaptureRole, CaptureSealed, CaptureSourceOutcome,
+    CaptureSourceRecord, CaptureStateBinding, Sha256Digest, StreamMap, CAPTURE_CLONE_RESERVE_BYTES,
+    CAPTURE_CUT_FILE, CAPTURE_CUT_TEMPORARY_FILE, CAPTURE_EVIDENCE_FILE,
+    CAPTURE_EVIDENCE_TEMPORARY_FILE, CAPTURE_LAYOUT_FILE, CAPTURE_RECORD_VERSION,
+    CAPTURE_SOURCE_FILE, CAPTURE_SOURCE_TEMPORARY_FILE, CAPTURE_STATE_RESERVE_BYTES,
+    MAX_CAPTURE_RECORD_BYTES,
 };
 use vm_spec::lifecycle::{
     CancelCompleted, CancelOperationOutcome, CaptureResumePolicy, CurrentPause, Diagnostic,
@@ -53,8 +58,8 @@ use crate::live::coordinator::{
 use crate::live::gate::DrainError;
 use crate::live::journal::{CaptureBinding, Eligibility, Phase, WorkerPreparation};
 use crate::live::staging::{
-    assemble_ram_map, hash_state, parse_layout, CaptureStaging, DiskCopyError, LayoutGeometry,
-    RecordCommit,
+    assemble_ram_map, hash_state, parse_layout, CaptureStaging, DiskCopyError, DiskCopyMethod,
+    LayoutGeometry, RecordCommit,
 };
 use crate::state::ReadyAgentIdentity;
 use crate::virt::lifecycle::{
@@ -187,6 +192,7 @@ impl Abort {
 }
 
 /// How a capture's source continuation ended.
+#[derive(Clone)]
 enum Finish {
     Running(CaptureContinuation),
     Paused(CurrentPause, CaptureContinuation),
@@ -242,6 +248,9 @@ struct Run {
     inventory: Vec<CaptureInventoryEntry>,
     native_memory: Option<CommandOutcome>,
     resolved_map: Option<Arc<vm_spec::capture::StreamMap>>,
+    pending_disks: Vec<CaptureDiskCut>,
+    continued: Option<Finish>,
+    source_continued: bool,
 }
 
 impl Run {
@@ -492,6 +501,9 @@ impl LiveCoordinator {
             inventory: Vec::new(),
             native_memory: None,
             resolved_map: None,
+            pending_disks: Vec::new(),
+            continued: None,
+            source_continued: false,
         };
         match self.capture_stages(&mut run).await {
             Ok(evidence) => self.seal(run, evidence).await,
@@ -507,6 +519,42 @@ impl LiveCoordinator {
         self.stage_execution_and_memory(run).await?;
         let staged = self.stage_verify(run).await?;
         staging_budget(run.plan.reservation.staging_bytes, staged).map_err(Abort::Failed)?;
+        if !run.pending_disks.is_empty() {
+            self.stage_cut(run, staged).await?;
+            let staging = run.staging.clone().ok_or_else(|| {
+                Abort::Failed(failure(
+                    LiveFailureCode::StagingFailed,
+                    LiveStage::CaptureVerify,
+                    "capture staging is not prepared",
+                ))
+            })?;
+            match self.accept_baseline(run, &staging).await {
+                Ok(()) => {}
+                Err(Abort::Stopped) => return Err(Abort::Stopped),
+                Err(Abort::Failed(cause)) => {
+                    tracing::warn!(operation = %run.operation, %cause, "baseline acceptance failed before disk identity");
+                    self.abandon(run).await?;
+                }
+            }
+            let finish = self.source_finish(run).await.ok_or(Abort::Stopped)?;
+            let continuation = match &finish {
+                Finish::Running(continuation) | Finish::Paused(_, continuation) => {
+                    continuation.clone()
+                }
+                Finish::Error(cause) => CaptureContinuation::ResumeFailed {
+                    failure: cause.clone(),
+                    state: VmLifecycleState::Error,
+                },
+            };
+            self.write_source_record(run, &continuation).await;
+            run.source_continued = true;
+            run.continued = Some(finish.clone());
+            if let Some(facts) = self.lock().journal.capture_mut(&run.operation) {
+                facts.continuation = continuation;
+            }
+            self.finish_projection(run, finish, false);
+            self.stage_disk_identity(run, staged).await?;
+        }
         run.evidence(CaptureRecordOutcome::Coherent, None)
             .ok_or_else(|| {
                 Abort::Failed(failure(
@@ -534,12 +582,16 @@ impl LiveCoordinator {
     }
 
     fn capture_stage(&self, run: &Run, stage: LiveStage) {
+        if run.source_continued {
+            tracing::info!(operation = %run.operation, stage = stage.as_str(), "capture stage");
+            return;
+        }
         self.publish_stage(
             &run.operation,
             &run.operation,
             LiveCommandKind::Capture,
             stage,
-            false,
+            matches!(&run.continued, Some(Finish::Running(_))),
         );
     }
 
@@ -907,18 +959,29 @@ impl LiveCoordinator {
         let (abort, watcher) = abort_token(&run.cancel, &self.stop);
         let copied = tokio::task::spawn_blocking({
             let abort = abort.clone();
-            move || -> Result<(), DiskCopyError> {
+            move || -> Result<Vec<CaptureDiskCut>, DiskCopyError> {
+                let mut pending = Vec::with_capacity(work.len());
                 for (role, source, length, copy) in &work {
                     let method = staging.copy_disk(role, source, *length, *copy, &abort)?;
+                    if method == DiskCopyMethod::Clone {
+                        let CaptureRole::Disk(name) = role else {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, "disk role required").into());
+                        };
+                        pending.push(staging.disk_cut(name)?);
+                    }
                     tracing::info!(role = %role.relative_path(), ?method, length, "sealed writable disk role");
                 }
-                Ok(())
+                Ok(pending)
             }
         })
         .await;
         watcher.abort();
         match copied {
-            Ok(Ok(())) => self.checkpoint(run, LiveStage::CaptureDisks),
+            Ok(Ok(pending)) => {
+                run.pending_disks = pending;
+                run.facts.disk_copies_sealed = run.pending_disks.is_empty();
+                self.checkpoint(run, LiveStage::CaptureDisks)
+            }
             Ok(Err(DiskCopyError::Cancelled)) => {
                 self.checkpoint(run, LiveStage::CaptureDisks)?;
                 Err(fail("disk copy was interrupted".into()))
@@ -1098,7 +1161,17 @@ impl LiveCoordinator {
                 "native capture writers are not sealed and closed".into(),
             ));
         }
-        let roles = run.plan.roles();
+        let roles = run
+            .plan
+            .roles()
+            .into_iter()
+            .filter(|role| match role {
+                CaptureRole::Disk(name) | CaptureRole::DiskMap(name) => {
+                    !run.pending_disks.iter().any(|disk| disk.name == *name)
+                }
+                _ => true,
+            })
+            .collect::<Vec<_>>();
         let disks = run.plan.disks.clone();
         let ram_limit = run.plan.ram_bytes;
         let receipt = run
@@ -1211,10 +1284,141 @@ impl LiveCoordinator {
             },
         });
         run.inventory = verified.inventory;
-        // Every role was copied, closed and re-identified.
-        run.facts.disk_copies_sealed = true;
         self.checkpoint(run, LiveStage::CaptureVerify)?;
-        Ok(verified.staged_bytes)
+        let mut staged_bytes = verified.staged_bytes;
+        let staging = run
+            .staging
+            .as_ref()
+            .ok_or_else(|| fail("capture staging is missing".into()))?;
+        for cut in &run.pending_disks {
+            let planned = run
+                .plan
+                .disks
+                .iter()
+                .find(|disk| disk.name == cut.name)
+                .ok_or_else(|| fail("pending disk has no plan".into()))?;
+            let charge = match planned.copy {
+                CaptureDiskCopy::Clone => CAPTURE_CLONE_RESERVE_BYTES,
+                CaptureDiskCopy::Copy => {
+                    let (file, _) = staging
+                        .open_sealed(&CaptureRole::Disk(cut.name.clone()))
+                        .map_err(|error| fail(error.to_string()))?;
+                    std::os::unix::fs::MetadataExt::blocks(
+                        &file.metadata().map_err(|error| fail(error.to_string()))?,
+                    )
+                    .saturating_mul(512)
+                }
+            };
+            staged_bytes = staged_bytes.saturating_add(charge);
+        }
+        Ok(staged_bytes)
+    }
+
+    async fn stage_cut(&self, run: &Run, staged: u64) -> Result<(), Abort> {
+        self.checkpoint(run, LiveStage::CaptureVerify)?;
+        let fail = |message: String| {
+            Abort::Failed(failure(
+                LiveFailureCode::SealFailed,
+                LiveStage::CaptureVerify,
+                message,
+            ))
+        };
+        let staging = run
+            .staging
+            .clone()
+            .ok_or_else(|| fail("capture staging is missing".into()))?;
+        let cut = CaptureCutRecord {
+            phase: CaptureCutPhase::IdentityPending,
+            evidence: run
+                .evidence(CaptureRecordOutcome::Coherent, None)
+                .ok_or_else(|| fail("capture request is missing".into()))?,
+            disks: run.pending_disks.clone(),
+        };
+        cut.validate_against_plan(&run.plan, &cut.evidence.request_digest)
+            .map_err(fail)?;
+        let bytes = cut.canonical_bytes().map_err(fail)?;
+        staging_budget(
+            run.plan.reservation.staging_bytes,
+            staged
+                .saturating_add(bytes.len() as u64)
+                .saturating_add(4095),
+        )
+        .map_err(Abort::Failed)?;
+        let result = tokio::task::spawn_blocking(move || {
+            staging.commit_record(CAPTURE_CUT_FILE, CAPTURE_CUT_TEMPORARY_FILE, &bytes)
+        })
+        .await
+        .map_err(|error| fail(format!("cut record task failed: {error}")))?
+        .map_err(|error| fail(error.to_string()))?;
+        match result {
+            RecordCommit::Complete => {}
+            RecordCommit::Uncertain(error) => return Err(fail(error.to_string())),
+        }
+        if let Some(record) = self.lock().journal.operation_mut(&run.operation) {
+            record.phase = Phase::IdentityPending;
+        }
+        Ok(())
+    }
+
+    async fn stage_disk_identity(&self, run: &mut Run, staged: u64) -> Result<(), Abort> {
+        self.capture_stage(run, LiveStage::CaptureDiskIdentity);
+        self.checkpoint(run, LiveStage::CaptureDiskIdentity)?;
+        let fail = |message: String| {
+            Abort::Failed(failure(
+                LiveFailureCode::CaptureVerificationFailed,
+                LiveStage::CaptureDiskIdentity,
+                message,
+            ))
+        };
+        let staging = run
+            .staging
+            .clone()
+            .ok_or_else(|| fail("capture staging is missing".into()))?;
+        let pending = run.pending_disks.clone();
+        let disks = run.plan.disks.clone();
+        let outputs = run
+            .outputs
+            .ok_or_else(|| fail("capture outputs are missing".into()))?;
+        let map = run
+            .resolved_map
+            .clone()
+            .ok_or_else(|| fail("RAM map is missing".into()))?;
+        let (abort, watcher) = abort_token(&run.cancel, &self.stop);
+        let result = tokio::task::spawn_blocking({
+            let abort = abort.clone();
+            move || -> Result<(Vec<CaptureInventoryEntry>, u64), DiskCopyError> {
+                let mut inventory = Vec::with_capacity(pending.len() * 2);
+                let mut bytes = staged;
+                for cut in pending {
+                    staging.complete_disk_identity(&cut, &abort)?;
+                    for role in [
+                        CaptureRole::Disk(cut.name.clone()),
+                        CaptureRole::DiskMap(cut.name),
+                    ] {
+                        let verified = verify_role(&staging, &role, &disks, outputs, &map, &abort)?;
+                        if matches!(role, CaptureRole::DiskMap(_)) {
+                            bytes = bytes.saturating_add(verified.staged_bytes);
+                        }
+                        inventory.push(verified.entry);
+                    }
+                }
+                let cut = staging.open_entry_allocation(CAPTURE_CUT_FILE)?;
+                Ok((inventory, bytes.saturating_add(cut)))
+            }
+        })
+        .await;
+        watcher.abort();
+        self.checkpoint(run, LiveStage::CaptureDiskIdentity)?;
+        let (inventory, bytes) = result
+            .map_err(|error| fail(format!("disk identity task failed: {error}")))?
+            .map_err(|error| fail(error.to_string()))?;
+        run.inventory.extend(inventory);
+        let roles = run.plan.roles();
+        run.inventory
+            .sort_by_key(|entry| roles.iter().position(|role| role == &entry.role));
+        staging_budget(run.plan.reservation.staging_bytes, bytes).map_err(Abort::Failed)?;
+        run.facts.disk_copies_sealed = true;
+        Ok(())
     }
 
     async fn get_capture(&self, operation: &LiveId) -> Result<NativeObservation, NativeError> {
@@ -1483,14 +1687,21 @@ impl LiveCoordinator {
                         completed: CancelCompleted {
                             effective: false,
                             operation: sealed.clone(),
-                            state: VmLifecycleState::Capturing,
+                            state: self
+                                .store
+                                .live_snapshot()
+                                .map_or(VmLifecycleState::Capturing, |snapshot| snapshot.state),
                         },
                     });
                 inner.journal.complete(&request, result);
             }
         }
         tracing::info!(operation = %run.operation, evidence = %evidence_sha256, "capture sealed");
-        self.continue_sealed(&mut run, &staging).await;
+        if let Some(finish) = run.continued.take() {
+            self.finish(&mut run, finish).await;
+        } else {
+            self.continue_sealed(&mut run, &staging).await;
+        }
     }
 
     /// A refusal before the link: the pipeline owns the operation again.
@@ -1618,14 +1829,17 @@ impl LiveCoordinator {
     /// Continue a source whose native candidate is resolved, under the
     /// plan's resume policy and the pause the capture actually holds.
     async fn continue_source(&self, run: &mut Run) {
+        let finish = self.source_finish(run).await;
+        self.finish_or_stop(run, finish).await;
+    }
+
+    async fn source_finish(&self, run: &mut Run) -> Option<Finish> {
         match (run.pause, run.plan.resume_policy) {
             (PauseState::Acquired(epoch, generation), CaptureResumePolicy::ResumeIfAcquired) => {
-                let finish = self.continue_resume(run, epoch, generation).await;
-                self.finish_or_stop(run, finish).await
+                self.continue_resume(run, epoch, generation).await
             }
             (PauseState::Acquired(epoch, _), CaptureResumePolicy::Preserve) => {
-                let finish = self.continue_preserve(run, epoch).await;
-                self.finish_or_stop(run, finish).await
+                self.continue_preserve(run, epoch).await
             }
             (PauseState::Borrowed, _) => {
                 let finish = match run.borrowed.clone() {
@@ -1641,17 +1855,13 @@ impl LiveCoordinator {
                         "borrowed pause authority is missing",
                     )),
                 };
-                self.finish(run, finish).await
+                Some(finish)
             }
             // No established pause: roll back, never a token transfer.
             (PauseState::Frozen(epoch) | PauseState::NativePending(epoch), _) => {
-                let finish = self.rollback_capture_pause(run, epoch).await;
-                self.finish_or_stop(run, finish).await
+                self.rollback_capture_pause(run, epoch).await
             }
-            (PauseState::Untouched, _) => {
-                self.finish(run, Finish::Running(CaptureContinuation::Unchanged))
-                    .await
-            }
+            (PauseState::Untouched, _) => Some(Finish::Running(CaptureContinuation::Unchanged)),
         }
     }
 
@@ -1932,6 +2142,11 @@ impl LiveCoordinator {
                 record.phase = Phase::Continuing;
             }
         }
+        if let Some(finish) = run.continued.take() {
+            self.write_failed_record(&run, &cause).await;
+            self.finish(&mut run, finish).await;
+            return;
+        }
         match self.resolve_candidate(&mut run).await {
             Ok(()) => {}
             Err(Abort::Stopped) => {
@@ -2114,7 +2329,13 @@ impl LiveCoordinator {
                 state: VmLifecycleState::Error,
             },
         };
-        self.write_source_record(run, &continuation).await;
+        if !run.source_continued {
+            self.write_source_record(run, &continuation).await;
+        }
+        self.finish_projection(run, finish, true);
+    }
+
+    fn finish_projection(&self, run: &mut Run, finish: Finish, settle: bool) {
         let state = {
             let mut inner = self.lock();
             let (state, continuation, published) = match finish {
@@ -2175,7 +2396,7 @@ impl LiveCoordinator {
                         Ok(true)
                     );
                     if let Some(record) = inner.journal.operation_mut(&run.operation) {
-                        if record.record.outcome == OperationOutcome::InProgress {
+                        if settle && record.record.outcome == OperationOutcome::InProgress {
                             record.record.outcome = OperationOutcome::Failed {
                                 failure: cause.clone(),
                             };
@@ -2199,10 +2420,16 @@ impl LiveCoordinator {
             if let Some(facts) = inner.journal.capture_mut(&run.operation) {
                 facts.continuation = continuation.clone();
             }
-            self.capture_terminal(&mut inner, run, None, state);
+            if settle {
+                self.capture_terminal(&mut inner, run, None, state);
+            }
             state
         };
-        tracing::info!(operation = %run.operation, %state, "capture continuation finished");
+        if settle {
+            tracing::info!(operation = %run.operation, %state, "capture continuation finished");
+        } else {
+            tracing::info!(operation = %run.operation, %state, "capture source continued before disk identity");
+        }
     }
 
     /// Stop took over: no continuation is claimed and no source record is
@@ -2738,7 +2965,7 @@ mod tests {
         let reserved_disk = file.metadata().unwrap().blocks() * 512;
         fill(grown);
         let disk = CaptureRole::Disk(CaptureDiskName::new("data").unwrap());
-        staging
+        let method = staging
             .copy_disk(
                 &disk,
                 &file,
@@ -2747,6 +2974,15 @@ mod tests {
                 &CancellationToken::new(),
             )
             .unwrap();
+        if method == crate::live::staging::DiskCopyMethod::Clone {
+            let name = CaptureDiskName::new("data").unwrap();
+            staging
+                .complete_disk_identity(
+                    &staging.disk_cut(&name).unwrap(),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+        }
         let roles = vec![
             CaptureRole::Execution,
             CaptureRole::Devices,

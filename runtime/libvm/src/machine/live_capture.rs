@@ -16,7 +16,10 @@
 //! Capture success, publication and source continuation are independent
 //! facts. A missing continuation never makes libvm send Resume: while the run
 //! lives GetOperation is authoritative; after it ends the outcome is unknown.
+//! An identity-pending cut is not a seal. If the exact source run has positively
+//! ended, reconciliation completes retained clone identities without VM effects.
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,9 +27,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vm_spec::capture::{
-    CaptureConfiguration, CaptureContinuation, CaptureEvidence, CapturePauseAuthority,
-    CapturePauseDisposition, CaptureReleaseDisposition, CaptureSourceRecord, Sha256Digest,
-    CAPTURES_DIRECTORY, CAPTURE_EVIDENCE_FILE, CAPTURE_SOURCE_FILE, MAX_CAPTURE_RECORD_BYTES,
+    CaptureConfiguration, CaptureContinuation, CaptureCutRecord, CaptureDiskCut, CaptureEvidence,
+    CaptureInventoryEntry, CapturePauseAuthority, CapturePauseDisposition, CapturePlan,
+    CaptureReleaseDisposition, CaptureRole, CaptureSourceRecord, Sha256Digest, CAPTURES_DIRECTORY,
+    CAPTURE_CUT_FILE, CAPTURE_CUT_TEMPORARY_FILE, CAPTURE_EVIDENCE_FILE,
+    CAPTURE_EVIDENCE_TEMPORARY_FILE, CAPTURE_SOURCE_FILE, MAX_CAPTURE_RECORD_BYTES,
 };
 use vm_spec::lifecycle::{
     CaptureCommand, CaptureOutcome, CapturePolicy, CaptureResumePolicy, Diagnostic,
@@ -596,6 +601,180 @@ fn coherent_record(
     Ok(Some(evidence))
 }
 
+/// Only the sole-reaper's positive end observation permits a manager to take
+/// over identity completion. A live monitor remains the only capture writer.
+async fn recover_cut(runtime: &Runtime, record: &CaptureRecord) -> Result<(), LibVmError> {
+    let _lock = runtime.lock_machine_config(record.machine_id).await?;
+    let Some(staging) = open_staging(runtime, record)? else {
+        return Ok(());
+    };
+    let plan = record.plan.clone();
+    tokio::task::spawn_blocking(move || complete_cut_identity(&staging, &plan))
+        .await
+        .map_err(|error| protocol(format!("capture identity recovery task failed: {error}")))??;
+    Ok(())
+}
+
+fn cut_disk_fingerprint(file: &std::fs::File, cut: &CaptureDiskCut) -> Result<(), LibVmError> {
+    let metadata = file.metadata()?;
+    if metadata.dev() != cut.device
+        || metadata.ino() != cut.inode
+        || metadata.len() != cut.length
+        || metadata.mode() != cut.mode
+        || metadata.ctime() != cut.changed_seconds
+        || metadata.ctime_nsec() != cut.changed_nanoseconds
+        || metadata.nlink() != 1
+    {
+        return Err(protocol("pending capture disk changed after the cut"));
+    }
+    Ok(())
+}
+
+/// Replay uses retained immutable inodes only, never a source VM or pause.
+/// Interrupted map writes are regenerated; the final seal is linked last.
+fn complete_cut_identity(staging: &OwnedDirectory, plan: &CapturePlan) -> Result<(), LibVmError> {
+    if staging.open_file(CAPTURE_EVIDENCE_FILE)?.is_some() {
+        return Ok(());
+    }
+    let Some(bytes) = read_bounded(staging, CAPTURE_CUT_FILE, MAX_CAPTURE_RECORD_BYTES)? else {
+        return Ok(());
+    };
+    let descriptor = staging
+        .open_file(CAPTURE_CUT_FILE)?
+        .ok_or_else(|| protocol("capture cut disappeared"))?;
+    let metadata = descriptor.metadata()?;
+    if metadata.nlink() == 2 {
+        let temporary = staging
+            .open_file(CAPTURE_CUT_TEMPORARY_FILE)?
+            .ok_or_else(|| protocol("capture cut has an unowned extra link"))?;
+        let temporary_metadata = temporary.metadata()?;
+        if temporary_metadata.dev() != metadata.dev()
+            || temporary_metadata.ino() != metadata.ino()
+            || temporary_metadata.nlink() != 2
+        {
+            return Err(protocol(
+                "capture cut temporary does not own its extra link",
+            ));
+        }
+        nix::unistd::unlinkat(
+            staging.fd(),
+            CAPTURE_CUT_TEMPORARY_FILE,
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .map_err(std::io::Error::from)?;
+    } else if metadata.nlink() != 1 {
+        return Err(protocol("capture cut has extra links"));
+    }
+    let mut cut = CaptureCutRecord::decode(&bytes).map_err(protocol)?;
+    let request = Sha256Digest::of_bytes(&plan.canonical_bytes().map_err(protocol)?);
+    cut.validate_against_plan(plan, &request)
+        .map_err(protocol)?;
+    let disks = staging
+        .open_dir("disks")?
+        .ok_or_else(|| protocol("cut disks are missing"))?;
+    let mut hasher = crate::storage::stream::StreamHasher::new();
+    for pending in &cut.disks {
+        let file = disks
+            .open_file(&pending.name.file_name())?
+            .ok_or_else(|| protocol("pending capture disk is missing"))?;
+        cut_disk_fingerprint(&file, pending)?;
+        let scan = hasher.hash_open_file(&file, pending.length)?;
+        cut_disk_fingerprint(&file, pending)?;
+        let fresh = disks
+            .open_file(&pending.name.file_name())?
+            .ok_or_else(|| protocol("pending capture disk disappeared"))?;
+        cut_disk_fingerprint(&fresh, pending)?;
+        let map_bytes = scan.map.canonical_bytes()?;
+        let map_name = format!("{}.map.json", pending.name.as_str());
+        if let Some(existing) = disks.open_file(&map_name)? {
+            if existing.metadata()?.nlink() != 1 {
+                return Err(protocol("pending capture disk map has extra links"));
+            }
+        }
+        disks.write_file(&map_name, &map_bytes)?;
+        cut.evidence.inventory.extend([
+            CaptureInventoryEntry {
+                role: CaptureRole::Disk(pending.name.clone()),
+                length: pending.length,
+                sha256: None,
+                identity: Some(Sha256Digest::from_bytes(*scan.map.id().as_bytes())),
+            },
+            CaptureInventoryEntry {
+                role: CaptureRole::DiskMap(pending.name.clone()),
+                length: map_bytes.len() as u64,
+                sha256: Some(Sha256Digest::of_bytes(&map_bytes)),
+                identity: None,
+            },
+        ]);
+    }
+    let roles = plan.roles();
+    cut.evidence
+        .inventory
+        .sort_by_key(|entry| roles.iter().position(|role| role == &entry.role));
+    cut.evidence.disk_copies_sealed = true;
+    cut.evidence
+        .validate_against_plan(plan, &request)
+        .map_err(protocol)?;
+    let mut charged = 2 * MAX_CAPTURE_RECORD_BYTES as u64;
+    for name in [vm_spec::capture::CAPTURE_REQUEST_FILE, CAPTURE_CUT_FILE] {
+        let file = staging
+            .open_file(name)?
+            .ok_or_else(|| protocol("capture control file is missing"))?;
+        charged = charged.saturating_add(file.metadata()?.blocks().saturating_mul(512));
+    }
+    for directory in [staging, &disks] {
+        let stat = nix::sys::stat::fstat(directory.fd()).map_err(std::io::Error::from)?;
+        let blocks =
+            u64::try_from(stat.st_blocks).map_err(|_| protocol("negative staging allocation"))?;
+        charged = charged.saturating_add(blocks.saturating_mul(512));
+    }
+    for entry in &cut.evidence.inventory {
+        let file = match &entry.role {
+            CaptureRole::Disk(name) => disks.open_file(&name.file_name())?,
+            CaptureRole::DiskMap(name) => {
+                disks.open_file(&format!("{}.map.json", name.as_str()))?
+            }
+            role => staging.open_file(&role.relative_path())?,
+        }
+        .ok_or_else(|| protocol("capture output disappeared"))?;
+        let clone_charge = matches!(&entry.role, CaptureRole::Disk(name)
+            if plan.disks.iter().any(|disk| disk.name == *name && disk.copy == vm_spec::capture::CaptureDiskCopy::Clone));
+        charged = charged.saturating_add(if clone_charge {
+            vm_spec::capture::CAPTURE_CLONE_RESERVE_BYTES
+        } else {
+            file.metadata()?.blocks().saturating_mul(512)
+        });
+    }
+    if charged > plan.reservation.staging_bytes {
+        return Err(protocol(
+            "recovered capture exceeds its staging reservation",
+        ));
+    }
+    let bytes = cut.evidence.canonical_bytes().map_err(protocol)?;
+    if let Some(temporary) = staging.open_file(CAPTURE_EVIDENCE_TEMPORARY_FILE)? {
+        if temporary.metadata()?.nlink() != 1 {
+            return Err(protocol("capture seal temporary has extra links"));
+        }
+    }
+    staging.write_file(CAPTURE_EVIDENCE_TEMPORARY_FILE, &bytes)?;
+    nix::unistd::linkat(
+        staging.fd(),
+        CAPTURE_EVIDENCE_TEMPORARY_FILE,
+        staging.fd(),
+        CAPTURE_EVIDENCE_FILE,
+        nix::fcntl::AtFlags::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    nix::unistd::unlinkat(
+        staging.fd(),
+        CAPTURE_EVIDENCE_TEMPORARY_FILE,
+        nix::unistd::UnlinkatFlags::NoRemoveDir,
+    )
+    .map_err(std::io::Error::from)?;
+    staging.sync()?;
+    Ok(())
+}
+
 /// The continuation record, correlated with the coherent record. A malformed or
 /// foreign record fails closed for continuation only; the seal stays valid.
 fn source_record(
@@ -925,6 +1104,15 @@ pub(crate) async fn advance(
         | CaptureState::Local { .. }
         | CaptureState::Published { .. } => {}
     }
+    let liveness = run_liveness(runtime, machine_id, record.run_id).await?;
+    if matches!(liveness, RunLiveness::Ended)
+        && !matches!(
+            record.state,
+            CaptureState::Published { .. } | CaptureState::Local { .. }
+        )
+    {
+        recover_cut(runtime, &record).await?;
+    }
     // Durable capture success does not depend on source continuation or on
     // reaching the original monitor. Preserve the closure before reconciling
     // run authority; uncertainty must retain ownership, not postpone publication.
@@ -948,7 +1136,6 @@ pub(crate) async fn advance(
         record.state,
         CaptureState::Published { .. } | CaptureState::Local { .. }
     );
-    let liveness = run_liveness(runtime, machine_id, record.run_id).await?;
     let monitor = match &liveness {
         RunLiveness::Alive(observation) => {
             match observe_capture(&machine, observation, &record.plan.capture_id).await? {
@@ -1617,5 +1804,302 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn identity_pending_files() -> (
+        tempfile::TempDir,
+        crate::paths::OwnedDirectory,
+        vm_spec::capture::CapturePlan,
+        vm_spec::capture::CaptureEvidence,
+    ) {
+        use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+        use vm_spec::capture::*;
+        use vm_spec::lifecycle::CapturePolicy;
+
+        let root = tempfile::tempdir().unwrap();
+        let staging =
+            crate::paths::OwnedDirectory::open_root(&root.path().join("capture")).unwrap();
+        let disks = staging.ensure_dir("disks").unwrap();
+        let name = CaptureDiskName::new("root").unwrap();
+        let length = 2 * STREAM_CHUNK_BYTES + 4096;
+        let block = vm_spec::BlockId::new("root").unwrap();
+        let configuration = CaptureConfiguration {
+            guest_os: None,
+            cpus: 1,
+            memory_mib: 1,
+            nested_virtualization: false,
+            rosetta: false,
+            kernel_cmdline: Vec::new(),
+            vsock: true,
+            attachments: vec![CaptureAttachment {
+                block_id: block.clone(),
+                role: vm_spec::DiskRole::Root,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length,
+                    logical_sector_size: 512,
+                },
+                read_only: false,
+            }],
+            shares: Vec::new(),
+        };
+        let plan = CapturePlan {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: id(1),
+            run_id: id(2),
+            capture_id: id(3),
+            ram_bytes: configuration.ram_bytes(),
+            configuration_digest: configuration.digest().unwrap(),
+            configuration,
+            policy: CapturePolicy::Full,
+            dirty_crossover_percent: 60,
+            resume_policy: CaptureResumePolicy::ResumeIfAcquired,
+            pause: CapturePauseAuthority::Acquire,
+            disks: vec![CaptureDiskPlan {
+                name: name.clone(),
+                attachment_index: 0,
+                block_id: block,
+                length,
+                copy: CaptureDiskCopy::Clone,
+            }],
+            read_only_inputs: Vec::new(),
+            reservation: CaptureReservation {
+                storage_operation_id: id(4),
+                launch_lease: CaptureLaunchLease {
+                    operation_id: id(5),
+                    device: 1,
+                    inode: 2,
+                },
+                staging_bytes: 128 << 20,
+            },
+        };
+        plan.validate().unwrap();
+        staging
+            .write_file(CAPTURE_REQUEST_FILE, &plan.canonical_bytes().unwrap())
+            .unwrap();
+        let path = disks.path().join(name.file_name());
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        file.set_len(length).unwrap();
+        file.write_all_at(b"mixed chunk", 4096).unwrap();
+        file.write_all_at(b"tail", length - 4).unwrap();
+        file.sync_all().unwrap();
+        let metadata = file.metadata().unwrap();
+        let disk = CaptureDiskCut {
+            name: name.clone(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length,
+            mode: metadata.mode(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        };
+        let mut hasher = crate::storage::stream::StreamHasher::new();
+        let expected_map = hasher
+            .hash_reader(std::fs::File::open(&path).unwrap())
+            .unwrap();
+        let ram = StreamMap::new(4096, vec![None]).unwrap();
+        let mut inventory = Vec::new();
+        for (role, bytes) in [
+            (CaptureRole::Execution, b"execution".to_vec()),
+            (CaptureRole::Devices, b"devices".to_vec()),
+            (CaptureRole::Ram, vec![0; 4096]),
+            (CaptureRole::Layout, br#"{"architecture":"x86_64","kind":"ram-layout","magic":"KRUNRAML","packedLength":4096,"pageGranule":4096,"regions":[{"guestPhysicalAddress":0,"length":4096,"streamOffset":0}],"schema":1,"topology":{"ramBelowGap":4096}}"#.to_vec()),
+            (CaptureRole::RamMap, ram.canonical_bytes().unwrap()),
+        ] {
+            staging.write_file(&role.relative_path(), &bytes).unwrap();
+            let stream = role == CaptureRole::Ram;
+            inventory.push(CaptureInventoryEntry {
+                role, length: bytes.len() as u64,
+                sha256: (!stream).then(|| Sha256Digest::of_bytes(&bytes)),
+                identity: stream.then(|| ram.id()),
+            });
+        }
+        let binding = Sha256Digest::of_bytes(b"native binding");
+        let evidence = CaptureEvidence {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: id(1),
+            run_id: id(2),
+            capture_id: id(3),
+            pause_token: Some(PauseToken {
+                machine_id: id(1),
+                run_id: id(2),
+                generation: NonZeroU64::new(3).unwrap(),
+                owner: PauseOwner::Capture {
+                    operation_id: id(3),
+                },
+            }),
+            pause_disposition: Some(CapturePauseDisposition::Acquired),
+            freeze_epoch: NonZeroU64::new(4),
+            freeze_operation_id: Some(id(3)),
+            configuration_digest: plan.configuration_digest,
+            request_digest: Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap()),
+            memory: Some(CaptureMemoryEvidence {
+                packed_length: 4096,
+                page_granule: 4096,
+                regions: 1,
+                ram_stream: ram.id(),
+                mode: CapturePolicy::Full,
+                baseline: None,
+                full_reason: Some(CaptureFullReason::Requested),
+                dirty_chunks: vec![1],
+                chunk_digests: vec![None],
+                stats: CaptureMemoryStats {
+                    logical_bytes: 4096,
+                    identity_bytes_hashed: 4096,
+                    ..Default::default()
+                },
+                binding: CaptureStateBinding {
+                    live_state_schema: "silo.live-state/1".into(),
+                    architecture: "x86_64".into(),
+                    profile: binding,
+                    topology: binding,
+                    ram_layout: binding,
+                    source_run: id(2),
+                    pause_generation: NonZeroU64::new(3).unwrap(),
+                    capture: id(3),
+                },
+            }),
+            inventory,
+            started_at_unix_ms: 10,
+            completed_at_unix_ms: 20,
+            capture_outcome: CaptureRecordOutcome::Coherent,
+            error: None,
+            workloads_frozen: true,
+            vcpus_paused: true,
+            devices_quiesced: true,
+            host_writers_drained: true,
+            host_flush_completed: true,
+            disk_copies_sealed: false,
+            memory_state_sealed: true,
+        };
+        let cut = CaptureCutRecord {
+            phase: CaptureCutPhase::IdentityPending,
+            evidence: evidence.clone(),
+            disks: vec![disk],
+        };
+        cut.validate_against_plan(&plan, &evidence.request_digest)
+            .unwrap();
+        staging
+            .write_file(CAPTURE_CUT_FILE, &cut.canonical_bytes().unwrap())
+            .unwrap();
+        drop(file);
+        let mut expected = evidence;
+        expected.disk_copies_sealed = true;
+        let bytes = expected_map.canonical_bytes().unwrap();
+        expected.inventory.extend([
+            CaptureInventoryEntry {
+                role: CaptureRole::Disk(name.clone()),
+                length,
+                sha256: None,
+                identity: Some(Sha256Digest::from_bytes(*expected_map.id().as_bytes())),
+            },
+            CaptureInventoryEntry {
+                role: CaptureRole::DiskMap(name),
+                length: bytes.len() as u64,
+                sha256: Some(Sha256Digest::of_bytes(&bytes)),
+                identity: None,
+            },
+        ]);
+        expected
+            .validate_against_plan(&plan, &expected.request_digest)
+            .unwrap();
+        (root, staging, plan, expected)
+    }
+
+    #[test]
+    fn identity_pending_recovery_matches_full_read_evidence_and_replays_partial_maps() {
+        use vm_spec::capture::*;
+        let (_root, staging, plan, expected) = identity_pending_files();
+        assert!(staging.open_file(CAPTURE_EVIDENCE_FILE).unwrap().is_none());
+        let disks = staging.open_dir("disks").unwrap().unwrap();
+        disks
+            .write_file("root.map.json", b"interrupted map")
+            .unwrap();
+        staging
+            .write_file(CAPTURE_EVIDENCE_TEMPORARY_FILE, b"interrupted seal")
+            .unwrap();
+        crate::machine::live_capture::complete_cut_identity(&staging, &plan).unwrap();
+        let bytes = crate::machine::live_capture::read_bounded(
+            &staging,
+            CAPTURE_EVIDENCE_FILE,
+            MAX_CAPTURE_RECORD_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(CaptureEvidence::decode(&bytes).unwrap(), expected);
+        assert_eq!(bytes, expected.canonical_bytes().unwrap());
+        crate::machine::live_capture::complete_cut_identity(&staging, &plan).unwrap();
+        assert_eq!(
+            std::fs::read(staging.path().join(CAPTURE_EVIDENCE_FILE)).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn identity_pending_recovery_refuses_changed_or_replaced_clone_without_sealing() {
+        use std::os::unix::fs::FileExt;
+        use vm_spec::capture::*;
+        for replace in [false, true] {
+            let (_root, staging, plan, _) = identity_pending_files();
+            let path = staging.path().join("disks/root.raw");
+            if replace {
+                let old = std::fs::File::open(&path).unwrap();
+                std::fs::remove_file(&path).unwrap();
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(old.metadata().unwrap().len())
+                    .unwrap();
+            } else {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all_at(b"changed", 0)
+                    .unwrap();
+            }
+            assert!(crate::machine::live_capture::complete_cut_identity(&staging, &plan).is_err());
+            assert!(staging.open_file(CAPTURE_EVIDENCE_FILE).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn identity_pending_recovery_settles_the_cut_link_and_never_promotes_a_failed_capture() {
+        use vm_spec::capture::*;
+        let (_root, staging, plan, expected) = identity_pending_files();
+        std::fs::hard_link(
+            staging.path().join(CAPTURE_CUT_FILE),
+            staging.path().join(CAPTURE_CUT_TEMPORARY_FILE),
+        )
+        .unwrap();
+        crate::machine::live_capture::complete_cut_identity(&staging, &plan).unwrap();
+        assert!(!staging.path().join(CAPTURE_CUT_TEMPORARY_FILE).exists());
+        assert_eq!(
+            CaptureEvidence::decode(
+                &std::fs::read(staging.path().join(CAPTURE_EVIDENCE_FILE)).unwrap(),
+            )
+            .unwrap(),
+            expected
+        );
+        let (_root, staging, plan, mut failed) = identity_pending_files();
+        failed.capture_outcome = CaptureRecordOutcome::Failed;
+        failed.memory = None;
+        failed.inventory.clear();
+        failed.error = Some(vm_spec::lifecycle::Diagnostic::new(
+            "capture cancelled after continuation",
+        ));
+        let bytes = failed.canonical_bytes().unwrap();
+        staging.write_file(CAPTURE_EVIDENCE_FILE, &bytes).unwrap();
+        crate::machine::live_capture::complete_cut_identity(&staging, &plan).unwrap();
+        assert_eq!(
+            std::fs::read(staging.path().join(CAPTURE_EVIDENCE_FILE)).unwrap(),
+            bytes
+        );
+        assert!(!staging.path().join("disks/root.map.json").exists());
     }
 }

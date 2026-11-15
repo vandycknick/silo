@@ -183,8 +183,8 @@ lifecycle_enum!(CaptureResumePolicy {
 lifecycle_enum!(
     /// Internal coordinator stage. Every stage except `PauseFailed` is active
     /// work; `PauseFailed` is a failed `Pausing` awaiting cancel or stop.
-    /// Capture stages appear only while `Capturing`; its continuation reuses
-    /// the resume and recovery stages.
+    /// Capture activity owns `Capturing`; after source continuation its identity
+    /// stages are traced while the public source remains Running or Paused.
     LiveStage {
         MonitorDrain => "monitor-drain",
         GuestFreeze => "guest-freeze",
@@ -204,6 +204,7 @@ lifecycle_enum!(
         CapturePrepare => "capture-prepare",
         CaptureFlush => "capture-flush",
         CaptureDisks => "capture-disks",
+        CaptureDiskIdentity => "capture-disk-identity",
         CaptureExecution => "capture-execution",
         CaptureMemory => "capture-memory",
         CaptureVerify => "capture-verify",

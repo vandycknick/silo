@@ -61,6 +61,7 @@ enumeration!(
         CapturePrepare,
         CaptureFlush,
         CaptureDisks,
+        CaptureDiskIdentity,
         CaptureExecution,
         CaptureMemory,
         CaptureVerify,
