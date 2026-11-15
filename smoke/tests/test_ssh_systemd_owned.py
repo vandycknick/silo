@@ -31,7 +31,7 @@ def iproute_image(config: SmokeConfig, registry: LoopbackRegistry) -> str:
 @pytest.fixture
 def systemd_image(config: SmokeConfig) -> str:
     if config.systemd_image is None:
-        pytest.skip("SILO_SMOKE_SYSTEMD_IMAGE not set")
+        pytest.skip("owner-published systemd/OpenSSH image required; enable with SILO_SMOKE_SYSTEMD_IMAGE=<accessible-oci-reference> make smoke SMOKE_MARK= SMOKE_ARGS='tests/test_ssh_systemd_owned.py'")
     return config.systemd_image
 
 

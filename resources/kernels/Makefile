@@ -168,10 +168,13 @@ kernel-image: kernel-config
 		ARCH="$(KERNEL_ARCH)" \
 		-j"$(JOBS)" "$(KERNEL_BUILD_TARGET)"
 	@set -eu; if [ -n "$(KERNEL_IMAGE_OUTPUT)" ]; then \
-		temporary=$$(mktemp "$(KERNEL_IMAGE_OUTPUT).XXXXXX"); \
-		trap 'rm -f "$$temporary"' EXIT HUP INT TERM; \
-		install -m 644 "$(KERNEL_BUILD_DIR)/$(KERNEL_IMAGE_FILE)" "$$temporary"; \
-		mv "$$temporary" "$(KERNEL_IMAGE_OUTPUT)"; \
+		image=$$(mktemp "$(KERNEL_IMAGE_OUTPUT).XXXXXX"); \
+		config=$$(mktemp "$(KERNEL_IMAGE_OUTPUT).config.XXXXXX"); \
+		trap 'rm -f "$$image" "$$config"' EXIT HUP INT TERM; \
+		install -m 644 "$(KERNEL_BUILD_DIR)/$(KERNEL_IMAGE_FILE)" "$$image"; \
+		install -m 644 "$(KERNEL_BUILD_DIR)/.config" "$$config"; \
+		mv "$$config" "$(KERNEL_IMAGE_OUTPUT).config"; \
+		mv "$$image" "$(KERNEL_IMAGE_OUTPUT)"; \
 	fi
 
 .PHONY: kernel

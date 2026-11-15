@@ -27,8 +27,17 @@ from silo_smoke.cli import Result, Silo, timed
 from silo_smoke.config import REPO
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
+from silo_smoke import prereqs
 
 pytestmark = pytest.mark.linux_only
+FILESYSTEM_OBSERVER = Path(os.environ.get(
+    "SILO_SMOKE_FILESYSTEM_OBSERVER",
+    str(Path(os.environ.get("CARGO_TARGET_DIR", str(REPO / "target"))) / "changeset-tools/extractor"),
+)).resolve()
+requires_filesystem_observer = pytest.mark.skipif(
+    not FILESYSTEM_OBSERVER.is_file() or not os.access(FILESYSTEM_OBSERVER, os.X_OK),
+    reason=prereqs.extractor_skip_reason() or f"independent guest collector missing at {FILESYSTEM_OBSERVER}; run make smoke SMOKE_MARK= to build it automatically",
+)
 
 
 @pytest.fixture
@@ -46,13 +55,7 @@ def overlay_image(registry: LoopbackRegistry, overlay_image_bytes: images.OciIma
 
 @pytest.fixture(scope="session")
 def filesystem_observer() -> Path:
-    observer = Path(os.environ.get("SILO_SMOKE_FILESYSTEM_OBSERVER", str(REPO / "target/changeset-tools/extractor"))).resolve()
-    assert observer.is_file() and os.access(observer, os.X_OK), (
-        "Build the existing pinned independent collector for the guest's architecture: "
-        "CGO_ENABLED=0 make changeset-extractor; set SILO_SMOKE_FILESYSTEM_OBSERVER "
-        "for another target directory. The binary must run on the Alpine guest."
-    )
-    return observer
+    return FILESYSTEM_OBSERVER
 
 
 def _install_observer(silo: Silo, name: str, observer: Path) -> None:
@@ -123,6 +126,7 @@ def _assert_fixture(rows: list[dict]) -> None:
     assert any(row["mtimeNanos"] != 0 for row in rows), "fixture must exercise subsecond metadata"
 
 
+@requires_filesystem_observer
 @pytest.mark.parametrize("output_format", ["plain", "json"])
 def test_flatten_export_kernel_upper_namespace_and_boot(silo: Silo, overlay_image: str,
                                                        filesystem_observer: Path, output_format: str) -> None:

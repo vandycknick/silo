@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import unittest
 import time
 
-from silo_smoke import shutdown
+from silo_smoke import prereqs, shutdown
 from silo_smoke.native_live_api import cleanup_session, make_session_type
 from silo_smoke.native_live_trace import _record_restore_wait
 
@@ -29,14 +29,14 @@ class ApiConstructorCleanupTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        native_root = os.environ.get("SILO_NATIVE_ROOT")
-        if native_root is None:
-            raise unittest.SkipTest("set SILO_NATIVE_ROOT to the frozen native checkout")
-        examples = Path(native_root).resolve(strict=True) / "src/libkrun/examples"
+        examples = prereqs.native_root() / "src/libkrun/examples"
         sys.path.insert(0, str(examples))
+        previous = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
         try:
             cls.session_type = make_session_type()
         finally:
+            sys.dont_write_bytecode = previous
             sys.path.remove(str(examples))
 
     def constructor_failure(self, directory: Path, *, running: bool = False,

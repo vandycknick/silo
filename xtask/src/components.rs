@@ -29,6 +29,7 @@ pub struct BuildContext<'a> {
     pub target_dir: &'a Path,
     pub profile: Profile,
     pub host: HostTarget,
+    pub vmm_features: Option<&'a str>,
 }
 
 #[derive(Debug, Error)]
@@ -288,6 +289,9 @@ fn guest_library_test_command(
 fn build_cargo_package(context: &BuildContext<'_>, package: &str) -> Result<(), ComponentError> {
     let mut cargo = cargo_command(context)?;
     cargo.args(["build", "--locked", "-p", package]);
+    if let ("silo-vmm", Some(features)) = (package, context.vmm_features) {
+        cargo.args(["--features", features]);
+    }
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
     Ok(())

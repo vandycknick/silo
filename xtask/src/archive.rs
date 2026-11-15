@@ -99,6 +99,7 @@ fn produce_kinds(
             target_dir,
             profile,
             host,
+            vmm_features: None,
         },
         &stage,
     )

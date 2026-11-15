@@ -6,6 +6,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import platform
 import subprocess
 import time
 
@@ -13,7 +14,7 @@ import pytest
 
 from silo_smoke import capture, incremental, overlay, pause, procs, reclaim, restore, shutdown, stopped
 from silo_smoke.cli import ROOT_PROFILES, Result, RootProfile, Silo
-from silo_smoke.restore import restore_image, restore_irq_fixture  # noqa: F401, pytest fixtures
+from silo_smoke.restore import restore_irq_fixture  # noqa: F401, pytest fixture
 
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 
@@ -415,10 +416,7 @@ def test_restore_selected_vz_backend_rejects_before_any_operational_allocation(
     assert "backend-excluded" in result.stderr and "vz" in result.stderr.lower(), result.stderr
 
 
-@pytest.mark.skip(reason=(
-    "IRQ restore requires an explicitly staged diagnostic monitor; "
-    "the staged runtime has no IRQ probe transport"
-))
+@pytest.mark.skipif(platform.machine().lower() not in {"x86_64", "amd64"}, reason="hardware IRQ witness is x86_64 assembly")
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_restore_pending_hardware_irq_continues_exactly_once(
     silo: Silo, restore_image: str, restore_irq_fixture: Path,

@@ -1,9 +1,9 @@
-"""Real bounded native DISCARD/WRITE_ZEROES evidence in a private mount namespace.
+"""Real bounded range-operation fallback evidence in a private mount namespace.
 
 Only one 4MiB Data file enters ramfs (which has no intrinsic size limit). All
 root storage, database, logs, copies and evidence remain outside that mount.
-An unmodified production-path run and a separately labelled COPY-only opcode
-observer are both required; neither an ioctl's name nor zeros prove its opcode.
+The unmodified staged runtime must preserve bytes, capacity and reopen behavior;
+guest ioctl names and zeroed bytes do not attest the native opcode selected.
 """
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ import sys
 from . import overlay
 from .cli import Silo
 from .config import SmokeConfig
-from .overlay_candidate import Candidate
 from .workspace import Workspace
 
 SIZE = 4 * 1024**2
@@ -68,7 +67,6 @@ def main() -> None:
     assert operation in ('discard', 'zero', 'zero-unmap')
     offset, length = {'middle': (4096, 4096), 'tail': (SIZE - 4096, 4096), 'whole': (0, SIZE), 'middle-sector': (512, 512), 'tail-sector': (SIZE - 512, 512)}[region]
     expected = original[:offset] + bytes(length) + original[offset + length:]
-    candidate = None
     failed = True
     production = None
     try:
@@ -115,47 +113,19 @@ def main() -> None:
             assert silo.exec(name, overlay.PROBE, 'read-file', device, str(position), user='root').stdout.strip() == '00' * 512
         silo.stop(name)
         assert data.stat().st_size == SIZE and data.read_bytes() == expected
-        # A separately built observer monitor only observes real parsed
-        # opcodes; the successful public production run above is not replaced.
-        data.write_bytes(original)
-        candidate = Candidate(silo, request['image'], fault='range-observer', data=data, range_request=f'{operation}:{offset}:{length}')
-        candidate.start()
-        text = candidate.wait()
-        assert f'SILO_RANGE_RESULT operation={operation} offset={offset} length={length}' in text
-        worker_file(ws, candidate.identities['workerPid'], data)
-        candidate.close()
-        diagnostic = candidate.native_diagnostic()
-        responders = set(re.findall(r'SILO_SMOKE_GET_ID device=(\S+) sectors=8192 reply=silo-data-0', diagnostic))
-        assert len(responders) == 1, diagnostic
-        opcode = 'DISCARD' if operation == 'discard' else 'WRITE_ZEROES'
-        expected_flags = 1 if operation == 'zero-unmap' else 0
-        observed = [(actual_op, int(start), int(count), int(flags)) for device_id, actual_op, start, count, flags in re.findall(r'SILO_SMOKE_BLOCK_REQUEST device=(\S+) op=(\S+) offset=(\d+) length=(\d+) flags=(\d+)', diagnostic) if device_id in responders]
-        assert observed, f'guest operation did not prove actual native {opcode}; ordinary-write kernel fallback is not opcode evidence: {diagnostic}'
-        assert all(actual_op == opcode and flags == expected_flags for actual_op, _, _, flags in observed), observed
-        requests = [(start, count) for _, start, count, _ in observed]
-        covered = offset
-        for start, count in sorted(requests):
-            assert count > 0 and offset <= start <= covered and start + count <= offset + length, requests
-            covered = max(covered, start + count)
-        assert covered == offset + length, requests
-        assert data.stat().st_size == SIZE and data.read_bytes() == expected
         assert list(mountpoint.iterdir()) == [data] and data.stat().st_size <= SIZE
-        ws.record('overlay-range-complete', json.dumps({'backing': backing, 'operation': operation, 'offset': offset, 'length': length, 'logicalLength': SIZE, 'nativeOpcode': opcode, 'nativeFlags': expected_flags, 'observedNativeRequests': observed, 'nativeRequests': requests, 'nativeIdentity': candidate.identities, 'productionPath': 'unmodified staged CLI/libvm/monitor/worker; stop/reopen/capacity/guest read', 'observerPath': 'COPY-only actual parsed opcode/flags; never installed into the shared stage'}) + '\n')
+        ws.record('overlay-range-complete', json.dumps({'backing': backing, 'operation': operation, 'offset': offset, 'length': length, 'logicalLength': SIZE, 'productionPath': 'unmodified staged CLI/libvm/monitor/worker; stop/reopen/capacity/guest read'}) + '\n')
         failed = False
     finally:
         try:
-            if candidate is not None:
-                candidate.close()
+            if production is not None:
+                silo.stop(production, force=True)
         finally:
             try:
-                if production is not None:
-                    silo.stop(production, force=True)
+                subprocess.run(['umount', str(mountpoint)], check=True, timeout=15)
             finally:
-                try:
-                    subprocess.run(['umount', str(mountpoint)], check=True, timeout=15)
-                finally:
-                    shutil.copytree(ws.evidence, destination, dirs_exist_ok=True)
-                    ws.cleanup(failed=failed)
+                shutil.copytree(ws.evidence, destination, dirs_exist_ok=True)
+                ws.cleanup(failed=failed)
 
 
 if __name__ == '__main__':

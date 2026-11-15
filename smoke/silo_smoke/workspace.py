@@ -11,6 +11,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from .config import RUN_ROOT_PARENT, SmokeConfig
+from .prereqs import workspace_parent
 
 if TYPE_CHECKING:
     from .daemon import Daemon
@@ -32,10 +33,8 @@ def _system_trust_bundle() -> bytes:
 class Workspace:
     def __init__(self, config: SmokeConfig, registry_ca: Path, *, parent: Path | None = None, runtime_parent: Path | None = None) -> None:
         self.config = config
-        # Linux callers can select durable scratch with a process-local TMPDIR.
-        # Keep macOS's deliberately short socket-safe /private/tmp default.
         if parent is None:
-            parent = Path(os.environ.get("TMPDIR", RUN_ROOT_PARENT) if platform.system() == "Linux" else RUN_ROOT_PARENT)
+            parent = workspace_parent() if platform.system() == "Linux" else Path(RUN_ROOT_PARENT)
         self.root = Path(tempfile.mkdtemp(prefix="silo-smoke-", dir=parent))
         self.root.chmod(0o700)
         self.user_home = self.root / "user"
@@ -43,6 +42,8 @@ class Workspace:
         self.config_home = self.root / "config"
         # Durable mounted state may have a long path. Generated sockets/locks
         # can live in a separately owned short runtime tree, never disk bytes.
+        if runtime_parent is None and len(os.fsencode(self.root / "run" / "machines" / ("x" * 36) / "vsock.sock")) >= 100:
+            runtime_parent = Path(RUN_ROOT_PARENT)
         self._runtime_directory = Path(tempfile.mkdtemp(prefix="silo-run-", dir=runtime_parent)) if runtime_parent is not None else None
         self.run_root = (self._runtime_directory or self.root) / "run"
         self.evidence = self.root / "evidence"
@@ -80,6 +81,10 @@ class Workspace:
     def register_machine(self, name: str) -> None:
         if name not in self._machines:
             self._machines.append(name)
+
+    def unregister_machine(self, name: str) -> None:
+        if name in self._machines:
+            self._machines.remove(name)
 
     def register_daemon(self, daemon: Daemon) -> None:
         if daemon not in self._daemons:

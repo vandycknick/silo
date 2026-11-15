@@ -26,11 +26,9 @@ from silo_smoke import restore_lifecycle as lifecycle
 from silo_smoke.cli import RootProfile, Silo, TIMINGS_PROPERTY, release
 from silo_smoke.config import RUN_ROOT_PARENT, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
-from silo_smoke.incremental import incremental_image  # noqa: F401, pytest fixture
-from silo_smoke.restore import restore_image  # noqa: F401, pytest fixture
 from silo_smoke.workspace import Workspace
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
+pytestmark = [pytest.mark.linux_only, pytest.mark.slow, pytest.mark.serial]
 
 SOURCE = "budget-source"
 GIB = fork_budget.GIB
@@ -111,7 +109,7 @@ def restart_source(silo: Silo, name: str) -> tuple[dict, dict]:
 
 
 def test_fork_budget_full_capture_interruption_and_four_child_fork(
-    silo: Silo, restore_image: str, budget_host: dict,  # noqa: F811
+    silo: Silo, restore_image: str, budget_host: dict,
 ) -> None:
     """One source, payload written once; every sample ends with its children
     and the source stopped, removed/pruned, so at most one 4 GiB cut exists.
@@ -222,7 +220,7 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
 
 
 def test_fork_budget_restore_to_running(
-    silo: Silo, restore_image: str, budget_host: dict,  # noqa: F811
+    silo: Silo, restore_image: str, budget_host: dict,
 ) -> None:
     host = budget_host
     reflink = host["reflinkProbe"]["reflink"]
@@ -326,7 +324,7 @@ def remove_checkpoint(silo: Silo, alias: str, value: dict) -> None:
 
 
 def test_fork_budget_incremental_ten_percent_dirty(
-    silo: Silo, incremental_image: str, budget_host: dict,  # noqa: F811
+    silo: Silo, incremental_image: str, budget_host: dict,
 ) -> None:
     host = budget_host
     evidence = fork_budget.Evidence("incremental", host)
@@ -465,7 +463,7 @@ def prepared_lower(silo: Silo, image: str, name: str) -> dict:
 
 
 def test_fork_budget_warm_create_stopped_machine(
-    silo: Silo, restore_image: str, budget_host: dict,  # noqa: F811
+    silo: Silo, restore_image: str, budget_host: dict,
 ) -> None:
     evidence = fork_budget.Evidence("warm-create", budget_host)
     fork_budget.headroom(silo, 4 * GIB)
@@ -500,7 +498,7 @@ def test_fork_budget_warm_create_stopped_machine(
 
 
 def test_fork_budget_boot_layered_within_raw(
-    silo: Silo, restore_image: str, budget_host: dict,  # noqa: F811
+    silo: Silo, restore_image: str, budget_host: dict,
 ) -> None:
     evidence = fork_budget.Evidence("boot-layered-raw", budget_host)
     fork_budget.headroom(silo, 6 * GIB)

@@ -2,7 +2,10 @@
 name = "silo-smoke"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["pytest>=8"]
+dependencies = [
+    "pytest>=8",
+    "pytest-xdist>=3.6",
+]
 
 [tool.uv]
 package = false
@@ -17,5 +20,6 @@ markers = [
   "linux_only: requires Linux",
   "macos_only: requires macOS",
   "slow: extended real-VM qualification",
+  "serial: must not overlap other VM work (host budgets, reclaim, or fixed-port ownership)",
   "live: requires internet access and explicit selection",
 ]

@@ -24,7 +24,6 @@ CHUNK = 8 * 1024 * 1024
 PROBE = "/usr/local/bin/incremental-memory"
 
 
-@pytest.fixture(scope="session")
 def incremental_image(config: SmokeConfig, registry: LoopbackRegistry,
                       tmp_path_factory: pytest.TempPathFactory) -> str:
     """Use the existing execution oracle plus a pinned CPU/block-DMA witness."""

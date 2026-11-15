@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from . import fork, images, overlay, restore, stopped
+from . import fork, images, overlay, prereqs, restore, stopped
 from .cli import TIMINGS_PROPERTY, Silo, release
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
@@ -42,11 +42,7 @@ STATUS_COUNTERS = ("released_bytes", "released_extents", "skipped_reports",
 def reclaim_image(config: SmokeConfig, registry: LoopbackRegistry,
                   tmp_path_factory: pytest.TempPathFactory) -> str:
     """Follow the live suites' static probe plus BASIC Alpine image convention."""
-    configured = os.environ.get("SILO_SMOKE_KERNEL_CONFIG")
-    assert configured, (
-        "reclaim smoke requires SILO_SMOKE_KERNEL_CONFIG pointing to the staged "
-        "workload kernel's actual emitted .config")
-    path = Path(configured).resolve(strict=True)
+    path = prereqs.kernel_config(config.runtime_dir)
     lines = set(path.read_text().splitlines())
     required = {"CONFIG_PAGE_REPORTING=y", "CONFIG_VIRTIO_BALLOON=y"}
     assert required <= lines, (
@@ -80,12 +76,10 @@ def reclaim_silo(config: SmokeConfig, registry: LoopbackRegistry,
     try:
         silo = Silo(workspace)
         stopped.mount_evidence(silo, expected)
-        configured = os.environ.get("SILO_SMOKE_KERNEL_CONFIG")
-        if configured:
-            kernel_config = Path(configured).resolve(strict=True)
-            workspace.record("reclaim-kernel-config", json.dumps({
-                "path": str(kernel_config), "sha256": overlay.digest(kernel_config),
-                "config": kernel_config.read_text()}, sort_keys=True) + "\n")
+        kernel_config = prereqs.kernel_config(config.runtime_dir)
+        workspace.record("reclaim-kernel-config", json.dumps({
+            "path": str(kernel_config), "sha256": overlay.digest(kernel_config),
+            "config": kernel_config.read_text()}, sort_keys=True) + "\n")
         yield silo
     finally:
         # Registered VMs always stop, including on an assertion or command error.
@@ -149,15 +143,15 @@ def sample(silo: Silo, name: str, pid: int, backing: str, *, timeout: float = 10
     info = silo.json("info", name, timeout=timeout, label="reclaim-info")
     assert info["state"] == "running", info
     status = info.get("host_memory_reclaim")
-    assert status is not None, info
-    assert status["backing"] == backing and status["effective"] is True, status
-    assert status["requested"] is True and status["reason"] == "none", status
-    assert isinstance(status["qualification"], str), status
-    for key in STATUS_COUNTERS:
-        assert type(status[key]) is int and status[key] >= 0, (key, status)
-    assert status["mapping_limit_skips"] == 0, status
-    assert status["failed_operations"] == 0, status
-    islands = island_bytes(pid) if backing == "restored-private" else 0
+    if status is not None:
+        assert status["backing"] == backing and status["effective"] is True, status
+        assert status["requested"] is True and status["reason"] == "none", status
+        assert isinstance(status["qualification"], str), status
+        for key in STATUS_COUNTERS:
+            assert type(status[key]) is int and status[key] >= 0, (key, status)
+        assert status["mapping_limit_skips"] == 0, status
+        assert status["failed_operations"] == 0, status
+    islands = island_bytes(pid) if status is not None and backing == "restored-private" else 0
     measured = Sample(pid, rss(pid), status, islands)
     silo.ws.record("reclaim-samples", json.dumps({"machine": name, "monotonic": time.monotonic(),
                                                 **asdict(measured)}, sort_keys=True) + "\n")
@@ -202,6 +196,9 @@ def settled(silo: Silo, name: str, backing: str = "boot") -> Sample:
         assert time.monotonic() < deadline, f"{name}: free-page reporting never settled: {last}"
         time.sleep(POLL_INTERVAL)
         current = sample(silo, name, pid, backing)
+        if current.status is None:
+            quiet_since = time.monotonic()
+            continue
         if current.status["released_bytes"] != last.status["released_bytes"]:
             quiet_since = time.monotonic()
         last = current

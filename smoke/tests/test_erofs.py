@@ -11,16 +11,20 @@ import time
 
 import pytest
 
-from silo_smoke import overlay
+from silo_smoke import overlay, preflight, prereqs
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO
 from silo_smoke.overlay_candidate import Candidate, bounded_log, cpio
 
 
+pytestmark = pytest.mark.skipif(
+    preflight.erofs_tool("fsck.erofs") is None or preflight.erofs_tool("dump.erofs") is None,
+    reason="install erofs-utils (fsck.erofs and dump.erofs on PATH), or set SILO_SMOKE_EROFS_UTILS to its built source tree",
+)
+
+
 @pytest.fixture(scope="session")
 def erofs_probe(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    if not os.environ.get("SILO_SMOKE_EROFS_KERNELS"):
-        pytest.skip("explicit EROFS candidate kernel paths required")
     output = tmp_path_factory.mktemp("erofs-probe") / "init"
     subprocess.run(
         [os.environ.get("CC", "cc"), "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(output), str(REPO / "smoke/fixtures/erofs_mount.c")],
@@ -30,31 +34,26 @@ def erofs_probe(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.mark.linux_only
-@pytest.mark.parametrize("track", ["stable", "longterm"])
+@pytest.mark.parametrize("track", list(json.loads(os.environ["SILO_SMOKE_EROFS_KERNELS"])) if os.environ.get("SILO_SMOKE_EROFS_KERNELS") else ["staged"])
 @pytest.mark.parametrize("fixture", ["empty", "metadata", "rich", "many", "split"])
 def test_erofs_native_vmdk_mount(
     silo: Silo, basic_image: str, erofs_probe: Path, track: str, fixture: str,
 ) -> None:
     kernels = json.loads(os.environ.get("SILO_SMOKE_EROFS_KERNELS", "{}"))
-    if track not in kernels:
-        pytest.skip("explicit EROFS candidate kernel paths required in SILO_SMOKE_EROFS_KERNELS")
-    kernel = Path(kernels[track])
-    config = kernel.parent / ".config"
+    kernel = Path(kernels[track]) if kernels else silo.ws.config.runtime_dir / "assets/kernel-default"
+    config = kernel.parent / ".config" if kernels else prereqs.kernel_config(silo.ws.config.runtime_dir)
     text = config.read_text()
     for feature in ["EROFS_FS", "EROFS_FS_XATTR", "EROFS_FS_POSIX_ACL", "EROFS_FS_SECURITY", "EXPORTFS"]:
         assert f"CONFIG_{feature}=y\n" in text, feature
     producer = silo.ws.config.bin_dir / "examples/erofs_qualification"
-    if not producer.is_file():
-        producer = REPO / "target/debug/examples/erofs_qualification"
-    assert producer.is_file(), "build libvm example erofs_qualification before qualification"
+    assert producer.is_file(), "missing erofs_qualification helper; run make smoke-prereqs"
     fixture_dir = silo.ws.root / "erofs"
     generated = subprocess.run([str(producer), str(fixture_dir), fixture], check=True, capture_output=True, text=True, timeout=300)
     silo.ws.record("erofs-producer", generated.stdout + generated.stderr)
     summary = json.loads(generated.stdout)
     first = fixture_dir / "fsmeta.erofs"
     assert first.read_bytes() == (fixture_dir / "fsmeta-second.erofs").read_bytes(), "double-build byte determinism"
-    tools = Path(os.environ.get("SILO_SMOKE_EROFS_UTILS", str(REPO / ".tmp/tools/erofs-utils-1.9.4")))
-    args = [str(tools / "fsck/fsck.erofs")]
+    args = [preflight.erofs_tool("fsck.erofs")]
     if fixture != "many":
         args.extend(["--extract", "--device=" + str(fixture_dir / "payload.pack")])
     # erofs-utils admits at most 256 external CLI devices. For 1024 slots,
@@ -63,7 +62,7 @@ def test_erofs_native_vmdk_mount(
     checked = subprocess.run(args, capture_output=True, text=True, timeout=180)
     silo.ws.record("erofs-fsck", checked.stdout + checked.stderr)
     assert checked.returncode == 0, checked.stdout + checked.stderr
-    dumped = subprocess.run([str(tools / "dump/dump.erofs"), "-s", str(first)], check=True, capture_output=True, text=True, timeout=30)
+    dumped = subprocess.run([preflight.erofs_tool("dump.erofs"), "-s", str(first)], check=True, capture_output=True, text=True, timeout=30)
     silo.ws.record("erofs-dump", dumped.stdout + dumped.stderr)
     candidate = Candidate(silo, basic_image)
     try:

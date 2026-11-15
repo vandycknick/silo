@@ -19,9 +19,8 @@ import pytest
 from silo_smoke import capture, fork, pause, procs, restore, shutdown, stopped
 from silo_smoke import restore_lifecycle as lifecycle
 from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
-from silo_smoke.restore import restore_image  # noqa: F401, pytest fixture
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
+pytestmark = [pytest.mark.linux_only, pytest.mark.slow, pytest.mark.serial]
 
 SOURCE = "fork-source"
 NAMES = ["fork-a", "fork-b", "fork-c", "fork-d"]
@@ -154,7 +153,7 @@ def source_running(silo: Silo, prepared: Prepared) -> None:
 # -- acceptance -------------------------------------------------------------------
 
 def test_live_restore_and_fork_without_public_vsock(
-    silo: Silo, restore_image: str,  # noqa: F811
+    silo: Silo, restore_image: str,
 ) -> None:
     source = "no-vsock-source"
     restored = "no-vsock-restored"
@@ -196,7 +195,7 @@ def test_live_restore_and_fork_without_public_vsock(
 
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
-    silo: Silo, restore_image: str, profile: RootProfile,  # noqa: F811
+    silo: Silo, restore_image: str, profile: RootProfile,
 ) -> None:
     prepared = prepare(silo, restore_image, "--forward", FORWARD, profile=profile, network="private")
     source_identity = lifecycle.guest_identity(silo, SOURCE)
@@ -295,7 +294,7 @@ def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
 
 
 def test_fork_child_failure_after_seal_names_that_child_and_keeps_siblings(
-    silo: Silo, restore_image: str,  # noqa: F811
+    silo: Silo, restore_image: str,
 ) -> None:
     prepared = prepare(silo, restore_image, profile="layered")
     failing = 2
@@ -342,7 +341,7 @@ def failed_child(silo: Silo, child: dict) -> dict | None:
 
 
 def test_fork_children_share_one_clean_ram_inode_by_pss_not_rss(
-    silo: Silo, restore_image: str,  # noqa: F811
+    silo: Silo, restore_image: str,
 ) -> None:
     prepared = prepare(silo, restore_image, profile="layered")
     report, operations = [], []
@@ -381,7 +380,7 @@ def test_fork_children_share_one_clean_ram_inode_by_pss_not_rss(
 
 
 def test_fork_children_outlive_source_deletion_and_gc_then_recapture(
-    silo: Silo, restore_image: str,  # noqa: F811
+    silo: Silo, restore_image: str,
 ) -> None:
     prepared = prepare(silo, restore_image, profile="layered")
     names = NAMES[:2]
@@ -484,7 +483,7 @@ def refusal_diagnostic(call: fork.Call) -> str:
 
 
 def test_fork_refuses_count_and_descriptor_budgets_before_freeze(
-    silo: Silo, restore_image: str,  # noqa: F811
+    silo: Silo, restore_image: str,
 ) -> None:
     prepared = prepare(silo, restore_image, profile="layered", memory="1gib")
     # Count: 17 children exceed the default maximum of 16 without an explicit flag.
@@ -499,7 +498,7 @@ def test_fork_refuses_count_and_descriptor_budgets_before_freeze(
 # -- cancellation and manager death ------------------------------------------------
 
 def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest(
-    silo: Silo, restore_image: str,  # noqa: F811
+    silo: Silo, restore_image: str,
 ) -> None:
     names = NAMES[:2]
     create(silo, restore_image, profile="layered")
@@ -543,7 +542,7 @@ def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest
 
 
 def test_fork_manager_killed_before_seal_recovers_one_cut_and_abandons_children(
-    silo: Silo, restore_image: str,  # noqa: F811
+    silo: Silo, restore_image: str,
 ) -> None:
     names = NAMES[:2]
     create(silo, restore_image, profile="layered")
@@ -578,7 +577,7 @@ def test_fork_manager_killed_before_seal_recovers_one_cut_and_abandons_children(
 
 
 def test_fork_manager_killed_during_child_construction_recovers_without_orphans(
-    silo: Silo, restore_image: str,  # noqa: F811
+    silo: Silo, restore_image: str,
 ) -> None:
     prepared = prepare(silo, restore_image, profile="layered")
     process, args, operation, dispatched = fork.spawn(silo, SOURCE, NAMES)

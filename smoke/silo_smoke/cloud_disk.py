@@ -42,6 +42,15 @@ from .cli import Result, Silo
 from .config import REPO
 from .overlay_candidate import bounded_log, cpio
 
+
+@dataclass(frozen=True)
+class Roots:
+    """Never-booted whole-disk ext4 roots differing only in their identity marker."""
+
+    root: Path
+    clone: Path
+
+
 SECTOR = 512
 MIB = 1024**2
 
@@ -731,9 +740,9 @@ def foreign_container(output: Path, kind: str) -> Path:
 
 def qemu_img_cross_check(raw: Path, encoded: Path, record) -> None:
     """Optional third-party oracle. Absent configuration is recorded, never passed."""
-    tool = os.environ.get("SILO_SMOKE_QEMU_IMG")
+    tool = os.environ.get("SILO_SMOKE_QEMU_IMG") or shutil.which("qemu-img")
     if not tool:
-        record("SILO_SMOKE_QEMU_IMG unset: qemu-img cross-check not exercised\n")
+        record("qemu-img absent on PATH and SILO_SMOKE_QEMU_IMG unset: extra cross-check not exercised\n")
         return
     for args in (["check", "-f", "qcow2", str(encoded)], ["compare", "-f", "raw", "-F", "qcow2", str(raw), str(encoded)]):
         result = subprocess.run([tool, *args], capture_output=True, text=True, timeout=300)
@@ -779,6 +788,7 @@ def refuse_before_publication(silo: Silo, *args: str, sources: tuple[Path, ...] 
     existing recovery. Catalog publication and every machine directory may not.
     """
     assert silo.ws.state_db().is_file(), "initialize the Home before a refusal oracle"
+    silo.run("ls", label="settle-before-publication-refusal")
     before = (_published(silo), stopped.inventory(silo.ws.silo_home / "machines"), _operations(silo))
     inputs = [fingerprint(path) for path in sources]
     result = silo.run(*args, expect=None, timeout=timeout)
@@ -807,6 +817,7 @@ class EarlyRefusals:
 
     def __init__(self, silo: Silo) -> None:
         assert silo.ws.state_db().is_file(), "initialize the Home before a refusal oracle"
+        silo.run("ls", label="settle-before-early-refusals")
         self.silo = silo
         self.before = self._state()
         self.inputs: dict[Path, Fingerprint] = {}

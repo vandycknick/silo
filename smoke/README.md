@@ -3,25 +3,102 @@
 This suite drives the staged CLI, daemon and runtime against real VMs. It is
 intentionally outside CI and does not replace the unit or integration suites.
 
-## Prerequisites and running
-
-- Python 3.12+, `uv`, `openssl` and `sqlite3` on PATH (`nix develop` supplies uv
-  and openssl).
-- Linux: readable and writable `/dev/kvm`. macOS: Apple Silicon with Hypervisor
-  Framework support and a signed silo-vmm with hypervisor/virtualization entitlements.
-- Run as an ordinary user, not root.
-- Run `make stage` first. Use the same `PROFILE` and `CARGO_TARGET_DIR` when
-  staging and running; smoke does not build missing components.
+## Running
 
 ```sh
-make stage
-make smoke
-make smoke SMOKE_ARGS="-m slow"       # explicit extended qualification
-make smoke SMOKE_ARGS="-k lifecycle"
-make smoke SMOKE_ARGS='-m "not daemon and not slow"'
-make smoke SMOKE_ARGS="--backend vz"   # macOS only
-make smoke SMOKE_ARGS="-k tty_resize --keep"
+make smoke                                  # default: not slow
+make smoke SMOKE_MARK=                       # everything, including slow budgets
+make smoke SMOKE_WORKERS=1                   # default: 2, size for guest RAM
+make smoke SMOKE_ARGS='-k lifecycle --keep'  # optional pytest selection
 ```
+
+Add `PROFILE=release` for optimized runtime and budget measurements.
+
+Run as an ordinary user on a dev box with readable/writable `/dev/kvm` (or Apple
+Silicon HVF). Use the repository's normal Rust/Go toolchain, Python 3.12+, `uv`,
+ORAS, a static C compiler, `openssl`, `sqlite3`, OpenSSH, GNU coreutils, util-linux
+(`findmnt`, `sfdisk`, `blkid`, `unshare`, `mount`, `umount`) and e2fsprogs
+(`mkfs.ext4`, `e2fsck`, `debugfs`). The Rust toolchain file supplies both guest
+musl targets. EROFS qualification additionally needs `fsck.erofs` and `dump.erofs`
+from erofs-utils on PATH; those cases skip with an installation reason if absent.
+First runs need internet access for pinned Cargo/Go modules, the published kernel,
+Alpine fixture bytes and verified Distribution releases. Budgets need substantial
+free disk space and an otherwise idle host, not root privileges.
+
+`smoke-prereqs` reuses `stage`, builds every Rust helper in the same `PROFILE` and
+`CARGO_TARGET_DIR`, resolves Cargo's pinned libkrun sources and fetches the exact
+resolved kernel config by its staged digest. No manual builds or environment
+variables are needed. Overrides below remain optional. Slow selection also builds
+the independent static collector when local Go >=1.26.6 is available, and an
+isolated diagnostic IRQ runtime on Linux x86_64. Missing/old Go skips only the two
+collector cases with the exact requirement. No Go toolchain is downloaded.
+
+The parallel xdist lane (`--dist loadfile`) always finishes before the serial
+lane starts. Both run even when the first fails; either failure makes Make fail.
+No selected cases (pytest exit 5) is successful. `SMOKE_MARK=` removes the default
+`not slow` filter; a final `-m` in `SMOKE_ARGS` overrides it. Serial budgets,
+reclaim and fixed-port cases never overlap workers. Do not run unrelated VMs or
+I/O-heavy workloads during budget measurements.
+
+JUnit paths are suffixed `-parallel` and `-serial`. Each worker owns its fixtures,
+Homes and short pytest base. Linux durable workspaces default to
+`${XDG_CACHE_HOME:-~/.cache}/silo/smoke` (short enough for Unix socket paths;
+`TMPDIR` overrides it); long paths move only sockets/locks to `/tmp`.
+Retained per-run evidence defaults to `$CARGO_TARGET_DIR/smoke/evidence/run-*`,
+with unique cohort/worker suffixes. Failed workspaces remain; `--keep` also keeps
+successes. Never share a live VM or mutable Home across workers.
+
+### Remaining owner/tool opt-ins
+
+```sh
+# Existing owner-mounted writable ext4, visible in this process's mount namespace:
+SILO_SMOKE_STOPPED_DIR=/absolute/owner-mounted-ext4 SILO_SMOKE_STOPPED_FS=ext4 \
+  make smoke SMOKE_MARK= SMOKE_ARGS='tests/test_stopped.py -k host_ext4'
+
+# Owner-published systemd/OpenSSH image with systemd-ssh-generator and vsock activation:
+SILO_SMOKE_SYSTEMD_IMAGE="${SYSTEMD_IMAGE:?set the owner-published OCI reference}" \
+  make smoke SMOKE_MARK= SMOKE_ARGS='tests/test_ssh_systemd_owned.py'
+
+# Optional extra qcow2 oracle, if qemu-img is installed:
+SILO_SMOKE_QEMU_IMG="$(command -v qemu-img)" make smoke SMOKE_ARGS='tests/test_cloud_disk.py'
+```
+
+The suite never mounts an ext4 filesystem on the host for you or requests sudo.
+Published private images must already be accessible to Silo; anonymous public
+system/distro defaults need no credentials. Local controlled registries are
+automatically provisioned and never touch hosted credentials. Internet-dependent
+`live` cases run with the normal selection, including `SMOKE_MARK=`.
+
+### Prerequisite inventory
+
+| Input / previous precondition | Resolution |
+| --- | --- |
+| CLI, daemon, monitor, netd, agent, initramfs, workload kernel | `smoke-prereqs: stage`, reusing normal build/acquisition/signing logic |
+| `storage_acceptance`, `live_acceptance`, `root_metrics`, `overlay_candidate_lower`, `erofs_qualification` | Automatically built libvm examples in the selected profile |
+| `format_upper` | Automatically built disk-image example |
+| `native-live-api`, `guest-lifecycle-controller` | Automatically built silo-vmm examples; specific executable env overrides remain |
+| Hardcoded debug/release example paths | Selected binary directory, derived from `CARGO_TARGET_DIR` and `PROFILE`; no cross-profile fallback |
+| `SILO_NATIVE_ROOT` | Cargo metadata's pinned git libkrun checkout; read-only Python validators/sources, no native checkout build or mutation |
+| `SILO_SMOKE_KERNEL_CONFIG` | Staged OCI kernel identity plus authenticated resolved-config blob; local `KERNEL_PATH` uses adjacent emitted `.config` |
+| EROFS candidate kernel matrix | Staged kernel/config by default; `SILO_SMOKE_EROFS_KERNELS` optionally supplies named local kernels/configs |
+| EROFS verifier source tree | Host `fsck.erofs`/`dump.erofs`, precise install skip if absent; `SILO_SMOKE_EROFS_UTILS` optionally selects a built tree |
+| IRQ diagnostic producer/witness | Separate `smoke-diagnostic` target directory and real xtask stage with `restore-irq-probe`; per-test private runtime and automatically assembled witness |
+| `SILO_SMOKE_FILESYSTEM_OBSERVER` / Go extractor | Existing `changeset-extractor` Make target, `CGO_ENABLED=0`, local Go >=1.26.6, only for eligible slow cases; precise Go skip otherwise |
+| `SILO_SMOKE_EVIDENCE`, `SILO_SMOKE_BUDGET_EVIDENCE`, `SILO_SMOKE_RESTORED_EVIDENCE` | Automatically created durable per-run evidence; env overrides optional |
+| `SILO_SMOKE_BUDGET_DIR`, `TMPDIR` | Optional scratch placement; default durable workspace root, short separate runtime sockets |
+| `SILO_SMOKE_STOPPED_DIR`, `SILO_SMOKE_STOPPED_FS` | Only actual host-ext4 gate is owner opt-in; exact enable command above |
+| `SILO_SMOKE_CAPTURE_FS` | Optional assertion on the observed host filesystem, not fixture setup |
+| Static C/Rust/assembly guest probes (`CC`, rustc, as/ld/objcopy/nm) | Built by session/test fixtures from repository or pinned native sources |
+| Alpine and OCI fixtures, ext4 images | Downloaded with pinned integrity or constructed by existing fixture builders, never prebuilt by hand |
+| Local loopback/Distribution registries and TLS CA | Existing automatic private registry fixtures and verified release cache |
+| `SILO_SMOKE_SYSTEM_IMAGE`, `SILO_SMOKE_DISTRO_IMAGES` | Public defaults; optional reference overrides or explicit empty opt-out |
+| `SILO_SMOKE_SYSTEMD_IMAGE` | Owner-published image opt-in, exact command above; no fabricated fallback image |
+| `SILO_SMOKE_CURL_IMAGE` | Removed unused configuration; live provider test already uses the generated CA-trust fixture |
+| `SILO_SMOKE_QEMU_IMG` | Optional extra oracle only, default PATH discovery when installed |
+| `SILO_SMOKE_BIN_DIR`, `SILO_SMOKE_RUNTIME_DIR`, `SILO_SMOKE_BACKEND` | Derived target/profile/host paths and krun default; pytest options/env remain overrides |
+| `SILO_SMOKE_CACHE`, `XDG_CACHE_HOME`, `SILO_SMOKE_KEEP` | Existing automatic cache and retention defaults |
+| `PATH`, `HOME`, `PYTEST_XDIST_WORKER`, `SILO_NATIVE_API_EXECUTABLE` | Tool discovery, per-workspace isolation, worker labeling, internally supplied native entry, not manual inputs |
+
 
 Phase 22 makes `linux-erofs-overlay-v1` the libkrun OCI default and removes the
 flat profile and root-profile selector. Linux x86_64 stable 7.2.2 and
@@ -34,18 +111,17 @@ mandatory Phase 24 sweep. Live support follows native backend/host primitives. S
 
 ### Controlled EROFS encoder qualification
 
-Build `cargo build --locked -p libvm --example erofs_qualification` and the
-stable/longterm workload kernels with the current fragments. Build upstream
-erofs-utils 1.9.4 separately; it is a verifier, not a production dependency.
+`make smoke` builds the producer and uses the staged kernel plus its authenticated
+resolved config. Install erofs-utils to enable the independent host verifier:
 
 ```sh
-export SILO_SMOKE_EROFS_KERNELS='{"stable":"/absolute/stable/build/vmlinux","longterm":"/absolute/longterm/build/vmlinux"}'
-export SILO_SMOKE_EROFS_UTILS=/absolute/erofs-utils-1.9.4
-uv run --project smoke pytest smoke/tests/test_erofs.py --keep
+make smoke SMOKE_ARGS='tests/test_erofs.py --keep'
 ```
 
-Each kernel must have its resolved `.config` beside `vmlinux`. The fixture
-producer authenticates packs, composes fsmeta twice, checks exact retained
+For an explicit multi-kernel matrix, `SILO_SMOKE_EROFS_KERNELS` may contain
+`{"stable":"/absolute/stable/vmlinux","longterm":"/absolute/longterm/vmlinux"}`.
+Each overridden kernel needs its emitted `.config` beside it.
+The fixture producer authenticates packs, composes fsmeta twice, checks exact retained
 loading, and publishes a descriptor through the existing storage/VMDK codec.
 The suite runs upstream `fsck.erofs` and `dump.erofs`, then mounts the actual
 VMDK in a guest using a static, independently authored C probe. It covers
@@ -101,8 +177,7 @@ and daemon routes (`artifact-stopped-corrected.xml`, 338.87 s). This establishes
 the controlled Distribution lane only; GHCR remains deferred.
 
 ```sh
-cargo build --locked -p libvm --example storage_acceptance
-uv run --project smoke pytest smoke/tests/test_artifact_stopped.py
+make smoke SMOKE_ARGS='tests/test_artifact_stopped.py'
 ```
 
 `test_artifact_live.py` is a functional slow selection, not a performance
@@ -141,19 +216,17 @@ relocation. The cases are included in the default non-slow suite.
 
 ### Guest lifecycle controller (Phase 12)
 
-Main builds the explicit host-only smoke executable separately, then stages
-the actual kernel/init/agent. The helper is an example with `test = false`,
-not a Cargo test and not a new production control route:
+Make builds the host-only helper and stages the kernel/init/agent automatically.
+The helper is an example with `test = false`, not a Cargo test or a production
+control route:
 
 ```sh
-cargo build -p silo-vmm --example guest-lifecycle-controller
-make stage
 make smoke SMOKE_ARGS='-k freeze_real_kernel'
 ```
 
-`SILO_SMOKE_GUEST_LIFECYCLE_CONTROLLER` selects an absolute helper path for
-nondefault target/profile builds. Tests never build a missing helper. They
-retain its digest, staged kernel/agent/initramfs digests, private fixture,
+`SILO_SMOKE_GUEST_LIFECYCLE_CONTROLLER` optionally selects an absolute helper path.
+The matching target/profile example is used by default. Tests retain its digest,
+staged kernel/agent/initramfs digests, private fixture,
 serial output and observed counter/epoch values. A fresh ordinary production
 `VirtualMachine` owns its production worker and native host-only vsock mux;
 cleanup force-stops/reaps that exact worker and closes attachments even when
@@ -182,7 +255,6 @@ exact host generation barrier.
 ### Public pause and resident resume (Phase 13)
 
 ```sh
-cargo build --locked -p libvm --example live_acceptance
 make smoke SMOKE_ARGS='tests/test_pause.py tests/test_guest_lifecycle.py -k pause --keep'
 ```
 
@@ -256,19 +328,10 @@ restore refuses mismatches in those fields, not different source or build inputs
 launch-environment and mutable-grant queries without starting a machine. Native
 live operations must report `supported`; mutable files cannot change the result.
 
-Stage and select the release runtime once for capture, restore, fork,
-incremental and budget suites:
+Capture, restore, fork, incremental and budget suites use the selected profile:
 
 ```sh
-make stage PROFILE=release
-export SILO_SMOKE_BIN_DIR=target/release
-export SILO_SMOKE_RUNTIME_DIR=target/silo-runtime/linux-amd64-gnu/release
-```
-
-Then run:
-
-```sh
-uv run --project smoke pytest smoke/tests/test_capture.py smoke/tests/test_capture_multidisk.py smoke/tests/test_capture_lifecycle.py -m slow --keep
+make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_capture.py tests/test_capture_multidisk.py tests/test_capture_lifecycle.py --keep'
 ```
 
 The root-family gates exercise raw and EROFS-overlay matched disk/RAM cuts,
@@ -280,6 +343,11 @@ write and record-settlement boundaries for manager/monitor/worker death, plus
 pool-file sync, pool publication and catalog checkpoint barriers. The catalog
 boundary is an actual WAL sync after capture provenance commits but before
 the checkpoint can be acknowledged.
+
+The borrowed case deliberately omits `--preserve`: admission must persist
+`resumePolicy: preserve`, keep the source paused and retain its exact user-owned
+resume token, as specified by ADR 0021.
+
 Pre-seal cancellation waits for the monitor's exact request-admission event
 before releasing the held syscall; it verifies acquired-resume, acquired-preserve
 and borrowed-pause policies. Post-seal cancellation preserves the known seal.
@@ -336,29 +404,17 @@ device decoding; the original device binding is retained explicitly. All
 rejections require no child/catalog/budget leak.
 Verification consumers may leave an unlocked stable lease inode by pool design;
 unsupported selected-backend refusal may not acquire even that consumer.
-The live suites expect the release helper binaries next to the CLI: build them
-once with `cargo build --release -p libvm -p silo-vmm --examples` and point
-`SILO_SMOKE_NATIVE_LIVE_API` at `target/release/examples/native-live-api`.
+The live suites use automatically built matching-profile helpers next to the CLI.
+`SILO_SMOKE_NATIVE_LIVE_API` optionally overrides the native entry.
 Foreign-lane compatibility still requires a real foreign-lane checkpoint, not a
 synthetic mixed-architecture envelope.
 
-The genuine hardware IRQ case is explicitly skipped because it depended on the
-removed isolated-build diagnostic-producer source mutation. The staged runtime
-does not perform that producer swap, so running against it cannot establish the
-hardware IRQ proof.
-
-The witness assembly can still be staged independently from the libkrun checkout
-resolved by `cargo metadata`:
-
-```sh
-PYTHONPATH=smoke uv run --project smoke python -m silo_smoke.irq_fixture \
-  --runtime "$SILO_SMOKE_RUNTIME_DIR"
-```
-
-This builds `assets/restore-irq-witness` using `as`, `ld`, `objcopy` and `nm`,
-recording the resolved source, assembly/binary/symbol digests, and the staged
-monitor's SHA-256 and `buildIdentity`. It does not mutate monitor source, rebuild
-the monitor, or enable the diagnostic endpoint.
+The hardware IRQ case uses an isolated diagnostic stage built automatically for
+eligible slow selections on Linux x86_64. The production stage remains unchanged.
+A per-test private runtime replaces only its monitor and uses the diagnostic
+manifest generated by the existing xtask staging path. The witness is assembled
+from Cargo's resolved libkrun sources with `as`, `ld`, `objcopy` and `nm`, with
+source/binary/symbol digests and exact monitor build identity retained.
 
 ### Restore activation lifecycle (Phase 15)
 
@@ -585,18 +641,13 @@ generation, checksum and upload steps instead allow 120 s per GiB, with a
 120 s minimum (1440 s for the 12 GiB layer); slow setup is not a prepare-budget
 failure and never shrinks the corpus.
 
-Use the same staged runtime/environment as the fork budget and an existing
-durable evidence directory. The pinned Distribution binary is reused from the smoke
-cache, or its verified release is downloaded during fixture setup. `bash`,
-`head`, `tee`, `sha256sum`, `curl` and `gzip` must be installed. The shared
-storage acceptance example must be built
-by Main as for the fork budgets.
+The pinned Distribution binary is reused from the smoke cache or downloaded and
+verified automatically. `bash`, `head`, `tee`, `sha256sum`, `curl` and `gzip` must
+be installed. Budget cohorts run under slow selection with durable workspace and
+evidence defaults:
 
 ```sh
-SILO_SMOKE_BUDGET_EVIDENCE=/absolute/durable/evidence \
-SILO_SMOKE_BUDGET_DIR=/absolute/durable/scratch TMPDIR=/short/durable/path \
-  uv run --project smoke pytest smoke/tests/test_ingest_budget.py -m '' -k 'not budget_gate'
-uv run --project smoke pytest smoke/tests/test_ingest_budget.py -k budget_gate
+make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_ingest_budget.py'
 ```
 
 Evidence is written under `$SILO_SMOKE_BUDGET_EVIDENCE/ingest-<stamp>/`:
@@ -609,26 +660,18 @@ unmeasured claim about the ADR's XFS/APFS reference hosts.
 ### Live fork budget cohorts (Phase 16)
 
 `tests/test_fork_budget.py` measures ADR 0021 full capture interruption,
-restore to Running and four-child fork to Running. Use the staged release
-runtime, durable workspace storage (tmpfs is refused) and a durable evidence
-directory outside the workspace. `SILO_SMOKE_BUDGET_DIR` selects a mounted
-workspace parent; sockets and runtime locks then use a separately owned short
-runtime directory, never the RAM or disk bytes. Without it, `TMPDIR` selects
-the workspace as usual and must be short enough for Unix socket paths:
-
-For optimized budget measurements, run `make stage PROFILE=release` and select
-`SILO_SMOKE_BIN_DIR=target/release` and
-`SILO_SMOKE_RUNTIME_DIR=target/silo-runtime/linux-amd64-gnu/release`.
-Reference-host evidence records the staged monitor's SHA-256 and its
-`buildIdentity` from `silo-vmm capabilities --backend krun --json`, alongside
-the other runtime inputs. Keep failed debug measurements as evidence of that
-build, not release results.
+restore to Running and four-child fork to Running. Workspaces and evidence
+default to durable directories under the Cargo smoke root; tmpfs is refused.
+`SILO_SMOKE_BUDGET_DIR` and `SILO_SMOKE_BUDGET_EVIDENCE` optionally override them.
+Short runtime directories keep sockets/locks separate from durable disk bytes.
+The reference-host record includes the staged monitor SHA-256/build identity,
+kernel/config and remaining runtime inputs. Debug failures do not qualify release.
 
 ```sh
-SILO_SMOKE_BUDGET_EVIDENCE=$PWD/.tmp/plan/evidence/phase-16 \
-SILO_SMOKE_BUDGET_DIR=/home/$USER/sm/phase16-ext4 TMPDIR=/home/$USER/sm \
-  uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow
+make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_fork_budget.py'
 ```
+
+All five measurement cohorts run by default in this slow selection.
 
 Allowance, gate, writeback and small-file hash-probe unit tests (no guest):
 
@@ -833,7 +876,7 @@ Each cohort writes `samples.jsonl`, `summary.json`, `summary.md`,
 `reference-host.json` and `fixture.json` under
 `$SILO_SMOKE_BUDGET_EVIDENCE/<label>-<stamp>/`, with cache labels, free-space
 proof, fixture proof and timings in each sample. A median equal to its target
-passes. For example, with the four environment variables above set:
+passes. For example:
 
 ```sh
 uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow \
@@ -851,31 +894,33 @@ uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow \
 `tests/test_reclaim.py` runs the host memory reclaim scenarios against real Linux/KVM
 workers. It uses the same `linux_only` and `slow` markers as capture, restore,
 fork and incremental suites, and parametrizes both raw and layered guest roots.
-The ordinary workspace is the default Btrfs lane. To exercise ext4, point the
+The ordinary workspace uses the Cargo target filesystem. To exercise ext4, point the
 stopped-lane variables at an actual mounted writable ext4 directory;
 all machine disks, checkpoint RAM and catalog bytes stay on that mount, while
 generated sockets use a short `/tmp` runtime directory. `findmnt` verifies the
 requested filesystem in the test process's namespace.
 
 ```sh
-export SILO_SMOKE_BIN_DIR=target/release
-export SILO_SMOKE_RUNTIME_DIR=target/silo-runtime/linux-amd64-gnu/release
-export SILO_SMOKE_KERNEL_CONFIG="$KERNEL_BUILD/.config"
-uv run --project smoke pytest smoke/tests/test_reclaim.py -m slow --keep
+make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_reclaim.py --keep'
 
 SILO_SMOKE_STOPPED_DIR="$MOUNT" SILO_SMOKE_STOPPED_FS=ext4 \
-  uv run --project smoke pytest smoke/tests/test_reclaim.py -m slow --keep
+  make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_reclaim.py --keep'
 ```
 
 Use the same staged x86_64 live-capable workload kernel, agent and initramfs as
 the restore suites, with `/dev/kvm`, `sqlite3`, `findmnt`, a static C toolchain
 (`CC`, default `cc`) and the matching `native-live-api inspect-devices` example.
-`SILO_SMOKE_KERNEL_CONFIG` is mandatory and must identify that staged kernel's
-actual emitted config. Missing `CONFIG_PAGE_REPORTING=y` or
+The staged kernel's actual emitted config is resolved automatically;
+`SILO_SMOKE_KERNEL_CONFIG` is an optional override. Missing `CONFIG_PAGE_REPORTING=y` or
 `CONFIG_VIRTIO_BALLOON=y` fails with the missing options named. The test also
 decodes a real saved balloon device to require negotiated free-page reporting.
 An arbitrary config file is not proof that it built the tested kernel; retain
 the staging/build provenance with the run.
+
+Host reclaim telemetry is initially absent until the worker publishes its first
+report; guest readiness is not a telemetry-publication barrier. Sampling waits
+within its existing 60-second deadline for that report, still rejects malformed
+or ineffective reports immediately, and never counts an absent sample as quiet.
 
 The fixture uses the existing pinned BASIC Alpine image, whose `/sbin/init` is
 removed, plus a small statically compiled C workload. Create explicitly passes
@@ -935,12 +980,9 @@ staged KVM x86_64 runtime and VM-generation-aware workload kernel as the restore
 gates. The CLI, monitor and helper examples must be staged together:
 
 ```sh
-export SILO_SMOKE_BIN_DIR=target/release
-export SILO_SMOKE_RUNTIME_DIR=target/silo-runtime/linux-amd64-gnu/release
-uv run --project smoke pytest smoke/tests/test_incremental.py -m slow --keep
-uv run --project smoke pytest smoke/tests/test_artifact_live.py -m slow --keep
-uv run --project smoke pytest smoke/tests/test_restore.py -m slow \
-  -k 'corrupt_real_closure or real_native_incompatibility' --keep
+make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_incremental.py --keep'
+make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_artifact_live.py --keep'
+make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_restore.py -k "corrupt_real_closure or real_native_incompatibility" --keep'
 ```
 
 Prerequisites are `/dev/kvm`, a static C toolchain (`CC`, default `cc`), `debugfs`,
@@ -1009,15 +1051,13 @@ target is relaxed or qualified by these functional cases.
 ### Raw/qcow2 import, cloud disks, boot pinning and conversion (Phase 17)
 
 `tests/test_cloud_disk.py` uses only the staged CLI and the staged monitor.
-Prerequisites: `make stage` with a runtime whose `assets/kernel-default` is the
-Phase 17 workload kernel (GPT/MBR scanning, `VFAT_FS`, `NLS_CODEPAGE_437`,
-`NLS_UTF8`; identity in Main's phase-17 evidence), plus `sfdisk`, `blkid`,
+The automatically staged workload kernel supplies GPT/MBR scanning, `VFAT_FS`,
+`NLS_CODEPAGE_437` and `NLS_UTF8`. Host tools include `sfdisk`, `blkid`,
 `e2fsck`, `debugfs` and `sqlite3` on PATH. `SILO_SMOKE_QEMU_IMG` optionally
 names a `qemu-img` for an additional `check`/`compare` of every qcow2 fixture;
-when unset the log records that this cross-check was not exercised.
+when unset, PATH discovery enables it if installed; otherwise the log records no cross-check.
 
 ```sh
-make stage
 make smoke SMOKE_ARGS='tests/test_cloud_disk.py -m linux_only'
 make smoke SMOKE_ARGS='tests/test_cloud_disk.py --backend vz'   # macOS VZ lane only
 ```
@@ -1062,23 +1102,19 @@ never passed.
 `silo_smoke/guest_restored.py` joins the standalone `native-live-api` owner
 (`--silo-fixture` real-Silo boot) with the attach-only guest controller
 (`guest-lifecycle-controller --attach`). It never uses the diagnostic native
-init, console oracles or echo streams. Build, stage and point at the exact
-inputs first:
+init, console oracles or echo streams. Make resolves the matching built helpers,
+read-only pinned libkrun validators and staged kernel config automatically:
 
 ```sh
-cargo build --locked -p silo-vmm --example guest-lifecycle-controller --example native-live-api
-make stage
-export SILO_NATIVE_ROOT=/home/nickvd/Projects/worktrees/libkrun/silo-production
-export SILO_SMOKE_KERNEL_CONFIG="$KERNEL_BUILD/.config"   # staged kernel's emitted config
-export CC=/usr/bin/gcc                                     # needs static libc for the guest probe
 make smoke SMOKE_ARGS='-m "not slow" -k "freeze or generation or activation" --keep'
 make smoke SMOKE_ARGS='-m slow -k activation --keep'
 ```
 
-`SILO_SMOKE_NATIVE_LIVE_API` overrides the entry path; `SILO_SMOKE_RESTORED_EVIDENCE`
-selects a parent directory for per-cohort evidence (default: the workspace,
-which is removed after a passing run unless `--keep`). The kernel config must
-contain `CONFIG_VMGENID=y` and `CONFIG_VIRTIO_SILO_VMGENID=y`.
+`SILO_SMOKE_NATIVE_LIVE_API` optionally overrides the entry path.
+`SILO_SMOKE_RESTORED_EVIDENCE` optionally selects a parent directory; otherwise
+the per-run durable evidence tree is used. The staged config must contain
+`CONFIG_VMGENID=y` and `CONFIG_VIRTIO_SILO_VMGENID=y`. No native-checkout env var
+or native-checkout build is needed.
 
 One cold AgentPid1 source (populated private root `disk0`, ext4 data `disk1`,
 complete two-block shutdown manifest, real netd behind a transparent
@@ -1107,20 +1143,19 @@ The agent refreshes kernel-observed system facts once at activation completion
 (including failure), notifying status watchers without syscalls on each read.
 
 Options override environment variables. Paths should be absolute when supplied
-explicitly. The Makefile sets binary and runtime directories for the selected
-profile; use the corresponding pytest options to override them.
+explicitly. Make derives binary/runtime directories from the selected profile
+unless their environment overrides are set.
 
 | Environment | pytest option | Default / meaning |
 | --- | --- | --- |
-| `SILO_SMOKE_BIN_DIR` | `--silo-bin-dir` | `<repo>/target/debug`; must contain silo |
-| `SILO_SMOKE_RUNTIME_DIR` | `--silo-runtime-dir` | `<repo>/target/silo-runtime/<host-target>/debug` |
+| `SILO_SMOKE_BIN_DIR` | `--silo-bin-dir` | `$CARGO_TARGET_DIR/$PROFILE`; must contain silo |
+| `SILO_SMOKE_RUNTIME_DIR` | `--silo-runtime-dir` | `$CARGO_TARGET_DIR/silo-runtime/<host-target>/$PROFILE` |
 | `SILO_SMOKE_BACKEND` | `--backend krun\|vz` | `krun`; `vz` requires macOS |
 | `SILO_SMOKE_CACHE` | `--cache-dir` | `${XDG_CACHE_HOME:-~/.cache}/silo-smoke` |
 | `SILO_SMOKE_KEEP` | `--keep` | `1` retains workspaces even on success |
 | `SILO_SMOKE_SYSTEM_IMAGE` | none | Appliance OCI reference; defaults to `ghcr.io/vandycknick/silo/system:dev`; set it empty to skip system tests |
 | `SILO_SMOKE_DISTRO_IMAGES` | none | `label=oci-ref` list for the SSH distro lane; defaults to `arch=ghcr.io/vandycknick/archlinux:latest,system=<system image>`; set it empty to skip |
 | `SILO_SMOKE_SYSTEMD_IMAGE` | none | Optional Phase F systemd image with vsock SSH socket activation |
-| `SILO_SMOKE_CURL_IMAGE` | none | Optional Phase F image containing curl for live secret-provider tests |
 
 Failed tests and `--keep` preserve stopped machine files and per-machine logs,
 not just the outer workspace directory. Teardown still force-stops every
@@ -1139,8 +1174,9 @@ default, so use `-m 'not daemon and not slow'` to retain the fast selection whil
 excluding daemon tests. `live` tests require explicit selection with `-m live`.
 
 The system and distro lanes pull their published default images from
-ghcr.io; `SILO_SMOKE_SYSTEM_IMAGE= SILO_SMOKE_DISTRO_IMAGES= make smoke` runs
-fully offline. Pulled images are kept under `<cache>/image-catalog/<schema-hash>`:
+ghcr.io; `SILO_SMOKE_SYSTEM_IMAGE= SILO_SMOKE_DISTRO_IMAGES= make smoke` disables
+those published-image lanes, but other first-run acquisitions still need network.
+Pulled images are kept under `<cache>/image-catalog/<schema-hash>`:
 each embedded initial schema gets a separate fixture cache. It contains immutable
 `images/{objects,streams,source-blobs,transport}` bytes and a sanitized image-only
 SQLite catalog. Fixtures use SQLite backup, never copy active database/WAL files,
@@ -1294,14 +1330,13 @@ dirty replay, lifecycle cleanup and existing deadlines remain in place.
 The probe source is `virt/vmm/tests/guest/overlay_probe.rs`. Pytest's session
 fixture compiles it with rustc for Linux musl and embeds that new executable in
 the OCI layer; use a new pytest session after changing it, not a retained image.
-This does not rebuild the production initramfs. Stage the production binaries
-with `make stage` as usual before measuring. For the after measurement, retain
+This does not rebuild the production initramfs. `make smoke` stages production
+binaries automatically. For the after measurement, retain
 the same kernel/config qualification, fault monitors, system-image fixture,
 host filesystem, resource conditions and environment as the Phase 9 baseline,
 and run the complete unchanged selection:
 
 ```sh
-make stage
 make smoke SMOKE_ARGS='-m "not slow and not live" --junitxml=../.tmp/phase10-default-qualified.xml --durations=20'
 ```
 
@@ -1419,16 +1454,8 @@ Managed overlay requires Linux 6.6 or newer; compatibility is a kernel-config
 property verified by the kernel track's gate at build time, not by per-boot
 artifact qualification. Custom kernels are not rejected for having new hashes.
 
-Prepare the two pure host consumers and stage production binaries after all
-changes have landed:
-
-```sh
-cargo build -p disk-image --example format_upper
-cargo build -p libvm --examples
-make stage
-```
-
-The Rust musl target for the guest architecture must already be installed.
+`make smoke` automatically builds both host consumers and stages the runtime.
+The repository Rust toolchain includes the guest musl targets.
 The smoke session builds `virt/vmm/tests/guest/overlay_probe.rs` directly with
 `rustc`, using the existing self-contained musl linker convention. It includes
 the exact production init effective-options verifier by source path. No Cargo
@@ -1443,14 +1470,10 @@ Before there is a positive tuple, run only the controlled candidate:
 make smoke SMOKE_ARGS="-k overlay_candidate_qualification --keep"
 ```
 
-For a freshly built local kernel, stage that exact output and supply its actual
-resolved configuration as evidence input (not as an admission switch):
+For a locally built kernel, Make automatically uses its adjacent emitted config:
 
 ```sh
-KERNEL_BUILD=/absolute/path/to/the/completed/kernel/build
-make stage KERNEL_PATH="$KERNEL_BUILD/vmlinux"
-export SILO_SMOKE_KERNEL_CONFIG="$KERNEL_BUILD/.config"
-make smoke SMOKE_ARGS="-k overlay_candidate_qualification --keep"
+make smoke KERNEL_PATH=/absolute/kernel/build/vmlinux SMOKE_ARGS="-k overlay_candidate_qualification --keep"
 ```
 
 This uses the `overlay_candidate_lower` libvm example to acquire an authenticated
@@ -1471,10 +1494,10 @@ snapshots. The actual worker `/proc/PID/exe` hash must match the consumed
 monitor/worker snapshot. The candidate records the real binary's
 `capabilities --backend krun --json` build identity and corrected signed native
 revision; these are provenance, not a feature grant. For an authenticated OCI
-kernel, its artifact metadata supplies the resolved-config digest. For a local
-kernel, set `SILO_SMOKE_KERNEL_CONFIG` to its actual resolved `.config`; Main
-must independently retain the build provenance associating that config with
-the exact tested kernel. Hashing an arbitrary config file is not that proof.
+kernel, its artifact metadata supplies the resolved-config digest. A local
+`KERNEL_PATH` uses its adjacent emitted `.config`; `SILO_SMOKE_KERNEL_CONFIG`
+overrides that location. Retain independent build provenance associating those
+bytes with the exact tested kernel; hashing an arbitrary config is not proof.
 
 Main reviews the observed compatibility evidence and the kernel track's build-time
 configuration gate, then exercises the real production path without rebuilding an artifact allowlist:
@@ -1507,53 +1530,21 @@ lower RO handles, upper RW handle and fourteen actual Data RW handles. The
 `records + 256` check is numeric admission, not a reservation of free FDs;
 concrete native resource/open failures remain failures with their diagnostics.
 
-### Controlled real-native failures
+### Controlled guest validation
 
-Serial/access/reordering negatives must pass unchanged host/private validation.
-Main builds isolated source-copy fixtures, never production feature/env bypasses:
+Serial identity/order/access and effective-overlay-option validation are covered
+by the production init's `root_checks` and `overlay_verify` unit tests. Routine
+smoke does not rebuild mutated native monitors or a mutated init to repeat
+these checks. The real scratch no-export-handle gate still measures
+`name_to_handle_at` EOPNOTSUPP, successful OverlayFS mounting, effective
+index=off, and the production verifier's downgrade rejection, alongside a
+production positive control. Failed mounting or an unrelated parser error
+does not pass.
 
-```sh
-PYTHONPATH=smoke uv run --project smoke python -m silo_smoke.overlay_faults \
-  --destination "$HOME/.cache/silo-overlay-faults-phase08" \
-  --native-source /home/nickvd/Projects/worktrees/libkrun/silo-production \
-  --production-monitor "${SILO_SMOKE_RUNTIME_DIR:-target/silo-runtime/linux-amd64-gnu/debug}/bin/silo-vmm" --build
-export SILO_SMOKE_FAULT_MONITORS="$HOME/.cache/silo-overlay-faults-phase08"
-make smoke SMOKE_ARGS="-k 'overlay_native or overlay_injected_request' --keep"
-```
-
-The destination must be new and outside the repository and native source tree.
-The controller refuses changed source anchors and makes a private copy of the
-selected native working tree, excluding Git metadata and build outputs. It does
-not ask the monitor to attest a source revision or require a clean checkout.
-The manifest records original/mutated source hashes and replacement text as
-experiment evidence, plus commands and binary hashes. The COPY uses its own
-explicit native path patch. Its informational `buildIdentity` remains
-`v1:silo:<target>:<version>` and is not source compatibility evidence.
-After each build, the actual binary's `capabilities --backend krun --json`
-stdout/stderr/exit status are retained in the manifest and `capabilities.log`.
-Old fixture manifests are historical evidence, never migrated or silently reused
-for new monitor bytes.
-Production validators, dependency/cache/pin and stage remain untouched. Rebuild
-fixtures after production source changes; never install observer/fault binaries
-into the shared staged runtime.
-
-Missing/truncated/swapped serial fixtures alter only the copied native
-`build_disk_image_id` response construction. Duplicate uses a third real raw
-Data device with its unique `silo-data-0` attachment key; only its native GET_ID
-response becomes `silo-root-lower`. Acceptance requires actual virtqueue GET_ID
-responses from two distinct native device objects and explicit guest duplicate
-rejection, not a missing/replaced attachment or host JSON rejection. Reordering
-reverses the copied worker's disk attachment order after validation. Access
-fixtures change only the actual copied native RO setting.
-
-The copied init `effective-index-off` fixture changes only the mount request;
-the production verifier remains byte-identical. It must reach the exact
-effective-profile rejection before any candidate workload or rescue shell.
-This is explicitly an injected-request gate. Separately, the scratch
-no-export-handle gate measures actual `name_to_handle_at` EOPNOTSUPP, requires
-successful OverlayFS mounting and actual effective index=off, and runs both a
-production positive control and the same verifier's downgrade rejection. A
-failed mount or an unrelated parser error does not pass.
+The owned-stage replacement test uses private, byte-identical runtime copies
+with distinct monitor inodes. It removes the retained source inode at the
+actual launch boundary, requires the pre-exec identity recheck to refuse, then
+boots the successor inode normally. No fault-monitor build is required.
 
 The slow controlled historical native fixture uses the same real monitor/worker
 and guest verifier with `[a, empty, b, b]`: a valid flattener-produced ext4 prefix
@@ -1624,71 +1615,46 @@ bounded to that original prefix even for a 1 TiB target. Fault-build copies
 also belong on durable storage, not `/tmp`. The dedicated host-ENOSPC tmpfs
 remains separately bounded and does not exhaust the workspace filesystem.
 
-### Native opcode and unsupported-hole-punch proof
+### Native range operations and unsupported-hole-punch fallback
 
-Run `test_overlay_native_range_opcode_and_real_fallback` after staging the
-corrected signed native pin and passing the kernel track's build-time configuration
-gate and the real overlay integration flow above. The source-copy build command
-also creates `range-observer`. Then:
+Run `test_overlay_native_range_and_real_fallback` against the staged production
+runtime:
 
 ```sh
-TMPDIR="$HOME/sm" make smoke SMOKE_ARGS="-m slow -k overlay_native_range_opcode_and_real_fallback --keep"
+TMPDIR="$HOME/sm" make smoke SMOKE_ARGS="-m slow -k overlay_native_range_and_real_fallback --keep"
 ```
 
-This genuinely slow Linux matrix covers DISCARD and WRITE_ZEROES flags 0/1, aligned
-middle/tail/whole and sector-aligned 512-byte middle/tail ranges that are not
-host-4K-aligned. Each case creates a real private user/mount namespace and
-either a bounded 8MiB tmpfs or ramfs containing **one controlled 4MiB Raw Data
-file only**. Ramfs itself is not size-bounded; the controller never fills it,
-never permits unbounded guest writes to it, and keeps database, logs, all root
-storage, copies and evidence outside. Actual owned-FD `fallocate` controls
-measure PUNCH_HOLE/KEEP_SIZE and ZERO_RANGE/KEEP_SIZE, preserving and checking
-the original bytes on EOPNOTSUPP; ramfs must actually report EOPNOTSUPP.
+The 30-case Linux matrix covers discard, BLKZEROOUT and block-device
+`fallocate(PUNCH_HOLE|KEEP_SIZE)` over aligned middle/tail/whole ranges and
+sector-aligned 512-byte middle/tail ranges. Each case creates a private
+user/mount namespace and either bounded 8 MiB tmpfs or ramfs containing one
+controlled 4 MiB Raw Data file. Database, root storage, copies and evidence stay
+outside that mount; ramfs itself is not size-bounded.
 
-The first lane uses the unmodified corrected staged CLI/libvm/monitor/worker,
-checks actual worker writable handles to that same device/inode, guest zero
-reads, every host byte inside/outside the range, unchanged logical length,
-stop/reopen, capacity and guest reads after restart. A separate diagnostic
-COPY-only monitor then logs actual parsed native requests, correlates their
-device object with that real Data device's GET_ID, and requires exact range
-coverage by the requested opcode **and actual parsed flags**. `zero` uses the
-real BLKZEROOUT ioctl and must yield WRITE_ZEROES flags=0. `zero-unmap` uses
-real block-device `fallocate(PUNCH_HOLE|KEEP_SIZE)`; the exact built kernel's
-`block/fops.c` selects BLKDEV_ZERO_NOFALLBACK without NOUNMAP, and
-`drivers/block/virtio_blk.c` maps this to WRITE_ZEROES flags=1. Both operations
-run in the unmodified production lane before the separately labelled observer.
-DISCARD must report flags=0. Every Data-device request receipt must match the
-expected opcode/flags and cover the exact requested range; bytes inside/outside,
-length and reopen checks remain mandatory. Raw finalized `vm.exit.json`
-diagnostics avoid logger-chunk fragmentation. Ordinary-WRITE fallback is not
-native WRITE_ZEROES evidence and fails this gate. The observer is never staged
-or admitted, and cannot substitute for the
-unmodified production-path lane.
+Actual owned-FD controls measure PUNCH_HOLE/KEEP_SIZE and ZERO_RANGE/KEEP_SIZE
+and require real EOPNOTSUPP on ramfs, with original bytes intact on refusal.
+The unchanged shipped CLI/libvm/monitor/worker must hold that Data inode
+writable, zero exactly the requested bytes, preserve every outside byte and
+logical length, and retain capacity and guest-visible zeros after stop/reopen.
+Failures are not skipped or relabelled as successful fallback.
 
-`native-range/` retains real host errno/FD controls, worker FD identities,
-native request receipts, complete case evidence and a child-workspace pointer.
-With `--keep`, that child workspace retains the private consumed monitor,
-kernel, base/composite initramfs and configuration snapshots. If actual native
-Raw open cannot use ramfs or a kernel refuses/rounds partial-sector requests,
-preserve that real failure: do not skip, fabricate EOPNOTSUPP, relabel an
-ordinary write, or claim the fallback gate passed. Report the exact missing
-prerequisite to Main; an exact-owned-FD syscall-fault fixture would then need
-the separately approved bounded implementation, never a production bypass.
+This is a product-behavior gate, not native opcode/flags attestation: a guest
+ioctl name or zeroed bytes cannot identify the selected virtqueue opcode.
+Source-patched native observers and their separate builds are not part of
+routine smoke. `native-range/` retains host errno/FD controls, worker identities,
+case evidence and a child-workspace pointer.
 
 Foreign-effective-UID host metadata remains the documented F3 P2 fixture gap;
 mode/hardlink/ACL tests must not be reported as having exercised that branch.
-
-Source-copy native provenance comes from the actual privately snapshotted
-production monitor's `capabilities --backend krun --json` build identity,
-not a duplicate Cargo pin parser. A stale production monitor is rejected
-before archiving.
 
 ### Whole private-stage replacement with owned boot files
 
 `test_overlay_owned_stage_replacement_rechecks_monitor` uses private complete
 runtime clones, never Main's stage. A child-only Linux x86_64 syscall tracer holds
-the first write to the private launch-kernel temporary file, before kernel or
-composite publication. The gate checks that pinned kernel/base pool objects and
+the first write to the private `.launch-<uuid>.tmp` file, before kernel or
+composite publication. Pinned launches publish the kernel before the descriptor;
+the gate requires an empty temporary and absent final kernel/initramfs files.
+It checks that pinned kernel/base pool objects and
 the monitor are held as read-only CLOEXEC descriptors with independent inode and
 content evidence, then atomically swaps the stage and unlinks the retired tree.
 
@@ -1754,7 +1720,7 @@ candidate rejection similarly keeps explicit workload/rescue prohibition and
 the active-journal no-write oracle, not incidental diagnostic substrings.
 
 Exact-tail growth uses the existing public Rust `storage_acceptance` consumer,
-built with `cargo build -p libvm --example storage_acceptance`. Its
+built automatically by `make smoke`. Its
 `set-root-capacity MACHINE BYTES` action calls `Machine::update` with the exact
 byte count against the same private Home/runtime and checks the returned
 published capacity. No parser expansion or production shim is involved.
@@ -1820,20 +1786,15 @@ The extended controllers are all explicitly `slow`, use normal staged
 CLI → libvm → monitor → worker launches:
 
 ```sh
-make stage
-cargo build -p libvm --examples
 make smoke SMOKE_ARGS='-m "not slow" -k lifecycle'
 make smoke SMOKE_ARGS='-m slow -k shutdown'
 ```
 
 `storage_acceptance` is a standalone consumer of the public Rust image
-remove/prune API. It boots no VM itself and is not a Cargo test. Smoke uses
-the staged `examples/storage_acceptance`, falling back to the explicit
-debug example build above. With a custom Cargo target directory, copy the
-example to the selected smoke binary directory's `examples/` subdirectory.
-
-Rebuild all libvm examples after changing the initial schema: both
-`root_metrics` and `storage_acceptance` embed its checksum, just like the CLI.
+remove/prune API. It boots no VM itself and is not a Cargo test. Smoke uses the
+matching-profile `examples/storage_acceptance`, built automatically even with a
+custom Cargo target directory. Helpers and CLI are rebuilt together after schema
+changes because they embed the same checksum.
 An old helper must refuse a new-format Home, not bypass schema admission.
 
 `test_shutdown_cli_clean_independent_facts` keeps two real guest writers
@@ -1944,8 +1905,6 @@ cargo test -p libvm --lib machine::stopped_storage::tests:: -- --nocapture
 cargo test -p libvm private_copy -- --nocapture
 cargo test -p libvm snapshot -- --nocapture
 cargo test -p libvm storage::stream -- --nocapture
-cargo build -p libvm --example storage_acceptance
-make stage
 make smoke SMOKE_ARGS='tests/test_stopped.py -m "not slow" --keep'
 make smoke SMOKE_ARGS='tests/test_stopped.py -m slow -k "not host_ext4" --keep'
 ```
@@ -1968,7 +1927,6 @@ refusal. It creates no VM, but the linked query may open/query the system KVM fd
 or resolve optional HVF symbols, so it belongs to smoke rather than Cargo tests:
 
 ```sh
-make stage
 make smoke SMOKE_ARGS='tests/test_native_capabilities.py -m "not slow"'
 ```
 
@@ -2117,10 +2075,11 @@ SILO_TEST_COPY_DIR="$MOUNT" SILO_TEST_COPY_CROSS_DIR=/actual/other/filesystem \
   cargo test -p libvm private_copy_real_cross_filesystem -- --ignored --nocapture
 ```
 
-`test_stopped_host_ext4_fork_requires_actual_mount` fails, rather than reporting
-a pass/skip, without an explicit process-visible ext4 input. Copy-provider output
-must separately show the actual sparse/streaming fallback method on that mount;
-native byte equivalence alone does not prove which syscall strategy ran.
+`test_stopped_host_ext4_fork_requires_actual_mount` skips at collection when
+`SILO_SMOKE_STOPPED_DIR` is unset. Configured lanes must still provide a real
+process-visible ext4 input and `SILO_SMOKE_STOPPED_FS=ext4`; invalid inputs fail.
+Copy-provider output must separately show the actual sparse/streaming fallback
+method on that mount; native byte equivalence alone does not prove the strategy.
 The owner-authorized image/mountpoint is not assumed usable until `findmnt`
 inside the executing process observes ext4. The Linux qualification run used
 an isolated loop-mounted ext4 image and observed `SparseCopy` for both children;
@@ -2152,11 +2111,11 @@ independent validation, not the native operations under test.
 Checkpoint compatibility uses the native live-state schema and guest architecture,
 not producer build identity. Keep source and input identities as reproduction
 evidence, and keep diagnostic native features separate from production captures.
-Build the example and stage the runtime before invoking a cohort:
+This standalone forensic CLI is separate from pytest and still takes explicit
+native-provider guest inputs; they are not prerequisites for `make smoke`.
 
 ```sh
-cargo build --locked -p silo-vmm --example native-live-api
-make stage KERNEL_PATH="$PRODUCTION_KERNEL"
+make smoke-prereqs KERNEL_PATH="$PRODUCTION_KERNEL"
 python3 smoke/silo_smoke/native_live_api.py \
   --native-root "$NATIVE_CHECKOUT" \
   --entry target/debug/examples/native-live-api \

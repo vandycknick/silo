@@ -16,6 +16,14 @@ from .config import RUN_ROOT_PARENT, SmokeConfig
 from .errors import SmokeEnvironmentError
 
 
+def erofs_tool(name: str) -> str | None:
+    configured = os.environ.get("SILO_SMOKE_EROFS_UTILS")
+    if configured:
+        path = Path(configured).expanduser() / name.split(".", 1)[0] / name
+        return str(path) if path.is_file() and os.access(path, os.X_OK) else None
+    return shutil.which(name)
+
+
 @dataclass(frozen=True)
 class LiveDaemonMark:
     path: Path
@@ -57,11 +65,11 @@ def check(config: SmokeConfig) -> LiveDaemonMark | None:
     if os.geteuid() == 0:
         raise SmokeEnvironmentError("Run smoke as a non-root user: the daemon refuses root")
     if not config.silo.is_file() or not os.access(config.silo, os.X_OK):
-        raise SmokeEnvironmentError(f"Missing executable {config.silo}; run make stage first")
+        raise SmokeEnvironmentError(f"Missing executable {config.silo}; run make smoke-prereqs")
     for relative in ("bin/silo-vmm", "bin/netd", "assets/kernel-default", "assets/initramfs", "assets/agent"):
         path = config.runtime_dir / relative
         if not path.is_file():
-            raise SmokeEnvironmentError(f"Missing staged runtime file {path}; run make stage first")
+            raise SmokeEnvironmentError(f"Missing staged runtime file {path}; run make smoke-prereqs")
     for program in ("openssl", "sqlite3"):
         if shutil.which(program) is None:
             raise SmokeEnvironmentError(f"{program} is not on PATH; enter the development shell")

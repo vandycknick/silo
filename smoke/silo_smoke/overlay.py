@@ -148,7 +148,7 @@ def image(config: SmokeConfig, probe: Path, *, large: bool = False, reserved: st
                 output.addfile(header, io.BytesIO(data) if data else None)
             member("usr/local/bin", kind=tarfile.DIRTYPE)
             member("usr/local/bin/overlay-probe", probe.read_bytes())
-            member("sbin/candidate-init", b"#!/bin/sh\nset -eu\nexec >/dev/console 2>&1\necho SILO_OVERLAY_CANDIDATE_BEGIN\necho GUEST_KERNEL_VERSION\ncat /proc/version\ncat /run/silo/rootfs/observation.json\ncat /proc/self/mountinfo\nfor p in /sys/module/overlay/parameters/*; do echo PARAM:$p; cat \"$p\"; done\nfor p in /sys/block/*; do test ! -f \"$p/serial\" || { echo DEVICE:$p; cat \"$p/serial\" \"$p/size\" \"$p/ro\" \"$p/queue/logical_block_size\"; }; done\nfor arg in $(cat /proc/cmdline); do case \"$arg\" in silo.smoke_probes=*) /usr/local/bin/overlay-probe mapping \"${arg#silo.smoke_probes=}\";; silo.smoke_range=*) /usr/local/bin/overlay-probe range-request \"${arg#silo.smoke_range=}\";; esac; done\necho SILO_OVERLAY_WORKLOAD_REACHED\nwhile true; do sleep 3600; done\n")
+            member("sbin/candidate-init", b"#!/bin/sh\nset -eu\nexec >/dev/console 2>&1\necho SILO_OVERLAY_CANDIDATE_BEGIN\necho GUEST_KERNEL_VERSION\ncat /proc/version\ncat /run/silo/rootfs/observation.json\ncat /proc/self/mountinfo\nfor p in /sys/module/overlay/parameters/*; do echo PARAM:$p; cat \"$p\"; done\nfor p in /sys/block/*; do test ! -f \"$p/serial\" || { echo DEVICE:$p; cat \"$p/serial\" \"$p/size\" \"$p/ro\" \"$p/queue/logical_block_size\"; }; done\nfor arg in $(cat /proc/cmdline); do case \"$arg\" in silo.smoke_probes=*) /usr/local/bin/overlay-probe mapping \"${arg#silo.smoke_probes=}\";; esac; done\necho SILO_OVERLAY_WORKLOAD_REACHED\nwhile true; do sleep 3600; done\n")
             if root_run_symlink:
                 member("run", kind=tarfile.SYMTYPE, link="tmp")
             member("overlay-fixture/capability", b"capability", attrs={"LIBARCHIVE.xattr.security.capability": base64.b64encode(struct.pack("<IIIII", 0x02000001, 1 << 10, 0, 0, 0)).decode()})
@@ -289,8 +289,6 @@ def filesystem_magic(silo: Silo, name: str, path: str) -> int:
 
 def metrics(silo: Silo, name: str) -> dict:
     binary = silo.ws.config.bin_dir / "examples/root_metrics"
-    if not binary.is_file():
-        binary = REPO / "target/debug/examples/root_metrics"
     with timed(silo.ws, "overlay.metrics"):
         # Require a new post-effect report, not merely a previously fresh report.
         after = int(time.time() * 1000)

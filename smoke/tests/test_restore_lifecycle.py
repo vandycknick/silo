@@ -28,7 +28,6 @@ from silo_smoke import procs, restore, shutdown, stopped
 from silo_smoke import restore_lifecycle as lifecycle
 from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.restore_lifecycle import restore_network_image  # noqa: F401  session fixture
-from silo_smoke.restore import restore_image  # noqa: F401  session fixture
 
 # VM cases use the staged runtime selected by SILO_SMOKE_BIN_DIR and
 # SILO_SMOKE_RUNTIME_DIR. They are slow; the host-only oracle tests below
@@ -202,7 +201,7 @@ def test_follower_keeps_new_files_after_unlink_and_ignores_existing(tmp_path: Pa
 @pytest.mark.parametrize("construction", ["restore", "fork"])
 @pytest.mark.parametrize("termination", ["stop", "worker-crash"])
 def test_restored_child_cold_start_keeps_its_own_disk_writes(
-    silo: Silo, restore_image: str, profile: RootProfile, construction: str, termination: str,  # noqa: F811
+    silo: Silo, restore_image: str, profile: RootProfile, construction: str, termination: str,
 ) -> None:
     source, child = "cold-start-source", "cold-start-child"
     restore.create_source(silo, restore_image, profile=profile, name=source, network="private")
@@ -278,13 +277,13 @@ def test_restore_exposes_only_the_fresh_destination_after_final_release(
             stream = lifecycle.SessionStream(silo, SOURCE, f"{lifecycle.STATE}/session")
             cleanup.callback(stream.close)
             stream.advances()
-            port = procs.free_port()
-            forward = silo.popen("forward", SOURCE, f"{port}:{lifecycle.LISTEN_PORT}",
+            forward = silo.popen("forward", SOURCE, f"0:{lifecycle.LISTEN_PORT}",
                                  stdin=subprocess.DEVNULL)
             cleanup.callback(stop_forward, forward)
             assert forward.stdout is not None
             status = forward.stdout.readline()
             assert status.startswith(b"Forwarding host:tcp:127.0.0.1:"), status
+            port = procs.bound_port(status)
             captured.update(stream=stream, port=port)
 
         source = cleanup.enter_context(lifecycle.networked_source(
@@ -477,6 +476,7 @@ def test_restore_undelivered_activate_fails_closed(
 
 
 @pytest.mark.slow
+@pytest.mark.serial
 def test_restore_listener_conflict_fails_closed_without_taking_the_source_listener(
     silo: Silo, restore_network_image: str,  # noqa: F811
 ) -> None:
