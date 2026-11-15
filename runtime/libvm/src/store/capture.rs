@@ -706,7 +706,7 @@ impl SnapshotStore {
         staging_dir: &Path,
         name: Option<String>,
     ) -> Result<SnapshotInfo, LibVmError> {
-        let pool = StoragePool::open(&self.store.images_dir)?;
+        let pool = StoragePool::open(&self.store.images_dir)?.defer_publications();
         let mut key = Sha256::new();
         key.update(b"silo:capture-publication:v1\0");
         key.update(capture.as_bytes());

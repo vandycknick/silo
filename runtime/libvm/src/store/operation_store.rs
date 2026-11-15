@@ -749,13 +749,12 @@ impl Store {
         let (device, inode) = lease.file_identity()?;
         sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,file_device,file_inode,record_json) VALUES(?1,1,?2,'staging',?3,?4,jsonb('{}'))")
             .bind(id.to_string()).bind(kind).bind(device.to_string()).bind(inode.to_string()).execute(&mut **tx).await?;
-        for stream in streams {
-            insert_stream(tx, id, stream).await?;
-        }
-        for object in objects {
-            sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) VALUES(?1,?2)")
-                .bind(id.to_string()).bind(object.to_string()).execute(&mut **tx).await?;
-        }
+        sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,value FROM json_each(?2)")
+            .bind(id.to_string()).bind(serde_json::to_string(streams).map_err(invalid)?)
+            .execute(&mut **tx).await?;
+        sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,value FROM json_each(?2)")
+            .bind(id.to_string()).bind(serde_json::to_string(objects).map_err(invalid)?)
+            .execute(&mut **tx).await?;
         Ok(())
     }
 
@@ -1133,13 +1132,12 @@ impl Store {
                 "published dependency has no active registered operation",
             ));
         }
-        for stream in streams {
-            insert_stream(&mut tx, operation_id, stream).await?;
-        }
-        for object in objects {
-            sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) VALUES(?1,?2)")
-                .bind(operation_id.to_string()).bind(object.to_string()).execute(&mut *tx).await?;
-        }
+        sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,value FROM json_each(?2)")
+            .bind(operation_id.to_string()).bind(serde_json::to_string(streams).map_err(invalid)?)
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,value FROM json_each(?2)")
+            .bind(operation_id.to_string()).bind(serde_json::to_string(objects).map_err(invalid)?)
+            .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }

@@ -107,6 +107,7 @@ CREATE TABLE verified_object (
     mode INTEGER NOT NULL,
     ctime_sec INTEGER NOT NULL,
     ctime_nsec INTEGER NOT NULL,
+    map_receipt BLOB,
     verified_at TEXT NOT NULL
 );
 
@@ -634,6 +635,7 @@ CREATE TABLE composition_validation (
     lower_id TEXT NOT NULL REFERENCES composition_result(id) ON DELETE CASCADE,
     schema INTEGER NOT NULL CHECK(schema > 0),
     receipt BLOB NOT NULL,
+    graph_receipt BLOB,
     PRIMARY KEY(lower_id,schema)
 );
 -- Exact ordered occurrences, including repetitions of one layer result.

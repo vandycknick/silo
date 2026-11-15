@@ -536,6 +536,11 @@ impl SnapshotStore {
         let (streams, mut objects) = record.content_dependencies()?;
         objects.insert(digest);
         let pool = StoragePool::open(&self.store.images_dir)?;
+        let pool = if inputs.is_some() {
+            pool.defer_publications()
+        } else {
+            pool
+        };
         let capture = if matches!(
             record.capture,
             crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { .. }
@@ -573,7 +578,10 @@ impl SnapshotStore {
         require_operation_closure(&self.store, operation_id, &streams, &objects, Some(digest))
             .await?;
         let mut fingerprints = match inputs {
-            Some(inputs) => verify_publication_closure(&pool, record, inputs.publications())?,
+            Some(inputs) => {
+                verify_publication_closure(&self.store, &pool, record, inputs.publications())
+                    .await?
+            }
             None => verify_closure(&pool, record, None, false)?.0,
         };
         let input = RecordInput::new(&self.store.images_dir, operation_id, &bytes)?;
@@ -584,12 +592,7 @@ impl SnapshotStore {
         self.store
             .pin_published_storage_dependencies(operation_id, &[], &[digest])
             .await?;
-        fingerprints.push((
-            published.path.clone(),
-            crate::storage::identity_file::SourceFingerprint::new(&std::fs::symlink_metadata(
-                &published.path,
-            )?),
-        ));
+        fingerprints.push((published.path.clone(), published.fingerprint));
         drop(roots);
         // Before a possibly uncertain SQL commit, persist its exact result ID.
         if capture.is_some() {
@@ -605,6 +608,49 @@ impl SnapshotStore {
             self.store
                 .preserve_snapshot_operation(operation_id, id)
                 .await?;
+        }
+        let mut authenticated_objects = BTreeMap::new();
+        for object in &objects {
+            let path = pool.object_path(object);
+            let fingerprint = fingerprints
+                .iter()
+                .find(|(member, _)| *member == path)
+                .map(|(_, fingerprint)| *fingerprint)
+                .ok_or_else(|| invalid("authenticated publication object has no fingerprint"))?;
+            authenticated_objects.insert(*object, fingerprint);
+        }
+        if let Some((digest, _)) = &capture {
+            let held = pool.open_object(digest)?;
+            let fingerprint = SourceFingerprint::new(&held.metadata()?);
+            let file = pool.verify_object(digest)?;
+            bind_held(&file, fingerprint)?;
+            bind_held(&held, fingerprint)?;
+            authenticated_objects.insert(*digest, fingerprint);
+            fingerprints.push((pool.object_path(digest), fingerprint));
+        }
+        let mut map_receipts = BTreeMap::new();
+        if let Some(inputs) = inputs {
+            for (stream, publication) in inputs.publications() {
+                let content = record
+                    .streams()
+                    .find(|content| content.stream == *stream)
+                    .ok_or_else(|| invalid("publication stream is outside snapshot"))?;
+                let canonical = matches!(&record.capture, crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } if execution.memory.stream == *stream);
+                map_receipts.insert(
+                    *stream,
+                    map_validation(
+                        &pool,
+                        content,
+                        publication.map(),
+                        publication.fingerprint(),
+                        canonical,
+                        &authenticated_objects,
+                    )?,
+                );
+            }
+        }
+        if inputs.is_some() {
+            pool.sync_publications()?;
         }
         let _roots = pool.lock_roots_shared()?;
         recheck_closure(&fingerprints)?;
@@ -654,11 +700,14 @@ impl SnapshotStore {
                 publication.recheck(&pool)?;
                 let [dev, ino, len, mode, ctime_sec, ctime_nsec] =
                     publication.fingerprint().verification_key();
+                let receipt = map_receipts
+                    .get(stream)
+                    .ok_or_else(|| invalid("publication map receipt is missing"))?;
                 sqlx::query(
-                    "INSERT INTO verified_object(stream_sha256,dev,ino,len,mode,ctime_sec,ctime_nsec,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(stream_sha256) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,len=excluded.len,mode=excluded.mode,ctime_sec=excluded.ctime_sec,ctime_nsec=excluded.ctime_nsec,verified_at=excluded.verified_at",
+                    "INSERT INTO verified_object(stream_sha256,dev,ino,len,mode,ctime_sec,ctime_nsec,map_receipt,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(stream_sha256) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,len=excluded.len,mode=excluded.mode,ctime_sec=excluded.ctime_sec,ctime_nsec=excluded.ctime_nsec,map_receipt=excluded.map_receipt,verified_at=excluded.verified_at",
                 )
                 .bind(stream.to_string()).bind(dev).bind(ino).bind(len).bind(mode)
-                .bind(ctime_sec).bind(ctime_nsec).execute(&mut *tx).await?;
+                .bind(ctime_sec).bind(ctime_nsec).bind(receipt).execute(&mut *tx).await?;
             }
         }
         let mut naming_outcome = None;
@@ -759,6 +808,28 @@ impl SnapshotStore {
         self.consume_selected(reference, false, false, true).await
     }
 
+    pub(crate) async fn cache_restore_map(
+        &self,
+        shape: &ShapeVerifiedClosure,
+        stream: StreamId,
+        object: &crate::storage::pool::PublishedObject,
+    ) -> Result<(), LibVmError> {
+        if !shape.receipt_maps.contains(&stream) {
+            return Ok(());
+        }
+        let fingerprint = shape
+            .stream_states
+            .get(&stream)
+            .ok_or_else(|| invalid("restore map stream is outside its verified shape"))?;
+        let [dev, ino, len, mode, ctime_sec, ctime_nsec] = fingerprint.verification_key();
+        let canonical =
+            serde_json::to_string(&(object.digest, object.fingerprint)).map_err(invalid)?;
+        sqlx::query("UPDATE verified_object SET map_receipt=CAST(json_set(CAST(map_receipt AS TEXT),'$.canonical',json(?8)) AS BLOB) WHERE stream_sha256=?1 AND dev=?2 AND ino=?3 AND len=?4 AND mode=?5 AND ctime_sec=?6 AND ctime_nsec=?7 AND map_receipt IS NOT NULL")
+            .bind(stream.to_string()).bind(dev).bind(ino).bind(len).bind(mode)
+            .bind(ctime_sec).bind(ctime_nsec).bind(canonical).execute(&self.store.pool).await?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn verify_closure_shape(
         &self,
@@ -813,6 +884,17 @@ impl SnapshotStore {
                 .iter()
                 .map(|entry| entry.evidence_digest),
         );
+        crate::storage::limits::preflight_fd_budget(
+            2 * (objects.len() + consumer.record.streams().count()) as u64
+                + retained.len() as u64
+                + consumer
+                    .record
+                    .streams()
+                    .map(|stream| stream.map_pages.len() as u64 + 1)
+                    .sum::<u64>()
+                + 4,
+        )
+        .map_err(crate::storage::StorageError::from)?;
         let ram = match &consumer.record.capture {
             crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } => {
                 let capture = self.restore_evidence(consumer, &pool)?;
@@ -851,6 +933,50 @@ impl SnapshotStore {
             }
             _ => None,
         };
+        let held_lower =
+            if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
+                lower,
+                lower_geometry,
+                lower_filesystem_uuid,
+                ..
+            } = &consumer.record.root.profile
+            {
+                let layers =
+                    crate::store::layer_store::LayerStore::from_store((*self.store).clone());
+                layers
+                    .publish_local_composition(consumer.operation_id, lower)
+                    .await?;
+                let held = layers
+                    .hold_lower(&crate::OverlayLower::ErofsComposition {
+                        record: lower.result,
+                        geometry: *lower_geometry,
+                        filesystem_uuid: *lower_filesystem_uuid,
+                    })
+                    .await?;
+                if held.snapshot_composition() != lower.as_ref() {
+                    return Err(invalid("held lower differs from snapshot graph"));
+                }
+                Some(held)
+            } else {
+                None
+            };
+        let mut cached = BTreeMap::new();
+        let mut deferred = deferred_maps.clone();
+        if let Some(held) = &held_lower {
+            deferred.extend(held.maps.keys().copied());
+        }
+        for content in consumer.record.streams() {
+            if held_lower
+                .as_ref()
+                .is_some_and(|held| held.maps.contains_key(&content.stream))
+            {
+                continue;
+            }
+            if let Some(receipt) = load_map_validation(&self.store, &pool, content).await? {
+                deferred.insert(content.stream);
+                cached.insert(content.stream, receipt);
+            }
+        }
         let mut shape = verify_artifact_shape(
             &pool,
             &consumer.record.canonical_bytes()?,
@@ -860,19 +986,24 @@ impl SnapshotStore {
             Some(consumer.info.record_digest),
             true,
             ram,
-            deferred_maps,
+            &deferred,
         )?;
-        if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
-            lower,
-            lower_geometry,
-            lower_filesystem_uuid,
-            ..
-        } = &consumer.record.root.profile
-        {
-            lower
-                .authenticate(|digest, maximum| Ok(pool.read_object(digest, maximum)?))?
-                .check_root_claims(lower_geometry, *lower_filesystem_uuid)?;
+        for (stream, receipt) in cached {
+            shape.apply_map_validation(&pool, stream, receipt)?;
         }
+        if let Some(held) = &held_lower {
+            for (digest, expected) in held.metadata_states() {
+                if shape.object_states.get(&digest) != Some(&expected) {
+                    return Err(invalid(
+                        "held lower metadata changed during shape validation",
+                    ));
+                }
+            }
+            shape
+                .maps
+                .extend(held.maps.iter().map(|(id, map)| (*id, Arc::clone(map))));
+        }
+        shape.held_lower = held_lower;
         shape.local_lower = consumer.record.lower().cloned();
         recheck_closure(&shape.fingerprints)?;
         Ok(shape)
@@ -908,58 +1039,60 @@ impl SnapshotStore {
                 }
                 Ok::<_, LibVmError>(warm)
             })?;
-            let lower = if let Some(expected) = &shape.local_lower {
-                let layers = crate::store::layer_store::LayerStore::from_store((*store).clone());
-                runtime.block_on(async {
-                    let held = layers.hold_composition(expected.result).await?;
-                    if held.snapshot_composition()? != *expected {
-                        return Err(invalid("held composition differs from snapshot lower"));
+            if shape.held_lower.is_none() {
+                if let Some(expected) = &shape.local_lower {
+                    let layers = crate::store::layer_store::LayerStore::from_store((*store).clone());
+                    let retained = runtime.block_on(layers.retained_composition(expected.result))?;
+                    let held = runtime.block_on(layers.hold_lower(&retained.overlay_lower()))?;
+                    if held.snapshot_composition() != expected {
+                        return Err(invalid("held lower differs from snapshot graph"));
                     }
-                    held.recheck()?;
-                    let fsmeta = held.retained().fsmeta();
-                    let (_, fingerprint) = held.held_backing(
-                        crate::storage::vmdk::LowerBacking::Object(fsmeta),
-                    )?;
-                    if shape.object_states.get(&fsmeta) != Some(&fingerprint) {
-                        return Err(invalid("held lower fsmeta differs from snapshot inode"));
-                    }
-                    let mut packs = BTreeMap::new();
-                    for layer in &expected.layers {
-                        let (_, fingerprint) = held.held_backing(
-                            crate::storage::vmdk::LowerBacking::Stream(layer.pack.stream),
-                        )?;
-                        if shape.stream_states.get(&layer.pack.stream) != Some(&fingerprint) {
-                            return Err(invalid("held lower pack differs from snapshot inode"));
-                        }
-                        packs.insert(layer.pack.stream, fingerprint);
-                    }
-                    Ok::<_, LibVmError>((held, fsmeta, packs))
-                }).ok()
-            } else {
-                None
-            };
-            if let Some((held, fsmeta, packs)) = &lower {
+                    shape.held_lower = Some(held);
+                }
+            }
+            if let Some(held) = &shape.held_lower {
                 held.recheck()?;
-                shape.objects.remove(fsmeta);
-                warm.extend(packs.iter().map(|(stream, fingerprint)| (*stream, *fingerprint)));
+                for (digest, expected) in held.metadata_states() {
+                    if shape.object_states.get(&digest) != Some(&expected) {
+                        return Err(invalid("held lower metadata differs from snapshot inode"));
+                    }
+                }
+                let graph = held.snapshot_composition();
+                for object in graph.objects().chain(graph.layers.iter().flat_map(|layer| {
+                    std::iter::once(layer.pack.map).chain(layer.pack.map_pages.iter().copied())
+                })) {
+                    shape.objects.remove(&object);
+                }
+                for layer in &graph.layers {
+                    let (_, fingerprint) = held.held_backing(crate::storage::vmdk::LowerBacking::Stream(layer.pack.stream))?;
+                    if shape.stream_states.get(&layer.pack.stream) != Some(&fingerprint) {
+                        return Err(invalid("held lower pack differs from snapshot inode"));
+                    }
+                    warm.insert(layer.pack.stream, fingerprint);
+                }
+                let (_, fingerprint) = held.held_backing(crate::storage::vmdk::LowerBacking::Object(graph.fsmeta))?;
+                if shape.object_states.get(&graph.fsmeta) != Some(&fingerprint) {
+                    return Err(invalid("held lower fsmeta differs from snapshot inode"));
+                }
             }
             let closure = shape.authenticate(&pool, Some(&warm))?;
-            if let Some((held, _, _)) = &lower {
-                held.recheck()?;
-            }
             runtime.block_on(async {
                 for (stream, authenticated) in &closure.streams {
-                    if warm.contains_key(stream) {
+                    if (shape.receipt_maps.contains(stream) && shape.objects.is_empty())
+                        || shape.held_lower.as_ref().is_some_and(|lower| lower.maps.contains_key(stream)) {
                         continue;
                     }
                     bind_held(authenticated.file(), authenticated.fingerprint())?;
                     let [dev, ino, len, mode, ctime_sec, ctime_nsec] =
                         authenticated.fingerprint().verification_key();
+                    let content = shape.contents.iter().find(|content| content.stream == *stream)
+                        .ok_or_else(|| invalid("authenticated stream is outside snapshot shape"))?;
+                    let receipt = map_validation(&pool, content, authenticated.map(), authenticated.fingerprint(), shape.ram_stream == Some(*stream), &shape.object_states)?;
                     sqlx::query(
-                        "INSERT INTO verified_object(stream_sha256,dev,ino,len,mode,ctime_sec,ctime_nsec,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(stream_sha256) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,len=excluded.len,mode=excluded.mode,ctime_sec=excluded.ctime_sec,ctime_nsec=excluded.ctime_nsec,verified_at=excluded.verified_at",
+                        "INSERT INTO verified_object(stream_sha256,dev,ino,len,mode,ctime_sec,ctime_nsec,map_receipt,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(stream_sha256) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,len=excluded.len,mode=excluded.mode,ctime_sec=excluded.ctime_sec,ctime_nsec=excluded.ctime_nsec,map_receipt=excluded.map_receipt,verified_at=excluded.verified_at",
                     )
                     .bind(stream.to_string()).bind(dev).bind(ino).bind(len).bind(mode)
-                    .bind(ctime_sec).bind(ctime_nsec).execute(&store.pool).await?;
+                    .bind(ctime_sec).bind(ctime_nsec).bind(receipt).execute(&store.pool).await?;
                 }
                 Ok::<_, LibVmError>(())
             })?;
@@ -1567,27 +1700,158 @@ pub(crate) async fn require_operation_closure(
     if !active {
         return Err(invalid("snapshot has no active retained operation"));
     }
-    for stream in streams {
-        let pinned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_stream WHERE operation_id=?1 AND stream_id=?2)")
-            .bind(operation.to_string()).bind(stream.to_string()).fetch_one(&mut *tx).await?;
-        if !pinned {
-            return Err(invalid("snapshot stream was not pinned before access"));
-        }
+    let missing_stream: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM json_each(?2) e LEFT JOIN storage_operation_stream p ON p.operation_id=?1 AND p.stream_id=e.value WHERE p.stream_id IS NULL)")
+        .bind(operation.to_string()).bind(serde_json::to_string(streams).map_err(invalid)?)
+        .fetch_one(&mut *tx).await?;
+    if missing_stream {
+        return Err(invalid("snapshot stream was not pinned before access"));
     }
-    for object in objects {
-        if Some(*object) == pending {
-            continue;
-        }
-        let pinned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_object WHERE operation_id=?1 AND object_digest=?2)")
-            .bind(operation.to_string()).bind(object.to_string()).fetch_one(&mut *tx).await?;
-        if !pinned {
-            return Err(invalid("snapshot object was not pinned before access"));
-        }
+    let objects = objects
+        .iter()
+        .filter(|object| Some(**object) != pending)
+        .collect::<Vec<_>>();
+    let missing_object: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM json_each(?2) e LEFT JOIN storage_operation_object p ON p.operation_id=?1 AND p.object_digest=e.value WHERE p.object_digest IS NULL)")
+        .bind(operation.to_string()).bind(serde_json::to_string(&objects).map_err(invalid)?)
+        .fetch_one(&mut *tx).await?;
+    if missing_object {
+        return Err(invalid("snapshot object was not pinned before access"));
     }
     tx.commit().await?;
     Ok(())
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MapValidation {
+    content: SnapshotStream,
+    stream: SourceFingerprint,
+    chunks: Vec<crate::storage::stream::Chunk>,
+    metadata: Vec<(ObjectDigest, SourceFingerprint)>,
+    canonical: Option<(ObjectDigest, SourceFingerprint)>,
+    objects: Vec<(ObjectDigest, SourceFingerprint)>,
+}
+
+struct HeldMapValidation {
+    map: Arc<crate::storage::stream::StreamMap>,
+    stream: SourceFingerprint,
+    metadata: Vec<(ObjectDigest, File, SourceFingerprint)>,
+    canonical: Option<(ObjectDigest, SourceFingerprint)>,
+    objects: Vec<(ObjectDigest, SourceFingerprint)>,
+}
+
+fn map_validation(
+    pool: &StoragePool,
+    content: &SnapshotStream,
+    map: &crate::storage::stream::StreamMap,
+    stream: SourceFingerprint,
+    canonical: bool,
+    objects: &BTreeMap<ObjectDigest, SourceFingerprint>,
+) -> Result<Vec<u8>, LibVmError> {
+    if map.id() != content.stream || map.length() != content.length {
+        return Err(invalid("map receipt contradicts its stream"));
+    }
+    let mut metadata = Vec::with_capacity(content.map_pages.len() + 1);
+    for digest in std::iter::once(content.map).chain(content.map_pages.iter().copied()) {
+        let file = pool.open_object(&digest)?;
+        let fingerprint = SourceFingerprint::new(&file.metadata()?);
+        metadata.push((digest, file, fingerprint));
+    }
+    let root = crate::storage::map::StreamMapRoot::decode(
+        &pool.read_object(&content.map, Resource::MetadataPageBytes.maximum())?,
+    )?;
+    if root.stream != content.stream
+        || root.length != content.length
+        || root.pages != content.map_pages
+        || root.read_map(pool)? != *map
+    {
+        return Err(invalid("map receipt contradicts retained map bytes"));
+    }
+    for (_, file, expected) in &metadata {
+        bind_held(file, *expected)?;
+    }
+    bind_held(&pool.open_stream(&content.stream)?, stream)?;
+    let canonical = if canonical {
+        let (object, _roots, ()) = pool.publish_produced_object_for_catalog(|file| {
+            map.write_canonical(file)?;
+            Ok::<_, crate::storage::StorageError>(())
+        })?;
+        Some((object.digest, object.fingerprint))
+    } else {
+        None
+    };
+    for (digest, expected) in objects {
+        bind_held(&pool.open_object(digest)?, *expected)?;
+    }
+    serde_json::to_vec(&MapValidation {
+        content: content.clone(),
+        stream,
+        chunks: map.chunks().to_vec(),
+        metadata: metadata
+            .into_iter()
+            .map(|(digest, _, fingerprint)| (digest, fingerprint))
+            .collect(),
+        canonical,
+        objects: objects
+            .iter()
+            .map(|(digest, fingerprint)| (*digest, *fingerprint))
+            .collect(),
+    })
+    .map_err(invalid)
+}
+
+async fn load_map_validation(
+    store: &Store,
+    pool: &StoragePool,
+    content: &SnapshotStream,
+) -> Result<Option<HeldMapValidation>, LibVmError> {
+    let file = pool.open_stream(&content.stream)?;
+    let fingerprint = SourceFingerprint::new(&file.metadata()?);
+    let [dev, ino, len, mode, ctime_sec, ctime_nsec] = fingerprint.verification_key();
+    let bytes: Option<Vec<u8>> = sqlx::query_scalar("SELECT map_receipt FROM verified_object WHERE stream_sha256=?1 AND dev=?2 AND ino=?3 AND len=?4 AND mode=?5 AND ctime_sec=?6 AND ctime_nsec=?7")
+        .bind(content.stream.to_string()).bind(dev).bind(ino).bind(len).bind(mode)
+        .bind(ctime_sec).bind(ctime_nsec).fetch_optional(&store.pool).await?.flatten();
+    let Some(receipt) =
+        bytes.and_then(|bytes| serde_json::from_slice::<MapValidation>(&bytes).ok())
+    else {
+        return Ok(None);
+    };
+    if receipt.content != *content || receipt.stream != fingerprint {
+        return Ok(None);
+    }
+    let expected = std::iter::once(content.map)
+        .chain(content.map_pages.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if receipt
+        .metadata
+        .iter()
+        .map(|(digest, _)| *digest)
+        .collect::<BTreeSet<_>>()
+        != expected
+        || receipt.metadata.len() != expected.len()
+    {
+        return Ok(None);
+    }
+    let mut metadata = Vec::with_capacity(expected.len());
+    for (digest, expected) in receipt.metadata {
+        let file = pool.open_object(&digest)?;
+        if SourceFingerprint::new(&file.metadata()?) != expected {
+            return Ok(None);
+        }
+        metadata.push((digest, file, expected));
+    }
+    bind_held(&file, fingerprint)?;
+    Ok(Some(HeldMapValidation {
+        map: Arc::new(crate::storage::stream::StreamMap::from_validated_parts(
+            content.length,
+            receipt.chunks,
+            content.stream,
+        )?),
+        stream: fingerprint,
+        metadata,
+        canonical: receipt.canonical,
+        objects: receipt.objects,
+    }))
+}
 pub(crate) type ClosureFingerprints = Vec<(std::path::PathBuf, SourceFingerprint)>;
 
 pub(crate) fn recheck_closure(
@@ -1952,14 +2216,64 @@ fn verify_closure(
 
 /// Consume held producer authority only for the streams it actually published.
 /// Replay has no capability and therefore authenticates every byte.
-fn verify_publication_closure(
+async fn verify_publication_closure(
+    store: &Store,
     pool: &StoragePool,
     record: &SnapshotRecord,
     publications: &BTreeMap<StreamId, crate::storage::pool::SealedStreamPublication>,
 ) -> Result<ClosureFingerprints, LibVmError> {
+    if publications.is_empty() {
+        return Ok(verify_closure(pool, record, None, false)?.0);
+    }
     let bytes = record.canonical_bytes()?;
     let (_, objects) = record.content_dependencies()?;
     let (_, retained_objects) = retained_members(record)?;
+    crate::storage::limits::preflight_fd_budget(
+        2 * (objects.len() + record.streams().count()) as u64
+            + record
+                .streams()
+                .map(|stream| stream.map_pages.len() as u64 + 1)
+                .sum::<u64>()
+            + 4,
+    )
+    .map_err(crate::storage::StorageError::from)?;
+    let lower = if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
+        lower,
+        lower_geometry,
+        lower_filesystem_uuid,
+        ..
+    } = &record.root.profile
+    {
+        let held = crate::store::layer_store::LayerStore::from_store(store.clone())
+            .hold_lower(&crate::OverlayLower::ErofsComposition {
+                record: lower.result,
+                geometry: *lower_geometry,
+                filesystem_uuid: *lower_filesystem_uuid,
+            })
+            .await?;
+        if held.snapshot_composition() != lower.as_ref() {
+            return Err(invalid(
+                "publication lower differs from retained composition",
+            ));
+        }
+        Some(held)
+    } else {
+        None
+    };
+    let mut deferred: BTreeSet<_> = lower
+        .as_ref()
+        .map(|lower| lower.maps.keys().copied().collect())
+        .unwrap_or_default();
+    let mut cached = BTreeMap::new();
+    for content in record.streams() {
+        if deferred.contains(&content.stream) {
+            continue;
+        }
+        if let Some(receipt) = load_map_validation(store, pool, content).await? {
+            deferred.insert(content.stream);
+            cached.insert(content.stream, receipt);
+        }
+    }
     let mut shape = verify_artifact_shape(
         pool,
         &bytes,
@@ -1969,18 +2283,46 @@ fn verify_publication_closure(
         None,
         false,
         None,
-        &BTreeSet::new(),
+        &deferred,
     )?;
+    for (stream, receipt) in cached {
+        shape.apply_map_validation(pool, stream, receipt)?;
+    }
     for (stream, publication) in publications {
         publication.recheck(pool)?;
         if shape.stream_map(stream)? != publication.map() {
             return Err(invalid("publication map differs from sealed producer map"));
         }
     }
+    if let Some(lower) = &lower {
+        lower.recheck()?;
+        for (digest, expected) in lower.metadata_states() {
+            if shape.object_states.get(&digest) != Some(&expected) {
+                return Err(invalid(
+                    "publication lower metadata changed during validation",
+                ));
+            }
+            shape.objects.remove(&digest);
+        }
+        for layer in &lower.snapshot_composition().layers {
+            let (_, fingerprint) = lower.held_backing(
+                crate::storage::vmdk::LowerBacking::Stream(layer.pack.stream),
+            )?;
+            if shape.stream_states.get(&layer.pack.stream) != Some(&fingerprint) {
+                return Err(invalid("publication lower pack changed during validation"));
+            }
+            shape
+                .contents
+                .retain(|content| content.stream != layer.pack.stream);
+        }
+    }
     shape
         .contents
         .retain(|content| !publications.contains_key(&content.stream));
     shape.authenticate(pool, None)?;
+    if let Some(lower) = &lower {
+        lower.recheck()?;
+    }
     for publication in publications.values() {
         publication.recheck(pool)?;
     }
@@ -2000,6 +2342,10 @@ pub(crate) struct ShapeVerifiedClosure {
     stream_states: BTreeMap<StreamId, SourceFingerprint>,
     object_states: BTreeMap<ObjectDigest, SourceFingerprint>,
     local_lower: Option<crate::store::models::snapshot::SnapshotComposition>,
+    held_lower: Option<crate::store::composition_store::LaunchLower>,
+    receipt_pins: Vec<(File, SourceFingerprint)>,
+    receipt_maps: BTreeSet<StreamId>,
+    restore_maps: BTreeMap<StreamId, (ObjectDigest, SourceFingerprint)>,
 }
 
 pub(crate) struct RestoreInspectionShape {
@@ -2023,10 +2369,75 @@ impl RestoreInspectionShape {
 }
 
 impl ShapeVerifiedClosure {
+    fn apply_map_validation(
+        &mut self,
+        pool: &StoragePool,
+        stream: StreamId,
+        receipt: HeldMapValidation,
+    ) -> Result<(), LibVmError> {
+        if self.stream_states.get(&stream) != Some(&receipt.stream) {
+            return Err(invalid(
+                "receipt-backed stream changed during shape validation",
+            ));
+        }
+        for (digest, file, expected) in receipt.metadata {
+            if self.object_states.get(&digest) != Some(&expected) {
+                return Err(invalid(
+                    "receipt-backed map changed during shape validation",
+                ));
+            }
+            if self.objects.remove(&digest) {
+                self.receipt_pins.push((file, expected));
+            }
+        }
+        for (digest, expected) in receipt.objects {
+            if self.object_states.get(&digest) == Some(&expected) && self.objects.contains(&digest)
+            {
+                let file = pool.open_object(&digest)?;
+                bind_held(&file, expected)?;
+                self.objects.remove(&digest);
+                self.receipt_pins.push((file, expected));
+            }
+        }
+        self.maps.insert(stream, receipt.map);
+        if let Some(canonical) = receipt.canonical {
+            self.restore_maps.insert(stream, canonical);
+        }
+        self.receipt_maps.insert(stream);
+        Ok(())
+    }
+
+    pub(crate) fn held_restore_map(
+        &self,
+        pool: &StoragePool,
+        stream: StreamId,
+    ) -> Result<Option<(ObjectDigest, File)>, LibVmError> {
+        let Some((digest, fingerprint)) = self.restore_maps.get(&stream) else {
+            return Ok(None);
+        };
+        let file = match pool.open_object(digest) {
+            Ok(file) => file,
+            Err(crate::storage::StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if SourceFingerprint::new(&file.metadata()?) != *fingerprint {
+            return Ok(None);
+        }
+        Ok(Some((*digest, file)))
+    }
+
     /// Peak held descriptors: shape-pinned objects plus authenticated streams.
     pub(crate) fn retained_descriptors(&self) -> u64 {
         if self.retain {
-            (self.stream_states.len() + self.object_pins.len()) as u64
+            (self.stream_states.len() + self.object_pins.len() + self.receipt_pins.len()) as u64
+                + self
+                    .held_lower
+                    .as_ref()
+                    .map_or(0, |lower| lower.retained_descriptors())
         } else {
             0
         }
@@ -2102,6 +2513,12 @@ impl ShapeVerifiedClosure {
         pool: &StoragePool,
         warm: Option<&BTreeMap<StreamId, SourceFingerprint>>,
     ) -> Result<AuthenticatedClosure, LibVmError> {
+        for (file, expected) in &self.receipt_pins {
+            bind_held(file, *expected)?;
+        }
+        if let Some(lower) = &self.held_lower {
+            lower.recheck()?;
+        }
         let held = self.retained_descriptors();
         if self.retain {
             crate::storage::limits::preflight_fd_budget(held + 1)
@@ -2125,6 +2542,12 @@ impl ShapeVerifiedClosure {
         }
         .authenticate(parallel)?;
         recheck_closure(&self.fingerprints)?;
+        for (file, expected) in &self.receipt_pins {
+            bind_held(file, *expected)?;
+        }
+        if let Some(lower) = &self.held_lower {
+            lower.recheck()?;
+        }
         Ok(closure)
     }
 }
@@ -2208,6 +2631,10 @@ fn verify_artifact_shape(
         fingerprints,
         stream_states,
         local_lower: None,
+        held_lower: None,
+        receipt_pins: Vec::new(),
+        receipt_maps: BTreeSet::new(),
+        restore_maps: BTreeMap::new(),
         object_states,
     })
 }
@@ -2497,22 +2924,16 @@ pub(crate) async fn publish_map(
     operation: Uuid,
     map: &crate::storage::stream::StreamMap,
 ) -> Result<SnapshotStream, LibVmError> {
-    let parent = OwnedDirectory::open_existing_root(
-        &store
-            .home_path()
-            .join("images/tmp")
-            .join(operation.to_string()),
-    )?
-    .ok_or_else(|| invalid("registered capture staging is missing"))?;
-    let name = format!("map-{}", Uuid::new_v4());
-    let stage = parent
-        .create_dir(&name)?
-        .ok_or_else(|| invalid("map staging collision"))?;
+    store
+        .pin_published_storage_dependencies(operation, &[], &[])
+        .await?;
     let mut map_pages = Vec::new();
-    for (index, page) in crate::storage::map::pages(map).enumerate() {
-        let name = format!("page-{index}");
-        stage.write_file(&name, &page?)?;
-        let (object, roots) = pool.publish_object_for_catalog(&stage.path().join(&name))?;
+    for page in crate::storage::map::pages(map) {
+        let page = page?;
+        let (object, roots, ()) = pool.publish_produced_object_for_catalog(|file| {
+            std::io::Write::write_all(file, &page)?;
+            Ok::<_, crate::storage::StorageError>(())
+        })?;
         store
             .pin_published_storage_dependencies(operation, &[], &[object.digest])
             .await?;
@@ -2520,14 +2941,15 @@ pub(crate) async fn publish_map(
         drop(roots);
     }
     let root = crate::storage::map::StreamMapRoot::new(map, map_pages.clone())?;
-    stage.write_file("record", &root.encode()?)?;
-    let (object, roots) = pool.publish_object_for_catalog(&stage.path().join("record"))?;
+    let bytes = root.encode()?;
+    let (object, roots, ()) = pool.publish_produced_object_for_catalog(|file| {
+        std::io::Write::write_all(file, &bytes)?;
+        Ok::<_, crate::storage::StorageError>(())
+    })?;
     store
         .pin_published_storage_dependencies(operation, &[map.id()], &[object.digest])
         .await?;
     drop(roots);
-    parent.remove_tree(&name)?;
-    parent.sync()?;
     Ok(SnapshotStream {
         stream: map.id(),
         map: object.digest,
@@ -2745,15 +3167,61 @@ pub(crate) mod tests {
                     .unwrap();
             assert_eq!(receipts, 1, "held producer authority seeds local trust");
             watchers.push(watch_stream_reads(&pool.stream_path(&stream)));
+            let content = consumer
+                .record
+                .streams()
+                .find(|content| content.stream == stream)
+                .unwrap();
+            for digest in std::iter::once(content.map).chain(content.map_pages.iter().copied()) {
+                watchers.push(watch_stream_reads(&pool.object_path(&digest)));
+            }
+        }
+        let (_, dependencies) = consumer.record.content_dependencies().unwrap();
+        for object in dependencies {
+            watchers.push(watch_stream_reads(&pool.object_path(&object)));
         }
         let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        let (canonical, file) = shape.held_restore_map(&pool, ram).unwrap().unwrap();
+        drop(file);
+        let canonical_watcher = watch_stream_reads(&pool.object_path(&canonical));
+        drop(shape.held_restore_map(&pool, ram).unwrap().unwrap());
+        assert!(
+            !observed_stream_read(&canonical_watcher),
+            "canonical RAM map reuse is fingerprint-only"
+        );
+        let mut publications = std::collections::BTreeMap::new();
+        for content in consumer.record.streams() {
+            let file = shape
+                .open_stream(&pool, &content.stream, content.length)
+                .unwrap();
+            let fingerprint =
+                crate::storage::identity_file::SourceFingerprint::new(&file.metadata().unwrap());
+            let (publication, roots) = pool
+                .publish_sealed_stream_for_catalog(
+                    &file,
+                    shape.stream_map(&content.stream).unwrap(),
+                    Some(fingerprint),
+                )
+                .unwrap();
+            publications.insert(content.stream, publication);
+            drop(roots);
+        }
+        crate::store::snapshot_store::verify_publication_closure(
+            &snapshots.store,
+            &pool,
+            &consumer.record,
+            &publications,
+        )
+        .await
+        .unwrap();
         drop(snapshots.authenticate_closure_bytes(shape).await.unwrap());
         for watcher in &watchers {
             assert!(
                 !observed_stream_read(watcher),
-                "first restore must not read RAM or disk"
+                "first restore must not read RAM, disk, or retained maps"
             );
         }
+        assert_eq!(execution.memory.map_pages, vec![canonical]);
         drop(snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap());
         for watcher in &watchers {
             assert!(
@@ -4829,5 +5297,162 @@ pub(crate) mod tests {
         assert!(
             std::mem::size_of::<crate::store::snapshot_store::SnapshotVerificationError>() <= 96
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn map_receipt_hits_skip_map_reads_and_changed_fingerprints_revalidate() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temporary, snapshots, record, operation, _lease) = fixture("snapshot").await;
+        let info = snapshots.publish(&record, operation, None).await.unwrap();
+        let consumer = snapshots
+            .consume_shape(&SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        snapshots.authenticate_closure_bytes(shape).await.unwrap();
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let stream = watch_stream_reads(&pool.stream_path(&record.root.stream.stream));
+        let maps = std::iter::once(record.root.stream.map)
+            .chain(record.root.stream.map_pages.iter().copied())
+            .map(|digest| watch_stream_reads(&pool.object_path(&digest)))
+            .collect::<Vec<_>>();
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        snapshots.authenticate_closure_bytes(shape).await.unwrap();
+        assert!(!observed_stream_read(&stream));
+        assert!(maps.iter().all(|watcher| !observed_stream_read(watcher)));
+
+        sqlx::query("UPDATE verified_object SET map_receipt=NULL WHERE stream_sha256=?1")
+            .bind(record.root.stream.stream.to_string())
+            .execute(&snapshots.store.pool)
+            .await
+            .unwrap();
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        snapshots.authenticate_closure_bytes(shape).await.unwrap();
+        assert!(maps.iter().all(observed_stream_read));
+        assert!(!observed_stream_read(&stream));
+
+        let path = pool.object_path(&record.root.stream.map);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        snapshots.authenticate_closure_bytes(shape).await.unwrap();
+        assert!(maps.iter().all(observed_stream_read));
+        assert!(!observed_stream_read(&stream));
+        let length = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, vec![b'x'; length]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(snapshots.verify_closure_shape(&consumer).await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn canonical_map_cache_eviction_preserves_retained_pages_and_recovers_without_reads() {
+        let (temporary, snapshots, mut record, operation, _lease) = fixture("snapshot").await;
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let length = (crate::storage::map::MAP_PAGE_ENTRIES as u64 + 1)
+            * crate::storage::limits::CHUNK_SIZE as u64;
+        let source = std::fs::File::create(temporary.path().join("sparse-root")).unwrap();
+        source.set_len(length).unwrap();
+        drop(source);
+        let (published, roots) = pool
+            .publish_stream_for_catalog(&temporary.path().join("sparse-root"))
+            .unwrap();
+        snapshots
+            .store
+            .pin_published_storage_dependencies(operation, &[published.id], &[])
+            .await
+            .unwrap();
+        drop(roots);
+        record.root.stream = crate::store::snapshot_store::publish_map(
+            &pool,
+            &snapshots.store,
+            operation,
+            &published.map,
+        )
+        .await
+        .unwrap();
+        record.root.geometry.length = length;
+        let info = snapshots.publish(&record, operation, None).await.unwrap();
+        let consumer = snapshots
+            .consume_shape(&SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        let objects = shape.object_states.clone();
+        let closure = snapshots.authenticate_closure_bytes(shape).await.unwrap();
+        let stream = closure.streams.get(&published.id).unwrap();
+        let receipt = crate::store::snapshot_store::map_validation(
+            &pool,
+            &record.root.stream,
+            stream.map(),
+            stream.fingerprint(),
+            true,
+            &objects,
+        )
+        .unwrap();
+        sqlx::query("UPDATE verified_object SET map_receipt=?2 WHERE stream_sha256=?1")
+            .bind(published.id.to_string())
+            .bind(receipt)
+            .execute(&snapshots.store.pool)
+            .await
+            .unwrap();
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        let (canonical, file) = shape
+            .held_restore_map(&pool, published.id)
+            .unwrap()
+            .unwrap();
+        drop(file);
+        let (_, dependencies) = record.content_dependencies().unwrap();
+        assert!(!dependencies.contains(&canonical));
+        assert_eq!(record.root.stream.map_pages.len(), 2);
+        let maps = std::iter::once(record.root.stream.map)
+            .chain(record.root.stream.map_pages.iter().copied())
+            .map(|digest| watch_stream_reads(&pool.object_path(&digest)))
+            .collect::<Vec<_>>();
+        let payload = watch_stream_reads(&pool.stream_path(&published.id));
+        {
+            let _roots = pool.lock_roots().unwrap();
+            let retained: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM retained_object WHERE object_digest=?1)",
+            )
+            .bind(canonical.to_string())
+            .fetch_one(&snapshots.store.pool)
+            .await
+            .unwrap();
+            assert!(!retained);
+            pool.remove_object(&canonical).unwrap();
+        }
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        assert!(shape
+            .held_restore_map(&pool, published.id)
+            .unwrap()
+            .is_none());
+        let (recreated, roots, ()) = pool
+            .publish_produced_object_for_catalog(|file| {
+                shape
+                    .stream_map(&published.id)
+                    .unwrap()
+                    .write_canonical(file)?;
+                Ok::<_, crate::storage::StorageError>(())
+            })
+            .unwrap();
+        snapshots
+            .cache_restore_map(&shape, published.id, &recreated)
+            .await
+            .unwrap();
+        drop(roots);
+        let refreshed = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        assert_eq!(
+            refreshed
+                .held_restore_map(&pool, published.id)
+                .unwrap()
+                .unwrap()
+                .0,
+            recreated.digest,
+        );
+        assert!(!observed_stream_read(&payload));
+        assert!(maps.iter().all(|watcher| !observed_stream_read(watcher)));
     }
 }

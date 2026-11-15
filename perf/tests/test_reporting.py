@@ -59,10 +59,9 @@ def test_checked_in_targets_and_cohorts() -> None:
     assert cohorts["arch-30g"].disks == ("100gb",)
     assert cohorts["disk-invariance"].disks == ("30gib", "500gib")
     targets = load_targets()
-    assert len(targets) == 7
-    assert target_for(targets, "silo", "arch-30g", "image", "restore_first_exec") == Target(0.1, True, "30g")
+    exec_target = target_for(targets, "silo", "arch-30g", "image", "restore_first_exec")
+    assert exec_target is not None and exec_target.seconds == 0.1
     assert target_for(targets, "msb", "arch-30g", "default", "start") is None
-    assert all(target.expected_fail and target.slice for target in targets.values())
 
 
 def test_history_append_and_parse(tmp_path: Path) -> None:

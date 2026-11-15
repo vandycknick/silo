@@ -91,6 +91,7 @@ pub struct StoragePool {
     lock_directory: OwnedDirectory,
     publication: OwnedDirectory,
     leases: OwnedDirectory,
+    defer_publication: bool,
 }
 /// Bounded-memory, metadata-only discovery of retained stream files. It never
 /// opens backing bytes before launch admission. Catalog reachability is checked
@@ -329,6 +330,7 @@ impl StoragePool {
             lock_directory,
             publication,
             leases,
+            defer_publication: false,
         })
     }
     /// Open only an already-initialized pool, without creating any directory,
@@ -365,7 +367,28 @@ impl StoragePool {
             lock_directory,
             publication,
             leases,
+            defer_publication: false,
         }))
+    }
+
+    pub(crate) fn defer_publications(mut self) -> Self {
+        self.defer_publication = true;
+        self
+    }
+
+    pub(crate) fn sync_publications(&self) -> Result<(), StorageError> {
+        owned(self.objects.sync())?;
+        owned(self.streams.sync())?;
+        owned(self.publication.sync())?;
+        owned(self.temporary.sync())
+    }
+
+    fn publication_lock(&self, name: &str) -> Result<StorageLock, StorageError> {
+        if self.defer_publication {
+            locks::blocking_deferred(&self.publication, name, FlockArg::LockExclusive)
+        } else {
+            locks::blocking(&self.publication, name, FlockArg::LockExclusive)
+        }
     }
 
     /// Validate the immutable pool file and its identity without modifying state.
@@ -845,11 +868,7 @@ impl StoragePool {
         let id = map.id();
         seal(&file)?;
         let name = id.hex();
-        let _publication = locks::blocking(
-            &self.publication,
-            &format!("stream-{name}.lock"),
-            FlockArg::LockExclusive,
-        )?;
+        let _publication = self.publication_lock(&format!("stream-{name}.lock"))?;
         let verified = if let Some(existing) = existing(&self.streams, &name)? {
             let before = SourceFingerprint::new(&existing.metadata()?);
             if existing.metadata()?.len() != map.length()
@@ -885,81 +904,68 @@ impl StoragePool {
     ) -> Result<(SealedStreamPublication, StorageLock), StorageError> {
         let metadata = input.metadata()?;
         let before = SourceFingerprint::new(&metadata);
+        let id = map.id();
+        let name = id.hex();
         if !metadata.is_file() || metadata.len() != map.length() {
-            return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
+            return Err(StorageError::ContentMismatch(self.stream_path(&id)));
+        }
+        let _publication = self.publication_lock(&format!("stream-{name}.lock"))?;
+        if let Some(file) = existing(&self.streams, &name)? {
+            let fingerprint = SourceFingerprint::new(&file.metadata()?);
+            if file.metadata()?.len() != map.length() {
+                return Err(StorageError::ContentMismatch(self.stream_path(&id)));
+            }
+            let stats = if verified_receipt == Some(fingerprint) {
+                StreamStats::default()
+            } else {
+                let scan = StreamHasher::new().hash_open_file(&file, map.length())?;
+                if scan.map != *map {
+                    return Err(StorageError::ContentMismatch(self.stream_path(&id)));
+                }
+                scan.stats
+            };
+            let roots = self.lock_roots_shared()?;
+            if SourceFingerprint::new(&input.metadata()?) != before {
+                return Err(StorageError::ContentMismatch(self.stream_path(&id)));
+            }
+            let publication = SealedStreamPublication {
+                file,
+                map: map.clone(),
+                fingerprint,
+                scan_stats: stats,
+            };
+            publication.recheck(self)?;
+            return Ok((publication, roots));
         }
         let (staging, file) = self.stage()?;
-        let mut hasher = None;
-        let (staging, file, published_map, mut stats) = if try_clone_stream(input, &file)? {
+        let (staging, file, published_map, stats) = if try_clone_stream(input, &file)? {
             (staging, file, map.clone(), StreamStats::default())
         } else {
-            // An unsupported ioctl may have partially changed the destination.
-            // Preserve the existing copy+hash path with a fresh empty inode.
             drop(file);
             drop(staging);
             let (staging, file) = self.stage()?;
-            let scan = hasher
-                .get_or_insert_with(StreamHasher::new)
-                .copy_file_and_hash(input, map.length(), &file)?;
+            let scan = StreamHasher::new().copy_file_and_hash(input, map.length(), &file)?;
             if scan.map != *map {
-                return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
+                return Err(StorageError::ContentMismatch(self.stream_path(&id)));
             }
             (staging, file, scan.map, scan.stats)
         };
         if SourceFingerprint::new(&input.metadata()?) != before
             || file.metadata()?.len() != map.length()
         {
-            return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
+            return Err(StorageError::ContentMismatch(self.stream_path(&id)));
         }
         seal(&file)?;
-        let id = map.id();
-        let name = id.hex();
-        let _publication = locks::blocking(
-            &self.publication,
-            &format!("stream-{name}.lock"),
-            FlockArg::LockExclusive,
-        )?;
-        let (file, mut fingerprint, verified) = if let Some(existing) =
-            existing(&self.streams, &name)?
-        {
-            // An independent dedup inode has no owned clone provenance.
-            let fingerprint = SourceFingerprint::new(&existing.metadata()?);
-            if verified_receipt != Some(fingerprint) {
-                let scan = hasher
-                    .get_or_insert_with(StreamHasher::new)
-                    .hash_open_file(&existing, map.length())?;
-                if scan.map != *map || SourceFingerprint::new(&existing.metadata()?) != fingerprint
-                {
-                    return Err(StorageError::ContentMismatch(self.stream_path(&id)));
-                }
-                stats.bytes_read += scan.stats.bytes_read;
-                stats.logical_bytes_hashed += scan.stats.logical_bytes_hashed;
-                stats.whole_bytes_hashed += scan.stats.whole_bytes_hashed;
-                stats.allocated_bytes += scan.stats.allocated_bytes;
-                stats.extent_queries += scan.stats.extent_queries;
-            }
-            if existing.metadata()?.len() != map.length() {
-                return Err(StorageError::ContentMismatch(self.stream_path(&id)));
-            }
-            (existing, fingerprint, Some(fingerprint))
-        } else {
-            let fingerprint = SourceFingerprint::new(&file.metadata()?);
-            (file, fingerprint, None)
-        };
-        let roots = self.finish_publication(&self.streams, &staging, &name, verified)?;
-        // Only our rename may change ctime. Inode, length and mtime must
-        // still match the held publication descriptor.
-        if verified.is_none() {
-            let metadata = file.metadata()?;
-            if !fingerprint.same_contents_after_metadata_change(&metadata) {
-                return Err(StorageError::ContentMismatch(self.stream_path(&id)));
-            }
-            fingerprint = SourceFingerprint::new(&metadata);
+        let sealed = SourceFingerprint::new(&file.metadata()?);
+        let roots = self.finish_publication(&self.streams, &staging, &name, None)?;
+        let metadata = file.metadata()?;
+        if !sealed.same_contents_after_metadata_change(&metadata) {
+            return Err(StorageError::ContentMismatch(self.stream_path(&id)));
         }
         let publication = SealedStreamPublication {
             file,
             map: published_map,
-            fingerprint,
+            fingerprint: SourceFingerprint::new(&metadata),
             scan_stats: stats,
         };
         publication.recheck(self)?;
@@ -1000,11 +1006,7 @@ impl StoragePool {
         }
         seal(&file)?;
         let name = digest.hex();
-        let _publication = locks::blocking(
-            &self.publication,
-            &format!("object-{name}.lock"),
-            FlockArg::LockExclusive,
-        )?;
+        let _publication = self.publication_lock(&format!("object-{name}.lock"))?;
         let verified = if let Some(mut existing) = existing(&self.objects, &name)? {
             let before = SourceFingerprint::new(&existing.metadata()?);
             if copy_object(&mut existing, &mut std::io::sink())? != (digest, length)
@@ -1041,7 +1043,6 @@ impl StoragePool {
         let (staging, mut file) = self.stage()?;
         let output = produce(&mut file)?;
         let published = (|| {
-            file.sync_all()?;
             file.seek(SeekFrom::Start(0))?;
             let before = SourceFingerprint::new(&file.metadata()?);
             let (digest, length) = copy_object(&mut file, &mut std::io::sink())?;
@@ -1050,11 +1051,7 @@ impl StoragePool {
             }
             seal(&file)?;
             let name = digest.hex();
-            let _publication = locks::blocking(
-                &self.publication,
-                &format!("object-{name}.lock"),
-                FlockArg::LockExclusive,
-            )?;
+            let _publication = self.publication_lock(&format!("object-{name}.lock"))?;
             let verified = if let Some(mut existing) = existing(&self.objects, &name)? {
                 let before = SourceFingerprint::new(&existing.metadata()?);
                 if copy_object(&mut existing, &mut std::io::sink())? != (digest, length)
@@ -1122,8 +1119,10 @@ impl StoragePool {
         } else {
             rename_no_replace(&staging.directory, destination, name)?;
         }
-        owned(destination.sync())?;
-        owned(staging.directory.sync())?;
+        if !self.defer_publication {
+            owned(destination.sync())?;
+            owned(staging.directory.sync())?;
+        }
         Ok(roots)
     }
 
@@ -1131,14 +1130,26 @@ impl StoragePool {
         // These locks protect only unpublished disposable directories, not a
         // semantic closure. Canonical operation leases require catalog roots.
         let name = format!("stage-{}", Uuid::new_v4());
-        let lease = locks::acquire_new(
-            &self.publication,
-            &format!("{name}.lock"),
-            FlockArg::LockSharedNonblock,
-        )?
+        let lease = if self.defer_publication {
+            locks::acquire_new_deferred(
+                &self.publication,
+                &format!("{name}.lock"),
+                FlockArg::LockSharedNonblock,
+            )?
+        } else {
+            locks::acquire_new(
+                &self.publication,
+                &format!("{name}.lock"),
+                FlockArg::LockSharedNonblock,
+            )?
+        }
         .ok_or_else(|| StorageError::InvalidPath("fresh staging lock is busy".into()))?;
-        let directory = owned(self.temporary.create_dir(&name))?
-            .ok_or_else(|| StorageError::InvalidPath("staging ID collision".into()))?;
+        let directory = owned(if self.defer_publication {
+            self.temporary.create_dir_deferred(&name)
+        } else {
+            self.temporary.create_dir(&name)
+        })?
+        .ok_or_else(|| StorageError::InvalidPath("staging ID collision".into()))?;
         let staging = Staging {
             parent: &self.temporary,
             directory,
@@ -2204,9 +2215,10 @@ mod tests {
         let (reused, roots) = pool
             .publish_sealed_stream_for_catalog(&input, &map, Some(fingerprint))
             .unwrap();
+        assert_eq!(reused.fingerprint(), fingerprint);
         assert_eq!(
-            reused.scan_stats().bytes_read,
-            if reflink { 0 } else { map.length() }
+            reused.scan_stats(),
+            crate::storage::stream::StreamStats::default()
         );
         drop(roots);
         std::fs::set_permissions(
@@ -2223,6 +2235,22 @@ mod tests {
         assert!(pool
             .publish_sealed_stream_for_catalog(&input, &map, Some(fingerprint))
             .is_err());
+        let next_source = temporary.path().join("distinct-sealed-disk.raw");
+        let next_bytes = vec![0x53; bytes.len()];
+        std::fs::write(&next_source, &next_bytes).unwrap();
+        let next_map = StreamHasher::new()
+            .hash_reader(next_bytes.as_slice())
+            .unwrap();
+        assert_ne!(next_map.id(), map.id());
+        let (distinct, roots) = pool
+            .publish_sealed_stream_for_catalog(&File::open(next_source).unwrap(), &next_map, None)
+            .unwrap();
+        assert_eq!(
+            distinct.scan_stats().bytes_read,
+            if reflink { 0 } else { next_map.length() }
+        );
+        distinct.recheck(&pool).unwrap();
+        drop(roots);
     }
 
     #[test]
@@ -2281,5 +2309,66 @@ mod tests {
             "FICLONE emits IN_ACCESS for {} even without read/pread",
             path.display()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_stream_receipt_hit_skips_staging_clone_and_payload_access() {
+        use crate::storage::identity_file::SourceFingerprint;
+        use crate::store::snapshot_store::tests::{observed_stream_read, watch_stream_reads};
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("source");
+        std::fs::write(&input, [0x73; 4096]).unwrap();
+        let pool = StoragePool::open(&temporary.path().join("images"))
+            .unwrap()
+            .defer_publications();
+        let (published, roots) = pool.publish_stream_for_catalog(&input).unwrap();
+        drop(roots);
+        pool.sync_publications().unwrap();
+        let source = File::open(&input).unwrap();
+        let held = pool.open_stream(&published.id).unwrap();
+        let fingerprint = SourceFingerprint::new(&held.metadata().unwrap());
+        let staging = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).unwrap();
+        staging
+            .add_watch(pool.temporary.path(), AddWatchFlags::IN_CREATE)
+            .unwrap();
+        let input_reads = watch_stream_reads(&input);
+        let retained_reads = watch_stream_reads(&published.path);
+        let (reused, roots) = pool
+            .publish_sealed_stream_for_catalog(&source, &published.map, Some(fingerprint))
+            .unwrap();
+        assert_eq!(reused.fingerprint(), fingerprint);
+        assert_eq!(
+            reused.scan_stats(),
+            crate::storage::stream::StreamStats::default()
+        );
+        assert!(!observed_stream_read(&input_reads));
+        assert!(!observed_stream_read(&retained_reads));
+        assert_eq!(
+            staging.read_events().unwrap_err(),
+            nix::errno::Errno::EAGAIN
+        );
+        drop(roots);
+        std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let (authenticated, roots) = pool
+            .publish_sealed_stream_for_catalog(&source, &published.map, Some(fingerprint))
+            .unwrap();
+        assert!(authenticated.scan_stats().bytes_read > 0);
+        assert!(observed_stream_read(&retained_reads));
+        assert!(!observed_stream_read(&input_reads));
+        assert_eq!(
+            staging.read_events().unwrap_err(),
+            nix::errno::Errno::EAGAIN
+        );
+        drop(roots);
+        std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&published.path, [0x74; 4096]).unwrap();
+        std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(pool
+            .publish_sealed_stream_for_catalog(&source, &published.map, Some(fingerprint))
+            .is_err());
     }
 }
