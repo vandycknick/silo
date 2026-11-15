@@ -54,6 +54,20 @@ native live operations subject to the existing host and machine checks.
 Checkpoints record the live state format schema and guest architecture; restore
 refuses those mismatches, not a different build.
 
+The owner decisions of 2026-11-15 (Phase 30) measure start and live-operation
+latency from command start until the guest agent is ready, not `Running`.
+They require work independent of configured RAM and logical disk size, replace
+explicit zero-byte overlays with format-level zero ranges, and admit an
+explicit, non-durable same-host fast fork alongside the default durable fork.
+Local snapshot publication now seeds the warm receipt, reversing the
+2026-11-14 rule that the first durable restore independently scans RAM.
+Silent local corruption between capture and restore is an accepted risk;
+`silo snapshot verify IMAGE` provides on-demand full authentication. Imported,
+pulled and transported snapshots, export and handoff retain full byte
+authentication. The budgets below retain the 4 GiB gates and add the owner's
+30 GiB Arch cohort, both gated by `make perf`, not `make smoke`. These are
+requirements, not a claim that the Phase 30 targets have been met.
+
 ## The Problem
 
 [ADR 0014](0014-layered-oci-image-storage.md) gives Silo snapshots and forks of **stopped** machines: a machine's
@@ -100,9 +114,9 @@ deliberately onto Silo's fork, not adopted by changing a dependency revision.
 | Pause | Every vCPU parked at an instruction boundary, every device worker stopped at a terminal queue position, every host memory writer drained. Reversible; produces no artifact. |
 | Pause token | `(machineId, runId, pauseGeneration, owner)` identifying one established pause and who may resume it. A resume names the exact token. |
 | Capture | One operation that produces a coherent cut of execution state, RAM and every included writable disk at one pause token. |
-| Execution checkpoint | The immutable closure bound to producer-computed identities by a capture: RAM stream and layout, execution envelope, device state, sealed disks, boot and configuration provenance, compatibility profile. Cold durable restore and export independently authenticate RAM bytes. [ADR 0014](0014-layered-oci-image-storage.md) calls this a snapshot with `captureKind: live-execution`. |
+| Execution checkpoint | The immutable closure bound to producer-computed identities by a capture: RAM stream and layout, execution envelope, device state, sealed disks, boot and configuration provenance, compatibility profile. Local publication establishes restore trust; import, transport, export, handoff and explicit verification independently authenticate bytes. [ADR 0014](0014-layered-oci-image-storage.md) calls this a snapshot with `captureKind: live-execution`. |
 | Restore | Construction of a new machine generation whose first guest instruction continues from an execution checkpoint. |
-| Fork | One capture of a running source followed by N restores, with the source resumed under its recorded policy. |
+| Fork | By default, one durable capture-backed branch of a running source followed by N restores, with the source resumed under its recorded policy. The explicitly selected fast same-host mode shares source memory copy-on-write without a RAM file and is non-durable. |
 | Activation | The barrier between a restored guest's first instruction and the moment its workload runs and its endpoints are reachable: fresh VM generation identity acknowledged, agent rebound, network applied, workload thawed. |
 | Baseline | The retained RAM generation a VM's dirty tracking is measured against, enabling incremental capture. |
 | Workload freezer | A cgroup freezer subtree containing every guest process except the agent and its control dependencies. |
@@ -167,9 +181,9 @@ libkrun backend**, built from five commitments:
   sealed by a qualified clone or copy of their paused view into immutable raw
   files. [ADR 0014](0014-layered-oci-image-storage.md)'s one-encoding rule stands: no qcow2 chain, no block
   service, no Silo-owned CoW container. Children receive private raw copies.
-- **One immutable RAM file, privately mapped.** A checkpoint's memory is one
-  complete sparse RAM image with a separate layout record. Every restored
-  machine maps that file `MAP_PRIVATE` from a read-only descriptor, so
+- **One immutable RAM file, privately mapped, for durable operation.** A
+  checkpoint's memory is one complete sparse RAM image with a separate layout
+  record. Every durable restore maps it `MAP_PRIVATE` from a read-only descriptor, so
   children share clean pages through the page cache and own only the pages
   they write. Incremental captures chain through complete resolved chunk maps,
   never through a replayed delta chain at restore.
@@ -224,6 +238,16 @@ separately admitted profile with its own compatibility contract.
    operation.
 8. A user-paused machine stays paused. Only the operation that acquired a
    pause resumes it.
+9. No step of restore or fork may scale with configured RAM or logical
+   (configured) disk size. Capture work scales with changed bytes; full capture
+   work and pause scale with touched RAM, not never-touched configured pages.
+10. Configured disk size has no effect on snapshot, fork or restore time: a
+    30 GiB and a 500 GiB disk holding the same written data take the same time.
+    On reflink filesystems the disk step is a constant-time clone regardless of
+    written data. Without reflinks, the only permitted disk cost is copying
+    bytes actually written to the upper, an accepted rare slow case. Sealing,
+    identity and publication must not add logical-length scans or additional
+    data passes to these operations.
 
 ### Scope and relationship to existing decisions
 
@@ -511,13 +535,17 @@ A capture runs in this order; each step completes before the next begins:
    worker freezes host writers, harvests dirty coverage, and pipelines RAM reads
    through bounded 32 MiB packs to two hash/write workers (96 MiB pack scratch).
    Identity remains the ordered 8 MiB chunk map; pipelining changes neither
-   sparse-zero semantics nor the coherent cut. Full capture still scans configured
-   RAM, without pagemap-based untouched-page skipping. Workers join before capture
-   returns, including on cancellation or failure. A changed-to-zero page is
-   written as an explicit zero, never omitted.
+   sparse-zero semantics nor the coherent cut. Full capture skips never-touched
+   RAM; its work follows touched bytes, not configured capacity. Workers join
+   before capture returns, including on cancellation or failure. A
+   changed-to-zero page is recorded as an explicit zero range: a hole with a
+   format-level zero marker, never an inherit-from-baseline hole. Zero chunks
+   are never hashed or stored.
 5. **Record.** The staged digests are computed while the bytes are written:
-   the worker hashes each RAM chunk as it streams it and the monitor hashes
-   each disk chunk as it copies it; no staged file is read back to be
+   the worker hashes each nonzero affected RAM chunk as it streams it. Disk
+   identities follow changed written bytes and accompany the seal through
+   publication; a qualified reflink carries identity without a reread, and a
+   required non-reflink copy hashes inline. No staged file is read back to be
    verified. The monitor closes every writer, writes `vm.capture.json` to a
    private `.vm.capture.json.tmp` file in the capture directory, links the
    final name without replacement, then unlinks the temporary name. If the
@@ -604,11 +632,14 @@ invalidates the baseline and the next capture is full. The default crossover
 to a full capture is 60 percent dirty coverage; the operation may lower it.
 
 On CoW lanes, incremental RAM capture seeds a fresh private output by reflink
-from the exact retained immutable baseline and overlays only dirty runs,
-including explicit changed-to-zero writes. Without reflink support it
-rebuilds the complete file from the baseline as before; no baseline copy is
-prepared before pause. Both paths produce the same complete RAM bytes and
-chunk identity. `CaptureMemoryStats.seedMethod` records `clone` or `rebuild`.
+from the exact retained immutable baseline and overlays only dirty runs.
+Changed-to-zero runs punch holes and carry explicit format-level zero markers;
+they never inherit old baseline bytes. Zero chunks are neither hashed nor
+stored. Every lane must produce the same complete RAM bytes and chunk identity
+without a configured-RAM scan. The former complete baseline rebuild is not an
+exception to changed-byte scaling, and no baseline copy is prepared before
+pause. `CaptureMemoryStats.seedMethod` records `clone` or `rebuild`; those
+labels do not relax the scaling invariant.
 
 A restored machine seeds its own baseline from the immutable RAM file it was
 restored from and arms tracking before any restore-time write, so a
@@ -619,20 +650,21 @@ applies to durable restores as well as local forks.
 
 ### Backing
 
-A checkpoint's memory is one complete sparse RAM file and one layout record.
+A durable checkpoint's memory is one complete sparse RAM file and one layout record.
 The layout lists ordered, disjoint `(guestPhysicalAddress, length,
 streamOffset)` regions, the memory topology and the native page granule.
 Registered RAM is packed in guest-physical order; holes in the guest physical
 map are described by the layout, not stored. Offsets and lengths are aligned
 to the admitted native page size, which the worker queries rather than assumes.
 
-Every restored machine opens the RAM file read-only and maps each region
+Every durable restore opens the RAM file read-only and maps each region
 `PROT_READ | PROT_WRITE, MAP_PRIVATE`. Clean pages are shared through the host
 page cache between every child mapping the same inode; written pages are
 private to the writer. The file is never mapped shared, never handed to a
-child as a writable descriptor, and never modified in place. The source keeps
-its existing mappings after capture; children share with one another and with
-later restores, not with the still-running source.
+child as a writable descriptor, and never modified in place. In this default
+durable mode the source keeps its existing mappings after capture; children
+share with one another and later restores, not with the still-running source.
+The separate fast same-host fork mode below admits source-child sharing.
 
 The worker never forks its own process to clone a VM; a child is always a
 fresh hypervisor VM in a fresh process that installs saved state before its
@@ -643,9 +675,10 @@ first instruction.
 RAM is a logical stream under [ADR 0014](0014-layered-oci-image-storage.md)'s `stream` identity: 8 MiB decoded
 chunks, `zero` only for an entirely zero chunk. The stream's identity is the
 SHA-256 of its ordered chunk-digest list with the stream length, computed
-from the chunk map; it is not the SHA-256 of the file's bytes. The all-zero
-chunk has one constant digest, so hashing a sparse RAM image costs its data
-chunks only, and an incremental capture hashes only the chunks it rewrote.
+from the chunk map; it is not the SHA-256 of the file's bytes. An all-zero
+chunk uses the format's `zero` marker, never a stored or freshly hashed zero
+payload. Hashing a sparse RAM image costs its nonzero data chunks only, and an
+incremental capture hashes only affected nonzero chunks.
 A transported artifact blob additionally records the whole-file SHA-256 of the
 bytes it transports, computed at export, never on the pause path. The
 layout record is identified separately and binds the stream to its
@@ -654,11 +687,13 @@ memory.
 
 An incremental checkpoint is published with a complete resolved chunk map that
 reuses unchanged chunk identities from its predecessor. The parent is lineage,
-not a dependency to replay. Capture produces one complete immutable RAM file:
-a reflink of the retained baseline plus dirty overlays where supported, a full
-write otherwise. That complete file is the restore mapping target. A changed
-page costs a rehash of its 8 MiB identity chunk; this is accepted hash and
-transfer amplification, not the dirty-tracking granule.
+not a dependency to replay. Capture produces one complete immutable RAM file,
+using a retained-baseline reflink plus dirty overlays where supported, without
+work proportional to configured RAM. That complete file is the restore mapping
+target. A changed page costs a rehash of its 8 MiB identity chunk unless the
+whole chunk becomes zero; this is accepted hash and transfer amplification,
+not the dirty-tracking granule. Explicit zero ranges within a nonzero chunk
+remain part of that chunk's logical bytes.
 
 First publication of closed, owned, sealed producer RAM validates its canonical
 map, geometry and unchanged source inode facts across a successful reflink,
@@ -668,10 +703,12 @@ Thus RAM identity work follows affected chunks rather than all populated RAM on
 the owned reflink path. A non-reflink copy still hashes
 inline, and an independent existing same-ID pool inode is always authenticated
 before dedup reuse. Files and parent directories are still synchronized before
-the catalog commit and its durability barrier. The new publication binding is
-clone provenance, not independently verified bytes, and never seeds a warm
-restore receipt. Corruption between capture and publication is detected by cold
-durable restore or export, not by reflink publication.
+the catalog commit and its durability barrier. This publication binding is
+clone provenance, not independently verified bytes, but publication of a
+snapshot produced on this host seeds the warm restore receipt. Its first local
+restore, like repeated local restores, does not hash RAM. Silent local
+corruption between capture and restore is not detected at restore; explicit
+verification, export and handoff authenticate bytes independently.
 The 1 s incremental budget below is measured on the defined fixture: one
 contiguous 410 MiB dirty region in a 4 GiB guest, under this unchanged 8 MiB
 chunk identity. Scattered dirty placement can legitimately affect every chunk
@@ -680,9 +717,10 @@ and require up to a full-RAM rehash, even at the same dirty-page fraction.
 placement-dependent cost is visible, not hidden by the fixture's target.
 
 Lazy restore through `userfaultfd` is not part of this contract. File-private
-mapping already demand-pages local memory. Cold durable restore authenticates
-RAM before the first guest instruction; unchanged-inode warm receipts may skip
-that read, and local forks trust owned producer identity as described below.
+mapping already demand-pages local memory. Local snapshots trust the receipt
+seeded at publication from their first restore; imported, pulled or transported
+snapshots authenticate every byte before execution. Local forks trust owned
+producer identity as described below.
 A materialization from chunk storage is not presented as remote lazy restore.
 
 ### Accounting
@@ -787,8 +825,10 @@ against the host mapping limit with a fixed VMM reserve. At the bound, or on
 never fail the VM or fall back to file-private advice. Status also reports the
 current `replaced_islands` count. These counters are process-local and are not
 captured balloon device state. Reports are drained and quiesced before a
-capture cut. Incremental capture writes discarded dirty pages as explicit zero
-overlays; full capture may omit zero pages as holes. Linux tracked and restored
+capture cut. Incremental capture records discarded dirty pages as explicit zero
+ranges with format-level markers and holes, never baseline inheritance; full
+capture may omit zero pages as holes. Zero chunks are never hashed or stored.
+Linux tracked and restored
 RAM report effective reclaim with reason `none`. The macOS/HVF inhibition and
 qualification contract above are unchanged.
 
@@ -804,19 +844,22 @@ from eviction while the consumer's operation roots are live.
 
 libvm verifies the checkpoint closure's shape, trust policy and compatibility
 profile before allocating anything for a child: every member is present with
-its recorded length, role and lineage; already-present stream bytes are not
-read in full yet. Cold byte authentication of the RAM stream and sealed disks
-runs concurrently with construction of the child's private disk copies; a failed
-authentication rolls the owned child allocation back and reports the
-authentication error, never a construction error. A content object that
-libvm itself independently verified and sealed earlier is reused without
-re-reading when its recorded inode, length, mode `0400` and change time still
-match; a mismatch re-authenticates. Publication alone does not establish this
-warm receipt, so a newly published RAM inode's first durable restore scans it.
-Silent corruption that preserves inode metadata, including the change time, is
-outside this local warm-reuse trust boundary. Export and handoff always
-authenticate every byte, without warm receipts. Local forks instead use the
-producer/owned-inode authority described below. libvm creates the child's machine
+its recorded length, role and lineage. A snapshot produced on this host is
+trusted at publication: publication seeds the warm receipt, so neither its
+first nor repeated local restore hashes RAM. Reuse requires the recorded inode,
+length, mode `0400` and change time to match; a mismatch re-authenticates.
+Imported, pulled or transported snapshots still authenticate every byte;
+required byte authentication runs concurrently with private disk construction.
+A failed authentication rolls the owned child allocation back and reports the
+authentication error, never a construction error.
+
+Silent local corruption between capture and restore is not detected at restore
+under this trust boundary. The recovery tool is `silo snapshot verify IMAGE`:
+on demand, libvm rereads and authenticates every RAM, state and disk byte of a
+local snapshot against its recorded identities. A failure exits nonzero and
+names the first bad stream and chunk. Export and handoff always authenticate
+every byte, without warm receipts. Local forks use the producer/owned-inode
+authority described below. libvm creates the child's machine
 directory, private raw copies of every sealed disk, fresh network reservations
 and sockets, the composite initramfs for provenance only, and the leases for
 the RAM file, lower and boot assets. It passes the resolved restore inputs to
@@ -825,8 +868,9 @@ layout, execution and device-state objects as inherited read-only
 descriptors; the private disk roles; the compatibility profile; the
 activation configuration; and `startPaused: true`.
 
-A restored child's private copies follow the fork rule: hashed as written,
-recorded `constructed` when complete, started on that record, and moved to
+A restored child's private copies follow the fork rule: qualified reflinks
+carry identity without rereading, required copies hash written bytes inline,
+and complete children are recorded `constructed`, started on that record, and moved to
 `durable` by background synchronization. Recovery adopts a pending barrier while
 the exact monitor or run lease remains live; it deletes an incomplete child only
 after ordinary liveness reconciliation proves that no live owner remains.
@@ -998,6 +1042,8 @@ this timer exception changes neither kernel builds nor the support matrix.
 
 ## Fork
 
+### Default durable fork
+
 Fork is one capture followed by N restores. libvm performs the capture, pins
 the recorded RAM file and disk cut under a recoverable operation root, then
 restores each child subject to the admitted resource budgets. A local fork uses
@@ -1007,13 +1053,15 @@ durable checkpoint. An operation root is required. libvm validates the cut's
 receipt structurally (run and configuration correlation, roles, lengths,
 chunk counts, token binding) and checks unchanged owned inode facts. Local fork
 RAM restore trusts that producer identity and inode ownership without rehashing
-RAM, including on the first restore. Each disk's private copy is authenticated
-as it is written. Local forks do not promise independent detection of RAM
+RAM, including on the first restore. Qualified disk reflinks carry the cut's
+identity without rereading; required copies authenticate written bytes inline.
+Local forks do not promise independent detection of RAM
 corruption that preserves those trusted facts. The cut is never published as a
 checkpoint; it exists only until every child is durable.
 
-Each child's private disk copy is hashed as it is written and compared with
-the cut's identity; a mismatch fails that child. The child's construction is
+Each child's qualified private disk clone carries the cut's identity. A
+non-reflink copy hashes written bytes inline and compares with that identity;
+a mismatch fails that child. The child's construction is
 recorded as `constructed`, not yet durable, as soon as its copies are
 complete, and the child may start on that record. Its durability barrier
 (file and directory synchronization) completes in the background and moves
@@ -1048,6 +1096,16 @@ are supplied per child through the activation configuration. A child's
 captured-but-stale TCP connections receive errors inside the guest; the
 destination netd does not deliver traffic for the source's addresses to the
 child.
+
+### Explicit fast same-host fork
+
+Silo admits a separate, explicitly selected non-durable live fork mode without
+a RAM file. Source and children share guest memory copy-on-write, and siblings
+share physical pages. This mode is same host only; children do not survive a
+host crash or reboot. It never silently replaces the default durable fork.
+Its mechanism, lifecycle and resource-ownership details are pending a Phase 30
+design review before implementation; this decision does not select those
+details or claim the mode is delivered.
 
 ## Device And Identity Model
 
@@ -1290,9 +1348,10 @@ correlation and the structural consistency of the inventory (roles, lengths,
 chunk counts, chunk-list identities recomputed from the recorded chunk
 digests) and committing. Owned reflink RAM publication and local fork restore
 rely on producer identity and unchanged inode facts, not a staged RAM reread.
-Copy publication hashes inline; cold durable restore, export and handoff
-independently authenticate bytes, while warm durable restores may reuse a
-matching receipt. libvm does not infer capture success from process exit, from
+Copy publication hashes inline. Local snapshot publication seeds the warm
+receipt, including for its first restore; imported, pulled or transported
+snapshots, export and handoff independently authenticate bytes. libvm does not
+infer capture success from process exit, from
 a file's existence or from an RPC that returned before the seal.
 
 ### ADR 0018 additions
@@ -1353,9 +1412,14 @@ A checkpoint is executable state with the authority of the machine that
 produced it. Restoring one requires at least the authorization required to run
 its image. Its native-state parsers are host attack surface: the worker
 validates sizes, topology, schema and bounds before any hypervisor call.
-Cold durable restore and transport independently verify chunk and state digests;
-unchanged-inode warm receipts and local producer/owned-inode fork authority are
-the explicit local exceptions to RAM rereads. Hashing is integrity, not
+Imported, pulled or transported snapshots, export and handoff independently
+verify every byte against chunk and state identities. Locally produced
+snapshots trust publication-seeded warm receipts from their first restore;
+local forks trust producer/owned-inode authority without RAM rereads. Silent
+local corruption between capture and restore is not detected at restore.
+`silo snapshot verify IMAGE` rereads and authenticates every RAM, state and disk
+byte against recorded identities and names the first bad stream and chunk on
+failure. Hashing is integrity, not
 authenticity; publisher trust and signatures apply to the OCI index under
 [ADR 0014](0014-layered-oci-image-storage.md)'s trust policy.
 
@@ -1412,32 +1476,70 @@ machine, who paused it.
 | Restore/fork child disk construction | Per child: allocated bytes of every writable disk + state reserves + pinned boot-object copies. Live forks use the allocation sample retained by capture planning; standalone restores measure their held immutable source files. |
 | Activation deadlines | VM generation acknowledgement 5 s; agent `Activate` 30 s; both configurable. |
 
-These are initial budgets measured by the gates below, on the three reference
-hosts named in [ADR 0014](0014-layered-oci-image-storage.md)'s qualification matrix (Linux x86_64 on ext4 without
-reflinks, Linux x86_64 on XFS with reflinks, Apple-silicon macOS on APFS), with
-cold and warm cache recorded separately, as the median of five runs with
-minimum and maximum reported; a budget passes when the median meets it. The
-target pause durations are: full capture of a 4 GiB machine with a 1 GiB
-nonzero upper on APFS or reflink-capable Linux within 5 s of workload
-interruption; an incremental capture of the defined contiguous 410 MiB dirty
-region in a 4 GiB guest (10 percent rounded to whole MiB) within 1 s;
-restore to `Running` within 2 s; a fork of four children to `Running` within
-10 s. On Linux without reflinks every one of these budgets is extended by the
-**non-CoW copy allowance**: the allocated bytes of each private raw copy the
-operation must make (the upper for capture and incremental capture, one
-private upper for restore, one per child for fork) at the host's measured
-sequential copy rate. In addition, full capture interruption and incremental
-capture interruption on **every lane** are extended by the **disk-sealing
-allowance**: the sealed upper's allocated bytes at the host's measured
-sequential SHA-256 hash rate. Restore and fork-to-Running do not receive this
+Live-operation and start latency is measured from command start until the guest
+agent is ready, not until `Running` or application readiness. Capture additionally
+records total command time and the source's workload interruption separately;
+the pause budget never substitutes for total latency. A fork's readiness clock
+ends only when every requested child agent is ready. Exec measures a complete
+command round trip.
+
+The existing 4 GiB fixture budgets remain gates on the three reference hosts
+named in [ADR 0014](0014-layered-oci-image-storage.md)'s qualification matrix
+(Linux x86_64 on ext4 without reflinks, Linux x86_64 on XFS with reflinks,
+Apple-silicon macOS on APFS). Cold and warm cache are recorded separately as the
+median of five runs with minimum and maximum reported; a budget passes when the
+median meets it. Full capture of a 4 GiB machine with a 1 GiB nonzero upper on
+APFS or reflink-capable Linux has a 5 s workload-interruption gate; incremental
+capture of one contiguous 410 MiB dirty region in a 4 GiB guest (10 percent
+rounded to whole MiB) has a 1 s interruption gate. Restore to agent ready has a
+2 s gate; a fork of four children to all agents ready has a 10 s gate.
+
+On Linux without reflinks these retained fixture budgets include the
+**non-CoW copy allowance**: the allocated bytes actually written to each
+private upper copy (one for capture, incremental capture or restore, one per
+child for fork) at the host's measured sequential copy rate. The retained
+capture and incremental interruption gates also report the historical
+**disk-sealing allowance**: sealed upper allocated bytes at the host's measured
+sequential SHA-256 rate. Restore and fork-to-agent-ready do not receive this
 allowance; the capture-interruption gate within a fork does. On 2026-11-09,
-Btrfs disk sealing alone measured 1.1–1.2 s for the fixture's 2 GiB logical
-upper with 1 GiB payload, despite a successful reflink. Raw interruption,
-non-CoW copy allowance, disk-sealing allowance and gated excess are reported
-separately, with their measured rate inputs. The cold-cache restore figure is
-recorded on every lane and budgeted on the reflink-capable lanes. Raw clone
-and copy remains the disk representation; qcow2 upper generations are not
-reopened by these measurements.
+Btrfs disk sealing alone measured 1.1–1.2 s for the fixture's 2 GiB logical upper
+with 1 GiB payload despite a successful reflink. Raw interruption, both
+allowances and gated excess remain separately reported with measured rates.
+These retained allowances do not authorize a violation of the Phase 30
+constant-time reflink or written-byte-only disk rules. Cold-cache restore is
+recorded on every lane and budgeted on reflink-capable lanes. Raw clone and copy
+remain the disk representation; these measurements do not reopen qcow2 uppers.
+
+The owner-approved Phase 30 cohort (2026-11-15) is an idle Arch guest with
+30 GiB RAM, 10 vCPUs and a 100 GiB configured disk, using default image init.
+Its command-start-to-agent-ready targets are additional gates, not replacements
+for the 4 GiB fixture:
+
+| Operation | Phase 30 target |
+| --- | --- |
+| Start | Under 1 s |
+| Restore of a local snapshot, first or repeated | 0.5 s |
+| Durable fork with a baseline | 1 s |
+| First durable fork | 2 s |
+| Fast same-host fork | 0.5 s |
+| Incremental snapshot | 2 s total, with a 1 s pause |
+| Full snapshot | Pause proportional to touched RAM |
+| Exec round trip | 0.1 s |
+
+Image init as PID 1 stays the default. Every new performance figure must record
+both default image init and agent-as-PID-1 (`--kernel-arg init=`), with the mode
+explicitly labeled. The default-init cohort determines the targets above;
+historical measurements keep their original mode and clock labels.
+
+The standalone project `perf/`, run with `make perf`, gates these budgets and
+the retained storage budgets from ADR 0014. `make smoke` does not run performance
+budgets. The suite reuses the smoke setup and runs serially, reporting Silo
+versus the checked-in targets as pass/fail and Silo versus msb on a roughly
+equal setup as informational. It records both init modes, cold/warm conditions
+and history for the retained 4 GiB fixture, 2/8/30 GiB Alpine 2-vCPU cohorts,
+and this Arch cohort. An unavailable msb run is skipped with a reason.
+The [performance tracker](../architecture/live-operation-performance.md) records
+the Phase 30 baseline and each slice's measured result; targets are not yet met.
 
 ## libkrun Fork Commit Series
 
@@ -1466,7 +1568,7 @@ omitted throughout.
 | 5 | `vmm: serialize and restore execution state` | Versioned, bounded codec for the execution envelope: x86_64 vCPU, MSR, FPU/XSAVE, LAPIC, IRQ chip, PIT and clock state; arm64 core and system registers, GICv3 distributor, redistributor and CPU interface, virtual timer offset; HVF arm64 through the symbols of commit 2. Construction-time restore into a fresh VM before the first instruction, including the timer-restore ordering fixes the reference implementation found necessary on HVF. | Device and memory state. |
 | 6 | `devices: capture and restore block, net, vsock, balloon, rng and console` | A provider per admitted device on commit 3's trait: explicit raw block flush and reopen; fenced network reconstruction; native vsock mux quiescence and host-session drop (extends `vsock: add an owned native control-channel mux`); balloon, rng and console state. Flips native `pause`. | virtiofs, Rosetta, GPU, TAP and Unix-stream providers (rejected by commit 3's default). |
 | 7 | `vmm: add a host-writer memory domain and dirty tracking` | Every host writer into guest RAM goes through one access domain so dirty maps are complete; KVM slot dirty logging on Linux; second-stage write protection with first-write faults on HVF; harvest, re-arm and baseline invalidation. | RAM image I/O. |
-| 8 | `vmm: write and load sparse RAM images with a layout record` | Full and delta RAM capture into a named descriptor with a layout record; explicit zero pages; `MAP_PRIVATE` guest memory over an inherited read-only RAM descriptor; inherited baseline ledger without an initial scan. Restored private mappings are created with host reclaim disabled from this commit on, so no revision ever reclaims a restored mapping. | Chunk identity and publication (libvm). |
+| 8 | `vmm: write and load sparse RAM images with a layout record` | Full and delta RAM capture into a named descriptor with a layout record; explicit zero ranges with format-level markers, not stored zero bytes; `MAP_PRIVATE` guest memory over an inherited read-only RAM descriptor; inherited baseline ledger without an initial scan. Restored private mappings are created with host reclaim disabled from this commit on, so no revision ever reclaims a restored mapping. | Chunk identity and publication (libvm). |
 | 9 | `balloon: report reclaim qualification for restored private mappings` | Reclaim stays disabled for restored `MAP_PRIVATE` mappings; qualification is reported as `not-run` for such VMs and the discard-reads-zero contract is written as the test that would re-enable it (extends `balloon: reclaim reported guest RAM on macOS`). | Re-enabling reclaim. |
 | 10 | `devices: add the acknowledged virtio VM generation device` | Device ID `0x5347`; request carries sequence, 128-bit identity and flags; processed-sequence acknowledgement; clock-only requests that keep identity. The guest driver lives in Silo's kernel tree, not in this commit. | ACPI or device-tree `vmgenid`. |
 | 11 | `krun: expose pause, capture and restore on the native API` | `VmmBuilder` restore inputs (RAM descriptor, layout, execution and device state, start paused, fenced network and vsock); `VmmHandle` pause, resume, capture execution, capture memory, dirty baseline control; the ABI `silo-vmm`'s worker consumes. Flips native `capture`, `restore`, `incremental` and `fork` (`fork` is the conjunction of `capture`, `restore` and the private RAM mapping of commit 8; it has no primitive of its own). | Any Silo-side protocol. |
@@ -1591,12 +1693,16 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
 - **Retention.** Delete the source and every checkpoint alias while children
   run; move `SILO_HOME` while stopped; restore and recapture with original
   paths gone. The full RAM, disk and boot closure survives GC.
-- **Artifact and bounds.** On cold durable restore, corrupt every kind of chunk,
-  state and layout object; overlapping and out-of-range guest-physical regions;
-  oversized state; incompatible ABI: each rejects before the first instruction.
-  Warm-receipt invalidation and local-fork inode ownership have their separate
-  trust-boundary checks above. Export and pull through an admitted registry,
-  delete the source OCI objects, run registry GC, restore the exact closure.
+- **Artifact and bounds.** Imported, pulled and transported snapshots with a
+  corrupt chunk, state or layout object reject before the first instruction.
+  Overlapping or out-of-range regions, oversized state and incompatible ABI
+  reject on every restore. Local publication seeds first-restore trust without
+  hashing RAM; warm-receipt invalidation and local-fork inode ownership have
+  separate trust-boundary checks. `silo snapshot verify IMAGE` detects corrupt
+  RAM, state and disk bytes, naming the first bad stream and chunk and exiting
+  nonzero; it succeeds on an intact closure. Export and handoff authenticate
+  every byte. Pull through an admitted registry, delete source OCI objects,
+  run registry GC and restore the exact closure.
 - **Portability refusal.** Wrong architecture, hypervisor, CPU feature,
   XSAVE set, timebase, GIC format, host build or kernel identity fails
   preflight with the pin named; disk-only recovery remains available as the
@@ -1611,10 +1717,14 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   unsupported bit. The stopped snapshot of the same machine succeeds
   unchanged. Exercised through the mock backend's declared vector and on a
   macOS host with VZ selected.
-- **Budgets.** Full and incremental pause durations, source-unavailable
-  time, seal latency, N-child time to `Running`, bytes scanned, hashed and
-  written, disk-copy bytes, descriptor counts, unique physical RAM and peak
-  staging are recorded against the budgets above, under cold and warm cache.
+- **Budgets.** Command start to agent ready, full and incremental pause,
+  source-unavailable time, seal latency, N-child time to all agents ready,
+  bytes scanned, hashed and written, disk-copy bytes, descriptor counts,
+  unique physical RAM and peak staging are recorded against the budgets above
+  under cold and warm cache and both init modes by `make perf`. Equal written
+  data on 30 GiB and 500 GiB disks must yield equal snapshot, fork and restore
+  times within measurement noise; reflink disk steps are constant-time, while
+  non-reflink evidence attributes copy time only to written upper bytes.
 
 ## Consequences
 
@@ -1638,11 +1748,15 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   kernel driver and guest protocol. This is hypervisor ownership, not a
   dependency bump.
 - Capture pauses the machine; there is no pre-copy or live migration. On
-  Linux hosts without reflinks the pause includes a full copy of the
-  writable upper.
-- Each child costs a private raw copy of every writable disk and, on
-  non-CoW hosts, the bytes to make it. Memory sharing is between children,
-  not with the still-running source.
+  Linux hosts without reflinks the pause includes copying the bytes actually
+  written to the upper, not its configured capacity.
+- Each durable child costs a private raw clone or copy of every writable disk
+  and, on non-CoW hosts, the written bytes to make it. Durable memory sharing is
+  between children, not the still-running source; the explicitly selected fast
+  same-host mode shares source memory but loses children on host crash or reboot.
+- Local publication trust removes the first-restore RAM scan but deliberately
+  does not detect silent local corruption between capture and restore.
+  Operators use `silo snapshot verify IMAGE` for on-demand full authentication.
 - Execution portability requires the same state schema and guest architecture.
   Native decoders still validate payloads and host execution prerequisites.
   Unrunnable checkpoints stay inspectable and recoverable as disks.
