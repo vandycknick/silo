@@ -693,29 +693,6 @@ pub(crate) async fn check_catalog(store: &Store) -> Result<(), LibVmError> {
     Ok(())
 }
 
-/// Reverse reachability shared by canonical object collection and representation
-/// retirement. Semantic rows remain structural roots until their explicit release.
-pub(crate) async fn stream_reachable(
-    connection: &mut sqlx::SqliteConnection,
-    stream: StreamId,
-) -> Result<bool, LibVmError> {
-    let direct:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=?1 UNION ALL SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM image_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM layer_result WHERE pack_stream=?1)")
-        .bind(stream.to_string()).fetch_one(&mut *connection).await?;
-    if direct {
-        return Ok(true);
-    }
-    let object: Option<String> = sqlx::query_scalar(
-        "SELECT object_digest FROM object_stream_representation WHERE stream_id=?1",
-    )
-    .bind(stream.to_string())
-    .fetch_optional(&mut *connection)
-    .await?;
-    let Some(object) = object else {
-        return Ok(false);
-    };
-    object_base_reachable(connection, object.parse().map_err(invalid)?).await
-}
-
 pub(crate) async fn insert_object_binding(
     connection: &mut sqlx::SqliteConnection,
     object: ObjectDigest,
@@ -737,17 +714,6 @@ pub(crate) async fn insert_object_binding(
     Ok(())
 }
 
-async fn object_base_reachable(
-    connection: &mut sqlx::SqliteConnection,
-    object: ObjectDigest,
-) -> Result<bool, LibVmError> {
-    if crate::store::cache_paths::machine_retains_object(connection, object).await? {
-        return Ok(true);
-    }
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM layer_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM composition_recipe WHERE record_digest=?1 UNION ALL SELECT 1 FROM composition_result WHERE record_digest=?1 OR fsmeta_digest=?1 UNION ALL SELECT 1 FROM storage_operation_object WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM image_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_capture_provenance WHERE evidence_digest=?1 UNION ALL SELECT 1 FROM snapshot_imported_capture WHERE provenance_digest=?1 OR evidence_digest=?1 UNION ALL SELECT 1 FROM managed_artifact_acquisition a WHERE receipt_digest=?1 AND ((managed_kind='image' AND EXISTS(SELECT 1 FROM storage_image WHERE id=a.managed_id)) OR (managed_kind='snapshot' AND EXISTS(SELECT 1 FROM storage_snapshot WHERE id=a.managed_id))))")
-        .bind(object.to_string()).fetch_one(connection).await?)
-}
-
 fn authenticate_object_binding(
     pool: &StoragePool,
     object: ObjectDigest,
@@ -766,50 +732,32 @@ fn authenticate_object_binding(
     Ok(authenticated.fingerprint())
 }
 
-pub(crate) async fn object_reachable(
+pub(crate) async fn unreachable_objects(
     connection: &mut sqlx::SqliteConnection,
-    object: ObjectDigest,
-) -> Result<bool, LibVmError> {
-    if object_base_reachable(connection, object).await? {
-        return Ok(true);
-    }
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM stream_representation_object WHERE object_digest=?1)",
+    objects: &[ObjectDigest],
+) -> Result<Vec<ObjectDigest>, LibVmError> {
+    let values = sqlx::query_scalar::<_, String>(
+        "SELECT c.value FROM json_each(?1) c LEFT JOIN retained_object r ON r.object_digest=c.value WHERE r.object_digest IS NULL",
     )
-    .bind(object.to_string())
-    .fetch_one(connection)
-    .await?)
+    .bind(serde_json::to_string(objects).map_err(invalid)?)
+    .fetch_all(connection)
+    .await?;
+    values
+        .into_iter()
+        .map(|value| value.parse().map_err(invalid))
+        .collect()
 }
 
 pub(crate) async fn retire_unrooted(store: &Store, pool: &StoragePool) -> Result<(), LibVmError> {
-    let mut cursor = String::new();
     crate::store::cache_paths::check_machine_dependencies(store).await?;
-    loop {
-        let ids = sqlx::query_scalar::<_, String>(
-            "SELECT stream_id FROM storage_stream WHERE stream_id>?1 ORDER BY stream_id LIMIT 256",
-        )
-        .bind(&cursor)
-        .fetch_all(&store.pool)
-        .await?;
-        if ids.is_empty() {
-            break;
-        }
-        let _roots = pool.lock_roots()?;
-        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        for id in ids {
-            cursor.clone_from(&id);
-            let stream = id.parse().map_err(invalid)?;
-            if !crate::store::cache_paths::machine_retains_stream(&mut tx, stream).await?
-                && !stream_reachable(&mut tx, stream).await?
-            {
-                sqlx::query("DELETE FROM storage_stream WHERE stream_id=?1")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
-        tx.commit().await?;
-    }
+    let _roots = pool.lock_roots()?;
+    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query(
+        "DELETE FROM storage_stream WHERE stream_id NOT IN (SELECT stream_id FROM retained_stream)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -891,52 +839,44 @@ impl Store {
                 if candidates.is_empty() {
                     break;
                 }
+                if let Some(last) = candidates.last() {
+                    cursor.clone_from(last);
+                }
+                let candidates = serde_json::to_string(&candidates).map_err(invalid)?;
                 let _roots = pool.lock_roots()?;
-                for value in candidates {
-                    let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-                    cursor.clone_from(&value);
-                    let digest: ObjectDigest = value.parse().map_err(invalid)?;
-                    let eligible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_cache_entry e WHERE kind=?1 AND digest=?2 AND (?3 OR last_used_at<=?4) AND NOT EXISTS(SELECT 1 FROM storage_operation_cache p WHERE p.kind=e.kind AND p.digest=e.digest))")
-                        .bind(kind.as_str()).bind(&value).bind(pressure).bind(cutoff).fetch_one(&mut *tx).await?;
-                    if !eligible {
-                        tx.commit().await?;
-                        continue;
-                    }
-                    let path = self
-                        .images_dir
-                        .join(kind.directory())
-                        .join("sha256")
-                        .join(digest.hex());
-                    crate::store::ensure_cache_paths_unreferenced(
-                        &mut tx,
-                        std::slice::from_ref(&path),
-                        &self.home,
-                    )
-                    .await?;
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                let eligible =
+                    eligible_cache_entries(&mut tx, kind, &candidates, pressure, cutoff).await?;
+                if eligible.is_empty() {
                     tx.commit().await?;
-                    // Persist this observed pin absence before unlink, then
-                    // recheck admission under a fresh SQLite writer fence.
-                    if let Some(deferred) = self.try_checkpoint_catalog().await?.deferral() {
-                        recovery.deferred.push(deferred);
-                        return Ok((removed, recovery));
-                    }
-                    let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-                    let eligible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_cache_entry e WHERE kind=?1 AND digest=?2 AND (?3 OR last_used_at<=?4) AND NOT EXISTS(SELECT 1 FROM storage_operation_cache p WHERE p.kind=e.kind AND p.digest=e.digest))")
-                        .bind(kind.as_str()).bind(&value).bind(pressure).bind(cutoff).fetch_one(&mut *tx).await?;
-                    if !eligible {
-                        tx.commit().await?;
-                        continue;
-                    }
-                    crate::store::ensure_cache_paths_unreferenced(
-                        &mut tx,
-                        std::slice::from_ref(&path),
-                        &self.home,
-                    )
-                    .await?;
-                    let directory = crate::paths::OwnedDirectory::open_existing_root(
-                        &self.images_dir.join(kind.directory()).join("sha256"),
-                    )?
-                    .ok_or_else(|| invalid("cache directory disappeared"))?;
+                    continue;
+                }
+                let paths = eligible
+                    .iter()
+                    .map(|digest| {
+                        self.images_dir
+                            .join(kind.directory())
+                            .join("sha256")
+                            .join(digest.hex())
+                    })
+                    .collect::<Vec<_>>();
+                crate::store::ensure_cache_paths_unreferenced(&mut tx, &paths, &self.home).await?;
+                tx.commit().await?;
+                // Stabilize pin absence before unlink, then recheck under the
+                // same roots guard and a fresh SQLite writer fence.
+                if let Some(deferred) = self.try_checkpoint_catalog().await?.deferral() {
+                    recovery.deferred.push(deferred);
+                    return Ok((removed, recovery));
+                }
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                let eligible =
+                    eligible_cache_entries(&mut tx, kind, &candidates, pressure, cutoff).await?;
+                crate::store::ensure_cache_paths_unreferenced(&mut tx, &paths, &self.home).await?;
+                let directory = crate::paths::OwnedDirectory::open_existing_root(
+                    &self.images_dir.join(kind.directory()).join("sha256"),
+                )?
+                .ok_or_else(|| invalid("cache directory disappeared"))?;
+                for digest in &eligible {
                     if let Some(file) = directory.open_file(&digest.hex())? {
                         use std::os::unix::fs::MetadataExt;
                         let metadata = file.metadata()?;
@@ -951,18 +891,32 @@ impl Store {
                         directory.remove_tree(&digest.hex())?;
                         directory.sync()?;
                     }
-                    sqlx::query("DELETE FROM storage_cache_entry WHERE kind=?1 AND digest=?2")
-                        .bind(kind.as_str())
-                        .bind(value)
-                        .execute(&mut *tx)
-                        .await?;
-                    tx.commit().await?;
                 }
+                sqlx::query("DELETE FROM storage_cache_entry WHERE kind=?1 AND digest IN (SELECT value FROM json_each(?2))")
+                    .bind(kind.as_str()).bind(serde_json::to_string(&eligible).map_err(invalid)?)
+                    .execute(&mut *tx).await?;
+                tx.commit().await?;
             }
         }
-        let _ = pool;
         Ok((removed, recovery))
     }
+}
+
+async fn eligible_cache_entries(
+    connection: &mut sqlx::SqliteConnection,
+    kind: CacheKind,
+    candidates: &str,
+    pressure: bool,
+    cutoff: i64,
+) -> Result<Vec<ObjectDigest>, LibVmError> {
+    let values = sqlx::query_scalar::<_, String>(
+        "SELECT e.digest FROM storage_cache_entry e JOIN json_each(?2) c ON c.value=e.digest WHERE e.kind=?1 AND (?3 OR e.last_used_at<=?4) AND NOT EXISTS(SELECT 1 FROM storage_operation_cache p WHERE p.kind=e.kind AND p.digest=e.digest)",
+    ).bind(kind.as_str()).bind(candidates).bind(pressure).bind(cutoff)
+        .fetch_all(connection).await?;
+    values
+        .into_iter()
+        .map(|value| value.parse().map_err(invalid))
+        .collect()
 }
 
 #[cfg(test)]

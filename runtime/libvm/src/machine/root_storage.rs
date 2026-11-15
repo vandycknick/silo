@@ -355,8 +355,7 @@ pub(crate) fn prepare(
                 ));
             }
             let admitted = plan.preflight(data_disks)?;
-            // Streams by map, the fsmeta object by held whole-byte SHA-256.
-            admitted.verify(&pool)?;
+            admitted.verify_composition(&pool, &launch.validation)?;
             validate_private(&machine_dir.join(upper.as_path()), *capacity)?;
             descriptor = Some(admitted.descriptor()?);
             let temporary_directory = match temporary_directory {
@@ -1000,7 +999,9 @@ mod tests {
             .preflight(0)
             .unwrap();
         assert_eq!(admitted.logical_length(), lower.geometry().length);
-        admitted.verify(&pool).unwrap();
+        admitted
+            .verify_composition(&pool, &launch.validation)
+            .unwrap();
         // Neither another generation nor forged lower claims can reuse this authority.
         let mut forged = lease.storage_record().clone();
         forged.storage_generation += 1;
@@ -1018,8 +1019,7 @@ mod tests {
         } = forged_lower;
         *filesystem_uuid = uuid::Uuid::new_v4();
         assert!(layers.launch_lower(&lease, &forged).await.is_err());
-        // A retained fsmeta byte change is refused by the held whole-object
-        // verification before any descriptor could be handed to a monitor.
+        // A ctime change revokes the held proof before descriptor handoff.
         let fsmeta = pool.object_path(&retained.fsmeta());
         let mode = std::fs::metadata(&fsmeta).unwrap().permissions().mode();
         std::fs::set_permissions(&fsmeta, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1033,6 +1033,8 @@ mod tests {
         file.write_all_at(&[byte[0] ^ 0xff], 0).unwrap();
         drop(file);
         std::fs::set_permissions(&fsmeta, std::fs::Permissions::from_mode(mode)).unwrap();
-        assert!(admitted.verify(&pool).is_err());
+        assert!(admitted
+            .verify_composition(&pool, &launch.validation)
+            .is_err());
     }
 }

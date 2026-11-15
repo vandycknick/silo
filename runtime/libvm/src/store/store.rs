@@ -110,6 +110,30 @@ impl Store {
     }
 
     pub(crate) async fn open(state_db_path: &Path) -> Result<Self, LibVmError> {
+        let store = Self::admit(state_db_path).await?;
+        if let Err(error) = store.recover().await {
+            store.pool.close().await;
+            return Err(error);
+        }
+        Ok(store)
+    }
+
+    pub(crate) async fn open_observation(state_db_path: &Path) -> Result<Self, LibVmError> {
+        let store = Self::admit(state_db_path).await?;
+        let recovered = async {
+            Self::log_cache_recovery(store.recover_pending_operations().await?);
+            store.reconcile_restore_budget().await
+        }
+        .await;
+        if let Err(error) = recovered {
+            store.pool.close().await;
+            return Err(error);
+        }
+        Ok(store)
+    }
+
+    /// Connection and schema admission only. No operation recovery or collection.
+    pub(crate) async fn admit(state_db_path: &Path) -> Result<Self, LibVmError> {
         let home = state_db_path.parent().ok_or_else(|| {
             std::io::Error::other(format!(
                 "state database {} has no parent directory",
@@ -129,7 +153,7 @@ impl Store {
                 other => other.into(),
             });
         }
-        let store = Self {
+        Ok(Self {
             pool,
             home: home.to_path_buf(),
             images_dir: home.join("images"),
@@ -138,43 +162,35 @@ impl Store {
             layer_hook: None,
             #[cfg(any(test, feature = "test-isolated-resource-budget"))]
             resource_budget_directory: Some(home.join("resource-budget")),
-        };
-        match store.recover_image_cache().await {
-            Ok(report) => {
-                for deferred in report.deferred {
-                    match deferred {
-                        // A held lease belongs to a live producer, e.g. every
-                        // running machine's launch. That is steady state, not news.
-                        crate::store::models::CacheCleanupDeferral::ActiveLease { .. }
-                        | crate::store::models::CacheCleanupDeferral::CatalogCheckpoint {
-                            ..
-                        } => {
-                            tracing::debug!(
-                                ?deferred,
-                                "image cache cleanup deferred; bytes and pending jobs retained"
-                            );
-                        }
-                        crate::store::models::CacheCleanupDeferral::ExternalDependency {
-                            ..
-                        } => {
-                            tracing::warn!(
-                                ?deferred,
-                                "image cache cleanup deferred; bytes and pending jobs retained"
-                            );
-                        }
-                    }
+        })
+    }
+
+    pub(crate) async fn recover(&self) -> Result<(), LibVmError> {
+        Self::log_cache_recovery(self.recover_pending_image_cache().await?);
+        self.reconcile_restore_budget().await?;
+        Ok(())
+    }
+
+    fn log_cache_recovery(report: crate::store::models::CacheRecoveryReport) {
+        for deferred in report.deferred {
+            match deferred {
+                // A held lease belongs to a live producer, e.g. every
+                // running machine's launch. That is steady state, not news.
+                crate::store::models::CacheCleanupDeferral::ActiveLease { .. }
+                | crate::store::models::CacheCleanupDeferral::CatalogCheckpoint { .. } => {
+                    tracing::debug!(
+                        ?deferred,
+                        "image cache cleanup deferred; bytes and pending jobs retained"
+                    );
+                }
+                crate::store::models::CacheCleanupDeferral::ExternalDependency { .. } => {
+                    tracing::warn!(
+                        ?deferred,
+                        "image cache cleanup deferred; bytes and pending jobs retained"
+                    );
                 }
             }
-            Err(error) => {
-                store.pool.close().await;
-                return Err(error);
-            }
         }
-        if let Err(error) = store.reconcile_restore_budget().await {
-            store.pool.close().await;
-            return Err(error);
-        }
-        Ok(store)
     }
 
     #[cfg(test)]
@@ -435,6 +451,525 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(dir.path());
         (dir, paths)
+    }
+
+    #[tokio::test]
+    async fn lean_admission_retires_pending_work_without_scanning_pool() {
+        let (_temporary, paths) = temp_paths();
+        let store = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let owner = pool.create_operation_with_lease(operation, lease).unwrap();
+        let source = owner.temporary.join("payload");
+        std::fs::write(&source, [7; 512]).unwrap();
+        let (object, roots) = pool.publish_object_for_catalog(&source).unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[], &[object.digest])
+            .await
+            .unwrap();
+        drop(roots);
+        let staging = owner.temporary.clone();
+        drop(owner);
+        store.close().await;
+
+        let lean = Store::open_observation(&paths.state_db_path())
+            .await
+            .unwrap();
+        assert!(object.path.exists());
+        assert!(!staging.exists());
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)"
+        )
+        .bind(operation.to_string())
+        .fetch_one(&lean.pool)
+        .await
+        .unwrap());
+
+        let before = logical_catalog::snapshot(paths.home()).await;
+        lean.close().await;
+        let lean = Store::open_observation(&paths.state_db_path())
+            .await
+            .unwrap();
+        assert_eq!(logical_catalog::snapshot(paths.home()).await, before);
+        assert!(object.path.exists());
+        lean.close().await;
+        let maintenance = Store::open(&paths.state_db_path()).await.unwrap();
+        assert!(!staging.exists());
+        assert!(!object.path.exists());
+        maintenance.close().await;
+    }
+
+    #[tokio::test]
+    async fn observation_preserves_pending_operation_with_another_live_lease_handle() {
+        let (_temporary, paths) = temp_paths();
+        let store = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let live_lease = lease.duplicate().unwrap();
+        let owner = pool.create_operation_with_lease(operation, lease).unwrap();
+        let staging = owner.temporary.clone();
+        std::fs::write(staging.join("payload"), b"live producer").unwrap();
+        drop(owner);
+        store.close().await;
+
+        let observation = Store::open_observation(&paths.state_db_path())
+            .await
+            .unwrap();
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)"
+        )
+        .bind(operation.to_string())
+        .fetch_one(&observation.pool)
+        .await
+        .unwrap());
+        assert!(staging.join("payload").exists());
+        observation.close().await;
+        drop(live_lease);
+
+        let observation = Store::open_observation(&paths.state_db_path())
+            .await
+            .unwrap();
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)"
+        )
+        .bind(operation.to_string())
+        .fetch_one(&observation.pool)
+        .await
+        .unwrap());
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn healthy_maintenance_admission_does_not_read_published_maps_or_mutate_catalog() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temporary, store, _record, _snapshot, owner, representation) =
+            crate::store::stream_representation::tests::retained_paginated(&[3; 512], 1).await;
+        let pool = crate::storage::pool::StoragePool::open(&store.images_dir).unwrap();
+        drop(owner);
+        store.recover_pending_image_cache().await.unwrap();
+        let before = logical_catalog::snapshot(store.home_path()).await;
+        // A broken immutable metadata object makes an accidental authentication
+        // pass observable without depending on filesystem cache state.
+        let path = pool.object_path(&representation);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, b"map read canary").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        store.pool.close().await;
+        let reopened = Store::open(&store.home_path().join("state.db"))
+            .await
+            .unwrap();
+        assert_eq!(logical_catalog::snapshot(store.home_path()).await, before);
+        assert!(path.exists());
+        assert!(
+            reopened.recover_image_cache().await.is_err(),
+            "explicit recovery authenticates the map canary"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_based_collection_preserves_shared_image_snapshot_and_composition_roots() {
+        use crate::storage::pool::StoragePool;
+        use crate::store::managed_image_store::ManagedImageStore;
+        use crate::store::snapshot_store::{SnapshotRef, SnapshotStore};
+        use crate::store::ImageStore;
+
+        let (_temporary, store, record, snapshot, snapshot_owner, representation) =
+            crate::store::stream_representation::tests::retained_paginated(&[3; 512], 1).await;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let lower = retained_lower(&store, store.home_path(), b'G').await;
+        let fsmeta = pool.object_path(&lower.retained().fsmeta());
+        let image_record = crate::ImageRecord {
+            schema: 1,
+            kind: crate::ImageRecordKind::Image,
+            root: record.root.clone(),
+            boot: record.boot.clone(),
+            process: crate::ProcessConfig::default(),
+        };
+        let (streams, objects) = image_record.content_dependencies().unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation(
+                "import",
+                &streams.into_iter().collect::<Vec<_>>(),
+                &objects.into_iter().collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        let image_owner = pool
+            .create_operation_with_lease(operation, lease.duplicate().unwrap())
+            .unwrap();
+        let images = ManagedImageStore::from_store(store.clone());
+        let image = images
+            .publish_owned(image_record, operation, lease, None, Vec::new(), None)
+            .await
+            .unwrap();
+        let source = store.home_path().join("orphan");
+        std::fs::write(&source, b"unrooted candidate").unwrap();
+        let orphan = pool.publish_object(&source).unwrap();
+        let candidates = pool
+            .scan_objects()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let roots = pool.lock_roots().unwrap();
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(
+            crate::store::stream_representation::unreachable_objects(&mut tx, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let unreachable =
+            crate::store::stream_representation::unreachable_objects(&mut tx, &candidates)
+                .await
+                .unwrap();
+        tx.commit().await.unwrap();
+        drop(roots);
+        assert_eq!(unreachable, [orphan.digest]);
+        assert_all_retention_root_classes(&store, image.id, snapshot.id, lower.retained().id).await;
+
+        drop(lower);
+        drop(snapshot_owner);
+        drop(image_owner);
+        let snapshots = SnapshotStore::from_store(store.clone());
+        snapshots
+            .release_retention(&SnapshotRef::Id(snapshot.id))
+            .await
+            .unwrap();
+        store.recover_pending_image_cache().await.unwrap();
+        assert!(
+            fsmeta.exists(),
+            "catalogued composition survives ordinary recovery"
+        );
+        store.prune_images().await.unwrap();
+        assert!(
+            !fsmeta.exists(),
+            "unrooted composition and layer graph was retired"
+        );
+        assert!(!orphan.path.exists());
+        let flat_state: String =
+            sqlx::query_scalar("SELECT flat_state FROM storage_stream WHERE stream_id=?1")
+                .bind(record.root.stream.stream.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            flat_state, "absent",
+            "explicit prune may evict a reconstructible flat"
+        );
+        assert!(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM image_stream_dependency WHERE image_id=?1 AND stream_id=?2)")
+            .bind(image.id.to_string()).bind(record.root.stream.stream.to_string()).fetch_one(&store.pool).await.unwrap());
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM retained_stream WHERE stream_id=?1)"
+        )
+        .bind(record.root.stream.stream.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap());
+        assert!(pool.object_path(&representation).exists());
+        let consumer = images
+            .consume(&crate::ManagedSourceRef::Image(image.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(pool.stream_path(&record.root.stream.stream)).unwrap(),
+            [3; 512]
+        );
+        drop(consumer);
+
+        images
+            .release_retention(&crate::ManagedSourceRef::Image(image.id))
+            .await
+            .unwrap();
+        store.recover_pending_image_cache().await.unwrap();
+        assert!(!pool.stream_path(&record.root.stream.stream).exists());
+        assert!(!pool.object_path(&representation).exists());
+        assert!(!pool.object_path(&record.root.stream.map).exists());
+    }
+
+    async fn assert_all_retention_root_classes(
+        store: &Store,
+        image: crate::ImageId,
+        snapshot: crate::SnapshotId,
+        lower: crate::storage::identity::LowerResultId,
+    ) {
+        use crate::storage::identity::ObjectDigest;
+        use crate::storage::pool::StoragePool;
+        use crate::store::snapshot_store::publish_map;
+        use crate::store::stream_representation::{insert_object_binding, unreachable_objects};
+
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let paths = LocalPaths::new(store.home_path());
+        let machine =
+            add_catalog_relative_raw_fixture(store, &paths, "retention-root-classes").await;
+        let generation = store
+            .machine_storage(machine.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .storage_generation;
+        let (recipe_object, result_object, fsmeta_object, layer, pack) =
+            sqlx::query_as::<_, (String, String, String, String, String)>(
+                "SELECT p.record_digest,r.record_digest,r.fsmeta_digest,l.id,l.pack_stream FROM composition_result r JOIN composition_recipe p ON p.id=r.recipe_id JOIN composition_layer c ON c.result_id=r.id AND c.position=0 JOIN layer_result l ON l.id=c.layer_result_id WHERE r.id=?1",
+            ).bind(lower.to_string()).fetch_one(&store.pool).await.unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let owner = pool.create_operation_with_lease(operation, lease).unwrap();
+        let source = owner.temporary.join("root-candidate");
+        std::fs::write(&source, b"independent provenance member").unwrap();
+        let auxiliary = pool.publish_object(&source).unwrap().digest;
+
+        // This is the original object authority union, with branch labels.
+        // Savepoint-scoped edges isolate the SQL retention contract from
+        // publication validation; every candidate has real immutable bytes.
+        let original_object_query = "WITH original_roots(kind,object_digest) AS (
+            SELECT 'machine-object',object_digest FROM machine_object_dependency
+            UNION ALL SELECT 'layer-object',object_digest FROM layer_object_dependency
+            UNION ALL SELECT 'composition-recipe',record_digest FROM composition_recipe
+            UNION ALL SELECT 'composition-record',record_digest FROM composition_result
+            UNION ALL SELECT 'composition-fsmeta',fsmeta_digest FROM composition_result
+            UNION ALL SELECT 'operation-object',object_digest FROM storage_operation_object
+            UNION ALL SELECT 'snapshot-object',object_digest FROM snapshot_object_dependency
+            UNION ALL SELECT 'image-object',object_digest FROM image_object_dependency
+            UNION ALL SELECT 'capture-evidence',evidence_digest FROM snapshot_capture_provenance
+            UNION ALL SELECT 'imported-provenance',provenance_digest FROM snapshot_imported_capture
+            UNION ALL SELECT 'imported-evidence',evidence_digest FROM snapshot_imported_capture
+            UNION ALL SELECT 'image-acquisition',receipt_digest FROM managed_artifact_acquisition a WHERE managed_kind='image' AND EXISTS(SELECT 1 FROM storage_image WHERE id=a.managed_id)
+            UNION ALL SELECT 'snapshot-acquisition',receipt_digest FROM managed_artifact_acquisition a WHERE managed_kind='snapshot' AND EXISTS(SELECT 1 FROM storage_snapshot WHERE id=a.managed_id)
+            ) SELECT DISTINCT kind FROM original_roots WHERE object_digest=?1 ORDER BY kind";
+        let missing = uuid::Uuid::new_v4();
+        let parents = serde_json::json!({
+            "machine": machine.id.to_string(),
+            "generation": generation,
+            "layer": layer,
+            "operation": operation.to_string(),
+            "snapshot": snapshot.to_string(),
+            "image": image.to_string(),
+            "auxiliary": auxiliary.to_string(),
+            "missing": missing.to_string(),
+        })
+        .to_string();
+        let object_cases = [
+            ("machine-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO machine_object_dependency(machine_id,generation,object_digest) SELECT json_extract(parents,'$.machine'),json_extract(parents,'$.generation'),digest FROM candidate"), true, true),
+            ("layer-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO layer_object_dependency(result_id,object_digest) SELECT json_extract(parents,'$.layer'),digest FROM candidate"), true, true),
+            ("composition-recipe", Some(recipe_object.parse::<ObjectDigest>().unwrap()), None, true, true),
+            ("composition-record", Some(result_object.parse::<ObjectDigest>().unwrap()), None, true, true),
+            ("composition-fsmeta", Some(fsmeta_object.parse::<ObjectDigest>().unwrap()), None, true, true),
+            ("operation-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO storage_operation_object(operation_id,object_digest) SELECT json_extract(parents,'$.operation'),digest FROM candidate"), true, true),
+            ("snapshot-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_object_dependency(snapshot_id,object_digest) SELECT json_extract(parents,'$.snapshot'),digest FROM candidate"), true, true),
+            ("image-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO image_object_dependency(image_id,object_digest) SELECT json_extract(parents,'$.image'),digest FROM candidate"), true, true),
+            ("capture-evidence", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes,plan_bytes) SELECT json_extract(parents,'$.operation'),json_extract(parents,'$.snapshot'),digest,bytes,bytes FROM candidate"), true, true),
+            ("imported-provenance", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),digest,json_extract(parents,'$.auxiliary'),bytes FROM candidate"), true, true),
+            ("imported-evidence", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),json_extract(parents,'$.auxiliary'),digest,bytes FROM candidate"), true, true),
+            ("image-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'image',json_extract(parents,'$.image'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), true, true),
+            ("snapshot-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'snapshot',json_extract(parents,'$.snapshot'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), true, true),
+            ("missing-image-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'image',json_extract(parents,'$.missing'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), false, false),
+            ("missing-snapshot-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'snapshot',json_extract(parents,'$.missing'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), false, false),
+            ("representation-object", None, None, false, true),
+        ];
+        for (kind, existing, insert, base_retained, object_retained) in object_cases {
+            let object = match existing {
+                Some(object) => object,
+                None => {
+                    std::fs::write(&source, format!("independent retention object: {kind}"))
+                        .unwrap();
+                    pool.publish_object(&source).unwrap().digest
+                }
+            };
+            let bytes = std::fs::read(pool.object_path(&object)).unwrap();
+            let stream = pool.publish_stream(&pool.object_path(&object)).unwrap();
+            let content = publish_map(&pool, store, operation, &stream.map)
+                .await
+                .unwrap();
+            let _roots = pool.lock_roots().unwrap();
+            let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            // Composition objects may also be pinned by their acquisition.
+            sqlx::query("DELETE FROM storage_operation_object WHERE object_digest=?1")
+                .bind(object.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            // Map publication independently pins the stream; exclude that
+            // authority while testing only the whole-object binding.
+            sqlx::query("DELETE FROM storage_operation_stream WHERE stream_id=?1")
+                .bind(stream.id.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,flat_state) VALUES(?1,?2,?3,'present') ON CONFLICT DO NOTHING")
+                .bind(stream.id.to_string()).bind(stream.length as i64).bind(content.map.to_string())
+                .execute(&mut *tx).await.unwrap();
+            insert_object_binding(&mut tx, object, stream.id)
+                .await
+                .unwrap();
+            if let Some(insert) = insert {
+                sqlx::query(insert)
+                    .bind(object.to_string())
+                    .bind(&bytes)
+                    .bind(&parents)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            if kind == "representation-object" {
+                sqlx::query(
+                    "INSERT INTO stream_representation(stream_id,root_digest) VALUES(?1,?2)",
+                )
+                .bind(stream.id.to_string())
+                .bind(content.map.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO stream_representation_object(stream_id,root_digest,object_digest) VALUES(?1,?2,?3)")
+                    .bind(stream.id.to_string()).bind(content.map.to_string()).bind(object.to_string()).execute(&mut *tx).await.unwrap();
+            }
+            let original = sqlx::query_scalar::<_, String>(original_object_query)
+                .bind(object.to_string())
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+            let expected = if base_retained {
+                vec![kind.to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(original, expected, "{kind}: isolated original authority");
+            assert_eq!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM retained_base_object WHERE object_digest=?1)"
+                )
+                .bind(object.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+                base_retained,
+                "{kind}"
+            );
+            assert_eq!(
+                unreachable_objects(&mut tx, &[object])
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                object_retained,
+                "{kind}: canonical object"
+            );
+            let directly_rooted: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM machine_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM storage_operation_stream WHERE stream_id=?1 UNION ALL SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM image_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM layer_result WHERE pack_stream=?1)",
+            ).bind(stream.id.to_string()).fetch_one(&mut *tx).await.unwrap();
+            assert!(
+                !directly_rooted,
+                "{kind}: whole-object authority must be isolated from direct stream roots"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM retained_stream WHERE stream_id=?1)"
+                )
+                .bind(stream.id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+                base_retained,
+                "{kind}: whole-object stream"
+            );
+            // Representation membership alone must not create a self-rooting
+            // whole-object stream cycle.
+            tx.rollback().await.unwrap();
+        }
+
+        let original_stream_query = "WITH original_roots(kind,stream_id) AS (
+            SELECT 'machine-stream',stream_id FROM machine_stream_dependency
+            UNION ALL SELECT 'operation-stream',stream_id FROM storage_operation_stream
+            UNION ALL SELECT 'snapshot-stream',stream_id FROM snapshot_stream_dependency
+            UNION ALL SELECT 'image-stream',stream_id FROM image_stream_dependency
+            UNION ALL SELECT 'layer-pack',pack_stream FROM layer_result
+            ) SELECT DISTINCT kind FROM original_roots WHERE stream_id=?1 ORDER BY kind";
+        let stream_cases = [
+            ("machine-stream", Some("INSERT INTO machine_stream_dependency(machine_id,generation,stream_id) VALUES(json_extract(?2,'$.machine'),json_extract(?2,'$.generation'),?1)")),
+            ("operation-stream", Some("INSERT INTO storage_operation_stream(operation_id,stream_id) VALUES(json_extract(?2,'$.operation'),?1)")),
+            ("snapshot-stream", Some("INSERT INTO snapshot_stream_dependency(snapshot_id,stream_id) VALUES(json_extract(?2,'$.snapshot'),?1)")),
+            ("image-stream", Some("INSERT INTO image_stream_dependency(image_id,stream_id) VALUES(json_extract(?2,'$.image'),?1)")),
+            ("layer-pack", None),
+        ];
+        for (kind, insert) in stream_cases {
+            if kind == "layer-pack" {
+                let stream: crate::storage::identity::StreamId = pack.parse().unwrap();
+                std::fs::copy(pool.stream_path(&stream), &source).unwrap();
+            } else {
+                std::fs::write(&source, format!("independent retention stream: {kind}")).unwrap();
+            }
+            let published = pool.publish_stream(&source).unwrap();
+            let stream = published.id;
+            let content = publish_map(&pool, store, operation, &published.map)
+                .await
+                .unwrap();
+            let member = pool.publish_object(&source).unwrap().digest;
+            let _roots = pool.lock_roots().unwrap();
+            let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            sqlx::query("DELETE FROM storage_operation_stream WHERE stream_id=?1")
+                .bind(stream.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,flat_state) VALUES(?1,?2,?3,'present') ON CONFLICT DO NOTHING")
+                .bind(stream.to_string()).bind(published.length as i64).bind(content.map.to_string())
+                .execute(&mut *tx).await.unwrap();
+            sqlx::query(
+                "INSERT OR IGNORE INTO stream_representation(stream_id,root_digest) VALUES(?1,?2)",
+            )
+            .bind(stream.to_string())
+            .bind(content.map.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query("INSERT OR IGNORE INTO stream_representation_object(stream_id,root_digest,object_digest) VALUES(?1,?2,?3)")
+                .bind(stream.to_string()).bind(content.map.to_string()).bind(member.to_string()).execute(&mut *tx).await.unwrap();
+            if let Some(insert) = insert {
+                sqlx::query(insert)
+                    .bind(stream.to_string())
+                    .bind(&parents)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let original = sqlx::query_scalar::<_, String>(original_stream_query)
+                .bind(stream.to_string())
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(original, [kind], "{kind}: isolated original authority");
+            let unretained: Vec<String> = sqlx::query_scalar("SELECT c.value FROM json_each(?1) c LEFT JOIN retained_stream r ON r.stream_id=c.value WHERE r.stream_id IS NULL")
+                .bind(serde_json::to_string(&[stream]).unwrap()).fetch_all(&mut *tx).await.unwrap();
+            assert!(unretained.is_empty(), "{kind}: flat anti-join");
+            sqlx::query("DELETE FROM storage_stream WHERE stream_id=?1 AND stream_id NOT IN (SELECT stream_id FROM retained_stream)")
+                .bind(stream.to_string()).execute(&mut *tx).await.unwrap();
+            assert!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM storage_stream WHERE stream_id=?1)"
+                )
+                .bind(stream.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+                "{kind}: retained representation"
+            );
+            assert!(
+                unreachable_objects(&mut tx, &[member])
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{kind}: representation member"
+            );
+            tx.rollback().await.unwrap();
+        }
+        drop(owner);
+        store.remove_machine(&machine).await.unwrap();
     }
 
     fn machine_from_path(id: MachineId, name: String, machine_dir: &Path) -> MachineConfig {

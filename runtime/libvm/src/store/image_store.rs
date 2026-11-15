@@ -17,6 +17,13 @@ use crate::store::models::{
 use crate::store::{ImageStore, ReadOnlyStore, Store};
 use crate::LibVmError;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheMaintenance {
+    Recovery,
+    Sweep,
+    Prune,
+}
+
 #[async_trait]
 impl ImageStore for Store {
     async fn begin_storage_operation(
@@ -280,7 +287,7 @@ impl ImageStore for Store {
                 bytes_removed: 0,
             });
         }
-        let (mut report, _) = self.prune_image_cache(true).await?;
+        let (mut report, _) = self.prune_image_cache(CacheMaintenance::Prune).await?;
         report.artifacts_removed = report.artifacts_removed.saturating_add(artifacts);
         Ok(report)
     }
@@ -391,7 +398,57 @@ impl Store {
         Ok(selected.zip(manifest))
     }
 
+    /// Recover only catalogued producers and disposable staging directories.
+    /// Neither immutable pool discovery nor published-map validation runs here.
+    pub(crate) async fn recover_pending_operations(
+        &self,
+    ) -> Result<CacheRecoveryReport, LibVmError> {
+        match fs::symlink_metadata(&self.images_dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CacheRecoveryReport::default())
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let store = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let recovered = tokio::task::spawn_blocking(move || {
+            runtime.block_on(async {
+                let pool = crate::storage::pool::StoragePool::open(&store.images_dir)?;
+                let recovery = store.retire_pending_storage_operations(&pool).await?;
+                if recovery.checkpoint_deferred() {
+                    return Ok(recovery);
+                }
+                store.recover_temporary_workspaces(&pool, recovery).await
+            })
+        })
+        .await?;
+        match recovered {
+            Err(LibVmError::CacheDependency { machine, path }) => Ok(CacheRecoveryReport {
+                deferred: vec![CacheCleanupDeferral::ExternalDependency { machine, path }],
+            }),
+            result => result,
+        }
+    }
+
+    /// Recover abandoned producers and orphan pool files without revalidating
+    /// published maps or retiring prune-only image and layer cache roots.
+    pub(crate) async fn recover_pending_image_cache(
+        &self,
+    ) -> Result<CacheRecoveryReport, LibVmError> {
+        self.recover_image_cache_with_mode(CacheMaintenance::Recovery)
+            .await
+    }
+
     pub(crate) async fn recover_image_cache(&self) -> Result<CacheRecoveryReport, LibVmError> {
+        self.recover_image_cache_with_mode(CacheMaintenance::Sweep)
+            .await
+    }
+
+    async fn recover_image_cache_with_mode(
+        &self,
+        maintenance: CacheMaintenance,
+    ) -> Result<CacheRecoveryReport, LibVmError> {
         match fs::symlink_metadata(&self.images_dir) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -400,11 +457,16 @@ impl Store {
             Err(error) => return Err(error.into()),
         }
         let recovered = async {
-            let recovery = self.recover_layer_objects().await?;
+            let recovery = match maintenance {
+                CacheMaintenance::Recovery => self.recover_orphan_objects().await?,
+                CacheMaintenance::Sweep | CacheMaintenance::Prune => {
+                    self.recover_layer_objects().await?
+                }
+            };
             if recovery.checkpoint_deferred() {
                 return Ok::<_, LibVmError>(recovery);
             }
-            let (_, recovery) = self.prune_image_cache(false).await?;
+            let (_, recovery) = self.prune_image_cache(maintenance).await?;
             Ok(recovery)
         }
         .await;
@@ -419,7 +481,7 @@ impl Store {
 
     async fn prune_image_cache(
         &self,
-        prune_unreferenced: bool,
+        maintenance: CacheMaintenance,
     ) -> Result<(ImagePruneReport, CacheRecoveryReport), LibVmError> {
         let store = self.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -427,25 +489,16 @@ impl Store {
         // Cancellation of an awaiting caller cannot strand filesystem cleanup
         // on an executor or outlive its writable catalog capability.
         tokio::task::spawn_blocking(move || {
-            runtime.block_on(store.prune_image_cache_inner(prune_unreferenced))
+            runtime.block_on(store.prune_image_cache_inner(maintenance))
         })
         .await?
     }
 
-    async fn prune_image_cache_inner(
+    async fn recover_temporary_workspaces(
         &self,
-        prune_unreferenced: bool,
-    ) -> Result<(ImagePruneReport, CacheRecoveryReport), LibVmError> {
-        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
-        let mut recovery = self.retire_abandoned_storage_operations(&pool).await?;
-        let mut report = ImagePruneReport {
-            references_removed: 0,
-            artifacts_removed: 0,
-            bytes_removed: 0,
-        };
-        if recovery.checkpoint_deferred() {
-            return Ok((report, recovery));
-        }
+        pool: &crate::storage::pool::StoragePool,
+        mut recovery: CacheRecoveryReport,
+    ) -> Result<CacheRecoveryReport, LibVmError> {
         // Keep only one temporary directory/lease open, and never discover
         // directory entries while holding roots.
         for candidate in pool.abandoned_temporary()? {
@@ -476,7 +529,7 @@ impl Store {
             // Stabilize the observed absence, not an earlier catalog snapshot.
             if let Some(deferred) = self.try_checkpoint_catalog().await?.deferral() {
                 recovery.deferred.push(deferred);
-                return Ok((report, recovery));
+                return Ok(recovery);
             }
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let retained_capture: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('capture','live-fork'))")
@@ -494,14 +547,41 @@ impl Store {
             candidate.remove()?;
             tx.commit().await?;
         }
-        crate::store::stream_representation::check_catalog(self).await?;
-        if prune_unreferenced {
+        Ok(recovery)
+    }
+
+    async fn prune_image_cache_inner(
+        &self,
+        maintenance: CacheMaintenance,
+    ) -> Result<(ImagePruneReport, CacheRecoveryReport), LibVmError> {
+        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+        let mut recovery = self.retire_abandoned_storage_operations(&pool).await?;
+        let mut report = ImagePruneReport {
+            references_removed: 0,
+            artifacts_removed: 0,
+            bytes_removed: 0,
+        };
+        if recovery.checkpoint_deferred() {
+            return Ok((report, recovery));
+        }
+        recovery = self.recover_temporary_workspaces(&pool, recovery).await?;
+        if recovery.checkpoint_deferred() {
+            return Ok((report, recovery));
+        }
+        if maintenance != CacheMaintenance::Recovery {
+            self.check_operation_recovery(&pool).await?;
+            crate::store::snapshot_store::check_snapshot_catalog(self).await?;
+            crate::store::managed_image_store::check_image_catalog(self).await?;
+            crate::store::stream_representation::check_catalog(self).await?;
+            crate::store::cache_paths::check_machine_dependencies(self).await?;
+        }
+        if maintenance == CacheMaintenance::Prune {
             report.bytes_removed = report
                 .bytes_removed
                 .saturating_add(self.evict_flat_materializations().await?);
         }
         let (transport_bytes, transport_recovery) = self
-            .prune_transport_caches(&pool, prune_unreferenced)
+            .prune_transport_caches(&pool, maintenance == CacheMaintenance::Prune)
             .await?;
         report.bytes_removed = report.bytes_removed.saturating_add(transport_bytes);
         recovery.deferred.extend(transport_recovery.deferred);
@@ -511,30 +591,19 @@ impl Store {
         let mut scan = pool.scan_streams()?;
         let mut pending_cursor = String::new();
         loop {
-            self.check_operation_recovery(&pool).await?;
-            crate::store::snapshot_store::check_snapshot_catalog(self).await?;
-            crate::store::managed_image_store::check_image_catalog(self).await?;
-            crate::store::stream_representation::check_catalog(self).await?;
-            crate::store::cache_paths::check_machine_dependencies(self).await?;
             let discovered = scan.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
             let scan_finished = discovered.is_empty();
             let _roots = pool.lock_roots()?;
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-            for (id, length) in discovered {
-                if crate::store::cache_paths::machine_retains_stream(&mut tx, id).await?
-                    || crate::store::stream_representation::stream_reachable(&mut tx, id).await?
-                {
-                    continue;
-                }
-                sqlx::query("INSERT INTO image_stream_gc(stream_id,size_bytes) VALUES(?1,?2) ON CONFLICT(stream_id) DO NOTHING")
-                    .bind(id.to_string()).bind(i64_from_u64(length)?).execute(&mut *tx).await?;
-            }
+            sqlx::query("INSERT INTO image_stream_gc(stream_id,size_bytes) SELECT json_extract(c.value,'$[0]'),json_extract(c.value,'$[1]') FROM json_each(?1) c LEFT JOIN retained_stream r ON r.stream_id=json_extract(c.value,'$[0]') WHERE r.stream_id IS NULL ON CONFLICT(stream_id) DO NOTHING")
+                .bind(serde_json::to_string(&discovered).map_err(crate::store::models::snapshot::invalid)?)
+                .execute(&mut *tx).await?;
             sqlx::query("DELETE FROM image_manifest WHERE NOT EXISTS(SELECT 1 FROM image_ref r WHERE r.manifest_digest=image_manifest.digest) AND NOT EXISTS(SELECT 1 FROM image_composition_artifact a WHERE a.manifest_digest=image_manifest.digest)").execute(&mut *tx).await?;
             sqlx::query("DELETE FROM image_layer WHERE NOT EXISTS(SELECT 1 FROM image_manifest_layer ml WHERE ml.layer_diff_id=image_layer.diff_id AND ml.layer_blob_digest=image_layer.blob_digest)").execute(&mut *tx).await?;
             if !scan_finished {
                 pending_cursor.clear();
             }
-            let pending = sqlx::query("SELECT stream_id,size_bytes FROM image_stream_gc g WHERE stream_id>?1 AND NOT EXISTS(SELECT 1 FROM layer_result l WHERE l.pack_stream=g.stream_id) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream p WHERE p.stream_id=g.stream_id) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency s WHERE s.stream_id=g.stream_id) AND NOT EXISTS(SELECT 1 FROM image_stream_dependency i WHERE i.stream_id=g.stream_id) ORDER BY stream_id LIMIT 256").bind(&pending_cursor).fetch_all(&mut *tx).await?;
+            let pending = sqlx::query("SELECT g.stream_id,g.size_bytes FROM image_stream_gc g LEFT JOIN retained_stream r ON r.stream_id=g.stream_id WHERE g.stream_id>?1 AND r.stream_id IS NULL ORDER BY g.stream_id LIMIT 256").bind(&pending_cursor).fetch_all(&mut *tx).await?;
             let pending_count = pending.len();
             let mut deletions = Vec::new();
             for row in pending {
@@ -543,11 +612,6 @@ impl Store {
                 let id = stream
                     .parse::<crate::storage::identity::StreamId>()
                     .map_err(|error| storage_error(error.into()))?;
-                if crate::store::cache_paths::machine_retains_stream(&mut tx, id).await?
-                    || crate::store::stream_representation::stream_reachable(&mut tx, id).await?
-                {
-                    continue;
-                }
                 let path = pool.stream_path(&id);
                 validate_collectable_stream(&path, &self.images_dir, &stream)?;
                 deletions.push((stream, path, u64_from_i64(row.try_get("size_bytes")?)?));

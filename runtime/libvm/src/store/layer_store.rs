@@ -817,6 +817,12 @@ fn prepare(
         _staged: staged,
     })
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectRecovery {
+    CatalogEdges,
+    ValidateCatalog,
+}
+
 impl Store {
     pub(crate) async fn check_layer_catalog(&self) -> Result<(), LibVmError> {
         let mut cursor = String::new();
@@ -848,50 +854,40 @@ impl Store {
             let pool=StoragePool::open(&store.images_dir)?;
             store.retire_abandoned_storage_operations(&pool).await?;
             store.check_layer_catalog().await?;
-            let mut cursor=String::new();
-            loop {
-                let ids=sqlx::query_scalar::<_,String>("SELECT owner_digest FROM layer_occurrence_set WHERE owner_digest>?1 ORDER BY owner_digest LIMIT 256")
-                    .bind(&cursor).fetch_all(&store.pool).await?;
-                if ids.is_empty(){break;}
+            {
                 let _roots=pool.lock_roots()?;
                 let mut tx=store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                for owner in ids {
-                    cursor.clone_from(&owner);
-                    sqlx::query("DELETE FROM layer_occurrence_set WHERE owner_digest=?1 AND NOT EXISTS(SELECT 1 FROM image_manifest m JOIN image_ref r ON r.manifest_digest=m.digest WHERE m.digest=?1 OR m.config_digest=?1) AND NOT EXISTS(SELECT 1 FROM storage_image WHERE record_digest=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_object WHERE object_digest=?1)")
-                        .bind(owner).execute(&mut *tx).await?;
-                }
+                sqlx::query("DELETE FROM layer_occurrence_set WHERE NOT EXISTS(SELECT 1 FROM image_manifest m JOIN image_ref r ON r.manifest_digest=m.digest WHERE m.digest=layer_occurrence_set.owner_digest OR m.config_digest=layer_occurrence_set.owner_digest) AND NOT EXISTS(SELECT 1 FROM storage_image WHERE record_digest=layer_occurrence_set.owner_digest) AND NOT EXISTS(SELECT 1 FROM storage_operation_object WHERE object_digest=layer_occurrence_set.owner_digest)")
+                    .execute(&mut *tx).await?;
                 tx.commit().await?;
             }
             crate::store::cache_paths::check_machine_dependencies(&store).await?;
             crate::store::composition_store::retire_compositions(&store, &pool).await?;
-            let mut cursor=String::new();
-            loop {
-                let ids=sqlx::query_scalar::<_,String>("SELECT id FROM layer_result WHERE id>?1 ORDER BY id LIMIT 256")
-                    .bind(&cursor).fetch_all(&store.pool).await?;
-                if ids.is_empty(){break;}
-                let _roots=pool.lock_roots()?;
-                let mut tx=store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                for id in ids {
-                    cursor.clone_from(&id);
-                    let stream: Option<String>=sqlx::query_scalar("SELECT pack_stream FROM layer_result WHERE id=?1").bind(&id).fetch_optional(&mut *tx).await?;
-                    if let Some(stream)=stream {
-                        if crate::store::cache_paths::machine_retains_stream(&mut tx,stream.parse::<StreamId>().map_err(semantic)?).await? {continue;}
-                    }
-                    sqlx::query("DELETE FROM layer_result WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM layer_occurrence WHERE result_id=?1) AND NOT EXISTS(SELECT 1 FROM composition_layer WHERE layer_result_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_layer WHERE result_id=?1) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM image_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=layer_result.pack_stream)")
-                        .bind(&id).execute(&mut *tx).await?;
-                }
-                tx.commit().await?;
-            }
-            loop {
-                let _roots=pool.lock_roots()?;
-                let removed=sqlx::query("DELETE FROM layer_recipe WHERE id IN (SELECT p.id FROM layer_recipe p WHERE NOT EXISTS(SELECT 1 FROM layer_result r WHERE r.recipe_id=p.id) ORDER BY p.id LIMIT 256)").execute(&store.pool).await?.rows_affected();
-                if removed<256 {break;}
-            }
+            let _roots=pool.lock_roots()?;
+            let mut tx=store.pool.begin_with("BEGIN IMMEDIATE").await?;
+            sqlx::query("DELETE FROM layer_result WHERE NOT EXISTS(SELECT 1 FROM machine_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM layer_occurrence WHERE result_id=layer_result.id) AND NOT EXISTS(SELECT 1 FROM composition_layer WHERE layer_result_id=layer_result.id) AND NOT EXISTS(SELECT 1 FROM storage_operation_layer WHERE result_id=layer_result.id) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM image_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=layer_result.pack_stream)")
+                .execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM layer_recipe WHERE NOT EXISTS(SELECT 1 FROM layer_result r WHERE r.recipe_id=layer_recipe.id)")
+                .execute(&mut *tx).await?;
+            tx.commit().await?;
             Ok::<_,LibVmError>(())
         })).await?
     }
     pub(crate) async fn recover_layer_objects(
         &self,
+    ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
+        self.recover_objects(ObjectRecovery::ValidateCatalog).await
+    }
+
+    pub(crate) async fn recover_orphan_objects(
+        &self,
+    ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
+        self.recover_objects(ObjectRecovery::CatalogEdges).await
+    }
+
+    async fn recover_objects(
+        &self,
+        mode: ObjectRecovery,
     ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
         let store = self.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -911,12 +907,7 @@ impl Store {
             runtime.block_on(crate::store::artifact_store::retire_unrooted_managed(
                 &store, &pool,
             ))?;
-            let mut scan = pool.scan_objects()?;
-            loop {
-                let batch = scan.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
-                if batch.is_empty() {
-                    break;
-                }
+            if mode == ObjectRecovery::ValidateCatalog {
                 runtime.block_on(store.check_operation_recovery(&pool))?;
                 runtime.block_on(store.check_layer_catalog())?;
                 runtime.block_on(crate::store::composition_store::check_composition_catalog(
@@ -927,24 +918,22 @@ impl Store {
                     &store,
                 ))?;
                 runtime.block_on(crate::store::stream_representation::check_catalog(&store))?;
-                runtime.block_on(crate::store::stream_representation::retire_unrooted(
-                    &store, &pool,
-                ))?;
-                runtime.block_on(crate::store::cache_paths::check_machine_dependencies(
-                    &store,
-                ))?;
+            }
+            runtime.block_on(crate::store::stream_representation::retire_unrooted(
+                &store, &pool,
+            ))?;
+            let mut scan = pool.scan_objects()?;
+            loop {
+                let batch = scan.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
+                if batch.is_empty() {
+                    break;
+                }
                 let _roots = pool.lock_roots()?;
                 let deferred = runtime.block_on(async {
                     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                    let mut orphaned = Vec::new();
-                    for digest in batch {
-                        let retained =
-                            crate::store::stream_representation::object_reachable(&mut tx, digest)
-                                .await?;
-                        if !retained {
-                            orphaned.push(digest);
-                        }
-                    }
+                    let orphaned =
+                        crate::store::stream_representation::unreachable_objects(&mut tx, &batch)
+                            .await?;
                     // A fully retained batch has no unlink to authorize. In
                     // particular it needs neither a WAL checkpoint nor a
                     // second writer transaction on every runtime open.
@@ -977,12 +966,10 @@ impl Store {
                     .await?;
                     #[cfg(test)]
                     _context.hit(WorkerPoint::RecoveryDelete)?;
-                    for digest in orphaned {
-                        if crate::store::stream_representation::object_reachable(&mut tx, digest)
+                    for digest in
+                        crate::store::stream_representation::unreachable_objects(&mut tx, &orphaned)
                             .await?
-                        {
-                            continue;
-                        }
+                    {
                         pool.remove_object(&digest)?;
                     }
                     tx.commit().await?;

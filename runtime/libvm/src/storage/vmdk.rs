@@ -20,7 +20,7 @@ const HEADER: &str = "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=
 
 /// The retained immutable identity backing one occurrence: the fsmeta byte
 /// object or a payload-pack stream. Neither is ever copied into a lower file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LowerBacking {
     Object(ObjectDigest),
     Stream(StreamId),
@@ -211,6 +211,39 @@ impl PreparedLowerPlan<'_> {
                     actual,
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// A held local validation proof replaces byte hashing, not pool/path,
+    /// occurrence-order, length or resource admission checks.
+    pub(crate) fn verify_composition(
+        &self,
+        pool: &StoragePool,
+        validation: &crate::storage::composition::CompositionValidation,
+    ) -> Result<(), StorageError> {
+        validation.check_occurrences(self.occurrences())?;
+        for (index, occurrence) in self.occurrences().iter().enumerate() {
+            let path = match occurrence.backing {
+                LowerBacking::Stream(id) => pool.stream_path(&id),
+                LowerBacking::Object(id) => pool.object_path(&id),
+            };
+            if path != occurrence.path {
+                return Err(StorageError::InvalidPath(
+                    "validated lower occurrence is outside the current pool".into(),
+                ));
+            }
+            if self.occurrences()[..index]
+                .iter()
+                .any(|previous| previous.backing == occurrence.backing)
+            {
+                continue;
+            }
+            let file = match occurrence.backing {
+                LowerBacking::Stream(id) => pool.open_stream(&id)?,
+                LowerBacking::Object(id) => pool.open_object(&id)?,
+            };
+            validation.check_file(occurrence.backing, &file)?;
         }
         Ok(())
     }

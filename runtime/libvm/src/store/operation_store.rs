@@ -1151,6 +1151,24 @@ impl Store {
         pool: &StoragePool,
     ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
         self.check_operation_recovery(pool).await?;
+        self.retire_storage_operations(pool).await
+    }
+
+    /// Recover catalogued operations without scanning historical lease files.
+    /// Each record's lease identity is validated before the retirement path
+    /// separately proves exclusive ownership.
+    pub(crate) async fn retire_pending_storage_operations(
+        &self,
+        pool: &StoragePool,
+    ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
+        self.check_pending_operation_recovery(pool).await?;
+        self.retire_storage_operations(pool).await
+    }
+
+    async fn retire_storage_operations(
+        &self,
+        pool: &StoragePool,
+    ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
         self.retire_boot_update_operations(pool).await?;
         let mut report = crate::store::models::CacheRecoveryReport::default();
         let mut cursor = String::new();
@@ -1809,6 +1827,10 @@ impl Store {
                 }
             }
         }
+        self.check_pending_operation_recovery(pool).await
+    }
+
+    async fn check_pending_operation_recovery(&self, pool: &StoragePool) -> Result<(), LibVmError> {
         let mut cursor = String::new();
         loop {
             let operations = sqlx::query_scalar::<_,String>("SELECT operation_id FROM storage_operation WHERE operation_id>?1 ORDER BY operation_id LIMIT 256")

@@ -267,7 +267,7 @@ async fn restore_consumer(
     // checkpoint graph (authenticated, exact-loaded) under the consumer.
     if let Some(lower) = consumer.record.lower() {
         crate::store::layer_store::LayerStore::from_store(runtime.native_store()?)
-            .publish_snapshot_composition(consumer.operation_id, lower)
+            .publish_local_composition(consumer.operation_id, lower)
             .await?;
     }
     let transfer_roles = request.objects.len() as u64
@@ -763,9 +763,8 @@ fn verify_lower_shape(
     })
 }
 
-/// Lower of a local cut: the cut operation pins the retained composition;
-/// every backing is authenticated here (streams by map, fsmeta by streaming
-/// whole-byte SHA-256) and held through descriptor handoff.
+/// The cut operation pins the retained composition. Held local validation
+/// authority binds each immutable backing through descriptor handoff.
 pub(crate) fn verify_local_lower(
     pool: &StoragePool,
     storage: &MachineStorageRecord,
@@ -775,27 +774,14 @@ pub(crate) fn verify_local_lower(
     match (&storage.root, lower) {
         (MachineRoot::LinuxOverlay { lower: root, .. }, Some(launch)) => {
             launch.retained.check_lower(root)?;
+            crate::storage::vmdk::FlatLowerPlan::new(&launch.occurrences)?
+                .preflight(0)?
+                .verify_composition(pool, &launch.validation)?;
             verify_lower_shape(
                 &launch.occurrences,
                 root.geometry().length,
                 configuration,
-                |backing, length| match backing {
-                    LowerBacking::Stream(stream) => {
-                        let authenticated =
-                            crate::machine::stopped::open_immutable_stream(pool, &stream, length)?;
-                        Ok((
-                            authenticated.file().try_clone()?,
-                            authenticated.fingerprint(),
-                        ))
-                    }
-                    LowerBacking::Object(object) => {
-                        let file = pool.verify_object(&object)?;
-                        let fingerprint = crate::storage::identity_file::SourceFingerprint::new(
-                            &file.metadata()?,
-                        );
-                        Ok((file, fingerprint))
-                    }
-                },
+                |backing, _length| launch.held_backing(backing),
             )
             .map(Some)
         }
