@@ -1,7 +1,8 @@
 # Retained 4 GiB and OCI performance gates
 
-These serial gates retain their original measurement contracts in addition to
-Phase 30's agent-ready scenario. They are not collected by `make smoke`.
+These serial gates retain the 4 GiB and OCI fixtures alongside Phase 30's
+agent-ready scenario. Wave two measures capture pause exactly, separately from
+post-resume seal latency and workload gaps. `make smoke` does not collect them.
 
 ### OCI ingest budget cohort (Phase 24)
 
@@ -108,8 +109,8 @@ unmeasured claim about the ADR's XFS/APFS reference hosts.
 
 ### Live fork budget cohorts (Phase 16)
 
-`tests/test_fork_budget.py` measures ADR 0021 full capture interruption,
-restore to Running and four-child fork to Running. Workspaces and evidence
+`tests/test_fork_budget.py` measures ADR 0021 full capture pause,
+restore to agent ready and four-child fork through activation. Workspaces and evidence
 default to durable directories under the Cargo smoke root; tmpfs is refused.
 `SILO_SMOKE_BUDGET_DIR` and `SILO_SMOKE_BUDGET_EVIDENCE` optionally override them.
 Short runtime directories keep sockets/locks separate from durable disk bytes.
@@ -155,22 +156,31 @@ claiming the disk was quiet. Boot pairs retain separate raw/layered records unde
 `writeback`, and repeat conditioning before each profile's start.
 
 Gated values: fork4 is CLI dispatch to the last durable child `running` stamp
-(API entry, seal to Running and caller end-to-end are separate fields); capture
-interruption is the larger of the source monitor's conservative staging-to-
-continuation interval and an independent host observation of the guest's
-durable 50 ms witness writes in the source backing. At fixture setup, a real
-`FICLONE` probe between sibling files in the budget workspace selects the lane,
-independently of the capture request's disk copy contract. Reflink lanes subtract
-zero **copy allowance** and budget cold restore. On non-reflink lanes the ADR
-non-CoW allowance (upper allocated bytes at the measured sequential copy rate)
-is subtracted, and cold restore is recorded but not budgeted. Capture interruption
-and incremental interruption additionally subtract the **disk-sealing allowance**
-on every lane: sealed upper allocated bytes divided by the host's measured
-warm sequential SHA-256 CPU rate. Restore and fork-to-Running receive no
-disk-sealing allowance. Samples keep raw timing and existing copy fields,
-adding `diskSealAllowance`, `diskSealAllowanceSeconds` and the separately
-adjusted `gatedExcessSeconds`; summaries report both allowances and their inputs.
-The measured disk-seal duration is still recorded, not used as the allowance.
+(API entry, seal to Running and caller end-to-end are separate fields). Capture
+pause is exactly the source monitor's `capture pause established` to
+`capture pause released with ClockOnly`, not staging-to-continuation time or the
+host-observed gap between durable 50 ms witness writes. The witness gap remains
+an independent workload-unavailability diagnostic. `pauseToSealSeconds` separately
+records pause established to final seal, which can extend beyond source resume.
+
+At setup a real `FICLONE` probe between sibling workspace files selects the lane,
+independently of the request's disk-copy contract. Reflink lanes subtract zero
+**copy allowance** and budget cold restore. Non-reflink lanes subtract the
+non-CoW allowance (upper allocated bytes at the measured sequential copy rate);
+cold restore remains recorded but unbudgeted. Capture and incremental pause
+subtract a **disk-sealing allowance** only when identity work occurs inside the
+measured pause: sealed upper allocated bytes divided by the measured warm
+sequential SHA-256 rate. Deferred reflink identity work occurs after source
+continuation at `capture-disk-identity`, is separately reported seal latency,
+and receives no pause allowance. Its `diskSealAllowance.includedInInterval` is
+false and `diskSealAllowanceSeconds` is zero. Restore and fork receive no
+disk-sealing allowance.
+
+Samples retain raw timing, copy fields, `diskSealAllowance`,
+`diskSealAllowanceSeconds` and `gatedExcessSeconds`; summaries report allowances
+and their inputs. `diskIdentityInPause` identifies whether the identity work was
+included in the pause. Measured disk-seal duration remains a diagnostic, not the
+allowance, and no post-resume time is subtracted from a pause gate.
 
 The reference-host hash probe writes and fsyncs a fresh 1 GiB `/dev/urandom`
 file in the budget workspace, then hashes it twice using in-process
@@ -212,7 +222,7 @@ budgeted for every new gate, including non-reflink incremental capture.
 
 | Pytest selector (`-k`) | Measured boundary and median gate | Additional free-space preflight |
 | --- | --- | --- |
-| `test_fork_budget_incremental_ten_percent_dirty` | Incremental workload interruption, larger of monitor staging-to-continuation interval and independent durable-workload gap, at most 1.0 s after non-CoW copy and disk-sealing allowances | 14 GiB |
+| `test_fork_budget_incremental_ten_percent_dirty` | Exact native pause established to released, at most 1.0 s after non-CoW copy allowance and only disk identity work included in that pause; workload gap and pause-to-seal latency are separate diagnostics | 14 GiB |
 | `test_fork_budget_warm_create_stopped_machine` | Prepared-image `silo create` dispatch to command exit, at most 2.0 s, no allowance | 4 GiB |
 | `test_fork_budget_boot_layered_within_raw` | `silo start` dispatch to product trace's first guest-agent-serving event, median layered seconds / median raw seconds at most 1.2 | 6 GiB |
 
@@ -242,12 +252,13 @@ record the exact workload byte count and fraction separately from
 `productDirtyFraction`, derived from the product's
 `memory.stats.identityBytesHashed / logicalBytes` at its 8 MiB chunk resolution;
 the product exposes no separate page-granular dirty-fraction field.
-They retain the complete memory receipt, raw interruption, monitor disk-seal
-times and separate one-upper copy and disk-sealing allowance inputs. The copy
-allowance is zero on reflink filesystems or allocated source-upper bytes divided
-by the host's measured sequential copy rate otherwise. The disk-sealing allowance
-is the actual sealed upper's allocated bytes divided by the measured sequential
-hash rate on every filesystem. The target stays 1.0 s.
+They retain the complete memory receipt, exact pause, independent workload gap,
+pause-to-seal latency and separate one-upper copy and disk-sealing allowance
+inputs. Copy allowance is zero on reflink filesystems or allocated source-upper
+bytes divided by the measured sequential copy rate otherwise. Disk-sealing
+allowance is sealed upper allocated bytes divided by the measured hash rate
+only when that work is inside the pause; post-resume identity completion has
+`includedInInterval = false` and zero pause allowance. The target stays 1.0 s.
 After each sample the source run ends, its machine and previous checkpoint
 alias/retention are removed, and storage is pruned. Except after the last
 sample, the newest checkpoint is restored outside timing with its inherited

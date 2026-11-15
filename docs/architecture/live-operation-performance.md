@@ -20,7 +20,7 @@ durable summary.
 |---|---|---|
 | Start to agent ready | command start → guest agent ready | CLI and store preamble, launch, boot and guest-agent readiness; image init as PID 1 is the default. |
 | Capture total | command start → snapshot complete and source agent ready under the continuation policy | cut, source continuation and durable publication; record separately from interruption. A preserved user pause remains paused by policy. |
-| Capture interruption | source workload unavailable → thawed and agent ready, or the preserved-pause outcome | workload freeze, upper seal, device/vCPU serialization, touched RAM capture and receipt. The retained 4 GiB gates include their recorded copy and disk-sealing allowances; these do not permit violating Phase 30 scaling. |
+| Capture pause | native pause established → native pause released | exact vCPU pause, with copy and only in-pause identity allowances; deferred post-resume disk identity completion is separate seal latency and receives no pause allowance. Workload-unavailability gaps remain independent diagnostics. |
 | Restore to agent ready | command start → child guest agent ready, witness continuing | closure shape and trust checks, private upper clone or written-byte copy, launch, private RAM mapping, generation acknowledgement, activation and thaw. Local publication seeds first-restore trust without hashing RAM; imports and transport retain full authentication. |
 | Fork to all agents ready | command start → every requested child guest agent ready | one cut including pause, admission and child restores; the retained Fork4 gate requires all four agents. Durable fork is the default; fast same-host fork is a separate explicit mode. |
 | Exec round trip | command start → guest command completes and CLI returns | complete agent request and response, not application readiness. |
@@ -115,8 +115,9 @@ mismatches name the whole object's role, digest and length. Missing, truncated,
 writable or replaced members are structural failures. Recorded-zero chunks are
 read and checked; warm and composition receipts are ignored. Imported, pulled or
 transported snapshots, export and handoff still authenticate every byte.
-Changed-to-zero pages are explicit zero ranges, holes with format-level zero
-markers rather than inheritance; zero chunks are never hashed or stored.
+Changed-to-zero pages are explicit zero ranges, never inheritance: omitted on
+sparse rebuilds, punched on reflink seeds, and physically written as zeros only
+when punching is unsupported. Zero chunk objects are never hashed or stored.
 
 Durable fork remains the default. The separately selected fast same-host fork
 has no RAM file; source and children share guest memory copy-on-write, siblings
@@ -165,6 +166,25 @@ required copies hash inline, and recovery/replay authenticate bytes.
 Independent same-identity pool streams skip scanning only when their
 `verified_object` receipt matches the current fingerprint. The snapshot
 publication transaction seeds warm receipts for RAM and those disks.
+
+### Wave two: deferred disk identities and sparse RAM
+
+Reflink capture now flushes, clones and records ownership in the pause, then
+persists an `IdentityPending` cut before accepting RAM and continuing the source.
+Clone hashing runs at `capture-disk-identity`; only complete identities permit
+the unchanged final seal or fork children. The cut survives process crashes,
+not power loss. Running sources admit sessions but refuse a new user pause
+until capture settles; exact-capture cancellation retains any accepted baseline.
+Pause established to released is measured separately from seal latency, and
+post-resume identity work receives no pause allowance.
+
+RAM zero runs are omitted, punched or zero-written only on unsupported punching;
+full private anonymous boot RAM uses held-cut pagemap proof to skip known-zero
+pages, with full-read fallback for other backing or unavailable metadata.
+Discarded dirties still require classification reads; swapped and huge-page
+cases are not separately qualified. These changes do not establish the
+end-to-end targets; measured wave-two results must be recorded before claiming
+that a target is met.
 
 ### Runtime opening and recovery
 
@@ -410,11 +430,12 @@ on CoW lanes and overlays only dirty runs; non-reflink lanes then rebuilt
 the complete file from the baseline, without a pre-pause copy. Both yielded
 the same bytes, and `CaptureMemoryStats.seedMethod` records `clone` or
 `rebuild`. Phase 30 disallows configured-RAM scans and requires changed-byte
-scaling on every lane. The retained capture and incremental interruption gates
-subtract a separate disk-sealing allowance (sealed upper allocated bytes /
-host-measured sequential SHA-256 rate), in addition to the existing non-CoW
-copy allowance where applicable. Restore and fork-to-agent-ready do not gain
-this allowance. Allowances do not authorize size-dependent reflink work.
+scaling on every lane. At Batch 4c, capture and incremental interruption gates
+subtracted a separate disk-sealing allowance (sealed upper allocated bytes /
+host-measured sequential SHA-256 rate), plus the non-CoW copy allowance where
+applicable; restore and fork received no disk-sealing allowance. Wave two keeps
+that allowance only for identity work inside the exact pause, never for deferred
+post-resume seal latency. Allowances do not authorize size-dependent reflink work.
 The historical allowance accounts for the measured Btrfs disk sealing cost of
 1.1–1.2 s for a 2 GiB upper with 1 GiB payload, not a changed RAM target;
 raw timings, both allowances and rate inputs remain in evidence. Attribution:

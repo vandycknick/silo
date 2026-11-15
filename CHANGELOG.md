@@ -9,6 +9,10 @@
   receipts and distinguishes stream chunks, state objects and structural failures.
   Every runtime open recovers abandoned pending work; only maintenance performs
   store-wide recovery. Retention semantics stay unchanged.
+  Reflink captures persist a process-crash recovery cut and complete disk identity
+  after source continuation, retaining accepted RAM on failure or cancellation.
+  Sparse RAM capture omits or punches zero runs and skips known-zero anonymous
+  boot pages with cut-bound pagemap proof; unsupported cases keep safe fallbacks.
   Performance budgets move to `make perf`; image init stays default.
 - Incremental snapshot publication no longer rereads all RAM on owned reflink
   paths, so RAM identity cost follows changed chunks. The Phase 30 contract
