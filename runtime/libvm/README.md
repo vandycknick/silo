@@ -679,9 +679,12 @@ default `ResumeIfAcquired` policy. Admission resolves that policy to `Preserve`
 in the immutable capture plan; fork results report the resolved `resumePolicy`
 separately from the original replay inputs.
 
-One authenticated operation-owned local cut supplies all children. RAM is not
-published as a named checkpoint or copied once per child: every child maps the
-same immutable inode privately. Writable disks remain independent qualified
+One structurally validated operation-owned local cut supplies all children.
+RAM is not published as a named checkpoint or copied once per child: every child
+maps the same immutable inode privately, trusting producer identities and
+unchanged owned inode facts without independently hashing RAM. This does not
+promise detection of RAM corruption that preserves those trusted facts.
+Writable disks remain independent qualified
 private copies. Empty destination options inherit no forwards, publications,
 network credentials, mount grants or secret scopes. Captured NIC presence and
 execution/device identities are preserved.
@@ -737,51 +740,47 @@ descriptor capacity before capture dispatch. Stable reservation ownership moves
 to exact child generations atomically with their launch dependency closure.
 Construction is parallel within that pre-admitted inventory, not subject to a
 fixed concurrent-restore cap. Metadata readers use independent descriptors of
-the authenticated immutable roles rather than rehashing RAM for every child.
-Seal verification derives each writable disk's canonical stream map in the same
-traversal that checks its evidence SHA-256; the fork loop that retained the cut
-hands those held inodes and maps directly to its cut opening, and every child
-copies from its own descriptor sharing that map. A cross-filesystem or
-uncertain relocation authenticates the resulting inode again (SHA-256 plus map)
-during retention; a restart or another process lacks the handoff and does the
-same for every cut disk before any child uses it.
+the retained immutable roles rather than rehashing RAM for every child. Cut
+retention validates the producer's canonical maps and inventory structurally.
+The fork loop hands its held disk inodes and maps to cut opening; children
+authenticate their private disk copies while writing. Cross-filesystem or
+uncertain disk relocation, and reopening a cut without the retained handoff,
+authenticate the cut disks before child use. RAM remains under the separate
+producer/owned-inode trust boundary.
 
-Seal verification (publication and local-cut retention) first admits every
-role's geometry, hardlink, cross-role and writable-source alias bounds, then
-authenticates in exactly two lanes: RAM on one extra thread with an explicit
-1 MiB stack and 1 MiB read buffer, every other role in inventory order on the
-caller. Monitor staging verification uses the same bounded scratch and never
-overlaps libvm's, which needs the sealed evidence. A
-lane that fails or unwinds stops its sibling at the next read or role
-boundary; both are joined before verification returns (a panicked RAM lane is
-a typed error), so no lane outlives the caller's
-descriptors, staging or lease. Results keep the evidence inventory order.
-Restore closure verification falls back to serial operation when the additional
-lane's descriptor budget does not fit.
+Seal verification first admits every role's geometry, hardlink, cross-role and
+writable-source alias bounds. First-attempt RAM publication uses producer map
+authority and the clone/copy rules below; replay from persisted sealed state
+authenticates staged bytes again. Full byte verification uses two joined lanes:
+RAM on one extra thread with a 1 MiB stack and 1 MiB read buffer, other roles
+on the caller in inventory order. Failure or unwind stops the sibling at the
+next boundary and joins it before releasing descriptors, staging or leases.
+Restore closure verification can fall back to serial operation when the extra
+lane cannot be admitted.
 
 ### Execution restore
 
 `silo restore <checkpoint> [--name CHILD]` accepts an `image:` reference or a
 checkpoint alias and uses the same typed API locally and through the daemon.
 Live restore first checks the selected host capability without initializing a
-writable runtime. A leased verification consumer authenticates the complete
-closure and locally recorded capture seal, holding each hashed stream and
-non-map object inode; descriptor admission for exactly that set precedes the
-first open. Restore and stopped-snapshot construction take fresh independent
-descriptors bound to those held inodes by fingerprint instead of reopening and
-rehashing them, then close the held set before resource reservation; the lease
-keeps the closure pinned. State object digests are their whole-file SHA-256;
-RAM still receives one whole-file SHA-256 pass for its evidence binding, and
-private copies still verify their completed output. The exact selected monitor
-executable then inspects inherited state/lower descriptors and the real host
-profile before any child directory, private disk or network reservation is
-created.
+writable runtime, then validates closure shape before child allocation. A leased
+consumer retains the exact stream and object descriptors under descriptor
+admission. Cold durable restore authenticates RAM against its chunk map; warm
+restore may reuse a `verified_object` receipt matching device, inode, length,
+mode `0400` and ctime. Publication alone never creates that receipt. Export and
+handoff always authenticate bytes; local forks instead trust owned producer RAM.
+State object digests are whole-file SHA-256, while RAM identity is its ordered
+chunk map, not a whole-file SHA-256. Closure authentication overlaps private
+disk construction and must succeed before child publication. The selected monitor
+inspects inherited state/lower descriptors and the real host profile before any
+child directory, private disk or network reservation is created.
 
-Raw roots and writable Data disks become isolated private copies. A streaming
-copy from an authenticated closure or cut reuses that source map instead of
-recomputing it, but still scans the completed output and compares its complete
-map and length, rechecks source stability and syncs before publication; stopped
-machine disks, which carry no map authority, are scanned while copying. Layered
+Raw roots and writable Data disks become isolated private copies. Streaming
+copies reuse the source map and hash while writing, comparing chunk identities
+and length without rereading the completed output. Qualified kernel clones use
+the clone identity contract; source stability is rechecked in either case.
+Child synchronization belongs to the independent durability barrier described
+above. Stopped machine disks without map authority are scanned while copying. Layered
 EROFS lowers remain read-only VMDK devices with an explicitly retained fsmeta/pack
 closure; the generated descriptor is moved into the child without changing its
 inode. Source device IDs, order, format, access and geometry are preserved.
@@ -891,7 +890,8 @@ or failed-start cleanup, the manager reacquires the mutation lock and
 reauthenticates the published run; a concurrent stop or replacement run cannot be
 overwritten by a late startup result.
 
-Production restore remains lane-gated; public live lanes are unqualified.
+Production live operations use native availability and host/machine admission,
+not build-specific lane qualification.
 Stopped layered snapshots preserve the exact fsmeta/pack graph, while live
 capture/restore preserves its admitted read-only VMDK representation. Existing
 state still requires an explicit user wipe. Phase 22's independent umoci
@@ -899,7 +899,9 @@ namespace observations matched actual readonly EROFS traversals for all six
 published positives. Exact stable 7.2.2 and longterm 6.18.48 tuples passed
 production boot/lifecycle and guest-mutated flatten export followed by raw boot.
 Stopped portable artifacts and ownership return cycles passed independently.
-Performance remains deferred to the mandatory Phase 24 sweep.
+The completed Phase 24 Btrfs/ext4 live-budget sweep and its separate ingest
+limitations remain in the [performance record](../../docs/architecture/live-operation-performance.md);
+those dated measurements do not qualify later changes automatically.
 
 
 The initial stream hash of a private root describes its creation bytes only.
@@ -919,8 +921,14 @@ its independently admitted same-host Linux krun direct-boot profiles. General
 raw/cloud boot support does not qualify EFI, macOS, translation or partitioned
 roots for stopped/live capture.
 
-Acknowledged catalog writes use SQLite WAL with synchronous `FULL` and
-`fullfsync` enabled. Database identity checks use path metadata, never a raw
+Catalog writes use SQLite WAL with synchronous `NORMAL`, `fullfsync` and
+`checkpoint_fullfsync` enabled. Power-loss durability boundaries explicitly
+require a completed checkpoint before acknowledgment. Maintenance attempts one
+nonblocking PASSIVE checkpoint and defers deletion on contention; required
+boundaries retry PASSIVE on a dedicated guarded connection for up to five
+seconds, then return retryable `DurabilityPending` without acknowledging or
+deleting. This avoids a pending FULL checkpoint starving child durability
+writers. Database identity checks use path metadata, never a raw
 database/WAL/shared-memory descriptor. Writable pools retain a shared
 `catalog.lock` guard; SQLite also owns it through native connection teardown,
 including cancelled connection setup and asynchronous worker shutdown. A

@@ -2,7 +2,7 @@
 
 Date: 2026-10-25
 
-Updated: 2026-11-13
+Updated: 2026-11-15
 
 ## Status
 
@@ -331,6 +331,11 @@ finalizes without resuming. The pause token and owner are reported by the
 monitor's status API and persisted by libvm with the machine record, so a
 client that lost the response recovers them from either.
 
+A missing current pause authority is a refusal, never permission to recover a
+token from historical success. Manager diagnostics include the observed state,
+live activity, last live error, machine/run identity and pending resume request
+(or its lookup failure).
+
 ### Command and state matrix
 
 | State | Admitted commands | Rejected commands |
@@ -398,16 +403,21 @@ Both admitted profiles use this cgroup v2 layout:
 ```
 
 The split avoids cgroup v2's no-internal-process rule and systemd's
-single-writer ownership of its own subtree. Every agent-spawned session enters
-`exec`, then gets its own cgroup namespace rooted there. There is no
-login-session integration with the image init (owner decision O3).
+single-writer ownership of its own subtree. Every agent-spawned workload session
+enters `exec`; root sessions also get a cgroup namespace rooted there. Non-root
+sessions cannot unshare after their UID transition and cannot mount cgroupfs or
+migrate tasks. There is no login-session integration with the image init (O3).
 
 Before handing PID 1 to the image, the single-threaded handoff parent enters
 `image`, unshares its cgroup namespace, detaches the old `/sys/fs/cgroup`
 mount and mounts a fresh cgroup2 view. Silo mounts cgroup2 with
-`nsdelegate,memory_recursiveprot`; mounts from the initial namespace must
-preserve both options. The parent reports setup status through a close-on-exec
-pipe, closes inherited descriptors and execs the image init. Setup failure
+`nsdelegate,memory_recursiveprot`. A second cgroup2 mount from the initial
+namespace can clear these options even when it returns `EBUSY` (spike F1), so
+the agent does not remount it. Containment checks require `nsdelegate`.
+Every available controller is delegated at the real root, `silo` and
+`workloads`, including `cpuset` when offered; a fixed controller allowlist would
+silently remove image resource controls. The parent reports setup status through
+a close-on-exec pipe, closes inherited descriptors and execs the image init. Setup failure
 still execs init so PID 1 does not exit, but cannot qualify `ContainedInit`.
 The agent observes the distinct PID 1 namespace, image-rooted cgroup mount and
 PID 1 membership before reporting containment. It stays in `control` and uses
@@ -463,9 +473,10 @@ remains. Systemd-networkd may reacquire DHCP after thaw. This is a one-shot
 activation operation, not continuous network reconciliation.
 
 Owner decision D3 requires the agent to call `sync()` before the host's force
-stop when the image owns PID 1. This preserves writes made before ordinary
-`silo stop` without calling a particular init system. It does not turn force
-stop into an orderly image-service shutdown or certify clean storage.
+stop when the image owns PID 1, without calling a particular init system.
+The attempt is bounded to ten seconds; failure or timeout is diagnostic and
+cannot prove persistence. Even a completed sync does not turn force stop into
+an orderly image-service shutdown or certify clean storage.
 
 
 ### Ordering
@@ -482,9 +493,10 @@ A capture runs in this order; each step completes before the next begins:
 2. **Seal disks.** The worker completes outstanding block requests and
    flushes every writable backing file. The monitor then creates one
    immutable raw clone or copy of each included writable disk into the named
-   staging role, using [ADR 0014](0014-layered-oci-image-storage.md)'s qualified copy hierarchy, and synchronizes
-   it. Read-only attachments (the lower, boot assets) are recorded by
-   identity, not copied. A clone or copy failure on any disk fails the whole
+   staging role, using [ADR 0014](0014-layered-oci-image-storage.md)'s qualified copy hierarchy.
+   Staged copies close without synchronization; checkpoint publication or child
+   durability barriers provide persistence. Read-only attachments (the lower,
+   boot assets) are recorded by identity, not copied. A clone or copy failure on any disk fails the whole
    capture; no partial multi-disk cut is ever published.
 3. **Capture execution and devices.** The worker serializes transport, queue
    and device-specific state for every device, then the vCPU and VM
@@ -492,9 +504,13 @@ A capture runs in this order; each step completes before the next begins:
    timers, clocks). Execution capture precedes memory capture because
    interrupt-controller save can write guest RAM.
 4. **Capture memory.** Full, or incremental against a valid baseline. The
-   worker freezes host writers, harvests dirty coverage, and streams RAM into
-   the staging file. A changed-to-zero page is written as an explicit zero,
-   never omitted.
+   worker freezes host writers, harvests dirty coverage, and pipelines RAM reads
+   through bounded 32 MiB packs to two hash/write workers (96 MiB pack scratch).
+   Identity remains the ordered 8 MiB chunk map; pipelining changes neither
+   sparse-zero semantics nor the coherent cut. Full capture still scans configured
+   RAM, without pagemap-based untouched-page skipping. Workers join before capture
+   returns, including on cancellation or failure. A changed-to-zero page is
+   written as an explicit zero, never omitted.
 5. **Record.** The staged digests are computed while the bytes are written:
    the worker hashes each RAM chunk as it streams it and the monitor hashes
    each disk chunk as it copies it; no staged file is read back to be
@@ -528,7 +544,7 @@ A capture runs in this order; each step completes before the next begins:
    ownership of the pause transfers to `user`; the monitor issues the
    user-owned token and reports it through status and `GetOperation`. The
    monitor records the continuation in
-   `vm.capture-source.json`, written atomically and durably the same way,
+   `vm.capture-source.json`, written atomically without synchronization,
    with version, `machineId`, `runId`, `captureId`, the pause token and
    `sourceOutcome`: `resumed`, `preserved` or `resume-failed` with an error.
    A missing record while the run is alive means the continuation is
@@ -640,10 +656,12 @@ write otherwise. That complete file is the restore mapping target. A changed
 page costs a rehash of its 8 MiB identity chunk; this is accepted hash and
 transfer amplification, not the dirty-tracking granule.
 
-Durable publication of closed, owned, sealed producer RAM validates its canonical
+First publication of closed, owned, sealed producer RAM validates its canonical
 map, geometry and unchanged source inode facts across a successful reflink,
-without rereading RAM. Thus RAM identity work follows affected chunks rather
-than all populated RAM on the owned reflink path. A non-reflink copy still hashes
+without rereading RAM. A replay from persisted sealed state authenticates staged
+bytes again before publication; prior clone provenance is not replay authority.
+Thus RAM identity work follows affected chunks rather than all populated RAM on
+the owned reflink path. A non-reflink copy still hashes
 inline, and an independent existing same-ID pool inode is always authenticated
 before dedup reuse. Files and parent directories are still synchronized before
 the catalog commit and its durability barrier. The new publication binding is
@@ -698,9 +716,10 @@ private staging, file fsync, atomic rename, then directory fsync. SQL ownership
 commits before initial publication or construction-peak reduction. Interrupted
 updates therefore retain the complete conservative old charge or the complete
 new charge; interrupted initial staging is never an authoritative inventory
-entry. Under `admission.lock`, each home first atomically publishes a versioned
+entry. Under `admission.lock`, each home first atomically publishes a schema-2
 `<state-db-device>-<state-db-inode>-home.json` anchor containing its canonical
-absolute home path and `state.db` device/inode identity. Opening a home
+absolute home path, `state.db` device/inode identity and the exact operation
+lease device/inode identities and scopes for its charge documents. Opening a home
 reconciles its entries from authoritative SQL and refreshes the anchor, including
 after relocation. Before summing charges, every admission reclaims abandoned
 staging and checks other homes' anchors: a prefix is live only if its anchor
@@ -708,19 +727,35 @@ parses with a supported schema and the recorded path's `state.db` still has
 exactly the recorded device and inode. Missing or malformed anchors, deleted
 homes, and replaced databases release all entries of that prefix at the next
 admission by any home of the same user. The ledger directory is synced after
-reclamation. An anchor proves only existence, so an invalid anchor does not
-retain charges; malformed authoritative charges of a live home still refuse
-admission. Live homes' charges remain governed by their SQL journal receipts,
-never by PID or lock observations.
+reclamation. An anchor proves home existence, not an active producer.
+
+Admission probes the recorded operation leases exclusively without waiting.
+A free producer lease removes its future disk peak and descriptor charge from
+the sum without deleting its document or retiring SQL ownership: already-written
+bytes are accounted for by filesystem free space. Inherited native launch leases
+and detached workers still retain their own peaks after caller death. Fork
+inventories distinguish capture writers and each bound child, so one live sibling
+cannot retain dead siblings' peaks. Unknown lease ownership remains conservative;
+malformed authoritative charges with live or unknown owners refuse admission.
+Journal retirement and mapped-file retention still require their normal receipts
+and holder/lease reconciliation, independently of budget accounting. Resumed
+capture publishers re-admit peaks before writing. Generation handoff retains the
+old consumer lease through SQL transfer and refreshes the anchor afterwards,
+without holding `admission.lock` across the handoff.
 The resource-only ledger is `/tmp/silo-resource-budget-<euid>` (`/private/tmp`
 on macOS), a clean namespace cutover from older builds'
 `silo-restore-budget-<euid>` directory. New builds never read old-namespace
 documents, so old homes, including ones with old-build VMs still running, cannot
 block admission in a fresh home. The old directory may be deleted once no
 old-build Silo processes remain. No compatibility reader is provided.
-Charge documents in the new namespace reject unknown fields; live-home
-malformed-charge refusals and orphan-prefix reclamation apply unchanged.
+Charge documents in the new namespace reject unknown fields. Malformed charges
+with live or unknown lease owners refuse; orphan-prefix reclamation is unchanged.
 Refusals identify the owning home and ledger directory with removal guidance.
+Schema-2 anchors are a hard cutover; running older resource-ledger builds
+concurrently against the same user's ledger is unsupported. Host tests enable
+the dev-only `test-isolated-resource-budget` feature and use a ledger inside
+each fixture home; cross-home tests explicitly share a temporary ledger. There
+is no environment switch and production builds do not enable that feature.
 
 
 ### Reclaim
@@ -788,8 +823,9 @@ activation configuration; and `startPaused: true`.
 
 A restored child's private copies follow the fork rule: hashed as written,
 recorded `constructed` when complete, started on that record, and moved to
-`durable` by a background synchronization; a child without a durable record
-after a runtime restart is deleted by recovery, never started.
+`durable` by background synchronization. Recovery adopts a pending barrier while
+the exact monitor or run lease remains live; it deletes an incomplete child only
+after ordinary liveness reconciliation proves that no live owner remains.
 
 Private disk copies are role-selected paths under the child's data directory;
 the RAM file, layout, execution and device-state objects are leased content
@@ -977,15 +1013,21 @@ the cut's identity; a mismatch fails that child. The child's construction is
 recorded as `constructed`, not yet durable, as soon as its copies are
 complete, and the child may start on that record. Its durability barrier
 (file and directory synchronization) completes in the background and moves
-the record to `durable`; a child that still lacks a durable record after a
-runtime restart is deleted by recovery, never started. The fork completes
-when every child is `Running` and reports durability separately. A fork cut
-is collectable once every child is `durable`.
+the record to `durable`. After manager restart, recovery adopts pending barriers
+for children with live monitors or retained run leases; it deletes an incomplete
+child only after ordinary liveness reconciliation proves no live owner remains.
+Fork and restore record `Running` before joining the barriers, but do not return
+with barriers pending. A barrier failure reports `constructed` without stopping
+a running child. Collection also waits for all source-baseline and child leases,
+not just the last child's durability.
 
 The result names every child and its outcome and the source's continuation
-outcome. Before the capture seals, every child fails together. After it seals,
-one child's failure does not roll back running siblings or recapture the
-source. Cancelling a fork never deletes a running child's dependency root.
+outcome. A capture failure before sealing fails the batch together. Cancellation
+fences unsubmitted children, including an exact handoff cancelled before launch:
+after ownership cleanup they report `cancelled`, not `failed`. Already-submitted
+children settle normally. After sealing, one child's failure does not roll back
+running siblings or recapture the source. Cancelling a fork never deletes a
+running child's dependency root.
 
 An observed child restore failure retains its original bounded diagnostic and
 typed construction or activation phase in the fork journal before failed-start
@@ -1272,17 +1314,18 @@ destination matches:
 | Pinned | Admission |
 | --- | --- |
 | Guest ISA and hypervisor kind | Exact. KVM state never restores into HVF or VZ. OCI userspace architecture is irrelevant; the pin is the executing kernel's architecture. |
-| Capture ABI and producer | Exact libkrun capture ABI version, device codec versions and the Silo build that produced the checkpoint. Initial admission is exact-producer; a later release may admit an older producer only after qualifying that pair, and must reject with a diagnostic otherwise. |
+| Live state format | Exact `liveStateSchema` and component magic/schema versions. Native or Silo build identity, source revision and compiler settings are not compatibility pins. |
 | CPU contract | x86_64: effective CPUID, MSR inventory, TSC frequency (or qualified scaling), XSAVE component set. arm64: register list, feature inventory, counter frequency, GIC model. Expanded XSAVE, SVE/SME and nested state reject until qualified. |
 | Clocks and controllers | Saved TSC rate or counter and Mach timebase; HVF requires an equal timebase and a compatible GIC state format. |
 | Topology | vCPU count, RAM regions and granule, device IDs, order, MMIO windows, IRQs, negotiated features, queue sizes and capacities. Only the destination network binding and MAC may differ. |
 | Guest assets | Exact running kernel, initramfs provenance, agent binary and configuration schema, VM generation driver. A restore cannot upgrade any of them. |
 | Storage | Exact sealed disk identities, lower closure, root profile and geometry; required external resources with destination bindings. |
 
-The initial admitted target is the same host class: same hypervisor, same CPU
-contract, same Silo and libkrun build, in a fresh process after the source and
-its directory may be gone. Same-architecture restore on another host is a
-later profile with its own qualified source-to-destination contracts.
+The initial target is the same host class: same hypervisor and CPU contract,
+with the compatible state formats above, in a fresh process after the source
+and its directory may be gone. A different Silo or libkrun build alone is not a
+refusal. Same-architecture restore on another host remains a separate execution
+portability profile.
 Execution relocation through [ADR 0014](0014-layered-oci-image-storage.md)'s handoff protocol is a separately
 admitted mode that preserves the captured boot bundle and keeps the source
 fenced until ownership commits; it never uses fork auto-resume.
@@ -1291,7 +1334,7 @@ Publication retains the whole execution closure even when only the local host
 can run it. An artifact can be valid, inspectable and transferable while its
 execution is incompatible with the destination; the destination reports the
 incompatibility and preserves the artifact. Disk-only recovery from a
-checkpoint is an explicit `silo machine create --from-checkpoint-disks`
+checkpoint is an explicit `silo recover-disks <CHECKPOINT> --name <CHILD>`
 operation that boots a new machine from private copies of the sealed disks
 with stop outcome `unknown`; it is never offered as a fallback for a failed
 restore.
@@ -1394,18 +1437,19 @@ reopened by these measurements.
 
 ## libkrun Fork Commit Series
 
-Silo pins its own libkrun fork (`vandycknick/libkrun`, revision
-`11dbc786` in the root `Cargo.toml`): upstream plus four Silo commits
-(`balloon: reclaim reported guest RAM on macOS`, `vsock: add an owned native
-control-channel mux`, `virtio-fs: serve immutable captured Rosetta
-compatibility data`, `vmm: stream the external initramfs into guest
-memory`). The `Cargo.toml` pin is the only authority for the baseline. The
-live capability is added as the following series on top of
-that baseline. Each commit is one bounded feature in the fork's existing
-`subsystem: summary` style, builds and passes its own tests on Linux and
-macOS, depends only on the commits before it, and leaves every earlier
-native capability bit truthful. Advancing the upstream baseline is a
-separate rebase of the whole stack with no feature content and is never
+Silo pins its own libkrun fork (`vandycknick/libkrun`) at `662b359c` in the root
+`Cargo.toml`, directly from Git without a local path patch. That pin includes
+Linux tracked/restored balloon reclaim (`1742283d`) and pipelined RAM capture
+(`662b359c`). `Cargo.toml` is the authority for the current dependency.
+
+The table records the original live-state implementation series on historical
+baseline `11dbc786`, which already included Silo's macOS balloon reclaim,
+owned vsock mux, immutable Rosetta data and streamed external initramfs. It is
+not the current revision or a restriction on later amendments: in particular,
+the Linux reclaim amendment supersedes the restored-RAM inhibition in original
+commits 8 and 9. Each original commit was designed as one bounded feature in
+the fork's `subsystem: summary` style, preserving truthful native capability
+bits. Upstream rebases remain separate from feature changes and are never
 mixed into these commits. WHP, nested virtualization and TEE paths are
 omitted throughout.
 

@@ -246,7 +246,7 @@ root.
 
 ### Agent
 
-When the later handoff contract invokes a default or custom agent, every
+When the handoff contract invokes a default or custom agent, every
 `libvm`-managed invocation has `--config=<path>`. The agent:
 
 1. Parses its process arguments.
@@ -261,6 +261,16 @@ changes. The explicit configuration path is mandatory. There is no implicit
 managed-config path, environment-variable fallback, or discovery mechanism.
 The path is not sensitive and may appear in process arguments; configuration
 contents must never appear in arguments, environment variables, or logs.
+
+The default image-init handoff now preserves live operations through
+[ADR 0021's contained-init profile](0021-live-snapshots-and-forks.md#guest-profiles-and-contained-image-init).
+The image retains PID 1 in `silo/workloads/image`; the agent remains in
+`silo/control` with descriptors retained before the namespace remount. An
+uncontained handoff can still cold boot, but reports `InitChild` and refuses
+live operations. Agent-PID-1 boots use the same layout without image handoff.
+This changes no payload-copy or configuration provenance rule here. Restore
+activation updates runtime identity and network state through its separate
+bounded protocol, not by rereading the cold-boot configuration.
 
 ## Configuration And Failure Semantics
 
