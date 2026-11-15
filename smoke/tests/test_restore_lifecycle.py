@@ -213,7 +213,7 @@ def test_restored_child_cold_start_keeps_its_own_disk_writes(
         restored = restore.restore_child(silo, saved, child)
     else:
         silo.ws.register_machine(child)
-        result = json.loads(silo.run("fork", source, "--live", "--name", child, timeout=240).stdout)
+        result = silo.json("fork", source, "--live", "--name", child, timeout=240)
         assert result["children"][0]["outcome"]["kind"] == "running", result
         restored = silo.wait_ready(child)
     assert silo.exec(child, "cat", "/var/lib/cold-start-marker").stdout == "source-cut"
@@ -246,7 +246,7 @@ def test_restored_child_cold_start_keeps_its_own_disk_writes(
     listed = next(machine for machine in silo.ls() if machine["id"] == cold["id"])
     assert listed["image"] == "stopped-storage"
     if saved is not None:
-        assert json.loads(silo.run("snapshot", "inspect", saved.reference).stdout)["retained"] is True
+        assert silo.json("snapshot", "inspect", saved.reference)["retained"] is True
         silo.run("resume", source)
     assert silo.exec(source, "cat", "/var/lib/cold-start-marker").stdout == "source-cut"
     # Subsequent starts use the ordinary stopped-machine path too.
@@ -295,8 +295,8 @@ def test_restore_exposes_only_the_fresh_destination_after_final_release(
         children = None
         try:
             stream.stationary()
-            restored = restore.restore(silo, source.saved.reference, child, expect=0)
-            machine = UUID(restored.stdout.strip()).hex
+            restored = restore.restore(silo, source.saved.reference, child, "--format", "json", expect=0)
+            machine = UUID(json.loads(restored.stdout)["id"]).hex
             assert machine == evidence.machine_hex()
             children = lifecycle.ChildProcesses.observe(silo, machine)
             # CLI completion can beat the trace follower's next 20ms poll.

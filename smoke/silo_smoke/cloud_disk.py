@@ -756,12 +756,12 @@ def qemu_img_cross_check(raw: Path, encoded: Path, record) -> None:
 
 def import_disk(silo: Silo, path: Path, *, root: str, name: str | None = None, platform_spelling: str | None = None) -> dict:
     result = silo.run("image", "import", str(path), "--platform", platform_spelling or host_platform(), "--root", root,
-                      "--boot", "linux-direct", *(["--name", name] if name else []), timeout=600, label="image-import")
+                      "--boot", "linux-direct", *(["--name", name] if name else []), "--format", "json", timeout=600, label="image-import")
     return json.loads(result.stdout)
 
 
 def inspect(silo: Silo, reference: str) -> dict:
-    return json.loads(silo.run("image", "inspect", reference, label="image-inspect").stdout)
+    return silo.json("image", "inspect", reference, label="image-inspect")
 
 
 PUBLISHED_TABLES = (

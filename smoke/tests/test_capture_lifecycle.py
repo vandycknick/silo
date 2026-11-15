@@ -418,7 +418,7 @@ def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
                 rows = run.provenance()
                 assert len(rows) == 1, "stop lost the linked coherent checkpoint"
                 assert json.loads(rows[0][1]) == json.loads(seal_bytes)
-                snapshot = json.loads(silo.run("snapshot", "inspect", "image:" + rows[0][0]).stdout)
+                snapshot = silo.json("snapshot", "inspect", "image:" + rows[0][0])
                 assert snapshot["id"] == rows[0][0] and snapshot["captureKind"] == "live-execution"
                 record = run.capture_record()
                 if record is None:

@@ -86,7 +86,7 @@ def checkpoint(silo: Silo, name: str, *, alias: str = "restore-checkpoint",
         original_pause = silo.info(name)["lifecycle"]["lifecycle"]["currentPause"]
     result = silo.run("snapshot", "create", name, "--live", "--preserve", "--name", alias,
                       *(["--capture-policy", policy] if policy is not None else []),
-                      "--dirty-crossover-percent", str(dirty_crossover_percent), timeout=240)
+                      "--dirty-crossover-percent", str(dirty_crossover_percent), "--format", "json", timeout=240)
     value = json.loads(result.stdout)
     summary = value["capture"]
     assert value["snapshot"]["captureKind"] == "live-execution"

@@ -226,14 +226,21 @@ def _extract_binary(archive: Path, release: DistributionRelease, target: Path) -
             temporary.unlink(missing_ok=True)
 
 
-def install_distribution(cache_dir: Path, release: DistributionRelease | None = None) -> InstalledDistribution:
+def install_distribution(cache_dir: Path, release: DistributionRelease | None = None, *,
+                         binary_path: Path | None = None) -> InstalledDistribution:
     """Return the verified pinned executable, acquiring it into `cache_dir` if needed.
 
     Layout: `<cache>/distribution-registry/<version>/<arch>/{<archive>,registry}`.
     A cached binary or archive is reused only after its exact SHA256 and size
     match the pin; anything else is replaced from the pinned source.
+    An explicit binary is verified against the same pin and never downloaded.
     """
     release = release or host_release()
+    if binary_path is not None:
+        binary = binary_path.expanduser().resolve()
+        if not _matches(binary, release.binary_sha256, release.binary_size) or not os.access(binary, os.X_OK):
+            raise SmokeEnvironmentError(f"Explicit Distribution executable does not match the {release.version} pin: {binary}")
+        return InstalledDistribution(release, binary)
     directory = cache_dir / "distribution-registry" / release.version / release.arch
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     binary = directory / _BINARY_MEMBER

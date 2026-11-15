@@ -119,7 +119,7 @@ def plan(source: Runtime, destination: Runtime, name: str, mode: str, operation:
     A running source's own guest legitimately writes its files, so then only the
     destination is held to byte-for-byte no-effect evidence."""
     runtimes = (destination,) if running else (source, destination)
-    result = without_effects(runtimes, "plan", lambda: handoff(source, destination, "plan", name, "--mode", mode, "--operation", operation, *flags, timeout=300), batch=batch)
+    result = without_effects(runtimes, "plan", lambda: handoff(source, destination, "plan", name, "--mode", mode, "--operation", operation, "--format", "json", *flags, timeout=300), batch=batch)
     value = _report(result)
     assert _DIGEST.fullmatch(value["digest"]), value["digest"]
     assert UUID(value["operation"]) == UUID(operation)
@@ -134,32 +134,32 @@ def transfer_args(name: str, mode: str, operation: str, digest: str, *flags: str
 
 
 def transfer(source: Runtime, destination: Runtime, name: str, mode: str, operation: str, digest: str, *flags: str) -> dict[str, Any]:
-    report = _report(handoff(source, destination, *transfer_args(name, mode, operation, digest, *flags)))
+    report = _report(handoff(source, destination, *transfer_args(name, mode, operation, digest, "--format", "json", *flags)))
     assert_committed(report, source, destination, operation, mode)
     return report
 
 
 def status(source: Runtime, destination: Runtime, operation: str, *, batch: NoEffects | None = None) -> dict[str, Any]:
     """Read-only two-sided observation; it never chooses an outcome."""
-    value = _report(without_effects((source, destination), "status", lambda: handoff(source, destination, "status", operation), batch=batch))
+    value = _report(without_effects((source, destination), "status", lambda: handoff(source, destination, "status", operation, "--format", "json"), batch=batch))
     assert UUID(value["operation"]) == UUID(operation)
     return value
 
 
 def stale(source: Runtime, destination: Runtime, label: str, *args: str, batch: NoEffects | None = None) -> dict[str, Any] | None:
     """Replay an old request: refusal or a historical answer, never a durable change."""
-    result = without_effects((source, destination), label, lambda: handoff(source, destination, *args, expect=None), batch=batch)
+    result = without_effects((source, destination), label, lambda: handoff(source, destination, *args, "--format", "json", expect=None), batch=batch)
     return _report(result) if result.returncode == 0 else None
 
 
 def recover(source: Runtime, destination: Runtime, operation: str, mode: str) -> dict[str, Any]:
-    report = _report(handoff(source, destination, "recover", operation))
+    report = _report(handoff(source, destination, "recover", operation, "--format", "json"))
     assert_committed(report, source, destination, operation, mode)
     return report
 
 
 def abort(source: Runtime, destination: Runtime, operation: str) -> dict[str, Any]:
-    value = _report(handoff(source, destination, "abort", operation))
+    value = _report(handoff(source, destination, "abort", operation, "--format", "json"))
     assert UUID(value["operation"]) == UUID(operation)
     for side in ("source", "destination"):
         record = value[side]

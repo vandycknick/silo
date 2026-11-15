@@ -204,7 +204,7 @@ def test_restore_execution_continues_exact_cut_and_isolates_siblings(
         asset.chmod(0o755 if filename == "agent" else 0o644)
     assert {relative: stopped.read_bytes(relocated / relative).content()
             for relative in closure_before} == closure_before
-    assert json.loads(silo.run("snapshot", "inspect", saved.reference).stdout)["retained"] is True
+    assert silo.json("snapshot", "inspect", saved.reference)["retained"] is True
     relocated_saved = replace(saved, staging=relocated / saved.staging.relative_to(old_home))
     restore.restore_child(silo, relocated_saved, "restore-relocated")
     own(silo, "restore-relocated", restore_processes)

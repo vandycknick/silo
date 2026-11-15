@@ -53,7 +53,7 @@ def test_capture_matched_cut_isolation_and_pause_authority(silo: Silo, capture_i
             silo.run("pause", name)
             borrowed = silo.info(name)["lifecycle"]["lifecycle"]["currentPause"]
             counter.stationary()
-        result = silo.run("snapshot", "create", name, "--live", "--name", "captured",
+        result = silo.run("snapshot", "create", name, "--live", "--name", "captured", "--format", "json",
                           *(["--preserve"] if policy == "preserve" else []), timeout=240)
         value = json.loads(result.stdout)
         summary = value["capture"]
@@ -150,13 +150,13 @@ def retained_capture_survives_source_removal_and_relocation(
     assert not source_dir.exists()
     silo.run("image", "remove", "image:captured")
     immutable = "image:" + snapshot
-    assert json.loads(silo.run("snapshot", "inspect", immutable).stdout)["retained"] is True
+    assert silo.json("snapshot", "inspect", immutable)["retained"] is True
     original_home = silo.ws.silo_home
     relocated = silo.ws.root / "relocated-capture-home"
     original_home.rename(relocated)
     silo.ws.silo_home = relocated
     shutdown.storage_tool(silo, "prune")
-    inspected = json.loads(silo.run("snapshot", "inspect", immutable).stdout)
+    inspected = silo.json("snapshot", "inspect", immutable)
     assert inspected["id"] == snapshot and inspected["captureKind"] == "live-execution"
     assert inspected["retained"] is True and inspected["aliases"] == []
     after = {str(path): replace(stopped.read_bytes(relocated / path), path=str(path))
@@ -271,7 +271,7 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
             if capture_policy == "incremental":
                 reclaim.settled(silo, name)
                 baseline = json.loads(silo.run(
-                    "snapshot", "create", name, "--live", "--name", "crash-baseline",
+                    "snapshot", "create", name, "--live", "--name", "crash-baseline", "--format", "json",
                     "--capture-policy", "incremental", timeout=120,
                 ).stdout)
                 assert baseline["capture"]["memory"]["mode"] == "full"
@@ -401,7 +401,7 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                                recovered_live.stdout + "\n[stderr]\n" + recovered_live.stderr)
                 assert recovered_live.returncode == 0, recovered_live.stderr
                 retry = json.loads(silo.run(
-                    "snapshot", "create", name, "--live", "--preserve", "--name", "crash-retry",
+                    "snapshot", "create", name, "--live", "--preserve", "--name", "crash-retry", "--format", "json",
                     "--capture-policy", "incremental", timeout=120,
                 ).stdout)
                 memory = retry["capture"]["memory"]
@@ -441,7 +441,7 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                 assert all(sealed[fact] is True for fact in (
                     "workloadsFrozen", "vcpusPaused", "devicesQuiesced", "hostWritersDrained",
                     "hostFlushCompleted", "diskCopiesSealed", "memoryStateSealed"))
-                inspected = json.loads(silo.run("snapshot", "inspect", "image:" + rows[0][0]).stdout)
+                inspected = silo.json("snapshot", "inspect", "image:" + rows[0][0])
                 assert inspected["captureKind"] == "live-execution"
             else:
                 assert recovered.returncode != 0, "successful reconciliation lost its capture"
@@ -478,7 +478,7 @@ def test_capture_taken_alias_refuses_before_pause_and_new_name_succeeds(
         silo.start(name)
         silo.wait_ready(name)
     first = json.loads(silo.run("snapshot", "create", "alias-owner", "--live",
-                               "--name", "taken", timeout=240).stdout)
+                               "--name", "taken", "--format", "json", timeout=240).stdout)
     contender = silo.info("alias-contender")
     counter = capture.Counter(silo, "alias-contender", PROBE)
     try:
@@ -505,13 +505,13 @@ def test_capture_taken_alias_refuses_before_pause_and_new_name_succeeds(
         assert current["state"] == "running" and current["run_id"] == contender["run_id"]
 
         retry = json.loads(silo.run("snapshot", "create", "alias-contender", "--live",
-                                   "--name", "available", timeout=240).stdout)
+                                   "--name", "available", "--format", "json", timeout=240).stdout)
         assert retry["capture"]["released"] is True
         assert retry["capture"]["sourceOutcome"] == "resumed"
         assert UUID(retry["capture"]["machineId"]).hex == UUID(contender["id"]).hex
         assert retry["namingOutcome"] is None
         for _ in range(3):
-            listed = silo.run("snapshot", "list")
+            listed = silo.run("snapshot", "list", "--format", "json")
             assert "retained uncertainty" not in listed.stderr
             by_id = {snapshot["id"]: snapshot for snapshot in json.loads(listed.stdout)}
             assert "taken" in by_id[first["snapshot"]["id"]]["aliases"]

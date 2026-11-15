@@ -83,7 +83,7 @@ def _start_daemon(silo: Silo, enabled: bool) -> None:
 
 
 def _json(silo: Silo, *args: str) -> dict:
-    return json.loads(silo.run(*args, timeout=300).stdout)
+    return silo.json(*args, timeout=300)
 
 
 def _publish_oci(registry: DistributionRegistry, image: images.OciImage) -> str:

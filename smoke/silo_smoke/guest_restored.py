@@ -200,10 +200,7 @@ class Held:
         self.result: dict | None = None
 
     def release(self) -> dict:
-        self.process.stdin.write(b"release\n")
-        self.process.stdin.flush()
-        self.process.stdin.close()
-        stdout, stderr = self.process.communicate(timeout=60)
+        stdout, stderr = self.process.communicate(b"release\n", timeout=60)
         self.stem.with_suffix(".release.stdout").write_bytes(stdout)
         self.stem.with_suffix(".stderr").write_bytes(stderr)
         records = [json.loads(line) for line in stdout.splitlines() if line.startswith(b"{")]

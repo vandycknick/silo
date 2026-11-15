@@ -1,7 +1,7 @@
 """ADR 0021 live-operation and ADR 0014 prepared-create/layered-boot budgets.
 
 Exact fixture, cohorts, cache method and boundaries are documented in
-`silo_smoke/fork_budget.py` and `smoke/README.md`. Each test writes its reference-host record,
+`silo_perf/fork_budget.py` and `perf/README.md`. Each test writes its reference-host record,
 per-sample text and median/min/max summary under `SILO_SMOKE_BUDGET_EVIDENCE`
 before asserting, so a failing budget still leaves its measured evidence.
 Live operations run directly against the staged runtime. A budget failure
@@ -21,14 +21,15 @@ from uuid import UUID
 
 import pytest
 
-from silo_smoke import fork, fork_budget, incremental, overlay, reclaim, restore, shutdown, stopped
+from silo_smoke import fork, incremental, overlay, reclaim, restore, shutdown, stopped
+from silo_perf import fork_budget
 from silo_smoke import restore_lifecycle as lifecycle
 from silo_smoke.cli import RootProfile, Silo, TIMINGS_PROPERTY, release
 from silo_smoke.config import RUN_ROOT_PARENT, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow, pytest.mark.serial]
+pytestmark = pytest.mark.linux_only
 
 SOURCE = "budget-source"
 GIB = fork_budget.GIB
@@ -228,7 +229,7 @@ def test_fork_budget_restore_to_running(
     source = budget_source(silo, restore_image)
     initial = source["initial"]
     fixture = fixture_proof(silo, SOURCE, source["upper"])
-    created = silo.run("snapshot", "create", SOURCE, "--live", "--name", "budget-checkpoint", timeout=600)
+    created = silo.run("snapshot", "create", SOURCE, "--live", "--name", "budget-checkpoint", "--format", "json", timeout=300)
     value = json.loads(created.stdout)
     assert value["snapshot"]["captureKind"] == "live-execution", value
     assert value["capture"]["sourceOutcome"] == "resumed", value
@@ -350,7 +351,7 @@ def test_fork_budget_incremental_ten_percent_dirty(
     reclaim.settled(silo, SOURCE)
     previous = json.loads(silo.run(
         "snapshot", "create", SOURCE, "--live", "--capture-policy", "incremental",
-        "--name", alias, timeout=240).stdout)
+        "--name", alias, "--format", "json", timeout=240).stdout)
     previous_directory, previous_seal = checkpoint_value(silo, previous)
     assert previous_seal["memory"]["mode"] == "full", previous_seal["memory"]
     evidence.record("fixture.json", {**fixture, "sequentialCopy": rate,
@@ -370,7 +371,7 @@ def test_fork_budget_incremental_ten_percent_dirty(
                 allocated = upper.stat().st_blocks * 512
                 stdout, dispatched, exited = budget_dispatch(
                     silo, "snapshot", "create", SOURCE, "--live", "--capture-policy", "incremental",
-                    "--name", current_alias)
+                    "--name", current_alias, "--format", "json")
                 value = json.loads(stdout)
                 directory, seal = checkpoint_value(silo, value)
                 memory = seal["memory"]

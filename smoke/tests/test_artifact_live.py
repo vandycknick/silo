@@ -348,7 +348,7 @@ def push_checkpoint(silo: Silo, distribution: DistributionRegistry, source: str,
     assert distribution.stored_blob_digests() == before and blob_requests(distribution) == blobs, (
         "unacknowledged checkpoint publication contacted the registry")
     assert tag not in distribution.client().tags(REPOSITORY)
-    report = json.loads(push(silo, source, reference, *flags, "--acknowledge-checkpoint").stdout)
+    report = json.loads(push(silo, source, reference, *flags, "--acknowledge-checkpoint", "--format", "json").stdout)
     assert report["repository"] == f"{distribution.address}/{REPOSITORY}" and report["tag"] == tag, report
     assert report["source"] == {"kind": "snapshot", "id": snapshot}, report
     assert report["purpose"] == "checkpoint" and report["captureKind"] == "live-execution", report
@@ -368,7 +368,7 @@ def refused_pull(silo: Silo, distribution: DistributionRegistry, reference: str,
 
 
 def pull(silo: Silo, reference: str, digest: str, alias: str) -> dict:
-    result = silo.run("image", "pull", reference, "--approve-digest", digest, "--name", alias,
+    result = silo.run("image", "pull", reference, "--approve-digest", digest, "--name", alias, "--format", "json",
                       timeout=TRANSFER, label="artifact-pull")
     report = json.loads(result.stdout)
     silo.ws.record("artifact-acquisition", json.dumps(report, sort_keys=True) + "\n")
@@ -520,7 +520,7 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
 
     # Inspection reads only the immutable graph and retains nothing.
     reference = distribution.reference(REPOSITORY, "v1")
-    inspected = json.loads(destination.run("image", "inspect-remote", reference, label="artifact-inspect").stdout)
+    inspected = destination.json("image", "inspect-remote", reference, label="artifact-inspect")
     assert inspected["indexDigest"] == graph.index_digest and inspected["repository"] == report["repository"]
     assert inspected["content"] == {"kind": "snapshot", "id": saved.snapshot}, inspected
     assert (inspected["purpose"], inspected["captureKind"]) == ("checkpoint", "live-execution"), inspected
@@ -574,7 +574,7 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
         asset.write_bytes(b"not the checkpoint boot bytes\n")
         asset.chmod(mode)
     shutdown.storage_tool(destination, "prune")
-    assert json.loads(destination.run("snapshot", "inspect", "image:artifact-pulled").stdout)["retained"] is True
+    assert destination.json("snapshot", "inspect", "image:artifact-pulled")["retained"] is True
 
     child = "artifact-restored"
     pulled = replace(saved, reference="image:artifact-pulled")

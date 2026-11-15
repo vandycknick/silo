@@ -9,19 +9,26 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import tarfile
 
 import pytest
 
-from silo_smoke import fork_budget, images, ingest_budget, shutdown
+from silo_smoke import images, shutdown
+from silo_perf import fork_budget, ingest_budget
 from silo_smoke.cli import Silo, TIMINGS_PROPERTY, release
 from silo_smoke.config import RUN_ROOT_PARENT, SmokeConfig
 from silo_smoke.distribution_registry import DistributionRegistry, install_distribution
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
 
-pytestmark = pytest.mark.serial
+@pytest.fixture(scope="session")
+def distribution_binary() -> Path:
+    binary = shutil.which("registry")
+    if binary is None:
+        pytest.skip("enter the perf shell: nix develop .#perf")
+    return Path(binary)
 
 
 def _budget_workspace(config: SmokeConfig, ca_path: Path) -> Workspace:
@@ -44,7 +51,7 @@ class IngestCorpus:
 
 @pytest.fixture(scope="session")
 def ingest_corpus(config: SmokeConfig, registry: LoopbackRegistry, request: pytest.FixtureRequest,
-                  session_evidence: Workspace) -> Iterator[IngestCorpus]:
+                  session_evidence: Workspace, distribution_binary: Path) -> Iterator[IngestCorpus]:
     """Generate once per session; never retain bulk blobs, even after failed setup."""
     workspace = _budget_workspace(config, registry.ca_path)
     local: DistributionRegistry | None = None
@@ -53,7 +60,7 @@ def ingest_corpus(config: SmokeConfig, registry: LoopbackRegistry, request: pyte
         space = fork_budget.headroom(Silo(workspace), ingest_budget.SCRATCH_BYTES)
         base = images.build(images.BASIC, images.fetch_alpine(config.cache_dir))
         base_reference = registry.publish(base, "ingest-budget-base")
-        local = DistributionRegistry(install_distribution(config.cache_dir), config.cache_dir,
+        local = DistributionRegistry(install_distribution(config.cache_dir, binary_path=distribution_binary), config.cache_dir,
                                      parent=workspace.root)
         local.start()
         corpus = ingest_budget.publish_corpus(local, base)
@@ -85,7 +92,6 @@ def ingest_silo(config: SmokeConfig, registry: LoopbackRegistry,
 
 
 @pytest.mark.linux_only
-@pytest.mark.slow
 def test_ingest_budget_full_prepare_and_linearity(silo: Silo, ingest_corpus: IngestCorpus) -> None:
     """Fixed 1/4/12 GiB corpus, five cold and warm samples, never a scaled substitute."""
     local = ingest_corpus.registry
@@ -227,12 +233,11 @@ def test_ingest_generation_empty_input_budget_gate(size: int) -> None:
 
 
 @pytest.mark.linux_only
-@pytest.mark.slow
 def test_ingest_native_layer_streaming_and_failure_cleanup(
-    silo: Silo, config: SmokeConfig, tmp_path: Path,
+    silo: Silo, config: SmokeConfig, tmp_path: Path, distribution_binary: Path,
 ) -> None:
     """Real producer/upload and OCI reference removal, including failure cleanup."""
-    local = DistributionRegistry(install_distribution(config.cache_dir), config.cache_dir, parent=tmp_path)
+    local = DistributionRegistry(install_distribution(config.cache_dir, binary_path=distribution_binary), config.cache_dir, parent=tmp_path)
     size = 64 * 1024
     try:
         local.start()

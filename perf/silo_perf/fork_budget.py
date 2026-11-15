@@ -58,9 +58,6 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-import errno
-import fcntl
 import hashlib
 import json
 import math
@@ -74,8 +71,11 @@ import tempfile
 import time
 from uuid import UUID
 
-from . import overlay, page_cache, prereqs, restore_lifecycle
-from .cli import Silo
+from silo_smoke import overlay, prereqs, restore_lifecycle
+from silo_smoke.cli import Silo
+from silo_smoke.evidence import evidence_directory as create_evidence_directory
+from silo_smoke.filesystem import reflink_probe
+from silo_perf import page_cache
 
 RAM = "4096mib"
 UPPER = "2gib"
@@ -231,12 +231,7 @@ def boot_timing(text: str, *, trace: Path, machine_id: str, run_id: str,
 
 
 def evidence_directory(label: str) -> Path:
-    """Durable text evidence outside the (deleted-on-success) workspace."""
-    parent = prereqs.evidence_parent(EVIDENCE_VARIABLE)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
-    directory = Path(tempfile.mkdtemp(prefix=f"{label}-{stamp}-{worker}-", dir=parent))
-    return directory
+    return create_evidence_directory(label, variable=EVIDENCE_VARIABLE)
 
 
 def _digest(path: Path) -> str:
@@ -252,21 +247,6 @@ def _findmnt(path: Path) -> dict:
     return mounts[0]
 
 
-def reflink_probe(directory: Path) -> dict:
-    """Probe the budget filesystem, cleaning up both sibling files on every exit."""
-    error_number = None
-    with tempfile.NamedTemporaryFile(dir=directory, prefix="budget-reflink-source-") as source, \
-            tempfile.NamedTemporaryFile(dir=directory, prefix="budget-reflink-destination-") as destination:
-        source.write(b"\xa5" * 4096)
-        source.flush()
-        try:
-            fcntl.ioctl(destination.fileno(), 0x40049409, source.fileno())  # FICLONE
-        except OSError as error:
-            if error.errno not in {errno.EOPNOTSUPP, errno.EXDEV, errno.EINVAL}:
-                raise
-            error_number = error.errno
-    return {"method": "FICLONE", "directory": str(directory),
-            "reflink": error_number is None, "errno": error_number}
 
 
 def reference_host(silo: Silo) -> dict:

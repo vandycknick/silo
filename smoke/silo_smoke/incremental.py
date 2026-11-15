@@ -15,7 +15,8 @@ import subprocess
 
 import pytest
 
-from . import fork_budget, images, overlay, procs, restore, stopped
+from . import images, overlay, procs, restore, stopped
+from .filesystem import reflink_probe
 from .cli import Silo
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
@@ -143,7 +144,7 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
     assert stats["identityBytesHashed"] == coverage
     probe = None
     if mode == "incremental":
-        probe = fork_budget.reflink_probe(saved.staging)
+        probe = reflink_probe(saved.staging)
         assert stats["seedMethod"] == ("clone" if probe["reflink"] else "rebuild"), (stats, probe)
         assert stats["fullBytesWritten"] == 0
         assert stats["overlayBytesWritten"] <= stats["liveBytesRead"] <= coverage <= length
@@ -241,7 +242,7 @@ def frozen_full_oracle(silo: Silo, name: str, saved: restore.Checkpoint) -> rest
     incremental_layout = (saved.staging / "memory-layout.json").read_bytes()
     result = json.loads(silo.run("snapshot", "create", name, "--live", "--preserve",
         "--capture-policy", "full", "--dirty-crossover-percent", "60",
-        "--name", "incremental-full-oracle", timeout=240).stdout)
+        "--name", "incremental-full-oracle", "--format", "json", timeout=240).stdout)
     summary = result["capture"]
     assert summary["pause"] == "borrowed" and summary["sourceOutcome"] == "preserved"
     relative = Path(summary["staging"])

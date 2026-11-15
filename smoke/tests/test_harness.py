@@ -8,7 +8,7 @@ import sqlite3
 
 import pytest
 
-from silo_smoke import procs
+from silo_smoke import fork, procs
 from silo_smoke.cli import Silo
 from silo_smoke.config import SmokeConfig
 from silo_smoke.errors import SmokeAssertion
@@ -111,3 +111,14 @@ def test_successful_remove_unregisters_and_recreate_registers(silo: Silo, basic_
     assert refused.returncode == 1 and name in silo.ws._machines
     silo.rm(name)
     assert name not in silo.ws._machines
+
+
+@pytest.mark.parametrize("names", [["child"], ["first", "second"]])
+def test_live_fork_argv_explicitly_selects_json(names: list[str]) -> None:
+    operation = "ac615223-973b-4b60-b839-d339f976bbd4"
+    args = fork.create_argv("source", names, "--preserve", operation=operation)
+    assert args == [
+        "fork", "source", "--live", "--format", "json",
+        *(argument for name in names for argument in ("--name", name)),
+        "--operation-id", operation, "--preserve",
+    ]
