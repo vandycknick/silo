@@ -38,11 +38,8 @@ fn publish_at(
     }
     result?;
 
-    let path = root.join("etc/machine-id");
-    if let Err(error) = rotate_machine_id(&path, destination_machine_id) {
-        tracing::warn!(%error, path = %path.display(), "failed to rotate image machine-id");
-    }
-    Ok(())
+    // A child must never thaw with its parent's identity (owner decision O2).
+    rotate_machine_id(&root.join("etc/machine-id"), destination_machine_id)
 }
 
 fn rotate_machine_id(path: &Path, destination_machine_id: &str) -> io::Result<()> {
@@ -52,19 +49,23 @@ fn rotate_machine_id(path: &Path, destination_machine_id: &str) -> io::Result<()
         Err(error) => return Err(error),
     };
     if metadata.file_type().is_symlink() {
-        tracing::warn!(path = %path.display(), "skipping symlink image machine-id");
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "image machine-id {} is a symlink; refusing to follow it",
+                path.display()
+            ),
+        ));
     }
     if !metadata.is_file() || metadata.len() == 0 {
         return Ok(());
     }
-    let Some(machine_id) = parse_machine_id(destination_machine_id) else {
-        tracing::error!(
-            destination_machine_id,
-            "invalid destination machine-id; leaving image machine-id unchanged"
-        );
-        return Ok(());
-    };
+    let machine_id = parse_machine_id(destination_machine_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid destination machine-id {destination_machine_id:?}"),
+        )
+    })?;
     let mut file = OpenOptions::new()
         .write(true)
         .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
@@ -177,22 +178,19 @@ mod tests {
     }
 
     #[test]
-    fn symlink_machine_id_is_not_followed() {
+    fn symlink_machine_id_is_refused_without_following_it() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("etc")).unwrap();
         let target = root.path().join("original-id");
         fs::write(&target, "original\n").unwrap();
         let path = root.path().join("etc/machine-id");
         symlink(&target, &path).unwrap();
-        publish_at(root.path(), MACHINE_ID, "run").unwrap();
+        assert!(publish_at(root.path(), MACHINE_ID, "run").is_err());
         assert!(fs::symlink_metadata(&path)
             .unwrap()
             .file_type()
             .is_symlink());
         assert_eq!(fs::read_to_string(target).unwrap(), "original\n");
-        fs::remove_file(root.path().join("original-id")).unwrap();
-        publish_at(root.path(), MACHINE_ID, "next").unwrap();
-        assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
     }
 
     #[test]
@@ -206,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_machine_ids_are_skipped_without_blocking_generation() {
+    fn invalid_destination_machine_ids_fail_activation_without_writing() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("etc")).unwrap();
         let path = root.path().join("etc/machine-id");
@@ -221,13 +219,24 @@ mod tests {
             "0123456789abcdef0123456789abcdef\n",
         ] {
             assert!(parse_machine_id(invalid).is_none());
-            publish_at(root.path(), invalid, "run").unwrap();
+            assert!(publish_at(root.path(), invalid, "run").is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
-            assert_eq!(
-                fs::read_to_string(root.path().join("run/silo/generation")).unwrap(),
-                "run\n"
-            );
         }
+    }
+
+    #[test]
+    fn unwritable_machine_id_fails_activation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("etc")).unwrap();
+        let path = root.path().join("etc/machine-id");
+        fs::write(&path, "original\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        if fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            // Running as root ignores the mode; nothing to prove here.
+            return;
+        }
+        assert!(publish_at(root.path(), MACHINE_ID, "run").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
     }
 
     #[test]
