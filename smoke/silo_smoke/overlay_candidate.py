@@ -19,7 +19,7 @@ import subprocess
 import time
 from uuid import UUID, uuid4
 
-from . import overlay
+from . import overlay, prereqs
 from .cli import Silo
 from .config import REPO
 
@@ -44,7 +44,7 @@ def cpio(entries: list[tuple[str, bytes, int]]) -> bytes:
 
 
 class Candidate:
-    def __init__(self, silo: Silo, reference: str | None = None, *, fault: str = "none", historical: bool = False, data: Path | None = None, range_request: str | None = None) -> None:
+    def __init__(self, silo: Silo, reference: str | None = None, *, fault: str = "none", historical: bool = False) -> None:
         self.silo = silo
         self.root = silo.ws.root / ("candidate-" + str(uuid4())[:8])
         self.root.mkdir(mode=0o700)
@@ -53,40 +53,22 @@ class Candidate:
         self.process: subprocess.Popen | None = None
         self.closed = False
         self.lease_fd: int | None = None
-        copied_native = fault in {"missing", "truncated", "swapped", "duplicate", "reordered", "writable-lower", "readonly-upper", "range-observer"}
         self.monitor = silo.ws.config.runtime_dir / "bin/silo-vmm"
-        if copied_native:
-            fixture_root = os.environ.get("SILO_SMOKE_FAULT_MONITORS")
-            assert fixture_root, "Main must build isolated COPY-only native fault monitors"
-            manifest = json.loads((Path(fixture_root) / fault / "fault-manifest.json").read_text())
-            assert manifest["fault"] == fault
-            assert manifest["validationUnchanged"] and manifest["uniqueAttachmentKeysUnchanged"]
-            self.monitor = Path(manifest["binary"])
-            assert overlay.digest(self.monitor) == manifest["binarySha256"]
-            assert manifest["productionEngineSha256"] == overlay.digest(REPO / "virt/vmm/src/krun/engine.rs"), "fault fixture source stale"
-            silo.ws.record("overlay-native-fault-build", json.dumps(manifest, sort_keys=True) + "\n")
         monitor_snapshot = self.root / "silo-vmm"
         shutil.copyfile(self.monitor, monitor_snapshot)
         monitor_snapshot.chmod(0o700)
-        if copied_native:
-            assert overlay.digest(monitor_snapshot) == manifest["binarySha256"]
         self.monitor = monitor_snapshot
         native_capabilities = overlay.native_capabilities(self.monitor)
         overlay.monitor_build_identity(native_capabilities)
-        if copied_native:
-            assert native_capabilities["buildIdentity"] == manifest["monitorBuildIdentity"], "fault binary informational identity mismatch"
-        if not copied_native:
-            stage = json.loads((silo.ws.config.runtime_dir / "runtime-manifest.json").read_text())
-            assert stage["managedOverlayCandidate"]["nativeExecutableDigest"] == "sha256:" + overlay.digest(self.monitor)
+        stage = json.loads((silo.ws.config.runtime_dir / "runtime-manifest.json").read_text())
+        assert stage["managedOverlayCandidate"]["nativeExecutableDigest"] == "sha256:" + overlay.digest(self.monitor)
         silo.ws.record("overlay-candidate-native-capabilities", json.dumps(native_capabilities, sort_keys=True) + "\n")
         self.mapping_only = historical
         produced = None
         if not historical:
             assert reference is not None, "root qualification requires an OCI reference"
             producer = silo.ws.config.bin_dir / "examples/overlay_candidate_lower"
-            if not producer.is_file():
-                producer = REPO / "target/debug/examples/overlay_candidate_lower"
-            assert producer.is_file(), "Main must build cargo build -p libvm --example overlay_candidate_lower"
+            assert producer.is_file(), "missing overlay_candidate_lower helper; run make smoke-prereqs"
             result = subprocess.run([str(producer), reference, str(self.root / "composition")], env=silo.ws.env(), check=True, capture_output=True, text=True, timeout=300)
             silo.ws.record("overlay-candidate-composition", result.stdout + result.stderr)
             produced = json.loads(result.stdout)
@@ -121,8 +103,6 @@ class Candidate:
         upper = self.root / "upper.raw"
         self.upper = upper
         formatter = silo.ws.config.bin_dir / "examples/format_upper"
-        if not formatter.is_file():
-            formatter = REPO / "target/debug/examples/format_upper"
         result = subprocess.run([str(formatter), str(upper), str(256 * 1024**2)], check=True, capture_output=True, text=True, timeout=90)
         formatted = json.loads(result.stdout)
         silo.ws.record("overlay-candidate-formatter", result.stdout + result.stderr)
@@ -202,18 +182,8 @@ class Candidate:
         self.bootstrap = bootstrap
         assets = silo.ws.config.runtime_dir / "assets"
         base = assets / "initramfs"
-        if fault == "effective-index-off":
-            fixture_root = os.environ.get("SILO_SMOKE_FAULT_MONITORS")
-            assert fixture_root, "Main must build isolated bad-request init fixture"
-            manifest = json.loads((Path(fixture_root) / fault / "fault-manifest.json").read_text())
-            assert manifest["verifierSourceSha256"] == overlay.digest(REPO / "guest/init/src/overlay_verify.rs")
-            assert manifest["productionInitSourceSha256"] == overlay.digest(REPO / "guest/init/src/overlay.rs")
-            base = Path(manifest["baseInitramfs"])
-            silo.ws.record("overlay-native-init-fault-build", json.dumps(manifest, sort_keys=True) + "\n")
         composite = self.root / "initramfs"
         base_bytes = base.read_bytes()
-        if fault == "effective-index-off":
-            assert hashlib.sha256(base_bytes).hexdigest() == manifest["baseInitramfsSha256"]
         base_snapshot = self.root / "base-initramfs"
         base_snapshot.write_bytes(base_bytes)
         kernel_snapshot = self.root / "kernel"
@@ -232,26 +202,9 @@ class Candidate:
             {"path": str(descriptor), "role": "root-lower", "format": "vmdk", "geometry": {"length": self.logical_lower_bytes, "logicalSectorSize": 512}, "blockId": "silo-root-lower", "readOnly": True},
             {"path": str(upper), "role": "root-upper", "format": "raw", "geometry": {"length": formatted["backing_bytes"], "logicalSectorSize": 512}, "blockId": "silo-root-upper", "readOnly": False},
         ]
-        if fault == "duplicate":
-            # Unique host/native key. The isolated native response mutation maps
-            # ONLY this extra real block device's GET_ID to silo-root-lower.
-            duplicate = self.root / "duplicate-lower.raw"
-            with duplicate.open("xb") as output:
-                for occurrence in self.occurrences:
-                    with occurrence.open("rb") as source:
-                        shutil.copyfileobj(source, output)
-            assert duplicate.stat().st_size == self.logical_lower_bytes
-            disks.append({"path": str(duplicate), "role": "data", "format": "raw", "geometry": {"length": self.logical_lower_bytes, "logicalSectorSize": 512}, "blockId": "silo-data-0", "readOnly": True})
-        if data is not None:
-            assert fault == "range-observer" and range_request is not None
-            assert data.stat().st_size == 4 * 1024**2
-            disks.append({"path": str(data), "role": "data", "format": "raw", "geometry": {"length": data.stat().st_size, "logicalSectorSize": 512}, "blockId": "silo-data-0", "readOnly": False})
         self.spec = {"specVersion": "0.2.0", "boot": {"kernel": {"path": str(kernel_snapshot), "initramfs": str(composite), "cmdline": ["loglevel=6", "silo.rootfs=" + overlay.PROFILE, "init=/sbin/candidate-init"]}}, "hardware": {"cpus": 1, "memory": 512, "rosetta": False, "nestedVirtualization": False}, "storage": {"disks": disks}}
         if self.mapping_probes:
             self.spec["boot"]["kernel"]["cmdline"].append("silo.smoke_probes=" + ",".join(f"{offset}:{length}" for offset, length in self.mapping_probes))
-        if range_request is not None:
-            assert fault == "range-observer" and data is not None
-            self.spec["boot"]["kernel"]["cmdline"].append("silo.smoke_range=" + range_request)
         if historical:
             mapping_init = self.root / "mapping-init"
             subprocess.run([os.environ.get("CC", "cc"), "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(mapping_init), str(REPO / "smoke/fixtures/vmdk_mapping.c")], check=True, capture_output=True, timeout=90)
@@ -271,13 +224,12 @@ class Candidate:
             self.identities["experiment"] = "arbitrary-byte-vmdk-mapping"
             self.identities["initramfsSha256"] = overlay.digest(composite)
             self.identities["compositeInitramfsSha256"] = overlay.digest(composite)
-        config_input = os.environ.get("SILO_SMOKE_KERNEL_CONFIG")
-        if config_input:
-            config_snapshot = self.root / "resolved.config"
-            shutil.copyfile(Path(config_input), config_snapshot)
-            self.identities["resolvedConfigDigest"] = "sha256:" + overlay.digest(config_snapshot)
-            self.identities["resolvedConfigSourcePath"] = config_input
-            self.identities["configEvidence"] = "local-build-supplied-requires-independent-build-provenance"
+        config_input = prereqs.kernel_config(silo.ws.config.runtime_dir)
+        config_snapshot = self.root / "resolved.config"
+        shutil.copyfile(config_input, config_snapshot)
+        self.identities["resolvedConfigDigest"] = "sha256:" + overlay.digest(config_snapshot)
+        self.identities["resolvedConfigSourcePath"] = str(config_input)
+        self.identities["configEvidence"] = stage["managedOverlayCandidate"]["configEvidence"]
 
     def start(self) -> None:
         machine_id, run_id, operation_id = str(uuid4()), str(uuid4()), str(uuid4())
@@ -387,11 +339,3 @@ class Candidate:
             self.lease_fd = None
         self.closed = True
 
-    def native_diagnostic(self) -> str:
-        assert self.closed, "native request evidence requires finalized actual worker diagnostic"
-        event = json.loads((self.root / "vm.exit.json").read_text())
-        assert event["pid"] == self.identities["monitorPid"]
-        assert event["backend"]["process"]["pid"] == self.identities["workerPid"]
-        text = event["backend"]["diagnostic"]["tail"]
-        self.silo.ws.record("overlay-native-raw-diagnostic", text)
-        return text

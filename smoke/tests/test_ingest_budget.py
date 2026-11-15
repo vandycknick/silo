@@ -1,7 +1,7 @@
 """Real OCI ingest performance cohort and pure summary budget gates."""
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 import gzip
 import hashlib
@@ -20,6 +20,8 @@ from silo_smoke.config import RUN_ROOT_PARENT, SmokeConfig
 from silo_smoke.distribution_registry import DistributionRegistry, install_distribution
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
+
+pytestmark = pytest.mark.serial
 
 
 def _budget_workspace(config: SmokeConfig, ca_path: Path) -> Workspace:
@@ -42,7 +44,7 @@ class IngestCorpus:
 
 @pytest.fixture(scope="session")
 def ingest_corpus(config: SmokeConfig, registry: LoopbackRegistry, request: pytest.FixtureRequest,
-                  record_testsuite_property: Callable[[str, object], None]) -> Iterator[IngestCorpus]:
+                  session_evidence: Workspace) -> Iterator[IngestCorpus]:
     """Generate once per session; never retain bulk blobs, even after failed setup."""
     workspace = _budget_workspace(config, registry.ca_path)
     local: DistributionRegistry | None = None
@@ -67,8 +69,8 @@ def ingest_corpus(config: SmokeConfig, registry: LoopbackRegistry, request: pyte
                     local.close(retain=False)
         finally:
             release(workspace, failed=failed or request.session.testsfailed > 0,
-                    publish=lambda summary: record_testsuite_property(
-                        f"{TIMINGS_PROPERTY}-ingest-corpus", summary))
+                    publish=lambda summary: session_evidence.record(
+                        f"{TIMINGS_PROPERTY}-ingest-corpus", summary + "\n"))
 
 
 @pytest.fixture(name="silo")

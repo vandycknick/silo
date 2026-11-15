@@ -29,7 +29,7 @@ import tempfile
 import time
 import uuid
 
-from . import guest_lifecycle, overlay
+from . import guest_lifecycle, overlay, prereqs
 from .cli import Silo
 from .config import REPO
 from .guest_activation_network import NetworkIdentity
@@ -104,24 +104,17 @@ class RestoredInputs:
 
     @classmethod
     def resolve(cls, silo: Silo) -> RestoredInputs:
-        native_root = os.environ.get("SILO_NATIVE_ROOT")
-        require(native_root is not None, "set SILO_NATIVE_ROOT to the frozen read-only native checkout")
-        target = Path(os.environ.get("CARGO_TARGET_DIR", str(REPO / "target")))
-        entry = Path(os.environ.get("SILO_SMOKE_NATIVE_LIVE_API", str(target / "debug/examples/native-live-api")))
-        require(entry.is_file() and os.access(entry, os.X_OK),
-                "Main must build the explicit native entry: cargo build --locked -p silo-vmm --example native-live-api; "
-                "set SILO_SMOKE_NATIVE_LIVE_API for another target/profile")
-        config = os.environ.get("SILO_SMOKE_KERNEL_CONFIG")
-        require(config is not None, "set SILO_SMOKE_KERNEL_CONFIG to the staged kernel's actual emitted .config")
-        kernel_config = Path(config).resolve(strict=True)
+        native_root = prereqs.native_root()
+        entry = prereqs.example("native-live-api", silo.ws.config.bin_dir, "SILO_SMOKE_NATIVE_LIVE_API")
+        kernel_config = prereqs.kernel_config(silo.ws.config.runtime_dir)
         lines = set(kernel_config.read_text().splitlines())
         require({"CONFIG_VMGENID=y", "CONFIG_VIRTIO_SILO_VMGENID=y"} <= lines,
                 "staged kernel config lacks the built-in Silo generation driver")
         netd = silo.ws.config.runtime_dir / "bin/netd"
         require(netd.is_file() and os.access(netd, os.X_OK), "staged runtime lacks netd; run make stage")
-        return cls(NativeInputs(Path(native_root).resolve(strict=True), entry.resolve(),
+        return cls(NativeInputs(native_root, entry,
                                 (Path(__file__).with_name("native_live_launch.py")).resolve(strict=True), netd.resolve()),
-                   guest_lifecycle.controller(), kernel_config, silo.ws.config.runtime_dir / "assets")
+                   guest_lifecycle.controller(silo.ws.config.bin_dir), kernel_config, silo.ws.config.runtime_dir / "assets")
 
 
 @dataclass
@@ -235,8 +228,7 @@ class Cohort:
         self.silo = silo
         self.case = case
         self.inputs = RestoredInputs.resolve(silo)
-        parent = Path(os.environ.get("SILO_SMOKE_RESTORED_EVIDENCE", str(silo.ws.root)))
-        parent.mkdir(parents=True, exist_ok=True)
+        parent = prereqs.evidence_parent("SILO_SMOKE_RESTORED_EVIDENCE")
         self.evidence = Path(tempfile.mkdtemp(prefix=f"guest-restored-{case}-", dir=parent))
         require(shutil.disk_usage(self.evidence).free >= 8 * 1024 * MIB, "restored cohort requires 8 GiB headroom")
         self.attach_root = self.evidence / "attach"

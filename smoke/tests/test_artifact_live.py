@@ -39,7 +39,6 @@ from silo_smoke.distribution_registry import (
     OCI_EMPTY, OCI_INDEX, OCI_MANIFEST, DistributionClient, DistributionRegistry, digest_of, install_distribution,
 )
 from silo_smoke.registry import LoopbackRegistry
-from silo_smoke.restore import restore_image  # noqa: F401, pytest fixture
 from silo_smoke.workspace import Workspace
 
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
@@ -450,7 +449,7 @@ def allocation_state(silo: Silo) -> dict:
     ("raw", "zstd", "full"), ("layered", "raw", "full"), ("raw", "zstd", "incremental"),
 ], ids=["raw-root-zstd-chunks", "layered-root-raw-chunks", "incremental-standalone"])
 def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
-    silo: Silo, destination: Silo, distribution: DistributionRegistry, restore_image: str,  # noqa: F811
+    silo: Silo, destination: Silo, distribution: DistributionRegistry, restore_image: str,
     registry: LoopbackRegistry, profile: RootProfile, encoding: str, policy: str,
     artifact_processes: list[shutdown.Process],
 ) -> None:
@@ -634,7 +633,7 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
 
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_incompatible_imported_execution_refuses_before_child_allocation(
-    silo: Silo, destination: Silo, distribution: DistributionRegistry, restore_image: str,  # noqa: F811
+    silo: Silo, destination: Silo, distribution: DistributionRegistry, restore_image: str,
     registry: LoopbackRegistry, artifact_processes: list[shutdown.Process], profile: RootProfile,
 ) -> None:
     """Exact Phase 20 portability refusal, then separately named cold recovery.

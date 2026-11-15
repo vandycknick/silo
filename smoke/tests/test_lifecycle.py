@@ -14,7 +14,8 @@ def test_create_start_ready_stop_restart_rm(
     silo: Silo, workspace: Workspace, basic_image: str, registry: LoopbackRegistry,
 ) -> None:
     name = "lifecycle-vm"
-    created = silo.create(name, basic_image, "--cpus", "1", "--memory", "512mb", "--vsock", "--network", "none")
+    silo.create(name, basic_image, "--cpus", "1", "--memory", "512mb", "--vsock", "--network", "none")
+    created = silo.info(name)
     assert created["state"] == "stopped"
     assert created["observation"] == "observed"
     assert created["ready"] is False

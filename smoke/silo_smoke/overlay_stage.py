@@ -31,17 +31,11 @@ def replacement(silo: Silo, reference: str) -> None:
     retired = root / 'unlinked-stage'
     overlay.copy_runtime(silo.ws.config.runtime_dir, private)
     overlay.copy_runtime(private, successor)
-    fixture_root = os.environ.get('SILO_SMOKE_FAULT_MONITORS')
-    assert fixture_root, 'build fresh COPY-only reordered fixture first'
-    fixture = json.loads((Path(fixture_root) / 'reordered/fault-manifest.json').read_text())
-    assert fixture['fault'] == 'reordered'
-    assert fixture['validationUnchanged'] and fixture['uniqueAttachmentKeysUnchanged']
-    assert overlay.digest(Path(fixture['binary'])) == fixture['binarySha256']
-    shutil.copyfile(fixture['binary'], successor / 'bin/silo-vmm')
-    (successor / 'bin/silo-vmm').chmod(0o700)
     files = {'kernel': private / 'assets/kernel-default', 'base': private / 'assets/initramfs', 'native': private / 'bin/silo-vmm'}
-    assert fixture['binarySha256'] != overlay.digest(files['native'])
-    for kind in ('kernel', 'base'):
+    successor_monitor = successor / 'bin/silo-vmm'
+    successor_identity = successor_monitor.stat()
+    assert (successor_identity.st_dev, successor_identity.st_ino) != (files['native'].stat().st_dev, files['native'].stat().st_ino)
+    for kind in files:
         assert overlay.digest(successor / files[kind].relative_to(private)) == overlay.digest(files[kind])
     environment = silo.ws.env(SILO_RUNTIME_DIR=str(private))
     name = 'overlay-stage-replacement'
@@ -61,7 +55,9 @@ def replacement(silo: Silo, reference: str) -> None:
         silo.ws.record('overlay-stage-interception', json.dumps({'receipt': receipt, 'descriptors': observed, 'sourceIdentities': identities}) + '\n')
         temporary = Path(receipt['target'])
         assert temporary.parent == directory and temporary.stat().st_size == 0
+        assert temporary.name.startswith('.launch-') and temporary.name.endswith('.tmp')
         assert not (directory / 'kernel-qualified').exists()
+        assert not (directory / 'initramfs').exists()
         assert not list(directory.glob('.initramfs.*.tmp'))
         assert procs.vmm_pid(silo.ws, name) is None
         captured_fds = {}
@@ -91,7 +87,7 @@ def replacement(silo: Silo, reference: str) -> None:
     assert overlay.digest(directory / 'kernel-qualified') == identities['kernel']['sha256']
     assert overlay.digest(directory / 'initramfs', identities['base']['length']) == identities['base']['sha256']
     silo.ws.record('overlay-stage-replacement-refusal', output)
-    # A fresh launch owns the successor monitor. New monitor bytes are not an admission policy.
+    # A fresh launch owns the successor inode, even with byte-identical assets.
     silo.run('start', name, env=environment)
     silo.wait_ready(name)
     actual = {}
@@ -99,8 +95,10 @@ def replacement(silo: Silo, reference: str) -> None:
     assert monitor is not None
     for kind, pid in [('monitor', monitor), ('worker', overlay.worker_pid(silo, name))]:
         executable = Path('/proc') / str(pid) / 'exe'
-        assert overlay.digest(executable) == fixture['binarySha256']
-        actual[kind] = {'pid': pid, 'sha256': fixture['binarySha256'], 'target': os.readlink(executable)}
+        metadata = executable.stat()
+        assert (metadata.st_dev, metadata.st_ino) == (successor_identity.st_dev, successor_identity.st_ino)
+        assert overlay.digest(executable) == identities['native']['sha256']
+        actual[kind] = {'pid': pid, 'inode': metadata.st_ino, 'sha256': identities['native']['sha256'], 'target': os.readlink(executable)}
     overlay.evidence(silo, name)
     silo.ws.record('overlay-stage-successor-executables', json.dumps(actual) + '\n')
     silo.stop(name)

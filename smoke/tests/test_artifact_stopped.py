@@ -21,8 +21,8 @@ from silo_smoke.distribution_registry import (
     OCI_INDEX, OCI_MANIFEST, DistributionRegistry, install_distribution,
 )
 from silo_smoke.workspace import Workspace
-# These fixtures intentionally stay owned by their existing modules, not conftest.
-from .test_cloud_disk import CONVERTED_PROCESS, Roots, cloud_roots, convert_image
+from silo_smoke.cloud_disk import Roots
+from .test_cloud_disk import CONVERTED_PROCESS
 from .test_stopped import stopped_silo
 
 pytestmark = pytest.mark.linux_only
@@ -201,13 +201,14 @@ def _inspect_and_refuse(consumer: Silo, registry: DistributionRegistry, graph: G
     assert before == (stopped.catalog(consumer), stopped.inventory(consumer.ws.silo_home), stopped.inventory(consumer.ws.run_root))
     assert consumer.ls() == [], "inspection must never create or boot imported code"
     wrong = "sha256:" + ("0" if graph.index[7] != "0" else "1") * 64
+    refusals = cloud_disk.EarlyRefusals(consumer)
     for flags in (
         ("--approve-digest", wrong),
         ("--require-signature",),
         (),
     ):
-        cloud_disk.refuse_without_effects(consumer, "image", "pull", reference, *flags, "--name", "untrusted")
-    cloud_disk.refuse_without_effects(consumer, "create", reference, "--name", "not-a-container", "--network", "none")
+        refusals.refuse("image", "pull", reference, *flags, "--name", "untrusted")
+    refusals.refuse("create", reference, "--name", "not-a-container", "--network", "none")
     assert consumer.ls() == []
 
 

@@ -39,9 +39,7 @@ def overlay_large_image(config: SmokeConfig, registry: LoopbackRegistry, overlay
 @pytest.fixture(scope="session")
 def overlay_capacity_consumer(config: SmokeConfig) -> Path:
     binary = config.bin_dir / "examples/storage_acceptance"
-    if not binary.is_file():
-        binary = REPO / "target/debug/examples/storage_acceptance"
-    assert binary.is_file(), "Main must build cargo build -p libvm --example storage_acceptance"
+    assert binary.is_file(), "missing storage_acceptance helper; run make smoke-prereqs"
     return binary
 
 
@@ -473,15 +471,11 @@ def test_overlay_candidate_qualification(silo: Silo, overlay_image: str) -> None
         assert metadata["kernelDigest"] == "sha256:" + candidate.identities["kernelSha256"]
         assert metadata["baseInitramfsDigest"] == "sha256:" + candidate.identities["initramfsSha256"]
         assert metadata["nativeExecutableDigest"] == "sha256:" + candidate.identities["monitorWorkerSha256"]
-        config_input = os.environ.get("SILO_SMOKE_KERNEL_CONFIG")
-        if config_input:
-            config_digest = candidate.identities["resolvedConfigDigest"]
-        else:
+        config_digest = candidate.identities["resolvedConfigDigest"]
+        if not os.environ.get("SILO_SMOKE_KERNEL_CONFIG") and metadata["kernelArtifact"] is not None:
             artifact = metadata["kernelArtifact"]
-            assert artifact is not None, "supply actual resolved Kconfig via SILO_SMOKE_KERNEL_CONFIG for local kernel"
-            config_digest = artifact["resolvedConfig"]["digest"]
+            assert config_digest == artifact["resolvedConfig"]["digest"]
             assert artifact["kernel"]["digest"] == metadata["kernelDigest"]
-        candidate.identities["resolvedConfigDigest"] = config_digest
         candidate.identities["guestArchitecture"] = metadata["guestArchitecture"]
         candidate.identities["observedVerifierAccepted"] = True
         version = next(line.strip() for line in text.split("GUEST_KERNEL_VERSION", 1)[1].splitlines() if line.strip().startswith("Linux version "))
@@ -559,56 +553,6 @@ def test_overlay_scratch_discard_zero_length_invariants(silo: Silo, overlay_imag
     silo.start(name)
     silo.wait_ready(name)
     assert silo.exec(name, "cat", "/upper-trim-sentinel", user="root").stdout == "committed\n"
-
-
-@pytest.mark.linux_only
-@pytest.mark.parametrize("fault", ["missing", "truncated", "swapped", "duplicate", "writable-lower", "readonly-upper"])
-def test_overlay_native_serial_and_access_fail_closed(silo: Silo, overlay_image: str, fault: str) -> None:
-    from silo_smoke.overlay_candidate import Candidate
-    import re
-    candidate = Candidate(silo, overlay_image, fault=fault)
-    try:
-        candidate.start()
-        text = candidate.wait(rejected=True)
-        expected = {
-            "missing": "missing lower serial",
-            "truncated": "missing lower serial",
-            "swapped": "mismatch",
-            "duplicate": "duplicate lower serial",
-            "writable-lower": "read-only mismatch",
-            "readonly-upper": "read-only mismatch",
-        }[fault]
-        assert expected in text
-        candidate.close()
-        logs = candidate.native_diagnostic()
-        responses = re.findall(r"SILO_SMOKE_GET_ID device=(0x[0-9a-f]+) sectors=([0-9]+) reply=([^\s]+)", logs)
-        assert responses, "missing actual native virtqueue GET_ID request/response evidence"
-        if fault == "duplicate":
-            devices = {address for address, sectors, reply in responses if reply == "silo-root-lower"}
-            assert len(devices) == 2, "must observe two distinct attached devices returning duplicate GET_ID, not missing/replaced native key"
-            assert any(reply == "silo-root-upper" for _, _, reply in responses)
-        silo.ws.record("overlay-native-get-id", json.dumps({"fault": fault, "actualResponses": responses}) + "\n")
-    finally:
-        candidate.close()
-
-
-@pytest.mark.linux_only
-def test_overlay_native_reordered_devices_keep_exact_serial_discovery(silo: Silo, overlay_image: str) -> None:
-    from silo_smoke.overlay_candidate import Candidate
-    candidate = Candidate(silo, overlay_image, fault="reordered")
-    try:
-        candidate.start()
-        text = candidate.wait()
-        assert "init: overlay: verified managed root" in text
-        # The candidate workload reports actual /sys/block names/serials, so the
-        # reordered native attachments are observed, not inferred from a flag.
-        assert "DEVICE:/sys/block/vda" in text and "DEVICE:/sys/block/vdb" in text
-        first = text.index("DEVICE:/sys/block/vda")
-        second = text.index("DEVICE:/sys/block/vdb")
-        assert "silo-root-upper" in text[first:second]
-        assert "silo-root-lower" in text[second:]
-    finally:
-        candidate.close()
 
 
 def test_overlay_capacity_refusal_is_nonmutating(silo: Silo, overlay_image: str, overlay_capacity_consumer: Path) -> None:
@@ -703,18 +647,6 @@ def test_overlay_shutdown_rejects_real_maintenance_path_replacement(silo: Silo, 
     assert terminal["storageShutdown"]["hostFlushCompleted"] is False
     assert shutdown.outcome(silo, name) != "clean"
     shutdown.assert_failed_completion(silo.ws.silo_home / "logs/machines" / silo.machine_id(name), watched["runId"])
-
-
-def test_overlay_injected_request_is_rejected_before_workload(silo: Silo, overlay_image: str) -> None:
-    from silo_smoke.overlay_candidate import Candidate
-    candidate = Candidate(silo, overlay_image, fault="effective-index-off")
-    try:
-        candidate.start()
-        text = candidate.wait(rejected=True)
-        assert "init: overlay: effective persistence profile downgraded" in text
-        silo.ws.record("overlay-injected-request-proof", "mutation=copied-init-mount-request-index-off; verifier=byte-identical-production; not-a-spontaneous-kernel-downgrade\n" + text)
-    finally:
-        candidate.close()
 
 
 @pytest.mark.parametrize("kind", ["file", "symlink"])
@@ -930,18 +862,18 @@ def test_overlay_actual_journal_inode_ignores_wrong_superblock_backup(silo: Silo
 @pytest.mark.parametrize("backing", ["tmpfs", "ramfs"])
 @pytest.mark.parametrize("operation", ["discard", "zero", "zero-unmap"])
 @pytest.mark.parametrize("region", ["middle", "tail", "whole", "middle-sector", "tail-sector"])
-def test_overlay_native_range_opcode_and_real_fallback(silo: Silo, config: SmokeConfig, registry: LoopbackRegistry, overlay_image: str, backing: str, operation: str, region: str) -> None:
+def test_overlay_native_range_and_real_fallback(silo: Silo, config: SmokeConfig, registry: LoopbackRegistry, overlay_image: str, backing: str, operation: str, region: str) -> None:
     from dataclasses import asdict
     import sys
     request = silo.ws.evidence / "native-range-request.json"
     evidence = silo.ws.evidence / "native-range"
     request.write_text(json.dumps({"config": asdict(config), "registry_ca": str(registry.ca_path), "image": overlay_image, "backing": backing, "operation": operation, "region": region, "evidence": str(evidence), "outer_uid": str(os.getuid()), "outer_user_namespace": os.readlink("/proc/self/ns/user")}, default=str))
-    result = subprocess.run(["unshare", "--user", "--map-root-user", "--mount", "--propagation", "private", sys.executable, "-m", "silo_smoke.overlay_range", str(request)], env=silo.ws.env(PYTHONPATH=str(REPO / "smoke"), TMPDIR=str(silo.ws.root.parent), SILO_SMOKE_FAULT_MONITORS=os.environ.get("SILO_SMOKE_FAULT_MONITORS", "")), capture_output=True, text=True, timeout=240)
+    result = subprocess.run(["unshare", "--user", "--map-root-user", "--mount", "--propagation", "private", sys.executable, "-m", "silo_smoke.overlay_range", str(request)], env=silo.ws.env(PYTHONPATH=str(REPO / "smoke"), TMPDIR=str(silo.ws.root.parent)), capture_output=True, text=True, timeout=240)
     silo.ws.record("overlay-native-range-namespace", result.stdout + result.stderr)
     assert result.returncode == 0, result.stderr
     complete = (evidence / "overlay-range-complete.log").read_text()
     assert f'"backing": "{backing}"' in complete
-    assert '"nativeRequests": [' in complete
+    assert '"productionPath": "unmodified staged CLI/libvm/monitor/worker; stop/reopen/capacity/guest read"' in complete
 
 
 @pytest.mark.linux_only

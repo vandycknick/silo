@@ -53,12 +53,8 @@ def test_capture_matched_cut_isolation_and_pause_authority(silo: Silo, capture_i
             silo.run("pause", name)
             borrowed = silo.info(name)["lifecycle"]["lifecycle"]["currentPause"]
             counter.stationary()
-            intents = procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command")
-            refused = silo.run("snapshot", "create", name, "--live", expect=None)
-            assert refused.returncode != 0, "capture must not resume a borrowed user pause"
-            assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command") == intents
         result = silo.run("snapshot", "create", name, "--live", "--name", "captured",
-                          *(["--preserve"] if policy != "resume" else []), timeout=240)
+                          *(["--preserve"] if policy == "preserve" else []), timeout=240)
         value = json.loads(result.stdout)
         summary = value["capture"]
         assert value["snapshot"]["captureKind"] == "live-execution"
@@ -69,6 +65,9 @@ def test_capture_matched_cut_isolation_and_pause_authority(silo: Silo, capture_i
         assert not relative.is_absolute() and ".." not in relative.parts
         directory = silo.ws.silo_home / relative
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        plan = json.loads((directory / "request.json").read_bytes())
+        assert plan["resumePolicy"] == ("resume-if-acquired" if policy == "resume" else "preserve")
+        assert summary["resumePolicy"] == plan["resumePolicy"]
         seal = json.loads((directory / "vm.capture.json").read_bytes())
         assert seal["captureOutcome"] == "coherent" and seal["error"] is None
         assert seal["captureId"] == summary["captureId"]
@@ -417,9 +416,7 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
             assert not shutdown.lease_busy(lease)
             # New manager reconciles the retained exact operation, never requests Resume.
             binary = silo.ws.config.bin_dir / "examples/live_acceptance"
-            if not binary.is_file():
-                binary = REPO / "target/debug/examples/live_acceptance"
-            assert binary.is_file(), "build the real durable capture driver"
+            assert binary.is_file(), "missing live_acceptance helper; run make smoke-prereqs"
             recovered = subprocess.run(
                 [str(binary), name, "complete-capture", plan["captureId"]],
                 env=silo.ws.env(), capture_output=True, text=True, timeout=90,

@@ -7,7 +7,7 @@ VZ refusal is a macOS lane and is not exercised on Linux.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import partial
 import json
 import os
@@ -18,51 +18,14 @@ from uuid import uuid4
 import pytest
 
 from silo_smoke import cloud_disk, images, overlay, shutdown, stopped
-from silo_smoke.cli import TIMINGS_PROPERTY, Silo, release
-from silo_smoke.cloud_disk import Disk, Guids, Part
-from silo_smoke.config import SmokeConfig
-from silo_smoke.registry import LoopbackRegistry
-from silo_smoke.workspace import Workspace
+from silo_smoke.cli import Silo
+from silo_smoke.cloud_disk import Disk, Guids, Part, Roots
 
 linux = pytest.mark.linux_only
 
 
-@dataclass(frozen=True)
-class Roots:
-    """Never-booted whole-disk ext4 roots differing only in their identity marker."""
-
-    root: Path
-    clone: Path
-
-
-@pytest.fixture(scope="session")
-def cloud_roots(config: SmokeConfig, registry: LoopbackRegistry, tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest,
-                record_testsuite_property) -> Roots:
-    directory = tmp_path_factory.mktemp("phase17-roots")
-    base = images.fetch_alpine(config.cache_dir)
-    preparation = Workspace(config, registry.ca_path)
-    prepared: dict[str, Path] = {}
-    try:
-        silo = Silo(preparation)
-        for identity in ("root", "clone"):
-            reference = registry.publish(images.build(cloud_disk.root_image_spec(identity), base), f"phase17-{identity}")
-            name = f"phase17-prepare-{identity}"
-            silo.create(name, silo.raw_image(reference), "--disk-size", "512mib", "--network", "none")
-            record = stopped.record(silo, name)
-            assert record["root"]["kind"] == "opaque-raw" and record["root"]["layout"] == {"kind": "whole-disk"}, record["root"]
-            output = cloud_disk.sparse_clone(cloud_disk.root_disk(silo, name), directory / f"{identity}.ext4")
-            cloud_disk.e2fsck_clean(output)
-            assert cloud_disk.debugfs_cat(output, cloud_disk.IDENTITY) == identity.encode() + b"\n"
-            assert cloud_disk.debugfs_cat(output, cloud_disk.PROBE) == cloud_disk.PROBE_SCRIPT
-            prepared[identity] = output
-    finally:
-        release(preparation, failed=len(prepared) != 2 or request.session.testsfailed > 0,
-                publish=partial(record_testsuite_property, f"{TIMINGS_PROPERTY}-prepare-phase17-roots"))
-    return Roots(prepared["root"], prepared["clone"])
-
-
-def create_vm(silo: Silo, name: str, source: str, *flags: str) -> dict:
-    return silo.create(name, source, "--cpus", "1", "--memory", "512mib", "--network", "none", "--vsock", *flags)
+def create_vm(silo: Silo, name: str, source: str, *flags: str) -> None:
+    silo.create(name, source, "--cpus", "1", "--memory", "512mib", "--network", "none", "--vsock", *flags)
 
 
 def gpt(silo: Silo, ext4: Path, name: str = "cloud.raw", guids: Guids | None = None, **options) -> tuple[Disk, Guids]:
@@ -520,6 +483,12 @@ def test_pinned_bundle_survives_removal_and_changes_only_by_explicit_update(silo
     assert replacement["baseInitramfs"] != original["baseInitramfs"] and replacement["agent"] != original["agent"]
     view = silo.info("pinned-a")["boot"]
     assert view["bundle"] == cloud_disk.bundle_digest(original)
+    assert view["packagedReplacement"] is None, "unimported installed bytes are not an admitted bundle"
+    create_vm(silo, "replacement-admission", "image:pinned")
+    silo.run("set", "replacement-admission", "boot-assets=packaged")
+    assert stopped.record(silo, "replacement-admission")["boot"]["binding"] == replacement
+    view = silo.info("pinned-a")["boot"]
+    assert view["bundle"] == cloud_disk.bundle_digest(original)
     assert view["packagedReplacement"] == cloud_disk.bundle_digest(replacement), "a locally admitted replacement is visible, not applied"
 
     # Start never upgrades implicitly; a running machine refuses the update.
@@ -585,22 +554,11 @@ def test_image_and_snapshot_creation_preserve_semantics_and_every_disk(silo: Sil
     stopped.same_content(source, stopped.backing(silo, "snap-source", "phase17-source-unchanged"))
 
 
-CONVERTED_DEFAULTS = {
-    "Entrypoint": ["/bin/sleep"], "Cmd": ["3600"],
-    "Env": ["PATH=/usr/sbin:/usr/bin:/sbin:/bin", "PHASE17_CONVERTED=exact value"],
-    "WorkingDir": "/srv", "User": "root",
-}
 CONVERTED_PROCESS = {
     "entrypoint": ["/bin/sleep"], "command": ["3600"],
     "environment": {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "PHASE17_CONVERTED": "exact value"},
     "workingDirectory": "/srv", "user": "root",
 }
-
-
-@pytest.fixture(scope="session")
-def convert_image(config: SmokeConfig, registry: LoopbackRegistry) -> tuple[str, images.OciImage]:
-    image = cloud_disk.with_process_defaults(images.build(cloud_disk.root_image_spec("root"), images.fetch_alpine(config.cache_dir)), CONVERTED_DEFAULTS)
-    return registry.publish(image, "phase17-convert"), image
 
 
 @linux

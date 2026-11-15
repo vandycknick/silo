@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from .workspace import Workspace
 
 TIMING_EVIDENCE = "timing"
-# Per-test JUnit property; session preparations append `-prepare-<catalog>`.
+# Per-test JUnit property and per-worker session preparation evidence prefix.
 TIMINGS_PROPERTY = "silo-smoke-timings"
 # Lifecycle matrices: an explicitly converted opaque raw disk, or the ordinary
 # OCI default (layered `linux-erofs-overlay-v1` root on libkrun).
@@ -171,10 +171,9 @@ class Silo:
                     raise SmokeAssertion(f"machine {name} not ready after {timeout}s: {json.dumps(last)}")
                 time.sleep(min(poll_interval, remaining))
 
-    def create(self, name: str, image: str, *flags: str) -> dict[str, Any]:
+    def create(self, name: str, image: str, *flags: str) -> None:
         self.run("create", image, "--name", name, *flags)
         self.ws.register_machine(name)
-        return self.info(name)
 
     def raw_image(self, reference: str) -> str:
         """Explicitly convert an OCI reference into the opaque raw disk family.
@@ -198,6 +197,7 @@ class Silo:
 
     def rm(self, name: str, force: bool = False) -> None:
         self.run("rm", name, *(["--force"] if force else []))
+        self.ws.unregister_machine(name)
 
     def exec(
         self, name: str, *argv: str, stdin: bytes | str | None = None,

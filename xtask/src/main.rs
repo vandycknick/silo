@@ -62,6 +62,8 @@ enum Commands {
     Stage {
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
         profile: Profile,
+        #[arg(long, value_name = "FEATURES")]
+        vmm_features: Option<String>,
         #[command(flatten)]
         kernel: KernelOptions,
         #[command(flatten)]
@@ -250,8 +252,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             profile,
             kernel,
             rprobe,
+            vmm_features,
         } => {
-            let context = build_context(&workspace_root, &target_dir, profile)?;
+            let mut context = build_context(&workspace_root, &target_dir, profile)?;
+            context.vmm_features = vmm_features.as_deref();
             build_runtime(&context)?;
             assemble_runtime(&context, kernel, true, &rprobe)?;
         }
@@ -487,6 +491,7 @@ fn build_context<'a>(
         target_dir,
         profile,
         host: HostTarget::current()?,
+        vmm_features: None,
     })
 }
 

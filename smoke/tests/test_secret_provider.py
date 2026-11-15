@@ -9,24 +9,14 @@ from uuid import UUID
 
 import pytest
 
-from silo_smoke import images
 from silo_smoke.cli import Silo
-from silo_smoke.config import SmokeConfig
 from silo_smoke.errors import SmokeAssertion
-from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
 
 
 KEY = "openai_codex_oauth.personal.oauth"
 EXPIRED_TOKEN = "expired-initial-payload"
 REFRESHED_TOKEN = "synthetic-sec02-refreshed-access"
-
-
-@pytest.fixture(scope="session")
-def ca_trust_image(config: SmokeConfig, registry: LoopbackRegistry) -> str:
-    return registry.publish(
-        images.build(images.CA_TRUST, images.fetch_alpine(config.cache_dir)), "ca-trust",
-    )
 
 
 def _replace_record(store: Path, token: str, expiry: str) -> None:

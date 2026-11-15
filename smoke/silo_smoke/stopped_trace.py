@@ -666,7 +666,7 @@ def main() -> None:
                             or (boundary == "source-read" and syscall in (0, 5, 8, 17) and source)
                             or (boundary == "boot-kernel-copy" and syscall in (1, 18, 20)
                                 and actual_path is not None and actual_path.parent.parent == machines
-                                and actual_path.name.startswith(".kernel-") and actual_path.name.endswith(".tmp"))
+                                and actual_path.name.startswith(".launch-") and actual_path.name.endswith(".tmp"))
                             or (boundary == "destination-copy" and owned_copy and (syscall in (1, 18, 20) or (syscall == 16 and info.data[2] == 0x40049409)))
                             or (boundary == "destination-sync" and (owned_copy or published_copy) and syscall in (74, 75))
                             or (boundary == "publication-rename" and publication)

@@ -381,6 +381,8 @@ class NoEffects:
     """
 
     def __init__(self, runtimes: tuple[Runtime, ...]) -> None:
+        for runtime in runtimes:
+            runtime.silo.run("ls", label="settle-before-handoff-refusals")
         self.runtimes = runtimes
         self.before = _state(runtimes)
 

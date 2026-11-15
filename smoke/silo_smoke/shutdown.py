@@ -20,7 +20,6 @@ from uuid import UUID
 
 from . import procs
 from .cli import Silo
-from .config import REPO
 
 
 def until(predicate, *, timeout: float = 30, description: str):
@@ -196,9 +195,7 @@ def outcome(silo: Silo, name: str) -> str:
 
 def storage_tool(silo: Silo, *args: str) -> None:
     binary = silo.ws.config.bin_dir / "examples/storage_acceptance"
-    if not binary.is_file():
-        binary = REPO / "target/debug/examples/storage_acceptance"
-    assert binary.is_file(), "Main must build cargo build -p libvm --example storage_acceptance"
+    assert binary.is_file(), "missing storage_acceptance helper; run make smoke-prereqs"
     result = subprocess.run([str(binary), *args], env=silo.ws.env(), capture_output=True, text=True, timeout=90)
     silo.ws.record("shutdown-storage-api", result.stdout + result.stderr)
     assert result.returncode == 0, result.stderr

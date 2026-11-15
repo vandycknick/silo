@@ -74,7 +74,7 @@ import tempfile
 import time
 from uuid import UUID
 
-from . import overlay, page_cache, restore_lifecycle
+from . import overlay, page_cache, prereqs, restore_lifecycle
 from .cli import Silo
 
 RAM = "4096mib"
@@ -232,13 +232,10 @@ def boot_timing(text: str, *, trace: Path, machine_id: str, run_id: str,
 
 def evidence_directory(label: str) -> Path:
     """Durable text evidence outside the (deleted-on-success) workspace."""
-    value = os.environ.get(EVIDENCE_VARIABLE)
-    assert value, f"set {EVIDENCE_VARIABLE} to a durable directory for budget evidence"
-    parent = Path(value).expanduser().resolve()
-    assert parent.is_dir(), parent
+    parent = prereqs.evidence_parent(EVIDENCE_VARIABLE)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    directory = parent / f"{label}-{stamp}"
-    directory.mkdir(mode=0o700)
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    directory = Path(tempfile.mkdtemp(prefix=f"{label}-{stamp}-{worker}-", dir=parent))
     return directory
 
 
@@ -288,12 +285,8 @@ def reference_host(silo: Silo) -> dict:
     monitor = inputs["silo-vmm"]
     capabilities = overlay.native_capabilities(monitor)
     overlay.monitor_build_identity(capabilities)  # Informational metadata; binary SHA-256 is evidence.
-    # Same convention as the other smoke gates: the staged kernel's emitted .config.
-    configured = os.environ.get("SILO_SMOKE_KERNEL_CONFIG")
-    kernel_config = None
-    if configured:
-        path = Path(configured).resolve(strict=True)
-        kernel_config = {"path": str(path), "sha256": _digest(path)}
+    path = prereqs.kernel_config(runtime)
+    kernel_config = {"path": str(path), "sha256": _digest(path)}
     headroom(silo, GIB)
     return {
         "cpu": cpu, "logicalCpus": os.cpu_count(), "memTotalKiB": int(memory),

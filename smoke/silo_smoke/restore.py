@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import socket
 import struct
 import subprocess
@@ -24,7 +25,7 @@ import uuid
 
 import pytest
 
-from . import images, overlay, pause, procs, stopped
+from . import images, irq_fixture, overlay, pause, prereqs, procs, stopped
 from .cli import Result, RootProfile, Silo
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
@@ -35,7 +36,6 @@ RECORD = struct.Struct("<8Q")
 STATE = struct.Struct("<15Q")
 
 
-@pytest.fixture(scope="session")
 def restore_image(config: SmokeConfig, registry: LoopbackRegistry,
                   tmp_path_factory: pytest.TempPathFactory) -> str:
     output = tmp_path_factory.mktemp("restore-probe") / "restore-execution"
@@ -325,7 +325,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
     """
     assert mutation in {"cpu", "schema", "architecture", "profile", "xsave", "tsc-rate", "msr"}
     binary = silo.ws.config.bin_dir / "examples/native-live-api"
-    assert binary.is_file(), "Main must stage cargo build -p silo-vmm --example native-live-api"
+    assert binary.is_file(), "missing native-live-api helper; run make smoke-prereqs"
     original = snapshot_record(silo, saved)
     source_digest = original["execution"]["execution"]
     source = silo.ws.silo_home / "images/objects/sha256" / source_digest[7:]
@@ -457,17 +457,27 @@ def irq_cut(silo: Silo, saved: Checkpoint, *, pending: bool) -> dict:
     return proof
 
 
-@pytest.fixture(scope="session")
-def restore_irq_fixture(config: SmokeConfig) -> Path:
-    """Authenticate witness inputs against the selected staged monitor."""
-    directory = config.runtime_dir / "assets/restore-irq-witness"
+@pytest.fixture
+def restore_irq_fixture(silo: Silo) -> Path:
+    """Use a private production runtime with the separately staged diagnostic monitor."""
+    config = silo.ws.config
+    diagnostic = prereqs.target_dir() / "smoke-diagnostic/silo-runtime" / config.runtime_dir.parent.name / config.runtime_dir.name
+    runtime = silo.ws.root / "irq-runtime"
+    overlay.copy_runtime(config.runtime_dir, runtime)
+    shutil.copyfile(diagnostic / "bin/silo-vmm", runtime / "bin/silo-vmm")
+    shutil.copyfile(diagnostic / "runtime-manifest.json", runtime / "runtime-manifest.json")
+    staged = json.loads((runtime / "runtime-manifest.json").read_text())
+    for filename, expected in staged["files"].items():
+        assert overlay.digest(runtime / filename) == expected, filename
+    silo.ws.config = replace(config, runtime_dir=runtime)
+    directory = irq_fixture.stage(runtime)
     manifest = json.loads((directory / "fixture-manifest.json").read_text())
     for field, filename in (("sourceSha256", "witness.S"), ("binarySha256", "witness.bin"),
                             ("symbolsSha256", "witness.nm")):
         assert overlay.digest(directory / filename) == manifest[field], (field, filename)
     assert 0 < (directory / "witness.bin").stat().st_size <= 0x3000
     assert 0 < (directory / "witness.nm").stat().st_size <= 65536
-    monitor = config.runtime_dir / "bin/silo-vmm"
+    monitor = runtime / "bin/silo-vmm"
     assert overlay.digest(monitor) == manifest["monitorSha256"]
     capabilities = overlay.native_capabilities(monitor)
     assert capabilities["buildIdentity"] == manifest["buildIdentity"]

@@ -12,7 +12,6 @@ import pytest
 from silo_smoke import capture, fork, incremental, overlay, pause, procs, reclaim, restore, shutdown, stopped
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO
-from silo_smoke.incremental import incremental_image  # noqa: F401, pytest fixture
 
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 SOURCE = "incremental-source"
@@ -27,7 +26,7 @@ def create(silo: Silo, image: str, *, start: bool = True) -> None:
 
 
 def test_incremental_fork_preserves_pause_and_child_baseline(
-    silo: Silo, incremental_image: str,  # noqa: F811
+    silo: Silo, incremental_image: str,
 ) -> None:
     create(silo, incremental_image)
     initial = incremental.witness(silo, SOURCE, "start")
@@ -53,7 +52,7 @@ def test_incremental_fork_preserves_pause_and_child_baseline(
 
 
 def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
-    silo: Silo, incremental_image: str,  # noqa: F811
+    silo: Silo, incremental_image: str,
 ) -> None:
     create(silo, incremental_image)
     initial = incremental.witness(silo, SOURCE, "start")
@@ -111,7 +110,7 @@ def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
 
 
 def test_observed_console_vsock_and_balloon_writes_match_frozen_full_ram(
-    silo: Silo, incremental_image: str,  # noqa: F811
+    silo: Silo, incremental_image: str,
 ) -> None:
     create(silo, incremental_image)
     reclaim.settled(silo, SOURCE)
@@ -172,7 +171,7 @@ def test_observed_console_vsock_and_balloon_writes_match_frozen_full_ram(
 
 
 @pytest.mark.parametrize("threshold", [0, 61, 255])
-def test_incremental_threshold_refuses_before_freeze(silo: Silo, incremental_image: str, threshold: int) -> None:  # noqa: F811
+def test_incremental_threshold_refuses_before_freeze(silo: Silo, incremental_image: str, threshold: int) -> None:
     create(silo, incremental_image)
     before = incremental.no_child(silo)
     info = silo.info(SOURCE)
@@ -187,7 +186,7 @@ def test_incremental_threshold_refuses_before_freeze(silo: Silo, incremental_ima
 
 
 def test_full_request_lowered_crossover_and_new_worker_invalidate_baseline(
-    silo: Silo, incremental_image: str,  # noqa: F811
+    silo: Silo, incremental_image: str,
 ) -> None:
     create(silo, incremental_image)
     initial = incremental.witness(silo, SOURCE, "start")
@@ -217,7 +216,7 @@ def test_full_request_lowered_crossover_and_new_worker_invalidate_baseline(
 @pytest.mark.parametrize("boundary", ["capture-ram-write", "capture-dirty-harvest"],
                          ids=["abandoned-union", "post-effect-coverage-lost"])
 def test_capture_dirty_union_and_coverage_recovery(
-    silo: Silo, incremental_image: str, boundary: str,  # noqa: F811
+    silo: Silo, incremental_image: str, boundary: str,
 ) -> None:
     """Cancel a real completed RAM attempt or fail a real harvested dirty log."""
     create(silo, incremental_image, start=False)

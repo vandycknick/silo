@@ -47,6 +47,7 @@ from urllib.parse import quote, urlsplit
 from .config import RUN_ROOT_PARENT
 from .errors import SmokeAssertion, SmokeEnvironmentError
 from .registry import ensure_ca, issue_leaf_certificate
+from .prereqs import workspace_parent
 
 # Source: https://github.com/distribution/distribution/releases/tag/v3.1.2 (stable,
 # 2026-09-24). Archive digests equal the release API asset `digest` fields and the
@@ -505,8 +506,8 @@ _LISTENING = re.compile(r"listening on 127\.0\.0\.1:(\d+), tls")
 
 
 def default_parent() -> Path:
-    """Same scratch placement as `Workspace`: process TMPDIR on Linux, else the run root."""
-    return Path(os.environ.get("TMPDIR", RUN_ROOT_PARENT) if platform.system() == "Linux" else RUN_ROOT_PARENT)
+    """Same durable scratch placement as `Workspace`, with short runtime sockets."""
+    return workspace_parent() if platform.system() == "Linux" else Path(RUN_ROOT_PARENT)
 
 
 class DistributionRegistry:

@@ -8,22 +8,13 @@ import shutil
 import subprocess
 from uuid import uuid4
 
-from . import overlay, shutdown, stopped
+from . import overlay, prereqs, shutdown, stopped
 from .cli import Silo
-from .config import REPO
 from .overlay_candidate import cpio
 
 
-def controller() -> Path:
-    override = os.environ.get("SILO_SMOKE_GUEST_LIFECYCLE_CONTROLLER")
-    target = Path(os.environ.get("CARGO_TARGET_DIR", str(REPO / "target")))
-    path = Path(override) if override else target / "debug/examples/guest-lifecycle-controller"
-    assert path.is_file() and os.access(path, os.X_OK), (
-        "Main must build the explicit helper first: cargo build -p silo-vmm "
-        "--example guest-lifecycle-controller; set SILO_SMOKE_GUEST_LIFECYCLE_CONTROLLER "
-        "when using a different target/profile"
-    )
-    return path.resolve()
+def controller(directory: Path | None = None) -> Path:
+    return prereqs.example("guest-lifecycle-controller", directory, "SILO_SMOKE_GUEST_LIFECYCLE_CONTROLLER")
 
 
 def _run_controller(silo: Silo, executable: Path, fixture: Path, directory: Path) -> subprocess.CompletedProcess:
@@ -152,7 +143,7 @@ def private_kernel(assets: Path, directory: Path) -> tuple[Path, Path]:
 
 
 def run(silo: Silo, image: str) -> dict:
-    executable = controller()
+    executable = controller(silo.ws.config.bin_dir)
     disk, directory = private_root(silo, image, "guest-lifecycle-")
     machine, run_id = str(uuid4()), str(uuid4())
     manifest = {"kind": "complete", "attachments": [block_attachment(disk)]}
@@ -173,7 +164,7 @@ def run(silo: Silo, image: str) -> dict:
                   "compositeInitramfsSha256": overlay.digest(composite), "machineId": machine, "runId": run_id,
                   "scope": "real cold guest API, not native pause/capture/restore/generation qualification"}
     identities["kernelSource"] = str(kernel_source)
-    resolved = kernel_source.parent / ".config"
+    resolved = kernel_source.parent / ".config" if os.environ.get("SILO_SMOKE_GUEST_LIFECYCLE_KERNEL") else prereqs.kernel_config(silo.ws.config.runtime_dir)
     if resolved.is_file():
         shutil.copyfile(resolved, directory / "resolved.config")
         identities["resolvedConfigSha256"] = overlay.digest(resolved)

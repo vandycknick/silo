@@ -12,7 +12,7 @@ from typing import BinaryIO
 import pytest
 
 from silo_smoke.cli import Silo, Vm
-from silo_smoke.procs import free_port
+from silo_smoke.procs import bound_port
 from silo_smoke.workspace import Workspace
 
 
@@ -42,7 +42,6 @@ def test_inbound_forward_host_to_guest(silo: Silo, workspace: Workspace, basic_i
     silo.create(name, basic_image, "--cpus", "1", "--memory", "512mb", "--vsock")
     silo.start(name)
     silo.wait_ready(name)
-    port = free_port()
     guest = silo.popen("exec", name, "--", "sh", "-c", "printf hello | nc -l -p 9000", stdin=subprocess.DEVNULL)
     forward: subprocess.Popen[bytes] | None = None
     try:
@@ -53,9 +52,10 @@ def test_inbound_forward_host_to_guest(silo: Silo, workspace: Workspace, basic_i
                 break
             assert time.monotonic() < deadline, f"Guest listener not ready: {tcp}"
             time.sleep(0.05)
-        forward = silo.popen("forward", name, f"{port}:9000", stdin=subprocess.DEVNULL)
+        forward = silo.popen("forward", name, "0:9000", stdin=subprocess.DEVNULL)
         assert forward.stdout is not None
         status = _read_status(forward.stdout)
+        port = bound_port(status)
         workspace.record("forward-status", status.decode())
         assert status == f"Forwarding host:tcp:127.0.0.1:{port} -> guest:tcp:127.0.0.1:9000 (inbound)\n".encode()
         active = silo.run("forward", name, "--list").stdout

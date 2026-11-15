@@ -162,15 +162,7 @@ def mount_evidence(silo: Silo, expected: str | None = None) -> dict:
 
 def catalog(silo: Silo) -> dict[str, list[tuple[str, ...]]]:
     """Full logical schema/rows, excluding only SQLite's physical sidecars."""
-    schema = procs.query(silo.ws.state_db(), "SELECT quote(type),quote(name),quote(tbl_name),quote(sql) FROM sqlite_schema ORDER BY type,name")
-    result = {"schema": schema}
-    for (table,) in procs.query(silo.ws.state_db(), "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name"):
-        identifier = '"' + table.replace('"', '""') + '"'
-        columns = procs.query(silo.ws.state_db(), f"PRAGMA table_info({identifier})")
-        names = ['"' + column[1].replace('"', '""') + '"' for column in columns]
-        expressions = [f"typeof({name}) || ':' || hex({name})" for name in names]
-        result[table] = sorted(procs.query(silo.ws.state_db(), f"SELECT {','.join(expressions)} FROM {identifier}"))
-    return result
+    return procs.catalog(silo.ws.state_db())
 
 
 def inventory(root: Path) -> dict[str, tuple]:
@@ -192,6 +184,7 @@ def inventory(root: Path) -> dict[str, tuple]:
 
 
 def refuse_without_effects(silo: Silo, *args: str) -> None:
+    silo.run("ls", label="settle-before-refusal")
     before = (catalog(silo), inventory(silo.ws.silo_home), inventory(silo.ws.run_root))
     result = silo.run(*args, expect=None, timeout=30)
     after = (catalog(silo), inventory(silo.ws.silo_home), inventory(silo.ws.run_root))

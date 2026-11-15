@@ -2,19 +2,9 @@ from __future__ import annotations
 
 import json
 import stat
-import pytest
-
-from silo_smoke import images
 from silo_smoke.cli import Silo
-from silo_smoke.config import SmokeConfig
 from silo_smoke.errors import SmokeAssertion
-from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
-
-
-@pytest.fixture(scope="session")
-def ca_trust_image(config: SmokeConfig, registry: LoopbackRegistry) -> str:
-    return registry.publish(images.build(images.CA_TRUST, images.fetch_alpine(config.cache_dir)), "ca-trust")
 
 
 def test_bearer_policy_machine_starts_ready(silo: Silo, workspace: Workspace, ca_trust_image: str) -> None:

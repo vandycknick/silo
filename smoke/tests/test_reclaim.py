@@ -7,7 +7,7 @@ from silo_smoke import fork, incremental, reclaim, restore
 from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.reclaim import reclaim_image, reclaim_silo  # noqa: F401, pytest fixtures
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
+pytestmark = [pytest.mark.linux_only, pytest.mark.slow, pytest.mark.serial]
 SOURCE = "reclaim-a"
 RESTORED = "reclaim-b"
 

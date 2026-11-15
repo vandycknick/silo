@@ -55,9 +55,7 @@ def digest(data: bytes) -> str:
 
 def acceptance_binary(silo: Silo) -> Path:
     binary = silo.ws.config.bin_dir / "examples/live_acceptance"
-    if not binary.is_file():
-        binary = REPO / "target/debug/examples/live_acceptance"
-    assert binary.is_file(), "build the real durable capture driver (live_acceptance example)"
+    assert binary.is_file(), "missing live_acceptance helper; run make smoke-prereqs"
     return binary
 
 
