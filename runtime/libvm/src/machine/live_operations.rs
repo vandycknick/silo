@@ -506,6 +506,13 @@ fn require_new_command(
         _ => {}
     }
     let state = observation.state()?;
+    if matches!(command, LiveCommand::CancelOperation(_))
+        && matches!(state, VmLifecycleState::Running | VmLifecycleState::Paused)
+    {
+        // Only the monitor knows whether this exact target still owns an
+        // identity-pending cut after its source continuation.
+        return Ok(None);
+    }
     Ok((!state.admits(command.kind())).then(|| {
         LiveCommandResult::rejected(
             command.kind(),
@@ -790,5 +797,48 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("journal unavailable"), "{message}");
+    }
+
+    #[test]
+    fn stable_source_cancellation_defers_target_phase_to_monitor_without_changing_matrix() {
+        use crate::machine::live_operations::{envelope, require_new_command};
+        use vm_spec::lifecycle::{CancelOperationCommand, LiveCommand};
+
+        for state in [VmLifecycleState::Running, VmLifecycleState::Paused] {
+            let observation = observed(state, LiveLifecycle::default());
+            let command = LiveCommand::CancelOperation(CancelOperationCommand {
+                envelope: envelope(&observation, uuid::Uuid::from_u128(9)).unwrap(),
+                operation_id: id(4),
+            });
+            assert!(!state.admits(command.kind()));
+            assert!(require_new_command(&observation, &command)
+                .unwrap()
+                .is_none());
+        }
+        for state in [
+            VmLifecycleState::Starting,
+            VmLifecycleState::Stopped,
+            VmLifecycleState::Error,
+        ] {
+            let observation = observed(state, LiveLifecycle::default());
+            let command = LiveCommand::CancelOperation(CancelOperationCommand {
+                envelope: envelope(&observation, uuid::Uuid::from_u128(9)).unwrap(),
+                operation_id: id(4),
+            });
+            let rejected = require_new_command(&observation, &command)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                rejected,
+                vm_spec::lifecycle::LiveCommandResult::rejected(
+                    LiveCommandKind::CancelOperation,
+                    vm_spec::lifecycle::LiveRejection::new(
+                        vm_spec::lifecycle::LiveRejectionReason::InvalidState,
+                        state,
+                        "command is not admitted in the observed lifecycle state",
+                    ),
+                ),
+            );
+        }
     }
 }

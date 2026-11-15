@@ -654,8 +654,8 @@ def incremental_cohort(args, echo) -> dict:
     parent.command("pause")
     zeros = comparison(parent, args.evidence, "changed-to-zero")
     zeros["pinned_pages"] = verify_saved_buffer(Path(zeros["left"]), observed)
-    require(zeros["resolved"]["stats"]["explicit_zero_bytes_written"] >= 4096,
-            "zero transition was omitted rather than overlaid into the complete resolved image")
+    require(zeros["resolved"]["stats"]["zero_run_bytes_covered"] >= 4096,
+            "zero transition was not covered in the complete resolved image")
     wrong = comparison(parent, args.evidence, "wrong-old-baseline", first_mode="wrong")
     require(wrong["resolved"]["mode"] == "Full" and "BaselineToken" in wrong["resolved"]["full_reason"],
             "stale baseline token must produce real full fallback")

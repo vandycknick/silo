@@ -634,16 +634,17 @@ def capture_events(silo: Silo, source_id: str, capture_id: str) -> dict[str, lis
 
 
 def product_interruption(found: dict[str, list[tuple[int, str]]]) -> dict:
-    """Conservative monitor-reported interruption: staging written (before the
-    guest freeze) through continuation finished (after thaw and readiness)."""
+    """Exact native pause interval, with independent cut-to-seal latency."""
     stamp = {name: values[0][0] for name, values in found.items() if name != DISK_SEALED}
-    order = [stamp[name] for name in (STAGING_WRITTEN, PAUSE_ESTABLISHED, SEALED, PAUSE_RELEASED,
+    order = [stamp[name] for name in (STAGING_WRITTEN, PAUSE_ESTABLISHED, PAUSE_RELEASED,
                                       CONTINUATION_FINISHED)]
     assert order == sorted(order), found
+    assert stamp[PAUSE_ESTABLISHED] <= stamp[SEALED] <= stamp[CONTINUATION_FINISHED], found
     return {
-        "conservativeSeconds": (stamp[CONTINUATION_FINISHED] - stamp[STAGING_WRITTEN]) / 1e9,
+        "interruptionSeconds": (stamp[PAUSE_RELEASED] - stamp[PAUSE_ESTABLISHED]) / 1e9,
         "vcpuPausedSeconds": (stamp[PAUSE_RELEASED] - stamp[PAUSE_ESTABLISHED]) / 1e9,
         "pauseToSealSeconds": (stamp[SEALED] - stamp[PAUSE_ESTABLISHED]) / 1e9,
+        "diskIdentityInPause": stamp[SEALED] <= stamp[PAUSE_RELEASED],
         "clock": "monitor trace CLOCK_REALTIME",
     }
 

@@ -18,8 +18,9 @@
 //! A capture operation's phases:
 //!
 //! ```text
-//!   Pipeline ─(cancel joins, wins before Sealing)─► Sealing ─► Continuing ─► Settled
-//!      └── unsealed failure/cancel: continuation runs, then Settled
+//!   Pipeline ─► [IdentityPending: immutable cut, continue, hash clones] ─► Sealing
+//!      └── cancel joins and wins before Sealing; source continuation runs once
+//!   Sealing ─► Continuing (only if source has not continued) ─► Settled
 //! ```
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -150,6 +151,8 @@ struct Entry {
 pub(crate) enum Phase {
     /// The operation pipeline task owns it.
     Pipeline,
+    /// The immutable cut is retained; disk identities are not yet complete.
+    IdentityPending,
     /// Failed Pausing: only cancel or stop leaves it.
     FailedPausing,
     /// A cancellation task owns it.
@@ -332,12 +335,48 @@ impl Journal {
                 format!("{kind} is unsupported for this machine"),
             );
         }
-        if !view.state.admits(kind) {
+        let identity_pending_cancel = matches!(
+            view.state,
+            VmLifecycleState::Running | VmLifecycleState::Paused
+        ) && match command {
+            LiveCommand::CancelOperation(cancel) => self
+                .operations
+                .get(&cancel.operation_id)
+                .is_some_and(|operation| {
+                    operation.capture.is_some() && operation.phase == Phase::IdentityPending
+                }),
+            _ => false,
+        };
+        if !view.state.admits(kind) && !identity_pending_cancel {
             return self.reject(
                 command,
                 LiveRejectionReason::InvalidState,
                 view.state,
-                format!("{kind} is not admitted while {}", view.state),
+                if kind == LiveCommandKind::CancelOperation
+                    && matches!(
+                        view.state,
+                        VmLifecycleState::Running | VmLifecycleState::Paused
+                    )
+                {
+                    "command is not admitted in the observed lifecycle state".into()
+                } else {
+                    format!("{kind} is not admitted while {}", view.state)
+                },
+            );
+        }
+        if matches!(
+            kind,
+            LiveCommandKind::Pause | LiveCommandKind::Resume | LiveCommandKind::Capture
+        ) && self
+            .operations
+            .values()
+            .any(|operation| operation.capture.is_some() && operation.phase != Phase::Settled)
+        {
+            return self.reject(
+                command,
+                LiveRejectionReason::InvalidState,
+                view.state,
+                "a capture still owns its immutable cut and lifecycle completion",
             );
         }
         match command {
@@ -739,7 +778,7 @@ impl Journal {
                 self.record(command, result.clone());
                 Admitted::Answer(Answer::Ready(result))
             }
-            Phase::Pipeline | Phase::Cancelling | Phase::Sealing => {
+            Phase::Pipeline | Phase::IdentityPending | Phase::Cancelling | Phase::Sealing => {
                 let receiver = self.pending(command);
                 if let Some(operation) = self.operations.get_mut(target) {
                     operation.cancel_requests.push(request);
@@ -1495,7 +1534,7 @@ mod tests {
     fn capture_cancel_joins_before_the_seal_and_never_interrupts_continuation() {
         let cancel = |request| command(LiveCommandKind::CancelOperation, request, CAPTURE);
         let capturing = view(VmLifecycleState::Capturing);
-        for phase in [Phase::Pipeline, Phase::Sealing] {
+        for phase in [Phase::Pipeline, Phase::IdentityPending, Phase::Sealing] {
             let mut journal = captured(phase);
             assert!(matches!(
                 journal.admit(&cancel(0xa0), &capturing, Eligibility::Eligible),
@@ -1830,5 +1869,79 @@ mod tests {
         // An older observation never moves the epoch backwards.
         assert_eq!(journal.next_epoch(NonZeroU64::new(3)), NonZeroU64::new(9));
         assert_eq!(journal.next_epoch(NonZeroU64::new(u64::MAX)), None);
+    }
+
+    #[test]
+    fn identity_pending_capture_fences_new_lifecycle_work_but_remains_cancellable() {
+        for state in [VmLifecycleState::Running, VmLifecycleState::Paused] {
+            let mut journal = captured(Phase::IdentityPending);
+            let view = view(state);
+            for command in [
+                capture_command(0xd0, CapturePauseAuthority::Acquire),
+                command(LiveCommandKind::Pause, 0xd1, PAUSE),
+                command(LiveCommandKind::Resume, 0xd2, PAUSE),
+            ] {
+                assert_eq!(
+                    rejection(&journal.admit(&command, &view, Eligibility::Eligible)),
+                    Some(LiveRejectionCode::InvalidState)
+                );
+            }
+            for (request, target) in [(0xd5, PAUSE), (0xd6, 0xef)] {
+                assert_eq!(
+                    ready(journal.admit(
+                        &command(LiveCommandKind::CancelOperation, request, target),
+                        &view,
+                        Eligibility::Eligible,
+                    )),
+                    LiveCommandResult::rejected(
+                        LiveCommandKind::CancelOperation,
+                        vm_spec::lifecycle::LiveRejection::new(
+                            LiveRejectionReason::InvalidState,
+                            state,
+                            "command is not admitted in the observed lifecycle state",
+                        ),
+                    ),
+                );
+            }
+            assert!(!journal
+                .operation(&id(CAPTURE))
+                .unwrap()
+                .cancel
+                .is_cancelled());
+            assert!(matches!(
+                journal.admit(
+                    &command(LiveCommandKind::GetOperation, 0xd3, CAPTURE),
+                    &view,
+                    Eligibility::Eligible,
+                ),
+                Admitted::Answer(Answer::Ready(_))
+            ));
+            assert!(matches!(
+                journal.admit(
+                    &command(LiveCommandKind::CancelOperation, 0xd4, CAPTURE),
+                    &view,
+                    Eligibility::Eligible,
+                ),
+                Admitted::Joined { .. }
+            ));
+            assert!(journal
+                .operation(&id(CAPTURE))
+                .unwrap()
+                .cancel
+                .is_cancelled());
+            assert_eq!(
+                journal.operation(&id(CAPTURE)).unwrap().phase,
+                Phase::IdentityPending
+            );
+            journal.operation_mut(&id(CAPTURE)).unwrap().phase = Phase::Settled;
+            assert_eq!(
+                rejection(&journal.admit(
+                    &command(LiveCommandKind::CancelOperation, 0xd7, CAPTURE),
+                    &view,
+                    Eligibility::Eligible,
+                )),
+                Some(LiveRejectionCode::InvalidState),
+            );
+        }
     }
 }

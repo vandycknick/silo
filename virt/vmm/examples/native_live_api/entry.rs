@@ -835,6 +835,8 @@ impl Commands {
             "stats":{"logical_bytes":stats.logical_bytes,"live_bytes_read":stats.live_bytes_read,
                 "baseline_bytes_read":stats.baseline_bytes_read,"baseline_bytes_written":stats.baseline_bytes_written,
                 "overlay_bytes_written":stats.overlay_bytes_written,"full_bytes_written":stats.full_bytes_written,
+                "zero_run_bytes_covered":stats.zero_run_bytes_covered,"zero_bytes_punched":stats.zero_bytes_punched,
+                "known_zero_bytes_skipped":stats.known_zero_bytes_skipped,
                 "explicit_zero_bytes_written":stats.explicit_zero_bytes_written,"extent_queries":stats.extent_queries}}),
         )?;
         self.snapshot()?;

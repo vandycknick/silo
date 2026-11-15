@@ -7,7 +7,8 @@
 //! monitor's euid. Records use no-replace `linkat` and single-link settlement.
 //! Capture writers close without durability barriers; publication belongs to libvm.
 //! RAM identity comes from the worker receipt; disk copies hash while writing.
-//! Reflink seals walk extents once, then classify and hash chunks in up to eight
+//! Reflinks close without traversing extents or constructing maps in the pause.
+//! After continuation, seals walk extents once and hash chunks in up to eight
 //! scoped workers using positional reads. Only complete ordered maps are published.
 //! On Linux, monitor-written output starts nonblocking writeback after each complete
 //! 8 MiB region containing writes. Holes, short tails and reflinks need no hint;
@@ -18,6 +19,7 @@
 //!                                   ├─ execution.state devices.state
 //!                                   ├─ memory.ram memory-layout.json
 //!                                   ├─ disks/ ─► <name>.raw (clone or copy)
+//!                                   ├─ vm.capture-cut.json    (identity pending)
 //!                                   ├─ vm.capture.json        (once)
 //!                                   └─ vm.capture-source.json (once)
 //! ```
@@ -226,12 +228,11 @@ impl CaptureStaging {
     /// Allocated bytes of the private `request.json`, reopened read-only
     /// through the held directory.
     pub(crate) fn request_allocation(&self) -> io::Result<u64> {
-        let file = File::from(openat(
-            &self.directory,
-            CAPTURE_REQUEST_FILE,
-            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )?);
+        self.open_entry_allocation(CAPTURE_REQUEST_FILE)
+    }
+
+    pub(crate) fn open_entry_allocation(&self, name: &str) -> io::Result<u64> {
+        let file = self.open_entry(name)?;
         validate_private_file(&file)?;
         Ok(file.metadata()?.blocks().saturating_mul(512))
     }
@@ -275,7 +276,7 @@ impl CaptureStaging {
     }
 
     /// Clone or sparse-copy exactly `length` bytes from the held paused source.
-    /// Publish its chunk map and close writers.
+    /// Clones retain ownership facts only; copies publish their inline chunk map.
     /// Holes stay holes; zero data is not written into a fresh destination.
     pub(crate) fn copy_disk(
         &self,
@@ -296,19 +297,12 @@ impl CaptureStaging {
             return Err(DiskCopyError::Cancelled);
         }
         let (method, map) = match self.clone_disk(source, &name) {
-            Ok(()) => {
-                drop(self.reopen_disk_writer(&name)?);
-                let (cloned, _) = self.open_sealed(role)?;
-                (
-                    DiskCopyMethod::Clone,
-                    seal_disk_parallel(&cloned, length, cancel)?,
-                )
-            }
+            Ok(()) => (DiskCopyMethod::Clone, None),
             Err(error) if clone_unsupported(&error) => match copy {
                 CaptureDiskCopy::Clone => return Err(DiskCopyError::CloneRequired(error)),
                 CaptureDiskCopy::Copy => (
                     DiskCopyMethod::SparseCopy,
-                    self.sparse_copy(source, &name, length, cancel)?,
+                    Some(self.sparse_copy(source, &name, length, cancel)?),
                 ),
             },
             Err(error) => return Err(error.into()),
@@ -326,8 +320,48 @@ impl CaptureStaging {
         let CaptureRole::Disk(disk) = role else {
             return Err(invalid("disk copy requires a disk role").into());
         };
-        self.publish_map(&CaptureRole::DiskMap(disk.clone()), &map)?;
+        if let Some(map) = map {
+            self.publish_map(&CaptureRole::DiskMap(disk.clone()), &map)?;
+        }
         Ok(method)
+    }
+
+    pub(crate) fn disk_cut(
+        &self,
+        name: &vm_spec::capture::CaptureDiskName,
+    ) -> io::Result<vm_spec::capture::CaptureDiskCut> {
+        let (file, facts) = self.open_sealed(&CaptureRole::Disk(name.clone()))?;
+        let metadata = file.metadata()?;
+        Ok(vm_spec::capture::CaptureDiskCut {
+            name: name.clone(),
+            device: facts.device,
+            inode: facts.inode,
+            length: facts.length,
+            mode: metadata.mode(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    /// Complete a retained clone without opening any writable descriptor.
+    pub(crate) fn complete_disk_identity(
+        &self,
+        cut: &vm_spec::capture::CaptureDiskCut,
+        cancel: &CancellationToken,
+    ) -> Result<(), DiskCopyError> {
+        if self.disk_cut(&cut.name)? != *cut {
+            return Err(invalid("retained disk clone changed before identity completion").into());
+        }
+        let (file, _) = self.open_sealed(&CaptureRole::Disk(cut.name.clone()))?;
+        let map = seal_disk_parallel(&file, cut.length, cancel)?;
+        if self.disk_cut(&cut.name)? != *cut {
+            return Err(invalid("retained disk clone changed during identity completion").into());
+        }
+        if cancel.is_cancelled() {
+            return Err(DiskCopyError::Cancelled);
+        }
+        self.publish_map(&CaptureRole::DiskMap(cut.name.clone()), &map)?;
+        Ok(())
     }
 
     fn reopen_disk_writer(&self, name: &str) -> io::Result<(File, FileFacts)> {
@@ -1106,7 +1140,9 @@ mod tests {
     }
 
     fn root() -> Root {
-        let path = std::env::temp_dir().join(format!(
+        let base =
+            std::env::var_os("SILO_TEST_COPY_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        let path = base.join(format!(
             "silo-staging-{:x}-{:x}",
             std::process::id(),
             rand::random::<u64>()
@@ -1269,6 +1305,15 @@ mod tests {
                 &CancellationToken::new(),
             )
             .unwrap();
+        if method == DiskCopyMethod::Clone {
+            let name = vm_spec::capture::CaptureDiskName::new("data0").unwrap();
+            staging
+                .complete_disk_identity(
+                    &staging.disk_cut(&name).unwrap(),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+        }
         let (sealed, facts) = staging.open_sealed(&role).unwrap();
         assert_eq!(facts.length, length);
         assert_ne!(
@@ -1566,6 +1611,121 @@ mod tests {
         }
         assert_eq!(map.id(), identity.finish());
         map
+    }
+
+    #[test]
+    fn reflink_cut_defers_identity_and_keeps_the_exact_cut_after_source_writes() {
+        let root = root();
+        let length = 3 * STREAM_CHUNK_BYTES + 17;
+        let file = source(
+            &root,
+            "source.raw",
+            length,
+            &[
+                (0, b"first"),
+                (2 * STREAM_CHUNK_BYTES + 4096, b"mixed"),
+                (length - 4, b"tail"),
+            ],
+        );
+        let expected = independent_map(&file, length);
+        let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+        let name = vm_spec::capture::CaptureDiskName::new("upper").unwrap();
+        match staging.copy_disk(
+            &CaptureRole::Disk(name.clone()),
+            &file,
+            length,
+            CaptureDiskCopy::Clone,
+            &CancellationToken::new(),
+        ) {
+            Ok(DiskCopyMethod::Clone) => {}
+            Err(DiskCopyError::CloneRequired(error)) => {
+                eprintln!("skipping reflink cut test: FICLONE unavailable: {error}");
+                return;
+            }
+            other => panic!("unexpected clone outcome: {other:?}"),
+        }
+        let cut = staging.disk_cut(&name).unwrap();
+        assert!(
+            !staging.path().join("disks/upper.map.json").exists(),
+            "the in-pause clone must not construct or publish an identity map"
+        );
+        file.write_all_at(b"guest writes after continuation", 0)
+            .unwrap();
+        assert_ne!(independent_map(&file, length), expected);
+        staging
+            .complete_disk_identity(&cut, &CancellationToken::new())
+            .unwrap();
+        let (cloned, _) = staging
+            .open_sealed(&CaptureRole::Disk(name.clone()))
+            .unwrap();
+        let (map, facts) = staging.open_sealed(&CaptureRole::DiskMap(name)).unwrap();
+        let mut bytes = vec![0; facts.length as usize];
+        map.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(StreamMap::decode(&bytes).unwrap(), expected);
+        assert_eq!(bytes, expected.canonical_bytes().unwrap());
+        assert_eq!(independent_map(&cloned, length), expected);
+    }
+
+    #[test]
+    fn reflink_identity_cancellation_never_publishes_a_partial_map() {
+        let root = root();
+        let length = 512 * STREAM_CHUNK_BYTES;
+        let writes = (0..512)
+            .map(|chunk| (chunk * STREAM_CHUNK_BYTES, b"x".as_slice()))
+            .collect::<Vec<_>>();
+        let file = source(&root, "source.raw", length, &writes);
+        let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+        let name = vm_spec::capture::CaptureDiskName::new("upper").unwrap();
+        match staging.copy_disk(
+            &CaptureRole::Disk(name.clone()),
+            &file,
+            length,
+            CaptureDiskCopy::Clone,
+            &CancellationToken::new(),
+        ) {
+            Ok(DiskCopyMethod::Clone) => {}
+            Err(DiskCopyError::CloneRequired(error)) => {
+                eprintln!("skipping reflink cancellation test: FICLONE unavailable: {error}");
+                return;
+            }
+            other => panic!("unexpected clone outcome: {other:?}"),
+        }
+        let cut = staging.disk_cut(&name).unwrap();
+        let cancel = CancellationToken::new();
+        std::thread::scope(|scope| {
+            let token = cancel.clone();
+            let hash = scope.spawn(|| staging.complete_disk_identity(&cut, &cancel));
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                token.cancel();
+            });
+            assert!(matches!(
+                hash.join().unwrap(),
+                Err(DiskCopyError::Cancelled)
+            ));
+        });
+        assert!(!staging.path().join("disks/upper.map.json").exists());
+        assert_eq!(staging.disk_cut(&name).unwrap(), cut);
+    }
+
+    #[test]
+    fn sparse_copy_still_hashes_inline_without_identity_completion() {
+        let root = root();
+        let length = 2 * STREAM_CHUNK_BYTES + 7;
+        let file = source(
+            &root,
+            "source.raw",
+            length,
+            &[(4096, b"data"), (length - 1, b"x")],
+        );
+        let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+        let map = staging
+            .sparse_copy(&file, "upper.raw", length, &CancellationToken::new())
+            .unwrap();
+        let (copied, _) = staging.open_sealed(&disk("upper")).unwrap();
+        assert_eq!(map, independent_map(&file, length));
+        assert_eq!(map, independent_map(&copied, length));
+        assert!(copied.metadata().unwrap().blocks() * 512 < length);
     }
 
     #[test]

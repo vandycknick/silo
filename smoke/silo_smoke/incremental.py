@@ -155,7 +155,8 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
         else:
             assert stats["liveBytesRead"] == stats["overlayBytesWritten"]
     else:
-        assert stats["seedMethod"] == "rebuild" and stats["liveBytesRead"] == length
+        assert stats["seedMethod"] == "rebuild"
+        assert stats["liveBytesRead"] + stats["knownZeroBytesSkipped"] == length
     record = restore.snapshot_record(silo, saved)
     assert record["execution"]["memory"]["stream"] == stream
     dependencies = procs.query(silo.ws.state_db(),

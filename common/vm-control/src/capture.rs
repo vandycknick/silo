@@ -120,6 +120,9 @@ fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
             baseline_hole_bytes: stats.baseline_hole_bytes,
             zero_bytes_omitted: stats.zero_bytes_omitted,
             explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
+            zero_run_bytes_covered: stats.zero_run_bytes_covered,
+            zero_bytes_punched: stats.zero_bytes_punched,
+            known_zero_bytes_skipped: stats.known_zero_bytes_skipped,
             extent_queries: stats.extent_queries,
             identity_bytes_hashed: stats.identity_bytes_hashed,
             whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
@@ -195,6 +198,9 @@ fn memory_from_wire(
             baseline_hole_bytes: stats.baseline_hole_bytes,
             zero_bytes_omitted: stats.zero_bytes_omitted,
             explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
+            zero_run_bytes_covered: stats.zero_run_bytes_covered,
+            zero_bytes_punched: stats.zero_bytes_punched,
+            known_zero_bytes_skipped: stats.known_zero_bytes_skipped,
             extent_queries: stats.extent_queries,
             identity_bytes_hashed: stats.identity_bytes_hashed,
             whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
@@ -762,6 +768,25 @@ mod tests {
         let value = live();
         let wire = live_snapshot_to_wire(&value).unwrap();
         assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
+    }
+
+    #[test]
+    fn memory_zero_stats_round_trip_through_protobuf() {
+        use prost::Message;
+
+        let mut value = memory();
+        value.stats.explicit_zero_bytes_written = 4096;
+        value.stats.zero_run_bytes_covered = 7 * 4096;
+        value.stats.zero_bytes_punched = 2 * 4096;
+        value.stats.known_zero_bytes_skipped = 3 * 4096;
+        let wire = crate::capture::memory_to_wire(&value);
+        let stats = wire.stats.as_ref().unwrap();
+        assert_eq!(stats.explicit_zero_bytes_written, 4096);
+        assert_eq!(stats.zero_run_bytes_covered, 7 * 4096);
+        assert_eq!(stats.zero_bytes_punched, 2 * 4096);
+        assert_eq!(stats.known_zero_bytes_skipped, 3 * 4096);
+        let decoded = w::CaptureMemoryEvidence::decode(wire.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(crate::capture::memory_from_wire(decoded).unwrap(), value);
     }
 
     #[test]

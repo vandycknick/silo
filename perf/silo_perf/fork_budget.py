@@ -24,9 +24,9 @@ Measured boundaries (all reported; the gated value is named):
 - fork4 (gated): CLI dispatch (harness CLOCK_MONOTONIC just before spawn) to
   the last child's durable `running` stamp. API entry to Running, seal to
   Running and caller end-to-end (dispatch to exit) are recorded separately.
-- capture interruption (gated): the larger of the source monitor's
-  conservative staging-written..continuation-finished interval and the
-  host-observed gap in the guest witness's durable writes.
+- capture interruption (gated): the source monitor's exact native pause,
+  pause-established..pause-released. The host-observed durable-write gap and
+  pause-to-seal latency remain separate diagnostics.
 - restore: `silo restore` dispatch to its exit with the child already Running
   and ready (or the first later Running+ready observation). Cold restore is
   recorded on every lane but gated only when the workspace supports reflinks.
@@ -40,10 +40,11 @@ at fixture setup, independently of the capture request's disk copy contract.
 Without reflinks, the gated value subtracts the upper's allocated bytes at the
 host's measured sequential copy rate: one upper for capture, one sealed upper
 for restore, one sealed upper per child for fork4. Reflink lanes subtract zero
-copy allowance. Capture interruption and incremental capture also subtract the
-sealed upper's allocated bytes at the host's measured warm sequential SHA-256
-CPU rate on every lane. Samples and summaries retain raw and gated values, both
-allowances and their inputs, and actual disk-seal durations; targets do not change.
+copy allowance. Capture interruption and incremental capture subtract the sealed
+upper's allocated bytes at the host's measured warm sequential SHA-256 CPU rate
+only when disk sealing occurs inside the pause. Post-resume sealing never earns
+a pause allowance. Samples retain raw and gated values, allowance inputs and
+separate seal latency; targets do not change.
 
 A running source keeps its accepted capture baseline, and a local cut retires
 only after that exact source run ends. Each successful fork sample therefore
@@ -390,15 +391,16 @@ def sequential_hash_rate(path: Path, *, size_bytes: int = GIB) -> dict:
 
 def gated_timing(seconds: float, *, allocated_bytes: int, bytes_per_second: float,
                  reflink: bool, copies: int = 1, sealed_allocated_bytes: int = 0,
-                 hash_bytes_per_second: float | None = None) -> dict:
-    """Subtract the ADR's separate copy and disk-sealing costs, without clamping."""
+                 hash_bytes_per_second: float | None = None,
+                 disk_seal_in_interval: bool = True) -> dict:
+    """Subtract only copy and disk-sealing costs inside the measured interval."""
     if hash_bytes_per_second is not None and not hash_bytes_per_second > 0:
         raise ValueError("hash_bytes_per_second must be positive")
     if sealed_allocated_bytes and hash_bytes_per_second is None:
         raise ValueError("sealed allocated bytes require hash_bytes_per_second")
     allowance = 0.0 if reflink else copies * allocated_bytes / bytes_per_second
     seal_allowance = (sealed_allocated_bytes / hash_bytes_per_second
-                      if hash_bytes_per_second is not None else 0.0)
+                      if hash_bytes_per_second is not None and disk_seal_in_interval else 0.0)
     return {
         "copyAllowance": {
             "lane": "reflink" if reflink else "non-reflink",
@@ -410,6 +412,7 @@ def gated_timing(seconds: float, *, allocated_bytes: int, bytes_per_second: floa
         "diskSealAllowance": {
             "sealedAllocatedBytes": sealed_allocated_bytes,
             "bytesPerSecond": hash_bytes_per_second,
+            "includedInInterval": disk_seal_in_interval,
         },
         "diskSealAllowanceSeconds": seal_allowance,
         "gatedExcessSeconds": seconds - allowance - seal_allowance,

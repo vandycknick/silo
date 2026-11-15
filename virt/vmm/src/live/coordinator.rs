@@ -703,6 +703,7 @@ impl LiveCoordinator {
         stage: LiveStage,
         readiness_probe: bool,
     ) {
+        tracing::info!(%operation, stage = stage.as_str(), "live operation stage");
         let inner = self.lock();
         let activity = activity(operation, request, command, stage);
         let state = if command == LiveCommandKind::Capture {

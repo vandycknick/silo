@@ -38,3 +38,6 @@ libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.g
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+[patch."https://github.com/vandycknick/libkrun.git"]
+libkrun = { path = "/home/nickvd/Projects/worktrees/libkrun/silo-production/src/libkrun" }

@@ -43,6 +43,9 @@ pub const MAX_RAM_MAP_BYTES: usize =
     (MAX_CAPTURE_RAM_BYTES / STREAM_CHUNK_BYTES) as usize * 74 + 256;
 pub const CAPTURE_EVIDENCE_FILE: &str = "vm.capture.json";
 pub const CAPTURE_SOURCE_FILE: &str = "vm.capture-source.json";
+/// Immutable cut retained before post-continuation disk identity completion.
+pub const CAPTURE_CUT_FILE: &str = "vm.capture-cut.json";
+pub const CAPTURE_CUT_TEMPORARY_FILE: &str = ".vm.capture-cut.json.tmp";
 /// The only temporary names a reader may find next to the records. A
 /// temporary is never a record; it is left only by an interrupted write.
 pub const CAPTURE_EVIDENCE_TEMPORARY_FILE: &str = ".vm.capture.json.tmp";
@@ -941,7 +944,14 @@ pub struct CaptureMemoryStats {
     pub layout_bytes_written: u64,
     pub baseline_hole_bytes: u64,
     pub zero_bytes_omitted: u64,
+    /// Zero-valued bytes physically written by overlay writes, including mixed data.
     pub explicit_zero_bytes_written: u64,
+    /// Complete zero runs successfully covered, whether omitted, punched, or written.
+    pub zero_run_bytes_covered: u64,
+    /// Covered zero bytes deallocated from a seeded output, never the baseline.
+    pub zero_bytes_punched: u64,
+    /// Live RAM bytes not read because cut-bound pagemap metadata proves zero origin.
+    pub known_zero_bytes_skipped: u64,
     pub extent_queries: u64,
     pub identity_bytes_hashed: u64,
     /// Always zero on local capture; byte SHA is reserved for transported blobs.
@@ -1125,6 +1135,155 @@ pub enum CaptureRecordOutcome {
 pub enum CapturePauseDisposition {
     Acquired,
     Borrowed,
+}
+
+/// Operation-owned clone fingerprint, sampled after the last writer closes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureDiskCut {
+    pub name: CaptureDiskName,
+    pub device: u64,
+    pub inode: u64,
+    pub length: u64,
+    pub mode: u32,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureCutPhase {
+    IdentityPending,
+}
+
+/// `vm.capture-cut.json` is never a seal. Its evidence keeps
+/// `disk_copies_sealed` false and lacks exactly the pending clone/map roles.
+/// Recovery completes those roles from retained bytes before setting the fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureCutRecord {
+    pub phase: CaptureCutPhase,
+    pub evidence: CaptureEvidence,
+    pub disks: Vec<CaptureDiskCut>,
+}
+
+impl CaptureCutRecord {
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_CAPTURE_RECORD_BYTES {
+            return Err(invalid("capture cut record exceeds its bound"));
+        }
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    pub fn validate_against_plan(
+        &self,
+        plan: &CapturePlan,
+        request_digest: &Sha256Digest,
+    ) -> Result<(), String> {
+        let evidence = &self.evidence;
+        if evidence.version != CAPTURE_RECORD_VERSION
+            || evidence.machine_id != plan.machine_id
+            || evidence.run_id != plan.run_id
+            || evidence.capture_id != plan.capture_id
+            || evidence.configuration_digest != plan.configuration_digest
+            || &evidence.request_digest != request_digest
+            || evidence.capture_outcome != CaptureRecordOutcome::Coherent
+            || evidence.error.is_some()
+            || evidence.disk_copies_sealed
+            || [
+                evidence.workloads_frozen,
+                evidence.vcpus_paused,
+                evidence.devices_quiesced,
+                evidence.host_writers_drained,
+                evidence.host_flush_completed,
+                evidence.memory_state_sealed,
+            ]
+            .contains(&false)
+            || evidence.completed_at_unix_ms < evidence.started_at_unix_ms
+            || self.disks.is_empty()
+        {
+            return Err(invalid(
+                "pending identity cut does not bind its plan and immutable bytes",
+            ));
+        }
+        let memory = evidence
+            .memory
+            .as_ref()
+            .ok_or_else(|| invalid("cut lacks RAM evidence"))?;
+        memory.validate_capture()?;
+        if memory.packed_length > plan.ram_bytes
+            || memory.binding.capture != plan.capture_id
+            || memory.binding.source_run != plan.run_id
+        {
+            return Err(invalid("pending identity cut RAM differs from its plan"));
+        }
+        let token = evidence
+            .pause_token
+            .as_ref()
+            .ok_or_else(|| invalid("cut lacks its pause"))?;
+        if token.machine_id != plan.machine_id
+            || token.run_id != plan.run_id
+            || token.generation != memory.binding.pause_generation
+            || evidence.freeze_epoch.is_none()
+        {
+            return Err(invalid("pending identity cut belongs to another pause"));
+        }
+        match &plan.pause {
+            CapturePauseAuthority::Acquire
+                if evidence.pause_disposition == Some(CapturePauseDisposition::Acquired)
+                    && evidence.freeze_operation_id.as_ref() == Some(&plan.capture_id)
+                    && token.owner
+                        == (PauseOwner::Capture {
+                            operation_id: plan.capture_id.clone(),
+                        }) => {}
+            CapturePauseAuthority::Borrow {
+                token: expected,
+                pause_operation_id,
+            } if token == expected
+                && evidence.pause_disposition == Some(CapturePauseDisposition::Borrowed)
+                && evidence.freeze_operation_id.as_ref() == Some(pause_operation_id) => {}
+            _ => return Err(invalid("pending identity cut changed pause authority")),
+        }
+        for (index, disk) in self.disks.iter().enumerate() {
+            if disk.inode == 0
+                || disk.mode & 0o177777 != 0o100600
+                || self.disks[..index]
+                    .iter()
+                    .any(|other| other.name == disk.name)
+                || !plan
+                    .disks
+                    .iter()
+                    .any(|planned| planned.name == disk.name && planned.length == disk.length)
+            {
+                return Err(invalid("pending identity cut has an invalid disk owner"));
+            }
+        }
+        let roles = plan
+            .roles()
+            .into_iter()
+            .filter(|role| match role {
+                CaptureRole::Disk(name) | CaptureRole::DiskMap(name) => {
+                    !self.disks.iter().any(|disk| disk.name == *name)
+                }
+                _ => true,
+            })
+            .collect::<Vec<_>>();
+        if roles.len() != evidence.inventory.len()
+            || roles
+                .iter()
+                .zip(&evidence.inventory)
+                .any(|(role, entry)| role != &entry.role)
+        {
+            return Err(invalid(
+                "pending identity cut inventory differs from its plan",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `vm.capture.json`, version 1. A coherent record is the seal.
@@ -2582,6 +2741,78 @@ mod tests {
     }
 
     #[test]
+    fn memory_stats_have_exact_required_wire_fields() {
+        let stats = CaptureMemoryStats {
+            seed_method: crate::capture::CaptureSeedMethod::Rebuild,
+            logical_bytes: 1,
+            live_bytes_read: 2,
+            baseline_bytes_read: 3,
+            baseline_bytes_written: 4,
+            overlay_bytes_written: 5,
+            full_bytes_written: 6,
+            layout_bytes_written: 7,
+            baseline_hole_bytes: 8,
+            zero_bytes_omitted: 9,
+            explicit_zero_bytes_written: 10,
+            zero_run_bytes_covered: 11,
+            zero_bytes_punched: 12,
+            known_zero_bytes_skipped: 13,
+            extent_queries: 14,
+            identity_bytes_hashed: 15,
+            whole_file_bytes_hashed: 16,
+        };
+        let value = serde_json::to_value(&stats).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "seedMethod": "rebuild",
+                "logicalBytes": 1,
+                "liveBytesRead": 2,
+                "baselineBytesRead": 3,
+                "baselineBytesWritten": 4,
+                "overlayBytesWritten": 5,
+                "fullBytesWritten": 6,
+                "layoutBytesWritten": 7,
+                "baselineHoleBytes": 8,
+                "zeroBytesOmitted": 9,
+                "explicitZeroBytesWritten": 10,
+                "zeroRunBytesCovered": 11,
+                "zeroBytesPunched": 12,
+                "knownZeroBytesSkipped": 13,
+                "extentQueries": 14,
+                "identityBytesHashed": 15,
+                "wholeFileBytesHashed": 16,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CaptureMemoryStats>(value.clone()).unwrap(),
+            stats
+        );
+        for field in value.as_object().unwrap().keys() {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<CaptureMemoryStats>(missing).is_err(),
+                "missing field {field}"
+            );
+        }
+        let mut unknown = value.clone();
+        unknown["unknown"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<CaptureMemoryStats>(unknown).is_err());
+        for field in [
+            "zeroRunBytesCovered",
+            "zeroBytesPunched",
+            "knownZeroBytesSkipped",
+        ] {
+            for invalid in [serde_json::json!(-1), serde_json::json!("4096")] {
+                let mut malformed = value.clone();
+                malformed[field] = invalid;
+                assert!(serde_json::from_value::<CaptureMemoryStats>(malformed).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn clone_seed_requires_incremental_capture_without_baseline_io() {
         use crate::capture::CaptureSeedMethod;
 
@@ -2597,5 +2828,55 @@ mod tests {
         memory.stats.baseline_bytes_read = 0;
         memory.stats.baseline_bytes_written = 1;
         assert!(memory.validate_capture().is_err());
+    }
+
+    #[test]
+    fn identity_pending_cut_is_not_a_seal_and_binds_exact_clone_owners() {
+        let plan = plan();
+        let mut partial = evidence(&plan);
+        let disks = plan
+            .disks
+            .iter()
+            .map(|disk| CaptureDiskCut {
+                name: disk.name.clone(),
+                device: 7,
+                inode: u64::from(disk.attachment_index) + 10,
+                length: disk.length,
+                mode: 0o100600,
+                changed_seconds: 10,
+                changed_nanoseconds: 20,
+            })
+            .collect::<Vec<_>>();
+        partial
+            .inventory
+            .retain(|entry| !matches!(entry.role, CaptureRole::Disk(_) | CaptureRole::DiskMap(_)));
+        partial.disk_copies_sealed = false;
+        let cut = CaptureCutRecord {
+            phase: CaptureCutPhase::IdentityPending,
+            evidence: partial,
+            disks,
+        };
+        let request = Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap());
+        cut.validate_against_plan(&plan, &request).unwrap();
+        assert!(!cut.evidence.is_sealed());
+        assert!(CaptureEvidence::decode(&cut.evidence.canonical_bytes().unwrap()).is_err());
+        let bytes = cut.canonical_bytes().unwrap();
+        assert_eq!(CaptureCutRecord::decode(&bytes).unwrap(), cut);
+        assert!(CaptureEvidence::decode(&bytes).is_err());
+        for mutation in 0..7 {
+            let mut bad = cut.clone();
+            match mutation {
+                0 => bad.disks[0].length += 512,
+                1 => bad.disks[0].mode = 0o100644,
+                2 => bad.disks.push(bad.disks[0].clone()),
+                3 => bad.evidence.host_flush_completed = false,
+                4 => {
+                    bad.evidence.inventory.pop();
+                }
+                5 => bad.evidence.disk_copies_sealed = true,
+                _ => bad.evidence.request_digest = Sha256Digest::of_bytes(b"foreign"),
+            }
+            assert!(bad.validate_against_plan(&plan, &request).is_err());
+        }
     }
 }

@@ -86,7 +86,7 @@ def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
     facts = incremental.authenticated_map(silo, zero, mode="incremental", baseline=second)
     zero_chunk = incremental.pages_at_cut(silo, zero, {**zero_pages, "pages": zero_pages["pages"][2:3]})
     assert zero_chunk <= facts["affected"]
-    assert facts["stats"]["explicitZeroBytesWritten"] >= zero_pages["pageSize"]
+    assert facts["stats"]["zeroRunBytesCovered"] >= zero_pages["pageSize"]
     for index in zero_chunk:
         assert facts["map"]["chunks"][index] != "zero", "one page incorrectly zeroed its mixed 8MiB chunk"
     sealed = capture.inventory(zero.staging)
