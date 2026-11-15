@@ -169,15 +169,14 @@ def main() -> None:
     slow = includes_slow(marker)
     if slow and platform.system() == "Linux":
         if platform.machine().lower() in {"x86_64", "amd64"}:
-            subprocess.run(["timeout", "--kill-after=5s", "300s", "make", "-C", str(REPO),
-                            "smoke-diagnostic", f"PROFILE={os.environ.get('PROFILE', 'debug')}",
-                            f"SMOKE_RUNTIME_SOURCE={args.runtime.resolve()}"], check=True, timeout=310)
+            subprocess.run(["make", "-C", str(REPO), "smoke-diagnostic", f"PROFILE={os.environ.get('PROFILE', 'debug')}",
+                            f"SMOKE_RUNTIME_SOURCE={args.runtime.resolve()}"], check=True)
         reason = extractor_skip_reason()
         if reason is not None:
             print(f"Smoke collector skip: {reason}", flush=True)
         elif not os.environ.get("SILO_SMOKE_FILESYSTEM_OBSERVER"):
-            subprocess.run(["timeout", "--kill-after=5s", "300s", "make", "-C", str(REPO), "changeset-extractor"],
-                           env={**os.environ, "CGO_ENABLED": "0"}, check=True, timeout=310)
+            subprocess.run(["make", "-C", str(REPO), "changeset-extractor"],
+                           env={**os.environ, "CGO_ENABLED": "0"}, check=True)
 
 
 if __name__ == "__main__":

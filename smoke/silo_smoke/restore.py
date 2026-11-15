@@ -459,13 +459,13 @@ def irq_cut(silo: Silo, saved: Checkpoint, *, pending: bool) -> dict:
 
 @pytest.fixture
 def restore_irq_fixture(silo: Silo) -> Path:
-    """Use a private production runtime with the separately staged diagnostic monitor."""
+    """Use a private copy of the separately staged diagnostic runtime."""
     config = silo.ws.config
     diagnostic = prereqs.target_dir() / "smoke-diagnostic/silo-runtime" / config.runtime_dir.parent.name / config.runtime_dir.name
     runtime = silo.ws.root / "irq-runtime"
-    overlay.copy_runtime(config.runtime_dir, runtime)
-    shutil.copyfile(diagnostic / "bin/silo-vmm", runtime / "bin/silo-vmm")
-    shutil.copyfile(diagnostic / "runtime-manifest.json", runtime / "runtime-manifest.json")
+    # The diagnostic stage is a complete stage of its own (same kernel, its own
+    # agent build), so it is used whole rather than spliced into production.
+    overlay.copy_runtime(diagnostic, runtime)
     staged = json.loads((runtime / "runtime-manifest.json").read_text())
     for filename, expected in staged["files"].items():
         assert overlay.digest(runtime / filename) == expected, filename
