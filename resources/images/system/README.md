@@ -49,7 +49,8 @@ units, proxy binaries, static portd installation, and records the package lock.
 
 After rebuilding the image, `make verify-systemd IMAGE=<built-image>` tests the
 activation readiness helper against real systemd: absent-manager timeout,
-delayed manager startup, and an already available manager. It uses a temporary
+delayed manager startup, a responsive manager whose boot transaction is still
+unfinished, and an already available manager. It uses a temporary
 privileged container with private cgroup and tmpfs mounts, and requires a Docker
 host that supports running systemd with cgroup v2. It does not start the host's
 Silo daemon or replace its system image.
@@ -83,7 +84,9 @@ The helper verifies the immutable image contract, cgroup v2, guest route/DNS,
 every requested virtiofs mount, the ext4 UUID, and the existing data-layout marker before it
 mounts anything. It never formats a disk or creates data directories. It then
 bind-mounts the existing `docker` and `containerd` directories over their
-upstream locations and starts `silo-system-docker.target` synchronously.
+upstream locations, waits up to 30 seconds for systemd to finish booting
+(`running` or `degraded`, not merely an early successful property query), and
+starts `silo-system-docker.target` synchronously.
 Repeated activation validates an already healthy engine without restarting it.
 
 Docker, containerd, their socket activation, distro networking, and OpenSSH

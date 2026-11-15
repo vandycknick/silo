@@ -51,6 +51,7 @@ impl From<String> for VmmClientError {
 
 pub const DEFAULT_GUEST_READINESS_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
 const FILE_RPC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ACCESS_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const FORWARD_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -69,7 +70,6 @@ impl VmmClient {
     }
 
     pub(crate) async fn status(&self) -> Result<HostStatus, VmmClientError> {
-        const INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
         tokio::time::timeout(INSPECT_TIMEOUT, async {
             let mut client = monitor_client(self.channel().await?);
             client
@@ -190,12 +190,16 @@ impl VmmClient {
     }
 
     pub(crate) async fn metrics(&self) -> Result<HostMetrics, VmmClientError> {
-        let mut client = monitor_client(self.channel().await?);
-        client
-            .get_metrics(timed_request(GetMetricsRequest {}, RPC_TIMEOUT))
-            .await
-            .map(|response| response.into_inner())
-            .map_err(|error| rpc_error("vm monitor get_metrics RPC failed", error))
+        tokio::time::timeout(INSPECT_TIMEOUT, async {
+            let mut client = monitor_client(self.channel().await?);
+            client
+                .get_metrics(timed_request(GetMetricsRequest {}, INSPECT_TIMEOUT))
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|error| rpc_error("vm monitor get_metrics RPC failed", error))
+        })
+        .await
+        .map_err(|_| VmmClientError::Protocol("vm monitor metrics timed out after 2s".into()))?
     }
 
     pub(crate) async fn get_entry(
@@ -485,6 +489,25 @@ mod tests {
                 panic!("missing socket was misclassified as a guest path error: {message}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn telemetry_deadlines_include_an_unresponsive_socket_handshake() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("monitor.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let client = VmmClient::new(socket);
+        let (status, metrics) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(client.status(), client.metrics())
+        })
+        .await
+        .expect("both telemetry calls must include connection setup in their deadline");
+        assert!(
+            matches!(status, Err(VmmClientError::Protocol(message)) if message.contains("timed out"))
+        );
+        assert!(
+            matches!(metrics, Err(VmmClientError::Protocol(message)) if message.contains("timed out"))
+        );
     }
 
     #[test]
