@@ -282,7 +282,7 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     source_binding = stopped.record(silo, "snapshot-source")["boot"]["binding"]
     data_key = f"data:{2 if profile == 'layered' else 1}"
     assert set(source) == {"root", data_key}
-    captured = json.loads(silo.run("snapshot", "create", "snapshot-source", "--name", "stopped-checkpoint", timeout=240).stdout)
+    captured = silo.json("snapshot", "create", "snapshot-source", "--name", "stopped-checkpoint", timeout=240)
     assert captured["retained"] is True and "stopped-checkpoint" in captured["aliases"]
     captured_rows = procs.query(silo.ws.state_db(), f"SELECT CAST(record_bytes AS TEXT) FROM storage_snapshot WHERE id='{captured['id']}'")
     assert len(captured_rows) == 1
@@ -304,7 +304,7 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     else:
         assert source_root["kind"] == "opaque-raw" and snapshot_root == {"kind": "opaque-raw"}, (source_root, snapshot_root)
     immutable = "image:" + captured["id"]
-    inspected = json.loads(silo.run("snapshot", "inspect", immutable).stdout)
+    inspected = silo.json("snapshot", "inspect", immutable)
     assert inspected == captured
     stopped.same_content(source, stopped.backing(silo, "snapshot-source", "source-after-snapshot"))
     stopped.fork(silo, "snapshot-source", "boot-pinned-fork")
@@ -341,7 +341,7 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     assert stopped.configured_semantics(stopped.configuration(silo, "snapshot-second")) == expected_config
     # Alias deletion and explicit retention release are different root changes.
     silo.run("image", "remove", "image:stopped-checkpoint")
-    assert json.loads(silo.run("snapshot", "inspect", immutable).stdout)["retained"] is True
+    assert silo.json("snapshot", "inspect", immutable)["retained"] is True
     silo.run("snapshot", "remove", immutable)
     shutdown.storage_tool(silo, "prune")
     first_after = None
@@ -375,7 +375,7 @@ def test_stopped_restore_retains_closure_during_concurrent_snapshot_removal(stop
     create(silo, stopped_image, "retention-source", profile)
     stopped.install_managed_fixture(silo, "retention-source", custom_boot=False)
     baseline = stopped.backing(silo, "retention-source", "retention-before")
-    info = json.loads(silo.run("snapshot", "create", "retention-source", "--name", "retention-race", timeout=240).stdout)
+    info = silo.json("snapshot", "create", "retention-source", "--name", "retention-race", timeout=240)
     reference = "image:" + info["id"]
     rows = procs.query(silo.ws.state_db(), f"SELECT CAST(record_bytes AS TEXT) FROM storage_snapshot WHERE id='{info['id']}'")
     assert len(rows) == 1

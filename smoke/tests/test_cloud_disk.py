@@ -534,7 +534,7 @@ def test_image_and_snapshot_creation_preserve_semantics_and_every_disk(silo: Sil
     stopped.stop(silo, "snap-source", require_clean=False)
     source = stopped.backing(silo, "snap-source", "phase17-before-snapshot")
     assert set(source) == {"root", "data:1"}
-    captured = json.loads(silo.run("snapshot", "create", "snap-source", "--name", "cloud-snap", timeout=240).stdout)
+    captured = silo.json("snapshot", "create", "snap-source", "--name", "cloud-snap", timeout=240)
     assert captured["retained"] is True and "cloud-snap" in captured["aliases"]
 
     cloud_disk.refuse_before_publication(silo, "create", "image:cloud-snap", "--name", "never-overridden", "--cpus", "2")
@@ -570,7 +570,7 @@ def test_explicit_conversion_is_cached_preserves_defaults_and_boots(silo: Silo, 
     for name in ("kernel-default", "initramfs", "agent"):
         shutil.copyfile(assets / name, saved / name)
     packaged = cloud_disk.packaged_binding(assets)
-    converted = json.loads(silo.run("image", "convert", reference, "--disk-format", "raw", "--name", "conv-a", timeout=600).stdout)
+    converted = silo.json("image", "convert", reference, "--disk-format", "raw", "--name", "conv-a", timeout=600)
     record = converted["record"]
     assert record["root"]["layout"] == {"kind": "whole-disk"} and record["root"]["profile"] == {"kind": "opaque-raw"}
     assert record["boot"]["rootSelector"] == {"kind": "whole-disk"} and record["boot"]["rootFilesystem"] == "ext4"
@@ -580,11 +580,11 @@ def test_explicit_conversion_is_cached_preserves_defaults_and_boots(silo: Silo, 
                                         "sourceManifest": oci.manifest_digest, "sourceConfig": oci.config_digest, "disk": None}]
     assert converted["retained"] is True and converted["aliases"] == ["conv-a"]
 
-    repeated = json.loads(silo.run("image", "convert", reference, "--disk-format", "raw", timeout=600).stdout)
+    repeated = silo.json("image", "convert", reference, "--disk-format", "raw", timeout=600)
     assert repeated["id"] == converted["id"] and repeated["record"] == record
     # A packaged upgrade never re-keys or re-pins a cached conversion.
     cloud_disk.valid_replacement_assets(assets, saved)
-    aliased = json.loads(silo.run("image", "convert", reference, "--disk-format", "raw", "--name", "conv-b", timeout=600).stdout)
+    aliased = silo.json("image", "convert", reference, "--disk-format", "raw", "--name", "conv-b", timeout=600)
     assert aliased["id"] == converted["id"] and aliased["record"]["boot"]["binding"] == packaged
     assert set(aliased["aliases"]) == {"conv-a", "conv-b"}
     catalog = stopped.catalog(silo)

@@ -17,6 +17,16 @@ SMOKE_ARGS ?=
 SMOKE_WORKERS ?= 2
 ##? SMOKE_MARK=expression: Smoke marker selection (default: not slow; SMOKE_ARGS=-m overrides it).
 SMOKE_MARK ?= not slow
+##? PERF_COHORTS=a,b: Performance cohorts (empty selects all).
+PERF_COHORTS ?=
+##? PERF_SYSTEMS=silo,msb: Performance systems (default: silo).
+PERF_SYSTEMS ?= silo
+##? PERF_SAMPLES=N: Samples per performance cohort and mode (default: 3).
+PERF_SAMPLES ?= 3
+##? PERF_ARGS=...: Extra serial performance pytest arguments.
+PERF_ARGS ?=
+##? PERF_SHELL=command: Performance toolchain prefix (default: nix develop .#perf --command).
+PERF_SHELL ?= nix develop .\#perf --command
 ##? CHANGESET_ARGS=...: Extra arguments for explicit OCI fixture/acquisition/qualification commands.
 CHANGESET_ARGS ?=
 ##? BASELINE=path: Select the coverage regression baseline (default: target/coverage-baseline).
@@ -218,6 +228,17 @@ smoke: smoke-prereqs ## Build and run real-VM smoke (needs KVM/HVF; not CI).
 		uv run pytest -m "$(SMOKE_MARK)" $(SMOKE_ARGS) -n 0 --smoke-lane serial || { code=$$?; test $$code -eq 5 || status=$$code; }; \
 		exit $$status; \
 	}
+
+.PHONY: perf perf-run
+perf: ## Enter the pinned perf shell, stage prerequisites and benchmark serially.
+	$(PERF_SHELL) $(MAKE) perf-run
+
+perf-run: smoke-prereqs
+	cd perf && PROFILE="$(PROFILE)" \
+		SILO_SMOKE_BIN_DIR="$${SILO_SMOKE_BIN_DIR:-$(CARGO_TARGET_DIR)/$(PROFILE)}" \
+		SILO_SMOKE_RUNTIME_DIR="$${SILO_SMOKE_RUNTIME_DIR:-$(CARGO_TARGET_DIR)/silo-runtime/$(RUNTIME_TARGET)/$(PROFILE)}" \
+		PERF_COHORTS="$(PERF_COHORTS)" PERF_SYSTEMS="$(PERF_SYSTEMS)" PERF_SAMPLES="$(PERF_SAMPLES)" \
+		uv run pytest -s $(PERF_ARGS) -n 0
 
 version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check

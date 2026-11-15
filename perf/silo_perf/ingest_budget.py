@@ -22,10 +22,11 @@ import urllib.request
 from urllib.parse import quote
 import zlib
 
-from . import images, page_cache, shutdown
-from .cli import Silo
-from .distribution_registry import DistributionRegistry, OCI_MANIFEST
-from .fork_budget import SAMPLES, cache_state, describe, headroom, owned_inputs
+from silo_smoke import images, shutdown
+from silo_smoke.cli import Silo
+from silo_smoke.distribution_registry import DistributionRegistry, OCI_MANIFEST
+from silo_perf import page_cache
+from silo_perf.fork_budget import SAMPLES, cache_state, describe, headroom, owned_inputs
 
 GIB = 1024 ** 3
 SIZES = (GIB, 4 * GIB, 12 * GIB)

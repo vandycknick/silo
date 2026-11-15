@@ -136,7 +136,7 @@ def create_argv(source: str, names: list[str], *flags: str, operation: str,
                 hooks: dict[int, dict] | None = None) -> list[str]:
     selection = (["--children-json", children_json(names, hooks=hooks)] if hooks
                  else [argument for name in names for argument in ("--name", name)])
-    return ["fork", source, "--live", *selection, "--operation-id", operation, *flags]
+    return ["fork", source, "--live", "--format", "json", *selection, "--operation-id", operation, *flags]
 
 
 def _nofile(limit: int | None):
@@ -199,7 +199,7 @@ def run(silo: Silo, source: str, names: list[str], *flags: str, operation: str |
 
 def observe(silo: Silo, operation: str, *, cancel: bool = False) -> dict:
     """`silo fork --operation` (exit 0 even for failed operations), plus `--cancel`."""
-    result = silo.run("fork", "--operation", operation, *(["--cancel"] if cancel else []),
+    result = silo.run("fork", "--operation", operation, "--format", "json", *(["--cancel"] if cancel else []),
                       timeout=180, label="fork-observe")
     value = json.loads(result.stdout)
     return validate(value, operation=operation, names=[child["name"] for child in value["children"]])

@@ -100,7 +100,7 @@ def test_local_kernel_uses_adjacent_emitted_config_and_remembers_exact_kernel(tm
 
 
 def test_release_paths_and_evidence_do_not_need_manual_environment(tmp_path: Path) -> None:
-    code = "from silo_smoke import prereqs; from silo_smoke.fork_budget import evidence_directory; print(prereqs.bin_dir()); print(prereqs.workspace_parent()); print(evidence_directory('first')); print(evidence_directory('first'))"
+    code = "from silo_smoke import prereqs; from silo_smoke.evidence import evidence_directory; print(prereqs.bin_dir()); print(prereqs.workspace_parent()); print(evidence_directory('first')); print(evidence_directory('first'))"
     result = _run(code, tmp_path)
     assert result.returncode == 0, result.stderr
     binary, workspace, first, second = map(Path, result.stdout.splitlines())

@@ -1,4 +1,8 @@
-"""Evidence-recording black-box CLI driver."""
+"""Evidence-recording black-box CLI driver.
+
+Use ``Silo.json`` for machine-readable command output. ``Silo.run`` preserves
+the CLI's default human format unless the caller explicitly selects JSON.
+"""
 
 from __future__ import annotations
 
@@ -182,7 +186,7 @@ class Silo:
         opaque whole-disk bytes request them through the real conversion CLI.
         Returns the immutable managed `image:sha256:HEX` spelling.
         """
-        converted = json.loads(self.run("image", "convert", reference, "--disk-format", "raw", timeout=600, label="image-convert-raw").stdout)
+        converted = self.json("image", "convert", reference, "--disk-format", "raw", timeout=600, label="image-convert-raw")
         return "image:" + str(converted["id"])
 
     def root_image(self, reference: str, profile: RootProfile) -> str:

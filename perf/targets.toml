@@ -1,0 +1,35 @@
+# Each Phase 30 fix removes its expected_fail marker after measured qualification.
+[silo.arch-30g.image.start]
+seconds = 1.0
+expected_fail = true
+slice = "30c, 30g"
+
+[silo.arch-30g.image.restore_first]
+seconds = 0.5
+expected_fail = true
+slice = "30c, 30d, 30g"
+
+[silo.arch-30g.image.restore_second]
+seconds = 0.5
+expected_fail = true
+slice = "30c, 30g"
+
+[silo.arch-30g.image.fork_second]
+seconds = 1.0
+expected_fail = true
+slice = "30a, 30b, 30c, 30g"
+
+[silo.arch-30g.image.fork_first]
+seconds = 2.0
+expected_fail = true
+slice = "30a, 30c, 30e, 30g"
+
+[silo.arch-30g.image.snapshot_incremental]
+seconds = 2.0
+expected_fail = true
+slice = "30a, 30b, 30g"
+
+[silo.arch-30g.image.exec]
+seconds = 0.1
+expected_fail = true
+slice = "30g"

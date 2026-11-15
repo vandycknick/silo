@@ -1,0 +1,32 @@
+[alpine-2g]
+image = "docker.io/library/alpine:latest"
+msb_image = "alpine"
+cpus = 2
+memory_gib = 2
+
+[alpine-8g]
+image = "docker.io/library/alpine:latest"
+msb_image = "alpine"
+cpus = 2
+memory_gib = 8
+
+[alpine-30g]
+image = "docker.io/library/alpine:latest"
+msb_image = "alpine"
+cpus = 2
+memory_gib = 30
+
+[arch-30g]
+image = "ghcr.io/vandycknick/archlinux:20260831.150324"
+cpus = 10
+memory_gib = 30
+disks = ["100gb"]
+
+[disk-invariance]
+image = "docker.io/library/alpine:latest"
+cpus = 2
+memory_gib = 2
+disks = ["30gib", "500gib"]
+written_mib = 64
+noise_relative = 0.30
+noise_absolute_seconds = 0.10
