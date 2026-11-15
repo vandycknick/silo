@@ -472,9 +472,9 @@ impl SnapshotStore {
         // be operation-pinned before opening their bytes.
         require_operation_closure(&self.store, operation_id, &streams, &objects, Some(digest))
             .await?;
-        let (mut fingerprints, _) = match inputs {
+        let mut fingerprints = match inputs {
             Some(inputs) => verify_publication_closure(&pool, record, inputs.published_ram()?)?,
-            None => verify_closure(&pool, record, None, false)?,
+            None => verify_closure(&pool, record, None, false)?.0,
         };
         let input = RecordInput::new(&self.store.images_dir, operation_id, &bytes)?;
         let (published, roots) = pool.publish_object_for_catalog(&input.path())?;
@@ -1482,27 +1482,29 @@ fn verify_closure(
     )
 }
 
-/// Reuse only the pool-inode proof from this owned publication. Recovery creates
-/// a fresh proof by authenticating publication bytes again; no proof is durable.
+/// Bind owned RAM publication provenance and authenticate all other members.
+/// This yields publication fingerprints, not a byte-authenticated RAM closure
+/// or a persisted warm receipt. Recovery without this binding authenticates RAM.
 fn verify_publication_closure(
     pool: &StoragePool,
     record: &SnapshotRecord,
-    ram: &crate::storage::pool::VerifiedRamPublication,
-) -> Result<(ClosureFingerprints, AuthenticatedClosure), LibVmError> {
+    ram: &crate::storage::pool::RamPublication,
+) -> Result<ClosureFingerprints, LibVmError> {
     let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
         &record.capture
     else {
-        return Err(invalid("RAM publication proof requires a live checkpoint"));
+        return Err(invalid(
+            "RAM publication binding requires a live checkpoint",
+        ));
     };
-    let stream = ram.stream();
-    if execution.memory.stream != stream.map().id() || execution.memory.length != stream.length() {
-        return Err(invalid("RAM publication proof belongs to another stream"));
+    if execution.memory.stream != ram.map().id() || execution.memory.length != ram.map().length() {
+        return Err(invalid("RAM publication binding belongs to another stream"));
     }
     ram.recheck(pool)?;
     let bytes = record.canonical_bytes()?;
     let (_, objects) = record.content_dependencies()?;
     let (_, retained_objects) = retained_members(record)?;
-    let shape = verify_artifact_shape(
+    let mut shape = verify_artifact_shape(
         pool,
         &bytes,
         &record.streams().collect::<Vec<_>>(),
@@ -1513,15 +1515,19 @@ fn verify_publication_closure(
         None,
         &BTreeSet::new(),
     )?;
-    if shape.stream_map(&execution.memory.stream)? != stream.map() {
+    if shape.stream_map(&execution.memory.stream)? != ram.map() {
         return Err(invalid(
-            "RAM publication map differs from authenticated pool bytes",
+            "RAM publication map differs from the sealed producer map",
         ));
     }
-    let warm = BTreeMap::from([(execution.memory.stream, stream.fingerprint())]);
-    let closure = shape.authenticate(pool, Some(&warm))?;
+    // RAM is authorized only by the separate held publication binding. Do not
+    // turn it into authenticated bytes through the warm-receipt constructor.
+    shape
+        .contents
+        .retain(|content| content.stream != execution.memory.stream);
+    shape.authenticate(pool, None)?;
     ram.recheck(pool)?;
-    Ok((shape.fingerprints, closure))
+    Ok(shape.fingerprints)
 }
 
 /// A metadata-validated closure, with no stream-byte authentication authority.
@@ -1774,7 +1780,7 @@ fn read_shape_maps<'a>(
     Ok(())
 }
 
-/// Publication, export and handoff always authenticate every stream byte.
+/// Recovery, export and handoff authenticate every stream byte without receipts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_artifact_closure(
     pool: &StoragePool,
@@ -2242,6 +2248,114 @@ pub(crate) mod tests {
             Err(nix::errno::Errno::EAGAIN) => false,
             Err(error) => panic!("reading stream access observations: {error}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_publication_does_not_seed_warm_ram_receipt() {
+        let fixture = crate::store::capture::tests::fixture().await;
+        let (directory, _) = crate::store::capture::tests::seal(&fixture);
+        let snapshots = &fixture.snapshots;
+        let info = snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let consumer = snapshots
+            .consume_shape(&SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &consumer.record.capture
+        else {
+            panic!("live fixture");
+        };
+        let ram = execution.memory.stream;
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM verified_object WHERE stream_sha256=?1")
+                .bind(ram.to_string())
+                .fetch_one(&snapshots.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(receipts, 0, "publication is not a cold authentication");
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let watcher = watch_stream_reads(&pool.stream_path(&ram));
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        assert!(!observed_stream_read(&watcher));
+        drop(snapshots.authenticate_closure_bytes(shape).await.unwrap());
+        assert!(
+            observed_stream_read(&watcher),
+            "first restore must read RAM"
+        );
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        drop(snapshots.authenticate_closure_bytes(shape).await.unwrap());
+        assert!(
+            !observed_stream_read(&watcher),
+            "warm restore may reuse RAM"
+        );
+        drop(snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap());
+        assert!(observed_stream_read(&watcher), "export must still read RAM");
+    }
+
+    #[tokio::test]
+    async fn live_publication_corruption_is_rejected_by_cold_restore_and_export() {
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+
+        let fixture = crate::store::capture::tests::fixture().await;
+        let (directory, _) = crate::store::capture::tests::seal(&fixture);
+        let snapshots = &fixture.snapshots;
+        let info = snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let consumer = snapshots
+            .consume_shape(&SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &consumer.record.capture
+        else {
+            panic!("live fixture");
+        };
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let path = pool.stream_path(&execution.memory.stream);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(&[0xff], execution.memory.length - 1)
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            execution.memory.length
+        );
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        let error = snapshots
+            .authenticate_closure_bytes(shape)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            crate::storage::StorageError::ContentMismatch(path).to_string()
+        );
+        assert!(snapshots.consume(&SnapshotRef::Id(info.id)).await.is_err());
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM verified_object WHERE stream_sha256=?1")
+                .bind(execution.memory.stream.to_string())
+                .fetch_one(&snapshots.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(receipts, 0, "failed authentication cannot establish trust");
     }
 
     #[cfg(target_os = "linux")]

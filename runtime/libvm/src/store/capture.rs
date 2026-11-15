@@ -753,8 +753,14 @@ impl SnapshotStore {
         let directory = capture_directory(&self.store, &record)?
             .ok_or_else(|| invalid("capture staging is missing"))?;
         settle_capture_seal(&directory)?;
-        // RAM is authenticated during pool publication, not before it.
-        let mut verified = verify_capture(&directory, &record, CaptureAuthentication::Publication)?;
+        // Sealed is persisted before the first pool publication. A replay must
+        // authenticate staging again instead of trusting prior clone provenance.
+        let authentication = if record.state == CaptureState::Reserved {
+            CaptureAuthentication::Publication
+        } else {
+            CaptureAuthentication::Bytes
+        };
+        let mut verified = verify_capture(&directory, &record, authentication)?;
         let boot = record
             .captured_boot
             .clone()
@@ -784,13 +790,13 @@ impl SnapshotStore {
             payload.recheck()?;
             match payload.role {
                 CaptureRole::Ram => {
-                    let (proof, roots) =
+                    let (publication, roots) =
                         pool.publish_sealed_ram_for_catalog(payload.file(), &verified.ram_map)?;
-                    let id = proof.stream().map().id();
+                    let id = publication.map().id();
                     tracing::debug!(
-                        bytes_read = proof.authentication_stats().bytes_read,
-                        logical_bytes_hashed = proof.authentication_stats().logical_bytes_hashed,
-                        "authenticated RAM publication"
+                        bytes_read = publication.scan_stats().bytes_read,
+                        logical_bytes_hashed = publication.scan_stats().logical_bytes_hashed,
+                        "published sealed RAM"
                     );
                     self.store
                         .pin_published_storage_dependencies(capture, &[id], &[])
@@ -804,7 +810,7 @@ impl SnapshotStore {
                     )
                     .await?;
                     streams.insert(payload.role.relative_path(), content);
-                    verified.published_ram = Some(proof);
+                    verified.published_ram = Some(publication);
                 }
                 CaptureRole::Disk(_) => {
                     let (published, roots) = pool.publish_stream_file_for_catalog(
@@ -1559,7 +1565,7 @@ const AUTHENTICATION_LANE_STACK_BYTES: usize = 1 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureAuthentication {
     Receipt,
-    /// RAM bytes are authenticated by the map-checked pool publication.
+    /// First-attempt RAM publication retains producer map and clone provenance.
     Publication,
     Bytes,
 }
@@ -1606,17 +1612,17 @@ pub(crate) struct VerifiedCapture {
     evidence_bytes: Vec<u8>,
     files: Vec<VerifiedPayload>,
     ram_map: crate::storage::stream::StreamMap,
-    published_ram: Option<crate::storage::pool::VerifiedRamPublication>,
+    published_ram: Option<crate::storage::pool::RamPublication>,
     directory_identity: (u64, u64),
     control_fingerprints: Vec<(&'static str, SourceFingerprint)>,
 }
 impl VerifiedCapture {
     pub(crate) fn published_ram(
         &self,
-    ) -> Result<&crate::storage::pool::VerifiedRamPublication, LibVmError> {
+    ) -> Result<&crate::storage::pool::RamPublication, LibVmError> {
         self.published_ram
             .as_ref()
-            .ok_or_else(|| invalid("capture RAM has no authenticated pool publication"))
+            .ok_or_else(|| invalid("capture RAM has no owned pool publication"))
     }
 
     pub(crate) fn recheck_registered(

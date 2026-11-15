@@ -204,8 +204,11 @@ additional opaque encoding on VZ without changing the raw contract here.
    standalone registry reference must retain the complete closure there, even
    when direct handoff could have regenerated part of it.
 9. Local clone operations may rely on a qualified kernel clone contract without
-   hashing an entire disk. Immutable publication and network transfer verify
-   cryptographic identities before making a result usable.
+   hashing an entire disk. Owned, sealed RAM publication may likewise rely on
+   producer-computed chunk identities, unchanged inode facts and a successful
+   reflink without rereading RAM. Independent existing dedup objects and copy
+   fallbacks still verify bytes; cold durable restore and network transfer
+   authenticate the published RAM against its original identity.
 10. Starts use the persisted root representation. Conversion, guest
     generalization, boot-profile changes and transfer are explicit operations.
 11. Storage compatibility is necessary but not sufficient for boot. Silo checks
@@ -2367,11 +2370,18 @@ than deleting the source opportunistically after a push.
 ### Publication and crash recovery
 
 Immutable publication stages under a unique operation directory on the final
-filesystem, validates and hashes output, synchronizes files, publishes through
-atomic no-replace rename, then synchronizes parent directories. A recipe/result
-record becomes visible only after every dependency is durable. An existing
-object at the same digest must validate; corruption is quarantined under
-coordination, never repaired in place while readers may use it.
+filesystem, validates output, synchronizes files, publishes through atomic
+no-replace rename, then synchronizes parent directories. Output is hashed except
+for a successful reflink of closed, owned, sealed RAM whose canonical producer
+map, geometry and source inode facts have validated and remain unchanged across
+the clone. That path binds the new inode to producer identity and clone
+provenance, not an independent read-back proof, and creates no warm verification
+receipt. Same-length corruption between capture and publication is detected at
+cold durable restore or export, not at publication. The non-reflink path copies
+and hashes inline. A recipe/result record becomes visible only after every
+dependency is durable. An independent existing object at the same digest must
+still validate; corruption is quarantined under coordination, never repaired in
+place while readers may use it.
 
 Operations have durable IDs and phases in `operations/`. Machine storage is
 published before the database transaction references it. When replacing existing
