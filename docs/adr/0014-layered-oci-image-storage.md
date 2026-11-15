@@ -30,9 +30,10 @@ first durable restore independently scans RAM. Silent local corruption between
 capture and restore is accepted; `silo snapshot verify IMAGE` supplies on-demand
 authentication. Import, pull, transport, export and handoff still authenticate
 every byte. [ADR 0021](0021-live-snapshots-and-forks.md) records the agent-ready
-clock, scaling invariants, explicit zero ranges, separate fast same-host fork
-mode and retained plus new performance gates; these are requirements, not
-claims of completed Phase 30 implementation.
+clock, scaling invariants, explicit zero ranges and retained plus new performance
+gates; these are requirements, not claims of completed Phase 30 implementation.
+The non-durable fast same-host fork was deferred after design review on
+2026-11-15; durable fork is the only live fork mode in the contract.
 
 The same Phase 30 implementation adds local composition validation receipts,
 shared owned sealed-stream publication for RAM and writable disks, and
@@ -951,6 +952,16 @@ entirely zero. That amplification is accepted; the dirty-tracking granule is
 the hypervisor's, not the chunk. A changed-to-zero page is an explicit zero
 range, represented by a hole with a format-level zero marker, never a hole
 that inherits baseline bytes. Zero chunks are never hashed or stored.
+
+#### Planned Phase 30 identity changes
+
+The owner approved the following direction on 2026-11-15; it is not yet
+implemented. Per-chunk write tracking in the block device with inherited maps
+lets a seal hash only chunks written since the last seal. A temporary
+create-time hash of a fresh upper is removed by a cached upper template in a
+later stage, so create must not end up slower. A sparse authenticated stream map
+has size and work that do not grow with configured length. RAM uses a smaller
+identity unit than 8 MiB.
 
 ### Identity layers
 
@@ -2079,6 +2090,11 @@ After a monitor/manager process crash, recovery completes identities from
 retained clones without VM operations. No power-loss durability is claimed
 before libvm publication or child durability barriers.
 
+On the deferred-identity lane, a machine's first snapshot hashes its written disk
+data once after the guest resumes. `pause` is refused while post-resume disk
+identity is pending, even though the source is `Running`. Both are accepted
+limitations (owner, 2026-11-15).
+
 A sealed capture is a copy of the paused view, never the source's file
 relabelled read-only while its backend still writes it. After capture the
 source's original files and every child's restore copies are distinct
@@ -2132,14 +2148,11 @@ synchronized before the database publishes the child's root and configuration
 in one transaction. Failure removes only child-owned staging and cannot cause
 source data loss.
 
-A default durable running-machine fork ([ADR 0021](0021-live-snapshots-and-forks.md))
+A durable running-machine fork ([ADR 0021](0021-live-snapshots-and-forks.md))
 captures once and restores each child from that exact execution checkpoint.
 Every child receives distinct private writable raw clones or copies of the
 sealed captures; unchanged RAM is shared between children through private
-mappings of one immutable RAM file. The separate, explicitly selected fast
-same-host mode has no RAM file and shares source and child memory copy-on-write;
-siblings share physical pages, and children do not survive host crash or reboot.
-Its mechanism details require a Phase 30 design review.
+mappings of one immutable RAM file.
 The source's storage remains private to it. Under the continuation policy, the
 reflink lane continues after the persistent cut and RAM acceptance, before disk
 identity completion and the final seal; the copy-only lane seals first.

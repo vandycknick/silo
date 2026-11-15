@@ -26,7 +26,9 @@ def render(records: Sequence[Record], history: Sequence[Record],
             if entry is None:
                 return "-"
             target = target_for(targets, entry.system, cohort.split("/")[0], entry.mode, metric)
-            return "-" if target is None else f"{target.seconds:g} {target.evaluate(entry.median)}"
+            if target is None:
+                return "-"
+            return f"{target.seconds:g} {target.evaluate(entry.median).render(target.tolerance)}"
         def change(entry: Record | None) -> str:
             value = None if entry is None else delta(entry, history)
             return "-" if value is None else f"{value:+.1f}%"
@@ -44,11 +46,14 @@ def render(records: Sequence[Record], history: Sequence[Record],
 
 
 def trend(records: Sequence[Record]) -> str:
-    lines = ["timestamp  host  system  cohort  mode  metric  median s  delta"]
+    lines = ["timestamp  host  system  cohort  mode  metric  median s  verdict  delta"]
     for index, record in enumerate(records):
         change = delta(record, records[:index])
+        verdict = ("-" if record.verdict is None or record.tolerance is None
+                   else record.verdict.render(record.tolerance))
         lines.append(f"{record.timestamp}  {record.host.fingerprint[:12]}  {record.system}  "
                      f"{record.cohort}  {record.mode}  {record.metric}  {record.median:.3f}  "
+                     f"{verdict}  "
                      + ("-" if change is None else f"{change:+.1f}%"))
     return "\n".join(lines)
 

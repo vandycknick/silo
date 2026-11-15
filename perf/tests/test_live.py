@@ -105,13 +105,17 @@ def test_live_operations(config: SmokeConfig, registry: LoopbackRegistry) -> Non
                         disk_medians[disk] = {metric: statistics.median(values) for metric, values in timings.items()}
                         label = cohort_name if len(cohort.disks) == 1 else f"{cohort_name}/{disk}"
                         for metric, values in timings.items():
-                            record = Record(system, label, mode.value, metric, tuple(values),
-                                            statistics.median(values), min(values), max(values), commit,
-                                            silo_version, msb_version, fingerprint, stamp, run_id)
-                            records.append(record)
                             target = target_for(targets, system, cohort_name, mode.value, metric)
-                            if target is not None and target.evaluate(record.median) == Verdict.FAIL:
-                                failures.append(f"{system}/{label}/{mode}/{metric} exceeds {target.seconds:g}s")
+                            median = statistics.median(values)
+                            verdict = None if target is None else target.evaluate(median)
+                            record = Record(system, label, mode.value, metric, tuple(values),
+                                            median, min(values), max(values), commit,
+                                            silo_version, msb_version, fingerprint, stamp, run_id,
+                                            verdict, None if target is None else target.tolerance)
+                            records.append(record)
+                            if target is not None and verdict == Verdict.FAIL:
+                                failures.append(f"{system}/{label}/{mode}/{metric} exceeds "
+                                                f"{target.seconds:g}s plus {target.tolerance:.0%} tolerance")
                     if len(cohort.disks) > 1:
                         first, second = (disk_medians[disk] for disk in cohort.disks)
                         for metric in ("snapshot_full", "snapshot_incremental", "fork_first", "fork_second",

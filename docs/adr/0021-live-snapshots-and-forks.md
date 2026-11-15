@@ -56,9 +56,11 @@ refuses those mismatches, not a different build.
 
 The owner decisions of 2026-11-15 (Phase 30) measure start and live-operation
 latency from command start until the guest agent is ready, not `Running`.
-They require work independent of configured RAM and logical disk size, replace
-explicit zero-byte overlays with format-level zero ranges, and admit an
-explicit, non-durable same-host fast fork alongside the default durable fork.
+They require work independent of configured RAM and logical disk size and replace
+explicit zero-byte overlays with format-level zero ranges. A non-durable
+same-host fast fork was admitted on 2026-11-15, then deferred the same day after
+stock-kernel design review. Durable fork is the only fork mode in this contract;
+the alternative and its costs are recorded under Alternatives Considered.
 Local snapshot publication now seeds the warm receipt, reversing the
 2026-11-14 rule that the first durable restore independently scans RAM.
 Silent local corruption between capture and restore is an accepted risk;
@@ -135,7 +137,7 @@ deliberately onto Silo's fork, not adopted by changing a dependency revision.
 | Capture | One operation that produces a coherent cut of execution state, RAM and every included writable disk at one pause token. |
 | Execution checkpoint | The immutable closure bound to producer-computed identities by a capture: RAM stream and layout, execution envelope, device state, sealed disks, boot and configuration provenance, compatibility profile. Local publication establishes restore trust; import, transport, export, handoff and explicit verification independently authenticate bytes. [ADR 0014](0014-layered-oci-image-storage.md) calls this a snapshot with `captureKind: live-execution`. |
 | Restore | Construction of a new machine generation whose first guest instruction continues from an execution checkpoint. |
-| Fork | By default, one durable capture-backed branch of a running source followed by N restores, with the source resumed under its recorded policy. The explicitly selected fast same-host mode shares source memory copy-on-write without a RAM file and is non-durable. |
+| Fork | One durable capture-backed branch of a running source followed by N restores, with the source resumed under its recorded policy. |
 | Activation | The barrier between a restored guest's first instruction and the moment its workload runs and its endpoints are reachable: fresh VM generation identity acknowledged, agent rebound, network applied, workload thawed. |
 | Baseline | The retained RAM generation a VM's dirty tracking is measured against, enabling incremental capture. |
 | Workload freezer | A cgroup freezer subtree containing every guest process except the agent and its control dependencies. |
@@ -400,8 +402,9 @@ admission; the operation table below does not replace them.
 
 While an `IdentityPending` capture's source is `Running`, new sessions are
 admitted, but new `Pause`, `Resume` and `Capture` commands for that run remain
-fenced until capture settles. A user pause is refused during this window, a
-known limit even though public state is `Running`. A preserved source stays
+fenced until capture settles. Refusing `pause` while post-resume disk identity is
+pending is an accepted limitation (owner, 2026-11-15), even though public state
+is `Running`. A preserved source stays
 `Paused` with the same lifecycle fence. `CancelOperation` is admitted from
 `Running` or `Paused` only for that exact identity-pending capture, as decided by
 the monitor journal; libvm routes such cancellation to the monitor rather than
@@ -599,6 +602,9 @@ A capture runs in this order; each step completes before the next begins:
    Preserved sources remain paused by policy. Fork children still wait for
    these complete identities; neither the cut record nor an incomplete map is
    restore authority.
+   A machine's first snapshot hashes its written disk data once after the guest
+   resumes on this lane. That first-snapshot pass is an accepted limitation
+   (owner, 2026-11-15).
 8. **Seal.** The worker computes nonzero RAM chunk digests during capture;
    non-reflink disk copies hash inline, and deferred clone identities come from
    step 7. Publication carries those identities without another payload pass.
@@ -727,10 +733,9 @@ Every durable restore opens the RAM file read-only and maps each region
 `PROT_READ | PROT_WRITE, MAP_PRIVATE`. Clean pages are shared through the host
 page cache between every child mapping the same inode; written pages are
 private to the writer. The file is never mapped shared, never handed to a
-child as a writable descriptor, and never modified in place. In this default
-durable mode the source keeps its existing mappings after capture; children
-share with one another and later restores, not with the still-running source.
-The separate fast same-host fork mode below admits source-child sharing.
+child as a writable descriptor, and never modified in place. The source keeps
+its existing mappings after capture; children share with one another and later
+restores, not with the still-running source.
 
 The worker never forks its own process to clone a VM; a child is always a
 fresh hypervisor VM in a fresh process that installs saved state before its
@@ -815,6 +820,16 @@ seeded at publication from their first restore; imported, pulled or transported
 snapshots authenticate every byte before execution. Local forks trust owned
 producer identity as described below.
 A materialization from chunk storage is not presented as remote lazy restore.
+
+### Planned Phase 30 identity changes
+
+The owner approved the following direction on 2026-11-15; it is not yet
+implemented. Per-chunk write tracking in the block device with inherited maps
+lets a seal hash only chunks written since the last seal. A temporary
+create-time hash of a fresh upper is removed by a cached upper template in a
+later stage, so create must not end up slower. A sparse authenticated stream map
+has size and work that do not grow with configured length. RAM uses a smaller
+identity unit than 8 MiB.
 
 ### Accounting
 
@@ -1169,7 +1184,7 @@ this timer exception changes neither kernel builds nor the support matrix.
 
 ## Fork
 
-### Default durable fork
+### Durable fork
 
 Fork is one capture followed by N restores. libvm performs the capture, pins
 the recorded RAM file and disk cut under a recoverable operation root, then
@@ -1223,16 +1238,6 @@ are supplied per child through the activation configuration. A child's
 captured-but-stale TCP connections receive errors inside the guest; the
 destination netd does not deliver traffic for the source's addresses to the
 child.
-
-### Explicit fast same-host fork
-
-Silo admits a separate, explicitly selected non-durable live fork mode without
-a RAM file. Source and children share guest memory copy-on-write, and siblings
-share physical pages. This mode is same host only; children do not survive a
-host crash or reboot. It never silently replaces the default durable fork.
-Its mechanism, lifecycle and resource-ownership details are pending a Phase 30
-design review before implementation; this decision does not select those
-details or claim the mode is delivered.
 
 ## Device And Identity Model
 
@@ -1644,12 +1649,17 @@ unavailability and pause-to-seal latency are separate diagnostics. Deferred
 post-resume disk identity completion is seal latency, not pause time, and earns
 no pause allowance.
 
+A measured median at or below its target passes. A median above its target by
+at most 10 percent is accepted and reported as **within tolerance**; a median
+beyond that grace fails. This rule applies to the retained budgets and the
+Phase 30 targets below.
+
 The existing 4 GiB fixture budgets remain gates on the three reference hosts
 named in [ADR 0014](0014-layered-oci-image-storage.md)'s qualification matrix
 (Linux x86_64 on ext4 without reflinks, Linux x86_64 on XFS with reflinks,
 Apple-silicon macOS on APFS). Cold and warm cache are recorded separately as the
-median of five runs with minimum and maximum reported; a budget passes when the
-median meets it. Full capture of a 4 GiB machine with a 1 GiB nonzero upper on
+median of five runs with minimum and maximum reported, applying the grace rule
+above. Full capture of a 4 GiB machine with a 1 GiB nonzero upper on
 APFS or reflink-capable Linux has a 5 s pause gate; incremental capture of one
 contiguous 410 MiB dirty region in a 4 GiB guest (10 percent rounded to whole
 MiB) has a 1 s pause gate. Restore to agent ready has a
@@ -1680,13 +1690,14 @@ for the 4 GiB fixture:
 | Operation | Phase 30 target |
 | --- | --- |
 | Start | Under 1 s |
-| Restore of a local snapshot, first or repeated | 0.5 s |
-| Durable fork with a baseline | 1 s |
-| First durable fork | 2 s |
-| Fast same-host fork | 0.5 s |
-| Incremental snapshot | 2 s total, with a 1 s pause |
-| Full snapshot | Pause proportional to touched RAM |
+| Create | Under 1 s |
+| `run -- /bin/true` | Under 2 s |
 | Exec round trip | 0.1 s |
+| Restore of a local snapshot, first or repeated | 0.5 s |
+| First durable fork | 2 s |
+| Later durable fork | 1.25 s |
+| Full snapshot | Under 3 s |
+| Incremental snapshot | 1.5 s total, with a 1 s pause |
 
 Image init as PID 1 stays the default. Every new performance figure must record
 both default image init and agent-as-PID-1 (`--kernel-arg init=`), with the mode
@@ -1701,7 +1712,9 @@ equal setup as informational. It records both init modes, cold/warm conditions
 and history for the retained 4 GiB fixture, 2/8/30 GiB Alpine 2-vCPU cohorts,
 and this Arch cohort. An unavailable msb run is skipped with a reason.
 The [performance tracker](../architecture/live-operation-performance.md) records
-the Phase 30 baseline and each slice's measured result; targets are not yet met.
+the baseline and measured results through wave three. Fork and incremental
+snapshot targets are not yet met; they depend on disk write tracking and the
+map format change planned above.
 
 ## libkrun Fork Commit Series
 
@@ -1919,9 +1932,8 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   Linux hosts without reflinks the pause includes copying the bytes actually
   written to the upper, not its configured capacity.
 - Each durable child costs a private raw clone or copy of every writable disk
-  and, on non-CoW hosts, the written bytes to make it. Durable memory sharing is
-  between children, not the still-running source; the explicitly selected fast
-  same-host mode shares source memory but loses children on host crash or reboot.
+  and, on non-CoW hosts, the written bytes to make it. Memory sharing is
+  between children, not the still-running source.
 - Local publication trust removes the first-restore RAM scan but deliberately
   does not detect silent local corruption between capture and restore.
   Operators use `silo snapshot verify IMAGE` for on-demand full authentication.
@@ -1933,6 +1945,20 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   users must treat them as credentials.
 
 ## Alternatives Considered
+
+### Fast same-host fork (deferred 2026-11-15)
+
+A non-durable same-host fork without a RAM file was considered to avoid RAM
+materialization and share source and child pages. It was admitted on
+2026-11-15 and deferred the same day after stock-kernel design review.
+
+A private mapping of a mutable memfd is not a snapshot. Sealed memfd generations
+cannot be chained without copying. An implementable userfaultfd write-protect
+design copies on first touch rather than sharing pages, has a cut cost that
+grows with populated RAM, and adds a pager process whose failure takes the fork
+family down. The owner deferred that complexity. This alternative and its
+former 0.5 s target are not part of the contract; durable fork is the only fork
+mode.
 
 ### Adopt a third-party libkrun fork that already captures
 

@@ -38,19 +38,33 @@ def load_cohorts(path: Path = ROOT / "cohorts.toml") -> dict[str, Cohort]:
 
 class Verdict(StrEnum):
     PASS = "PASS"
+    WITHIN_TOLERANCE = "PASS (within tolerance)"
     FAIL = "FAIL"
     NOT_YET = "NOT YET"
+
+    def render(self, tolerance: float) -> str:
+        if self == Verdict.WITHIN_TOLERANCE:
+            return f"PASS (within {tolerance * 100:.12g}%)"
+        return self.value
+
+
+def validate_tolerance(tolerance: float) -> None:
+    if (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
+            or not math.isfinite(tolerance) or not 0 <= tolerance < 1):
+        raise ValueError("tolerance must be finite and in [0, 1)")
 
 
 @dataclass(frozen=True)
 class Target:
     seconds: float
+    tolerance: float
     expected_fail: bool = False
     slice: str = ""
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.seconds) or self.seconds <= 0:
             raise ValueError("target seconds must be finite and positive")
+        validate_tolerance(self.tolerance)
         if self.expected_fail and not self.slice:
             raise ValueError("expected_fail requires a slice reference")
 
@@ -59,6 +73,9 @@ class Target:
             raise ValueError("measurement must be finite and nonnegative")
         if seconds <= self.seconds:
             return Verdict.PASS
+        bound = self.seconds * (1 + self.tolerance)
+        if seconds <= bound:
+            return Verdict.WITHIN_TOLERANCE
         return Verdict.NOT_YET if self.expected_fail else Verdict.FAIL
 
 
@@ -68,7 +85,9 @@ TargetKey = tuple[str, str, str, str]
 def load_targets(path: Path = ROOT / "targets.toml") -> dict[TargetKey, Target]:
     with path.open("rb") as stream:
         data = tomllib.load(stream)
-    return {(system, cohort, mode, metric): Target(**value)
+    tolerance = data.pop("tolerance", None)
+    validate_tolerance(tolerance)
+    return {(system, cohort, mode, metric): Target(**{"tolerance": tolerance, **value})
             for system, cohorts in data.items() for cohort, modes in cohorts.items()
             for mode, metrics in modes.items() for metric, value in metrics.items()}
 

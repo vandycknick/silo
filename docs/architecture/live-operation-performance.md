@@ -22,7 +22,7 @@ durable summary.
 | Capture total | command start → snapshot complete and source agent ready under the continuation policy | cut, source continuation and durable publication; record separately from interruption. A preserved user pause remains paused by policy. |
 | Capture pause | native pause established → native pause released | exact vCPU pause, with copy and only in-pause identity allowances; deferred post-resume disk identity completion is separate seal latency and receives no pause allowance. Workload-unavailability gaps remain independent diagnostics. |
 | Restore to agent ready | command start → child guest agent ready, witness continuing | closure shape and trust checks, private upper clone or written-byte copy, launch, private RAM mapping, generation acknowledgement, activation and thaw. Local publication seeds first-restore trust without hashing RAM; imports and transport retain full authentication. |
-| Fork to all agents ready | command start → every requested child guest agent ready | one cut including pause, admission and child restores; the retained Fork4 gate requires all four agents. Durable fork is the default; fast same-host fork is a separate explicit mode. |
+| Fork to all agents ready | command start → every requested child guest agent ready | one durable cut including pause, admission and child restores; the retained Fork4 gate requires all four agents. Durable fork is the only fork mode in the contract. |
 | Exec round trip | command start → guest command completes and CLI returns | complete agent request and response, not application readiness. |
 
 `make perf` runs the standalone `perf/` project serially and gates the retained
@@ -33,9 +33,10 @@ original evidence and are not silently converted to the new clock or mode.
 
 ## Phase 30 baseline (2026-11-15)
 
-The Phase 30 targets are not yet met. Each implementation slice must append its
-measured result, including raw samples, both init modes and clock endpoints;
-the baseline is not a passing qualification.
+The baseline predates the improvements recorded under State after wave three.
+Each implementation slice must append its measured result, including raw
+samples, both init modes and clock endpoints; the baseline is not a passing
+qualification.
 
 These are the plan's three-sample medians in seconds, measured on the same
 Ryzen 5 3600 host with Btrfs, Linux 7.2.11 and idle guests. Alpine uses 2 vCPUs;
@@ -119,10 +120,10 @@ Changed-to-zero pages are explicit zero ranges, never inheritance: omitted on
 sparse rebuilds, punched on reflink seeds, and physically written as zeros only
 when punching is unsupported. Zero chunk objects are never hashed or stored.
 
-Durable fork remains the default. The separately selected fast same-host fork
-has no RAM file; source and children share guest memory copy-on-write, siblings
-share physical pages, and children do not survive host crash or reboot.
-Mechanism details await the Phase 30 design review.
+Durable fork is the only fork mode in the contract. The owner deferred the
+non-durable fast same-host fork on 2026-11-15 after stock-kernel design review;
+[ADR 0021](../adr/0021-live-snapshots-and-forks.md#fast-same-host-fork-deferred-2026-11-15)
+records the considered alternative and its costs.
 
 The approved idle Arch cohort uses 30 GiB RAM, 10 vCPUs, a 100 GiB disk and
 default image init, with command start to agent ready as the latency clock:
@@ -130,13 +131,28 @@ default image init, with command start to agent ready as the latency clock:
 | Operation | Target |
 | --- | --- |
 | Start | Under 1 s |
-| Local snapshot restore, first or repeated | 0.5 s |
-| Durable fork with baseline | 1 s |
-| First durable fork | 2 s |
-| Fast same-host fork | 0.5 s |
-| Incremental snapshot | 2 s total, with a 1 s pause |
-| Full snapshot | Pause proportional to touched RAM |
+| Create | Under 1 s |
+| `run -- /bin/true` | Under 2 s |
 | Exec round trip | 0.1 s |
+| Local snapshot restore, first or repeated | 0.5 s |
+| First durable fork | 2 s |
+| Later durable fork | 1.25 s |
+| Full snapshot | Under 3 s |
+| Incremental snapshot | 1.5 s total, with a 1 s pause |
+
+A measured median at or below its target passes. A median above its target by
+at most 10 percent is accepted and reported as **within tolerance**; a median
+beyond that grace fails. This rule applies to the Phase 30 targets and retained
+budgets.
+
+Fork and incremental snapshot targets are not yet met; they depend on disk write
+tracking and the map format change. The owner approved the following direction
+on 2026-11-15; it is not yet implemented. Per-chunk write tracking in the block
+device with inherited maps lets a seal hash only chunks written since the last
+seal. A temporary create-time hash of a fresh upper is removed by a cached upper
+template in a later stage, so create must not end up slower. A sparse
+authenticated stream map has size and work that do not grow with configured
+length. RAM uses a smaller identity unit than 8 MiB.
 
 Image init as PID 1 stays the default, with both init modes reported. The
 existing 4 GiB fixture gates remain in force alongside this cohort. The
@@ -144,6 +160,51 @@ standalone perf suite reports Silo versus target as gating pass/fail, Silo
 versus msb on a roughly equal setup as informational, and appends run history.
 msb is skipped with a reason when unavailable. Reaching msb's 0.3-0.4 s start
 latency is a later stretch goal, not a Phase 30 gate.
+
+## State after wave three (2026-11-15)
+
+These are medians of three, in seconds, using default image init on the reference
+host. Latency measurements are command start to agent ready, not `Running`.
+Create measures command completion, snapshots include durable publication and
+source readiness, exec measures the round trip, and `run -- /bin/true` ends at
+workload exit. The Arch cohort is 30 GiB RAM, 10 vCPUs and a 100 GiB disk.
+
+| Operation | Start of day | Wave 1 | Wave 2 | Wave 3 | Target |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Start | 1.55 | 0.96 | 0.95 | 0.81 | 1 |
+| First exec | 0.34 | 0.061 | 0.051 | 0.055 | 0.1 |
+| Restore, first | 12.14 | 1.28 | 1.08 | 0.50 | 0.5 |
+| Restore, repeated | 1.93 | 0.92 | 0.89 | 0.38 | 0.5 |
+| Fork, first | 8.13 | 7.67 | 2.55 | 2.74 | 2 |
+| Fork, later | 3.38 | 2.89 | 2.59 | 2.18 | 1.25 |
+| Snapshot, full | 21.26 | 8.02 | 2.79 | 2.11 | 3 |
+| Snapshot, incremental | 42.11 | 3.44 | 2.64 | 2.04 | 1.5 |
+| Create | 1.73 | 0.77 | 0.53 | 0.84 | 1 |
+| `run -- /bin/true` | 4.64 | 1.66 | 1.71 | 1.60 | 2 |
+
+The Alpine comparison uses 30 GiB RAM and 2 vCPUs, also with default init and
+three-sample medians in seconds. The msb measurements are from the wave 1 run,
+not a new wave 3 run, and remain informational.
+
+| Operation | Silo start of day | Silo now | msb |
+| --- | ---: | ---: | ---: |
+| Create + start | 1.57 | 1.39 | 0.43 |
+| First exec | 0.30 | 0.041 | 0.030 |
+| Fork, first | 6.45 | 1.21 | 10.49 |
+| Fork, later | 1.80 | 0.67 | 2.38 |
+| Snapshot, full | 7.76 | 1.05 | 11.50 |
+| Snapshot, incremental | 3.36 | 0.57 | 1.54 |
+| Restore, first | 2.39 | 0.48 | 0.37 |
+| Restore, repeated | 0.65 | 0.28 | 0.36 |
+| `run -- /bin/true` | 2.15 | 1.24 | 0.55 |
+
+Evidence is retained in the perf history (`PERF_HISTORY`, default
+`$XDG_DATA_HOME/silo/perf/history.jsonl`, or `~/.local/share/silo/perf/history.jsonl`
+when unset) and `.tmp/plan/evidence/phase-30/perf-wave1-final.log`,
+`perf-wave2.log` and `perf-wave3.log`. The rounded table values do not replace raw
+medians when applying the 10 percent grace rule. Fork and incremental snapshot
+still miss their targets; the other Arch rows meet their targets or are within
+tolerance.
 
 ## Implemented Phase 30 validation and store admission (2026-11-15)
 
@@ -178,13 +239,16 @@ until capture settles; exact-capture cancellation retains any accepted baseline.
 Pause established to released is measured separately from seal latency, and
 post-resume identity work receives no pause allowance.
 
+A machine's first snapshot hashes its written disk data once after the guest
+resumes on this lane. That pass and refusing `pause` while post-resume disk
+identity is pending are accepted limitations (owner, 2026-11-15).
+
 RAM zero runs are omitted, punched or zero-written only on unsupported punching;
 full private anonymous boot RAM uses held-cut pagemap proof to skip known-zero
 pages, with full-read fallback for other backing or unavailable metadata.
 Discarded dirties still require classification reads; swapped and huge-page
-cases are not separately qualified. These changes do not establish the
-end-to-end targets; measured wave-two results must be recorded before claiming
-that a target is met.
+cases are not separately qualified. The measured wave-two results above, rather
+than these mechanisms alone, determine whether an end-to-end target is met.
 
 ### Wave three: graph and map receipts
 
@@ -203,8 +267,8 @@ commit; the checked catalog checkpoint still precedes acknowledgement.
 Transport, export, handoff, explicit verification and capture replay without a
 producer capability still authenticate bytes.
 
-This code-path note adds no measurements. Each slice must append its measured
-result before these changes can establish any end-to-end target.
+The State after wave three tables record the measured results; these code-path
+changes alone do not establish an end-to-end target.
 
 
 ### Runtime opening and recovery
