@@ -78,6 +78,15 @@ It runs after any target-init handoff, so target software may already be running
 and may later change the interface. Silo does not attempt to continuously
 compete with a network manager started by the image.
 
+[ADR 0021](0021-live-snapshots-and-forks.md#threat-model-and-accepted-residuals)
+adds one exception for restore/fork activation (owner decision D2): while image
+workloads are frozen, activation replaces whatever addresses and routes are on
+the retained managed link, for every boot profile. Entry checks bind the link
+and source-or-destination MAC, not the captured static addresses or routes.
+Strict validation after applying the destination configuration remains required,
+including resolver readback. Image network managers may reconfigure the link
+after thaw; this is still not continuous reconciliation.
+
 The first implementation supports one IPv4 attachment. IPv6 and multiple guest
 NICs remain future work.
 

@@ -68,9 +68,10 @@ Measured effect: capture pause 8.94 → 5.51 s; manager work after the seal
    durable restore, export and handoff independently authenticate bytes.
 4. A fork is a local branch: the cut is written and closed, not synchronized.
 5. Children hash their private copy as it is written, start at
-   `constructed`, and become `durable` in the background; recovery deletes a
-   child that never became durable.
-6. Restore checks closure shape before allocating, authenticates bytes
+   `constructed`, and become `durable` in the background. Current recovery adopts
+   pending barriers while an exact monitor or run lease remains live; deletion
+   waits for positive liveness reconciliation.
+6. Durable restore checks closure shape before allocating, authenticates bytes
    concurrently with the private copy, and reuses previously verified objects
    whose inode metadata is unchanged.
 
@@ -315,3 +316,43 @@ Batch 4c cohorts (same restore monitor except parallel seal):
 `.tmp/plan/evidence/phase-24/batch4c-ext4/`. Warm-create measurements:
 `.tmp/plan/evidence/phase-24/deferred-btrfs/warm-create-20261109T112829Z/`
 and `.tmp/plan/evidence/phase-24/deferred-ext4/warm-create-20261109T112350Z/`.
+
+## Post-closeout capture and publication changes
+
+The Phase 24 cohorts above remain dated evidence, not measurements of the later
+implementation. Phase 27 pipelined native RAM capture using three 32 MiB packs
+and two hash/write workers (96 MiB pack scratch), preserving 8 MiB identities,
+explicit zero overlays and joined failure/cancellation. It also reduced repeated
+publication authentication to one pass. The plan records these 30 GiB,
+4-vCPU observations in `.tmp/plan/evidence/phase-27/perf-*.log`:
+
+| Guest | Pause before → after | Publication before → after | Wall before → after |
+| --- | --- | --- | --- |
+| Idle, 560 MiB nonzero | about 8.5 → 5.9 s | 2.7-4.0 → 2.7-3.2 s | 11.3-12.5 → 8.5-9.1 s |
+| 8 GiB dense | 16.2-18.7 → 9.4-9.6 s | 50-53 → 29-35 s | 66-72 → 38-44 s |
+
+Phase 28 removed RAM admission/reservations, made incremental capture the default
+when a valid baseline exists, and replaced RAM publication copies with reflinks
+where supported. The recorded restored-guest comparison (30 GiB RAM, 4 GiB
+random payload, 256 MiB new data) is in `phase-27/perf-restored.log`:
+
+| Capture | Wall | Paused | Publication | Live RAM read | Child RssFile afterwards |
+| --- | --- | --- | --- | --- | --- |
+| Booted source, full | 14.4 s | 8.5 s | 5.7 s | 30 GiB | not applicable |
+| Restored child, default incremental | 7.5 s | 0.6 s | 6.7 s | 0.52 GiB | 280 MiB |
+| Restored child, explicit full | 30.2 s | 22.8 s | 7.3 s | 30 GiB | 23.2 GiB |
+
+The incremental publication still cost 6.7 s because it reread every populated
+RAM extent, not just changed chunks. Commit `10ae51ed` removes that read on the
+first owned reflink publication: producer identities and stable inode facts bind
+the clone. Replay from sealed state, copy fallbacks and independent dedup objects
+still authenticate bytes. Publication creates no warm restore receipt; cold
+durable restore and export detect intervening RAM corruption. Local fork RAM
+instead trusts its producer/owned-inode authority. No post-`10ae51ed` timings are
+recorded here, and none of the historical numbers is relabeled as a new result.
+
+The published Git dependency pin `662b359c` includes the pipeline and Linux
+balloon reclaim. Phase 29 adds contained image-init live operation support and
+retained-descriptor workload reclaim; it does not change these performance
+budgets. See [ADR 0021](../adr/0021-live-snapshots-and-forks.md) for the current
+resource, publication and guest-containment decisions.

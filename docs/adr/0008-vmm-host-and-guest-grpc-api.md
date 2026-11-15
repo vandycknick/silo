@@ -261,6 +261,13 @@ that section cannot be collected. Metric arrays are bounded. Counters are
 cumulative guest observations and may decrease after reset, reattachment,
 reinitialization, or overflow.
 
+Manager inspection of retained monitor status and metrics uses independent
+two-second deadlines, each covering connection setup and its unary RPC.
+`silo info` omits unavailable metrics instead of failing inspection; an
+unresponsive metrics RPC must not add the ordinary thirty-second command
+deadline after the bounded status request. These caller-side inspection bounds
+do not change the guest WatchMetrics interval or freshness contract.
+
 ## Agent Identity And Freshness
 
 Each agent process creates a random `agent_instance_id`. Status also reports the

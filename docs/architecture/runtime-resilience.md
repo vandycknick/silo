@@ -79,7 +79,7 @@ silo fork <VM> --live --name <CHILD> [--name <CHILD>...] [--preserve]
           [--capture-policy full|incremental] [--dirty-crossover-percent 1..60]
 silo fork <VM> --live --children-json '<JSON array>'
 silo fork --operation <UUID> [--cancel]
-silo restore <CHECKPOINT> --execution [--name <CHILD>]
+silo restore <CHECKPOINT> [--name <CHILD>]
 silo recover-disks <CHECKPOINT> --name <CHILD>
 ```
 
@@ -93,8 +93,12 @@ dirty crossover. `--capture-policy full` forces full capture; the existing
 `incremental` value expresses the default preference without a new policy mode.
 Before reservation, libvm resolves that preference to full when the exact
 backend/host report does not admit incremental capture. Normal Capture/Fork
-admission still applies. Incremental captures reuse authenticated clean-chunk
-identities, but publish complete RAM maps and full-file SHA evidence. Missing
+admission still applies. Incremental captures reuse producer-computed clean-chunk
+identities and publish complete RAM maps, not a full-file RAM SHA-256. Cold
+durable restore and export authenticate RAM; warm durable restore can reuse an
+unchanged-inode receipt and local forks trust producer identities and owned inode
+facts. First owned reflink publication creates no warm receipt and does no RAM
+readback; replay, copy fallback and independent dedup still hash. Missing
 baselines, changed topology or epochs, uncertain coverage and the selected dirty
 threshold cause an explicitly reported full capture, never an incomplete delta
 chain. A booted VM's first default capture reports `no-baseline`; restored and
@@ -123,7 +127,9 @@ JSON is printed. A failed child never rolls back its siblings, and a nonzero
 status or an interrupted client never stops running children or cancels the
 operation. `silo fork --operation` observes the operation by ID even after its
 source is removed; `--cancel` records durable cancellation intent, so
-unsubmitted children never start while submitted children settle normally.
+unsubmitted children never start and report `cancelled` after ownership cleanup,
+while submitted children settle normally. An exact cancelled pre-launch handoff
+is not a child failure; genuinely lost identities remain failures.
 
 Stopped-storage operations are separate mutations, never a live fallback:
 

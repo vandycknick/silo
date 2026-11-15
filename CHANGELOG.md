@@ -77,7 +77,7 @@
   import, explicit raw conversion, stopped snapshots, publication and handoff
   use the content-addressed storage model. See [ADR 0014](docs/adr/0014-layered-oci-image-storage.md).
 - Live pause/resume, snapshots, restore, forks and incremental capture on
-  libkrun (`kvm-x86_64`; libkrun `7b61232`). A live operation is available
+  libkrun (`kvm-x86_64`; libkrun `662b359c`). A live operation is available
   whenever the backend provides it. Checkpoint compatibility is a format
   contract: every captured record carries a magic and schema (`silo.live-state/1`)
   and restore refuses a checkpoint whose live-state schema or architecture

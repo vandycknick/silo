@@ -259,6 +259,13 @@ The transport survives writer admission closure and actual writer drains;
 `ACCEPTED`, disconnect and a timeout cannot establish completion. No persistent
 success file or filesystem logging follows guest completion.
 
+With image-owned PID 1, the agent instead attempts a bounded guest `sync()`
+before returning unsupported shutdown authority, then the host force-stops the
+VM (ADR 0021 decision D3). The sync worker has a ten-second deadline; timeout or
+failure is diagnostic, not a clean-storage certificate. This does not invoke
+systemd or any other image service manager and does not run an orderly service
+shutdown.
+
 For the qualified Linux Raw attachment profile, the monitor retains each
 actual backing inode before native writes and supplies checked FD-derived
 paths to the worker. After actual native owners are terminal/reaped, its
@@ -349,6 +356,14 @@ Checkpoints record `liveStateSchema` and guest `architecture`; restore refuses
 those format/architecture mismatches, not different native or monitor builds.
 Each component checks its own state magic and schema when decoding.
 
+Machine admission accepts observed `AgentPid1` with `agent_is_pid1=true` or
+`ContainedInit` with `agent_is_pid1=false`, subject to the remaining lifecycle
+evidence. An uncontained `InitChild` refuses with `guest-init-not-contained`;
+other unsupported profile combinations use `guest-profile-unsupported`.
+Containment failure at freeze or activation carries `guest-containment-escaped`
+with the task diagnostic. ADR 0021 owns the cgroup layout, containment checks,
+accepted guest-root residuals and activation identity/network policy.
+
 **Live commands** are additions to `VmMonitorService` on `--socket`, for the
 current run only: `Pause`, `Resume`, `Capture`, `GetOperation`,
 `CancelOperation` and `ReleaseCapture`. Every command carries `machineId`,
@@ -412,9 +427,12 @@ absence means `unknown`. The manager never issues a resume because the file
 is absent.
 
 **Restore inputs** extend the start request with an optional, capability-gated
-`restore` object: `checkpointId`; `memory` (RAM file and layout), its authenticated
-complete `ram-map`, `execution` and `devices` state, each as an inherited read-only descriptor named by an
-environment variable in the same way as the descriptors above; the private
+`restore` object: `checkpointId`; `memory` (RAM file and layout), its canonical
+complete `ram-map`, `execution` and `devices` state, each as an inherited read-only
+descriptor named by an environment variable in the same way as the descriptors
+above. Cold durable restore authenticates RAM; unchanged-inode warm receipts and
+local-fork producer/owned-inode trust are the explicit ADR 0021 exceptions to a
+RAM reread. The request also carries the private
 disk roles as paths under `--data-dir`; `compatibilityProfile`; `activation`
 (the new identity, network configuration, guest-side listeners for the
 machine-scoped forwards the monitor will open, and optional hook); and

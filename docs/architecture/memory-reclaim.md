@@ -51,7 +51,10 @@ Native status, `daemon status` and `silo info` expose actual `backing` (`boot` o
 qualification `not-run`, and zero released bytes/extents. Reports remain absent
 until the first native report. `silo info` observes the running machine's monitor
 in both local and daemon modes; unavailable metrics omit the row and JSON field
-instead of failing inspection. JSON follows the existing snake_case convention:
+instead of failing inspection. Status and metrics each have an independent
+two-second inspection deadline covering connection and RPC; metrics do not add
+the ordinary thirty-second RPC wait when the monitor is unresponsive. JSON
+follows the existing snake_case convention:
 `host_memory_reclaim` contains `backing`, `reason`, `requested`, `effective`,
 `qualification`, `released_bytes`, `released_extents`, `skipped_reports`,
 `failed_operations`, `mapping_limit_skips`, and `replaced_islands`.
@@ -82,11 +85,14 @@ unreported live pages or ranges crossing region boundaries.
   `MADV_DONTNEED` is never applied to file-private RAM because it would expose
   old checkpoint bytes again.
 
-Capturing a restored VM reads all of its RAM, which maps every clean
-checkpoint page the guest has not written into the VMM. Those pages are shared
-page cache (`RssFile`), not private memory, and the host can evict them under
-pressure. The guest does not report pages that were already free again, so
-they stay mapped until eviction or until the guest reuses and frees them.
+A forced full capture of a restored VM reads all of its RAM, mapping clean
+checkpoint pages into the VMM as shared page cache (`RssFile`), not private
+memory. The host can evict those pages under pressure. Incremental capture is
+now the default when a valid inherited baseline exists; on reflink-capable hosts
+it overlays dirty runs without scanning all unchanged live RAM. A full fallback
+or explicit `--capture-policy full` still has the full-scan cost. The guest does
+not report already-free pages again, so those pages can stay mapped until host
+eviction or guest reuse and release.
 
 Adjacent reports are coalesced before replacement. Each disjoint replacement
 island can add two host mappings; adjacent anonymous islands merge. The runtime
@@ -162,14 +168,16 @@ order, not a hexadecimal feature mask. Device presence alone is insufficient.
 Negotiation/readiness is a prerequisite, not proof of reports arriving or host
 physical discard.
 
-The agent uses the root cgroup when that interface is available; otherwise it
-uses writable immediate child cgroups. These include their descendants, so it
-does not reclaim both parent and child. It does not create cgroups, move
-workloads, change controller settings, or assume every guest has a suitable
-hierarchy.
+The agent targets `silo/workloads` through a directory descriptor retained
+before image-init handoff. It opens `memory.stat` and `memory.reclaim` relative
+to that descriptor, not through the image's remounted cgroup namespace view.
+That one target covers both image services and Silo sessions, excludes the
+agent's control group, and avoids reclaiming both parent and child targets.
+Missing retained interfaces disable this policy rather than selecting a
+different guest-visible cgroup.
 
 After twelve idle ten-second intervals, with CPU busy share at most 0.5%, it
-reclaims from one target per tick in round-robin order. The requested amount is
+reclaims from that retained workload target each tick. The requested amount is
 bounded by RAM/32 (256 MiB to 1 GiB), retaining a 128 MiB cache floor in that
 cgroup. File cache excludes shmem; reclaimable slab is included. Requests use
 `swappiness=0`, and successful/partial requests may be followed by compaction.

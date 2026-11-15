@@ -74,11 +74,11 @@ regeneration is only a digest-gated fallback, not a portability requirement.
 The published-builder namespace gate matched all 35,904 independent umoci rows
 through actual readonly EROFS mounts. Linux x86_64 stable 7.2.2 and
 longterm 6.18.48 production roots passed boot, lifecycle and flatten gates.
-Phase 24 refreshed exact-build production qualification for all five live
-operations on Linux KVM x86_64. The [qualification record](docs/architecture/silo-vmm.md#qualification)
-and [performance tracker](docs/architecture/live-operation-performance.md)
-retain the admitted identity, passing Btrfs/ext4 budgets and recorded suite
-failures; foreign lanes remain pending owner Phase 25.
+Phase 24 recorded all five live operations and passing Btrfs/ext4 budgets on
+Linux KVM x86_64. The [performance tracker](docs/architecture/live-operation-performance.md)
+retains those historical measurements and their evidence paths. Current
+admission uses backend availability and host/machine checks, not exact-build
+qualification; foreign runtime evidence remains pending owner Phase 25.
 
 `/tmp` remains persistent and disk-backed by default. With the overlay profile,
 `--tmpfs-size 64mib` explicitly selects a memory-charged, nonpersistent `/tmp`;
@@ -182,9 +182,18 @@ can resume DHCP afterwards.
 Containment checks refuse escaped tasks with `guest-containment-escaped` and
 leave the source running. They detect accidents and naive escapes, not
 malicious guest root. Guest root's `kill -9 -1` can kill the agent; host
-`silo stop` still recovers the VM. With image-owned PID 1, ordinary stop syncs
-guest filesystems before the host force stop, but does not shut down image
-services in an orderly manner. See [ADR 0021](docs/adr/0021-live-snapshots-and-forks.md).
+`silo stop` still recovers the VM. With image-owned PID 1, ordinary stop attempts
+a bounded guest filesystem sync before the host force stop; a timeout is not
+proof of persistence or orderly image-service shutdown.
+See [ADR 0021](docs/adr/0021-live-snapshots-and-forks.md).
+
+Live snapshots and forks prefer incremental capture when a valid baseline exists;
+`--capture-policy full` remains an explicit override. Restore, fork and capture
+do not reserve host RAM; disk, descriptor and fork-count admission still apply.
+First owned reflink RAM publication trusts producer identities without readback.
+Cold durable restore and export authenticate RAM; warm restore can reuse an
+unchanged-inode verification receipt, and local forks trust owned producer RAM.
+See ADR 0021 for these distinct corruption-detection boundaries.
 
 ## Stopped handoff
 
@@ -463,6 +472,11 @@ engine data survives daemon and appliance replacement, while the host uses the
 dedicated `silo` Docker context and `~/.silo/run/docker.sock` endpoint. This is
 separate from ordinary Silo VMs and does not require or replace a host Docker
 Engine.
+
+The appliance receives every available cgroup controller, including `cpuset`
+when offered. Agent readiness can precede image-init readiness: before starting
+Docker, appliance activation waits up to 30 seconds for systemd to report
+`running` or `degraded`, not merely to answer an early property query.
 
 See the [system daemon operator guide](docs/system-daemon.md) for setup,
 security implications, lifecycle, upgrades, recovery, and deliberate v1

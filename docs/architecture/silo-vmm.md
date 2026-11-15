@@ -174,7 +174,7 @@ had a process, and the diagnostic tail.
 
 The lifecycle outcome named `clean` is not a storage shutdown certificate.
 Neither a zero worker exit, device drop nor observed process reap proves the
-future `storageShutdown`, `hostFlushCompleted` or `attachmentsClosed` facts.
+independent `storageShutdown`, `hostFlushCompleted` or `attachmentsClosed` facts.
 
 `finalize.rs` is the only code that ends a generation. It stops a failed live
 machine, reads the cached exit, writes `vm.exit.json` (with the `backend`
@@ -192,6 +192,9 @@ the recovery exit from an unfinished or failed `Pausing`.
 Manager journal and authority updates acquire the SQLite writer reservation
 before reading current state, so concurrent checkpoint publication cannot
 invalidate a deferred read-to-write upgrade.
+Missing pause authority diagnostics include observed state, activity, last live
+error and pending resume identity. They never manufacture authority from an old
+successful command.
 
 The monitor drains new session, mutation and forward-connection setup before
 freezing the workload. Existing streams remain attached. The worker's dedicated
@@ -199,6 +202,15 @@ lifecycle socket owns native tokens; only a positive native barrier publishes
 `Paused`. Stop terminates a paused worker without resuming it.
 Host forward arrivals are refused while fenced even when guest transport is
 unavailable; they cannot be parked for admission after resume.
+
+Guest admission accepts agent PID 1 or an observed contained image init, not
+PID 1 ownership alone. Both use `silo/{control,activation,workloads/{image,exec}}`;
+the image and root Silo sessions receive subtree-rooted cgroup namespaces.
+Every available controller is delegated, and freeze/activation checks use retained
+cgroup/procfs descriptors. Uncontained handoff, unsupported profiles and escapes
+report `guest-init-not-contained`, `guest-profile-unsupported` and
+`guest-containment-escaped` respectively. ADR 0021 specifies the required
+protections, accepted guest-root residuals and fail-closed child behavior.
 
 On Linux x86_64, the guest reports actual same-boot clock evidence, refreshed
 after Freeze: TSC, every online CPU's deadline clockevent, a non-PIT broadcast
@@ -254,6 +266,10 @@ the continuation policy; cancellation after sealing cannot discard the cut.
 libvm verifies the sealed closure and native envelope bindings before publishing
 a `live-execution` snapshot. Publication serializes concurrent consumers and
 retains independent pool RAM, dependency roots and native baseline leases.
+First owned reflink RAM publication binds producer identities to unchanged inode
+facts without reading RAM back. Replay from sealed state authenticates staged
+bytes again; copy fallback hashes inline and independent dedup authenticates
+the existing inode. Publication establishes no warm verification receipt.
 Reconciliation can publish a coherent cut even when source continuation is
 unknown; uncertainty does not authorize releasing a live owner's storage.
 Terminal staging reclamation preserves the capture evidence separately.
@@ -264,8 +280,13 @@ retains its independent background durability barrier.
 
 ## Execution Restore Ownership
 
-Restore verifies the retained checkpoint closure and native compatibility before
-allocating a child. The worker reconstructs private RAM mappings and disk
+Restore verifies retained closure shape and native compatibility before
+allocating a child. Cold durable byte authentication overlaps private disk
+construction and must finish before child publication; warm restores may reuse
+matching independently verified inode receipts. Local forks instead trust
+producer identities and unchanged owned RAM inodes, without a first-use RAM
+rehash. Export and handoff authenticate bytes independently. The worker
+reconstructs private RAM mappings and disk
 attachments from held descriptors, starts paused, and keeps network and vsock
 providers fenced. Activation requires the exact fresh VM-generation
 acknowledgement, destination guest identity and SSH CA, listener preparation,

@@ -2372,9 +2372,10 @@ than deleting the source opportunistically after a push.
 Immutable publication stages under a unique operation directory on the final
 filesystem, validates output, synchronizes files, publishes through atomic
 no-replace rename, then synchronizes parent directories. Output is hashed except
-for a successful reflink of closed, owned, sealed RAM whose canonical producer
-map, geometry and source inode facts have validated and remain unchanged across
-the clone. That path binds the new inode to producer identity and clone
+for the first successful reflink publication of closed, owned, sealed RAM whose
+canonical producer map, geometry and source inode facts have validated and
+remain unchanged across the clone. Replaying persisted sealed state hashes the
+staged bytes again. The first-publication path binds the new inode to producer identity and clone
 provenance, not an independent read-back proof, and creates no warm verification
 receipt. Same-length corruption between capture and publication is detected at
 cold durable restore or export, not at publication. The non-reflink path copies
