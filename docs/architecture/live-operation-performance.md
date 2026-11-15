@@ -109,8 +109,11 @@ passes are contract violations, not allowances.
 Local snapshot publication seeds the warm receipt, so the first local restore
 does not hash RAM. Silent local corruption between capture and restore is not
 detected at restore. `silo snapshot verify IMAGE` rereads and authenticates every
-RAM, state and disk byte against recorded identities, exiting nonzero and
-naming the first bad stream and chunk on failure. Imported, pulled or
+RAM, state and disk byte against recorded identities, exiting nonzero on failure.
+RAM and disk mismatches name the stream, chunk index and byte range; state
+mismatches name the whole object's role, digest and length. Missing, truncated,
+writable or replaced members are structural failures. Recorded-zero chunks are
+read and checked; warm and composition receipts are ignored. Imported, pulled or
 transported snapshots, export and handoff still authenticate every byte.
 Changed-to-zero pages are explicit zero ranges, holes with format-level zero
 markers rather than inheritance; zero chunks are never hashed or stored.
@@ -140,6 +143,75 @@ standalone perf suite reports Silo versus target as gating pass/fail, Silo
 versus msb on a roughly equal setup as informational, and appends run history.
 msb is skipped with a reason when unavailable. Reaching msb's 0.3-0.4 s start
 latency is a later stretch goal, not a Phase 30 gate.
+
+## Implemented Phase 30 validation and store admission (2026-11-15)
+
+These are implemented path changes, not new performance measurements or claims
+that the targets pass.
+
+Local composition validation receipts are keyed by `LowerResultId` and schema
+version. They bind canonical recipe/result identities, ordered layer occurrences,
+fsmeta identity and length, and every unique pack/fsmeta inode's fingerprint.
+Producer-bound compose or exact validation seeds them; a changed fingerprint
+forces exact authentication or refusal. Hits on local create, start, restore and
+fork-child paths read no lower payload. They are a validation cache, not
+retention roots or transport authority, and import, transport, export, handoff
+and explicit verification do not honour them. See
+[ADR 0014](../adr/0014-layered-oci-image-storage.md#local-composition-validation-receipts).
+
+RAM and writable disks now share the owned `SealedStreamPublication` path.
+Fresh local reflinks carry producer identity without publication rereads;
+required copies hash inline, and recovery/replay authenticate bytes.
+Independent same-identity pool streams skip scanning only when their
+`verified_object` receipt matches the current fingerprint. The snapshot
+publication transaction seeds warm receipts for RAM and those disks.
+
+### Runtime opening and recovery
+
+`RuntimeOpenMode::Observation` uses `Store::open_observation`: after connection
+and schema admission it validates pending operation records, retires only those
+proven abandoned through each operation's own lease, removes their disposable
+temporary workspaces and reconciles the restore budget. A live operation lease
+prevents retirement. Observation does no store-wide work: no immutable-pool or
+historical-lease scan, no published-map authentication and no per-chunk queries.
+
+CLI exec, shell, cp, logs, forward, list, info, pause, resume, and snapshot/image
+listing and inspection use this mode. It is not a read-only database capability:
+runtime configuration and capability validation still run, and connection/schema
+admission can create the catalog and its initial schema. Other mutating commands
+use the default `Maintenance` mode; a cached observation runtime must complete
+`recover_maintenance` before that work.
+Cold handoff capabilities, planning and status initialize an `Observation`
+backend, transfer operations initialize `Maintenance`
+(`app/cli/lib/daemon/control/handoff.rs`), and source observation reuses the
+runtime's open store instead of reopening it (`runtime/libvm/src/handoff/source.rs`),
+so planning never triggers store-wide recovery.
+
+`Maintenance` adds orphan object and stream discovery, transport-cache
+collection, historical lease-inventory validation, and constructed-child,
+capture and fork recovery. Orphan discovery uses bounded metadata-only scans and
+set-based anti-joins against catalog retention without authenticating healthy
+published stream maps. Checkpoint and ownership rechecks still fence deletion.
+
+Pending-operation recovery stays on every runtime open so that prior completed
+work does not leave cleanup for a later refused live operation or planning
+command. Such a command finds nothing to recover and leaves the catalog and
+state files byte-identical, as ADR 0021 requires. Successful operations still
+defer retirement of their own records to the next open, as before Phase 30.
+The explicit read-only capability-observation path remains separate from this
+writable runtime admission and does not run recovery.
+
+Retention semantics are unchanged from before Phase 30. Removing an image or
+releasing a snapshot removes references only; artifacts, compositions and layers
+remain until explicit prune. Explicit prune and layer recovery retain full
+validation and their checkpoint/recheck fences. The daemon's management runtime
+opens once in `Maintenance` and is reused, not reopened per RPC.
+
+Implementation: `runtime/libvm/src/runtime/core.rs`, `store/store.rs`,
+`store/image_store.rs`, `store/operation_store.rs`, `store/layer_store.rs` and
+`app/cli/lib/daemon/control.rs`. Snapshot verification is
+`SnapshotStore::verify`; its traversal and stream versus object diagnostics are
+defined in [ADR 0021](../adr/0021-live-snapshots-and-forks.md#on-demand-verification).
 
 ## Results by batch
 
@@ -183,10 +255,11 @@ Measured effect: capture pause 8.94 → 5.51 s; manager work after the seal
 2. The stream identity (SHA-256 over the ordered chunk-digest list) is the
    identity of RAM and disk streams on every live path. Whole-file digests are
    computed only for blobs that leave the host.
-3. libvm validates a cut structurally at retention. Owned reflink RAM publication
-   binds producer identity and unchanged inode facts without rereading RAM;
-   copies hash inline and independent dedup objects are still verified.
-   Phase 30 seeds local restore trust at publication; imported, pulled or
+3. libvm validates a cut structurally at retention. Owned reflink RAM and
+   writable-disk publication bind producer identity and unchanged inode facts
+   without rereading payloads; copies hash inline. Independent dedup streams
+   require a matching `verified_object` receipt or full authentication. Phase 30
+   seeds local restore trust in the publication transaction; imported, pulled or
    transported snapshots, export and handoff independently authenticate bytes.
 4. A fork is a local branch: the cut is written and closed, not synchronized.
 5. Children hash their private copy as it is written, start at
@@ -273,7 +346,7 @@ boot marker is the monitor's `guest agent became responsive` trace event
 | Budget | Target | ext4 cold / warm | Btrfs cold / warm | Result |
 |---|---|---:|---:|---|
 | Warm create of a stopped machine (Alpine lower) | 2 s | 0.70 / 1.01 | 0.56 / 0.74 | pass |
-| Warm create, 4 GiB single-layer lower | Original 2 s; revised size-dependent budget below | not run | 6.15 (one sample) | missed original target; not requalified |
+| Warm create, 4 GiB single-layer lower | Original 2 s; historical pre-receipt size-dependent revision discussed below | not run | 6.15 (one sample) | missed original target; not requalified after receipts |
 | Incremental capture, 10 % dirty (410 MiB) | 1 s + allowance | 7.44 / 7.77 raw, 5.92 / 6.25 gated | 2.74 / 2.21 | miss |
 | Layered / raw boot ratio | 1.2 | 1.21 / 1.44 | 1.25 / 1.32 | miss |
 | Cold OCI prepare / (download + decompress) | Original 1.5; revised 10 on Btrfs | not run | 6.0 (1 GiB), 9.2 (4 GiB) | missed original target; not requalified |
@@ -283,9 +356,11 @@ boot marker is the monitor's `guest agent became responsive` trace event
 a 10× cold-prepare budget on the Btrfs reference host; 1.5× remains the
 product goal for the ingest pipeline rewrite. Linearity is reported per
 size, with 1.25 a goal rather than an admission gate until that rewrite.
-Prepared-lower create is budgeted at 2 s up to 1 GiB allocated, with larger
-lowers scaling at about 1.35 s/GiB until composition receipts land. The
-larger-lower slope comes from the two recorded sizes, not a validated bound.
+The 2 s prepared-lower create gate up to 1 GiB allocated remains. The former
+larger-lower 1.35 s/GiB slope is historical pre-receipt evidence from two sizes,
+not a validated bound or a post-receipt allowance. Composition receipts are now
+implemented and avoid lower payload reads on hits at every size; larger-lower
+latency still requires post-receipt measurement.
 All revised ingest numbers and the missed original targets above cite
 `.tmp/plan/evidence/phase-24/deferred-btrfs/ingest-20261109T121355Z/`:
 `size-cold-0-1073741824.json`, `size-cold-0-4294967296.json`,
@@ -415,10 +490,10 @@ clock.
 **Ingest.** The 2026-11-09 owner decision records the original cold-prepare,
 linearity and large prepared-create targets as missed, with revised ADR
 budgets backed by the ingest evidence directory cited above, not a passing
-claim. The later rewrite targets single-pass decode→pack, removal of
-spool/publication copies and authenticated composition receipts, following
-`.tmp/plan/research/phase24-ingest-cost.md`. Live-operation budgets are
-unchanged by this ingest decision.
+claim. The later ingest rewrite targets single-pass decode→pack and removal of
+spool/publication copies, following `.tmp/plan/research/phase24-ingest-cost.md`.
+Composition receipts are implemented in Phase 30; this does not requalify the
+historical measurements. Live-operation budgets are unchanged by the ingest decision.
 
 ## Batch 4d: final live-budget closeout (2026-11-09)
 
@@ -470,9 +545,10 @@ random payload, 256 MiB new data) is in `phase-27/perf-restored.log`:
 The incremental publication still cost 6.7 s because it reread every populated
 RAM extent, not just changed chunks. Commit `10ae51ed` removes that read on the
 first owned reflink publication: producer identities and stable inode facts bind
-the clone. Replay from sealed state, copy fallbacks and independent dedup objects
-still authenticate bytes. Phase 30 now seeds the warm restore receipt at local
-publication; silent local corruption between capture and restore is not detected
+the clone. Replay from sealed state and copy fallbacks still authenticate bytes;
+independent dedup streams use matching verified receipts or full authentication.
+Phase 30 now seeds warm receipts for RAM and sealed writable disks in the local
+publication transaction; silent local corruption between capture and restore is not detected
 at restore. Explicit verification, export and handoff authenticate every byte.
 Local fork RAM trusts producer/owned-inode authority. The Phase 30 baseline above
 records later timings; none of these historical numbers is relabeled as a new

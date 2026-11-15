@@ -34,6 +34,12 @@ clock, scaling invariants, explicit zero ranges, separate fast same-host fork
 mode and retained plus new performance gates; these are requirements, not
 claims of completed Phase 30 implementation.
 
+The same Phase 30 implementation adds local composition validation receipts,
+shared owned sealed-stream publication for RAM and writable disks, and
+fingerprint-matched reuse of previously verified pool streams. Receipt hits
+avoid lower payload reads on local create, start, restore and fork-child paths;
+they do not weaken import, transport or explicit verification.
+
 ## Implementation status (2026-11-09)
 
 Stages 1–4 are implemented on Linux/libkrun, with `linux-erofs-overlay-v1`
@@ -217,12 +223,14 @@ additional opaque encoding on VZ without changing the raw contract here.
    standalone registry reference must retain the complete closure there, even
    when direct handoff could have regenerated part of it.
 9. Local clone operations may rely on a qualified kernel clone contract without
-   hashing an entire disk. Owned, sealed RAM publication may likewise rely on
-   producer-computed chunk identities, unchanged inode facts and a successful
-   reflink without rereading RAM. Publication of a snapshot produced on this
-   host seeds the warm receipt, so its first local restore does not hash RAM.
-   Independent existing dedup objects and required copy fallbacks still verify
-   bytes; imported, pulled or transported snapshots, export and handoff
+   hashing an entire disk. Owned, sealed RAM and writable-disk publication rely
+   on producer-computed chunk identities, unchanged inode facts and a successful
+   reflink without a payload reread. Publication seeds warm receipts for those
+   streams in the snapshot publication transaction. An independent same-identity
+   stream is reused without scanning only when its `verified_object` receipt
+   matches its current fingerprint; otherwise it is fully authenticated.
+   Required copy fallbacks verify inline; imported, pulled or transported
+   snapshots, export and handoff
    authenticate every byte against recorded identities.
 10. Starts use the persisted root representation. Conversion, guest
     generalization, boot-profile changes and transfer are explicit operations.
@@ -2418,29 +2426,34 @@ than deleting the source opportunistically after a push.
 
 Immutable publication stages under a unique operation directory on the final
 filesystem, validates output, synchronizes files, publishes through atomic
-no-replace rename, then synchronizes parent directories. Qualified local sealed
-disk reflinks carry their recorded stream identity without a payload reread.
-The first successful reflink publication of closed, owned, sealed RAM validates
-the canonical producer map, geometry and unchanged source inode facts across
-the clone, also without rereading RAM. Replaying persisted sealed RAM state
-authenticates staged bytes again; clone provenance alone is not replay authority.
-The first-publication path binds the new inode to producer identity and clone
-provenance, not an independent read-back proof, but publication of a snapshot
-produced on this host seeds the warm restore receipt. Its first and repeated
-local restores do not hash RAM while the receipt's inode facts remain unchanged;
-a mismatch re-authenticates. Silent local corruption between capture and restore
-is not detected at restore.
+no-replace rename, then synchronizes parent directories. Closed, owned, sealed
+RAM and writable disks use the same `SealedStreamPublication` capability:
+canonical producer maps, geometry and unchanged held inode facts bind a
+successful reflink without rereading the fresh local payload. Non-reflink
+copies authenticate inline. Recovery and replay have no producer capability and
+authenticate bytes rather than treating prior clone provenance as authority.
+Snapshot publication records `verified_object` warm receipts for both RAM and
+those writable disks in the same transaction that retains the snapshot.
+First and repeated local restores do not hash those streams while their receipt
+fingerprints match. A changed fingerprint forces authentication or refusal.
+Silent local corruption between capture and restore is not detected at restore
+under the local receipt trust boundary.
 
 `silo snapshot verify IMAGE` rereads and authenticates every RAM, state and disk
-byte of a local snapshot against recorded identities; a failure exits nonzero
-and names the first bad stream and chunk. Imported, pulled or transported
-snapshots, export and handoff authenticate every byte without this local
+byte of a local snapshot against recorded identities. RAM and disk mismatches
+name the stream, chunk index and byte range; state-object mismatches name the
+role, whole-object digest and length, not a chunk. Missing, truncated, writable
+or replaced members are structural failures. Recorded-zero chunks are read and
+checked; warm and composition receipts are ignored. Failure exits nonzero.
+Imported, pulled or transported snapshots, export and handoff authenticate
+every byte without this local
 publication exception. Required non-reflink copies hash written bytes inline,
 never through a configured-length scan or another publication pass. Other
 publication output is hashed. A recipe/result record becomes visible only after
-every dependency is durable. An independent existing object at the same digest must
-still validate; corruption is quarantined under coordination, never repaired in
-place while readers may use it.
+every dependency is durable. Independent same-identity pool streams require a
+matching `verified_object` fingerprint receipt or full authentication. Other
+existing objects still validate; corruption is quarantined under coordination,
+never repaired in place while readers may use it.
 
 Operations have durable IDs and phases in `operations/`. Machine storage is
 published before the database transaction references it. When replacing existing
@@ -2489,9 +2502,32 @@ staging leases survive through actual cleanup. Durability/removal and
 substantial composition work do not run on the async executor.
 
 Source-free load uses non-creating pool access and authenticates recipe/result
-records, the full pack stream, all index objects and the complete dependency
-set. Missing structure is not recreated by verification. Page I/O/corruption,
-semantic rejection and worker failures retain their concrete error causes.
+records, all index objects and the complete dependency set. Local lower reuse
+may satisfy payload validation through a matching composition receipt; a miss
+authenticates the exact retained bytes. Missing structure is not recreated by
+verification. Page I/O/corruption, semantic rejection and worker failures retain
+their concrete error causes.
+
+### Local composition validation receipts
+
+`composition_validation` is an implemented local validation cache, keyed by
+`LowerResultId` and validation schema version (currently 1). A receipt binds the
+canonical recipe and result identities and bytes, all ordered layer occurrences
+(including repetitions and empty packs), fsmeta identity and length, and the
+device/inode/length/mode/mtime/ctime fingerprints of every unique pack and fsmeta
+inode. Members must be exact read-only files. Held descriptors and leases remain
+in force, and fingerprints are rechecked across validation and before handoff.
+
+Only a producer-bound compose or exact retained-byte validation seeds a receipt.
+A matching local receipt lets create, start, restore and fork-child construction
+read no lower payload: canonical metadata and current fingerprints establish the
+hit. A changed fingerprint invalidates reuse and forces exact authentication or
+refusal, never substitution of another lower.
+
+Receipts are not retention roots and are not transported authority. Import,
+pull, transport, export, handoff and `silo snapshot verify IMAGE` never honour
+them as byte-authentication proof. Exact imported composition admission validates
+bytes even if a matching local receipt exists.
 
 ### Leases and coordination
 
@@ -2567,9 +2603,14 @@ file it maps for as long as any mapping or worker holds it, even after the
 source machine and every snapshot alias are gone; that dependency is a
 content lease held through the mapping's open descriptor, not a PID or TTL.
 A retained child never depends on its source's machine directory remaining
-present. Removing aliases and explicit retention permits GC once no other
-root references the image. GC walks changeset pages, lower extents, stream
-maps, RAM layouts and platform assets. GC may remove a flat RAM
+present. Removing an image, aliases or explicit snapshot retention removes
+references only; artifacts, compositions and layers remain until explicit prune,
+as before Phase 30. An unreferenced artifact is eligible for GC, not immediately
+unlinked by reference removal. Ordinary maintenance recovers orphan pool files
+without authenticating healthy published stream maps; explicit prune and layer
+recovery retain full validation and checkpoint/recheck fences. GC walks
+changeset pages, lower extents, stream maps, RAM layouts and platform assets.
+GC may remove a flat RAM
 materialization only when no mapping lease needs it and its reachable chunks
 retain reconstruction. Snapshot deletion never deletes objects still used by
 machines or other snapshots.
@@ -2690,10 +2731,13 @@ envelope with those measurements and may never narrow it silently.
 
 The raised process-wide soft limit is not restored after start, avoiding races
 between concurrent starts. Admission precedes every lower backing open,
-including content-hash verification. Unique objects are authenticated once after
-preflight while ordered/repeated FLAT records remain distinct for descriptor and
-FD accounting. Semantic machine storage roots protect retained lower streams
-from GC; generated descriptor files are never reachability authorities.
+including content-hash verification. After preflight, a matching composition
+receipt validates held unique backings without reading their payloads; misses
+authenticate exact bytes. Ordered/repeated FLAT records remain distinct for
+descriptor and FD accounting. Receipt metadata and fingerprints scale with
+unique backings and ordered occurrences, not lower payload length. Semantic
+machine storage roots protect retained lower streams from GC; neither receipts
+nor generated descriptors are reachability authorities.
 
 
 ### Acceptance budgets
@@ -2708,8 +2752,8 @@ agent-as-PID-1 (`--kernel-arg init=`); image init stays the default.
 
 | Operation                                                        | Budget                                                                                                                      |
 | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| Cold prepare of an OCI image (pull, decode, pack, index, fsmeta) | At most 10× the time to download and decompress the same layers on the Btrfs reference host, recorded 2026-11-09 (6.0×/9.2×); the 1.5× product target is retained as the goal of a later ingest pipeline rewrite (single-pass decode→pack, no spool/publication copies, composition receipts) per `.tmp/plan/research/phase24-ingest-cost.md`. Linearity is reported per size; the 1.25 ratio is a goal, not an admission gate, until the rewrite. See the dated ingest measurement note below. |
-| Warm create of a stopped machine from a prepared lower           | 2 s for lowers up to 1 GiB allocated; larger lowers scale at about 1.35 s per GiB until composition receipts land. See the dated ingest measurement note below. |
+| Cold prepare of an OCI image (pull, decode, pack, index, fsmeta) | At most 10× the time to download and decompress the same layers on the Btrfs reference host, recorded 2026-11-09 (6.0×/9.2×); the 1.5× product target remains the ingest pipeline rewrite goal (single-pass decode→pack, no spool/publication copies) per `.tmp/plan/research/phase24-ingest-cost.md`. Composition receipts are implemented. Linearity is reported per size; 1.25 remains a goal, not an admission gate, until the ingest rewrite. See the dated measurement note below. |
+| Warm create of a stopped machine from a prepared lower | Retained 2 s gate up to 1 GiB allocated. Matching composition receipts read no lower payload at any size; larger-lower latency requires post-receipt measurement, not the former 1.35 s/GiB validation allowance. |
 | Start to guest agent ready (layered versus opaque raw, same image) | Within 20 percent of the raw root                                                                                            |
 | Copy-up of a lower file on first write                           | Whole-file cost at the host's sequential copy rate; reported, never hidden                                                   |
 | Stopped fork                                                     | Sub-second with host CoW; bounded by upper allocated bytes at sequential copy rate without                                   |
@@ -2722,9 +2766,11 @@ The original ingest ratio target was **missed**: 6.0× at 1 GiB and 9.2× at
 ratio versus 1.25; the 12 GiB unprepared create exceeded 300 s, so no
 12 GiB prepare duration was measured. Prepared-lower create was **missed**:
 6.15 s for a 4 GiB lower versus 2 s. These observations support the revised
-targets above, not a passing qualification. The 1.35 s/GiB larger-lower
-scaling is the observed slope between the 1 GiB and 4 GiB samples, not a
-validated bound for all sizes; the 2 s small-lower budget remains a target.
+targets above, not a passing qualification. The historical 1.35 s/GiB
+larger-lower slope came from the two pre-receipt sizes, not a validated bound
+for all sizes. Implemented composition receipts remove that payload-validation
+scaling on hits; they do not remeasure these observations or prove the retained
+2 s gate passes.
 Evidence:
 
 - `.tmp/plan/evidence/phase-24/deferred-btrfs/ingest-20261109T121355Z/size-cold-0-1073741824.json`

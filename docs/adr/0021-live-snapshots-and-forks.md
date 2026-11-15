@@ -68,6 +68,13 @@ authentication. The budgets below retain the 4 GiB gates and add the owner's
 30 GiB Arch cohort, both gated by `make perf`, not `make smoke`. These are
 requirements, not a claim that the Phase 30 targets have been met.
 
+The implemented publication path uses one owned sealed-stream capability for
+RAM and writable disks and seeds their warm receipts in the snapshot publication
+transaction. Existing same-identity streams avoid scanning only with a matching
+`verified_object` fingerprint receipt. Explicit snapshot verification bypasses
+both warm and composition receipts; its stream-chunk and state-object diagnostics
+are defined under On-demand verification below.
+
 ## The Problem
 
 [ADR 0014](0014-layered-oci-image-storage.md) gives Silo snapshots and forks of **stopped** machines: a machine's
@@ -695,20 +702,24 @@ whole chunk becomes zero; this is accepted hash and transfer amplification,
 not the dirty-tracking granule. Explicit zero ranges within a nonzero chunk
 remain part of that chunk's logical bytes.
 
-First publication of closed, owned, sealed producer RAM validates its canonical
-map, geometry and unchanged source inode facts across a successful reflink,
-without rereading RAM. A replay from persisted sealed state authenticates staged
-bytes again before publication; prior clone provenance is not replay authority.
-Thus RAM identity work follows affected chunks rather than all populated RAM on
-the owned reflink path. A non-reflink copy still hashes
-inline, and an independent existing same-ID pool inode is always authenticated
-before dedup reuse. Files and parent directories are still synchronized before
-the catalog commit and its durability barrier. This publication binding is
-clone provenance, not independently verified bytes, but publication of a
-snapshot produced on this host seeds the warm restore receipt. Its first local
-restore, like repeated local restores, does not hash RAM. Silent local
-corruption between capture and restore is not detected at restore; explicit
-verification, export and handoff authenticate bytes independently.
+First publication of closed, owned, sealed producer RAM and writable disks uses
+the same `SealedStreamPublication` capability in `storage/pool.rs`. Canonical
+maps, geometry and unchanged held inode facts bind a successful reflink without
+rereading the fresh local payload. A non-reflink copy authenticates inline.
+Recovery and replay authenticate staged bytes again before publication; prior
+clone provenance is not replay authority.
+
+An independent existing same-identity pool stream is reused without a scan only
+when a `verified_object` receipt matches its current device, inode, length, mode
+and ctime fingerprint. Otherwise its bytes are fully authenticated against the
+recorded map before dedup reuse. Files and parent directories are synchronized
+before the catalog commit and its durability barrier. The snapshot publication
+transaction seeds warm receipts for both RAM and those writable disks from the
+held publication capabilities. This binding is producer/clone provenance, not
+independent read-back proof. First and repeated local restores skip hashing
+those streams while the receipt matches. Silent local corruption between
+capture and restore is not detected at restore under this trust boundary;
+explicit verification, export and handoff authenticate bytes independently.
 The 1 s incremental budget below is measured on the defined fixture: one
 contiguous 410 MiB dirty region in a 4 GiB guest, under this unchanged 8 MiB
 chunk identity. Scattered dirty placement can legitimately affect every chunk
@@ -854,12 +865,11 @@ A failed authentication rolls the owned child allocation back and reports the
 authentication error, never a construction error.
 
 Silent local corruption between capture and restore is not detected at restore
-under this trust boundary. The recovery tool is `silo snapshot verify IMAGE`:
-on demand, libvm rereads and authenticates every RAM, state and disk byte of a
-local snapshot against its recorded identities. A failure exits nonzero and
-names the first bad stream and chunk. Export and handoff always authenticate
-every byte, without warm receipts. Local forks use the producer/owned-inode
-authority described below. libvm creates the child's machine
+under this trust boundary. The recovery tool is `silo snapshot verify IMAGE`,
+whose exact traversal and diagnostics are defined below. It rereads every RAM,
+state and disk byte without warm or composition receipts. Export and handoff
+also authenticate every byte without warm receipts. Local forks use the
+producer/owned-inode authority described below. libvm creates the child's machine
 directory, private raw copies of every sealed disk, fresh network reservations
 and sockets, the composite initramfs for provenance only, and the leases for
 the RAM file, lower and boot assets. It passes the resolved restore inputs to
@@ -884,6 +894,23 @@ an unsupported execution ABI, an incompatible CPU or device profile, or a
 required external resource without a destination binding reject before guest
 execution. Nothing substitutes: not a current image tag, not a newer kernel,
 not a cold boot.
+
+### On-demand verification
+
+`silo snapshot verify IMAGE` uses `SnapshotStore::verify` to pin the selected
+local snapshot once and authenticate every byte against recorded identities.
+It ignores warm receipts, composition receipts and producer capabilities, and
+reads and checks recorded-zero chunks, including filesystem holes.
+
+Verification visits RAM first, then state objects in layout, execution and
+devices order, then the root disk, data disks in recorded order and remaining
+dependencies. Shared streams and objects are checked once. It stops at the
+first failure and exits nonzero. A RAM or disk mismatch names the stream,
+chunk index and byte range. State objects have whole-object digests, not chunk
+maps: their mismatch names the object role, digest and length, never an invented
+chunk. Missing, truncated, writable or replaced members are structural failures.
+An intact closure returns its snapshot identity, stream count and verified-byte
+count.
 
 ### Construction
 
@@ -1242,6 +1269,28 @@ returns the same error as a precondition failure with the reason code, and
 its status API carries the host vector so a remote client can decide before
 it sends the request. `silo system info` and `silo info` print the vector.
 
+Runtime admission is separate from this explicit read-only capability
+observation. Every runtime open, including `RuntimeOpenMode::Observation`,
+validates pending operation records and retires only those proven abandoned
+through each operation's own lease; a live lease prevents retirement. It removes
+disposable temporary workspaces and reconciles the restore budget without
+immutable-pool or historical-lease scans, published-map authentication or
+per-chunk queries. `Maintenance` adds store-wide orphan discovery,
+transport-cache collection, historical lease-inventory validation and
+constructed-child, capture and fork recovery.
+Cold handoff capabilities, planning and status initialize an `Observation`
+backend, transfer operations initialize `Maintenance`
+(`app/cli/lib/daemon/control/handoff.rs`), and source observation reuses the
+runtime's open store instead of reopening it (`runtime/libvm/src/handoff/source.rs`),
+so planning never triggers store-wide recovery.
+
+Pending-operation recovery remains on every open so that a later refused live
+operation or planning command finds nothing left to recover and preserves the
+catalog and state files byte-identically. Successful operations still defer
+retirement of their own records to the next open, as before Phase 30. This does
+not authorize recovery during the explicit read-only observation phase or
+weaken its no-mutation requirement.
+
 **No implicit fallback.** An unsupported live operation is never converted
 into a different operation: libvm never stops a machine to snapshot it, never
 downgrades a live snapshot request to a stopped snapshot, and never cold
@@ -1346,12 +1395,12 @@ it permits libvm to complete publication from the sealed files.
 libvm reconciles `vm.capture.json` by validating run and configuration
 correlation and the structural consistency of the inventory (roles, lengths,
 chunk counts, chunk-list identities recomputed from the recorded chunk
-digests) and committing. Owned reflink RAM publication and local fork restore
-rely on producer identity and unchanged inode facts, not a staged RAM reread.
-Copy publication hashes inline. Local snapshot publication seeds the warm
-receipt, including for its first restore; imported, pulled or transported
-snapshots, export and handoff independently authenticate bytes. libvm does not
-infer capture success from process exit, from
+digests) and committing. Owned reflink RAM and writable-disk publication use
+producer identity and unchanged inode facts, not a staged payload reread. Copy
+publication hashes inline; recovery/replay authenticate bytes. The publication
+transaction seeds warm receipts for RAM and those disks, including for their
+first restore. Imported, pulled or transported snapshots, export and handoff
+independently authenticate bytes. libvm does not infer capture success from process exit, from
 a file's existence or from an RPC that returned before the seal.
 
 ### ADR 0018 additions
@@ -1417,9 +1466,10 @@ verify every byte against chunk and state identities. Locally produced
 snapshots trust publication-seeded warm receipts from their first restore;
 local forks trust producer/owned-inode authority without RAM rereads. Silent
 local corruption between capture and restore is not detected at restore.
-`silo snapshot verify IMAGE` rereads and authenticates every RAM, state and disk
-byte against recorded identities and names the first bad stream and chunk on
-failure. Hashing is integrity, not
+`silo snapshot verify IMAGE` independently authenticates every RAM, state and
+disk byte. Stream failures identify the chunk and byte range; state failures
+identify the whole object's role, digest and length. Structural failures are
+reported separately, as defined under On-demand verification. Hashing is integrity, not
 authenticity; publisher trust and signatures apply to the OCI index under
 [ADR 0014](0014-layered-oci-image-storage.md)'s trust policy.
 
@@ -1699,8 +1749,11 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   reject on every restore. Local publication seeds first-restore trust without
   hashing RAM; warm-receipt invalidation and local-fork inode ownership have
   separate trust-boundary checks. `silo snapshot verify IMAGE` detects corrupt
-  RAM, state and disk bytes, naming the first bad stream and chunk and exiting
-  nonzero; it succeeds on an intact closure. Export and handoff authenticate
+  RAM and disk chunks with stream identity, index and byte range, and corrupt
+  state objects with role, whole-object digest and length. Missing, truncated,
+  writable or replaced members are structural failures. Recorded-zero chunks
+  are read and checked without warm or composition receipts. Verification exits
+  nonzero on failure and succeeds on an intact closure. Export and handoff authenticate
   every byte. Pull through an admitted registry, delete source OCI objects,
   run registry GC and restore the exact closure.
 - **Portability refusal.** Wrong architecture, hypervisor, CPU feature,
