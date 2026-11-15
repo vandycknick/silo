@@ -1,12 +1,14 @@
 # Live operation performance: budgets, batches, measurements
 
-Tracks the ADR 0021 live-operation budgets (capture interruption, restore to
-`Running`, four-child fork) across the performance batches that shaped the
-implementation. Numbers are medians of five cold and five warm samples on the
-same fixture: a running 4 GiB-RAM, 2 vCPU machine with a 2 GiB layered upper
-holding a 1 GiB random payload, a private network and an in-guest witness that
-proves continuation. Reference host: AMD Ryzen 5 3600; ext4 lane is a loop
-device without reflinks, Btrfs lane is the host's `/home`.
+Tracks [ADR 0021](../adr/0021-live-snapshots-and-forks.md)'s live-operation and
+start budgets from command start until the guest agent is ready, plus capture
+interruption and exec round trips. `Running` alone is not the latency endpoint.
+The Phase 24 batches below retain their historical clocks and measurements;
+their numbers are medians of five cold and five warm samples on a running
+4 GiB-RAM, 2-vCPU fixture with a 2 GiB layered upper holding a 1 GiB random
+payload, a private network and an in-guest witness proving continuation.
+Reference host: AMD Ryzen 5 3600; ext4 is a loop device without reflinks, Btrfs
+is the host's `/home`. The Phase 30 baseline uses its separately labeled cohorts.
 
 Raw evidence (samples, syscall traces, probes) lives under
 `.tmp/plan/evidence/phase-24/` in the working tree; this file keeps the
@@ -16,9 +18,128 @@ durable summary.
 
 | Target | Clock | Exercises |
 |---|---|---|
-| Capture interruption | source vCPUs paused → running again | workload freeze, upper seal (1 GiB copy on non-reflink hosts), device/vCPU serialization, 4 GiB sparse RAM write, receipt. Non-reflink hosts get an allowance of the upper's allocated bytes at the host's sequential copy rate. |
-| Restore to `Running` | `silo restore` dispatched → child `Running`, witness continuing | closure shape check, byte authentication, private upper copy, monitor/worker launch, private RAM mapping, VM generation ack, agent activation, thaw. |
-| Fork4 to `Running` | `silo fork` with four children dispatched → all four `Running` | one fork cut (pause included), manager admission, four concurrent restores sharing one RAM inode. |
+| Start to agent ready | command start → guest agent ready | CLI and store preamble, launch, boot and guest-agent readiness; image init as PID 1 is the default. |
+| Capture total | command start → snapshot complete and source agent ready under the continuation policy | cut, source continuation and durable publication; record separately from interruption. A preserved user pause remains paused by policy. |
+| Capture interruption | source workload unavailable → thawed and agent ready, or the preserved-pause outcome | workload freeze, upper seal, device/vCPU serialization, touched RAM capture and receipt. The retained 4 GiB gates include their recorded copy and disk-sealing allowances; these do not permit violating Phase 30 scaling. |
+| Restore to agent ready | command start → child guest agent ready, witness continuing | closure shape and trust checks, private upper clone or written-byte copy, launch, private RAM mapping, generation acknowledgement, activation and thaw. Local publication seeds first-restore trust without hashing RAM; imports and transport retain full authentication. |
+| Fork to all agents ready | command start → every requested child guest agent ready | one cut including pause, admission and child restores; the retained Fork4 gate requires all four agents. Durable fork is the default; fast same-host fork is a separate explicit mode. |
+| Exec round trip | command start → guest command completes and CLI returns | complete agent request and response, not application readiness. |
+
+`make perf` runs the standalone `perf/` project serially and gates the retained
+4 GiB fixture and Phase 30 targets; `make smoke` does not run budgets. Every new
+performance figure records both default image init and agent-as-PID-1
+(`--kernel-arg init=`), with the mode labeled. Historical rows keep their
+original evidence and are not silently converted to the new clock or mode.
+
+## Phase 30 baseline (2026-11-15)
+
+The Phase 30 targets are not yet met. Each implementation slice must append its
+measured result, including raw samples, both init modes and clock endpoints;
+the baseline is not a passing qualification.
+
+These are the plan's three-sample medians in seconds, measured on the same
+Ryzen 5 3600 host with Btrfs, Linux 7.2.11 and idle guests. Alpine uses 2 vCPUs;
+the Arch cohort uses 30 GiB RAM, 10 vCPUs and a 100 GiB disk. "Image" is default
+image init as PID 1; "agent" is `--kernel-arg init=`. msb 0.7.15 ran earlier on
+the same host that day, with its default init and 4 GiB disk, not a matched Arch
+guest. The comparison is informational.
+
+| Operation | msb 2 GiB | Silo 2 GiB image / agent | msb 30 GiB | Silo 30 GiB image / agent | Arch 30 GiB image / agent |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Create + start | 0.31 | 1.12 / 1.14 | 0.42 | 1.57 / 1.82 | 3.28 / 3.17 |
+| First exec | 0.03 | 0.26 / 0.28 | 0.03 | 0.30 / 0.33 | 0.34 / 0.36 |
+| Fork, first | 1.11 | 1.07 / 1.08 | 11.00 | 6.45 / 6.51 | 8.13 / 8.03 |
+| Fork, second | 0.53 | 0.85 / 0.87 | 2.43 | 1.80 / 1.84 | 3.38 / 2.44 |
+| Snapshot, full | 1.06 | 1.88 / 1.88 | 11.60 | 7.76 / 7.79 | 21.26 / 20.17 |
+| Snapshot, incremental | 0.38 | 1.61 / 1.74 | 1.76 | 3.36 / 3.18 | 42.11 / 22.97 |
+| Restore, first | 0.21 | 0.83 / 0.85 | 0.36 | 2.39 / 2.42 | 12.14 / 10.56 |
+| Restore, second | 0.21 | 0.53 / 0.56 | 0.37 | 0.65 / 0.65 | 1.93 / 1.93 |
+| `run -- /bin/true` | 0.45 | 1.21 / 1.69 | 0.72 | 2.15 / 3.25 | 4.64 / 6.96 |
+
+The baseline table records command wall time. `silo start` returns after guest
+agent readiness by default (`--no-wait` skips waiting). Live restore and fork
+return after activation, including the agent's `Activate` and `Thaw` RPCs, so
+command return is their agent-ready boundary. Snapshot rows include publication,
+not just the pause. "Create + start" includes creation, unlike the start-only
+target. First exec is a separate round trip; `run -- /bin/true` ends at workload
+exit. These three-sample observations do not establish five-run gate medians.
+Evidence: `.tmp/plan/evidence/phase-30/bench2/bench.sh`,
+`bench2/results.csv` and `bench2/msb-bench.md`; attribution and comparison
+research: `.tmp/research/msb-timings.md` and `.tmp/research/boxd-timings.md`.
+
+### Causes C1-C8
+
+- **C1, disk capacity scans.** Capture walks the entire logical upper:
+  0.93 s inside the pause for a 100 GiB disk with only 17 MB allocated.
+  Publication walks it three more times at about 4 s each. Post-resume
+  publication is 13-17 s with that disk versus 1.5-2 s with the default disk.
+- **C2, freed RAM written as zeros.** Guest-freed pages become dirty zero pages.
+  Incremental capture writes 7.9-14.7 GiB of real zeros, extending the pause,
+  allocating disk space and adding restore hashing. On Arch, default systemd
+  init costs about 19 s more than agent-as-PID-1 on incremental snapshot
+  (24.0 s versus 6.5 s in capture-memory). Even agent-only 10-vCPU incremental
+  capture takes 6.5 s versus 5.7 s full; that additional cause is not isolated.
+  Free-page reporting is a suspect, not a confirmed explanation.
+- **C3, repeated lower validation.** Each restore, fork child and create rereads
+  the prepared lower, about 1.2 GiB and 1 s for Arch, instead of reusing image
+  validation.
+- **C4, untouched RAM scan.** First capture reads all 30 GiB of configured RAM
+  in about 5.7 s to find about 0.7 GiB of data.
+- **C5, first-restore RAM hashing.** Cold restore hashes the RAM stream before
+  execution, about 5.3 s in the owner trace, despite local capture provenance.
+- **C6, completion polling.** CLI capture polling backs off to 1 s, delaying
+  observation of a completed operation.
+- **C7, fixed command overhead.** About 0.5 s per command and 1.5 s per snapshot
+  remain outside useful guest work. Exec round trips cost 0.26-0.40 s versus
+  about 0.03 s for msb; second restore at 2 GiB is 0.53 s versus 0.21 s.
+- **C8, agent-init run gap.** `run -- /bin/true` is 0.5-2.3 s slower with
+  agent-as-PID-1 than image init. The cause is not yet explained.
+
+### Adopted contract and targets
+
+No restore or fork step may scale with configured RAM or logical disk size.
+Capture work scales with changed bytes, and full capture pause with touched
+RAM. A 30 GiB and a 500 GiB disk with identical written data must take the same
+snapshot, fork and restore time within measurement noise. Reflink disk steps
+are constant-time clones regardless of written data. Without reflinks, the
+only permitted disk cost is copying bytes actually written to the upper, an
+accepted rare slow case. Configured-length scans and repeated publication
+passes are contract violations, not allowances.
+
+Local snapshot publication seeds the warm receipt, so the first local restore
+does not hash RAM. Silent local corruption between capture and restore is not
+detected at restore. `silo snapshot verify IMAGE` rereads and authenticates every
+RAM, state and disk byte against recorded identities, exiting nonzero and
+naming the first bad stream and chunk on failure. Imported, pulled or
+transported snapshots, export and handoff still authenticate every byte.
+Changed-to-zero pages are explicit zero ranges, holes with format-level zero
+markers rather than inheritance; zero chunks are never hashed or stored.
+
+Durable fork remains the default. The separately selected fast same-host fork
+has no RAM file; source and children share guest memory copy-on-write, siblings
+share physical pages, and children do not survive host crash or reboot.
+Mechanism details await the Phase 30 design review.
+
+The approved idle Arch cohort uses 30 GiB RAM, 10 vCPUs, a 100 GiB disk and
+default image init, with command start to agent ready as the latency clock:
+
+| Operation | Target |
+| --- | --- |
+| Start | Under 1 s |
+| Local snapshot restore, first or repeated | 0.5 s |
+| Durable fork with baseline | 1 s |
+| First durable fork | 2 s |
+| Fast same-host fork | 0.5 s |
+| Incremental snapshot | 2 s total, with a 1 s pause |
+| Full snapshot | Pause proportional to touched RAM |
+| Exec round trip | 0.1 s |
+
+Image init as PID 1 stays the default, with both init modes reported. The
+existing 4 GiB fixture gates remain in force alongside this cohort. The
+standalone perf suite reports Silo versus target as gating pass/fail, Silo
+versus msb on a roughly equal setup as informational, and appends run history.
+msb is skipped with a reason when unavailable. Reaching msb's 0.3-0.4 s start
+latency is a later stretch goal, not a Phase 30 gate.
 
 ## Results by batch
 
@@ -64,23 +185,25 @@ Measured effect: capture pause 8.94 → 5.51 s; manager work after the seal
    computed only for blobs that leave the host.
 3. libvm validates a cut structurally at retention. Owned reflink RAM publication
    binds producer identity and unchanged inode facts without rereading RAM;
-   copies hash inline and independent dedup objects are still verified. Cold
-   durable restore, export and handoff independently authenticate bytes.
+   copies hash inline and independent dedup objects are still verified.
+   Phase 30 seeds local restore trust at publication; imported, pulled or
+   transported snapshots, export and handoff independently authenticate bytes.
 4. A fork is a local branch: the cut is written and closed, not synchronized.
 5. Children hash their private copy as it is written, start at
    `constructed`, and become `durable` in the background. Current recovery adopts
    pending barriers while an exact monitor or run lease remains live; deletion
    waits for positive liveness reconciliation.
-6. Durable restore checks closure shape before allocating, authenticates bytes
-   concurrently with the private copy, and reuses previously verified objects
-   whose inode metadata is unchanged.
+6. Durable restore checks closure shape before allocating. Required byte
+   authentication runs concurrently with the private copy; trusted local
+   objects with unchanged inode facts avoid that read.
 
-Owned reflink publication creates no warm restore receipt. Corruption between
-capture and publication is detected at cold durable restore or export, not at
-publication; file/directory synchronization and catalog durability are unchanged.
-Local fork RAM restore trusts producer-computed identities and unchanged owned
-inode facts without rehashing RAM. These contracts do not remeasure the historical
-batch results below.
+Phase 30 reverses the former no-warm-receipt publication rule: publication of a
+snapshot produced on this host seeds the warm receipt for its first restore.
+Silent local corruption between capture and restore is not detected at restore;
+explicit verification, export and handoff authenticate bytes independently.
+File/directory synchronization and catalog durability are unchanged. Local fork
+RAM restore trusts producer-computed identities and unchanged owned inode facts
+without rehashing RAM. These amendments do not remeasure historical batch results.
 
 Measured effect on ext4: pause 5.51 → 2.52 s; manager 3.56 → 1.46 s; restore
 7.21 → 3.5–4.3 s. Child construction stayed at about 9 s for four children.
@@ -122,9 +245,9 @@ bytes at the device's sequential write rate (about 1 s per 1 GiB here).
 4. Capability discovery caches validated reports per process (stat/digest
    keyed, replacement still invalidates); disk-map verification overlaps
    `inspect-restore`.
-5. Budgets: the non-CoW copy allowance now applies to restore and fork as it
-   did to capture; the smoke harness probes `FICLONE` in the budget workspace
-   to choose the lane.
+5. Budgets: the non-CoW copy allowance applied to restore and fork as it
+   did to capture; the harness probed `FICLONE` in the budget workspace
+   to choose the lane. Phase 30 moves these gates from smoke to `make perf`.
 
 | Batch 3 | Lane | Capture raw / gated | Restore raw / gated | Fork4 raw / gated |
 |---|---|---:|---:|---:|
@@ -208,14 +331,16 @@ Batch 4c's 2026-11-09 contract keeps the 8 MiB chunk-list identity and defines
 the 1 s incremental target on one contiguous 410 MiB dirty region in a 4 GiB
 guest; scattered dirties may require a full-RAM rehash, exposed through
 `identityBytesHashed`. Incremental RAM capture reflinks the retained baseline
-on CoW lanes and overlays only dirty runs; non-reflink lanes keep rebuilding
-the complete file from the baseline, without a pre-pause copy. Both yield
+on CoW lanes and overlays only dirty runs; non-reflink lanes then rebuilt
+the complete file from the baseline, without a pre-pause copy. Both yielded
 the same bytes, and `CaptureMemoryStats.seedMethod` records `clone` or
-`rebuild`. Capture and incremental interruption gates on every lane now
+`rebuild`. Phase 30 disallows configured-RAM scans and requires changed-byte
+scaling on every lane. The retained capture and incremental interruption gates
 subtract a separate disk-sealing allowance (sealed upper allocated bytes /
 host-measured sequential SHA-256 rate), in addition to the existing non-CoW
-copy allowance where applicable. Restore and fork-to-Running do not gain
-this allowance. This accounts for the measured Btrfs disk sealing cost of
+copy allowance where applicable. Restore and fork-to-agent-ready do not gain
+this allowance. Allowances do not authorize size-dependent reflink work.
+The historical allowance accounts for the measured Btrfs disk sealing cost of
 1.1–1.2 s for a 2 GiB upper with 1 GiB payload, not a changed RAM target;
 raw timings, both allowances and rate inputs remain in evidence. Attribution:
 `.tmp/plan/research/phase24-incremental-memory-cost.md`, sections 1 and 3.
@@ -346,10 +471,12 @@ The incremental publication still cost 6.7 s because it reread every populated
 RAM extent, not just changed chunks. Commit `10ae51ed` removes that read on the
 first owned reflink publication: producer identities and stable inode facts bind
 the clone. Replay from sealed state, copy fallbacks and independent dedup objects
-still authenticate bytes. Publication creates no warm restore receipt; cold
-durable restore and export detect intervening RAM corruption. Local fork RAM
-instead trusts its producer/owned-inode authority. No post-`10ae51ed` timings are
-recorded here, and none of the historical numbers is relabeled as a new result.
+still authenticate bytes. Phase 30 now seeds the warm restore receipt at local
+publication; silent local corruption between capture and restore is not detected
+at restore. Explicit verification, export and handoff authenticate every byte.
+Local fork RAM trusts producer/owned-inode authority. The Phase 30 baseline above
+records later timings; none of these historical numbers is relabeled as a new
+result.
 
 The published Git dependency pin `662b359c` includes the pipeline and Linux
 balloon reclaim. Phase 29 adds contained image-init live operation support and

@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 
-Updated: 2026-11-09
+Updated: 2026-11-15
 
 ## Status
 
@@ -20,6 +20,19 @@ state conversion. The initial schema and all callers are replaced directly;
 incompatible state is refused with a reinstall/wipe diagnostic, never deleted
 automatically. This supersedes the former existing-machine preservation and
 additive-migration requirements throughout the implementation plan.
+
+The owner decisions of 2026-11-15 (Phase 30) require snapshot, fork and restore
+disk work independent of configured capacity, constant-time qualified reflink
+clones, and written-upper-byte-only copies without reflinks. Sealed stream
+identities accompany publication without another data pass. Local snapshot
+publication seeds restore trust, reversing the 2026-11-14 requirement that the
+first durable restore independently scans RAM. Silent local corruption between
+capture and restore is accepted; `silo snapshot verify IMAGE` supplies on-demand
+authentication. Import, pull, transport, export and handoff still authenticate
+every byte. [ADR 0021](0021-live-snapshots-and-forks.md) records the agent-ready
+clock, scaling invariants, explicit zero ranges, separate fast same-host fork
+mode and retained plus new performance gates; these are requirements, not
+claims of completed Phase 30 implementation.
 
 ## Implementation status (2026-11-09)
 
@@ -206,9 +219,11 @@ additional opaque encoding on VZ without changing the raw contract here.
 9. Local clone operations may rely on a qualified kernel clone contract without
    hashing an entire disk. Owned, sealed RAM publication may likewise rely on
    producer-computed chunk identities, unchanged inode facts and a successful
-   reflink without rereading RAM. Independent existing dedup objects and copy
-   fallbacks still verify bytes; cold durable restore and network transfer
-   authenticate the published RAM against its original identity.
+   reflink without rereading RAM. Publication of a snapshot produced on this
+   host seeds the warm receipt, so its first local restore does not hash RAM.
+   Independent existing dedup objects and required copy fallbacks still verify
+   bytes; imported, pulled or transported snapshots, export and handoff
+   authenticate every byte against recorded identities.
 10. Starts use the persisted root representation. Conversion, guest
     generalization, boot-profile changes and transfer are explicit operations.
 11. Storage compatibility is necessary but not sufficient for boot. Silo checks
@@ -217,6 +232,13 @@ additional opaque encoding on VZ without changing the raw contract here.
     before publishing a runnable destination.
 12. Failure never silently selects another lower, disables required indexing,
     modifies an import source or resumes both ends of a relocation.
+13. Configured disk size has no effect on snapshot, fork or restore time.
+    A 30 GiB and a 500 GiB disk holding the same written data take the same
+    time. On reflink filesystems the disk step is a constant-time clone
+    regardless of written data; without reflinks the only permitted disk cost
+    is copying bytes actually written to the upper, an accepted rare slow
+    case. No step of restore or fork may scale with configured RAM or logical
+    disk size; capture work scales with changed bytes.
 
 ### Scope and relationship to existing decisions
 
@@ -881,6 +903,15 @@ A receiver verifies stream identity from the canonical decoded map and every
 chunk, without a second whole-file pass. A raw stream's whole-file SHA-256 is
 optional export metadata, not its identity.
 
+For local snapshot, fork and restore disk steps, neither extent discovery nor
+identity construction may walk configured capacity. A qualified reflink carries
+the sealed stream identity in constant time; a required non-reflink copy works
+only on written upper bytes and computes required digests inline. Sealing
+passes its identities through publication without another data pass. The
+general byte-authentication rules above still apply to import, pull, transport,
+export, handoff and explicit verification; they do not authorize repeated scans
+on trusted local live paths.
+
 The concatenated lower's chunk boundaries need not align with pack boundaries.
 Its stream map therefore may require scanning shared payloads again; pack hashes
 alone cannot derive shifted chunk hashes. V1 accepts and measures this cost
@@ -892,8 +923,11 @@ chunk. Its layout record, identified separately, maps stream offsets to
 guest-physical regions; equal bytes at different guest addresses are different
 memory. An incremental checkpoint publishes a complete resolved chunk map that
 reuses unchanged chunk objects; its parent is lineage, not a replay
-dependency. A changed page rehashes its whole 8 MiB chunk. That amplification
-is accepted; the dirty-tracking granule is the hypervisor's, not the chunk.
+dependency. A changed page rehashes its whole 8 MiB chunk unless that chunk is
+entirely zero. That amplification is accepted; the dirty-tracking granule is
+the hypervisor's, not the chunk. A changed-to-zero page is an explicit zero
+range, represented by a hole with a format-level zero marker, never a hole
+that inherits baseline bytes. Zero chunks are never hashed or stored.
 
 ### Identity layers
 
@@ -918,6 +952,9 @@ Local paths, pause-token values and source run IDs are provenance and
 evidence, never content identity. A sealed disk capture carries exactly the
 stream identity, length and geometry a stopped snapshot of the same bytes
 would; the capture kind does not salt disk identities.
+The seal's stream identity accompanies its qualified clone through local
+publication and child construction. Publication must not reconstruct that
+identity by scanning configured disk length or rereading the sealed payload.
 
 ### Records and the database
 
@@ -2014,17 +2051,21 @@ execution restore that loads its matching RAM; a sealed disk whose matching
 RAM is not loaded is attached only through the explicit disk-only recovery
 operation, with recovery evidence `unknown`.
 
-On hosts with a qualified clone contract the seal is a clone; elsewhere it is
-a full copy of the allocated bytes taken while the machine is paused, and the
-pause lasts as long as that copy. [ADR 0021](0021-live-snapshots-and-forks.md) states the budgets that measure
-this cost and the single condition under which qcow2 upper generations would
-be reconsidered.
+On hosts with a qualified clone contract the seal is a constant-time clone
+regardless of written data; elsewhere it copies only bytes actually written to
+the upper while the machine is paused, and the pause includes that copy.
+Configured disk capacity does not affect either path. The identity accompanies
+the seal through publication without another data pass.
+[ADR 0021](0021-live-snapshots-and-forks.md) states the retained budgets and
+Phase 30 targets that measure this cost and the condition under which qcow2
+upper generations would be reconsidered; raw storage remains the representation.
 
 ### Local fork
 
 Fork stages a new machine directory and private state using the qualified copy
-hierarchy. Linux overlay forks copy the entire upper. Raw forks copy the raw
-root. All included writable data and platform files receive distinct private
+hierarchy. Linux overlay forks clone or copy the upper's written bytes, never
+its unwritten configured capacity; raw forks retain the same sparse raw root.
+All included writable data and platform files receive distinct private
 copies. The source storage files and representation do not change.
 Clonefile/reflink paths may rely on their qualified kernel clone contract.
 Streaming copy paths compute the source stream identity and verify the
@@ -2051,11 +2092,15 @@ synchronized before the database publishes the child's root and configuration
 in one transaction. Failure removes only child-owned staging and cannot cause
 source data loss.
 
-A running-machine fork ([ADR 0021](0021-live-snapshots-and-forks.md)) captures once and restores each child from
-that exact execution checkpoint. Every child receives distinct private
-writable raw copies of the sealed captures; unchanged RAM may be shared
-between children through private mappings of one immutable RAM file. The
-source's storage remains private to it and resumes after the seal under the
+A default durable running-machine fork ([ADR 0021](0021-live-snapshots-and-forks.md))
+captures once and restores each child from that exact execution checkpoint.
+Every child receives distinct private writable raw clones or copies of the
+sealed captures; unchanged RAM is shared between children through private
+mappings of one immutable RAM file. The separate, explicitly selected fast
+same-host mode has no RAM file and shares source and child memory copy-on-write;
+siblings share physical pages, and children do not survive host crash or reboot.
+Its mechanism details require a Phase 30 design review.
+The source's storage remains private to it and resumes after the seal under the
 operation's policy. The clone, copy and identity-verification rules of this
 section apply equally to sealed captures and child copies.
 
@@ -2069,11 +2114,13 @@ snapshot includes all managed writable disks as sealed captures, the RAM image
 and layout, the execution and device-state objects, the exact boot, agent and
 configuration provenance, the compatibility profile and the external-resource
 declarations. Both kinds include all managed writable data disks by default.
-Snapshot creation of a storage stream reads every allocated byte of the
-included private file to compute its stream identity; it is not the same cost
-contract as a local clonefile fork. A RAM stream may instead reuse the chunk
-identities of a verified baseline for chunks that dirty tracking proves
-unchanged ([ADR 0021](0021-live-snapshots-and-forks.md)); without valid tracking coverage it is read in full.
+Local snapshot disk steps obey the same constant-time reflink and
+written-byte-only non-reflink cost contract as fork and restore. A live sealed
+disk carries its recorded stream identity into publication without another
+payload pass. RAM capture reuses identities of baseline chunks that valid dirty
+tracking proves unchanged ([ADR 0021](0021-live-snapshots-and-forks.md)); a full
+capture follows touched RAM rather than configured capacity. Changed-to-zero
+ranges remain explicitly zero, and zero chunks are neither hashed nor stored.
 
 Snapshots have purpose `checkpoint` or `generalized-image`. A checkpoint contains
 exact selected storage bytes and includes a warning about credentials, journals
@@ -2371,16 +2418,27 @@ than deleting the source opportunistically after a push.
 
 Immutable publication stages under a unique operation directory on the final
 filesystem, validates output, synchronizes files, publishes through atomic
-no-replace rename, then synchronizes parent directories. Output is hashed except
-for the first successful reflink publication of closed, owned, sealed RAM whose
-canonical producer map, geometry and source inode facts have validated and
-remain unchanged across the clone. Replaying persisted sealed state hashes the
-staged bytes again. The first-publication path binds the new inode to producer identity and clone
-provenance, not an independent read-back proof, and creates no warm verification
-receipt. Same-length corruption between capture and publication is detected at
-cold durable restore or export, not at publication. The non-reflink path copies
-and hashes inline. A recipe/result record becomes visible only after every
-dependency is durable. An independent existing object at the same digest must
+no-replace rename, then synchronizes parent directories. Qualified local sealed
+disk reflinks carry their recorded stream identity without a payload reread.
+The first successful reflink publication of closed, owned, sealed RAM validates
+the canonical producer map, geometry and unchanged source inode facts across
+the clone, also without rereading RAM. Replaying persisted sealed RAM state
+authenticates staged bytes again; clone provenance alone is not replay authority.
+The first-publication path binds the new inode to producer identity and clone
+provenance, not an independent read-back proof, but publication of a snapshot
+produced on this host seeds the warm restore receipt. Its first and repeated
+local restores do not hash RAM while the receipt's inode facts remain unchanged;
+a mismatch re-authenticates. Silent local corruption between capture and restore
+is not detected at restore.
+
+`silo snapshot verify IMAGE` rereads and authenticates every RAM, state and disk
+byte of a local snapshot against recorded identities; a failure exits nonzero
+and names the first bad stream and chunk. Imported, pulled or transported
+snapshots, export and handoff authenticate every byte without this local
+publication exception. Required non-reflink copies hash written bytes inline,
+never through a configured-length scan or another publication pass. Other
+publication output is hashed. A recipe/result record becomes visible only after
+every dependency is durable. An independent existing object at the same digest must
 still validate; corruption is quarantined under coordination, never repaired in
 place while readers may use it.
 
@@ -2640,15 +2698,19 @@ from GC; generated descriptor files are never reachability authorities.
 
 ### Acceptance budgets
 
-The benchmarks in the conformance section measure against these budgets. They
-are initial product targets for admitting the layered profile as the default,
-not format requirements; a budget is revised only with a recorded measurement.
+The standalone `perf/` project, run with `make perf`, gates these budgets;
+`make smoke` does not run performance budgets. They are initial product targets
+for admitting the layered profile as the default, not format requirements; a
+budget is revised only with a recorded measurement. Start and live-operation
+latency uses command start until the guest agent is ready, not `Running`.
+Every new performance figure records default image init as PID 1 and
+agent-as-PID-1 (`--kernel-arg init=`); image init stays the default.
 
 | Operation                                                        | Budget                                                                                                                      |
 | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | Cold prepare of an OCI image (pull, decode, pack, index, fsmeta) | At most 10× the time to download and decompress the same layers on the Btrfs reference host, recorded 2026-11-09 (6.0×/9.2×); the 1.5× product target is retained as the goal of a later ingest pipeline rewrite (single-pass decode→pack, no spool/publication copies, composition receipts) per `.tmp/plan/research/phase24-ingest-cost.md`. Linearity is reported per size; the 1.25 ratio is a goal, not an admission gate, until the rewrite. See the dated ingest measurement note below. |
 | Warm create of a stopped machine from a prepared lower           | 2 s for lowers up to 1 GiB allocated; larger lowers scale at about 1.35 s per GiB until composition receipts land. See the dated ingest measurement note below. |
-| Start to guest `/` mounted (layered versus opaque raw, same image)| Within 20 percent of the raw root                                                                                            |
+| Start to guest agent ready (layered versus opaque raw, same image) | Within 20 percent of the raw root                                                                                            |
 | Copy-up of a lower file on first write                           | Whole-file cost at the host's sequential copy rate; reported, never hidden                                                   |
 | Stopped fork                                                     | Sub-second with host CoW; bounded by upper allocated bytes at sequential copy rate without                                   |
 | Lower-wide rescan on shifted chunk boundaries                    | Linear in retained nonzero bytes; measured and reported per composition                                                      |
