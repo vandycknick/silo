@@ -15,6 +15,98 @@ use crate::store::models::{MachineConfig, MachineRuntimeState, MachineState};
 use crate::store::Store;
 use crate::{LibVmError, Runtime};
 
+/// Best-effort presentation stages, independent of durable operation outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveOperationProgress {
+    Admitting,
+    PausingSource,
+    CapturingMemory,
+    CapturingDisks,
+    CapturingExecution,
+    VerifyingCapture,
+    FinalizingCapture,
+    ResumingSource,
+    PreservingSource,
+    ComputingDiskIdentity,
+    Publishing,
+    PreparingChildStorage,
+    StartingChild {
+        /// One-based position in the requested child batch.
+        index: usize,
+        total: usize,
+        name: String,
+    },
+    WaitingForAgent,
+    Done,
+}
+
+impl From<LiveStage> for LiveOperationProgress {
+    fn from(stage: LiveStage) -> Self {
+        match stage {
+            LiveStage::Admission => Self::Admitting,
+            LiveStage::MonitorDrain
+            | LiveStage::GuestFreeze
+            | LiveStage::NativePause
+            | LiveStage::PauseFailed
+            | LiveStage::RecoveryFreeze
+            | LiveStage::RecoveryPause => Self::PausingSource,
+            LiveStage::RollbackThaw
+            | LiveStage::CancelNative
+            | LiveStage::CancelThaw
+            | LiveStage::ResumeNative
+            | LiveStage::ResumeClock
+            | LiveStage::ResumeHandshake
+            | LiveStage::ResumeThaw => Self::ResumingSource,
+            LiveStage::Readiness => Self::WaitingForAgent,
+            LiveStage::CapturePrepare | LiveStage::CaptureFlush | LiveStage::CaptureDisks => {
+                Self::CapturingDisks
+            }
+            LiveStage::CaptureDiskIdentity => Self::ComputingDiskIdentity,
+            LiveStage::CaptureExecution => Self::CapturingExecution,
+            LiveStage::CaptureMemory => Self::CapturingMemory,
+            LiveStage::CaptureVerify => Self::VerifyingCapture,
+            LiveStage::CapturePreserve => Self::PreservingSource,
+            LiveStage::CaptureSeal
+            | LiveStage::CaptureAccept
+            | LiveStage::CaptureAbandon
+            | LiveStage::CaptureSourceRecord
+            | LiveStage::CaptureRelease => Self::FinalizingCapture,
+        }
+    }
+}
+
+pub type LiveOperationProgressReceiver = tokio::sync::mpsc::Receiver<LiveOperationProgress>;
+
+/// Bounded and nonblocking, like image progress. Full or closed channels are ignored.
+#[derive(Debug, Clone)]
+pub struct LiveOperationProgressSender {
+    tx: tokio::sync::mpsc::Sender<LiveOperationProgress>,
+}
+
+impl LiveOperationProgressSender {
+    pub fn channel(bound: usize) -> (Self, LiveOperationProgressReceiver) {
+        let (tx, rx) = tokio::sync::mpsc::channel(bound.max(1));
+        (Self { tx }, rx)
+    }
+
+    pub fn default_channel() -> (Self, LiveOperationProgressReceiver) {
+        Self::channel(256)
+    }
+
+    pub fn send(&self, stage: LiveOperationProgress) {
+        let _ = self.tx.try_send(stage);
+    }
+}
+
+pub(crate) fn report_progress(
+    progress: Option<&LiveOperationProgressSender>,
+    stage: LiveOperationProgress,
+) {
+    if let Some(progress) = progress {
+        progress.send(stage);
+    }
+}
+
 fn protocol(message: impl Into<String>) -> LibVmError {
     LibVmError::LiveProtocol {
         message: message.into(),
@@ -673,6 +765,8 @@ pub(crate) async fn reconcile(runtime: &Runtime, config: &MachineConfig) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use crate::machine::live::MachineLiveObservation;
+    use crate::machine::live_operations::missing_pause_authority;
     use vm_spec::lifecycle::{
         LiveActivity, LiveCommandKind, LiveFailure, LiveFailureCode, LiveId, LiveLifecycle,
         LiveStage, VmLifecycleState,
@@ -681,8 +775,91 @@ mod tests {
         LiveBackend, LiveCapabilityVector, LiveLane, LiveMachineReport, LiveReasonCode, LiveScope,
     };
 
-    use crate::machine::live::MachineLiveObservation;
-    use crate::machine::live_operations::missing_pause_authority;
+    #[test]
+    fn monitor_stages_have_user_meaningful_progress() {
+        use crate::machine::live_operations::LiveOperationProgress as Progress;
+
+        let mut covered = Vec::new();
+        for (stages, expected) in [
+            (vec![LiveStage::Admission], Progress::Admitting),
+            (
+                vec![
+                    LiveStage::MonitorDrain,
+                    LiveStage::GuestFreeze,
+                    LiveStage::NativePause,
+                    LiveStage::PauseFailed,
+                    LiveStage::RecoveryFreeze,
+                    LiveStage::RecoveryPause,
+                ],
+                Progress::PausingSource,
+            ),
+            (
+                vec![
+                    LiveStage::RollbackThaw,
+                    LiveStage::CancelNative,
+                    LiveStage::CancelThaw,
+                    LiveStage::ResumeNative,
+                    LiveStage::ResumeClock,
+                    LiveStage::ResumeHandshake,
+                    LiveStage::ResumeThaw,
+                ],
+                Progress::ResumingSource,
+            ),
+            (vec![LiveStage::Readiness], Progress::WaitingForAgent),
+            (
+                vec![
+                    LiveStage::CapturePrepare,
+                    LiveStage::CaptureFlush,
+                    LiveStage::CaptureDisks,
+                ],
+                Progress::CapturingDisks,
+            ),
+            (
+                vec![LiveStage::CaptureDiskIdentity],
+                Progress::ComputingDiskIdentity,
+            ),
+            (
+                vec![LiveStage::CaptureExecution],
+                Progress::CapturingExecution,
+            ),
+            (vec![LiveStage::CaptureMemory], Progress::CapturingMemory),
+            (vec![LiveStage::CaptureVerify], Progress::VerifyingCapture),
+            (vec![LiveStage::CapturePreserve], Progress::PreservingSource),
+            (
+                vec![
+                    LiveStage::CaptureSeal,
+                    LiveStage::CaptureAccept,
+                    LiveStage::CaptureAbandon,
+                    LiveStage::CaptureSourceRecord,
+                    LiveStage::CaptureRelease,
+                ],
+                Progress::FinalizingCapture,
+            ),
+        ] {
+            for stage in stages {
+                assert_eq!(Progress::from(stage), expected, "{stage:?}");
+                assert!(!covered.contains(&stage), "duplicate stage {stage:?}");
+                covered.push(stage);
+            }
+        }
+        assert_eq!(covered.len(), LiveStage::ALL.len());
+        assert!(LiveStage::ALL.iter().all(|stage| covered.contains(stage)));
+    }
+
+    #[test]
+    fn progress_is_best_effort_when_full_or_closed() {
+        use crate::machine::live_operations::{LiveOperationProgress, LiveOperationProgressSender};
+
+        let (sender, mut receiver) = LiveOperationProgressSender::channel(0);
+        sender.send(LiveOperationProgress::Admitting);
+        sender.send(LiveOperationProgress::Done);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            LiveOperationProgress::Admitting
+        );
+        drop(receiver);
+        sender.send(LiveOperationProgress::Done);
+    }
 
     fn id(last: u8) -> LiveId {
         LiveId::parse(&format!("00000000-0000-4000-8000-0000000000{last:02x}")).unwrap()

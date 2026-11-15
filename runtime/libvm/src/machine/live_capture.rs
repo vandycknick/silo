@@ -42,7 +42,10 @@ use vm_spec::lifecycle::{
 use vm_spec::live::LiveOperation;
 
 use crate::machine::live::{require_live_operation, MachineLiveObservation};
-use crate::machine::live_operations::{envelope, require_same_observation, result_error};
+use crate::machine::live_operations::{
+    envelope, report_progress, require_same_observation, result_error, LiveOperationProgress,
+    LiveOperationProgressSender,
+};
 use crate::machine::{Machine, MachineRef};
 use crate::paths::OwnedDirectory;
 use crate::store::live_store::LiveCommandIntent;
@@ -295,8 +298,10 @@ impl Machine {
         &self,
         observation: &MachineLiveObservation,
         options: LiveSnapshotOptions,
+        progress: Option<LiveOperationProgressSender>,
     ) -> Result<LiveSnapshot, LibVmError> {
         let capture_id = Uuid::new_v4();
+        report_progress(progress.as_ref(), LiveOperationProgress::Admitting);
         match self
             .submit_capture(observation, capture_id, options)
             .await?
@@ -306,7 +311,8 @@ impl Machine {
                     && receipt.kind == OperationKind::Capture => {}
             result => return Err(result_error(&result)),
         }
-        self.complete_capture(capture_id).await
+        self.complete_capture_with_progress(capture_id, progress.as_ref())
+            .await
     }
 
     /// Reserve, journal and submit one capture under a caller-chosen identity
@@ -441,14 +447,31 @@ impl Machine {
     /// Only the exact retained identity is followed; nothing is resubmitted
     /// under a new identity and nothing resumes the source.
     pub async fn complete_capture(&self, capture_id: Uuid) -> Result<LiveSnapshot, LibVmError> {
+        self.complete_capture_with_progress(capture_id, None).await
+    }
+
+    async fn complete_capture_with_progress(
+        &self,
+        capture_id: Uuid,
+        progress: Option<&LiveOperationProgressSender>,
+    ) -> Result<LiveSnapshot, LibVmError> {
         let capture = live_id(capture_id)?;
         let deadline = tokio::time::Instant::now() + CAPTURE_WAIT;
         loop {
             // A snapshot capture never retains a local cut to open.
-            let stage = match advance(self.runtime(), self.machine_id(), capture_id, &mut None)
-                .await?
+            let stage = match advance(
+                self.runtime(),
+                self.machine_id(),
+                capture_id,
+                &mut None,
+                progress,
+            )
+            .await?
             {
-                CaptureProgress::Finished(snapshot) => return Ok(*snapshot),
+                CaptureProgress::Finished(snapshot) => {
+                    report_progress(progress, LiveOperationProgress::Done);
+                    return Ok(*snapshot);
+                }
                 CaptureProgress::Local => {
                     return Err(capture_error(
                         &capture,
@@ -1070,6 +1093,7 @@ pub(crate) async fn advance(
     machine_id: MachineId,
     capture_id: Uuid,
     retained: &mut Option<crate::store::fork::AuthenticatedCutDisks>,
+    progress: Option<&LiveOperationProgressSender>,
 ) -> Result<CaptureProgress, LibVmError> {
     let snapshots = snapshot_store(runtime)?;
     let record = snapshots
@@ -1121,7 +1145,7 @@ pub(crate) async fn advance(
         CaptureState::Published { .. } | CaptureState::Local { .. }
     ) && coherent_record(runtime, &record)?.is_some()
     {
-        if let Some(disks) = retain_or_publish(runtime, &snapshots, &record).await? {
+        if let Some(disks) = retain_or_publish(runtime, &snapshots, &record, progress).await? {
             *retained = Some(disks);
         }
         snapshots
@@ -1139,7 +1163,31 @@ pub(crate) async fn advance(
     let monitor = match &liveness {
         RunLiveness::Alive(observation) => {
             match observe_capture(&machine, observation, &record.plan.capture_id).await? {
-                MonitorCapture::Observed(observed) => Some(observed),
+                MonitorCapture::Observed(observed) => {
+                    if let Some(progress) = progress {
+                        if let Some(activity) = observed
+                            .activity
+                            .as_ref()
+                            .filter(|activity| activity.operation_id == record.plan.capture_id)
+                        {
+                            progress.send(activity.stage.into());
+                        } else if matches!(observed.operation.outcome, OperationOutcome::InProgress)
+                            && observed.capture.as_ref().is_some_and(|capture| {
+                                matches!(
+                                    capture.continuation,
+                                    CaptureContinuation::Resumed { .. }
+                                        | CaptureContinuation::Preserved { .. }
+                                        | CaptureContinuation::ResumeFailed { .. }
+                                )
+                            })
+                        {
+                            // Post-continuation identity stages are traced but
+                            // deliberately absent from monitor lifecycle activity.
+                            progress.send(LiveOperationProgress::ComputingDiskIdentity);
+                        }
+                    }
+                    Some(observed)
+                }
                 MonitorCapture::NotFound if published => None,
                 MonitorCapture::NotFound => {
                     let releasing=runtime.native_store()?.pending_live_commands(record.machine_id,record.run_id,&observation.report().monitor_id).await?.into_iter().any(|retained| matches!(retained.intent.command,LiveCommand::ReleaseCapture(command) if command.operation_id==record.plan.capture_id && command.disposition==CaptureReleaseDisposition::Abandoned));
@@ -1218,7 +1266,7 @@ pub(crate) async fn advance(
         ));
     }
     if !published {
-        if let Some(disks) = retain_or_publish(runtime, &snapshots, &record).await? {
+        if let Some(disks) = retain_or_publish(runtime, &snapshots, &record, progress).await? {
             *retained = Some(disks);
         }
     }
@@ -1476,7 +1524,15 @@ pub(crate) async fn reconcile_captures(
     for record in snapshots.pending_captures(machine).await? {
         // Reconciliation never opens a fork cut; a fork whose own loop is not
         // running here later authenticates its cut disks again.
-        match advance(runtime, record.machine_id, record.capture_id, &mut None).await {
+        match advance(
+            runtime,
+            record.machine_id,
+            record.capture_id,
+            &mut None,
+            None,
+        )
+        .await
+        {
             Ok(CaptureProgress::Pending(stage)) => {
                 tracing::debug!(capture = %record.capture_id, stage, "capture remains owned by its run");
             }
@@ -1507,6 +1563,7 @@ async fn retain_or_publish(
     runtime: &Runtime,
     snapshots: &SnapshotStore,
     record: &CaptureRecord,
+    progress: Option<&LiveOperationProgressSender>,
 ) -> Result<Option<crate::store::fork::AuthenticatedCutDisks>, LibVmError> {
     if runtime
         .native_store()?
@@ -1517,6 +1574,7 @@ async fn retain_or_publish(
         let (_, disks) = snapshots.retain_local_capture(record.capture_id).await?;
         return Ok(disks);
     }
+    report_progress(progress, LiveOperationProgress::Publishing);
     snapshots
         .publish_capture(
             record.capture_id,

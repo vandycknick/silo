@@ -119,6 +119,34 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
+/// Keep user-controlled names in the message, never in the spinner template.
+pub(crate) fn live_operation_progress_words(
+    stage: &libvm::LiveOperationProgress,
+    source: &str,
+) -> (&'static str, String) {
+    use libvm::LiveOperationProgress;
+
+    match stage {
+        LiveOperationProgress::Admitting => ("Admitting", source.into()),
+        LiveOperationProgress::PausingSource => ("Pausing", source.into()),
+        LiveOperationProgress::CapturingMemory => ("Capturing memory", String::new()),
+        LiveOperationProgress::CapturingDisks => ("Capturing disks", String::new()),
+        LiveOperationProgress::CapturingExecution => ("Capturing execution", String::new()),
+        LiveOperationProgress::VerifyingCapture => ("Verifying capture", String::new()),
+        LiveOperationProgress::FinalizingCapture => ("Finalizing capture", String::new()),
+        LiveOperationProgress::ResumingSource => ("Resuming", source.into()),
+        LiveOperationProgress::PreservingSource => ("Leaving paused", source.into()),
+        LiveOperationProgress::ComputingDiskIdentity => ("Hashing disk", String::new()),
+        LiveOperationProgress::Publishing => ("Publishing snapshot", String::new()),
+        LiveOperationProgress::PreparingChildStorage => ("Preparing child storage", String::new()),
+        LiveOperationProgress::StartingChild { index, total, name } => {
+            ("Starting child", format!("{index} of {total}: {name}"))
+        }
+        LiveOperationProgress::WaitingForAgent => ("Waiting for agent", String::new()),
+        LiveOperationProgress::Done => ("Done", String::new()),
+    }
+}
+
 pub fn print_json(value: &impl Serialize) -> eyre::Result<()> {
     write_json(&mut std::io::stdout().lock(), value)
 }
@@ -927,6 +955,50 @@ mod tests {
     use libvm::ImageProgress;
 
     use crate::ui::{relative_time, short_id, with_delayed_spinner, PullProgressDisplay};
+    #[test]
+    fn live_progress_words_describe_each_stage_without_changing_names() {
+        use crate::ui::live_operation_progress_words;
+        use libvm::LiveOperationProgress as Progress;
+
+        for (stage, expected_label, expected_target) in [
+            (Progress::Admitting, "Admitting", "archy"),
+            (Progress::PausingSource, "Pausing", "archy"),
+            (Progress::CapturingMemory, "Capturing memory", ""),
+            (Progress::CapturingDisks, "Capturing disks", ""),
+            (Progress::CapturingExecution, "Capturing execution", ""),
+            (Progress::VerifyingCapture, "Verifying capture", ""),
+            (Progress::FinalizingCapture, "Finalizing capture", ""),
+            (Progress::ResumingSource, "Resuming", "archy"),
+            (Progress::PreservingSource, "Leaving paused", "archy"),
+            (Progress::ComputingDiskIdentity, "Hashing disk", ""),
+            (Progress::Publishing, "Publishing snapshot", ""),
+            (
+                Progress::PreparingChildStorage,
+                "Preparing child storage",
+                "",
+            ),
+            (
+                Progress::StartingChild {
+                    index: 2,
+                    total: 4,
+                    name: "child {two}".into(),
+                },
+                "Starting child",
+                "2 of 4: child {two}",
+            ),
+            (Progress::WaitingForAgent, "Waiting for agent", ""),
+            (Progress::Done, "Done", ""),
+        ] {
+            assert_eq!(
+                live_operation_progress_words(&stage, "archy"),
+                (expected_label, expected_target.to_owned()),
+            );
+        }
+        assert_eq!(
+            live_operation_progress_words(&Progress::PausingSource, ""),
+            ("Pausing", String::new()),
+        );
+    }
 
     #[cfg(unix)]
     #[test]

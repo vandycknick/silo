@@ -7,6 +7,9 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::machine::live_operations::{
+    report_progress, LiveOperationProgress, LiveOperationProgressSender,
+};
 use crate::machine::root_storage::invalid;
 use crate::paths::OwnedDirectory;
 use crate::runtime::boot_assets::{
@@ -324,11 +327,23 @@ impl Runtime {
         &self,
         reference: SnapshotRef,
         options: RestoreOptions,
+        progress: Option<LiveOperationProgressSender>,
     ) -> Result<Machine, LibVmError> {
+        report_progress(progress.as_ref(), LiveOperationProgress::Admitting);
         let runtime = self.clone();
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            handle.block_on(restore_owned(runtime, reference, options, false))
+            let result = handle.block_on(restore_owned(
+                runtime,
+                reference,
+                options,
+                false,
+                progress.as_ref(),
+            ));
+            if result.is_ok() {
+                report_progress(progress.as_ref(), LiveOperationProgress::Done);
+            }
+            result
         })
         .await?
     }
@@ -350,6 +365,7 @@ impl Runtime {
                     ..RestoreOptions::default()
                 },
                 true,
+                None,
             ))
         })
         .await?
@@ -1260,6 +1276,7 @@ async fn restore_owned(
     reference: SnapshotRef,
     options: RestoreOptions,
     recovery: bool,
+    progress: Option<&LiveOperationProgressSender>,
 ) -> Result<Machine, LibVmError> {
     runtime.require_recoverable_child_scopes()?;
     if let Some(name) = &options.name {
@@ -1274,7 +1291,10 @@ async fn restore_owned(
     if recovery {
         require_live_recovery(&preview)?;
     } else if matches!(preview.capture, SnapshotCaptureKind::LiveExecution { .. }) {
-        return crate::machine::restore::restore_owned(runtime, reference, options, preview).await;
+        return crate::machine::restore::restore_owned(
+            runtime, reference, options, preview, progress,
+        )
+        .await;
     }
     if options.activation_hook.is_some() {
         return Err(invalid(
@@ -1288,6 +1308,7 @@ async fn restore_owned(
         storage_from_snapshot(&preview)?
     };
     runtime.preflight_captured_lane(&preview_storage, CaptureLane::Stopped)?;
+    report_progress(progress, LiveOperationProgress::PreparingChildStorage);
     let _names = runtime.lock_machine_names().await?;
     let name =
         crate::machine::builder::stopped_child_name(&runtime, options.name.as_deref()).await?;
@@ -1722,6 +1743,7 @@ mod tests {
                     name: Some("refused-restore".into()),
                     ..Default::default()
                 },
+                None,
             )
             .await;
         for result in [fork, restore] {

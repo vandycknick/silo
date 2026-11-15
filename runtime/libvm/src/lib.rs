@@ -38,6 +38,9 @@ pub use crate::machine::live_fork::{
     ForkSourceOutcome, ForkStage, LiveForkChild, LiveForkOptions, LiveForkResult,
     DEFAULT_LIVE_FORK_MAX_CHILDREN,
 };
+pub use crate::machine::live_operations::{
+    LiveOperationProgress, LiveOperationProgressReceiver, LiveOperationProgressSender,
+};
 pub use crate::machine::{
     preflight_recover_checkpoint_disks, preflight_restore_snapshot, preflight_stopped,
     validate_new_machine_name, ExternalResourceKey, ExternalResourceMapping,

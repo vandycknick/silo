@@ -116,7 +116,7 @@ impl w::machine_service_server::MachineService for Service {
                 let snapshot = state
                     .machine(&reference)
                     .await?
-                    .snapshot_live(&observation, options)
+                    .snapshot_live(&observation, options, None)
                     .await
                     .map_err(native)?;
                 silo_vm_control::capture::live_snapshot_to_wire(&snapshot).map_err(conversion)
@@ -143,7 +143,7 @@ impl w::machine_service_server::MachineService for Service {
                 let result = state
                     .machine(&reference)
                     .await?
-                    .fork_live(&observation, options)
+                    .fork_live(&observation, options, None)
                     .await
                     .map_err(native)?;
                 silo_vm_control::fork::result_to_wire(&result).map_err(conversion)

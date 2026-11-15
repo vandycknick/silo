@@ -1,6 +1,7 @@
 use crate::context::Context;
 use crate::ui::{self, OutputFormat, Spinner, Table};
 use clap::{Args, Subcommand};
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 const EXACT_BYTES_WARNING: &str = "Copies exact storage bytes, including credentials, guest keys, dirty journals and deleted-data remnants. No sanitization, journal replay, implicit stop or implicit start is performed. External resources require explicit policy. Layered snapshots retain their authenticated immutable composition and exact writable upper.";
@@ -157,17 +158,18 @@ impl Snapshot {
                 } else {
                     vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired
                 };
-                let snapshot = api
-                    .snapshot_live(
-                        &machine,
-                        libvm::LiveSnapshotOptions {
-                            name,
-                            resume_policy,
-                            policy: capture.policy(),
-                            dirty_crossover_percent: capture.crossover(),
-                        },
-                    )
-                    .await?;
+                let (progress, stages) = libvm::LiveOperationProgressSender::default_channel();
+                let operation = api.snapshot_live(
+                    &machine,
+                    libvm::LiveSnapshotOptions {
+                        name,
+                        resume_policy,
+                        policy: capture.policy(),
+                        dirty_crossover_percent: capture.crossover(),
+                    },
+                    Some(progress),
+                );
+                let snapshot = feedback.during(operation, stages, &machine).await?;
                 let elapsed = feedback.finish();
                 match self.format {
                     OutputFormat::Json => ui::print_json(&snapshot)?,
@@ -434,7 +436,9 @@ impl Fork {
                     "Forking",
                     format!("{machine} (capture and child activation)"),
                 );
-                let result = match api.fork_live(&machine, options).await {
+                let (progress, stages) = libvm::LiveOperationProgressSender::default_channel();
+                let operation = api.fork_live(&machine, options, Some(progress));
+                let result = match feedback.during(operation, stages, &machine).await {
                     Ok(result) => result,
                     Err(error) => {
                         if !fork_rejected_before_acceptance(&error)
@@ -613,7 +617,9 @@ impl Restore {
             "Restoring",
             format!("{} (disks and activation)", self.checkpoint),
         );
-        let machine = api.restore_snapshot(&self.checkpoint, options).await?;
+        let (progress, stages) = libvm::LiveOperationProgressSender::default_channel();
+        let operation = api.restore_snapshot(&self.checkpoint, options, Some(progress));
+        let machine = feedback.during(operation, stages, &self.checkpoint).await?;
         let readiness = if machine.status.is_running() {
             feedback.step("Waiting for agent", &machine.name);
             wait_machine_ready(api, &machine.id).await
@@ -1299,6 +1305,30 @@ impl OperationFeedback {
         self.spinner.step(label, target);
     }
 
+    async fn during<T, E>(
+        &mut self,
+        operation: impl Future<Output = Result<T, E>>,
+        mut stages: libvm::LiveOperationProgressReceiver,
+        source: &str,
+    ) -> Result<T, E> {
+        tokio::pin!(operation);
+        let mut open = true;
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut operation => return result,
+                stage = stages.recv(), if open => {
+                    if let Some(stage) = stage {
+                        let (label, target) = ui::live_operation_progress_words(&stage, source);
+                        self.step(label, target);
+                    } else {
+                        open = false;
+                    }
+                }
+            }
+        }
+    }
+
     fn finish(self) -> Duration {
         self.spinner.finish_clear();
         self.started.elapsed()
@@ -1825,6 +1855,28 @@ mod tests {
     use crate::commands::Command;
     use clap::Parser;
     use vm_spec::lifecycle::CaptureResumePolicy;
+
+    #[tokio::test]
+    async fn live_feedback_preserves_results_when_progress_closes() {
+        use crate::commands::live::OperationFeedback;
+        use crate::ui::OutputFormat;
+
+        let mut feedback = OperationFeedback::new(OutputFormat::Json, "Admitting", "archy");
+        let (progress, stages) = libvm::LiveOperationProgressSender::default_channel();
+        progress.send(libvm::LiveOperationProgress::CapturingMemory);
+        drop(progress);
+        let result = feedback
+            .during(
+                async {
+                    tokio::task::yield_now().await;
+                    Err::<(), _>("retained original operation error")
+                },
+                stages,
+                "archy",
+            )
+            .await;
+        assert_eq!(result, Err("retained original operation error"));
+    }
 
     const OPERATION: &str = "00000000-0000-4000-8000-0000000000aa";
 

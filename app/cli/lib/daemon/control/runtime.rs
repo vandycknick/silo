@@ -286,7 +286,7 @@ impl w::runtime_service_server::RuntimeService for Service {
                 let machine = state
                     .runtime()
                     .await?
-                    .restore_snapshot(reference, options)
+                    .restore_snapshot(reference, options, None)
                     .await
                     .map_err(native)?;
                 silo_vm_control::snapshots::snapshot_to_wire(
