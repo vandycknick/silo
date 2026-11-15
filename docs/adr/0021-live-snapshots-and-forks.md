@@ -75,6 +75,13 @@ transaction. Existing same-identity streams avoid scanning only with a matching
 both warm and composition receipts; its stream-chunk and state-object diagnostics
 are defined under On-demand verification below.
 
+The Phase 30 wave-two amendment records persistent `IdentityPending` cuts and
+post-continuation reflink disk identity completion, with exact native-pause
+timing rather than charging post-resume work to interruption. It also records
+the implemented sparse zero-run handling and the limited pagemap-backed full
+capture optimization; other backing types and unavailable pagemap metadata
+still require full reads, and swapped/huge-page cases are not separately qualified.
+
 ## The Problem
 
 [ADR 0014](0014-layered-oci-image-storage.md) gives Silo snapshots and forks of **stopped** machines: a machine's
@@ -130,7 +137,7 @@ deliberately onto Silo's fork, not adopted by changing a dependency revision.
 
 ## Representative Flow
 
-A fork of a running machine into two children, with the source resumed:
+A fork of a running machine into two children on the reflink lane, with the source resumed:
 
 ```mermaid
 sequenceDiagram
@@ -149,9 +156,11 @@ sequenceDiagram
     S->>S: flush writable disks, clone or copy each into staging
     S->>W: CaptureExecution, then CaptureMemory(full or delta)
     W-->>S: execution.state, devices.state, memory.ram sealed
-    S->>S: fsync staging, write vm.capture.json (coherent)
+    S->>S: write vm.capture-cut.json (IdentityPending, not a seal)
+    S->>W: AcceptCapture (retain sealed RAM baseline)
     S->>W: Resume(token) with clock-only request
     S->>G: re-handshake transport, then Thaw(captureId)
+    S->>S: capture-disk-identity on immutable clones, then vm.capture.json
     S-->>L: capture coherent, source running
     L->>L: verify, chunk, publish checkpoint, pin RAM inode
     loop child 1 and child 2
@@ -219,9 +228,11 @@ separately admitted profile with its own compatibility contract.
 1. A capture binds execution state, device state, RAM and every included
    writable disk to one pause token. An artifact that cannot prove the
    binding is not a checkpoint.
-2. Disks are sealed before memory is captured and before any source write is
-   admitted. Nothing replays, repairs or flattens a sealed disk between the
-   cut and the restore that loads its matching RAM.
+2. Writable disks have immutable private clones or copies before memory is
+   captured and before any source write is admitted. Reflink disk identities
+   may complete after source continuation, but every identity is complete before
+   the final seal or a child restore. Nothing replays, repairs or flattens a
+   captured disk between the cut and the restore that loads its matching RAM.
 3. A restored machine executes its first guest instruction only after memory,
    execution and device state are installed into a freshly constructed VM.
    The cold-boot path never runs; no initramfs extraction, no agent
@@ -286,8 +297,8 @@ dropped.
 
 | Component | Owns | Never does |
 | --- | --- | --- |
-| libvm | Operation records, locks and leases; budgets and admission; the live capability vector and early rejection; staging roles; verification, chunking and publication of checkpoints; child allocation; database reconciliation; N-way fork orchestration. | Touches hypervisor state; reads worker files before the monitor has sealed them; converts an unsupported live operation into another operation. |
-| `silo-vmm` (monitor) | Host capability query without a machine; machine `live` vector in status; live commands on `vm.sock`; guest freeze and thaw; worker pause and capture commands; disk flush and clone/copy into named staging; `vm.capture.json`; restore launch of a fresh worker; activation sequencing. | Opens the database; chooses output paths; declares success it did not observe. |
+| libvm | Operation records, locks and leases; budgets and admission; the live capability vector and early rejection; staging roles; verification, chunking and publication of checkpoints; child allocation; database reconciliation; N-way fork orchestration; identity completion from a retained cut after positive monitor/worker termination. | Touches hypervisor state; reads staged payloads with live writers; completes identities while a live monitor still owns capture; converts an unsupported live operation into another operation. |
+| `silo-vmm` (monitor) | Host capability query without a machine; machine `live` vector in status; live commands on `vm.sock`; guest freeze and thaw; worker pause and capture commands; disk flush and clone/copy into named staging; `vm.capture-cut.json` and `vm.capture.json`; restore launch of a fresh worker; activation sequencing. | Opens the database; chooses output paths; declares success it did not observe. |
 | krun worker | Pause linearization; device quiescence; execution, device and RAM capture and restore through the libkrun capture ABI; dirty tracking and baselines; VM generation device. | Opens files outside its named inputs; resumes without the exact token. |
 | Guest init and agent | Workload freezer; `FreezeWorkloads`, `Activate` and `Thaw` RPCs; identity rotation after the VM generation acknowledgement; one-shot network reapplication. | Flushes or repairs filesystems as part of capture; runs the workload before `Thaw`. |
 | Guest kernel (Silo build) | The VM generation driver that reseeds the kernel RNG and acknowledges the new identity; cgroup freezer. | Binds the device without acknowledging the exact sequence. |
@@ -296,12 +307,12 @@ dropped.
 
 A pause has an **owner**, carried in the token. A pause established by the
 public `Pause` command is owned by `user`. A pause established by a capture
-is owned by that capture while the capture is in progress; at the seal the
-ownership either returns to the capture for its own resume
-(`resume-if-acquired`) or transfers to `user` (`preserve`). Outside
-`Capturing`, therefore, every `Paused` machine is user-owned and resumable
-through the public `Resume`. A token is consumed by the resume that names it;
-a later pause issues a new token.
+is owned by that capture until source continuation: the capture either resumes
+its exact token (`resume-if-acquired`) or transfers ownership to `user`
+(`preserve`), possibly before disk identities and the final seal complete.
+A borrowed user pause remains user-owned. A preserved `Paused` source is
+resumable through public `Resume` only after the capture settles. A token is
+consumed by the resume that names it; a later pause issues a new token.
 
 `Pause` is a monitor operation on a `Running` machine for an exact run ID. It
 proceeds in order:
@@ -371,16 +382,26 @@ live activity, last live error, machine/run identity and pending resume request
 
 | State | Admitted commands | Rejected commands |
 | --- | --- | --- |
-| `Running` | `Pause`, `Capture`, `GetOperation`, `ReleaseCapture`, stop | `Resume`, `CancelOperation` |
+| `Running` | `Pause`, `Capture`, `GetOperation`, `ReleaseCapture`, stop; identity-pending exception below | `Resume`, `CancelOperation` except the exact identity-pending capture |
 | `Pausing` | `GetOperation`, `CancelOperation` (the pause), stop | `Pause`, `Capture`, `Resume`, `ReleaseCapture` |
-| `Paused` | `Resume`, `Capture` (borrows the pause; `resumePolicy` must be `preserve`), `GetOperation`, `ReleaseCapture`, stop | `Pause`, `CancelOperation` |
+| `Paused` | `Resume`, `Capture` (borrows the pause; `resumePolicy` must be `preserve`), `GetOperation`, `ReleaseCapture`, stop; identity-pending exception below | `Pause`, `CancelOperation` except the exact identity-pending capture |
 | `Capturing` | `GetOperation`, `CancelOperation` (the capture), stop | `Pause`, `Resume`, `Capture`, `ReleaseCapture` |
 | `Restoring`, `Activating` | `GetOperation`, stop | everything else |
 | `ActivationFailed` | `GetOperation`, `ReleaseCapture`, stop | everything else; a new restore is the retry |
 | `Error` | `GetOperation`, `ReleaseCapture`, stop | everything else |
 
-This table is the single source of admission; the operation table below
-repeats none of it.
+This table and the following phase-specific exception are the single source of
+admission; the operation table below does not replace them.
+
+While an `IdentityPending` capture's source is `Running`, new sessions are
+admitted, but new `Pause`, `Resume` and `Capture` commands for that run remain
+fenced until capture settles. A user pause is refused during this window, a
+known limit even though public state is `Running`. A preserved source stays
+`Paused` with the same lifecycle fence. `CancelOperation` is admitted from
+`Running` or `Paused` only for that exact identity-pending capture, as decided by
+the monitor journal; libvm routes such cancellation to the monitor rather than
+rejecting it solely by public state. Other cancellation targets keep their
+existing rejection.
 
 Stop in `Capturing` cancels an unsealed capture and finalizes; after the seal
 it preserves the sealed result and finalizes. Stop in `Paused` finalizes
@@ -525,14 +546,17 @@ A capture runs in this order; each step completes before the next begins:
    capture that borrows a user pause must carry `resumePolicy: preserve`.
    The freeze is itself captured: a restored child's workload is frozen until
    the destination thaws it.
-2. **Seal disks.** The worker completes outstanding block requests and
-   flushes every writable backing file. The monitor then creates one
-   immutable raw clone or copy of each included writable disk into the named
-   staging role, using [ADR 0014](0014-layered-oci-image-storage.md)'s qualified copy hierarchy.
-   Staged copies close without synchronization; checkpoint publication or child
-   durability barriers provide persistence. Read-only attachments (the lower,
-   boot assets) are recorded by identity, not copied. A clone or copy failure on any disk fails the whole
-   capture; no partial multi-disk cut is ever published.
+2. **Cut disks.** The worker completes outstanding block requests and flushes
+   every writable backing file. The monitor creates one immutable private raw
+   clone or copy per included writable disk using
+   [ADR 0014](0014-layered-oci-image-storage.md)'s qualified copy hierarchy.
+   On reflink filesystems this in-pause disk step is flush, clone and recording
+   ownership facts only: no extent walk, map construction or hashing. Without
+   reflinks the copy and inline hashing remain inside the pause. Staged files
+   close without synchronization; checkpoint publication or child durability
+   barriers provide persistence. Read-only attachments (lower and boot assets)
+   are recorded by identity, not copied. Any clone or copy failure fails the
+   whole capture; no partial multi-disk checkpoint is published.
 3. **Capture execution and devices.** The worker serializes transport, queue
    and device-specific state for every device, then the vCPU and VM
    execution envelope (registers, extended state, interrupt controller,
@@ -541,55 +565,67 @@ A capture runs in this order; each step completes before the next begins:
 4. **Capture memory.** Full, or incremental against a valid baseline. The
    worker freezes host writers, harvests dirty coverage, and pipelines RAM reads
    through bounded 32 MiB packs to two hash/write workers (96 MiB pack scratch).
-   Identity remains the ordered 8 MiB chunk map; pipelining changes neither
-   sparse-zero semantics nor the coherent cut. Full capture skips never-touched
-   RAM; its work follows touched bytes, not configured capacity. Workers join
-   before capture returns, including on cancellation or failure. A
-   changed-to-zero page is recorded as an explicit zero range: a hole with a
-   format-level zero marker, never an inherit-from-baseline hole. Zero chunks
-   are never hashed or stored.
-5. **Record.** The staged digests are computed while the bytes are written:
-   the worker hashes each nonzero affected RAM chunk as it streams it. Disk
-   identities follow changed written bytes and accompany the seal through
-   publication; a qualified reflink carries identity without a reread, and a
-   required non-reflink copy hashes inline. No staged file is read back to be
-   verified. The monitor closes every writer, writes `vm.capture.json` to a
-   private `.vm.capture.json.tmp` file in the capture directory, links the
-   final name without replacement, then unlinks the temporary name. If the
-   monitor dies between link and unlink, libvm settles only that exact
-   two-name inode under the operation's publisher lock and checked capture
-   lease, before checkpoint publication or local fork-cut retention. Both
-   names must be private regular files in the same owned staging directory
-   with matching device/inode and exactly two links; any foreign extra link
-   is refused without removing names. After settlement the seal, like every
-   other control record, must pass ordinary singleton validation. The
-   monitor's own bounded settlement retry applies the same exact-pair rule.
-   The monitor synchronizes nothing: durability belongs to libvm, at publication
-   for a named checkpoint and in each child's background barrier for a fork.
-   A capture is **recorded** when `vm.capture.json` with `captureOutcome:
-   coherent` and all seven facts true exists; a record with `captureOutcome:
-   failed` is written the same way for diagnosis and is not a coherent
-   record. The recorded inventory (every staged file named in
-   `vm.capture.json`) and the record itself never change afterwards; the
-   continuation record of step 6 is the only file added to the directory
-   after the record. A host crash before libvm has published (checkpoint) or
-   made every child durable (fork) loses that capture and nothing else; the
-   source continues or is recovered by its own rules. Elsewhere in this
-   document "sealed" means "recorded" in this sense.
-6. **Continue the source.** Under `resumePolicy: resume-if-acquired` the
-   capture owns the pause: the worker accepts the new baseline and resumes
-   the exact token, the monitor re-handshakes the agent and sends `Thaw`.
-   Under `preserve` the source stays paused with its workload frozen and
-   ownership of the pause transfers to `user`; the monitor issues the
-   user-owned token and reports it through status and `GetOperation`. The
-   monitor records the continuation in
-   `vm.capture-source.json`, written atomically without synchronization,
-   with version, `machineId`, `runId`, `captureId`, the pause token and
-   `sourceOutcome`: `resumed`, `preserved` or `resume-failed` with an error.
-   A missing record while the run is alive means the continuation is
-   unfinished and `GetOperation` is authoritative; a missing record after the
-   run has ended means `unknown`. libvm never re-issues a resume because the
-   record is absent; it reconciles against the monitor's actual state.
+   Identity remains the ordered 8 MiB chunk map. Eligible private anonymous boot
+   RAM uses cut-bound pagemap metadata to skip known-zero pages; all other
+   backing and metadata fallbacks read in full, as specified under Memory Model.
+   Workers join before return, including on cancellation or failure.
+   Changed-to-zero runs are explicit logical zeros, never baseline inheritance:
+   omit them on a rebuilt sparse output, punch them on a reflink seed, and write
+   zeros only when punching is unsupported. Zero chunks use format markers,
+   without hashing or storing zero chunk objects.
+5. **Record a pending cut.** If reflink disk identities remain, the monitor
+   writes `vm.capture-cut.json` in phase `IdentityPending`, with the clone
+   fingerprints, partial inventory and `disk_copies_sealed = false`, before
+   accepting the sealed RAM baseline or continuing the source. This persistent
+   process-crash recovery record is never a seal. It is not synchronized or
+   power-loss durable.
+6. **Accept RAM and continue once.** On the deferred-identity lane the worker
+   accepts the sealed RAM baseline, then under `resume-if-acquired` resumes the
+   exact capture token; the monitor re-handshakes the agent and sends `Thaw`.
+   A borrowed user pause or explicit `--preserve` leaves the source paused with
+   its workload frozen; an acquired preserved token transfers to `user`.
+   Continuation is recorded and public `Running` admits sessions while the
+   capture's lifecycle fence remains. If no identities were deferred, baseline
+   acceptance and continuation remain after the final seal in step 8.
+7. **Complete disk identities.** At stage `capture-disk-identity`, the monitor
+   reads the immutable clones, discovers extents and computes their complete
+   chunk maps, checking their retained fingerprints before and after. This is
+   post-continuation seal latency, not pause time on a resumed source.
+   Preserved sources remain paused by policy. Fork children still wait for
+   these complete identities; neither the cut record nor an incomplete map is
+   restore authority.
+8. **Seal.** The worker computes nonzero RAM chunk digests during capture;
+   non-reflink disk copies hash inline, and deferred clone identities come from
+   step 7. Publication carries those identities without another payload pass.
+   With every writer closed and every identity complete, the monitor writes
+   `vm.capture.json` through private `.vm.capture.json.tmp`, links the final
+   name without replacement and unlinks the temporary. Its schema is unchanged.
+   If the monitor dies between link and unlink, libvm settles only that exact
+   two-name inode under the publisher lock and checked capture lease before
+   publication or local fork-cut retention. Both names must be private regular
+   files in the same owned staging directory, with matching device/inode and
+   exactly two links; foreign extra links are refused without removal. The
+   monitor retries settlement once. Every settled control record must pass
+   ordinary singleton validation.
+
+The monitor synchronizes no staging files or records. Durability belongs to
+libvm at named-checkpoint publication and each fork child's barrier. A cut
+survives a monitor or manager process crash when its retained bytes remain;
+power loss before publication or child durability is not acknowledged capture
+success, and recovery discards that interrupted capture. A capture is sealed
+only when `vm.capture.json` has `captureOutcome: coherent` and all seven facts
+true. A failed diagnostic record is not a seal. Final evidence and its complete
+inventory never change afterwards.
+
+The monitor records source continuation in `vm.capture-source.json`, atomically
+without synchronization, with version, `machineId`, `runId`, `captureId`, pause
+token and `sourceOutcome`: `resumed`, `preserved` or `resume-failed` with an
+error. On the deferred lane this precedes the final seal; on the copy-only lane
+it follows it. An unfinished live run uses `GetOperation` as authority; a missing
+source record after the run ends means `unknown`. libvm never resumes because
+the record is absent. Failure or cancellation after baseline acceptance retains
+that baseline, and native `ReleaseCapture` reports `baseline_retained = true`;
+continuation is never repeated and no later incremental dependency is removed.
 
 ### Evidence
 
@@ -601,15 +637,24 @@ inventory of staged output roles with sizes and SHA-256 digests, capture
 timestamps, `captureOutcome` (`coherent` or `failed`), an error string or
 null, and these booleans: `workloadsFrozen`, `vcpusPaused`, `devicesQuiesced`,
 `hostWritersDrained`, `hostFlushCompleted`, `diskCopiesSealed`,
-`memoryStateSealed`. Each boolean records a positively observed fact. A false,
-missing or malformed field cannot yield `coherent`. The record is versioned by
-addition only.
+`memoryStateSealed`. Each boolean records a positively observed fact. All seven
+must be true for a final coherent seal; false, missing or malformed facts refuse
+that seal. The final record schema remains version 1, unchanged by deferred identity.
 
 A coherent seal retains the original guest freeze reference for restore after
 source deletion. An acquired pause uses the capture ID as `freezeOperationId`;
 a borrowed user pause retains its original pause operation ID, not the new
 capture ID. Restore authenticates this reference from the seal and does not
 depend on the source's request file.
+
+`vm.capture-cut.json` is a separate persistent recovery record, not an earlier
+version of the seal. Its `IdentityPending` phase binds the same plan, pause and
+RAM evidence, clone device/inode/length/mode/ctime fingerprints, and an inventory
+omitting pending disk and map roles. `disk_copies_sealed` remains false until
+identities complete. Recovery after positive monitor/worker termination completes
+identities from those retained clones without any VM operation, validates the
+complete inventory and writes the final seal last. It never reports a pending
+cut as sealed. No power-loss durability is claimed for this staging record.
 
 ### Incremental capture
 
@@ -640,13 +685,22 @@ to a full capture is 60 percent dirty coverage; the operation may lower it.
 
 On CoW lanes, incremental RAM capture seeds a fresh private output by reflink
 from the exact retained immutable baseline and overlays only dirty runs.
-Changed-to-zero runs punch holes and carry explicit format-level zero markers;
-they never inherit old baseline bytes. Zero chunks are neither hashed nor
-stored. Every lane must produce the same complete RAM bytes and chunk identity
-without a configured-RAM scan. The former complete baseline rebuild is not an
-exception to changed-byte scaling, and no baseline copy is prepared before
-pause. `CaptureMemoryStats.seedMethod` records `clone` or `rebuild`; those
-labels do not relax the scaling invariant.
+Changed-to-zero runs punch the private seeded output, never the baseline; on a
+rebuilt sparse output they are omitted, and only unsupported punching falls
+back to physically writing zeros. The resolved image and format-level zero
+markers mean explicit zero, never inheritance. Zero chunks are neither hashed
+nor stored as chunk objects.
+
+The non-reflink lane still rebuilds from populated baseline extents and overlays
+dirty runs; this is implemented behavior, not proof of changed-byte scaling on
+every lane. No baseline copy is prepared before pause.
+`CaptureMemoryStats.seedMethod` records `clone` or `rebuild`.
+`zero_run_bytes_covered` counts successfully omitted, punched or written zero
+runs, `zero_bytes_punched` counts deallocated bytes of the seeded output, and
+`known_zero_bytes_skipped` counts live bytes not read under cut-bound pagemap
+proof. `explicit_zero_bytes_written` counts only physically written zeros,
+including zero bytes inside mixed overlay writes, not omitted or punched runs.
+The serialized `CaptureMemoryStats` fields use camelCase.
 
 A restored machine seeds its own baseline from the immutable RAM file it was
 restored from and arms tracking before any restore-time write, so a
@@ -676,6 +730,21 @@ The separate fast same-host fork mode below admits source-child sharing.
 The worker never forks its own process to clone a VM; a child is always a
 fresh hypervisor VM in a fresh process that installs saved state before its
 first instruction.
+
+### Full-capture read coverage
+
+On Linux, full capture of private anonymous boot RAM reads only pages marked
+present or swapped by `/proc/self/pagemap` under the held memory cut. Pages with
+neither bit set have known-zero origin and are represented without reading live
+RAM. This optimization requires an owned, private anonymous boot mapping and
+readable, aligned pagemap metadata. Restored, file-backed, shared, unknown and
+explicit huge-page mappings, and unavailable or unreadable pagemap metadata,
+fall back to reading the complete range. The fallback is required for correctness;
+the implementation does not claim untouched-page skipping for every backing.
+
+Incremental discarded dirty pages are still classified by reading their bytes,
+not skipped based on discard history. Swapped and huge-page cases have not been
+separately qualified; their inclusion or fallback is not a qualification claim.
 
 ### Identity and chains
 
@@ -836,10 +905,11 @@ against the host mapping limit with a fixed VMM reserve. At the bound, or on
 never fail the VM or fall back to file-private advice. Status also reports the
 current `replaced_islands` count. These counters are process-local and are not
 captured balloon device state. Reports are drained and quiesced before a
-capture cut. Incremental capture records discarded dirty pages as explicit zero
-ranges with format-level markers and holes, never baseline inheritance; full
-capture may omit zero pages as holes. Zero chunks are never hashed or stored.
-Linux tracked and restored
+capture cut. Incremental capture reads and classifies discarded dirty pages,
+then covers their explicit zero ranges by omission on sparse rebuilds, punching
+seeded output or zero-write fallback when punching is unsupported, never baseline
+inheritance. Full capture may omit zero pages as holes. Zero chunk objects are
+never hashed or stored. Linux tracked and restored
 RAM report effective reclaim with reason `none`. The macOS/HVF inhibition and
 qualification contract above are unchanged.
 
@@ -1340,8 +1410,8 @@ lost any response reads the same answer from `GetOperation`.
 | `Resume` | target operation (the pause or capture that owns the token), pause token | `Running` after clock, transport and thaw barriers; stale or foreign tokens rejected; rejected while a capture is in progress |
 | `Capture` | expected configuration digest, staging roles, policy (`full` or `incremental`), `resumePolicy` (`resume-if-acquired` or `preserve`) | operation receipt; the sealed result is read from `vm.capture.json`, the source outcome from `vm.capture-source.json` |
 | `GetOperation` | target operation | the operation status and result above, the pause token and owner if any, and the actual machine state |
-| `CancelOperation` | target operation | a pause while the machine is `Pausing` (in progress or failed): worker rollback, thaw, fences lifted, `Running` or `Error`; a capture before the seal: abandoned, staging removed, source continued under its `resumePolicy`; any other finished operation: no effect, its status returned |
-| `ReleaseCapture` | target operation | the monitor releases its staging and baseline ownership once libvm has published or abandoned the result; repeated release is idempotent |
+| `CancelOperation` | target operation | Existing pause rollback and pre-seal capture cancellation; an exact `IdentityPending` capture may also be cancelled in `Running` or `Paused` through monitor-journal authority. Already accepted baseline bytes remain retained; source continuation runs at most once. An admitted sealed or terminal target returns its unchanged result without effect. Other targets keep the command/state matrix rejection. |
+| `ReleaseCapture` | target operation | Release capture-result ownership after publication or abandonment, idempotently; an accepted baseline remains retained and is reported with `baseline_retained = true`. |
 
 A command on a machine whose `live` vector marks the operation unsupported
 is rejected with the same typed reason the vector reports; libvm has
@@ -1371,6 +1441,7 @@ captures/<capture-id>/
   execution.state         # versioned native VM and vCPU envelope
   devices.state           # device and transport inventory and payloads
   disks/<role>.raw        # sealed raw captures of writable attachments
+  vm.capture-cut.json     # persistent IdentityPending cut, never a seal
   vm.capture.json         # the monitor's atomic result and evidence
   vm.capture-source.json  # source continuation outcome
 ```
@@ -1389,8 +1460,11 @@ The machine lifecycle gains `Pausing`, `Paused`, `Capturing`, `Restoring`,
 `Running`. Stop is serialized with capture: before the seal it cancels the
 capture and finalizes; after the seal it preserves the sealed result and
 terminates the source. A monitor or worker death never produces positive
-evidence; a crash before the seal leaves no admissible capture, a crash after
-it permits libvm to complete publication from the sealed files.
+evidence by itself. Before a cut or seal exists there is no recoverable capture.
+An `IdentityPending` cut permits libvm, after positive monitor/worker termination,
+to complete identities from retained clones without operating a VM and only then
+write the final seal. A crash after the seal permits ordinary publication from
+the sealed files; no pending cut is reported sealed early.
 
 libvm reconciles `vm.capture.json` by validating run and configuration
 correlation and the structural consistency of the inventory (roles, lengths,
@@ -1500,10 +1574,12 @@ cache assumption, as in [ADR 0014](0014-layered-oci-image-storage.md).
 | Device without provider, unsupported guest, budget exceeded | Typed refusal before freeze; machine unchanged. |
 | Workload freeze incomplete or timed out | Thaw what was frozen, report the frozen set, operation failed, machine stays `Running`. If that thaw fails, machine transitions to `Error`, stays fenced and admits no lifecycle transition but stop. |
 | Worker pause cannot be established | Machine stays fenced in `Pausing` with the operation failed; `GetOperation` reports the partial state; `CancelOperation` returns it to `Running` (or `Error`), stop finalizes; a retry is a new `Pause`. Never reported as `Paused`. |
-| Disk clone or copy fails, `ENOSPC` | Whole capture fails; staging removed; source resumes under its policy. |
+| Disk clone or copy fails, `ENOSPC` | Whole capture fails; only unneeded staging is removed after ownership reconciliation; source continues under its policy. |
 | Execution or memory capture fails | Capture fails; harvested dirties preserved for retry; baseline invalidated if re-arm failed; source resumes under its policy. |
+| Disk identity fails or capture is cancelled after RAM acceptance | Capture fails, but accepted RAM baseline remains retained (`ReleaseCapture` reports `baseline_retained = true`); no second resume and no removal of later incremental dependencies. |
 | Seal written, source resume fails | Capture is valid and publishable; source reports its failure separately; the user decides. |
-| Monitor or worker dies before seal | No capture; libvm removes staging on reconciliation. |
+| Monitor or worker dies before any cut or seal | No capture; libvm removes unneeded staging after ownership reconciliation. |
+| Monitor/worker dies in `IdentityPending` | After positive termination, libvm completes identities from retained clones without VM operations and writes the seal last; the pending cut is never reported sealed early. |
 | Monitor dies after seal | libvm completes publication from sealed files; source generation ends per [ADR 0018](0018-silo-vmm-contract.md). |
 | Restore construction fails | Child attempt destroyed; checkpoint untouched; retry with a new run. |
 | Activation incomplete | Workload stays frozen and fences stay closed; child re-paused into `ActivationFailed`, or killed and reaped if pause fails; never `Running`; retry is a new restore. |
@@ -1533,25 +1609,31 @@ the pause budget never substitutes for total latency. A fork's readiness clock
 ends only when every requested child agent is ready. Exec measures a complete
 command round trip.
 
+The pause interval is exactly pause established to pause released. Workload
+unavailability and pause-to-seal latency are separate diagnostics. Deferred
+post-resume disk identity completion is seal latency, not pause time, and earns
+no pause allowance.
+
 The existing 4 GiB fixture budgets remain gates on the three reference hosts
 named in [ADR 0014](0014-layered-oci-image-storage.md)'s qualification matrix
 (Linux x86_64 on ext4 without reflinks, Linux x86_64 on XFS with reflinks,
 Apple-silicon macOS on APFS). Cold and warm cache are recorded separately as the
 median of five runs with minimum and maximum reported; a budget passes when the
 median meets it. Full capture of a 4 GiB machine with a 1 GiB nonzero upper on
-APFS or reflink-capable Linux has a 5 s workload-interruption gate; incremental
-capture of one contiguous 410 MiB dirty region in a 4 GiB guest (10 percent
-rounded to whole MiB) has a 1 s interruption gate. Restore to agent ready has a
+APFS or reflink-capable Linux has a 5 s pause gate; incremental capture of one
+contiguous 410 MiB dirty region in a 4 GiB guest (10 percent rounded to whole
+MiB) has a 1 s pause gate. Restore to agent ready has a
 2 s gate; a fork of four children to all agents ready has a 10 s gate.
 
 On Linux without reflinks these retained fixture budgets include the
 **non-CoW copy allowance**: the allocated bytes actually written to each
 private upper copy (one for capture, incremental capture or restore, one per
-child for fork) at the host's measured sequential copy rate. The retained
-capture and incremental interruption gates also report the historical
-**disk-sealing allowance**: sealed upper allocated bytes at the host's measured
-sequential SHA-256 rate. Restore and fork-to-agent-ready do not receive this
-allowance; the capture-interruption gate within a fork does. On 2026-11-09,
+child for fork) at the host's measured sequential copy rate. Capture and
+incremental samples retain the historical **disk-sealing allowance** calculation,
+sealed upper allocated bytes at the measured sequential SHA-256 rate, only when
+that identity work is inside the measured pause. Deferred post-resume sealing
+has `includedInInterval = false` and zero pause allowance. Restore and
+fork-to-agent-ready never receive a disk-sealing allowance. On 2026-11-09,
 Btrfs disk sealing alone measured 1.1–1.2 s for the fixture's 2 GiB logical upper
 with 1 GiB payload despite a successful reflink. Raw interruption, both
 allowances and gated excess remain separately reported with measured rates.
@@ -1725,9 +1807,12 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   through forwards and publications is likewise refused before release.
 - **Pause ownership.** A user pause cannot be resumed by a capture operation,
   a capture that borrowed it cannot carry `resume-if-acquired`, `Resume`
-  during `Capturing` is rejected, `CancelOperation` before the seal continues
-  the source under its policy and removes staging, and `CancelOperation` after
-  the seal leaves the sealed result intact.
+  during `Capturing` or while an identity-pending capture owns admission is
+  rejected. During post-resume identity work, sessions succeed but a new user
+  pause is refused; only cancellation of the exact pending capture is admitted
+  from `Running` or `Paused`. Pre-seal cancellation continues the source at most
+  once and preserves any accepted baseline; post-seal cancellation preserves the
+  sealed result.
 - **Network and sessions.** Child MAC, IP and netd reservations agree; queued
   source packets and source addresses do not escape; old TCP, vsock, exec
   sessions and session forwards are not resurrected; machine forwards rebind

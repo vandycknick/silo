@@ -40,6 +40,13 @@ fingerprint-matched reuse of previously verified pool streams. Receipt hits
 avoid lower payload reads on local create, start, restore and fork-child paths;
 they do not weaken import, transport or explicit verification.
 
+Phase 30 wave two moves initial reflink disk identity completion after source
+continuation. The in-pause step records clone ownership without traversing
+extents or hashing; a persistent `IdentityPending` cut precedes RAM acceptance,
+and only complete identities permit the unchanged final seal. This record
+survives process crashes, not power loss; staging durability remains libvm's
+publication responsibility.
+
 ## Implementation status (2026-11-09)
 
 Stages 1–4 are implemented on Linux/libkrun, with `linux-erofs-overlay-v1`
@@ -912,11 +919,14 @@ chunk, without a second whole-file pass. A raw stream's whole-file SHA-256 is
 optional export metadata, not its identity.
 
 For local snapshot, fork and restore disk steps, neither extent discovery nor
-identity construction may walk configured capacity. A qualified reflink carries
-the sealed stream identity in constant time; a required non-reflink copy works
-only on written upper bytes and computes required digests inline. Sealing
-passes its identities through publication without another data pass. The
-general byte-authentication rules above still apply to import, pull, transport,
+identity construction may walk configured capacity. Cloning an already sealed
+stream carries its identity without a payload pass. A fresh live disk clone
+records only ownership facts in the pause; its initial extent walk and identity
+hashing happen after source continuation, before the final seal. A required
+non-reflink copy works only on written upper bytes and computes digests inline
+inside the pause. Sealing then passes identities through publication without
+another data pass. The general byte-authentication rules above still apply to
+import, pull, transport,
 export, handoff and explicit verification; they do not authorize repeated scans
 on trusted local live paths.
 
@@ -960,9 +970,11 @@ Local paths, pause-token values and source run IDs are provenance and
 evidence, never content identity. A sealed disk capture carries exactly the
 stream identity, length and geometry a stopped snapshot of the same bytes
 would; the capture kind does not salt disk identities.
-The seal's stream identity accompanies its qualified clone through local
-publication and child construction. Publication must not reconstruct that
-identity by scanning configured disk length or rereading the sealed payload.
+An initial reflink cut has ownership facts but no disk stream identity yet.
+The monitor completes that identity from the retained immutable clone at
+`capture-disk-identity` after source continuation; fork children wait for the
+complete result. The final seal's identity accompanies its qualified clone
+through publication and child construction without a payload reread.
 
 ### Records and the database
 
@@ -2044,11 +2056,23 @@ An execution checkpoint of a running machine follows [ADR 0021](0021-live-snapsh
 stopped procedure above. For storage, that means: the monitor proves every
 vCPU parked, every device and host-memory writer drained and every writable
 block backend flushed at one pause token; it then creates one immutable
-private raw capture of every included writable attachment, using the
-qualified clone and copy hierarchy, and synchronizes it before any source
-write is admitted. Read-only attachments (the lower, boot assets, platform
-files) are recorded by identity. A clone or copy failure on any attachment
-fails the capture; no partial multi-disk cut is published.
+private raw capture of every included writable attachment using the qualified
+clone and copy hierarchy before any source write is admitted. A reflink records
+ownership facts only, with no in-pause extent walk, map or hash; a non-reflink
+copy hashes inline inside the pause. Staging is not synchronized by the monitor
+or worker. Read-only attachments (lower, boot assets and platform files) are
+recorded by identity. A clone or copy failure fails the whole capture.
+
+If clone identities remain pending, `vm.capture-cut.json` records
+`IdentityPending`, clone fingerprints, a partial inventory and
+`disk_copies_sealed = false` before RAM baseline acceptance and source
+continuation. The source resumes or stays paused under its recorded policy,
+then the monitor hashes the immutable clones and writes the unchanged
+`vm.capture.json` final seal only when every identity is complete. The cut is
+never a seal, and no partial multi-disk checkpoint or fork child is admitted.
+After a monitor/manager process crash, recovery completes identities from
+retained clones without VM operations. No power-loss durability is claimed
+before libvm publication or child durability barriers.
 
 A sealed capture is a copy of the paused view, never the source's file
 relabelled read-only while its backend still writes it. After capture the
@@ -2059,11 +2083,14 @@ execution restore that loads its matching RAM; a sealed disk whose matching
 RAM is not loaded is attached only through the explicit disk-only recovery
 operation, with recovery evidence `unknown`.
 
-On hosts with a qualified clone contract the seal is a constant-time clone
-regardless of written data; elsewhere it copies only bytes actually written to
-the upper while the machine is paused, and the pause includes that copy.
-Configured disk capacity does not affect either path. The identity accompanies
-the seal through publication without another data pass.
+On hosts with a qualified clone contract the in-pause disk step is flush plus
+constant-time clone and ownership-fact recording regardless of written data;
+initial identity completion is separately reported post-continuation seal
+latency. Elsewhere the pause includes copying and inline hashing of bytes
+actually written to the upper. Configured disk capacity must not affect either
+path. The completed seal carries its identity through publication without
+another data pass; moving work outside the pause does not itself establish that
+all end-to-end Phase 30 targets pass.
 [ADR 0021](0021-live-snapshots-and-forks.md) states the retained budgets and
 Phase 30 targets that measure this cost and the condition under which qcow2
 upper generations would be reconsidered; raw storage remains the representation.
@@ -2126,9 +2153,13 @@ Local snapshot disk steps obey the same constant-time reflink and
 written-byte-only non-reflink cost contract as fork and restore. A live sealed
 disk carries its recorded stream identity into publication without another
 payload pass. RAM capture reuses identities of baseline chunks that valid dirty
-tracking proves unchanged ([ADR 0021](0021-live-snapshots-and-forks.md)); a full
-capture follows touched RAM rather than configured capacity. Changed-to-zero
-ranges remain explicitly zero, and zero chunks are neither hashed nor stored.
+tracking proves unchanged ([ADR 0021](0021-live-snapshots-and-forks.md)).
+Full capture skips known-zero private anonymous boot pages using cut-bound
+pagemap metadata; other backings or unreadable pagemap metadata read in full.
+Changed-to-zero runs are omitted on sparse rebuilds or punched on seeded output,
+with physical zero writes only when punching is unsupported. Their logical
+meaning is explicit zero, never inheritance; zero chunk objects are not hashed
+or stored.
 
 Snapshots have purpose `checkpoint` or `generalized-image`. A checkpoint contains
 exact selected storage bytes and includes a warning about credentials, journals
