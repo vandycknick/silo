@@ -101,6 +101,26 @@ reason, affected identity chunks and separate native I/O/whole-file hashing
 facts. Each checkpoint owns a complete canonical RAM map and complete closure;
 its predecessor is not a replay dependency.
 
+`Machine::snapshot_live`, `Machine::fork_live` and `Runtime::restore_snapshot`
+take an optional `LiveOperationProgressSender`. Its `default_channel()` returns
+the sender and a `LiveOperationProgressReceiver` of user-facing stages. Like
+image progress, delivery is bounded, nonblocking and best effort: full or
+dropped receivers never change operation results or cancellation semantics.
+Pass `None` when progress is not needed. `StartingChild` carries a one-based
+index, the batch size and the reserved child name.
+
+Capture stages are observations from the existing capture poll's operation
+replies, mapped exhaustively from `LiveStage`. After source
+continuation the monitor traces disk identity without publishing activity, so
+`ComputingDiskIdentity` is inferred from an in-progress capture with terminal
+source continuation and no matching activity. Publication, child storage,
+launch, activation/readiness waiting and completion are reported at their
+existing libvm call boundaries, not as new monitor events. The CLI also keeps
+its existing explicit guest-agent readiness waits. Local plain-text commands
+show these stages only in an interactive spinner; JSON and noninteractive
+output have no stage lines. The daemon API has no progress stream for these
+operations and retains its coarse spinner labels.
+
 Execution restore reports `LibVmError::CheckpointPortability` with the exact
 failed pin and captured/destination values at `restore-preflight`, before a
 child is allocated. Compatibility is not required to import or retain an

@@ -111,9 +111,10 @@ impl AppApi {
         &mut self,
         reference: &str,
         options: libvm::LiveSnapshotOptions,
+        progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<libvm::LiveSnapshot> {
         match self {
-            Self::Local(service) => service.snapshot_live(reference, options).await,
+            Self::Local(service) => service.snapshot_live(reference, options, progress).await,
             Self::Daemon(service) => service.snapshot_live(reference, options).await,
         }
     }
@@ -124,9 +125,14 @@ impl AppApi {
         &mut self,
         reference: &str,
         options: libvm::LiveForkOptions,
+        progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<libvm::LiveForkResult> {
         let result = match self {
-            Self::Local(service) => service.fork_live(reference, options.clone()).await?,
+            Self::Local(service) => {
+                service
+                    .fork_live(reference, options.clone(), progress)
+                    .await?
+            }
             Self::Daemon(service) => service.fork_live(reference, options.clone()).await?,
         };
         silo_vm_control::fork::validate_creation(&result, &options)?;
@@ -183,6 +189,7 @@ impl AppApi {
         &mut self,
         reference: &str,
         options: libvm::RestoreOptions,
+        progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<MachineData> {
         let reference: libvm::SnapshotRef = if reference.starts_with("image:") {
             reference.parse()?
@@ -190,7 +197,7 @@ impl AppApi {
             format!("image:{reference}").parse()?
         };
         match self {
-            Self::Local(service) => service.restore_snapshot(reference, options).await,
+            Self::Local(service) => service.restore_snapshot(reference, options, progress).await,
             Self::Daemon(service) => service.restore_snapshot(reference, options).await,
         }
     }

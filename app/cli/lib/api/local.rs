@@ -190,6 +190,7 @@ impl LocalVmService {
         &mut self,
         reference: &str,
         mut options: libvm::LiveSnapshotOptions,
+        progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<libvm::LiveSnapshot> {
         options.validate()?;
         options.name = options
@@ -201,7 +202,9 @@ impl LocalVmService {
         let reference = MachineRef::parse(reference)?;
         let observation = self.observe_machine_live(&reference).await?;
         let machine = self.runtime().await?.get_machine(&reference).await?;
-        Ok(machine.snapshot_live(&observation, options).await?)
+        Ok(machine
+            .snapshot_live(&observation, options, progress)
+            .await?)
     }
 
     /// Live fork applies the daemon's strict request rules and requires exact
@@ -211,6 +214,7 @@ impl LocalVmService {
         &mut self,
         reference: &str,
         options: libvm::LiveForkOptions,
+        progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<libvm::LiveForkResult> {
         let machine_ref = MachineRef::parse(reference)?;
         silo_vm_control::fork::request_to_wire(&machine_ref, &options)?;
@@ -219,7 +223,7 @@ impl LocalVmService {
             .await?;
         let observation = self.observe_machine_live(&machine_ref).await?;
         let machine = self.runtime().await?.get_machine(&machine_ref).await?;
-        Ok(machine.fork_live(&observation, options).await?)
+        Ok(machine.fork_live(&observation, options, progress).await?)
     }
 
     /// Fork operations are addressed by ID alone, never through their source.
@@ -351,6 +355,7 @@ impl LocalVmService {
         &mut self,
         reference: libvm::SnapshotRef,
         mut options: libvm::RestoreOptions,
+        progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<MachineData> {
         options.name = silo_vm_control::stopped::name(options.name)?;
         if let Self::Uninitialized {
@@ -372,7 +377,7 @@ impl LocalVmService {
         Ok(self
             .runtime()
             .await?
-            .restore_snapshot(reference, options)
+            .restore_snapshot(reference, options, progress)
             .await?
             .inspect()
             .await?)
@@ -1575,6 +1580,7 @@ mod tests {
                         external_resources: ExternalResourcePolicy::Reject,
                         activation_hook: None,
                     },
+                    None,
                 )
                 .await
                 .unwrap_err();

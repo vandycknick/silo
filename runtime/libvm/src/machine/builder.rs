@@ -602,6 +602,7 @@ async fn create_machine_config_with_name(
                             name: Some(name.clone()),
                             ..crate::RestoreOptions::default()
                         },
+                        None,
                     )
                     .await?;
                 return runtime

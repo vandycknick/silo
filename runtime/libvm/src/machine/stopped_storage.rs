@@ -316,6 +316,7 @@ mod tests {
                         name: Some("first".into()),
                         ..Default::default()
                     },
+                    None,
                 )
                 .await
                 .expect("first private restore");
@@ -327,6 +328,7 @@ mod tests {
                         name: Some("second".into()),
                         ..Default::default()
                     },
+                    None,
                 )
                 .await
                 .expect("second private restore");
@@ -400,6 +402,7 @@ mod tests {
                         name: Some("after-source-delete".into()),
                         ..Default::default()
                     },
+                    None,
                 )
                 .await
                 .expect("retained boot/storage restore");
@@ -475,6 +478,7 @@ mod tests {
                     external_resources: ExternalResourcePolicy::RequireMappings,
                     activation_hook: None,
                 },
+                None,
             )
             .await
             .expect("stopped child with explicit requirements");

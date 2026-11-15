@@ -9,6 +9,9 @@ use vm_spec::capture::Sha256Digest;
 use vm_spec::lifecycle::{CaptureResumePolicy, Diagnostic, LiveId};
 
 use crate::machine::live::MachineLiveObservation;
+use crate::machine::live_operations::{
+    report_progress, LiveOperationProgress, LiveOperationProgressSender,
+};
 use crate::machine::root_storage::invalid;
 use crate::store::MachineStore;
 use crate::{GuestPublish, LibVmError, Machine, MachineId, MachineRunId, RestoreHook, Runtime};
@@ -246,8 +249,10 @@ impl Machine {
         &self,
         observation: &MachineLiveObservation,
         mut options: LiveForkOptions,
+        progress: Option<LiveOperationProgressSender>,
     ) -> Result<LiveForkResult, LibVmError> {
         let entered = monotonic_ns()?;
+        report_progress(progress.as_ref(), LiveOperationProgress::Admitting);
         if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
             return Err(LibVmError::LiveObservation {
                 reference: self.id(),
@@ -291,7 +296,14 @@ impl Machine {
         let operation = options.operation_id;
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            handle.block_on(create_fork(runtime, machine, observation, options, entered))
+            handle.block_on(create_fork(
+                runtime,
+                machine,
+                observation,
+                options,
+                entered,
+                progress,
+            ))
         })
         .await
         .map_err(|error| fork_error(operation, error))?
@@ -314,6 +326,7 @@ async fn create_fork(
     observation: MachineLiveObservation,
     mut options: LiveForkOptions,
     entered: i64,
+    progress: Option<LiveOperationProgressSender>,
 ) -> Result<LiveForkResult, LibVmError> {
     let store = runtime.native_store()?;
     let operation = options.operation_id;
@@ -457,7 +470,14 @@ async fn create_fork(
         if current.cancellation_requested && !launched {
             cancel_source_capture(&runtime, &current).await?;
         }
-        match crate::machine::live_capture::advance(&runtime, machine, capture, &mut retained).await
+        match crate::machine::live_capture::advance(
+            &runtime,
+            machine,
+            capture,
+            &mut retained,
+            progress.as_ref(),
+        )
+        .await
         {
             Ok(crate::machine::live_capture::CaptureProgress::Abandoned(reason)) => {
                 fail_capture(&runtime, operation, diagnostic(reason), false).await?;
@@ -473,6 +493,10 @@ async fn create_fork(
                 .await?
                 .is_some_and(|cut| cut.relocated)
         {
+            report_progress(
+                progress.as_ref(),
+                LiveOperationProgress::PreparingChildStorage,
+            );
             let cut = store.open_local_cut(operation, retained.take()).await?;
             if let Err(error) = store.bind_fork_resources(&cut).await {
                 for child in store.fork_children(operation).await? {
@@ -531,6 +555,8 @@ async fn create_fork(
                 let child_runtime = runtime.clone();
                 let cut = cut.clone();
                 let handle = tokio::runtime::Handle::current();
+                let progress = progress.clone();
+                let total = options.children.len();
                 launches.spawn_blocking(move || {
                     handle.block_on(async move {
                         let store = child_runtime.native_store()?;
@@ -549,6 +575,8 @@ async fn create_fork(
                             cut,
                             child,
                             child_options,
+                            progress.as_ref(),
+                            total,
                         )
                         .await
                         {
@@ -595,6 +623,9 @@ async fn create_fork(
         if launches.is_empty()
             && (result.stage == ForkStage::Finished || tokio::time::Instant::now() >= deadline)
         {
+            if result.stage == ForkStage::Finished {
+                report_progress(progress.as_ref(), LiveOperationProgress::Done);
+            }
             return Ok(result);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1234,6 +1265,7 @@ async fn reconcile_one(runtime: &Runtime, operation: Uuid) -> Result<(), LibVmEr
             result.source_machine_id,
             capture,
             &mut None,
+            None,
         )
         .await
         {

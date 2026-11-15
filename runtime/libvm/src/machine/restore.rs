@@ -15,6 +15,9 @@ use vm_spec::live::{LiveHostReport, LiveOperation};
 use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
 
 use crate::machine::lifecycle::{finish_failed_start, started_run_monitor, FailedStartState};
+use crate::machine::live_operations::{
+    report_progress, LiveOperationProgress, LiveOperationProgressSender,
+};
 use crate::machine::root_storage::invalid;
 use crate::machine::stopped::PrivateSource;
 use crate::storage::pool::StoragePool;
@@ -71,6 +74,7 @@ pub(crate) async fn restore_owned(
     reference: SnapshotRef,
     options: RestoreOptions,
     preview: SnapshotRecord,
+    progress: Option<&LiveOperationProgressSender>,
 ) -> Result<Machine, LibVmError> {
     // Repeat the observation-only gate before a consumer, name lock or budget.
     let host_report = runtime.live_capabilities().await?;
@@ -82,14 +86,20 @@ pub(crate) async fn restore_owned(
     let store = runtime.native_store()?;
     let snapshots = SnapshotStore::from_store(Arc::new(store.clone()));
     let consumer = snapshots.consume_shape(&reference).await?;
+    report_progress(progress, LiveOperationProgress::PreparingChildStorage);
     let result = async {
         let shape = snapshots.prepare_restore_shape(&consumer).await?;
+        if consumer.record != preview {
+            return Err(invalid(
+                "checkpoint alias changed between preflight and verification",
+            ));
+        }
         restore_consumer(
             &runtime,
             &snapshots,
             &consumer,
             options,
-            preview,
+            progress,
             host_report,
             shape,
         )
@@ -120,16 +130,11 @@ async fn restore_consumer(
     snapshots: &SnapshotStore,
     consumer: &crate::store::snapshot_store::SnapshotConsumer,
     options: RestoreOptions,
-    preview: SnapshotRecord,
+    progress: Option<&LiveOperationProgressSender>,
     host_report: LiveHostReport,
     inspection_shape: crate::store::snapshot_store::RestoreInspectionShape,
 ) -> Result<Machine, LibVmError> {
     let shape = inspection_shape.shape();
-    if consumer.record != preview {
-        return Err(invalid(
-            "checkpoint alias changed between preflight and verification",
-        ));
-    }
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let evidence = snapshots.restore_evidence(consumer, &pool)?.evidence;
     let execution = match &consumer.record.capture {
@@ -356,6 +361,8 @@ async fn restore_consumer(
         name,
         run,
         Some(_names),
+        progress,
+        (1, 1),
     )
     .await
 }
@@ -403,6 +410,8 @@ async fn execute_prepared(
     name: String,
     run: Uuid,
     names: Option<File>,
+    progress: Option<&LiveOperationProgressSender>,
+    child: (usize, usize),
 ) -> Result<Machine, LibVmError> {
     let PreparedRestore {
         configuration,
@@ -478,6 +487,13 @@ async fn execute_prepared(
         executable_identity,
         lowers: lower_inputs.map(|lower| lower.files).unwrap_or_default(),
     };
+    if let Some(progress) = progress {
+        progress.send(LiveOperationProgress::StartingChild {
+            index: child.0,
+            total: child.1,
+            name: config.name.clone(),
+        });
+    }
     let startup = launch_restored(
         runtime,
         &config,
@@ -493,6 +509,7 @@ async fn execute_prepared(
     let result = async {
         let (_lock, config, result, _lifetime) = match startup {
             Ok((pending, lifetime)) => {
+                report_progress(progress, LiveOperationProgress::WaitingForAgent);
                 let (lock, config, result) =
                     await_restored_start(runtime, config.id, run, lock, pending).await?;
                 (lock, config, result, Some(lifetime))
@@ -1406,6 +1423,8 @@ pub(crate) async fn restore_reserved_fork_child(
     prepared: Arc<VerifiedForkRestore>,
     child: crate::store::fork::ForkChildIdentity,
     options: crate::LiveForkChild,
+    progress: Option<&LiveOperationProgressSender>,
+    total: usize,
 ) -> Result<Machine, LibVmError> {
     let cut = &prepared.cut;
     let store = runtime.native_store()?;
@@ -1574,6 +1593,7 @@ pub(crate) async fn restore_reserved_fork_child(
         inspection,
         network_attachment: network,
     };
+    let index = child.result.index as usize + 1;
     execute_prepared(
         runtime,
         PreparedRestore {
@@ -1595,6 +1615,8 @@ pub(crate) async fn restore_reserved_fork_child(
         Uuid::parse_str(child.result.run_id.as_str())
             .map_err(|error| invalid(error.to_string()))?,
         None,
+        progress,
+        (index, total),
     )
     .await
 }

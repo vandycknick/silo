@@ -327,7 +327,7 @@ impl Cmd {
                 return context
                     .app_api()
                     .await?
-                    .restore_snapshot(&format!("image:{id}"), options)
+                    .restore_snapshot(&format!("image:{id}"), options, None)
                     .await;
             }
             let settings = machine_settings(&machine);
