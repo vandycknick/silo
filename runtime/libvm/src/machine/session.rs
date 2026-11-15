@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use crate::machine::{Machine, MachineRef, MachineUserConfig};
+use crate::machine::{Machine, MachineData, MachineObservation, MachineUserConfig};
 use crate::runtime::core::RuntimeStatus;
 use crate::store::models::MachineRuntimeState;
 use crate::LibVmError;
@@ -657,7 +657,11 @@ impl Machine {
     ) -> Result<ExecutionOutput, LibVmError> {
         let options = configure(ExecutionOptionsBuilder::default()).build();
         let timeout = options.timeout;
-        let mut session = self.start_execution(program.into(), options).await?;
+        let observation = self.inspect().await?;
+        let run_id = observed_execution_run(self.machine_id(), &observation)?;
+        let mut session = self
+            .start_execution(&observation, run_id, program.into(), options)
+            .await?;
         if let Some(timeout) = timeout {
             match tokio::time::timeout(timeout, session.collect()).await {
                 Ok(output) => output,
@@ -697,7 +701,23 @@ impl Machine {
         program: impl Into<String>,
         configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
     ) -> Result<ExecutionSession, LibVmError> {
+        let observation = self.inspect().await?;
+        self.spawn_observed_with(&observation, program, configure)
+            .await
+    }
+
+    /// Executes against the exact ready run already returned by `inspect`.
+    /// A replacement run is rejected by the monitor, never silently selected.
+    pub async fn spawn_observed_with(
+        &self,
+        observation: &MachineData,
+        program: impl Into<String>,
+        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
+    ) -> Result<ExecutionSession, LibVmError> {
+        let run_id = observed_execution_run(self.machine_id(), observation)?;
         self.start_execution(
+            observation,
+            run_id,
             program.into(),
             configure(ExecutionOptionsBuilder::default()).build(),
         )
@@ -729,20 +749,13 @@ impl Machine {
 
     async fn start_execution(
         &self,
+        observation: &MachineData,
+        run_id: Uuid,
         program: String,
         mut options: ExecutionOptions,
     ) -> Result<ExecutionSession, LibVmError> {
-        let config = self
-            .runtime()
-            .resolve_machine_config(&MachineRef::id(self.machine_id()))
-            .await?;
-        let status = self
-            .runtime()
-            .reconcile_machine_runtime_best_effort(&config)
-            .await?;
-        let run_id = current_run_id(&config.name, &status)?;
-        apply_default_execution_user(&mut options, config.guest.user.as_ref());
-        let reference = config.name;
+        apply_default_execution_user(&mut options, observation.guest.user.as_ref());
+        let reference = observation.name.clone();
         let stdin = std::mem::take(&mut options.stdin);
         let tty = options.tty;
         let pipe_stdin = !tty && matches!(stdin, StdinMode::Pipe | StdinMode::Bytes(_));
@@ -821,6 +834,37 @@ async fn send_initial_stdin(
             .map_err(|_| guest_session_error(reference, "execution request stream is closed"))?;
     }
     Ok(())
+}
+
+fn observed_execution_run(
+    machine: crate::store::models::MachineId,
+    observation: &MachineData,
+) -> Result<Uuid, LibVmError> {
+    if observation.id != machine.to_string() {
+        return Err(guest_session_error(
+            &observation.name,
+            "observation belongs to another machine",
+        ));
+    }
+    if observation.observation != MachineObservation::Observed
+        || !observation.is_running()
+        || !observation.status.guest_ready()
+    {
+        return Err(guest_session_error(
+            &observation.name,
+            "machine has no observed ready run",
+        ));
+    }
+    let run = observation
+        .run_id
+        .as_ref()
+        .ok_or_else(|| guest_session_error(&observation.name, "running machine has no run ID"))?;
+    Uuid::parse_str(run.as_str()).map_err(|error| {
+        guest_session_error(
+            &observation.name,
+            format!("running machine has invalid run ID: {error}"),
+        )
+    })
 }
 
 pub(super) fn current_run_id(reference: &str, status: &RuntimeStatus) -> Result<Uuid, LibVmError> {
@@ -1007,12 +1051,55 @@ mod tests {
     use protocol::v1::execute_input::Message as ExecuteMessage;
     use tokio::sync::{watch, Mutex as AsyncMutex};
 
-    use super::{
+    use crate::machine::session::{
         apply_default_execution_user, execution_event_from_wire, mark_execution_started,
         process_spec, ExecutionControl, ExecutionControlState, ExecutionEvent, ExecutionLostReason,
         ExecutionOptions, ExecutionResult, StdinMode,
     };
     use crate::machine::MachineUserConfig;
+
+    #[test]
+    fn observed_execution_preserves_exact_ready_run_and_rejects_unproven_observations() {
+        use crate::machine::session::observed_execution_run;
+        use crate::machine::{MachineData, MachineObservation, MachineStatus};
+        let machine = crate::store::models::MachineId::new();
+        let run = uuid::Uuid::new_v4();
+        let mut observation = MachineData::new(
+            machine.to_string(),
+            "ready-run".into(),
+            vm_spec::VmSpec::current(),
+        );
+        observation.observation = MachineObservation::Observed;
+        observation.status = MachineStatus::Running {
+            ready: true,
+            guest_ready: true,
+            message: None,
+        };
+        observation.run_id = Some(run.to_string().parse().unwrap());
+        assert_eq!(observed_execution_run(machine, &observation).unwrap(), run);
+        assert!(
+            observed_execution_run(crate::store::models::MachineId::new(), &observation).is_err()
+        );
+
+        observation.observation = MachineObservation::LastKnown;
+        assert!(observed_execution_run(machine, &observation).is_err());
+        observation.observation = MachineObservation::Observed;
+        observation.status = MachineStatus::Running {
+            ready: false,
+            guest_ready: false,
+            message: None,
+        };
+        assert!(observed_execution_run(machine, &observation).is_err());
+        observation.status = MachineStatus::Stopped;
+        assert!(observed_execution_run(machine, &observation).is_err());
+        observation.status = MachineStatus::Running {
+            ready: true,
+            guest_ready: true,
+            message: None,
+        };
+        observation.run_id = None;
+        assert!(observed_execution_run(machine, &observation).is_err());
+    }
 
     #[test]
     fn vmm_execution_process_spec_preserves_argv_environment_and_pipe_stdin() {

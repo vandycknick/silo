@@ -8,28 +8,31 @@
 //!                                    └─ fsmeta object (never a stream copy)  └─ index root/pages
 //! ```
 //!
-//! The concatenated lower is never materialized: its logical stream identity
-//! is recomputed by `storage::composition` over the held fsmeta object and pack
-//! streams. Reuse authenticates exact retained bytes; regeneration is only ever
-//! checked against an exact retained or expected result.
+//! The concatenated lower is never materialized. Local validation receipts
+//! bind canonical records to held immutable inodes. Receipt misses and all
+//! transport admission authenticate the exact retained bytes.
 
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
 
 use oci::changeset::{ChangesetLimits, LayerResultId};
 use oci::composition::{CompositionRecipe, CompositionResult, MAX_RECORD_BYTES};
 use sqlx::Row;
 use vm_spec::DiskGeometry;
 
+use crate::storage::composition::CompositionValidation;
 use crate::storage::identity::{LowerResultId, ObjectDigest};
 use crate::storage::pool::StoragePool;
-use crate::storage::vmdk::LowerOccurrence;
+use crate::storage::vmdk::{LowerBacking, LowerOccurrence};
 use crate::storage::StorageError;
 use crate::store::layer_store::{LayerReadOwner, LayerStore, PinnedLayer};
 use crate::store::models::snapshot::{content_object, SnapshotComposition, SnapshotLayer};
 use crate::store::Store;
 use crate::{LibVmError, OverlayLower};
+
+type HeldLayer = (PinnedLayer, Arc<File>);
 
 fn invalid(message: impl std::fmt::Display) -> LibVmError {
     LibVmError::StateDecode {
@@ -120,9 +123,10 @@ impl RetainedComposition {
 /// descriptors that `storage::composition` authenticated.
 pub struct HeldComposition {
     retained: RetainedComposition,
-    unique: Vec<(PinnedLayer, File)>,
+    unique: Vec<HeldLayer>,
     occurrences: Vec<usize>,
     fsmeta: File,
+    validation: CompositionValidation,
     _owner: LayerReadOwner,
 }
 
@@ -148,6 +152,26 @@ impl HeldComposition {
         &self.fsmeta
     }
 
+    pub(crate) fn recheck(&self) -> Result<(), LibVmError> {
+        let current = CompositionValidation::capture(
+            &self.retained.recipe,
+            &self.retained.result,
+            &self.layers(),
+            &self.fsmeta,
+        )?;
+        if current != self.validation {
+            return Err(invalid("held composition changed after validation"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn held_backing(
+        &self,
+        backing: LowerBacking,
+    ) -> Result<(File, crate::storage::identity_file::SourceFingerprint), LibVmError> {
+        held_backing(&self.validation, &self.unique, &self.fsmeta, backing)
+    }
+
     pub fn snapshot_composition(&self) -> Result<SnapshotComposition, LibVmError> {
         snapshot_graph(&self.retained, &self.unique, &self.occurrences)
     }
@@ -158,6 +182,9 @@ impl HeldComposition {
 pub struct LaunchLower {
     pub occurrences: Vec<LowerOccurrence>,
     pub retained: RetainedComposition,
+    pub(crate) validation: CompositionValidation,
+    unique: Vec<HeldLayer>,
+    fsmeta: File,
     _authority: LowerAuthority,
 }
 
@@ -166,9 +193,38 @@ enum LowerAuthority {
     Consumer { _owner: LayerReadOwner },
 }
 
+impl LaunchLower {
+    pub(crate) fn held_backing(
+        &self,
+        backing: LowerBacking,
+    ) -> Result<(File, crate::storage::identity_file::SourceFingerprint), LibVmError> {
+        held_backing(&self.validation, &self.unique, &self.fsmeta, backing)
+    }
+}
+
+fn held_backing(
+    validation: &CompositionValidation,
+    unique: &[HeldLayer],
+    fsmeta: &File,
+    backing: LowerBacking,
+) -> Result<(File, crate::storage::identity_file::SourceFingerprint), LibVmError> {
+    let file = match backing {
+        LowerBacking::Object(_) => fsmeta,
+        LowerBacking::Stream(id) => {
+            &unique
+                .iter()
+                .find(|(layer, _)| layer.pack.stream == id)
+                .ok_or_else(|| invalid("pack is outside the held composition"))?
+                .1
+        }
+    };
+    let fingerprint = validation.check_file(backing, file)?;
+    Ok((file.try_clone()?, fingerprint))
+}
+
 fn snapshot_graph(
     retained: &RetainedComposition,
-    unique: &[(PinnedLayer, File)],
+    unique: &[HeldLayer],
     occurrences: &[usize],
 ) -> Result<SnapshotComposition, LibVmError> {
     let layers = occurrences
@@ -203,7 +259,7 @@ async fn pin_layers(
     pool: &StoragePool,
     occurrences: &[LayerResultId],
     limits: &ChangesetLimits,
-) -> Result<(Vec<(PinnedLayer, File)>, Vec<usize>), LibVmError> {
+) -> Result<(Vec<HeldLayer>, Vec<usize>), LibVmError> {
     let mut ids: Vec<LayerResultId> = Vec::new();
     let mut unique = Vec::new();
     let mut mapping = Vec::with_capacity(occurrences.len());
@@ -213,7 +269,7 @@ async fn pin_layers(
             continue;
         }
         let pinned = layers.load_pinned_layer(*id, limits, false).await?;
-        let pack = pool.open_stream(&pinned.pack.stream)?;
+        let pack = hold_pack(pool, &unique, &pinned)?;
         mapping.push(unique.len());
         ids.push(*id);
         unique.push((pinned, pack));
@@ -221,10 +277,21 @@ async fn pin_layers(
     Ok((unique, mapping))
 }
 
-fn layer_refs<'a>(
-    unique: &'a [(PinnedLayer, File)],
-    occurrences: &[usize],
-) -> Vec<oci::erofs::Layer<'a>> {
+fn hold_pack(
+    pool: &StoragePool,
+    unique: &[HeldLayer],
+    layer: &PinnedLayer,
+) -> Result<Arc<File>, StorageError> {
+    match unique
+        .iter()
+        .find(|(other, _)| other.pack.stream == layer.pack.stream)
+    {
+        Some((_, pack)) => Ok(Arc::clone(pack)),
+        None => pool.open_stream(&layer.pack.stream).map(Arc::new),
+    }
+}
+
+fn layer_refs<'a>(unique: &'a [HeldLayer], occurrences: &[usize]) -> Vec<oci::erofs::Layer<'a>> {
     occurrences
         .iter()
         .filter_map(|index| unique.get(*index))
@@ -234,6 +301,66 @@ fn layer_refs<'a>(
             pack,
         })
         .collect()
+}
+
+const COMPOSITION_VALIDATION_SCHEMA: i64 = 1;
+
+async fn save_validation(
+    store: &Store,
+    id: LowerResultId,
+    validation: &CompositionValidation,
+) -> Result<(), LibVmError> {
+    sqlx::query("INSERT INTO composition_validation(lower_id,schema,receipt) SELECT id,?2,?3 FROM composition_result WHERE id=?1 ON CONFLICT(lower_id,schema) DO UPDATE SET receipt=excluded.receipt")
+        .bind(id.to_string())
+        .bind(COMPOSITION_VALIDATION_SCHEMA)
+        .bind(serde_json::to_vec(validation).map_err(invalid)?)
+        .execute(&store.pool).await?;
+    Ok(())
+}
+
+/// All byte work runs with held descriptors and leases, outside SQL/root locks.
+async fn validate_composition(
+    store: &Store,
+    id: LowerResultId,
+    recipe: &CompositionRecipe,
+    result: &CompositionResult,
+    layers: &[oci::erofs::Layer<'_>],
+    fsmeta: &File,
+    local: bool,
+) -> Result<CompositionValidation, LibVmError> {
+    let before = CompositionValidation::capture(recipe, result, layers, fsmeta)?;
+    let receipt: Option<Vec<u8>> = if local {
+        sqlx::query_scalar(
+            "SELECT receipt FROM composition_validation WHERE lower_id=?1 AND schema=?2",
+        )
+        .bind(id.to_string())
+        .bind(COMPOSITION_VALIDATION_SCHEMA)
+        .fetch_optional(&store.pool)
+        .await?
+    } else {
+        None
+    };
+    let hit = receipt
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<CompositionValidation>(bytes).ok())
+        .is_some_and(|previous| previous == before);
+    if !hit {
+        sqlx::query("DELETE FROM composition_validation WHERE lower_id=?1")
+            .bind(id.to_string())
+            .execute(&store.pool)
+            .await?;
+        let loaded = crate::storage::composition::load_exact(recipe, layers, result, fsmeta)?;
+        if loaded.result != *result {
+            return Err(invalid("retained composition failed exact loading"));
+        }
+    }
+    if CompositionValidation::capture(recipe, result, layers, fsmeta)? != before {
+        return Err(invalid("composition input changed during validation"));
+    }
+    if !hit {
+        save_validation(store, id, &before).await?;
+    }
+    Ok(before)
 }
 
 /// Read and authenticate one composition's rows and record objects.
@@ -471,7 +598,7 @@ impl LayerStore {
                 .bind(recipe_id.to_string())
                 .fetch_optional(&store.pool)
                 .await?;
-        let (retained, fsmeta) = match existing {
+        let (retained, fsmeta, validation) = match existing {
             Some(id) => {
                 let id: LowerResultId = id.parse().map_err(invalid)?;
                 store.pin_operation_lowers(owner.operation, &[id]).await?;
@@ -484,18 +611,17 @@ impl LayerStore {
                 let fsmeta = pool
                     .open_object(&retained.fsmeta())
                     .map_err(self::retained(id))?;
-                let loaded = crate::storage::composition::load_exact(
+                let validation = validate_composition(
+                    store,
+                    id,
                     &recipe,
-                    &layers,
                     &retained.result,
+                    &layers,
                     &fsmeta,
-                )?;
-                if loaded.result != retained.result {
-                    return Err(invalid(
-                        "retained fsmeta does not reproduce its exact result",
-                    ));
-                }
-                (retained, fsmeta)
+                    true,
+                )
+                .await?;
+                (retained, fsmeta, validation)
             }
             None => {
                 let (object, roots, composed) =
@@ -525,6 +651,16 @@ impl LayerStore {
                     &composed.result.canonical_bytes().map_err(invalid)?,
                 )
                 .await?;
+                let fsmeta = pool.open_object(&object.digest)?;
+                let validation = composed.published_validation(&recipe, &layers, &fsmeta)?;
+                if crate::storage::identity_file::SourceFingerprint::new(&fsmeta.metadata()?)
+                    != object.fingerprint
+                {
+                    return Err(invalid(
+                        "published fsmeta inode changed before receipt seeding",
+                    ));
+                }
+                validation.check_file(LowerBacking::Object(object.digest), &fsmeta)?;
                 let retained = RetainedComposition {
                     id: LowerResultId::from_composition(composed.result.id().map_err(invalid)?),
                     recipe: recipe.clone(),
@@ -534,8 +670,8 @@ impl LayerStore {
                     layers: occurrences.clone(),
                 };
                 commit_composition(store, &pool, owner.operation, &retained).await?;
-                let fsmeta = pool.open_object(&object.digest)?;
-                (retained, fsmeta)
+                save_validation(store, retained.id, &validation).await?;
+                (retained, fsmeta, validation)
             }
         };
         drop(layers);
@@ -544,6 +680,7 @@ impl LayerStore {
             unique,
             occurrences: mapping,
             fsmeta,
+            validation,
             _owner: owner,
         })
     }
@@ -570,9 +707,8 @@ impl LayerStore {
             .collect()
     }
 
-    /// Lease and authenticate an exact retained composition: every pack and
-    /// fsmeta byte, all records and the logical lower identity. No encoder or
-    /// OCI source participates.
+    /// Lease an exact retained composition. Local receipts avoid payload reads;
+    /// a miss authenticates every byte without invoking an encoder or OCI source.
     pub async fn hold_composition(&self, id: LowerResultId) -> Result<HeldComposition, LibVmError> {
         let store = self.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -588,20 +724,22 @@ impl LayerStore {
                 let fsmeta = pool
                     .open_object(&retained.fsmeta())
                     .map_err(self::retained(id))?;
-                let loaded = crate::storage::composition::load_exact(
+                let validation = validate_composition(
+                    &store.store,
+                    id,
                     &retained.recipe,
-                    &layer_refs(&unique, &mapping),
                     &retained.result,
+                    &layer_refs(&unique, &mapping),
                     &fsmeta,
-                )?;
-                if loaded.result != retained.result {
-                    return Err(invalid("retained composition failed exact loading"));
-                }
+                    true,
+                )
+                .await?;
                 Ok(HeldComposition {
                     retained,
                     unique,
                     occurrences: mapping,
                     fsmeta,
+                    validation,
                     _owner: owner,
                 })
             })
@@ -610,8 +748,7 @@ impl LayerStore {
     }
 
     /// Resolve a lower authorized by the exact existing launch generation.
-    /// Records, indexes and pack maps are authenticated here; backing bytes
-    /// are hashed by the caller's admitted VMDK plan verification.
+    /// Canonical metadata and held inode validation precede descriptor handoff.
     pub(crate) async fn launch_lower(
         &self,
         lease: &crate::store::operation_store::LaunchStorageLease,
@@ -631,6 +768,7 @@ impl LayerStore {
         let lower = lower.clone();
         let operation = lease.operation_id();
         let generation = int(lease.storage_record().storage_generation)?;
+        let data_disks = storage.disks.len() as u64;
         let lease = lease.lock().duplicate()?;
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
@@ -650,7 +788,7 @@ impl LayerStore {
                 if !authorized {
                     return Err(invalid("launch lease does not root this retained lower"));
                 }
-                let resolved = store.resolve_lower(&lower, LowerAuthority::Launch).await;
+                let resolved = store.resolve_lower(&lower, LowerAuthority::Launch, data_disks).await;
                 // Cancellation may drop the caller's typed lease while this
                 // blocking worker runs. Keep its duplicate until authentication
                 // completes, but do not obstruct failed-start reconciliation.
@@ -674,7 +812,7 @@ impl LayerStore {
                     .begin_consumer(&occurrences, &[lower.record()])
                     .await?;
                 store
-                    .resolve_lower(&lower, LowerAuthority::Consumer { _owner: owner })
+                    .resolve_lower(&lower, LowerAuthority::Consumer { _owner: owner }, 0)
                     .await
             })
         })
@@ -685,6 +823,7 @@ impl LayerStore {
         &self,
         lower: &OverlayLower,
         authority: LowerAuthority,
+        data_disks: u64,
     ) -> Result<LaunchLower, LibVmError> {
         let id = lower.record();
         let pool = existing_pool(&self.store)?;
@@ -719,9 +858,41 @@ impl LayerStore {
                 .map_err(self::retained(id))?;
             resolved.push(occurrence);
         }
+        crate::storage::vmdk::FlatLowerPlan::new(&resolved)?.preflight(data_disks)?;
+        let mapping = retained
+            .layers
+            .iter()
+            .map(|id| {
+                pinned
+                    .iter()
+                    .position(|(other, _)| other == id)
+                    .ok_or_else(|| invalid("resolved composition lost a layer occurrence"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut unique = Vec::with_capacity(pinned.len());
+        for (_, layer) in pinned {
+            let file = hold_pack(&pool, &unique, &layer).map_err(self::retained(id))?;
+            unique.push((layer, file));
+        }
+        let fsmeta = pool
+            .open_object(&retained.fsmeta())
+            .map_err(self::retained(id))?;
+        let validation = validate_composition(
+            &self.store,
+            id,
+            &retained.recipe,
+            &retained.result,
+            &layer_refs(&unique, &mapping),
+            &fsmeta,
+            true,
+        )
+        .await?;
         Ok(LaunchLower {
             occurrences: resolved,
             retained,
+            validation,
+            unique,
+            fsmeta,
             _authority: authority,
         })
     }
@@ -792,7 +963,22 @@ impl LayerStore {
         let lower = lower.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            runtime.block_on(store.publish_snapshot_composition_owned(operation, lower))
+            runtime.block_on(store.publish_snapshot_composition_owned(operation, lower, false))
+        })
+        .await?
+    }
+
+    /// Same-host reuse only. Imported metadata can never supply a receipt.
+    pub(crate) async fn publish_local_composition(
+        &self,
+        operation: uuid::Uuid,
+        lower: &SnapshotComposition,
+    ) -> Result<LowerResultId, LibVmError> {
+        let store = self.clone();
+        let lower = lower.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(store.publish_snapshot_composition_owned(operation, lower, true))
         })
         .await?
     }
@@ -801,6 +987,7 @@ impl LayerStore {
         &self,
         operation: uuid::Uuid,
         lower: SnapshotComposition,
+        local: bool,
     ) -> Result<LowerResultId, LibVmError> {
         let store = &self.store;
         let pool = existing_pool(store)?;
@@ -859,15 +1046,16 @@ impl LayerStore {
             })
             .collect::<Vec<_>>();
         let fsmeta = pool.open_object(&lower.fsmeta).map_err(retained(id))?;
-        let loaded = crate::storage::composition::load_exact(
+        let validation = validate_composition(
+            store,
+            id,
             &authenticated.recipe,
-            &refs,
             &authenticated.result,
+            &refs,
             &fsmeta,
-        )?;
-        if loaded.result != authenticated.result {
-            return Err(invalid("received composition failed exact loading"));
-        }
+            local,
+        )
+        .await?;
         drop(refs);
         let mut committed = BTreeSet::new();
         for ((layer, facts), id) in lower
@@ -915,6 +1103,7 @@ impl LayerStore {
             layers: layer_ids,
         };
         commit_composition(store, &pool, operation, &retained).await?;
+        save_validation(store, id, &validation).await?;
         Ok(id)
     }
 }
@@ -950,7 +1139,7 @@ pub(crate) async fn publish_regenerated(
     }
     let layer_store = LayerStore::from_store(store.clone());
     layer_store
-        .publish_snapshot_composition_owned(operation, expected.clone())
+        .publish_snapshot_composition_owned(operation, expected.clone(), false)
         .await
 }
 
@@ -1044,4 +1233,449 @@ pub(crate) async fn retire_compositions(
         .execute(&store.pool)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use std::fs::File;
+    use std::fs::{FileTimes, OpenOptions, Permissions};
+    use std::os::unix::fs::{FileExt, PermissionsExt};
+    use std::path::Path;
+
+    use oci::changeset::{ChangesetLimits, ContentDigest, LayerInput};
+
+    use crate::paths::LocalPaths;
+    use crate::storage::pool::StoragePool;
+    use crate::store::composition_store::HeldComposition;
+    use crate::store::layer_store::LayerStore;
+    use crate::store::Store;
+
+    async fn fixture() -> (tempfile::TempDir, LocalPaths, Store, HeldComposition) {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temporary.path().join("home"));
+        let store = Store::new(&paths).await.unwrap();
+        let first =
+            crate::store::storage::tests::retained_lower(&store, temporary.path(), b'A').await;
+        let layers = LayerStore::from_store(store.clone());
+        let second = layers
+            .publish(
+                crate::store::layer_store::tests::staged_byte(temporary.path(), &layers, b'B'),
+                &ChangesetLimits::default(),
+            )
+            .await
+            .unwrap();
+        let empty_path = temporary.path().join("empty.tar");
+        let empty_bytes = [0u8; 1024];
+        std::fs::write(&empty_path, empty_bytes).unwrap();
+        let digest = ContentDigest::of_bytes(&empty_bytes);
+        let staged = oci::changeset::ingest_layer(
+            &empty_path,
+            &LayerInput {
+                blob_digest: digest,
+                media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+                size_bytes: empty_bytes.len() as u64,
+                diff_id: digest,
+            },
+            paths.images_dir(),
+            &oci::StagingOperation::try_from(uuid::Uuid::new_v4().to_string()).unwrap(),
+            &ChangesetLimits::default(),
+        )
+        .unwrap();
+        let empty = layers
+            .publish(staged, &ChangesetLimits::default())
+            .await
+            .unwrap();
+        let first_id = first.retained.layers[0];
+        let held = layers
+            .compose_retained(
+                oci::Platform::host().unwrap(),
+                &[first_id, empty.id, second.id, first_id, empty.id],
+                &ChangesetLimits::default(),
+            )
+            .await
+            .unwrap();
+        (temporary, paths, store, held)
+    }
+
+    async fn receipt(store: &Store, held: &HeldComposition) -> Vec<u8> {
+        sqlx::query_scalar(
+            "SELECT receipt FROM composition_validation WHERE lower_id=?1 AND schema=1",
+        )
+        .bind(held.retained.id.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+    }
+
+    fn replace(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, bytes).unwrap();
+        std::fs::set_permissions(&replacement, Permissions::from_mode(0o400)).unwrap();
+        std::fs::rename(replacement, path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watch(held: &HeldComposition, pool: &StoragePool) -> nix::sys::inotify::Inotify {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let events = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).unwrap();
+        events
+            .add_watch(
+                &pool.object_path(&held.retained.fsmeta()),
+                AddWatchFlags::IN_ACCESS,
+            )
+            .unwrap();
+        for (layer, _) in &held.unique {
+            events
+                .add_watch(
+                    &pool.stream_path(&layer.pack.stream),
+                    AddWatchFlags::IN_ACCESS,
+                )
+                .unwrap();
+        }
+        events
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unread(events: &nix::sys::inotify::Inotify) {
+        assert_eq!(events.read_events().unwrap_err(), nix::errno::Errno::EAGAIN);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn receipt_hits_skip_lower_bytes_across_create_restore_start_and_fork() {
+        let (_temporary, paths, store, held) = fixture().await;
+        let layers = LayerStore::from_store(store.clone());
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        let id = held.retained.id;
+        assert_eq!(held.layers().len(), 5);
+        assert_eq!(held.unique.len(), 3);
+        assert!(held.unique.iter().any(|(layer, _)| layer.pack.length == 0));
+        assert!(!receipt(&store, &held).await.is_empty());
+        let events = watch(&held, &pool);
+        sqlx::query("DELETE FROM composition_validation WHERE lower_id=?1")
+            .bind(id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let exact = layers.hold_composition(id).await.unwrap();
+        assert!(!events.read_events().unwrap().is_empty());
+        unread(&events);
+
+        let reused = layers
+            .compose_retained(
+                held.retained.recipe.platform.clone(),
+                &held.retained.layers,
+                &ChangesetLimits::default(),
+            )
+            .await
+            .unwrap();
+        reused.recheck().unwrap();
+        unread(&events);
+        let graph = held.snapshot_composition().unwrap();
+        layers
+            .publish_local_composition(held._owner.operation, &graph)
+            .await
+            .unwrap();
+        layers
+            .hold_composition(id)
+            .await
+            .unwrap()
+            .recheck()
+            .unwrap();
+        unread(&events);
+
+        let (config, lease) =
+            crate::store::storage::tests::leased_layered_machine(&store, &paths, &held).await;
+        let launch = layers
+            .launch_lower(&lease, lease.storage_record())
+            .await
+            .unwrap();
+        let admitted = crate::storage::vmdk::FlatLowerPlan::new(&launch.occurrences)
+            .unwrap()
+            .preflight(0)
+            .unwrap();
+        let mut reordered = launch.occurrences.clone();
+        reordered.swap(1, 2);
+        assert!(crate::storage::vmdk::FlatLowerPlan::new(&reordered)
+            .unwrap()
+            .preflight(0)
+            .unwrap()
+            .verify_composition(&pool, &launch.validation)
+            .is_err());
+        admitted
+            .verify_composition(&pool, &launch.validation)
+            .unwrap();
+        unread(&events);
+        let fork = layers
+            .hold_lower(&held.retained.overlay_lower())
+            .await
+            .unwrap();
+        let configuration = crate::SnapshotConfiguration::capture(&config).unwrap();
+        crate::machine::restore::verify_local_lower(
+            &pool,
+            lease.storage_record(),
+            &configuration,
+            Some(&fork),
+        )
+        .unwrap();
+        unread(&events);
+
+        // Imported/transported admission is unconditional even with a local receipt.
+        layers
+            .publish_snapshot_composition(held._owner.operation, &graph)
+            .await
+            .unwrap();
+        assert!(!events.read_events().unwrap().is_empty());
+        drop(exact);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn receipt_hit_works_with_descriptors_that_cannot_read_payloads() {
+        use nix::fcntl::{open, OFlag};
+        use nix::sys::stat::Mode;
+
+        let (_temporary, paths, store, mut held) = fixture().await;
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        held.fsmeta = File::from(
+            open(
+                &pool.object_path(&held.retained.fsmeta()),
+                OFlag::O_PATH | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap(),
+        );
+        for (layer, file) in &mut held.unique {
+            *file = std::sync::Arc::new(File::from(
+                open(
+                    &pool.stream_path(&layer.pack.stream),
+                    OFlag::O_PATH | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .unwrap(),
+            ));
+        }
+        held.recheck().unwrap();
+        crate::store::composition_store::validate_composition(
+            &store,
+            held.retained.id,
+            &held.retained.recipe,
+            &held.retained.result,
+            &held.layers(),
+            &held.fsmeta,
+            true,
+        )
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM composition_validation WHERE lower_id=?1")
+            .bind(held.retained.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(crate::store::composition_store::validate_composition(
+            &store,
+            held.retained.id,
+            &held.retained.recipe,
+            &held.retained.result,
+            &held.layers(),
+            &held.fsmeta,
+            true,
+        )
+        .await
+        .is_err());
+        LayerStore::from_store(store)
+            .hold_composition(held.retained.id)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inode_replacement_and_chmod_reauthenticate_exact_bytes() {
+        let (_temporary, paths, store, held) = fixture().await;
+        let layers = LayerStore::from_store(store.clone());
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        let pack = pool.stream_path(&held.unique[0].0.pack.stream);
+        let original = receipt(&store, &held).await;
+        replace(&pack);
+        let events = watch(&held, &pool);
+        let replaced = layers.hold_composition(held.retained.id).await.unwrap();
+        assert!(!events.read_events().unwrap().is_empty());
+        assert_ne!(receipt(&store, &held).await, original);
+        assert!(held.recheck().is_err());
+        replaced.recheck().unwrap();
+
+        let original = receipt(&store, &replaced).await;
+        std::fs::set_permissions(&pack, Permissions::from_mode(0o600)).unwrap();
+        assert!(layers.hold_composition(held.retained.id).await.is_err());
+        std::fs::set_permissions(&pack, Permissions::from_mode(0o400)).unwrap();
+        let resealed = layers.hold_composition(held.retained.id).await.unwrap();
+        assert_ne!(receipt(&store, &resealed).await, original);
+        assert!(!events.read_events().unwrap().is_empty());
+
+        let fsmeta = pool.object_path(&held.retained.fsmeta());
+        let original = receipt(&store, &resealed).await;
+        replace(&fsmeta);
+        let events = watch(&resealed, &pool);
+        let replaced = layers.hold_composition(held.retained.id).await.unwrap();
+        assert!(!events.read_events().unwrap().is_empty());
+        assert_ne!(receipt(&store, &replaced).await, original);
+    }
+
+    #[tokio::test]
+    async fn byte_mutation_restoring_mtime_and_missing_members_are_refused() {
+        let (_temporary, paths, store, held) = fixture().await;
+        let layers = LayerStore::from_store(store.clone());
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        let pack = pool.stream_path(&held.unique[0].0.pack.stream);
+        let modified = std::fs::metadata(&pack).unwrap().modified().unwrap();
+        std::fs::set_permissions(&pack, Permissions::from_mode(0o600)).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pack)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, 0).unwrap();
+        file.write_all_at(&[byte[0] ^ 0xff], 0).unwrap();
+        file.set_times(FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::set_permissions(&pack, Permissions::from_mode(0o400)).unwrap();
+        assert!(layers.hold_composition(held.retained.id).await.is_err());
+        assert!(held.recheck().is_err());
+        let absent: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM composition_validation WHERE lower_id=?1")
+                .bind(held.retained.id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(absent, 0);
+        file.write_all_at(&byte, 0).unwrap();
+        drop(file);
+        layers.hold_composition(held.retained.id).await.unwrap();
+        std::fs::remove_file(&pack).unwrap();
+        assert!(layers.hold_composition(held.retained.id).await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn malformed_or_different_schema_receipts_fall_back_to_exact_validation() {
+        let (_temporary, paths, store, held) = fixture().await;
+        let layers = LayerStore::from_store(store.clone());
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        let events = watch(&held, &pool);
+        sqlx::query("UPDATE composition_validation SET schema=2 WHERE lower_id=?1")
+            .bind(held.retained.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        layers.hold_composition(held.retained.id).await.unwrap();
+        assert!(!events.read_events().unwrap().is_empty());
+        sqlx::query("UPDATE composition_validation SET receipt=?2 WHERE lower_id=?1")
+            .bind(held.retained.id.to_string())
+            .bind(b"not a receipt".as_slice())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        layers.hold_composition(held.retained.id).await.unwrap();
+        assert!(!events.read_events().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_same_length_replacements_and_missing_fsmeta_never_regenerate() {
+        let (_temporary, paths, store, held) = fixture().await;
+        let layers = LayerStore::from_store(store.clone());
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        for path in [
+            pool.stream_path(&held.unique[0].0.pack.stream),
+            pool.object_path(&held.retained.fsmeta()),
+        ] {
+            replace(&path);
+            std::fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut byte = [0u8; 1];
+            file.read_exact_at(&mut byte, 0).unwrap();
+            file.write_all_at(&[byte[0] ^ 0xff], 0).unwrap();
+            std::fs::set_permissions(&path, Permissions::from_mode(0o400)).unwrap();
+            assert!(layers.hold_composition(held.retained.id).await.is_err());
+            assert_eq!(
+                layers.retained_composition(held.retained.id).await.unwrap(),
+                held.retained
+            );
+            file.write_all_at(&byte, 0).unwrap();
+            drop(file);
+            layers.hold_composition(held.retained.id).await.unwrap();
+        }
+        std::fs::remove_file(pool.object_path(&held.retained.fsmeta())).unwrap();
+        assert!(layers.hold_composition(held.retained.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn canonical_occurrence_order_is_not_authorized_by_a_receipt() {
+        let (_temporary, _paths, store, held) = fixture().await;
+        let layers = LayerStore::from_store(store.clone());
+        sqlx::query("DELETE FROM composition_layer WHERE result_id=?1 AND position IN (0,1)")
+            .bind(held.retained.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        for (position, layer) in [
+            (0i64, held.retained.layers[1]),
+            (1, held.retained.layers[0]),
+        ] {
+            sqlx::query("INSERT INTO composition_layer(result_id,position,layer_result_id) VALUES(?1,?2,?3)")
+                .bind(held.retained.id.to_string()).bind(position).bind(layer.to_string())
+                .execute(&store.pool).await.unwrap();
+        }
+        assert!(layers.hold_composition(held.retained.id).await.is_err());
+        assert!(!receipt(&store, &held).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn held_leases_survive_concurrent_gc_and_receipts_are_not_roots() {
+        let (_temporary, paths, store, held) = fixture().await;
+        let layers = LayerStore::from_store(store.clone());
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        let id = held.retained.id;
+        let fsmeta = pool.object_path(&held.retained.fsmeta());
+        let (again, collected) =
+            tokio::join!(layers.hold_composition(id), store.retire_layer_cache(),);
+        collected.unwrap();
+        let again = again.unwrap();
+        held.recheck().unwrap();
+        again.recheck().unwrap();
+        assert!(fsmeta.exists());
+        drop(held);
+        drop(again);
+        store.retire_layer_cache().await.unwrap();
+        store.recover_layer_objects().await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM composition_validation WHERE lower_id=?1")
+                .bind(id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+        assert!(!fsmeta.exists());
+    }
 }

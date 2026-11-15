@@ -38,6 +38,8 @@ pub enum SnapshotCaptureKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotExecution {
     pub memory: SnapshotStream,
+    /// State identities authenticate complete objects, not individual chunks.
+    /// Explicit verification reports their role, digest and admitted length.
     pub layout: ObjectDigest,
     pub execution: ObjectDigest,
     pub devices: ObjectDigest,

@@ -104,8 +104,7 @@ pub(crate) async fn observation_body(
             lower: crate::OverlayLower::ErofsComposition { record, .. },
             ..
         } => Some(
-            crate::store::layer_store::LayerStore::open(runtime.local_home())
-                .await?
+            crate::store::layer_store::LayerStore::from_store(runtime.native_store()?)
                 .snapshot_composition(*record)
                 .await?,
         ),

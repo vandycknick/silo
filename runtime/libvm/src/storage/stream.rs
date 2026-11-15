@@ -31,6 +31,24 @@ pub enum Chunk {
     Data(ObjectDigest),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ExpectedMapError {
+    #[error("stream length changed: expected {expected}, actual {actual}")]
+    Length { expected: u64, actual: u64 },
+    #[error("chunk {index} bytes {start}..{end}: expected {expected:?}, actual {actual:?}")]
+    ChunkMismatch {
+        index: u64,
+        start: u64,
+        end: u64,
+        expected: Chunk,
+        actual: Chunk,
+    },
+    #[error("stream changed during verification")]
+    Changed,
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamMap {
     length: u64,
@@ -231,16 +249,23 @@ impl AuthenticatedStream {
 
 /// Whole-byte authentication, independent of stream chunk identity.
 pub(crate) fn whole_file_sha256(file: &File) -> Result<Sha256Digest, StorageError> {
+    let metadata = file.metadata()?;
+    Resource::ArtifactStreamBytes.check(metadata.len())?;
+    if !metadata.is_file() {
+        return Err(invalid_data("whole-object authentication requires a regular file").into());
+    }
+    let fingerprint = SourceFingerprint::new(&metadata);
     let mut buffer = [0u8; 64 << 10];
     let mut offset = 0;
     let mut hash = Sha256::new();
-    loop {
-        let count = file.read_at(&mut buffer, offset)?;
-        if count == 0 {
-            break;
-        }
+    while offset < metadata.len() {
+        let count = (metadata.len() - offset).min(buffer.len() as u64) as usize;
+        read_exact_at(file, &mut buffer[..count], offset)?;
         hash.update(&buffer[..count]);
         offset += count as u64;
+    }
+    if fingerprint != SourceFingerprint::new(&file.metadata()?) {
+        return Err(invalid_data("object changed during authentication").into());
     }
     Ok(Sha256Digest::from_bytes(hash.finalize().into()))
 }
@@ -337,6 +362,59 @@ impl StreamHasher {
         length: u64,
     ) -> Result<StreamScan, StorageError> {
         self.scan_file(source, length, None, Extents::new(source, length), None)
+    }
+
+    /// Explicit verification reads every logical byte, including recorded zeros
+    /// and filesystem holes. Comparison stops at the first differing chunk.
+    pub fn verify_expected_map(
+        &mut self,
+        source: &File,
+        expected: &StreamMap,
+    ) -> Result<StreamStats, ExpectedMapError> {
+        let metadata = source.metadata().map_err(StorageError::from)?;
+        if !metadata.is_file() {
+            return Err(
+                StorageError::from(invalid_data("verification requires a regular file")).into(),
+            );
+        }
+        if metadata.len() != expected.length() {
+            return Err(ExpectedMapError::Length {
+                expected: expected.length(),
+                actual: metadata.len(),
+            });
+        }
+        let fingerprint = SourceFingerprint::new(&metadata);
+        let mut stats = StreamStats::default();
+        let mut start = 0;
+        for (index, expected) in expected.chunks().iter().enumerate() {
+            let end = (start + CHUNK_SIZE as u64).min(metadata.len());
+            let bytes = &mut self.buffer[..(end - start) as usize];
+            read_exact_at(source, bytes, start).map_err(StorageError::from)?;
+            stats.bytes_read += end - start;
+            let actual = classify_chunk(bytes);
+            if matches!(actual, Chunk::Data(_)) {
+                stats.logical_bytes_hashed += end - start;
+            }
+            if actual != *expected {
+                if fingerprint
+                    != SourceFingerprint::new(&source.metadata().map_err(StorageError::from)?)
+                {
+                    return Err(ExpectedMapError::Changed);
+                }
+                return Err(ExpectedMapError::ChunkMismatch {
+                    index: index as u64,
+                    start,
+                    end,
+                    expected: *expected,
+                    actual,
+                });
+            }
+            start = end;
+        }
+        if fingerprint != SourceFingerprint::new(&source.metadata().map_err(StorageError::from)?) {
+            return Err(ExpectedMapError::Changed);
+        }
+        Ok(stats)
     }
 
     /// Compute both identities in one extent-aware logical pass. Whole-file
@@ -1582,5 +1660,38 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("copy-time stream chunks"));
         assert_eq!(fcntl(&output, FcntlArg::F_GETFL).unwrap(), flags);
+    }
+
+    #[test]
+    fn expected_map_reads_holes_and_reports_first_chunk_and_tail() {
+        use crate::storage::stream::ExpectedMapError;
+        let source = tempfile::tempfile().unwrap();
+        let length = 2 * CHUNK_SIZE as u64 + 7;
+        source.set_len(length).unwrap();
+        let map = StreamMap::new(length, vec![Chunk::Zero; 3]).unwrap();
+        assert_eq!(
+            StreamHasher::new()
+                .verify_expected_map(&source, &map)
+                .unwrap()
+                .bytes_read,
+            length
+        );
+        source.write_all_at(&[1], length - 1).unwrap();
+        let error = StreamHasher::new()
+            .verify_expected_map(&source, &map)
+            .unwrap_err();
+        assert!(matches!(error, ExpectedMapError::ChunkMismatch {
+            index: 2, start, end, expected: Chunk::Zero, actual: Chunk::Data(_)
+        } if start == 2 * CHUNK_SIZE as u64 && end == length));
+        source.write_all_at(&[2], 0).unwrap();
+        assert!(matches!(
+            StreamHasher::new().verify_expected_map(&source, &map),
+            Err(ExpectedMapError::ChunkMismatch { index: 0, .. })
+        ));
+        source.set_len(length - 1).unwrap();
+        assert!(matches!(
+            StreamHasher::new().verify_expected_map(&source, &map),
+            Err(ExpectedMapError::Length { expected, actual }) if expected == length && actual == length - 1
+        ));
     }
 }

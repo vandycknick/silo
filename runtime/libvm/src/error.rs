@@ -44,6 +44,8 @@ pub enum LibVmError {
         operation_id: uuid::Uuid,
         child_index: u32,
     },
+    #[error(transparent)]
+    SnapshotVerification(#[from] crate::store::snapshot_store::SnapshotVerificationError),
     #[error("checkpoint {checkpoint} refused at {}: pin {} expected {}, destination {}; no execution child was started", .refusal.stage, .refusal.pin, .refusal.expected, .refusal.actual)]
     CheckpointPortability {
         checkpoint: String,
@@ -395,6 +397,7 @@ impl LibVmError {
             Self::LiveFork { .. } => "LiveFork",
             Self::LiveForkNotFound { .. } => "LiveForkNotFound",
             Self::ForkChildCancelled { .. } => "ForkChildCancelled",
+            Self::SnapshotVerification(_) => "SnapshotVerification",
             Self::Storage(_) => "Storage",
             Self::BootAsset(_) => "BootAsset",
             Self::DirectKernelRejected(_) => "DirectKernelRejected",

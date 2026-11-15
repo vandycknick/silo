@@ -867,7 +867,7 @@ async fn create_machine_config_with_name(
             // operation (which pins every graph object and pack), then lease it.
             let layers = crate::store::layer_store::LayerStore::from_store(runtime.native_store()?);
             let id = layers
-                .publish_snapshot_composition(consumer.operation_id(), lower)
+                .publish_local_composition(consumer.operation_id(), lower)
                 .await?;
             CreateRoot::Image {
                 held: layers.hold_composition(id).await?,

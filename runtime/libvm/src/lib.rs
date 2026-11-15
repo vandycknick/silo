@@ -69,7 +69,8 @@ pub use crate::store::models::storage::{
 pub use crate::store::models::{MachineId, MachineIdParseError};
 pub use crate::store::snapshot_store::{
     CaptureNamingOutcome, SnapshotCaptureKindName, SnapshotCaptureProvenance, SnapshotInfo,
-    SnapshotRef, SnapshotStore,
+    SnapshotRef, SnapshotStore, SnapshotStructuralFailure, SnapshotVerificationError,
+    SnapshotVerificationMember, SnapshotVerificationReport, SnapshotVerificationRole,
 };
 pub use vm_spec::restore::{RestoreEnvironmentVariable, RestoreHook};
 pub use vm_spec::{live, BlockId, DiskFormat};
@@ -130,7 +131,7 @@ pub use crate::network::{
 pub use crate::paths::HostPaths;
 pub use crate::runtime::{
     NetdRuntimeConfig, ReadOnlyRuntime, ResolvedRuntimeComponents, Runtime, RuntimeBuilder,
-    RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride,
+    RuntimeConfig, RuntimeNetworkingConfig, RuntimeOpenMode, VirtBackendOverride,
 };
 pub use crate::supervisor::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use forward_spec::{

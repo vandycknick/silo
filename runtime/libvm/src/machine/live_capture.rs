@@ -51,8 +51,7 @@ use crate::{LibVmError, Runtime};
 /// Bound on one CLI wait for monitor progress. Expiry is not cancellation:
 /// the operation, reservation, staging and journal are retained.
 const CAPTURE_WAIT: Duration = Duration::from_secs(600);
-const POLL_MIN: Duration = Duration::from_millis(100);
-const POLL_MAX: Duration = Duration::from_secs(1);
+const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Bound for reading the launched `config.json` back for the capture plan.
 const MAX_LAUNCH_SPEC_BYTES: usize = 4 << 20;
 
@@ -439,7 +438,6 @@ impl Machine {
     pub async fn complete_capture(&self, capture_id: Uuid) -> Result<LiveSnapshot, LibVmError> {
         let capture = live_id(capture_id)?;
         let deadline = tokio::time::Instant::now() + CAPTURE_WAIT;
-        let mut delay = POLL_MIN;
         loop {
             // A snapshot capture never retains a local cut to open.
             let stage = match advance(self.runtime(), self.machine_id(), capture_id, &mut None)
@@ -463,8 +461,7 @@ impl Machine {
                     ),
                 ));
             }
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, POLL_MAX);
+            tokio::time::sleep(CAPTURE_POLL).await;
         }
     }
 

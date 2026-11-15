@@ -75,6 +75,75 @@ pub struct SnapshotInfo {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotVerificationReport {
+    pub snapshot: SnapshotId,
+    pub streams: u64,
+    /// Unique logical bytes verified, including holes, state and metadata.
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotVerificationRole {
+    Ram,
+    Layout,
+    Execution,
+    Devices,
+    RootDisk,
+    DataDisk { order: u32 },
+    Dependency,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotVerificationMember {
+    Stream(StreamId),
+    Object(ObjectDigest),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotStructuralFailure {
+    #[error("missing member")]
+    Missing,
+    #[error("truncated member: expected {expected} bytes, actual {actual}")]
+    Truncated { expected: u64, actual: u64 },
+    #[error("length mismatch: expected {expected} bytes, actual {actual}")]
+    Length { expected: u64, actual: u64 },
+    #[error("writable member (mode {mode:o})")]
+    Writable { mode: u32 },
+    #[error("member replaced or modified during verification")]
+    Replaced,
+    #[error("invalid member: {message}")]
+    Invalid { message: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotVerificationError {
+    #[error("{role:?} {member:?}: {failure}")]
+    Structural {
+        role: SnapshotVerificationRole,
+        member: SnapshotVerificationMember,
+        failure: SnapshotStructuralFailure,
+    },
+    #[error("{role:?} stream {stream} chunk {index} bytes {start}..{end}: expected {expected:?}, actual {actual:?}")]
+    ChunkMismatch {
+        role: SnapshotVerificationRole,
+        stream: StreamId,
+        index: u64,
+        start: u64,
+        end: u64,
+        expected: Box<crate::storage::stream::Chunk>,
+        actual: Box<crate::storage::stream::Chunk>,
+    },
+    #[error("{role:?} object {object} ({length} bytes): expected {object}, actual {actual}")]
+    ObjectMismatch {
+        role: SnapshotVerificationRole,
+        object: ObjectDigest,
+        length: u64,
+        actual: ObjectDigest,
+    },
+}
+
 /// A checkpoint is retained even when its optional requested name loses a race.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
@@ -327,6 +396,37 @@ impl SnapshotStore {
         Ok(info)
     }
 
+    /// Pin a reference once and unconditionally reread its closure. Warm local
+    /// receipts and producer capabilities are never verification authority.
+    pub async fn verify(
+        &self,
+        reference: &SnapshotRef,
+    ) -> Result<SnapshotVerificationReport, LibVmError> {
+        let snapshots = self.clone();
+        let reference = reference.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let consumer =
+                runtime.block_on(snapshots.consume_selected(&reference, false, false, false))?;
+            let result = verify_snapshot_bytes(&snapshots, &consumer);
+            let cleanup = runtime.block_on(
+                snapshots
+                    .store
+                    .finish_stopped_operation(consumer.operation_id),
+            );
+            drop(consumer);
+            match (result, cleanup) {
+                (Err(primary), Err(cleanup)) => Err(LibVmError::MachineStartCleanupFailed {
+                    primary: primary.to_string(),
+                    cleanup: cleanup.to_string(),
+                }),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+                (Ok(report), Ok(())) => Ok(report),
+            }
+        })
+        .await?
+    }
+
     pub async fn list(&self) -> Result<Vec<SnapshotInfo>, LibVmError> {
         // Each discovery page is bounded. Immutable IDs provide a stable cursor;
         // concurrent removal can only omit an entry, never fabricate a record.
@@ -473,7 +573,7 @@ impl SnapshotStore {
         require_operation_closure(&self.store, operation_id, &streams, &objects, Some(digest))
             .await?;
         let mut fingerprints = match inputs {
-            Some(inputs) => verify_publication_closure(&pool, record, inputs.published_ram()?)?,
+            Some(inputs) => verify_publication_closure(&pool, record, inputs.publications())?,
             None => verify_closure(&pool, record, None, false)?.0,
         };
         let input = RecordInput::new(&self.store.images_dir, operation_id, &bytes)?;
@@ -510,7 +610,9 @@ impl SnapshotStore {
         recheck_closure(&fingerprints)?;
         if let Some(inputs) = inputs {
             inputs.recheck_registered(&self.store, operation_id)?;
-            inputs.published_ram()?.recheck(&pool)?;
+            for publication in inputs.publications().values() {
+                publication.recheck(&pool)?;
+            }
         }
         require_operation_closure(&self.store, operation_id, &streams, &objects, None).await?;
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -545,6 +647,18 @@ impl SnapshotStore {
             for object in &objects {
                 sqlx::query("INSERT INTO snapshot_object_dependency(snapshot_id,object_digest) VALUES(?1,?2)")
                     .bind(id.to_string()).bind(object.to_string()).execute(&mut *tx).await?;
+            }
+        }
+        if let Some(inputs) = inputs {
+            for (stream, publication) in inputs.publications() {
+                publication.recheck(&pool)?;
+                let [dev, ino, len, mode, ctime_sec, ctime_nsec] =
+                    publication.fingerprint().verification_key();
+                sqlx::query(
+                    "INSERT INTO verified_object(stream_sha256,dev,ino,len,mode,ctime_sec,ctime_nsec,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(stream_sha256) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,len=excluded.len,mode=excluded.mode,ctime_sec=excluded.ctime_sec,ctime_nsec=excluded.ctime_nsec,verified_at=excluded.verified_at",
+                )
+                .bind(stream.to_string()).bind(dev).bind(ino).bind(len).bind(mode)
+                .bind(ctime_sec).bind(ctime_nsec).execute(&mut *tx).await?;
             }
         }
         let mut naming_outcome = None;
@@ -626,14 +740,14 @@ impl SnapshotStore {
         &self,
         reference: &SnapshotRef,
     ) -> Result<SnapshotConsumer, LibVmError> {
-        self.consume_selected(reference, false, true).await
+        self.consume_selected(reference, false, true, true).await
     }
 
     pub(crate) async fn consume_disks(
         &self,
         reference: &SnapshotRef,
     ) -> Result<SnapshotConsumer, LibVmError> {
-        self.consume_selected(reference, true, true).await
+        self.consume_selected(reference, true, true, true).await
     }
 
     /// Pin catalog authority and materialize evicted streams without authenticating
@@ -642,7 +756,7 @@ impl SnapshotStore {
         &self,
         reference: &SnapshotRef,
     ) -> Result<SnapshotConsumer, LibVmError> {
-        self.consume_selected(reference, false, false).await
+        self.consume_selected(reference, false, false, true).await
     }
 
     #[cfg(test)]
@@ -737,7 +851,7 @@ impl SnapshotStore {
             }
             _ => None,
         };
-        let shape = verify_artifact_shape(
+        let mut shape = verify_artifact_shape(
             &pool,
             &consumer.record.canonical_bytes()?,
             &consumer.record.streams().collect::<Vec<_>>(),
@@ -759,6 +873,7 @@ impl SnapshotStore {
                 .authenticate(|digest, maximum| Ok(pool.read_object(digest, maximum)?))?
                 .check_root_claims(lower_geometry, *lower_filesystem_uuid)?;
         }
+        shape.local_lower = consumer.record.lower().cloned();
         recheck_closure(&shape.fingerprints)?;
         Ok(shape)
     }
@@ -766,13 +881,13 @@ impl SnapshotStore {
     /// Local restore only. Transport callers use the unconditional full path.
     pub(crate) async fn authenticate_closure_bytes(
         &self,
-        shape: ShapeVerifiedClosure,
+        mut shape: ShapeVerifiedClosure,
     ) -> Result<AuthenticatedClosure, LibVmError> {
         let store = self.store.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             let pool = StoragePool::open(&store.images_dir)?;
-            let warm = runtime.block_on(async {
+            let mut warm = runtime.block_on(async {
                 let mut warm = BTreeMap::new();
                 for stream in shape.maps.keys() {
                     let file = pool.open_stream(stream)?;
@@ -793,7 +908,45 @@ impl SnapshotStore {
                 }
                 Ok::<_, LibVmError>(warm)
             })?;
+            let lower = if let Some(expected) = &shape.local_lower {
+                let layers = crate::store::layer_store::LayerStore::from_store((*store).clone());
+                runtime.block_on(async {
+                    let held = layers.hold_composition(expected.result).await?;
+                    if held.snapshot_composition()? != *expected {
+                        return Err(invalid("held composition differs from snapshot lower"));
+                    }
+                    held.recheck()?;
+                    let fsmeta = held.retained().fsmeta();
+                    let (_, fingerprint) = held.held_backing(
+                        crate::storage::vmdk::LowerBacking::Object(fsmeta),
+                    )?;
+                    if shape.object_states.get(&fsmeta) != Some(&fingerprint) {
+                        return Err(invalid("held lower fsmeta differs from snapshot inode"));
+                    }
+                    let mut packs = BTreeMap::new();
+                    for layer in &expected.layers {
+                        let (_, fingerprint) = held.held_backing(
+                            crate::storage::vmdk::LowerBacking::Stream(layer.pack.stream),
+                        )?;
+                        if shape.stream_states.get(&layer.pack.stream) != Some(&fingerprint) {
+                            return Err(invalid("held lower pack differs from snapshot inode"));
+                        }
+                        packs.insert(layer.pack.stream, fingerprint);
+                    }
+                    Ok::<_, LibVmError>((held, fsmeta, packs))
+                }).ok()
+            } else {
+                None
+            };
+            if let Some((held, fsmeta, packs)) = &lower {
+                held.recheck()?;
+                shape.objects.remove(fsmeta);
+                warm.extend(packs.iter().map(|(stream, fingerprint)| (*stream, *fingerprint)));
+            }
             let closure = shape.authenticate(&pool, Some(&warm))?;
+            if let Some((held, _, _)) = &lower {
+                held.recheck()?;
+            }
             runtime.block_on(async {
                 for (stream, authenticated) in &closure.streams {
                     if warm.contains_key(stream) {
@@ -820,6 +973,7 @@ impl SnapshotStore {
         reference: &SnapshotRef,
         disks_only: bool,
         authenticate: bool,
+        materialize: bool,
     ) -> Result<SnapshotConsumer, LibVmError> {
         let store = self.store.clone();
         let (record, observed) = self.load_observed(reference).await?;
@@ -884,7 +1038,7 @@ impl SnapshotStore {
                 } else {
                     record.streams().collect::<Vec<_>>()
                 };
-                for content in &contents {
+                for content in contents.iter().filter(|_| materialize) {
                     runtime.block_on(store.materialize_stream(id, content))?;
                 }
                 if !authenticate {
@@ -1449,6 +1603,320 @@ pub(crate) fn recheck_closure(
     Ok(())
 }
 
+fn structural(
+    role: &SnapshotVerificationRole,
+    member: SnapshotVerificationMember,
+    failure: SnapshotStructuralFailure,
+) -> LibVmError {
+    SnapshotVerificationError::Structural {
+        role: role.clone(),
+        member,
+        failure,
+    }
+    .into()
+}
+
+fn verification_path(pool: &StoragePool, member: SnapshotVerificationMember) -> std::path::PathBuf {
+    match member {
+        SnapshotVerificationMember::Stream(stream) => pool.stream_path(&stream),
+        SnapshotVerificationMember::Object(object) => pool.object_path(&object),
+    }
+}
+
+fn open_verification_member(
+    pool: &StoragePool,
+    role: &SnapshotVerificationRole,
+    member: SnapshotVerificationMember,
+    length: Option<u64>,
+) -> Result<(File, SourceFingerprint), LibVmError> {
+    use std::os::unix::fs::MetadataExt;
+    let path = verification_path(pool, member);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        structural(
+            role,
+            member,
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SnapshotStructuralFailure::Missing
+            } else {
+                SnapshotStructuralFailure::Invalid {
+                    message: error.to_string(),
+                }
+            },
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(structural(
+            role,
+            member,
+            SnapshotStructuralFailure::Invalid {
+                message: "member is not a regular file".into(),
+            },
+        ));
+    }
+    if metadata.mode() & 0o222 != 0 {
+        return Err(structural(
+            role,
+            member,
+            SnapshotStructuralFailure::Writable {
+                mode: metadata.mode(),
+            },
+        ));
+    }
+    if let Some(expected) = length {
+        let actual = metadata.len();
+        if actual != expected {
+            return Err(structural(
+                role,
+                member,
+                if actual < expected {
+                    SnapshotStructuralFailure::Truncated { expected, actual }
+                } else {
+                    SnapshotStructuralFailure::Length { expected, actual }
+                },
+            ));
+        }
+    }
+    let before = SourceFingerprint::new(&metadata);
+    let file = match member {
+        SnapshotVerificationMember::Stream(stream) => pool.open_stream(&stream),
+        SnapshotVerificationMember::Object(object) => pool.open_object(&object),
+    }
+    .map_err(|error| {
+        structural(
+            role,
+            member,
+            SnapshotStructuralFailure::Invalid {
+                message: error.to_string(),
+            },
+        )
+    })?;
+    recheck_verification_member(pool, role, member, &file, before)?;
+    Ok((file, before))
+}
+
+fn recheck_verification_member(
+    pool: &StoragePool,
+    role: &SnapshotVerificationRole,
+    member: SnapshotVerificationMember,
+    file: &File,
+    before: SourceFingerprint,
+) -> Result<(), LibVmError> {
+    let held = file
+        .metadata()
+        .map(|metadata| SourceFingerprint::new(&metadata));
+    let named = std::fs::symlink_metadata(verification_path(pool, member))
+        .map(|metadata| SourceFingerprint::new(&metadata));
+    if held.ok() != Some(before) || named.ok() != Some(before) {
+        return Err(structural(
+            role,
+            member,
+            SnapshotStructuralFailure::Replaced,
+        ));
+    }
+    Ok(())
+}
+
+struct SnapshotByteVerifier<'a> {
+    pool: &'a StoragePool,
+    hasher: crate::storage::stream::StreamHasher,
+    streams: BTreeSet<StreamId>,
+    objects: BTreeSet<ObjectDigest>,
+    report: SnapshotVerificationReport,
+}
+
+impl SnapshotByteVerifier<'_> {
+    fn stream(
+        &mut self,
+        role: SnapshotVerificationRole,
+        content: &SnapshotStream,
+    ) -> Result<(), LibVmError> {
+        if !self.streams.insert(content.stream) {
+            return Ok(());
+        }
+        let member = SnapshotVerificationMember::Stream(content.stream);
+        let (file, before) =
+            open_verification_member(self.pool, &role, member, Some(content.length))?;
+        let mut maps = BTreeMap::new();
+        read_shape_maps(self.pool, std::iter::once(content), &mut maps).map_err(|error| {
+            structural(
+                &role,
+                member,
+                SnapshotStructuralFailure::Invalid {
+                    message: error.to_string(),
+                },
+            )
+        })?;
+        let map = maps
+            .get(&content.stream)
+            .ok_or_else(|| invalid("verification map is missing"))?;
+        let result = self.hasher.verify_expected_map(&file, map);
+        recheck_verification_member(self.pool, &role, member, &file, before)?;
+        result.map_err(|error| match error {
+            crate::storage::stream::ExpectedMapError::ChunkMismatch {
+                index,
+                start,
+                end,
+                expected,
+                actual,
+            } => SnapshotVerificationError::ChunkMismatch {
+                role: role.clone(),
+                stream: content.stream,
+                index,
+                start,
+                end,
+                expected: Box::new(expected),
+                actual: Box::new(actual),
+            }
+            .into(),
+            crate::storage::stream::ExpectedMapError::Length { expected, actual } => structural(
+                &role,
+                member,
+                if actual < expected {
+                    SnapshotStructuralFailure::Truncated { expected, actual }
+                } else {
+                    SnapshotStructuralFailure::Length { expected, actual }
+                },
+            ),
+            crate::storage::stream::ExpectedMapError::Changed => {
+                structural(&role, member, SnapshotStructuralFailure::Replaced)
+            }
+            crate::storage::stream::ExpectedMapError::Storage(error) => structural(
+                &role,
+                member,
+                SnapshotStructuralFailure::Invalid {
+                    message: error.to_string(),
+                },
+            ),
+        })?;
+        self.report.streams += 1;
+        self.report.bytes += content.length;
+        Ok(())
+    }
+
+    fn object(
+        &mut self,
+        role: SnapshotVerificationRole,
+        object: ObjectDigest,
+        length: Option<u64>,
+    ) -> Result<(), LibVmError> {
+        if !self.objects.insert(object) {
+            return Ok(());
+        }
+        let member = SnapshotVerificationMember::Object(object);
+        let (file, before) = open_verification_member(self.pool, &role, member, length)?;
+        let length = file.metadata()?.len();
+        let digest = crate::storage::stream::whole_file_sha256(&file);
+        recheck_verification_member(self.pool, &role, member, &file, before)?;
+        let digest = digest.map_err(|error| {
+            structural(
+                &role,
+                member,
+                SnapshotStructuralFailure::Invalid {
+                    message: error.to_string(),
+                },
+            )
+        })?;
+        let actual = ObjectDigest::from_sha256(*digest.as_bytes());
+        if actual != object {
+            return Err(SnapshotVerificationError::ObjectMismatch {
+                role,
+                object,
+                length,
+                actual,
+            }
+            .into());
+        }
+        self.report.bytes += length;
+        Ok(())
+    }
+}
+
+fn verify_snapshot_bytes(
+    snapshots: &SnapshotStore,
+    consumer: &SnapshotConsumer,
+) -> Result<SnapshotVerificationReport, LibVmError> {
+    let pool = StoragePool::open(&snapshots.store.images_dir)?;
+    let record = &consumer.record;
+    let mut verifier = SnapshotByteVerifier {
+        pool: &pool,
+        hasher: crate::storage::stream::StreamHasher::new(),
+        streams: BTreeSet::new(),
+        objects: BTreeSet::new(),
+        report: SnapshotVerificationReport {
+            snapshot: consumer.info.id,
+            streams: 0,
+            bytes: 0,
+        },
+    };
+    if let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+        &record.capture
+    {
+        verifier.stream(SnapshotVerificationRole::Ram, &execution.memory)?;
+        let capture = snapshots.restore_evidence(consumer, &pool)?;
+        for (role, capture_role, object) in [
+            (
+                SnapshotVerificationRole::Layout,
+                vm_spec::capture::CaptureRole::Layout,
+                execution.layout,
+            ),
+            (
+                SnapshotVerificationRole::Execution,
+                vm_spec::capture::CaptureRole::Execution,
+                execution.execution,
+            ),
+            (
+                SnapshotVerificationRole::Devices,
+                vm_spec::capture::CaptureRole::Devices,
+                execution.devices,
+            ),
+        ] {
+            let entry = capture
+                .evidence
+                .inventory
+                .iter()
+                .find(|entry| entry.role == capture_role)
+                .ok_or_else(|| invalid("capture inventory omitted state object"))?;
+            if entry.sha256.as_ref().map(|digest| digest.as_bytes()) != Some(object.as_bytes()) {
+                return Err(invalid("capture state identity contradicts snapshot"));
+            }
+            verifier.object(role, object, Some(entry.length))?;
+        }
+    }
+    verifier.stream(SnapshotVerificationRole::RootDisk, &record.root.stream)?;
+    for disk in &record.disks {
+        verifier.stream(
+            SnapshotVerificationRole::DataDisk { order: disk.order },
+            &disk.content,
+        )?;
+    }
+    for stream in record.streams() {
+        verifier.stream(SnapshotVerificationRole::Dependency, stream)?;
+    }
+    let (_, mut objects) = record.content_dependencies()?;
+    objects.insert(consumer.info.record_digest);
+    objects.extend(
+        consumer
+            .info
+            .provenance
+            .iter()
+            .map(|entry| entry.evidence_digest),
+    );
+    for imported in &consumer.imported {
+        objects.extend([
+            imported.provenance_digest,
+            imported.evidence_digest,
+            imported.receipt_digest,
+        ]);
+    }
+    for object in objects {
+        verifier.object(SnapshotVerificationRole::Dependency, object, None)?;
+    }
+    if let Some(lower) = record.lower() {
+        lower.authenticate(|digest, maximum| Ok(pool.read_object(digest, maximum)?))?;
+    }
+    Ok(verifier.report)
+}
+
 /// Verification is identical either way. With `retain`, the returned held
 /// descriptors are the exact inodes hashed here, each bound to the path state
 /// observed before hashing began; process descriptor admission for all of
@@ -1482,25 +1950,13 @@ fn verify_closure(
     )
 }
 
-/// Bind owned RAM publication provenance and authenticate all other members.
-/// This yields publication fingerprints, not a byte-authenticated RAM closure
-/// or a persisted warm receipt. Recovery without this binding authenticates RAM.
+/// Consume held producer authority only for the streams it actually published.
+/// Replay has no capability and therefore authenticates every byte.
 fn verify_publication_closure(
     pool: &StoragePool,
     record: &SnapshotRecord,
-    ram: &crate::storage::pool::RamPublication,
+    publications: &BTreeMap<StreamId, crate::storage::pool::SealedStreamPublication>,
 ) -> Result<ClosureFingerprints, LibVmError> {
-    let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-        &record.capture
-    else {
-        return Err(invalid(
-            "RAM publication binding requires a live checkpoint",
-        ));
-    };
-    if execution.memory.stream != ram.map().id() || execution.memory.length != ram.map().length() {
-        return Err(invalid("RAM publication binding belongs to another stream"));
-    }
-    ram.recheck(pool)?;
     let bytes = record.canonical_bytes()?;
     let (_, objects) = record.content_dependencies()?;
     let (_, retained_objects) = retained_members(record)?;
@@ -1515,18 +1971,19 @@ fn verify_publication_closure(
         None,
         &BTreeSet::new(),
     )?;
-    if shape.stream_map(&execution.memory.stream)? != ram.map() {
-        return Err(invalid(
-            "RAM publication map differs from the sealed producer map",
-        ));
+    for (stream, publication) in publications {
+        publication.recheck(pool)?;
+        if shape.stream_map(stream)? != publication.map() {
+            return Err(invalid("publication map differs from sealed producer map"));
+        }
     }
-    // RAM is authorized only by the separate held publication binding. Do not
-    // turn it into authenticated bytes through the warm-receipt constructor.
     shape
         .contents
-        .retain(|content| content.stream != execution.memory.stream);
+        .retain(|content| !publications.contains_key(&content.stream));
     shape.authenticate(pool, None)?;
-    ram.recheck(pool)?;
+    for publication in publications.values() {
+        publication.recheck(pool)?;
+    }
     Ok(shape.fingerprints)
 }
 
@@ -1542,6 +1999,7 @@ pub(crate) struct ShapeVerifiedClosure {
     fingerprints: ClosureFingerprints,
     stream_states: BTreeMap<StreamId, SourceFingerprint>,
     object_states: BTreeMap<ObjectDigest, SourceFingerprint>,
+    local_lower: Option<crate::store::models::snapshot::SnapshotComposition>,
 }
 
 pub(crate) struct RestoreInspectionShape {
@@ -1749,6 +2207,7 @@ fn verify_artifact_shape(
         ram_stream,
         fingerprints,
         stream_states,
+        local_lower: None,
         object_states,
     })
 }
@@ -2252,7 +2711,7 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn live_publication_does_not_seed_warm_ram_receipt() {
+    async fn live_publication_seeds_ram_and_disk_receipts_for_first_restore() {
         let fixture = crate::store::capture::tests::fixture().await;
         let (directory, _) = crate::store::capture::tests::seal(&fixture);
         let snapshots = &fixture.snapshots;
@@ -2274,30 +2733,34 @@ pub(crate) mod tests {
             panic!("live fixture");
         };
         let ram = execution.memory.stream;
-        let receipts: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM verified_object WHERE stream_sha256=?1")
-                .bind(ram.to_string())
-                .fetch_one(&snapshots.store.pool)
-                .await
-                .unwrap();
-        assert_eq!(receipts, 0, "publication is not a cold authentication");
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
-        let watcher = watch_stream_reads(&pool.stream_path(&ram));
+        let disk = consumer.record.root.stream.stream;
+        let mut watchers = Vec::new();
+        for stream in [ram, disk] {
+            let receipts: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM verified_object WHERE stream_sha256=?1")
+                    .bind(stream.to_string())
+                    .fetch_one(&snapshots.store.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(receipts, 1, "held producer authority seeds local trust");
+            watchers.push(watch_stream_reads(&pool.stream_path(&stream)));
+        }
         let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
-        assert!(!observed_stream_read(&watcher));
         drop(snapshots.authenticate_closure_bytes(shape).await.unwrap());
-        assert!(
-            observed_stream_read(&watcher),
-            "first restore must read RAM"
-        );
-        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
-        drop(snapshots.authenticate_closure_bytes(shape).await.unwrap());
-        assert!(
-            !observed_stream_read(&watcher),
-            "warm restore may reuse RAM"
-        );
+        for watcher in &watchers {
+            assert!(
+                !observed_stream_read(watcher),
+                "first restore must not read RAM or disk"
+            );
+        }
         drop(snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap());
-        assert!(observed_stream_read(&watcher), "export must still read RAM");
+        for watcher in &watchers {
+            assert!(
+                observed_stream_read(watcher),
+                "transport must still authenticate bytes"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2355,7 +2818,10 @@ pub(crate) mod tests {
                 .fetch_one(&snapshots.store.pool)
                 .await
                 .unwrap();
-        assert_eq!(receipts, 0, "failed authentication cannot establish trust");
+        assert_eq!(
+            receipts, 1,
+            "failed authentication must not refresh the producer receipt"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2568,7 +3034,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(stored, old, "failed authentication cannot refresh trust");
         // Silent same-ctime corruption is outside ADR 0021's local trust
-        // boundary. Publication/export/handoff never trust this receipt.
+        // boundary. Explicit verify, export and handoff ignore warm receipts.
     }
 
     #[cfg(target_os = "linux")]
@@ -4069,5 +4535,299 @@ pub(crate) mod tests {
             .finish_stopped_operation(operation)
             .await
             .unwrap();
+    }
+
+    fn corrupt_member(path: &std::path::Path) {
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .write_all_at(&[0xff], 0)
+            .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_verify_ignores_forged_receipts_and_checks_recorded_zeros() {
+        use crate::store::snapshot_store::{SnapshotVerificationError, SnapshotVerificationRole};
+        for zero in [false, true] {
+            let (temporary, snapshots, mut record, operation, _lease) = fixture("snapshot").await;
+            let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+            if zero {
+                let source = temporary.path().join("zero-disk");
+                std::fs::write(&source, [0; 512]).unwrap();
+                let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+                snapshots
+                    .store
+                    .pin_published_storage_dependencies(operation, &[stream.id], &[])
+                    .await
+                    .unwrap();
+                drop(roots);
+                record.root.stream = crate::store::snapshot_store::publish_map(
+                    &pool,
+                    &snapshots.store,
+                    operation,
+                    &stream.map,
+                )
+                .await
+                .unwrap();
+            }
+            let info = snapshots.publish(&record, operation, None).await.unwrap();
+            let reference = SnapshotRef::Id(info.id);
+            let report = snapshots.verify(&reference).await.unwrap();
+            assert_eq!(report.snapshot, info.id);
+            assert_eq!(report.streams, 1);
+            assert!(report.bytes >= 512);
+            let path = pool.stream_path(&record.root.stream.stream);
+            corrupt_member(&path);
+            let fingerprint = crate::storage::identity_file::SourceFingerprint::new(
+                &std::fs::metadata(&path).unwrap(),
+            );
+            let [dev, ino, len, mode, ctime_sec, ctime_nsec] = fingerprint.verification_key();
+            sqlx::query(
+                "INSERT OR REPLACE INTO verified_object(stream_sha256,dev,ino,len,mode,ctime_sec,ctime_nsec,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'forged')",
+            ).bind(record.root.stream.stream.to_string()).bind(dev).bind(ino).bind(len).bind(mode)
+                .bind(ctime_sec).bind(ctime_nsec).execute(&snapshots.store.pool).await.unwrap();
+            let error = snapshots.verify(&reference).await.unwrap_err();
+            assert!(matches!(
+                error,
+                crate::LibVmError::SnapshotVerification(SnapshotVerificationError::ChunkMismatch {
+                    role: SnapshotVerificationRole::RootDisk,
+                    stream, index: 0, start: 0, end: 512, expected, ..
+                }) if stream == record.root.stream.stream
+                    && matches!(*expected, crate::storage::stream::Chunk::Zero) == zero
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_verify_names_structural_stream_failures() {
+        use crate::store::snapshot_store::{
+            SnapshotStructuralFailure, SnapshotVerificationError, SnapshotVerificationRole,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        for case in 0..3 {
+            let (_temporary, snapshots, record, operation, _lease) = fixture("snapshot").await;
+            let info = snapshots.publish(&record, operation, None).await.unwrap();
+            let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+            let path = pool.stream_path(&record.root.stream.stream);
+            match case {
+                0 => std::fs::remove_file(&path).unwrap(),
+                1 => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_len(511)
+                        .unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                }
+                _ => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap()
+                }
+            }
+            let error = snapshots
+                .verify(&SnapshotRef::Id(info.id))
+                .await
+                .unwrap_err();
+            let crate::LibVmError::SnapshotVerification(SnapshotVerificationError::Structural {
+                role: SnapshotVerificationRole::RootDisk,
+                failure,
+                ..
+            }) = error
+            else {
+                panic!("{error}")
+            };
+            assert!(match case {
+                0 => matches!(failure, SnapshotStructuralFailure::Missing),
+                1 => matches!(
+                    failure,
+                    SnapshotStructuralFailure::Truncated {
+                        expected: 512,
+                        actual: 511
+                    }
+                ),
+                _ => matches!(failure, SnapshotStructuralFailure::Writable { .. }),
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_verify_reports_ram_before_state_and_disks_and_state_without_chunk() {
+        use crate::store::snapshot_store::{SnapshotVerificationError, SnapshotVerificationRole};
+        let fixture = crate::store::capture::tests::fixture().await;
+        let (directory, _) = crate::store::capture::tests::seal(&fixture);
+        let snapshots = &fixture.snapshots;
+        let info = snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let consumer = snapshots
+            .consume_shape(&SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &consumer.record.capture
+        else {
+            panic!("live fixture")
+        };
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let ram_path = pool.stream_path(&execution.memory.stream);
+        let original_ram = std::fs::read(&ram_path).unwrap();
+        for object in [execution.layout, execution.execution, execution.devices] {
+            corrupt_member(&pool.object_path(&object));
+        }
+        corrupt_member(&pool.stream_path(&consumer.record.root.stream.stream));
+        corrupt_member(&ram_path);
+        assert!(matches!(
+            snapshots
+                .verify(&SnapshotRef::Id(info.id))
+                .await
+                .unwrap_err(),
+            crate::LibVmError::SnapshotVerification(SnapshotVerificationError::ChunkMismatch {
+                role: SnapshotVerificationRole::Ram,
+                index: 0,
+                ..
+            })
+        ));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ram_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&ram_path, original_ram).unwrap();
+        std::fs::set_permissions(&ram_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let length = std::fs::metadata(pool.object_path(&execution.layout))
+            .unwrap()
+            .len();
+        assert!(matches!(
+            snapshots.verify(&SnapshotRef::Id(info.id)).await.unwrap_err(),
+            crate::LibVmError::SnapshotVerification(SnapshotVerificationError::ObjectMismatch {
+                role: SnapshotVerificationRole::Layout, object, length: actual_length, ..
+            }) if object == execution.layout && actual_length == length
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_verify_rejects_replaced_held_member() {
+        use crate::store::snapshot_store::{
+            open_verification_member, recheck_verification_member, SnapshotStructuralFailure,
+            SnapshotVerificationError, SnapshotVerificationMember, SnapshotVerificationRole,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let (_temporary, snapshots, record, _operation, _lease) = fixture("snapshot").await;
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let role = SnapshotVerificationRole::RootDisk;
+        let member = SnapshotVerificationMember::Stream(record.root.stream.stream);
+        let (file, fingerprint) =
+            open_verification_member(&pool, &role, member, Some(512)).unwrap();
+        let path = pool.stream_path(&record.root.stream.stream);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, [0x5a; 512]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(matches!(
+            recheck_verification_member(&pool, &role, member, &file, fingerprint),
+            Err(crate::LibVmError::SnapshotVerification(
+                SnapshotVerificationError::Structural {
+                    failure: SnapshotStructuralFailure::Replaced,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_closure_reuses_composition_receipt_and_reauthenticates_replaced_pack() {
+        use crate::store::snapshot_store::verify_artifact_shape;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::os::unix::fs::PermissionsExt;
+        let (temporary, snapshots, record, _operation, _lease) = fixture("snapshot").await;
+        let held =
+            crate::store::storage::tests::retained_lower(&snapshots.store, temporary.path(), 0x47)
+                .await;
+        let graph = held.snapshot_composition().unwrap();
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let pack = graph.layers[0].pack.stream;
+        let pack_path = pool.stream_path(&pack);
+        let fsmeta_path = pool.object_path(&graph.fsmeta);
+        let pack_watch = watch_stream_reads(&pack_path);
+        let fsmeta_watch = watch_stream_reads(&fsmeta_path);
+        let mut contents = vec![&record.root.stream];
+        contents.extend(graph.layers.iter().map(|layer| &layer.pack));
+        let (_, mut objects) = record.content_dependencies().unwrap();
+        objects.extend(graph.objects());
+        for content in &contents {
+            objects.insert(content.map);
+            objects.extend(content.map_pages.iter().copied());
+        }
+        let bytes = record.canonical_bytes().unwrap();
+        let shape = || {
+            let mut shape = verify_artifact_shape(
+                &pool,
+                &bytes,
+                &contents,
+                objects.clone(),
+                BTreeSet::from([graph.fsmeta]),
+                None,
+                true,
+                None,
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            shape.local_lower = Some(graph.clone());
+            shape
+        };
+        let closure = snapshots.authenticate_closure_bytes(shape()).await.unwrap();
+        assert!(closure.streams.contains_key(&pack));
+        assert!(
+            !observed_stream_read(&pack_watch),
+            "retained composition packs stay warm"
+        );
+        assert!(
+            !observed_stream_read(&fsmeta_watch),
+            "retained fsmeta stays warm"
+        );
+        drop(closure);
+        let original = std::fs::read(&pack_path).unwrap();
+        observed_stream_read(&pack_watch);
+        std::fs::remove_file(&pack_path).unwrap();
+        std::fs::write(&pack_path, original).unwrap();
+        std::fs::set_permissions(&pack_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let replacement_watch = watch_stream_reads(&pack_path);
+        let closure = snapshots.authenticate_closure_bytes(shape()).await.unwrap();
+        assert!(
+            observed_stream_read(&replacement_watch),
+            "new inode requires full authentication"
+        );
+        assert!(closure.streams.contains_key(&pack));
+        assert!(
+            observed_stream_read(&fsmeta_watch),
+            "receipt miss fully validates the composition"
+        );
+        let streams: BTreeMap<_, _> = closure
+            .streams
+            .iter()
+            .map(|(stream, held)| (*stream, held.fingerprint()))
+            .collect();
+        assert_eq!(
+            streams.get(&pack),
+            Some(&crate::storage::identity_file::SourceFingerprint::new(
+                &std::fs::metadata(pack_path).unwrap()
+            )),
+        );
+    }
+
+    #[test]
+    fn verification_error_stays_small_enough_for_libvm_results() {
+        assert!(
+            std::mem::size_of::<crate::store::snapshot_store::SnapshotVerificationError>() <= 96
+        );
     }
 }

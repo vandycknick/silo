@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 
 use oci::composition::{CompositionRecipe, CompositionResult, PreparedComposition};
 use oci::erofs::Layer;
@@ -16,9 +16,138 @@ use crate::storage::identity_file::SourceFingerprint;
 use crate::storage::stream::{StreamHasher, StreamMap};
 use crate::storage::StorageError;
 
+/// Local validation cache. Canonical records bind all ordered occurrences,
+/// including empty/repeated packs; fingerprints bind each unique held inode.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompositionValidation {
+    recipe: Vec<u8>,
+    result: Vec<u8>,
+    members: Vec<(crate::storage::vmdk::LowerBacking, SourceFingerprint)>,
+}
+
+impl CompositionValidation {
+    pub(crate) fn capture(
+        recipe: &CompositionRecipe,
+        result: &CompositionResult,
+        layers: &[Layer<'_>],
+        fsmeta: &File,
+    ) -> Result<Self, StorageError> {
+        use crate::storage::identity::ObjectDigest;
+        use crate::storage::vmdk::LowerBacking;
+
+        result.validate_recipe(recipe).map_err(invalid)?;
+        if CompositionRecipe::from_layers(recipe.platform.clone(), layers).map_err(invalid)?
+            != *recipe
+        {
+            return Err(invalid("held layers contradict the canonical recipe"));
+        }
+        let fingerprint = |file: &File, length| -> Result<_, StorageError> {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() != length || metadata.mode() & 0o7777 != 0o400
+            {
+                return Err(invalid("validation member is not an exact read-only file"));
+            }
+            Ok(SourceFingerprint::new(&metadata))
+        };
+        let mut members = Vec::with_capacity(layers.len() + 1);
+        members.push((
+            LowerBacking::Object(ObjectDigest::from_sha256(*result.fsmeta.digest.as_bytes())),
+            fingerprint(fsmeta, result.fsmeta.length)?,
+        ));
+        for (layer, range) in layers.iter().zip(&result.packs) {
+            if layer.result.pack_stream != range.stream || layer.result.pack_length != range.length
+            {
+                return Err(invalid("held pack contradicts the canonical range"));
+            }
+            let backing = LowerBacking::Stream(StreamId::from_sha256(*range.stream.as_bytes()));
+            let current = fingerprint(layer.pack, range.length)?;
+            match members.iter().find(|(other, _)| *other == backing) {
+                Some((_, previous)) if *previous != current => {
+                    return Err(invalid("one pack identity has conflicting held inodes"));
+                }
+                Some(_) => {}
+                None => members.push((backing, current)),
+            }
+        }
+        Ok(Self {
+            recipe: recipe.canonical_bytes().map_err(invalid)?,
+            result: result.canonical_bytes().map_err(invalid)?,
+            members,
+        })
+    }
+
+    pub(crate) fn check_file(
+        &self,
+        backing: crate::storage::vmdk::LowerBacking,
+        file: &File,
+    ) -> Result<SourceFingerprint, StorageError> {
+        let expected = self
+            .members
+            .iter()
+            .find(|(other, _)| *other == backing)
+            .map(|(_, fingerprint)| *fingerprint)
+            .ok_or_else(|| invalid("backing is outside the validated composition"))?;
+        recheck(file, expected)?;
+        Ok(expected)
+    }
+
+    pub(crate) fn check_occurrences(
+        &self,
+        occurrences: &[crate::storage::vmdk::LowerOccurrence],
+    ) -> Result<(), StorageError> {
+        use crate::storage::identity::ObjectDigest;
+        use crate::storage::vmdk::LowerBacking;
+        let result = CompositionResult::decode(&self.result).map_err(invalid)?;
+        let expected = std::iter::once((
+            LowerBacking::Object(ObjectDigest::from_sha256(*result.fsmeta.digest.as_bytes())),
+            result.fsmeta.length,
+        ))
+        .chain(result.packs.iter().map(|pack| {
+            (
+                LowerBacking::Stream(StreamId::from_sha256(*pack.stream.as_bytes())),
+                pack.length,
+            )
+        }));
+        if occurrences.len() != result.packs.len() + 1
+            || occurrences
+                .iter()
+                .zip(expected)
+                .any(|(actual, (backing, length))| {
+                    actual.backing() != backing || actual.length() != length
+                })
+        {
+            return Err(invalid(
+                "VMDK occurrences contradict the validated composition",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub struct ComposedLower {
     pub result: CompositionResult,
     pub map: StreamMap,
+    pack_fingerprints: Vec<SourceFingerprint>,
+}
+
+impl ComposedLower {
+    /// Pool publication has authenticated and sealed the final fsmeta inode.
+    /// Packs must still be the exact descriptors authenticated by this producer.
+    pub(crate) fn published_validation(
+        &self,
+        recipe: &CompositionRecipe,
+        layers: &[Layer<'_>],
+        fsmeta: &File,
+    ) -> Result<CompositionValidation, StorageError> {
+        if layers.len() != self.pack_fingerprints.len() {
+            return Err(invalid("published composition occurrence count changed"));
+        }
+        for (layer, fingerprint) in layers.iter().zip(&self.pack_fingerprints) {
+            recheck(layer.pack, *fingerprint)?;
+        }
+        CompositionValidation::capture(recipe, &self.result, layers, fsmeta)
+    }
 }
 
 /// Inputs must remain leased by the caller through publication. This function
@@ -30,7 +159,7 @@ pub fn compose(
 ) -> Result<ComposedLower, StorageError> {
     let fingerprints = authenticate_packs(layers)?;
     let prepared = oci::composition::prepare(recipe, layers, fsmeta).map_err(invalid)?;
-    finish(prepared, layers, fsmeta, &fingerprints)
+    finish(prepared, layers, fsmeta, fingerprints)
 }
 
 /// Exact artifacts stay loadable without executing a historical encoder.
@@ -43,7 +172,7 @@ pub fn load_exact(
     let fingerprints = authenticate_packs(layers)?;
     let prepared =
         oci::composition::load_exact(recipe, layers, expected, fsmeta).map_err(invalid)?;
-    finish(prepared, layers, fsmeta, &fingerprints)
+    finish(prepared, layers, fsmeta, fingerprints)
 }
 
 /// A locally available encoder may regenerate only the exact retained bytes.
@@ -57,7 +186,7 @@ pub fn regenerate_exact(
     let fingerprints = authenticate_packs(layers)?;
     let prepared =
         oci::composition::regenerate_exact(recipe, layers, expected, fsmeta).map_err(invalid)?;
-    finish(prepared, layers, fsmeta, &fingerprints)
+    finish(prepared, layers, fsmeta, fingerprints)
 }
 
 fn authenticate_packs(layers: &[Layer<'_>]) -> Result<Vec<SourceFingerprint>, StorageError> {
@@ -102,7 +231,7 @@ fn finish(
     prepared: PreparedComposition,
     layers: &[Layer<'_>],
     fsmeta: &File,
-    fingerprints: &[SourceFingerprint],
+    fingerprints: Vec<SourceFingerprint>,
 ) -> Result<ComposedLower, StorageError> {
     let metadata = fsmeta.metadata()?;
     if !metadata.is_file() {
@@ -128,7 +257,7 @@ fn finish(
     };
     let map = StreamHasher::new().hash_reader(&mut input)?;
     recheck(fsmeta, fingerprint)?;
-    for (layer, fingerprint) in layers.iter().zip(fingerprints) {
+    for (layer, fingerprint) in layers.iter().zip(&fingerprints) {
         recheck(layer.pack, *fingerprint)?;
     }
     let result = prepared
@@ -146,7 +275,11 @@ fn finish(
     {
         return Err(invalid("fsmeta bytes changed after composition validation"));
     }
-    Ok(ComposedLower { result, map })
+    Ok(ComposedLower {
+        result,
+        map,
+        pack_fingerprints: fingerprints,
+    })
 }
 
 fn recheck(file: &File, expected: SourceFingerprint) -> Result<(), StorageError> {

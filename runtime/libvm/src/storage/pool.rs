@@ -28,21 +28,25 @@ pub struct PublishedStream {
 
 /// Process-local binding of a sealed producer map to the held published inode.
 /// A fresh reflink relies on owned clone provenance, not independent byte
-/// authentication. This binding must never seed a warm verification receipt.
-pub(crate) struct RamPublication {
+/// authentication. Only a held producer capability can seed restore trust.
+pub(crate) struct SealedStreamPublication {
     file: File,
     map: StreamMap,
     fingerprint: SourceFingerprint,
     scan_stats: StreamStats,
 }
 
-impl RamPublication {
+impl SealedStreamPublication {
     pub(crate) fn map(&self) -> &StreamMap {
         &self.map
     }
 
     pub(crate) fn scan_stats(&self) -> StreamStats {
         self.scan_stats
+    }
+
+    pub(crate) fn fingerprint(&self) -> SourceFingerprint {
+        self.fingerprint
     }
 
     pub(crate) fn recheck(&self, pool: &StoragePool) -> Result<(), StorageError> {
@@ -62,6 +66,7 @@ pub struct PublishedObject {
     pub digest: ObjectDigest,
     pub length: u64,
     pub path: PathBuf,
+    pub(crate) fingerprint: SourceFingerprint,
 }
 
 /// The operation's durable recovery directory is separate from disposable bytes.
@@ -869,14 +874,15 @@ impl StoragePool {
         ))
     }
 
-    /// Publish a closed, owned producer's complete RAM and validated canonical
-    /// map. Successful reflinks retain producer identity without reading RAM;
-    /// copies and independent existing pool inodes still authenticate bytes.
-    pub(crate) fn publish_sealed_ram_for_catalog(
+    /// Publish a closed, owned producer's sealed stream and canonical map.
+    /// Reflinks carry producer identity; copies authenticate inline. Existing
+    /// pool inodes require a matching verified receipt or full authentication.
+    pub(crate) fn publish_sealed_stream_for_catalog(
         &self,
         input: &File,
         map: &StreamMap,
-    ) -> Result<(RamPublication, StorageLock), StorageError> {
+        verified_receipt: Option<SourceFingerprint>,
+    ) -> Result<(SealedStreamPublication, StorageLock), StorageError> {
         let metadata = input.metadata()?;
         let before = SourceFingerprint::new(&metadata);
         if !metadata.is_file() || metadata.len() != map.length() {
@@ -884,7 +890,7 @@ impl StoragePool {
         }
         let (staging, file) = self.stage()?;
         let mut hasher = None;
-        let (staging, file, published_map, mut stats) = if try_clone_ram(input, &file)? {
+        let (staging, file, published_map, mut stats) = if try_clone_stream(input, &file)? {
             (staging, file, map.clone(), StreamStats::default())
         } else {
             // An unsupported ioctl may have partially changed the destination.
@@ -918,17 +924,23 @@ impl StoragePool {
         {
             // An independent dedup inode has no owned clone provenance.
             let fingerprint = SourceFingerprint::new(&existing.metadata()?);
-            let scan = hasher
-                .get_or_insert_with(StreamHasher::new)
-                .hash_open_file(&existing, map.length())?;
-            if scan.map != *map || SourceFingerprint::new(&existing.metadata()?) != fingerprint {
+            if verified_receipt != Some(fingerprint) {
+                let scan = hasher
+                    .get_or_insert_with(StreamHasher::new)
+                    .hash_open_file(&existing, map.length())?;
+                if scan.map != *map || SourceFingerprint::new(&existing.metadata()?) != fingerprint
+                {
+                    return Err(StorageError::ContentMismatch(self.stream_path(&id)));
+                }
+                stats.bytes_read += scan.stats.bytes_read;
+                stats.logical_bytes_hashed += scan.stats.logical_bytes_hashed;
+                stats.whole_bytes_hashed += scan.stats.whole_bytes_hashed;
+                stats.allocated_bytes += scan.stats.allocated_bytes;
+                stats.extent_queries += scan.stats.extent_queries;
+            }
+            if existing.metadata()?.len() != map.length() {
                 return Err(StorageError::ContentMismatch(self.stream_path(&id)));
             }
-            stats.bytes_read += scan.stats.bytes_read;
-            stats.logical_bytes_hashed += scan.stats.logical_bytes_hashed;
-            stats.whole_bytes_hashed += scan.stats.whole_bytes_hashed;
-            stats.allocated_bytes += scan.stats.allocated_bytes;
-            stats.extent_queries += scan.stats.extent_queries;
             (existing, fingerprint, Some(fingerprint))
         } else {
             let fingerprint = SourceFingerprint::new(&file.metadata()?);
@@ -944,7 +956,7 @@ impl StoragePool {
             }
             fingerprint = SourceFingerprint::new(&metadata);
         }
-        let publication = RamPublication {
+        let publication = SealedStreamPublication {
             file,
             map: published_map,
             fingerprint,
@@ -1004,12 +1016,15 @@ impl StoragePool {
         } else {
             None
         };
+        let sealed = SourceFingerprint::new(&file.metadata()?);
         let roots = self.finish_publication(&self.objects, &staging, &name, verified)?;
+        let fingerprint = self.published_object_fingerprint(digest, &file, sealed, verified)?;
         Ok((
             PublishedObject {
                 digest,
                 length,
                 path: self.object_path(&digest),
+                fingerprint,
             },
             roots,
         ))
@@ -1051,17 +1066,43 @@ impl StoragePool {
             } else {
                 None
             };
+            let sealed = SourceFingerprint::new(&file.metadata()?);
             let roots = self.finish_publication(&self.objects, &staging, &name, verified)?;
+            let fingerprint = self.published_object_fingerprint(digest, &file, sealed, verified)?;
             Ok((
                 PublishedObject {
                     digest,
                     length,
                     path: self.object_path(&digest),
+                    fingerprint,
                 },
                 roots,
             ))
         })()?;
         Ok((published.0, published.1, output))
+    }
+
+    fn published_object_fingerprint(
+        &self,
+        digest: ObjectDigest,
+        file: &File,
+        sealed: SourceFingerprint,
+        verified: Option<SourceFingerprint>,
+    ) -> Result<SourceFingerprint, StorageError> {
+        let fingerprint = match verified {
+            Some(fingerprint) => fingerprint,
+            None => {
+                let metadata = file.metadata()?;
+                if !sealed.same_contents_after_metadata_change(&metadata) {
+                    return Err(StorageError::ContentMismatch(self.object_path(&digest)));
+                }
+                SourceFingerprint::new(&metadata)
+            }
+        };
+        if SourceFingerprint::new(&self.open_object(&digest)?.metadata()?) != fingerprint {
+            return Err(StorageError::ContentMismatch(self.object_path(&digest)));
+        }
+        Ok(fingerprint)
     }
 
     fn finish_publication(
@@ -1209,7 +1250,7 @@ pub(crate) fn rename_component_no_replace(
 }
 
 #[cfg(target_os = "linux")]
-fn try_clone_ram(source: &File, destination: &File) -> Result<bool, StorageError> {
+fn try_clone_stream(source: &File, destination: &File) -> Result<bool, StorageError> {
     use std::os::unix::fs::MetadataExt;
 
     use nix::fcntl::{fcntl, FcntlArg};
@@ -1232,7 +1273,7 @@ fn try_clone_ram(source: &File, destination: &File) -> Result<bool, StorageError
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "RAM clone requires a readable source and distinct empty writable destination",
+            "stream clone requires a readable source and distinct empty writable destination",
         )
         .into());
     }
@@ -1247,7 +1288,7 @@ fn try_clone_ram(source: &File, destination: &File) -> Result<bool, StorageError
 }
 
 #[cfg(not(target_os = "linux"))]
-fn try_clone_ram(_source: &File, _destination: &File) -> Result<bool, StorageError> {
+fn try_clone_stream(_source: &File, _destination: &File) -> Result<bool, StorageError> {
     Ok(false)
 }
 
@@ -1347,7 +1388,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn reflink_or_skip(source: &File, destination: &File) -> bool {
-        let cloned = crate::storage::pool::try_clone_ram(source, destination).unwrap();
+        let cloned = crate::storage::pool::try_clone_stream(source, destination).unwrap();
         if !cloned {
             eprintln!(
                 "SKIPPED RAM reflink test: test tmpdir does not support whole-file reflinks; \
@@ -1836,7 +1877,11 @@ mod tests {
         )
         .unwrap();
         let (published, roots) = pool
-            .publish_sealed_ram_for_catalog(&std::fs::File::open(&candidate).unwrap(), &map)
+            .publish_sealed_stream_for_catalog(
+                &std::fs::File::open(&candidate).unwrap(),
+                &map,
+                None,
+            )
             .unwrap();
         drop(roots);
         std::fs::remove_file(&baseline.path).unwrap();
@@ -1892,7 +1937,7 @@ mod tests {
         ] {
             std::fs::write(&source, bytes).unwrap();
             assert!(matches!(
-                pool.publish_sealed_ram_for_catalog(&input, &map),
+                pool.publish_sealed_stream_for_catalog(&input, &map, None),
                 Err(StorageError::ContentMismatch(_))
             ));
             assert!(!pool.stream_path(&map.id()).exists());
@@ -1911,12 +1956,12 @@ mod tests {
             .hash_reader(b"sealed RAM".as_slice())
             .unwrap();
         let (proof, roots) = pool
-            .publish_sealed_ram_for_catalog(&File::open(&source).unwrap(), &map)
+            .publish_sealed_stream_for_catalog(&File::open(&source).unwrap(), &map, None)
             .unwrap();
         drop(roots);
         let path = pool.stream_path(&map.id());
         let (reused, roots) = pool
-            .publish_sealed_ram_for_catalog(&File::open(&source).unwrap(), &map)
+            .publish_sealed_stream_for_catalog(&File::open(&source).unwrap(), &map, None)
             .unwrap();
         assert!(reused.scan_stats().bytes_read >= map.length());
         assert_eq!(
@@ -1929,7 +1974,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(proof.recheck(&pool).is_err());
         assert!(
-            pool.publish_sealed_ram_for_catalog(&File::open(&source).unwrap(), &map)
+            pool.publish_sealed_stream_for_catalog(&File::open(&source).unwrap(), &map, None)
                 .is_err(),
             "a dedup hit must authenticate the preexisting bytes"
         );
@@ -1945,8 +1990,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sealed_ram_reflink_publishes_without_reading_ram() {
-        use crate::store::snapshot_store::tests::{observed_stream_read, watch_stream_reads};
-
         let temporary = ram_tempdir();
         let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
         let bytes = vec![0x39; 2 * crate::storage::limits::CHUNK_SIZE + 3];
@@ -1960,14 +2003,14 @@ mod tests {
         }
         drop(destination);
         drop(staging);
-        let watcher = watch_stream_reads(&source);
-        let (publication, roots) = pool.publish_sealed_ram_for_catalog(&input, &map).unwrap();
+        let (publication, roots) = pool
+            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .unwrap();
         assert_eq!(publication.map(), &map);
         assert_eq!(
             publication.scan_stats(),
             crate::storage::stream::StreamStats::default()
         );
-        assert!(!observed_stream_read(&watcher));
         assert_ne!(
             publication.file.metadata().unwrap().ino(),
             input.metadata().unwrap().ino()
@@ -1980,7 +2023,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn sealed_ram_reflink_defers_capture_corruption_detection_to_consumer() {
+    fn sealed_ram_reflink_retains_producer_identity_until_explicit_authentication() {
         for zero in [false, true] {
             let temporary = ram_tempdir();
             let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
@@ -2005,7 +2048,9 @@ mod tests {
                 .unwrap()
                 .write_all_at(&[0xff], map.length() - 1)
                 .unwrap();
-            let (publication, roots) = pool.publish_sealed_ram_for_catalog(&input, &map).unwrap();
+            let (publication, roots) = pool
+                .publish_sealed_stream_for_catalog(&input, &map, None)
+                .unwrap();
             assert_eq!(publication.scan_stats().bytes_read, 0);
             publication.recheck(&pool).unwrap();
             drop(roots);
@@ -2025,7 +2070,7 @@ mod tests {
         let input = File::open(&source).unwrap();
         let map = StreamHasher::new().hash_file(&source).unwrap();
         let (staging, destination) = pool.stage().unwrap();
-        if crate::storage::pool::try_clone_ram(&input, &destination).unwrap() {
+        if crate::storage::pool::try_clone_stream(&input, &destination).unwrap() {
             eprintln!(
                 "SKIPPED RAM copy fallback test: test tmpdir supports reflinks; \
                  set SILO_TEST_COPY_DIR to an ext4 directory"
@@ -2034,7 +2079,9 @@ mod tests {
         }
         drop(destination);
         drop(staging);
-        let (proof, roots) = pool.publish_sealed_ram_for_catalog(&input, &map).unwrap();
+        let (proof, roots) = pool
+            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .unwrap();
         assert_eq!(proof.map(), &map);
         assert_eq!(proof.scan_stats().bytes_read, map.length());
         assert_eq!(
@@ -2046,11 +2093,13 @@ mod tests {
         drop(roots);
         std::fs::remove_file(pool.stream_path(&map.id())).unwrap();
         std::fs::write(&source, b"broken RAM").unwrap();
-        assert!(pool.publish_sealed_ram_for_catalog(&input, &map).is_err());
+        assert!(pool
+            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .is_err());
         let zero_map =
             StreamMap::new(map.length(), vec![crate::storage::stream::Chunk::Zero]).unwrap();
         assert!(pool
-            .publish_sealed_ram_for_catalog(&input, &zero_map)
+            .publish_sealed_stream_for_catalog(&input, &zero_map, None)
             .is_err());
         assert_eq!(std::fs::read_dir(pool.temporary.path()).unwrap().count(), 0);
     }
@@ -2075,10 +2124,12 @@ mod tests {
             input.metadata().unwrap().dev(),
             destination.metadata().unwrap().dev()
         );
-        assert!(!crate::storage::pool::try_clone_ram(&input, &destination).unwrap());
+        assert!(!crate::storage::pool::try_clone_stream(&input, &destination).unwrap());
         drop(destination);
         drop(staging);
-        let (proof, _roots) = pool.publish_sealed_ram_for_catalog(&input, &map).unwrap();
+        let (proof, _roots) = pool
+            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .unwrap();
         assert_eq!(proof.map(), &map);
         assert_eq!(proof.scan_stats().bytes_read, map.length());
         assert_eq!(
@@ -2097,7 +2148,7 @@ mod tests {
         std::fs::write(&source, []).unwrap();
         let map = StreamMap::new(0, Vec::new()).unwrap();
         let (proof, _roots) = pool
-            .publish_sealed_ram_for_catalog(&File::open(&source).unwrap(), &map)
+            .publish_sealed_stream_for_catalog(&File::open(&source).unwrap(), &map, None)
             .unwrap();
         assert_eq!(proof.map(), &map);
         assert_eq!(proof.scan_stats().bytes_read, 0);
@@ -2114,7 +2165,7 @@ mod tests {
         let destination = temporary.path().join("readonly");
         std::fs::write(&source, b"sealed RAM").unwrap();
         std::fs::write(&destination, []).unwrap();
-        let error = crate::storage::pool::try_clone_ram(
+        let error = crate::storage::pool::try_clone_stream(
             &File::open(&source).unwrap(),
             &File::open(&destination).unwrap(),
         )
@@ -2125,5 +2176,110 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&source).unwrap(), b"sealed RAM");
         assert_eq!(std::fs::read(&destination).unwrap(), b"");
+    }
+
+    #[test]
+    fn sealed_disk_publication_reads_once_for_copy_and_never_for_reflink() {
+        let temporary = ram_tempdir();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let source = temporary.path().join("sealed-disk.raw");
+        let bytes = vec![0x51; 8192];
+        std::fs::write(&source, &bytes).unwrap();
+        let input = File::open(&source).unwrap();
+        let map = StreamHasher::new().hash_reader(bytes.as_slice()).unwrap();
+        let (staging, probe) = pool.stage().unwrap();
+        let reflink = crate::storage::pool::try_clone_stream(&input, &probe).unwrap();
+        drop(probe);
+        drop(staging);
+        let (publication, roots) = pool
+            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .unwrap();
+        assert_eq!(
+            publication.scan_stats().bytes_read,
+            if reflink { 0 } else { map.length() }
+        );
+        publication.recheck(&pool).unwrap();
+        drop(roots);
+        let fingerprint = publication.fingerprint();
+        let (reused, roots) = pool
+            .publish_sealed_stream_for_catalog(&input, &map, Some(fingerprint))
+            .unwrap();
+        assert_eq!(
+            reused.scan_stats().bytes_read,
+            if reflink { 0 } else { map.length() }
+        );
+        drop(roots);
+        std::fs::set_permissions(
+            pool.stream_path(&map.id()),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(pool.stream_path(&map.id()), vec![0x52; bytes.len()]).unwrap();
+        std::fs::set_permissions(
+            pool.stream_path(&map.id()),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        assert!(pool
+            .publish_sealed_stream_for_catalog(&input, &map, Some(fingerprint))
+            .is_err());
+    }
+
+    #[test]
+    fn produced_object_fingerprint_binds_post_rename_and_authenticated_dedup() {
+        use crate::storage::identity_file::SourceFingerprint;
+        use std::io::Write;
+        let temporary = tempfile::tempdir().unwrap();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let bytes = b"owned fsmeta producer";
+        let (produced, roots, ()) = pool
+            .publish_produced_object_for_catalog::<_, StorageError>(|file| {
+                file.write_all(bytes)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            produced.fingerprint,
+            SourceFingerprint::new(
+                &pool
+                    .open_object(&produced.digest)
+                    .unwrap()
+                    .metadata()
+                    .unwrap(),
+            )
+        );
+        drop(roots);
+        let source = temporary.path().join("fsmeta");
+        std::fs::write(&source, bytes).unwrap();
+        let (dedup, roots) = pool.publish_object_for_catalog(&source).unwrap();
+        assert_eq!(dedup.fingerprint, produced.fingerprint);
+        drop(roots);
+        std::fs::remove_file(&dedup.path).unwrap();
+        std::fs::write(&dedup.path, bytes).unwrap();
+        std::fs::set_permissions(&dedup.path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert_ne!(
+            dedup.fingerprint,
+            SourceFingerprint::new(&pool.open_object(&dedup.digest).unwrap().metadata().unwrap(),)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_reflink_emits_access_without_a_payload_scan() {
+        use crate::store::snapshot_store::tests::{observed_stream_read, watch_stream_reads};
+        let temporary = ram_tempdir();
+        let path = temporary.path().join("clone-source");
+        std::fs::write(&path, [0x39; 4096]).unwrap();
+        let source = File::open(&path).unwrap();
+        let destination = tempfile::tempfile_in(temporary.path()).unwrap();
+        let watcher = watch_stream_reads(&path);
+        if !reflink_or_skip(&source, &destination) {
+            return;
+        }
+        assert!(
+            observed_stream_read(&watcher),
+            "FICLONE emits IN_ACCESS for {} even without read/pread",
+            path.display()
+        );
     }
 }

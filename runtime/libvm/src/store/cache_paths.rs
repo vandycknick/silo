@@ -49,6 +49,7 @@ pub(crate) fn storage_pool_dependencies(
     Ok(dependencies)
 }
 
+#[cfg(test)]
 pub(crate) async fn machine_retains_object(
     connection: &mut sqlx::SqliteConnection,
     object: crate::storage::identity::ObjectDigest,

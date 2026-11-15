@@ -629,6 +629,13 @@ CREATE TABLE composition_result (
 CREATE INDEX composition_result_fsmeta_idx ON composition_result(fsmeta_digest);
 CREATE INDEX composition_result_record_idx ON composition_result(record_digest);
 CREATE INDEX composition_recipe_record_idx ON composition_recipe(record_digest);
+-- A local validation cache, never a retention root or transported authority.
+CREATE TABLE composition_validation (
+    lower_id TEXT NOT NULL REFERENCES composition_result(id) ON DELETE CASCADE,
+    schema INTEGER NOT NULL CHECK(schema > 0),
+    receipt BLOB NOT NULL,
+    PRIMARY KEY(lower_id,schema)
+);
 -- Exact ordered occurrences, including repetitions of one layer result.
 CREATE TABLE composition_layer (
     result_id TEXT NOT NULL REFERENCES composition_result(id) ON DELETE CASCADE,
@@ -775,3 +782,31 @@ CREATE TRIGGER storage_image_acquisition_delete AFTER DELETE ON storage_image
 BEGIN DELETE FROM managed_artifact_acquisition WHERE managed_kind='image' AND managed_id=OLD.id; END;
 CREATE TRIGGER storage_snapshot_acquisition_delete AFTER DELETE ON storage_snapshot
 BEGIN DELETE FROM managed_artifact_acquisition WHERE managed_kind='snapshot' AND managed_id=OLD.id; END;
+
+CREATE VIEW retained_base_object AS
+SELECT object_digest FROM machine_object_dependency
+UNION SELECT object_digest FROM layer_object_dependency
+UNION SELECT record_digest FROM composition_recipe
+UNION SELECT record_digest FROM composition_result
+UNION SELECT fsmeta_digest FROM composition_result
+UNION SELECT object_digest FROM storage_operation_object
+UNION SELECT object_digest FROM snapshot_object_dependency
+UNION SELECT object_digest FROM image_object_dependency
+UNION SELECT evidence_digest FROM snapshot_capture_provenance
+UNION SELECT provenance_digest FROM snapshot_imported_capture
+UNION SELECT evidence_digest FROM snapshot_imported_capture
+UNION SELECT receipt_digest FROM managed_artifact_acquisition a
+WHERE (managed_kind='image' AND EXISTS(SELECT 1 FROM storage_image WHERE id=a.managed_id))
+   OR (managed_kind='snapshot' AND EXISTS(SELECT 1 FROM storage_snapshot WHERE id=a.managed_id));
+CREATE VIEW retained_stream AS
+SELECT stream_id FROM machine_stream_dependency
+UNION SELECT stream_id FROM storage_operation_stream
+UNION SELECT stream_id FROM snapshot_stream_dependency
+UNION SELECT stream_id FROM image_stream_dependency
+UNION SELECT pack_stream FROM layer_result
+UNION SELECT b.stream_id FROM object_stream_representation b
+JOIN retained_base_object r ON r.object_digest=b.object_digest;
+CREATE VIEW retained_object AS
+SELECT object_digest FROM retained_base_object
+UNION SELECT object_digest FROM stream_representation_object;
+

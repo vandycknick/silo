@@ -15,5 +15,5 @@ pub use capabilities::{
 pub use components::ResolvedRuntimeComponents;
 pub(crate) use config::{normalize_absolute_path, validate_db_config};
 pub use config::{NetdRuntimeConfig, RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride};
-pub use core::Runtime;
+pub use core::{Runtime, RuntimeOpenMode};
 pub use planning::ReadOnlyRuntime;

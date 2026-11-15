@@ -789,14 +789,37 @@ impl SnapshotStore {
         for payload in &verified.files {
             payload.recheck()?;
             match payload.role {
-                CaptureRole::Ram => {
+                CaptureRole::Ram | CaptureRole::Disk(_) => {
+                    let map = match &payload.role {
+                        CaptureRole::Ram => &verified.ram_map,
+                        _ => match &payload.bytes {
+                            VerifiedBytes::Stream(stream) => stream.map(),
+                            _ => return Err(invalid("sealed disk has no canonical map")),
+                        },
+                    };
+                    let receipt = match std::fs::symlink_metadata(pool.stream_path(&map.id())) {
+                        Ok(metadata) => {
+                            let fingerprint = SourceFingerprint::new(&metadata);
+                            let [dev, ino, len, mode, ctime_sec, ctime_nsec] =
+                                fingerprint.verification_key();
+                            let matches: bool = sqlx::query_scalar(
+                                "SELECT EXISTS(SELECT 1 FROM verified_object WHERE stream_sha256=?1 AND dev=?2 AND ino=?3 AND len=?4 AND mode=?5 AND ctime_sec=?6 AND ctime_nsec=?7)",
+                            )
+                            .bind(map.id().to_string()).bind(dev).bind(ino).bind(len).bind(mode)
+                            .bind(ctime_sec).bind(ctime_nsec).fetch_one(&self.store.pool).await?;
+                            matches.then_some(fingerprint)
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error.into()),
+                    };
                     let (publication, roots) =
-                        pool.publish_sealed_ram_for_catalog(payload.file(), &verified.ram_map)?;
+                        pool.publish_sealed_stream_for_catalog(payload.file(), map, receipt)?;
                     let id = publication.map().id();
                     tracing::debug!(
                         bytes_read = publication.scan_stats().bytes_read,
                         logical_bytes_hashed = publication.scan_stats().logical_bytes_hashed,
-                        "published sealed RAM"
+                        role = ?payload.role,
+                        "published sealed stream"
                     );
                     self.store
                         .pin_published_storage_dependencies(capture, &[id], &[])
@@ -806,29 +829,13 @@ impl SnapshotStore {
                         &pool,
                         &self.store,
                         capture,
-                        &verified.ram_map,
+                        publication.map(),
                     )
                     .await?;
                     streams.insert(payload.role.relative_path(), content);
-                    verified.published_ram = Some(publication);
-                }
-                CaptureRole::Disk(_) => {
-                    let (published, roots) = pool.publish_stream_file_for_catalog(
-                        payload.file().try_clone()?,
-                        payload.length,
-                    )?;
-                    self.store
-                        .pin_published_storage_dependencies(capture, &[published.id], &[])
-                        .await?;
-                    drop(roots);
-                    let content = crate::store::snapshot_store::publish_map(
-                        &pool,
-                        &self.store,
-                        capture,
-                        &published.map,
-                    )
-                    .await?;
-                    streams.insert(payload.role.relative_path(), content);
+                    if authentication == CaptureAuthentication::Publication {
+                        verified.publications.insert(id, publication);
+                    }
                 }
                 CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout => {
                     let (published, roots) = pool.publish_object_file_for_catalog(
@@ -1565,7 +1572,7 @@ const AUTHENTICATION_LANE_STACK_BYTES: usize = 1 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureAuthentication {
     Receipt,
-    /// First-attempt RAM publication retains producer map and clone provenance.
+    /// First-attempt publication retains owned producer maps and clone provenance.
     Publication,
     Bytes,
 }
@@ -1612,17 +1619,17 @@ pub(crate) struct VerifiedCapture {
     evidence_bytes: Vec<u8>,
     files: Vec<VerifiedPayload>,
     ram_map: crate::storage::stream::StreamMap,
-    published_ram: Option<crate::storage::pool::RamPublication>,
+    publications:
+        BTreeMap<crate::storage::identity::StreamId, crate::storage::pool::SealedStreamPublication>,
     directory_identity: (u64, u64),
     control_fingerprints: Vec<(&'static str, SourceFingerprint)>,
 }
 impl VerifiedCapture {
-    pub(crate) fn published_ram(
+    pub(crate) fn publications(
         &self,
-    ) -> Result<&crate::storage::pool::RamPublication, LibVmError> {
-        self.published_ram
-            .as_ref()
-            .ok_or_else(|| invalid("capture RAM has no owned pool publication"))
+    ) -> &BTreeMap<crate::storage::identity::StreamId, crate::storage::pool::SealedStreamPublication>
+    {
+        &self.publications
     }
 
     pub(crate) fn recheck_registered(
@@ -1874,13 +1881,6 @@ fn verify_capture(
         admitted
             .into_iter()
             .map(|payload| {
-                let authentication = if authentication == CaptureAuthentication::Publication
-                    && payload.entry.role != CaptureRole::Ram
-                {
-                    CaptureAuthentication::Bytes
-                } else {
-                    authentication
-                };
                 verify_payload(payload, authentication, &mut buffer, &mut hasher, &stop)?
                     .ok_or_else(|| invalid("receipt validation was interrupted"))
             })
@@ -1983,6 +1983,11 @@ fn verify_capture(
                 payload.file().try_clone()?,
                 map,
             )?;
+            if stream.fingerprint() != payload.fingerprint() {
+                return Err(invalid(
+                    "sealed disk changed while binding its producer map",
+                ));
+            }
             files[index].bytes = VerifiedBytes::Stream(stream);
         }
     }
@@ -2023,7 +2028,7 @@ fn verify_capture(
         evidence,
         evidence_bytes,
         ram_map,
-        published_ram: None,
+        publications: BTreeMap::new(),
         files,
         directory_identity: (stat.st_dev as u64, stat.st_ino as u64),
         control_fingerprints,
@@ -2055,11 +2060,7 @@ fn verify_payload(
         return Ok(None);
     }
     let bytes = match (&entry.role, authentication) {
-        (
-            CaptureRole::Disk(_),
-            CaptureAuthentication::Bytes | CaptureAuthentication::Publication,
-        )
-        | (CaptureRole::Ram, CaptureAuthentication::Bytes) => {
+        (CaptureRole::Disk(_) | CaptureRole::Ram, CaptureAuthentication::Bytes) => {
             let stream = hasher
                 .get_or_insert_with(crate::storage::stream::StreamHasher::new)
                 .authenticate(file, entry.length)?;
@@ -2071,10 +2072,10 @@ fn verify_payload(
             }
             VerifiedBytes::Stream(stream)
         }
-        (CaptureRole::Disk(_), CaptureAuthentication::Receipt)
-        | (CaptureRole::Ram, CaptureAuthentication::Receipt | CaptureAuthentication::Publication) => {
-            VerifiedBytes::Digest { file, fingerprint }
-        }
+        (
+            CaptureRole::Disk(_) | CaptureRole::Ram,
+            CaptureAuthentication::Receipt | CaptureAuthentication::Publication,
+        ) => VerifiedBytes::Digest { file, fingerprint },
         _ => {
             let mut hash = Sha256::new();
             let mut input = &file;
@@ -6439,25 +6440,39 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn ram_publication_reuses_authenticated_inode_without_post_publication_reads() {
+    async fn sealed_stream_publication_carries_maps_without_payload_rereads() {
         use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
         use crate::store::models::snapshot::SnapshotCaptureKind;
         use crate::store::snapshot_store::tests::{observed_stream_read, watch_stream_reads};
 
         let fixture = fixture().await;
         let (directory, evidence) = seal(&fixture);
-        let staged = directory.path().join(CaptureRole::Ram.relative_path());
-        let source_reads = watch_stream_reads(&staged);
+        let streams = evidence
+            .inventory
+            .iter()
+            .filter(|entry| matches!(entry.role, CaptureRole::Ram | CaptureRole::Disk(_)))
+            .map(|entry| {
+                let staged = directory.path().join(entry.role.relative_path());
+                let watcher = watch_stream_reads(&staged);
+                let id = crate::storage::identity::StreamId::from_sha256(
+                    *entry.identity.unwrap().as_bytes(),
+                );
+                (id, entry.role.clone(), staged, watcher)
+            })
+            .collect::<Vec<_>>();
         let receipt = verify_capture(
             &directory,
             &fixture.reservation.record,
             CaptureAuthentication::Publication,
         )
         .unwrap();
-        assert!(
-            !observed_stream_read(&source_reads),
-            "receipt validation must not read RAM"
-        );
+        for (_, role, path, watcher) in &streams {
+            assert!(
+                !observed_stream_read(watcher),
+                "producer receipt must not scan {role:?} at {}",
+                path.display()
+            );
+        }
         drop(receipt);
 
         let (hook, mut entered, release) = WorkerHook::new(WorkerPoint::AfterObject, false);
@@ -6473,24 +6488,40 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Copying reads staging, whereas reflinking authenticates the private
-        // destination. Either may emit source access events; drain them here.
-        let _ = observed_stream_read(&source_reads);
+        // Linux vfs_clone_file_range emits IN_ACCESS for FICLONE itself.
+        // Pool scan_stats measure publication payload reads; access watches
+        // can only exclude scans before and after the clone/copy interval.
+        for (_, _, _, watcher) in &streams {
+            let _ = observed_stream_read(watcher);
+        }
         let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
         let id = crate::storage::identity::StreamId::from_sha256(
             *evidence.memory.as_ref().unwrap().ram_stream.as_bytes(),
         );
-        let output_reads = watch_stream_reads(&pool.stream_path(&id));
+        let output_watchers = streams
+            .iter()
+            .map(|(stream, role, _, _)| {
+                let path = pool.stream_path(stream);
+                let watcher = watch_stream_reads(&path);
+                (role, path, watcher)
+            })
+            .collect::<Vec<_>>();
         release.send(()).unwrap();
         let published = waiter.await.unwrap().unwrap();
-        assert!(
-            !observed_stream_read(&source_reads),
-            "no post-publication staging authentication"
-        );
-        assert!(
-            !observed_stream_read(&output_reads),
-            "closure validation must consume the publication proof"
-        );
+        for (_, role, path, watcher) in &streams {
+            assert!(
+                !observed_stream_read(watcher),
+                "post-publication source scan of {role:?} at {}",
+                path.display()
+            );
+        }
+        for (role, path, watcher) in &output_watchers {
+            assert!(
+                !observed_stream_read(watcher),
+                "closure must consume {role:?} capability at {}",
+                path.display()
+            );
+        }
         let consumer = fixture
             .snapshots
             .consume_shape(&SnapshotRef::Id(published.id))

@@ -92,6 +92,15 @@ enum MachineScopeRecovery {
     External,
 }
 
+/// Admission policy for a local runtime. Observation recovers pending operations
+/// but performs no store-wide work; mutations must use Maintenance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeOpenMode {
+    #[default]
+    Maintenance,
+    Observation,
+}
+
 #[derive(Debug, Clone)]
 pub struct Runtime {
     paths: LocalPaths,
@@ -132,7 +141,15 @@ impl Runtime {
 
     /// Opens a local runtime from explicit configuration.
     pub async fn new(config: RuntimeConfig) -> Result<Self, LibVmError> {
-        Self::open_with_capability_query(config, None).await
+        Self::new_with_mode(config, RuntimeOpenMode::Maintenance).await
+    }
+
+    /// Opens with an explicit recovery policy.
+    pub async fn new_with_mode(
+        config: RuntimeConfig,
+        mode: RuntimeOpenMode,
+    ) -> Result<Self, LibVmError> {
+        Self::open_with_capability_query(config, None, mode).await
     }
 
     /// Initialize using the process's observation-only discovery cache.
@@ -140,12 +157,22 @@ impl Runtime {
         config: RuntimeConfig,
         query: crate::LiveCapabilityQuery,
     ) -> Result<Self, LibVmError> {
-        Self::open_with_capability_query(config, Some(query)).await
+        Self::new_with_capability_query_and_mode(config, query, RuntimeOpenMode::Maintenance).await
+    }
+
+    /// Reuses discovery while choosing whether to perform store recovery.
+    pub async fn new_with_capability_query_and_mode(
+        config: RuntimeConfig,
+        query: crate::LiveCapabilityQuery,
+        mode: RuntimeOpenMode,
+    ) -> Result<Self, LibVmError> {
+        Self::open_with_capability_query(config, Some(query), mode).await
     }
 
     async fn open_with_capability_query(
         config: RuntimeConfig,
         query: Option<crate::LiveCapabilityQuery>,
+        mode: RuntimeOpenMode,
     ) -> Result<Self, LibVmError> {
         let discovery_started = std::time::Instant::now();
         let components = resolve_components(&config)?;
@@ -163,7 +190,10 @@ impl Runtime {
         let discovery = discovery_started.elapsed();
         let catalog_started = std::time::Instant::now();
         let roots = config.resolve_roots()?;
-        let store = Store::open(&roots.state_db_path()).await?;
+        let store = match mode {
+            RuntimeOpenMode::Maintenance => Store::open(&roots.state_db_path()).await?,
+            RuntimeOpenMode::Observation => Store::open_observation(&roots.state_db_path()).await?,
+        };
         let stored = store.read_or_seed_db_config(&DbConfig::current()).await?;
         crate::runtime::config::validate_db_config(&stored)?;
         let observation_store = crate::store::observation::ObservationStore::existing(&store);
@@ -178,21 +208,39 @@ impl Runtime {
             Some(Arc::new(observation_store)),
         )
         .await?;
-        runtime.recover_constructed_children().await?;
-        // Capture-aware recovery: a crash after a coherent record must still
-        // publish, and an ended unsealed attempt is abandoned. Captures of a
-        // live run stay owned by it. Uncertainty is retained, never fatal.
-        if let Err(error) = crate::machine::live_capture::reconcile_captures(&runtime, None).await {
-            tracing::warn!(%error, "live capture recovery retained uncertainty");
-        }
-        if let Err(error) = crate::machine::live_fork::reconcile_forks(&runtime).await {
-            tracing::warn!(%error, "live fork recovery retained uncertainty");
+        if mode == RuntimeOpenMode::Maintenance {
+            runtime.recover_machine_operations().await?;
         }
         runtime.open_timing = crate::runtime::start_timeline::RuntimeOpenTiming {
             discovery,
             catalog_recovery: catalog_started.elapsed(),
         };
         Ok(runtime)
+    }
+
+    /// Admit mutations after an observation-only open. Callers caching a runtime
+    /// must complete this phase before changing storage ownership.
+    pub async fn recover_maintenance(&self) -> Result<(), LibVmError> {
+        self.native_store()?.recover().await?;
+        self.recover_machine_operations().await
+    }
+
+    async fn recover_machine_operations(&self) -> Result<(), LibVmError> {
+        self.recover_constructed_children().await?;
+        if let Err(error) = crate::machine::live_capture::reconcile_captures(self, None).await {
+            tracing::warn!(%error, "live capture recovery retained uncertainty");
+        }
+        if let Err(error) = crate::machine::live_fork::reconcile_forks(self).await {
+            tracing::warn!(%error, "live fork recovery retained uncertainty");
+        }
+        Ok(())
+    }
+
+    /// Access snapshots through this runtime's already admitted catalog.
+    pub fn snapshots(&self) -> Result<crate::SnapshotStore, LibVmError> {
+        Ok(crate::SnapshotStore::from_store(Arc::new(
+            self.native_store()?,
+        )))
     }
 
     async fn recover_constructed_children(&self) -> Result<(), LibVmError> {
