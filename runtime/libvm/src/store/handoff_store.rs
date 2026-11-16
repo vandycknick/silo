@@ -274,6 +274,7 @@ impl Store {
         if current.ownership_epoch != intent.from_epoch.get() || current.operation.is_some() {
             return Err(HandoffError::AdmissionStale.into());
         }
+        current.invalidate_disk_baselines();
         current.ownership = MachineOwnership::Reserved {
             operation: intent.operation,
         };
@@ -456,6 +457,7 @@ impl Store {
         require_stopped(&mut tx, intent.source_machine, true).await?;
         // Fork authorization also records a durable stop reservation, but never advances source ownership.
         if intent.mode == HandoffMode::Relocate {
+            current.invalidate_disk_baselines();
             current.ownership = MachineOwnership::Fenced {
                 operation: intent.operation,
                 destination_runtime: intent.destination_runtime,
@@ -652,7 +654,7 @@ impl<'a> HandoffDestinationCommit<'a> {
             return Ok(receipt);
         }
         let intent = &self.record.intent;
-        let published = storage(&mut self.tx, intent.destination_machine)
+        let mut published = storage(&mut self.tx, intent.destination_machine)
             .await?
             .ok_or(HandoffError::InvalidState)?;
         require_stopped(&mut self.tx, intent.destination_machine, false).await?;
@@ -662,6 +664,8 @@ impl<'a> HandoffDestinationCommit<'a> {
         {
             return Err(HandoffError::InvalidState.into());
         }
+        published.invalidate_disk_baselines();
+        Store::write_machine_storage(&mut self.tx, intent.destination_machine, &published).await?;
         let receipt = TerminalReceipt {
             intent: intent.clone(),
             binding: self.record.binding.clone(),
@@ -1501,5 +1505,96 @@ mod tests {
             1
         );
         assert_eq!(b.abort_handoff_destination(&intent).await.unwrap(), stable);
+    }
+    #[tokio::test]
+    async fn handoff_ownership_changes_invalidate_source_and_destination_baselines() {
+        use crate::store::models::storage::DiskBaselineState;
+        let (_source_home, source) = catalog().await;
+        let (_destination_home, destination) = catalog().await;
+        let machine = MachineId::new();
+        let source_directory = crate::paths::OwnedDirectory::open_root(
+            &crate::paths::machine_data_dir_in(source.home_path(), machine),
+        )
+        .unwrap();
+        source_directory
+            .write_file("root.raw", &[0x61; 512])
+            .unwrap();
+        seed(&source, machine).await;
+        let mut source_storage = source.machine_storage(machine).await.unwrap().unwrap();
+        let disk = crate::machine::root_storage::disk(
+            "root.raw",
+            vm_spec::DiskRole::Root,
+            512,
+            "root".into(),
+        )
+        .unwrap();
+        let file = std::fs::File::open(source_directory.path().join("root.raw")).unwrap();
+        let map = crate::storage::stream::StreamHasher::new()
+            .hash_open_file(&file, 512)
+            .unwrap()
+            .map;
+        crate::machine::root_storage::seed_disk(
+            &mut source_storage,
+            source_directory.path(),
+            0,
+            &disk,
+            &file,
+            &map,
+        )
+        .unwrap();
+        source
+            .save_machine_config_with_storage(&config(&source, machine), &source_storage)
+            .await
+            .unwrap();
+        let intent = new_intent(&source, &destination, machine, 0).await;
+        let prepared = prepared(&source, &destination, &intent).await;
+        assert!(matches!(
+            source
+                .machine_storage(machine)
+                .await
+                .unwrap()
+                .unwrap()
+                .disk_baselines[0]
+                .state,
+            DiskBaselineState::Invalid
+        ));
+        let authorization = source.fence_handoff_source(&prepared).await.unwrap();
+        let destination_directory = crate::paths::OwnedDirectory::open_root(
+            &crate::paths::machine_data_dir_in(destination.home_path(), machine),
+        )
+        .unwrap();
+        destination_directory
+            .write_file("root.raw", &[0x61; 512])
+            .unwrap();
+        let (mut commit, _boot) = publication(&destination, &authorization, &intent).await;
+        let tx = commit.transaction().unwrap();
+        let mut received = crate::store::handoff_store::storage(tx, machine)
+            .await
+            .unwrap()
+            .unwrap();
+        let file = std::fs::File::open(destination_directory.path().join("root.raw")).unwrap();
+        crate::machine::root_storage::seed_disk(
+            &mut received,
+            destination_directory.path(),
+            0,
+            &disk,
+            &file,
+            &map,
+        )
+        .unwrap();
+        Store::write_machine_storage(tx, machine, &received)
+            .await
+            .unwrap();
+        commit.commit().await.unwrap();
+        assert!(matches!(
+            destination
+                .machine_storage(machine)
+                .await
+                .unwrap()
+                .unwrap()
+                .disk_baselines[0]
+                .state,
+            DiskBaselineState::Invalid
+        ));
     }
 }

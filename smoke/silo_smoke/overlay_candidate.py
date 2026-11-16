@@ -242,7 +242,7 @@ class Candidate:
         ]}}
         request = {"version": 1, "machineId": machine_id, "machineRunId": run_id, "startupCommand": None,
                    "storageLease": {"operationId": operation_id, "fileDevice": metadata.st_dev, "fileInode": metadata.st_ino},
-                   "storageShutdown": context}
+                   "storageShutdown": context, "diskTrackingSeeds": []}
         reader, writer = os.pipe()
         environment = self.silo.ws.env(RUST_LOG="info,silo_vmm::virt::backend::krun::owner=debug")
         environment.update(_VM_STARTPIPE=str(reader), _VM_STORAGE_LEASES=json.dumps([self.lease_fd]))

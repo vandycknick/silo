@@ -212,7 +212,7 @@ def test_capture_rejects_readonly_virtiofs_before_freeze(silo: Silo, capture_ima
         "capture-catalog-commit",
     )
     for victim in ("manager", "monitor", "krun-worker")
-] + [("capture-source-write", "cancel", "full")]
+] + [("capture-record-settle", "cancel", "full")]
   + [("capture-execution-write", policy, "full") for policy in
      ("cancel-resume", "cancel-preserve", "cancel-borrow")]
   + [(boundary, "manager", "incremental") for boundary in (
@@ -250,6 +250,7 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
     counter = None
     borrowed = None
     observed_seal = None
+    observed_cut = None
     with (evidence / "boundary-controller.log").open("wb") as output:
         controller = subprocess.Popen(
             [sys.executable, "-m", "silo_smoke.stopped_trace", str(trace_request)],
@@ -304,8 +305,12 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                          held_path if held_path.parent.name == "captures" else held_path.parent)
             plan = json.loads((directory / "request.json").read_bytes())
             assert plan["runId"] == running["run_id"]
-            if (boundary in {"capture-seal-publish", "capture-record-settle", "capture-source-write"}
-                    or "captureDirectory" in held):
+            if boundary == "capture-source-write" and (directory / "vm.capture-cut.json").exists():
+                observed_cut = capture.pending_cut(directory)
+                assert observed_cut["captureId"] == plan["captureId"]
+                assert observed_cut["runId"] == plan["runId"]
+            elif (boundary in {"capture-seal-publish", "capture-record-settle", "capture-source-write"}
+                  or "captureDirectory" in held):
                 seal_path = directory / (
                     ".vm.capture.json.tmp" if boundary == "capture-seal-publish" else "vm.capture.json")
                 cut = json.loads(seal_path.read_bytes())
@@ -325,17 +330,7 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                 assert refused["outcome"] == "rejected", refused
                 assert refused["rejection"]["reason"]["code"] == "invalidState", refused
                 assert refused["rejection"]["state"] == "capturing", refused
-            if victim == "cancel":
-                cancelled = pause.request(silo, name, {
-                    "command": "cancelOperation",
-                    "envelope": {"machineId": plan["machineId"], "runId": plan["runId"],
-                                 "requestId": str(uuid4())},
-                    "operationId": plan["captureId"],
-                })
-                assert cancelled["outcome"] == "completed", cancelled
-                assert cancelled["completed"]["effective"] is False, cancelled
-                assert cancelled["completed"]["operation"]["outcome"]["status"] == "captureSealed"
-            elif victim.startswith("cancel-"):
+            if victim == "cancel" or victim.startswith("cancel-"):
                 cancel_id = str(uuid4())
                 command = {
                     "command": "cancelOperation",
@@ -357,19 +352,23 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                                and cancel_id in line and plan["captureId"] in line
                                for line in trace.read_text().splitlines())
 
-                shutdown.until(cancel_admitted, description="monitor did not admit pre-seal cancel")
+                shutdown.until(cancel_admitted, description="monitor did not admit capture cancel")
             else:
                 processes[victim].send(signal.SIGKILL)
             release.touch()
-            if victim.startswith("cancel-"):
+            if victim == "cancel" or victim.startswith("cancel-"):
                 output, errors = cancel_process.communicate(timeout=90)
                 silo.ws.record("capture-preseal-cancel", output + "\n[stderr]\n" + errors)
                 assert cancel_process.returncode == 0, errors
                 cancelled = json.loads(output)
                 assert cancelled["outcome"] == "completed", cancelled
-                assert cancelled["completed"]["effective"] is True, cancelled
-                assert cancelled["completed"]["operation"]["outcome"]["status"] == "failed"
-                assert cancelled["completed"]["operation"]["outcome"]["failure"]["code"] == "cancelled"
+                assert cancelled["completed"]["effective"] is (victim != "cancel"), cancelled
+                outcome = cancelled["completed"]["operation"]["outcome"]
+                if victim == "cancel":
+                    assert outcome["status"] == "captureSealed", outcome
+                else:
+                    assert outcome["status"] == "failed", outcome
+                    assert outcome["failure"]["code"] == "cancelled", outcome
             elif victim != "cancel":
                 processes[victim].wait()
             shutdown.until(lambda: record("capture-manager-result.json"), timeout=90,
@@ -426,13 +425,14 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                            recovered.stdout + "\n[stderr]\n" + recovered.stderr)
             rows = procs.query(silo.ws.state_db(),
                                f"SELECT snapshot_id,CAST(evidence_bytes AS TEXT) FROM snapshot_capture_provenance WHERE replace(capture_id,'-','')='{plan['captureId'].replace('-', '')}'")
-            if observed_seal is not None:
+            if observed_seal is not None or observed_cut is not None:
                 assert rows, (
-                    "observed coherent seal was not published",
+                    "observed seal or recoverable cut was not published",
                     {"stagingExists": directory.exists(), "recoveryExit": recovered.returncode,
                      "recoveryStderr": recovered.stderr},
                 )
-                assert json.loads(rows[0][1]) == observed_seal
+                if observed_seal is not None:
+                    assert json.loads(rows[0][1]) == observed_seal
             if victim.startswith("cancel-"):
                 assert not rows, "cancelled pre-seal capture published a checkpoint"
             if rows:
@@ -442,6 +442,8 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                 assert all(sealed[fact] is True for fact in (
                     "workloadsFrozen", "vcpusPaused", "devicesQuiesced", "hostWritersDrained",
                     "hostFlushCompleted", "diskCopiesSealed", "memoryStateSealed"))
+                if observed_cut is not None:
+                    capture.completed_cut(observed_cut, sealed)
                 inspected = silo.json("snapshot", "inspect", "image:" + rows[0][0])
                 assert inspected["captureKind"] == "live-execution"
             else:

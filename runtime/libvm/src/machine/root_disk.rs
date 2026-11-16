@@ -13,7 +13,7 @@ use crate::storage::clone::clone_error_allows_fallback;
 use crate::storage::clone::try_reflink;
 use crate::storage::identity::StreamId;
 use crate::storage::identity_file::{FileIdentity, SourceFingerprint};
-use crate::storage::stream::{AuthenticatedStream, StreamHasher, StreamScan, StreamStats};
+use crate::storage::stream::{AuthenticatedStream, StreamHasher, StreamStats};
 use crate::storage::StorageError;
 
 use thiserror::Error;
@@ -183,15 +183,6 @@ pub(crate) struct CopyVerification {
     pub(crate) source: StreamStats,
 }
 
-impl CopyVerification {
-    fn scanned(scan: StreamScan) -> Self {
-        Self {
-            stream: scan.map.id(),
-            source: scan.stats,
-        }
-    }
-}
-
 /// The file and its pinned parent travel with the actual blocking owner.
 /// Drop only removes a still-owned private entry, never an existing collision.
 pub(crate) struct PreparedPrivateCopy {
@@ -200,6 +191,7 @@ pub(crate) struct PreparedPrivateCopy {
     name: String,
     method: CloneDiskMethod,
     verification: Option<CopyVerification>,
+    map: Option<crate::storage::stream::StreamMap>,
     preserve: bool,
 }
 
@@ -218,6 +210,10 @@ impl PreparedPrivateCopy {
 
     pub(crate) fn verification(&self) -> Option<&CopyVerification> {
         self.verification.as_ref()
+    }
+
+    pub(crate) fn map(&self) -> Option<&crate::storage::stream::StreamMap> {
+        self.map.as_ref()
     }
 
     /// Once rename succeeds, a directory-sync error is an uncertain publication.
@@ -334,7 +330,7 @@ pub(crate) fn copy_private(
     let clone_supported = source_device == destination_device && qualification.qualify(&staging)?;
     let mut prepared = if clone_supported {
         match clone_attempt(file, &staging, name)? {
-            CloneAttempt::Complete(prepared) => prepared,
+            CloneAttempt::Complete(prepared) => *prepared,
             CloneAttempt::Unsupported => new_private_file(staging, name)?,
         }
     } else {
@@ -350,7 +346,13 @@ pub(crate) fn copy_private(
                 hasher.copy_authenticated(stream, &prepared.file)?
             }
         };
-        prepared.verification = Some(CopyVerification::scanned(scan));
+        prepared.verification = Some(CopyVerification {
+            stream: scan.map.id(),
+            source: scan.stats,
+        });
+        prepared.map = Some(scan.map);
+    } else if let CopySource::Authenticated(stream) = source {
+        prepared.map = Some(stream.map().clone());
     }
     if before != SourceFingerprint::new(&file.metadata()?) {
         return Err(invalid_copy("source changed during private copy"));
@@ -473,6 +475,7 @@ fn new_private_file(
         name: name.to_owned(),
         method: CloneDiskMethod::SparseCopy,
         verification: None,
+        map: None,
         preserve: false,
     };
     fchmod(&prepared.file, Mode::S_IRUSR | Mode::S_IWUSR).map_err(io::Error::from)?;
@@ -480,7 +483,7 @@ fn new_private_file(
 }
 
 enum CloneAttempt {
-    Complete(PreparedPrivateCopy),
+    Complete(Box<PreparedPrivateCopy>),
     Unsupported,
 }
 
@@ -499,7 +502,7 @@ fn clone_attempt(
     match try_reflink(source, &prepared.file) {
         Ok(()) => {
             prepared.method = CloneDiskMethod::Reflink;
-            Ok(CloneAttempt::Complete(prepared))
+            Ok(CloneAttempt::Complete(Box::new(prepared)))
         }
         Err(error) if clone_error_allows_fallback(&error, true) => {
             // Never stream into a potentially partially cloned file.
@@ -533,6 +536,7 @@ fn clone_attempt(
                 name: name.to_owned(),
                 method: CloneDiskMethod::Clonefile,
                 verification: None,
+                map: None,
                 preserve: false,
             };
             let metadata = prepared.file.metadata()?;
@@ -565,7 +569,7 @@ fn clone_attempt(
                 ));
             }
             prepared.file = writable;
-            Ok(CloneAttempt::Complete(prepared))
+            Ok(CloneAttempt::Complete(Box::new(prepared)))
         }
         Err(error) if clone_error_allows_fallback(&error, false) => {
             // fclonefileat atomically creates an absent destination. If a failed
@@ -605,7 +609,7 @@ fn qualify_clone(
             source.file.sync_all()?;
         }
         let mut child = match clone_attempt(&source.file, directory, &destination_name)? {
-            CloneAttempt::Complete(child) => child,
+            CloneAttempt::Complete(child) => *child,
             CloneAttempt::Unsupported => {
                 remove_probe(&mut source, durability)?;
                 return Ok(false);
@@ -683,6 +687,32 @@ fn verify_probe_reopened(
     Ok(())
 }
 
+pub(crate) fn raw_disk_needs_growth(path: &Path, desired: u64) -> Result<bool, RootDiskError> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() < desired {
+        return Ok(true);
+    }
+    if matches!(
+        disk_image::ext4::probe(path),
+        Ok(disk_image::ext4::ProbeResult::Ext4)
+    ) {
+        let superblock = disk_image::ext4::read_superblock(&file).map_err(|source| {
+            RootDiskError::Ext4Probe {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        let blocks =
+            (u64::from(superblock.blocks_count_hi) << 32) | u64::from(superblock.blocks_count_lo);
+        let bytes = 1024u64
+            .checked_shl(superblock.log_block_size)
+            .and_then(|size| size.checked_mul(blocks));
+        return Ok(bytes.is_none_or(|bytes| bytes < desired - desired % 4096));
+    }
+    Ok(false)
+}
+
+/// Existing machine storage requires durable baseline invalidation before growth.
 pub(crate) fn resize_raw_disk(
     path: &Path,
     size_bytes: u64,
@@ -725,9 +755,11 @@ pub(crate) fn resize_raw_disk(
         RootDiskResizeOutcome::GuestRequired
     };
 
-    let file = File::options().write(true).open(path)?;
-    file.set_len(size_bytes)?;
-    file.sync_all()?;
+    if size_bytes > current_size {
+        let file = File::options().write(true).open(path)?;
+        file.set_len(size_bytes)?;
+        file.sync_all()?;
+    }
     Ok(outcome)
 }
 
@@ -2042,5 +2074,40 @@ mod tests {
             );
             assert!(fs::read_dir(child.path()).unwrap().next().is_none());
         }
+    }
+    #[test]
+    fn equal_size_resize_preserves_the_stopped_baseline_fingerprint() {
+        use crate::machine::root_disk::raw_disk_needs_growth;
+        use crate::storage::identity_file::SourceFingerprint;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("raw");
+        fs::write(&path, [0x51; 512]).unwrap();
+        let before = SourceFingerprint::new(&fs::metadata(&path).unwrap());
+        assert!(!raw_disk_needs_growth(&path, 512).unwrap());
+        resize_raw_disk(&path, 512).unwrap();
+        assert_eq!(
+            SourceFingerprint::new(&fs::metadata(&path).unwrap()),
+            before
+        );
+        assert!(raw_disk_needs_growth(&path, 1024).unwrap());
+    }
+
+    #[test]
+    fn growth_detection_includes_a_smaller_filesystem_inside_an_existing_backing() {
+        use crate::machine::root_disk::raw_disk_needs_growth;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("root.raw");
+        disk_image::ext4::Formatter::new(&path, 4096, 64 << 20)
+            .unwrap()
+            .close()
+            .unwrap();
+        let original = fs::metadata(&path).unwrap().len();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(original + (8 << 20))
+            .unwrap();
+        assert!(raw_disk_needs_growth(&path, original + (8 << 20)).unwrap());
     }
 }

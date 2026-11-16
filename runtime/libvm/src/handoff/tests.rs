@@ -173,6 +173,11 @@ async fn install_layered_root(
         .unwrap()
         .unwrap();
     let mut storage = participant.storage(machine).await;
+    store
+        .invalidate_machine_disk_baselines(machine)
+        .await
+        .unwrap();
+    storage.invalidate_disk_baselines();
     let root = participant.root_file(machine).await;
     let pool =
         crate::storage::pool::StoragePool::open(participant.runtime.local_images_dir()).unwrap();

@@ -74,6 +74,17 @@ pub enum LifecycleCommand {
         #[serde(with = "millis")]
         timeout: Duration,
     },
+    FreezeCaptureDisks {
+        operation: Uuid,
+        #[serde(with = "millis")]
+        timeout: Duration,
+    },
+    SettleCaptureDisks {
+        operation: Uuid,
+        settlements: Vec<vm_spec::capture::DiskTrackingSettlement>,
+        #[serde(with = "millis")]
+        timeout: Duration,
+    },
     /// Move the prepared execution and device outputs into native capture.
     CaptureExecution {
         operation: Uuid,
@@ -153,6 +164,8 @@ impl LifecycleCommand {
             Self::CancelPause { .. } => Some(CommandKind::CancelPause),
             Self::PrepareCapture { .. } => Some(CommandKind::PrepareCapture),
             Self::FlushCapture { .. } => Some(CommandKind::FlushCapture),
+            Self::FreezeCaptureDisks { .. } => Some(CommandKind::FreezeCaptureDisks),
+            Self::SettleCaptureDisks { .. } => Some(CommandKind::SettleCaptureDisks),
             Self::CaptureExecution { .. } => Some(CommandKind::CaptureExecution),
             Self::CaptureMemory { .. } => Some(CommandKind::CaptureMemory),
             Self::AcceptCapture { .. } => Some(CommandKind::AcceptCapture),
@@ -173,6 +186,8 @@ impl LifecycleCommand {
             | Self::CancelPause { operation, .. }
             | Self::PrepareCapture { operation, .. }
             | Self::FlushCapture { operation, .. }
+            | Self::FreezeCaptureDisks { operation, .. }
+            | Self::SettleCaptureDisks { operation, .. }
             | Self::CaptureExecution { operation, .. }
             | Self::CaptureMemory { operation, .. }
             | Self::AcceptCapture { operation, .. }
@@ -194,6 +209,8 @@ impl LifecycleCommand {
             | Self::CancelPause { timeout, .. }
             | Self::PrepareCapture { timeout, .. }
             | Self::FlushCapture { timeout, .. }
+            | Self::FreezeCaptureDisks { timeout, .. }
+            | Self::SettleCaptureDisks { timeout, .. }
             | Self::CaptureExecution { timeout, .. }
             | Self::CaptureMemory { timeout, .. }
             | Self::AcceptCapture { timeout, .. }
@@ -223,6 +240,7 @@ impl LifecycleCommand {
             self,
             Self::PrepareCapture { .. }
                 | Self::FlushCapture { .. }
+                | Self::FreezeCaptureDisks { .. }
                 | Self::CaptureExecution { .. }
                 | Self::CaptureMemory { .. }
                 | Self::AcceptCapture { .. }
@@ -676,6 +694,8 @@ pub enum CommandKind {
     CancelPause,
     PrepareCapture,
     FlushCapture,
+    FreezeCaptureDisks,
+    SettleCaptureDisks,
     CaptureExecution,
     CaptureMemory,
     AcceptCapture,
@@ -926,6 +946,10 @@ pub enum CommandOutcome {
         pause: NativePause,
         attachments: Vec<FlushedAttachment>,
     },
+    DiskGenerationsFrozen {
+        receipts: Vec<vm_spec::capture::DiskTrackingReceipt>,
+    },
+    DiskGenerationsSettled,
     /// Both execution writers are closed by native before this report.
     ExecutionCaptured {
         /// Boxed: keeps every retained command state small.
@@ -1515,6 +1539,27 @@ impl LifecycleRequest {
         if let LifecycleCommand::AcceptCapture { stream, .. } = &self.command {
             if stream.is_zero() {
                 return invalid(InvalidRequest::CaptureBinding);
+            }
+        }
+        if let LifecycleCommand::SettleCaptureDisks {
+            operation,
+            settlements,
+            ..
+        } = &self.command
+        {
+            if settlements.len() > 16 {
+                return invalid(InvalidRequest::CaptureBinding);
+            }
+            for (index, settlement) in settlements.iter().enumerate() {
+                if settlement.validate().is_err()
+                    || Uuid::parse_str(settlement.token.capture_id.as_str()).ok()
+                        != Some(*operation)
+                    || settlements[..index]
+                        .iter()
+                        .any(|previous| previous.block_id == settlement.block_id)
+                {
+                    return invalid(InvalidRequest::CaptureBinding);
+                }
             }
         }
         Ok(())

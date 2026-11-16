@@ -13,6 +13,7 @@ pub struct StorageLaunch {
     pub binding: protocol::shutdown::StorageLeaseBinding,
     pub lease: Arc<std::os::fd::OwnedFd>,
     pub holder_path: PathBuf,
+    pub disk_tracking_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
 }
 
 impl PartialEq for StorageLaunch {
@@ -21,6 +22,7 @@ impl PartialEq for StorageLaunch {
             && self.run_id == other.run_id
             && self.binding == other.binding
             && self.holder_path == other.holder_path
+            && self.disk_tracking_seeds == other.disk_tracking_seeds
     }
 }
 

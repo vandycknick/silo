@@ -36,6 +36,8 @@ pub(crate) struct KrunNative {
     protected: Vec<OutputIdentity>,
     baseline: Mutex<Option<NativeBaseline>>,
     accepting: Mutex<Option<(Uuid, Digest32, Digest32)>>,
+    disk_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
+    disk_cuts: Mutex<HashMap<Uuid, libkrun::live::DiskTrackingCut>>,
 }
 
 struct NativeBaseline {
@@ -81,6 +83,8 @@ impl KrunNative {
             protected,
             baseline: Mutex::new(None),
             accepting: Mutex::new(None),
+            disk_seeds: config.disk_tracking_seeds.clone(),
+            disk_cuts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -381,6 +385,126 @@ impl NativeLifecycle for KrunNative {
                 irq: attachment.irq,
             })
             .collect())
+    }
+
+    fn freeze_disks(
+        &self,
+        token: &PauseToken,
+        capture: Uuid,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<Vec<vm_spec::capture::DiskTrackingReceipt>, NativeFailure> {
+        let cut = self
+            .control
+            .freeze_disk_generations(
+                token,
+                CaptureId::new(*capture.as_bytes()),
+                OperationId(operation.get()),
+                deadline,
+            )
+            .map_err(live_failure)?;
+        let mut cuts = self
+            .disk_cuts
+            .lock()
+            .map_err(|_| NativeFailure::new(NativeFailureKind::Unexpected))?;
+        cuts.insert(capture, cut);
+        let cut = cuts
+            .get(&capture)
+            .ok_or_else(|| NativeFailure::new(NativeFailureKind::Unexpected))?;
+        if cut.pause != *token
+            || cut.capture != CaptureId::new(*capture.as_bytes())
+            || cut.disks.len() != self.disk_seeds.len()
+        {
+            return Err(NativeFailure::with_detail(
+                NativeFailureKind::InvalidToken,
+                "disk cut differs from its pause or writable inventory",
+            ));
+        }
+        cut.disks
+            .iter()
+            .map(|(attachment, receipt)| {
+                let seed = self
+                    .disk_seeds
+                    .iter()
+                    .find(|seed| seed.block_id.as_str() == attachment.configured_id)
+                    .ok_or_else(|| {
+                        NativeFailure::with_detail(
+                            NativeFailureKind::InvalidToken,
+                            "disk cut has no constructor seed",
+                        )
+                    })?;
+                crate::krun::worker::disk_tracking::receipt(receipt, seed).map_err(|detail| {
+                    NativeFailure::with_detail(NativeFailureKind::InvalidToken, detail)
+                })
+            })
+            .collect()
+    }
+
+    fn settle_disks(
+        &self,
+        capture: Uuid,
+        settlements: &[vm_spec::capture::DiskTrackingSettlement],
+        operation: &mut dyn FnMut() -> Result<NativeOperation, NativeFailure>,
+        deadline: Instant,
+    ) -> Result<(), NativeFailure> {
+        let mut cuts = self
+            .disk_cuts
+            .lock()
+            .map_err(|_| NativeFailure::new(NativeFailureKind::Unexpected))?;
+        let Some(cut) = cuts.get_mut(&capture) else {
+            return if settlements.is_empty() {
+                Ok(())
+            } else {
+                Err(NativeFailure::new(NativeFailureKind::InvalidToken))
+            };
+        };
+        if !settlements.is_empty() {
+            if settlements.len() != cut.disks.len() {
+                return Err(NativeFailure::new(NativeFailureKind::InvalidToken));
+            }
+            for (attachment, receipt) in &cut.disks {
+                let settlement = settlements
+                    .iter()
+                    .find(|value| value.block_id.as_str() == attachment.configured_id)
+                    .ok_or_else(|| NativeFailure::new(NativeFailureKind::InvalidToken))?;
+                settlement.validate().map_err(|detail| {
+                    NativeFailure::with_detail(NativeFailureKind::InvalidToken, detail)
+                })?;
+                if crate::krun::worker::disk_tracking::token(&settlement.token).map_err(
+                    |detail| NativeFailure::with_detail(NativeFailureKind::InvalidToken, detail),
+                )? != receipt.token
+                {
+                    return Err(NativeFailure::new(NativeFailureKind::InvalidToken));
+                }
+            }
+        }
+        while let Some((attachment, receipt)) = cut.disks.last() {
+            let settlement = settlements
+                .iter()
+                .find(|value| value.block_id.as_str() == attachment.configured_id);
+            let settlement = match settlement.map(|value| &value.settlement) {
+                Some(vm_spec::capture::DiskGenerationSettlement::Commit { baseline }) => {
+                    libkrun::live::DiskGenerationSettlement::Commit {
+                        baseline: *baseline.as_bytes(),
+                    }
+                }
+                Some(vm_spec::capture::DiskGenerationSettlement::Abort) | None => {
+                    libkrun::live::DiskGenerationSettlement::Abort
+                }
+            };
+            self.control
+                .settle_disk_generation(
+                    attachment.clone(),
+                    receipt.token,
+                    settlement,
+                    OperationId(operation()?.get()),
+                    deadline,
+                )
+                .map_err(live_failure)?;
+            cut.disks.pop();
+        }
+        cuts.remove(&capture);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

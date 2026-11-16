@@ -75,9 +75,10 @@ pub(crate) async fn observation_body(
     if own_reservation {
         storage.ownership = MachineOwnership::Owned;
     }
-    // Stop evidence belongs to the cut (the manifest), not to admission: a
-    // deliberate stop after reservation must not make the plan stale.
+    // Stop and tracking evidence belong to the cut, not to admission: their
+    // invalidation after reservation must not make the approved plan stale.
     storage.stop_outcome = crate::StorageStopOutcome::Unknown;
+    storage.disk_baselines.clear();
     storage.ownership.ensure_owned(config.id)?;
     crate::machine::stopped::validate_managed_attachments(&config.spec, &storage)?;
     crate::machine::stopped::validate_capture_shape(&storage, StoppedAdmission::Ordinary)?;

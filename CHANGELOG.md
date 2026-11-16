@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed: large `silo exec` stdin now applies bounded end-to-end backpressure
+  instead of killing the command when the guest queue fills. Guest stdin closure
+  stops host/preloaded input without replacing the command's exit status.
+- Changed: execution streams add the nonterminal `StdinClosed` protocol event;
+  the agent, monitor and host/libvm/CLI must match. `silo shell` still uses SSH.
 - Document Phase 30's agent-ready latency gates, capacity-independent live
   operations and explicit zero ranges. Fast same-host fork was admitted and
   deferred after design review on 2026-11-15; durable fork is the only fork mode.
@@ -12,8 +17,16 @@
   store-wide recovery. Retention semantics stay unchanged.
   Reflink captures persist a process-crash recovery cut and complete disk identity
   after source continuation, retaining accepted RAM on failure or cancellation.
-  The first snapshot's one post-resume pass over written disk data and refusal
-  of `pause` while disk identity is pending are accepted limits.
+  Stage-1 disk tracking inherits managed baseline maps and hashes only written
+  8 MiB chunks on reflink captures, committing or aborting coverage at the seal.
+  Child baseline maps are optional, deferred-write caches authenticated before
+  launch; missing or torn maps use full hashing. Constructed children defer
+  admission's catalog checkpoint to their later durable-child transition.
+  Freshly formatted disks have no baseline at create; the first snapshot hashes
+  written disk data once and seeds later captures in the same run. Every ended
+  run invalidates its baseline, so the first snapshot after restart fully hashes
+  again. External writable disks remain capturable through full hashing.
+  Refusing `pause` while disk identity is pending remains an accepted limit.
   Sparse RAM capture omits or punches zero runs and skips known-zero anonymous
   boot pages with cut-bound pagemap proof; unsupported cases keep safe fallbacks.
   Graph/map receipts skip repeated index decoding and reuse canonical RAM maps.
@@ -25,11 +38,11 @@
   first fork 2 s, later fork 1.25 s; full snapshot under 3 s; incremental snapshot
   1.5 s with a 1 s pause. Medians up to 10 percent above target are accepted and
   reported as within tolerance; beyond that they fail. Fork and incremental
-  targets are not yet met and depend on planned disk write tracking and the map
-  format change. Per-chunk write tracking with inherited maps, a sparse
-  authenticated stream map and a RAM identity unit smaller than 8 MiB are approved
-  directions, not yet implemented. A later cached upper template removes the
-  temporary create-time hash so create must not end up slower.
+  targets await new stage-1 tracking measurements and the planned map-format
+  change. A sparse authenticated stream map and a RAM identity unit smaller than
+  8 MiB remain approved directions, not yet implemented. Stage-2 clean-stop
+  sealing and a cached deterministic upper template are also planned to avoid
+  restart and first-snapshot hashes without slowing create.
 - Incremental snapshot publication no longer rereads all RAM on owned reflink
   paths, so RAM identity cost follows changed chunks. The Phase 30 contract
   places local corruption detection in explicit verification, export or handoff;

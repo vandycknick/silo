@@ -130,6 +130,7 @@ async fn run(fixture: Fixture) -> eyre::Result<()> {
         },
         lease: Arc::new(lease.try_clone()?.into()),
         holder_path: fixture.directory.join("vm.storage-holder.json"),
+        disk_tracking_seeds: Vec::new(),
     };
     let config = virt::VmConfig::builder("guest-lifecycle-smoke")
         .vm_id(&fixture.machine_id)

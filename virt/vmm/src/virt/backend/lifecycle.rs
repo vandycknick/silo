@@ -11,7 +11,8 @@
 //!
 //! Stop linearizes with mutator submission through [`LifecycleSlot`]: the
 //! fence and every enqueue take the client's state lock, so a mutator is
-//! either admitted before the fence or refused `Stopping` without effect.
+//! either admitted before the fence or refused `Stopping`. Disk-generation
+//! settlement alone stays admissible: it cannot expose devices or resume CPUs.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
@@ -135,9 +136,9 @@ impl LifecycleSlot {
         self.slot().client.clone()
     }
 
-    /// Close mutator submission for good; observation and joins of commands
-    /// admitted earlier stay available. Synchronous: it returns only after
-    /// any concurrent enqueue has either finished or been refused.
+    /// Close execution mutator submission for good. Disk-generation settlement,
+    /// observation and earlier joins remain available. The fence synchronizes
+    /// with every enqueue before returning.
     pub(crate) fn close_admission(&self) {
         let mut slot = self.slot();
         slot.closed = true;
@@ -200,7 +201,7 @@ impl LifecycleClient {
         Ok((Self { shared }, fault_receiver))
     }
 
-    /// Stop admitting new mutators; observation and joins stay available.
+    /// Stop admitting execution mutators; retain disk settlement and observations.
     /// Only [`LifecycleSlot`] closes, so its fence also covers late installs.
     fn close_admission(&self) {
         lock(&self.shared.state).admission_closed = true;
@@ -342,7 +343,13 @@ impl LifecycleClient {
             ));
         }
         let mut state = lock(&self.shared.state);
-        if state.lost.is_some() || state.admission_closed {
+        let disk_settlement = matches!(command, LifecycleCommand::SettleCaptureDisks { .. });
+        if disk_settlement {
+            if let Some(lost) = &state.lost {
+                return Err(LifecycleError::Unknown(lost.clone()));
+            }
+        }
+        if state.lost.is_some() || (state.admission_closed && !disk_settlement) {
             return Err(LifecycleError::Rejected(LifecycleRejection::Stopping));
         }
         let sequence = next_sequence(&mut state)?;

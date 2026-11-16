@@ -27,6 +27,7 @@ import pytest
 from silo_smoke import capture, images, procs, shutdown, stopped
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO, SmokeConfig
+from silo_smoke.filesystem import reflink_probe
 from silo_smoke.registry import LoopbackRegistry
 
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
@@ -363,21 +364,32 @@ def test_capture_manager_death_leaves_the_recorded_policy_to_the_monitor(
         run.finish()
 
 
-@pytest.mark.parametrize("boundary", ["capture-execution-write", "capture-record-settle"])
+@pytest.mark.parametrize("boundary", [
+    "capture-execution-write", "capture-cut-settle", "capture-record-settle",
+])
 def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
     silo: Silo, lifecycle_image: str, boundary: str,
 ) -> None:
-    """Gap 3: an actual `silo stop` admitted while resume-if-acquired capture
-    is held before the record (worker execution-state write) or after its
-    link (monitor temporary-link removal). Stop never resumes or thaws; an
-    unsealed capture never becomes coherent, a linked seal still publishes
-    and its continuation is unknown."""
+    """Stop never resumes or thaws a held source. Exercise resume-if-acquired
+    before continuation, including a recoverable pending cut, and preserve at
+    the final seal, which deferred identity now writes after continuation."""
+    if boundary == "capture-cut-settle":
+        probe = reflink_probe(silo.ws.silo_home)
+        if not probe["reflink"]:
+            pytest.skip(f"pending cut settlement requires FICLONE: {probe}")
     sealed = boundary == "capture-record-settle"
-    with captured(silo, lifecycle_image, boundary, "resume") as run:
+    policy = "preserve" if sealed else "resume"
+    with captured(silo, lifecycle_image, boundary, policy) as run:
         seal_bytes = None
         if sealed:
             seal_bytes = (run.directory / "vm.capture.json").read_bytes()
             run.coherent(json.loads(seal_bytes))
+        cut = capture.pending_cut(run.directory) if boundary == "capture-cut-settle" else None
+        source_path = run.directory / "vm.capture-source.json"
+        source_bytes = source_path.read_bytes() if source_path.exists() else None
+        source_outcome = "preserved" if source_bytes is not None else "unknown"
+        if source_bytes is not None:
+            assert json.loads(source_bytes)["sourceOutcome"] == "preserved"
         run.counter.stationary()
         with (silo.ws.evidence / "capture-race-stop.stdout").open("wb") as output, \
                 (silo.ws.evidence / "capture-race-stop.stderr").open("wb") as errors:
@@ -402,34 +414,56 @@ def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
         assert silo.info(NAME)["state"] == "stopped"
         # The racing manager may be refused with monitor-stopping; recorded only.
         manager_result = run.trace.wait("capture-manager-result.json")
-        assert not (run.directory / "vm.capture-source.json").exists(), (
-            "a continuation record claims an outcome after stop took over")
+        if source_bytes is None:
+            assert not source_path.exists(), "a continuation was fabricated after stop took over"
+        else:
+            source_record = source_path if source_path.exists() else (
+                silo.ws.silo_home / "capture-evidence" / str(UUID(run.plan["captureId"]))
+                / "vm.capture-source.json")
+            assert source_record.read_bytes() == source_bytes, "stop changed prior continuation evidence"
+
+        if cut is not None:
+            run.complete(expect=None)
+            rows = run.provenance()
+            if rows:
+                assert len(rows) == 1
+                seal_bytes = rows[0][1].encode()
+                seal = json.loads(seal_bytes)
+                run.coherent(seal)
+                capture.completed_cut(cut, seal)
 
         if seal_bytes is not None:
             if manager_result["code"] == 0:
                 value = run.manager_snapshot()
-                summary = run.summary(value, "resume", "unknown")
+                summary = run.summary(value, policy, source_outcome)
                 assert summary["sourceError"] is None, summary
                 run.published(json.loads(seal_bytes), value)
             else:
-                # Stop's manager may already have published and released the
-                # capture. Its terminal operation is collectible once the run
-                # ends; complete_capture only accepts a still-retained identity.
+                # Stop may interrupt the manager after publication but before
+                # release. Positive exact-run death lets a later manager finish
+                # that same operation without contacting or resuming its source.
                 rows = run.provenance()
                 assert len(rows) == 1, "stop lost the linked coherent checkpoint"
                 assert json.loads(rows[0][1]) == json.loads(seal_bytes)
                 snapshot = silo.json("snapshot", "inspect", "image:" + rows[0][0])
                 assert snapshot["id"] == rows[0][0] and snapshot["captureKind"] == "live-execution"
                 record = run.capture_record()
+                if record is not None and record["state"]["state"] == "published":
+                    value = json.loads(run.complete().stdout)
+                    run.summary(value, policy, source_outcome)
+                    run.published(json.loads(seal_bytes), value)
+                    record = run.capture_record()
                 if record is None:
                     archive = (silo.ws.silo_home / "capture-evidence"
                                / str(UUID(run.plan["captureId"])) / "owner.json")
                     record = json.loads(archive.read_bytes())["record"]
                 assert record["captureId"] == run.plan["captureId"]
                 assert record["runId"] == run.plan["runId"]
-                assert record["plan"]["resumePolicy"] == POLICY["resume"]
+                assert record["plan"]["resumePolicy"] == POLICY[policy]
                 assert record["state"] == {"state": "released", "snapshot": rows[0][0]}
-                assert record["sourceOutcome"] == {"kind": "unknown"}
+                expected = ({"kind": "known", "record": json.loads(source_bytes)}
+                            if source_bytes is not None else {"kind": "unknown"})
+                assert record["sourceOutcome"] == expected
         else:
             recovered = run.complete(expect=None)
             assert recovered.returncode != 0, "stop-raced unsealed capture reconciled as success"
@@ -446,10 +480,9 @@ def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
 def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_thaw(
     silo: Silo, lifecycle_image: str,
 ) -> None:
-    """Gap 3, resume-if-acquired: a real CancelOperation is admitted while the
-    record is linked but not yet settled, so the capture's cancel token is set
-    before ClockOnly release, handshake and Thaw. Cancel loses; the started
-    continuation finishes normally and no sealed byte changes."""
+    """A joined post-seal cancel cannot change the coherent seal or repeat
+    continuation. On the deferred lane ClockOnly, handshake and Thaw already
+    completed before identity and the seal; their source record must survive."""
     with captured(silo, lifecycle_image, "capture-record-settle", "resume") as run:
         seal_bytes = (run.directory / "vm.capture.json").read_bytes()
         seal = json.loads(seal_bytes)
@@ -475,8 +508,13 @@ def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_
             metadata.st_blocks * 512, stat.S_IMODE(metadata.st_mode),
             hashlib.sha256(seal_bytes).hexdigest(),
         )
-        assert "vm.capture-source.json" not in before
-        run.counter.stationary()
+        continued = "vm.capture-source.json" in before
+        if continued:
+            source = json.loads((run.directory / "vm.capture-source.json").read_bytes())
+            assert source["sourceOutcome"] == "resumed" and source["pauseToken"] == seal["pauseToken"]
+            run.counter.advances()
+        else:
+            run.counter.stationary()
         cancel_id = str(uuid4())
         request = silo.ws.evidence / "sealing-cancel-request.json"
         request.write_text(json.dumps({
@@ -502,7 +540,7 @@ def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_
         cancelled = json.loads(output)
         assert cancelled["outcome"] == "completed", cancelled
         assert cancelled["completed"]["effective"] is False, cancelled
-        assert cancelled["completed"]["state"] == "capturing", cancelled
+        assert cancelled["completed"]["state"] == ("running" if continued else "capturing"), cancelled
         outcome = cancelled["completed"]["operation"]["outcome"]
         assert outcome["status"] == "captureSealed", outcome
         assert outcome["capture"]["captureId"] == run.plan["captureId"]
@@ -535,28 +573,39 @@ def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_
 def test_capture_absent_continuation_record_is_pending_while_run_lives_then_unknown(
     silo: Silo, lifecycle_image: str,
 ) -> None:
-    """Gap 4: the monitor is held writing `vm.capture-source.json` after a
-    coherent record and a completed native preserve. While the exact run lives,
-    managers publish and stay Pending without inventing an outcome or
-    resuming; once that run ends without the record, the outcome is unknown."""
+    """Missing continuation stays pending while the exact run lives. A
+    deferred-identity cut is not published early; after positive run death
+    recovery completes the same cut and records the source as unknown."""
     with captured(silo, lifecycle_image, "capture-source-write", "preserve") as run:
         assert Path(run.held["target"]).name == ".vm.capture-source.json.tmp", run.held
-        seal_bytes = (run.directory / "vm.capture.json").read_bytes()
-        seal = json.loads(seal_bytes)
-        run.coherent(seal)
+        seal_path = run.directory / "vm.capture.json"
+        cut = capture.pending_cut(run.directory) if not seal_path.exists() else None
+        seal_bytes = seal_path.read_bytes() if cut is None else None
+        seal = json.loads(seal_bytes) if seal_bytes is not None else None
+        if seal is not None:
+            run.coherent(seal)
         final = run.directory / "vm.capture-source.json"
         assert not final.exists()
         run.counter.stationary()
-        rows = shutdown.until(run.provenance, timeout=120,
-                              description="manager did not publish the coherent cut while continuation was pending")
-        assert len(rows) == 1 and json.loads(rows[0][1]) == seal
-        record = run.capture_record()
-        assert record["state"] == {"state": "published", "snapshot": rows[0][0]}, record
+        if cut is None:
+            rows = shutdown.until(run.provenance, timeout=120,
+                                  description="manager did not publish the coherent seal")
+            assert len(rows) == 1 and json.loads(rows[0][1]) == seal
+            record = run.capture_record()
+            assert record["state"] == {"state": "published", "snapshot": rows[0][0]}, record
+        else:
+            assert run.provenance() == [], "manager published incomplete disk identities"
+            record = run.capture_record()
+            assert record["state"] == {"state": "reserved"}, record
         assert record["sourceOutcome"] is None, record
         observed = run.operation()
         assert observed["state"] == "capturing", observed
-        assert observed["operation"]["outcome"]["status"] == "captureSealed", observed
-        assert observed["operation"]["outcome"]["capture"]["evidenceSha256"] == digest(seal_bytes)
+        if cut is None:
+            assert observed["operation"]["outcome"]["status"] == "captureSealed", observed
+            assert observed["operation"]["outcome"]["capture"]["evidenceSha256"] == digest(seal_bytes)
+        else:
+            assert observed["operation"]["outcome"]["status"] == "inProgress", observed
+            assert observed["capture"]["evidence"] is None, observed
         assert observed["capture"]["continuation"] == {"status": "pending"}, observed
         assert observed["capture"]["sourceRecordSha256"] is None, observed
         assert observed["capture"]["release"] == {"status": "retained"}, observed
@@ -574,6 +623,12 @@ def test_capture_absent_continuation_record_is_pending_while_run_lives_then_unkn
         value = run.manager_snapshot()
         summary = run.summary(value, "preserve", "unknown")
         assert summary["sourceError"] is None, summary
+        if cut is not None:
+            rows = run.provenance()
+            assert len(rows) == 1, "dead-run recovery did not complete the retained cut"
+            seal = json.loads(rows[0][1])
+            run.coherent(seal)
+            capture.completed_cut(cut, seal)
         run.published(seal, value)
         assert not final.exists()
         record = run.capture_record()
@@ -637,16 +692,15 @@ def test_checkpoint_publication_syncs_real_pool_fds_before_catalog_acknowledgmen
 def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
     silo: Silo, lifecycle_image: str,
 ) -> None:
-    """Gap 4: after a coherent seal the worker's real libkrun vsock muxer thread
-    is held, so the monitor's production handshake/Thaw/recovery deadlines
-    expire. The checkpoint stays coherent and publishes, `resume-failed` is
-    recorded separately, and the source stays fenced in Error until stop."""
+    """Hold the real muxer after the cut, before source continuation. The
+    production handshake/Thaw/recovery deadlines expire; identity completion
+    still seals and publishes the same cut, with a separate resume-failed
+    outcome and an Error-fenced source until stop."""
     with captured(silo, lifecycle_image, "capture-guest-transport", "resume") as run:
         assert run.held["thread"] == "vsock muxer", run.held
         assert run.held["pid"] == run.processes["krun-worker"].pid, run.held
-        seal_bytes = (run.directory / "vm.capture.json").read_bytes()
-        seal = json.loads(seal_bytes)
-        run.coherent(seal)
+        seal_path = run.directory / "vm.capture.json"
+        cut = capture.pending_cut(run.directory) if not seal_path.exists() else None
         before = capture.inventory(run.directory)
         assert "vm.capture-source.json" not in before
         # The ordinary OCI source is layered; its upper keeps the tree below /upper.
@@ -664,6 +718,11 @@ def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
         run.counter.stationary()
         run.wait_logged("held guest transport did not end the real continuation",
                         "capture continuation finished", run.plan["captureId"], timeout=180)
+        seal_bytes = seal_path.read_bytes()
+        seal = json.loads(seal_bytes)
+        run.coherent(seal)
+        if cut is not None:
+            capture.completed_cut(cut, seal)
         observed = run.operation()
         assert observed["state"] == "error", observed
         assert observed["currentPause"] is None, observed
@@ -703,7 +762,8 @@ def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
         assert refused.returncode != 0, "a fenced source admitted a new capture"
         assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command") == intents
         assert silo.info(NAME)["state"] == "error"
-        capture.unchanged(silo, run.directory, before)
+        added = {"vm.capture.json", *(entry["role"] for entry in seal["inventory"])}
+        capture.unchanged(silo, run.directory, before, added=added if cut is not None else None)
         assert run.resume_requests() == 0
         run.finish()
         run.ended_silently()

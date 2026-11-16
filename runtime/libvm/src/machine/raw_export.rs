@@ -608,6 +608,11 @@ mod tests {
                 .machine_storage_record(self.machine.machine_id())
                 .await
                 .unwrap();
+            store
+                .invalidate_machine_disk_baselines(self.machine.machine_id())
+                .await
+                .unwrap();
+            storage.invalidate_disk_baselines();
             let BootProfile::LinuxDirect {
                 userspace_platform, ..
             } = &storage.boot

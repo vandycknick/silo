@@ -499,6 +499,189 @@ pub(crate) fn publish_kernel(
     Ok((machine_dir.join("kernel-qualified"), file))
 }
 
+pub(crate) fn baseline_map_path(
+    identity: &vm_spec::capture::Sha256Digest,
+) -> Result<crate::PrivatePath, LibVmError> {
+    let stream = crate::storage::identity::StreamId::from_sha256(*identity.as_bytes());
+    crate::PrivatePath::new(format!("disk-baseline-{}.map", stream.hex()))
+}
+
+/// Optional map cache, not a durability boundary. Launch authenticates it before
+/// issuing a seed and falls back to unknown coverage if a crash loses its bytes.
+pub(crate) fn retain_disk_map(
+    machine_dir: &Path,
+    map: &crate::storage::stream::StreamMap,
+) -> Result<crate::PrivatePath, LibVmError> {
+    let path = baseline_map_path(&vm_spec::capture::Sha256Digest::from_bytes(
+        *map.id().as_bytes(),
+    ))?;
+    let name = path
+        .as_path()
+        .to_str()
+        .ok_or_else(|| invalid("disk baseline path is not UTF-8"))?;
+    let directory = crate::paths::OwnedDirectory::open_existing_root(machine_dir)?
+        .ok_or_else(|| invalid("machine directory disappeared before disk baseline"))?;
+    let bytes = map.canonical_bytes()?;
+    if let Some(existing) = directory.open_immutable_file(name)? {
+        use std::io::Read;
+        let mut retained = Vec::new();
+        existing
+            .take(bytes.len() as u64 + 1)
+            .read_to_end(&mut retained)?;
+        if retained == bytes {
+            return Ok(path);
+        }
+        tracing::warn!("replacing incomplete disk baseline map cache");
+    }
+    directory.publish_file_deferred(name, nix::sys::stat::Mode::S_IRUSR, |file| {
+        file.write_all(&bytes)?;
+        Ok(())
+    })?;
+    Ok(path)
+}
+
+pub(crate) fn seed_disk(
+    storage: &mut MachineStorageRecord,
+    machine_dir: &Path,
+    index: usize,
+    disk: &Disk,
+    file: &File,
+    map: &crate::storage::stream::StreamMap,
+) -> Result<(), LibVmError> {
+    use crate::store::models::storage::{DiskBaseline, DiskBaselineState};
+    let metadata = file.metadata()?;
+    if disk.read_only
+        || disk.format != DiskFormat::Raw
+        || metadata.len() != map.length()
+        || disk.geometry.length != map.length()
+    {
+        return Err(invalid("disk baseline differs from private raw attachment"));
+    }
+    let map_path = retain_disk_map(machine_dir, map)?;
+    let seed = vm_spec::capture::DiskTrackingSeed {
+        version: vm_spec::capture::DISK_TRACKING_VERSION,
+        role: disk.role,
+        attachment_index: u32::try_from(index).map_err(|error| invalid(error.to_string()))?,
+        block_id: disk.block_id.clone(),
+        file_device: metadata.dev(),
+        file_inode: metadata.ino(),
+        length: metadata.len(),
+        chunk_size: vm_spec::capture::STREAM_CHUNK_BYTES,
+        epoch: vm_spec::lifecycle::LiveId::parse(&uuid::Uuid::new_v4().to_string())
+            .map_err(invalid)?,
+        baseline: Some(vm_spec::capture::Sha256Digest::from_bytes(
+            *map.id().as_bytes(),
+        )),
+    };
+    seed.validate().map_err(invalid)?;
+    storage
+        .disk_baselines
+        .retain(|baseline| baseline.seed.attachment_index != seed.attachment_index);
+    storage.disk_baselines.push(DiskBaseline {
+        seed,
+        map: map_path,
+        storage_generation: storage.storage_generation,
+        generation: 0,
+        state: DiskBaselineState::Ready,
+        fingerprint: crate::storage::identity_file::SourceFingerprint::new(&metadata),
+    });
+    storage
+        .disk_baselines
+        .sort_by_key(|baseline| baseline.seed.attachment_index);
+    Ok(())
+}
+
+pub(crate) fn launch_disk_seeds(
+    storage: &MachineStorageRecord,
+    machine_dir: &Path,
+) -> Result<Vec<vm_spec::capture::DiskTrackingSeed>, LibVmError> {
+    use crate::store::models::storage::DiskBaselineState;
+    let mut ready = storage
+        .disk_baselines
+        .iter()
+        .filter(|baseline| {
+            matches!(baseline.state, DiskBaselineState::Ready)
+                && baseline.storage_generation == storage.storage_generation
+        })
+        .peekable();
+    if ready.peek().is_none() {
+        return Ok(Vec::new());
+    }
+    let directory = crate::paths::OwnedDirectory::open_existing_root(machine_dir)?
+        .ok_or_else(|| invalid("ready disk baseline machine directory disappeared"))?;
+    let mut seeds = Vec::with_capacity(storage.disk_baselines.len());
+    for baseline in ready {
+        let path = match baseline.seed.role {
+            DiskRole::Root | DiskRole::RootUpper => {
+                crate::machine::stopped::root_private(storage).0
+            }
+            DiskRole::Data => match storage
+                .disks
+                .iter()
+                .find(|disk| disk.order == baseline.seed.attachment_index)
+                .map(|disk| &disk.storage)
+            {
+                Some(crate::DiskStorage::ManagedWritable { path, .. }) => path,
+                _ => continue,
+            },
+            DiskRole::RootLower => continue,
+        };
+        let held = crate::machine::stopped::open_private(&directory, path, baseline.seed.length)?;
+        if crate::storage::identity_file::SourceFingerprint::new(&held.file.metadata()?)
+            != baseline.fingerprint
+        {
+            tracing::warn!(
+                attachment = baseline.seed.attachment_index,
+                "disk baseline invalidated by stopped backing fingerprint change"
+            );
+            continue;
+        }
+        let authenticated = (|| -> Result<(), LibVmError> {
+            use std::io::Read;
+            let name = baseline
+                .map
+                .as_path()
+                .to_str()
+                .ok_or_else(|| invalid("disk baseline map path is not UTF-8"))?;
+            let file = directory
+                .open_immutable_file(name)?
+                .ok_or_else(|| invalid("disk baseline map cache is missing"))?;
+            let limit = baseline
+                .seed
+                .length
+                .div_ceil(vm_spec::capture::STREAM_CHUNK_BYTES)
+                * 74
+                + 256;
+            let length = file.metadata()?.len();
+            if length > limit {
+                return Err(invalid("disk baseline map cache exceeds its encoded bound"));
+            }
+            let mut bytes = Vec::with_capacity(length as usize);
+            file.take(limit + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > limit {
+                return Err(invalid(
+                    "disk baseline map cache grew beyond its encoded bound",
+                ));
+            }
+            let map = vm_spec::capture::StreamMap::decode(&bytes).map_err(invalid)?;
+            if map.length() != baseline.seed.length || Some(map.id()) != baseline.seed.baseline {
+                return Err(invalid("disk baseline map cache differs from its seed"));
+            }
+            Ok(())
+        })();
+        if let Err(error) = authenticated {
+            tracing::warn!(
+                attachment = baseline.seed.attachment_index,
+                %error,
+                "disk baseline invalidated by unavailable map cache"
+            );
+            continue;
+        }
+        seeds.push(baseline.seed.clone());
+    }
+    Ok(seeds)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::machine::root_storage::{disk, prepare, validate_spec};
@@ -1036,5 +1219,306 @@ mod tests {
         assert!(admitted
             .verify_composition(&pool, &launch.validation)
             .is_err());
+    }
+    #[test]
+    fn fresh_upper_has_no_disk_baseline_or_launch_seed() {
+        use crate::machine::root_storage::launch_disk_seeds;
+        let temp = tempfile::tempdir().unwrap();
+        let directory =
+            crate::paths::OwnedDirectory::open_root(&temp.path().join("machine")).unwrap();
+        let length = 64 << 20;
+        let formatted = disk_image::ext4::upper::format_upper(
+            &directory.path().join("upper.raw"),
+            rootfs_spec::upper_geometry::UpperCapacity::new(length).unwrap(),
+        )
+        .unwrap();
+        let mut record = storage();
+        if let MachineRoot::LinuxOverlay { upper_uuid, .. } = &mut record.root {
+            *upper_uuid = formatted.uuid;
+        }
+        #[cfg(target_os = "linux")]
+        let reads = crate::store::snapshot_store::tests::watch_stream_reads(
+            &directory.path().join("upper.raw"),
+        );
+        assert!(record.disk_baselines.is_empty());
+        assert!(launch_disk_seeds(&record, directory.path())
+            .unwrap()
+            .is_empty());
+        #[cfg(target_os = "linux")]
+        assert!(!crate::store::snapshot_store::tests::observed_stream_read(
+            &reads
+        ));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn authenticated_private_children_inherit_maps_with_distinct_bindings() {
+        use crate::machine::root_disk::{copy_private, CopyQualification, CopySource};
+        use crate::machine::root_storage::{launch_disk_seeds, seed_disk};
+        use crate::storage::stream::{AuthenticatedStream, CopyWriteback, StreamHasher};
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::paths::OwnedDirectory::open_root(&temp.path().join("source")).unwrap();
+        source.write_file("root.raw", &[0x56; 512]).unwrap();
+        let file = std::fs::File::open(source.path().join("root.raw")).unwrap();
+        let parent_inode = file.metadata().unwrap().ino();
+        let map = StreamHasher::new().hash_open_file(&file, 512).unwrap().map;
+        let authenticated = AuthenticatedStream::from_receipt(file, map.clone()).unwrap();
+        let disk = disk("root.raw", DiskRole::Root, 512, "root".into()).unwrap();
+        let mut epochs = std::collections::BTreeSet::new();
+        let mut inodes = std::collections::BTreeSet::new();
+        for name in ["restore", "fork-a", "fork-b"] {
+            let directory =
+                crate::paths::OwnedDirectory::open_root(&temp.path().join(name)).unwrap();
+            let mut copy = copy_private(
+                CopySource::Authenticated(&authenticated),
+                directory.try_clone().unwrap(),
+                "staged",
+                &mut CopyQualification::new(32),
+                CopyWriteback::Buffered,
+            )
+            .unwrap();
+            assert_eq!(copy.map(), Some(&map));
+            copy.publish_constructed(directory.try_clone().unwrap(), "root.raw")
+                .unwrap();
+            let mut record = MachineStorageRecord::opaque_raw(
+                PrivatePath::new("root.raw").unwrap(),
+                512,
+                &oci::Platform::host().unwrap(),
+            )
+            .unwrap();
+            #[cfg(target_os = "linux")]
+            let reads = crate::store::snapshot_store::tests::watch_stream_reads(
+                &directory.path().join("root.raw"),
+            );
+            seed_disk(
+                &mut record,
+                directory.path(),
+                0,
+                &disk,
+                copy.file(),
+                copy.map().unwrap(),
+            )
+            .unwrap();
+            let seed = launch_disk_seeds(&record, directory.path())
+                .unwrap()
+                .remove(0);
+            #[cfg(target_os = "linux")]
+            assert!(!crate::store::snapshot_store::tests::observed_stream_read(
+                &reads
+            ));
+            assert_eq!(seed.baseline.unwrap().as_bytes(), map.id().as_bytes());
+            assert_ne!(seed.file_inode, parent_inode);
+            assert!(epochs.insert(seed.epoch));
+            assert!(inodes.insert(seed.file_inode));
+            assert_eq!(
+                StreamHasher::new()
+                    .hash_open_file(copy.file(), 512)
+                    .unwrap()
+                    .map,
+                map
+            );
+            copy.retain();
+        }
+    }
+
+    #[test]
+    fn stopped_mutations_and_unavailable_maps_never_reuse_a_ready_disk_baseline() {
+        use crate::machine::root_storage::{launch_disk_seeds, retain_disk_map, seed_disk};
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+        for mutation in [
+            "write",
+            "replace",
+            "resize",
+            "chmod",
+            "link",
+            "generation",
+            "map-missing",
+            "map-truncated",
+            "map-identity",
+            "map-writable",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory =
+                crate::paths::OwnedDirectory::open_root(&temp.path().join("machine")).unwrap();
+            directory.write_file("root.raw", &[0x41; 512]).unwrap();
+            let path = directory.path().join("root.raw");
+            let file = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let map = crate::storage::stream::StreamHasher::new()
+                .hash_open_file(&file, 512)
+                .unwrap()
+                .map;
+            let mut record = MachineStorageRecord::opaque_raw(
+                PrivatePath::new("root.raw").unwrap(),
+                512,
+                &oci::Platform::host().unwrap(),
+            )
+            .unwrap();
+            let disk = disk("root.raw", DiskRole::Root, 512, "root".into()).unwrap();
+            seed_disk(&mut record, directory.path(), 0, &disk, &file, &map).unwrap();
+            assert_eq!(
+                launch_disk_seeds(&record, directory.path()).unwrap().len(),
+                1
+            );
+            let map_path = directory
+                .path()
+                .join(record.disk_baselines[0].map.as_path());
+            #[cfg(target_os = "linux")]
+            let reads = crate::store::snapshot_store::tests::watch_stream_reads(&path);
+            match mutation {
+                "write" => file.write_all_at(b"changed", 0).unwrap(),
+                "replace" => {
+                    directory
+                        .write_file("replacement.raw", &[0x42; 512])
+                        .unwrap();
+                    std::fs::rename(directory.path().join("replacement.raw"), &path).unwrap();
+                }
+                "resize" => file.set_len(1024).unwrap(),
+                "chmod" => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap()
+                }
+                "link" => std::fs::hard_link(&path, directory.path().join("alias.raw")).unwrap(),
+                "generation" => record.storage_generation += 1,
+                "map-missing" => std::fs::remove_file(&map_path).unwrap(),
+                "map-truncated" | "map-identity" => {
+                    std::fs::set_permissions(&map_path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    let bytes = if mutation == "map-truncated" {
+                        b"{".to_vec()
+                    } else {
+                        crate::storage::stream::StreamMap::new(
+                            512,
+                            vec![crate::storage::stream::Chunk::Zero],
+                        )
+                        .unwrap()
+                        .canonical_bytes()
+                        .unwrap()
+                    };
+                    std::fs::write(&map_path, bytes).unwrap();
+                    std::fs::set_permissions(&map_path, std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                }
+                "map-writable" => {
+                    std::fs::set_permissions(&map_path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if let Ok(seeds) = launch_disk_seeds(&record, directory.path()) {
+                assert!(seeds.is_empty(), "{mutation}");
+            }
+            if matches!(mutation, "map-missing" | "map-truncated" | "map-identity") {
+                assert!(launch_disk_seeds(&record, directory.path())
+                    .unwrap()
+                    .is_empty());
+                retain_disk_map(directory.path(), &map).unwrap();
+                assert_eq!(
+                    launch_disk_seeds(&record, directory.path()).unwrap().len(),
+                    1
+                );
+            }
+            #[cfg(target_os = "linux")]
+            assert!(!crate::store::snapshot_store::tests::observed_stream_read(
+                &reads
+            ));
+        }
+    }
+    #[test]
+    fn disk_baselines_cover_root_and_each_managed_writable_data_attachment() {
+        use crate::machine::root_storage::{launch_disk_seeds, seed_disk};
+        use std::os::unix::fs::FileExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let directory =
+            crate::paths::OwnedDirectory::open_root(&temporary.path().join("machine")).unwrap();
+        let mut record = MachineStorageRecord::opaque_raw(
+            PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        for (index, name) in ["root.raw", "data-a.raw", "data-b.raw"]
+            .into_iter()
+            .enumerate()
+        {
+            directory.write_file(name, &[index as u8 + 1; 512]).unwrap();
+            let role = if index == 0 {
+                DiskRole::Root
+            } else {
+                DiskRole::Data
+            };
+            let disk = disk(name, role, 512, format!("disk-{index}")).unwrap();
+            if index != 0 {
+                record.disks.push(crate::IncludedDisk {
+                    id: uuid::Uuid::new_v4(),
+                    role,
+                    order: index as u32,
+                    storage: crate::DiskStorage::ManagedWritable {
+                        path: PrivatePath::new(name).unwrap(),
+                        geometry: disk.geometry,
+                    },
+                });
+            }
+            let file = std::fs::File::open(directory.path().join(name)).unwrap();
+            let map = crate::storage::stream::StreamHasher::new()
+                .hash_open_file(&file, 512)
+                .unwrap()
+                .map;
+            seed_disk(&mut record, directory.path(), index, &disk, &file, &map).unwrap();
+        }
+        record.validate().unwrap();
+        let seeds = launch_disk_seeds(&record, directory.path()).unwrap();
+        assert_eq!(
+            seeds
+                .iter()
+                .map(|seed| seed.attachment_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(
+            seeds
+                .iter()
+                .map(|seed| &seed.epoch)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(directory.path().join("data-a.raw"))
+            .unwrap()
+            .write_all_at(b"host edit", 0)
+            .unwrap();
+        let seeds = launch_disk_seeds(&record, directory.path()).unwrap();
+        assert_eq!(
+            seeds
+                .iter()
+                .map(|seed| seed.attachment_index)
+                .collect::<Vec<_>>(),
+            [0, 2]
+        );
+    }
+    #[test]
+    fn retained_disk_baseline_reuses_only_an_immutable_owned_map() {
+        use crate::machine::root_storage::retain_disk_map;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let temporary = tempfile::tempdir().unwrap();
+        let directory =
+            crate::paths::OwnedDirectory::open_root(&temporary.path().join("machine")).unwrap();
+        directory.write_file("root.raw", &[0x41; 512]).unwrap();
+        let map = crate::storage::stream::StreamHasher::new()
+            .hash_file(&directory.path().join("root.raw"))
+            .unwrap();
+        let retained = retain_disk_map(directory.path(), &map).unwrap();
+        let path = directory.path().join(retained.as_path());
+        let before = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.mode() & 0o7777, 0o400);
+        assert_eq!(retain_disk_map(directory.path(), &map).unwrap(), retained);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), before.ino());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(retain_disk_map(directory.path(), &map).is_err());
     }
 }

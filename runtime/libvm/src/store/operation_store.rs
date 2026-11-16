@@ -115,21 +115,37 @@ fn validate_record(record: &RetainedStorageOperation) -> Result<(), LibVmError> 
     }
     Ok(())
 }
+pub(crate) const MAX_RESTORE_LAUNCH_RECORD_BYTES: usize =
+    vm_spec::restore::MAX_RESTORE_INSPECTION_BYTES + (4 << 20);
+
 pub(crate) fn encode(record: &RetainedStorageOperation) -> Result<String, LibVmError> {
     validate_record(record)?;
     let json = serde_json::to_string(record).map_err(|error| invalid(error.to_string()))?;
-    crate::storage::limits::Resource::MetadataPageBytes
-        .check(json.len() as u64)
-        .map_err(crate::storage::StorageError::from)?;
+    if record.restore.is_some() {
+        if json.len() > MAX_RESTORE_LAUNCH_RECORD_BYTES {
+            return Err(invalid(
+                "restore launch record exceeds its control-record bound",
+            ));
+        }
+    } else {
+        crate::storage::limits::Resource::MetadataPageBytes
+            .check(json.len() as u64)
+            .map_err(crate::storage::StorageError::from)?;
+    }
     Ok(json)
 }
 fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<RetainedStorageOperation, LibVmError> {
     let json: String = row.try_get("record_json")?;
-    crate::storage::limits::Resource::MetadataPageBytes
-        .check(json.len() as u64)
-        .map_err(crate::storage::StorageError::from)?;
+    if json.len() > MAX_RESTORE_LAUNCH_RECORD_BYTES {
+        return Err(invalid("launch record exceeds its control-record bound"));
+    }
     let record: RetainedStorageOperation =
         serde_json::from_str(&json).map_err(|error| invalid(error.to_string()))?;
+    if record.restore.is_none() {
+        crate::storage::limits::Resource::MetadataPageBytes
+            .check(json.len() as u64)
+            .map_err(crate::storage::StorageError::from)?;
+    }
     validate_record(&record)?;
     let id: String = row.try_get("operation_id")?;
     let machine: String = row.try_get("machine_id")?;
@@ -1679,7 +1695,34 @@ impl Store {
             .await?
             .ok_or_else(|| invalid("launch operation disappeared"))?;
         let mut record = decode(&row)?;
+        let constructed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM machine_config WHERE id=?1 AND durability='constructed')",
+        )
+        .bind(record.machine_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
         if !record.admitted {
+            let json: String = sqlx::query_scalar(
+                "SELECT json(record_json) FROM machine_storage WHERE machine_id=?1",
+            )
+            .bind(record.machine_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            let mut storage = MachineStorageRecord::decode(&json)?;
+            if storage.storage_generation != record.storage_generation {
+                return Err(invalid("disk baseline launch generation changed"));
+            }
+            let directory = crate::paths::machine_data_dir_in(&self.home, record.machine_id);
+            let seeds = crate::machine::root_storage::launch_disk_seeds(&storage, &directory)?;
+            for baseline in &mut storage.disk_baselines {
+                baseline.state = crate::store::models::storage::DiskBaselineState::Running {
+                    run_id: record.run_id,
+                    seeded: seeds.iter().any(|seed| seed == &baseline.seed),
+                };
+            }
+            storage.stop_outcome = StorageStopOutcome::Unknown;
+            Self::write_machine_storage(&mut tx, record.machine_id, &storage).await?;
+            record.storage = storage;
             if record.restore.is_some() {
                 let current:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM machine_state WHERE machine_id=?1 AND status IN ('restoring','activating','starting') AND json_extract(state_json,'$.runId')=?2)").bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *tx).await?;
                 if !current {
@@ -1710,7 +1753,16 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(())
+        drop(_roots);
+        if constructed {
+            // A lost admission leaves an undiscoverable constructed child.
+            // If the later durable-child transaction survives, WAL ordering
+            // also preserves this earlier Running marker. Ordinary machines
+            // must stabilize invalidation before guest writes.
+            Ok(())
+        } else {
+            self.checkpoint_catalog().await
+        }
     }
 
     pub(crate) async fn launch_storage_operations_inner(
@@ -1785,6 +1837,8 @@ impl Store {
             return Err(invalid("machine generation changed before reconciliation"));
         }
         storage.stop_outcome = outcome;
+        storage.invalidate_disk_baselines();
+        tracing::info!(machine_id = %next_state.machine_id, "disk tracking baseline invalidated at stop; stage 1 restart requires one full capture hash");
         Self::write_machine_storage(&mut tx, next_state.machine_id, &storage).await?;
         sqlx::query("INSERT INTO machine_state(machine_id,status,state_json) VALUES(?1,?2,jsonb(?3)) ON CONFLICT(machine_id) DO UPDATE SET status=excluded.status,state_json=excluded.state_json")
             .bind(next_state.machine_id.to_string()).bind(next_state.status.as_str()).bind(Self::serialize("machine_state.state_json",next_state)?).execute(&mut *tx).await?;

@@ -347,6 +347,7 @@ impl SupervisorFixture {
         let mut encoded = serde_json::to_vec(&serde_json::json!({
             "version": 1, "machineId": self.1.to_string(), "machineRunId": run_id,
             "storageLease": self.2.binding(),
+            "diskTrackingSeeds": [],
             "storageShutdown": {
                 "version": 1, "machineId": self.1.to_string(), "runId": run_id,
                 "manifest": {"kind":"unsupported","reason":"worker startup failure fixture"}

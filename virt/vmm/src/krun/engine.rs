@@ -118,6 +118,29 @@ impl Control {
         self.handle.flush_writable_disks(pause, operation, deadline)
     }
 
+    pub fn freeze_disk_generations(
+        &self,
+        pause: &PauseToken,
+        capture: libkrun::live::CaptureId,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<libkrun::live::DiskTrackingCut, LiveError> {
+        self.handle
+            .freeze_disk_generations(pause, capture, operation, deadline)
+    }
+
+    pub fn settle_disk_generation(
+        &self,
+        attachment: libkrun::live::AttachmentIdentity,
+        token: libkrun::live::DiskGenerationToken,
+        settlement: libkrun::live::DiskGenerationSettlement,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), LiveError> {
+        self.handle
+            .settle_disk_generation(attachment, token, settlement, operation, deadline)
+    }
+
     pub fn capture_execution(
         &self,
         pause: &PauseToken,
@@ -464,6 +487,15 @@ pub fn run_process(
                 .map_err(|source| libkrun_error("create block device", source))?;
                 device.set_read_only(disk.read_only);
                 device.set_sync_mode(disk_sync_mode());
+                if let Some(seed) = config
+                    .disk_tracking_seeds
+                    .iter()
+                    .find(|seed| seed.block_id == disk.block_id)
+                {
+                    let seed = crate::krun::worker::disk_tracking::seed(seed)
+                        .map_err(crate::krun::KrunBackendError::InvalidConfig)?;
+                    device.set_disk_tracking_seed(seed);
+                }
                 devices.add(device);
             }
             DeviceConfig::Mount(mount) => {

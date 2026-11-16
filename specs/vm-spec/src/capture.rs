@@ -51,7 +51,7 @@ pub const CAPTURE_CUT_TEMPORARY_FILE: &str = ".vm.capture-cut.json.tmp";
 pub const CAPTURE_EVIDENCE_TEMPORARY_FILE: &str = ".vm.capture.json.tmp";
 pub const CAPTURE_SOURCE_TEMPORARY_FILE: &str = ".vm.capture-source.json.tmp";
 /// Upper bound for one JSON control record (plan, evidence, continuation).
-pub const MAX_CAPTURE_RECORD_BYTES: usize = (1 << 20) + MAX_RAM_MAP_BYTES;
+pub const MAX_CAPTURE_RECORD_BYTES: usize = (1 << 20) + MAX_RAM_MAP_BYTES + MAX_DISK_TRACKING_BYTES;
 /// ADR 0021 `Resource Limits`: staged state and evidence allowance.
 pub const CAPTURE_STATE_RESERVE_BYTES: u64 = 64 << 20;
 /// ADR 0021 `Resource Limits`: metadata charge of a qualified clone.
@@ -690,6 +690,11 @@ pub struct CaptureDiskPlan {
     pub block_id: BlockId,
     pub length: u64,
     pub copy: CaptureDiskCopy,
+    /// Only exclusively managed backing may inherit a tracked predecessor.
+    pub tracking_eligible: bool,
+    /// Immutable canonical map supplied under the launch storage authority.
+    #[serde(deserialize_with = "required")]
+    pub baseline_map: Option<String>,
 }
 
 /// One read-only attachment (composed lower, read-only data), bound by libvm's
@@ -817,6 +822,18 @@ impl CapturePlan {
                 return Err(invalid(
                     "capture disks must name every writable raw attachment in order",
                 ));
+            }
+            if disk
+                .baseline_map
+                .as_ref()
+                .is_some_and(|path| path.len() > 4096 || !std::path::Path::new(path).is_absolute())
+            {
+                return Err(invalid(
+                    "disk baseline map path is not bounded and absolute",
+                ));
+            }
+            if !disk.tracking_eligible && disk.baseline_map.is_some() {
+                return Err(invalid("external disk cannot carry baseline authority"));
             }
             if names.contains(&&disk.name) {
                 return Err(invalid("capture disk names must be unique"));
@@ -1338,6 +1355,29 @@ impl DiskTrackingSettlement {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DiskFullScanReason {
+    InvalidReceipt { reason: DiskTrackingInvalidReason },
+    MissingBaseline,
+    Untracked,
+    CopyLane,
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureDiskStats {
+    pub name: CaptureDiskName,
+    pub dirty_chunks: u64,
+    pub total_chunks: u64,
+    /// Decoded nonzero chunk bytes passed to SHA-256.
+    pub bytes_hashed: u64,
+    pub baseline_reused: bool,
+    #[serde(deserialize_with = "required")]
+    pub full_scan_reason: Option<DiskFullScanReason>,
+}
+
 /// Operation-owned clone fingerprint, sampled after the last writer closes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1349,6 +1389,8 @@ pub struct CaptureDiskCut {
     pub mode: u32,
     pub changed_seconds: i64,
     pub changed_nanoseconds: i64,
+    #[serde(deserialize_with = "required")]
+    pub tracking_receipt: Option<DiskTrackingReceipt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1360,6 +1402,8 @@ pub enum CaptureCutPhase {
 /// `vm.capture-cut.json` is never a seal. Its evidence keeps
 /// `disk_copies_sealed` false and lacks exactly the pending clone/map roles.
 /// Recovery completes those roles from retained bytes before setting the fact.
+/// Pending clone receipts live beside their fingerprints; this partial evidence
+/// retains only completed copy receipts. Coherent evidence reunites every disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaptureCutRecord {
@@ -1462,6 +1506,32 @@ impl CaptureCutRecord {
             {
                 return Err(invalid("pending identity cut has an invalid disk owner"));
             }
+            if let Some(receipt) = &disk.tracking_receipt {
+                receipt.validate()?;
+                let planned = plan
+                    .disks
+                    .iter()
+                    .find(|planned| planned.name == disk.name)
+                    .ok_or_else(|| invalid("disk receipt has no planned attachment"))?;
+                let attachment = plan
+                    .configuration
+                    .attachments
+                    .get(planned.attachment_index as usize)
+                    .ok_or_else(|| invalid("disk receipt attachment is absent"))?;
+                if receipt.token.capture_id != plan.capture_id
+                    || receipt.token.pause_generation != token.generation.get()
+                    || receipt.seed.attachment_index != planned.attachment_index
+                    || receipt.seed.block_id != planned.block_id
+                    || receipt.seed.role != attachment.role
+                    || receipt.seed.length != disk.length
+                    || (receipt.seed.file_device, receipt.seed.file_inode)
+                        == (disk.device, disk.inode)
+                {
+                    return Err(invalid(
+                        "disk tracking receipt differs from its immutable cut",
+                    ));
+                }
+            }
         }
         let roles = plan
             .roles()
@@ -1512,6 +1582,8 @@ pub struct CaptureEvidence {
     #[serde(deserialize_with = "required")]
     pub memory: Option<CaptureMemoryEvidence>,
     pub inventory: Vec<CaptureInventoryEntry>,
+    pub disk_stats: Vec<CaptureDiskStats>,
+    pub disk_tracking_receipts: Vec<DiskTrackingReceipt>,
     pub started_at_unix_ms: u64,
     pub completed_at_unix_ms: u64,
     pub capture_outcome: CaptureRecordOutcome,
@@ -1621,6 +1693,37 @@ impl CaptureEvidence {
                     return Err(invalid("capture binding does not match its cut"));
                 }
                 memory.validate_capture()?;
+                for (index, receipt) in self.disk_tracking_receipts.iter().enumerate() {
+                    receipt.validate()?;
+                    if receipt.token.capture_id != self.capture_id
+                        || receipt.token.pause_generation != token.generation.get()
+                        || self.disk_tracking_receipts[..index].iter().any(|other| {
+                            other.seed.block_id == receipt.seed.block_id
+                                || other.seed.attachment_index == receipt.seed.attachment_index
+                        })
+                    {
+                        return Err(invalid(
+                            "disk receipt differs from its unique capture pause",
+                        ));
+                    }
+                }
+                for (index, stats) in self.disk_stats.iter().enumerate() {
+                    let disk = self
+                        .inventory
+                        .iter()
+                        .find(|entry| entry.role == CaptureRole::Disk(stats.name.clone()))
+                        .ok_or_else(|| invalid("disk statistics lack their sealed payload"))?;
+                    if stats.total_chunks != disk.length.div_ceil(STREAM_CHUNK_BYTES)
+                        || stats.dirty_chunks > stats.total_chunks
+                        || stats.bytes_hashed > disk.length
+                        || stats.baseline_reused != stats.full_scan_reason.is_none()
+                        || self.disk_stats[..index]
+                            .iter()
+                            .any(|other| other.name == stats.name)
+                    {
+                        return Err(invalid("disk statistics have invalid geometry or lineage"));
+                    }
+                }
                 for role in [
                     CaptureRole::Execution,
                     CaptureRole::Devices,
@@ -1767,6 +1870,32 @@ impl CaptureEvidence {
         {
             return Err(invalid("capture inventory differs from the plan's roles"));
         }
+        if (!self.disk_tracking_receipts.is_empty()
+            && self.disk_tracking_receipts.len() != plan.disks.len())
+            || (!self.disk_stats.is_empty() && self.disk_stats.len() != plan.disks.len())
+        {
+            return Err(invalid(
+                "disk receipts or statistics do not cover the writable inventory",
+            ));
+        }
+        for receipt in &self.disk_tracking_receipts {
+            let planned = plan
+                .disks
+                .iter()
+                .find(|disk| disk.block_id == receipt.seed.block_id)
+                .ok_or_else(|| invalid("disk receipt attachment is not planned"))?;
+            let attachment = plan
+                .configuration
+                .attachments
+                .get(planned.attachment_index as usize)
+                .ok_or_else(|| invalid("disk receipt configuration is missing"))?;
+            if receipt.seed.attachment_index != planned.attachment_index
+                || receipt.seed.length != planned.length
+                || receipt.seed.role != attachment.role
+            {
+                return Err(invalid("disk receipt differs from its planned attachment"));
+            }
+        }
         for disk in &plan.disks {
             let role = CaptureRole::Disk(disk.name.clone());
             if !self
@@ -1775,6 +1904,17 @@ impl CaptureEvidence {
                 .any(|entry| entry.role == role && entry.length == disk.length)
             {
                 return Err(invalid("sealed disk length differs from its attachment"));
+            }
+            if !disk.tracking_eligible
+                && self.disk_stats.iter().any(|stats| {
+                    stats.name == disk.name
+                        && (stats.baseline_reused
+                            || stats.full_scan_reason != Some(DiskFullScanReason::External))
+                })
+            {
+                return Err(invalid(
+                    "external disk identity cannot inherit a tracked baseline",
+                ));
             }
         }
         if self
@@ -2247,6 +2387,8 @@ mod tests {
                     block_id: BlockId::new("silo-root-upper").unwrap(),
                     length: 1 << 30,
                     copy: CaptureDiskCopy::Copy,
+                    baseline_map: None,
+                    tracking_eligible: true,
                 },
                 CaptureDiskPlan {
                     name: CaptureDiskName::new("data0").unwrap(),
@@ -2254,6 +2396,8 @@ mod tests {
                     block_id: BlockId::new("data0").unwrap(),
                     length: 1 << 20,
                     copy: CaptureDiskCopy::Clone,
+                    baseline_map: None,
+                    tracking_eligible: true,
                 },
             ],
             read_only_inputs: vec![CaptureReadOnlyInput {
@@ -2282,6 +2426,8 @@ mod tests {
         };
         let digest = Sha256Digest::of_bytes(b"x");
         CaptureEvidence {
+            disk_stats: Vec::new(),
+            disk_tracking_receipts: Vec::new(),
             version: CAPTURE_RECORD_VERSION,
             machine_id: machine(),
             run_id: run(),
@@ -2779,6 +2925,7 @@ mod tests {
             }
         });
         RestoreRequest {
+            disk_tracking_seeds: Vec::new(),
             version: 1,
             checkpoint: Sha256Digest::of_bytes(b"checkpoint"),
             activation_id: id("44444444-4444-4444-8444-444444444444"),
@@ -3200,14 +3347,31 @@ mod tests {
         let disks = plan
             .disks
             .iter()
-            .map(|disk| CaptureDiskCut {
-                name: disk.name.clone(),
-                device: 7,
-                inode: u64::from(disk.attachment_index) + 10,
-                length: disk.length,
-                mode: 0o100600,
-                changed_seconds: 10,
-                changed_nanoseconds: 20,
+            .map(|disk| {
+                let mut receipt = tracking_receipt();
+                receipt.seed.length = disk.length;
+                receipt.seed.attachment_index = disk.attachment_index;
+                receipt.seed.block_id = disk.block_id.clone();
+                receipt.seed.role =
+                    plan.configuration.attachments[disk.attachment_index as usize].role;
+                receipt.total_chunks = disk.length.div_ceil(STREAM_CHUNK_BYTES);
+                receipt.runs = vec![DiskDirtyRun {
+                    first_chunk: 0,
+                    chunk_count: 1,
+                }];
+                receipt.dirty_chunks = 1;
+                receipt.token.pause_generation =
+                    partial.pause_token.as_ref().unwrap().generation.get();
+                CaptureDiskCut {
+                    tracking_receipt: Some(receipt),
+                    name: disk.name.clone(),
+                    device: 7,
+                    inode: u64::from(disk.attachment_index) + 10,
+                    length: disk.length,
+                    mode: 0o100600,
+                    changed_seconds: 10,
+                    changed_nanoseconds: 20,
+                }
             })
             .collect::<Vec<_>>();
         partial
@@ -3226,7 +3390,7 @@ mod tests {
         let bytes = cut.canonical_bytes().unwrap();
         assert_eq!(CaptureCutRecord::decode(&bytes).unwrap(), cut);
         assert!(CaptureEvidence::decode(&bytes).is_err());
-        for mutation in 0..7 {
+        for mutation in 0..11 {
             let mut bad = cut.clone();
             match mutation {
                 0 => bad.disks[0].length += 512,
@@ -3237,9 +3401,72 @@ mod tests {
                     bad.evidence.inventory.pop();
                 }
                 5 => bad.evidence.disk_copies_sealed = true,
+                6 => {
+                    bad.disks[0]
+                        .tracking_receipt
+                        .as_mut()
+                        .unwrap()
+                        .token
+                        .capture_id = run()
+                }
+                7 => {
+                    bad.disks[0]
+                        .tracking_receipt
+                        .as_mut()
+                        .unwrap()
+                        .seed
+                        .block_id = BlockId::new("foreign").unwrap()
+                }
+                8 => {
+                    bad.disks[0]
+                        .tracking_receipt
+                        .as_mut()
+                        .unwrap()
+                        .token
+                        .pause_generation += 1
+                }
+                9 => {
+                    let receipt = bad.disks[0].tracking_receipt.as_mut().unwrap();
+                    receipt.runs[0].chunk_count = receipt.total_chunks + 1;
+                }
                 _ => bad.evidence.request_digest = Sha256Digest::of_bytes(b"foreign"),
             }
             assert!(bad.validate_against_plan(&plan, &request).is_err());
         }
+    }
+
+    #[test]
+    fn external_capture_disks_cannot_carry_or_claim_baseline_authority() {
+        let mut plan = plan();
+        plan.disks[0].tracking_eligible = false;
+        plan.validate().unwrap();
+        plan.disks[0].baseline_map = Some("/private/baseline.map.json".into());
+        assert!(plan.validate().is_err());
+        plan.disks[0].baseline_map = None;
+        let mut evidence = evidence(&plan);
+        evidence.disk_stats = plan
+            .disks
+            .iter()
+            .map(|disk| CaptureDiskStats {
+                name: disk.name.clone(),
+                dirty_chunks: 0,
+                total_chunks: disk.length.div_ceil(STREAM_CHUNK_BYTES),
+                bytes_hashed: 0,
+                baseline_reused: false,
+                full_scan_reason: Some(if disk.tracking_eligible {
+                    DiskFullScanReason::MissingBaseline
+                } else {
+                    DiskFullScanReason::External
+                }),
+            })
+            .collect();
+        let request = Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap());
+        evidence.validate_against_plan(&plan, &request).unwrap();
+        evidence.disk_stats[0].baseline_reused = true;
+        evidence.disk_stats[0].full_scan_reason = None;
+        assert!(evidence.validate_against_plan(&plan, &request).is_err());
+        evidence.disk_stats[0].baseline_reused = false;
+        evidence.disk_stats[0].full_scan_reason = Some(DiskFullScanReason::MissingBaseline);
+        assert!(evidence.validate_against_plan(&plan, &request).is_err());
     }
 }

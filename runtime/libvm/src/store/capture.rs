@@ -36,6 +36,46 @@ use crate::store::{MachineStore, Store};
 use crate::{BootBinding, BootProfile, DiskStorage, LibVmError, MachineRoot, RawLayout};
 
 impl SnapshotStore {
+    pub(crate) async fn accept_live_disk_baselines(
+        &self,
+        record: &CaptureRecord,
+    ) -> Result<(), LibVmError> {
+        let this = self.clone();
+        let mut record = record.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                if record.evidence.is_none() {
+                    if let Some(operation) = record.fork_operation_id {
+                        if let Some(cut) = this.store.local_cut(operation).await? {
+                            record.evidence = Some(
+                                String::from_utf8(cut.evidence.canonical_bytes().map_err(invalid)?)
+                                    .map_err(invalid)?,
+                            );
+                        }
+                    }
+                }
+                if record.evidence.is_none() {
+                    let directory = capture_directory(&this.store, &record)?
+                        .ok_or_else(|| invalid("accepted capture staging disappeared"))?;
+                    settle_capture_seal(&directory)?;
+                    let verified = validate_receipt(&directory, &record)?;
+                    verified.retain_disk_baselines(
+                        &crate::paths::machine_data_dir_in(
+                            this.store.home_path(),
+                            record.machine_id,
+                        ),
+                        &record.plan,
+                    )?;
+                    record.evidence =
+                        Some(String::from_utf8(verified.evidence_bytes).map_err(invalid)?);
+                }
+                this.store.accept_capture_disk_baselines(&record).await
+            })
+        })
+        .await?
+    }
+
     /// Plans, pins and reserves the complete peak before the monitor may freeze.
     /// Detached blocking ownership retains the lease/catalog on waiter loss.
     pub(crate) async fn reserve_capture(
@@ -114,7 +154,9 @@ impl SnapshotStore {
             .into_iter()
             .find(|launch| launch.run_id == request.run_id && launch.admitted)
             .ok_or_else(|| invalid("capture has no admitted exact-run launch owner"))?;
-        if storage != launch.storage || storage.operation.is_some() || !storage.ownership.is_owned()
+        if !storage.matches_launch_storage(&launch.storage)
+            || storage.operation.is_some()
+            || !storage.ownership.is_owned()
         {
             return Err(invalid(
                 "capture source generation changed or has an unresolved operation",
@@ -191,12 +233,12 @@ impl SnapshotStore {
                     identity: read_only_identity(&storage, index as u32, attachment.role)?,
                 });
             } else {
-                let source = if attachment.role == vm_spec::DiskRole::Data
+                let external_writable = attachment.role == vm_spec::DiskRole::Data
                     && !storage
                         .disks
                         .iter()
-                        .any(|disk| disk.order as usize == index)
-                {
+                        .any(|disk| disk.order as usize == index);
+                let source = if external_writable {
                     let launched = launch
                         .disks
                         .get(index)
@@ -253,6 +295,16 @@ impl SnapshotStore {
                     attachment_index: index as u32,
                     block_id: attachment.block_id.clone(),
                     length: metadata.len(),
+                    tracking_eligible: !external_writable,
+                    baseline_map: storage.disk_baselines.iter().find(|baseline| {
+                        !external_writable && matches!(baseline.state, crate::store::models::storage::DiskBaselineState::Running { run_id, seeded: true } if run_id == request.run_id)
+                            && baseline.storage_generation == storage.storage_generation
+                            && baseline.seed.attachment_index == index as u32
+                            && baseline.seed.block_id == attachment.block_id
+                            && baseline.seed.file_device == metadata.dev()
+                            && baseline.seed.file_inode == metadata.ino()
+                            && baseline.seed.length == metadata.len()
+                    }).map(|baseline| machine.path().join(baseline.map.as_path()).to_string_lossy().into_owned()),
                     copy: CaptureDiskCopy::Copy,
                 });
             }
@@ -761,6 +813,10 @@ impl SnapshotStore {
             CaptureAuthentication::Bytes
         };
         let mut verified = verify_capture(&directory, &record, authentication)?;
+        verified.retain_disk_baselines(
+            &crate::paths::machine_data_dir_in(self.store.home_path(), record.machine_id),
+            &record.plan,
+        )?;
         let boot = record
             .captured_boot
             .clone()
@@ -1110,9 +1166,11 @@ impl SnapshotStore {
 }
 
 pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
-    Resource::MetadataPageBytes
-        .check(json.len() as u64)
-        .map_err(StorageError::from)?;
+    if json.len() > 2 * vm_spec::capture::MAX_CAPTURE_RECORD_BYTES + (4 << 20) {
+        return Err(invalid(
+            "capture catalog record exceeds its control-record bound",
+        ));
+    }
     let record: CaptureRecord = serde_json::from_str(json).map_err(invalid)?;
     record.plan.validate().map_err(invalid)?;
     record
@@ -1372,7 +1430,7 @@ fn capture_directory(
     captures.open_dir(&record.capture_id.to_string())
 }
 
-fn writable_path(
+pub(crate) fn writable_path(
     storage: &crate::MachineStorageRecord,
     order: u32,
     role: vm_spec::DiskRole,
@@ -1625,6 +1683,28 @@ pub(crate) struct VerifiedCapture {
     control_fingerprints: Vec<(&'static str, SourceFingerprint)>,
 }
 impl VerifiedCapture {
+    fn retain_disk_baselines(
+        &self,
+        machine_dir: &Path,
+        plan: &CapturePlan,
+    ) -> Result<(), LibVmError> {
+        for payload in &self.files {
+            if let CaptureRole::Disk(name) = &payload.role {
+                if !plan
+                    .disks
+                    .iter()
+                    .any(|disk| &disk.name == name && disk.tracking_eligible)
+                {
+                    continue;
+                }
+                if let VerifiedBytes::Stream(stream) = &payload.bytes {
+                    crate::machine::root_storage::retain_disk_map(machine_dir, stream.map())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn publications(
         &self,
     ) -> &BTreeMap<crate::storage::identity::StreamId, crate::storage::pool::SealedStreamPublication>
@@ -2345,7 +2425,9 @@ impl SnapshotStore {
                     settle_capture_seal(&source)?;
                     let verified = validate_receipt(&source, &record)?;
                     verified.recheck_registered(&this.store, capture)?;
+                    verified.retain_disk_baselines(&crate::paths::machine_data_dir_in(this.store.home_path(), record.machine_id), &record.plan)?;
                     let mut storage = record.storage.clone();
+                    storage.disk_baselines.clear();
                     storage.boot = record.captured_boot.clone().ok_or_else(|| invalid("local capture has no pinned boot closure"))?;
                     storage.snapshot = None;
                     storage.image = None;
@@ -2852,7 +2934,28 @@ pub(crate) mod tests {
             updated_at: 1,
         };
         store.add_machine(&config, &state).await.unwrap();
-        let storage = store.machine_storage(id).await.unwrap().unwrap();
+        let mut storage = store.machine_storage(id).await.unwrap().unwrap();
+        if let crate::MachineRoot::OpaqueRaw { geometry, .. } = &mut storage.root {
+            geometry.length = disk_length;
+        }
+        let file = std::fs::File::open(directory.path().join("root.raw")).unwrap();
+        let map = StreamHasher::new()
+            .hash_open_file(&file, disk_length)
+            .unwrap()
+            .map;
+        crate::machine::root_storage::seed_disk(
+            &mut storage,
+            directory.path(),
+            0,
+            &config.spec.storage.as_ref().unwrap().disks[0],
+            &file,
+            &map,
+        )
+        .unwrap();
+        store
+            .save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
         let launch = store
             .register_launch_storage(id, run, &storage, &config.spec)
             .await
@@ -3047,6 +3150,8 @@ pub(crate) mod tests {
             });
         }
         let evidence = CaptureEvidence {
+            disk_stats: Vec::new(),
+            disk_tracking_receipts: Vec::new(),
             version: 1,
             machine_id: record.plan.machine_id.clone(),
             run_id: record.plan.run_id.clone(),
@@ -6629,6 +6734,426 @@ pub(crate) mod tests {
             CaptureState::Published {
                 snapshot: published.id
             },
+        );
+    }
+    fn disk_baseline_receipt(
+        record: &crate::store::snapshot_store::CaptureRecord,
+    ) -> vm_spec::capture::DiskTrackingReceipt {
+        use vm_spec::capture::{DiskGenerationToken, DiskTrackingReceipt, DISK_TRACKING_VERSION};
+        let seed = record.storage.disk_baselines[0].seed.clone();
+        DiskTrackingReceipt {
+            version: DISK_TRACKING_VERSION,
+            seed: seed.clone(),
+            token: DiskGenerationToken {
+                capture_id: record.plan.capture_id.clone(),
+                pause_generation: 1,
+                epoch: seed.epoch.clone(),
+                generation: 1,
+                file_device: seed.file_device,
+                file_inode: seed.file_inode,
+            },
+            runs: Vec::new(),
+            dirty_chunks: 0,
+            total_chunks: seed.length.div_ceil(seed.chunk_size),
+            invalid_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_baseline_lifecycle_is_durable_and_restart_is_conservative() {
+        use crate::store::models::storage::DiskBaselineState;
+        use std::os::unix::fs::FileExt;
+        let fixture = fixture().await;
+        let store = &fixture.snapshots.store;
+        let mut record = fixture.reservation.record.clone();
+        let initial = store
+            .machine_storage(record.machine_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(initial.disk_baselines[0].state, DiskBaselineState::Running { run_id, seeded: true } if run_id == record.run_id)
+        );
+        assert!(record.plan.disks[0].baseline_map.is_some());
+        assert!(crate::machine::root_storage::launch_disk_seeds(
+            &initial,
+            &fixture.config.machine_dir
+        )
+        .unwrap()
+        .is_empty());
+        let reopened = Store::new(&crate::paths::LocalPaths::new(store.home_path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .machine_storage(record.machine_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .disk_baselines,
+            initial.disk_baselines
+        );
+        let (directory, mut evidence) = seal(&fixture);
+        let seed = initial.disk_baselines[0].seed.clone();
+        evidence
+            .disk_tracking_receipts
+            .push(disk_baseline_receipt(&record));
+        directory
+            .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
+            .unwrap();
+        let verified =
+            verify_capture(&directory, &record, CaptureAuthentication::Publication).unwrap();
+        verified
+            .retain_disk_baselines(&fixture.config.machine_dir, &record.plan)
+            .unwrap();
+        assert_eq!(
+            store
+                .machine_storage(record.machine_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .disk_baselines,
+            initial.disk_baselines,
+            "failed or cancelled candidate cannot replace its predecessor"
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(fixture.config.machine_dir.join("root.raw"))
+            .unwrap()
+            .write_all_at(b"post-cut", 0)
+            .unwrap();
+        record.evidence = Some(String::from_utf8(evidence.canonical_bytes().unwrap()).unwrap());
+        store.accept_capture_disk_baselines(&record).await.unwrap();
+        let accepted = store
+            .machine_storage(record.machine_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.disk_baselines[0].generation, 1);
+        assert_eq!(accepted.disk_baselines[0].seed.epoch, seed.epoch);
+        assert!(
+            matches!(accepted.disk_baselines[0].state, DiskBaselineState::Running { run_id, seeded: true } if run_id == record.run_id)
+        );
+        fixture
+            .snapshots
+            .publish_capture(record.capture_id, directory.path(), record.alias.clone())
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .finish_capture_release(record.capture_id, true)
+            .await
+            .unwrap();
+        let mut repeat = record.request.clone();
+        repeat.capture_id = Uuid::new_v4();
+        repeat.alias = Some("checkpoint-repeat".into());
+        let next_capture = fixture.snapshots.reserve_capture(&repeat).await.unwrap();
+        assert!(next_capture.record.plan.disks[0].tracking_eligible);
+        assert_eq!(
+            next_capture.record.plan.disks[0]
+                .baseline_map
+                .as_ref()
+                .unwrap(),
+            &fixture
+                .config
+                .machine_dir
+                .join(accepted.disk_baselines[0].map.as_path())
+                .to_string_lossy()
+                .into_owned()
+        );
+        fixture
+            .snapshots
+            .abandon_capture(repeat.capture_id)
+            .await
+            .unwrap();
+        let operation = fixture.launch.operation_id();
+        drop(fixture.launch);
+        let stopped = MachineState {
+            machine_id: record.machine_id,
+            status: MachineRuntimeState::Stopped,
+            vmm_pid: None,
+            started_at: None,
+            run_id: Some(record.run_id.to_string()),
+            last_error: None,
+            updated_at: 3,
+        };
+        assert!(store
+            .try_retire_launch_storage(
+                operation,
+                record.run_id,
+                0,
+                &stopped,
+                crate::StorageStopOutcome::Clean
+            )
+            .await
+            .unwrap());
+        let ended = store
+            .machine_storage(record.machine_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ended.disk_baselines[0].state,
+            DiskBaselineState::Invalid
+        ));
+        assert!(crate::machine::root_storage::launch_disk_seeds(
+            &ended,
+            &fixture.config.machine_dir
+        )
+        .unwrap()
+        .is_empty());
+        let next = store
+            .register_launch_storage(
+                record.machine_id,
+                Uuid::new_v4(),
+                &ended,
+                &fixture.config.spec,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_launch_storage_admitted(next.operation_id())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .machine_storage(record.machine_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .disk_baselines[0]
+                .state,
+            DiskBaselineState::Running { seeded: false, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn disk_baseline_schema_requires_explicit_array_and_invalidation_is_durable() {
+        use crate::store::models::storage::DiskBaselineState;
+        let fixture = fixture().await;
+        let store = &fixture.snapshots.store;
+        for query in [
+            "UPDATE machine_storage SET record_json=jsonb(json_set(record_json,'$.diskBaselines',NULL)) WHERE machine_id=?1",
+            "UPDATE machine_storage SET record_json=jsonb(json_set(record_json,'$.diskBaselines',jsonb('{}'))) WHERE machine_id=?1",
+            "UPDATE machine_storage SET record_json=jsonb(json_set(record_json,'$.diskBaselines',jsonb('null'))) WHERE machine_id=?1",
+        ] {
+            assert!(sqlx::query(query)
+                .bind(fixture.config.id.to_string())
+                .execute(&store.pool)
+                .await
+                .is_err());
+        }
+        assert!(sqlx::query("UPDATE machine_storage SET record_json=jsonb(json_remove(record_json,'$.diskBaselines')) WHERE machine_id=?1")
+            .bind(fixture.config.id.to_string()).execute(&store.pool).await.is_err());
+        store
+            .invalidate_machine_disk_baselines(fixture.config.id)
+            .await
+            .unwrap();
+        let reopened = Store::new(&crate::paths::LocalPaths::new(store.home_path()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened
+                .machine_storage(fixture.config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .disk_baselines[0]
+                .state,
+            DiskBaselineState::Invalid
+        ));
+    }
+    #[tokio::test]
+    async fn external_writable_disks_remain_capturable_but_never_tracking_eligible() {
+        let fixture = fixture_with_external_data(true).await;
+        let disks = &fixture.reservation.record.plan.disks;
+        assert_eq!(disks.len(), 2);
+        assert!(disks[0].tracking_eligible);
+        assert!(!disks[1].tracking_eligible);
+        assert!(disks[1].baseline_map.is_none());
+        assert_eq!(fixture.reservation.record.storage.disk_baselines.len(), 1);
+        let (directory, _) = seal(&fixture);
+        fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn disk_baseline_crash_between_admission_and_stop_never_reuses_ready() {
+        use crate::store::models::storage::DiskBaselineState;
+        const HOME: &str = "SILO_DISK_TRACKING_CRASH_HOME";
+        const MACHINE: &str = "SILO_DISK_TRACKING_CRASH_MACHINE";
+        if let Ok(home) = std::env::var(HOME) {
+            let store = Store::new(&LocalPaths::new(home)).await.unwrap();
+            let machine: MachineId = std::env::var(MACHINE).unwrap().parse().unwrap();
+            let config = store.machine_config(machine).await.unwrap().unwrap();
+            let storage = store.machine_storage(machine).await.unwrap().unwrap();
+            let run = Uuid::new_v4();
+            let launch = store
+                .register_launch_storage(machine, run, &storage, &config.spec)
+                .await
+                .unwrap();
+            store
+                .save_machine_state(&MachineState {
+                    machine_id: machine,
+                    status: MachineRuntimeState::Starting,
+                    vmm_pid: None,
+                    started_at: None,
+                    run_id: Some(run.to_string()),
+                    last_error: None,
+                    updated_at: 4,
+                })
+                .await
+                .unwrap();
+            store
+                .mark_launch_storage_admitted(launch.operation_id())
+                .await
+                .unwrap();
+            std::process::exit(77);
+        }
+        let fixture = fixture().await;
+        let store = &fixture.snapshots.store;
+        let original = &fixture.reservation.record;
+        let operation = fixture.launch.operation_id();
+        drop(fixture.launch);
+        let stopped = MachineState {
+            machine_id: original.machine_id,
+            status: MachineRuntimeState::Stopped,
+            vmm_pid: None,
+            started_at: None,
+            run_id: Some(original.run_id.to_string()),
+            last_error: None,
+            updated_at: 3,
+        };
+        assert!(store
+            .try_retire_launch_storage(
+                operation,
+                original.run_id,
+                0,
+                &stopped,
+                crate::StorageStopOutcome::Clean
+            )
+            .await
+            .unwrap());
+        let mut storage = store
+            .machine_storage(original.machine_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let file = std::fs::File::open(fixture.config.machine_dir.join("root.raw")).unwrap();
+        let map = StreamHasher::new().hash_open_file(&file, 512).unwrap().map;
+        crate::machine::root_storage::seed_disk(
+            &mut storage,
+            &fixture.config.machine_dir,
+            0,
+            &fixture.config.spec.storage.as_ref().unwrap().disks[0],
+            &file,
+            &map,
+        )
+        .unwrap();
+        store
+            .save_machine_config_with_storage(&fixture.config, &storage)
+            .await
+            .unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::capture::tests::disk_baseline_crash_between_admission_and_stop_never_reuses_ready", "--nocapture"])
+            .env(HOME, store.home_path()).env(MACHINE, original.machine_id.to_string()).status().unwrap();
+        assert_eq!(status.code(), Some(77));
+        let crashed = store
+            .machine_storage(original.machine_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            crashed.disk_baselines[0].state,
+            DiskBaselineState::Running { seeded: true, .. }
+        ));
+        assert!(crate::machine::root_storage::launch_disk_seeds(
+            &crashed,
+            &fixture.config.machine_dir
+        )
+        .unwrap()
+        .is_empty());
+        let launches = store
+            .launch_storage_operations(original.machine_id)
+            .await
+            .unwrap();
+        assert_eq!(launches.len(), 1);
+        let mut stopped = stopped;
+        stopped.run_id = Some(launches[0].run_id.to_string());
+        assert!(store
+            .try_retire_launch_storage(
+                launches[0].operation_id,
+                launches[0].run_id,
+                0,
+                &stopped,
+                crate::StorageStopOutcome::Unknown
+            )
+            .await
+            .unwrap());
+        let restart = store
+            .machine_storage(original.machine_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            restart.disk_baselines[0].state,
+            DiskBaselineState::Invalid
+        ));
+        assert!(crate::machine::root_storage::launch_disk_seeds(
+            &restart,
+            &fixture.config.machine_dir
+        )
+        .unwrap()
+        .is_empty());
+    }
+    #[tokio::test]
+    async fn disk_baseline_acceptance_survives_snapshot_publication_failure() {
+        let fixture = fixture().await;
+        let record = &fixture.reservation.record;
+        let store = &fixture.snapshots.store;
+        let (directory, mut evidence) = seal(&fixture);
+        evidence
+            .disk_tracking_receipts
+            .push(disk_baseline_receipt(record));
+        directory
+            .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
+            .unwrap();
+        sqlx::query("CREATE TRIGGER reject_capture_publication BEFORE UPDATE ON storage_operation WHEN NEW.kind='capture' BEGIN SELECT RAISE(ABORT,'publication interrupted'); END")
+            .execute(&store.pool).await.unwrap();
+        assert!(fixture
+            .snapshots
+            .publish_capture(record.capture_id, directory.path(), record.alias.clone())
+            .await
+            .is_err());
+        assert!(fixture.snapshots.list().await.unwrap().is_empty());
+        assert!(fixture
+            .snapshots
+            .capture_reservation(record.capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .is_none());
+        fixture
+            .snapshots
+            .accept_live_disk_baselines(record)
+            .await
+            .unwrap();
+        let accepted = store
+            .machine_storage(record.machine_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.disk_baselines[0].generation, 1);
+        assert_eq!(
+            accepted.disk_baselines[0].seed.epoch,
+            evidence.disk_tracking_receipts[0].seed.epoch
         );
     }
 }

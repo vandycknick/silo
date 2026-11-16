@@ -692,6 +692,7 @@ pub(crate) fn test_storage_launch(
         },
         lease: Arc::new(std::os::fd::OwnedFd::from(lease)),
         holder_path: directory.join("vm.storage-holder.json"),
+        disk_tracking_seeds: Vec::new(),
     })
 }
 

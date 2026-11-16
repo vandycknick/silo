@@ -4,7 +4,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 pub(crate) const VMM_START_REQUEST_VERSION: u32 = 1;
-pub(crate) const VMM_START_REQUEST_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const VMM_START_REQUEST_MAX_BYTES: usize =
+    vm_spec::capture::MAX_CAPTURE_RECORD_BYTES + (1 << 20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +15,7 @@ pub(crate) struct VmmStartRequest {
     machine_run_id: String,
     storage_lease: protocol::shutdown::StorageLeaseBinding,
     storage_shutdown: protocol::shutdown::StorageShutdownContext,
+    disk_tracking_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
     #[serde(skip_serializing_if = "Option::is_none")]
     startup_command: Option<VmmStartupCommand>,
     // Runtime always sends its frozen prospective selection explicitly.
@@ -91,6 +93,7 @@ impl VmmStartRequest {
             machine_run_id: machine_run_id.into(),
             storage_lease,
             storage_shutdown,
+            disk_tracking_seeds: Vec::new(),
             startup_command,
             virt_backend: None,
             rosetta_intent: None,
@@ -98,6 +101,14 @@ impl VmmStartRequest {
             startup_budget_ms,
             restore: None,
         }
+    }
+
+    pub(crate) fn with_disk_tracking_seeds(
+        mut self,
+        seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
+    ) -> Self {
+        self.disk_tracking_seeds = seeds;
+        self
     }
 
     pub(crate) fn with_virt_backend(mut self, virt_backend: Option<VmmVirtBackend>) -> Self {

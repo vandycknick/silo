@@ -10,7 +10,9 @@
 //!
 //! The concatenated lower is never materialized. Local validation receipts
 //! bind canonical records to held immutable inodes. Receipt misses and all
-//! transport admission authenticate the exact retained bytes.
+//! transport admission authenticate the exact retained bytes. Failed validation
+//! preserves existing receipts; changed fingerprints keep them unusable until
+//! successful authentication replaces them.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -647,10 +649,6 @@ async fn validate_composition(
         .and_then(|bytes| serde_json::from_slice::<CompositionValidation>(bytes).ok())
         .is_some_and(|previous| previous == before);
     if !hit {
-        sqlx::query("DELETE FROM composition_validation WHERE lower_id=?1")
-            .bind(id.to_string())
-            .execute(&store.pool)
-            .await?;
         let loaded = crate::storage::composition::load_exact(recipe, layers, result, fsmeta)?;
         if loaded.result != *result {
             return Err(invalid("retained composition failed exact loading"));
@@ -1907,38 +1905,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_mutation_restoring_mtime_and_missing_members_are_refused() {
+    async fn refused_composition_preserves_receipts_without_authorizing_corrupt_retries() {
         let (_temporary, paths, store, held) = fixture().await;
         let layers = LayerStore::from_store(store.clone());
         let pool = StoragePool::open_existing(paths.images_dir())
             .unwrap()
             .unwrap();
+        let graph = held.snapshot_composition().unwrap();
+        let lower = held.retained.overlay_lower();
+        let receipt_query =
+            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=1";
         let pack = pool.stream_path(&held.unique[0].0.pack.stream);
-        let modified = std::fs::metadata(&pack).unwrap().modified().unwrap();
-        std::fs::set_permissions(&pack, Permissions::from_mode(0o600)).unwrap();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&pack)
-            .unwrap();
-        let mut byte = [0u8; 1];
-        file.read_exact_at(&mut byte, 0).unwrap();
-        file.write_all_at(&[byte[0] ^ 0xff], 0).unwrap();
-        file.set_times(FileTimes::new().set_modified(modified))
-            .unwrap();
-        std::fs::set_permissions(&pack, Permissions::from_mode(0o400)).unwrap();
-        assert!(layers.hold_composition(held.retained.id).await.is_err());
-        assert!(held.recheck().is_err());
-        let absent: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM composition_validation WHERE lower_id=?1")
+        let fsmeta = pool.object_path(&held.retained.fsmeta());
+        for path in [&pack, &fsmeta] {
+            let previous: (Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(receipt_query)
                 .bind(held.retained.id.to_string())
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();
-        assert_eq!(absent, 0);
-        file.write_all_at(&byte, 0).unwrap();
-        drop(file);
-        layers.hold_composition(held.retained.id).await.unwrap();
+            assert!(previous.1.is_some());
+            let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+            std::fs::set_permissions(path, Permissions::from_mode(0o600)).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let mut byte = [0u8; 1];
+            file.read_exact_at(&mut byte, 0).unwrap();
+            file.write_all_at(&[byte[0] ^ 0xff], 0).unwrap();
+            file.set_times(FileTimes::new().set_modified(modified))
+                .unwrap();
+            std::fs::set_permissions(path, Permissions::from_mode(0o400)).unwrap();
+            for _ in 0..2 {
+                assert!(layers
+                    .publish_local_composition(held._owner.operation, &graph)
+                    .await
+                    .is_err());
+                assert!(layers.hold_lower(&lower).await.is_err());
+                let unchanged: (Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(receipt_query)
+                    .bind(held.retained.id.to_string())
+                    .fetch_one(&store.pool)
+                    .await
+                    .unwrap();
+                assert_eq!(unchanged, previous);
+            }
+            assert!(held.recheck().is_err());
+            file.write_all_at(&byte, 0).unwrap();
+            drop(file);
+            layers
+                .publish_local_composition(held._owner.operation, &graph)
+                .await
+                .unwrap();
+            let refreshed: (Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(receipt_query)
+                .bind(held.retained.id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+            assert_ne!(refreshed.0, previous.0);
+            assert!(refreshed.1.is_some());
+            layers.hold_lower(&lower).await.unwrap().recheck().unwrap();
+        }
         std::fs::remove_file(&pack).unwrap();
         assert!(layers.hold_composition(held.retained.id).await.is_err());
     }

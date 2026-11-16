@@ -715,6 +715,51 @@ fn complete_cut_identity(staging: &OwnedDirectory, plan: &CapturePlan) -> Result
             }
         }
         disks.write_file(&map_name, &map_bytes)?;
+        cut.evidence
+            .disk_stats
+            .retain(|stats| stats.name != pending.name);
+        cut.evidence
+            .disk_stats
+            .push(vm_spec::capture::CaptureDiskStats {
+                name: pending.name.clone(),
+                dirty_chunks: pending.tracking_receipt.as_ref().map_or(
+                    pending
+                        .length
+                        .div_ceil(vm_spec::capture::STREAM_CHUNK_BYTES),
+                    |receipt| receipt.dirty_chunks,
+                ),
+                total_chunks: pending
+                    .length
+                    .div_ceil(vm_spec::capture::STREAM_CHUNK_BYTES),
+                bytes_hashed: scan.stats.logical_bytes_hashed,
+                baseline_reused: false,
+                full_scan_reason: Some(
+                    if plan
+                        .disks
+                        .iter()
+                        .any(|disk| disk.name == pending.name && !disk.tracking_eligible)
+                    {
+                        vm_spec::capture::DiskFullScanReason::External
+                    } else {
+                        pending
+                            .tracking_receipt
+                            .as_ref()
+                            .and_then(|receipt| receipt.invalid_reason)
+                            .map_or(
+                                vm_spec::capture::DiskFullScanReason::MissingBaseline,
+                                |reason| vm_spec::capture::DiskFullScanReason::InvalidReceipt {
+                                    reason,
+                                },
+                            )
+                    },
+                ),
+            });
+        if let Some(receipt) = &pending.tracking_receipt {
+            cut.evidence
+                .disk_tracking_receipts
+                .retain(|existing| existing.seed.attachment_index != receipt.seed.attachment_index);
+            cut.evidence.disk_tracking_receipts.push(receipt.clone());
+        }
         cut.evidence.inventory.extend([
             CaptureInventoryEntry {
                 role: CaptureRole::Disk(pending.name.clone()),
@@ -734,6 +779,12 @@ fn complete_cut_identity(staging: &OwnedDirectory, plan: &CapturePlan) -> Result
     cut.evidence
         .inventory
         .sort_by_key(|entry| roles.iter().position(|role| role == &entry.role));
+    cut.evidence
+        .disk_tracking_receipts
+        .sort_by_key(|receipt| receipt.seed.attachment_index);
+    cut.evidence
+        .disk_stats
+        .sort_by_key(|stats| plan.disks.iter().position(|disk| disk.name == stats.name));
     cut.evidence.disk_copies_sealed = true;
     cut.evidence
         .validate_against_plan(plan, &request)
@@ -1140,13 +1191,16 @@ pub(crate) async fn advance(
     // Durable capture success does not depend on source continuation or on
     // reaching the original monitor. Preserve the closure before reconciling
     // run authority; uncertainty must retain ownership, not postpone publication.
+    let mut publication_error = None;
     let record = if !matches!(
         record.state,
         CaptureState::Published { .. } | CaptureState::Local { .. }
     ) && coherent_record(runtime, &record)?.is_some()
     {
-        if let Some(disks) = retain_or_publish(runtime, &snapshots, &record, progress).await? {
-            *retained = Some(disks);
+        match retain_or_publish(runtime, &snapshots, &record, progress).await {
+            Ok(Some(disks)) => *retained = Some(disks),
+            Ok(None) => {}
+            Err(error) => publication_error = Some(error),
         }
         snapshots
             .capture_reservation(capture_id)
@@ -1162,7 +1216,14 @@ pub(crate) async fn advance(
     );
     let monitor = match &liveness {
         RunLiveness::Alive(observation) => {
-            match observe_capture(&machine, observation, &record.plan.capture_id).await? {
+            let observed =
+                match observe_capture(&machine, observation, &record.plan.capture_id).await {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        return Err(publication_error.take().map_or(error, |primary| primary))
+                    }
+                };
+            match observed {
                 MonitorCapture::Observed(observed) => {
                     if let Some(progress) = progress {
                         if let Some(activity) = observed
@@ -1190,6 +1251,9 @@ pub(crate) async fn advance(
                 }
                 MonitorCapture::NotFound if published => None,
                 MonitorCapture::NotFound => {
+                    if let Some(error) = publication_error.take() {
+                        return Err(error);
+                    }
                     let releasing=runtime.native_store()?.pending_live_commands(record.machine_id,record.run_id,&observation.report().monitor_id).await?.into_iter().any(|retained| matches!(retained.intent.command,LiveCommand::ReleaseCapture(command) if command.operation_id==record.plan.capture_id && command.disposition==CaptureReleaseDisposition::Abandoned));
                     if releasing {
                         return match release(
@@ -1219,8 +1283,24 @@ pub(crate) async fn advance(
             }
         }
         RunLiveness::Ended => None,
-        RunLiveness::Uncertain => return Ok(CaptureProgress::Pending("run reconciliation")),
+        RunLiveness::Uncertain => {
+            return match publication_error {
+                Some(error) => Err(error),
+                None => Ok(CaptureProgress::Pending("run reconciliation")),
+            }
+        }
     };
+    if let Some(observed) = &monitor {
+        if let OperationOutcome::CaptureSealed { capture } = &observed.operation.outcome {
+            if capture.capture_id != record.plan.capture_id {
+                return Err(protocol("seal names another capture"));
+            }
+            snapshots.accept_live_disk_baselines(&record).await?;
+        }
+    }
+    if let Some(error) = publication_error {
+        return Err(error);
+    }
     let sealed = published
         || match &monitor {
             Some(observed) => match &observed.operation.outcome {
@@ -1918,6 +1998,8 @@ mod tests {
                 attachment_index: 0,
                 block_id: block,
                 length,
+                baseline_map: None,
+                tracking_eligible: true,
                 copy: CaptureDiskCopy::Clone,
             }],
             read_only_inputs: Vec::new(),
@@ -1949,6 +2031,7 @@ mod tests {
         file.sync_all().unwrap();
         let metadata = file.metadata().unwrap();
         let disk = CaptureDiskCut {
+            tracking_receipt: None,
             name: name.clone(),
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -1980,6 +2063,8 @@ mod tests {
         }
         let binding = Sha256Digest::of_bytes(b"native binding");
         let evidence = CaptureEvidence {
+            disk_stats: Vec::new(),
+            disk_tracking_receipts: Vec::new(),
             version: CAPTURE_RECORD_VERSION,
             machine_id: id(1),
             run_id: id(2),
@@ -2049,6 +2134,22 @@ mod tests {
         drop(file);
         let mut expected = evidence;
         expected.disk_copies_sealed = true;
+        expected.disk_stats.push(CaptureDiskStats {
+            name: name.clone(),
+            dirty_chunks: length.div_ceil(STREAM_CHUNK_BYTES),
+            total_chunks: length.div_ceil(STREAM_CHUNK_BYTES),
+            bytes_hashed: expected_map
+                .chunks()
+                .iter()
+                .enumerate()
+                .filter(|(_, chunk)| matches!(chunk, crate::storage::stream::Chunk::Data(_)))
+                .map(|(index, _)| {
+                    (length - index as u64 * STREAM_CHUNK_BYTES).min(STREAM_CHUNK_BYTES)
+                })
+                .sum(),
+            baseline_reused: false,
+            full_scan_reason: Some(DiskFullScanReason::MissingBaseline),
+        });
         let bytes = expected_map.canonical_bytes().unwrap();
         expected.inventory.extend([
             CaptureInventoryEntry {

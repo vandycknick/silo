@@ -8,8 +8,8 @@
 //! Capture writers close without durability barriers; publication belongs to libvm.
 //! RAM identity comes from the worker receipt; disk copies hash while writing.
 //! Reflinks close without traversing extents or constructing maps in the pause.
-//! After continuation, seals walk extents once and hash chunks in up to eight
-//! scoped workers using positional reads. Only complete ordered maps are published.
+//! After continuation, tracked seals read only dirty chunks and inherit clean map
+//! entries. Unknown coverage walks allocated extents and hashes in scoped workers.
 //! On Linux, monitor-written output starts nonblocking writeback after each complete
 //! 8 MiB region containing writes. Holes, short tails and reflinks need no hint;
 //! hint failures never affect capture success or establish durability.
@@ -39,9 +39,9 @@ use nix::unistd::{ftruncate, geteuid, linkat, lseek, unlinkat, UnlinkatFlags, Wh
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use vm_spec::capture::{
-    CaptureDiskCopy, CaptureRole, Sha256Digest, StreamMap, CAPTURES_DIRECTORY,
-    CAPTURE_DISKS_DIRECTORY, CAPTURE_REQUEST_FILE, MAX_CAPTURE_RAM_BYTES, MAX_CAPTURE_RECORD_BYTES,
-    STREAM_CHUNK_BYTES,
+    CaptureDiskCopy, CaptureDiskStats, CaptureRole, DiskFullScanReason, DiskTrackingReceipt,
+    Sha256Digest, StreamMap, CAPTURES_DIRECTORY, CAPTURE_DISKS_DIRECTORY, CAPTURE_REQUEST_FILE,
+    MAX_CAPTURE_RAM_BYTES, MAX_CAPTURE_RECORD_BYTES, STREAM_CHUNK_BYTES,
 };
 use vm_spec::lifecycle::LiveId;
 
@@ -340,28 +340,93 @@ impl CaptureStaging {
             mode: metadata.mode(),
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
+            tracking_receipt: None,
         })
     }
 
-    /// Complete a retained clone without opening any writable descriptor.
+    /// Hash immutable dirty chunks only when complete predecessor authority is held.
     pub(crate) fn complete_disk_identity(
         &self,
         cut: &vm_spec::capture::CaptureDiskCut,
+        baseline: Option<&StreamMap>,
+        tracking_eligible: bool,
         cancel: &CancellationToken,
-    ) -> Result<(), DiskCopyError> {
-        if self.disk_cut(&cut.name)? != *cut {
+    ) -> Result<(StreamMap, CaptureDiskStats), DiskCopyError> {
+        let fingerprint = self.disk_cut(&cut.name)?;
+        if (
+            fingerprint.device,
+            fingerprint.inode,
+            fingerprint.length,
+            fingerprint.mode,
+            fingerprint.changed_seconds,
+            fingerprint.changed_nanoseconds,
+        ) != (
+            cut.device,
+            cut.inode,
+            cut.length,
+            cut.mode,
+            cut.changed_seconds,
+            cut.changed_nanoseconds,
+        ) {
             return Err(invalid("retained disk clone changed before identity completion").into());
         }
         let (file, _) = self.open_sealed(&CaptureRole::Disk(cut.name.clone()))?;
-        let map = seal_disk_parallel(&file, cut.length, cancel)?;
-        if self.disk_cut(&cut.name)? != *cut {
+        let (map, bytes_hashed, reason) = match cut.tracking_receipt.as_ref() {
+            Some(receipt)
+                if tracking_eligible
+                    && receipt.validate().is_ok()
+                    && receipt.invalid_reason.is_none()
+                    && baseline.is_some_and(|map| {
+                        map.length() == cut.length
+                            && receipt.seed.length == cut.length
+                            && Some(map.id()) == receipt.seed.baseline
+                    }) =>
+            {
+                let baseline = baseline.ok_or_else(|| invalid("disk baseline is missing"))?;
+                let (map, bytes) = seal_disk_incremental(&file, baseline, receipt, cancel)?;
+                (map, bytes, None)
+            }
+            receipt => {
+                let reason = if !tracking_eligible {
+                    DiskFullScanReason::External
+                } else {
+                    match receipt {
+                        Some(receipt) => match receipt.invalid_reason {
+                            Some(reason) => DiskFullScanReason::InvalidReceipt { reason },
+                            None if receipt.validate().is_err() => {
+                                DiskFullScanReason::InvalidReceipt {
+                                    reason: vm_spec::capture::DiskTrackingInvalidReason::Lost,
+                                }
+                            }
+                            None => DiskFullScanReason::MissingBaseline,
+                        },
+                        None => DiskFullScanReason::Untracked,
+                    }
+                };
+                let map = seal_disk_parallel(&file, cut.length, cancel)?;
+                let bytes = hashed_map_bytes(&map);
+                (map, bytes, Some(reason))
+            }
+        };
+        if self.disk_cut(&cut.name)? != fingerprint {
             return Err(invalid("retained disk clone changed during identity completion").into());
         }
         if cancel.is_cancelled() {
             return Err(DiskCopyError::Cancelled);
         }
         self.publish_map(&CaptureRole::DiskMap(cut.name.clone()), &map)?;
-        Ok(())
+        let stats = CaptureDiskStats {
+            name: cut.name.clone(),
+            dirty_chunks: cut
+                .tracking_receipt
+                .as_ref()
+                .map_or(0, |receipt| receipt.dirty_chunks),
+            total_chunks: cut.length.div_ceil(STREAM_CHUNK_BYTES),
+            bytes_hashed,
+            baseline_reused: reason.is_none(),
+            full_scan_reason: reason,
+        };
+        Ok((map, stats))
     }
 
     fn reopen_disk_writer(&self, name: &str) -> io::Result<(File, FileFacts)> {
@@ -759,6 +824,90 @@ fn classify_disk_chunk(bytes: &[u8]) -> Option<Sha256Digest> {
     } else {
         Some(Sha256Digest::of_bytes(bytes))
     }
+}
+
+pub(crate) fn hashed_map_bytes(map: &StreamMap) -> u64 {
+    map.chunks()
+        .iter()
+        .enumerate()
+        .filter(|(_, digest)| digest.is_some())
+        .map(|(index, _)| {
+            (map.length() - index as u64 * STREAM_CHUNK_BYTES).min(STREAM_CHUNK_BYTES)
+        })
+        .sum()
+}
+
+fn seal_disk_incremental(
+    source: &File,
+    baseline: &StreamMap,
+    receipt: &DiskTrackingReceipt,
+    cancel: &CancellationToken,
+) -> Result<(StreamMap, u64), DiskCopyError> {
+    receipt.validate().map_err(invalid)?;
+    if receipt.invalid_reason.is_some()
+        || receipt.seed.length != baseline.length()
+        || receipt.seed.baseline != Some(baseline.id())
+        || source.metadata()?.len() != baseline.length()
+    {
+        return Err(invalid("disk predecessor authority differs from coverage").into());
+    }
+    if cancel.is_cancelled() {
+        return Err(DiskCopyError::Cancelled);
+    }
+    let dirty = receipt
+        .runs
+        .iter()
+        .flat_map(|run| run.first_chunk..run.first_chunk + run.chunk_count)
+        .collect::<Vec<_>>();
+    if dirty.is_empty() {
+        return Ok((baseline.clone(), 0));
+    }
+    // Same bound as the full scan: at most eight chunk buffers, one per worker.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |count| count.get().min(8))
+        .min(dirty.len());
+    let hash_batch =
+        |batch: &[u64]| -> Result<Vec<(u64, Option<Sha256Digest>, u64)>, DiskCopyError> {
+            let mut buffer = vec![0u8; baseline.length().min(STREAM_CHUNK_BYTES) as usize];
+            let mut hashed = Vec::with_capacity(batch.len());
+            for &index in batch {
+                if cancel.is_cancelled() {
+                    return Err(DiskCopyError::Cancelled);
+                }
+                let offset = index * STREAM_CHUNK_BYTES;
+                let length = (baseline.length() - offset).min(STREAM_CHUNK_BYTES) as usize;
+                let chunk = &mut buffer[..length];
+                source.read_exact_at(chunk, offset)?;
+                hashed.push((index, classify_disk_chunk(chunk), length as u64));
+            }
+            Ok(hashed)
+        };
+    let batches = std::thread::scope(|scope| {
+        let handles = dirty
+            .chunks(dirty.len().div_ceil(workers))
+            .map(|batch| scope.spawn(|| hash_batch(batch)))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| DiskCopyError::from(invalid("disk identity worker panicked")))?
+            })
+            .collect::<Result<Vec<_>, DiskCopyError>>()
+    })?;
+    let mut chunks = baseline.chunks().to_vec();
+    let mut bytes_hashed = 0;
+    for (index, digest, length) in batches.into_iter().flatten() {
+        if digest.is_some() {
+            bytes_hashed += length;
+        }
+        chunks[index as usize] = digest;
+    }
+    Ok((
+        StreamMap::new(baseline.length(), chunks).map_err(invalid)?,
+        bytes_hashed,
+    ))
 }
 
 /// Reflink sealing never writes. Read independent chunk ranges with pread,
@@ -1310,6 +1459,8 @@ mod tests {
             staging
                 .complete_disk_identity(
                     &staging.disk_cut(&name).unwrap(),
+                    None,
+                    true,
                     &CancellationToken::new(),
                 )
                 .unwrap();
@@ -1653,7 +1804,7 @@ mod tests {
             .unwrap();
         assert_ne!(independent_map(&file, length), expected);
         staging
-            .complete_disk_identity(&cut, &CancellationToken::new())
+            .complete_disk_identity(&cut, None, true, &CancellationToken::new())
             .unwrap();
         let (cloned, _) = staging
             .open_sealed(&CaptureRole::Disk(name.clone()))
@@ -1694,7 +1845,7 @@ mod tests {
         let cancel = CancellationToken::new();
         std::thread::scope(|scope| {
             let token = cancel.clone();
-            let hash = scope.spawn(|| staging.complete_disk_identity(&cut, &cancel));
+            let hash = scope.spawn(|| staging.complete_disk_identity(&cut, None, true, &cancel));
             scope.spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 token.cancel();
@@ -2049,5 +2200,294 @@ mod tests {
             seal_disk_parallel(&file, STREAM_CHUNK_BYTES, &cancel),
             Err(DiskCopyError::Cancelled)
         ));
+    }
+
+    fn tracking_receipt(
+        file: &File,
+        baseline: &StreamMap,
+        indices: &[u64],
+    ) -> vm_spec::capture::DiskTrackingReceipt {
+        use vm_spec::capture::{
+            DiskDirtyRun, DiskGenerationToken, DiskTrackingReceipt, DiskTrackingSeed,
+            DISK_TRACKING_VERSION,
+        };
+        let metadata = file.metadata().unwrap();
+        let seed = DiskTrackingSeed {
+            version: DISK_TRACKING_VERSION,
+            role: vm_spec::DiskRole::Root,
+            attachment_index: 0,
+            block_id: vm_spec::BlockId::new("root").unwrap(),
+            file_device: metadata.dev(),
+            file_inode: metadata.ino(),
+            length: baseline.length(),
+            chunk_size: STREAM_CHUNK_BYTES,
+            epoch: capture(),
+            baseline: Some(baseline.id()),
+        };
+        let mut runs: Vec<DiskDirtyRun> = Vec::new();
+        for &index in indices {
+            match runs.last_mut() {
+                Some(run) if run.first_chunk + run.chunk_count == index => run.chunk_count += 1,
+                _ => runs.push(DiskDirtyRun {
+                    first_chunk: index,
+                    chunk_count: 1,
+                }),
+            }
+        }
+        DiskTrackingReceipt {
+            version: DISK_TRACKING_VERSION,
+            token: DiskGenerationToken {
+                capture_id: capture(),
+                pause_generation: 1,
+                epoch: seed.epoch.clone(),
+                generation: 1,
+                file_device: seed.file_device,
+                file_inode: seed.file_inode,
+            },
+            seed,
+            runs,
+            dirty_chunks: indices.len() as u64,
+            total_chunks: baseline.length().div_ceil(STREAM_CHUNK_BYTES),
+            invalid_reason: None,
+        }
+    }
+
+    #[test]
+    fn incremental_disk_map_equals_full_hash_for_random_writes_zeroes_and_tail() {
+        let root = root();
+        let length = 6 * STREAM_CHUNK_BYTES + 512;
+        let file = source(
+            &root,
+            "incremental.raw",
+            length,
+            &[
+                (0, b"becomes zero"),
+                (STREAM_CHUNK_BYTES, b"unchanged"),
+                (2 * STREAM_CHUNK_BYTES, b"becomes zero"),
+                (4 * STREAM_CHUNK_BYTES, b"also unchanged"),
+                (length - 512, b"old tail"),
+            ],
+        );
+        let baseline = independent_map(&file, length);
+        let mut random = 0x71d9_0213_a943_ba65u64;
+        let mut dirty = std::collections::BTreeSet::new();
+        for _ in 0..48 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let index = [0, 2, 3, 6][random as usize % 4];
+            let chunk_length = (length - index * STREAM_CHUNK_BYTES).min(STREAM_CHUNK_BYTES);
+            let offset =
+                index * STREAM_CHUNK_BYTES + (random.rotate_left(19) % (chunk_length - 31));
+            file.write_all_at(&random.to_le_bytes().repeat(4), offset)
+                .unwrap();
+            dirty.insert(index);
+        }
+        file.write_all_at(b"known nonzero dirty chunk", 3 * STREAM_CHUNK_BYTES)
+            .unwrap();
+        dirty.extend([0, 2, 3, 6]);
+        let zeros = vec![0; STREAM_CHUNK_BYTES as usize];
+        file.write_all_at(&zeros, 0).unwrap();
+        file.write_all_at(&zeros, 2 * STREAM_CHUNK_BYTES).unwrap();
+        file.write_all_at(&[0; 512], length - 512).unwrap();
+        let receipt = tracking_receipt(&file, &baseline, &dirty.into_iter().collect::<Vec<_>>());
+        let (incremental, bytes_hashed) = crate::live::staging::seal_disk_incremental(
+            &file,
+            &baseline,
+            &receipt,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let full = independent_map(&file, length);
+        assert_eq!(incremental, full);
+        assert_eq!(
+            incremental.canonical_bytes().unwrap(),
+            full.canonical_bytes().unwrap()
+        );
+        assert_eq!(incremental.id(), full.id());
+        assert_eq!(incremental.chunks()[0], None);
+        assert_eq!(incremental.chunks()[2], None);
+        assert_eq!(incremental.chunks()[6], None);
+        assert_eq!(bytes_hashed, STREAM_CHUNK_BYTES);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incremental_disk_map_hashes_actual_discarded_bytes() {
+        let root = root();
+        let length = 3 * STREAM_CHUNK_BYTES + 512;
+        let file = source(
+            &root,
+            "discard.raw",
+            length,
+            &[
+                (0, b"preserved"),
+                (STREAM_CHUNK_BYTES, b"discarded"),
+                (2 * STREAM_CHUNK_BYTES, b"partial chunk survives"),
+                (2 * STREAM_CHUNK_BYTES + 8192, b"partial chunk discarded"),
+                (length - 4, b"tail"),
+            ],
+        );
+        let baseline = independent_map(&file, length);
+        let flags = nix::fcntl::FallocateFlags::FALLOC_FL_PUNCH_HOLE
+            | nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE;
+        match nix::fcntl::fallocate(
+            &file,
+            flags,
+            STREAM_CHUNK_BYTES as i64,
+            STREAM_CHUNK_BYTES as i64,
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS) => {
+                eprintln!("skipping real discard test: filesystem does not support hole punching");
+                return;
+            }
+            Err(error) => panic!("hole punch failed: {error}"),
+        }
+        nix::fcntl::fallocate(&file, flags, (2 * STREAM_CHUNK_BYTES + 4096) as i64, 8192).unwrap();
+        let receipt = tracking_receipt(&file, &baseline, &[1, 2]);
+        let (map, _) = crate::live::staging::seal_disk_incremental(
+            &file,
+            &baseline,
+            &receipt,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(map, independent_map(&file, length));
+        assert_eq!(map.chunks()[1], None);
+        assert!(map.chunks()[2].is_some());
+    }
+
+    #[test]
+    fn empty_disk_generation_does_not_read_the_payload() {
+        let root = root();
+        let file = source(
+            &root,
+            "unchanged.raw",
+            STREAM_CHUNK_BYTES + 512,
+            &[(0, b"unchanged")],
+        );
+        let baseline = independent_map(&file, STREAM_CHUNK_BYTES + 512);
+        let receipt = tracking_receipt(&file, &baseline, &[]);
+        let write_only = OpenOptions::new()
+            .write(true)
+            .open(root.0.join("unchanged.raw"))
+            .unwrap();
+        let (map, bytes) = crate::live::staging::seal_disk_incremental(
+            &write_only,
+            &baseline,
+            &receipt,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(map, baseline);
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn invalid_or_missing_disk_baseline_falls_back_to_full_clone_hash() {
+        let root = root();
+        let length = 2 * STREAM_CHUNK_BYTES + 512;
+        let file = source(
+            &root,
+            "fallback.raw",
+            length,
+            &[(0, b"before"), (length - 4, b"tail")],
+        );
+        let baseline = independent_map(&file, length);
+        file.write_all_at(b"changed without valid coverage", STREAM_CHUNK_BYTES)
+            .unwrap();
+        let expected = independent_map(&file, length);
+        for case in 0..4 {
+            let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+            let name = CaptureDiskName::new("upper").unwrap();
+            let output = staging
+                .create_output(&CaptureRole::Disk(name.clone()))
+                .unwrap();
+            output.set_len(length).unwrap();
+            let mut bytes = vec![0; length as usize];
+            file.read_exact_at(&mut bytes, 0).unwrap();
+            output.write_all_at(&bytes, 0).unwrap();
+            drop(output);
+            let mut cut = staging.disk_cut(&name).unwrap();
+            let mut receipt = tracking_receipt(&file, &baseline, &[]);
+            if case == 0 {
+                receipt.invalid_reason = Some(vm_spec::capture::DiskTrackingInvalidReason::Lost);
+            } else if case == 2 {
+                receipt.dirty_chunks = 1;
+            }
+            cut.tracking_receipt = Some(receipt);
+            let supplied = (case != 1).then_some(&baseline);
+            let (map, stats) = staging
+                .complete_disk_identity(&cut, supplied, case != 3, &CancellationToken::new())
+                .unwrap();
+            assert_eq!(map, expected);
+            assert!(!stats.baseline_reused);
+            assert!(stats.full_scan_reason.is_some());
+            if case == 3 {
+                assert_eq!(
+                    stats.full_scan_reason,
+                    Some(vm_spec::capture::DiskFullScanReason::External)
+                );
+            }
+            assert_eq!(stats.bytes_hashed, 2 * STREAM_CHUNK_BYTES + 512);
+        }
+    }
+
+    #[test]
+    fn tracked_reflink_identity_reads_the_cut_and_inherits_clean_chunks() {
+        let root = root();
+        let length = 3 * STREAM_CHUNK_BYTES + 512;
+        let file = source(
+            &root,
+            "tracked.raw",
+            length,
+            &[
+                (0, b"becomes zero"),
+                (STREAM_CHUNK_BYTES, b"clean predecessor"),
+                (2 * STREAM_CHUNK_BYTES, b"also clean"),
+                (length - 4, b"tail"),
+            ],
+        );
+        let baseline = independent_map(&file, length);
+        file.write_all_at(&vec![0; STREAM_CHUNK_BYTES as usize], 0)
+            .unwrap();
+        file.write_all_at(b"changed tail", length - 16).unwrap();
+        let receipt = tracking_receipt(&file, &baseline, &[0, 3]);
+        let expected = independent_map(&file, length);
+        let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+        let name = CaptureDiskName::new("upper").unwrap();
+        match staging.copy_disk(
+            &CaptureRole::Disk(name.clone()),
+            &file,
+            length,
+            CaptureDiskCopy::Clone,
+            &CancellationToken::new(),
+        ) {
+            Ok(DiskCopyMethod::Clone) => {}
+            Err(DiskCopyError::CloneRequired(error)) => {
+                eprintln!("skipping tracked reflink test: clone unavailable: {error}");
+                return;
+            }
+            other => panic!("unexpected clone result: {other:?}"),
+        }
+        let mut cut = staging.disk_cut(&name).unwrap();
+        cut.tracking_receipt = Some(receipt);
+        file.write_all_at(b"post-cut source mutation", STREAM_CHUNK_BYTES)
+            .unwrap();
+        assert_ne!(independent_map(&file, length), expected);
+        let (map, stats) = staging
+            .complete_disk_identity(&cut, Some(&baseline), true, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(map, expected);
+        assert!(stats.baseline_reused);
+        assert_eq!(stats.full_scan_reason, None);
+        assert_eq!(stats.dirty_chunks, 2);
+        assert_eq!(stats.total_chunks, 4);
+        assert_eq!(stats.bytes_hashed, 512);
+        let (stored, facts) = staging.open_sealed(&CaptureRole::DiskMap(name)).unwrap();
+        let mut bytes = vec![0; facts.length as usize];
+        stored.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, expected.canonical_bytes().unwrap());
     }
 }

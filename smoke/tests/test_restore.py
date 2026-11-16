@@ -373,6 +373,10 @@ def test_restore_corrupt_real_closure_refuses_before_child_allocation(
         os.fchmod(fd, mode)
         try:
             refused_before_allocation(silo, saved.reference, "restore-corrupt-" + member.lower())
+            if member in ("lower-fsmeta", "layer-pack"):
+                # A failed check must neither mutate catalog receipts nor let
+                # their old fingerprints authorize the still-corrupt retry.
+                refused_before_allocation(silo, saved.reference, "restore-corrupt-retry-" + member)
         finally:
             assert os.pwrite(fd, original, offset) == 1
             os.fsync(fd)

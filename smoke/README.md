@@ -12,9 +12,16 @@ make smoke SMOKE_WORKERS=1                   # default: 2, size for guest RAM
 make smoke SMOKE_ARGS='-k lifecycle --keep'  # optional pytest selection
 ```
 
-Add `PROFILE=release` for optimized runtime measurements.
+`make smoke` stages and tests a fresh release build on every run, so results
+never come from binaries older than the tree. `SMOKE_PROFILE=debug` selects a
+debug build when that makes a failure easier to debug or trace.
 Performance cohorts and budget arithmetic live in the separate
 [serial perf suite](../perf/README.md); `make smoke` collects functional cases only.
+
+`tests/test_exec_stdin.py` runs in the default selection with the small guest.
+It checks a deterministic 64 MiB stdin SHA-256 digest, first-line and no-reader
+early exits, an explicitly closed guest input pipe, empty input and `/dev/null`.
+Run it with `make smoke SMOKE_ARGS='tests/test_exec_stdin.py'`.
 
 Run as an ordinary user on a dev box with readable/writable `/dev/kvm` (or Apple
 Silicon HVF). Use the repository's normal Rust/Go toolchain, Python 3.12+, `uv`,
@@ -26,7 +33,7 @@ from erofs-utils on PATH; those cases skip with an installation reason if absent
 First runs need internet access for pinned Cargo/Go modules, the published kernel,
 Alpine fixture bytes and verified Distribution releases.
 
-`smoke-prereqs` reuses `stage`, builds every Rust helper in the same `PROFILE` and
+`smoke-prereqs` reuses `stage`, builds every Rust helper in `SMOKE_PROFILE` and
 `CARGO_TARGET_DIR`, resolves Cargo's pinned libkrun sources and fetches the exact
 resolved kernel config by its staged digest. No manual builds or environment
 variables are needed. Overrides below remain optional. Slow selection also builds
@@ -77,7 +84,7 @@ automatically provisioned and never touch hosted credentials. Internet-dependent
 | `storage_acceptance`, `live_acceptance`, `root_metrics`, `overlay_candidate_lower`, `erofs_qualification` | Automatically built libvm examples in the selected profile |
 | `format_upper` | Automatically built disk-image example |
 | `native-live-api`, `guest-lifecycle-controller` | Automatically built silo-vmm examples; specific executable env overrides remain |
-| Hardcoded debug/release example paths | Selected binary directory, derived from `CARGO_TARGET_DIR` and `PROFILE`; no cross-profile fallback |
+| Hardcoded debug/release example paths | Selected binary directory, derived from `CARGO_TARGET_DIR` and `SMOKE_PROFILE`; no cross-profile fallback |
 | `SILO_NATIVE_ROOT` | Cargo metadata's pinned git libkrun checkout; read-only Python validators/sources, no native checkout build or mutation |
 | `SILO_SMOKE_KERNEL_CONFIG` | Staged OCI kernel identity plus authenticated resolved-config blob; local `KERNEL_PATH` uses adjacent emitted `.config` |
 | EROFS candidate kernel matrix | Staged kernel/config by default; `SILO_SMOKE_EROFS_KERNELS` optionally supplies named local kernels/configs |
@@ -331,7 +338,7 @@ live operations must report `supported`; mutable files cannot change the result.
 Capture, restore, fork and incremental suites use the selected profile:
 
 ```sh
-make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_capture.py tests/test_capture_multidisk.py tests/test_capture_lifecycle.py --keep'
+make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_capture.py tests/test_capture_multidisk.py tests/test_capture_lifecycle.py --keep'
 ```
 
 The root-family gates exercise raw and EROFS-overlay matched disk/RAM cuts,
@@ -360,12 +367,20 @@ These are process-crash tests, not physical power-loss simulation. Retain failed
 workspaces; archive evidence before pruning completed generated payloads.
 
 The lifecycle cases hold real boundaries across manager death, stop and
-post-seal cancellation. Missing continuation evidence remains pending while
-the exact run lives and becomes unknown after it ends. Holding the worker's
-vsock muxer exercises genuine continuation deadlines without injected errors
-or changed timeouts. The failure oracle checks the coherent published seal,
-Error fences and the source's durable workload counter, not survival of an
-exec session whose readiness has been invalidated.
+post-seal cancellation. Reflink captures write an identity-pending cut before
+continuation and the final seal afterwards. Stop is exercised before continuation
+at execution/cut settlement and on a preserved source at final seal settlement;
+neither stop path may resume or thaw. Run death during disk settlement leaves
+a retained pending cut available for identity recovery, without fabricating a
+continuation failure. Missing continuation evidence stays pending while the exact
+run lives and becomes unknown after it ends; a pending cut is not published until
+disk identities complete. Completed continuation evidence is retained unchanged
+across final seal settlement and cancellation. If stop interrupts a manager after
+publication, replay after exact-run death must finish release of the same capture.
+Holding the worker's vsock muxer after cut publication, before continuation, exercises
+genuine deadlines without injected errors or changed timeouts. The failure
+oracle checks the coherent published seal, Error fences and the source's durable
+workload counter, not survival of an exec session whose readiness was invalidated.
 The checkpoint durability gate records successful `fsync`/`fdatasync` calls
 through real `/proc/<tid>/fd` device/inode observations. Every captured pool
 payload must have a file barrier and a later publication-directory barrier,
@@ -540,7 +555,7 @@ the harness's own dispatch/exit clock; the authenticated local cut under
   inode-deduplicated bound RAM. Existing homes are neither cleared nor ignored.
   The pre-seal gate remains the native `pwrite64` into `execution.state`;
   cancellation is checked when that execution stage completes, before sealing.
-- Post-seal cancellation (held at the source continuation record) leaves every
+- Post-seal cancellation (held at final seal settlement) leaves every
   child Running or Cancelled. Manager SIGKILL before the seal recovers one cut
   (never a recapture) and abandons every child; SIGKILL right after the first
   durable child stamp recovers by reconciling submitted children and
@@ -568,10 +583,10 @@ generated sockets use a short `/tmp` runtime directory. `findmnt` verifies the
 requested filesystem in the test process's namespace.
 
 ```sh
-make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_reclaim.py --keep'
+make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_reclaim.py --keep'
 
 SILO_SMOKE_STOPPED_DIR="$MOUNT" SILO_SMOKE_STOPPED_FS=ext4 \
-  make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_reclaim.py --keep'
+  make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_reclaim.py --keep'
 ```
 
 Use the same staged x86_64 live-capable workload kernel, agent and initramfs as
@@ -647,9 +662,9 @@ staged KVM x86_64 runtime and VM-generation-aware workload kernel as the restore
 gates. The CLI, monitor and helper examples must be staged together:
 
 ```sh
-make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_incremental.py --keep'
-make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_artifact_live.py --keep'
-make smoke PROFILE=release SMOKE_MARK=slow SMOKE_ARGS='tests/test_restore.py -k "corrupt_real_closure or real_native_incompatibility" --keep'
+make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_incremental.py --keep'
+make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_artifact_live.py --keep'
+make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_restore.py -k "corrupt_real_closure or real_native_incompatibility" --keep'
 ```
 
 Prerequisites are `/dev/kvm`, a static C toolchain (`CC`, default `cc`), `debugfs`,
@@ -823,8 +838,8 @@ unless their environment overrides are set.
 
 | Environment | pytest option | Default / meaning |
 | --- | --- | --- |
-| `SILO_SMOKE_BIN_DIR` | `--silo-bin-dir` | `$CARGO_TARGET_DIR/$PROFILE`; must contain silo |
-| `SILO_SMOKE_RUNTIME_DIR` | `--silo-runtime-dir` | `$CARGO_TARGET_DIR/silo-runtime/<host-target>/$PROFILE` |
+| `SILO_SMOKE_BIN_DIR` | `--silo-bin-dir` | `$CARGO_TARGET_DIR/$SMOKE_PROFILE`; must contain silo |
+| `SILO_SMOKE_RUNTIME_DIR` | `--silo-runtime-dir` | `$CARGO_TARGET_DIR/silo-runtime/<host-target>/$SMOKE_PROFILE` |
 | `SILO_SMOKE_BACKEND` | `--backend krun\|vz` | `krun`; `vz` requires macOS |
 | `SILO_SMOKE_CACHE` | `--cache-dir` | `${XDG_CACHE_HOME:-~/.cache}/silo-smoke` |
 | `SILO_SMOKE_KEEP` | `--keep` | `1` retains workspaces even on success |

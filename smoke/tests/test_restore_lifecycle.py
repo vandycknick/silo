@@ -94,6 +94,19 @@ def assert_failed_closed(silo: Silo, child: str, evidence: lifecycle.ChildEviden
     return found
 
 
+def wait_child_durable(silo: Silo, machine_hex: str) -> None:
+    """Visibility after manager death requires the real background barrier.
+
+    An ownerless constructed child is hidden and may be deleted by maintenance;
+    activation failure alone does not promise a discoverable failed machine.
+    """
+    shutdown.until(
+        lambda: procs.query(silo.ws.state_db(),
+                            f"SELECT durability FROM machine_config WHERE id='{machine_hex}'") == [("durable",)],
+        description="restored child did not complete its durability barrier while activation was held",
+    )
+
+
 def test_activation_events_parse_exact_names_fields_and_wall_time() -> None:
     text = "\n".join([
         '2026-11-06T10:00:00.000001Z  INFO restore prepared activation=a1',
@@ -748,8 +761,8 @@ def test_restore_refrozen_activation_failed_is_stop_only_with_manager_suspended(
 def test_restore_manager_death_during_unacknowledged_thaw_reaps_child(
     silo: Silo, restore_network_image: str,  # noqa: F811
 ) -> None:
-    """Manager death cancels startup during an uncertain Thaw. The monitor
-    reaps rather than leaving an unowned, potentially thawed child running."""
+    """A durable child's manager dies during uncertain Thaw. The monitor reaps
+    rather than leaving an unowned, potentially thawed child running."""
     child = "restore-orphan-failed"
     with lifecycle.networked_source(silo, restore_network_image, SOURCE, "--forward", UNIX_FORWARD) as source:
         sealed = source.sealed_progress()
@@ -763,6 +776,11 @@ def test_restore_manager_death_during_unacknowledged_thaw_reaps_child(
                 traced.held_thaw_reply(evidence.wait(lifecycle.THAW_SENDING, timeout=180))
                 machine = evidence.machine_hex()
                 children = lifecycle.ChildProcesses.observe(silo, machine)
+                wait_child_durable(silo, machine)
+                lifecycle.assert_not_logged(evidence.events(), *AFTER_FAILURE,
+                                            lifecycle.THAW_ACKNOWLEDGED, lifecycle.THAW_RECOVERY_FREEZING,
+                                            lifecycle.REAPING)
+                assert all(not process.terminal() for process in children.processes.values())
                 manager = traced.manager()
                 manager.send(signal.SIGKILL)
                 manager.wait()
@@ -814,6 +832,10 @@ def test_restore_crash_while_activating(
                 children = lifecycle.ChildProcesses.observe(silo, machine)
                 assert held["pid"] == children.processes["krun-worker"].pid, held
                 if victim == "manager":
+                    wait_child_durable(silo, machine)
+                    lifecycle.assert_not_logged(evidence.events(), *AFTER_FAILURE,
+                                                lifecycle.ACTIVATE_ACKNOWLEDGED, lifecycle.REAPING)
+                    assert all(not process.terminal() for process in children.processes.values())
                     manager = traced.manager()
                     manager.send(signal.SIGKILL)
                     manager.wait()

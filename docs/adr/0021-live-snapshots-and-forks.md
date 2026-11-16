@@ -89,6 +89,15 @@ receipts, reusable canonical RAM maps, deduplication before clone creation, and
 batched pool-directory barriers. Per-payload seal synchronization and the final
 catalog checkpoint before snapshot acknowledgement remain required.
 
+The 2026-11-16 Phase 30 amendment records implemented stage-1 disk write
+tracking. Managed disks inherit accepted maps and hash only written chunks on
+the eligible reflink lane. Freshly formatted disks have no baseline at create;
+their first snapshot hashes written disk data once and seeds later captures in
+the same run.
+Every ended run invalidates its baseline; clean-stop sealing and deterministic
+upper templates remain planned stage 2. Flat-map metadata work still prevents
+claiming the complete configured-size scaling contract.
+
 ## The Problem
 
 [ADR 0014](0014-layered-oci-image-storage.md) gives Silo snapshots and forks of **stopped** machines: a machine's
@@ -565,6 +574,9 @@ A capture runs in this order; each step completes before the next begins:
    barriers provide persistence. Read-only attachments (lower and boot assets)
    are recorded by identity, not copied. Any clone or copy failure fails the
    whole capture; no partial multi-disk checkpoint is published.
+   Before execution/device capture, while still paused, the monitor freezes
+   each writable disk's dirty generation and binds its receipt to this exact
+   cut and held backing. Writes after continuation enter a separate generation.
 3. **Capture execution and devices.** The worker serializes transport, queue
    and device-specific state for every device, then the vCPU and VM
    execution envelope (registers, extended state, interrupt controller,
@@ -596,21 +608,24 @@ A capture runs in this order; each step completes before the next begins:
    capture's lifecycle fence remains. If no identities were deferred, baseline
    acceptance and continuation remain after the final seal in step 8.
 7. **Complete disk identities.** At stage `capture-disk-identity`, the monitor
-   reads the immutable clones, discovers extents and computes their complete
-   chunk maps, checking their retained fingerprints before and after. This is
-   post-continuation seal latency, not pause time on a resumed source.
-   Preserved sources remain paused by policy. Fork children still wait for
-   these complete identities; neither the cut record nor an incomplete map is
-   restore authority.
-   A machine's first snapshot hashes its written disk data once after the guest
-   resumes on this lane. That first-snapshot pass is an accepted limitation
-   (owner, 2026-11-15).
+   completes each immutable clone's map, checking retained fingerprints before
+   and after. With valid managed baseline authority and a matching tracking
+   receipt, it reads only dirty 8 MiB chunks and inherits clean entries, without
+   discovering whole-file extents. Otherwise it fully hashes the clone and
+   records the fallback reason. This is post-continuation seal latency, not
+   pause time on a resumed source. Preserved sources remain paused by policy.
+   Fork children still wait for complete identities; neither the cut record nor
+   an incomplete map is restore authority. Freshly formatted disks have no
+   baseline at create; their first snapshot hashes written disk data once and
+   seeds later captures in the same run. After a restart the first capture must
+   hash once again.
 8. **Seal.** The worker computes nonzero RAM chunk digests during capture;
    non-reflink disk copies hash inline, and deferred clone identities come from
    step 7. Publication carries those identities without another payload pass.
    With every writer closed and every identity complete, the monitor writes
    `vm.capture.json` through private `.vm.capture.json.tmp`, links the final
-   name without replacement and unlinks the temporary. Its schema is unchanged.
+   name without replacement and unlinks the temporary. The record remains
+   version 1, with disk statistics and tracking receipts added to its evidence.
    If the monitor dies between link and unlink, libvm settles only that exact
    two-name inode under the publisher lock and checked capture lease before
    publication or local fork-cut retention. Both names must be private regular
@@ -618,6 +633,12 @@ A capture runs in this order; each step completes before the next begins:
    exactly two links; foreign extra links are refused without removal. The
    monitor retries settlement once. Every settled control record must pass
    ordinary singleton validation.
+   Only a settled coherent seal authorizes disk-generation `Commit` and
+   installation of the candidate source maps. RAM acceptance in step 6 does
+   not accept disk generations. Pre-seal failures and cancellation `Abort`
+   frozen disk generations, merging their dirty coverage back into the active
+   generation even when the source has already continued. Unresolved settlement
+   leaves the source fenced; it never authorizes another cut with lost dirties.
 
 The monitor synchronizes no staging files or records. Durability belongs to
 libvm at named-checkpoint publication and each fork child's barrier. A cut
@@ -650,7 +671,8 @@ null, and these booleans: `workloadsFrozen`, `vcpusPaused`, `devicesQuiesced`,
 `hostWritersDrained`, `hostFlushCompleted`, `diskCopiesSealed`,
 `memoryStateSealed`. Each boolean records a positively observed fact. All seven
 must be true for a final coherent seal; false, missing or malformed facts refuse
-that seal. The final record schema remains version 1, unchanged by deferred identity.
+that seal. The final record remains version 1. Stage 1 adds `diskStats` and
+`diskTrackingReceipts`, separate from guest device state and RAM acceptance.
 
 A coherent seal retains the original guest freeze reference for restore after
 source deletion. An acquired pause uses the capture ID as `freezeOperationId`;
@@ -666,6 +688,98 @@ identities complete. Recovery after positive monitor/worker termination complete
 identities from those retained clones without any VM operation, validates the
 complete inventory and writes the final seal last. It never reports a pending
 cut as sealed. No power-loss durability is claimed for this staging record.
+
+### Disk write tracking: stage 1 (2026-11-16)
+
+The virtual block device records every 8 MiB identity chunk touched by writable
+requests from constructor admission onwards. Writes, discard and write-zeroes
+mark coverage before backend effects; a failed or partial request cannot lose
+the attempted range. Reads and flushes do not clear coverage. A valid managed
+baseline lets capture hash only those chunks from its immutable reflink cut
+and reuse the accepted map for the rest. An empty dirty set reads no disk
+payload. A dirty all-zero chunk becomes the existing explicit zero marker.
+The resulting snapshot still describes a complete standalone disk, not a delta
+requiring the source or predecessor snapshot.
+
+`DiskTrackingSeed` binds role, attachment order, block ID, held device/inode,
+exact length, chunk size, epoch and optional predecessor stream identity.
+`DiskTrackingReceipt` additionally binds the capture and pause generation,
+tracking generation and bounded coalesced dirty runs. A native receipt must
+cover the exact writable attachment inventory. Malformed, foreign or cross-cut
+receipts are refused, not treated as clean coverage. Exclusive Silo ownership
+is required to reuse a predecessor; inode identity alone is not byte authority.
+Legitimate tracked writes change ctime, so a live disk is not checked against
+its old stopped fingerprint to infer cleanliness.
+
+Freeze rotates the dirty set under the native pause. Post-cut writes accumulate
+separately while clone identity completes. `DiskTrackingSettlement::Commit`
+after the coherent seal advances the predecessor and clears only the frozen
+set, preserving all post-cut writes. `Abort` after any pre-seal failure or
+cancellation merges frozen coverage back into the active set. Disk settlement
+is independent of early RAM acceptance and source continuation. A later pool
+publication failure does not retroactively abort an accepted disk generation.
+
+A managed writable disk with an accepted map has a catalog `DiskBaseline` with
+its seed, storage and tracking generations, stopped fingerprint and a
+machine-private `disk-baseline-<stream>.map` file. A disk without an authenticated
+source map has no baseline record or map file until its first coherent capture.
+Accepted map files outlive capture release and snapshot deletion and remain
+until machine deletion. They are optional, deferred-write caches: launch checks
+their bounded map identity and rejects missing or torn bytes without reading the
+disk. Monitor-held maps and native coverage govern same-run reuse; persisted
+maps are not permission to reuse a previous run's coverage.
+
+| State or transition | Stage-1 authority |
+| --- | --- |
+| `Ready` | A producer or authenticated source map bound to the private backing and storage generation, before launch. |
+| Launch to `Running { run_id, seeded }` | Every launch commits this state for its baselines before guest writes. Durable machines checkpoint the catalog; hidden `constructed` children defer this barrier to their later durable-child transition. `seeded: true` requires a matching `Ready` seed, stopped fingerprint and authenticated map cache; `false` retains provenance only and requires full cut hashing. |
+| Coherent capture in the same run | Installs the accepted map and tracking generation as `Running { run_id, seeded: true }`, not `Ready`. |
+| Any ended run to `Invalid` | Clean, forced, failed and recovered runs all invalidate baseline authority. A stale `Running` record is never a seed for another run. |
+
+A restored child's map cache needs no file or directory synchronization during
+construction. If power loss discards its launch admission, the child is still
+`constructed` and must be reconciled before discovery or reuse. If its later
+`durable` catalog transition survives, SQLite WAL ordering also preserves the
+earlier `Running` marker. Process loss alone retains the committed WAL. A
+surviving stale `Running` marker is never reusable launch authority.
+
+Thus the first snapshot after a restart fully hashes each managed disk before
+same-run incremental reuse can resume. Stage 2's clean-stop seal would preserve
+the final accepted map for a later launch; it is planned, not implemented.
+Freshly formatted disks have no baseline at create; their first snapshot hashes
+written disk data once and seeds later captures in the same run. Unchanged
+image-backed disks and authenticated restore/fork children inherit source maps
+in deferred private caches, rebound to their own private inodes, without reading
+or hashing the disk. Launch authenticates the cache before issuing a seed.
+A stopped copy without authenticated map authority still needs a hash. The
+deterministic upper template that avoids the first-snapshot hash is also planned
+stage 2, not implemented; create must not end up slower.
+
+Growth/resize, storage or attachment changes, boot-bundle changes, handoff source
+reservation/fencing and destination ownership commit invalidate baseline
+authority. Launch checks stopped fingerprints: host-side replacement, edits,
+truncate or other mutation refuses the old seed and launches unseeded.
+Read-only export does not invalidate an untouched source. `silo cp` uploads
+through the running guest, so disk effects traverse the tracked virtual block
+device rather than bypassing it as a stopped host editor.
+
+Full hashing remains the recorded fallback for `missing-baseline`,
+`invalid-receipt` coverage, `untracked`, `copy-lane` without reflinks and
+`external` disks. Writable external disks remain capturable, but are not
+exclusively Silo-owned: `tracking_eligible` is false, `baseline_map` is absent,
+and their bytes are always fully hashed rather than inherited. Copy-lane disks
+likewise retain inline full hashing in stage 1, even with a baseline.
+`CaptureDiskStats` records `dirtyChunks`, `totalChunks`, `bytesHashed`,
+`baselineReused` and `fullScanReason`; `bytesHashed` counts nonzero decoded
+chunk bytes passed to SHA-256, not all bytes read. Invalid coverage reasons
+include never armed, lost, overflow and suspected out-of-device mutation.
+
+This stage removes recurring payload hashes only on the valid managed reflink
+lane. Flat map cloning, serialization and identity computation still traverse
+logical chunk entries, so it does not deliver the complete configured-size
+invariant. The planned sparse authenticated map remains necessary. Tracking
+receipts do not weaken independent pool dedup authentication, full capture
+replay without producer authority, import, export, handoff or explicit verify.
 
 ### Incremental capture
 
@@ -823,12 +937,12 @@ A materialization from chunk storage is not presented as remote lazy restore.
 
 ### Planned Phase 30 identity changes
 
-The owner approved the following direction on 2026-11-15; it is not yet
-implemented. Per-chunk write tracking in the block device with inherited maps
-lets a seal hash only chunks written since the last seal. A temporary
-create-time hash of a fresh upper is removed by a cached upper template in a
-later stage, so create must not end up slower. A sparse authenticated stream map
-has size and work that do not grow with configured length. RAM uses a smaller
+The owner approved block-device write tracking with inherited maps on
+2026-11-15; the stage-1 implementation above is now present. The remaining
+direction is not yet implemented: stage-2 clean-stop sealing and a cached
+deterministic upper template avoid restart and first-snapshot hashes without
+slowing create. A sparse authenticated stream map must have
+size and work that do not grow with configured length. RAM must use a smaller
 identity unit than 8 MiB.
 
 ### Accounting
@@ -999,6 +1113,11 @@ and complete children are recorded `constructed`, started on that record, and mo
 `durable` by background synchronization. Recovery adopts a pending barrier while
 the exact monitor or run lease remains live; it deletes an incomplete child only
 after ordinary liveness reconciliation proves that no live owner remains.
+Ordinary discovery includes only `durable` children. If the restore manager dies
+before background promotion commits, an ownerless `constructed` child stays
+hidden until maintenance deletes it and releases its reserved name. A child
+whose promotion already committed remains discoverable after failed activation
+and reaping. Activation stage alone does not determine either persistence outcome.
 
 Private disk copies are role-selected paths under the child's data directory;
 the RAM file, layout, execution and device-state objects are leased content
@@ -1118,6 +1237,14 @@ conformance gate, not an assumption.
 Owner decision O2 rotates `/etc/machine-id` to the child's Silo machine ID,
 formatted as 32 lowercase hexadecimal characters, only if the file exists and
 is non-empty. Missing and empty files keep their image first-boot semantics.
+Symlinks are rejected, not followed. If systemd has installed its transient
+read-only bind mount over this file, the agent writes and syncs `/run/machine-id`
+in place after verifying that it is the same inode as the visible
+`/etc/machine-id`. All readers of the bind mount then see the child ID.
+The normal `systemd-machine-id-commit.service` persists that value after thaw.
+As on an ordinary first boot, a reboot before this commit may generate another
+fresh ID; identity stability across reboot is guaranteed only after commit.
+Rotation failures name `/etc/machine-id` and the underlying reason.
 On every restore or fork activation, the agent atomically renames a new file
 containing the child run ID into `/run/silo/generation`. It never creates this
 file at cold boot. The source's identity and generation file are unchanged.
@@ -1632,6 +1759,9 @@ machine, who paused it.
 | Boundary | Initial bound |
 | --- | --- |
 | RAM per captured machine | [ADR 0014](0014-layered-oci-image-storage.md)'s per-stream limits apply; 1 TiB logical. |
+| Writable disk geometry | 1 TiB per disk, unchanged. |
+| Aggregate captured logical streams | 4 TiB across RAM and writable disks, unchanged. Read-only inputs are retained by identity. |
+| Capture JSON control record | `1 MiB + MAX_RAM_MAP_BYTES + 16 MiB`; stage 1 adds the bounded disk-receipt allowance `MAX_DISK_TRACKING_BYTES`. |
 | Children per fork call | 16 by default; higher with an explicit flag, still within budget. |
 | Capture staging | Reserved before freeze by libvm: staging (RAM image + allocated bytes of each writable disk + state reserves), plus the publication peak (RAM image copy + allocated bytes of each writable disk + map and state reserves) when the pool shares the filesystem. On separate filesystems, publication is charged to the pool's filesystem instead. A same-filesystem local fork cut is renamed, so it needs no publication copy. |
 | Restore/fork child disk construction | Per child: allocated bytes of every writable disk + state reserves + pinned boot-object copies. Live forks use the allocation sample retained by capture planning; standalone restores measure their held immutable source files. |
@@ -1713,8 +1843,8 @@ and history for the retained 4 GiB fixture, 2/8/30 GiB Alpine 2-vCPU cohorts,
 and this Arch cohort. An unavailable msb run is skipped with a reason.
 The [performance tracker](../architecture/live-operation-performance.md) records
 the baseline and measured results through wave three. Fork and incremental
-snapshot targets are not yet met; they depend on disk write tracking and the
-map format change planned above.
+snapshot targets are not yet established after stage-1 disk tracking; new
+measurements and the planned map-format change remain required.
 
 ## libkrun Fork Commit Series
 

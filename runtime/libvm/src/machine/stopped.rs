@@ -1141,6 +1141,7 @@ async fn publish_private_stream(
 }
 
 fn reset_child_storage(storage: &mut MachineStorageRecord) {
+    storage.disk_baselines.clear();
     storage.storage_generation = 0;
     storage.ownership_epoch = 0;
     storage.stop_outcome = StorageStopOutcome::Unknown;
@@ -1175,6 +1176,7 @@ fn storage_from_snapshot(record: &SnapshotRecord) -> Result<MachineStorageRecord
         boot: record.boot.clone(),
         profile,
         backend,
+        disk_baselines: Vec::new(),
         disks: record
             .disks
             .iter()
@@ -1889,6 +1891,16 @@ mod tests {
             .machine_storage_record(child.machine_id())
             .await
             .unwrap();
+        assert_eq!(child_storage.disk_baselines.len(), 2);
+        let seeds = crate::machine::root_storage::launch_disk_seeds(
+            &child_storage,
+            &child_config.machine_dir,
+        )
+        .unwrap();
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].role, vm_spec::DiskRole::Root);
+        assert_eq!(seeds[1].role, vm_spec::DiskRole::Data);
+        assert_ne!(seeds[0].epoch, seeds[1].epoch);
         assert_ne!(config.id, child_config.id);
         assert_ne!(config.lock_id, child_config.lock_id);
         assert_eq!(config.process, child_config.process);
