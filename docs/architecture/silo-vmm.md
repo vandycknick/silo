@@ -181,6 +181,46 @@ machine, reads the cached exit, writes `vm.exit.json` (with the `backend`
 block described in ADR 0018), reports failure on the syncpipe, removes the
 pidfile and triggers the exit runner, in that order.
 
+## Guest execution streams
+
+`silo exec` uses libvm's `ExecutionSession`, the monitor's bidirectional
+`VmExecutionService::Execute` RPC and the agent's
+`GuestProcessService::Execute` RPC. This is not the opaque SSH relay:
+`silo shell` still uses SSH and is unaffected by these stdin changes.
+The protobuf contracts are
+[`execution.proto`](../../specs/protocol/proto/execution.proto) and
+[`guest_process.proto`](../../specs/protocol/proto/guest_process.proto).
+
+Stdin is backpressured end to end. Host input is read on demand through bounded
+queues; libvm requests, monitor forwarding, agent controls and the child-input
+writer each have bounded queues. Data messages are at most 64 KiB. A full guest
+writer queue retains one pending chunk and retries instead of failing the
+execution and killing the command. Upstream producers wait as those queues and
+the gRPC transport fill. The monitor continues receiving guest events while
+input forwarding waits, so output and terminal events are not blocked behind
+stdin production.
+
+When a send observes that the guest command's input writer has closed, the
+agent emits `GuestProcessStdinClosed`; the monitor translates it to the
+nonterminal `ExecutionStdinClosed` event, exposed by libvm as `StdinClosed`.
+The monitor stops forwarding stdin data and EOF, libvm wakes blocked stdin
+sends, and the CLI drops its host-input producer. The event does not cancel
+the command or its output stream, close unrelated controls, or manufacture an
+exit status. Process exit may produce a terminal result without a preceding
+`StdinClosed`; the terminal result independently stops input production.
+The CLI still drains events and returns the guest's terminal result rather
+than replacing it with a guest-closed-stdin write error.
+
+Preloaded stdin bytes are streamed by a session-owned cancellable task, in
+bounded chunks, followed by EOF for pipe stdin. Setup no longer waits for all
+preloaded bytes to enter a bounded request queue before returning the session.
+The caller can receive output and terminal events while that producer waits
+for capacity. `StdinClosed`, terminal completion, stream failure, cancellation
+or session drop stops the producer; it cannot outlive the session.
+
+Agent, monitor and host/libvm/CLI must implement the matching stdin-close
+protocol. This fresh-state cutover adds no mixed-version fallback or event alias.
+
 ## Live Pause Ownership
 
 `live/coordinator.rs` owns the run's Pause/Resume/Cancel journal and fences.

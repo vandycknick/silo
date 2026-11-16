@@ -352,6 +352,29 @@ async fn run_execution(
     let mut guest_events = response.into_inner();
     let mut input_open = true;
     let mut guest_state = GuestEventState::default();
+    let (stdin_closed, mut stdin_state) = tokio::sync::watch::channel(false);
+    let input_identity = identity_changes.clone();
+    let gate = Arc::clone(&fence.gate);
+    let forwarding = async {
+        while let Some(control) = input.message().await? {
+            ensure_agent_generation(&expected_agent, &input_identity)?;
+            let control = guest_control(control)?;
+            let is_stdin = matches!(
+                &control.message,
+                Some(
+                    protocol::v1::guest_process_input::Message::StdinData(_)
+                        | protocol::v1::guest_process_input::Message::CloseStdin(_)
+                )
+            );
+            tokio::select! {
+                biased;
+                _ = stdin_state.wait_for(|closed| *closed), if is_stdin => {}
+                result = forward_guest_control(control, &guest_inputs, &gate, &cancellation, &shutdown) => result?,
+            }
+        }
+        Ok::<(), Status>(())
+    };
+    tokio::pin!(forwarding);
     loop {
         tokio::select! {
             biased;
@@ -386,6 +409,9 @@ async fn run_execution(
                     Ok((event, terminal)) => {
                         // The guest settled session setup (started or failed).
                         fence._setup = None;
+                        if matches!(&event.event, Some(ExecutionEventKind::StdinClosed(_))) {
+                            stdin_closed.send_replace(true);
+                        }
                         log_execution_output(exec_log.as_ref(), execution_id, &event);
                         if events.send(Ok(event)).await.is_err() { return; }
                         if terminal { return; }
@@ -409,39 +435,26 @@ async fn run_execution(
                     return;
                 }
             },
-            control = input.message(), if input_open => match control {
-                Ok(Some(control)) => {
-                    let current = identity_changes.borrow().clone();
-                    if let Some((reason, message)) = identity_loss(expected_agent.clone(), current) {
-                        send_lost(&events, reason, message).await;
+            result = &mut forwarding, if input_open => {
+                input_open = false;
+                match result {
+                    Ok(()) if !guest_state.started => {
                         cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
+                        let _ = events.send(Ok(cancelled_before_start_event())).await;
                         return;
                     }
-                    match guest_control(control) {
-                    Ok(control) => match forward_guest_control(control, &guest_inputs, &fence.gate, &cancellation, &shutdown).await {
-                        Ok(()) => {}
-                        Err(error) => {
-                            let _ = events.send(Err(protocol::detailed_status(error))).await;
-                            cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
-                            return;
-                        }
-                    },
+                    Ok(()) => {}
+                    Err(_) if guest_inputs.is_closed() => {}
                     Err(error) => {
-                        let _ = events.send(Err(protocol::detailed_status(error))).await;
+                        let current = identity_changes.borrow().clone();
+                        if let Some((reason, message)) = identity_loss(expected_agent.clone(), current) {
+                            send_lost(&events, reason, message).await;
+                        } else {
+                            let _ = events.send(Err(protocol::detailed_status(error))).await;
+                        }
                         cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
                         return;
                     }
-                    }
-                },
-                Ok(None) if !guest_state.started => {
-                    cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
-                    let _ = events.send(Ok(cancelled_before_start_event())).await;
-                    return;
-                }
-                Ok(None) => input_open = false,
-                Err(_) => {
-                    cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
-                    return;
                 }
             }
         }
@@ -633,6 +646,13 @@ pub(super) fn translate_event(
             (ExecutionEventKind::Started(ExecutionStarted {}), false)
         }
         Some(GuestEventKind::Started(_)) => return Err("guest process emitted duplicate Started"),
+        Some(GuestEventKind::StdinClosed(_)) if state.started => (
+            ExecutionEventKind::StdinClosed(protocol::v1::ExecutionStdinClosed {}),
+            false,
+        ),
+        Some(GuestEventKind::StdinClosed(_)) => {
+            return Err("guest process closed stdin before Started")
+        }
         Some(GuestEventKind::Stdout(stdout))
             if state.started && stdout.data.len() <= protocol::CHUNK_64_KIB =>
         {
@@ -1102,6 +1122,24 @@ mod tests {
         assert!(matches!(
             identity_loss(expected, Some(replacement)),
             Some((protocol::v1::LostReason::AgentInstanceReplaced, _))
+        ));
+    }
+
+    #[test]
+    fn guest_stdin_closure_is_nonterminal_and_requires_started() {
+        let event = || GuestProcessEvent {
+            event: Some(GuestEventKind::StdinClosed(
+                protocol::v1::GuestProcessStdinClosed {},
+            )),
+        };
+        let mut state = GuestEventState::default();
+        assert!(translate_event(event(), &mut state).is_err());
+        state.started = true;
+        let (event, terminal) = translate_event(event(), &mut state).unwrap();
+        assert!(!terminal);
+        assert!(matches!(
+            event.event,
+            Some(ExecutionEventKind::StdinClosed(_))
         ));
     }
 }

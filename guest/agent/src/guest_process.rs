@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -792,12 +792,12 @@ impl Read for PtyOutputReader {
     }
 }
 
-struct PtyInputWriter {
+struct ProcessInputWriter {
     master: File,
     exited: Arc<AtomicBool>,
 }
 
-impl PtyInputWriter {
+impl ProcessInputWriter {
     fn new(master: File, exited: Arc<AtomicBool>) -> io::Result<Self> {
         let flags = OFlag::from_bits_truncate(fcntl(&master, FcntlArg::F_GETFL)?);
         fcntl(&master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
@@ -805,7 +805,7 @@ impl PtyInputWriter {
     }
 }
 
-impl Write for PtyInputWriter {
+impl Write for ProcessInputWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
@@ -836,16 +836,19 @@ impl Write for PtyInputWriter {
 enum ProcessInput {
     Null,
     Pipe(Option<ChildStdin>),
-    Pty(PtyInputWriter),
+    Pty(ProcessInputWriter),
 }
 
 enum InputCommand {
-    Data(Vec<u8>),
+    Data(Bytes),
 }
 
 enum ActiveInput {
     Null,
-    Pipe(Option<std_mpsc::SyncSender<InputCommand>>),
+    Pipe {
+        sender: Option<std_mpsc::SyncSender<InputCommand>>,
+        writer: Option<thread::JoinHandle<()>>,
+    },
     Pty {
         sender: std_mpsc::SyncSender<InputCommand>,
         writer: Option<thread::JoinHandle<()>>,
@@ -854,11 +857,14 @@ enum ActiveInput {
 
 impl ActiveInput {
     fn close(self) {
-        if let Self::Pty { sender, writer } = self {
-            drop(sender);
-            if let Some(writer) = writer {
-                let _ = writer.join();
-            }
+        let (sender, writer) = match self {
+            Self::Pipe { sender, writer } => (sender, writer),
+            Self::Pty { sender, writer } => (Some(sender), writer),
+            Self::Null => return,
+        };
+        drop(sender);
+        if let Some(writer) = writer {
+            let _ = writer.join();
         }
     }
 }
@@ -940,7 +946,7 @@ fn spawn_process(
             let master = File::from(pty.master);
             let reader = master.try_clone().map_err(LaunchFailure::spawn)?;
             let exited = Arc::new(AtomicBool::new(false));
-            let writer = PtyInputWriter::new(
+            let writer = ProcessInputWriter::new(
                 master.try_clone().map_err(LaunchFailure::spawn)?,
                 Arc::clone(&exited),
             )
@@ -1037,12 +1043,23 @@ fn drive_process(
         retirement,
     } = runtime;
     let writer = process.guard.writer();
-    let mut input = start_input_writer(
+    let input_exited = Arc::new(AtomicBool::new(false));
+    let mut input = match start_input_writer(
         std::mem::replace(&mut process.stdin, ProcessInput::Null),
         writer.clone(),
         runtime.clone(),
         retirement,
-    );
+        Arc::clone(&input_exited),
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            let _ = events.blocking_send(Err(protocol::detailed_status(Status::internal(
+                format!("prepare guest process stdin: {error}"),
+            ))));
+            terminate_and_reap(&mut process.child, process.process_group);
+            return;
+        }
+    };
     let disconnected = Arc::new(AtomicBool::new(false));
     let readers = process
         .outputs
@@ -1058,6 +1075,7 @@ fn drive_process(
         })
         .collect::<Vec<_>>();
 
+    let mut stdin_closed = false;
     let status = loop {
         if *cancellation.borrow() || disconnected.load(Ordering::Acquire) {
             terminate_and_reap(&mut process.child, process.process_group);
@@ -1066,6 +1084,7 @@ fn drive_process(
         let control = deferred_control
             .take()
             .map_or_else(|| controls.try_recv(), Ok);
+        let mut progressed = false;
         match control {
             Ok(control) => {
                 let _mutation = match runtime.admit_mutation() {
@@ -1076,19 +1095,49 @@ fn drive_process(
                         continue;
                     }
                 };
-                if let Err(status) = apply_control(&mut process, &mut input, control) {
-                    let _ = events.blocking_send(Err(status));
-                    terminate_and_reap(&mut process.child, process.process_group);
-                    break process.child.wait().ok();
+                if stdin_closed
+                    && matches!(
+                        &control.message,
+                        Some(Message::StdinData(_) | Message::CloseStdin(_))
+                    )
+                {
+                    progressed = true;
+                } else {
+                    match apply_control(&mut process, &mut input, control) {
+                        Ok(ControlOutcome::Applied) => progressed = true,
+                        Ok(ControlOutcome::Pending(data)) => {
+                            deferred_control = Some(protocol::v1::GuestProcessInput {
+                                message: Some(Message::StdinData(StdinData { data })),
+                            });
+                        }
+                        Ok(ControlOutcome::StdinClosed) => {
+                            stdin_closed = true;
+                            if events
+                                .blocking_send(Ok(GuestProcessEvent {
+                                    event: Some(Event::StdinClosed(
+                                        protocol::v1::GuestProcessStdinClosed {},
+                                    )),
+                                }))
+                                .is_err()
+                            {
+                                disconnected.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(status) => {
+                            let _ = events.blocking_send(Err(status));
+                            terminate_and_reap(&mut process.child, process.process_group);
+                            break process.child.wait().ok();
+                        }
+                    }
                 }
-                continue;
             }
             Err(mpsc::error::TryRecvError::Disconnected)
             | Err(mpsc::error::TryRecvError::Empty) => {}
         }
         match process.child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) => thread::sleep(POLL_INTERVAL),
+            Ok(None) if !progressed => thread::sleep(POLL_INTERVAL),
+            Ok(None) => {}
             Err(error) => {
                 let _ = events.blocking_send(Err(protocol::detailed_status(Status::internal(
                     format!("wait for guest process: {error}"),
@@ -1098,6 +1147,7 @@ fn drive_process(
             }
         }
     };
+    input_exited.store(true, Ordering::Release);
     if let Some(exited) = &process.pty_exited {
         exited.store(true, Ordering::Release);
     }
@@ -1122,20 +1172,30 @@ fn start_input_writer(
     worker: Option<crate::pid1::InternalWriterGuard>,
     runtime: Arc<crate::lifecycle::RuntimeContext>,
     retirement: Option<watch::Receiver<u64>>,
-) -> ActiveInput {
+    exited: Arc<AtomicBool>,
+) -> io::Result<ActiveInput> {
     match input {
-        ProcessInput::Null => ActiveInput::Null,
+        ProcessInput::Null => Ok(ActiveInput::Null),
         ProcessInput::Pipe(writer) => {
             let Some(writer) = writer else {
-                return ActiveInput::Pipe(None);
+                return Ok(ActiveInput::Pipe {
+                    sender: None,
+                    writer: None,
+                });
             };
-            let (sender, _) = spawn_input_writer(writer, worker, runtime, retirement, None);
-            ActiveInput::Pipe(Some(sender))
+            let writer =
+                ProcessInputWriter::new(File::from(OwnedFd::from(writer)), Arc::clone(&exited))?;
+            let (sender, writer) =
+                spawn_input_writer(writer, worker, runtime, retirement, Some(exited));
+            Ok(ActiveInput::Pipe {
+                sender: Some(sender),
+                writer,
+            })
         }
         ProcessInput::Pty(writer) => {
             let exited = Some(Arc::clone(&writer.exited));
             let (sender, writer) = spawn_input_writer(writer, worker, runtime, retirement, exited);
-            ActiveInput::Pty { sender, writer }
+            Ok(ActiveInput::Pty { sender, writer })
         }
     }
 }
@@ -1247,16 +1307,26 @@ fn spawn_output_reader(
     }
 }
 
+enum ControlOutcome {
+    Applied,
+    Pending(Bytes),
+    StdinClosed,
+}
+
 fn apply_control(
     process: &mut RunningProcess,
     input: &mut ActiveInput,
     control: protocol::v1::GuestProcessInput,
-) -> Result<(), Status> {
+) -> Result<ControlOutcome, Status> {
     match control.message {
         Some(Message::StdinData(StdinData { data })) => write_stdin(input, data),
-        Some(Message::CloseStdin(_)) => close_stdin(input),
-        Some(Message::ResizePty(resize)) => resize_pty(process, resize),
-        Some(Message::SignalProcess(signal)) => signal_process(process, signal),
+        Some(Message::CloseStdin(_)) => close_stdin(input).map(|()| ControlOutcome::Applied),
+        Some(Message::ResizePty(resize)) => {
+            resize_pty(process, resize).map(|()| ControlOutcome::Applied)
+        }
+        Some(Message::SignalProcess(signal)) => {
+            signal_process(process, signal).map(|()| ControlOutcome::Applied)
+        }
         Some(Message::Start(_)) => Err(invalid_request(
             "StartGuestProcess is only valid as the first Execute request",
         )),
@@ -1264,13 +1334,16 @@ fn apply_control(
     }
 }
 
-fn write_stdin(input: &mut ActiveInput, data: Bytes) -> Result<(), Status> {
+fn write_stdin(input: &mut ActiveInput, data: Bytes) -> Result<ControlOutcome, Status> {
     if data.len() > protocol::CHUNK_64_KIB {
         return Err(invalid_request("stdin data exceeds 64 KiB"));
     }
     let sender = match input {
-        ActiveInput::Pipe(Some(sender)) => sender,
-        ActiveInput::Pipe(None) => {
+        ActiveInput::Pipe {
+            sender: Some(sender),
+            ..
+        } => sender,
+        ActiveInput::Pipe { sender: None, .. } => {
             return Err(protocol::detailed_status(Status::failed_precondition(
                 "stdin is already closed",
             )));
@@ -1282,30 +1355,27 @@ fn write_stdin(input: &mut ActiveInput, data: Bytes) -> Result<(), Status> {
             )));
         }
     };
-    sender
-        .try_send(InputCommand::Data(data.to_vec()))
-        .map_err(|error| match error {
-            std_mpsc::TrySendError::Full(_) => protocol::status_with_error(
-                tonic::Code::ResourceExhausted,
-                protocol::v1::ErrorCode::ResourceExhausted,
-                "guest process stdin queue is full",
-                None,
-            ),
-            std_mpsc::TrySendError::Disconnected(_) => protocol::detailed_status(
-                Status::failed_precondition("guest process stdin is closed"),
-            ),
-        })
+    match sender.try_send(InputCommand::Data(data)) {
+        Ok(()) => Ok(ControlOutcome::Applied),
+        Err(std_mpsc::TrySendError::Full(InputCommand::Data(data))) => {
+            Ok(ControlOutcome::Pending(data))
+        }
+        Err(std_mpsc::TrySendError::Disconnected(_)) => Ok(ControlOutcome::StdinClosed),
+    }
 }
 
 fn close_stdin(input: &mut ActiveInput) -> Result<(), Status> {
     match input {
-        ActiveInput::Pipe(sender @ Some(_)) => {
+        ActiveInput::Pipe {
+            sender: sender @ Some(_),
+            ..
+        } => {
             drop(sender.take());
             Ok(())
         }
-        ActiveInput::Pipe(None) => Err(protocol::detailed_status(Status::failed_precondition(
-            "stdin is already closed",
-        ))),
+        ActiveInput::Pipe { sender: None, .. } => Err(protocol::detailed_status(
+            Status::failed_precondition("stdin is already closed"),
+        )),
         ActiveInput::Pty { .. } => Err(protocol::detailed_status(Status::failed_precondition(
             "PTY stdin cannot be half-closed",
         ))),
@@ -1473,7 +1543,7 @@ mod tests {
             crate::guest_process::spawn_input_writer(writer, None, runtime, Some(retirement), None);
         sender
             .send(crate::guest_process::InputCommand::Data(
-                b"must-not-write".to_vec(),
+                bytes::Bytes::from_static(b"must-not-write"),
             ))
             .unwrap();
         let mut output = Vec::new();
@@ -1973,7 +2043,7 @@ mod tests {
                 guard,
                 process_group: group,
                 stdin: crate::guest_process::ProcessInput::Pty(
-                    crate::guest_process::PtyInputWriter::new(
+                    crate::guest_process::ProcessInputWriter::new(
                         master.try_clone().unwrap(),
                         Arc::clone(&exited),
                     )
@@ -2131,7 +2201,7 @@ mod tests {
         nix::sys::termios::tcsetattr(&pty.slave, nix::sys::termios::SetArg::TCSANOW, &termios)
             .unwrap();
         let exited = Arc::new(AtomicBool::new(false));
-        let mut writer = crate::guest_process::PtyInputWriter::new(
+        let mut writer = crate::guest_process::ProcessInputWriter::new(
             std::fs::File::from(pty.master),
             Arc::clone(&exited),
         )
@@ -2165,5 +2235,195 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         task.join().unwrap();
         drop(pty.slave);
+    }
+
+    fn rootless_pipe(script: &str) -> (crate::guest_process::RunningProcess, KillTestGroup) {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, guard) = ProcessSupervisor::default()
+            .spawn_session_child(&mut command, "guest process stdin test")
+            .unwrap();
+        let group = i32::try_from(child.id()).unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        (
+            crate::guest_process::RunningProcess {
+                child,
+                guard,
+                process_group: group,
+                stdin: crate::guest_process::ProcessInput::Pipe(Some(stdin)),
+                outputs: vec![
+                    (crate::guest_process::OutputKind::Stdout, Box::new(stdout)),
+                    (crate::guest_process::OutputKind::Stderr, Box::new(stderr)),
+                ],
+                pty_resize: None,
+                pty_exited: None,
+            },
+            KillTestGroup(nix::unistd::Pid::from_raw(group)),
+        )
+    }
+
+    async fn send_large_stdin(controls: mpsc::Sender<GuestProcessInput>) -> usize {
+        let mut sent = 0;
+        for chunk in 0..512 {
+            let offset = chunk * protocol::CHUNK_64_KIB;
+            let data: Vec<u8> = (offset..offset + protocol::CHUNK_64_KIB)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            if controls
+                .send(GuestProcessInput {
+                    message: Some(Message::StdinData(StdinData { data: data.into() })),
+                })
+                .await
+                .is_err()
+            {
+                return sent;
+            }
+            sent += protocol::CHUNK_64_KIB;
+        }
+        let _ = controls
+            .send(GuestProcessInput {
+                message: Some(Message::CloseStdin(protocol::v1::CloseStdin {})),
+            })
+            .await;
+        sent
+    }
+
+    #[tokio::test]
+    async fn large_stdin_backpressures_slow_child_and_delivers_ordered_eof() {
+        let (running, _cleanup) = rootless_pipe(
+            "sleep 0.1; i=0; while [ \"$i\" -lt 512 ]; do head -c 65536; sleep 0.001; i=$((i+1)); done; cat",
+        );
+        let (controls, mut events, task) = start_running(running);
+        let sending = tokio::spawn(send_large_stdin(controls));
+        let mut received = 0;
+        let mut exited = false;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(event) = events.recv().await {
+                match event.unwrap().event {
+                    Some(Event::Stdout(output)) => {
+                        for byte in output.data {
+                            assert_eq!(byte, (received % 251) as u8);
+                            received += 1;
+                        }
+                    }
+                    Some(Event::Exited(status)) => {
+                        assert_eq!(status.code, Some(0));
+                        exited = true;
+                    }
+                    other => panic!("unexpected slow-reader event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("slow child must receive all input and EOF");
+        assert!(exited);
+        assert_eq!(received, 32 * 1024 * 1024);
+        assert_eq!(sending.await.unwrap(), received);
+        task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_stdin_preserves_early_exit_and_closed_pipe_status() {
+        for (script, code) in [
+            ("sleep 0.05; exit 7", 7),
+            ("head -n 1; exit 9", 9),
+            ("sleep 600 <&0 >/dev/null 2>&1 & exit 13", 13),
+        ] {
+            let (running, _cleanup) = rootless_pipe(script);
+            let (controls, mut events, task) = start_running(running);
+            let sending = tokio::spawn(send_large_stdin(controls));
+            let events = tokio::time::timeout(Duration::from_secs(5), collect(&mut events))
+                .await
+                .expect("early exit must not wait for a blocked input writer");
+            assert!(events.iter().any(|event| matches!(
+                &event.event, Some(Event::Exited(status)) if status.code == Some(code)
+            )));
+            assert!(sending.await.unwrap() < 32 * 1024 * 1024);
+            task.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_stdin_closes_real_child_pipe() {
+        let (running, _cleanup) = rootless_pipe("cat");
+        let (controls, mut events, task) = start_running(running);
+        controls
+            .send(GuestProcessInput {
+                message: Some(Message::CloseStdin(protocol::v1::CloseStdin {})),
+            })
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), collect(&mut events))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0].event, Some(Event::Exited(status)) if status.code == Some(0)));
+        drop(controls);
+        task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_child_stdin_keeps_process_controls_and_exit_status() {
+        let (running, _cleanup) = rootless_pipe("exec 0<&-; kill -STOP $$; exit 11");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match nix::sys::wait::waitpid(
+                    nix::unistd::Pid::from_raw(running.process_group),
+                    Some(
+                        nix::sys::wait::WaitPidFlag::WNOHANG
+                            | nix::sys::wait::WaitPidFlag::WUNTRACED,
+                    ),
+                )
+                .unwrap()
+                {
+                    nix::sys::wait::WaitStatus::Stopped(_, nix::sys::signal::Signal::SIGSTOP) => {
+                        break
+                    }
+                    nix::sys::wait::WaitStatus::StillAlive => {
+                        tokio::time::sleep(Duration::from_millis(1)).await
+                    }
+                    status => panic!("child must stop with its stdin closed: {status:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (controls, mut events, task) = start_running(running);
+        let sending = tokio::spawn(send_large_stdin(controls.clone()));
+        let closed = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(closed.event, Some(Event::StdinClosed(_))));
+        sending.abort();
+        let _ = sending.await;
+        controls
+            .send(GuestProcessInput {
+                message: Some(Message::SignalProcess(SignalProcess {
+                    signal: Some(nix::sys::signal::Signal::SIGCONT as u32),
+                })),
+            })
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), collect(&mut events))
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event, Some(Event::Exited(status)) if status.code == Some(11)
+        )));
+        drop(controls);
+        task.join().unwrap();
     }
 }

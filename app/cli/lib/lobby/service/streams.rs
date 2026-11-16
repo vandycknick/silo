@@ -169,7 +169,7 @@ impl Service {
                             Ok(Some(ExecutionEvent::Stdout(data) | ExecutionEvent::TerminalOutput(data))) => io.stdout.write_all(&data).await.map_err(|_| lost("guest output transport failed"))?,
                             Ok(Some(ExecutionEvent::Stderr(data))) => io.stderr.write_all(&data).await.map_err(|_| lost("guest output transport failed"))?,
                             Ok(Some(ExecutionEvent::Terminal(result))) => break execution_status(result),
-                            Ok(Some(ExecutionEvent::Accepted)) => {},
+                            Ok(Some(ExecutionEvent::Accepted | ExecutionEvent::StdinClosed)) => {},
                             Ok(None) | Err(_) => break Err(lost("guest execution stream lost")),
                         }
                     };

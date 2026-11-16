@@ -1266,7 +1266,7 @@ let result = loop {
             eprintln!("{}", String::from_utf8_lossy(&bytes));
         }
         ExecutionEvent::Terminal(result) => break result,
-        ExecutionEvent::Accepted => {}
+        ExecutionEvent::Accepted | ExecutionEvent::StdinClosed => {}
     }
 };
 assert_eq!(received, b"streamed input\n");
@@ -1279,6 +1279,17 @@ Receive `Started` before obtaining stdin, writing, resizing or sending
 process controls. `Accepted` only acknowledges host admission. Pipe stdin
 supports explicit EOF; PTY input does not. Consume output through the terminal
 result, which distinguishes exit, signal, launch failure and execution loss.
+
+Stdin uses bounded queues and transport flow control all the way to the child's
+pipe. A slow reader blocks writes instead of failing the execution. Explicit EOF
+is ordered after queued bytes. `StdinClosed` means the child closed its pipe:
+stop producing input and keep receiving output and the command's terminal result.
+The CLI does this automatically, including while an input write is blocked.
+
+`stdin_bytes` streams its owned payload in the background after opening the
+session, so backpressure never prevents the caller from receiving an early
+terminal result. The session owns and cancels that producer on input closure,
+cancellation or completion; the payload is not copied into an unbounded queue.
 
 For large bidirectional transfers, receive events concurrently with input using
 `session.control()` or `session.stdin()` after `Started`; otherwise both sides

@@ -198,7 +198,7 @@ fn apply_event(
             }));
             true
         }
-        None => false,
+        Some(Event::StdinClosed(_)) | None => false,
     }
 }
 
