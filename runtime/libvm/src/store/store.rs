@@ -1473,6 +1473,85 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_filters_constructed_rows_before_name_and_prefix_resolution() {
+        let (_temporary, paths) = temp_paths();
+        let store = Store::new(&paths).await.unwrap();
+        let named_id: MachineId = "11111111111141118111111111111111".parse().unwrap();
+        let first_id: MachineId = "def00000000040008000000000000001".parse().unwrap();
+        let second_id: MachineId = "def00000000040008000000000000002".parse().unwrap();
+        let named = machine_from_path(named_id, "def".into(), paths.machine(named_id).dir());
+        let first = machine_from_path(first_id, "first".into(), paths.machine(first_id).dir());
+        let second = machine_from_path(second_id, "second".into(), paths.machine(second_id).dir());
+        for config in [&named, &first, &second] {
+            seed_machine(&store, config).await;
+        }
+        for id in [named_id, second_id] {
+            sqlx::query("UPDATE machine_config SET durability='constructed' WHERE id=?1")
+                .bind(id.to_string())
+                .execute(store.test_pool())
+                .await
+                .unwrap();
+        }
+        let observer = crate::store::observation::ObservationStore::existing(&store);
+        let reference = crate::MachineRef::parse("def").unwrap();
+        assert_eq!(
+            store
+                .discover_machine(&reference)
+                .await
+                .unwrap()
+                .config
+                .unwrap(),
+            first
+        );
+        assert_eq!(observer.lookup(&reference).await.unwrap().0, first);
+        assert_eq!(store.machine_inventory().await.unwrap().len(), 1);
+        for reference in [
+            crate::MachineRef::id(named_id),
+            crate::MachineRef::id(second_id),
+            crate::MachineRef::parse("second").unwrap(),
+        ] {
+            assert!(matches!(
+                store.discover_machine(&reference).await,
+                Err(LibVmError::MachineNotFound { .. })
+            ));
+            assert!(matches!(
+                observer.lookup(&reference).await,
+                Err(LibVmError::MachineNotFound { .. })
+            ));
+        }
+        assert_eq!(
+            store.machine_config(named_id).await.unwrap(),
+            Some(named.clone())
+        );
+        assert_eq!(
+            store.machine_config_by_name("def").await.unwrap(),
+            Some(named.clone())
+        );
+        assert!(store.machine_name_in_use("def").await.unwrap());
+        store.mark_child_durable(named_id).await.unwrap();
+        assert_eq!(
+            store
+                .discover_machine(&reference)
+                .await
+                .unwrap()
+                .config
+                .unwrap(),
+            named
+        );
+        assert_eq!(observer.lookup(&reference).await.unwrap().0, named);
+        store.mark_child_durable(second_id).await.unwrap();
+        let prefix = crate::MachineRef::parse("def0").unwrap();
+        assert!(matches!(
+            store.discover_machine(&prefix).await,
+            Err(LibVmError::AmbiguousIdPrefix { count: 2, .. })
+        ));
+        assert!(matches!(
+            observer.lookup(&prefix).await,
+            Err(LibVmError::AmbiguousIdPrefix { count: 2, .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn lookup_hex_names_precedes_prefixes_in_writable_and_observation_stores() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.unwrap();

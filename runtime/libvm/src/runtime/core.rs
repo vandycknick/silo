@@ -804,9 +804,13 @@ impl Runtime {
         NetworkBuilder::new(self.clone(), name)
     }
 
-    /// Resolves a machine by name, full ID, or ID prefix.
+    /// Resolves a durable machine by name, full ID, or ID prefix.
     pub async fn get_machine(&self, machine: &MachineRef) -> Result<Machine, LibVmError> {
-        match self.resolve_machine_config(machine).await {
+        let config = match self.optional_native_store() {
+            Some(store) => store.discover_machine(machine).await?.config,
+            None => self.resolve_machine_config(machine).await,
+        };
+        match config {
             Ok(config) => Ok(Machine::new(self.clone(), config.id)),
             Err(error) if error.is_machine_observation_error() => {
                 let record = self.inventory_record(machine).await?;
@@ -835,6 +839,9 @@ impl Runtime {
         &self,
         reference: &MachineRef,
     ) -> Result<crate::store::machine_store::InventoryRecord, LibVmError> {
+        if let Some(store) = self.optional_native_store() {
+            return store.discover_machine(reference).await;
+        }
         let records = self.store.machine_inventory().await?;
         let name_match = match reference.kind() {
             MachineRefKind::IdPrefix { name, .. } => {
@@ -911,8 +918,22 @@ impl Runtime {
         Ok(entries)
     }
 
-    /// Lists known machines as operable handles.
+    /// Lists durable machines as operable handles.
     pub async fn list_machines(&self) -> Result<Vec<Machine>, LibVmError> {
+        use crate::store::MachineStore as _;
+
+        if let Some(store) = self.optional_native_store() {
+            return store
+                .machine_inventory()
+                .await?
+                .into_iter()
+                .map(|record| {
+                    record
+                        .config
+                        .map(|config| Machine::new(self.clone(), config.id))
+                })
+                .collect();
+        }
         let configs = self.list_machine_configs().await?;
         Ok(configs
             .into_iter()
@@ -4213,6 +4234,159 @@ pub(crate) mod tests {
         machine_ref: MachineRef,
     ) -> Result<crate::MachineData, LibVmError> {
         runtime.get_machine(&machine_ref).await?.inspect().await
+    }
+
+    fn discovery_runtime_config(runtime: &Runtime) -> crate::RuntimeConfig {
+        let binary = test_utils::mock_vmm_binary();
+        let components = crate::ResolvedRuntimeComponents::from_paths(
+            binary.to_path_buf(),
+            binary.to_path_buf(),
+            binary.to_path_buf(),
+            binary.to_path_buf(),
+            binary.to_path_buf(),
+            runtime.local_home().to_path_buf(),
+        )
+        .unwrap();
+        crate::RuntimeConfig::local(runtime.local_home())
+            .with_run_root(runtime.paths.run_root())
+            .with_runtime_components(components)
+            .with_virt_backend(crate::VirtBackendOverride::Mock { scenario: None })
+    }
+
+    async fn assert_constructed_child_hidden(runtime: &Runtime, config: &MachineConfig) {
+        assert!(runtime.inventory().await.unwrap().is_empty());
+        assert!(runtime.list_machines().await.unwrap().is_empty());
+        for reference in [
+            MachineRef::id(config.id),
+            MachineRef::parse(config.name.clone()).unwrap(),
+            MachineRef::parse(&config.id.to_string()[..8]).unwrap(),
+        ] {
+            assert!(matches!(
+                runtime.get_machine(&reference).await,
+                Err(LibVmError::MachineNotFound { .. })
+            ));
+            assert!(matches!(
+                runtime.inspect_inventory(&reference).await,
+                Err(LibVmError::MachineNotFound { .. })
+            ));
+            assert!(matches!(
+                runtime.observe_live(&reference).await,
+                Err(LibVmError::MachineNotFound { .. })
+            ));
+        }
+        assert!(matches!(
+            runtime.ensure_name_available(&config.name).await,
+            Err(LibVmError::MachineAlreadyExists { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn observation_hides_abandoned_constructed_child_until_maintenance_retires_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        crate::paths::ensure_run_root(paths.run_root()).unwrap();
+        let (owner, config, _) = shutdown_storage_fixture(&temp).await;
+        let store = owner.native_store().unwrap();
+        sqlx::query("UPDATE machine_config SET durability='constructed' WHERE id=?1")
+            .bind(config.id.to_string())
+            .execute(store.test_pool())
+            .await
+            .unwrap();
+        let runtime_config = discovery_runtime_config(&owner);
+        let observation =
+            Runtime::new_with_mode(runtime_config.clone(), crate::RuntimeOpenMode::Observation)
+                .await
+                .unwrap();
+        assert_constructed_child_hidden(&observation, &config).await;
+        assert!(config.machine_dir.exists());
+        assert!(store.machine_config(config.id).await.unwrap().is_some());
+
+        let maintenance =
+            Runtime::new_with_mode(runtime_config, crate::RuntimeOpenMode::Maintenance)
+                .await
+                .unwrap();
+        assert!(store.machine_config(config.id).await.unwrap().is_none());
+        assert!(!config.machine_dir.exists());
+        maintenance
+            .ensure_name_available(&config.name)
+            .await
+            .unwrap();
+        let reused = create_pending_sample(&maintenance, &config.name)
+            .await
+            .unwrap()
+            .commit(&maintenance)
+            .await
+            .unwrap();
+        assert_ne!(reused.id, config.id);
+        assert_eq!(maintenance.inventory().await.unwrap()[0].name, config.name);
+    }
+
+    #[tokio::test]
+    async fn observation_hides_live_constructed_child_without_revoking_owner_or_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        crate::paths::ensure_run_root(paths.run_root()).unwrap();
+        let (owner, config, _) = shutdown_storage_fixture(&temp).await;
+        let store = owner.native_store().unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("fork", &[], &[])
+            .await
+            .unwrap();
+        store
+            .preserve_stopped_operation(operation, config.id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE machine_config SET durability='constructed' WHERE id=?1")
+            .bind(config.id.to_string())
+            .execute(store.test_pool())
+            .await
+            .unwrap();
+        let runtime_config = discovery_runtime_config(&owner);
+        let observation =
+            Runtime::new_with_mode(runtime_config.clone(), crate::RuntimeOpenMode::Observation)
+                .await
+                .unwrap();
+        assert_constructed_child_hidden(&observation, &config).await;
+        assert!(matches!(
+            crate::LiveObservationReader::open(&runtime_config)
+                .unwrap()
+                .observe(&MachineRef::id(config.id))
+                .await,
+            Err(LibVmError::MachineNotFound { .. })
+        ));
+        assert_eq!(
+            owner
+                .resolve_machine_config(&MachineRef::id(config.id))
+                .await
+                .unwrap(),
+            config
+        );
+        let pool = crate::storage::pool::StoragePool::open(owner.local_images_dir()).unwrap();
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        assert_eq!(
+            machine_handle(&owner, config.id)
+                .inspect()
+                .await
+                .unwrap()
+                .durability,
+            crate::MachineDurability::Constructed
+        );
+        store.mark_child_durable(config.id).await.unwrap();
+        store.finish_stopped_operation(operation).await.unwrap();
+        drop(lease);
+        assert_eq!(observation.inventory().await.unwrap()[0].name, config.name);
+        assert_eq!(
+            observation
+                .get_machine(&MachineRef::id(config.id))
+                .await
+                .unwrap()
+                .machine_id(),
+            config.id
+        );
+        assert!(matches!(
+            observation.observe_live(&MachineRef::id(config.id)).await,
+            Err(LibVmError::MachineNotRunning { .. })
+        ));
     }
 
     #[tokio::test]

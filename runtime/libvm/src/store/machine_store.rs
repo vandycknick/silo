@@ -12,6 +12,30 @@ pub(crate) const MACHINE_CONFIGS_BY_ID_PREFIX: &str =
      FROM machine_config
      WHERE name = ?1 OR (id LIKE ?2 AND NOT EXISTS (SELECT 1 FROM machine_config WHERE name = ?1))";
 
+/// Public discovery excludes construction rows even while their owner is alive.
+/// Name reservation and operation-owned ID lookups use the unfiltered catalog.
+pub(crate) fn discovery_query(
+    reference: &crate::MachineRef,
+) -> (&'static str, String, Option<String>) {
+    match reference.kind() {
+        crate::machine::MachineRefKind::Id(id) => (
+            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE durability='durable' AND id=?1 LIMIT 2",
+            id.to_string(),
+            None,
+        ),
+        crate::machine::MachineRefKind::Name(name) => (
+            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE durability='durable' AND name=?1 LIMIT 2",
+            name.clone(),
+            None,
+        ),
+        crate::machine::MachineRefKind::IdPrefix { name, prefix } => (
+            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE durability='durable' AND (name=?1 OR (id LIKE ?2 AND NOT EXISTS(SELECT 1 FROM machine_config WHERE durability='durable' AND name=?1)))",
+            name.clone(),
+            Some(format!("{prefix}%")),
+        ),
+    }
+}
+
 fn has_pool_roots(storage: &crate::MachineStorageRecord) -> bool {
     matches!(&storage.root, crate::MachineRoot::LinuxOverlay { .. })
         || storage
@@ -98,7 +122,7 @@ impl MachineStore for Store {
     async fn machine_inventory(&self) -> Result<Vec<InventoryRecord>, LibVmError> {
         // Guard JSON conversion per row: malformed JSONB must not abort the
         // entire SELECT before we can retain its indexed identity.
-        let rows = sqlx::query("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config ORDER BY name")
+        let rows = sqlx::query("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE durability='durable' ORDER BY name")
             .fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
@@ -427,6 +451,33 @@ impl MachineStore for Store {
 }
 
 impl Store {
+    pub(crate) async fn discover_machine(
+        &self,
+        reference: &crate::MachineRef,
+    ) -> Result<InventoryRecord, LibVmError> {
+        let (statement, value, prefix) = discovery_query(reference);
+        let query = sqlx::query(statement).bind(&value);
+        let query = match &prefix {
+            Some(prefix) => query.bind(prefix),
+            None => query,
+        };
+        let rows = query.fetch_all(&self.pool).await?;
+        match rows.as_slice() {
+            [] => Err(LibVmError::MachineNotFound { reference: value }),
+            [row] => Ok(InventoryRecord {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                config: DbMachineConfig::from_row_in(row, &self.home)
+                    .map(|DbMachineConfig(config)| config)
+                    .map_err(Into::into),
+            }),
+            _ => Err(LibVmError::AmbiguousIdPrefix {
+                prefix: reference.id_prefix().unwrap_or(&value).to_string(),
+                count: rows.len(),
+            }),
+        }
+    }
+
     pub(crate) async fn preflight_restored_cold_start(
         &self,
         machine: MachineId,
