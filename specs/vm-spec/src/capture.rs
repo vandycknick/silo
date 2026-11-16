@@ -1137,6 +1137,207 @@ pub enum CapturePauseDisposition {
     Borrowed,
 }
 
+/// Host-local write coverage, independent of portable disk stream identity.
+pub const DISK_TRACKING_VERSION: u32 = 1;
+pub const MAX_DISK_TRACKING_BYTES: usize = 16 << 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskTrackingInvalidReason {
+    NeverArmed,
+    Lost,
+    Overflow,
+    OutOfDeviceMutationSuspected,
+}
+
+/// `Some(baseline)` asserts a complete authenticated map and exclusive writer
+/// ownership of this exact backing from constructor admission onwards.
+/// `None` requires full immutable-cut authentication before baseline acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskTrackingSeed {
+    pub version: u32,
+    pub role: DiskRole,
+    pub attachment_index: u32,
+    pub block_id: BlockId,
+    pub file_device: u64,
+    pub file_inode: u64,
+    pub length: u64,
+    pub chunk_size: u64,
+    pub epoch: LiveId,
+    /// Baseline stream identity, not a portable identity for this host binding.
+    #[serde(deserialize_with = "required")]
+    pub baseline: Option<Sha256Digest>,
+}
+
+impl DiskTrackingSeed {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != DISK_TRACKING_VERSION
+            || self.file_inode == 0
+            || self.attachment_index >= 16
+            || self.role == DiskRole::RootLower
+            || self.length == 0
+            || self.length > MAX_STREAM_BYTES
+            || !self.length.is_multiple_of(512)
+            || self.chunk_size != STREAM_CHUNK_BYTES
+        {
+            return Err(invalid(
+                "disk tracking seed version, binding or geometry is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_DISK_TRACKING_BYTES {
+            return Err(invalid("disk tracking seed exceeds its bound"));
+        }
+        let value: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if value.canonical_bytes()? != bytes {
+            return Err(invalid("disk tracking seed bytes are not canonical"));
+        }
+        Ok(value)
+    }
+}
+
+/// Half-open identity-chunk range. Adjacent ranges must be coalesced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskDirtyRun {
+    pub first_chunk: u64,
+    pub chunk_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskGenerationToken {
+    pub capture_id: LiveId,
+    pub pause_generation: u64,
+    pub epoch: LiveId,
+    pub generation: u64,
+    pub file_device: u64,
+    pub file_inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskTrackingReceipt {
+    pub version: u32,
+    pub seed: DiskTrackingSeed,
+    pub token: DiskGenerationToken,
+    pub runs: Vec<DiskDirtyRun>,
+    pub dirty_chunks: u64,
+    pub total_chunks: u64,
+    #[serde(deserialize_with = "required")]
+    pub invalid_reason: Option<DiskTrackingInvalidReason>,
+}
+
+impl DiskTrackingReceipt {
+    pub fn validate(&self) -> Result<(), String> {
+        self.seed.validate()?;
+        if self.version != DISK_TRACKING_VERSION
+            || self.token.epoch != self.seed.epoch
+            || self.token.file_device != self.seed.file_device
+            || self.token.file_inode != self.seed.file_inode
+            || self.token.generation == 0
+            || self.token.pause_generation == 0
+            || self.total_chunks != self.seed.length.div_ceil(self.seed.chunk_size)
+            || (self.seed.baseline.is_none() && self.invalid_reason.is_none())
+        {
+            return Err(invalid("disk generation binding or coverage is invalid"));
+        }
+        let mut previous_end = None;
+        let mut count = 0u64;
+        for run in &self.runs {
+            let end = run
+                .first_chunk
+                .checked_add(run.chunk_count)
+                .ok_or_else(|| invalid("disk dirty run overflows"))?;
+            if run.chunk_count == 0
+                || end > self.total_chunks
+                || previous_end.is_some_and(|previous| run.first_chunk <= previous)
+            {
+                return Err(invalid("disk dirty runs are not bounded and coalesced"));
+            }
+            previous_end = Some(end);
+            count = count
+                .checked_add(run.chunk_count)
+                .ok_or_else(|| invalid("disk dirty count overflows"))?;
+        }
+        if count != self.dirty_chunks {
+            return Err(invalid("disk dirty count differs from runs"));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_DISK_TRACKING_BYTES {
+            return Err(invalid("disk tracking receipt exceeds its bound"));
+        }
+        let value: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if value.canonical_bytes()? != bytes {
+            return Err(invalid("disk tracking receipt bytes are not canonical"));
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DiskGenerationSettlement {
+    Commit { baseline: Sha256Digest },
+    Abort,
+}
+
+/// Settlement is independent of RAM baseline acceptance and source resumption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskTrackingSettlement {
+    pub version: u32,
+    pub block_id: BlockId,
+    pub token: DiskGenerationToken,
+    pub settlement: DiskGenerationSettlement,
+}
+
+impl DiskTrackingSettlement {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != DISK_TRACKING_VERSION
+            || self.token.generation == 0
+            || self.token.pause_generation == 0
+            || self.token.file_inode == 0
+        {
+            return Err(invalid("disk settlement version or token is invalid"));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_DISK_TRACKING_BYTES {
+            return Err(invalid("disk settlement exceeds its bound"));
+        }
+        let value: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if value.canonical_bytes()? != bytes {
+            return Err(invalid("disk settlement bytes are not canonical"));
+        }
+        Ok(value)
+    }
+}
+
 /// Operation-owned clone fingerprint, sampled after the last writer closes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1788,6 +1989,168 @@ mod tests {
     use crate::capture::*;
     use crate::lifecycle::{LiveFailureCode, LiveStage};
     use crate::{Disk, Hardware, Mount};
+
+    fn tracking_receipt() -> DiskTrackingReceipt {
+        let seed = DiskTrackingSeed {
+            version: DISK_TRACKING_VERSION,
+            role: DiskRole::RootUpper,
+            attachment_index: 1,
+            block_id: BlockId::new("silo-root-upper").unwrap(),
+            file_device: 5,
+            file_inode: 7,
+            length: 2 * STREAM_CHUNK_BYTES + 512,
+            chunk_size: STREAM_CHUNK_BYTES,
+            epoch: run(),
+            baseline: Some(Sha256Digest::of_bytes(b"baseline")),
+        };
+        DiskTrackingReceipt {
+            version: DISK_TRACKING_VERSION,
+            token: DiskGenerationToken {
+                capture_id: capture(),
+                pause_generation: 1,
+                epoch: seed.epoch.clone(),
+                generation: 1,
+                file_device: seed.file_device,
+                file_inode: seed.file_inode,
+            },
+            seed,
+            runs: vec![DiskDirtyRun {
+                first_chunk: 1,
+                chunk_count: 2,
+            }],
+            dirty_chunks: 2,
+            total_chunks: 3,
+            invalid_reason: None,
+        }
+    }
+
+    #[test]
+    fn disk_tracking_contract_roundtrips_and_rejects_noncanonical_syntax() {
+        let receipt = tracking_receipt();
+        let bytes = receipt.canonical_bytes().unwrap();
+        assert_eq!(DiskTrackingReceipt::decode(&bytes).unwrap(), receipt);
+        let seed = &receipt.seed;
+        assert_eq!(
+            DiskTrackingSeed::decode(&seed.canonical_bytes().unwrap()).unwrap(),
+            *seed
+        );
+        let json = String::from_utf8(bytes.clone()).unwrap();
+        for malformed in [
+            format!(" {json}"),
+            format!("{json}\n"),
+            json.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
+            json.replacen("\"version\":1", "\"version\":1,\"future\":true", 1),
+            json.replace(",\"invalidReason\":null", ""),
+            json.replace(",\"baseline\":\"sha256:", ",\"baseline\":\"SHA256:"),
+            json.replace("\"dirtyChunks\":2", "\"dirtyChunks\":2.0"),
+            "[]".to_owned(),
+        ] {
+            assert!(
+                DiskTrackingReceipt::decode(malformed.as_bytes()).is_err(),
+                "{malformed}"
+            );
+        }
+        assert!(DiskTrackingReceipt::decode(&vec![b' '; MAX_DISK_TRACKING_BYTES + 1]).is_err());
+        let mut unknown = receipt.clone();
+        unknown.seed.baseline = None;
+        assert!(unknown.validate().is_err());
+        for reason in [
+            DiskTrackingInvalidReason::NeverArmed,
+            DiskTrackingInvalidReason::Lost,
+            DiskTrackingInvalidReason::Overflow,
+            DiskTrackingInvalidReason::OutOfDeviceMutationSuspected,
+        ] {
+            unknown.invalid_reason = Some(reason);
+            assert_eq!(
+                DiskTrackingReceipt::decode(&unknown.canonical_bytes().unwrap()).unwrap(),
+                unknown
+            );
+        }
+    }
+
+    #[test]
+    fn disk_tracking_contract_checks_ranges_counts_and_binding() {
+        for mutation in 0..21 {
+            let mut value = tracking_receipt();
+            match mutation {
+                0 => value.version += 1,
+                1 => value.seed.version += 1,
+                2 => value.seed.file_inode = 0,
+                3 => value.seed.length = 0,
+                4 => value.seed.length = MAX_STREAM_BYTES + 512,
+                5 => value.seed.chunk_size /= 2,
+                6 => value.token.epoch = machine(),
+                7 => value.token.generation = 0,
+                8 => value.token.pause_generation = 0,
+                9 => value.token.file_inode += 1,
+                10 => value.total_chunks += 1,
+                11 => value.dirty_chunks += 1,
+                12 => value.runs[0].chunk_count = 0,
+                13 => value.runs[0].first_chunk = u64::MAX,
+                14 => value.runs[0].chunk_count = 3,
+                15 => {
+                    value.runs = vec![
+                        DiskDirtyRun {
+                            first_chunk: 0,
+                            chunk_count: 1,
+                        },
+                        DiskDirtyRun {
+                            first_chunk: 1,
+                            chunk_count: 1,
+                        },
+                    ];
+                }
+                16 => value.runs.push(value.runs[0]),
+                17 => value.seed.attachment_index = 16,
+                18 => value.seed.role = DiskRole::RootLower,
+                19 => value.seed.length += 1,
+                _ => value.token.file_device += 1,
+            }
+            assert!(value.validate().is_err(), "mutation {mutation}");
+        }
+        let mut empty = tracking_receipt();
+        empty.runs.clear();
+        empty.dirty_chunks = 0;
+        empty.validate().unwrap();
+        let mut maximum = empty;
+        maximum.seed.length = MAX_STREAM_BYTES;
+        maximum.total_chunks = MAX_STREAM_BYTES / STREAM_CHUNK_BYTES;
+        maximum.runs = vec![DiskDirtyRun {
+            first_chunk: maximum.total_chunks - 1,
+            chunk_count: 1,
+        }];
+        maximum.dirty_chunks = 1;
+        maximum.validate().unwrap();
+    }
+
+    #[test]
+    fn disk_tracking_settlement_is_closed_and_independent() {
+        let receipt = tracking_receipt();
+        for settlement in [
+            DiskGenerationSettlement::Commit {
+                baseline: Sha256Digest::of_bytes(b"new"),
+            },
+            DiskGenerationSettlement::Abort,
+        ] {
+            let value = DiskTrackingSettlement {
+                version: DISK_TRACKING_VERSION,
+                block_id: receipt.seed.block_id.clone(),
+                token: receipt.token.clone(),
+                settlement,
+            };
+            let bytes = value.canonical_bytes().unwrap();
+            assert_eq!(DiskTrackingSettlement::decode(&bytes).unwrap(), value);
+            let mut bad = value;
+            bad.version += 1;
+            assert!(bad.validate().is_err());
+            let json = String::from_utf8(bytes).unwrap();
+            assert!(DiskTrackingSettlement::decode(
+                json.replace("\"outcome\":", "\"extra\":1,\"outcome\":")
+                    .as_bytes()
+            )
+            .is_err());
+        }
+    }
 
     fn id(value: &str) -> LiveId {
         LiveId::parse(value).unwrap()

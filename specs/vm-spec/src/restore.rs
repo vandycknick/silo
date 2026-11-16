@@ -21,6 +21,85 @@ pub const RESTORE_RNG_ID: &str = "rng";
 pub const RESTORE_BALLOON_ID: &str = "balloon";
 pub const RESTORE_GENERATION_ID: &str = "silo-vmgenid";
 
+/// Destination-only seeds, rebound after authenticated private cloning/copying.
+/// Neither source dirty bits nor source tracking epochs are restored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RestoreDiskTrackingSeeds {
+    pub version: u32,
+    pub seeds: Vec<crate::capture::DiskTrackingSeed>,
+}
+
+impl RestoreDiskTrackingSeeds {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != crate::capture::DISK_TRACKING_VERSION || self.seeds.len() > 256 {
+            return Err("restore disk seeds version or count is invalid".into());
+        }
+        let mut inodes = BTreeSet::new();
+        let mut epochs = BTreeSet::new();
+        let mut blocks = BTreeSet::new();
+        let mut previous = None;
+        for seed in &self.seeds {
+            seed.validate()?;
+            if seed.baseline.is_none()
+                || !inodes.insert((seed.file_device, seed.file_inode))
+                || !epochs.insert(seed.epoch.clone())
+                || !blocks.insert(seed.block_id.clone())
+                || previous.is_some_and(|index| seed.attachment_index <= index)
+            {
+                return Err(
+                    "restore disk seeds lack unique authenticated destination bindings".into(),
+                );
+            }
+            previous = Some(seed.attachment_index);
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_configuration(
+        &self,
+        configuration: &CaptureConfiguration,
+    ) -> Result<(), String> {
+        self.validate()?;
+        configuration.validate()?;
+        let mut seeds = self.seeds.iter();
+        for (index, attachment) in configuration.attachments.iter().enumerate() {
+            if attachment.read_only {
+                continue;
+            }
+            let seed = seeds.next().ok_or("restore disk seed is missing")?;
+            if seed.attachment_index as usize != index
+                || seed.block_id != attachment.block_id
+                || seed.role != attachment.role
+                || seed.length != attachment.geometry.length
+                || attachment.format != crate::DiskFormat::Raw
+            {
+                return Err("restore disk seed differs from destination attachment".into());
+            }
+        }
+        if seeds.next().is_some() {
+            return Err("restore disk seed has no writable destination attachment".into());
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > crate::capture::MAX_DISK_TRACKING_BYTES {
+            return Err("restore disk seeds exceed their bound".into());
+        }
+        let value: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if value.canonical_bytes()? != bytes {
+            return Err("restore disk seed bytes are not canonical".into());
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestoreObjectRole {
@@ -635,6 +714,82 @@ mod tests {
     use crate::restore::{
         RestoreInspectionFailure, RestorePortabilityRefusal, RESTORE_INSPECTION_VERSION,
     };
+
+    #[test]
+    fn restore_disk_tracking_seeds_bind_every_destination_and_decode_strictly() {
+        use crate::capture::{
+            CaptureAttachment, CaptureConfiguration, DiskTrackingSeed, DISK_TRACKING_VERSION,
+            STREAM_CHUNK_BYTES,
+        };
+        use crate::lifecycle::LiveId;
+        use crate::restore::RestoreDiskTrackingSeeds;
+        use crate::{BlockId, DiskFormat, DiskGeometry, DiskRole};
+        let seed = DiskTrackingSeed {
+            version: DISK_TRACKING_VERSION,
+            role: DiskRole::Root,
+            attachment_index: 0,
+            block_id: BlockId::new("root").unwrap(),
+            file_device: 5,
+            file_inode: 7,
+            length: STREAM_CHUNK_BYTES + 512,
+            chunk_size: STREAM_CHUNK_BYTES,
+            epoch: LiveId::parse("11111111-1111-4111-8111-111111111111").unwrap(),
+            baseline: Some(Sha256Digest::of_bytes(b"authenticated destination")),
+        };
+        let configuration = CaptureConfiguration {
+            guest_os: None,
+            cpus: 1,
+            memory_mib: 512,
+            nested_virtualization: false,
+            rosetta: false,
+            kernel_cmdline: Vec::new(),
+            vsock: true,
+            shares: Vec::new(),
+            attachments: vec![CaptureAttachment {
+                block_id: seed.block_id.clone(),
+                role: seed.role,
+                format: DiskFormat::Raw,
+                geometry: DiskGeometry {
+                    length: seed.length,
+                    logical_sector_size: 512,
+                },
+                read_only: false,
+            }],
+        };
+        let seeds = RestoreDiskTrackingSeeds {
+            version: DISK_TRACKING_VERSION,
+            seeds: vec![seed],
+        };
+        seeds
+            .validate_against_configuration(&configuration)
+            .unwrap();
+        let bytes = seeds.canonical_bytes().unwrap();
+        assert_eq!(RestoreDiskTrackingSeeds::decode(&bytes).unwrap(), seeds);
+        let json = String::from_utf8(bytes).unwrap();
+        for invalid in [
+            format!("{json}\n"),
+            json.replacen("\"version\":1", "\"version\":1,\"unexpected\":0", 1),
+        ] {
+            assert!(RestoreDiskTrackingSeeds::decode(invalid.as_bytes()).is_err());
+        }
+        for mutation in 0..8 {
+            let mut bad = seeds.clone();
+            match mutation {
+                0 => bad.seeds.clear(),
+                1 => bad.seeds[0].baseline = None,
+                2 => bad.seeds[0].attachment_index += 1,
+                3 => bad.seeds[0].block_id = BlockId::new("other").unwrap(),
+                4 => bad.seeds[0].role = DiskRole::Data,
+                5 => bad.seeds[0].length += 512,
+                6 => bad.seeds.push(bad.seeds[0].clone()),
+                _ => bad.version += 1,
+            }
+            assert!(
+                bad.validate_against_configuration(&configuration).is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
 
     #[test]
     fn portability_refusals_keep_exact_pin_and_bounded_complete_identity() {
