@@ -5,11 +5,12 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from silo_smoke import capture, fork, incremental, overlay, pause, procs, reclaim, restore, shutdown, stopped
+from silo_smoke import contained_init as contained
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO
 
@@ -351,3 +352,76 @@ def test_capture_dirty_union_and_coverage_recovery(
                     controller.kill()
                     controller.wait(timeout=5)
             controller.stdin.close()
+
+
+def test_three_live_disk_write_snapshots_restore_every_cut(
+    silo: Silo, incremental_image: str,
+) -> None:
+    create(silo, incremental_image)
+    expected: list[str] = []
+    for index in range(3):
+        path = f"/root/tracked-{index}"
+        silo.exec(SOURCE, "sh", "-eu", "-c",
+                  f"dd if=/dev/urandom of={path} bs=1M count=8; sync", user="root")
+        expected.append(silo.exec(SOURCE, "sha256sum", path, user="root").stdout)
+        saved = restore.checkpoint(silo, SOURCE, alias=f"tracked-cut-{index}")
+        silo.run("snapshot", "verify", saved.reference, timeout=240)
+        silo.run("resume", SOURCE)
+        child = f"tracked-child-{index}"
+        restore.restore_child(silo, saved, child)
+        for previous in range(index + 1):
+            actual = silo.exec(child, "sha256sum", f"/root/tracked-{previous}", user="root")
+            assert actual.stdout == expected[previous]
+        silo.exec(child, "test", "!", "-e", f"/root/tracked-{index + 1}", user="root")
+        silo.exec(child, "sh", "-eu", "-c",
+                  "printf 'child writes work\\n' >/root/restore-writable; sync", user="root")
+        stopped.stop(silo, child, require_clean=False)
+
+
+@pytest.mark.usefixtures("pulled_images")
+@pytest.mark.parametrize("hold_commit", [False, True], ids=["early-ready", "transient-bind"])
+def test_early_systemd_machine_id_restore_and_reboot(silo: Silo, hold_commit: bool) -> None:
+    silo.create(SOURCE, contained.ARCH, "--cpus", "2", "--memory", "2gib",
+                "--disk-size", "2gib", "--vsock", "--network", "none")
+    silo.start(SOURCE)
+    silo.wait_ready(SOURCE)
+    if hold_commit:
+        # Keep a real first-boot transient mount alive, independent of host speed.
+        # The next boot and its systemd setup/commit code are otherwise stock.
+        contained.wait_shell(silo, SOURCE, 'test "$(systemctl is-system-running)" = running')
+        contained.shell(silo, SOURCE, "systemctl mask systemd-machine-id-commit.service; "
+                        "printf 'uninitialized\\n' >/etc/machine-id; sync")
+        silo.stop(SOURCE)
+        silo.start(SOURCE)
+        silo.wait_ready(SOURCE)
+        source_id = contained.wait_shell(
+            silo, SOURCE,
+            'test "$(stat -c %d:%i /etc/machine-id)" = "$(stat -c %d:%i /run/machine-id)"; '
+            'findmnt -rn -M /etc/machine-id -o VFS-OPTIONS | grep -qw ro; cat /etc/machine-id',
+        ).strip()
+    else:
+        # Do not wait for systemd's boot targets, as the ordinary init smoke does.
+        source_id = contained.wait_shell(
+            silo, SOURCE, "test -s /etc/machine-id; cat /etc/machine-id",
+        ).strip()
+    saved = restore.checkpoint(silo, SOURCE, alias="early-systemd")
+    silo.run("resume", SOURCE)
+    child = "early-systemd-child"
+    info = restore.restore_child(silo, saved, child)
+    child_id = contained.shell(silo, child, "cat /etc/machine-id").strip()
+    assert child_id == UUID(info["id"]).hex and child_id != source_id
+    if hold_commit:
+        assert contained.shell(silo, child, "cat /run/machine-id").strip() == child_id
+        contained.shell(silo, child, "systemctl unmask systemd-machine-id-commit.service")
+    # A reboot before first-boot commit has ordinary uninitialized-image semantics.
+    # Check persistence only after the real commit unit has finished.
+    contained.wait_shell(silo, child, 'test "$(systemctl is-system-running)" = running')
+    contained.shell(silo, child, "systemctl start systemd-machine-id-commit.service; "
+                    "! mountpoint -q /etc/machine-id; "
+                    "printf 'writable\\n' >/root/restore-writable; sync")
+    assert contained.shell(silo, child, "cat /etc/machine-id").strip() == child_id
+    silo.stop(child)
+    silo.start(child)
+    silo.wait_ready(child)
+    assert contained.shell(silo, child, "cat /etc/machine-id").strip() == child_id
+    assert contained.shell(silo, child, "cat /root/restore-writable") == "writable\n"
