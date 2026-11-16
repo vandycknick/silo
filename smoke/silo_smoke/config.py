@@ -86,7 +86,7 @@ def resolve(pytestconfig: pytest.Config) -> SmokeConfig:
     keep = pytestconfig.getoption("--keep")
     return SmokeConfig(
         bin_dir=_path(pytestconfig, "--silo-bin-dir", "SILO_SMOKE_BIN_DIR", bin_dir()),
-        runtime_dir=_path(pytestconfig, "--silo-runtime-dir", "SILO_SMOKE_RUNTIME_DIR", target_dir() / "silo-runtime" / runtime_target() / os.environ.get("PROFILE", "debug")),
+        runtime_dir=_path(pytestconfig, "--silo-runtime-dir", "SILO_SMOKE_RUNTIME_DIR", target_dir() / "silo-runtime" / runtime_target() / os.environ.get("PROFILE", "release")),
         backend=backend,
         cache_dir=_path(pytestconfig, "--cache-dir", "SILO_SMOKE_CACHE", Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "silo-smoke"),
         keep=bool(keep) if keep is not None else os.environ.get("SILO_SMOKE_KEEP") == "1",

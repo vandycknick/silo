@@ -97,7 +97,7 @@ with `enter the perf shell: nix develop .#perf` when absent, never downloading i
 Budget cohorts run serially and stage their matching runtime automatically:
 
 ```sh
-make perf PROFILE=release PERF_ARGS='tests/test_ingest_budget.py'
+make perf PERF_ARGS='tests/test_ingest_budget.py'
 ```
 
 Evidence is written under `$SILO_SMOKE_BUDGET_EVIDENCE/ingest-<stamp>/`:
@@ -118,7 +118,7 @@ The reference-host record includes the staged monitor SHA-256/build identity,
 kernel/config and remaining runtime inputs. Debug failures do not qualify release.
 
 ```sh
-make perf PROFILE=release PERF_ARGS='tests/test_fork_budget.py'
+make perf PERF_ARGS='tests/test_fork_budget.py'
 ```
 
 All five measurement cohorts run when this module is selected.
@@ -339,9 +339,8 @@ proof, fixture proof and timings in each sample. A median equal to its target
 passes. For example:
 
 ```sh
-make perf PROFILE=release PERF_ARGS='tests/test_fork_budget.py -k test_fork_budget_incremental_ten_percent_dirty'
-make perf PROFILE=release PERF_ARGS='tests/test_fork_budget.py -k test_fork_budget_warm_create_stopped_machine'
-make perf PROFILE=release PERF_ARGS='tests/test_fork_budget.py -k test_fork_budget_boot_layered_within_raw'
-uv run --project perf pytest perf/tests/test_fork_budget.py -n 0 \
-  -k 'copy_allowance or reflink_probe or budget_gate'
+make perf PERF_ARGS='tests/test_fork_budget.py -k test_fork_budget_incremental_ten_percent_dirty'
+make perf PERF_ARGS='tests/test_fork_budget.py -k test_fork_budget_warm_create_stopped_machine'
+make perf PERF_ARGS='tests/test_fork_budget.py -k test_fork_budget_boot_layered_within_raw'
+make perf PERF_ARGS="tests/test_fork_budget.py -k 'copy_allowance or reflink_probe or budget_gate'"
 ```

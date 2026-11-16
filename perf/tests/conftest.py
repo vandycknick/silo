@@ -1,6 +1,8 @@
 """Reuse the smoke fixtures, without smoke's autouse real-VM guard for unit tests."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from smoke.tests.conftest import (
@@ -27,4 +29,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     if getattr(config.option, "numprocesses", None) not in (None, 0) or hasattr(config, "workerinput"):
         raise pytest.UsageError("perf must run serially, without xdist")
+    if os.environ.get("PROFILE") != "release":
+        raise pytest.UsageError("perf measures only fresh release builds; run it through `make perf`")
     configure_smoke(config)

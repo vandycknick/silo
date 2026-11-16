@@ -2,8 +2,8 @@
 
 ```sh
 make perf
-make perf PROFILE=release PERF_COHORTS=arch-30g
-make perf PROFILE=release PERF_SYSTEMS=silo,msb PERF_COHORTS=alpine-30g
+make perf PERF_COHORTS=arch-30g
+make perf PERF_SYSTEMS=silo,msb PERF_COHORTS=alpine-30g
 make perf PERF_COHORTS=disk-invariance PERF_SAMPLES=5 PERF_ARGS='--keep'
 make perf PERF_COHORTS=arch-30g-busy,alpine-8g-busy,alpine-2g-raw
 ```
@@ -13,8 +13,10 @@ its kernel shell. It then reuses `smoke-prereqs`, including `smoke-kernel`, stag
 runtime, authenticated kernel configuration and matching-profile helpers. No
 manual VM image, runtime, kernel, workspace or private Home setup is required.
 The smoke harness is an editable uv path dependency, not a copied harness.
-`PROFILE` has the same default as the rest of the repository (debug); use release
-for qualification. Public image acquisition needs internet and KVM/HVF must be
+Performance is measured only on release binaries: `make perf` always stages a
+fresh release build first and ignores `PROFILE` and `SMOKE_PROFILE`, and the
+suite refuses to start outside that path. Never point it at an existing build
+by hand. Public image acquisition needs internet and KVM/HVF must be
 available to the ordinary user. Keep the host idle and use durable disk storage.
 
 All tools are supplied by `nix/perfShell.nix`, including uv, Python 3.12, build
@@ -292,8 +294,8 @@ The optional ingest lane resolves Nix's `registry` from PATH and skips with the
 perf-shell command when absent, never downloading a tool itself.
 
 ```sh
-make perf PROFILE=release PERF_ARGS='tests/test_fork_budget.py'
-make perf PROFILE=release PERF_ARGS='tests/test_ingest_budget.py'
+make perf PERF_ARGS='tests/test_fork_budget.py'
+make perf PERF_ARGS='tests/test_ingest_budget.py'
 ```
 
 Explicit test paths in `PERF_ARGS` replace default scenario collection.
