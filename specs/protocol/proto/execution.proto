@@ -38,6 +38,9 @@ message ExecutionAccepted {}
 
 message ExecutionStarted {}
 
+// Stop producing stdin without cancelling the command or its output stream.
+message ExecutionStdinClosed {}
+
 message ExecutionStdout {
   bytes data = 1;
 }
@@ -90,5 +93,6 @@ message ExecutionEvent {
     ExecutionSignaled signaled = 8;
     ExecutionLaunchFailed launch_failed = 9;
     ExecutionLost lost = 10;
+    ExecutionStdinClosed stdin_closed = 11;
   }
 }
