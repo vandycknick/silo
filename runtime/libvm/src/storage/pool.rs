@@ -931,9 +931,38 @@ impl StoragePool {
         ))
     }
 
-    pub(crate) fn qualify_sealed_clone(&self, input: &File) -> Result<bool, StorageError> {
-        let (_staging, file) = self.stage()?;
-        try_clone_stream(input, &file)
+    /// Qualify one staging-filesystem/pool pair using bounded anonymous files.
+    /// Probe bytes and namespace entries are never publication authority and
+    /// need no durability. Actual streams still enforce CloneRequired.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn qualify_capture_clone(
+        &self,
+        source: &OwnedDirectory,
+    ) -> Result<bool, StorageError> {
+        use std::os::unix::fs::FileExt;
+        if fstat(source.fd())?.st_dev != fstat(self.temporary.fd())?.st_dev {
+            return Ok(false);
+        }
+        let probe = |directory: &OwnedDirectory| -> Result<File, StorageError> {
+            Ok(File::from(openat(
+                directory.fd(),
+                ".",
+                OFlag::O_TMPFILE | OFlag::O_RDWR | OFlag::O_CLOEXEC,
+                Mode::S_IRUSR | Mode::S_IWUSR,
+            )?))
+        };
+        let input = probe(source)?;
+        let output = probe(&self.temporary)?;
+        input.write_all_at(&[0x51; 4096], 0)?;
+        try_clone_stream(&input, &output)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn qualify_capture_clone(
+        &self,
+        _source: &OwnedDirectory,
+    ) -> Result<bool, StorageError> {
+        Ok(false)
     }
 
     /// Publish a closed, owned producer's sealed stream and canonical map.
@@ -2524,7 +2553,8 @@ mod tests {
         let map = crate::storage::stream::StreamHasher::new()
             .hash_reader(bytes.as_slice())
             .unwrap();
-        let qualified = pool.qualify_sealed_clone(&source).unwrap();
+        let probe = tempfile::tempfile_in(pool.temporary.path()).unwrap();
+        let qualified = crate::storage::pool::try_clone_stream(&source, &probe).unwrap();
         let result = pool.publish_sealed_stream_for_catalog(
             &source,
             &map,
@@ -2550,5 +2580,46 @@ mod tests {
                 .unwrap();
             assert_eq!(publication.map(), &map);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_clone_qualification_does_not_touch_payloads_or_create_durable_staging() {
+        use crate::store::snapshot_store::tests::{observed_stream_read, watch_stream_reads};
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let temporary = ram_tempdir();
+        let source =
+            crate::paths::OwnedDirectory::open_root(&temporary.path().join("capture")).unwrap();
+        source.write_file("memory.ram", &[0x71; 4096]).unwrap();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let payload = watch_stream_reads(&source.path().join("memory.ram"));
+        let stages = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).unwrap();
+        stages
+            .add_watch(pool.temporary.path(), AddWatchFlags::IN_CREATE)
+            .unwrap();
+        stages
+            .add_watch(pool.publication.path(), AddWatchFlags::IN_CREATE)
+            .unwrap();
+        let _supported = pool.qualify_capture_clone(&source).unwrap_or(false);
+        assert!(!observed_stream_read(&payload));
+        // Anonymous O_TMPFILE events, if exposed by the filesystem, are not
+        // named stage directories or stable publication lock files.
+        match stages.read_events() {
+            Ok(events) => assert!(events.iter().all(|event| {
+                event
+                    .name
+                    .as_ref()
+                    .is_none_or(|name| !name.as_encoded_bytes().starts_with(b"stage-"))
+            })),
+            Err(error) => assert_eq!(error, nix::errno::Errno::EAGAIN),
+        }
+        assert!(std::fs::read_dir(pool.temporary.path())
+            .unwrap()
+            .next()
+            .is_none());
+        assert!(std::fs::read_dir(pool.publication.path())
+            .unwrap()
+            .next()
+            .is_none());
     }
 }
