@@ -152,14 +152,14 @@ The payload is written and synced outside timing on each fresh source.
 
 `targets.toml` is the sole Phase 30 gate configuration, keyed by
 system/cohort/mode/metric. The approved Arch image-init targets are start and
-create 1 s, first/repeated restore 0.5 s, first fork 2 s, second fork 1.25 s,
+create 1 s, first restore 0.75 s, repeated restore 0.5 s, first fork 2 s, second fork 1.25 s,
 full snapshot 3 s, incremental snapshot 1.5 s, run-to-exit 2 s and every
 first-exec round trip 0.1 s. `exec` is the shared target for the separately
 reported `*_exec` metrics.
 
 A median at or below its target reports PASS; above target through
 `target * (1 + tolerance)`, inclusive, it reports `PASS (within 10%)` with the
-default tolerance, so restore at 0.504 s against 0.5 s is accepted.
+default tolerance, so a repeated restore at 0.504 s against 0.5 s is accepted.
 Above that bound it reports FAIL, or NOT YET when `expected_fail = true`, and
 only FAIL fails the target gate.
 Change the top-level `tolerance = 0.10` in `targets.toml` to adjust the default,

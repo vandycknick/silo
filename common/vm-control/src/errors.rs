@@ -154,6 +154,15 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = message.clone();
             tonic::Code::FailedPrecondition
         }
+        E::CaptureRemovalDependency {
+            capture_id,
+            dependency,
+        } => {
+            d.kind = 4;
+            d.reference = Some(capture_id.to_string());
+            d.safe_message = dependency.clone();
+            tonic::Code::FailedPrecondition
+        }
         E::LiveFork {
             operation_id,
             message,
@@ -637,6 +646,16 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
                 E::LiveCapture {
                     capture_id: required(d.reference, "error.reference")?,
                     message: d.safe_message,
+                }
+            }
+            "CaptureRemovalDependency"
+                if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 =>
+            {
+                E::CaptureRemovalDependency {
+                    capture_id: required(d.reference, "error.reference")?
+                        .parse()
+                        .map_err(|_| invalid("error.reference", "invalid capture identity"))?,
+                    dependency: d.safe_message,
                 }
             }
             "LiveFork" if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
@@ -1295,5 +1314,36 @@ mod tests {
             status_to_native_error(&status(detail, tonic::Code::InvalidArgument)).is_err(),
             "container only belongs to unsupported-container failures"
         );
+    }
+
+    #[test]
+    fn capture_removal_dependencies_round_trip_as_failed_preconditions() {
+        let capture_id = uuid::Uuid::new_v4();
+        let dependency = "fork child machine fork-first using local cut sha256:1234";
+        let error = libvm::LibVmError::CaptureRemovalDependency {
+            capture_id,
+            dependency: dependency.into(),
+        };
+        let encoded = native_error_to_status(&error);
+        assert_eq!(encoded.code(), tonic::Code::FailedPrecondition);
+        assert!(encoded.message().contains("fork-first"));
+        assert!(matches!(
+            status_to_native_error(&encoded).unwrap(),
+            libvm::LibVmError::CaptureRemovalDependency {
+                capture_id: actual,
+                dependency: actual_dependency,
+            } if actual == capture_id && actual_dependency == dependency
+        ));
+        let mut detail = crate::errors::status_error_detail(&encoded)
+            .unwrap()
+            .unwrap();
+        detail.reference = Some("not-a-capture".into());
+        assert!(status_to_native_error(&status(detail, tonic::Code::FailedPrecondition,)).is_err());
+        let contradictory = tonic::Status::with_details(
+            tonic::Code::Internal,
+            encoded.message(),
+            encoded.details().to_vec().into(),
+        );
+        assert!(status_to_native_error(&contradictory).is_err());
     }
 }

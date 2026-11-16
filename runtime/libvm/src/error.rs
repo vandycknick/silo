@@ -132,6 +132,12 @@ pub enum LibVmError {
     #[error("image removal would invalidate machine {machine} dependency {path}")]
     CacheDependency { machine: String, path: PathBuf },
 
+    #[error("cannot remove capture {capture_id}: {dependency}")]
+    CaptureRemovalDependency {
+        capture_id: uuid::Uuid,
+        dependency: String,
+    },
+
     /// The SQL commit remains available for idempotent command replay.
     #[error("catalog transaction committed but is not yet confirmed power-loss durable after 5 seconds; retrying the command is safe")]
     DurabilityPending,
@@ -425,6 +431,7 @@ impl LibVmError {
             Self::Task(_) => "Task",
             Self::InvalidStorageRecord { .. } => "InvalidStorageRecord",
             Self::CacheDependency { .. } => "CacheDependency",
+            Self::CaptureRemovalDependency { .. } => "CaptureRemovalDependency",
             Self::DurabilityPending => "DurabilityPending",
             Self::StateDatabaseIncompatible { .. } => "StateDatabaseIncompatible",
             Self::SecretResolution { .. } => "SecretResolution",

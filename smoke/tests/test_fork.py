@@ -418,6 +418,54 @@ def test_fork_children_outlive_source_deletion_and_gc_then_recapture(
     stopped.stop(silo, "fork-recaptured-child", require_clean=False)
 
 
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
+@pytest.mark.parametrize("order", ["child-first", "source-first"])
+def test_force_remove_fork_lineage_preserves_survivors_and_published_snapshot(
+    silo: Silo, restore_image: str, profile: RootProfile, order: str,
+) -> None:
+    source, child, grandchild, restored = "force-source", "force-child", "force-grandchild", "force-restored"
+    restore.create_source(silo, restore_image, profile=profile, name=source)
+    mark(silo, source, "source-cut")
+    initial = restore.start_witness(silo, source)
+    first = fork.run(silo, source, [child], expect=0)
+    assert first.result is not None and fork.outcomes(first.result) == ["running"]
+    silo.wait_ready(child)
+    mark(silo, child, "child-cut")
+    second = fork.run(silo, child, [grandchild], expect=0)
+    assert second.result is not None and fork.outcomes(second.result) == ["running"]
+    silo.wait_ready(grandchild)
+    saved = restore.checkpoint(silo, child, alias="force-lineage-snapshot")
+    restore.restore_child(silo, saved, restored)
+    silo.run("resume", child)
+    expected = {source: "source-cut", child: "child-cut", grandchild: "child-cut", restored: "child-cut"}
+    identities = {name: silo.info(name)["id"] for name in expected}
+    names = ([grandchild, restored, child, source] if order == "child-first"
+             else [source, child, grandchild, restored])
+    for name in names:
+        silo.run("rm", "--force", name, timeout=180)
+        assert not (silo.ws.silo_home / "machines" / UUID(identities[name]).hex).exists()
+        del expected[name]
+        assert {entry["name"] for entry in silo.ls()} == set(expected)
+        for survivor, value in expected.items():
+            assert marker(silo, survivor) == value
+            restore.advances(silo, survivor, restore.witness(silo, survivor))
+    # A checkpoint's independent pool roots survive every originating machine.
+    restore.restore_child(silo, saved, "force-after-lineage")
+    assert marker(silo, "force-after-lineage") == "child-cut"
+    restore.advances(silo, "force-after-lineage", initial)
+    silo.run("rm", "--force", "force-after-lineage", timeout=180)
+    silo.run("image", "remove", "image:force-lineage-snapshot")
+    silo.run("snapshot", "remove", saved.reference)
+    gone_after_prune(silo, first.operation, second.operation)
+    assert silo.ls() == []
+    for table in ("storage_operation", "capture_resource_reservation", "restore_resource_reservation",
+                  "storage_operation_stream", "storage_operation_object", "storage_operation_layer",
+                  "storage_operation_lower", "storage_operation_cut", "local_cut"):
+        assert procs.query(silo.ws.state_db(), f"SELECT count(*) FROM {table}") == [("0",)], table
+    assert not list((silo.ws.silo_home / "images/tmp").iterdir()), "capture or fork staging leaked"
+    fork.assert_no_orphans(silo, [])
+
+
 # -- pre-freeze refusal -----------------------------------------------------------
 
 def capture_dirs(silo: Silo, machine_id: str) -> set[str]:

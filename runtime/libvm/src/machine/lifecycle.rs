@@ -880,6 +880,15 @@ impl Machine {
             Some(store) => {
                 if discard_captures {
                     store.discard_machine_captures(config.id).await?;
+                    // Only independently owned snapshots and relocated local
+                    // cuts remain. Settle their ended-source continuation and
+                    // release without publishing discarded staging.
+                    crate::machine::live_capture::reconcile_captures(
+                        runtime,
+                        Some(config.id),
+                        crate::storage::pool::PublicationLockPolicy::Defer,
+                    )
+                    .await?;
                 }
                 crate::SnapshotStore::from_store(std::sync::Arc::new(store))
                     .machine_capture_retained(config.id)
