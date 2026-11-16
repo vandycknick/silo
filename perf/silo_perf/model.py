@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import tomllib
 from typing import Mapping
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -17,6 +18,37 @@ class Mode(StrEnum):
 
 
 @dataclass(frozen=True)
+class Workload:
+    memory_mib: int
+    disk_mib: int
+    disk_files: int
+    small_files: int
+    dirty_percent: int
+    dirty_chunk_kib: int
+    seed: int
+
+    def __post_init__(self) -> None:
+        for name in ("memory_mib", "disk_mib", "disk_files", "small_files",
+                     "dirty_percent", "dirty_chunk_kib", "seed"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"workload {name} must be a positive integer")
+        if self.dirty_percent > 100:
+            raise ValueError("workload dirty_percent must be at most 100")
+        if self.disk_mib % self.disk_files:
+            raise ValueError("workload disk_mib must be divisible by disk_files")
+        if self.dirty_chunk_kib % 4 or self.memory_mib * 1024 % self.dirty_chunk_kib:
+            raise ValueError("workload dirty chunks must be page aligned and divide memory")
+        if self.memory_mib * 1024 // self.dirty_chunk_kib * self.dirty_percent // 100 == 0:
+            raise ValueError("workload must dirty at least one chunk")
+
+    @property
+    def tmpfs_mib(self) -> int:
+        dirty_mib = (self.memory_mib * self.dirty_percent + 99) // 100
+        return self.memory_mib + max(self.disk_mib, dirty_mib) + 256
+
+
+@dataclass(frozen=True)
 class Cohort:
     name: str
     image: str
@@ -25,15 +57,29 @@ class Cohort:
     disks: tuple[str, ...] = ("",)
     msb_image: str | None = None
     written_mib: int = 0
-    noise_relative: float = 0.30
-    noise_absolute_seconds: float = 0.10
+    noise_relative: float = 0.10
+    noise_absolute_seconds: float = 0.05
+    informational: bool = False
+    raw_root: bool = False
+    workload: Workload | None = None
+
+    def __post_init__(self) -> None:
+        if self.workload is not None and self.workload.tmpfs_mib >= self.memory_gib * 1024:
+            raise ValueError("workload tmpfs must leave guest memory available")
+        if self.raw_root and self.msb_image is not None:
+            raise ValueError("raw-root cohorts are Silo only")
 
 
 def load_cohorts(path: Path = ROOT / "cohorts.toml") -> dict[str, Cohort]:
     with path.open("rb") as stream:
         data = tomllib.load(stream)
-    return {name: Cohort(name=name, **{**values, "disks": tuple(values.get("disks", [""]))})
-            for name, values in data.items()}
+    cohorts: dict[str, Cohort] = {}
+    for name, values in data.items():
+        values["disks"] = tuple(values.get("disks", [""]))
+        if "workload" in values:
+            values["workload"] = Workload(**values["workload"])
+        cohorts[name] = Cohort(name=name, **values)
+    return cohorts
 
 
 class Verdict(StrEnum):
@@ -98,8 +144,16 @@ def target_for(targets: Mapping[TargetKey, Target], system: str, cohort: str,
     return targets.get((system, cohort, mode, target_metric))
 
 
+def image_source(reference: str) -> str:
+    if reference.startswith(("image:", "disk:")):
+        return "local"
+    hostname = urlsplit("//" + reference).hostname
+    return "local" if hostname in {"localhost", "127.0.0.1", "::1"} else "remote"
+
+
 def invariant(first: float, second: float, cohort: Cohort) -> bool:
     if not all(math.isfinite(value) and value >= 0 for value in (first, second)):
         raise ValueError("invariance medians must be finite and nonnegative")
-    return abs(first - second) <= max(cohort.noise_absolute_seconds,
-                                      cohort.noise_relative * min(first, second))
+    smaller = min(first, second)
+    return max(first, second) <= smaller + max(cohort.noise_absolute_seconds,
+                                               cohort.noise_relative * smaller)

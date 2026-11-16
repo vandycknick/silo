@@ -28,5 +28,44 @@ cpus = 2
 memory_gib = 2
 disks = ["30gib", "500gib"]
 written_mib = 64
-noise_relative = 0.30
-noise_absolute_seconds = 0.10
+noise_relative = 0.10
+noise_absolute_seconds = 0.05
+
+[arch-30g-busy]
+image = "ghcr.io/vandycknick/archlinux:20260831.150324"
+cpus = 10
+memory_gib = 30
+disks = ["100gb"]
+informational = true
+
+[arch-30g-busy.workload]
+memory_mib = 4096
+disk_mib = 512
+disk_files = 8
+small_files = 1024
+dirty_percent = 10
+dirty_chunk_kib = 256
+seed = 3001
+
+[alpine-8g-busy]
+image = "docker.io/library/alpine:latest"
+msb_image = "alpine"
+cpus = 2
+memory_gib = 8
+informational = true
+
+[alpine-8g-busy.workload]
+memory_mib = 2048
+disk_mib = 256
+disk_files = 8
+small_files = 512
+dirty_percent = 10
+dirty_chunk_kib = 256
+seed = 3002
+
+[alpine-2g-raw]
+image = "docker.io/library/alpine:latest"
+cpus = 2
+memory_gib = 2
+informational = true
+raw_root = true
