@@ -355,7 +355,9 @@ END;
 
 CREATE TABLE machine_storage (
     machine_id TEXT PRIMARY KEY NOT NULL REFERENCES machine_config(id) ON DELETE CASCADE,
-    record_json BLOB NOT NULL
+    record_json BLOB NOT NULL CHECK (
+        json_type(record_json, '$.diskBaselines') IS 'array'
+    )
 );
 CREATE TABLE machine_stream_dependency (
     machine_id TEXT NOT NULL REFERENCES machine_storage(machine_id) ON DELETE CASCADE,

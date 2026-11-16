@@ -126,16 +126,38 @@ def matched_cut(silo: Silo, directory: Path, disk: Path, counter: Counter,
     return proof
 
 
+def pending_cut(directory: Path) -> dict:
+    cut = json.loads((directory / "vm.capture-cut.json").read_bytes())
+    assert cut["phase"] == "identity-pending" and cut["disks"], cut
+    evidence = cut["evidence"]
+    assert evidence["captureOutcome"] == "coherent" and evidence["error"] is None, evidence
+    assert evidence["diskCopiesSealed"] is False, evidence
+    assert all(evidence[fact] is True for fact in (
+        "workloadsFrozen", "vcpusPaused", "devicesQuiesced", "hostWritersDrained",
+        "hostFlushCompleted", "memoryStateSealed")), evidence
+    assert not any(entry["role"].startswith("disks/") for entry in evidence["inventory"])
+    assert not (directory / "vm.capture.json").exists(), "pending disk identities were sealed early"
+    return evidence
+
+
+def completed_cut(cut: dict, seal: dict) -> None:
+    for field in ("captureId", "machineId", "runId", "pauseToken", "pauseDisposition", "freezeEpoch",
+                  "freezeOperationId", "configurationDigest", "requestDigest", "memory"):
+        assert seal[field] == cut[field], field
+    assert all(entry in seal["inventory"] for entry in cut["inventory"])
+
+
 def inventory(directory: Path) -> dict[str, stopped.Bytes]:
-    """Fingerprint all sealed files; only continuation may be added afterwards."""
+    """Fingerprint staged files without synthesizing producer identities."""
     return {str(path.relative_to(directory)): stopped.read_bytes(path)
             for path in sorted(directory.rglob("*")) if path.is_file()}
 
 
-def unchanged(silo: Silo, directory: Path, before: dict[str, stopped.Bytes]) -> None:
+def unchanged(silo: Silo, directory: Path, before: dict[str, stopped.Bytes],
+              *, added: set[str] | None = None) -> None:
     after = inventory(directory)
     assert set(before) <= set(after)
-    assert set(after) - set(before) <= {"vm.capture-source.json"}
+    assert set(after) - set(before) <= {"vm.capture-source.json"} | (added or set())
     for name, original in before.items():
         observed = after[name]
         # Read-only faults can allocate tmpfs holes without changing file bytes.

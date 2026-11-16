@@ -1115,6 +1115,8 @@ impl Harness {
                 block_id: vm_spec::BlockId::new("root").unwrap(),
                 length: self.root_disk_bytes,
                 copy: CaptureDiskCopy::Copy,
+                baseline_map: None,
+                tracking_eligible: true,
             }],
             read_only_inputs: Vec::new(),
             reservation: CaptureReservation {

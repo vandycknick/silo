@@ -310,6 +310,7 @@ mod tests {
                 },
                 lease: Arc::new(OwnedFd::from(lease)),
                 holder_path: directory.join("vm.storage-holder.json"),
+                disk_tracking_seeds: Vec::new(),
             };
             let mut builder = VmConfig::builder("retained").base_directory(&directory);
             for (index, read_only) in [false, false, true].into_iter().enumerate() {

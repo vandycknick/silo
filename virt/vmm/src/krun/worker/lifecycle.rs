@@ -273,6 +273,20 @@ pub(crate) trait NativeLifecycle: Send + Sync + 'static {
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<Vec<FlushedAttachment>, NativeFailure>;
+    fn freeze_disks(
+        &self,
+        token: &Self::Token,
+        capture: Uuid,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<Vec<vm_spec::capture::DiskTrackingReceipt>, NativeFailure>;
+    fn settle_disks(
+        &self,
+        capture: Uuid,
+        settlements: &[vm_spec::capture::DiskTrackingSettlement],
+        operation: &mut dyn FnMut() -> Result<NativeOperation, NativeFailure>,
+        deadline: Instant,
+    ) -> Result<(), NativeFailure>;
     #[allow(clippy::too_many_arguments)]
     fn capture_execution(
         &self,
@@ -709,6 +723,31 @@ impl<T, C> Journal<T, C> {
         self.advance();
         true
     }
+
+    fn disk_settlement_outcome(
+        &self,
+        capture: Uuid,
+        command: &LifecycleCommand,
+    ) -> Result<Option<CommandOutcome>, LifecycleRejection> {
+        let record = self
+            .captures
+            .get(&capture)
+            .ok_or(LifecycleRejection::UnknownCapture)?;
+        let Some(key) = record.disk_settlement else {
+            return Ok(None);
+        };
+        let entry = self
+            .commands
+            .get(&key)
+            .ok_or(LifecycleRejection::CaptureUnresolved)?;
+        if entry.command != *command {
+            return Err(LifecycleRejection::RequestConflict);
+        }
+        match &entry.state {
+            CommandState::Completed { outcome } => Ok(Some(outcome.clone())),
+            CommandState::Accepted => Err(LifecycleRejection::CapturePending),
+        }
+    }
 }
 
 /// Why the candidate-only IRQ probe was not admitted. Nothing native ran.
@@ -901,6 +940,7 @@ struct CaptureRecord<C> {
     execution: Option<(OutputReceipt, OutputReceipt)>,
     memory: Option<MemoryCapture>,
     accepted: bool,
+    disk_settlement: Option<CommandKey>,
 }
 
 #[derive(Default)]
@@ -1005,6 +1045,16 @@ enum Admission<T, C> {
     Flush {
         capture: Uuid,
         token: T,
+        deadline: Instant,
+    },
+    FreezeDisks {
+        capture: Uuid,
+        token: T,
+        deadline: Instant,
+    },
+    SettleDisks {
+        capture: Uuid,
+        settlements: Vec<vm_spec::capture::DiskTrackingSettlement>,
         deadline: Instant,
     },
     Execution {
@@ -1564,6 +1614,7 @@ impl<N: NativeLifecycle> Shared<N> {
                         execution: None,
                         memory: None,
                         accepted: false,
+                        disk_settlement: None,
                     },
                 );
                 Admitted::Settled(CommandOutcome::CapturePrepared {
@@ -1589,6 +1640,41 @@ impl<N: NativeLifecycle> Shared<N> {
                     token,
                     deadline: now + *timeout,
                 })
+            }
+            (
+                LifecycleCommand::FreezeCaptureDisks { operation, timeout },
+                LifecycleRights::None,
+            ) => {
+                if capture_record(&journal, *operation)?.progress != CaptureProgress::Flushed {
+                    return Err(LifecycleRejection::CaptureStage);
+                }
+                let (token, _) = self.capture_token(&journal, *operation)?;
+                journal.mutator = Some(sequence);
+                Admitted::Run(Admission::FreezeDisks {
+                    capture: *operation,
+                    token,
+                    deadline: now + *timeout,
+                })
+            }
+            (
+                LifecycleCommand::SettleCaptureDisks {
+                    operation,
+                    settlements,
+                    timeout,
+                },
+                LifecycleRights::None,
+            ) => {
+                if let Some(outcome) = journal.disk_settlement_outcome(*operation, &command)? {
+                    Admitted::Settled(outcome)
+                } else {
+                    capture_record_mut(&mut journal, *operation)?.disk_settlement = Some(key);
+                    journal.mutator = Some(sequence);
+                    Admitted::Run(Admission::SettleDisks {
+                        capture: *operation,
+                        settlements: settlements.clone(),
+                        deadline: now + *timeout,
+                    })
+                }
             }
             (LifecycleCommand::CaptureExecution { operation, timeout }, LifecycleRights::None) => {
                 if capture_record(&journal, *operation)?.progress != CaptureProgress::Flushed {
@@ -2232,6 +2318,41 @@ impl<N: NativeLifecycle> Shared<N> {
                         token,
                         deadline,
                     } => shared.run_flush(capture, token, deadline),
+                    Admission::FreezeDisks {
+                        capture,
+                        token,
+                        deadline,
+                    } => {
+                        match shared.native_operation().and_then(|operation| {
+                            shared
+                                .native
+                                .freeze_disks(&token, capture, operation, deadline)
+                        }) {
+                            Ok(receipts) => CommandOutcome::DiskGenerationsFrozen { receipts },
+                            Err(failure) => CommandOutcome::CaptureFailed {
+                                stage: CaptureStage::Flush,
+                                failure,
+                            },
+                        }
+                    }
+                    Admission::SettleDisks {
+                        capture,
+                        settlements,
+                        deadline,
+                    } => {
+                        match shared.native.settle_disks(
+                            capture,
+                            &settlements,
+                            &mut || shared.native_operation(),
+                            deadline,
+                        ) {
+                            Ok(()) => CommandOutcome::DiskGenerationsSettled,
+                            Err(failure) => CommandOutcome::CaptureFailed {
+                                stage: CaptureStage::Accept,
+                                failure,
+                            },
+                        }
+                    }
                     Admission::Execution {
                         capture,
                         token,
@@ -3940,6 +4061,7 @@ mod tests {
                 execution: Some((receipt(1), receipt(2))),
                 memory: None,
                 accepted: false,
+                disk_settlement: None,
             },
         );
         binding
@@ -4650,5 +4772,64 @@ mod tests {
         assert!(memory.valid_for(&preparation));
         memory.chunk_digests[1] = Some(Sha256Digest::of_bytes(b"unaffected"));
         assert!(!memory.valid_for(&preparation));
+    }
+
+    #[test]
+    fn disk_settlement_journal_replays_once_and_refuses_opposite_decisions() {
+        use crate::virt::lifecycle::CommandKind;
+        let mut journal = Journal::<(), u32>::default();
+        let capture = Uuid::new_v4();
+        memory_pending(&mut journal, capture);
+        let command = LifecycleCommand::SettleCaptureDisks {
+            operation: capture,
+            settlements: Vec::new(),
+            timeout: std::time::Duration::from_secs(5),
+        };
+        assert_eq!(journal.disk_settlement_outcome(capture, &command), Ok(None));
+        let key = CommandKey {
+            request_id: Uuid::new_v4(),
+            kind: CommandKind::SettleCaptureDisks,
+        };
+        journal.captures.get_mut(&capture).unwrap().disk_settlement = Some(key);
+        journal.admit_command(
+            key,
+            Entry {
+                sequence: CommandSequence::new(1).unwrap(),
+                command: command.clone(),
+                state: CommandState::Accepted,
+            },
+        );
+        assert_eq!(
+            journal.disk_settlement_outcome(capture, &command),
+            Err(LifecycleRejection::CapturePending)
+        );
+        let completed = CommandOutcome::DiskGenerationsSettled;
+        journal.complete_command(key, CommandSequence::new(1).unwrap(), &completed);
+        assert_eq!(
+            journal.disk_settlement_outcome(capture, &command),
+            Ok(Some(completed))
+        );
+        let mut opposite = command.clone();
+        if let LifecycleCommand::SettleCaptureDisks { settlements, .. } = &mut opposite {
+            settlements.push(vm_spec::capture::DiskTrackingSettlement {
+                version: vm_spec::capture::DISK_TRACKING_VERSION,
+                block_id: vm_spec::BlockId::new("root").unwrap(),
+                token: vm_spec::capture::DiskGenerationToken {
+                    capture_id: vm_spec::lifecycle::LiveId::parse(&capture.to_string()).unwrap(),
+                    pause_generation: 1,
+                    epoch: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+                    generation: 1,
+                    file_device: 1,
+                    file_inode: 2,
+                },
+                settlement: vm_spec::capture::DiskGenerationSettlement::Commit {
+                    baseline: vm_spec::capture::Sha256Digest::of_bytes(b"new baseline"),
+                },
+            });
+        }
+        assert_eq!(
+            journal.disk_settlement_outcome(capture, &opposite),
+            Err(LifecycleRejection::RequestConflict)
+        );
     }
 }

@@ -33,8 +33,8 @@ use crate::virt::lifecycle::{
     LifecycleCommand, LifecycleRejection, LifecycleRights,
 };
 
-pub(crate) const PROTOCOL_VERSION: u32 = 3;
-/// Includes the bounded 1 TiB chunk digest list and exact native producer binding.
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
+/// Bounded RAM digests plus sparse disk runs for the aggregate 4 TiB stream limit.
 pub(crate) const MAX_FRAME: usize = vm_spec::capture::MAX_CAPTURE_RECORD_BYTES;
 /// The largest typed descriptor set of any command.
 pub(crate) const MAX_RIGHTS: usize = 5;
@@ -676,6 +676,69 @@ mod tests {
         };
         let bytes = encode(&outcome).unwrap();
         assert!(bytes.len() > 16 * 1024);
+        assert!(bytes.len() <= MAX_FRAME + 4);
+        let mut buffer = FrameBuffer::default();
+        buffer.extend(&bytes).unwrap();
+        assert_eq!(buffer.next::<CommandOutcome>().unwrap(), Some(outcome));
+    }
+
+    #[test]
+    fn multi_disk_four_tib_sparse_runs_fit_disk_specific_frame_bound() {
+        use crate::virt::lifecycle::CommandOutcome;
+        use vm_spec::capture::{
+            DiskDirtyRun, DiskGenerationToken, DiskTrackingReceipt, DiskTrackingSeed, Sha256Digest,
+            DISK_TRACKING_VERSION, STREAM_CHUNK_BYTES,
+        };
+        let capture = vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap();
+        let length = 1 << 40;
+        let total_chunks = length / STREAM_CHUNK_BYTES;
+        let receipts = (0..4)
+            .map(|index| {
+                let seed = DiskTrackingSeed {
+                    version: DISK_TRACKING_VERSION,
+                    role: if index == 0 {
+                        vm_spec::DiskRole::Root
+                    } else {
+                        vm_spec::DiskRole::Data
+                    },
+                    attachment_index: index,
+                    block_id: vm_spec::BlockId::new(format!("disk-{index}")).unwrap(),
+                    file_device: 1,
+                    file_inode: u64::from(index) + 2,
+                    length,
+                    chunk_size: STREAM_CHUNK_BYTES,
+                    epoch: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+                    baseline: Some(Sha256Digest::of_bytes(b"predecessor")),
+                };
+                let receipt = DiskTrackingReceipt {
+                    version: DISK_TRACKING_VERSION,
+                    token: DiskGenerationToken {
+                        capture_id: capture.clone(),
+                        pause_generation: 1,
+                        epoch: seed.epoch.clone(),
+                        generation: 1,
+                        file_device: seed.file_device,
+                        file_inode: seed.file_inode,
+                    },
+                    seed,
+                    runs: (0..total_chunks)
+                        .step_by(2)
+                        .map(|first_chunk| DiskDirtyRun {
+                            first_chunk,
+                            chunk_count: 1,
+                        })
+                        .collect(),
+                    dirty_chunks: total_chunks / 2,
+                    total_chunks,
+                    invalid_reason: None,
+                };
+                receipt.validate().unwrap();
+                receipt
+            })
+            .collect();
+        let outcome = CommandOutcome::DiskGenerationsFrozen { receipts };
+        let bytes = encode(&outcome).unwrap();
+        assert!(bytes.len() > 1 << 20);
         assert!(bytes.len() <= MAX_FRAME + 4);
         let mut buffer = FrameBuffer::default();
         buffer.extend(&bytes).unwrap();

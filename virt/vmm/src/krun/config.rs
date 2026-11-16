@@ -21,6 +21,7 @@ pub struct KrunConfig {
     pub initramfs: Option<PathBuf>,
     pub cmdline: Vec<String>,
     pub disks: Vec<Disk>,
+    pub disk_tracking_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
     pub mounts: Vec<Mount>,
     pub vsock_mux: bool,
     pub storage_context: WorkerStorageContext,
@@ -83,6 +84,7 @@ impl Default for KrunConfig {
             initramfs: None,
             cmdline: Vec::new(),
             disks: Vec::new(),
+            disk_tracking_seeds: Vec::new(),
             mounts: Vec::new(),
             vsock_mux: false,
             storage_context: WorkerStorageContext::default(),
@@ -115,6 +117,47 @@ pub(crate) fn validate_worker_storage(config: &KrunConfig) -> std::result::Resul
     }
     if bindings.next().is_some() {
         return Err("worker descriptor coverage includes a non-Raw or absent disk".to_string());
+    }
+    let mut previous = None;
+    let mut epochs = std::collections::BTreeSet::new();
+    for seed in &config.disk_tracking_seeds {
+        seed.validate()?;
+        let disk = config
+            .disks
+            .get(seed.attachment_index as usize)
+            .ok_or("disk tracking seed attachment is absent")?;
+        let binding = config
+            .storage_context
+            .raw_handles
+            .iter()
+            .find(|binding| binding.disk_index == seed.attachment_index)
+            .ok_or("disk tracking seed has no raw handle")?;
+        if previous.is_some_and(|index| seed.attachment_index <= index)
+            || !epochs.insert(seed.epoch.clone())
+            || disk.read_only
+            || disk.format != vm_spec::DiskFormat::Raw
+            || disk.block_id != seed.block_id
+            || disk.role != seed.role
+            || binding.device != seed.file_device
+            || binding.inode != seed.file_inode
+            || binding.length_bytes != seed.length
+        {
+            return Err("disk tracking seed differs from adopted writable backing".into());
+        }
+        previous = Some(seed.attachment_index);
+    }
+    if let Some(request) = &config.restore {
+        for seed in &request.disk_tracking_seeds {
+            if !config
+                .disk_tracking_seeds
+                .iter()
+                .any(|configured| configured == seed)
+            {
+                return Err(
+                    "restore request disk seeds differ from worker construction seeds".into(),
+                );
+            }
+        }
     }
     Ok(())
 }

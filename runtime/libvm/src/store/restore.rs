@@ -1085,9 +1085,11 @@ impl crate::store::Store {
             return Err(invalid("restore construction has no exact run"));
         }
         let json = serde_json::to_string(construction).map_err(invalid)?;
-        crate::storage::limits::Resource::MetadataPageBytes
-            .check(json.len() as u64)
-            .map_err(crate::storage::StorageError::from)?;
+        if json.len() > crate::store::operation_store::MAX_RESTORE_LAUNCH_RECORD_BYTES {
+            return Err(invalid(
+                "restore construction exceeds its control-record bound",
+            ));
+        }
         let result = sqlx::query("UPDATE restore_resource_reservation SET construction_json=jsonb(?2) WHERE operation_id=?1 AND construction_json IS NULL")
             .bind(construction.intent.consumer_operation.to_string())
             .bind(json).execute(&self.pool).await?;
@@ -1917,6 +1919,7 @@ mod tests {
             .unwrap()
             .evidence;
         let request = RestoreRequest {
+            disk_tracking_seeds: Vec::new(),
             version: vm_spec::restore::RESTORE_REQUEST_VERSION,
             checkpoint: Sha256Digest::from_bytes(*info.id.as_bytes()),
             activation_id: vm_spec::lifecycle::LiveId::parse(&uuid::Uuid::new_v4().to_string())

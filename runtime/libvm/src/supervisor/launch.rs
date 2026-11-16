@@ -50,6 +50,7 @@ pub(crate) struct VmmLaunch<'a> {
     pub(crate) storage_lease: &'a crate::storage::locks::StorageLock,
     pub(crate) storage_lease_binding: protocol::shutdown::StorageLeaseBinding,
     pub(crate) storage_shutdown: &'a protocol::shutdown::StorageShutdownContext,
+    pub(crate) disk_tracking_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
     pub(crate) restore: Option<&'a RestoreLaunch>,
 }
 
@@ -287,6 +288,8 @@ impl VmSupervisor {
         .with_rosetta_intent(launch.rosetta_intent)
         .with_asset_directory(launch.asset_directory.clone())
         .with_startup_budget(startup_deadline.saturating_duration_since(Instant::now()));
+        let start_request =
+            start_request.with_disk_tracking_seeds(launch.disk_tracking_seeds.clone());
         let start_request = start_request.with_restore(restore_request);
         handoff_start_request(start_write, &start_request, VMM_START_REQUEST_TIMEOUT).await?;
         Ok(PendingStartup::new(

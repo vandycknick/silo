@@ -140,7 +140,7 @@ impl Machine {
             };
             timeline.lower_resolve_authentication += lower_started.elapsed();
             let secrets_started = std::time::Instant::now();
-            let (root_disk_resize, mut secrets) = match (|| {
+            let (root_disk_resize, mut secrets) = match async {
                 let secrets = runtime.resolve_machine_secrets(
                     &config,
                     &run_id,
@@ -148,14 +148,16 @@ impl Machine {
                 )?;
                 let resize = match &storage_lease.storage_record().root {
                     crate::MachineRoot::OpaqueRaw { path, .. } => {
-                        reconcile_root_disk_size(&config, path.as_path())?
+                        reconcile_root_disk_size(runtime, &config, path.as_path()).await?
                     }
                     crate::MachineRoot::LinuxOverlay { .. } => {
                         RootDiskResizeOutcome::OfflineComplete
                     }
                 };
                 Ok((resize, secrets))
-            })() {
+            }
+            .await
+            {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     return Err(finish_failed_start(
@@ -267,6 +269,24 @@ impl Machine {
                 }
             };
 
+            let disk_tracking_seeds = match crate::machine::root_storage::launch_disk_seeds(
+                &runtime.machine_storage_record(config.id).await?,
+                &config.machine_dir,
+            ) {
+                Ok(seeds) => seeds,
+                Err(error) => {
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Stopped),
+                        None,
+                        storage_lease,
+                        error,
+                    )
+                    .await);
+                }
+            };
             let launch = VmmLaunch {
                 machine_id: config.id,
                 name: &config.name,
@@ -295,6 +315,7 @@ impl Machine {
                     file_inode,
                 },
                 storage_shutdown: &launch_inputs.storage_shutdown,
+                disk_tracking_seeds,
                 restore: None,
             };
             timeline.launch_publication = publication_started.elapsed();

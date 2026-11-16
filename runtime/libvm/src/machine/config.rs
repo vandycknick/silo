@@ -77,6 +77,12 @@ impl Machine {
         crate::machine::root_storage::validate_spec(&storage, &spec)?;
         crate::runtime::boot_assets::effective_boot(&storage, &spec, runtime.effective_backend())?;
 
+        if config.spec.storage != spec.storage {
+            runtime
+                .native_store()?
+                .invalidate_machine_disk_baselines(config.id)
+                .await?;
+        }
         let previous_spec = config.spec.clone();
         runtime.validate_tailscale_vsock(&config.network, &spec)?;
         config.spec = spec;
@@ -377,6 +383,27 @@ impl Machine {
             None
         };
         if let Some(storage) = &mut storage_update {
+            if let (Some(length), crate::MachineRoot::LinuxOverlay { capacity, .. }) =
+                (update.root_disk_size, &storage.root)
+            {
+                rootfs_spec::upper_geometry::UpperCapacity::new(length).map_err(|error| {
+                    LibVmError::InvalidMachineUpdate {
+                        reference: config.name.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                if length < *capacity {
+                    return Err(LibVmError::InvalidMachineUpdate {
+                        reference: config.name.clone(),
+                        reason: "overlay upper cannot be shrunk".into(),
+                    });
+                }
+            }
+            runtime
+                .native_store()?
+                .invalidate_machine_disk_baselines(config.id)
+                .await?;
+            storage.invalidate_disk_baselines();
             match &mut storage.root {
                 crate::MachineRoot::OpaqueRaw { geometry, .. } => {
                     if let Some(length) = update.root_disk_size {
@@ -387,18 +414,6 @@ impl Machine {
                     upper, capacity, ..
                 } => {
                     if let Some(length) = update.root_disk_size {
-                        rootfs_spec::upper_geometry::UpperCapacity::new(length).map_err(
-                            |error| LibVmError::InvalidMachineUpdate {
-                                reference: config.name.clone(),
-                                reason: error.to_string(),
-                            },
-                        )?;
-                        if length < *capacity {
-                            return Err(LibVmError::InvalidMachineUpdate {
-                                reference: config.name.clone(),
-                                reason: "overlay upper cannot be shrunk".into(),
-                            });
-                        }
                         if length > *capacity {
                             let path = crate::PrivatePath::new(format!(
                                 "upper-{}.raw",
@@ -556,6 +571,8 @@ impl Machine {
         };
         config.agent_mode = Some(config.guest.agent.clone());
         let bundle = binding.digest()?;
+        store.invalidate_machine_disk_baselines(config.id).await?;
+        storage.invalidate_disk_baselines();
         storage.boot = boot;
         storage.storage_generation = storage
             .storage_generation
@@ -827,6 +844,16 @@ mod tests {
                 runtime.machine_storage_record(id).await.unwrap().root,
                 crate::MachineRoot::OpaqueRaw { geometry, .. } if geometry.length == length
             ));
+            assert!(runtime
+                .machine_storage_record(id)
+                .await
+                .unwrap()
+                .disk_baselines
+                .iter()
+                .all(|baseline| matches!(
+                    baseline.state,
+                    crate::store::models::storage::DiskBaselineState::Invalid
+                )));
         }
     }
 
@@ -1038,6 +1065,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.storage_generation, before.storage_generation + 1);
+        assert!(before.disk_baselines.iter().all(|baseline| matches!(
+            baseline.state,
+            crate::store::models::storage::DiskBaselineState::Ready
+        )));
+        assert!(after.disk_baselines.iter().all(|baseline| matches!(
+            baseline.state,
+            crate::store::models::storage::DiskBaselineState::Invalid
+        )));
         assert_eq!(after.root, before.root);
         assert_ne!(after.boot, before.boot);
         assert_eq!(updated.guest.agent, crate::machine::MachineAgent::Disabled);
@@ -1153,5 +1188,94 @@ mod tests {
                 .unwrap(),
             before
         );
+    }
+    #[tokio::test]
+    async fn raw_resize_invalidates_durably_before_any_mutation() {
+        use crate::store::models::storage::DiskBaselineState;
+        let (_home, runtime, machine) = stopped_storage_machine("tracked-resize").await;
+        let mut config = runtime
+            .machine_config(machine.machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let storage = runtime.machine_storage_record(config.id).await.unwrap();
+        assert!(matches!(
+            storage.disk_baselines[0].state,
+            DiskBaselineState::Ready
+        ));
+        let root = config.machine_dir.join("root.raw");
+        let before = crate::storage::stream::StreamHasher::new()
+            .hash_file(&root)
+            .unwrap();
+        config.root_disk_size = Some(before.length() + 512);
+        let store = runtime.native_store().unwrap();
+        sqlx::query("CREATE TRIGGER reject_disk_baseline_invalidation BEFORE UPDATE ON machine_storage BEGIN SELECT RAISE(ABORT,'baseline invalidation interrupted'); END")
+            .execute(store.test_pool()).await.unwrap();
+        assert!(crate::runtime::core::reconcile_root_disk_size(
+            &runtime,
+            &config,
+            std::path::Path::new("root.raw")
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            crate::storage::stream::StreamHasher::new()
+                .hash_file(&root)
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            runtime.machine_storage_record(config.id).await.unwrap(),
+            storage
+        );
+        sqlx::query("DROP TRIGGER reject_disk_baseline_invalidation")
+            .execute(store.test_pool())
+            .await
+            .unwrap();
+        crate::runtime::core::reconcile_root_disk_size(
+            &runtime,
+            &config,
+            std::path::Path::new("root.raw"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().len(),
+            before.length() + 512
+        );
+        assert!(matches!(
+            runtime
+                .machine_storage_record(config.id)
+                .await
+                .unwrap()
+                .disk_baselines[0]
+                .state,
+            DiskBaselineState::Invalid
+        ));
+    }
+    #[tokio::test]
+    async fn attachment_replacement_invalidates_the_stopped_baseline_before_publication() {
+        use crate::store::models::storage::DiskBaselineState;
+        let (_home, runtime, machine) = stopped_storage_machine("tracked-replacement").await;
+        let config = runtime
+            .machine_config(machine.machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let before = runtime.machine_storage_record(config.id).await.unwrap();
+        assert!(matches!(
+            before.disk_baselines[0].state,
+            DiskBaselineState::Ready
+        ));
+        let mut spec = config.spec.clone();
+        spec.storage.as_mut().unwrap().disks[0].block_id =
+            vm_spec::BlockId::new("replaced-root").unwrap();
+        machine.replace_config(spec).await.unwrap();
+        let after = runtime.machine_storage_record(config.id).await.unwrap();
+        assert!(matches!(
+            after.disk_baselines[0].state,
+            DiskBaselineState::Invalid
+        ));
+        assert_eq!(after.root, before.root);
     }
 }

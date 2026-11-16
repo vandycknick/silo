@@ -204,6 +204,7 @@ def main() -> None:
         "capture-dirty-harvest": {16},
         "capture-seal-publish": {265},
         "capture-record-settle": {263},
+        "capture-cut-settle": {263},
         "capture-source-write": {1, 18, 20},
         "capture-disk-copy": {1, 16, 18, 20},
         "capture-pool-sync": {74, 75},
@@ -272,18 +273,21 @@ def main() -> None:
         except OSError:
             return False
 
-    def publication_capture() -> Path | None:
+    def publication_capture(*, before_continuation: bool = False) -> Path | None:
         excluded = set()
         if "excludeCapturesFile" in request:
             exclusion_file = Path(request["excludeCapturesFile"])
             assert exclusion_file.stat().st_size <= 4096, "bounded exact prior-capture list"
             excluded = set(json.loads(exclusion_file.read_bytes()))
-        for seal_path in sorted((Path(request["target"]).parent / "captures").glob("*/vm.capture.json")):
-            if seal_path.parent.name in excluded:
-                continue
-            seal = json.loads(seal_path.read_bytes())
-            if seal["captureOutcome"] == "coherent":
-                return seal_path.parent
+        records = ("vm.capture-cut.json", "vm.capture.json") if before_continuation else ("vm.capture.json",)
+        for filename in records:
+            for path in sorted((Path(request["target"]).parent / "captures").glob("*/" + filename)):
+                if path.parent.name in excluded:
+                    continue
+                record = json.loads(path.read_bytes())
+                evidence_record = record["evidence"] if filename == "vm.capture-cut.json" else record
+                if evidence_record["captureOutcome"] == "coherent":
+                    return path.parent
         return None
 
     def lifecycle(event: str, tid: int, **details) -> None:
@@ -525,7 +529,7 @@ def main() -> None:
                         "injectedReturn": True, "kind": "post-effect GET_DIRTY_LOG error, never injected success"}
                 if (boundary == "capture-guest-transport" and publication_seen
                         and thread_name(tid) == "vsock muxer"):
-                    directory = publication_capture()
+                    directory = publication_capture(before_continuation=True)
                     if directory is not None:
                         assert request.get("errno") is None, "transport gate never injects a result"
                         receipt = {"pid": group, "tid": tid, "syscall": syscall,
@@ -623,8 +627,10 @@ def main() -> None:
                 )
                 seal_publish = False
                 if syscall == 265 and capture_directory:  # linkat: no-replace seal publication
-                    seal_publish = tracee_name(tid, int(info.data[2])) == b".vm.capture.json.tmp"
-                    publication_seen = publication_seen or seal_publish
+                    record_name = tracee_name(tid, int(info.data[2]))
+                    seal_publish = record_name == b".vm.capture.json.tmp"
+                    publication_seen = publication_seen or seal_publish or (
+                        boundary == "capture-guest-transport" and record_name == b".vm.capture-cut.json.tmp")
                 source = metadata is not None and (metadata.st_dev, metadata.st_ino) == identity
                 copy_call = capture_disk and (
                     syscall in (1, 18, 20) or (syscall == 16 and info.data[2] == 0x40049409))
@@ -676,6 +682,8 @@ def main() -> None:
                             or (boundary == "capture-seal-publish" and seal_publish)
                             or (boundary == "capture-record-settle" and capture_directory and syscall == 263
                                 and tracee_name(tid, int(info.data[2])) == b".vm.capture.json.tmp")
+                            or (boundary == "capture-cut-settle" and capture_directory and syscall == 263
+                                and tracee_name(tid, int(info.data[2])) == b".vm.capture-cut.json.tmp")
                             or (boundary == "capture-source-write" and capture_file and actual_path.name == ".vm.capture-source.json.tmp" and syscall in (1, 18, 20))
                             or (boundary == "capture-disk-copy" and copy_call
                                 and actual_path.name == request.get("captureDiskName", actual_path.name))

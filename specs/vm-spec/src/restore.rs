@@ -12,7 +12,8 @@ pub const RESTORE_REQUEST_VERSION: u32 = 1;
 pub const GENERATION_ACK_TIMEOUT_MS: u64 = 5_000;
 pub const ACTIVATE_TIMEOUT_MS: u64 = 30_000;
 pub const RESTORE_INSPECTION_VERSION: u32 = 1;
-pub const MAX_RESTORE_INSPECTION_BYTES: usize = 1 << 20;
+pub const MAX_RESTORE_INSPECTION_BYTES: usize =
+    crate::capture::MAX_CAPTURE_RECORD_BYTES + (1 << 20);
 pub const MAX_RESTORE_LOWER_EXTENTS: usize = 1536;
 pub const RESTORE_CONSOLE_ID: &str = "hvc0";
 pub const RESTORE_VSOCK_ID: &str = "vsock";
@@ -172,6 +173,36 @@ pub struct RestoreEnvironmentVariable {
     pub value: String,
 }
 
+/// Optional per-attachment seeds. Omitted attachments have unknown coverage.
+pub fn validate_disk_tracking_seeds(
+    seeds: &[crate::capture::DiskTrackingSeed],
+    configuration: &CaptureConfiguration,
+) -> Result<(), String> {
+    let mut previous = None;
+    let mut inodes = BTreeSet::new();
+    let mut epochs = BTreeSet::new();
+    for seed in seeds {
+        seed.validate()?;
+        let attachment = configuration
+            .attachments
+            .get(seed.attachment_index as usize)
+            .ok_or("disk seed has no destination attachment")?;
+        if previous.is_some_and(|index| seed.attachment_index <= index)
+            || !inodes.insert((seed.file_device, seed.file_inode))
+            || !epochs.insert(seed.epoch.clone())
+            || attachment.read_only
+            || attachment.format != crate::DiskFormat::Raw
+            || seed.block_id != attachment.block_id
+            || seed.role != attachment.role
+            || seed.length != attachment.geometry.length
+        {
+            return Err("disk seed differs from its unique writable raw attachment".into());
+        }
+        previous = Some(seed.attachment_index);
+    }
+    Ok(())
+}
+
 /// Machine/run, forward policy and shutdown context are supplied by the
 /// enclosing managed launch, never inherited from the source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +215,7 @@ pub struct RestoreRequest {
     pub start_paused: bool,
     pub configuration: CaptureConfiguration,
     pub evidence: CaptureEvidence,
+    pub disk_tracking_seeds: Vec<crate::capture::DiskTrackingSeed>,
     /// Exactly RAM, layout, execution, devices, complete RAM map, in that order.
     pub objects: [RestoreObject; 5],
     pub lowers: Vec<RestoreLower>,
@@ -199,6 +231,7 @@ impl RestoreRequest {
             return Err("restore requires the current schema and startPaused=true".into());
         }
         self.configuration.validate()?;
+        validate_disk_tracking_seeds(&self.disk_tracking_seeds, &self.configuration)?;
         if !self.evidence.is_sealed() {
             return Err("restore requires a coherent capture seal".into());
         }
@@ -763,6 +796,17 @@ mod tests {
         seeds
             .validate_against_configuration(&configuration)
             .unwrap();
+        crate::restore::validate_disk_tracking_seeds(&[], &configuration).unwrap();
+        crate::restore::validate_disk_tracking_seeds(&seeds.seeds, &configuration).unwrap();
+        let mut unknown = seeds.seeds.clone();
+        unknown[0].baseline = None;
+        crate::restore::validate_disk_tracking_seeds(&unknown, &configuration).unwrap();
+        let mut wrong = seeds.seeds.clone();
+        wrong[0].block_id = BlockId::new("foreign").unwrap();
+        assert!(crate::restore::validate_disk_tracking_seeds(&wrong, &configuration).is_err());
+        let mut readonly = configuration.clone();
+        readonly.attachments[0].read_only = true;
+        assert!(crate::restore::validate_disk_tracking_seeds(&seeds.seeds, &readonly).is_err());
         let bytes = seeds.canonical_bytes().unwrap();
         assert_eq!(RestoreDiskTrackingSeeds::decode(&bytes).unwrap(), seeds);
         let json = String::from_utf8(bytes).unwrap();

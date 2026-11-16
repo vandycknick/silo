@@ -63,11 +63,12 @@ pub use crate::store::live_store::MachineLifecycle;
 pub use crate::store::models::image::{ImageRecord, ImageRecordKind};
 pub use crate::store::models::storage::{
     BackendRequirement, BootBinding, BootFileRole, BootProfile, DirectCommandLinePolicy,
-    DiskOwnership, DiskStorage, EfiFirmware, Ext4Profile, ExternalResource, GuestArchitecture,
-    IncludedDisk, LinuxPlatform, MachineOwnership, MachineRoot, MachineStorageRecord, OverlayLower,
-    OverlayProfile, PartitionTable, PrivatePath, RawLayout, RootFilesystem, RootSelector,
-    StorageOperationKind, StorageOperationRecord, StorageOperationState, StorageProfile,
-    StorageStopOutcome, TemporaryDirectoryPolicy, Translation,
+    DiskBaseline, DiskBaselineState, DiskOwnership, DiskStorage, EfiFirmware, Ext4Profile,
+    ExternalResource, GuestArchitecture, IncludedDisk, LinuxPlatform, MachineOwnership,
+    MachineRoot, MachineStorageRecord, OverlayLower, OverlayProfile, PartitionTable, PrivatePath,
+    RawLayout, RootFilesystem, RootSelector, StorageOperationKind, StorageOperationRecord,
+    StorageOperationState, StorageProfile, StorageStopOutcome, TemporaryDirectoryPolicy,
+    Translation,
 };
 pub use crate::store::models::{MachineId, MachineIdParseError};
 pub use crate::store::snapshot_store::{

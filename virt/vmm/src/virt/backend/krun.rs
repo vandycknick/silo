@@ -692,6 +692,9 @@ fn engine_config(config: &VmConfig) -> Result<crate::krun::KrunConfig, VirtError
         initramfs: config.initramfs_path().map(Path::to_path_buf),
         cmdline: build_boot_args(config),
         disks: config.disks().to_vec(),
+        disk_tracking_seeds: config
+            .storage_launch()
+            .map_or_else(Vec::new, |launch| launch.disk_tracking_seeds.clone()),
         mounts: config.mounts().iter().map(krun_mount).collect(),
         vsock_mux: true,
         vsock_cid: None,

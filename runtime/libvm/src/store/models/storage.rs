@@ -563,6 +563,35 @@ impl ExternalResource {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum DiskBaselineState {
+    Ready,
+    /// Never reusable across runs, even after a clean guest shutdown.
+    Running {
+        run_id: uuid::Uuid,
+        /// False retains predecessor provenance only and requires a full cut hash.
+        seeded: bool,
+    },
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskBaseline {
+    pub seed: vm_spec::capture::DiskTrackingSeed,
+    pub map: PrivatePath,
+    pub storage_generation: u64,
+    pub generation: u64,
+    pub state: DiskBaselineState,
+    pub(crate) fingerprint: crate::storage::identity_file::SourceFingerprint,
+}
+
 /// Durable storage meaning, independent of source provenance and launch files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -573,6 +602,7 @@ pub struct MachineStorageRecord {
     pub profile: StorageProfile,
     pub backend: BackendRequirement,
     pub disks: Vec<IncludedDisk>,
+    pub disk_baselines: Vec<DiskBaseline>,
     pub external_requirements: Vec<crate::ExternalResourceRequirement>,
     pub storage_generation: u64,
     pub ownership_epoch: u64,
@@ -584,6 +614,46 @@ pub struct MachineStorageRecord {
 }
 
 impl MachineStorageRecord {
+    pub(crate) fn matches_launch_storage(&self, launch: &Self) -> bool {
+        let Self {
+            schema,
+            root,
+            boot,
+            profile,
+            backend,
+            disks,
+            disk_baselines: _,
+            external_requirements,
+            storage_generation,
+            ownership_epoch,
+            stop_outcome,
+            ownership,
+            operation,
+            image,
+            snapshot,
+        } = self;
+        *schema == launch.schema
+            && *root == launch.root
+            && *boot == launch.boot
+            && *profile == launch.profile
+            && *backend == launch.backend
+            && *disks == launch.disks
+            && *external_requirements == launch.external_requirements
+            && *storage_generation == launch.storage_generation
+            && *ownership_epoch == launch.ownership_epoch
+            && *stop_outcome == launch.stop_outcome
+            && *ownership == launch.ownership
+            && *operation == launch.operation
+            && *image == launch.image
+            && *snapshot == launch.snapshot
+    }
+
+    pub(crate) fn invalidate_disk_baselines(&mut self) {
+        for baseline in &mut self.disk_baselines {
+            baseline.state = DiskBaselineState::Invalid;
+        }
+    }
+
     pub(crate) fn opaque_raw(
         path: PrivatePath,
         length: u64,
@@ -607,6 +677,7 @@ impl MachineStorageRecord {
             profile: StorageProfile::OpaqueRawV1,
             backend: BackendRequirement::RawBlock,
             disks: Vec::new(),
+            disk_baselines: Vec::new(),
             external_requirements: Vec::new(),
             storage_generation: 0,
             ownership_epoch: 0,
@@ -673,6 +744,70 @@ impl MachineStorageRecord {
                 .map_err(crate::storage::StorageError::from)?;
         }
         validate_root(&self.root)?;
+        for (index, baseline) in self.disk_baselines.iter().enumerate() {
+            baseline.seed.validate().map_err(invalid)?;
+            if matches!(baseline.state, DiskBaselineState::Running { run_id, .. } if run_id.is_nil())
+            {
+                return Err(invalid("disk baseline run identity is nil"));
+            }
+            let binding = baseline.fingerprint.verification_key();
+            if binding[..3]
+                != [
+                    baseline.seed.file_device as i64,
+                    baseline.seed.file_inode as i64,
+                    baseline.seed.length as i64,
+                ]
+            {
+                return Err(invalid(
+                    "disk baseline fingerprint differs from its backing binding",
+                ));
+            }
+            if matches!(
+                baseline.state,
+                DiskBaselineState::Ready | DiskBaselineState::Running { seeded: true, .. }
+            ) {
+                let length = match (
+                    &self.root,
+                    baseline.seed.role,
+                    baseline.seed.attachment_index,
+                ) {
+                    (MachineRoot::OpaqueRaw { geometry, .. }, DiskRole::Root, 0) => {
+                        Some(geometry.length)
+                    }
+                    (MachineRoot::LinuxOverlay { capacity, .. }, DiskRole::RootUpper, 1) => {
+                        Some(*capacity)
+                    }
+                    (_, DiskRole::Data, order) => {
+                        self.disks.iter().find_map(|disk| match &disk.storage {
+                            DiskStorage::ManagedWritable { geometry, .. }
+                                if disk.order == order =>
+                            {
+                                Some(geometry.length)
+                            }
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                };
+                if length != Some(baseline.seed.length) {
+                    return Err(invalid(
+                        "disk baseline role or geometry differs from managed storage",
+                    ));
+                }
+            }
+            if baseline.seed.baseline.is_none()
+                || self.disk_baselines[..index].iter().any(|other| {
+                    other.seed.attachment_index == baseline.seed.attachment_index
+                        || other.seed.block_id == baseline.seed.block_id
+                })
+                || (matches!(
+                    baseline.state,
+                    DiskBaselineState::Ready | DiskBaselineState::Running { seeded: true, .. }
+                ) && baseline.storage_generation != self.storage_generation)
+            {
+                return Err(invalid("disk baseline identity or generation is invalid"));
+            }
+        }
         for (index, requirement) in self.external_requirements.iter().enumerate() {
             requirement.validate()?;
             if self.external_requirements[..index]
@@ -1598,5 +1733,70 @@ mod tests {
                 expected
             );
         }
+    }
+    #[test]
+    fn disk_baseline_records_require_complete_binding_and_explicit_state() {
+        use crate::store::models::storage::DiskBaselineState;
+        let temp = tempfile::tempdir().unwrap();
+        let directory =
+            crate::paths::OwnedDirectory::open_root(&temp.path().join("machine")).unwrap();
+        directory.write_file("root.raw", &[0x31; 512]).unwrap();
+        let file = std::fs::File::open(directory.path().join("root.raw")).unwrap();
+        let map = crate::storage::stream::StreamHasher::new()
+            .hash_open_file(&file, 512)
+            .unwrap()
+            .map;
+        let mut record = MachineStorageRecord::opaque_raw(
+            PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        pin(&mut record);
+        let disk = crate::machine::root_storage::disk(
+            "root.raw",
+            vm_spec::DiskRole::Root,
+            512,
+            "root".into(),
+        )
+        .unwrap();
+        crate::machine::root_storage::seed_disk(
+            &mut record,
+            directory.path(),
+            0,
+            &disk,
+            &file,
+            &map,
+        )
+        .unwrap();
+        for state in [
+            DiskBaselineState::Ready,
+            DiskBaselineState::Running {
+                run_id: uuid::Uuid::new_v4(),
+                seeded: true,
+            },
+            DiskBaselineState::Invalid,
+        ] {
+            record.disk_baselines[0].state = state;
+            let json = serde_json::to_string(&record).unwrap();
+            assert_eq!(MachineStorageRecord::decode(&json).unwrap(), record);
+        }
+        let mut malformed = record.clone();
+        malformed.disk_baselines[0].state = DiskBaselineState::Running {
+            run_id: uuid::Uuid::nil(),
+            seeded: false,
+        };
+        assert!(malformed.validate().is_err());
+        let mut malformed = record.clone();
+        malformed.disk_baselines[0].seed.file_inode += 1;
+        assert!(malformed.validate().is_err());
+        let mut malformed = record.clone();
+        malformed
+            .disk_baselines
+            .push(malformed.disk_baselines[0].clone());
+        assert!(malformed.validate().is_err());
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("diskBaselines");
+        assert!(MachineStorageRecord::decode(&value.to_string()).is_err());
     }
 }

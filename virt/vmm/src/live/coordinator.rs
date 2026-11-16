@@ -416,10 +416,9 @@ impl LiveCoordinator {
 
     /// Seal admission and every continuation, then report how to stop.
     ///
-    /// The native submission fence closes first and under the journal lock,
-    /// before any await of the shutdown path: a mutator the worker admits was
-    /// enqueued before stop began, and one refused by the fence observes
-    /// `stopped` as soon as it takes this lock.
+    /// The execution submission fence closes under the journal lock before any
+    /// shutdown await. Only disk-generation settlement may pass it, without
+    /// resuming a source or exposing a device.
     pub(crate) fn begin_stop(&self) -> StopMode {
         let mut inner = self.lock();
         self.machine.close_lifecycle_admission();

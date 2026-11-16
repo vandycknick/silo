@@ -1007,7 +1007,7 @@ class RawCandidate:
             for disk in self.spec["storage"]["disks"]]}}
         request = {"version": 1, "machineId": machine_id, "machineRunId": run_id, "startupCommand": None,
                    "storageLease": {"operationId": operation_id, "fileDevice": metadata.st_dev, "fileInode": metadata.st_ino},
-                   "storageShutdown": context}
+                   "storageShutdown": context, "diskTrackingSeeds": []}
         reader, writer = os.pipe()
         environment = self.silo.ws.env()
         environment.update(_VM_STARTPIPE=str(reader), _VM_STORAGE_LEASES=json.dumps([self.lease_fd]))

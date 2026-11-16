@@ -145,14 +145,15 @@ at most 10 percent is accepted and reported as **within tolerance**; a median
 beyond that grace fails. This rule applies to the Phase 30 targets and retained
 budgets.
 
-Fork and incremental snapshot targets are not yet met; they depend on disk write
-tracking and the map format change. The owner approved the following direction
-on 2026-11-15; it is not yet implemented. Per-chunk write tracking in the block
-device with inherited maps lets a seal hash only chunks written since the last
-seal. A temporary create-time hash of a fresh upper is removed by a cached upper
-template in a later stage, so create must not end up slower. A sparse
-authenticated stream map has size and work that do not grow with configured
-length. RAM uses a smaller identity unit than 8 MiB.
+The recorded wave-three run misses the fork and incremental snapshot targets.
+Stage-1 disk write tracking with inherited maps is now implemented, but its
+measurements are not yet recorded here. Create does not hash freshly formatted
+disks or seed their baseline; the first snapshot hashes written disk data once
+and seeds later captures in the same run. The remaining owner-approved direction
+of 2026-11-15 is still planned: clean-stop sealing and a cached deterministic
+upper template avoid restart and first-snapshot hashes without slowing create.
+A sparse authenticated stream map must eliminate work that grows with configured
+length. RAM must use a smaller identity unit than 8 MiB.
 
 Image init as PID 1 stays the default, with both init modes reported. The
 existing 4 GiB fixture gates remain in force alongside this cohort. The
@@ -239,9 +240,11 @@ until capture settles; exact-capture cancellation retains any accepted baseline.
 Pause established to released is measured separately from seal latency, and
 post-resume identity work receives no pause allowance.
 
-A machine's first snapshot hashes its written disk data once after the guest
-resumes on this lane. That pass and refusing `pause` while post-resume disk
-identity is pending are accepted limitations (owner, 2026-11-15).
+The owner accepted one first-snapshot pass over written disk data on
+2026-11-15. A freshly formatted disk starts without a baseline, so its first
+snapshot performs that pass and seeds later captures in the same run. The first
+snapshot after a restart still fully hashes the disk. Refusing `pause` while
+post-resume disk identity is pending remains an accepted limitation.
 
 RAM zero runs are omitted, punched or zero-written only on unsupported punching;
 full private anonymous boot RAM uses held-cut pagemap proof to skip known-zero
@@ -317,6 +320,62 @@ Implementation: `runtime/libvm/src/runtime/core.rs`, `store/store.rs`,
 `app/cli/lib/daemon/control.rs`. Snapshot verification is
 `SnapshotStore::verify`; its traversal and stream versus object diagnostics are
 defined in [ADR 0021](../adr/0021-live-snapshots-and-forks.md#on-demand-verification).
+
+## Disk write tracking: stage 1 (2026-11-16)
+
+This is an implementation note without new performance measurements. The
+virtual block device tracks writes in 8 MiB chunks from construction, including
+discard and write-zeroes. Capture freezes dirty coverage under the native pause.
+With a valid managed baseline on the reflink lane, identity completion reads and
+hashes only dirty chunks of the immutable cut and inherits the rest of its map;
+an empty dirty set reads no payload. The result is a standalone disk image.
+Coherent sealing commits the disk generation without clearing post-cut writes.
+Any pre-seal failure or cancellation aborts and merges frozen coverage back.
+RAM acceptance and source continuation do not accept disk generations.
+
+Per-managed-writable-disk `DiskBaseline` records bind the map, backing, storage
+generation and tracking epoch. Machine-private map files survive capture release
+and remain until machine deletion as deferred-write caches. `Ready` maps may seed
+launch only when stopped backing fingerprints and bounded map identities match;
+missing or torn caches launch unseeded. Every launch commits
+`Running { run_id, seeded }` for existing baselines before guest writes. Durable
+machines checkpoint the catalog; hidden constructed children rely on WAL ordering
+with their later durable-child transition. `seeded: false` means provenance only,
+not reusable content authority. Disks without a baseline remain unseeded.
+A coherent same-run capture installs a new `Running` baseline even when none
+existed. Every ended run invalidates its
+baselines, even after a clean stop, so the first snapshot after restart fully
+hashes once. Stage-2 clean-stop sealing is planned, not implemented.
+
+Freshly formatted disks have no baseline at create; their first snapshot hashes
+written disk data once and seeds later captures in the same run. Unchanged
+image-backed disks and authenticated restore/fork children inherit source maps
+without an extra baseline hash, rebound to their private destination inodes.
+The planned stage-2 deterministic template avoids the first-snapshot hash
+without slowing create.
+Growth/resize, storage or attachment changes, boot-bundle changes and handoff
+source reservation/fencing or destination commit invalidate baseline authority.
+Stopped host edits refuse seed reuse when backing fingerprints change.
+Read-only export does not invalidate an untouched source; `silo cp` uses the
+guest and its disk effects pass through the tracked device.
+
+Full hashing records `missing-baseline`, `invalid-receipt` coverage, `untracked`,
+`copy-lane` or `external` as its fallback reason. Malformed or cross-cut receipts
+are refused rather than used as coverage. External writable disks remain
+capturable but never inherit a baseline: they are not exclusively Silo-owned.
+The non-reflink copy lane also fully hashes in stage 1. Capture evidence records
+dirty/total chunk counts, decoded nonzero bytes hashed, baseline reuse and the
+fallback reason. The existing 1 TiB per-disk and 4 TiB aggregate capture limits
+are unchanged; JSON capture records gain a bounded 16 MiB disk-receipt allowance.
+
+Flat map copying, serialization and identity computation still traverse logical
+chunk entries. This stage does not establish the configured-size invariant or
+the remaining latency targets; the sparse authenticated map and new standalone
+perf measurements remain necessary. Publication trust, transport, export,
+handoff, explicit verification and replay authentication boundaries are unchanged.
+See [ADR 0021](../adr/0021-live-snapshots-and-forks.md#disk-write-tracking-stage-1-2026-11-16)
+for the exact bindings, transitions and settlement rules.
+
 
 ## Results by batch
 

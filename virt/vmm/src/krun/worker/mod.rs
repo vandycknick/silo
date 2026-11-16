@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "macos")]
 mod admission;
+pub(crate) mod disk_tracking;
 pub(crate) mod fds;
 #[cfg(all(
     feature = "restore-irq-probe",
@@ -271,6 +272,28 @@ fn bind_raw_handles(config: &mut crate::krun::KrunConfig, handles: &[OwnedFd]) -
                 "Raw backing identity, length or access mismatch",
             ));
         }
+        if !disk.read_only
+            && !config
+                .disk_tracking_seeds
+                .iter()
+                .any(|seed| seed.block_id == disk.block_id)
+        {
+            config
+                .disk_tracking_seeds
+                .push(vm_spec::capture::DiskTrackingSeed {
+                    version: vm_spec::capture::DISK_TRACKING_VERSION,
+                    role: disk.role,
+                    attachment_index: disk_index as u32,
+                    block_id: disk.block_id.clone(),
+                    file_device: binding.device,
+                    file_inode: binding.inode,
+                    length: binding.length_bytes,
+                    chunk_size: vm_spec::capture::STREAM_CHUNK_BYTES,
+                    epoch: vm_spec::lifecycle::LiveId::parse(&uuid::Uuid::new_v4().to_string())
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    baseline: None,
+                });
+        }
         #[cfg(target_os = "linux")]
         {
             disk.path = std::path::Path::new("/proc/self/fd").join(binding.child_fd.to_string());
@@ -281,6 +304,11 @@ fn bind_raw_handles(config: &mut crate::krun::KrunConfig, handles: &[OwnedFd]) -
         }
         next += 1;
     }
+    config
+        .disk_tracking_seeds
+        .sort_by_key(|seed| seed.attachment_index);
+    crate::krun::config::validate_worker_storage(config)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(())
 }
 

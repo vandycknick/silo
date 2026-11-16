@@ -3096,7 +3096,14 @@ pub(crate) mod tests {
             &machine_from_path(id, "corrupt-storage".to_string(), paths.machine(id).dir()),
         )
         .await;
-        sqlx::query("UPDATE machine_storage SET record_json = x'ff' WHERE machine_id = ?1")
+        assert!(sqlx::query(
+            "UPDATE machine_storage SET record_json = x'ff' WHERE machine_id = ?1"
+        )
+        .bind(id.to_string())
+        .execute(&db.pool)
+        .await
+        .is_err());
+        sqlx::query("UPDATE machine_storage SET record_json = jsonb('{\"diskBaselines\":[]}') WHERE machine_id = ?1")
             .bind(id.to_string())
             .execute(&db.pool)
             .await

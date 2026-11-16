@@ -20,7 +20,7 @@
 //! ```text
 //!   Pipeline ─► [IdentityPending: immutable cut, continue, hash clones] ─► Sealing
 //!      └── cancel joins and wins before Sealing; source continuation runs once
-//!   Sealing ─► Continuing (only if source has not continued) ─► Settled
+//!   Sealing ─► independent disk settlement ─► Continuing ─► Settled
 //! ```
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -335,7 +335,9 @@ impl Journal {
                 format!("{kind} is unsupported for this machine"),
             );
         }
-        let identity_pending_cancel = matches!(
+        // Deferred continuation already projected Running/Paused. Its exact
+        // capture remains cancellable until sealing and continuation settle.
+        let active_capture_cancel = matches!(
             view.state,
             VmLifecycleState::Running | VmLifecycleState::Paused
         ) && match command {
@@ -343,11 +345,15 @@ impl Journal {
                 .operations
                 .get(&cancel.operation_id)
                 .is_some_and(|operation| {
-                    operation.capture.is_some() && operation.phase == Phase::IdentityPending
+                    operation.capture.is_some()
+                        && matches!(
+                            operation.phase,
+                            Phase::IdentityPending | Phase::Sealing | Phase::Continuing
+                        )
                 }),
             _ => false,
         };
-        if !view.state.admits(kind) && !identity_pending_cancel {
+        if !view.state.admits(kind) && !active_capture_cancel {
             return self.reject(
                 command,
                 LiveRejectionReason::InvalidState,
@@ -1942,6 +1948,46 @@ mod tests {
                 )),
                 Some(LiveRejectionCode::InvalidState),
             );
+        }
+    }
+
+    #[test]
+    fn continued_capture_cancel_joins_sealing_and_never_interrupts_continuation() {
+        for state in [VmLifecycleState::Running, VmLifecycleState::Paused] {
+            for phase in [Phase::Sealing, Phase::Continuing] {
+                let mut journal = captured(phase);
+                let view = view(state);
+                for (request, target) in [(0xd5, PAUSE), (0xd6, 0xef)] {
+                    assert_eq!(
+                        rejection(&journal.admit(
+                            &command(LiveCommandKind::CancelOperation, request, target),
+                            &view,
+                            Eligibility::Eligible,
+                        )),
+                        Some(LiveRejectionCode::InvalidState),
+                    );
+                }
+                let admitted = journal.admit(
+                    &command(LiveCommandKind::CancelOperation, 0xd4, CAPTURE),
+                    &view,
+                    Eligibility::Eligible,
+                );
+                if phase == Phase::Sealing {
+                    assert!(matches!(admitted, Admitted::Joined { .. }));
+                } else {
+                    let LiveCommandResult::CancelOperation(CancelOperationOutcome::Completed {
+                        completed,
+                    }) = ready(admitted)
+                    else {
+                        panic!("continued capture cancel did not return its unchanged result");
+                    };
+                    assert!(!completed.effective);
+                    let operation = journal.operation(&id(CAPTURE)).unwrap();
+                    assert_eq!(completed.operation, operation.record);
+                    assert!(!operation.cancel.is_cancelled());
+                }
+                assert_eq!(journal.operation(&id(CAPTURE)).unwrap().phase, phase);
+            }
         }
     }
 }

@@ -224,6 +224,7 @@ async fn restore_consumer(
     }
     let lower_inputs = prepare_lower(&pool, consumer, map_stage, shape)?;
     let request = RestoreRequest {
+        disk_tracking_seeds: Vec::new(),
         version: vm_spec::restore::RESTORE_REQUEST_VERSION,
         checkpoint: Sha256Digest::from_bytes(*consumer.info.id.as_bytes()),
         activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string())
@@ -920,6 +921,7 @@ pub(crate) fn storage_from_snapshot(
         boot: record.boot.clone(),
         profile,
         backend,
+        disk_baselines: Vec::new(),
         disks: record
             .disks
             .iter()
@@ -1205,6 +1207,8 @@ async fn launch_restored(
     let socket = paths.vmm_socket_path();
     let serial = paths.serial_log_path();
     let trace = paths.vm_trace_log_path();
+    restore.request.disk_tracking_seeds =
+        crate::machine::root_storage::launch_disk_seeds(storage, &config.machine_dir)?;
     let launch = crate::supervisor::VmmLaunch {
         machine_id: config.id,
         name: &config.name,
@@ -1233,6 +1237,7 @@ async fn launch_restored(
             file_inode,
         },
         storage_shutdown: &shutdown,
+        disk_tracking_seeds: restore.request.disk_tracking_seeds.clone(),
         restore: Some(restore),
     };
     runtime
@@ -1264,8 +1269,10 @@ async fn inspect(
         network,
     };
     let bytes = serde_json::to_vec(&request).map_err(|error| invalid(error.to_string()))?;
-    if bytes.len() >= 1 << 20 {
-        return Err(invalid("restore inspection request exceeds 1 MiB"));
+    if bytes.len() >= vm_spec::restore::MAX_RESTORE_INSPECTION_BYTES {
+        return Err(invalid(
+            "restore inspection request exceeds its control-record bound",
+        ));
     }
     let mut command = pinned_command(executable);
     command
@@ -1543,6 +1550,7 @@ pub(crate) async fn restore_reserved_fork_child(
         files.push(file);
     }
     let request = RestoreRequest {
+        disk_tracking_seeds: Vec::new(),
         version: vm_spec::restore::RESTORE_REQUEST_VERSION,
         checkpoint: cut.record.cut_id,
         activation_id: vm_spec::lifecycle::LiveId::parse(&child.activation_id.to_string())

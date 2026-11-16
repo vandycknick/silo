@@ -870,6 +870,26 @@ impl NativeLifecycle for ScenarioNative {
             .collect())
     }
 
+    fn freeze_disks(
+        &self,
+        _token: &Self::Token,
+        _capture: Uuid,
+        _operation: NativeOperation,
+        _deadline: Instant,
+    ) -> Result<Vec<vm_spec::capture::DiskTrackingReceipt>, NativeFailure> {
+        Err(NativeFailure::new(NativeFailureKind::Unsupported))
+    }
+
+    fn settle_disks(
+        &self,
+        _capture: Uuid,
+        _settlements: &[vm_spec::capture::DiskTrackingSettlement],
+        _operation: &mut dyn FnMut() -> Result<NativeOperation, NativeFailure>,
+        _deadline: Instant,
+    ) -> Result<(), NativeFailure> {
+        Err(NativeFailure::new(NativeFailureKind::Unsupported))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn capture_execution(
         &self,

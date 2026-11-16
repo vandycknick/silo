@@ -502,12 +502,12 @@ def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest
 ) -> None:
     names = NAMES[:2]
     create(silo, restore_image, profile="layered")
-    traced = fork.TracedSource(silo, SOURCE, names, "capture-source-write")
+    traced = fork.TracedSource(silo, SOURCE, names, "capture-record-settle")
     try:
         prepared = witness_source(silo)
         traced.fork()
-        seal = json.loads((Path(traced.wait("boundary-held.json")["target"]).parent / "vm.capture.json")
-                          .read_bytes())
+        directory = Path(traced.wait("boundary-held.json")["target"])
+        seal = json.loads((directory / "vm.capture.json").read_bytes())
         assert seal["captureOutcome"] == "coherent", seal
         cancelled = fork.observe(silo, traced.operation, cancel=True)
         assert cancelled["cancellationRequested"] is True, cancelled

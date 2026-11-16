@@ -880,12 +880,10 @@ async fn create_machine_config_with_name(
             }
         }
         MaterializedRoot::Raw {
-            stream,
             size_bytes,
             authenticated,
             ..
         } if !overlay => CreateRoot::Raw {
-            stream,
             size_bytes,
             authenticated,
         },
@@ -1024,11 +1022,12 @@ async fn create_machine_config_with_name(
                 .reserve_copy_space(*operation, *bytes, directory)
                 .await?;
         }
-        let (rootfs_path, storage) = match &root {
+        let mut root_mutated = false;
+        let (rootfs_path, mut storage) = match &root {
             CreateRoot::Raw {
-                stream,
                 size_bytes,
                 authenticated,
+                ..
             } => {
                 let rootfs_path = create.dir().join(root_disk_relative_path());
                 copy_root(
@@ -1038,16 +1037,12 @@ async fn create_machine_config_with_name(
                     "root.raw",
                 )?;
                 if let Some(size_bytes) = request.disk_size_bytes {
+                    root_mutated =
+                        crate::machine::root_disk::raw_disk_needs_growth(&rootfs_path, size_bytes)?;
                     resize_raw_disk(&rootfs_path, size_bytes)?;
                 }
-                if let crate::MachineRoot::OpaqueRaw {
-                    geometry,
-                    initial_content,
-                    ..
-                } = &mut admitted_storage.root
-                {
+                if let crate::MachineRoot::OpaqueRaw { geometry, .. } = &mut admitted_storage.root {
                     geometry.length = root_disk_size;
-                    *initial_content = (root_disk_size == *size_bytes).then_some(*stream);
                 }
                 (rootfs_path, admitted_storage)
             }
@@ -1129,6 +1124,46 @@ async fn create_machine_config_with_name(
                 }
             }
         }
+        let map = match &root {
+            CreateRoot::Raw {
+                authenticated,
+                size_bytes,
+                ..
+            } if *size_bytes == root_disk_size && !root_mutated => Some(authenticated.map()),
+            CreateRoot::Image { upper, .. } => Some(upper.map()),
+            _ => None,
+        };
+        if let crate::MachineRoot::OpaqueRaw {
+            initial_content, ..
+        } = &mut storage.root
+        {
+            *initial_content = map.map(|map| map.id());
+        }
+        if let Some(map) = map {
+            let (index, disk) = create
+                .spec
+                .storage
+                .as_ref()
+                .and_then(|spec| {
+                    spec.disks.iter().enumerate().find(|(_, disk)| {
+                        matches!(
+                            disk.role,
+                            vm_spec::DiskRole::Root | vm_spec::DiskRole::RootUpper
+                        )
+                    })
+                })
+                .ok_or_else(|| {
+                    crate::machine::root_storage::invalid("created private root attachment missing")
+                })?;
+            crate::machine::root_storage::seed_disk(
+                &mut storage,
+                create.dir(),
+                index,
+                disk,
+                &std::fs::File::open(&rootfs_path)?,
+                map,
+            )?;
+        }
         if lower_length.is_some() {
             crate::machine::root_storage::validate_spec(&storage, &create.spec)?;
             crate::runtime::boot_assets::effective_boot(&storage, &create.spec, backend)?;
@@ -1155,8 +1190,7 @@ async fn create_machine_config_with_name(
                 runtime,
                 rootfs,
                 requested_reference,
-                &platform,
-                Some(storage),
+                storage,
                 SourceOwnership {
                     _lease: source_lease,
                     _managed: managed,
@@ -1203,7 +1237,6 @@ async fn create_machine_config_with_name(
 enum CreateRoot {
     /// A private copy of an authenticated raw image stream.
     Raw {
-        stream: crate::storage::identity::StreamId,
         size_bytes: u64,
         authenticated: crate::storage::stream::AuthenticatedStream,
     },
@@ -1455,38 +1488,23 @@ impl MachineCreateGuard {
         runtime: &Runtime,
         rootfs: MachineRootfsRecord,
         image_ref: String,
-        platform: &oci::Platform,
-        storage: Option<crate::MachineStorageRecord>,
+        mut storage: crate::MachineStorageRecord,
         source: SourceOwnership,
     ) -> Result<MachineConfig, LibVmError> {
         let config = self.config(image_ref, Some(rootfs.root_disk_size_bytes))?;
         let root_path = rootfs.root_disk_path.clone();
-        let map = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             use std::os::unix::fs::OpenOptionsExt;
-            let map = if storage.as_ref().is_none_or(|storage| {
-                matches!(
-                    &storage.root,
-                    crate::MachineRoot::OpaqueRaw {
-                        initial_content: None,
-                        ..
-                    }
-                )
-            }) {
-                Some(crate::storage::stream::StreamHasher::new().hash_file(&root_path)?)
-            } else {
-                None
-            };
             std::fs::File::options()
                 .read(true)
                 .write(true)
                 .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
                 .open(&root_path)?
                 .sync_all()?;
-            Ok::<_, crate::storage::StorageError>((map, storage))
+            Ok::<_, std::io::Error>(())
         })
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))??;
-        let (map, storage) = map;
         let directory = OwnedDirectory::open_existing_root(self.dir())?.ok_or_else(|| {
             LibVmError::InvalidOwnedPath {
                 path: self.machine_dir.clone(),
@@ -1494,37 +1512,6 @@ impl MachineCreateGuard {
             }
         })?;
         directory.sync()?;
-        let mut storage = match (storage, map) {
-            (Some(mut storage), Some(map)) => {
-                if let crate::MachineRoot::OpaqueRaw {
-                    initial_content, ..
-                } = &mut storage.root
-                {
-                    *initial_content = Some(map.id());
-                }
-                storage
-            }
-            (Some(storage), _) => storage,
-            (None, Some(map)) => {
-                let mut storage = crate::MachineStorageRecord::opaque_raw(
-                    crate::PrivatePath::new(root_disk_relative_path())?,
-                    map.length(),
-                    platform,
-                )?;
-                if let crate::MachineRoot::OpaqueRaw {
-                    initial_content, ..
-                } = &mut storage.root
-                {
-                    *initial_content = Some(map.id());
-                }
-                storage
-            }
-            (None, None) => {
-                return Err(crate::machine::root_storage::invalid(
-                    "creation has no root identity",
-                ))
-            }
-        };
         let store = runtime.native_store()?;
         let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
         let (boot_operation, boot_lease) =
@@ -1789,6 +1776,7 @@ async fn publish_checkpoint_child(
         durability,
     )
     .await?;
+    storage.disk_baselines.clear();
     let directory = OwnedDirectory::open_existing_root(create.dir())?.ok_or_else(|| {
         crate::machine::root_storage::invalid("new machine directory disappeared")
     })?;
@@ -1873,6 +1861,57 @@ async fn publish_checkpoint_child(
                 );
                 private_files.push(prepared.file().try_clone()?);
                 prepared.publish_constructed(directory.try_clone()?, target_name)?;
+                let order = if index == 0 {
+                    usize::from(matches!(
+                        storage.root,
+                        crate::MachineRoot::LinuxOverlay { .. }
+                    ))
+                } else {
+                    storage
+                        .disks
+                        .iter()
+                        .find_map(|disk| match &disk.storage {
+                            crate::DiskStorage::ManagedWritable { path, .. } if path == &target => {
+                                Some(disk.order as usize)
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            crate::machine::root_storage::invalid(
+                                "child managed disk order missing",
+                            )
+                        })?
+                };
+                let disk = create
+                    .spec
+                    .storage
+                    .as_ref()
+                    .and_then(|spec| spec.disks.get(order))
+                    .ok_or_else(|| {
+                        crate::machine::root_storage::invalid("child disk attachment missing")
+                    })?;
+                let scanned;
+                let map = match prepared.map() {
+                    Some(map) => map,
+                    None => {
+                        tracing::info!(
+                            disk_baseline_full_scans = 1u64,
+                            reason = "stopped-copy",
+                            "hashing unscanned stopped clone for child baseline"
+                        );
+                        scanned = crate::storage::stream::StreamHasher::new()
+                            .hash_open_file(prepared.file(), length)?;
+                        &scanned.map
+                    }
+                };
+                crate::machine::root_storage::seed_disk(
+                    &mut storage,
+                    create.dir(),
+                    order,
+                    disk,
+                    prepared.file(),
+                    map,
+                )?;
                 prepared.retain();
             }
             Ok(private_files)
@@ -1899,6 +1938,15 @@ async fn publish_checkpoint_child(
             &storage,
             runtime.local_images_dir(),
         )?;
+    }
+    for baseline in &mut storage.disk_baselines {
+        let disk = create
+            .spec
+            .storage
+            .as_ref()
+            .and_then(|spec| spec.disks.get(baseline.seed.attachment_index as usize))
+            .ok_or_else(|| crate::machine::root_storage::invalid("projected child disk missing"))?;
+        baseline.seed.block_id = disk.block_id.clone();
     }
     write_owned_machine_config(create.dir(), &create.name, &create.spec, durability)?;
     storage.validate()?;
@@ -2272,6 +2320,41 @@ mod tests {
                 assert!(durability.launch_directories.iter().any(
                     |directory| directory.path() == launch.serial_log_path().parent().unwrap()
                 ));
+                let storage = store.machine_storage(child.id).await.unwrap().unwrap();
+                assert_eq!(
+                    crate::machine::root_storage::launch_disk_seeds(&storage, &child.machine_dir)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                std::fs::remove_file(
+                    child
+                        .machine_dir
+                        .join(storage.disk_baselines[0].map.as_path()),
+                )
+                .unwrap();
+                let lease = store
+                    .register_launch_storage(child.id, uuid::Uuid::new_v4(), &storage, &child.spec)
+                    .await
+                    .unwrap();
+                let mut reader = store.test_pool().begin().await.unwrap();
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM machine_config")
+                    .fetch_one(&mut *reader)
+                    .await
+                    .unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    store.mark_launch_storage_admitted(lease.operation_id()),
+                )
+                .await
+                .expect("constructed child admission must not wait for a catalog checkpoint")
+                .unwrap();
+                let admitted = store.machine_storage(child.id).await.unwrap().unwrap();
+                assert!(matches!(
+                    admitted.disk_baselines[0].state,
+                    crate::store::models::storage::DiskBaselineState::Running { seeded: false, .. }
+                ));
+                reader.rollback().await.unwrap();
                 durability.complete().await.unwrap();
                 assert_eq!(
                     store.machine_durability(child.id).await.unwrap(),
@@ -2944,7 +3027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_guard_and_commit_write_vm_spec_and_state() {
+    async fn create_guard_commit_publishes_without_hashing_or_seeding_private_disk() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = LocalPaths::new(temp.path().join("silo"));
         let (runtime, store) = runtime_with_sqlite_store(paths).await;
@@ -2965,19 +3048,49 @@ mod tests {
             0o700
         );
 
-        std::fs::write(create.dir().join(root_disk_relative_path()), [0x64; 512]).unwrap();
-        let rootfs = rootfs_record(&create);
+        let mut rootfs = rootfs_record(&create);
+        rootfs.root_disk_size_bytes = 64 << 20;
+        disk_image::ext4::upper::format_upper(
+            &rootfs.root_disk_path,
+            rootfs_spec::upper_geometry::UpperCapacity::new(rootfs.root_disk_size_bytes).unwrap(),
+        )
+        .unwrap();
+        let storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new(root_disk_relative_path()).unwrap(),
+            rootfs.root_disk_size_bytes,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        #[cfg(target_os = "linux")]
+        let reads = crate::store::snapshot_store::tests::watch_stream_reads(&rootfs.root_disk_path);
         let config = create
             .commit(
                 &runtime,
                 rootfs,
                 "test-image:latest".to_string(),
-                &oci::Platform::host().unwrap(),
-                None,
+                storage,
                 crate::machine::builder::SourceOwnership::default(),
             )
             .await
             .expect("commit should succeed");
+        #[cfg(target_os = "linux")]
+        assert!(!crate::store::snapshot_store::tests::observed_stream_read(
+            &reads
+        ));
+        let storage = store.machine_storage(config.id).await.unwrap().unwrap();
+        assert!(storage.disk_baselines.is_empty());
+        assert!(matches!(
+            storage.root,
+            crate::MachineRoot::OpaqueRaw {
+                initial_content: None,
+                ..
+            }
+        ));
+        assert!(std::fs::read_dir(&machine_dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("disk-baseline-")));
 
         assert!(config.machine_dir.exists());
         assert_eq!(config.machine_dir, machine_dir);
@@ -3080,13 +3193,18 @@ mod tests {
             .unwrap();
 
         let rootfs = rootfs_record(&create);
+        let storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new(root_disk_relative_path()).unwrap(),
+            rootfs.root_disk_size_bytes,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
         let err = create
             .commit(
                 &runtime,
                 rootfs,
                 "test-image:latest".to_string(),
-                &oci::Platform::host().unwrap(),
-                None,
+                storage,
                 crate::machine::builder::SourceOwnership::default(),
             )
             .await
@@ -3111,16 +3229,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creation_records_final_resized_root_as_initial_provenance_only() {
+    async fn resized_creation_has_no_initial_identity_or_disk_baseline() {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("silo"));
         let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
         let source = write_base_rootfs(temp.path());
         let requested_length = std::fs::metadata(&source).unwrap().len() + 1024 * 1024;
-        let source_id = crate::storage::stream::StreamHasher::new()
-            .hash_file(&source)
-            .unwrap()
-            .id();
         let machine = runtime
             .machine()
             .name("typed-root")
@@ -3132,15 +3246,23 @@ mod tests {
         let id = machine.machine_id();
         let storage = store.machine_storage(id).await.unwrap().unwrap();
         let private = paths.machine(id).dir().join("root.raw");
-        let initial_id = crate::storage::stream::StreamHasher::new()
-            .hash_file(&private)
-            .unwrap()
-            .id();
-        assert_ne!(initial_id, source_id);
         assert!(
-            matches!(&storage.root, crate::MachineRoot::OpaqueRaw { path, geometry, layout: crate::RawLayout::WholeDisk, initial_content: Some(identity) }
-            if path.as_path() == Path::new("root.raw") && geometry.length == requested_length && *identity == initial_id)
+            matches!(&storage.root, crate::MachineRoot::OpaqueRaw { path, geometry, layout: crate::RawLayout::WholeDisk, initial_content: None }
+            if path.as_path() == Path::new("root.raw") && geometry.length == requested_length)
         );
+        assert!(storage.disk_baselines.is_empty());
+        assert!(
+            crate::machine::root_storage::launch_disk_seeds(&storage, paths.machine(id).dir())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(std::fs::read_dir(paths.machine(id).dir())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("disk-baseline-")));
         assert_eq!(storage.stop_outcome, crate::StorageStopOutcome::Unknown);
         assert_eq!(
             std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
@@ -3150,14 +3272,7 @@ mod tests {
             machine.inspect().await.unwrap().storage,
             Some(storage.clone())
         );
-        // Private writable bytes can change. The explicitly named initial
-        // provenance remains truthful without claiming a current identity.
         std::fs::write(&private, [0x65; 1024]).unwrap();
-        let changed = crate::storage::stream::StreamHasher::new()
-            .hash_file(&private)
-            .unwrap()
-            .id();
-        assert_ne!(initial_id, changed);
         assert_eq!(store.machine_storage(id).await.unwrap(), Some(storage));
     }
 
@@ -3380,7 +3495,25 @@ mod tests {
             std::fs::read(directory.join(root_disk_relative_path())).unwrap(),
             expected
         );
-        assert!(store.machine_storage(id).await.unwrap().is_some());
+        let storage = store.machine_storage(id).await.unwrap().unwrap();
+        assert_eq!(storage.disk_baselines.len(), 1);
+        assert!(matches!(
+            storage.disk_baselines[0].state,
+            crate::store::models::storage::DiskBaselineState::Ready
+        ));
+        let map = crate::storage::stream::StreamHasher::new()
+            .hash_file(&directory.join(root_disk_relative_path()))
+            .unwrap();
+        assert_eq!(
+            storage.disk_baselines[0].seed.baseline.unwrap().as_bytes(),
+            map.id().as_bytes()
+        );
+        assert_eq!(
+            crate::machine::root_storage::launch_disk_seeds(&storage, &directory)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3527,6 +3660,27 @@ mod tests {
         assert_eq!(config.guest, source.guest);
         let child_storage = store.machine_storage(config.id).await.unwrap().unwrap();
         assert_eq!(child_storage.boot, source_storage.boot);
+        assert_eq!(child_storage.disk_baselines.len(), 1);
+        assert!(matches!(
+            child_storage.disk_baselines[0].state,
+            crate::store::models::storage::DiskBaselineState::Ready
+        ));
+        assert_eq!(
+            child_storage.disk_baselines[0]
+                .seed
+                .baseline
+                .unwrap()
+                .as_bytes(),
+            source_stream.as_bytes()
+        );
+        assert_ne!(
+            child_storage.disk_baselines[0].seed.file_inode,
+            source_storage.disk_baselines[0].seed.file_inode
+        );
+        assert_ne!(
+            child_storage.disk_baselines[0].seed.epoch,
+            source_storage.disk_baselines[0].seed.epoch
+        );
         assert!(matches!(
             child_storage.root,
             crate::MachineRoot::OpaqueRaw { initial_content: Some(stream), .. }

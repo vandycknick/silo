@@ -451,6 +451,192 @@ impl MachineStore for Store {
 }
 
 impl Store {
+    pub(crate) async fn accept_capture_disk_baselines(
+        &self,
+        record: &crate::store::snapshot_store::CaptureRecord,
+    ) -> Result<(), LibVmError> {
+        use crate::store::models::storage::{DiskBaseline, DiskBaselineState};
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let Some(bytes) = &record.evidence else {
+            return Ok(());
+        };
+        let evidence = vm_spec::capture::CaptureEvidence::decode(bytes.as_bytes())
+            .map_err(crate::machine::root_storage::invalid)?;
+        evidence
+            .validate_against_plan(
+                &record.plan,
+                &vm_spec::capture::Sha256Digest::of_bytes(
+                    &record
+                        .plan
+                        .canonical_bytes()
+                        .map_err(crate::machine::root_storage::invalid)?,
+                ),
+            )
+            .map_err(crate::machine::root_storage::invalid)?;
+        if evidence.disk_tracking_receipts.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND machine_id=?2 AND run_id=?3 AND kind='launch')")
+            .bind(record.launch_operation_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *tx).await?;
+        if !current {
+            return Ok(());
+        }
+        let json: String =
+            sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
+                .bind(record.machine_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        let mut storage = crate::MachineStorageRecord::decode(&json)?;
+        if storage.storage_generation != record.storage.storage_generation {
+            return Ok(());
+        }
+        let directory = crate::paths::machine_data_dir_in(&self.home, record.machine_id);
+        let owned_directory = crate::paths::OwnedDirectory::open_existing_root(&directory)?
+            .ok_or_else(|| {
+                crate::machine::root_storage::invalid(
+                    "running disk baseline machine directory disappeared",
+                )
+            })?;
+        for receipt in &evidence.disk_tracking_receipts {
+            receipt
+                .validate()
+                .map_err(crate::machine::root_storage::invalid)?;
+            if receipt.token.capture_id != record.plan.capture_id
+                || evidence
+                    .pause_token
+                    .as_ref()
+                    .is_none_or(|pause| pause.generation.get() != receipt.token.pause_generation)
+            {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk receipt differs from accepted capture",
+                ));
+            }
+            let seed = &receipt.seed;
+            let Some(plan) = record.plan.disks.iter().find(|disk| {
+                disk.attachment_index == seed.attachment_index && disk.block_id == seed.block_id
+            }) else {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk tracker lacks its planned attachment",
+                ));
+            };
+            if !plan.tracking_eligible {
+                continue;
+            }
+            if record
+                .plan
+                .configuration
+                .attachments
+                .get(seed.attachment_index as usize)
+                .is_none_or(|attachment| {
+                    attachment.role != seed.role
+                        || attachment.geometry.length != seed.length
+                        || attachment.read_only
+                })
+            {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk receipt role or geometry changed",
+                ));
+            }
+            if storage.disk_baselines.iter().any(|baseline| baseline.seed.attachment_index == seed.attachment_index
+                && matches!(baseline.state, DiskBaselineState::Running { run_id, seeded: true } if run_id == record.run_id)
+                && baseline.seed.epoch != seed.epoch) {
+                return Err(crate::machine::root_storage::invalid("sealed disk receipt changes the running tracking epoch"));
+            }
+            let Some(identity) = evidence
+                .inventory
+                .iter()
+                .find(|entry| entry.role == vm_spec::capture::CaptureRole::Disk(plan.name.clone()))
+                .and_then(|entry| entry.identity)
+            else {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk lacks map identity",
+                ));
+            };
+            if storage.disk_baselines.iter().any(|baseline| {
+                baseline.seed.attachment_index == seed.attachment_index
+                    && baseline.seed.epoch == seed.epoch
+                    && baseline.generation >= receipt.token.generation
+            }) {
+                continue;
+            }
+            let Ok(path) =
+                crate::store::capture::writable_path(&storage, seed.attachment_index, seed.role)
+            else {
+                continue;
+            };
+            let source = crate::machine::stopped::open_private(
+                &owned_directory,
+                &crate::PrivatePath::new(path)?,
+                seed.length,
+            )?;
+            let metadata = source.file.metadata()?;
+            if metadata.dev() != seed.file_device
+                || metadata.ino() != seed.file_inode
+                || metadata.len() != seed.length
+            {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk tracker differs from running backing",
+                ));
+            }
+            let map_path = crate::machine::root_storage::baseline_map_path(&identity)?;
+            let mut map_bytes = Vec::new();
+            std::fs::File::open(directory.join(map_path.as_path()))?
+                .take(
+                    vm_spec::capture::MAX_STREAM_BYTES / vm_spec::capture::STREAM_CHUNK_BYTES * 74
+                        + 257,
+                )
+                .read_to_end(&mut map_bytes)?;
+            let map = vm_spec::capture::StreamMap::decode(&map_bytes)
+                .map_err(crate::machine::root_storage::invalid)?;
+            if map.id() != identity || map.length() != seed.length {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk baseline map identity changed",
+                ));
+            }
+            let mut seed = seed.clone();
+            seed.baseline = Some(identity);
+            storage
+                .disk_baselines
+                .retain(|baseline| baseline.seed.attachment_index != seed.attachment_index);
+            storage.disk_baselines.push(DiskBaseline {
+                seed,
+                map: map_path,
+                storage_generation: storage.storage_generation,
+                generation: receipt.token.generation,
+                state: DiskBaselineState::Running {
+                    run_id: record.run_id,
+                    seeded: true,
+                },
+                fingerprint: crate::storage::identity_file::SourceFingerprint::new(&metadata),
+            });
+        }
+        storage
+            .disk_baselines
+            .sort_by_key(|baseline| baseline.seed.attachment_index);
+        Self::write_machine_storage(&mut tx, record.machine_id, &storage).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate_machine_disk_baselines(
+        &self,
+        machine: MachineId,
+    ) -> Result<(), LibVmError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let json: String =
+            sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
+                .bind(machine.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        let mut storage = crate::MachineStorageRecord::decode(&json)?;
+        storage.invalidate_disk_baselines();
+        Self::write_machine_storage(&mut tx, machine, &storage).await?;
+        tx.commit().await?;
+        self.checkpoint_catalog().await
+    }
+
     pub(crate) async fn discover_machine(
         &self,
         reference: &crate::MachineRef,

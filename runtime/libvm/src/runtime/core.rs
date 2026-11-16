@@ -1018,7 +1018,6 @@ impl Runtime {
         let stream = &consumer.info.record.root.stream;
         Ok(MaterializedImage {
             root: MaterializedRoot::Raw {
-                stream: stream.stream,
                 size_bytes: stream.length,
                 authenticated,
             },
@@ -2919,7 +2918,8 @@ pub(crate) fn validate_root_disk_growth(
     Ok(())
 }
 
-pub(crate) fn reconcile_root_disk_size(
+pub(crate) async fn reconcile_root_disk_size(
+    runtime: &Runtime,
     config: &MachineConfig,
     path: &Path,
 ) -> Result<crate::machine::root_disk::RootDiskResizeOutcome, LibVmError> {
@@ -2930,6 +2930,12 @@ pub(crate) fn reconcile_root_disk_size(
         .map_err(crate::storage::StorageError::from)?;
 
     let root_disk_path = config.machine_dir.join(path);
+    if crate::machine::root_disk::raw_disk_needs_growth(&root_disk_path, desired_size)? {
+        runtime
+            .native_store()?
+            .invalidate_machine_disk_baselines(config.id)
+            .await?;
+    }
     resize_raw_disk(&root_disk_path, desired_size).map_err(Into::into)
 }
 

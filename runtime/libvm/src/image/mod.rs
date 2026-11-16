@@ -437,7 +437,6 @@ impl Images {
 pub(crate) enum MaterializedRoot {
     /// Whole authenticated raw disk bytes, copied into the machine.
     Raw {
-        stream: crate::storage::identity::StreamId,
         size_bytes: u64,
         authenticated: crate::storage::stream::AuthenticatedStream,
     },

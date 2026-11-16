@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::krun::KrunConfig;
 use crate::virt::exit::StartupStage;
 
-pub(crate) const MAX_CONFIG: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_CONFIG: usize = vm_spec::capture::MAX_CAPTURE_RECORD_BYTES + (1 << 20);
 pub(crate) const MAX_EVENT: usize = 16 * 1024;
 pub(crate) const MAX_DIAGNOSTIC: usize = 8 * 1024;
 

@@ -6,7 +6,8 @@ use std::os::fd::{FromRawFd, RawFd};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const VMM_START_REQUEST_VERSION: u32 = 1;
-pub(crate) const VMM_START_REQUEST_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const VMM_START_REQUEST_MAX_BYTES: usize =
+    vm_spec::capture::MAX_CAPTURE_RECORD_BYTES + (1 << 20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -17,6 +18,7 @@ pub(crate) struct VmmStartRequest {
     pub(crate) storage_lease: protocol::shutdown::StorageLeaseBinding,
     pub(crate) storage_shutdown: protocol::shutdown::StorageShutdownContext,
     pub(crate) startup_command: Option<StartupCommand>,
+    pub(crate) disk_tracking_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
     // Optional additive field within version 1: absent means the
     // platform-default backend. NEVER feature-gate this field — both sides of
     // the pipe must parse the same schema regardless of compiled features.
@@ -218,6 +220,14 @@ fn validate_start_request(
     }
     request.storage_lease.validate().map_err(invalid_data)?;
     request.storage_shutdown.validate().map_err(invalid_data)?;
+    if request.disk_tracking_seeds.len() > 16 {
+        return Err(invalid_data(
+            "disk tracking seeds exceed the attachment limit",
+        ));
+    }
+    for seed in &request.disk_tracking_seeds {
+        seed.validate().map_err(invalid_data)?;
+    }
     if request.storage_shutdown.machine_id != request.machine_id
         || request.storage_shutdown.run_id != request.machine_run_id
     {
@@ -767,6 +777,9 @@ mod tests {
     }
 
     fn encode(mut value: serde_json::Value) -> Vec<u8> {
+        if value.get("diskTrackingSeeds").is_none() {
+            value["diskTrackingSeeds"] = json!([]);
+        }
         value["storageLease"] = json!({
             "operationId": "33333333-3333-4333-8333-333333333333",
             "fileDevice": 1, "fileInode": 1
@@ -834,5 +847,38 @@ mod tests {
         ] {
             assert!(destination_ssh_ca(Some(&invalid)).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn start_request_carries_strict_optional_disk_seeds() {
+        use vm_spec::capture::{
+            DiskTrackingSeed, Sha256Digest, DISK_TRACKING_VERSION, STREAM_CHUNK_BYTES,
+        };
+        let machine = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        let seed = DiskTrackingSeed {
+            version: DISK_TRACKING_VERSION,
+            role: vm_spec::DiskRole::Root,
+            attachment_index: 0,
+            block_id: vm_spec::BlockId::new("root").unwrap(),
+            file_device: 1,
+            file_inode: 2,
+            length: STREAM_CHUNK_BYTES + 512,
+            chunk_size: STREAM_CHUNK_BYTES,
+            epoch: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+            baseline: Some(Sha256Digest::of_bytes(b"map")),
+        };
+        let request = json!({
+            "version": VMM_START_REQUEST_VERSION, "machineId": machine, "machineRunId": run,
+            "diskTrackingSeeds": [seed],
+        });
+        let decoded = decode_start_request(&encode(request.clone()), &machine, &run).unwrap();
+        assert_eq!(decoded.disk_tracking_seeds, vec![seed]);
+        let mut invalid = request.clone();
+        invalid["diskTrackingSeeds"][0]["chunkSize"] = json!(4096);
+        assert!(decode_start_request(&encode(invalid), &machine, &run).is_err());
+        let mut invalid = request;
+        invalid["diskTrackingSeeds"][0]["unrecognized"] = json!(true);
+        assert!(decode_start_request(&encode(invalid), &machine, &run).is_err());
     }
 }

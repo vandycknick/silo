@@ -4,15 +4,16 @@
 //!  admit ─► prepare[staging, request.json, 4 outputs + launch-lease pin ─► worker]
 //!        ─► pause[acquire: drain → freeze(e) → native Capture pause | borrow user pause]
 //!        ─► flush[exact cut] ─► disks[clone only | sparse copy + inline map]
-//!        ─► execution+devices ─► RAM receipt ─► verify[RAM and completed copy maps]
+//!        ─► freeze disk generations ─► execution+devices ─► RAM receipt ─► verify
 //!        ─► reflink lane: IdentityPending cut record ─► accept RAM baseline
 //!             ─► continue[resume-if-acquired | preserve; publish source, open sessions if Running]
 //!             ─► clone identities (new lifecycle operations remain fenced)
 //!        ─► record[cancel/stop linearized; write-once coherent record]
+//!        ─► commit disk generations + retain source maps independently of staging
 //!        ═══ capture succeeded ═══ (cancel no longer has effect)
 //!        ─► copy-only lane: accept baseline + continue ─► final source projection
 //!
-//!  unsealed failure/cancel ─► resolve an unaccepted native candidate
+//!  unsealed failure/cancel ─► abort frozen disk generations ─► resolve RAM candidate
 //!       ─► failed vm.capture.json ─► continue once under policy
 //! ```
 //!
@@ -20,7 +21,7 @@
 //! continuation never touches the seal, and a successful continuation never
 //! turns a failed capture into a success. Nothing here unlinks staging.
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -84,6 +85,7 @@ pub(crate) struct CaptureContext {
     lease: Arc<OwnedFd>,
     digests: CaptureDigests,
     baseline: std::sync::Mutex<Option<AcceptedMap>>,
+    disk_baselines: std::sync::Mutex<std::collections::BTreeMap<vm_spec::BlockId, Arc<StreamMap>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +130,7 @@ impl CaptureContext {
             launch: launch_lease,
             lease: launch.lease.clone(),
             baseline: std::sync::Mutex::new(None),
+            disk_baselines: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -251,6 +254,10 @@ struct Run {
     pending_disks: Vec<CaptureDiskCut>,
     continued: Option<Finish>,
     source_continued: bool,
+    disk_freeze_attempted: bool,
+    disk_receipts: Vec<vm_spec::capture::DiskTrackingReceipt>,
+    disk_stats: Vec<vm_spec::capture::CaptureDiskStats>,
+    disk_maps: Vec<(vm_spec::BlockId, Arc<StreamMap>)>,
 }
 
 impl Run {
@@ -284,6 +291,8 @@ impl Run {
         let request_digest = self.request_digest?;
         let token = self.cut.clone();
         Some(CaptureEvidence {
+            disk_stats: self.disk_stats.clone(),
+            disk_tracking_receipts: self.disk_receipts.clone(),
             version: CAPTURE_RECORD_VERSION,
             machine_id: self.plan.machine_id.clone(),
             run_id: self.plan.run_id.clone(),
@@ -338,6 +347,35 @@ struct Verified {
     /// Actual staged bytes charged against the reservation, before the seal.
     staged_bytes: u64,
     map: Arc<vm_spec::capture::StreamMap>,
+}
+
+struct DiskIdentityResult {
+    inventory: Vec<CaptureInventoryEntry>,
+    bytes: u64,
+    maps: Vec<(vm_spec::BlockId, Arc<StreamMap>)>,
+    stats: Vec<vm_spec::capture::CaptureDiskStats>,
+}
+
+fn read_disk_map(file: File) -> io::Result<StreamMap> {
+    let maximum =
+        (vm_spec::capture::MAX_STREAM_BYTES / vm_spec::capture::STREAM_CHUNK_BYTES) * 74 + 256;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "disk map exceeds its bound",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(maximum + 1).read_to_end(&mut bytes)?;
+    let map = StreamMap::decode(&bytes).map_err(io::Error::other)?;
+    if map.canonical_bytes().map_err(io::Error::other)? != bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "disk map is not canonical",
+        ));
+    }
+    Ok(map)
 }
 
 /// A token tripped by cancel or stop for blocking stages; the watcher ends
@@ -504,6 +542,10 @@ impl LiveCoordinator {
             pending_disks: Vec::new(),
             continued: None,
             source_continued: false,
+            disk_freeze_attempted: false,
+            disk_receipts: Vec::new(),
+            disk_stats: Vec::new(),
+            disk_maps: Vec::new(),
         };
         match self.capture_stages(&mut run).await {
             Ok(evidence) => self.seal(run, evidence).await,
@@ -516,6 +558,7 @@ impl LiveCoordinator {
         self.stage_pause(run).await?;
         self.stage_flush(run).await?;
         self.stage_disks(run).await?;
+        self.stage_freeze_disks(run).await?;
         self.stage_execution_and_memory(run).await?;
         let staged = self.stage_verify(run).await?;
         staging_budget(run.plan.reservation.staging_bytes, staged).map_err(Abort::Failed)?;
@@ -991,6 +1034,163 @@ impl LiveCoordinator {
         }
     }
 
+    async fn stage_freeze_disks(&self, run: &mut Run) -> Result<(), Abort> {
+        let fail = |message: String| {
+            Abort::Failed(failure(
+                LiveFailureCode::DiskFlushFailed,
+                LiveStage::CaptureDisks,
+                message,
+            ))
+        };
+        run.disk_freeze_attempted = true;
+        let response = self
+            .native(self.native_request(
+                &run.operation,
+                LifecycleCommand::FreezeCaptureDisks {
+                    operation: wire_uuid(&run.operation),
+                    timeout: self.timeouts.native,
+                },
+            ))
+            .await;
+        match response {
+            Ok(CommandOutcome::DiskGenerationsFrozen { receipts }) => run.disk_receipts = receipts,
+            Ok(CommandOutcome::CaptureFailed { failure, .. })
+                if failure.kind == crate::virt::lifecycle::NativeFailureKind::Unsupported =>
+            {
+                run.disk_freeze_attempted = false;
+            }
+            Ok(outcome) => return Err(fail(format!("disk freeze failed: {outcome:?}"))),
+            Err(error) => {
+                return Err(Abort::native(
+                    error,
+                    LiveFailureCode::DiskFlushFailed,
+                    LiveStage::CaptureDisks,
+                ))
+            }
+        }
+        if let Some(context) = &self.capture {
+            let mut baselines = context
+                .disk_baselines
+                .lock()
+                .map_err(|_| fail("disk baseline owner is poisoned".into()))?;
+            for disk in run.plan.disks.iter().filter(|disk| !disk.tracking_eligible) {
+                baselines.remove(&disk.block_id);
+            }
+        }
+        let sources = self
+            .machine
+            .capture_sources()
+            .await
+            .map_err(|error| fail(error.to_string()))?;
+        if run.disk_freeze_attempted && run.disk_receipts.len() != run.plan.disks.len() {
+            return Err(fail(
+                "disk freeze does not cover every writable attachment".into(),
+            ));
+        }
+        for (index, receipt) in run.disk_receipts.iter().enumerate() {
+            receipt.validate().map_err(fail)?;
+            let disk = run
+                .plan
+                .disks
+                .iter()
+                .find(|disk| {
+                    disk.attachment_index == receipt.seed.attachment_index
+                        && disk.block_id == receipt.seed.block_id
+                })
+                .ok_or_else(|| fail("disk receipt has no planned attachment".into()))?;
+            let attachment = run
+                .plan
+                .configuration
+                .attachments
+                .get(disk.attachment_index as usize)
+                .ok_or_else(|| fail("disk receipt attachment is absent".into()))?;
+            let source = sources
+                .iter()
+                .find(|source| source.disk_index == disk.attachment_index && source.writable)
+                .ok_or_else(|| fail("disk receipt has no held backing".into()))?;
+            let metadata = source
+                .file
+                .metadata()
+                .map_err(|error| fail(error.to_string()))?;
+            use std::os::unix::fs::MetadataExt;
+            if receipt.token.capture_id != run.operation
+                || Some(receipt.token.pause_generation)
+                    != run.cut_generation().map(|generation| generation.get())
+                || receipt.seed.role != attachment.role
+                || receipt.seed.file_device != metadata.dev()
+                || receipt.seed.file_inode != metadata.ino()
+                || receipt.seed.length != disk.length
+                || receipt.seed.length != metadata.len()
+                || run.disk_receipts[..index]
+                    .iter()
+                    .any(|previous| previous.seed.block_id == receipt.seed.block_id)
+            {
+                return Err(fail(
+                    "disk receipt differs from the exact paused source".into(),
+                ));
+            }
+        }
+        for cut in &mut run.pending_disks {
+            let planned = run
+                .plan
+                .disks
+                .iter()
+                .find(|disk| disk.name == cut.name)
+                .ok_or_else(|| fail("clone has no planned attachment".into()))?;
+            cut.tracking_receipt = run
+                .disk_receipts
+                .iter()
+                .find(|receipt| receipt.seed.block_id == planned.block_id)
+                .cloned();
+        }
+        let staging = run
+            .staging
+            .clone()
+            .ok_or_else(|| fail("disk staging is absent".into()))?;
+        let copies = run
+            .plan
+            .disks
+            .iter()
+            .filter(|disk| !run.pending_disks.iter().any(|cut| cut.name == disk.name))
+            .map(|disk| {
+                let dirty_chunks = run
+                    .disk_receipts
+                    .iter()
+                    .find(|receipt| receipt.seed.block_id == disk.block_id)
+                    .map_or(0, |receipt| receipt.dirty_chunks);
+                (disk.clone(), dirty_chunks)
+            })
+            .collect::<Vec<_>>();
+        let result = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let mut maps = Vec::with_capacity(copies.len());
+            let mut stats = Vec::with_capacity(copies.len());
+            for (disk, dirty_chunks) in copies {
+                let (file, _) = staging.open_sealed(&CaptureRole::DiskMap(disk.name.clone()))?;
+                let map = read_disk_map(file)?;
+                stats.push(vm_spec::capture::CaptureDiskStats {
+                    name: disk.name,
+                    dirty_chunks,
+                    total_chunks: disk.length.div_ceil(vm_spec::capture::STREAM_CHUNK_BYTES),
+                    bytes_hashed: crate::live::staging::hashed_map_bytes(&map),
+                    baseline_reused: false,
+                    full_scan_reason: Some(if disk.tracking_eligible {
+                        vm_spec::capture::DiskFullScanReason::CopyLane
+                    } else {
+                        vm_spec::capture::DiskFullScanReason::External
+                    }),
+                });
+                maps.push((disk.block_id, Arc::new(map)));
+            }
+            Ok((maps, stats))
+        })
+        .await
+        .map_err(|error| fail(error.to_string()))?
+        .map_err(|error| fail(error.to_string()))?;
+        run.disk_maps.extend(result.0);
+        run.disk_stats.extend(result.1);
+        self.checkpoint(run, LiveStage::CaptureDisks)
+    }
+
     fn binding_matches(&self, run: &Run, binding: &NativeBinding) -> bool {
         let Some(context) = self.capture.as_ref() else {
             return false;
@@ -1327,13 +1527,20 @@ impl LiveCoordinator {
             .staging
             .clone()
             .ok_or_else(|| fail("capture staging is missing".into()))?;
-        let cut = CaptureCutRecord {
+        let mut cut = CaptureCutRecord {
             phase: CaptureCutPhase::IdentityPending,
             evidence: run
                 .evidence(CaptureRecordOutcome::Coherent, None)
                 .ok_or_else(|| fail("capture request is missing".into()))?,
             disks: run.pending_disks.clone(),
         };
+        cut.evidence.disk_tracking_receipts.retain(|receipt| {
+            !cut.disks.iter().any(|disk| {
+                disk.tracking_receipt
+                    .as_ref()
+                    .is_some_and(|pending| pending.seed.block_id == receipt.seed.block_id)
+            })
+        });
         cut.validate_against_plan(&run.plan, &cut.evidence.request_digest)
             .map_err(fail)?;
         let bytes = cut.canonical_bytes().map_err(fail)?;
@@ -1374,7 +1581,7 @@ impl LiveCoordinator {
             .staging
             .clone()
             .ok_or_else(|| fail("capture staging is missing".into()))?;
-        let pending = run.pending_disks.clone();
+        let pending = std::mem::take(&mut run.pending_disks);
         let disks = run.plan.disks.clone();
         let outputs = run
             .outputs
@@ -1383,14 +1590,51 @@ impl LiveCoordinator {
             .resolved_map
             .clone()
             .ok_or_else(|| fail("RAM map is missing".into()))?;
+        let baselines = self
+            .capture
+            .as_ref()
+            .and_then(|context| context.disk_baselines.lock().ok().map(|maps| maps.clone()))
+            .unwrap_or_default();
         let (abort, watcher) = abort_token(&run.cancel, &self.stop);
         let result = tokio::task::spawn_blocking({
             let abort = abort.clone();
-            move || -> Result<(Vec<CaptureInventoryEntry>, u64), DiskCopyError> {
+            move || -> Result<DiskIdentityResult, DiskCopyError> {
                 let mut inventory = Vec::with_capacity(pending.len() * 2);
                 let mut bytes = staged;
+                let mut maps = Vec::with_capacity(pending.len());
+                let mut stats = Vec::with_capacity(pending.len());
                 for cut in pending {
-                    staging.complete_disk_identity(&cut, &abort)?;
+                    let planned = disks.iter().find(|disk| disk.name == cut.name)
+                        .ok_or_else(|| io::Error::other("clone attachment is absent"))?;
+                    let expected = cut.tracking_receipt.as_ref()
+                        .filter(|receipt| planned.tracking_eligible && receipt.invalid_reason.is_none())
+                        .and_then(|receipt| receipt.seed.baseline);
+                    let mut baseline = expected.and_then(|_| baselines.get(&planned.block_id).cloned());
+                    if expected.is_some() && baseline.as_ref().is_none_or(|map| Some(map.id()) != expected) {
+                        baseline = planned.baseline_map.as_ref().and_then(|path| {
+                            let loaded = nix::fcntl::open(std::path::Path::new(path),
+                                nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC
+                                    | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK,
+                                nix::sys::stat::Mode::empty())
+                                .map(File::from).map_err(io::Error::from).and_then(read_disk_map);
+                            match loaded {
+                                Ok(map) if map.length() == cut.length && Some(map.id()) == expected => Some(Arc::new(map)),
+                                Ok(_) => None,
+                                Err(error) => {
+                                    tracing::warn!(%error, block = %planned.block_id.as_str(), "disk baseline map is unavailable; hashing immutable clone");
+                                    None
+                                }
+                            }
+                        });
+                    }
+                    let (disk_map, disk_stats) = staging.complete_disk_identity(
+                        &cut, baseline.as_deref(), planned.tracking_eligible, &abort)?;
+                    tracing::info!(disk = %cut.name.as_str(), dirty_chunks = disk_stats.dirty_chunks,
+                        total_chunks = disk_stats.total_chunks, bytes_hashed = disk_stats.bytes_hashed,
+                        baseline_reused = disk_stats.baseline_reused, full_scan_reason = ?disk_stats.full_scan_reason,
+                        "completed disk identity");
+                    maps.push((planned.block_id.clone(), Arc::new(disk_map)));
+                    stats.push(disk_stats);
                     for role in [
                         CaptureRole::Disk(cut.name.clone()),
                         CaptureRole::DiskMap(cut.name),
@@ -1403,20 +1647,22 @@ impl LiveCoordinator {
                     }
                 }
                 let cut = staging.open_entry_allocation(CAPTURE_CUT_FILE)?;
-                Ok((inventory, bytes.saturating_add(cut)))
+                Ok(DiskIdentityResult { inventory, bytes: bytes.saturating_add(cut), maps, stats })
             }
         })
         .await;
         watcher.abort();
         self.checkpoint(run, LiveStage::CaptureDiskIdentity)?;
-        let (inventory, bytes) = result
+        let result = result
             .map_err(|error| fail(format!("disk identity task failed: {error}")))?
             .map_err(|error| fail(error.to_string()))?;
-        run.inventory.extend(inventory);
+        run.inventory.extend(result.inventory);
+        run.disk_maps.extend(result.maps);
+        run.disk_stats.extend(result.stats);
         let roles = run.plan.roles();
         run.inventory
             .sort_by_key(|entry| roles.iter().position(|role| role == &entry.role));
-        staging_budget(run.plan.reservation.staging_bytes, bytes).map_err(Abort::Failed)?;
+        staging_budget(run.plan.reservation.staging_bytes, result.bytes).map_err(Abort::Failed)?;
         run.facts.disk_copies_sealed = true;
         Ok(())
     }
@@ -1634,7 +1880,7 @@ impl LiveCoordinator {
         match committed {
             Ok(Ok(RecordCommit::Complete)) => {}
             Ok(Ok(RecordCommit::Uncertain(error))) => {
-                return self.seal_uncertain(run, error.to_string());
+                return self.seal_uncertain(run, error.to_string()).await;
             }
             Ok(Err(error)) => {
                 // Nothing was linked: there is no record to preserve.
@@ -1651,12 +1897,17 @@ impl LiveCoordinator {
                     .await;
             }
             Err(error) => {
-                return self.seal_uncertain(run, format!("seal task failed: {error}"));
+                return self
+                    .seal_uncertain(run, format!("seal task failed: {error}"))
+                    .await;
             }
         }
         let Some(cut) = run.cut.clone() else {
-            return self.seal_uncertain(run, "sealed without a cut token".into());
+            return self
+                .seal_uncertain(run, "sealed without a cut token".into())
+                .await;
         };
+        let disk_settlement = self.settle_disks(&mut run, true).await;
         {
             let mut inner = self.lock();
             let sealed = LiveOperationRecord {
@@ -1696,6 +1947,10 @@ impl LiveCoordinator {
                 inner.journal.complete(&request, result);
             }
         }
+        if let Err(cause) = disk_settlement {
+            self.finish(&mut run, Finish::Error(cause)).await;
+            return;
+        }
         tracing::info!(operation = %run.operation, evidence = %evidence_sha256, "capture sealed");
         if let Some(finish) = run.continued.take() {
             self.finish(&mut run, finish).await;
@@ -1714,7 +1969,10 @@ impl LiveCoordinator {
     /// The record is visible but unsettled: never claim
     /// success, never overwrite or remove it, never continue the source.
     /// Stay fenced in Error until stop; libvm reconciles the files.
-    fn seal_uncertain(&self, run: Run, detail: String) {
+    async fn seal_uncertain(&self, mut run: Run, detail: String) {
+        if let Err(error) = self.settle_disks(&mut run, false).await {
+            tracing::error!(%error, "uncertain seal disk abort could not be reconciled");
+        }
         let cause = failure(
             LiveFailureCode::SealUncertain,
             LiveStage::CaptureSeal,
@@ -2111,26 +2369,129 @@ impl LiveCoordinator {
         }
     }
 
+    /// The worker journal owns retries, even after source stop/cancellation.
+    /// An empty settlement list aborts any native cut retained before a failed reply.
+    async fn settle_disks(&self, run: &mut Run, commit: bool) -> Result<(), LiveFailure> {
+        if !run.disk_freeze_attempted {
+            return Ok(());
+        }
+        let fail = |message: String| {
+            failure(
+                LiveFailureCode::BaselineAcceptFailed,
+                LiveStage::CaptureAccept,
+                message,
+            )
+        };
+        let settlements = if commit {
+            run.disk_receipts
+                .iter()
+                .map(|receipt| {
+                    let map = run
+                        .disk_maps
+                        .iter()
+                        .find(|(block, _)| block == &receipt.seed.block_id)
+                        .ok_or_else(|| fail("sealed disk map is absent at settlement".into()))?;
+                    Ok(vm_spec::capture::DiskTrackingSettlement {
+                        version: vm_spec::capture::DISK_TRACKING_VERSION,
+                        block_id: receipt.seed.block_id.clone(),
+                        token: receipt.token.clone(),
+                        settlement: vm_spec::capture::DiskGenerationSettlement::Commit {
+                            baseline: map.1.id(),
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, LiveFailure>>()?
+        } else {
+            Vec::new()
+        };
+        let mut request = self.native_request(
+            &run.operation,
+            LifecycleCommand::SettleCaptureDisks {
+                operation: wire_uuid(&run.operation),
+                settlements,
+                timeout: self.timeouts.native,
+            },
+        );
+        let deadline =
+            tokio::time::Instant::now() + self.timeouts.native + std::time::Duration::from_secs(5);
+        loop {
+            match self.machine.lifecycle(request.clone()).await {
+                Ok(response) => match response.command.map(|report| report.state) {
+                    Some(CommandState::Completed {
+                        outcome: CommandOutcome::DiskGenerationsSettled,
+                    }) => break,
+                    Some(CommandState::Accepted) => {}
+                    Some(CommandState::Completed { outcome }) => {
+                        return Err(fail(format!(
+                            "disk generation settlement failed: {outcome:?}"
+                        )))
+                    }
+                    None => return Err(fail("disk settlement omitted its journal report".into())),
+                },
+                Err(LifecycleError::Unknown(LifecycleUncertainty::WorkerLost)) => {
+                    run.disk_freeze_attempted = false;
+                    return Ok(());
+                }
+                Err(LifecycleError::Unknown(_)) if tokio::time::Instant::now() < deadline => {}
+                Err(LifecycleError::Rejected(
+                    LifecycleRejection::Busy | LifecycleRejection::CapturePending,
+                )) if tokio::time::Instant::now() < deadline => {
+                    request.request_id = Uuid::new_v4();
+                }
+                Err(error) => return Err(fail(error.to_string())),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(fail(
+                    "disk settlement journal is unresolved; source remains fenced".into(),
+                ));
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+        run.disk_freeze_attempted = false;
+        if commit {
+            if let Some(context) = &self.capture {
+                let mut maps = context
+                    .disk_baselines
+                    .lock()
+                    .map_err(|_| fail("accepted disk baseline owner is poisoned".into()))?;
+                for (block, map) in &run.disk_maps {
+                    if run
+                        .plan
+                        .disks
+                        .iter()
+                        .any(|disk| disk.block_id == *block && disk.tracking_eligible)
+                    {
+                        maps.insert(block.clone(), map.clone());
+                    } else {
+                        maps.remove(block);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ---------------------------------------------------------------- unwind
 
     /// The capture did not seal. Resolve the native candidate (an uncertain
     /// preparation first by exact observation), write the failed diagnostic
     /// record, then continue the source under its policy.
     async fn unwind(&self, mut run: Run, abort: Abort) {
+        let disk_settlement = self.settle_disks(&mut run, false).await;
         let cause = match abort {
-            Abort::Stopped => {
-                // Stop never resumes or thaws; worker and outputs stay owned
-                // until the sole reaper terminates them.
-                let stopped = failure(
-                    LiveFailureCode::Stopped,
-                    LiveStage::Admission,
-                    "monitor is stopping",
-                );
-                self.write_failed_record(&run, &stopped).await;
+            Abort::Failed(cause) if !self.stop.is_cancelled() => cause,
+            _ => {
+                // The run is terminating, not continuing unsuccessfully. Leave
+                // any retained cut for dead-run identity recovery; a failed
+                // diagnostic would permanently prevent its publication.
                 return self.capture_stopped(&mut run);
             }
-            Abort::Failed(cause) => cause,
         };
+        if let Err(cause) = disk_settlement {
+            self.write_failed_record(&run, &cause).await;
+            self.finish(&mut run, Finish::Error(cause)).await;
+            return;
+        }
         tracing::warn!(operation = %run.operation, cause = %cause, "capture failed before its seal");
         {
             let mut inner = self.lock();
@@ -2322,6 +2683,9 @@ impl LiveCoordinator {
     /// Record the observed continuation while capture still owns admission,
     /// then publish its final state and settle under the same journal lock.
     async fn finish(&self, run: &mut Run, finish: Finish) {
+        if self.stop.is_cancelled() {
+            return self.capture_stopped(run);
+        }
         let continuation = match &finish {
             Finish::Running(continuation) | Finish::Paused(_, continuation) => continuation.clone(),
             Finish::Error(cause) => CaptureContinuation::ResumeFailed {
@@ -2979,6 +3343,8 @@ mod tests {
             staging
                 .complete_disk_identity(
                     &staging.disk_cut(&name).unwrap(),
+                    None,
+                    true,
                     &CancellationToken::new(),
                 )
                 .unwrap();
@@ -3007,6 +3373,8 @@ mod tests {
             block_id: vm_spec::BlockId::new("data").unwrap(),
             length,
             copy,
+            baseline_map: None,
+            tracking_eligible: true,
         }]
     }
 

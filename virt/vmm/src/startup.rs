@@ -543,6 +543,21 @@ pub async fn init(
             runtime.config().display()
         )
     })?;
+    if !start_request.disk_tracking_seeds.is_empty() {
+        let disk_configuration =
+            vm_spec::capture::CaptureConfiguration::from_spec(&spec).map_err(eyre::Report::msg)?;
+        vm_spec::restore::validate_disk_tracking_seeds(
+            &start_request.disk_tracking_seeds,
+            &disk_configuration,
+        )
+        .map_err(eyre::Report::msg)?;
+    }
+    if let Some(restore) = &start_request.restore {
+        eyre::ensure!(
+            start_request.disk_tracking_seeds == restore.disk_tracking_seeds,
+            "restore disk seeds differ from launch disk seeds"
+        );
+    }
     let guest_services_enabled = agent_enabled;
     let network = parse_network_args(network_args)?;
     let backend_selection =
@@ -612,6 +627,7 @@ pub async fn init(
             holder_path: runtime.runtime_dir().join("vm.storage-holder.json"),
             binding: start_request.storage_lease,
             lease: storage_lease,
+            disk_tracking_seeds: start_request.disk_tracking_seeds,
         });
     let host_live = backend_selection.host_report()?;
     // Adopt the inherited state objects only once every destination check
@@ -1407,7 +1423,7 @@ mod tests {
             Vec::new(),
         )
         .await;
-        assert!(oversized_error.contains("exceeds 16MiB"));
+        assert!(oversized_error.contains("start request exceeds"));
         assert!(!oversized_error.contains("read vm spec"));
     }
 
@@ -1619,6 +1635,7 @@ mod tests {
     }
 
     fn encode_start_request(mut value: serde_json::Value) -> Vec<u8> {
+        value["diskTrackingSeeds"] = serde_json::json!([]);
         value["storageLease"] = serde_json::json!({
             "operationId":"33333333-3333-4333-8333-333333333333",
             "fileDevice":u64::MAX, "fileInode":u64::MAX

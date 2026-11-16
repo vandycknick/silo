@@ -242,9 +242,17 @@ fn resources(
                                 .ok_or_else(|| invalid("restored Raw backing role is missing"))?
                                 .try_clone()?,
                         );
-                        resources
-                            .blocks
-                            .push(RestoreBlock::raw(attachment, file, disk.read_only));
+                        let mut block = RestoreBlock::raw(attachment, file, disk.read_only);
+                        if let Some(seed) = config
+                            .disk_tracking_seeds
+                            .iter()
+                            .find(|seed| seed.block_id == disk.block_id)
+                        {
+                            block = block.with_tracking_seed(
+                                crate::krun::worker::disk_tracking::seed(seed).map_err(invalid)?,
+                            );
+                        }
+                        resources.blocks.push(block);
                     }
                     vm_spec::DiskFormat::Vmdk => {
                         let position = vmdk
@@ -495,6 +503,8 @@ pub(crate) mod tests {
             },
         });
         let evidence = CaptureEvidence {
+            disk_stats: Vec::new(),
+            disk_tracking_receipts: Vec::new(),
             version: 1,
             machine_id: machine.clone(),
             run_id: run.clone(),
@@ -561,6 +571,7 @@ pub(crate) mod tests {
             memory_state_sealed: true,
         };
         let request = RestoreRequest {
+            disk_tracking_seeds: Vec::new(),
             version: 1,
             checkpoint: digest,
             activation_id: id(),
