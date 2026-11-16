@@ -10,13 +10,13 @@ from uuid import uuid4
 
 import pytest
 
-from silo_smoke import image_cache, preflight
+from silo_smoke import preflight
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
-from silo_perf.drivers import Context, Names, REGISTRY
+from silo_perf.drivers import Context, INFORMATIONAL_METRICS, Names, REGISTRY
 from silo_perf.history import Record, append, history_path, host, load, now
-from silo_perf.model import Verdict, invariant, load_cohorts, load_targets, target_for
+from silo_perf.model import Verdict, image_source, invariant, load_cohorts, load_targets, target_for
 from silo_perf.report import render
 from silo_perf.scenario import sample
 
@@ -73,7 +73,6 @@ def test_live_operations(config: SmokeConfig, registry: LoopbackRegistry) -> Non
                             workspace = Workspace(config, registry.ca_path, parent=cache)
                             failed = True
                             try:
-                                image_cache.seed(config.cache_dir, workspace.silo_home)
                                 identity = host(workspace.root)
                                 if fingerprint is not None and identity != fingerprint:
                                     raise ValueError("host fingerprint changed within a cohort")
@@ -96,27 +95,27 @@ def test_live_operations(config: SmokeConfig, registry: LoopbackRegistry) -> Non
                                     timings[metric].append(seconds)
                                 failed = False
                             finally:
-                                try:
-                                    image_cache.persist(config.cache_dir, workspace.silo_home)
-                                finally:
-                                    workspace.cleanup(failed=failed)
+                                workspace.cleanup(failed=failed)
                         if fingerprint is None:
                             raise ValueError("cohort produced no samples")
                         disk_medians[disk] = {metric: statistics.median(values) for metric, values in timings.items()}
                         label = cohort_name if len(cohort.disks) == 1 else f"{cohort_name}/{disk}"
                         for metric, values in timings.items():
-                            target = target_for(targets, system, cohort_name, mode.value, metric)
+                            informational = cohort.informational or metric in INFORMATIONAL_METRICS
+                            target = (None if informational else
+                                      target_for(targets, system, cohort_name, mode.value, metric))
                             median = statistics.median(values)
                             verdict = None if target is None else target.evaluate(median)
                             record = Record(system, label, mode.value, metric, tuple(values),
                                             median, min(values), max(values), commit,
                                             silo_version, msb_version, fingerprint, stamp, run_id,
-                                            verdict, None if target is None else target.tolerance)
+                                            verdict, None if target is None else target.tolerance,
+                                            informational=informational, image_source=image_source(cohort.image))
                             records.append(record)
                             if target is not None and verdict == Verdict.FAIL:
                                 failures.append(f"{system}/{label}/{mode}/{metric} exceeds "
                                                 f"{target.seconds:g}s plus {target.tolerance:.0%} tolerance")
-                    if len(cohort.disks) > 1:
+                    if len(cohort.disks) > 1 and not cohort.informational:
                         first, second = (disk_medians[disk] for disk in cohort.disks)
                         for metric in ("snapshot_full", "snapshot_incremental", "fork_first", "fork_second",
                                        "restore_first", "restore_second"):
@@ -127,6 +126,6 @@ def test_live_operations(config: SmokeConfig, registry: LoopbackRegistry) -> Non
     finally:
         records = [replace(record, msb_version=versions.get("msb")) for record in records]
         append(history_path(), records)
-        print("\n" + render(records, history, targets))
+        print("\n" + render(records, history, targets, cohorts))
         assert preflight.live_daemon_unchanged(mark), "the live daemon socket changed during perf"
     assert not failures, "\n".join(failures)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,9 +14,12 @@ from typing import Callable, Protocol
 from silo_smoke.catalog_observer import observe
 from silo_smoke.workspace import Workspace
 from silo_perf.model import Cohort, Mode
+from silo_perf.workload import INPUT, Write, marker_check, marker_write, writes
 
 
 class Action(StrEnum):
+    IMAGE_CONVERT_RAW = "image_convert_raw"
+    CREATE_FIRST = "create_first"
     RUN = "run_true"
     CREATE = "create"
     START = "start"
@@ -24,12 +28,22 @@ class Action(StrEnum):
     FORK_FIRST_EXEC = "fork_first_exec"
     FORK_SECOND = "fork_second"
     FORK_SECOND_EXEC = "fork_second_exec"
+    FORK_OF_FORK = "fork_of_fork"
     SNAPSHOT_FULL = "snapshot_full"
     SNAPSHOT_INCREMENTAL = "snapshot_incremental"
+    SNAPSHOT_VERIFY = "snapshot_verify"
     RESTORE_FIRST = "restore_first"
     RESTORE_FIRST_EXEC = "restore_first_exec"
     RESTORE_SECOND = "restore_second"
     RESTORE_SECOND_EXEC = "restore_second_exec"
+    SNAPSHOT_OF_RESTORED = "snapshot_of_restored"
+    SNAPSHOT_AFTER_RESTART = "snapshot_after_restart"
+
+
+INFORMATIONAL_METRICS = frozenset({
+    Action.IMAGE_CONVERT_RAW.value, Action.CREATE_FIRST.value, Action.FORK_OF_FORK.value,
+    Action.SNAPSHOT_OF_RESTORED.value, Action.SNAPSHOT_AFTER_RESTART.value, Action.SNAPSHOT_VERIFY.value,
+})
 
 
 @dataclass(frozen=True)
@@ -61,6 +75,11 @@ class Driver(Protocol):
     def version(self) -> str: ...
     def prepare(self) -> None: ...
     def populate_source(self) -> None: ...
+    def rewrite_source(self, *, snapshot: bool) -> None: ...
+    def before_snapshot(self) -> None: ...
+    def after_snapshot(self) -> None: ...
+    def check_restore(self, action: Action) -> None: ...
+    def check_fork(self) -> None: ...
     def measure(self, action: Action) -> dict[str, float]: ...
     def prepare_snapshots(self) -> None: ...
     def remove_fork_sources(self) -> None: ...
@@ -83,6 +102,22 @@ def snapshot_id(database: Path, alias: str) -> str | None:
     return matches[0]
 
 
+def raw_conversion_command(cohort: Cohort) -> tuple[str, ...]:
+    if cohort.raw_root:
+        return ("image", "convert", cohort.image, "--disk-format", "raw", "--format", "json")
+    # image pull acquires Silo VM artifacts, not ordinary OCI container images.
+    return ()
+
+
+def copy_command(system: str, source: Path, machine: str, destination: str) -> tuple[str, ...]:
+    target = f"{machine}:{destination}"
+    if system == "silo":
+        return ("cp", "--owner", "0:0", "--mode", "600", str(source), target)
+    if system == "msb":
+        return ("copy", str(source), target)
+    raise ValueError(f"unsupported workload copy system: {system}")
+
+
 @dataclass
 class CommandDriver:
     context: Context
@@ -90,21 +125,114 @@ class CommandDriver:
     environment: dict[str, str]
     machines: list[str] = field(default_factory=list)
     snapshots: list[str] = field(default_factory=list)
+    workload_generations: dict[str, int] = field(default_factory=dict)
 
     def call(self, *args: str) -> float:
+        command = [str(self.binary), *args]
         started = time.perf_counter_ns()
-        result = subprocess.run([str(self.binary), *args], env=self.environment,
-                                capture_output=True, text=True, errors="replace", timeout=300)
+        timed_out = False
+        with subprocess.Popen(command, env=self.environment, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, errors="replace") as process:
+            try:
+                stdout, stderr = process.communicate(timeout=300)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                process.kill()
+                stdout, stderr = process.communicate()
+            except BaseException:
+                process.kill()
+                process.communicate()
+                raise
+            result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         seconds = (time.perf_counter_ns() - started) / 1e9
         self.context.workspace.record("perf-commands", f"{self.binary} {args}\nexit={result.returncode}\n"
                                       f"seconds={seconds:.9f}\n{result.stdout}\n{result.stderr}\n")
-        if result.returncode:
-            raise RuntimeError(f"{self.binary.name} {args} exited {result.returncode}: {result.stderr[-4000:]}")
+        if result.returncode or timed_out:
+            reason = " (timed out after 300 seconds)" if timed_out else ""
+            raise RuntimeError(f"{self.binary.name} {args} exited {result.returncode}{reason}: "
+                               f"{result.stderr[-4000:]}")
+        self.last_stdout = result.stdout
         return seconds
 
     def version(self) -> str:
         return subprocess.run([str(self.binary), "--version"], env=self.environment,
                               capture_output=True, text=True, check=True, timeout=15).stdout.strip()
+
+    def guest(self, name: str, script: str) -> None:
+        self.call("exec", name, "--user", "root", "--", "/bin/sh", "-ec", script)
+
+    def populate(self, name: str) -> None:
+        if self.context.cohort.written_mib:
+            self.guest(name, f"yes SILO-PERF | head -c {self.context.cohort.written_mib * 1024 * 1024} "
+                            "> /perf-payload; sync")
+        self.workload(name, initialize=True)
+
+    def workload(self, name: str, *, initialize: bool) -> None:
+        workload = self.context.cohort.workload
+        if workload is None:
+            return
+        if initialize:
+            # msb supplies this mount through create --tmpfs, like bench2.
+            script = "test -d /fill"
+            if self.system == "silo":
+                script = f"mkdir -p /fill; mount -t tmpfs -o size={workload.tmpfs_mib}m tmpfs /fill"
+            self.guest(name, script)
+        generation = self.workload_generations.get(name, 0)
+        for step in writes(workload, generation, initialize=initialize):
+            self.write_payload(name, step)
+        self.workload_generations[name] = generation + 1
+
+    def write_payload(self, name: str, step: Write) -> None:
+        with tempfile.TemporaryDirectory(prefix="perf-payload-", dir=self.context.workspace.root) as directory:
+            source = Path(directory) / "payload"
+            step.save(source)
+            failure: BaseException | None = None
+            try:
+                self.call(*copy_command(self.system, source, name, step.destination))
+                self.guest(name, step.script)
+            except BaseException as error:
+                failure = error
+            try:
+                if step.destination == INPUT:
+                    self.guest(name, f"rm -f {INPUT}")
+            except BaseException as error:
+                if failure is not None:
+                    raise BaseExceptionGroup("workload and staging cleanup failed", [failure, error])
+                raise
+            if failure is not None:
+                raise failure
+
+    def populate_source(self) -> None:
+        self.populate(self.context.names.source)
+
+    def rewrite_source(self, *, snapshot: bool) -> None:
+        name = self.context.names.snapshot_source if snapshot else self.context.names.source
+        self.workload(name, initialize=False)
+
+    def before_snapshot(self) -> None:
+        self.guest(self.context.names.snapshot_source, marker_write("before-snapshot"))
+
+    def after_snapshot(self) -> None:
+        name = self.context.names.snapshot_source
+        self.guest(name, marker_write("after-snapshot"))
+
+    def check_fork(self) -> None:
+        name = self.context.names.snapshot_source
+        child = name + "-check"
+        self.fork(name, child)
+        self.guest(child, marker_check("after-snapshot"))
+        self.remove_machine(child)
+
+    def check_restore(self, action: Action) -> None:
+        name = EXEC_NAMES[action](self.context.names.source, self.context.names.snapshot_source)
+        self.guest(name, marker_check("before-snapshot"))
+
+    def fork(self, source: str, name: str) -> float:
+        raise NotImplementedError
+
+    def remove_machine(self, name: str) -> None:
+        raise NotImplementedError
 
 
 
@@ -115,6 +243,7 @@ class SiloDriver(CommandDriver):
     def __init__(self, context: Context) -> None:
         super().__init__(context, context.workspace.config.silo, context.workspace.env())
         self.snapshot_ids: dict[str, str] = {}
+        self.image = context.cohort.image
 
     @classmethod
     def available(cls) -> str | None:
@@ -134,33 +263,47 @@ class SiloDriver(CommandDriver):
         return args
 
     def prepare(self) -> None:
-        name = self.context.names.source + "-prepare"
-        self.machines.append(name)
-        self.context.workspace.register_machine(name)
-        self.call("create", "--name", name, *self.shape(), self.context.cohort.image)
-        self.call("rm", "--force", name)
-        self.machines.remove(name)
-        self.context.workspace.unregister_machine(name)
+        # Container acquisition and lower preparation belong to create_first.
+        # Raw conversion is likewise a separately recorded scenario action.
+        pass
 
     def create(self, name: str) -> float:
         self.machines.append(name)
         self.context.workspace.register_machine(name)
-        return self.call("create", "--name", name, *self.shape(), self.context.cohort.image)
+        return self.call("create", "--name", name, *self.shape(), self.image)
 
-    def populate(self, name: str) -> None:
-        if self.context.cohort.written_mib:
-            self.call("exec", name, "--", "/bin/sh", "-ec",
-                      f"yes SILO-PERF | head -c {self.context.cohort.written_mib * 1024 * 1024} "
-                      "> /perf-payload; sync")
+    def fork(self, source: str, name: str) -> float:
+        self.machines.append(name)
+        self.context.workspace.register_machine(name)
+        return self.call("fork", source, "--live", "--name", name)
 
-    def populate_source(self) -> None:
-        self.populate(self.context.names.source)
+    def remove_machine(self, name: str) -> None:
+        self.call("rm", "--force", name)
+        self.machines.remove(name)
+        self.context.workspace.unregister_machine(name)
+
 
     def measure(self, action: Action) -> dict[str, float]:
         a, b = self.context.names.source, self.context.names.snapshot_source
+        if action == Action.IMAGE_CONVERT_RAW:
+            command = raw_conversion_command(self.context.cohort)
+            if not command:
+                return {}
+            seconds = self.call(*command)
+            converted = json.loads(self.last_stdout)
+            identity = converted["id"]
+            if not isinstance(identity, str) or not identity:
+                raise ValueError("raw image conversion returned no image id")
+            self.image = "image:" + identity
+            return {action.value: seconds}
+        if action == Action.CREATE_FIRST:
+            name = a + "-first"
+            seconds = self.create(name)
+            self.remove_machine(name)
+            return {action.value: seconds}
         if action == Action.RUN:
             try:
-                seconds = self.call("run", *self.shape(), self.context.cohort.image, "--", "/bin/true")
+                seconds = self.call("run", *self.shape(), self.image, "--", "/bin/true")
             finally:
                 if self.context.workspace.state_db().exists():
                     for row in observe(self.context.workspace.state_db()).get("machine_config", []):
@@ -174,33 +317,46 @@ class SiloDriver(CommandDriver):
             seconds = self.call("start", a)
         elif action in EXEC_NAMES:
             seconds = self.call("exec", EXEC_NAMES[action](a, b), "--", "/bin/true")
+        elif action == Action.SNAPSHOT_VERIFY:
+            if not self.context.cohort.raw_root:
+                return {}
+            seconds = self.call("snapshot", "verify", "image:" + b + "-s2")
         elif action in (Action.FORK_FIRST, Action.FORK_SECOND):
             name = a + ("-f1" if action == Action.FORK_FIRST else "-f2")
-            self.machines.append(name)
-            self.context.workspace.register_machine(name)
-            seconds = self.call("fork", a, "--live", "--name", name)
-        elif action in (Action.SNAPSHOT_FULL, Action.SNAPSHOT_INCREMENTAL):
-            name = b + ("-s1" if action == Action.SNAPSHOT_FULL else "-s2")
+            seconds = self.fork(a, name)
+        elif action == Action.FORK_OF_FORK:
+            seconds = self.fork(a + "-f1", a + "-f1-f1")
+        elif action in (Action.SNAPSHOT_FULL, Action.SNAPSHOT_INCREMENTAL,
+                        Action.SNAPSHOT_OF_RESTORED, Action.SNAPSHOT_AFTER_RESTART):
+            source = b + "-r1" if action == Action.SNAPSHOT_OF_RESTORED else b
+            if action == Action.SNAPSHOT_AFTER_RESTART:
+                self.call("stop", source)
+                self.call("start", source)
+                self.call("exec", source, "--", "/bin/true")
+                self.populate(source)
+            suffix = {Action.SNAPSHOT_FULL: "-s1", Action.SNAPSHOT_INCREMENTAL: "-s2",
+                      Action.SNAPSHOT_OF_RESTORED: "-restored", Action.SNAPSHOT_AFTER_RESTART: "-restarted"}[action]
+            name = b + suffix
             self.snapshots.append(name)
-            seconds = self.call("snapshot", "create", b, "--live", "--name", name,
+            seconds = self.call("snapshot", "create", source, "--live", "--name", name,
                                 *(["--capture-policy", "full"] if action == Action.SNAPSHOT_FULL else []))
             identity = snapshot_id(self.context.workspace.state_db(), name)
             if identity is None:
                 raise RuntimeError(f"published snapshot has no catalog alias: {name}")
             self.snapshot_ids[name] = identity
-        else:
+        elif action in (Action.RESTORE_FIRST, Action.RESTORE_SECOND):
             name = b + ("-r1" if action == Action.RESTORE_FIRST else "-r2")
             self.machines.append(name)
             self.context.workspace.register_machine(name)
             seconds = self.call("restore", "image:" + b + "-s2", "--name", name)
+        else:
+            raise ValueError(f"unsupported Silo action: {action}")
         return {action.value: seconds}
 
     def remove_fork_sources(self) -> None:
         a = self.context.names.source
-        for name in (a + "-f2", a + "-f1", a):
-            self.call("rm", "--force", name)
-            self.machines.remove(name)
-            self.context.workspace.unregister_machine(name)
+        for name in (a + "-f1-f1", a + "-f2", a + "-f1", a):
+            self.remove_machine(name)
 
     def prepare_snapshots(self) -> None:
         name = self.context.names.snapshot_source
@@ -276,7 +432,10 @@ class MsbDriver(CommandDriver):
         return cohort.msb_image is not None
 
     def shape(self) -> list[str]:
-        return ["-c", str(self.context.cohort.cpus), "-m", f"{self.context.cohort.memory_gib}G"]
+        args = ["-c", str(self.context.cohort.cpus), "-m", f"{self.context.cohort.memory_gib}G"]
+        if self.context.cohort.workload is not None:
+            args += ["--tmpfs", f"/fill:{self.context.cohort.workload.tmpfs_mib}M"]
+        return args
 
     def prepare(self) -> None:
         image = self.context.cohort.msb_image
@@ -284,16 +443,28 @@ class MsbDriver(CommandDriver):
             raise ValueError("msb cohort needs an msb_image")
         self.call("pull", image)
 
-    def populate_source(self) -> None:
-        if self.context.cohort.written_mib:
-            raise ValueError("disk-invariance is a Silo-only cohort")
 
     def create(self, name: str) -> float:
         self.machines.append(name)
         return self.call("create", "-n", name, *self.shape(), str(self.context.cohort.msb_image))
 
+    def fork(self, source: str, name: str) -> float:
+        self.machines.append(name)
+        return self.call("fork", source, "-n", name)
+
+    def remove_machine(self, name: str) -> None:
+        self.call("rm", "-f", name)
+        self.machines.remove(name)
+
     def measure(self, action: Action) -> dict[str, float]:
         a, b = self.context.names.source, self.context.names.snapshot_source
+        if action in (Action.IMAGE_CONVERT_RAW, Action.SNAPSHOT_VERIFY):
+            return {}
+        if action == Action.CREATE_FIRST:
+            name = a + "-first"
+            seconds = self.create(name)
+            self.remove_machine(name)
+            return {action.value: seconds}
         if action == Action.RUN:
             seconds = self.call("run", *self.shape(), str(self.context.cohort.msb_image), "--", "/bin/true")
         elif action == Action.CREATE:
@@ -305,26 +476,38 @@ class MsbDriver(CommandDriver):
             seconds = self.call("exec", EXEC_NAMES[action](a, b), "--", "/bin/true")
         elif action in (Action.FORK_FIRST, Action.FORK_SECOND):
             name = a + ("-f1" if action == Action.FORK_FIRST else "-f2")
-            self.machines.append(name)
-            seconds = self.call("fork", a, "-n", name)
-        elif action in (Action.SNAPSHOT_FULL, Action.SNAPSHOT_INCREMENTAL):
-            name = "s1" if action == Action.SNAPSHOT_FULL else "s2"
-            self.snapshots.append(b + ":" + name)
-            seconds = self.call("snap", "create", name, "--sandbox", b, "--full")
-        else:
+            seconds = self.fork(a, name)
+        elif action == Action.FORK_OF_FORK:
+            seconds = self.fork(a + "-f1", a + "-f1-f1")
+        elif action in (Action.SNAPSHOT_FULL, Action.SNAPSHOT_INCREMENTAL,
+                        Action.SNAPSHOT_OF_RESTORED, Action.SNAPSHOT_AFTER_RESTART):
+            source = b + "-r1" if action == Action.SNAPSHOT_OF_RESTORED else b
+            if action == Action.SNAPSHOT_AFTER_RESTART:
+                self.call("stop", source)
+                self.call("start", source)
+                self.call("exec", source, "--", "/bin/true")
+                self.populate(source)
+            name = {Action.SNAPSHOT_FULL: "s1", Action.SNAPSHOT_INCREMENTAL: "s2",
+                    Action.SNAPSHOT_OF_RESTORED: "restored", Action.SNAPSHOT_AFTER_RESTART: "restarted"}[action]
+            self.snapshots.append(source + ":" + name)
+            seconds = self.call("snap", "create", name, "--sandbox", source, "--full")
+        elif action in (Action.RESTORE_FIRST, Action.RESTORE_SECOND):
             name = b + ("-r1" if action == Action.RESTORE_FIRST else "-r2")
             self.machines.append(name)
             seconds = self.call("restore", b + ":s2", "-n", name)
+        else:
+            raise ValueError(f"unsupported msb action: {action}")
         return {action.value: seconds}
 
     def remove_fork_sources(self) -> None:
         a = self.context.names.source
-        self.call("rm", "-f", a + "-f1", a + "-f2", a)
-        for name in (a + "-f1", a + "-f2", a):
+        self.call("rm", "-f", a + "-f1-f1", a + "-f1", a + "-f2", a)
+        for name in (a + "-f1-f1", a + "-f1", a + "-f2", a):
             self.machines.remove(name)
 
     def prepare_snapshots(self) -> None:
         self.create(self.context.names.snapshot_source)
+        self.populate(self.context.names.snapshot_source)
 
     def cleanup(self) -> None:
         errors: list[Exception] = []

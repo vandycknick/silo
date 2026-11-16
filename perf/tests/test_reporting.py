@@ -83,7 +83,7 @@ def test_expected_failure_requires_slice() -> None:
 
 def test_checked_in_targets_and_cohorts() -> None:
     cohorts = load_cohorts()
-    assert tuple(cohorts) == ("alpine-2g", "alpine-8g", "alpine-30g", "arch-30g", "disk-invariance")
+    assert {"alpine-2g", "alpine-8g", "alpine-30g", "arch-30g", "disk-invariance"} <= cohorts.keys()
     assert cohorts["arch-30g"].cpus == 10
     assert cohorts["arch-30g"].disks == ("100gb",)
     assert cohorts["disk-invariance"].disks == ("30gib", "500gib")
@@ -266,7 +266,7 @@ def test_history_requires_gate_fields(tmp_path: Path, field: str) -> None:
 
 
 @pytest.mark.parametrize(("first", "second", "expected"), [
-    (1.0, 1.2, True), (1.0, 1.31, False), (0.01, 0.10, True), (0.01, 0.12, False),
+    (1.0, 1.10, True), (1.0, 1.11, False), (0.01, 0.06, True), (0.01, 0.07, False),
     (0.0, 0.0, True),
 ])
 def test_disk_invariance_noise(first: float, second: float, expected: bool) -> None:
@@ -307,3 +307,34 @@ def test_explicit_distribution_binary_never_acquires(tmp_path: Path) -> None:
     with pytest.raises(SmokeEnvironmentError, match="Explicit"):
         install_distribution(cache, replace(release, binary_sha256="0" * 64), binary_path=binary)
     assert not cache.exists()
+
+
+def test_informational_history_and_reporting(tmp_path: Path) -> None:
+    current = replace(record(median=1000), cohort="alpine-2g-raw",
+                      informational=True, image_source="remote")
+    path = tmp_path / "history.jsonl"
+    append(path, [current])
+    assert load(path) == [current]
+    table = render([current], [], {("silo", "alpine-2g-raw", "image", "start"): Target(0.01, 0.10)})
+    assert "alpine-2g-raw (informational)" in table
+    assert "remote" in table
+    assert "FAIL" not in table
+    assert "(informational)" in trend([current])
+    with pytest.raises(ValueError, match="informational"):
+        replace(current, verdict=Verdict.FAIL, tolerance=0.10)
+
+
+def test_disk_invariance_rule_is_visible() -> None:
+    cohort = Cohort("disk-invariance", "alpine", 2, 2, disks=("30gib", "500gib"))
+    current = replace(record(), cohort="disk-invariance/30gib")
+    table = render([current], [], {}, {cohort.name: cohort})
+    assert "max(0.05s, 10% of smaller median)" in table
+
+
+def test_create_and_run_clock_labels() -> None:
+    records = [replace(record(), metric=metric, informational=metric == "create_first")
+               for metric in ("create_first", "create", "run_true")]
+    table = render(records, [], {})
+    assert "first create, includes image pull and preparation" in table
+    assert "repeated create" in table
+    assert "warm run" in table

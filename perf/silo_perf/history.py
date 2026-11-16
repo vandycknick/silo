@@ -65,8 +65,14 @@ class Record:
     run_id: str
     verdict: Verdict | None
     tolerance: float | None
+    informational: bool = False
+    image_source: str | None = None
 
     def __post_init__(self) -> None:
+        if self.image_source not in (None, "local", "remote"):
+            raise ValueError("image source must be local or remote")
+        if self.informational and self.verdict is not None:
+            raise ValueError("informational measurements cannot have timing verdicts")
         if not self.samples or not all(math.isfinite(value) and value >= 0 for value in self.samples):
             raise ValueError("samples must be nonempty, finite and nonnegative")
         if (self.median, self.minimum, self.maximum) != (
