@@ -672,6 +672,172 @@ impl CaptureCleanup {
 }
 
 impl Store {
+    /// Caller holds the stopped source's machine lock and has positively reaped
+    /// its monitor. This path never authenticates or publishes capture payload.
+    pub(crate) async fn discard_machine_captures(
+        &self,
+        machine: MachineId,
+    ) -> Result<(), LibVmError> {
+        let store = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || runtime.block_on(async move {
+            let pool = StoragePool::open(&store.images_dir)?;
+            let ids: Vec<String> = sqlx::query_scalar("SELECT operation_id FROM storage_operation WHERE kind='capture' AND machine_id=?1 ORDER BY operation_id")
+                .bind(machine.to_string()).fetch_all(&store.pool).await?;
+            for id in ids {
+                store.discard_capture_owned(&pool, Uuid::parse_str(&id).map_err(invalid)?).await?;
+            }
+            Ok(())
+        })).await?
+    }
+
+    async fn discard_capture_owned(
+        &self,
+        pool: &StoragePool,
+        capture: Uuid,
+    ) -> Result<(), LibVmError> {
+        let _publisher = pool
+            .try_capture_publication(capture)?
+            .ok_or_else(|| invalid(format!("capture {capture} publisher is active")))?;
+        let _lease = pool.try_exclusive_lease(capture)?.ok_or_else(|| {
+            invalid(format!(
+                "capture {capture} has an active lease or baseline holder"
+            ))
+        })?;
+        let _roots = pool.lock_roots()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
+            .bind(capture.to_string()).fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+        validate_lease_identity(&row, &_lease)?;
+        let mut record =
+            crate::store::capture::decode_record(&row.try_get::<String, _>("record_json")?)?;
+        let _launch = pool
+            .try_exclusive_lease(record.launch_operation_id)?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "capture {capture} launch {} has an active lease or accepted baseline holder",
+                    record.launch_operation_id
+                ))
+            })?;
+        if _launch.file_identity()?
+            != (
+                record.plan.reservation.launch_lease.device,
+                record.plan.reservation.launch_lease.inode,
+            )
+        {
+            return Err(invalid("capture launch lease inode changed"));
+        }
+        let dependency: Option<String> = sqlx::query_scalar(
+            "SELECT cut_id FROM storage_operation_cut WHERE operation_id=?1 LIMIT 1",
+        )
+        .bind(capture.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(cut) = dependency {
+            return Err(invalid(format!(
+                "capture {capture} is retained by local-cut dependency {cut}"
+            )));
+        }
+        if let Some(fork) = record.fork_operation_id {
+            let child: Option<String> = sqlx::query_scalar("SELECT c.machine_id FROM live_fork_child c WHERE c.operation_id=?1 AND (c.name_reserved=1 OR EXISTS(SELECT 1 FROM machine_config m WHERE m.id=c.machine_id)) LIMIT 1")
+                .bind(fork.to_string()).fetch_optional(&mut *tx).await?;
+            if let Some(child) = child {
+                return Err(invalid(format!(
+                    "capture {capture} is retained by fork child {child} of {fork}"
+                )));
+            }
+        }
+        let home = crate::paths::OwnedDirectory::open_existing_root(&self.home)?
+            .ok_or_else(|| invalid("capture home disappeared"))?;
+        let parent = capture_cleanup_parent(&home, record.machine_id)?;
+        let source_name = capture.to_string();
+        let quarantine_name = format!(".retiring-{capture}");
+        let source = parent
+            .as_ref()
+            .map(|p| p.open_dir(&source_name))
+            .transpose()?
+            .flatten();
+        let quarantine = parent
+            .as_ref()
+            .map(|p| p.open_dir(&quarantine_name))
+            .transpose()?
+            .flatten();
+        if source.is_some() && quarantine.is_some() {
+            return Err(invalid("both capture staging names are occupied"));
+        }
+        let observed_parent = parent.as_ref().map(directory_identity).transpose()?;
+        let observed_directory = source
+            .as_ref()
+            .or(quarantine.as_ref())
+            .map(directory_identity)
+            .transpose()?;
+        let discard = match &record.discard {
+            Some(discard) => {
+                if discard.parent != observed_parent
+                    || observed_directory
+                        .is_some_and(|identity| Some(identity) != discard.directory)
+                {
+                    return Err(invalid(
+                        "forced-discard staging parent or inode was replaced",
+                    ));
+                }
+                discard.clone()
+            }
+            None => {
+                if quarantine.is_some() {
+                    return Err(invalid("unowned capture discard quarantine"));
+                }
+                crate::store::snapshot_store::CaptureDiscard {
+                    parent: observed_parent,
+                    directory: observed_directory,
+                }
+            }
+        };
+        let paths = [
+            crate::paths::machine_data_dir_in(&self.home, record.machine_id)
+                .join(vm_spec::capture::CAPTURES_DIRECTORY)
+                .join(&source_name),
+            crate::paths::machine_data_dir_in(&self.home, record.machine_id)
+                .join(vm_spec::capture::CAPTURES_DIRECTORY)
+                .join(&quarantine_name),
+        ];
+        crate::store::cache_paths::ensure_capture_paths_unreferenced(&mut tx, &paths, &self.home)
+            .await?;
+        record.discard = Some(discard.clone());
+        sqlx::query("UPDATE storage_operation SET state='cleaning',record_json=jsonb(?2) WHERE operation_id=?1")
+            .bind(capture.to_string()).bind(crate::store::capture::encode_record(&record)?).execute(&mut *tx).await?;
+        tx.commit().await?;
+        let tree = MachineCleanup {
+            parent,
+            source_name,
+            quarantine_name,
+            expected: discard.directory.unwrap_or((0, 0)),
+            #[cfg(test)]
+            hook: self.layer_hook.clone(),
+        };
+        tree.detach()?;
+        drop(_roots);
+        tree.remove(&self.home)?;
+        let _roots = pool.lock_roots()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        crate::store::cache_paths::ensure_capture_paths_unreferenced(&mut tx, &paths, &self.home)
+            .await?;
+        tree.recheck_absence()?;
+        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1 AND state='cleaning'")
+            .bind(capture.to_string())
+            .execute(&mut *tx)
+            .await?;
+        if let Some(snapshot) = record.candidate {
+            sqlx::query("DELETE FROM storage_snapshot WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE snapshot_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=?1)")
+                .bind(snapshot.to_string()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub(crate) async fn check_cleaning_dependencies(
         &self,
         connection: &mut sqlx::SqliteConnection,
@@ -1184,6 +1350,16 @@ impl Store {
         pool: &StoragePool,
     ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
         self.retire_boot_update_operations(pool).await?;
+        let discarded: Vec<String> = sqlx::query_scalar("SELECT operation_id FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.discard') IS NOT NULL")
+            .fetch_all(&self.pool).await?;
+        for id in discarded {
+            if let Err(error) = self
+                .discard_capture_owned(pool, Uuid::parse_str(&id).map_err(invalid)?)
+                .await
+            {
+                tracing::warn!(capture = %id, %error, "forced capture discard remains fenced for retry");
+            }
+        }
         let mut report = crate::store::models::CacheRecoveryReport::default();
         let mut cursor = String::new();
         loop {
@@ -1214,8 +1390,15 @@ impl Store {
                 }
                 let row = sqlx::query("SELECT kind,state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1").bind(&cursor).fetch_optional(&mut *tx).await?;
                 if let Some(row) = row {
-                    validate_lease_identity(&row, &_lease)?;
                     let kind: String = row.try_get("kind")?;
+                    if let Err(error) = validate_lease_identity(&row, &_lease) {
+                        if kind == "capture" {
+                            tracing::warn!(capture = %id, %error, "capture lease contradiction retained without blocking storage recovery");
+                            tx.commit().await?;
+                            continue;
+                        }
+                        return Err(error);
+                    }
                     let state: String = row.try_get("state")?;
                     if matches!(kind.as_str(), "live-fork" | "update-boot-assets") {
                         // Retire parents after all producers in this sweep.
@@ -1234,38 +1417,35 @@ impl Store {
                         }
                     }
                     if kind == "capture" {
-                        let capture = crate::store::capture::decode_record(
+                        let capture = match crate::store::capture::decode_record(
                             &row.try_get::<String, _>("record_json")?,
-                        )?;
+                        ) {
+                            Ok(capture) => capture,
+                            Err(error) => {
+                                tracing::warn!(capture = %id, %error, "corrupt capture retained without blocking storage recovery");
+                                tx.commit().await?;
+                                continue;
+                            }
+                        };
                         if !matches!(
                             capture.state,
                             crate::store::snapshot_store::CaptureState::Released { .. }
                                 | crate::store::snapshot_store::CaptureState::ReleasedLocal { .. }
                                 | crate::store::snapshot_store::CaptureState::Abandoned
-                        ) {
+                        ) || capture.discard.is_some()
+                        {
                             tx.commit().await?;
                             continue;
                         }
-                        let fork_owned: bool = sqlx::query_scalar(
-                            "SELECT EXISTS(SELECT 1 FROM live_fork WHERE capture_id=?1)",
-                        )
-                        .bind(capture.capture_id.to_string())
-                        .fetch_one(&mut *tx)
-                        .await?;
                         let intent:Option<(Option<String>,)>=sqlx::query_as("SELECT json(result_json) FROM live_command WHERE machine_id=?1 AND run_id=?2 AND request_id=?3").bind(capture.machine_id.to_string()).bind(capture.run_id.to_string()).bind(capture.capture_id.to_string()).fetch_optional(&mut *tx).await?;
-                        let never_submitted = match intent {
-                            None => true,
-                            Some((Some(json),)) => matches!(
-                                serde_json::from_str::<vm_spec::lifecycle::LiveCommandResult>(
-                                    &json
-                                )
-                                .map_err(invalid)?,
-                                vm_spec::lifecycle::LiveCommandResult::Capture(
-                                    vm_spec::lifecycle::CaptureOutcome::Rejected { .. }
-                                )
-                            ),
-                            Some((None,)) => false,
-                        };
+                        let result = intent
+                            .and_then(|(json,)| json)
+                            .map(|json| {
+                                serde_json::from_str::<vm_spec::lifecycle::LiveCommandResult>(&json)
+                                    .map_err(invalid)
+                            })
+                            .transpose()?;
+                        let never_submitted = capture.never_submitted(result.as_ref());
                         let unchanged = matches!(
                             capture.source_outcome,
                             Some(
@@ -1274,8 +1454,7 @@ impl Store {
                                 }
                             )
                         );
-                        let unused = fork_owned
-                            && capture.evidence.is_none()
+                        let unused = capture.evidence.is_none()
                             && (matches!(
                                 capture.state,
                                 crate::store::snapshot_store::CaptureState::Released {
@@ -1309,7 +1488,7 @@ impl Store {
                             }
                         }
                         // An inherited baseline needs both exclusive OFDs.
-                        // A fenced no-cut fork instead has positive no-use proof.
+                        // A fenced no-cut capture has positive no-use proof.
                         tx.commit().await?;
                         drop(_roots);
                         let cleanup = CaptureCleanup::prepare(self, &capture, state == "cleaning")?;
@@ -1908,35 +2087,47 @@ impl Store {
                         decode(&row)?;
                     }
                     "capture" => {
-                        let capture = crate::store::capture::decode_record(
-                            &row.try_get::<String, _>("record_json")?,
-                        )?;
-                        if capture.capture_id != id
-                            || row.try_get::<String, _>("machine_id")?
-                                != capture.machine_id.to_string()
-                            || row.try_get::<String, _>("run_id")? != capture.run_id.to_string()
-                            || row.try_get::<i64, _>("storage_generation")?
-                                != i64::try_from(capture.storage.storage_generation)
-                                    .map_err(invalid)?
-                            || !matches!(
-                                state.as_str(),
-                                "staging" | "committed" | "aborted" | "cleaning"
-                            )
-                        {
-                            return Err(invalid(
-                                "capture indexed identity contradicts retained plan",
-                            ));
-                        }
-                        if state == "cleaning"
+                        let validation = (|| -> Result<(), LibVmError> {
+                            let capture = crate::store::capture::decode_record(
+                                &row.try_get::<String, _>("record_json")?,
+                            )?;
+                            if capture.capture_id != id
+                                || row.try_get::<String, _>("machine_id")?
+                                    != capture.machine_id.to_string()
+                                || row.try_get::<String, _>("run_id")? != capture.run_id.to_string()
+                                || row.try_get::<i64, _>("storage_generation")?
+                                    != i64::try_from(capture.storage.storage_generation)
+                                        .map_err(invalid)?
+                                || !matches!(
+                                    state.as_str(),
+                                    "staging" | "committed" | "aborted" | "cleaning"
+                                )
+                            {
+                                return Err(invalid(
+                                    "capture indexed identity contradicts retained plan",
+                                ));
+                            }
+                            if state == "cleaning"
                             && !matches!(
                                 capture.state,
                                 crate::store::snapshot_store::CaptureState::Released { .. }
                                     | crate::store::snapshot_store::CaptureState::ReleasedLocal { .. }
                                     | crate::store::snapshot_store::CaptureState::Abandoned
                             )
+                            && capture.discard.is_none()
                         {
                             return Err(invalid("nonterminal capture has cleanup authority"));
                         }
+                            validate_lease_metadata(&row, pool.operation_lease_identity(id)?)?;
+                            if let Some(probe) = pool.try_exclusive_lease(id)? {
+                                validate_lease_identity(&row, &probe)?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = validation {
+                            tracing::warn!(capture = %id, %error, "corrupt capture retained without blocking runtime opening");
+                        }
+                        continue;
                     }
                     "update-boot-assets" if state == "committing" => {
                         let candidate =
@@ -2325,7 +2516,7 @@ mod tests {
         let operation = fixture.reservation.record.fork_operation_id.unwrap();
         let (_, retained) = fixture
             .snapshots
-            .retain_local_capture(capture)
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
             .await
             .unwrap();
         let cut = store.open_local_cut(operation, retained).await.unwrap();

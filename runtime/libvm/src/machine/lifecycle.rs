@@ -11,7 +11,8 @@ use crate::machine::{
     MachineStart, MachineStartOptions, MachineStopOptions, MachineWaitOptions,
 };
 use crate::runtime::core::{
-    read_exit_for_reconciliation, reconcile_root_disk_size, wait_for_monitor_stop, VmmRunIdentity,
+    read_exit_for_reconciliation, reconcile_root_disk_size, wait_for_monitor_stop, RuntimeStatus,
+    VmmRunIdentity,
 };
 use crate::runtime::Runtime;
 use crate::store::models::{MachineConfig, MachineRuntimeState};
@@ -421,17 +422,18 @@ impl Machine {
 
     /// Stops the machine and returns its updated inspect data.
     pub async fn stop(&self) -> Result<MachineData, LibVmError> {
-        self.stop_impl(None, MachineStopOptions::default()).await
+        self.stop_impl(None, MachineStopOptions::default(), false)
+            .await
     }
 
     /// Stops the machine with explicit stop options.
     pub async fn stop_with(&self, options: MachineStopOptions) -> Result<MachineData, LibVmError> {
-        self.stop_impl(None, options).await
+        self.stop_impl(None, options, false).await
     }
 
     /// Stops this exact machine run without affecting a replacement run.
     pub async fn stop_run(&self, run_id: MachineRunId) -> Result<MachineData, LibVmError> {
-        self.stop_impl(Some(&run_id), MachineStopOptions::default())
+        self.stop_impl(Some(&run_id), MachineStopOptions::default(), false)
             .await
     }
 
@@ -441,19 +443,43 @@ impl Machine {
         run_id: MachineRunId,
         options: MachineStopOptions,
     ) -> Result<MachineData, LibVmError> {
-        self.stop_impl(Some(&run_id), options).await
+        self.stop_impl(Some(&run_id), options, false).await
     }
 
     async fn stop_impl(
         &self,
         expected_run_id: Option<&MachineRunId>,
         options: MachineStopOptions,
+        for_removal: bool,
     ) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
         let wait_target = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
-            let status = runtime.reconcile_machine_runtime_locked(&config).await?;
+            // Removal must preflight orphan ownership before reconciliation,
+            // which can otherwise write a storage-busy lifecycle projection.
+            let status = if for_removal {
+                RuntimeStatus::from_machine_state(&runtime.machine_state(config.id).await?)
+            } else {
+                runtime.reconcile_machine_runtime_locked(&config).await?
+            };
             require_current_run(&config, &status, expected_run_id)?;
+            let identity = match status.pid {
+                Some(pid) => monitor_identity(&VmmRunIdentity {
+                    pid,
+                    started_at: status.started_at,
+                    run_id: status.run_id.clone(),
+                })?,
+                None => None,
+            };
+            if for_removal && identity.is_none() {
+                // A dead monitor is not a stopped source. Refuse before stop
+                // writes anything if an orphan worker still owns this run.
+                let storage = runtime.machine_storage_record(config.id).await?;
+                storage.ownership.ensure_owned(config.id)?;
+                runtime
+                    .preflight_stopped_generation_locked(&config, &storage)
+                    .await?;
+            }
             if status.state == MachineRuntimeState::Stopped
                 || (status.state == MachineRuntimeState::Error && status.pid.is_none())
             {
@@ -468,7 +494,7 @@ impl Machine {
                         started_at: status.started_at,
                         run_id: status.run_id.clone(),
                     };
-                    let Some(identity) = monitor_identity(&generation)? else {
+                    let Some(identity) = identity else {
                         runtime.mark_machine_stopped(config.id, None).await?;
                         runtime.cleanup_machine_resources_locked(&config).await?;
                         return runtime.machine_inspect_data(config).await;
@@ -488,12 +514,19 @@ impl Machine {
                         started_at: status.started_at,
                         run_id: status.run_id.clone(),
                     };
-                    let Some(identity) = monitor_identity(&generation)? else {
+                    let Some(identity) = identity else {
                         runtime.mark_machine_stopped(config.id, None).await?;
                         runtime.cleanup_machine_resources_locked(&config).await?;
                         return runtime.machine_inspect_data(config).await;
                     };
                     if !identity.signal(Signal::SIGINT)? {
+                        if for_removal {
+                            let storage = runtime.machine_storage_record(config.id).await?;
+                            storage.ownership.ensure_owned(config.id)?;
+                            runtime
+                                .preflight_stopped_generation_locked(&config, &storage)
+                                .await?;
+                        }
                         runtime.mark_machine_stopped(config.id, None).await?;
                         runtime.cleanup_machine_resources_locked(&config).await?;
                         return runtime.machine_inspect_data(config).await;
@@ -761,23 +794,51 @@ impl Machine {
 
     /// Removes a stopped machine's durable records and files.
     pub async fn remove(self) -> Result<(), LibVmError> {
-        self.remove_impl(None).await
+        self.remove_impl(None, false).await
+    }
+
+    /// Stop and reap the source, then discard only unreferenced local capture
+    /// staging. Published pool snapshots retain their independent ownership.
+    pub async fn remove_force(self) -> Result<(), LibVmError> {
+        match self
+            .stop_impl(
+                None,
+                MachineStopOptions::new()
+                    .timeout(Duration::from_secs(60))
+                    .force_after_timeout(Duration::from_secs(60)),
+                true,
+            )
+            .await
+        {
+            Ok(_) | Err(LibVmError::MachineNotRunning { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        self.remove_impl(None, true).await
     }
 
     /// Removes a stopped machine only when its latest exit belongs to the
     /// supplied run generation.
     pub async fn remove_after_run(self, run_id: MachineRunId) -> Result<(), LibVmError> {
-        self.remove_impl(Some(run_id)).await
+        self.remove_impl(Some(run_id), false).await
     }
 
-    async fn remove_impl(self, expected_run_id: Option<MachineRunId>) -> Result<(), LibVmError> {
+    async fn remove_impl(
+        self,
+        expected_run_id: Option<MachineRunId>,
+        discard_captures: bool,
+    ) -> Result<(), LibVmError> {
         let runtime = self.runtime();
         if runtime.machine_config(self.machine_id()).await?.is_none() {
             return Ok(());
         }
-        // Publish every valid seal and settle ended captures before any data
-        // deletion; staging lives below the machine data directory.
-        crate::machine::live_capture::reconcile_captures(runtime, Some(self.machine_id())).await?;
+        if !discard_captures {
+            crate::machine::live_capture::reconcile_captures(
+                runtime,
+                Some(self.machine_id()),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await?;
+        }
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
         let storage = runtime.machine_storage_record(config.id).await?;
@@ -817,6 +878,9 @@ impl Machine {
         }
         let retained = match runtime.optional_native_store() {
             Some(store) => {
+                if discard_captures {
+                    store.discard_machine_captures(config.id).await?;
+                }
                 crate::SnapshotStore::from_store(std::sync::Arc::new(store))
                     .machine_capture_retained(config.id)
                     .await?
@@ -1840,6 +1904,63 @@ mod tests {
                 .unwrap()
                 .stop_outcome,
             crate::StorageStopOutcome::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_removal_refuses_orphan_worker_without_changing_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let descriptor = inherit_lease(&mut command, &lease);
+        let worker = Child(command.spawn().unwrap());
+        drop(descriptor);
+        let worker_identity = ProcessIdentity::for_pid(worker.0.id() as i32)
+            .unwrap()
+            .unwrap();
+        runtime
+            .mark_machine_monitor_ready(config.id, run_id.clone(), i32::MAX, 1)
+            .await
+            .unwrap();
+        write_holder(
+            &runtime,
+            &config,
+            &run_id,
+            &lease,
+            vec![
+                StorageHolder {
+                    role: StorageHolderRole::Monitor,
+                    pid: i32::MAX as u32,
+                    started_at: 1,
+                },
+                StorageHolder {
+                    role: StorageHolderRole::KrunWorker,
+                    pid: worker.0.id(),
+                    started_at: u64::try_from(worker_identity.started_at().unwrap()).unwrap(),
+                },
+            ],
+        );
+        let before = runtime.machine_state(config.id).await.unwrap();
+        let result = crate::machine::Machine::new(runtime.clone(), config.id)
+            .remove_force()
+            .await;
+        assert!(matches!(
+            result,
+            Err(LibVmError::MachineAlreadyRunning { .. })
+        ));
+        assert_eq!(runtime.machine_state(config.id).await.unwrap(), before);
+        assert!(worker_identity.is_alive().unwrap());
+        assert!(runtime.machine_config(config.id).await.unwrap().is_some());
+        assert_eq!(
+            runtime
+                .native_store()
+                .unwrap()
+                .launch_storage_operations(config.id)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

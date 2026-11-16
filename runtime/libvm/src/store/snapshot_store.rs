@@ -218,6 +218,7 @@ pub(crate) struct CaptureRecord {
     pub configuration: crate::machine::stopped::SnapshotConfiguration,
     pub storage: crate::MachineStorageRecord,
     pub disk_charges: Vec<CaptureSpaceCharge>,
+    pub publication_clones: BTreeSet<String>,
     /// Allocated bytes sampled from each writable source, keyed by attachment index.
     pub disk_allocations: BTreeMap<u32, u64>,
     pub reservation_bytes: u64,
@@ -225,6 +226,30 @@ pub(crate) struct CaptureRecord {
     pub captured_boot: Option<crate::BootProfile>,
     pub source_inodes: Vec<(u64, u64)>,
     pub evidence: Option<String>,
+    pub discard: Option<CaptureDiscard>,
+    pub dispatch_attempted: bool,
+}
+
+impl CaptureRecord {
+    pub(crate) fn never_submitted(
+        &self,
+        result: Option<&vm_spec::lifecycle::LiveCommandResult>,
+    ) -> bool {
+        match result {
+            Some(vm_spec::lifecycle::LiveCommandResult::Capture(
+                vm_spec::lifecycle::CaptureOutcome::Rejected { .. },
+            )) => true,
+            None => !self.dispatch_attempted,
+            Some(_) => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureDiscard {
+    pub parent: Option<(u64, u64)>,
+    pub directory: Option<(u64, u64)>,
 }
 
 pub(crate) struct CaptureReservation {
@@ -507,8 +532,14 @@ impl SnapshotStore {
         operation_id: Uuid,
         alias: Option<&str>,
     ) -> Result<SnapshotInfo, LibVmError> {
-        self.publish_authenticated(record, operation_id, alias, None)
-            .await
+        self.publish_authenticated(
+            record,
+            operation_id,
+            alias,
+            None,
+            crate::storage::pool::PublicationLockPolicy::Wait,
+        )
+        .await
     }
 
     pub(crate) async fn publish_authenticated(
@@ -517,6 +548,7 @@ impl SnapshotStore {
         operation_id: Uuid,
         alias: Option<&str>,
         inputs: Option<&crate::store::capture::VerifiedCapture>,
+        lock_policy: crate::storage::pool::PublicationLockPolicy,
     ) -> Result<SnapshotInfo, LibVmError> {
         if matches!(
             record.capture,
@@ -535,7 +567,8 @@ impl SnapshotStore {
         let digest = ObjectDigest::of_bytes(&bytes);
         let (streams, mut objects) = record.content_dependencies()?;
         objects.insert(digest);
-        let pool = StoragePool::open(&self.store.images_dir)?;
+        let pool =
+            StoragePool::open(&self.store.images_dir)?.with_publication_lock_policy(lock_policy);
         let pool = if inputs.is_some() {
             pool.defer_publications()
         } else {
@@ -3142,6 +3175,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -3201,6 +3235,7 @@ pub(crate) mod tests {
                     &file,
                     shape.stream_map(&content.stream).unwrap(),
                     Some(fingerprint),
+                    crate::storage::pool::SealedStreamPublicationMode::CopyAllowed,
                 )
                 .unwrap();
             publications.insert(content.stream, publication);
@@ -3243,6 +3278,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -3307,6 +3343,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -3565,6 +3602,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -5136,6 +5174,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Live capture disk/descriptor refusal now leaves no pending capture, command,
+  pins or staging. Definite first pre-send refusals are terminal; uncertain sends
+  retain exact-identity recovery. Sealed publication charges remaining writes
+  only, with a 16 MiB allowance per qualified required reflink rather than another
+  RAM/disk payload copy. RAM staging stays logical once, and disk staging keeps
+  its allocation-priced Copy plan. These are bounded admission rules, not an
+  ENOSPC guarantee. Publication deferral no longer holds unrelated commands hostage.
+  `rm --force`, library forced removal and daemon forced removal can discard
+  unpublished, unreferenced local capture staging after source termination,
+  without publication, identity completion or a fresh evidence archive. Published
+  snapshots and live baseline/fork/local-cut dependencies remain protected.
+- Fixed: capture completion reconciles exact-run ownership when the monitor
+  disappears between status and operation observation, preserving sealed cuts.
 - Fixed: large `silo exec` stdin now applies bounded end-to-end backpressure
   instead of killing the command when the guest queue fills. Guest stdin closure
   stops host/preloaded input without replacing the command's exit status.

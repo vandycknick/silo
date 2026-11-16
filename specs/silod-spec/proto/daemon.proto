@@ -391,7 +391,7 @@ message Entrypoint { string program = 1; repeated string args = 2; optional stri
 message StartOptions { bool cleanup_on_exit = 1; repeated EgressSecret egress_secrets = 2; Entrypoint entrypoint = 3; }
 message StartMachineRequest { MachineRef machine = 1; StartOptions options = 2; }
 message StopMachineRequest { MachineRef machine = 1; bool force = 2; google.protobuf.Duration timeout = 3; optional string expected_run = 4; }
-message RemoveMachineRequest { MachineRef machine = 1; }
+message RemoveMachineRequest { MachineRef machine = 1; bool force = 2; }
 message PolicyUpdate { oneof update { string set = 1; google.protobuf.Empty clear = 2; } }
 message PublicationUpdate { oneof update { PublishBind set = 1; google.protobuf.Empty clear = 2; } }
 message UserUpdate { oneof update { User set = 1; google.protobuf.Empty clear = 2; } }

@@ -305,8 +305,61 @@ impl Machine {
         let runtime = self.runtime();
         let store = runtime.native_store()?;
         let capture_lock = if let LiveCommand::Capture(command) = &intent.command {
-            let (lock, _) = runtime.lock_machine_config(self.machine_id()).await?;
-            store.require_capture_dispatch(command).await?;
+            let (lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            if let Some(retained) = store
+                .live_command_record(
+                    config.id,
+                    uuid(&command.envelope.run_id)?,
+                    uuid(&command.envelope.request_id)?,
+                )
+                .await?
+            {
+                if let Some(result) = retained.result {
+                    return Ok(result);
+                }
+            }
+            if let Err(error) = store.require_capture_dispatch(command).await {
+                let snapshots =
+                    crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
+                let capture = uuid(&command.plan.capture_id)?;
+                if snapshots
+                    .capture_reservation(capture)
+                    .await?
+                    .is_some_and(|record| record.dispatch_attempted)
+                {
+                    return Err(error);
+                }
+                let result = LiveCommandResult::rejected(
+                    intent.command.kind(),
+                    vm_spec::lifecycle::LiveRejection::new(
+                        vm_spec::lifecycle::LiveRejectionReason::InvalidPlan,
+                        if matches!(
+                            command.plan.pause,
+                            vm_spec::capture::CapturePauseAuthority::Borrow { .. }
+                        ) {
+                            vm_spec::lifecycle::VmLifecycleState::Paused
+                        } else {
+                            vm_spec::lifecycle::VmLifecycleState::Running
+                        },
+                        format!("dispatch refusal before send: {error}"),
+                    ),
+                );
+                let envelope = intent.command.envelope();
+                store
+                    .complete_live_command(
+                        config.id,
+                        uuid(&envelope.run_id)?,
+                        uuid(&envelope.request_id)?,
+                        &intent.report.monitor_id,
+                        &result,
+                        None,
+                    )
+                    .await?;
+                crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()))
+                    .abandon_capture(uuid(&envelope.request_id)?)
+                    .await?;
+                return Ok(result);
+            }
             Some(lock)
         } else {
             None
@@ -572,7 +625,12 @@ impl Machine {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             reconcile(runtime, &config).await?;
         }
-        crate::machine::live_capture::reconcile_captures(runtime, Some(self.machine_id())).await?;
+        crate::machine::live_capture::reconcile_captures(
+            runtime,
+            Some(self.machine_id()),
+            crate::storage::pool::PublicationLockPolicy::Wait,
+        )
+        .await?;
         projection(&self.observe_live().await?)
     }
 }

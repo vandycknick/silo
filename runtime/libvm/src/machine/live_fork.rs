@@ -476,6 +476,7 @@ async fn create_fork(
             capture,
             &mut retained,
             progress.as_ref(),
+            crate::storage::pool::PublicationLockPolicy::Wait,
         )
         .await
         {
@@ -648,9 +649,13 @@ impl Runtime {
                 .iter()
                 .any(|child| matches!(child.outcome, ForkChildOutcome::RecoveryPending { .. }))
         {
-            reconcile_one(self, operation)
-                .await
-                .map_err(|error| fork_error(operation, error))?;
+            reconcile_one(
+                self,
+                operation,
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await
+            .map_err(|error| fork_error(operation, error))?;
         }
         store
             .fork_result(operation)
@@ -1243,7 +1248,11 @@ async fn finish_if_settled(runtime: &Runtime, operation: Uuid) -> Result<(), Lib
     Ok(())
 }
 
-async fn reconcile_one(runtime: &Runtime, operation: Uuid) -> Result<(), LibVmError> {
+async fn reconcile_one(
+    runtime: &Runtime,
+    operation: Uuid,
+    lock_policy: crate::storage::pool::PublicationLockPolicy,
+) -> Result<(), LibVmError> {
     let store = runtime.native_store()?;
     let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
     let Some(_owner) = pool.try_exclusive_lease(operation)? else {
@@ -1266,6 +1275,7 @@ async fn reconcile_one(runtime: &Runtime, operation: Uuid) -> Result<(), LibVmEr
             capture,
             &mut None,
             None,
+            lock_policy,
         )
         .await
         {
@@ -1299,7 +1309,13 @@ pub(crate) async fn reconcile_forks(runtime: &Runtime) -> Result<(), LibVmError>
     let operations = store.forks_requiring_reconciliation().await?;
     for operation in operations {
         let operation = Uuid::parse_str(&operation).map_err(|error| invalid(error.to_string()))?;
-        if let Err(error) = reconcile_one(runtime, operation).await {
+        if let Err(error) = reconcile_one(
+            runtime,
+            operation,
+            crate::storage::pool::PublicationLockPolicy::Defer,
+        )
+        .await
+        {
             tracing::warn!(%operation,%error,"fork recovery retains uncertain roots and charges");
         }
     }

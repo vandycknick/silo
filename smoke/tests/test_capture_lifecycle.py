@@ -12,8 +12,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import hashlib
+import fcntl
 import json
 from pathlib import Path
+import os
 import signal
 import stat
 import subprocess
@@ -487,17 +489,16 @@ def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_
         seal_bytes = (run.directory / "vm.capture.json").read_bytes()
         seal = json.loads(seal_bytes)
         run.coherent(seal)
-        # This gate deliberately holds unlinkat before single-link settlement.
-        # Fingerprint the one known seal inode through its two owned names,
-        # not through the ordinary singleton-only immutable-file reader.
+        # The monitor is held before unlinkat, but the manager may legitimately
+        # settle the owned temporary alias while publishing. Fingerprint the
+        # final seal inode, not the lifetime of that recovery-only alias.
         seal_path = run.directory / "vm.capture.json"
         temporary = run.directory / ".vm.capture.json.tmp"
-        metadata = seal_path.lstat()
-        alias = temporary.lstat()
-        assert stat.S_ISREG(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o600
-        assert metadata.st_nlink == alias.st_nlink == 2
-        assert (metadata.st_dev, metadata.st_ino) == (alias.st_dev, alias.st_ino)
-        assert temporary.read_bytes() == seal_bytes
+        with seal_path.open("rb") as opened:
+            metadata = os.fstat(opened.fileno())
+            assert stat.S_ISREG(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o600
+            assert metadata.st_nlink in (1, 2)
+            assert opened.read() == seal_bytes
         before = {
             str(path.relative_to(run.directory)): stopped.read_bytes(path)
             for path in sorted(run.directory.rglob("*"))
@@ -768,3 +769,117 @@ def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
         run.finish()
         run.ended_silently()
         assert disk_counter() == frozen_counter, "stop resumed the failed source"
+
+
+@contextmanager
+def exhausted_capture_budget(silo: Silo) -> Iterator[None]:
+    """Serial-only real ledger owner, leaving less than one publication clone."""
+    pool = silo.ws.silo_home / "images"
+    operation = str(uuid4())
+    state = silo.ws.state_db().stat()
+    ledger_charge = (Path(f"/tmp/silo-resource-budget-{os.geteuid()}")
+                     / f"{state.st_dev}-{state.st_ino}-{operation}.json")
+
+    def write_catalog(sql: str) -> None:
+        result = subprocess.run(
+            ["sqlite3", "-cmd", ".timeout 5000", "-cmd", "PRAGMA foreign_keys=ON;",
+             str(silo.ws.state_db()), sql],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+
+    lease_path = pool / "locks/leases" / f"{operation}.lease"
+    fd = os.open(lease_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "r+b") as lease:
+        fcntl.flock(lease, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        identity = os.fstat(lease.fileno())
+        filesystem = os.statvfs(pool)
+        # Admission needs RAM staging; publication needs at least its 16 MiB
+        # clone allowance. Leave 8 MiB free without charging beyond real space.
+        headroom = 8 << 20
+        available = filesystem.f_bavail * filesystem.f_frsize
+        assert available > headroom, "capture budget fixture needs 8 MiB free"
+        charge = {
+            "captureId": operation,
+            "captureDisks": [{"device": pool.stat().st_dev,
+                             "bytes": available - headroom}],
+            "pending": [], "bound": [], "descriptorOwner": None, "descriptors": 0,
+        }
+        try:
+            # Maintenance publishes the ledger's authenticated home anchor.
+            write_catalog(
+                "BEGIN IMMEDIATE;"
+                "INSERT INTO storage_operation(operation_id,schema,kind,state,file_device,file_inode,record_json)"
+                f" VALUES('{operation}',1,'import','staging','{identity.st_dev}','{identity.st_ino}',jsonb('{{}}'));"
+                "INSERT INTO capture_resource_reservation(operation_id,charge_json)"
+                f" VALUES('{operation}',jsonb('{json.dumps(charge)}'));COMMIT;"
+            )
+            yield
+        finally:
+            try:
+                write_catalog(f"DELETE FROM storage_operation WHERE operation_id='{operation}';")
+                # SQL deletion alone leaves the published host-wide charge behind.
+                # Reconcile it in this home before dropping its lease or workspace.
+                silo.run("ls")
+                assert not ledger_charge.exists(), "budget fixture left a host-wide charge"
+            finally:
+                lease_path.unlink(missing_ok=True)
+
+
+@pytest.mark.serial
+def test_capture_budget_refusal_leaves_no_ownership_and_force_removal_works(
+    silo: Silo, lifecycle_image: str,
+) -> None:
+    silo.create(NAME, lifecycle_image, "--cpus", "1", "--memory", "512mib",
+                "--disk-size", "512mib", "--vsock", "--network", "none")
+    silo.start(NAME)
+    running = silo.wait_ready(NAME)
+    assert running["lifecycle"]["report"]["live"]["capture"]["availability"] == {"status": "supported"}
+    counter = capture.Counter(silo, NAME, PROBE)
+    try:
+        counter.advances()
+        with exhausted_capture_budget(silo):
+            before = procs.query(silo.ws.state_db(),
+                                 "SELECT count(*) FROM live_command WHERE json_extract(input_json,'$.command.command')='capture'")
+            refused = silo.run("snapshot", "create", NAME, "--live", "--name", "over-budget",
+                               expect=None, timeout=120)
+            assert refused.returncode != 0
+            for component in ("pre-freeze admission", "requires", "available", "RAM staging",
+                              "disk staging", "publication", "reserves", "filesystem"):
+                assert component in refused.stderr, refused.stderr
+            assert procs.query(silo.ws.state_db(),
+                               "SELECT count(*) FROM live_command WHERE json_extract(input_json,'$.command.command')='capture'") == before
+            assert procs.query(silo.ws.state_db(),
+                               "SELECT count(*) FROM storage_operation WHERE kind='capture'") == [("0",)]
+            machine = silo.ws.silo_home / "machines" / UUID(running["id"]).hex
+            assert not list((machine / "captures").glob("*")), "admission refusal created staging"
+            counter.advances()
+            silo.run("rm", "--force", NAME, timeout=180)
+            assert not machine.exists()
+            assert NAME not in {entry["name"] for entry in silo.ls()}
+    finally:
+        counter.close()
+
+
+@pytest.mark.serial
+def test_force_removal_discards_sealed_unpublished_capture_when_publication_is_deferred(
+    silo: Silo, lifecycle_image: str,
+) -> None:
+    with captured(silo, lifecycle_image, "capture-execution-write", "resume") as run:
+        with exhausted_capture_budget(silo):
+            run.manager.send(signal.SIGKILL)
+            run.manager.wait()
+            assert run.trace.wait("capture-manager-result.json")["code"] == -signal.SIGKILL
+            run.trace.release()
+            run.wait_logged("monitor did not settle without its manager",
+                            "capture continuation finished", run.plan["captureId"])
+            shutdown.until(lambda: (run.directory / "vm.capture.json").is_file(),
+                           timeout=120, description="managerless capture did not seal")
+            run.coherent(json.loads((run.directory / "vm.capture.json").read_bytes()))
+            run.finish()
+            assert NAME in {entry["name"] for entry in silo.ls()}, "pending publication prevented home opening"
+            assert run.provenance() == [], "capture unexpectedly published before removal"
+            silo.run("rm", "--force", NAME, timeout=180)
+            assert not run.directory.exists()
+            assert run.provenance() == [], "forced removal published the discarded capture"
+            assert NAME not in {entry["name"] for entry in silo.ls()}

@@ -62,7 +62,7 @@ pub(crate) struct RuntimeStatus {
 }
 
 impl RuntimeStatus {
-    fn from_machine_state(state: &MachineState) -> Self {
+    pub(crate) fn from_machine_state(state: &MachineState) -> Self {
         Self {
             state: state.status,
             pid: state.vmm_pid,
@@ -227,8 +227,14 @@ impl Runtime {
 
     async fn recover_machine_operations(&self) -> Result<(), LibVmError> {
         self.recover_constructed_children().await?;
-        if let Err(error) = crate::machine::live_capture::reconcile_captures(self, None).await {
-            tracing::warn!(%error, "live capture recovery retained uncertainty");
+        if let Err(error) = crate::machine::live_capture::reconcile_captures(
+            self,
+            None,
+            crate::storage::pool::PublicationLockPolicy::Defer,
+        )
+        .await
+        {
+            tracing::warn!(phase = "capture recovery", %error, "capture recovery deferred; runtime opening continues");
         }
         if let Err(error) = crate::machine::live_fork::reconcile_forks(self).await {
             tracing::warn!(%error, "live fork recovery retained uncertainty");

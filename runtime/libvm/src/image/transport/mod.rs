@@ -1866,6 +1866,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();

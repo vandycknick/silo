@@ -26,6 +26,19 @@ pub struct PublishedStream {
     pub map: StreamMap,
 }
 
+/// Payload-copy authority granted by admission, not clone capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealedStreamPublicationMode {
+    CloneRequired,
+    CopyAllowed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicationLockPolicy {
+    Wait,
+    Defer,
+}
+
 /// Process-local binding of a sealed producer map to the held published inode.
 /// A fresh reflink relies on owned clone provenance, not independent byte
 /// authentication. Only a held producer capability can seed restore trust.
@@ -92,6 +105,7 @@ pub struct StoragePool {
     publication: OwnedDirectory,
     leases: OwnedDirectory,
     defer_publication: bool,
+    publication_lock_policy: PublicationLockPolicy,
 }
 /// Bounded-memory, metadata-only discovery of retained stream files. It never
 /// opens backing bytes before launch admission. Catalog reachability is checked
@@ -331,6 +345,7 @@ impl StoragePool {
             publication,
             leases,
             defer_publication: false,
+            publication_lock_policy: PublicationLockPolicy::Wait,
         })
     }
     /// Open only an already-initialized pool, without creating any directory,
@@ -368,11 +383,17 @@ impl StoragePool {
             publication,
             leases,
             defer_publication: false,
+            publication_lock_policy: PublicationLockPolicy::Wait,
         }))
     }
 
     pub(crate) fn defer_publications(mut self) -> Self {
         self.defer_publication = true;
+        self
+    }
+
+    pub(crate) fn with_publication_lock_policy(mut self, policy: PublicationLockPolicy) -> Self {
+        self.publication_lock_policy = policy;
         self
     }
 
@@ -384,10 +405,19 @@ impl StoragePool {
     }
 
     fn publication_lock(&self, name: &str) -> Result<StorageLock, StorageError> {
-        if self.defer_publication {
-            locks::blocking_deferred(&self.publication, name, FlockArg::LockExclusive)
-        } else {
-            locks::blocking(&self.publication, name, FlockArg::LockExclusive)
+        match self.publication_lock_policy {
+            PublicationLockPolicy::Defer => {
+                locks::acquire(&self.publication, name, FlockArg::LockExclusiveNonblock)?
+                    .ok_or_else(|| StorageError::PublicationBusy {
+                        resource: name.to_owned(),
+                    })
+            }
+            PublicationLockPolicy::Wait if self.defer_publication => {
+                locks::blocking_deferred(&self.publication, name, FlockArg::LockExclusive)
+            }
+            PublicationLockPolicy::Wait => {
+                locks::blocking(&self.publication, name, FlockArg::LockExclusive)
+            }
         }
     }
 
@@ -668,13 +698,21 @@ impl StoragePool {
         )
     }
 
-    /// Recipe inputs must already be verified before deriving this byte key.
-    pub fn lock_publication(&self, key: &ObjectDigest) -> Result<StorageLock, StorageError> {
-        locks::blocking(
+    pub(crate) fn try_capture_publication(
+        &self,
+        capture: Uuid,
+    ) -> Result<Option<StorageLock>, StorageError> {
+        let key = crate::store::capture::capture_publication_key(capture);
+        locks::acquire(
             &self.publication,
             &format!("recipe-{}.lock", key.hex()),
-            FlockArg::LockExclusive,
+            FlockArg::LockExclusiveNonblock,
         )
+    }
+
+    /// Recipe inputs must already be verified before deriving this byte key.
+    pub fn lock_publication(&self, key: &ObjectDigest) -> Result<StorageLock, StorageError> {
+        self.publication_lock(&format!("recipe-{}.lock", key.hex()))
     }
 
     /// Fresh IDs only. A colliding or unsafe stable inode is never replaced.
@@ -893,6 +931,11 @@ impl StoragePool {
         ))
     }
 
+    pub(crate) fn qualify_sealed_clone(&self, input: &File) -> Result<bool, StorageError> {
+        let (_staging, file) = self.stage()?;
+        try_clone_stream(input, &file)
+    }
+
     /// Publish a closed, owned producer's sealed stream and canonical map.
     /// Reflinks carry producer identity; copies authenticate inline. Existing
     /// pool inodes require a matching verified receipt or full authentication.
@@ -901,6 +944,7 @@ impl StoragePool {
         input: &File,
         map: &StreamMap,
         verified_receipt: Option<SourceFingerprint>,
+        mode: SealedStreamPublicationMode,
     ) -> Result<(SealedStreamPublication, StorageLock), StorageError> {
         let metadata = input.metadata()?;
         let before = SourceFingerprint::new(&metadata);
@@ -941,6 +985,12 @@ impl StoragePool {
         let (staging, file, published_map, stats) = if try_clone_stream(input, &file)? {
             (staging, file, map.clone(), StreamStats::default())
         } else {
+            if mode == SealedStreamPublicationMode::CloneRequired {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "publication deferred: qualified clone unavailable; copy requires fresh admission",
+                )));
+            }
             drop(file);
             drop(staging);
             let (staging, file) = self.stage()?;
@@ -1386,7 +1436,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::storage::identity::ObjectDigest;
-    use crate::storage::pool::StoragePool;
+    use crate::storage::pool::{SealedStreamPublicationMode, StoragePool};
     use crate::storage::stream::{StreamHasher, StreamMap};
     use crate::storage::StorageError;
 
@@ -1892,6 +1942,7 @@ mod tests {
                 &std::fs::File::open(&candidate).unwrap(),
                 &map,
                 None,
+                SealedStreamPublicationMode::CopyAllowed,
             )
             .unwrap();
         drop(roots);
@@ -1948,7 +1999,12 @@ mod tests {
         ] {
             std::fs::write(&source, bytes).unwrap();
             assert!(matches!(
-                pool.publish_sealed_stream_for_catalog(&input, &map, None),
+                pool.publish_sealed_stream_for_catalog(
+                    &input,
+                    &map,
+                    None,
+                    SealedStreamPublicationMode::CopyAllowed
+                ),
                 Err(StorageError::ContentMismatch(_))
             ));
             assert!(!pool.stream_path(&map.id()).exists());
@@ -1967,12 +2023,22 @@ mod tests {
             .hash_reader(b"sealed RAM".as_slice())
             .unwrap();
         let (proof, roots) = pool
-            .publish_sealed_stream_for_catalog(&File::open(&source).unwrap(), &map, None)
+            .publish_sealed_stream_for_catalog(
+                &File::open(&source).unwrap(),
+                &map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         drop(roots);
         let path = pool.stream_path(&map.id());
         let (reused, roots) = pool
-            .publish_sealed_stream_for_catalog(&File::open(&source).unwrap(), &map, None)
+            .publish_sealed_stream_for_catalog(
+                &File::open(&source).unwrap(),
+                &map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert!(reused.scan_stats().bytes_read >= map.length());
         assert_eq!(
@@ -1985,8 +2051,13 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(proof.recheck(&pool).is_err());
         assert!(
-            pool.publish_sealed_stream_for_catalog(&File::open(&source).unwrap(), &map, None)
-                .is_err(),
+            pool.publish_sealed_stream_for_catalog(
+                &File::open(&source).unwrap(),
+                &map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed
+            )
+            .is_err(),
             "a dedup hit must authenticate the preexisting bytes"
         );
         std::fs::remove_file(&path).unwrap();
@@ -2015,7 +2086,12 @@ mod tests {
         drop(destination);
         drop(staging);
         let (publication, roots) = pool
-            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .publish_sealed_stream_for_catalog(
+                &input,
+                &map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert_eq!(publication.map(), &map);
         assert_eq!(
@@ -2060,7 +2136,12 @@ mod tests {
                 .write_all_at(&[0xff], map.length() - 1)
                 .unwrap();
             let (publication, roots) = pool
-                .publish_sealed_stream_for_catalog(&input, &map, None)
+                .publish_sealed_stream_for_catalog(
+                    &input,
+                    &map,
+                    None,
+                    SealedStreamPublicationMode::CopyAllowed,
+                )
                 .unwrap();
             assert_eq!(publication.scan_stats().bytes_read, 0);
             publication.recheck(&pool).unwrap();
@@ -2091,7 +2172,12 @@ mod tests {
         drop(destination);
         drop(staging);
         let (proof, roots) = pool
-            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .publish_sealed_stream_for_catalog(
+                &input,
+                &map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert_eq!(proof.map(), &map);
         assert_eq!(proof.scan_stats().bytes_read, map.length());
@@ -2105,12 +2191,22 @@ mod tests {
         std::fs::remove_file(pool.stream_path(&map.id())).unwrap();
         std::fs::write(&source, b"broken RAM").unwrap();
         assert!(pool
-            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .publish_sealed_stream_for_catalog(
+                &input,
+                &map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed
+            )
             .is_err());
         let zero_map =
             StreamMap::new(map.length(), vec![crate::storage::stream::Chunk::Zero]).unwrap();
         assert!(pool
-            .publish_sealed_stream_for_catalog(&input, &zero_map, None)
+            .publish_sealed_stream_for_catalog(
+                &input,
+                &zero_map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed
+            )
             .is_err());
         assert_eq!(std::fs::read_dir(pool.temporary.path()).unwrap().count(), 0);
     }
@@ -2139,7 +2235,12 @@ mod tests {
         drop(destination);
         drop(staging);
         let (proof, _roots) = pool
-            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .publish_sealed_stream_for_catalog(
+                &input,
+                &map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert_eq!(proof.map(), &map);
         assert_eq!(proof.scan_stats().bytes_read, map.length());
@@ -2159,7 +2260,12 @@ mod tests {
         std::fs::write(&source, []).unwrap();
         let map = StreamMap::new(0, Vec::new()).unwrap();
         let (proof, _roots) = pool
-            .publish_sealed_stream_for_catalog(&File::open(&source).unwrap(), &map, None)
+            .publish_sealed_stream_for_catalog(
+                &File::open(&source).unwrap(),
+                &map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert_eq!(proof.map(), &map);
         assert_eq!(proof.scan_stats().bytes_read, 0);
@@ -2203,7 +2309,12 @@ mod tests {
         drop(probe);
         drop(staging);
         let (publication, roots) = pool
-            .publish_sealed_stream_for_catalog(&input, &map, None)
+            .publish_sealed_stream_for_catalog(
+                &input,
+                &map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert_eq!(
             publication.scan_stats().bytes_read,
@@ -2213,7 +2324,12 @@ mod tests {
         drop(roots);
         let fingerprint = publication.fingerprint();
         let (reused, roots) = pool
-            .publish_sealed_stream_for_catalog(&input, &map, Some(fingerprint))
+            .publish_sealed_stream_for_catalog(
+                &input,
+                &map,
+                Some(fingerprint),
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert_eq!(reused.fingerprint(), fingerprint);
         assert_eq!(
@@ -2233,7 +2349,12 @@ mod tests {
         )
         .unwrap();
         assert!(pool
-            .publish_sealed_stream_for_catalog(&input, &map, Some(fingerprint))
+            .publish_sealed_stream_for_catalog(
+                &input,
+                &map,
+                Some(fingerprint),
+                SealedStreamPublicationMode::CopyAllowed
+            )
             .is_err());
         let next_source = temporary.path().join("distinct-sealed-disk.raw");
         let next_bytes = vec![0x53; bytes.len()];
@@ -2243,7 +2364,12 @@ mod tests {
             .unwrap();
         assert_ne!(next_map.id(), map.id());
         let (distinct, roots) = pool
-            .publish_sealed_stream_for_catalog(&File::open(next_source).unwrap(), &next_map, None)
+            .publish_sealed_stream_for_catalog(
+                &File::open(next_source).unwrap(),
+                &next_map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert_eq!(
             distinct.scan_stats().bytes_read,
@@ -2337,7 +2463,12 @@ mod tests {
         let input_reads = watch_stream_reads(&input);
         let retained_reads = watch_stream_reads(&published.path);
         let (reused, roots) = pool
-            .publish_sealed_stream_for_catalog(&source, &published.map, Some(fingerprint))
+            .publish_sealed_stream_for_catalog(
+                &source,
+                &published.map,
+                Some(fingerprint),
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert_eq!(reused.fingerprint(), fingerprint);
         assert_eq!(
@@ -2354,7 +2485,12 @@ mod tests {
         std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o400)).unwrap();
         let (authenticated, roots) = pool
-            .publish_sealed_stream_for_catalog(&source, &published.map, Some(fingerprint))
+            .publish_sealed_stream_for_catalog(
+                &source,
+                &published.map,
+                Some(fingerprint),
+                SealedStreamPublicationMode::CopyAllowed,
+            )
             .unwrap();
         assert!(authenticated.scan_stats().bytes_read > 0);
         assert!(observed_stream_read(&retained_reads));
@@ -2368,7 +2504,51 @@ mod tests {
         std::fs::write(&published.path, [0x74; 4096]).unwrap();
         std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(pool
-            .publish_sealed_stream_for_catalog(&source, &published.map, Some(fingerprint))
+            .publish_sealed_stream_for_catalog(
+                &source,
+                &published.map,
+                Some(fingerprint),
+                SealedStreamPublicationMode::CopyAllowed
+            )
             .is_err());
+    }
+
+    #[test]
+    fn clone_qualified_publication_never_falls_back_to_an_unadmitted_copy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pool = StoragePool::open(&temporary.path().join("pool")).unwrap();
+        let path = temporary.path().join("sealed.raw");
+        let bytes = vec![0x53; 4096];
+        std::fs::write(&path, &bytes).unwrap();
+        let source = std::fs::File::open(&path).unwrap();
+        let map = crate::storage::stream::StreamHasher::new()
+            .hash_reader(bytes.as_slice())
+            .unwrap();
+        let qualified = pool.qualify_sealed_clone(&source).unwrap();
+        let result = pool.publish_sealed_stream_for_catalog(
+            &source,
+            &map,
+            None,
+            SealedStreamPublicationMode::CloneRequired,
+        );
+        if qualified {
+            let (publication, _roots) = result.unwrap();
+            assert_eq!(publication.scan_stats().bytes_read, 0);
+            publication.recheck(&pool).unwrap();
+        } else {
+            assert!(
+                matches!(result, Err(crate::storage::StorageError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported)
+            );
+            assert!(!pool.stream_path(&map.id()).exists());
+            let (publication, _roots) = pool
+                .publish_sealed_stream_for_catalog(
+                    &source,
+                    &map,
+                    None,
+                    SealedStreamPublicationMode::CopyAllowed,
+                )
+                .unwrap();
+            assert_eq!(publication.map(), &map);
+        }
     }
 }

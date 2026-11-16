@@ -25,4 +25,32 @@ mod tests {
             .count();
         assert_eq!(anchors, 1);
     }
+    #[test]
+    fn capture_budget_diagnostics_name_phase_device_and_components() {
+        let error = libvm::storage::StorageError::CaptureDiskBudget {
+            phase: "publication deferred",
+            filesystem: "/capture-pool".into(),
+            required: 104,
+            available: 99,
+            ram_staging: 0,
+            disk_staging: 0,
+            publication: 32,
+            reserves: 64,
+            other: 8,
+        };
+        let diagnostic = error.to_string();
+        for expected in [
+            "publication deferred",
+            "/capture-pool",
+            "requires 104 bytes",
+            "available 99 bytes",
+            "RAM staging 0",
+            "disk staging 0",
+            "publication 32",
+            "reserves 64",
+            "other reservations 8",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+    }
 }

@@ -167,7 +167,14 @@ impl AppMachine {
     pub(crate) async fn remove(self) -> Result<(), libvm::LibVmError> {
         match self {
             Self::Local { native, .. } => native.remove().await,
-            Self::Daemon { id, service, .. } => service.remove(&id).await,
+            Self::Daemon { id, service, .. } => service.remove(&id, false).await,
+        }
+    }
+
+    pub(crate) async fn remove_force(self) -> Result<(), libvm::LibVmError> {
+        match self {
+            Self::Local { native, .. } => native.remove_force().await,
+            Self::Daemon { id, service, .. } => service.remove(&id, true).await,
         }
     }
 
