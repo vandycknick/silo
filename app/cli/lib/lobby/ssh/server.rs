@@ -579,11 +579,23 @@ mod tests {
             .disconnect(russh::Disconnect::ByApplication, "", "")
             .await
             .unwrap();
-        timeout(Duration::from_secs(3), task)
+        match timeout(Duration::from_secs(3), task)
             .await
             .unwrap()
             .unwrap()
-            .unwrap();
+        {
+            Ok(()) => {}
+            // The client can close with a keepalive in flight while the server drains.
+            Err(russh::Error::IO(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::NotConnected
+                ) => {}
+            Err(error) => panic!("SSH disconnect cleanup failed: {error:?}"),
+        }
     }
 
     async fn collect(channel: &mut Channel<client::Msg>) -> (u32, Vec<u8>, Vec<u8>) {
