@@ -2,6 +2,7 @@ pub mod capture;
 pub mod lifecycle;
 pub mod live;
 pub mod restore;
+pub mod stream_map;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
