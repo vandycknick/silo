@@ -22,7 +22,7 @@ def target_dir() -> Path:
 
 
 def bin_dir() -> Path:
-    return Path(os.environ.get("SILO_SMOKE_BIN_DIR", str(target_dir() / os.environ.get("PROFILE", "debug")))).expanduser().resolve()
+    return Path(os.environ.get("SILO_SMOKE_BIN_DIR", str(target_dir() / os.environ.get("PROFILE", "release")))).expanduser().resolve()
 
 
 def example(name: str, directory: Path | None = None, override: str | None = None) -> Path:
@@ -169,7 +169,7 @@ def main() -> None:
     slow = includes_slow(marker)
     if slow and platform.system() == "Linux":
         if platform.machine().lower() in {"x86_64", "amd64"}:
-            subprocess.run(["make", "-C", str(REPO), "smoke-diagnostic", f"PROFILE={os.environ.get('PROFILE', 'debug')}",
+            subprocess.run(["make", "-C", str(REPO), "smoke-diagnostic", f"SMOKE_PROFILE={os.environ.get('PROFILE', 'release')}",
                             f"SMOKE_RUNTIME_SOURCE={args.runtime.resolve()}"], check=True)
         reason = extractor_skip_reason()
         if reason is not None:
