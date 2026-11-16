@@ -7,7 +7,7 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 
-use crate::machine::{MachineRef, MachineRefKind};
+use crate::machine::MachineRef;
 use crate::storage::identity_file::FileIdentity;
 use crate::store::catalog_guard::CatalogGuard;
 use crate::store::models::{MachineConfig, MachineState};
@@ -113,15 +113,7 @@ impl ObservationStore {
         reference: &MachineRef,
     ) -> Result<(MachineConfig, MachineState), LibVmError> {
         let mut transaction = self.pool.begin().await?;
-        let (statement, value, prefix) = match reference.kind() {
-            MachineRefKind::Id(id) => ("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE id = ?1 LIMIT 2", id.to_string(), None),
-            MachineRefKind::Name(name) => ("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE name = ?1 LIMIT 2", name.clone(), None),
-            MachineRefKind::IdPrefix { name, prefix } => (
-                crate::store::machine_store::MACHINE_CONFIGS_BY_ID_PREFIX,
-                name.clone(),
-                Some(format!("{prefix}%")),
-            ),
-        };
+        let (statement, value, prefix) = crate::store::machine_store::discovery_query(reference);
         let query = sqlx::query(statement).bind(&value);
         let query = match &prefix {
             Some(prefix) => query.bind(prefix),
