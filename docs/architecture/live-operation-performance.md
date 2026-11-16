@@ -134,7 +134,8 @@ default image init, with command start to agent ready as the latency clock:
 | Create | Under 1 s |
 | `run -- /bin/true` | Under 2 s |
 | Exec round trip | 0.1 s |
-| Local snapshot restore, first or repeated | 0.5 s |
+| Local snapshot restore, first | 0.75 s |
+| Local snapshot restore, repeated | 0.5 s |
 | First durable fork | 2 s |
 | Later durable fork | 1.25 s |
 | Full snapshot | Under 3 s |

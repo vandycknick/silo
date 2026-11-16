@@ -671,6 +671,57 @@ impl CaptureCleanup {
     }
 }
 
+fn capture_result_retained(state: &crate::store::snapshot_store::CaptureState) -> bool {
+    use crate::store::snapshot_store::CaptureState;
+    matches!(
+        state,
+        CaptureState::Published { .. }
+            | CaptureState::Released { snapshot: Some(_) }
+            | CaptureState::Local { .. }
+            | CaptureState::ReleasedLocal { .. }
+    )
+}
+
+fn capture_removal_paths(
+    home: &std::path::Path,
+    record: &crate::store::snapshot_store::CaptureRecord,
+) -> [std::path::PathBuf; 2] {
+    let captures = crate::paths::machine_data_dir_in(home, record.machine_id)
+        .join(vm_spec::capture::CAPTURES_DIRECTORY);
+    [
+        captures.join(record.capture_id.to_string()),
+        captures.join(format!(".retiring-{}", record.capture_id)),
+    ]
+}
+
+async fn ensure_capture_removal_unreferenced(
+    connection: &mut sqlx::SqliteConnection,
+    home: &std::path::Path,
+    record: &crate::store::snapshot_store::CaptureRecord,
+    paths: &[std::path::PathBuf],
+) -> Result<(), LibVmError> {
+    match crate::store::cache_paths::ensure_capture_paths_unreferenced(connection, paths, home)
+        .await
+    {
+        Err(LibVmError::CacheDependency { machine, path }) => {
+            let name: Option<String> =
+                sqlx::query_scalar("SELECT name FROM machine_config WHERE id=?1")
+                    .bind(&machine)
+                    .fetch_optional(&mut *connection)
+                    .await?;
+            Err(LibVmError::CaptureRemovalDependency {
+                capture_id: record.capture_id,
+                dependency: format!(
+                    "machine {} using {}",
+                    name.unwrap_or(machine),
+                    path.display()
+                ),
+            })
+        }
+        result => result,
+    }
+}
+
 impl Store {
     /// Caller holds the stopped source's machine lock and has positively reaped
     /// its monitor. This path never authenticates or publishes capture payload.
@@ -682,10 +733,22 @@ impl Store {
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || runtime.block_on(async move {
             let pool = StoragePool::open(&store.images_dir)?;
-            let ids: Vec<String> = sqlx::query_scalar("SELECT operation_id FROM storage_operation WHERE kind='capture' AND machine_id=?1 ORDER BY operation_id")
+            let rows: Vec<(String, String)> = sqlx::query_as("SELECT operation_id,json(record_json) FROM storage_operation WHERE kind='capture' AND machine_id=?1 ORDER BY operation_id")
                 .bind(machine.to_string()).fetch_all(&store.pool).await?;
-            for id in ids {
-                store.discard_capture_owned(&pool, Uuid::parse_str(&id).map_err(invalid)?).await?;
+            for (id, json) in rows {
+                let capture = Uuid::parse_str(&id).map_err(invalid)?;
+                let record = crate::store::capture::decode_record(&json)?;
+                if capture_result_retained(&record.state) {
+                    // Snapshot pool roots and relocated fork cuts have their
+                    // own owners. Removal is not permission to discard them.
+                    let _roots = pool.lock_roots()?;
+                    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+                    let paths = capture_removal_paths(&store.home, &record);
+                    ensure_capture_removal_unreferenced(&mut tx, &store.home, &record, &paths).await?;
+                    tx.commit().await?;
+                    continue;
+                }
+                store.discard_capture_owned(&pool, capture).await?;
             }
             Ok(())
         })).await?
@@ -696,13 +759,17 @@ impl Store {
         pool: &StoragePool,
         capture: Uuid,
     ) -> Result<(), LibVmError> {
-        let _publisher = pool
-            .try_capture_publication(capture)?
-            .ok_or_else(|| invalid(format!("capture {capture} publisher is active")))?;
+        let _publisher = pool.try_capture_publication(capture)?.ok_or_else(|| {
+            LibVmError::CaptureRemovalDependency {
+                capture_id: capture,
+                dependency: "capture publisher is active".into(),
+            }
+        })?;
         let _lease = pool.try_exclusive_lease(capture)?.ok_or_else(|| {
-            invalid(format!(
-                "capture {capture} has an active lease or baseline holder"
-            ))
+            LibVmError::CaptureRemovalDependency {
+                capture_id: capture,
+                dependency: "an active lease or baseline holder".into(),
+            }
         })?;
         let _roots = pool.lock_roots()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -714,13 +781,20 @@ impl Store {
         validate_lease_identity(&row, &_lease)?;
         let mut record =
             crate::store::capture::decode_record(&row.try_get::<String, _>("record_json")?)?;
+        let paths = capture_removal_paths(&self.home, &record);
+        // A publisher may have completed since the initial inventory read.
+        if capture_result_retained(&record.state) {
+            ensure_capture_removal_unreferenced(&mut tx, &self.home, &record, &paths).await?;
+            return Ok(());
+        }
         let _launch = pool
             .try_exclusive_lease(record.launch_operation_id)?
-            .ok_or_else(|| {
-                invalid(format!(
-                    "capture {capture} launch {} has an active lease or accepted baseline holder",
-                    record.launch_operation_id
-                ))
+            .ok_or_else(|| LibVmError::CaptureRemovalDependency {
+                capture_id: capture,
+                dependency: format!(
+                    "an active launch lease or accepted baseline holder for machine {}",
+                    record.machine_id
+                ),
             })?;
         if _launch.file_identity()?
             != (
@@ -730,6 +804,12 @@ impl Store {
         {
             return Err(invalid("capture launch lease inode changed"));
         }
+        let child = if let Some(fork) = record.fork_operation_id {
+            sqlx::query_scalar::<_, String>("SELECT COALESCE(m.name,c.name) FROM live_fork_child c LEFT JOIN machine_config m ON m.id=c.machine_id WHERE c.operation_id=?1 AND (c.name_reserved=1 OR m.id IS NOT NULL) ORDER BY c.child_index LIMIT 1")
+                .bind(fork.to_string()).fetch_optional(&mut *tx).await?
+        } else {
+            None
+        };
         let dependency: Option<String> = sqlx::query_scalar(
             "SELECT cut_id FROM storage_operation_cut WHERE operation_id=?1 LIMIT 1",
         )
@@ -737,18 +817,19 @@ impl Store {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(cut) = dependency {
-            return Err(invalid(format!(
-                "capture {capture} is retained by local-cut dependency {cut}"
-            )));
+            return Err(LibVmError::CaptureRemovalDependency {
+                capture_id: capture,
+                dependency: match child {
+                    Some(child) => format!("fork child machine {child} using local cut {cut}"),
+                    None => format!("local cut {cut} whose relocation is incomplete"),
+                },
+            });
         }
-        if let Some(fork) = record.fork_operation_id {
-            let child: Option<String> = sqlx::query_scalar("SELECT c.machine_id FROM live_fork_child c WHERE c.operation_id=?1 AND (c.name_reserved=1 OR EXISTS(SELECT 1 FROM machine_config m WHERE m.id=c.machine_id)) LIMIT 1")
-                .bind(fork.to_string()).fetch_optional(&mut *tx).await?;
-            if let Some(child) = child {
-                return Err(invalid(format!(
-                    "capture {capture} is retained by fork child {child} of {fork}"
-                )));
-            }
+        if let Some(child) = child {
+            return Err(LibVmError::CaptureRemovalDependency {
+                capture_id: capture,
+                dependency: format!("fork child machine {child}"),
+            });
         }
         let home = crate::paths::OwnedDirectory::open_existing_root(&self.home)?
             .ok_or_else(|| invalid("capture home disappeared"))?;
@@ -796,16 +877,7 @@ impl Store {
                 }
             }
         };
-        let paths = [
-            crate::paths::machine_data_dir_in(&self.home, record.machine_id)
-                .join(vm_spec::capture::CAPTURES_DIRECTORY)
-                .join(&source_name),
-            crate::paths::machine_data_dir_in(&self.home, record.machine_id)
-                .join(vm_spec::capture::CAPTURES_DIRECTORY)
-                .join(&quarantine_name),
-        ];
-        crate::store::cache_paths::ensure_capture_paths_unreferenced(&mut tx, &paths, &self.home)
-            .await?;
+        ensure_capture_removal_unreferenced(&mut tx, &self.home, &record, &paths).await?;
         record.discard = Some(discard.clone());
         sqlx::query("UPDATE storage_operation SET state='cleaning',record_json=jsonb(?2) WHERE operation_id=?1")
             .bind(capture.to_string()).bind(crate::store::capture::encode_record(&record)?).execute(&mut *tx).await?;
@@ -823,8 +895,7 @@ impl Store {
         tree.remove(&self.home)?;
         let _roots = pool.lock_roots()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        crate::store::cache_paths::ensure_capture_paths_unreferenced(&mut tx, &paths, &self.home)
-            .await?;
+        ensure_capture_removal_unreferenced(&mut tx, &self.home, &record, &paths).await?;
         tree.recheck_absence()?;
         sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1 AND state='cleaning'")
             .bind(capture.to_string())

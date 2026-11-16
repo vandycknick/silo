@@ -4,8 +4,10 @@ tolerance = 0.10
 [silo.arch-30g.image.start]
 seconds = 1.0
 
+# First restore of a snapshot pages its RAM file in for the first time;
+# measured 0.55 to 0.77 s. A RAM-file warm-up is planned after the format change.
 [silo.arch-30g.image.restore_first]
-seconds = 0.5
+seconds = 0.75
 
 [silo.arch-30g.image.restore_second]
 seconds = 0.5

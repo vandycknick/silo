@@ -8006,9 +8006,28 @@ pub(crate) mod tests {
             reservation,
             launch,
         } = fixture;
+        let capture = reservation.record.capture_id;
         drop(reservation);
         drop(launch);
         mark_fixture_stopped(&snapshots.store, config.id).await;
+        let before = snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        snapshots
+            .store
+            .discard_machine_captures(config.id)
+            .await
+            .unwrap();
+        let after = snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.evidence, before.evidence);
+        assert!(after.discard.is_none());
         let runtime = capture_runtime(&snapshots).await;
         runtime
             .get_machine(&crate::MachineRef::id(config.id))
@@ -8066,15 +8085,17 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn forced_discard_refuses_fork_children_and_local_cut_dependencies() {
+    async fn forced_discard_refuses_unrelocated_fork_children_but_preserves_relocated_cuts() {
         for local_cut in [false, true] {
             let fixture = fork_fixture().await;
+            let capture = fixture.reservation.record.capture_id;
+            let operation = fixture.reservation.record.fork_operation_id.unwrap();
             if local_cut {
                 seal(&fixture);
                 fixture
                     .snapshots
                     .retain_local_capture(
-                        fixture.reservation.record.capture_id,
+                        capture,
                         crate::storage::pool::PublicationLockPolicy::Wait,
                     )
                     .await
@@ -8089,20 +8110,184 @@ pub(crate) mod tests {
             } = fixture;
             drop(reservation);
             drop(launch);
-            let error = snapshots
-                .store
-                .discard_machine_captures(config.id)
-                .await
-                .unwrap_err();
-            assert!(
-                error.to_string().contains(if local_cut {
-                    "local-cut dependency"
-                } else {
-                    "fork child"
-                }),
-                "{error}"
-            );
+            if local_cut {
+                let before = snapshots
+                    .capture_reservation(capture)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                snapshots
+                    .store
+                    .discard_machine_captures(config.id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    snapshots
+                        .capture_reservation(capture)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    before.state
+                );
+                assert!(snapshots
+                    .store
+                    .open_local_cut(operation, None)
+                    .await
+                    .is_ok());
+            } else {
+                let error = snapshots
+                    .store
+                    .discard_machine_captures(config.id)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        &error,
+                        crate::LibVmError::CaptureRemovalDependency { capture_id, dependency }
+                            if *capture_id == capture && dependency.contains("fork-first")
+                    ),
+                    "{error}"
+                );
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn forced_child_then_source_removal_preserves_independent_fork_cut_and_retires_all_owners(
+    ) {
+        use crate::machine::stopped::PrivateSource;
+
+        let fixture = fork_fixture().await;
+        seal(&fixture);
+        let capture = fixture.reservation.record.capture_id;
+        let operation = fixture.reservation.record.fork_operation_id.unwrap();
+        let (cut, retained) = fixture
+            .snapshots
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
+            .await
+            .unwrap();
+        let store = fixture.snapshots.store.clone();
+        let held = store.open_local_cut(operation, retained).await.unwrap();
+        store.bind_fork_resources(&held).await.unwrap();
+        let runtime = capture_runtime(&fixture.snapshots).await;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let children = store.fork_children(operation).await.unwrap();
+        let root = cut.plan.disks[0].name.clone();
+        let mut constructed = Vec::new();
+        for child in children {
+            // Exercise the real private-copy constructor and real consumer OFD,
+            // without claiming that opaque fixture state can boot a VM.
+            let lease = pool.existing_lease(child.consumer_id).unwrap();
+            let config = crate::machine::builder::publish_stopped_child(
+                &runtime,
+                child.result.name.clone(),
+                cut.configuration.clone(),
+                cut.storage.clone(),
+                vec![PrivateSource::Authenticated {
+                    path: crate::PrivatePath::new("root.raw").unwrap(),
+                    stream: held.reopen_disk(&CaptureRole::Disk(root.clone())).unwrap(),
+                }],
+                child.consumer_id,
+            )
+            .await
+            .unwrap();
+            assert_eq!(config.id, child.result.machine_id);
+            assert_eq!(
+                std::fs::read(config.machine_dir.join("root.raw")).unwrap(),
+                [0x51; 512]
+            );
+            constructed.push((child, config, lease));
+        }
+        let survivor = constructed[1].1.machine_dir.join("root.raw");
+        let source = fixture.config.clone();
+        let Fixture {
+            _temporary,
+            reservation,
+            launch,
+            ..
+        } = fixture;
+        drop(reservation);
+        drop(launch);
+        mark_fixture_stopped(&store, source.id).await;
+        for (index, (child, config, lease)) in constructed.into_iter().enumerate() {
+            runtime
+                .get_machine(&crate::MachineRef::id(config.id))
+                .await
+                .unwrap()
+                .remove_force()
+                .await
+                .unwrap();
+            assert!(!config.machine_dir.exists());
+            drop(lease);
+            store
+                .finish_stopped_operation(child.consumer_id)
+                .await
+                .unwrap();
+            store
+                .set_fork_child(
+                    operation,
+                    child.result.index,
+                    crate::ForkChildOutcome::Abandoned {
+                        diagnostic: crate::machine::live_fork::diagnostic(
+                            "store-level child removed",
+                        ),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .release_abandoned_fork_name(operation, child.result.index)
+                .await
+                .unwrap();
+            if index == 0 {
+                assert_eq!(
+                    std::fs::read(source.machine_dir.join("root.raw")).unwrap(),
+                    [0x51; 512]
+                );
+                runtime
+                    .get_machine(&crate::MachineRef::id(source.id))
+                    .await
+                    .unwrap()
+                    .remove_force()
+                    .await
+                    .unwrap();
+                assert!(!source.machine_dir.exists());
+                assert_eq!(std::fs::read(&survivor).unwrap(), [0x51; 512]);
+                assert!(store.open_local_cut(operation, None).await.is_ok());
+            }
+        }
+        drop(held);
+        store
+            .update_fork(operation, |result| {
+                result.stage = crate::ForkStage::Finished;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.recover_image_cache().await.unwrap();
+        assert!(runtime.list_machines().await.unwrap().is_empty());
+        for query in [
+            "SELECT count(*) FROM storage_operation",
+            "SELECT count(*) FROM capture_resource_reservation",
+            "SELECT count(*) FROM restore_resource_reservation",
+            "SELECT count(*) FROM storage_operation_stream",
+            "SELECT count(*) FROM storage_operation_object",
+            "SELECT count(*) FROM storage_operation_layer",
+            "SELECT count(*) FROM storage_operation_lower",
+            "SELECT count(*) FROM storage_operation_cut",
+            "SELECT count(*) FROM local_cut",
+        ] {
+            let count: i64 = sqlx::query_scalar(query)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "{query}");
+        }
+        assert!(std::fs::read_dir(store.images_dir.join("tmp"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[tokio::test]

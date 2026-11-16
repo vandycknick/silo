@@ -1022,13 +1022,16 @@ original local refusal had failed. A live preparer's shared lease prevents this
 retirement from racing its first dispatch.
 
 Explicit `rm --force` (including library and daemon removal) first terminates and
-reaps the source. Under its machine lock, nonblocking capture publisher ownership
-and exclusive capture/launch leases, it checks configured paths, fork-child and
-local-cut dependencies. An active lease, accepted baseline holder or referenced
-cut refuses with its dependency; a lock miss never authorizes deletion.
-Unpublished staging can then be discarded without publication or identity
-completion. Published snapshots retain their independent pool/catalog roots.
-Plain removal keeps ordinary publish-and-reconcile behavior.
+reaps the source. Published snapshots and relocated fork cuts are not discarded:
+their independent pool/operation owners retain them after source removal.
+libvm settles only their ended-source continuation and release. Under the
+source's machine lock, nonblocking capture publisher ownership and exclusive
+capture/launch leases, unpublished staging is checked for configured-path,
+fork-child and unrelocated local-cut dependencies. A dependency on files still
+below the source directory refuses removal with a typed diagnostic naming its
+retaining machine; a lock miss never authorizes deletion. Unreferenced staging
+can then be discarded without publication or identity completion. Plain removal
+keeps ordinary publish-and-reconcile behavior.
 A dead monitor with a live or uncertain worker is not a stopped source: forced
 removal refuses before writing a stop transition or changing retained live-run
 authority. Every holder must be proven terminal before capture discard.

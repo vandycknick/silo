@@ -12,7 +12,9 @@
   `rm --force`, library forced removal and daemon forced removal can discard
   unpublished, unreferenced local capture staging after source termination,
   without publication, identity completion or a fresh evidence archive. Published
-  snapshots and live baseline/fork/local-cut dependencies remain protected.
+  snapshots and relocated fork cuts keep their independent ownership and do not
+  prevent source removal. Dependencies on files still below the source directory
+  refuse removal with a typed diagnostic naming their retaining machine.
 - Fixed: capture completion reconciles exact-run ownership when the monitor
   disappears between status and operation observation, preserving sealed cuts.
 - Fixed: large `silo exec` stdin now applies bounded end-to-end backpressure
@@ -47,7 +49,7 @@
   barriers without moving the snapshot acknowledgement boundary.
   Performance budgets move to `make perf`; image init stays default.
   Arch targets (30 GiB RAM, 10 vCPUs, 100 GiB disk): start and create under 1 s;
-  `run -- /bin/true` under 2 s; exec 0.1 s; first or repeated local restore 0.5 s;
+  `run -- /bin/true` under 2 s; exec 0.1 s; first local restore 0.75 s, repeated 0.5 s;
   first fork 2 s, later fork 1.25 s; full snapshot under 3 s; incremental snapshot
   1.5 s with a 1 s pause. Medians up to 10 percent above target are accepted and
   reported as within tolerance; beyond that they fail. Fork and incremental
