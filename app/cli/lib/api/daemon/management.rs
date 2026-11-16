@@ -519,11 +519,12 @@ impl DaemonVmService {
         )
         .map_err(invalid_response)
     }
-    pub(crate) async fn remove(&self, id: &str) -> Result<(), LibVmError> {
+    pub(crate) async fn remove(&self, id: &str, force: bool) -> Result<(), LibVmError> {
         self.machines
             .clone()
             .remove_machine(w::RemoveMachineRequest {
                 machine: Some(reference(id)?),
+                force,
             })
             .await
             .map_err(native_status)?;

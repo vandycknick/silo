@@ -446,14 +446,15 @@ impl w::machine_service_server::MachineService for Service {
         r: Request<w::RemoveMachineRequest>,
     ) -> Result<Response<()>, Status> {
         let reference = reference(r.get_ref().machine.clone())?;
+        let force = r.get_ref().force;
         let state = self.clone();
         self.mutate(async move {
-            state
-                .machine(&reference)
-                .await?
-                .remove()
-                .await
-                .map_err(native)
+            let machine = state.machine(&reference).await?;
+            if force {
+                machine.remove_force().await.map_err(native)
+            } else {
+                machine.remove().await.map_err(native)
+            }
         })
         .await?;
         Ok(Response::new(()))

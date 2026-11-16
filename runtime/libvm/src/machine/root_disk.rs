@@ -584,7 +584,7 @@ fn clone_attempt(
     }
 }
 
-fn qualify_clone(
+pub(crate) fn qualify_clone(
     directory: &OwnedDirectory,
     durability: crate::MachineDurability,
 ) -> Result<bool, RootDiskError> {

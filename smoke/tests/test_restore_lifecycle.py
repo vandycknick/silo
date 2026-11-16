@@ -649,6 +649,9 @@ def test_restore_refrozen_activation_failed_is_stop_only_with_manager_suspended(
                     with shutdown.owned_processes(manager):
                         sent = evidence.wait(lifecycle.THAW_SENDING, timeout=180)
                         traced.held_thaw_reply(sent)
+                        machine = evidence.machine_hex()
+                        children = lifecycle.ChildProcesses.observe(silo, machine)
+                        wait_child_durable(silo, machine)
                         # Ordinary tracing consumes SIGSTOP. Opt only this
                         # retained manager into real group-stop detachment;
                         # the held child reply and native wire remain traced.
@@ -656,8 +659,6 @@ def test_restore_refrozen_activation_failed_is_stop_only_with_manager_suspended(
                             json.dumps({"pid": manager.pid}) + "\n")
                         manager.send(signal.SIGSTOP)
                         shutdown.until(manager.stopped, description="restore manager did not stop")
-                        machine = evidence.machine_hex()
-                        children = lifecycle.ChildProcesses.observe(silo, machine)
                         freezing = evidence.wait(lifecycle.THAW_RECOVERY_FREEZING, timeout=60)
                         assert freezing.realtime_ns - sent.realtime_ns >= 14_900_000_000, (
                             sent.line, freezing.line)

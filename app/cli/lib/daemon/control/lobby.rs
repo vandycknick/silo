@@ -117,6 +117,7 @@ impl Management {
         self.0
             .remove_machine(Request::new(w::RemoveMachineRequest {
                 machine: Some(machine_ref(reference)),
+                force: false,
             }))
             .await?;
         Ok(())

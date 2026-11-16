@@ -512,6 +512,7 @@ mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();

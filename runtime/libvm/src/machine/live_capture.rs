@@ -465,6 +465,7 @@ impl Machine {
                 capture_id,
                 &mut None,
                 progress,
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await?
             {
@@ -951,11 +952,54 @@ async fn unsubmitted(
     record: &CaptureRecord,
 ) -> Result<Option<CaptureProgress>, LibVmError> {
     let store = runtime.native_store()?;
-    let retained = {
-        let _lock = runtime.lock_machine_config(record.machine_id).await?;
-        let retained = store
+    let (retained, attempted) = {
+        let (_lock, config) = runtime.lock_machine_config(record.machine_id).await?;
+        let mut retained = store
             .live_command_record(record.machine_id, record.run_id, record.capture_id)
             .await?;
+        let current = snapshot_store(runtime)?
+            .capture_reservation(record.capture_id)
+            .await?
+            .ok_or_else(|| {
+                protocol("capture reservation disappeared before submission reconciliation")
+            })?;
+        let attempted = current.dispatch_attempted;
+        if !attempted
+            && retained
+                .as_ref()
+                .is_some_and(|retained| retained.result.is_none())
+        {
+            let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
+            if let Some(_lease) = pool.try_exclusive_lease(record.capture_id)? {
+                let result = LiveCommandResult::rejected(
+                    LiveCommandKind::Capture,
+                    vm_spec::lifecycle::LiveRejection::new(
+                        LiveRejectionReason::InvalidPlan,
+                        if matches!(record.plan.pause, CapturePauseAuthority::Borrow { .. }) { vm_spec::lifecycle::VmLifecycleState::Paused } else { vm_spec::lifecycle::VmLifecycleState::Running },
+                        "dispatch refusal: producer ended before any send; exact request retired without replay",
+                    ),
+                );
+                let intent = retained
+                    .as_ref()
+                    .ok_or_else(|| protocol("capture intent disappeared"))?;
+                store
+                    .complete_live_command(
+                        config.id,
+                        record.run_id,
+                        record.capture_id,
+                        &intent.intent.report.monitor_id,
+                        &result,
+                        None,
+                    )
+                    .await?;
+                snapshot_store(runtime)?
+                    .abandon_capture(record.capture_id)
+                    .await?;
+                if let Some(retained) = &mut retained {
+                    retained.result = Some(result);
+                }
+            }
+        }
         if retained.is_none() {
             // Fence a never-submitted reservation while holding the same
             // machine lock as submit_capture's journal-before-send step.
@@ -963,16 +1007,18 @@ async fn unsubmitted(
                 .abandon_capture(record.capture_id)
                 .await?;
         }
-        retained
+        (retained, attempted)
     };
     match retained {
         None => Ok(Some(CaptureProgress::Abandoned(
             "capture was reserved but never journaled or submitted".into(),
         ))),
         Some(retained) => match retained.result {
-            Some(LiveCommandResult::Capture(CaptureOutcome::Rejected { rejection })) => Ok(Some(
-                CaptureProgress::Abandoned(format!("monitor refused the capture: {rejection}")),
-            )),
+            Some(LiveCommandResult::Capture(CaptureOutcome::Rejected { rejection })) => {
+                Ok(Some(CaptureProgress::Abandoned(format!(
+                    "capture was refused without an accepted submission: {rejection}"
+                ))))
+            }
             Some(LiveCommandResult::Capture(CaptureOutcome::Accepted { .. })) => {
                 match observation {
                     Some(_) => Err(protocol(
@@ -984,6 +1030,9 @@ async fn unsubmitted(
             Some(_) => Err(protocol(
                 "retained capture intent has another command's result",
             )),
+            None if !attempted => Ok(Some(CaptureProgress::Pending(
+                "capture awaiting its producer's first dispatch",
+            ))),
             None => match observation {
                 // Exact replay of the original full inputs, never a new plan.
                 Some(observation) => {
@@ -1145,6 +1194,7 @@ pub(crate) async fn advance(
     capture_id: Uuid,
     retained: &mut Option<crate::store::fork::AuthenticatedCutDisks>,
     progress: Option<&LiveOperationProgressSender>,
+    lock_policy: crate::storage::pool::PublicationLockPolicy,
 ) -> Result<CaptureProgress, LibVmError> {
     let snapshots = snapshot_store(runtime)?;
     let record = snapshots
@@ -1179,6 +1229,18 @@ pub(crate) async fn advance(
         | CaptureState::Local { .. }
         | CaptureState::Published { .. } => {}
     }
+    if record.state == CaptureState::Reserved
+        && !record.dispatch_attempted
+        && open_staging(runtime, &record)?.is_none()
+    {
+        let machine = Machine::new(runtime.clone(), machine_id);
+        if let Some(progress) = unsubmitted(runtime, &machine, None, &record).await? {
+            if matches!(progress, CaptureProgress::Abandoned(_)) {
+                snapshots.abandon_capture(capture_id).await?;
+            }
+            return Ok(progress);
+        }
+    }
     let liveness = run_liveness(runtime, machine_id, record.run_id).await?;
     if matches!(liveness, RunLiveness::Ended)
         && !matches!(
@@ -1197,7 +1259,7 @@ pub(crate) async fn advance(
         CaptureState::Published { .. } | CaptureState::Local { .. }
     ) && coherent_record(runtime, &record)?.is_some()
     {
-        match retain_or_publish(runtime, &snapshots, &record, progress).await {
+        match retain_or_publish(runtime, &snapshots, &record, progress, lock_policy).await {
             Ok(Some(disks)) => *retained = Some(disks),
             Ok(None) => {}
             Err(error) => publication_error = Some(error),
@@ -1220,7 +1282,20 @@ pub(crate) async fn advance(
                 match observe_capture(&machine, observation, &record.plan.capture_id).await {
                     Ok(observed) => observed,
                     Err(error) => {
-                        return Err(publication_error.take().map_or(error, |primary| primary))
+                        // Status and GetOperation are separate RPCs. Losing the
+                        // exact monitor between them does not invalidate a cut.
+                        // Re-enter through owner reconciliation on the next step;
+                        // never infer a terminal source outcome from transport.
+                        if !matches!(
+                            run_liveness(runtime, machine_id, record.run_id).await?,
+                            RunLiveness::Alive(_)
+                        ) {
+                            return match publication_error {
+                                Some(error) => Err(error),
+                                None => Ok(CaptureProgress::Pending("run reconciliation")),
+                            };
+                        }
+                        return Err(publication_error.take().map_or(error, |primary| primary));
                     }
                 };
             match observed {
@@ -1346,7 +1421,9 @@ pub(crate) async fn advance(
         ));
     }
     if !published {
-        if let Some(disks) = retain_or_publish(runtime, &snapshots, &record, progress).await? {
+        if let Some(disks) =
+            retain_or_publish(runtime, &snapshots, &record, progress, lock_policy).await?
+        {
             *retained = Some(disks);
         }
     }
@@ -1427,6 +1504,22 @@ async fn abandon_failed(
     observed: &OperationObservation,
     failure: String,
 ) -> Result<CaptureProgress, LibVmError> {
+    let filesystem = crate::paths::machine_data_dir_in(runtime.local_home(), record.machine_id);
+    let available = (|| -> Result<u64, LibVmError> {
+        let directory = OwnedDirectory::open_existing_root(&filesystem)?
+            .ok_or_else(|| protocol("staging filesystem disappeared"))?;
+        let stat = nix::sys::statvfs::fstatvfs(directory.fd()).map_err(std::io::Error::from)?;
+        stat.blocks_available()
+            .checked_mul(stat.fragment_size())
+            .ok_or_else(|| protocol("staging filesystem availability overflow"))
+    })()
+    .map(|bytes| format!("{bytes} bytes"))
+    .unwrap_or_else(|error| format!("unavailable ({error})"));
+    let failure = format!("staging failure on filesystem {}: required {} bytes, available {available} (RAM staging {}, disk staging {}, publication {}, reserves {}): {failure}",
+        filesystem.display(), record.reservation_bytes, record.plan.ram_bytes,
+        record.plan.reservation.staging_bytes - record.plan.ram_bytes - vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES,
+        record.reservation_bytes - record.plan.reservation.staging_bytes,
+        vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES);
     if let RunLiveness::Alive(observation) = liveness {
         let terminal = observed
             .capture
@@ -1596,6 +1689,7 @@ pub(crate) async fn machine_captures(
 pub(crate) async fn reconcile_captures(
     runtime: &Runtime,
     machine: Option<MachineId>,
+    lock_policy: crate::storage::pool::PublicationLockPolicy,
 ) -> Result<(), LibVmError> {
     let Some(store) = runtime.optional_native_store() else {
         return Ok(());
@@ -1610,6 +1704,7 @@ pub(crate) async fn reconcile_captures(
             record.capture_id,
             &mut None,
             None,
+            lock_policy,
         )
         .await
         {
@@ -1630,7 +1725,21 @@ pub(crate) async fn reconcile_captures(
                 tracing::info!(capture = %record.capture_id, reason, "abandoned unsealed live capture");
             }
             Err(error) => {
-                tracing::warn!(capture = %record.capture_id, %error, "live capture reconciliation retained uncertainty");
+                let deferred = matches!(
+                    &error,
+                    LibVmError::Storage(
+                        crate::storage::StorageError::CaptureDiskBudget {
+                            phase: "publication deferred",
+                            ..
+                        } | crate::storage::StorageError::CapturePublicationDeferred { .. }
+                            | crate::storage::StorageError::PublicationBusy { .. }
+                    )
+                );
+                if deferred {
+                    tracing::warn!(capture = %record.capture_id, phase = "publication deferred", %error, "publication deferred; staging retained");
+                } else {
+                    tracing::warn!(capture = %record.capture_id, %error, "live capture reconciliation retained uncertainty");
+                }
             }
         }
     }
@@ -1644,6 +1753,7 @@ async fn retain_or_publish(
     snapshots: &SnapshotStore,
     record: &CaptureRecord,
     progress: Option<&LiveOperationProgressSender>,
+    lock_policy: crate::storage::pool::PublicationLockPolicy,
 ) -> Result<Option<crate::store::fork::AuthenticatedCutDisks>, LibVmError> {
     if runtime
         .native_store()?
@@ -1651,7 +1761,9 @@ async fn retain_or_publish(
         .await?
         .is_some()
     {
-        let (_, disks) = snapshots.retain_local_capture(record.capture_id).await?;
+        let (_, disks) = snapshots
+            .retain_local_capture(record.capture_id, lock_policy)
+            .await?;
         return Ok(disks);
     }
     report_progress(progress, LiveOperationProgress::Publishing);
@@ -1660,6 +1772,7 @@ async fn retain_or_publish(
             record.capture_id,
             &staging_absolute(runtime, record),
             record.alias.clone(),
+            lock_policy,
         )
         .await?;
     Ok(None)
@@ -1670,7 +1783,12 @@ impl Runtime {
     /// abandon captures that can no longer seal. Captures whose run is alive
     /// stay owned by that run; this never sends Resume.
     pub async fn reconcile_captures(&self) -> Result<(), LibVmError> {
-        reconcile_captures(self, None).await
+        reconcile_captures(
+            self,
+            None,
+            crate::storage::pool::PublicationLockPolicy::Wait,
+        )
+        .await
     }
 }
 

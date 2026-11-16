@@ -21,7 +21,7 @@ use crate::paths::OwnedDirectory;
 use crate::storage::identity::ObjectDigest;
 use crate::storage::identity_file::SourceFingerprint;
 use crate::storage::limits::Resource;
-use crate::storage::pool::StoragePool;
+use crate::storage::pool::{PublicationLockPolicy, SealedStreamPublicationMode, StoragePool};
 use crate::storage::StorageError;
 use crate::store::models::snapshot::{
     invalid, SnapshotCaptureKind, SnapshotCompatibilityProfile, SnapshotDisk, SnapshotExecution,
@@ -126,7 +126,9 @@ impl SnapshotStore {
                 return Err(invalid("capture reservation replay changed its inputs"));
             }
             let lease = pool.existing_lease(record.capture_id)?;
-            self.store.reserve_capture_inventory(&record).await?;
+            if record.state == CaptureState::Reserved && !record.dispatch_attempted {
+                self.store.reserve_capture_inventory(&record, None).await?;
+            }
             check_lease(&self.store, &pool, record.capture_id, &lease).await?;
             return Ok(CaptureReservation {
                 record,
@@ -190,34 +192,23 @@ impl SnapshotStore {
             .ram_bytes()
             .checked_add(vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
             .ok_or_else(|| invalid("capture budget overflow"))?;
-        let map_bytes = std::iter::once(request.configuration.ram_bytes())
-            .chain(
-                request
-                    .configuration
-                    .attachments
-                    .iter()
-                    .map(|attachment| attachment.geometry.length),
+        let map_bytes = capture_map_budget(&request.configuration)?;
+        let clone_publication = machine_stat.st_dev == images_stat.st_dev
+            && crate::machine::root_disk::qualify_clone(
+                &machine,
+                crate::MachineDurability::Constructed,
             )
-            .try_fold(0u64, |total, length| {
-                let chunks = length.div_ceil(crate::storage::limits::CHUNK_SIZE as u64);
-                let pages = chunks.div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
-                total
-                    .checked_add(
-                        chunks
-                            .checked_mul(74)
-                            .ok_or_else(|| invalid("capture map budget overflow"))?,
-                    )
-                    .and_then(|total| total.checked_add(pages * 330 + 256))
-                    .ok_or_else(|| invalid("capture map budget overflow"))
-            })?;
-        // Retain staged state, pool state, bounded map pages and their inputs
-        // simultaneously. Neither metadata nor publication is charged as a clone.
-        let mut publication = request
-            .configuration
-            .ram_bytes()
-            .checked_add(2 * vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
-            .and_then(|bytes| bytes.checked_add(2 * map_bytes))
-            .ok_or_else(|| invalid("capture publication budget overflow"))?;
+            .unwrap_or(false)
+            && crate::storage::clone::qualify_capture_pair(&machine, &pool);
+        let mut publication_clones = BTreeSet::new();
+        if clone_publication {
+            publication_clones.insert(CaptureRole::Ram.relative_path());
+        }
+        let mut publication =
+            publication_stream_bytes(request.configuration.ram_bytes(), clone_publication)
+                .checked_add(2 * vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
+                .and_then(|bytes| bytes.checked_add(2 * map_bytes))
+                .ok_or_else(|| invalid("capture publication budget overflow"))?;
         let mut disks = Vec::new();
         let mut disk_allocations = BTreeMap::new();
         let mut read_only_inputs = Vec::new();
@@ -274,14 +265,8 @@ impl SnapshotStore {
                 stage = stage
                     .checked_add(allocated)
                     .ok_or_else(|| invalid("capture staging overflow"))?;
-                // Pool publication sparsely copies the sealed staging allocation.
-                // Guest growth before sealing can underestimate this peak: ENOSPC
-                // fails the whole capture under ADR 0021's failure table, via
-                // LiveCoordinator::stage_disks/unwind and libvm's abandon_failed;
-                // operation_store's CaptureCleanup removes staging after release.
-                publication = publication
-                    .checked_add(allocated)
-                    .ok_or_else(|| invalid("capture publication overflow"))?;
+                // Growth after this allocation sample can still fail capture
+                // cleanly. Clone-priced publication forbids a copy fallback.
                 let name = match attachment.role {
                     vm_spec::DiskRole::Root => "silo-root".into(),
                     vm_spec::DiskRole::RootUpper => "silo-root-upper".into(),
@@ -290,6 +275,16 @@ impl SnapshotStore {
                         return Err(invalid("overlay lower must be immutable and read-only"))
                     }
                 };
+                let role = CaptureRole::Disk(CaptureDiskName::new(name.clone()).map_err(invalid)?)
+                    .relative_path();
+                let clone =
+                    clone_publication && pool.qualify_sealed_clone(&source).unwrap_or(false);
+                if clone {
+                    publication_clones.insert(role);
+                }
+                publication = publication
+                    .checked_add(publication_stream_bytes(allocated, clone))
+                    .ok_or_else(|| invalid("capture publication overflow"))?;
                 disks.push(CaptureDiskPlan {
                     name: CaptureDiskName::new(name).map_err(invalid)?,
                     attachment_index: index as u32,
@@ -379,12 +374,15 @@ impl SnapshotStore {
             configuration,
             storage,
             disk_charges,
+            publication_clones,
             disk_allocations,
             reservation_bytes,
             candidate: None,
             captured_boot: None,
             source_inodes,
             evidence: None,
+            discard: None,
+            dispatch_attempted: false,
         };
         // Keep exact native block identities in live content; only host paths are projected.
         record.configuration.spec.storage = Some(vm_spec::Storage {
@@ -415,57 +413,9 @@ impl SnapshotStore {
             kernel.cmdline = record.plan.configuration.kernel_cmdline.clone();
         }
         let lease = pool.lease(record.capture_id)?;
-        let (lease_device, lease_inode) = lease.file_identity()?;
-        let _roots = pool.lock_roots()?;
-        let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        // Replays racing this producer join the original immutable reservation.
-        if let Some(json) = sqlx::query_scalar::<_, String>("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'").bind(record.capture_id.to_string()).fetch_optional(&mut *tx).await? {
-            let existing = decode_record(&json)?;
-            if existing.request != record.request { return Err(invalid("capture reservation replay conflict")); }
-            tx.commit().await?;
-            drop(_roots);
-            self.store.reserve_capture_inventory(&existing).await?;
-            return Ok(CaptureReservation { record: existing, _lease: lease });
-        }
-        if let Some(alias) = &record.alias {
-            crate::store::managed_image_store::check_alias_available(&mut tx, alias, None).await?;
-        }
-        let current: Option<String> =
-            sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
-                .bind(record.machine_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?;
-        if current
-            .as_deref()
-            .map(crate::MachineStorageRecord::decode)
-            .transpose()?
-            .as_ref()
-            != Some(&record.storage)
-        {
-            return Err(invalid(
-                "capture source storage changed before reservation commit",
-            ));
-        }
-        let launch_present: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='launch' AND machine_id=?2 AND run_id=?3 AND state='prepared')").bind(launch.operation_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *tx).await?;
-        if !launch_present {
-            return Err(invalid(
-                "capture launch owner retired before reservation commit",
-            ));
-        }
-        let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND machine_id=?1 AND run_id=?2 AND state='staging')")
-            .bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *tx).await?;
-        if busy {
-            return Err(invalid("the source run already has an unresolved capture"));
-        }
-        sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,machine_id,run_id,storage_generation,file_device,file_inode,record_json) VALUES(?1,1,'capture','staging',?2,?3,?4,?5,?6,jsonb(?7))")
-            .bind(record.capture_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).bind(i64::try_from(record.storage.storage_generation).map_err(invalid)?).bind(lease_device.to_string()).bind(lease_inode.to_string()).bind(encode_record(&record)?).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
-        tx.commit().await?;
-        drop(_roots);
-        self.store.reserve_capture_inventory(&record).await?;
+        self.store
+            .reserve_capture_inventory(&record, Some(&lease))
+            .await?;
         let tmp = images
             .open_dir("tmp")?
             .ok_or_else(|| invalid("pool staging directory is missing"))?;
@@ -499,15 +449,22 @@ impl SnapshotStore {
         let mut cursor = String::new();
         let mut records = Vec::new();
         loop {
-            let rows = sqlx::query("SELECT operation_id,json(record_json) AS record_json FROM storage_operation WHERE kind='capture' AND state='staging' AND operation_id>?1 AND (?2 IS NULL OR machine_id=?2) ORDER BY operation_id LIMIT 256").bind(&cursor).bind(machine.map(|id| id.to_string())).fetch_all(&self.store.pool).await?;
+            let rows = sqlx::query("SELECT operation_id,CASE WHEN json_valid(record_json,8) THEN json(record_json) ELSE '{}' END AS record_json FROM storage_operation WHERE kind='capture' AND state='staging' AND operation_id>?1 AND (?2 IS NULL OR machine_id=?2) ORDER BY operation_id LIMIT 256").bind(&cursor).bind(machine.map(|id| id.to_string())).fetch_all(&self.store.pool).await?;
             if rows.is_empty() {
                 break;
             }
             for row in rows {
                 cursor = row.try_get("operation_id")?;
-                let record = decode_record(&row.try_get::<String, _>("record_json")?)?;
+                let record = match decode_record(&row.try_get::<String, _>("record_json")?) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        tracing::warn!(capture = %cursor, %error, "corrupt capture retained; unrelated captures can reconcile");
+                        continue;
+                    }
+                };
                 if record.capture_id.to_string() != cursor {
-                    return Err(invalid("capture operation index contradiction"));
+                    tracing::warn!(capture = %cursor, "capture operation index contradicts its retained plan");
+                    continue;
                 }
                 if !matches!(
                     record.state,
@@ -656,14 +613,8 @@ impl SnapshotStore {
             .store
             .live_command_record(record.machine_id, record.run_id, capture)
             .await?;
-        let no_submission = intent.as_ref().is_none_or(|intent| {
-            matches!(
-                intent.result,
-                Some(vm_spec::lifecycle::LiveCommandResult::Capture(
-                    vm_spec::lifecycle::CaptureOutcome::Rejected { .. }
-                ))
-            )
-        });
+        let no_submission =
+            record.never_submitted(intent.as_ref().and_then(|intent| intent.result.as_ref()));
         let source_exists = self
             .store
             .machine_config(record.machine_id)
@@ -742,14 +693,31 @@ impl SnapshotStore {
         capture: Uuid,
         staging_dir: &Path,
         name: Option<String>,
+        lock_policy: PublicationLockPolicy,
     ) -> Result<SnapshotInfo, LibVmError> {
         let this = self.clone();
         let staging = staging_dir.to_path_buf();
         let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            runtime.block_on(this.publish_capture_owned(capture, &staging, name))
+        let result = tokio::task::spawn_blocking(move || {
+            runtime.block_on(this.publish_capture_owned(capture, &staging, name, lock_policy))
         })
-        .await?
+        .await?;
+        match result {
+            Err(LibVmError::Storage(StorageError::Io(error)))
+                if error.raw_os_error() == Some(nix::errno::Errno::ENOSPC as i32)
+                    || matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Unsupported
+                    ) =>
+            {
+                Err(StorageError::CapturePublicationDeferred {
+                    capture,
+                    reason: format!("filesystem {}: {error}", self.store.images_dir.display()),
+                }
+                .into())
+            }
+            result => result,
+        }
     }
 
     async fn publish_capture_owned(
@@ -757,13 +725,12 @@ impl SnapshotStore {
         capture: Uuid,
         staging_dir: &Path,
         name: Option<String>,
+        lock_policy: PublicationLockPolicy,
     ) -> Result<SnapshotInfo, LibVmError> {
-        let pool = StoragePool::open(&self.store.images_dir)?.defer_publications();
-        let mut key = Sha256::new();
-        key.update(b"silo:capture-publication:v1\0");
-        key.update(capture.as_bytes());
-        let _publisher =
-            pool.lock_publication(&ObjectDigest::from_sha256(key.finalize().into()))?;
+        let pool = StoragePool::open(&self.store.images_dir)?
+            .defer_publications()
+            .with_publication_lock_policy(lock_policy);
+        let _publisher = pool.lock_publication(&capture_publication_key(capture))?;
         let record = self
             .capture_reservation(capture)
             .await?
@@ -791,13 +758,13 @@ impl SnapshotStore {
         if matches!(
             record.state,
             CaptureState::Abandoned | CaptureState::Released { .. }
-        ) {
+        ) || record.discard.is_some()
+        {
             return Err(invalid("abandoned capture cannot publish"));
         }
         // The per-capture publisher owns all copying, not merely final insertion.
         let lease = pool.existing_lease(capture)?;
         check_lease(&self.store, &pool, capture, &lease).await?;
-        self.store.reserve_capture_inventory(&record).await?;
         #[cfg(test)]
         if let Some(hook) = &self.store.layer_hook {
             hook.hit(crate::store::layer_store::tests::WorkerPoint::Preparing)?;
@@ -813,10 +780,54 @@ impl SnapshotStore {
             CaptureAuthentication::Bytes
         };
         let mut verified = verify_capture(&directory, &record, authentication)?;
-        verified.retain_disk_baselines(
-            &crate::paths::machine_data_dir_in(self.store.home_path(), record.machine_id),
-            &record.plan,
-        )?;
+        let mut publication = 2 * vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
+        let mut publication_clones = BTreeSet::new();
+        for payload in &verified.files {
+            match payload.role {
+                CaptureRole::Ram | CaptureRole::Disk(_) => {
+                    let map = match &payload.role {
+                        CaptureRole::Ram => &verified.ram_map,
+                        _ => match &payload.bytes {
+                            VerifiedBytes::Stream(stream) => stream.map(),
+                            _ => return Err(invalid("sealed disk has no canonical map")),
+                        },
+                    };
+                    let pinned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_stream WHERE operation_id=?1 AND stream_id=?2)")
+                        .bind(capture.to_string()).bind(map.id().to_string()).fetch_one(&self.store.pool).await?;
+                    if pinned && pool.stream_path(&map.id()).try_exists()? {
+                        if pool.verify_stream(&map.id())? != *map {
+                            return Err(invalid(
+                                "pinned publication stream differs from sealed map",
+                            ));
+                        }
+                        continue;
+                    }
+                    let clone = pool.qualify_sealed_clone(payload.file()).unwrap_or(false);
+                    if clone {
+                        publication_clones.insert(payload.role.relative_path());
+                    }
+                    let bound = if payload.role == CaptureRole::Ram {
+                        record.plan.ram_bytes
+                    } else {
+                        payload
+                            .file()
+                            .metadata()?
+                            .blocks()
+                            .checked_mul(512)
+                            .ok_or_else(|| invalid("publication allocation overflow"))?
+                    };
+                    publication = publication
+                        .checked_add(publication_stream_bytes(bound, clone))
+                        .ok_or_else(|| invalid("publication budget overflow"))?;
+                }
+                CaptureRole::RamMap | CaptureRole::DiskMap(_) => {
+                    publication = publication
+                        .checked_add(2 * payload.length)
+                        .ok_or_else(|| invalid("publication map budget overflow"))?;
+                }
+                _ => {}
+            }
+        }
         let boot = record
             .captured_boot
             .clone()
@@ -840,6 +851,13 @@ impl SnapshotStore {
             Ok(())
         })
         .await?;
+        self.store
+            .reserve_capture_publication(&record, publication)
+            .await?;
+        verified.retain_disk_baselines(
+            &crate::paths::machine_data_dir_in(self.store.home_path(), record.machine_id),
+            &record.plan,
+        )?;
         let mut streams = BTreeMap::new();
         let mut objects = BTreeMap::new();
         for payload in &verified.files {
@@ -868,8 +886,16 @@ impl SnapshotStore {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                         Err(error) => return Err(error.into()),
                     };
-                    let (publication, roots) =
-                        pool.publish_sealed_stream_for_catalog(payload.file(), map, receipt)?;
+                    let (publication, roots) = pool.publish_sealed_stream_for_catalog(
+                        payload.file(),
+                        map,
+                        receipt,
+                        if publication_clones.contains(&payload.role.relative_path()) {
+                            SealedStreamPublicationMode::CloneRequired
+                        } else {
+                            SealedStreamPublicationMode::CopyAllowed
+                        },
+                    )?;
                     let id = publication.map().id();
                     tracing::debug!(
                         bytes_read = publication.scan_stats().bytes_read,
@@ -1099,7 +1125,13 @@ impl SnapshotStore {
             hook.hit(crate::store::layer_store::tests::WorkerPoint::AfterObject)?;
         }
         let result = self
-            .publish_authenticated(&snapshot, capture, name.as_deref(), Some(&verified))
+            .publish_authenticated(
+                &snapshot,
+                capture,
+                name.as_deref(),
+                Some(&verified),
+                lock_policy,
+            )
             .await?;
         self.store.complete_capture_peak(&record).await?;
         drop(lease);
@@ -1188,6 +1220,36 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
                 .ok_or_else(|| invalid("capture staging overflow"))
         },
     )?;
+    let expected_publication =
+        if record.fork_operation_id.is_some() && record.disk_charges.len() == 1 {
+            0
+        } else {
+            let maps = capture_map_budget(&record.plan.configuration)?;
+            let mut bytes = publication_stream_bytes(
+                record.plan.ram_bytes,
+                record
+                    .publication_clones
+                    .contains(&CaptureRole::Ram.relative_path()),
+            )
+            .checked_add(2 * vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
+            .and_then(|bytes| bytes.checked_add(2 * maps))
+            .ok_or_else(|| invalid("capture publication overflow"))?;
+            for disk in &record.plan.disks {
+                let allocated = record
+                    .disk_allocations
+                    .get(&disk.attachment_index)
+                    .ok_or_else(|| invalid("capture disk allocation is missing"))?;
+                bytes = bytes
+                    .checked_add(publication_stream_bytes(
+                        *allocated,
+                        record
+                            .publication_clones
+                            .contains(&CaptureRole::Disk(disk.name.clone()).relative_path()),
+                    ))
+                    .ok_or_else(|| invalid("capture publication overflow"))?;
+            }
+            bytes
+        };
     if let Some(operation) = record.fork_operation_id {
         if operation.is_nil() || operation == record.capture_id {
             return Err(invalid("capture fork operation identity is invalid"));
@@ -1219,6 +1281,18 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
             .try_fold(0u64, |total, charge| total.checked_add(charge.bytes))
             != Some(record.reservation_bytes)
         || record.reservation_bytes < record.plan.reservation.staging_bytes
+        || expected_staging.checked_add(expected_publication) != Some(record.reservation_bytes)
+        || record.publication_clones.iter().any(|role| {
+            let disk = role
+                .strip_prefix("disks/")
+                .and_then(|name| name.strip_suffix(".raw"));
+            role != vm_spec::capture::CAPTURE_RAM_FILE
+                && !record
+                    .plan
+                    .disks
+                    .iter()
+                    .any(|planned| disk == Some(planned.name.as_str()))
+        })
     {
         return Err(invalid(
             "capture reservation charges or immutable request contradict the plan",
@@ -1311,10 +1385,101 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
     Ok(record)
 }
 
+pub(crate) fn capture_publication_key(capture: Uuid) -> ObjectDigest {
+    let mut key = Sha256::new();
+    key.update(b"silo:capture-publication:v1\0");
+    key.update(capture.as_bytes());
+    ObjectDigest::from_sha256(key.finalize().into())
+}
+
 pub(crate) fn encode_record(record: &CaptureRecord) -> Result<String, LibVmError> {
     let json = serde_json::to_string(record).map_err(invalid)?;
     decode_record(&json)?;
     Ok(json)
+}
+fn publication_stream_bytes(copy_bound: u64, clone_required: bool) -> u64 {
+    if clone_required {
+        vm_spec::capture::CAPTURE_CLONE_RESERVE_BYTES
+    } else {
+        copy_bound
+    }
+}
+
+fn capture_map_budget(
+    configuration: &vm_spec::capture::CaptureConfiguration,
+) -> Result<u64, LibVmError> {
+    std::iter::once(configuration.ram_bytes())
+        .chain(
+            configuration
+                .attachments
+                .iter()
+                .map(|disk| disk.geometry.length),
+        )
+        .try_fold(0u64, |total, length| {
+            let chunks = length.div_ceil(crate::storage::limits::CHUNK_SIZE as u64);
+            let pages = chunks.div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
+            chunks
+                .checked_mul(74)
+                .and_then(|bytes| {
+                    pages
+                        .checked_mul(330)
+                        .and_then(|pages| bytes.checked_add(pages))
+                })
+                .and_then(|bytes| bytes.checked_add(256))
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or_else(|| invalid("capture map budget overflow"))
+        })
+}
+
+pub(crate) async fn register_capture(
+    connection: &mut sqlx::SqliteConnection,
+    record: &CaptureRecord,
+    lease_device: u64,
+    lease_inode: u64,
+) -> Result<(), LibVmError> {
+    if let Some(alias) = &record.alias {
+        crate::store::managed_image_store::check_alias_available(connection, alias, None).await?;
+    }
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
+            .bind(record.machine_id.to_string())
+            .fetch_optional(&mut *connection)
+            .await?;
+    if current
+        .as_deref()
+        .map(crate::MachineStorageRecord::decode)
+        .transpose()?
+        .as_ref()
+        != Some(&record.storage)
+    {
+        return Err(invalid(
+            "capture source storage changed before reservation commit",
+        ));
+    }
+    let launch_present: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='launch' AND machine_id=?2 AND run_id=?3 AND state='prepared')")
+        .bind(record.launch_operation_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *connection).await?;
+    if !launch_present {
+        return Err(invalid(
+            "capture launch owner retired before reservation commit",
+        ));
+    }
+    let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND machine_id=?1 AND run_id=?2 AND state='staging')")
+        .bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *connection).await?;
+    if busy {
+        return Err(invalid("the source run already has an unresolved capture"));
+    }
+    sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,machine_id,run_id,storage_generation,file_device,file_inode,record_json) VALUES(?1,1,'capture','staging',?2,?3,?4,?5,?6,jsonb(?7))")
+        .bind(record.capture_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).bind(i64::try_from(record.storage.storage_generation).map_err(invalid)?).bind(lease_device.to_string()).bind(lease_inode.to_string()).bind(encode_record(record)?).execute(&mut *connection).await?;
+    for statement in [
+        "INSERT INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2",
+        "INSERT INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2",
+        "INSERT INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2",
+        "INSERT INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2",
+    ] {
+        sqlx::query(statement)
+            .bind(record.capture_id.to_string()).bind(record.launch_operation_id.to_string()).execute(&mut *connection).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn write_record(
@@ -2399,6 +2564,7 @@ impl SnapshotStore {
     pub(crate) async fn retain_local_capture(
         &self,
         capture: Uuid,
+        lock_policy: PublicationLockPolicy,
     ) -> Result<
         (
             crate::store::fork::LocalCut,
@@ -2411,12 +2577,11 @@ impl SnapshotStore {
         tokio::task::spawn_blocking(move || handle.block_on(async move {
             let operation = this.store.fork_for_capture(capture).await?.ok_or_else(|| invalid("local capture has no fork owner"))?;
             let record = this.capture_reservation(capture).await?.ok_or_else(|| invalid("local capture reservation disappeared"))?;
-            let pool = StoragePool::open(&this.store.images_dir)?;
+            let pool = StoragePool::open(&this.store.images_dir)?.with_publication_lock_policy(lock_policy);
             let publication=ObjectDigest::of_bytes(format!("silo:local-cut:{operation}").as_bytes());
             let _publisher=pool.lock_publication(&publication)?;
             let _lease = pool.existing_lease(capture)?;
             check_lease(&this.store,&pool,capture,&_lease).await?;
-            this.store.reserve_capture_inventory(&record).await?;
             let source = capture_directory(&this.store, &record)?.ok_or_else(|| invalid("local capture source disappeared"))?;
             let mut verified_disks = Vec::new();
             let mut cut = match this.store.local_cut(operation).await? {
@@ -2474,6 +2639,11 @@ impl SnapshotStore {
             let mut relocated_disks = Vec::new();
             if !cut.relocated {
                 let images = OwnedDirectory::open_existing_root(&this.store.images_dir)?.ok_or_else(|| invalid("pool disappeared"))?;
+                let source_device = nix::sys::stat::fstat(source.fd()).map_err(std::io::Error::from)?.st_dev;
+                let pool_device = nix::sys::stat::fstat(images.fd()).map_err(std::io::Error::from)?.st_dev;
+                if source_device != pool_device {
+                    this.store.reserve_capture_publication(&record, record.reservation_bytes - record.plan.reservation.staging_bytes).await?;
+                }
                 let tmp = images.open_dir("tmp")?.ok_or_else(|| invalid("pool tmp disappeared"))?;
                 let owner = tmp.ensure_dir_deferred(&operation.to_string())?;
                 let destination = owner.ensure_dir_deferred("cut")?;
@@ -2634,6 +2804,7 @@ impl SnapshotStore {
                 tx.commit().await?;
             }
             let disks = (!relocated_disks.is_empty()).then(|| crate::store::fork::AuthenticatedCutDisks::new(operation, cut_id, relocated_disks));
+            this.store.complete_capture_peak(&record).await?;
             Ok((cut, disks))
         })).await?
     }
@@ -2659,12 +2830,21 @@ impl Store {
         }
         let json:String=sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'").bind(capture.to_string()).fetch_one(&self.pool).await?;
         let record = decode_record(&json)?;
-        if record.plan != command.plan || record.state != CaptureState::Reserved {
+        if record.plan != command.plan
+            || record.state != CaptureState::Reserved
+            || record.discard.is_some()
+        {
             return Err(invalid(
                 "a sealed or retired capture can never be recaptured",
             ));
         }
-        self.reserve_capture_inventory(&record).await
+        self.reserve_capture_inventory(&record, None).await?;
+        SnapshotStore::from_store(std::sync::Arc::new(self.clone()))
+            .update_capture(capture, |record| {
+                record.dispatch_attempted = true;
+                Ok(())
+            })
+            .await
     }
 }
 
@@ -2795,7 +2975,7 @@ pub(crate) mod tests {
         let operation = store.fork_for_capture(capture).await.unwrap().unwrap();
         let (_, retained) = fixture
             .snapshots
-            .retain_local_capture(capture)
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
             .await
             .unwrap();
         let cut = store.open_local_cut(operation, retained).await.unwrap();
@@ -3239,7 +3419,23 @@ pub(crate) mod tests {
         );
         assert_eq!(
             record.reservation_bytes,
-            2 * (record.plan.ram_bytes + allocated) + 3 * state + 2 * maps
+            record.plan.ram_bytes
+                + allocated
+                + state
+                + crate::store::capture::publication_stream_bytes(
+                    record.plan.ram_bytes,
+                    record
+                        .publication_clones
+                        .contains(&CaptureRole::Ram.relative_path())
+                )
+                + crate::store::capture::publication_stream_bytes(
+                    allocated,
+                    record.publication_clones.contains(
+                        &CaptureRole::Disk(record.plan.disks[0].name.clone()).relative_path()
+                    )
+                )
+                + 2 * state
+                + 2 * maps
         );
         assert_eq!(record.disk_charges.len(), 1);
         assert_eq!(record.disk_charges[0].bytes, record.reservation_bytes);
@@ -3298,7 +3494,7 @@ pub(crate) mod tests {
             let error = fixture
                 .snapshots
                 .store
-                .reserve_capture_inventory(&record)
+                .reserve_capture_inventory(&record, None)
                 .await
                 .unwrap_err();
             assert!(
@@ -3483,6 +3679,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -3564,6 +3761,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -3619,6 +3817,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -3656,6 +3855,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -3774,7 +3974,12 @@ pub(crate) mod tests {
             .is_some());
         assert!(directory.path().join("memory.ram").exists());
         assert!(snapshots
-            .publish_capture(capture, directory.path(), alias)
+            .publish_capture(
+                capture,
+                directory.path(),
+                alias,
+                crate::storage::pool::PublicationLockPolicy::Wait
+            )
             .await
             .is_ok());
         assert!(snapshots.abandon_capture(capture).await.is_err());
@@ -3799,7 +4004,12 @@ pub(crate) mod tests {
         snapshots.store.recover_image_cache().await.unwrap();
 
         let published = snapshots
-            .publish_capture(capture, directory.path(), alias.clone())
+            .publish_capture(
+                capture,
+                directory.path(),
+                alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
             .await
             .unwrap();
         let after = std::fs::metadata(&final_path).unwrap();
@@ -3821,7 +4031,12 @@ pub(crate) mod tests {
             .is_ok());
         assert_eq!(
             snapshots
-                .publish_capture(capture, directory.path(), alias)
+                .publish_capture(
+                    capture,
+                    directory.path(),
+                    alias,
+                    crate::storage::pool::PublicationLockPolicy::Wait
+                )
                 .await
                 .unwrap(),
             published
@@ -3841,7 +4056,10 @@ pub(crate) mod tests {
 
         let (cut, _) = fixture
             .snapshots
-            .retain_local_capture(fixture.reservation.record.capture_id)
+            .retain_local_capture(
+                fixture.reservation.record.capture_id,
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
             .await
             .unwrap();
         assert_eq!(cut.evidence, evidence);
@@ -3891,7 +4109,12 @@ pub(crate) mod tests {
 
             assert!(
                 snapshots
-                    .publish_capture(capture, directory.path(), alias)
+                    .publish_capture(
+                        capture,
+                        directory.path(),
+                        alias,
+                        crate::storage::pool::PublicationLockPolicy::Wait
+                    )
                     .await
                     .is_err(),
                 "{fault}"
@@ -3948,6 +4171,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .is_err());
@@ -3967,6 +4191,7 @@ pub(crate) mod tests {
                 first_capture,
                 first_directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -4022,6 +4247,7 @@ pub(crate) mod tests {
                 request.capture_id,
                 second_directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -4087,6 +4313,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -4591,6 +4818,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -4645,6 +4873,14 @@ pub(crate) mod tests {
         let fixture = fixture().await;
         let capture = fixture.reservation.record.capture_id;
         let inherited = fixture.launch.lock().duplicate().unwrap();
+        fixture
+            .snapshots
+            .update_capture(capture, |record| {
+                record.dispatch_attempted = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
         fixture.snapshots.abandon_capture(capture).await.unwrap();
         let snapshots = fixture.snapshots.clone();
         let machine = fixture.config.id;
@@ -4681,8 +4917,16 @@ pub(crate) mod tests {
         let staging = directory.path().to_path_buf();
         let alias = name.clone();
         drop(fixture.reservation);
-        let waiter =
-            tokio::spawn(async move { publisher.publish_capture(capture, &staging, alias).await });
+        let waiter = tokio::spawn(async move {
+            publisher
+                .publish_capture(
+                    capture,
+                    &staging,
+                    alias,
+                    crate::storage::pool::PublicationLockPolicy::Wait,
+                )
+                .await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
             .await
             .unwrap()
@@ -4707,7 +4951,12 @@ pub(crate) mod tests {
         release.send(()).unwrap();
         let published = fixture
             .snapshots
-            .publish_capture(capture, directory.path(), name)
+            .publish_capture(
+                capture,
+                directory.path(),
+                name,
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -4742,6 +4991,7 @@ pub(crate) mod tests {
                     capture,
                     directory.path(),
                     fixture.reservation.record.alias.clone(),
+                    crate::storage::pool::PublicationLockPolicy::Wait,
                 )
                 .await
                 .unwrap();
@@ -4804,21 +5054,40 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_concurrent_publication_joins_and_release_survives_staging_cleanup() {
+    async fn checkpoint_concurrent_publication_joins_and_retry_converges_before_cleanup() {
         let fixture = fixture().await;
         let (directory, _) = seal(&fixture);
         let capture = fixture.reservation.record.capture_id;
         let name = fixture.reservation.record.alias.clone();
         let (first, second) = tokio::join!(
-            fixture
-                .snapshots
-                .publish_capture(capture, directory.path(), name.clone()),
-            fixture
-                .snapshots
-                .publish_capture(capture, directory.path(), name.clone())
+            fixture.snapshots.publish_capture(
+                capture,
+                directory.path(),
+                name.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait
+            ),
+            fixture.snapshots.publish_capture(
+                capture,
+                directory.path(),
+                name.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait
+            )
         );
         let published = first.unwrap();
         assert_eq!(published, second.unwrap());
+        assert_eq!(
+            fixture
+                .snapshots
+                .publish_capture(
+                    capture,
+                    directory.path(),
+                    name.clone(),
+                    crate::storage::pool::PublicationLockPolicy::Wait
+                )
+                .await
+                .unwrap(),
+            published
+        );
         fixture
             .snapshots
             .finish_capture_release(capture, true)
@@ -4827,7 +5096,12 @@ pub(crate) mod tests {
         assert_eq!(
             fixture
                 .snapshots
-                .publish_capture(capture, directory.path(), name)
+                .publish_capture(
+                    capture,
+                    directory.path(),
+                    name,
+                    crate::storage::pool::PublicationLockPolicy::Wait
+                )
                 .await
                 .unwrap(),
             published
@@ -4956,6 +5230,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -5058,7 +5333,7 @@ pub(crate) mod tests {
             .unwrap();
         let (cut, retained) = fixture
             .snapshots
-            .retain_local_capture(capture)
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
             .await
             .unwrap();
         assert_eq!(cut.evidence, evidence);
@@ -5161,7 +5436,7 @@ pub(crate) mod tests {
             .unwrap();
         let (original, _) = fixture
             .snapshots
-            .retain_local_capture(capture)
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
             .await
             .unwrap();
         fixture
@@ -5184,7 +5459,7 @@ pub(crate) mod tests {
             .unwrap();
         let (recovered, recovered_disks) = fixture
             .snapshots
-            .retain_local_capture(capture)
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
             .await
             .unwrap();
         assert_eq!(recovered, original);
@@ -5239,7 +5514,7 @@ pub(crate) mod tests {
             .unwrap();
         let (cut, retained) = fixture
             .snapshots
-            .retain_local_capture(capture)
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
             .await
             .unwrap();
         let held = fixture
@@ -5373,7 +5648,7 @@ pub(crate) mod tests {
         let operation = store.fork_for_capture(capture).await.unwrap().unwrap();
         let (cut, retained) = fixture
             .snapshots
-            .retain_local_capture(capture)
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
             .await
             .unwrap();
         let retained = retained.expect("seal verification derived the writable disk maps");
@@ -5436,7 +5711,7 @@ pub(crate) mod tests {
         let operation = store.fork_for_capture(capture).await.unwrap().unwrap();
         let (_, retained) = fixture
             .snapshots
-            .retain_local_capture(capture)
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
             .await
             .unwrap();
         let mut record = store.local_cut(operation).await.unwrap().unwrap();
@@ -5507,6 +5782,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -5560,6 +5836,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .is_err());
@@ -5586,6 +5863,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -5668,6 +5946,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap_err();
@@ -5709,7 +5988,7 @@ pub(crate) mod tests {
             .unwrap();
             let error = fixture
                 .snapshots
-                .retain_local_capture(capture)
+                .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
                 .await
                 .err()
                 .expect("the relocation ownership commit must fail");
@@ -5769,7 +6048,7 @@ pub(crate) mod tests {
                 .unwrap();
             let (recovered, disks) = fixture
                 .snapshots
-                .retain_local_capture(capture)
+                .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
                 .await
                 .unwrap();
             assert!(recovered.relocated);
@@ -5861,7 +6140,10 @@ pub(crate) mod tests {
                 .unwrap();
             let error = fixture
                 .snapshots
-                .retain_local_capture(fixture.reservation.record.capture_id)
+                .retain_local_capture(
+                    fixture.reservation.record.capture_id,
+                    crate::storage::pool::PublicationLockPolicy::Wait,
+                )
                 .await
                 .err()
                 .expect("invalid structural receipts must be refused");
@@ -5953,7 +6235,7 @@ pub(crate) mod tests {
         );
         let (cut, disks) = fixture
             .snapshots
-            .retain_local_capture(capture)
+            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
             .await
             .unwrap();
         let destination = fixture
@@ -5993,6 +6275,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap()
@@ -6234,7 +6517,12 @@ pub(crate) mod tests {
         let staging = fixture.config.machine_dir.join(record.plan.directory());
         assert_eq!(
             snapshots
-                .publish_capture(capture, &staging, record.alias.clone())
+                .publish_capture(
+                    capture,
+                    &staging,
+                    record.alias.clone(),
+                    crate::storage::pool::PublicationLockPolicy::Wait
+                )
                 .await
                 .unwrap(),
             captured
@@ -6269,7 +6557,12 @@ pub(crate) mod tests {
         assert!(snapshots.pending_captures(None).await.unwrap().is_empty());
         assert_eq!(
             snapshots
-                .publish_capture(capture, &staging, record.alias.clone())
+                .publish_capture(
+                    capture,
+                    &staging,
+                    record.alias.clone(),
+                    crate::storage::pool::PublicationLockPolicy::Wait
+                )
                 .await
                 .unwrap(),
             captured
@@ -6281,7 +6574,12 @@ pub(crate) mod tests {
         // Removing the competing binding cannot make replay acquire the name.
         snapshots.remove_alias("racing").await.unwrap();
         assert!(snapshots
-            .publish_capture(capture, &staging, record.alias)
+            .publish_capture(
+                capture,
+                &staging,
+                record.alias,
+                crate::storage::pool::PublicationLockPolicy::Wait
+            )
             .await
             .unwrap()
             .aliases
@@ -6422,6 +6720,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap_err();
@@ -6589,8 +6888,16 @@ pub(crate) mod tests {
         let capture = fixture.reservation.record.capture_id;
         let staging = directory.path().to_path_buf();
         let alias = fixture.reservation.record.alias.clone();
-        let waiter =
-            tokio::spawn(async move { publisher.publish_capture(capture, &staging, alias).await });
+        let waiter = tokio::spawn(async move {
+            publisher
+                .publish_capture(
+                    capture,
+                    &staging,
+                    alias,
+                    crate::storage::pool::PublicationLockPolicy::Wait,
+                )
+                .await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
             .await
             .unwrap()
@@ -6657,8 +6964,16 @@ pub(crate) mod tests {
         let capture = fixture.reservation.record.capture_id;
         let staging = directory.path().to_path_buf();
         let alias = fixture.reservation.record.alias.clone();
-        let waiter =
-            tokio::spawn(async move { publisher.publish_capture(capture, &staging, alias).await });
+        let waiter = tokio::spawn(async move {
+            publisher
+                .publish_capture(
+                    capture,
+                    &staging,
+                    alias,
+                    crate::storage::pool::PublicationLockPolicy::Wait,
+                )
+                .await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
             .await
             .unwrap()
@@ -6691,8 +7006,16 @@ pub(crate) mod tests {
         let capture = fixture.reservation.record.capture_id;
         let staging = directory.path().to_path_buf();
         let alias = fixture.reservation.record.alias.clone();
-        let waiter =
-            tokio::spawn(async move { publisher.publish_capture(capture, &staging, alias).await });
+        let waiter = tokio::spawn(async move {
+            publisher
+                .publish_capture(
+                    capture,
+                    &staging,
+                    alias,
+                    crate::storage::pool::PublicationLockPolicy::Wait,
+                )
+                .await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
             .await
             .unwrap()
@@ -6708,6 +7031,7 @@ pub(crate) mod tests {
                     capture,
                     directory.path(),
                     fixture.reservation.record.alias.clone(),
+                    crate::storage::pool::PublicationLockPolicy::Wait,
                 )
                 .await
                 .is_err(),
@@ -6720,6 +7044,7 @@ pub(crate) mod tests {
                 capture,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -6836,7 +7161,12 @@ pub(crate) mod tests {
         );
         fixture
             .snapshots
-            .publish_capture(record.capture_id, directory.path(), record.alias.clone())
+            .publish_capture(
+                record.capture_id,
+                directory.path(),
+                record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
             .await
             .unwrap();
         fixture
@@ -6979,6 +7309,7 @@ pub(crate) mod tests {
                 fixture.reservation.record.capture_id,
                 directory.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -7128,7 +7459,12 @@ pub(crate) mod tests {
             .execute(&store.pool).await.unwrap();
         assert!(fixture
             .snapshots
-            .publish_capture(record.capture_id, directory.path(), record.alias.clone())
+            .publish_capture(
+                record.capture_id,
+                directory.path(),
+                record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait
+            )
             .await
             .is_err());
         assert!(fixture.snapshots.list().await.unwrap().is_empty());
@@ -7155,5 +7491,872 @@ pub(crate) mod tests {
             accepted.disk_baselines[0].seed.epoch,
             evidence.disk_tracking_receipts[0].seed.epoch
         );
+    }
+    fn free_capture_bytes(store: &Store) -> u64 {
+        let directory = OwnedDirectory::open_existing_root(&store.images_dir)
+            .unwrap()
+            .unwrap();
+        let stat = nix::sys::statvfs::fstatvfs(directory.fd()).unwrap();
+        stat.blocks_available()
+            .checked_mul(stat.fragment_size())
+            .unwrap()
+    }
+
+    async fn change_import_credit(store: &Store, operation: Uuid, bytes: u64, descriptors: u64) {
+        let directory = crate::store::restore::budget_directory(store).unwrap();
+        let _admission = crate::storage::locks::blocking(
+            &directory,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .unwrap();
+        let json: String = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
+        )
+        .bind(operation.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let mut inventory: crate::store::restore::CaptureBudgetInventory =
+            serde_json::from_str(&json).unwrap();
+        inventory.capture_disks[0].bytes = bytes;
+        inventory.descriptors = descriptors;
+        inventory.descriptor_owner =
+            (descriptors != 0).then(|| crate::store::restore::DescriptorOwner::current().unwrap());
+        let json = serde_json::to_string(&inventory).unwrap();
+        sqlx::query(
+            "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+        )
+        .bind(operation.to_string())
+        .bind(&json)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let state = std::fs::metadata(store.home_path().join("state.db")).unwrap();
+        directory
+            .write_file_atomic(
+                &format!("{}-{}-{operation}.json", state.dev(), state.ino()),
+                json.as_bytes(),
+            )
+            .unwrap();
+    }
+
+    async fn import_credit_owner(store: &Store) -> (Uuid, crate::storage::locks::StorageLock) {
+        let (operation, lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        store.reserve_import_space(operation, 1).await.unwrap();
+        (operation, lease)
+    }
+
+    async fn mark_fixture_stopped(store: &Store, machine: MachineId) {
+        use protocol::shutdown::{StorageHolder, StorageHolderRecord, StorageHolderRole};
+        for operation in store.launch_storage_operations(machine).await.unwrap() {
+            let pool = StoragePool::open(&store.images_dir).unwrap();
+            let lease = pool.existing_lease(operation.operation_id).unwrap();
+            let mut holder = std::process::Command::new("sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::from(lease.durability_file().unwrap()))
+                .spawn()
+                .unwrap();
+            let pid = i32::try_from(holder.id()).unwrap();
+            let started_at = utils::process::start_time(pid).unwrap().unwrap();
+            let record = StorageHolderRecord {
+                schema_version: 1,
+                machine_id: Uuid::from(machine).to_string(),
+                run_id: operation.run_id.to_string(),
+                operation_id: operation.operation_id.to_string(),
+                holders: vec![StorageHolder {
+                    role: StorageHolderRole::Monitor,
+                    pid: holder.id(),
+                    started_at: u64::try_from(started_at).unwrap(),
+                }],
+            };
+            let paths = LocalPaths::new(store.home_path().to_path_buf());
+            paths.ensure_machine_run_dir(machine).unwrap();
+            let path = paths.machine(machine).vmm_storage_holder_path();
+            let directory = OwnedDirectory::open_existing_root(path.parent().unwrap())
+                .unwrap()
+                .unwrap();
+            directory
+                .write_file("vm.storage-holder.json", &record.encode().unwrap())
+                .unwrap();
+            holder.kill().unwrap();
+            holder.wait().unwrap();
+        }
+        let mut state = store.machine_state(machine).await.unwrap().unwrap();
+        state.status = MachineRuntimeState::Stopped;
+        state.vmm_pid = None;
+        state.run_id = None;
+        store.save_machine_state(&state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn budget_and_descriptor_refusal_leave_no_capture_ownership_and_allow_removal() {
+        for descriptors in [false, true] {
+            let Fixture {
+                _temporary,
+                snapshots,
+                config,
+                reservation,
+                launch,
+            } = fixture().await;
+            let mut request = reservation.record.request.clone();
+            snapshots.abandon_capture(request.capture_id).await.unwrap();
+            drop(reservation);
+            let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+            snapshots
+                .store
+                .retire_abandoned_storage_operations(&pool)
+                .await
+                .unwrap();
+            assert!(snapshots
+                .pending_captures(Some(config.id))
+                .await
+                .unwrap()
+                .is_empty());
+            let (owner, _credit) = import_credit_owner(&snapshots.store).await;
+            let (_, hard) =
+                nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
+            change_import_credit(
+                &snapshots.store,
+                owner,
+                if descriptors {
+                    1
+                } else {
+                    free_capture_bytes(&snapshots.store)
+                },
+                if descriptors { hard } else { 0 },
+            )
+            .await;
+            request.capture_id = Uuid::new_v4();
+            request.alias = None;
+            let error = match snapshots.reserve_capture(&request).await {
+                Ok(_) => panic!("capture was admitted without capacity"),
+                Err(error) => error,
+            };
+            assert!(
+                if descriptors {
+                    error.to_string().contains("file descriptor budget")
+                } else {
+                    error.to_string().contains("pre-freeze admission")
+                },
+                "{error}"
+            );
+            for statement in [
+                "SELECT count(*) FROM storage_operation WHERE operation_id=?1",
+                "SELECT count(*) FROM storage_operation_stream WHERE operation_id=?1",
+                "SELECT count(*) FROM storage_operation_object WHERE operation_id=?1",
+                "SELECT count(*) FROM storage_operation_layer WHERE operation_id=?1",
+                "SELECT count(*) FROM storage_operation_lower WHERE operation_id=?1",
+                "SELECT count(*) FROM capture_resource_reservation WHERE operation_id=?1",
+            ] {
+                let count: i64 = sqlx::query_scalar(statement)
+                    .bind(request.capture_id.to_string())
+                    .fetch_one(&snapshots.store.pool)
+                    .await
+                    .unwrap();
+                assert_eq!(count, 0, "{statement}");
+            }
+            let commands: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM live_command WHERE request_id=?1")
+                    .bind(request.capture_id.to_string())
+                    .fetch_one(&snapshots.store.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(commands, 0);
+            assert!(!config
+                .machine_dir
+                .join(request.capture_id.to_string())
+                .exists());
+            assert!(!config
+                .machine_dir
+                .join("captures")
+                .join(request.capture_id.to_string())
+                .exists());
+            assert!(!snapshots
+                .store
+                .images_dir
+                .join("tmp")
+                .join(request.capture_id.to_string())
+                .exists());
+            drop(launch);
+            mark_fixture_stopped(&snapshots.store, config.id).await;
+            let runtime = capture_runtime(&snapshots).await;
+            runtime
+                .get_machine(&crate::MachineRef::id(config.id))
+                .await
+                .unwrap()
+                .remove_force()
+                .await
+                .unwrap();
+            assert!(runtime.list_machines().await.unwrap().is_empty());
+        }
+    }
+
+    async fn journal_fixture_capture(
+        store: &Store,
+        record: &crate::store::snapshot_store::CaptureRecord,
+    ) -> crate::store::live_store::LiveCommandIntent {
+        use vm_spec::lifecycle::{CaptureCommand, LiveCommand, LiveCommandEnvelope};
+        use vm_spec::live::{
+            LiveBackend, LiveCapabilityVector, LiveLane, LiveMachineReport, LiveReasonCode,
+            LiveScope,
+        };
+        let intent = crate::store::live_store::LiveCommandIntent {
+            report: LiveMachineReport {
+                schema_version: 1,
+                scope: LiveScope::Machine,
+                machine_id: record.plan.machine_id.to_string(),
+                run_id: record.run_id.to_string(),
+                monitor_id: Uuid::new_v4().to_string(),
+                backend: LiveBackend::Krun,
+                lane: LiveLane::KvmX86_64,
+                topology_revision: 1,
+                live: LiveCapabilityVector::all_unsupported(LiveReasonCode::NotDelivered),
+            },
+            command: LiveCommand::Capture(Box::new(CaptureCommand {
+                envelope: LiveCommandEnvelope {
+                    machine_id: record.plan.machine_id.clone(),
+                    run_id: record.plan.run_id.clone(),
+                    request_id: record.plan.capture_id.clone(),
+                },
+                plan: record.plan.clone(),
+            })),
+        };
+        sqlx::query("INSERT INTO live_command(machine_id,run_id,request_id,monitor_id,input_json) VALUES(?1,?2,?3,?4,jsonb(?5))")
+            .bind(record.machine_id.to_string()).bind(record.run_id.to_string()).bind(record.capture_id.to_string()).bind(&intent.report.monitor_id)
+            .bind(serde_json::to_string(&intent).unwrap()).execute(&store.pool).await.unwrap();
+        intent
+    }
+
+    #[tokio::test]
+    async fn interrupted_first_dispatch_retires_without_rpc_or_fresh_capacity() {
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture().await;
+        let record = reservation.record.clone();
+        journal_fixture_capture(&snapshots.store, &record).await;
+        let (owner, _credit) = import_credit_owner(&snapshots.store).await;
+        change_import_credit(
+            &snapshots.store,
+            owner,
+            free_capture_bytes(&snapshots.store) + (64 << 20),
+            0,
+        )
+        .await;
+        drop(reservation);
+        let runtime = capture_runtime(&snapshots).await;
+        runtime.reconcile_captures().await.unwrap();
+        let command = snapshots
+            .store
+            .live_command_record(config.id, record.run_id, record.capture_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            command.result,
+            Some(vm_spec::lifecycle::LiveCommandResult::Capture(
+                vm_spec::lifecycle::CaptureOutcome::Rejected { .. }
+            ))
+        ));
+        assert!(snapshots
+            .pending_captures(Some(config.id))
+            .await
+            .unwrap()
+            .is_empty());
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        snapshots
+            .store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert!(snapshots
+            .capture_reservation(record.capture_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            snapshots
+                .store
+                .machine_state(config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MachineRuntimeState::Running
+        );
+        drop(launch);
+        mark_fixture_stopped(&snapshots.store, config.id).await;
+        runtime
+            .get_machine(&crate::MachineRef::id(config.id))
+            .await
+            .unwrap()
+            .remove_force()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_capacity_refusal_is_terminal_without_a_monitor_endpoint_or_replay() {
+        use vm_spec::lifecycle::{LiveCommand, LiveCommandResult};
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture().await;
+        let record = reservation.record.clone();
+        let intent = journal_fixture_capture(&snapshots.store, &record).await;
+        let report = intent.report.clone();
+        let (owner, _credit) = import_credit_owner(&snapshots.store).await;
+        change_import_credit(
+            &snapshots.store,
+            owner,
+            free_capture_bytes(&snapshots.store),
+            0,
+        )
+        .await;
+        let runtime = capture_runtime(&snapshots).await;
+        let machine = runtime
+            .get_machine(&crate::MachineRef::id(config.id))
+            .await
+            .unwrap();
+        let result = machine.send_prepared(intent.clone()).await.unwrap();
+        assert!(
+            matches!(&result, LiveCommandResult::Capture(vm_spec::lifecycle::CaptureOutcome::Rejected { rejection }) if rejection.to_string().contains("dispatch refusal before send"))
+        );
+        let observation = crate::machine::live::MachineLiveObservation::for_test(
+            report,
+            vm_spec::lifecycle::VmLifecycleState::Running,
+            vm_spec::lifecycle::LiveLifecycle::default(),
+        );
+        assert_eq!(
+            machine
+                .live_command(&observation, intent.command.clone())
+                .await
+                .unwrap(),
+            result
+        );
+        assert!(
+            !snapshots
+                .capture_reservation(record.capture_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .dispatch_attempted
+        );
+        assert!(snapshots
+            .pending_captures(Some(config.id))
+            .await
+            .unwrap()
+            .is_empty());
+        // A durable attempt fence instead denotes an uncertain earlier send.
+        // A new local capacity failure must not invent a terminal RPC outcome.
+        change_import_credit(&snapshots.store, owner, 1, 0).await;
+        let mut request = record.request.clone();
+        request.capture_id = Uuid::new_v4();
+        request.alias = None;
+        let uncertain = snapshots.reserve_capture(&request).await.unwrap();
+        let mut uncertain_intent = intent;
+        if let LiveCommand::Capture(command) = &mut uncertain_intent.command {
+            command.plan = uncertain.record.plan.clone();
+            command.envelope.request_id = uncertain.record.plan.capture_id.clone();
+        }
+        sqlx::query("INSERT INTO live_command(machine_id,run_id,request_id,monitor_id,input_json) VALUES(?1,?2,?3,?4,jsonb(?5))")
+            .bind(config.id.to_string()).bind(record.run_id.to_string()).bind(request.capture_id.to_string()).bind(&uncertain_intent.report.monitor_id)
+            .bind(serde_json::to_string(&uncertain_intent).unwrap()).execute(&snapshots.store.pool).await.unwrap();
+        if let LiveCommand::Capture(command) = &uncertain_intent.command {
+            snapshots
+                .store
+                .require_capture_dispatch(command)
+                .await
+                .unwrap();
+        }
+        change_import_credit(
+            &snapshots.store,
+            owner,
+            free_capture_bytes(&snapshots.store) + (1 << 20),
+            0,
+        )
+        .await;
+        assert!(machine
+            .send_prepared(uncertain_intent)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("dispatch refusal"));
+        assert!(snapshots
+            .store
+            .live_command_record(config.id, record.run_id, request.capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .is_none());
+        drop(uncertain);
+        drop(reservation);
+        drop(launch);
+        mark_fixture_stopped(&snapshots.store, config.id).await;
+        machine.remove_force().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sealed_publication_admits_only_remaining_credit() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let Fixture {
+            _temporary,
+            snapshots,
+            config: _,
+            reservation,
+            launch,
+        } = fixture;
+        let record = reservation.record.clone();
+        drop(reservation);
+        drop(launch);
+        let (owner, _credit) = import_credit_owner(&snapshots.store).await;
+        let publication = record.reservation_bytes - record.plan.reservation.staging_bytes;
+        change_import_credit(
+            &snapshots.store,
+            owner,
+            free_capture_bytes(&snapshots.store) - publication - (8 << 20),
+            0,
+        )
+        .await;
+        let snapshot = snapshots
+            .publish_capture(
+                record.capture_id,
+                directory.path(),
+                record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await
+            .unwrap();
+        snapshots
+            .verify(&SnapshotRef::Id(snapshot.id))
+            .await
+            .unwrap();
+        assert!(directory.path().exists());
+    }
+
+    #[tokio::test]
+    async fn maintenance_open_lists_and_force_removes_a_publication_deferred_capture() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture;
+        let capture = reservation.record.capture_id;
+        drop(reservation);
+        drop(launch);
+        mark_fixture_stopped(&snapshots.store, config.id).await;
+        let (owner, _credit) = import_credit_owner(&snapshots.store).await;
+        change_import_credit(
+            &snapshots.store,
+            owner,
+            free_capture_bytes(&snapshots.store),
+            0,
+        )
+        .await;
+        let reopened = SnapshotStore::open(snapshots.store.home_path())
+            .await
+            .unwrap();
+        let runtime = capture_runtime(&reopened).await;
+        runtime.recover_maintenance().await.unwrap();
+        assert_eq!(runtime.list_machines().await.unwrap().len(), 1);
+        assert!(reopened.list().await.unwrap().is_empty());
+        assert!(directory.path().exists());
+        runtime
+            .get_machine(&crate::MachineRef::id(config.id))
+            .await
+            .unwrap()
+            .remove_force()
+            .await
+            .unwrap();
+        assert!(runtime.list_machines().await.unwrap().is_empty());
+        assert!(!directory.path().exists());
+        assert!(!snapshots
+            .store
+            .home_path()
+            .join("capture-evidence")
+            .join(capture.to_string())
+            .exists());
+        assert!(reopened.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn published_snapshot_survives_forced_source_removal_and_verifies() {
+        let fixture = fixture().await;
+        let snapshot = publish_fixture(&fixture).await;
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture;
+        drop(reservation);
+        drop(launch);
+        mark_fixture_stopped(&snapshots.store, config.id).await;
+        let runtime = capture_runtime(&snapshots).await;
+        runtime
+            .get_machine(&crate::MachineRef::id(config.id))
+            .await
+            .unwrap()
+            .remove_force()
+            .await
+            .unwrap();
+        snapshots
+            .verify(&SnapshotRef::Id(snapshot.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshots
+                .inspect(&SnapshotRef::Id(snapshot.id))
+                .await
+                .unwrap()
+                .id,
+            snapshot.id
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_discard_refuses_capture_and_accepted_baseline_holders() {
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture().await;
+        let capture = reservation.record.capture_id;
+        let error = snapshots
+            .store
+            .discard_machine_captures(config.id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("active lease"), "{error}");
+        drop(reservation);
+        let error = snapshots
+            .store
+            .discard_machine_captures(config.id)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("accepted baseline holder"),
+            "{error}"
+        );
+        assert!(snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .is_some());
+        drop(launch);
+    }
+
+    #[tokio::test]
+    async fn forced_discard_refuses_fork_children_and_local_cut_dependencies() {
+        for local_cut in [false, true] {
+            let fixture = fork_fixture().await;
+            if local_cut {
+                seal(&fixture);
+                fixture
+                    .snapshots
+                    .retain_local_capture(
+                        fixture.reservation.record.capture_id,
+                        crate::storage::pool::PublicationLockPolicy::Wait,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let Fixture {
+                _temporary,
+                snapshots,
+                config,
+                reservation,
+                launch,
+            } = fixture;
+            drop(reservation);
+            drop(launch);
+            let error = snapshots
+                .store
+                .discard_machine_captures(config.id)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(if local_cut {
+                    "local-cut dependency"
+                } else {
+                    "fork child"
+                }),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_discard_rejects_replaced_staging_inode_after_its_durable_fence() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture;
+        let mut record = reservation.record.clone();
+        let parent = OwnedDirectory::open_existing_root(directory.path().parent().unwrap())
+            .unwrap()
+            .unwrap();
+        let parent_stat = nix::sys::stat::fstat(parent.fd()).unwrap();
+        let stat = nix::sys::stat::fstat(directory.fd()).unwrap();
+        record.discard = Some(crate::store::snapshot_store::CaptureDiscard {
+            parent: Some((parent_stat.st_dev as u64, parent_stat.st_ino as u64)),
+            directory: Some((stat.st_dev as u64, stat.st_ino as u64 + 1)),
+        });
+        sqlx::query("UPDATE storage_operation SET state='cleaning',record_json=jsonb(?2) WHERE operation_id=?1")
+            .bind(record.capture_id.to_string()).bind(crate::store::capture::encode_record(&record).unwrap()).execute(&snapshots.store.pool).await.unwrap();
+        drop(reservation);
+        drop(launch);
+        let error = snapshots
+            .store
+            .discard_machine_captures(config.id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("inode was replaced"), "{error}");
+        assert!(directory
+            .open_file(vm_spec::capture::CAPTURE_RAM_FILE)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn clone_and_copy_publication_arithmetic_keeps_logical_ram_once_on_clones() {
+        let ram = 30 << 30;
+        let disk = 1 << 30;
+        let state = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
+        let metadata = vm_spec::capture::CAPTURE_CLONE_RESERVE_BYTES;
+        let stage = ram + disk + state;
+        let clone_peak = stage
+            + crate::store::capture::publication_stream_bytes(ram, true)
+            + crate::store::capture::publication_stream_bytes(disk, true)
+            + 2 * state;
+        assert_eq!(clone_peak, ram + disk + 3 * state + 2 * metadata);
+        let copy_peak = stage
+            + crate::store::capture::publication_stream_bytes(ram, false)
+            + crate::store::capture::publication_stream_bytes(disk, false)
+            + 2 * state;
+        assert_eq!(copy_peak, stage + ram + disk + 2 * state);
+        assert!(clone_peak < 32 << 30);
+    }
+
+    #[tokio::test]
+    async fn publisher_lock_defers_recovery_and_refuses_forced_discard() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture;
+        let record = reservation.record.clone();
+        drop(reservation);
+        drop(launch);
+        mark_fixture_stopped(&snapshots.store, config.id).await;
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let _publisher = pool
+            .lock_publication(&crate::store::capture::capture_publication_key(
+                record.capture_id,
+            ))
+            .unwrap();
+        let error = snapshots
+            .publish_capture(
+                record.capture_id,
+                directory.path(),
+                record.alias,
+                crate::storage::pool::PublicationLockPolicy::Defer,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::LibVmError::Storage(crate::storage::StorageError::PublicationBusy { .. })
+        ));
+        let runtime = capture_runtime(&snapshots).await;
+        runtime.recover_maintenance().await.unwrap();
+        assert_eq!(runtime.list_machines().await.unwrap().len(), 1);
+        let error = runtime
+            .get_machine(&crate::MachineRef::id(config.id))
+            .await
+            .unwrap()
+            .remove_force()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("publisher is active"), "{error}");
+        assert!(directory.path().exists());
+        assert!(snapshots.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forced_discard_restarts_partial_quarantine_deletion_without_an_archive() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture;
+        let mut record = reservation.record.clone();
+        let parent = OwnedDirectory::open_existing_root(directory.path().parent().unwrap())
+            .unwrap()
+            .unwrap();
+        let p = nix::sys::stat::fstat(parent.fd()).unwrap();
+        let d = nix::sys::stat::fstat(directory.fd()).unwrap();
+        record.discard = Some(crate::store::snapshot_store::CaptureDiscard {
+            parent: Some((p.st_dev as u64, p.st_ino as u64)),
+            directory: Some((d.st_dev as u64, d.st_ino as u64)),
+        });
+        sqlx::query("UPDATE storage_operation SET state='cleaning',record_json=jsonb(?2) WHERE operation_id=?1")
+            .bind(record.capture_id.to_string()).bind(crate::store::capture::encode_record(&record).unwrap()).execute(&snapshots.store.pool).await.unwrap();
+        crate::storage::pool::rename_component_no_replace(
+            &parent,
+            &record.capture_id.to_string(),
+            &parent,
+            &format!(".retiring-{}", record.capture_id),
+        )
+        .unwrap();
+        nix::unistd::unlinkat(
+            directory.fd(),
+            vm_spec::capture::CAPTURE_RAM_FILE,
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .unwrap();
+        drop(reservation);
+        drop(launch);
+        mark_fixture_stopped(&snapshots.store, config.id).await;
+        let reopened = SnapshotStore::open(snapshots.store.home_path())
+            .await
+            .unwrap();
+        assert!(reopened
+            .capture_reservation(record.capture_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!parent
+            .path()
+            .join(format!(".retiring-{}", record.capture_id))
+            .exists());
+        assert!(!snapshots
+            .store
+            .home_path()
+            .join("capture-evidence")
+            .join(record.capture_id.to_string())
+            .exists());
+        let runtime = capture_runtime(&reopened).await;
+        runtime
+            .get_machine(&crate::MachineRef::id(config.id))
+            .await
+            .unwrap()
+            .remove_force()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn forced_discard_control_write_failure_preserves_staging_for_retry() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture;
+        let capture = reservation.record.capture_id;
+        drop(reservation);
+        drop(launch);
+        mark_fixture_stopped(&snapshots.store, config.id).await;
+        sqlx::raw_sql("CREATE TRIGGER refuse_discard BEFORE UPDATE OF record_json ON storage_operation WHEN NEW.state='cleaning' BEGIN SELECT RAISE(ABORT,'control write unavailable'); END;")
+            .execute(&snapshots.store.pool).await.unwrap();
+        let error = snapshots
+            .store
+            .discard_machine_captures(config.id)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("control write unavailable"),
+            "{error}"
+        );
+        assert!(directory
+            .open_file(vm_spec::capture::CAPTURE_RAM_FILE)
+            .unwrap()
+            .is_some());
+        assert!(!snapshots
+            .store
+            .home_path()
+            .join("capture-evidence")
+            .join(capture.to_string())
+            .exists());
+        sqlx::raw_sql("DROP TRIGGER refuse_discard;")
+            .execute(&snapshots.store.pool)
+            .await
+            .unwrap();
+        snapshots
+            .store
+            .discard_machine_captures(config.id)
+            .await
+            .unwrap();
+        assert!(!directory.path().exists());
+    }
+
+    #[tokio::test]
+    async fn corrupt_capture_is_refused_individually_without_blocking_maintenance_or_listing() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let Fixture {
+            _temporary,
+            snapshots,
+            config,
+            reservation,
+            launch,
+        } = fixture;
+        let capture = reservation.record.capture_id;
+        drop(reservation);
+        drop(launch);
+        mark_fixture_stopped(&snapshots.store, config.id).await;
+        sqlx::query("UPDATE storage_operation SET record_json=jsonb_set(record_json,'$.reservationBytes',0) WHERE operation_id=?1")
+            .bind(capture.to_string()).execute(&snapshots.store.pool).await.unwrap();
+        let reopened = SnapshotStore::open(snapshots.store.home_path())
+            .await
+            .unwrap();
+        let runtime = capture_runtime(&reopened).await;
+        runtime.recover_maintenance().await.unwrap();
+        assert_eq!(runtime.list_machines().await.unwrap().len(), 1);
+        assert!(reopened.capture_reservation(capture).await.is_err());
+        assert!(runtime
+            .get_machine(&crate::MachineRef::id(config.id))
+            .await
+            .unwrap()
+            .remove_force()
+            .await
+            .is_err());
+        assert!(directory.path().exists());
     }
 }

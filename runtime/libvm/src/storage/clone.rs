@@ -36,3 +36,32 @@ pub(crate) fn try_reflink(source: &std::fs::File, destination: &std::fs::File) -
         Err(io::Error::last_os_error())
     }
 }
+
+/// Anonymous, bounded source on the actual staging filesystem. Failure to
+/// qualify is conservative copy admission, never filesystem-name inference.
+#[cfg(target_os = "linux")]
+pub(crate) fn qualify_capture_pair(
+    source: &crate::paths::OwnedDirectory,
+    pool: &crate::storage::pool::StoragePool,
+) -> bool {
+    use std::os::unix::fs::FileExt;
+    let probe = || -> Result<bool, crate::storage::StorageError> {
+        let file = std::fs::File::from(nix::fcntl::openat(
+            source.fd(),
+            ".",
+            nix::fcntl::OFlag::O_TMPFILE | nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?);
+        file.write_all_at(&[0x51; 4096], 0)?;
+        pool.qualify_sealed_clone(&file)
+    };
+    probe().unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn qualify_capture_pair(
+    _source: &crate::paths::OwnedDirectory,
+    _pool: &crate::storage::pool::StoragePool,
+) -> bool {
+    false
+}

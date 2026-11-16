@@ -27,6 +27,22 @@ pub enum StorageError {
     FileDescriptorBudget(#[from] limits::FileDescriptorBudgetError),
     #[error("restore disk budget requires {}, available {} (short by {})", utils::format_storage_size(*required), utils::format_storage_size(*available), utils::format_storage_size(required.saturating_sub(*available)))]
     RestoreDiskBudget { required: u64, available: u64 },
+    #[error("capture {phase} on filesystem {filesystem:?}: requires {required} bytes, available {available} bytes (RAM staging {ram_staging}, disk staging {disk_staging}, publication {publication}, reserves {reserves}, other reservations {other})")]
+    CaptureDiskBudget {
+        phase: &'static str,
+        filesystem: std::path::PathBuf,
+        required: u64,
+        available: u64,
+        ram_staging: u64,
+        disk_staging: u64,
+        publication: u64,
+        reserves: u64,
+        other: u64,
+    },
+    #[error("capture {capture} publication deferred: {reason}")]
+    CapturePublicationDeferred { capture: uuid::Uuid, reason: String },
+    #[error("publication deferred: lock held for {resource}")]
+    PublicationBusy { resource: String },
     #[error("invalid owned storage path: {0}")]
     InvalidPath(String),
     #[error("stream map has {actual} chunks, expected {expected} for its length")]

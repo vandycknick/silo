@@ -658,6 +658,9 @@ source record after the run ends means `unknown`. libvm never resumes because
 the record is absent. Failure or cancellation after baseline acceptance retains
 that baseline, and native `ReleaseCapture` reports `baseline_retained = true`;
 continuation is never repeated and no later incremental dependency is removed.
+If the monitor disappears between status and `GetOperation`, libvm reconciles
+the exact run again. Transport failure alone never invents a terminal source
+outcome or invalidates the sealed capture.
 
 ### Evidence
 
@@ -965,6 +968,77 @@ for every child, replay and boot-inventory refinement. Standalone restore
 measures allocation from its held immutable copy sources. Reflinks and sparse
 copies preserve disk holes; guest growth before the capture seal can still
 fail the operation under the failure semantics below.
+
+Capture admission reserves **future allocation**, not host memory and not a
+second charge for already allocated staging. Let `R` be configured logical RAM,
+`D_i` the allocated-block sample of writable disk `i`, `S = 64 MiB`,
+`K = 16 MiB`, and `M` the conservative map allowance for RAM and every configured
+attachment (including read-only attachments):
+
+```text
+T = R + sum(D_i) + S
+U = sum(publication stream charge) + 2*S + 2*M
+publication stream charge = K for a qualified required reflink, else its copy bound
+copy bound = R for RAM, D_i for a writable disk
+```
+
+`T` belongs to the machine filesystem and `U` to the pool filesystem. They add
+only when those devices coincide. A same-filesystem local fork still has `U=0`
+because its cut is renamed. Publication qualifies real source/destination clone
+pairs, not filesystem names; unavailable qualification is copy-priced. Every
+sealed stream is qualified again before publication, using its actual allocation
+for disk-copy admission. A clone-priced publication may not fall back to copying.
+Already published, pinned and authenticated streams require no payload credit.
+Publication retry replaces `T+U` with remaining `U`, never recharges staging.
+Explicit publication and reconciliation wait for an existing publisher to finish.
+Maintenance-open recovery defers instead of waiting on capture, local-cut or
+stream/object publication locks; forced discard also refuses a held publisher lock.
+
+Disk staging deliberately retains `CaptureDiskCopy::Copy` and allocation-based
+credit even when the monitor opportunistically clones. Its plan and accounting
+therefore agree without changing the monitor contract. RAM staging retains `R`
+once, even for sparse or incremental captures; lowering that bound requires a
+new native estimate and is deferred. The existing plan minimum `R+S` is retained.
+For a reflink-qualified 30 GiB guest, admission is about 30 GiB plus disk staging
+and metadata/state/map allowances, not a second 30 GiB publication copy.
+
+These are bounded-admission policy allowances, not filesystem reservations.
+Unrelated writers, disk growth, quotas, delayed allocation and clone metadata
+can still exhaust storage. ENOSPC fails capture or defers publication without
+publishing an invalid checkpoint; source continuation follows its recorded
+policy. Neither filesystem-wide no-exhaustion nor guest ENOSPC immunity is promised.
+
+Initial disk/descriptor admission precedes committing the capture operation,
+resource reservation and dependency pins in one transaction. A refusal creates
+no command, capture row, pins or staging. The ledger is published only after SQL
+commits and must succeed before dispatch. A durable dispatch-attempt fence is
+committed before sending. A definite first pre-send refusal records terminal
+rejection and releases unused credit/pins; an uncertain send retains exact-identity
+observation semantics. Observe, abandon, release and retire take no payload credit.
+If the producer dies before the dispatch-attempt fence, exclusive capture-lease
+ownership proves the prepared command was never sent. Recovery retires that exact
+journal entry without replay or new payload admission, even if recording the
+original local refusal had failed. A live preparer's shared lease prevents this
+retirement from racing its first dispatch.
+
+Explicit `rm --force` (including library and daemon removal) first terminates and
+reaps the source. Under its machine lock, nonblocking capture publisher ownership
+and exclusive capture/launch leases, it checks configured paths, fork-child and
+local-cut dependencies. An active lease, accepted baseline holder or referenced
+cut refuses with its dependency; a lock miss never authorizes deletion.
+Unpublished staging can then be discarded without publication or identity
+completion. Published snapshots retain their independent pool/catalog roots.
+Plain removal keeps ordinary publish-and-reconcile behavior.
+A dead monitor with a live or uncertain worker is not a stopped source: forced
+removal refuses before writing a stop transition or changing retained live-run
+authority. Every holder must be proven terminal before capture discard.
+
+Forced discard persists parent/staging inode identities and a `cleaning` fence in
+the existing operation journal before quarantining bulk files. Deletion resumes
+from that fence after interruption, refusing replaced directories. No fresh
+evidence archive or capture-sized credit is needed before freeing bulk storage.
+Minimal SQL/control writes can themselves fail at true exhaustion; failure
+preserves ownership for retry.
 
 Physical memory for a source and N children is approximately the source's
 resident set plus the clean baseline pages any child touches once plus every
@@ -1720,8 +1794,8 @@ RAM may contain old paths and handles; they are not capabilities. Destination
 netd rejects traffic for the source's addresses; forwards and publications
 require destination authorization; secrets require destination authorization.
 
-Against resource exhaustion, libvm bounds N, reserves staging and memory per
-the accounting rules, and refuses before the freeze when the budget cannot
+Against resource exhaustion, libvm bounds N, reserves future disk allocation and
+descriptor demand per the accounting rules, and refuses before freeze when it cannot
 admit the batch. There is no fixed concurrent-restore count limit. The source's
 immutable RAM file
 and sealed disks are held by content leases and read-only descriptors for the
@@ -1733,7 +1807,8 @@ cache assumption, as in [ADR 0014](0014-layered-oci-image-storage.md).
 
 | Failure | Behavior |
 | --- | --- |
-| Device without provider, unsupported guest, budget exceeded | Typed refusal before freeze; machine unchanged. |
+| Device without provider, unsupported guest, pre-freeze budget exceeded | Typed refusal before freeze; machine unchanged. Disk/descriptor refusal leaves no capture operation, command, pins or staging. |
+| Capacity lost after journaling but before first send | Terminal local dispatch refusal, no monitor request and no replay. An earlier uncertain send retains exact-identity observation instead. |
 | Workload freeze incomplete or timed out | Thaw what was frozen, report the frozen set, operation failed, machine stays `Running`. If that thaw fails, machine transitions to `Error`, stays fenced and admits no lifecycle transition but stop. |
 | Worker pause cannot be established | Machine stays fenced in `Pausing` with the operation failed; `GetOperation` reports the partial state; `CancelOperation` returns it to `Running` (or `Error`), stop finalizes; a retry is a new `Pause`. Never reported as `Paused`. |
 | Disk clone or copy fails, `ENOSPC` | Whole capture fails; only unneeded staging is removed after ownership reconciliation; source continues under its policy. |
@@ -1743,14 +1818,18 @@ cache assumption, as in [ADR 0014](0014-layered-oci-image-storage.md).
 | Monitor or worker dies before any cut or seal | No capture; libvm removes unneeded staging after ownership reconciliation. |
 | Monitor/worker dies in `IdentityPending` | After positive termination, libvm completes identities from retained clones without VM operations and writes the seal last; the pending cut is never reported sealed early. |
 | Monitor dies after seal | libvm completes publication from sealed files; source generation ends per [ADR 0018](0018-silo-vmm-contract.md). |
+| Sealed capture cannot admit remaining publication writes | Publication deferred with staging retained; no invalid snapshot is retained. Runtime maintenance open and unrelated commands continue. Retry only re-admits remaining writes, or explicit forced removal discards an unreferenced local cut after source termination. |
 | Restore construction fails | Child attempt destroyed; checkpoint untouched; retry with a new run. |
 | Activation incomplete | Workload stays frozen and fences stay closed; child re-paused into `ActivationFailed`, or killed and reaped if pause fails; never `Running`; retry is a new restore. |
 | Fork: child k fails after seal | Children 1..k-1 keep running; result names k's failure; source outcome independent. |
 | Compatibility mismatch on restore | Typed diagnostic naming the mismatched pin; artifact preserved; no cold boot. |
 | Live operation on VZ, an unqualified lane or a rejected device profile | `LiveOperationUnsupported` before the lock, lease or allocation; machine and database unchanged; the alternative is named. |
 
-Diagnostics distinguish refusal before freeze, failure during capture, failure
-during restore and failure during activation. `silo machine inspect` shows
+Diagnostics distinguish pre-freeze admission, dispatch refusal, staging failure
+and publication deferred, naming the filesystem and required/available byte
+components (RAM staging, disk staging, publication, reserves and other outstanding
+reservations) at disk-admission gates, plus restore and activation failures.
+`silo machine inspect` shows
 the current nonterminal state, the pending operation and, for a paused
 machine, who paused it.
 
@@ -1763,7 +1842,7 @@ machine, who paused it.
 | Aggregate captured logical streams | 4 TiB across RAM and writable disks, unchanged. Read-only inputs are retained by identity. |
 | Capture JSON control record | `1 MiB + MAX_RAM_MAP_BYTES + 16 MiB`; stage 1 adds the bounded disk-receipt allowance `MAX_DISK_TRACKING_BYTES`. |
 | Children per fork call | 16 by default; higher with an explicit flag, still within budget. |
-| Capture staging | Reserved before freeze by libvm: staging (RAM image + allocated bytes of each writable disk + state reserves), plus the publication peak (RAM image copy + allocated bytes of each writable disk + map and state reserves) when the pool shares the filesystem. On separate filesystems, publication is charged to the pool's filesystem instead. A same-filesystem local fork cut is renamed, so it needs no publication copy. |
+| Capture staging | Before freeze: `T = R + sum(D_i) + S`; publication `U = sum(K for each qualified required clone, otherwise its stream copy bound) + 2*S + 2*M`. RAM copy bound is `R`; writable-disk copy bound is its allocation sample. Disk staging keeps the Copy plan and allocation charge; RAM staging stays logical once. Assign `T` and `U` by device; same-filesystem local-fork rename has `U=0`. A sealed publisher replaces staging credit with remaining publication credit only. See Accounting for qualification, replay and ENOSPC limits. |
 | Restore/fork child disk construction | Per child: allocated bytes of every writable disk + state reserves + pinned boot-object copies. Live forks use the allocation sample retained by capture planning; standalone restores measure their held immutable source files. |
 | Activation deadlines | VM generation acknowledgement 5 s; agent `Activate` 30 s; both configurable. |
 

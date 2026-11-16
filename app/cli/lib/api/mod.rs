@@ -464,20 +464,11 @@ impl AppApi {
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
         let data = machine.inspect().await?;
-        if force && data.is_running() {
-            if let Err(error) = self
-                .stop_machine(&machine.id(), false, Duration::from_secs(60))
-                .await
-            {
-                if !matches!(
-                    error.downcast_ref::<libvm::LibVmError>(),
-                    Some(libvm::LibVmError::MachineNotRunning { .. })
-                ) {
-                    return Err(error);
-                }
-            }
+        if force {
+            machine.remove_force().await?;
+        } else {
+            machine.remove().await?;
         }
-        machine.remove().await?;
         Ok(data)
     }
 

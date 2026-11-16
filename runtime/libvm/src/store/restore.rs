@@ -61,7 +61,7 @@ pub(crate) struct DescriptorOwner {
 }
 
 impl DescriptorOwner {
-    fn current() -> Result<Self, LibVmError> {
+    pub(crate) fn current() -> Result<Self, LibVmError> {
         let pid = i32::try_from(std::process::id()).map_err(invalid)?;
         let started_at = utils::process::start_time(pid)?
             .ok_or_else(|| invalid("manager process birth identity is unavailable"))?;
@@ -1005,7 +1005,7 @@ fn reclaim_budget_orphans(
                 .map(|bytes| u128::from(*bytes))
                 .sum::<u128>()
         });
-        tracing::info!(
+        tracing::debug!(
             %prefix,
             entries = names.len(),
             charges,
@@ -1306,11 +1306,54 @@ fn fork_disk_peak(
 }
 
 impl crate::store::Store {
+    /// Replace allocated staging credit with only future publication writes.
+    pub(crate) async fn reserve_capture_publication(
+        &self,
+        record: &crate::store::snapshot_store::CaptureRecord,
+        bytes: u64,
+    ) -> Result<(), LibVmError> {
+        let directory = budget_directory(self)?;
+        let _admission = crate::storage::locks::blocking(
+            &directory,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )?;
+        let owner = record.fork_operation_id.unwrap_or(record.capture_id);
+        let json = self.capture_budget_document(owner).await?;
+        let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
+        if inventory.descriptors != 0 {
+            inventory.descriptor_owner = Some(DescriptorOwner::current()?);
+        }
+        let pool = crate::paths::OwnedDirectory::open_existing_root(&self.images_dir)?
+            .ok_or_else(|| invalid("publication filesystem disappeared"))?;
+        let device = nix::sys::stat::fstat(pool.fd())
+            .map_err(std::io::Error::from)?
+            .st_dev as u64;
+        inventory.capture_disks =
+            vec![crate::store::snapshot_store::CaptureSpaceCharge { device, bytes }];
+        let name = budget_name(self, owner)?;
+        let json = serde_json::to_string(&inventory).map_err(invalid)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .bind(&json)
+        .execute(&mut *tx)
+        .await?;
+        publish_budget(self, tx, &directory, &name, &json, |_| {}).await?;
+        let mut budget = RestoreBudget::read_except(self, &directory, Some(&name))?;
+        budget.add_capture(&inventory)?;
+        budget.admit_descriptors()?;
+        self.admit_capture_disks(&budget, "publication deferred", Some(record), Some(bytes))
+    }
+
     /// Shared cross-home admission. No capture command can precede successful
     /// publication of this complete inventory under the restore admission lock.
     pub(crate) async fn reserve_capture_inventory(
         &self,
         record: &crate::store::snapshot_store::CaptureRecord,
+        initial_lease: Option<&crate::storage::locks::StorageLock>,
     ) -> Result<(), LibVmError> {
         let directory = budget_directory(self)?;
         let _admission = crate::storage::locks::blocking(
@@ -1387,9 +1430,24 @@ impl crate::store::Store {
         let mut budget = RestoreBudget::read(self, &directory)?;
         budget.add_capture(&inventory)?;
         budget.admit_descriptors()?;
-        self.admit_capture_disks(&budget)?;
+        self.admit_capture_disks(&budget, "pre-freeze admission", Some(record), None)?;
         let json = serde_json::to_string(&inventory).map_err(invalid)?;
+        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let registered: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='capture')")
+            .bind(record.capture_id.to_string()).fetch_one(&mut *tx).await?;
+        if !registered {
+            let lease = initial_lease
+                .ok_or_else(|| invalid("capture registration requires its held lease"))?;
+            let (device, inode) = lease.file_identity()?;
+            if pool.operation_lease_identity(record.capture_id)? != (device, inode) {
+                return Err(invalid(
+                    "capture lease inode changed before admission commit",
+                ));
+            }
+            crate::store::capture::register_capture(&mut tx, record, device, inode).await?;
+        }
         sqlx::query("INSERT INTO capture_resource_reservation(operation_id,charge_json) VALUES(?1,jsonb(?2))").bind(owner.to_string()).bind(&json).execute(&mut *tx).await?;
         if let Some(operation) = fork {
             sqlx::query("UPDATE live_fork SET admission_complete=1 WHERE operation_id=?1")
@@ -1413,7 +1471,13 @@ impl crate::store::Store {
         Ok(())
     }
 
-    fn admit_capture_disks(&self, budget: &RestoreBudget) -> Result<(), LibVmError> {
+    fn admit_capture_disks(
+        &self,
+        budget: &RestoreBudget,
+        phase: &'static str,
+        record: Option<&crate::store::snapshot_store::CaptureRecord>,
+        remaining: Option<u64>,
+    ) -> Result<(), LibVmError> {
         for path in [&self.images_dir, &self.home.join("machines")] {
             let disk = crate::paths::OwnedDirectory::open_existing_root(path)?
                 .ok_or_else(|| invalid("capture budget filesystem disappeared"))?;
@@ -1430,9 +1494,64 @@ impl crate::store::Store {
                 .copied()
                 .unwrap_or_default();
             if required > available {
-                return Err(crate::storage::StorageError::RestoreDiskBudget {
+                let device = stat.st_dev as u64;
+                let staging_here = remaining.is_none()
+                    && record.is_some_and(|record| {
+                        record
+                            .disk_charges
+                            .first()
+                            .is_some_and(|charge| charge.device == device)
+                    });
+                let ram_staging = if staging_here {
+                    record.map(|record| record.plan.ram_bytes).unwrap_or(0)
+                } else {
+                    0
+                };
+                let disk_staging = if staging_here {
+                    record
+                        .map(|record| record.disk_allocations.values().sum())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let own = match remaining {
+                    Some(bytes)
+                        if record.is_some_and(|record| {
+                            record
+                                .disk_charges
+                                .last()
+                                .is_some_and(|charge| charge.device == device)
+                        }) =>
+                    {
+                        bytes
+                    }
+                    Some(_) => 0,
+                    None => record
+                        .map(|record| {
+                            record
+                                .disk_charges
+                                .iter()
+                                .filter(|charge| charge.device == device)
+                                .map(|charge| charge.bytes)
+                                .sum::<u64>()
+                        })
+                        .unwrap_or(0),
+                };
+                let reserves = if staging_here {
+                    vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES
+                } else {
+                    0
+                };
+                return Err(crate::storage::StorageError::CaptureDiskBudget {
+                    phase,
+                    filesystem: path.to_path_buf(),
                     required,
                     available,
+                    ram_staging,
+                    disk_staging,
+                    publication: own.saturating_sub(ram_staging + disk_staging + reserves),
+                    reserves,
+                    other: required.saturating_sub(own),
                 }
                 .into());
             }
@@ -1464,7 +1583,13 @@ impl crate::store::Store {
         let mut budget = RestoreBudget::read_except(self, directory, Some(&name))?;
         budget.add_capture(&inventory)?;
         budget.admit_descriptors()?;
-        self.admit_capture_disks(&budget)?;
+        let json: Option<String> = sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture' AND json_type(record_json,'$.plan')='object'")
+            .bind(inventory.capture_id.to_string()).fetch_optional(&self.pool).await?;
+        let record = json
+            .as_deref()
+            .map(crate::store::capture::decode_record)
+            .transpose()?;
+        self.admit_capture_disks(&budget, "dispatch refusal", record.as_ref(), None)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
@@ -1756,14 +1881,8 @@ impl crate::store::Store {
         let intent = self
             .live_command_record(record.machine_id, record.run_id, capture)
             .await?;
-        let no_submission = intent.as_ref().is_none_or(|intent| {
-            matches!(
-                intent.result,
-                Some(vm_spec::lifecycle::LiveCommandResult::Capture(
-                    vm_spec::lifecycle::CaptureOutcome::Rejected { .. }
-                ))
-            )
-        });
+        let no_submission =
+            record.never_submitted(intent.as_ref().and_then(|intent| intent.result.as_ref()));
         if !no_submission
             && !matches!(
                 record.state,
@@ -1779,6 +1898,8 @@ impl crate::store::Store {
             "admission.lock",
             nix::fcntl::FlockArg::LockExclusive,
         )?;
+        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let json: Option<String> = sqlx::query_scalar(
             "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
@@ -1811,6 +1932,19 @@ impl crate::store::Store {
         .bind(serde_json::to_string(&inventory).map_err(invalid)?)
         .execute(&mut *tx)
         .await?;
+        if no_submission {
+            for statement in [
+                "DELETE FROM storage_operation_stream WHERE operation_id=?1",
+                "DELETE FROM storage_operation_object WHERE operation_id=?1",
+                "DELETE FROM storage_operation_layer WHERE operation_id=?1",
+                "DELETE FROM storage_operation_lower WHERE operation_id=?1",
+            ] {
+                sqlx::query(statement)
+                    .bind(capture.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
         tx.commit().await?;
         write_budget_anchor(self, &directory).await?;
         directory.write_file_atomic(
@@ -1861,6 +1995,7 @@ mod tests {
                 fixture.reservation.record.capture_id,
                 sealed.path(),
                 fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
@@ -2329,7 +2464,7 @@ mod tests {
         let ledger = budget_directory(store).unwrap();
         let mut before = None;
         for _ in 0..2 {
-            store.reserve_capture_inventory(record).await.unwrap();
+            store.reserve_capture_inventory(record, None).await.unwrap();
             let inventory: CaptureBudgetInventory =
                 serde_json::from_str(&store.capture_budget_document(operation).await.unwrap())
                     .unwrap();
@@ -2362,7 +2497,7 @@ mod tests {
         assert!(record.fork_operation_id.is_none());
         let ledger = budget_directory(store).unwrap();
         for _ in 0..2 {
-            store.reserve_capture_inventory(record).await.unwrap();
+            store.reserve_capture_inventory(record, None).await.unwrap();
             let inventory: CaptureBudgetInventory = serde_json::from_reader(
                 ledger
                     .open_file(&budget_name(store, record.capture_id).unwrap())
@@ -2429,7 +2564,10 @@ mod tests {
         crate::store::capture::tests::seal(&fixture);
         let (_, retained) = fixture
             .snapshots
-            .retain_local_capture(record.capture_id)
+            .retain_local_capture(
+                record.capture_id,
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
             .await
             .unwrap();
         let cut = store.open_local_cut(operation, retained).await.unwrap();
@@ -2530,12 +2668,20 @@ mod tests {
             .await
             .unwrap();
         let error = snapshots
-            .publish_capture(record.capture_id, sealed.path(), record.alias)
+            .publish_capture(
+                record.capture_id,
+                sealed.path(),
+                record.alias,
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
             .await
             .unwrap_err();
         assert!(matches!(
             error,
-            crate::LibVmError::Storage(crate::storage::StorageError::RestoreDiskBudget { .. })
+            crate::LibVmError::Storage(crate::storage::StorageError::CaptureDiskBudget {
+                phase: "publication deferred",
+                ..
+            })
         ));
     }
 
@@ -2553,7 +2699,7 @@ mod tests {
             .unwrap();
         let ledger = budget_directory(store).unwrap();
         for _ in 0..2 {
-            store.reserve_capture_inventory(record).await.unwrap();
+            store.reserve_capture_inventory(record, None).await.unwrap();
             let inventory: CaptureBudgetInventory = serde_json::from_reader(
                 ledger
                     .open_file(&budget_name(store, operation).unwrap())
@@ -2566,7 +2712,10 @@ mod tests {
         crate::store::capture::tests::seal(&fixture);
         let (_, retained) = fixture
             .snapshots
-            .retain_local_capture(record.capture_id)
+            .retain_local_capture(
+                record.capture_id,
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
             .await
             .unwrap();
         let cut = store.open_local_cut(operation, retained).await.unwrap();

@@ -229,6 +229,43 @@ Independent same-identity pool streams skip scanning only when their
 `verified_object` receipt matches the current fingerprint. The snapshot
 publication transaction seeds warm receipts for RAM and those disks.
 
+### Capture-space admission and failure
+
+Admission charges configured logical RAM to staging once. Writable-disk staging
+keeps the existing Copy plan and allocated-block bound, even if the monitor
+opportunistically reflinks. Each pool-publication stream is independently priced:
+16 MiB metadata allowance for a real qualified same-filesystem required clone,
+otherwise RAM's logical length or the disk's allocation bound. Clone-priced
+publication never falls back to an unadmitted payload copy. State/map reserves
+remain conservative. Thus a 30 GiB reflink-qualified guest needs about 30 GiB plus
+disk staging and allowances, not two logical RAM images.
+
+A sealed publisher re-admits only remaining publication writes; pinned,
+authenticated streams already published consume no new payload credit. Observe,
+abandon, release and retirement require none. Logical RAM staging is not discounted
+by guest memory statistics or sampled population; a tighter estimate needs a
+native protocol change. Filesystem availability plus a ledger is bounded admission,
+not a hard reservation: ENOSPC can still fail staging or defer publication, while
+source continuation follows its policy and no invalid snapshot is retained.
+
+Initial disk/descriptor refusal leaves no operation, command, pins or staging.
+A definite first dispatch refusal is terminal; a prior uncertain send remains
+exact-identity observation work. Producer death before the durable send-attempt
+fence is also a definite no-send case: after exclusive capture ownership, recovery
+retires its journal without replay or fresh capacity admission. Maintenance
+recovery logs publication deferral without preventing unrelated commands.
+Explicit publication and reconciliation requests still wait their turn behind an
+existing publisher. Only maintenance-open recovery defers publication-lock waits;
+forced discard refuses a lock miss.
+`rm --force` can terminate/reap the source
+and discard unpublished, unreferenced staging under machine/publisher locks and
+exclusive operation/launch ownership. Published snapshots survive; active leases,
+accepted baseline holders, fork children, local cuts and configured path dependencies
+remain real refusals. Forced discard journals an inode-bound quarantine fence and
+resumes deletion after interruption without first allocating an evidence archive.
+Disk-admission diagnostics name phase, filesystem, required/available bytes and
+RAM staging, disk staging, publication, reserve and other-reservation components.
+
 ### Wave two: deferred disk identities and sparse RAM
 
 Reflink capture now flushes, clones and records ownership in the pause, then
