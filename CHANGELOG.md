@@ -9,6 +9,9 @@
   RAM/disk payload copy. RAM staging stays logical once, and disk staging keeps
   its allocation-priced Copy plan. These are bounded admission rules, not an
   ENOSPC guarantee. Publication deferral no longer holds unrelated commands hostage.
+  Clone qualification now probes each staging/pool filesystem pair with bounded
+  anonymous files, once per publication, without cloning RAM/disks or syncing
+  disposable staging. Unchanged lease anchors are not rewritten on credit resize.
   `rm --force`, library forced removal and daemon forced removal can discard
   unpublished, unreferenced local capture staging after source termination,
   without publication, identity completion or a fresh evidence archive. Published

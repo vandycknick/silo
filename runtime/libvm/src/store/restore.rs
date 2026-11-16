@@ -803,10 +803,15 @@ pub(crate) async fn write_budget_anchor(
         state_inode: state.ino(),
         leases,
     };
-    directory.write_file_atomic(
-        &format!("{}-{}-home.json", anchor.state_device, anchor.state_inode),
-        &serde_json::to_vec(&anchor).map_err(invalid)?,
-    )
+    let name = format!("{}-{}-home.json", anchor.state_device, anchor.state_inode);
+    let bytes = serde_json::to_vec(&anchor).map_err(invalid)?;
+    if read_budget_file(directory, &name)?.as_deref() == Some(bytes.as_slice()) {
+        // Atomic publication syncs the file before rename. Reconfirm its
+        // directory entry after an interrupted writer, but do not replace an
+        // identical anchor merely because a charge amount changed.
+        return directory.sync();
+    }
+    directory.write_file_atomic(&name, &bytes)
 }
 
 fn budget_file_prefix(name: &str) -> Result<&str, LibVmError> {
@@ -3878,5 +3883,46 @@ mod tests {
                 "failed construction retained its owner or reservation"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn publication_credit_resize_preserves_the_unchanged_lease_anchor_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = crate::store::capture::tests::fixture().await;
+        let store = &fixture.snapshots.store;
+        let ledger = crate::store::restore::budget_directory(store).unwrap();
+        let name = format!(
+            "{}home.json",
+            crate::store::restore::budget_prefix(store).unwrap()
+        );
+        let held = ledger.open_file(&name).unwrap().unwrap();
+        let before = std::fs::read(ledger.path().join(&name)).unwrap();
+        let record = &fixture.reservation.record;
+        store
+            .reserve_capture_publication(
+                record,
+                record.reservation_bytes - record.plan.reservation.staging_bytes,
+            )
+            .await
+            .unwrap();
+        let after = ledger.open_file(&name).unwrap().unwrap();
+        assert_eq!(
+            after.metadata().unwrap().ino(),
+            held.metadata().unwrap().ino()
+        );
+        assert_eq!(std::fs::read(ledger.path().join(&name)).unwrap(), before);
+        // Releasing native staging ownership really changes the anchor and
+        // must still publish a replacement for cross-home lease accounting.
+        fixture
+            .snapshots
+            .abandon_capture(record.capture_id)
+            .await
+            .unwrap();
+        let released = ledger.open_file(&name).unwrap().unwrap();
+        assert_ne!(
+            released.metadata().unwrap().ino(),
+            held.metadata().unwrap().ino()
+        );
+        assert_ne!(std::fs::read(ledger.path().join(&name)).unwrap(), before);
     }
 }

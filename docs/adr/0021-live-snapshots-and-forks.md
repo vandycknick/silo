@@ -984,12 +984,18 @@ copy bound = R for RAM, D_i for a writable disk
 
 `T` belongs to the machine filesystem and `U` to the pool filesystem. They add
 only when those devices coincide. A same-filesystem local fork still has `U=0`
-because its cut is renamed. Publication qualifies real source/destination clone
-pairs, not filesystem names; unavailable qualification is copy-priced. Every
-sealed stream is qualified again before publication, using its actual allocation
-for disk-copy admission. A clone-priced publication may not fall back to copying.
+because its cut is renamed. Admission and publication qualify real
+staging/pool filesystem pairs with bounded 4 KiB anonymous files, not filesystem
+names or full-payload trial clones. Publication qualifies its pair at most once,
+only if an unpinned stream needs credit; the probe has no named staging or fsync.
+Unavailable qualification is copy-priced. Disk-copy admission still uses the
+sealed file's actual allocation. A clone-priced publication may not fall back
+to copying if the actual file cannot be cloned, even on the qualified pair.
 Already published, pinned and authenticated streams require no payload credit.
 Publication retry replaces `T+U` with remaining `U`, never recharges staging.
+Changing credit does not replace an identical lease/home anchor. Its directory
+entry is still synchronized for interrupted-rename recovery, and changed anchors
+and charge documents retain their existing durable atomic publication.
 Explicit publication and reconciliation wait for an existing publisher to finish.
 Maintenance-open recovery defers instead of waiting on capture, local-cut or
 stream/object publication locks; forced discard also refuses a held publisher lock.

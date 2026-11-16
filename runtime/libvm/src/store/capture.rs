@@ -193,13 +193,11 @@ impl SnapshotStore {
             .checked_add(vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
             .ok_or_else(|| invalid("capture budget overflow"))?;
         let map_bytes = capture_map_budget(&request.configuration)?;
-        let clone_publication = machine_stat.st_dev == images_stat.st_dev
-            && crate::machine::root_disk::qualify_clone(
-                &machine,
-                crate::MachineDurability::Constructed,
-            )
-            .unwrap_or(false)
-            && crate::storage::clone::qualify_capture_pair(&machine, &pool);
+        let fork_operation_id = self.store.fork_for_capture(request.capture_id).await?;
+        let local_fork = fork_operation_id.is_some();
+        let clone_publication = !local_fork
+            && machine_stat.st_dev == images_stat.st_dev
+            && pool.qualify_capture_clone(&machine).unwrap_or(false);
         let mut publication_clones = BTreeSet::new();
         if clone_publication {
             publication_clones.insert(CaptureRole::Ram.relative_path());
@@ -277,8 +275,9 @@ impl SnapshotStore {
                 };
                 let role = CaptureRole::Disk(CaptureDiskName::new(name.clone()).map_err(invalid)?)
                     .relative_path();
-                let clone =
-                    clone_publication && pool.qualify_sealed_clone(&source).unwrap_or(false);
+                // Publication reads the staged copy on the machine filesystem,
+                // not this attachment's possibly external source filesystem.
+                let clone = clone_publication;
                 if clone {
                     publication_clones.insert(role);
                 }
@@ -304,8 +303,6 @@ impl SnapshotStore {
                 });
             }
         }
-        let fork_operation_id = self.store.fork_for_capture(request.capture_id).await?;
-        let local_fork = fork_operation_id.is_some();
         if local_fork && machine_stat.st_dev == images_stat.st_dev {
             // A local cut is renamed into the operation namespace. No durable
             // stream/object publication or second RAM materialization occurs.
@@ -782,6 +779,10 @@ impl SnapshotStore {
         let mut verified = verify_capture(&directory, &record, authentication)?;
         let mut publication = 2 * vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
         let mut publication_clones = BTreeSet::new();
+        let source_device = nix::sys::stat::fstat(directory.fd())
+            .map_err(std::io::Error::from)?
+            .st_dev as u64;
+        let mut clone_publication = None;
         for payload in &verified.files {
             match payload.role {
                 CaptureRole::Ram | CaptureRole::Disk(_) => {
@@ -802,16 +803,18 @@ impl SnapshotStore {
                         }
                         continue;
                     }
-                    let clone = pool.qualify_sealed_clone(payload.file()).unwrap_or(false);
+                    let metadata = payload.file().metadata()?;
+                    let clone = metadata.dev() == source_device
+                        && *clone_publication.get_or_insert_with(|| {
+                            pool.qualify_capture_clone(&directory).unwrap_or(false)
+                        });
                     if clone {
                         publication_clones.insert(payload.role.relative_path());
                     }
                     let bound = if payload.role == CaptureRole::Ram {
                         record.plan.ram_bytes
                     } else {
-                        payload
-                            .file()
-                            .metadata()?
+                        metadata
                             .blocks()
                             .checked_mul(512)
                             .ok_or_else(|| invalid("publication allocation overflow"))?
