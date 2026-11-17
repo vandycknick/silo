@@ -153,6 +153,12 @@ pub(crate) enum CopySource<'a> {
     /// Held under the caller's fences without content authority. A streaming
     /// copy derives its map while writing.
     Unscanned { file: &'a File, length: u64 },
+    /// Complete operation-owned bytes, without content identity.
+    Owned {
+        file: &'a File,
+        length: u64,
+        fingerprint: SourceFingerprint,
+    },
     /// A recorded canonical map; a streaming copy checks every chunk while writing.
     Authenticated(&'a AuthenticatedStream),
 }
@@ -160,14 +166,14 @@ pub(crate) enum CopySource<'a> {
 impl<'a> CopySource<'a> {
     fn file(self) -> &'a File {
         match self {
-            Self::Unscanned { file, .. } => file,
+            Self::Unscanned { file, .. } | Self::Owned { file, .. } => file,
             Self::Authenticated(stream) => stream.file(),
         }
     }
 
     fn length(self) -> u64 {
         match self {
-            Self::Unscanned { length, .. } => length,
+            Self::Unscanned { length, .. } | Self::Owned { length, .. } => length,
             Self::Authenticated(stream) => stream.length(),
         }
     }
@@ -316,6 +322,13 @@ pub(crate) fn copy_private(
     let file = source.file();
     let length = source.length();
     let before = validate_source(file, length)?;
+    if let CopySource::Owned { fingerprint, .. } = source {
+        if before != fingerprint {
+            return Err(invalid_copy(
+                "owned cut source facts changed before private copy",
+            ));
+        }
+    }
     if let CopySource::Authenticated(stream) = source {
         if before != stream.fingerprint() {
             return Err(invalid_copy(
@@ -336,15 +349,23 @@ pub(crate) fn copy_private(
     } else {
         new_private_file(staging, name)?
     };
-    if prepared.method == CloneDiskMethod::SparseCopy {
+    if prepared.method == CloneDiskMethod::SparseCopy && matches!(source, CopySource::Owned { .. })
+    {
+        copy_owned_sparse(file, &prepared.file, length)?;
+    } else if prepared.method == CloneDiskMethod::SparseCopy {
         let chunk_size = match source {
             CopySource::Authenticated(stream) => stream.map().chunk_size(),
-            CopySource::Unscanned { .. } => vm_spec::stream_map::ChunkSize::DISK,
+            CopySource::Unscanned { .. } | CopySource::Owned { .. } => {
+                vm_spec::stream_map::ChunkSize::DISK
+            }
         };
         let mut hasher = StreamHasher::with_writeback(chunk_size, writeback);
         let scan = match source {
             CopySource::Unscanned { file, length } => {
                 hasher.copy_file_and_hash(file, length, &prepared.file)?
+            }
+            CopySource::Owned { .. } => {
+                return Err(invalid_copy("owned copy entered identity lane"))
             }
             CopySource::Authenticated(stream) => {
                 hasher.copy_authenticated(stream, &prepared.file)?
@@ -364,6 +385,44 @@ pub(crate) fn copy_private(
     validate_destination(file, &prepared.file, length)?;
     validate_owned_entry(&prepared.directory, &prepared.name, &prepared.file)?;
     Ok(prepared)
+}
+
+/// Copy only allocated extents. Sparse classification is not content identity.
+fn copy_owned_sparse(source: &File, destination: &File, length: u64) -> io::Result<()> {
+    use nix::unistd::{lseek, Whence};
+    destination.set_len(length)?;
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut position = 0;
+    while position < length {
+        let start = match lseek(source, position as i64, Whence::SeekData) {
+            Ok(offset) => offset as u64,
+            Err(nix::errno::Errno::ENXIO) => break,
+            Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOTSUP) => position,
+            Err(error) => return Err(io::Error::from(error)),
+        };
+        let end = match lseek(source, start as i64, Whence::SeekHole) {
+            Ok(offset) => (offset as u64).min(length),
+            Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOTSUP) => length,
+            Err(error) => return Err(io::Error::from(error)),
+        };
+        if start >= length {
+            break;
+        }
+        if end <= start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid owned cut extent",
+            ));
+        }
+        position = start;
+        while position < end {
+            let size = (end - position).min(buffer.len() as u64) as usize;
+            source.read_exact_at(&mut buffer[..size], position)?;
+            crate::storage::stream::write_sparse_at(destination, &buffer[..size], position)?;
+            position += size as u64;
+        }
+    }
+    Ok(())
 }
 
 fn invalid_copy(message: &'static str) -> RootDiskError {
@@ -2116,5 +2175,147 @@ mod tests {
             .set_len(original + (8 << 20))
             .unwrap();
         assert!(raw_disk_needs_growth(&path, original + (8 << 20)).unwrap());
+    }
+
+    #[test]
+    fn owned_sparse_copy_and_private_construction_never_create_content_maps() {
+        use crate::machine::root_disk::{
+            copy_owned_sparse, copy_private, CopyQualification, CopySource,
+        };
+        use crate::storage::identity_file::SourceFingerprint;
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("owned");
+        let writer = File::create(&source_path).unwrap();
+        let length = (4 << 20) + 19;
+        writer.set_len(length).unwrap();
+        writer.write_all_at(b"first", 3).unwrap();
+        writer.write_all_at(b"last", length - 4).unwrap();
+        drop(writer);
+        let source = File::open(&source_path).unwrap();
+        let before = SourceFingerprint::new(&source.metadata().unwrap());
+        let oracle = tempfile::tempfile().unwrap();
+        copy_owned_sparse(&source, &oracle, length).unwrap();
+        let directory =
+            crate::paths::OwnedDirectory::open_root(&temporary.path().join("private")).unwrap();
+        let copy = copy_private(
+            CopySource::Owned {
+                file: &source,
+                length,
+                fingerprint: before,
+            },
+            directory,
+            "disk.raw",
+            &mut CopyQualification::new(1),
+            crate::storage::stream::CopyWriteback::Buffered,
+        )
+        .unwrap();
+        assert!(copy.map().is_none());
+        assert!(copy.verification().is_none());
+        let grandchild_directory =
+            crate::paths::OwnedDirectory::open_root(&temporary.path().join("grandchild")).unwrap();
+        let grandchild = copy_private(
+            CopySource::Owned {
+                file: copy.file(),
+                length,
+                fingerprint: SourceFingerprint::new(&copy.file().metadata().unwrap()),
+            },
+            grandchild_directory,
+            "disk.raw",
+            &mut CopyQualification::new(1),
+            crate::storage::stream::CopyWriteback::Buffered,
+        )
+        .unwrap();
+        assert!(grandchild.map().is_none());
+        assert!(grandchild.verification().is_none());
+        let mut actual = vec![0; length as usize];
+        let mut expected = vec![0; length as usize];
+        copy.file().read_exact_at(&mut actual, 0).unwrap();
+        oracle.read_exact_at(&mut expected, 0).unwrap();
+        assert_eq!(actual, expected);
+        grandchild.file().read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(SourceFingerprint::new(&source.metadata().unwrap()), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux user/mount namespaces and mount(8); run explicitly"]
+    fn owned_copy_enospc_on_private_tmpfs() {
+        use crate::machine::root_disk::{
+            copy_owned_sparse, copy_private, CopyQualification, CopySource, RootDiskError,
+        };
+        use crate::storage::identity_file::SourceFingerprint;
+        const CHILD: &str = "SILO_OWNED_COPY_ENOSPC_MOUNT";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = std::path::PathBuf::from(path);
+            assert!(std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "-o", "size=1048576,mode=700", "tmpfs"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+            let directory = crate::paths::OwnedDirectory::open_existing_root(&path)
+                .unwrap()
+                .unwrap();
+            let source_directory = tempfile::tempdir().unwrap();
+            let source = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(source_directory.path().join("source"))
+                .unwrap();
+            source.write_all_at(&vec![0x51; 2 << 20], 0).unwrap();
+            let before = SourceFingerprint::new(&source.metadata().unwrap());
+            let ram_error = directory
+                .write_file("ram", &vec![0x32; 2 << 20])
+                .unwrap_err();
+            assert!(ram_error.to_string().contains("No space left"));
+            directory.remove_tree("ram").unwrap();
+            let output = File::create(path.join("sparse")).unwrap();
+            assert_eq!(
+                copy_owned_sparse(&source, &output, 2 << 20)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(nix::errno::Errno::ENOSPC as i32)
+            );
+            drop(output);
+            directory.remove_tree("sparse").unwrap();
+            let failure = copy_private(
+                CopySource::Owned {
+                    file: &source,
+                    length: 2 << 20,
+                    fingerprint: before,
+                },
+                directory.try_clone().unwrap(),
+                "child.raw",
+                &mut CopyQualification::new(1),
+                crate::storage::stream::CopyWriteback::Buffered,
+            )
+            .err()
+            .unwrap();
+            assert!(
+                matches!(&failure, RootDiskError::Io(error) if error.raw_os_error() == Some(nix::errno::Errno::ENOSPC as i32))
+            );
+            assert!(!path.join("child.raw").exists());
+            assert_eq!(SourceFingerprint::new(&source.metadata().unwrap()), before);
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--fork", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "machine::root_disk::tests::owned_copy_enospc_on_private_tmpfs",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD, temporary.path())
+            .status()
+            .unwrap();
+        assert!(
+            result.success(),
+            "private tmpfs ENOSPC experiment requires working user/mount namespaces"
+        );
     }
 }

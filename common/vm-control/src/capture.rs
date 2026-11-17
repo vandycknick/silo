@@ -4,8 +4,8 @@ use std::path::{Component, Path, PathBuf};
 
 use silod_spec::daemon::v1 as w;
 use vm_spec::capture::{
-    CaptureFullReason, CaptureMemoryEvidence, CaptureMemoryStats, CapturePauseDisposition,
-    CaptureSeedMethod, CaptureStateBinding, Sha256Digest,
+    CaptureFullReason, CaptureIdentityReadFallback, CaptureMemoryEvidence, CaptureMemoryStats,
+    CapturePauseDisposition, CaptureSeedMethod, CaptureStateBinding, Sha256Digest,
 };
 use vm_spec::lifecycle::{CapturePolicy, CaptureResumePolicy, Diagnostic, LiveId};
 
@@ -60,6 +60,58 @@ fn full_reason_from_wire(value: i32) -> Result<CaptureFullReason, ConversionErro
     }
 }
 
+fn identity_policy_to_wire(value: vm_spec::capture::CaptureIdentityPolicy) -> i32 {
+    use vm_spec::capture::CaptureIdentityPolicy as Policy;
+    (match value {
+        Policy::None => w::CaptureIdentityPolicy::None,
+        Policy::Full => w::CaptureIdentityPolicy::Full,
+        Policy::SinceAnchor => w::CaptureIdentityPolicy::SinceAnchor,
+    }) as i32
+}
+
+fn identity_policy_from_wire(
+    value: i32,
+) -> Result<vm_spec::capture::CaptureIdentityPolicy, ConversionError> {
+    use vm_spec::capture::CaptureIdentityPolicy as Policy;
+    match w::CaptureIdentityPolicy::try_from(value) {
+        Ok(w::CaptureIdentityPolicy::None) => Ok(Policy::None),
+        Ok(w::CaptureIdentityPolicy::Full) => Ok(Policy::Full),
+        Ok(w::CaptureIdentityPolicy::SinceAnchor) => Ok(Policy::SinceAnchor),
+        _ => Err(invalid(
+            "capture.memory.identity_policy",
+            "unknown or unspecified policy",
+        )),
+    }
+}
+
+fn identity_reason_to_wire(value: vm_spec::capture::CaptureIdentityFullReason) -> i32 {
+    use vm_spec::capture::CaptureIdentityFullReason as Reason;
+    (match value {
+        Reason::Requested => w::CaptureIdentityFullReason::Requested,
+        Reason::UnknownAnchorAfterFork => w::CaptureIdentityFullReason::UnknownAnchorAfterFork,
+        Reason::CoverageLost => w::CaptureIdentityFullReason::CoverageLost,
+        Reason::NoIdentifiedAnchor => w::CaptureIdentityFullReason::NoIdentifiedAnchor,
+    }) as i32
+}
+
+fn identity_reason_from_wire(
+    value: i32,
+) -> Result<vm_spec::capture::CaptureIdentityFullReason, ConversionError> {
+    use vm_spec::capture::CaptureIdentityFullReason as Reason;
+    match w::CaptureIdentityFullReason::try_from(value) {
+        Ok(w::CaptureIdentityFullReason::Requested) => Ok(Reason::Requested),
+        Ok(w::CaptureIdentityFullReason::UnknownAnchorAfterFork) => {
+            Ok(Reason::UnknownAnchorAfterFork)
+        }
+        Ok(w::CaptureIdentityFullReason::CoverageLost) => Ok(Reason::CoverageLost),
+        Ok(w::CaptureIdentityFullReason::NoIdentifiedAnchor) => Ok(Reason::NoIdentifiedAnchor),
+        _ => Err(invalid(
+            "capture.memory.identity_full_reason",
+            "unknown or unspecified reason",
+        )),
+    }
+}
+
 fn seed_method_to_wire(value: CaptureSeedMethod) -> i32 {
     (match value {
         CaptureSeedMethod::Clone => w::CaptureSeedMethod::Clone,
@@ -73,6 +125,44 @@ fn seed_method_from_wire(value: i32) -> Result<CaptureSeedMethod, ConversionErro
         Ok(w::CaptureSeedMethod::Rebuild) => Ok(CaptureSeedMethod::Rebuild),
         _ => Err(invalid(
             "capture.memory.stats.seed_method",
+            "unknown or unspecified enum",
+        )),
+    }
+}
+
+fn identity_read_fallback_to_wire(value: CaptureIdentityReadFallback) -> i32 {
+    (match value {
+        CaptureIdentityReadFallback::None => w::CaptureIdentityReadFallback::None,
+        CaptureIdentityReadFallback::CoverageLost => w::CaptureIdentityReadFallback::CoverageLost,
+        CaptureIdentityReadFallback::BaselineMismatch => {
+            w::CaptureIdentityReadFallback::BaselineMismatch
+        }
+        CaptureIdentityReadFallback::ExtentsUnavailable => {
+            w::CaptureIdentityReadFallback::ExtentsUnavailable
+        }
+        CaptureIdentityReadFallback::ExtentLimit => w::CaptureIdentityReadFallback::ExtentLimit,
+    }) as i32
+}
+
+fn identity_read_fallback_from_wire(
+    value: i32,
+) -> Result<CaptureIdentityReadFallback, ConversionError> {
+    match w::CaptureIdentityReadFallback::try_from(value) {
+        Ok(w::CaptureIdentityReadFallback::None) => Ok(CaptureIdentityReadFallback::None),
+        Ok(w::CaptureIdentityReadFallback::CoverageLost) => {
+            Ok(CaptureIdentityReadFallback::CoverageLost)
+        }
+        Ok(w::CaptureIdentityReadFallback::BaselineMismatch) => {
+            Ok(CaptureIdentityReadFallback::BaselineMismatch)
+        }
+        Ok(w::CaptureIdentityReadFallback::ExtentsUnavailable) => {
+            Ok(CaptureIdentityReadFallback::ExtentsUnavailable)
+        }
+        Ok(w::CaptureIdentityReadFallback::ExtentLimit) => {
+            Ok(CaptureIdentityReadFallback::ExtentLimit)
+        }
+        _ => Err(invalid(
+            "capture.memory.stats.full_identity_read_fallback",
             "unknown or unspecified enum",
         )),
     }
@@ -99,6 +189,8 @@ fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
         mode: policy_to_wire(value.mode),
         baseline: value.baseline.as_ref().map(ToString::to_string),
         full_reason: value.full_reason.map(full_reason_to_wire),
+        identity_policy: identity_policy_to_wire(value.identity_policy),
+        identity_full_reason: value.identity_full_reason.map(identity_reason_to_wire),
         identity_chunk_bytes: value.identity_chunk_bytes,
         changes: Some(w::CaptureRamChanges {
             byte_len: value.changes.byte_len,
@@ -130,6 +222,14 @@ fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
             extent_queries: stats.extent_queries,
             identity_bytes_hashed: stats.identity_bytes_hashed,
             whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
+            map_nodes_written: stats.map_nodes_written,
+            identity_dirty_pages: stats.identity_dirty_pages,
+            materialization_dirty_pages: stats.materialization_dirty_pages,
+            live_pages_classified: stats.live_pages_classified,
+            identity_zero_bytes_filled: stats.identity_zero_bytes_filled,
+            full_identity_read_fallback: identity_read_fallback_to_wire(
+                stats.full_identity_read_fallback,
+            ),
         }),
     }
 }
@@ -174,6 +274,11 @@ fn memory_from_wire(
             .map(|value| digest(value, "capture.memory.baseline"))
             .transpose()?,
         full_reason: value.full_reason.map(full_reason_from_wire).transpose()?,
+        identity_policy: identity_policy_from_wire(value.identity_policy)?,
+        identity_full_reason: value
+            .identity_full_reason
+            .map(identity_reason_from_wire)
+            .transpose()?,
         identity_chunk_bytes: value.identity_chunk_bytes,
         changes: vm_spec::capture::CaptureRamChanges {
             byte_len: changes.byte_len,
@@ -214,6 +319,14 @@ fn memory_from_wire(
             extent_queries: stats.extent_queries,
             identity_bytes_hashed: stats.identity_bytes_hashed,
             whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
+            map_nodes_written: stats.map_nodes_written,
+            identity_dirty_pages: stats.identity_dirty_pages,
+            materialization_dirty_pages: stats.materialization_dirty_pages,
+            live_pages_classified: stats.live_pages_classified,
+            identity_zero_bytes_filled: stats.identity_zero_bytes_filled,
+            full_identity_read_fallback: identity_read_fallback_from_wire(
+                stats.full_identity_read_fallback,
+            )?,
         },
     };
     memory
@@ -322,6 +435,14 @@ fn summary_to_wire(
         released: value.released,
         staging: staging_to_wire(&value.staging)?,
         memory: Some(memory_to_wire(&value.memory)),
+        first_snapshot_full_identity_reason: value
+            .first_snapshot_full_identity_reason
+            .as_ref()
+            .map(|reason| match reason {
+                libvm::SnapshotIdentityReason::UnknownAfterFork => {
+                    w::SnapshotIdentityReason::UnknownAfterFork as i32
+                }
+            }),
     })
 }
 
@@ -367,6 +488,18 @@ fn summary_from_wire(
         released: value.released,
         staging: staging_from_wire(value.staging)?,
         memory: memory_from_wire(required(value.memory, "capture.memory")?)?,
+        first_snapshot_full_identity_reason: value
+            .first_snapshot_full_identity_reason
+            .map(|reason| match w::SnapshotIdentityReason::try_from(reason) {
+                Ok(w::SnapshotIdentityReason::UnknownAfterFork) => {
+                    Ok(libvm::SnapshotIdentityReason::UnknownAfterFork)
+                }
+                _ => Err(invalid(
+                    "capture.first_snapshot_full_identity_reason",
+                    "unknown or unspecified reason",
+                )),
+            })
+            .transpose()?,
     };
     if summary.memory.binding.source_run != summary.run_id
         || summary.memory.binding.capture != summary.capture_id
@@ -559,6 +692,8 @@ mod tests {
             mode: vm_spec::lifecycle::CapturePolicy::Full,
             baseline: None,
             full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
+            identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
+            identity_full_reason: Some(vm_spec::capture::CaptureIdentityFullReason::Requested),
             identity_chunk_bytes: 65_536,
             changes: vm_spec::capture::CaptureRamChanges {
                 byte_len: 16,
@@ -594,7 +729,66 @@ mod tests {
                 released: true,
                 staging: format!("machines/{MACHINE}/captures/{CAPTURE}").into(),
                 memory: memory(),
+                first_snapshot_full_identity_reason: None,
             },
+        }
+    }
+
+    #[test]
+    fn fork_child_full_identity_reason_round_trips_and_rejects_unknown_reason() {
+        let mut snapshot = live();
+        snapshot.capture.first_snapshot_full_identity_reason =
+            Some(libvm::SnapshotIdentityReason::UnknownAfterFork);
+        snapshot.capture.memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
+        snapshot.capture.memory.full_reason = None;
+        snapshot.capture.memory.identity_full_reason =
+            Some(vm_spec::capture::CaptureIdentityFullReason::UnknownAnchorAfterFork);
+        let mut wire = live_snapshot_to_wire(&snapshot).unwrap();
+        assert_eq!(live_snapshot_from_wire(wire.clone()).unwrap(), snapshot);
+        wire.capture
+            .as_mut()
+            .unwrap()
+            .first_snapshot_full_identity_reason = Some(0);
+        assert!(live_snapshot_from_wire(wire).is_err());
+    }
+
+    #[test]
+    fn identity_full_reasons_round_trip_without_conflating_cold_boot_and_fork() {
+        use vm_spec::capture::CaptureIdentityFullReason as Reason;
+        for reason in [
+            Reason::Requested,
+            Reason::NoIdentifiedAnchor,
+            Reason::UnknownAnchorAfterFork,
+            Reason::CoverageLost,
+        ] {
+            let wire = crate::capture::identity_reason_to_wire(reason);
+            assert_eq!(
+                crate::capture::identity_reason_from_wire(wire).unwrap(),
+                reason
+            );
+        }
+        assert!(crate::capture::identity_reason_from_wire(0).is_err());
+    }
+
+    #[test]
+    fn identity_read_work_and_fallback_reasons_round_trip_strictly() {
+        use vm_spec::capture::CaptureIdentityReadFallback as Reason;
+        for reason in [
+            Reason::None,
+            Reason::CoverageLost,
+            Reason::BaselineMismatch,
+            Reason::ExtentsUnavailable,
+            Reason::ExtentLimit,
+        ] {
+            let mut value = live();
+            value.capture.memory.stats.full_identity_read_fallback = reason;
+            value.capture.memory.stats.live_pages_classified = 7;
+            value.capture.memory.stats.identity_zero_bytes_filled = 4096;
+            let wire = live_snapshot_to_wire(&value).unwrap();
+            assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
+        }
+        for value in [0, -1, 6, i32::MAX] {
+            assert!(crate::capture::identity_read_fallback_from_wire(value).is_err());
         }
     }
 
@@ -691,6 +885,9 @@ mod tests {
             .unwrap();
         memory.mode = w::CapturePolicy::Incremental as i32;
         memory.full_reason = None;
+        memory.identity_policy = w::CaptureIdentityPolicy::SinceAnchor as i32;
+        memory.identity_full_reason = None;
+        memory.changes.as_mut().unwrap().coverage = w::CaptureRamCoverage::Incremental as i32;
         assert!(live_snapshot_from_wire(incremental).is_err());
     }
 
@@ -729,6 +926,8 @@ mod tests {
         memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
         memory.baseline = Some(vm_spec::capture::Sha256Digest::of_bytes(b"baseline"));
         memory.full_reason = None;
+        memory.identity_policy = vm_spec::capture::CaptureIdentityPolicy::SinceAnchor;
+        memory.identity_full_reason = None;
         memory.changes.coverage = vm_spec::capture::CaptureRamCoverage::Incremental;
         memory.changes.baseline_stream = memory.baseline;
         memory.stats.full_bytes_written = 0;
@@ -914,6 +1113,8 @@ mod tests {
             memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
             memory.baseline = Some(vm_spec::capture::Sha256Digest::of_bytes(b"baseline"));
             memory.full_reason = None;
+            memory.identity_policy = vm_spec::capture::CaptureIdentityPolicy::SinceAnchor;
+            memory.identity_full_reason = None;
             memory.changes.coverage = vm_spec::capture::CaptureRamCoverage::Incremental;
             memory.changes.baseline_stream = memory.baseline;
             memory.stats.seed_method = method;

@@ -80,6 +80,8 @@ def marker(silo: Silo, name: str) -> str:
 def test_restore_inspection_rejects_writable_state_descriptors(
     silo: Silo, restore_image: str, restore_processes: list[shutdown.Process],
 ) -> None:
+    """Inspection emits one typed refusal, not a success report, for writable FDs."""
+    inspection_version = 2
     restore.create_source(silo, restore_image, profile="layered")
     own(silo, "restore-source", restore_processes)
     saved = restore.checkpoint(silo, "restore-source")
@@ -110,7 +112,7 @@ def test_restore_inspection_rejects_writable_state_descriptors(
                 stat = os.fstat(file.fileno())
                 entry.update(fd=file.fileno(), fileDevice=stat.st_dev, fileInode=stat.st_ino)
                 descriptors.append(file.fileno())
-            encoded = json.dumps({"version": 1, "restore": request, "network": False}) + "\n"
+            encoded = json.dumps({"version": inspection_version, "restore": request, "network": False}) + "\n"
             result = subprocess.run(
                 [str(silo.ws.config.runtime_dir / "bin/silo-vmm"), "inspect-restore"],
                 input=encoded, text=True, capture_output=True,
@@ -123,10 +125,23 @@ def test_restore_inspection_rejects_writable_state_descriptors(
             return result
 
     rejected = inspect(True)
-    assert rejected.returncode != 0 and rejected.stdout == "", rejected
+    assert rejected.returncode != 0, rejected
+    assert json.loads(rejected.stdout) == {
+        "version": inspection_version,
+        "refusal": {
+            "pin": "restore-inputs",
+            "expected": "exact supported restore inputs",
+            "actual": "restore descriptor is not a read-only buffered regular file",
+            "stage": "restore-preflight",
+        },
+    }, rejected
     accepted = inspect(False)
     assert accepted.returncode == 0, accepted.stderr
-    assert json.loads(accepted.stdout)["checkpoint"] == request["checkpoint"]
+    report = json.loads(accepted.stdout)
+    assert report["version"] == inspection_version and "refusal" not in report, report
+    assert report["authority"] == {
+        "kind": "identified-snapshot", "checkpoint": request["authority"]["checkpoint"],
+    }, report
     stop_owned(silo, "inspection-source", restore_processes)
     stop_owned(silo, "restore-source", restore_processes)
 

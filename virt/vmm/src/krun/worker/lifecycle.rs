@@ -105,53 +105,80 @@ pub(crate) struct MemoryCapture {
     pub(crate) memory_generation: u64,
     pub(crate) writers_closed: bool,
     pub(crate) mode: vm_spec::lifecycle::CapturePolicy,
+    pub(crate) identity_policy: vm_spec::capture::CaptureIdentityPolicy,
+    pub(crate) identity_full_reason: Option<vm_spec::capture::CaptureIdentityFullReason>,
+    pub(crate) predecessor_generation: u64,
     pub(crate) baseline: Option<vm_spec::capture::Sha256Digest>,
     pub(crate) full_reason: Option<vm_spec::capture::CaptureFullReason>,
     pub(crate) identity_chunk_bytes: u32,
-    pub(crate) changes: vm_spec::capture::CaptureRamChanges,
+    pub(crate) changes: crate::virt::lifecycle::CaptureRamChangesAuthority,
     pub(crate) changes_output: OutputReceipt,
     pub(crate) stats: Box<vm_spec::capture::CaptureMemoryStats>,
 }
 
 impl MemoryCapture {
     fn valid_for(&self, preparation: &CapturePreparation) -> bool {
-        use vm_spec::capture::{CaptureFullReason, CaptureRamCoverage};
-        use vm_spec::lifecycle::CapturePolicy;
+        use crate::virt::lifecycle::CaptureRamChangesAuthority;
+        use vm_spec::capture::{CaptureIdentityPolicy, CaptureRamCoverage};
         if self.memory_generation == 0
+            || self.predecessor_generation >= self.memory_generation
             || self.stats.logical_bytes != self.ram.length
-            || self.identity_chunk_bytes != 1 << 16
-            || self.changes.validate(self.ram.length).is_err()
-            || self.changes.byte_len != self.changes_output.length
-            || self.changes.baseline_stream != self.baseline
-            || self.changes.coverage
-                != match self.mode {
-                    CapturePolicy::Full => CaptureRamCoverage::Full,
-                    CapturePolicy::Incremental => CaptureRamCoverage::Incremental,
-                }
         {
             return false;
         }
-        match self.mode {
-            CapturePolicy::Full => {
-                self.baseline.is_none()
-                    && self.full_reason.is_some()
-                    && self.changes.coverage == CaptureRamCoverage::Full
-                    && match preparation.policy {
-                        CapturePolicy::Full => {
-                            self.full_reason == Some(CaptureFullReason::Requested)
-                        }
-                        CapturePolicy::Incremental => {
-                            self.full_reason != Some(CaptureFullReason::Requested)
-                        }
+        let materialization_valid = match self.mode {
+            vm_spec::lifecycle::CapturePolicy::Full => {
+                self.full_reason.is_some()
+                    && if preparation.policy == vm_spec::lifecycle::CapturePolicy::Full {
+                        self.full_reason == Some(vm_spec::capture::CaptureFullReason::Requested)
+                    } else {
+                        self.full_reason != Some(vm_spec::capture::CaptureFullReason::Requested)
                     }
             }
-            CapturePolicy::Incremental => {
-                preparation.policy == CapturePolicy::Incremental
+            vm_spec::lifecycle::CapturePolicy::Incremental => {
+                preparation.policy == vm_spec::lifecycle::CapturePolicy::Incremental
                     && self.full_reason.is_none()
-                    && self.baseline.is_some()
-                    && self.baseline.map(|digest| Digest32(*digest.as_bytes()))
-                        == preparation.baseline
             }
+        };
+        if !materialization_valid {
+            return false;
+        }
+        match (&self.changes, self.identity_policy) {
+            (CaptureRamChangesAuthority::None, CaptureIdentityPolicy::None) => {
+                preparation.identity_policy == CaptureIdentityPolicy::None
+                    && self.baseline.is_none()
+                    && self.identity_full_reason.is_none()
+                    && self.changes_output.length == 0
+                    && self.stats.identity_bytes_hashed == 0
+                    && self.stats.map_nodes_written == 0
+                    && self.stats.whole_file_bytes_hashed == 0
+            }
+            (CaptureRamChangesAuthority::Identified(changes), policy)
+                if policy != CaptureIdentityPolicy::None =>
+            {
+                preparation.identity_policy != CaptureIdentityPolicy::None
+                    && self.identity_chunk_bytes == 1 << 16
+                    && changes.validate(self.ram.length).is_ok()
+                    && changes.byte_len == self.changes_output.length
+                    && changes.baseline_stream == self.baseline
+                    && match policy {
+                        CaptureIdentityPolicy::Full => {
+                            changes.coverage == CaptureRamCoverage::Full
+                                && self.baseline.is_none()
+                                && self.identity_full_reason.is_some()
+                        }
+                        CaptureIdentityPolicy::SinceAnchor => {
+                            changes.coverage == CaptureRamCoverage::Incremental
+                                && preparation.identity_policy == CaptureIdentityPolicy::SinceAnchor
+                                && self.identity_full_reason.is_none()
+                                && self.baseline.is_some()
+                                && self.baseline.map(|digest| Digest32(*digest.as_bytes()))
+                                    == preparation.baseline
+                        }
+                        CaptureIdentityPolicy::None => false,
+                    }
+            }
+            _ => false,
         }
     }
 }
@@ -313,7 +340,7 @@ pub(crate) trait NativeLifecycle: Send + Sync + 'static {
         binding: &CaptureStateBinding,
         ram: File,
         layout: File,
-        stream: Digest32,
+        authority: crate::virt::lifecycle::CaptureBaselineAuthority,
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<u64, NativeFailure>;
@@ -1075,7 +1102,7 @@ enum Admission<T, C> {
         binding: CaptureStateBinding,
         ram: File,
         layout: File,
-        stream: Digest32,
+        authority: crate::virt::lifecycle::CaptureBaselineAuthority,
         deadline: Instant,
     },
     Abandon {
@@ -1733,7 +1760,7 @@ impl<N: NativeLifecycle> Shared<N> {
                     operation,
                     ram: ram_identity,
                     layout: layout_identity,
-                    stream,
+                    authority,
                     timeout,
                 },
                 LifecycleRights::SealedMemory(files),
@@ -1753,6 +1780,20 @@ impl<N: NativeLifecycle> Shared<N> {
                     ) => (ticket.clone(), memory, binding.clone()),
                     _ => return Err(LifecycleRejection::CaptureStage),
                 };
+                let authority_matches = match authority {
+                    crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut {
+                        materialization_generation,
+                    } => {
+                        memory.identity_policy == vm_spec::capture::CaptureIdentityPolicy::None
+                            && *materialization_generation == memory.memory_generation
+                    }
+                    crate::virt::lifecycle::CaptureBaselineAuthority::Identified { .. } => {
+                        memory.identity_policy != vm_spec::capture::CaptureIdentityPolicy::None
+                    }
+                };
+                if !authority_matches {
+                    return Err(LifecycleRejection::CaptureStage);
+                }
                 for (role, declared, receipt) in [
                     (OutputRole::Ram, *ram_identity, memory.ram),
                     (OutputRole::Layout, *layout_identity, memory.layout),
@@ -1776,7 +1817,7 @@ impl<N: NativeLifecycle> Shared<N> {
                     binding,
                     ram: files.ram,
                     layout: files.layout,
-                    stream: *stream,
+                    authority: *authority,
                     deadline: now + *timeout,
                 })
             }
@@ -2380,9 +2421,10 @@ impl<N: NativeLifecycle> Shared<N> {
                         binding,
                         ram,
                         layout,
-                        stream,
+                        authority,
                         deadline,
-                    } => shared.run_accept(capture, ticket, binding, ram, layout, stream, deadline),
+                    } => shared
+                        .run_accept(capture, ticket, binding, ram, layout, authority, deadline),
                     Admission::Abandon {
                         capture,
                         ticket,
@@ -3383,10 +3425,13 @@ impl<N: NativeLifecycle> Shared<N> {
                             memory_generation: memory.memory_generation,
                             writers_closed: memory.writers_closed,
                             mode: memory.mode,
+                            identity_policy: memory.identity_policy,
+                            identity_full_reason: memory.identity_full_reason,
+                            predecessor_generation: memory.predecessor_generation,
                             baseline: memory.baseline,
                             full_reason: memory.full_reason,
                             identity_chunk_bytes: memory.identity_chunk_bytes,
-                            changes: Box::new(memory.changes.clone()),
+                            changes: memory.changes.clone(),
                             changes_output: memory.changes_output,
                             stats: memory.stats.clone(),
                         }
@@ -3434,12 +3479,13 @@ impl<N: NativeLifecycle> Shared<N> {
         binding: CaptureStateBinding,
         ram: File,
         layout: File,
-        stream: Digest32,
+        authority: crate::virt::lifecycle::CaptureBaselineAuthority,
         deadline: Instant,
     ) -> CommandOutcome {
         let result = self.native_operation().and_then(|operation| {
-            self.native
-                .accept_capture(&ticket, &binding, ram, layout, stream, operation, deadline)
+            self.native.accept_capture(
+                &ticket, &binding, ram, layout, authority, operation, deadline,
+            )
         });
         let accepted = match result {
             Ok(memory_generation) => Ok(memory_generation),
@@ -4042,6 +4088,7 @@ mod tests {
             capture,
             CaptureRecord {
                 preparation: CapturePreparation {
+                    identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
                     outputs: CaptureOutputIdentities {
                         execution: identity(1),
                         devices: identity(2),
@@ -4092,6 +4139,9 @@ mod tests {
         NativeCaptureStatus::CandidateComplete {
             ticket: TICKET,
             memory: MemoryCapture {
+                identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
+                identity_full_reason: Some(vm_spec::capture::CaptureIdentityFullReason::Requested),
+                predecessor_generation: 0,
                 binding: Box::new(binding.clone()),
                 ram: receipt(3),
                 layout: receipt(4),
@@ -4101,13 +4151,15 @@ mod tests {
                 baseline: None,
                 full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
                 identity_chunk_bytes: 1 << 16,
-                changes: vm_spec::capture::CaptureRamChanges {
-                    byte_len: 16,
-                    sha256: vm_spec::capture::Sha256Digest::of_bytes(b"changes"),
-                    record_count: 0,
-                    coverage: vm_spec::capture::CaptureRamCoverage::Full,
-                    baseline_stream: None,
-                },
+                changes: crate::virt::lifecycle::CaptureRamChangesAuthority::Identified(Box::new(
+                    vm_spec::capture::CaptureRamChanges {
+                        byte_len: 16,
+                        sha256: vm_spec::capture::Sha256Digest::of_bytes(b"changes"),
+                        record_count: 0,
+                        coverage: vm_spec::capture::CaptureRamCoverage::Full,
+                        baseline_stream: None,
+                    },
+                )),
                 changes_output: OutputReceipt {
                     length: 16,
                     ..receipt(5)
@@ -4193,10 +4245,13 @@ mod tests {
             memory_generation: memory.memory_generation,
             writers_closed: memory.writers_closed,
             mode: memory.mode,
+            identity_policy: memory.identity_policy,
+            identity_full_reason: memory.identity_full_reason,
+            predecessor_generation: memory.predecessor_generation,
             baseline: memory.baseline,
             full_reason: memory.full_reason,
             identity_chunk_bytes: memory.identity_chunk_bytes,
-            changes: Box::new(memory.changes),
+            changes: memory.changes,
             changes_output: memory.changes_output,
             stats: memory.stats,
         };
@@ -4803,6 +4858,16 @@ mod tests {
         assert_eq!(journal.last_native, u64::MAX);
     }
 
+    fn identified_changes(
+        memory: &mut crate::krun::worker::lifecycle::MemoryCapture,
+    ) -> &mut vm_spec::capture::CaptureRamChanges {
+        match &mut memory.changes {
+            crate::virt::lifecycle::CaptureRamChangesAuthority::Identified(changes) => changes,
+            crate::virt::lifecycle::CaptureRamChangesAuthority::None => {
+                panic!("identified changes")
+            }
+        }
+    }
     #[test]
     fn candidate_projection_rejects_wrong_policy_baseline_coverage_and_bounds() {
         for defect in 0..7 {
@@ -4814,7 +4879,7 @@ mod tests {
                 panic!("candidate");
             };
             match defect {
-                0 => memory.changes.byte_len = 0,
+                0 => identified_changes(memory).byte_len = 0,
                 1 => memory.identity_chunk_bytes = 8 << 20,
                 2 => memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental,
                 3 => {
@@ -4822,7 +4887,7 @@ mod tests {
                         Some(vm_spec::capture::Sha256Digest::of_bytes(b"wrong baseline"))
                 }
                 4 => memory.stats.logical_bytes += 1,
-                5 => memory.changes.record_count = 2,
+                5 => identified_changes(memory).record_count = 2,
                 _ => memory.full_reason = Some(vm_spec::capture::CaptureFullReason::NoBaseline),
             }
             let revision = journal.pending_revision(capture).unwrap();
@@ -4844,19 +4909,22 @@ mod tests {
         let mut preparation = journal.captures[&capture].preparation.clone();
         let baseline = Sha256Digest::of_bytes(b"baseline");
         preparation.policy = CapturePolicy::Incremental;
+        preparation.identity_policy = vm_spec::capture::CaptureIdentityPolicy::SinceAnchor;
         preparation.baseline = Some(Digest32(*baseline.as_bytes()));
         let NativeCaptureStatus::CandidateComplete { mut memory, .. } = candidate(&binding) else {
             panic!("candidate");
         };
         memory.mode = CapturePolicy::Incremental;
+        memory.identity_policy = vm_spec::capture::CaptureIdentityPolicy::SinceAnchor;
+        memory.identity_full_reason = None;
         memory.baseline = Some(baseline);
         memory.full_reason = None;
         memory.ram.length = (1 << 16) + 4096;
         memory.stats.logical_bytes = memory.ram.length;
-        memory.changes.coverage = CaptureRamCoverage::Incremental;
-        memory.changes.baseline_stream = Some(baseline);
+        identified_changes(&mut memory).coverage = CaptureRamCoverage::Incremental;
+        identified_changes(&mut memory).baseline_stream = Some(baseline);
         assert!(memory.valid_for(&preparation));
-        memory.changes.baseline_stream = Some(Sha256Digest::of_bytes(b"foreign"));
+        identified_changes(&mut memory).baseline_stream = Some(Sha256Digest::of_bytes(b"foreign"));
         assert!(!memory.valid_for(&preparation));
     }
 
@@ -4916,6 +4984,37 @@ mod tests {
         assert_eq!(
             journal.disk_settlement_outcome(capture, &opposite),
             Err(LifecycleRejection::RequestConflict)
+        );
+    }
+    #[test]
+    fn owned_candidate_has_no_identity_authority_or_identity_work() {
+        use crate::virt::lifecycle::CaptureRamChangesAuthority;
+        let mut journal = Journal::<(), u32>::default();
+        let capture = Uuid::new_v4();
+        let binding = memory_pending(&mut journal, capture);
+        let mut preparation = journal.captures[&capture].preparation.clone();
+        preparation.identity_policy = vm_spec::capture::CaptureIdentityPolicy::None;
+        let NativeCaptureStatus::CandidateComplete { mut memory, .. } = candidate(&binding) else {
+            panic!("candidate");
+        };
+        memory.identity_policy = vm_spec::capture::CaptureIdentityPolicy::None;
+        memory.identity_full_reason = None;
+        memory.changes = CaptureRamChangesAuthority::None;
+        memory.changes_output.length = 0;
+        assert!(memory.valid_for(&preparation));
+        for counter in 0..3 {
+            let mut invalid = memory.clone();
+            match counter {
+                0 => invalid.stats.identity_bytes_hashed = 1,
+                1 => invalid.stats.map_nodes_written = 1,
+                _ => invalid.stats.whole_file_bytes_hashed = 1,
+            }
+            assert!(!invalid.valid_for(&preparation));
+        }
+        preparation.identity_policy = vm_spec::capture::CaptureIdentityPolicy::Full;
+        assert!(
+            !memory.valid_for(&preparation),
+            "identified plans never accept owned changes"
         );
     }
 }

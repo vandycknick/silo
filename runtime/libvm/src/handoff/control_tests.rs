@@ -17,7 +17,7 @@ use crate::{DiskStorage, IncludedDisk, MachineId, MachineOwnership, PrivatePath}
 
 /// A real managed disk provides a lockable barrier between reservation and
 /// sealing, without substituting any participant or storage implementation.
-async fn add_managed_disk(source: &Participant, machine: MachineId) -> uuid::Uuid {
+pub(crate) async fn add_managed_disk(source: &Participant, machine: MachineId) -> uuid::Uuid {
     let mut config = source
         .runtime
         .machine_config(machine)
@@ -50,6 +50,7 @@ async fn add_managed_disk(source: &Participant, machine: MachineId) -> uuid::Uui
             },
         },
     });
+    storage.bind_disk_identity_inventory(&config.spec);
     source
         .runtime
         .native_store()

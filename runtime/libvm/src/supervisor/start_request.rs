@@ -429,7 +429,7 @@ mod tests {
                 file_device: metadata.dev(),
                 file_inode: metadata.ino(),
                 length: metadata.len(),
-                identity,
+                authority: vm_spec::restore::RestoreObjectAuthority::Identified { identity },
             };
             files.push(file);
             object
@@ -442,7 +442,10 @@ mod tests {
             .unwrap();
         let restore = RestoreRequest {
             version: vm_spec::restore::RESTORE_REQUEST_VERSION,
-            checkpoint: vm_spec::capture::Sha256Digest::of_bytes(b"checkpoint"),
+            authority: vm_spec::restore::RestoreAuthority::IdentifiedSnapshot {
+                checkpoint: vm_spec::capture::Sha256Digest::of_bytes(b"checkpoint"),
+                evidence: Box::new(evidence.clone()),
+            },
             activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
             freeze_operation_id: evidence.freeze_operation_id.clone().unwrap(),
             start_paused: true,
@@ -455,8 +458,7 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
             ),
-            objects,
-            evidence,
+            objects: objects.into(),
             lowers: Vec::new(),
             network: None,
             ssh_trusted_ca: None,
@@ -476,8 +478,14 @@ mod tests {
         let decoded: RestoreRequest = serde_json::from_value(value["restore"].clone()).unwrap();
         decoded.validate().unwrap();
         assert_eq!(decoded, restore);
-        assert_eq!(decoded.objects[0].identity, root.id());
-        assert_eq!(decoded.objects[4].identity, root.id());
+        for index in [0, 4] {
+            assert_eq!(
+                decoded.objects[index].authority,
+                vm_spec::restore::RestoreObjectAuthority::Identified {
+                    identity: root.id()
+                }
+            );
+        }
     }
 
     fn request_with_environment_value(value: String) -> VmmStartRequest {

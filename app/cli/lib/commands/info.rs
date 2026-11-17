@@ -94,6 +94,17 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
         ),
     ];
 
+    rows.push((
+        "RAM content identity".into(),
+        identity_summary(&view.ram_identity),
+    ));
+    for disk in &view.disk_identities {
+        rows.push((
+            format!("Disk {} content identity", disk.attachment_index),
+            identity_summary(&disk.identity),
+        ));
+    }
+
     if let Some(reclaim) = &view.host_memory_reclaim {
         rows.push(("Host memory reclaim".to_string(), reclaim.summary()));
     }
@@ -244,6 +255,15 @@ fn append_issues(rows: &mut Vec<(String, String)>, name: &str, issues: &[libvm::
     ));
 }
 
+fn identity_summary(identity: &libvm::ContentIdentityState) -> String {
+    match identity {
+        libvm::ContentIdentityState::UnknownAfterFork =>
+            "Not yet known because this machine was forked; its first snapshot will compute it in full".into(),
+        libvm::ContentIdentityState::Unknown => "Not yet known".into(),
+        libvm::ContentIdentityState::Identified { root } => format!("Identified ({root})"),
+    }
+}
+
 fn process_summary(process: &libvm::ProcessConfig) -> String {
     format!(
         "entrypoint={:?} command={:?} cwd={:?} user={:?}",
@@ -305,6 +325,17 @@ fn provision_summary(provision: &crate::view::MachineGuestProvisionReportView) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fork_identity_explains_first_snapshot_cost() {
+        let text =
+            crate::commands::info::identity_summary(&libvm::ContentIdentityState::UnknownAfterFork);
+        assert!(text.contains("forked") && text.contains("first snapshot will compute it in full"));
+        assert_eq!(
+            crate::commands::info::identity_summary(&libvm::ContentIdentityState::Unknown),
+            "Not yet known"
+        );
+    }
+
     #[test]
     fn contained_init_summary_distinguishes_image_init_from_agent_pid() {
         let boot = crate::view::MachineGuestBootReportView {

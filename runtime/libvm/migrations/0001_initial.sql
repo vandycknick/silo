@@ -591,16 +591,22 @@ CREATE TRIGGER machine_config_fork_reserved_update BEFORE UPDATE OF name ON mach
 WHEN EXISTS(SELECT 1 FROM live_fork_child WHERE name=NEW.name AND name_reserved=1 AND machine_id!=NEW.id)
 BEGIN SELECT RAISE(ABORT,'machine name reserved by live fork'); END;
 CREATE TABLE local_cut (
-    cut_id TEXT PRIMARY KEY NOT NULL,
+    cut_id TEXT PRIMARY KEY NOT NULL CHECK(length(cut_id)=36),
     operation_id TEXT UNIQUE NOT NULL REFERENCES live_fork(operation_id) ON DELETE RESTRICT,
-    record_json BLOB NOT NULL
+    record_json BLOB NOT NULL CHECK(
+        json_extract(record_json,'$.plan.identityPolicy') IS 'none'
+        AND json_extract(record_json,'$.captureId') IS cut_id
+        AND json_extract(record_json,'$.cutId') IS cut_id
+    )
 );
 CREATE TABLE storage_operation_cut (
     operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
     cut_id TEXT NOT NULL REFERENCES local_cut(cut_id) ON DELETE RESTRICT,
-    PRIMARY KEY(operation_id,cut_id)
+    role TEXT NOT NULL DEFAULT 'operation' CHECK(role IN ('operation','ram-baseline','ram-mapping')),
+    PRIMARY KEY(operation_id,cut_id,role)
 );
 CREATE INDEX storage_operation_cut_reverse ON storage_operation_cut(cut_id,operation_id);
+CREATE UNIQUE INDEX storage_operation_ram_baseline ON storage_operation_cut(operation_id) WHERE role='ram-baseline';
 CREATE TABLE capture_resource_reservation (
     operation_id TEXT PRIMARY KEY NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
     charge_json BLOB NOT NULL
@@ -608,7 +614,10 @@ CREATE TABLE capture_resource_reservation (
 CREATE TABLE fork_event (
     operation_id TEXT NOT NULL REFERENCES live_fork(operation_id) ON DELETE RESTRICT,
     child_index INTEGER,
-    phase TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN (
+        'api_entered','admission_committed','capture_submitted','source_settled',
+        'cut_retained','constructing','prepared','durable','activating','running','finished'
+    )),
     monotonic_ns INTEGER NOT NULL CHECK(monotonic_ns>=0)
 );
 CREATE UNIQUE INDEX fork_parent_event ON fork_event(operation_id,phase) WHERE child_index IS NULL;

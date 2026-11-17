@@ -138,6 +138,12 @@ pub enum LiveCaptureSource {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotIdentityReason {
+    UnknownAfterFork,
+}
+
 /// Capture identity and outcome of a published live checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -148,6 +154,7 @@ pub struct LiveCaptureSummary {
     pub run_id: LiveId,
     pub resume_policy: CaptureResumePolicy,
     pub memory: vm_spec::capture::CaptureMemoryEvidence,
+    pub first_snapshot_full_identity_reason: Option<SnapshotIdentityReason>,
     pub pause: CapturePauseDisposition,
     pub source_outcome: LiveCaptureSource,
     pub source_error: Option<Diagnostic>,
@@ -463,7 +470,6 @@ impl Machine {
                 self.runtime(),
                 self.machine_id(),
                 capture_id,
-                &mut None,
                 progress,
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
@@ -596,12 +602,17 @@ fn request_digest(record: &CaptureRecord) -> Result<Sha256Digest, LibVmError> {
     ))
 }
 
+enum CoherentRecord {
+    Identified(Box<CaptureEvidence>),
+    OwnedLocalCut,
+}
+
 /// A coherent, plan-correlated seal on disk. Storage re-verifies every byte
 /// before publication; this only decides publish versus abandon.
 fn coherent_record(
     runtime: &Runtime,
     record: &CaptureRecord,
-) -> Result<Option<CaptureEvidence>, LibVmError> {
+) -> Result<Option<CoherentRecord>, LibVmError> {
     let Some(staging) = open_staging(runtime, record)? else {
         return Ok(None);
     };
@@ -609,6 +620,11 @@ fn coherent_record(
     else {
         return Ok(None);
     };
+    if record.plan.identity_policy == vm_spec::capture::CaptureIdentityPolicy::None {
+        let cut = vm_spec::capture::OwnedLocalCut::decode(&bytes).map_err(protocol)?;
+        crate::store::capture::validate_owned_cut(&staging, &record.plan, &cut)?;
+        return Ok(Some(CoherentRecord::OwnedLocalCut));
+    }
     let evidence = match CaptureEvidence::decode(&bytes) {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -622,12 +638,16 @@ fn coherent_record(
     evidence
         .validate_against_plan(&record.plan, &request_digest(record)?)
         .map_err(|error| capture_error(&record.plan.capture_id, error))?;
-    Ok(Some(evidence))
+    Ok(Some(CoherentRecord::Identified(Box::new(evidence))))
 }
 
 /// Only the sole-reaper's positive end observation permits a manager to take
 /// over identity completion. A live monitor remains the only capture writer.
 async fn recover_cut(runtime: &Runtime, record: &CaptureRecord) -> Result<(), LibVmError> {
+    if record.plan.identity_policy == vm_spec::capture::CaptureIdentityPolicy::None {
+        // An incomplete owned cut cannot be recreated by hashing or recapture.
+        return Ok(());
+    }
     let _lock = runtime.lock_machine_config(record.machine_id).await?;
     let Some(staging) = open_staging(runtime, record)? else {
         return Ok(());
@@ -859,7 +879,13 @@ fn source_record(
     runtime: &Runtime,
     record: &CaptureRecord,
 ) -> Result<Option<CaptureSourceRecord>, LibVmError> {
-    let Some(evidence) = coherent_record(runtime, record)? else {
+    if record.plan.identity_policy == vm_spec::capture::CaptureIdentityPolicy::None {
+        // Owned cuts have no identified continuation record. Their source
+        // outcome comes from the monitor, or remains unknown after its run ends.
+        // Relocation has already removed the original staging payload paths.
+        return Ok(None);
+    }
+    let Some(CoherentRecord::Identified(evidence)) = coherent_record(runtime, record)? else {
         return Ok(None);
     };
     let Some(staging) = open_staging(runtime, record)? else {
@@ -1185,17 +1211,73 @@ async fn release(
     }
 }
 
+fn validate_capture_success(
+    runtime: &Runtime,
+    record: &CaptureRecord,
+    success: &vm_spec::capture::CaptureSuccess,
+) -> Result<(), LibVmError> {
+    success.validate().map_err(protocol)?;
+    if success.capture_id() != &record.plan.capture_id {
+        return Err(protocol("native success names another capture"));
+    }
+    match (&record.plan.identity_policy, success) {
+        (
+            vm_spec::capture::CaptureIdentityPolicy::None,
+            vm_spec::capture::CaptureSuccess::OwnedLocalCut { cut, cut_token },
+        ) => {
+            if let CapturePauseAuthority::Borrow { token, .. } = &record.plan.pause {
+                if token != cut_token {
+                    return Err(protocol(
+                        "owned cut success names another borrowed pause generation",
+                    ));
+                }
+            }
+            if let Some(bytes) = &record.evidence {
+                let expected =
+                    vm_spec::capture::OwnedLocalCut::decode(bytes.as_bytes()).map_err(protocol)?;
+                if expected != **cut {
+                    return Err(protocol(
+                        "owned cut native completion differs from its retained producer receipt",
+                    ));
+                }
+                return Ok(());
+            }
+            let staging = open_staging(runtime, record)?
+                .ok_or_else(|| protocol("owned cut staging is missing"))?;
+            crate::store::capture::validate_owned_cut(&staging, &record.plan, cut)?;
+            match read_bounded(&staging, CAPTURE_EVIDENCE_FILE, MAX_CAPTURE_RECORD_BYTES)? {
+                Some(bytes)
+                    if vm_spec::capture::OwnedLocalCut::decode(&bytes).map_err(protocol)?
+                        != **cut =>
+                {
+                    Err(protocol(
+                        "owned cut file receipt differs from exact native completion",
+                    ))
+                }
+                Some(_) => Ok(()),
+                None => staging.write_file_atomic(
+                    CAPTURE_EVIDENCE_FILE,
+                    &cut.canonical_bytes().map_err(protocol)?,
+                ),
+            }
+        }
+        (
+            vm_spec::capture::CaptureIdentityPolicy::Full
+            | vm_spec::capture::CaptureIdentityPolicy::SinceAnchor,
+            vm_spec::capture::CaptureSuccess::Identified { .. },
+        ) => Ok(()),
+        _ => Err(protocol(
+            "native capture success has the wrong input authority",
+        )),
+    }
+}
+
 /// Advance one retained capture by observed facts only. Never Resume, never
 /// reinterpret an absent continuation, never resubmit under a new identity.
-///
-/// When this step retains a fork's local cut, the writable disks it
-/// authenticated are handed to `retained` for that fork's own cut opening.
-/// Callers that never open the cut pass a fresh `None` and drop it.
 pub(crate) async fn advance(
     runtime: &Runtime,
     machine_id: MachineId,
     capture_id: Uuid,
-    retained: &mut Option<crate::store::fork::AuthenticatedCutDisks>,
     progress: Option<&LiveOperationProgressSender>,
     lock_policy: crate::storage::pool::PublicationLockPolicy,
 ) -> Result<CaptureProgress, LibVmError> {
@@ -1260,11 +1342,17 @@ pub(crate) async fn advance(
     let record = if !matches!(
         record.state,
         CaptureState::Published { .. } | CaptureState::Local { .. }
-    ) && coherent_record(runtime, &record)?.is_some()
+    ) && (match record.fork_operation_id {
+        Some(operation) => runtime
+            .native_store()?
+            .local_cut(operation)
+            .await?
+            .is_some(),
+        None => false,
+    } || coherent_record(runtime, &record)?.is_some())
     {
         match retain_or_publish(runtime, &snapshots, &record, progress, lock_policy).await {
-            Ok(Some(disks)) => *retained = Some(disks),
-            Ok(None) => {}
+            Ok(()) => {}
             Err(error) => publication_error = Some(error),
         }
         snapshots
@@ -1370,7 +1458,8 @@ pub(crate) async fn advance(
     };
     if let Some(observed) = &monitor {
         if let OperationOutcome::CaptureSealed { capture } = &observed.operation.outcome {
-            if capture.capture_id != record.plan.capture_id {
+            validate_capture_success(runtime, &record, capture)?;
+            if capture.capture_id() != &record.plan.capture_id {
                 return Err(protocol("seal names another capture"));
             }
             snapshots.accept_live_disk_baselines(&record).await?;
@@ -1383,7 +1472,7 @@ pub(crate) async fn advance(
         || match &monitor {
             Some(observed) => match &observed.operation.outcome {
                 OperationOutcome::CaptureSealed { capture } => {
-                    if capture.capture_id != record.plan.capture_id {
+                    if capture.capture_id() != &record.plan.capture_id {
                         return Err(protocol("seal names another capture"));
                     }
                     true
@@ -1424,11 +1513,7 @@ pub(crate) async fn advance(
         ));
     }
     if !published {
-        if let Some(disks) =
-            retain_or_publish(runtime, &snapshots, &record, progress, lock_policy).await?
-        {
-            *retained = Some(disks);
-        }
+        retain_or_publish(runtime, &snapshots, &record, progress, lock_policy).await?;
     }
     let record = snapshots
         .capture_reservation(capture_id)
@@ -1624,6 +1709,11 @@ fn summary(runtime: &Runtime, record: &CaptureRecord) -> Result<LiveCaptureSumma
         machine_id: record.plan.machine_id.clone(),
         run_id: record.plan.run_id.clone(),
         resume_policy: record.plan.resume_policy,
+        first_snapshot_full_identity_reason: matches!(
+            record.storage.ram_identity,
+            crate::store::models::storage::ContentIdentityState::UnknownAfterFork
+        )
+        .then_some(SnapshotIdentityReason::UnknownAfterFork),
         memory: CaptureEvidence::decode(
             record
                 .evidence
@@ -1705,7 +1795,6 @@ pub(crate) async fn reconcile_captures(
             runtime,
             record.machine_id,
             record.capture_id,
-            &mut None,
             None,
             lock_policy,
         )
@@ -1757,17 +1846,15 @@ async fn retain_or_publish(
     record: &CaptureRecord,
     progress: Option<&LiveOperationProgressSender>,
     lock_policy: crate::storage::pool::PublicationLockPolicy,
-) -> Result<Option<crate::store::fork::AuthenticatedCutDisks>, LibVmError> {
+) -> Result<(), LibVmError> {
     if runtime
         .native_store()?
         .fork_for_capture(record.capture_id)
         .await?
         .is_some()
     {
-        let (_, disks) = snapshots
-            .retain_local_capture(record.capture_id, lock_policy)
-            .await?;
-        return Ok(disks);
+        snapshots.retain_local_capture(record.capture_id).await?;
+        return Ok(());
     }
     report_progress(progress, LiveOperationProgress::Publishing);
     snapshots
@@ -1778,7 +1865,7 @@ async fn retain_or_publish(
             lock_policy,
         )
         .await?;
-    Ok(None)
+    Ok(())
 }
 
 impl Runtime {
@@ -2103,6 +2190,7 @@ mod tests {
             shares: Vec::new(),
         };
         let plan = CapturePlan {
+            identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
             map_node_store: None,
             version: CAPTURE_RECORD_VERSION,
             machine_id: id(1),
@@ -2116,6 +2204,7 @@ mod tests {
             resume_policy: CaptureResumePolicy::ResumeIfAcquired,
             pause: CapturePauseAuthority::Acquire,
             disks: vec![CaptureDiskPlan {
+                identity: vm_spec::capture::DiskIdentityState::Unknown,
                 name: name.clone(),
                 attachment_index: 0,
                 block_id: block,
@@ -2209,6 +2298,8 @@ mod tests {
             configuration_digest: plan.configuration_digest,
             request_digest: Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap()),
             memory: Some(CaptureMemoryEvidence {
+                identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
+                identity_full_reason: Some(vm_spec::capture::CaptureIdentityFullReason::Requested),
                 packed_length: 4096,
                 page_granule: 4096,
                 regions: 1,

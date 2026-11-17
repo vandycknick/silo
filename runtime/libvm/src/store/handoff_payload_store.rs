@@ -186,7 +186,7 @@ impl Store {
                 "handoff publication records name different machines",
             ));
         }
-        storage.validate()?;
+        storage.validate_disk_identity_inventory(&config.spec)?;
         let machine_dir = crate::paths::machine_data_dir_in(&self.home, config.id);
         let (root, length) = crate::machine::stopped::root_private(storage);
         if machine_dir.join(root.as_path()) != rootfs.root_disk_path

@@ -710,7 +710,7 @@ fn validate_elf_executable(header: &[u8], length: u64) -> Result<(), DirectKerne
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     use crate::owned_boot_assets::OwnedOverlayBoot;
     use crate::owned_boot_assets::{
@@ -1005,76 +1005,81 @@ mod tests {
         }
     }
 
+    pub(crate) fn elf_kernel_with_banner(version: &str) -> Vec<u8> {
+        let mut bytes = direct_kernel_fixture::kernel(KernelArchitecture::Amd64, "native");
+        let banner = bytes.len();
+        bytes.extend_from_slice(format!("Linux version {version} (build)\0").as_bytes());
+        let strings = bytes.len();
+        bytes.extend_from_slice(b"\0linux_banner\0");
+        let strings_length = bytes.len() - strings;
+        let symbols = bytes.len();
+        bytes.extend_from_slice(&[0; 48]);
+        let symbol = symbols + 24;
+        let banner_address = 0xffff_ffff_8100_0000u64 + banner as u64;
+        patch(&mut bytes, symbol, &1u32.to_le_bytes());
+        bytes[symbol + 4] = 0x11;
+        patch(&mut bytes, symbol + 6, &1u16.to_le_bytes());
+        patch(&mut bytes, symbol + 8, &banner_address.to_le_bytes());
+        patch(
+            &mut bytes,
+            symbol + 16,
+            &((strings - banner) as u64).to_le_bytes(),
+        );
+        let sections = bytes.len();
+        bytes.resize(sections + 4 * 64, 0);
+        patch(&mut bytes, 40, &(sections as u64).to_le_bytes());
+        patch(&mut bytes, 58, &64u16.to_le_bytes());
+        patch(&mut bytes, 60, &4u16.to_le_bytes());
+        patch(&mut bytes, sections + 64 + 4, &1u32.to_le_bytes());
+        patch(&mut bytes, sections + 64 + 8, &2u64.to_le_bytes());
+        patch(
+            &mut bytes,
+            sections + 64 + 16,
+            &banner_address.to_le_bytes(),
+        );
+        patch(
+            &mut bytes,
+            sections + 64 + 24,
+            &(banner as u64).to_le_bytes(),
+        );
+        patch(
+            &mut bytes,
+            sections + 64 + 32,
+            &((strings - banner) as u64).to_le_bytes(),
+        );
+        patch(&mut bytes, sections + 128 + 4, &3u32.to_le_bytes());
+        patch(
+            &mut bytes,
+            sections + 128 + 24,
+            &(strings as u64).to_le_bytes(),
+        );
+        patch(
+            &mut bytes,
+            sections + 128 + 32,
+            &(strings_length as u64).to_le_bytes(),
+        );
+        patch(&mut bytes, sections + 192 + 4, &2u32.to_le_bytes());
+        patch(
+            &mut bytes,
+            sections + 192 + 24,
+            &(symbols as u64).to_le_bytes(),
+        );
+        patch(&mut bytes, sections + 192 + 32, &48u64.to_le_bytes());
+        patch(&mut bytes, sections + 192 + 40, &2u32.to_le_bytes());
+        patch(&mut bytes, sections + 192 + 44, &1u32.to_le_bytes());
+        patch(&mut bytes, sections + 192 + 56, &24u64.to_le_bytes());
+        let length = bytes.len() as u64;
+        patch(&mut bytes, 64 + 32, &length.to_le_bytes());
+        patch(&mut bytes, 64 + 40, &length.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn overlay_kernel_floor_reads_native_elf_linux_banner() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vmlinux");
         for version in ["5.15.219", "6.6.0", "7.2.2"] {
-            let mut bytes = direct_kernel_fixture::kernel(KernelArchitecture::Amd64, "native");
-            let banner = bytes.len();
-            bytes.extend_from_slice(format!("Linux version {version} (build)\0").as_bytes());
-            let strings = bytes.len();
-            bytes.extend_from_slice(b"\0linux_banner\0");
-            let strings_length = bytes.len() - strings;
-            let symbols = bytes.len();
-            bytes.extend_from_slice(&[0; 48]);
-            let symbol = symbols + 24;
-            let banner_address = 0xffff_ffff_8100_0000u64 + banner as u64;
-            patch(&mut bytes, symbol, &1u32.to_le_bytes());
-            bytes[symbol + 4] = 0x11;
-            patch(&mut bytes, symbol + 6, &1u16.to_le_bytes());
-            patch(&mut bytes, symbol + 8, &banner_address.to_le_bytes());
-            patch(
-                &mut bytes,
-                symbol + 16,
-                &((strings - banner) as u64).to_le_bytes(),
-            );
-            let sections = bytes.len();
-            bytes.resize(sections + 4 * 64, 0);
-            patch(&mut bytes, 40, &(sections as u64).to_le_bytes());
-            patch(&mut bytes, 58, &64u16.to_le_bytes());
-            patch(&mut bytes, 60, &4u16.to_le_bytes());
-            patch(&mut bytes, sections + 64 + 4, &1u32.to_le_bytes());
-            patch(&mut bytes, sections + 64 + 8, &2u64.to_le_bytes());
-            patch(
-                &mut bytes,
-                sections + 64 + 16,
-                &banner_address.to_le_bytes(),
-            );
-            patch(
-                &mut bytes,
-                sections + 64 + 24,
-                &(banner as u64).to_le_bytes(),
-            );
-            patch(
-                &mut bytes,
-                sections + 64 + 32,
-                &((strings - banner) as u64).to_le_bytes(),
-            );
-            patch(&mut bytes, sections + 128 + 4, &3u32.to_le_bytes());
-            patch(
-                &mut bytes,
-                sections + 128 + 24,
-                &(strings as u64).to_le_bytes(),
-            );
-            patch(
-                &mut bytes,
-                sections + 128 + 32,
-                &(strings_length as u64).to_le_bytes(),
-            );
-            patch(&mut bytes, sections + 192 + 4, &2u32.to_le_bytes());
-            patch(
-                &mut bytes,
-                sections + 192 + 24,
-                &(symbols as u64).to_le_bytes(),
-            );
-            patch(&mut bytes, sections + 192 + 32, &48u64.to_le_bytes());
-            patch(&mut bytes, sections + 192 + 40, &2u32.to_le_bytes());
-            patch(&mut bytes, sections + 192 + 44, &1u32.to_le_bytes());
-            patch(&mut bytes, sections + 192 + 56, &24u64.to_le_bytes());
-            let length = bytes.len() as u64;
-            patch(&mut bytes, 64 + 32, &length.to_le_bytes());
-            patch(&mut bytes, 64 + 40, &length.to_le_bytes());
+            let bytes = elf_kernel_with_banner(version);
             std::fs::write(&path, bytes).unwrap();
             let kernel =
                 InspectedKernel::from_open_file(std::fs::File::open(&path).unwrap(), &path)

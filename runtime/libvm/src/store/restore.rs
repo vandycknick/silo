@@ -16,16 +16,10 @@ use crate::{LibVmError, MachineStorageRecord};
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) enum RestoreIdentity {
     Snapshot { id: SnapshotId },
-    LocalCut { id: vm_spec::capture::Sha256Digest },
+    LocalCut { id: Uuid },
 }
 
 impl RestoreIdentity {
-    pub(crate) fn digest(&self) -> &[u8; 32] {
-        match self {
-            Self::Snapshot { id } => id.as_bytes(),
-            Self::LocalCut { id } => id.as_bytes(),
-        }
-    }
     pub(crate) fn snapshot(&self) -> Option<SnapshotId> {
         match self {
             Self::Snapshot { id } => Some(*id),
@@ -266,23 +260,35 @@ impl RestoreBudget {
 
 impl RestoreIntent {
     pub(crate) fn validate(&self) -> Result<(), LibVmError> {
-        self.request.validate().map_err(invalid)?;
+        if self.request.ssh_trusted_ca.is_some() {
+            self.request.validate().map_err(invalid)?;
+        } else {
+            self.request.validate_for_inspection().map_err(invalid)?;
+        }
         self.resources.validate()?;
         let mut inspected = self.request.clone();
         inspected.network = None;
         inspected.ssh_trusted_ca = None;
-        let inspected = vm_spec::restore::RestoreInspectionRequest {
-            version: 1,
-            restore: inspected,
-            network: self.network_attachment,
-        };
+        // Inspection precedes allocation and therefore cannot bind child inodes.
+        inspected.disk_tracking_seeds.clear();
+        let inspected =
+            crate::machine::restore::inspection_request(inspected, self.network_attachment)?;
         let bytes = serde_json::to_vec(&inspected).map_err(invalid)?;
         self.inspection
             .validate_against(&bytes, &inspected)
             .map_err(invalid)?;
-        if self.consumer_operation.is_nil()
-            || self.checkpoint.digest() != self.request.checkpoint.as_bytes()
-        {
+        let authority_matches = match (&self.checkpoint, &self.request.authority) {
+            (
+                RestoreIdentity::Snapshot { id },
+                vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { checkpoint, .. },
+            ) => id.as_bytes() == checkpoint.as_bytes(),
+            (
+                RestoreIdentity::LocalCut { id },
+                vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut },
+            ) => id.to_string() == cut.capture_id.as_str(),
+            _ => false,
+        };
+        if self.consumer_operation.is_nil() || !authority_matches {
             return Err(invalid("restore intent contradicts checkpoint identity"));
         }
         Ok(())
@@ -1260,6 +1266,7 @@ impl crate::store::Store {
         let mut expected = intent.request.clone();
         expected.network = request.network.clone();
         expected.ssh_trusted_ca = request.ssh_trusted_ca.clone();
+        expected.disk_tracking_seeds = request.disk_tracking_seeds.clone();
         if &expected != request {
             return Err(invalid("activation changed authenticated restore inputs"));
         }
@@ -1989,10 +1996,6 @@ mod tests {
     async fn checkpoint_request_fixture() -> CheckpointRequestFixture {
         use crate::storage::pool::StoragePool;
         use crate::store::capture::tests::{fixture, seal};
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
-        use vm_spec::capture::{CaptureConfiguration, Sha256Digest};
-        use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
 
         let fixture = fixture().await;
         let snapshots = &fixture.snapshots;
@@ -2027,59 +2030,15 @@ mod tests {
             shape.open_object(&pool, &execution.devices).unwrap(),
             shape.open_object(&pool, &execution.memory.map).unwrap(),
         ];
-        let digests = [
-            Sha256Digest::from_bytes(*execution.memory.stream.as_bytes()),
-            Sha256Digest::from_bytes(*execution.layout.as_bytes()),
-            Sha256Digest::from_bytes(*execution.execution.as_bytes()),
-            Sha256Digest::from_bytes(*execution.devices.as_bytes()),
-            Sha256Digest::from_bytes(*execution.memory.map.as_bytes()),
-        ];
-        let objects: Vec<_> = files
-            .iter()
-            .zip(RestoreObjectRole::ALL)
-            .zip(digests)
-            .map(|((file, role), identity)| {
-                let metadata = file.metadata().unwrap();
-                RestoreObject {
-                    role,
-                    fd: file.as_raw_fd(),
-                    file_device: metadata.dev(),
-                    file_inode: metadata.ino(),
-                    length: metadata.len(),
-                    identity,
-                }
-            })
-            .collect();
         let evidence = snapshots
             .restore_evidence(&consumer, &pool)
             .unwrap()
             .evidence;
-        let request = RestoreRequest {
-            map_node_store: Some(
-                snapshots
-                    .store
-                    .images_dir
-                    .join("objects/sha256")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            disk_tracking_seeds: Vec::new(),
-            version: vm_spec::restore::RESTORE_REQUEST_VERSION,
-            checkpoint: Sha256Digest::from_bytes(*info.id.as_bytes()),
-            activation_id: vm_spec::lifecycle::LiveId::parse(&uuid::Uuid::new_v4().to_string())
-                .unwrap(),
-            freeze_operation_id: evidence.freeze_operation_id.clone().unwrap(),
-            start_paused: true,
-            configuration: CaptureConfiguration::from_spec(&consumer.record.configuration.spec)
-                .unwrap(),
-            evidence,
-            objects: objects.try_into().unwrap(),
-            lowers: Vec::new(),
-            network: None,
-            ssh_trusted_ca: None,
-            hook: None,
-        };
-        request.validate().unwrap();
+        let runtime = crate::store::capture::tests::capture_runtime(snapshots).await;
+        let request = crate::machine::restore::snapshot_restore_request(
+            &runtime, &consumer, evidence, &files, None, None,
+        )
+        .unwrap();
         CheckpointRequestFixture {
             capture: fixture,
             consumer,
@@ -2114,8 +2073,12 @@ mod tests {
             (expected.dev(), expected.ino())
         );
         assert_eq!(
-            request.objects[4].identity.as_bytes(),
-            execution.memory.map.as_bytes()
+            request.objects[4].authority,
+            vm_spec::restore::RestoreObjectAuthority::Identified {
+                identity: vm_spec::capture::Sha256Digest::from_bytes(
+                    *execution.memory.map.as_bytes()
+                ),
+            }
         );
         assert_eq!(request.objects[4].length, expected.len());
         for (root, role) in [
@@ -2136,7 +2099,12 @@ mod tests {
             }
             assert!(nodes > 0);
         }
-        let changes = &request.evidence.memory.as_ref().unwrap().changes;
+        let vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } =
+            &request.authority
+        else {
+            panic!("snapshot authority required");
+        };
+        let changes = &evidence.memory.as_ref().unwrap().changes;
         let digest =
             crate::storage::identity::ObjectDigest::from_sha256(*changes.sha256.as_bytes());
         assert_eq!(
@@ -2657,16 +2625,13 @@ mod tests {
         let store = fixture.snapshots.store.clone();
         let record = fixture.reservation.record.clone();
         let operation = record.fork_operation_id.unwrap();
-        crate::store::capture::tests::seal(&fixture);
-        let (_, retained) = fixture
+        crate::store::capture::tests::seal_owned(&fixture);
+        fixture
             .snapshots
-            .retain_local_capture(
-                record.capture_id,
-                crate::storage::pool::PublicationLockPolicy::Wait,
-            )
+            .retain_local_capture(record.capture_id)
             .await
             .unwrap();
-        let cut = store.open_local_cut(operation, retained).await.unwrap();
+        let cut = store.open_local_cut(operation).await.unwrap();
         store.bind_fork_resources(&cut).await.unwrap();
         let inventory: CaptureBudgetInventory =
             serde_json::from_str(&store.capture_budget_document(operation).await.unwrap()).unwrap();
@@ -2805,16 +2770,13 @@ mod tests {
             .unwrap();
             assert_eq!(inventory.pending.len(), 2);
         }
-        crate::store::capture::tests::seal(&fixture);
-        let (_, retained) = fixture
+        crate::store::capture::tests::seal_owned(&fixture);
+        fixture
             .snapshots
-            .retain_local_capture(
-                record.capture_id,
-                crate::storage::pool::PublicationLockPolicy::Wait,
-            )
+            .retain_local_capture(record.capture_id)
             .await
             .unwrap();
-        let cut = store.open_local_cut(operation, retained).await.unwrap();
+        let cut = store.open_local_cut(operation).await.unwrap();
         store.bind_fork_resources(&cut).await.unwrap();
         let inventory: CaptureBudgetInventory =
             serde_json::from_str(&store.capture_budget_document(operation).await.unwrap()).unwrap();

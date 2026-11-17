@@ -33,22 +33,20 @@ def test_incremental_fork_preserves_pause_and_child_baseline(
     initial = incremental.witness(silo, SOURCE, "start")
     reclaim.settled(silo, SOURCE)
     baseline = restore.checkpoint(silo, SOURCE, alias="fork-baseline")
-    baseline_map = incremental.authenticated_map(silo, baseline, mode="full", reason="no-baseline")["map"]
+    incremental.authenticated_map(silo, baseline, mode="full", reason="no-baseline")
     source = silo.info(SOURCE)
     child = "incremental-fork-child"
     call = fork.run(silo, SOURCE, [child], "--preserve", expect=0)
     assert fork.outcomes(call.result) == ["running"]
     assert silo.info(SOURCE)["lifecycle"]["lifecycle"]["currentPause"] == source["lifecycle"]["lifecycle"]["currentPause"]
     cut = fork.cut(silo, call, source, baseline.boot_id, baseline.generation)
-    memory = cut.seal["memory"]
-    assert memory["mode"] == "incremental" and memory["fullReason"] is None
-    assert memory["baseline"] == baseline.seal["memory"]["ramStream"]
-    assert memory["ramStream"] == baseline.seal["memory"]["ramStream"]
-    assert stream_map.decode_root((cut.staging / "memory.root").read_bytes()) == baseline_map[0]
+    assert cut.seal["stats"]["identityBytesHashed"] == 0
+    assert not (cut.staging / "memory.root").exists() or (cut.staging / "memory.root").stat().st_size == 0
     assert incremental.witness(silo, child, previous=initial) == initial
     changed = incremental.witness(silo, child, "first", previous=initial)
-    saved = restore.checkpoint(silo, child, alias="fork-child-incremental")
-    incremental.authenticated_map(silo, saved, mode="incremental", baseline=cut, baseline_map=baseline_map)
+    saved = restore.checkpoint(silo, child, alias="fork-child-first",
+                               full_identity_reason="unknown-after-fork")
+    incremental.full_file_oracle(silo, saved, full_identity=True)
     incremental.pages_at_cut(silo, saved, changed)
 
 
@@ -228,7 +226,7 @@ def test_full_request_lowered_crossover_and_new_worker_invalidate_baseline(
     pages = incremental.witness(silo, SOURCE, "crossover", previous=initial)
     crossed = restore.checkpoint(silo, SOURCE, alias="selection-crossover",
                                  dirty_crossover_percent=1)
-    incremental.authenticated_map(silo, crossed, mode="full", reason="dirty-crossover")
+    incremental.authenticated_map(silo, crossed, mode="full", reason="dirty-crossover", baseline=base)
     incremental.pages_at_cut(silo, crossed, pages)
     silo.run("resume", SOURCE)
     # A subsequent small write must reuse the newly accepted FULL baseline.

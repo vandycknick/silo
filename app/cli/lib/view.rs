@@ -50,6 +50,8 @@ pub struct MachineView {
     pub run_id: Option<String>,
     /// Observed terminal storage result; read-only inspection need not persist it.
     pub storage_stop_outcome: Option<libvm::StorageStopOutcome>,
+    pub ram_identity: libvm::ContentIdentityState,
+    pub disk_identities: Vec<libvm::DiskContentIdentity>,
     pub live: Option<vm_spec::live::LiveMachineReport>,
     pub prospective_live: Option<vm_spec::live::LiveHostReport>,
     pub lifecycle: Option<libvm::MachineLifecycle>,
@@ -316,6 +318,8 @@ impl MachineView {
             last_error: data.last_error.clone(),
             run_id: data.run_id.as_ref().map(ToString::to_string),
             storage_stop_outcome: data.storage_stop_outcome,
+            ram_identity: data.ram_identity.clone(),
+            disk_identities: data.disk_identities.clone(),
             live: data.live.clone(),
             prospective_live: data.prospective_live.clone(),
             lifecycle: data.lifecycle.clone(),

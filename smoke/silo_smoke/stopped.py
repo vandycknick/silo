@@ -204,6 +204,32 @@ def refuse_without_effects(silo: Silo, *args: str) -> None:
     silo.ws.record("stopped-refusal", json.dumps({"args": args, "exit": result.returncode, "logicalCatalogUnchanged": True, "ownedInventoryUnchanged": True}) + "\n")
 
 
+def bind_fixture_disk_identity_inventory(config: dict, storage: dict) -> None:
+    """Bind fresh fixture attachments without inventing content identities.
+
+    Direct SQL fixture publication bypasses libvm's inventory constructor.
+    Preserve admitted entries, reject mismatched ones, and mark new writable
+    attachments unknown. Read-only attachments have no inventory entry.
+    """
+    disks = config["spec"]["storage"]["disks"]
+    previous = {}
+    last_index = -1
+    for identity in storage["diskIdentities"]:
+        index = identity["attachmentIndex"]
+        assert last_index < index < len(disks)
+        assert not disks[index]["readOnly"] and identity["blockId"] == disks[index]["blockId"]
+        previous[index] = identity
+        last_index = index
+    storage["diskIdentities"] = [
+        previous.get(index, {
+            "attachmentIndex": index,
+            "blockId": disk["blockId"],
+            "identity": {"kind": "unknown"},
+        })
+        for index, disk in enumerate(disks) if not disk["readOnly"]
+    ]
+
+
 def install_managed_fixture(silo: Silo, name: str, *, custom_boot: bool) -> dict[str, str]:
     """Install real bytes/current-schema rows before the fixture's first launch.
 
@@ -250,6 +276,7 @@ def install_managed_fixture(silo: Silo, name: str, *, custom_boot: bool) -> dict
             config["spec"]["boot"]["kernel"]["path"] = str(boot_dir / "kernel-default")
             config["spec"]["boot"]["kernel"]["initramfs"] = str(boot_dir / "initramfs")
             config["guest"] = {"agent": {"mode": "custom", "path": str(boot_dir / "agent")}}
+        bind_fixture_disk_identity_inventory(config, storage)
         def literal(value: dict) -> str:
             return "'" + json.dumps(value, ensure_ascii=False).replace("'", "''") + "'"
         statement = f"BEGIN IMMEDIATE; UPDATE machine_config SET config_json=jsonb({literal(config)}) WHERE id='{machine_id}'; UPDATE machine_storage SET record_json=jsonb({literal(storage)}) WHERE machine_id='{machine_id}'; COMMIT;"

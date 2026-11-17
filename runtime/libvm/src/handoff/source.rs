@@ -74,10 +74,13 @@ pub(crate) async fn observation_body(
     if own_reservation {
         storage.ownership = MachineOwnership::Owned;
     }
-    // Stop and tracking evidence belong to the cut, not to admission: their
-    // invalidation after reservation must not make the approved plan stale.
+    // Stop, tracking and content identity evidence belong to the cut, not to
+    // admission. Reservation and stopping may invalidate them; the stopped
+    // file fingerprints still bind approval to the exact private bytes.
     storage.stop_outcome = crate::StorageStopOutcome::Unknown;
     storage.disk_baselines.clear();
+    storage.ram_identity = crate::store::models::storage::ContentIdentityState::Unknown;
+    storage.disk_identities.clear();
     storage.ownership.ensure_owned(config.id)?;
     crate::machine::stopped::validate_managed_attachments(&config.spec, &storage)?;
     crate::machine::stopped::validate_capture_shape(&storage, StoppedAdmission::Ordinary)?;

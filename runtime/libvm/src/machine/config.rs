@@ -56,7 +56,7 @@ impl Machine {
         let runtime = self.runtime();
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
-        let storage = runtime.machine_storage_record(config.id).await?;
+        let mut storage = runtime.machine_storage_record(config.id).await?;
         storage.ownership.ensure_owned(config.id)?;
         runtime
             .preflight_stopped_generation_locked(&config, &storage)
@@ -77,18 +77,28 @@ impl Machine {
         crate::machine::root_storage::validate_spec(&storage, &spec)?;
         crate::runtime::boot_assets::effective_boot(&storage, &spec, runtime.effective_backend())?;
 
-        if config.spec.storage != spec.storage {
+        let attachments_changed = config.spec.storage != spec.storage;
+        if attachments_changed {
             runtime
                 .native_store()?
                 .invalidate_machine_disk_baselines(config.id)
                 .await?;
+            storage.invalidate_disk_baselines();
+            storage.bind_disk_identity_inventory(&spec);
         }
         let previous_spec = config.spec.clone();
         runtime.validate_tailscale_vsock(&config.network, &spec)?;
         config.spec = spec;
         config.modified_at = now_unix();
         write_machine_config(&config.machine_dir, &config.name, &config.spec)?;
-        if let Err(err) = runtime.save_machine_config(&config).await {
+        let saved = if attachments_changed {
+            runtime
+                .save_machine_config_with_storage(&config, &storage)
+                .await
+        } else {
+            runtime.save_machine_config(&config).await
+        };
+        if let Err(err) = saved {
             let _ = write_machine_config(&config.machine_dir, &config.name, &previous_spec);
             return Err(err);
         }
@@ -1273,7 +1283,25 @@ mod tests {
         spec.storage.as_mut().unwrap().disks[0].block_id =
             vm_spec::BlockId::new("replaced-root").unwrap();
         machine.replace_config(spec).await.unwrap();
-        let after = runtime.machine_storage_record(config.id).await.unwrap();
+        let mut after = runtime.machine_storage_record(config.id).await.unwrap();
+        assert!(matches!(
+            after.disk_baselines[0].state,
+            DiskBaselineState::Invalid
+        ));
+        assert_eq!(after.root, before.root);
+        assert_eq!(after.disk_identities[0].block_id.as_str(), "replaced-root");
+        let (_lock, mut current) = runtime.lock_machine_config(config.id).await.unwrap();
+        after
+            .validate_disk_identity_inventory(&current.spec)
+            .unwrap();
+        runtime
+            .admit_cold_launch_storage(&mut current, &mut after)
+            .await
+            .unwrap();
+        after
+            .validate_disk_identity_inventory(&current.spec)
+            .unwrap();
+        assert_eq!(after.disk_identities[0].block_id.as_str(), "silo-root");
         assert!(matches!(
             after.disk_baselines[0].state,
             DiskBaselineState::Invalid

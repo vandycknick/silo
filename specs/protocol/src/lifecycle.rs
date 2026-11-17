@@ -390,11 +390,55 @@ impl TryFrom<wire::CaptureSealed> for capture::CaptureSealed {
     }
 }
 
-impl From<domain::LiveOperationRecord> for wire::LiveOperationRecord {
-    fn from(value: domain::LiveOperationRecord) -> Self {
+impl TryFrom<capture::CaptureSuccess> for wire::CaptureSuccess {
+    type Error = String;
+    fn try_from(value: capture::CaptureSuccess) -> Result<Self, String> {
+        use wire::capture_success::Authority;
+        value.validate()?;
+        Ok(Self {
+            authority: Some(match value {
+                capture::CaptureSuccess::Identified { sealed } => {
+                    Authority::Identified(sealed.into())
+                }
+                capture::CaptureSuccess::OwnedLocalCut { cut, cut_token } => {
+                    Authority::OwnedLocalCut(wire::OwnedCaptureSuccess {
+                        cut: Some(cut.canonical_bytes()?),
+                        cut_token: Some(cut_token.into()),
+                    })
+                }
+            }),
+        })
+    }
+}
+
+impl TryFrom<wire::CaptureSuccess> for capture::CaptureSuccess {
+    type Error = String;
+    fn try_from(value: wire::CaptureSuccess) -> Result<Self, String> {
+        use wire::capture_success::Authority;
+        let result = match required(value.authority, "capture.authority")? {
+            Authority::Identified(sealed) => Self::Identified {
+                sealed: sealed.try_into()?,
+            },
+            Authority::OwnedLocalCut(owned) => Self::OwnedLocalCut {
+                cut: Box::new(capture::OwnedLocalCut::decode(&required(
+                    owned.cut,
+                    "capture.cut",
+                )?)?),
+                cut_token: required(owned.cut_token, "capture.cutToken")?.try_into()?,
+            },
+        };
+        result.validate()?;
+        Ok(result)
+    }
+}
+
+impl TryFrom<domain::LiveOperationRecord> for wire::LiveOperationRecord {
+    type Error = String;
+    fn try_from(value: domain::LiveOperationRecord) -> Result<Self, String> {
         use wire::live_operation_record::Result as WireResult;
+        value.validate()?;
         let status = value.status();
-        Self {
+        Ok(Self {
             operation_id: Some(value.operation_id.into()),
             kind: number(wire::OperationKind::from(value.kind)),
             status: number(wire::OperationStatus::from(status)),
@@ -404,13 +448,13 @@ impl From<domain::LiveOperationRecord> for wire::LiveOperationRecord {
                     Some(WireResult::Pause(pause.into()))
                 }
                 domain::OperationOutcome::CaptureSealed { capture } => {
-                    Some(WireResult::Capture(capture.into()))
+                    Some(WireResult::Capture(capture.try_into()?))
                 }
                 domain::OperationOutcome::Failed { failure } => {
                     Some(WireResult::Failure(failure.into()))
                 }
             },
-        }
+        })
     }
 }
 impl TryFrom<wire::LiveOperationRecord> for domain::LiveOperationRecord {
@@ -905,58 +949,132 @@ impl TryFrom<wire::CaptureReleaseState> for capture::CaptureReleaseState {
     }
 }
 
-impl From<capture::CaptureObservation> for wire::CaptureObservation {
-    fn from(value: capture::CaptureObservation) -> Self {
+impl TryFrom<capture::CaptureRecordReference> for wire::CaptureRecordReference {
+    type Error = String;
+    fn try_from(value: capture::CaptureRecordReference) -> Result<Self, String> {
+        use wire::capture_record_reference::Authority;
+        Ok(Self {
+            authority: Some(match value {
+                capture::CaptureRecordReference::Identified { evidence } => {
+                    Authority::Identified(wire::CaptureEvidenceReference {
+                        outcome: number(wire::CaptureRecordOutcome::from(evidence.outcome)),
+                        sha256: Some(evidence.sha256.to_string()),
+                    })
+                }
+                capture::CaptureRecordReference::OwnedLocalCut { cut } => {
+                    Authority::OwnedLocalCut(cut.canonical_bytes()?)
+                }
+            }),
+        })
+    }
+}
+
+impl TryFrom<wire::CaptureRecordReference> for capture::CaptureRecordReference {
+    type Error = String;
+    fn try_from(value: wire::CaptureRecordReference) -> Result<Self, String> {
+        use wire::capture_record_reference::Authority;
+        Ok(match required(value.authority, "evidence.authority")? {
+            Authority::Identified(evidence) => Self::Identified {
+                evidence: capture::CaptureEvidenceReference {
+                    outcome: read_enum::<wire::CaptureRecordOutcome, _>(
+                        evidence.outcome,
+                        "evidence.outcome",
+                    )?,
+                    sha256: digest(evidence.sha256, "evidence.sha256")?,
+                },
+            },
+            Authority::OwnedLocalCut(bytes) => Self::OwnedLocalCut {
+                cut: Box::new(capture::OwnedLocalCut::decode(&bytes)?),
+            },
+        })
+    }
+}
+
+impl From<capture::CaptureSourceReference> for wire::CaptureSourceReference {
+    fn from(value: capture::CaptureSourceReference) -> Self {
+        use wire::capture_source_reference::Authority;
         Self {
+            authority: Some(match value {
+                capture::CaptureSourceReference::Identified { sha256 } => {
+                    Authority::Identified(sha256.to_string())
+                }
+                capture::CaptureSourceReference::OwnedLocalCut {
+                    capture_id,
+                    outcome,
+                } => Authority::OwnedLocalCut(wire::OwnedCaptureSourceReference {
+                    capture_id: Some(capture_id.into()),
+                    outcome: Some(
+                        match outcome {
+                            capture::CaptureSourceOutcome::Resumed => "resumed",
+                            capture::CaptureSourceOutcome::Preserved => "preserved",
+                            capture::CaptureSourceOutcome::ResumeFailed => "resume-failed",
+                        }
+                        .into(),
+                    ),
+                }),
+            }),
+        }
+    }
+}
+
+impl TryFrom<wire::CaptureSourceReference> for capture::CaptureSourceReference {
+    type Error = String;
+    fn try_from(value: wire::CaptureSourceReference) -> Result<Self, String> {
+        use wire::capture_source_reference::Authority;
+        Ok(match required(value.authority, "source.authority")? {
+            Authority::Identified(sha256) => Self::Identified {
+                sha256: digest(Some(sha256), "source.sha256")?,
+            },
+            Authority::OwnedLocalCut(owned) => Self::OwnedLocalCut {
+                capture_id: id(owned.capture_id, "source.captureId")?,
+                outcome: match required(owned.outcome, "source.outcome")?.as_str() {
+                    "resumed" => capture::CaptureSourceOutcome::Resumed,
+                    "preserved" => capture::CaptureSourceOutcome::Preserved,
+                    "resume-failed" => capture::CaptureSourceOutcome::ResumeFailed,
+                    _ => return Err("unknown source outcome".into()),
+                },
+            },
+        })
+    }
+}
+
+impl TryFrom<capture::CaptureObservation> for wire::CaptureObservation {
+    type Error = String;
+    fn try_from(value: capture::CaptureObservation) -> Result<Self, String> {
+        value.validate()?;
+        Ok(Self {
             continuation: Some(value.continuation.into()),
             release: Some(value.release.into()),
-            evidence: value
-                .evidence
-                .map(|evidence| wire::CaptureEvidenceReference {
-                    outcome: number(wire::CaptureRecordOutcome::from(evidence.outcome)),
-                    sha256: Some(evidence.sha256.to_string()),
-                }),
-            source_record_sha256: value.source_record_sha256.map(|digest| digest.to_string()),
-        }
+            evidence: value.evidence.map(TryInto::try_into).transpose()?,
+            source_record: value.source_record.map(Into::into),
+        })
     }
 }
 impl TryFrom<wire::CaptureObservation> for capture::CaptureObservation {
     type Error = String;
-    fn try_from(value: wire::CaptureObservation) -> Result<Self, Self::Error> {
+    fn try_from(value: wire::CaptureObservation) -> Result<Self, String> {
         let observation = Self {
             continuation: required(value.continuation, "capture.continuation")?.try_into()?,
             release: required(value.release, "capture.release")?.try_into()?,
-            evidence: value
-                .evidence
-                .map(|evidence| {
-                    Ok::<_, String>(capture::CaptureEvidenceReference {
-                        outcome: read_enum::<wire::CaptureRecordOutcome, _>(
-                            evidence.outcome,
-                            "evidence.outcome",
-                        )?,
-                        sha256: digest(evidence.sha256, "evidence.sha256")?,
-                    })
-                })
-                .transpose()?,
-            source_record_sha256: value
-                .source_record_sha256
-                .map(|value| digest(Some(value), "capture.sourceRecordSha256"))
-                .transpose()?,
+            evidence: value.evidence.map(TryInto::try_into).transpose()?,
+            source_record: value.source_record.map(TryInto::try_into).transpose()?,
         };
         observation.validate()?;
         Ok(observation)
     }
 }
 
-impl From<domain::OperationObservation> for wire::OperationObservation {
-    fn from(value: domain::OperationObservation) -> Self {
-        Self {
-            operation: Some(value.operation.into()),
+impl TryFrom<domain::OperationObservation> for wire::OperationObservation {
+    type Error = String;
+    fn try_from(value: domain::OperationObservation) -> Result<Self, String> {
+        value.validate()?;
+        Ok(Self {
+            operation: Some(value.operation.try_into()?),
             state: number(wire::VmState::from(value.state)),
             current_pause: value.current_pause.map(Into::into),
             activity: value.activity.map(Into::into),
-            capture: value.capture.map(Into::into),
-        }
+            capture: value.capture.map(TryInto::try_into).transpose()?,
+        })
     }
 }
 impl TryFrom<wire::OperationObservation> for domain::OperationObservation {
@@ -992,7 +1110,7 @@ impl TryFrom<domain::GetOperationOutcome> for wire::GetOperationResponse {
         Ok(Self {
             outcome: Some(match value {
                 domain::GetOperationOutcome::Observation { observation } => {
-                    Outcome::Observation(observation.into())
+                    Outcome::Observation(observation.try_into()?)
                 }
                 domain::GetOperationOutcome::Rejected { rejection } => {
                     Outcome::Rejected(rejection.try_into()?)
@@ -1025,14 +1143,14 @@ impl TryFrom<domain::CancelOperationOutcome> for wire::CancelOperationResponse {
                 domain::CancelOperationOutcome::Completed { completed } => {
                     Outcome::Completed(wire::CancelCompleted {
                         effective: Some(completed.effective),
-                        operation: Some(completed.operation.into()),
+                        operation: Some(completed.operation.try_into()?),
                         state: number(wire::VmState::from(completed.state)),
                     })
                 }
                 domain::CancelOperationOutcome::Failed { failed } => {
                     Outcome::Failed(wire::CancelFailed {
                         cause: Some(failed.cause.into()),
-                        operation: Some(failed.operation.into()),
+                        operation: Some(failed.operation.try_into()?),
                         state: number(wire::VmState::from(failed.state)),
                     })
                 }
@@ -1320,6 +1438,7 @@ mod tests {
             ram_bytes: configuration.ram_bytes(),
             configuration,
             policy: domain::CapturePolicy::Full,
+            identity_policy: CaptureIdentityPolicy::Full,
             dirty_crossover_percent: 60,
             resume_policy: domain::CaptureResumePolicy::ResumeIfAcquired,
             pause: CapturePauseAuthority::Acquire,
@@ -1352,10 +1471,12 @@ mod tests {
                 operation_id: id(3),
                 kind: domain::OperationKind::Capture,
                 outcome: domain::OperationOutcome::CaptureSealed {
-                    capture: CaptureSealed {
-                        capture_id: id(3),
-                        evidence_sha256: Sha256Digest::of_bytes(b"evidence"),
-                        cut_token: cut,
+                    capture: CaptureSuccess::Identified {
+                        sealed: CaptureSealed {
+                            capture_id: id(3),
+                            evidence_sha256: Sha256Digest::of_bytes(b"evidence"),
+                            cut_token: cut,
+                        },
                     },
                 },
             },
@@ -1370,27 +1491,33 @@ mod tests {
             capture: Some(CaptureObservation {
                 continuation: CaptureContinuation::Pending,
                 release: CaptureReleaseState::Retained,
-                evidence: Some(CaptureEvidenceReference {
-                    outcome: CaptureRecordOutcome::Coherent,
-                    sha256: Sha256Digest::of_bytes(b"evidence"),
+                evidence: Some(CaptureRecordReference::Identified {
+                    evidence: CaptureEvidenceReference {
+                        outcome: CaptureRecordOutcome::Coherent,
+                        sha256: Sha256Digest::of_bytes(b"evidence"),
+                    },
                 }),
-                source_record_sha256: None,
+                source_record: None,
             }),
         };
-        let encoded = wire::OperationObservation::from(observation.clone());
+        let encoded = wire::OperationObservation::try_from(observation.clone()).unwrap();
         assert_eq!(
             domain::OperationObservation::try_from(encoded.clone()).unwrap(),
             observation
         );
         let mut failed_record = encoded.clone();
-        failed_record
+        if let Some(wire::capture_record_reference::Authority::Identified(evidence)) = failed_record
             .capture
             .as_mut()
             .unwrap()
             .evidence
             .as_mut()
             .unwrap()
-            .outcome = Some(wire::CaptureRecordOutcome::Failed as i32);
+            .authority
+            .as_mut()
+        {
+            evidence.outcome = Some(wire::CaptureRecordOutcome::Failed as i32);
+        }
         assert!(
             domain::OperationObservation::try_from(failed_record).is_err(),
             "a sealed capture needs its coherent record"
@@ -1411,9 +1538,9 @@ mod tests {
         preserved.capture.as_mut().unwrap().continuation =
             CaptureContinuation::Preserved { preserved: current };
         assert_eq!(
-            domain::OperationObservation::try_from(wire::OperationObservation::from(
-                preserved.clone()
-            ))
+            domain::OperationObservation::try_from(
+                wire::OperationObservation::try_from(preserved.clone()).unwrap()
+            )
             .unwrap(),
             preserved
         );
@@ -1442,7 +1569,7 @@ mod tests {
                 pause: established(),
             },
         };
-        let encoded = wire::LiveOperationRecord::from(record.clone());
+        let encoded = wire::LiveOperationRecord::try_from(record.clone()).unwrap();
         assert_eq!(
             domain::LiveOperationRecord::try_from(encoded.clone()).unwrap(),
             record
@@ -1564,5 +1691,136 @@ mod tests {
         assert!(lifecycle.current_pause.is_some());
         status.lifecycle = None;
         assert!(crate::lifecycle::status_lifecycle(&status).is_err());
+    }
+
+    #[test]
+    fn owned_capture_success_wire_has_strict_local_authority_without_sha_fallback() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use vm_spec::capture::*;
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Directory(
+            std::env::temp_dir().join(format!("silo-owned-wire-{}-{nonce}", std::process::id())),
+        );
+        std::fs::create_dir(&directory.0).unwrap();
+        let plan = plan();
+        let roles = [
+            CaptureRole::Execution,
+            CaptureRole::Devices,
+            CaptureRole::Ram,
+            CaptureRole::Layout,
+        ];
+        let members = roles
+            .into_iter()
+            .map(|role| {
+                let path = directory.0.join(role.relative_path());
+                let file = std::fs::File::create(&path).unwrap();
+                file.set_len(if role == CaptureRole::Ram {
+                    plan.ram_bytes
+                } else {
+                    100
+                })
+                .unwrap();
+                drop(file);
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+                let metadata = std::fs::metadata(path).unwrap();
+                OwnedCutMember {
+                    role,
+                    complete: true,
+                    fingerprint: SourceFingerprint {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                        length: metadata.len(),
+                        mode: metadata.mode(),
+                        modified_seconds: metadata.mtime(),
+                        modified_nanoseconds: metadata.mtime_nsec(),
+                        changed_seconds: metadata.ctime(),
+                        changed_nanoseconds: metadata.ctime_nsec(),
+                    },
+                }
+            })
+            .collect();
+        let digest = Sha256Digest::of_bytes(b"retained compatibility");
+        let cut = OwnedLocalCut {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: id(1),
+            run_id: id(2),
+            capture_id: id(3),
+            freeze_operation_id: id(3),
+            freeze_epoch: NonZeroU64::new(1).unwrap(),
+            configuration: plan.configuration,
+            binding: CaptureStateBinding {
+                live_state_schema: "silo.live-state/1".into(),
+                architecture: "x86_64".into(),
+                profile: digest,
+                topology: digest,
+                ram_layout: digest,
+                source_run: id(2),
+                pause_generation: NonZeroU64::new(2).unwrap(),
+                capture: id(3),
+            },
+            materialization_generation: NonZeroU64::new(1).unwrap(),
+            predecessor_generation: 0,
+            packed_length: plan.ram_bytes,
+            page_granule: 4096,
+            regions: 1,
+            members,
+            stats: CaptureMemoryStats {
+                logical_bytes: plan.ram_bytes,
+                ..Default::default()
+            },
+        };
+        let success = CaptureSuccess::OwnedLocalCut {
+            cut: Box::new(cut),
+            cut_token: token(2),
+        };
+        let encoded = wire::CaptureSuccess::try_from(success.clone()).unwrap();
+        assert_eq!(CaptureSuccess::try_from(encoded.clone()).unwrap(), success);
+        let mut bad = encoded.clone();
+        if let Some(wire::capture_success::Authority::OwnedLocalCut(owned)) = &mut bad.authority {
+            owned.cut.as_mut().unwrap().push(b'\n');
+        }
+        assert!(CaptureSuccess::try_from(bad).is_err());
+        let mut bad = encoded;
+        bad.authority = None;
+        assert!(CaptureSuccess::try_from(bad).is_err());
+        let bad = wire::CaptureSuccess {
+            authority: Some(wire::capture_success::Authority::Identified(
+                wire::CaptureSealed {
+                    capture_id: Some(id(3).into()),
+                    evidence_sha256: None,
+                    cut_token: Some(token(2).into()),
+                },
+            )),
+        };
+        assert!(CaptureSuccess::try_from(bad).is_err());
+        let source = CaptureSourceReference::OwnedLocalCut {
+            capture_id: id(3),
+            outcome: CaptureSourceOutcome::Resumed,
+        };
+        assert_eq!(
+            CaptureSourceReference::try_from(wire::CaptureSourceReference::from(source.clone()))
+                .unwrap(),
+            source
+        );
+        assert!(
+            CaptureSourceReference::try_from(wire::CaptureSourceReference {
+                authority: Some(wire::capture_source_reference::Authority::OwnedLocalCut(
+                    wire::OwnedCaptureSourceReference {
+                        capture_id: Some(id(3).into()),
+                        outcome: Some("unknown".into())
+                    },
+                )),
+            })
+            .is_err()
+        );
     }
 }

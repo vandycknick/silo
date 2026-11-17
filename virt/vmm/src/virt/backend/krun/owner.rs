@@ -119,7 +119,7 @@ fn spawn(
             "Raw descriptor table exceeds the total disk bound",
         ));
     }
-    if !(restore_objects.is_empty() || restore_objects.len() == 5)
+    if !matches!(restore_objects.len(), 0 | 4 | 5)
         || restore_lowers.len() > inherit::MAX_LOWER_FDS
         || (restore_objects.is_empty() && !restore_lowers.is_empty())
     {

@@ -83,6 +83,7 @@ struct Inner {
     scenario: Option<LifecycleScenario>,
     model: Mutex<Model>,
     changed: Condvar,
+    layout_digest: Mutex<Option<Digest32>>,
 }
 
 struct Model {
@@ -103,6 +104,7 @@ struct Model {
     released: HashSet<Uuid>,
     next_capture: u64,
     memory_generation: u64,
+    baseline_generation: u64,
     stopped: bool,
 }
 
@@ -168,6 +170,7 @@ impl ScenarioNative {
                 run: rand::random(),
                 cpus: cpus.max(1),
                 scenario,
+                layout_digest: Mutex::new(None),
                 model: Mutex::new(Model {
                     control: NativeState::Running,
                     last_operation: 0,
@@ -185,6 +188,7 @@ impl ScenarioNative {
                     released: HashSet::new(),
                     next_capture: 0,
                     memory_generation: 0,
+                    baseline_generation: 0,
                     stopped: false,
                 }),
                 changed: Condvar::new(),
@@ -538,6 +542,21 @@ fn write_ram(
     })
 }
 
+fn write_owned_ram(file: &File, length: u64) -> Result<(), NativeFailure> {
+    let mut chunk = vec![0u8; WRITE_CHUNK];
+    let mut offset = 0;
+    while offset < length {
+        let count = (length - offset).min(WRITE_CHUNK as u64) as usize;
+        for (index, byte) in chunk[..count].iter_mut().enumerate() {
+            let page = (offset + index as u64) / PAGE;
+            *byte = (page % 251) as u8 ^ (index as u8);
+        }
+        write_all_at(file, &chunk[..count], offset)?;
+        offset += count as u64;
+    }
+    Ok(())
+}
+
 impl NativeLifecycle for ScenarioNative {
     type Token = ScenarioToken;
     type Ticket = ScenarioTicket;
@@ -787,7 +806,10 @@ impl NativeLifecycle for ScenarioNative {
         Ok(self.lock().control.clone())
     }
 
-    fn inventory(&self, _deadline: Instant) -> InventoryObservation {
+    fn inventory(&self, deadline: Instant) -> InventoryObservation {
+        if let Err(failure) = self.ram_layout_digest(deadline) {
+            return InventoryObservation::Unavailable { failure };
+        }
         let Some(scenario) = &self.inner.scenario else {
             return InventoryObservation::Unavailable {
                 failure: NativeFailure::with_detail(
@@ -856,7 +878,17 @@ impl NativeLifecycle for ScenarioNative {
 
     fn ram_layout_digest(&self, deadline: Instant) -> Result<Digest32, NativeFailure> {
         drop(self.entry(deadline)?);
-        Ok(Digest32(sha2::Sha256::digest(self.layout_bytes()).into()))
+        let mut cached = self
+            .inner
+            .layout_digest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(digest) = *cached {
+            return Ok(digest);
+        }
+        let digest = Digest32(sha2::Sha256::digest(self.layout_bytes()).into());
+        *cached = Some(digest);
+        Ok(digest)
     }
 
     fn flush_capture(
@@ -1029,7 +1061,7 @@ impl NativeLifecycle for ScenarioNative {
         ram: File,
         layout: File,
         changes: File,
-        _preparation: &crate::virt::lifecycle::CapturePreparation,
+        preparation: &crate::virt::lifecycle::CapturePreparation,
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<MemoryCapture, NativeFailure> {
@@ -1057,10 +1089,15 @@ impl NativeLifecycle for ScenarioNative {
             |_| false,
         )?;
         let length = self.ram_bytes();
+        let owned = preparation.identity_policy == vm_spec::capture::CaptureIdentityPolicy::None;
         let layout_bytes = self.layout_bytes();
         if step.result == NativeCaptureResult::Fail {
             // A partial image: the failure retains all three writers.
-            let partial = write_ram(&ram, &changes, (length / 2).max(PAGE).min(length));
+            let partial = if owned {
+                write_owned_ram(&ram, (length / 2).max(PAGE).min(length))
+            } else {
+                write_ram(&ram, &changes, (length / 2).max(PAGE).min(length)).map(|_| ())
+            };
             let failure = match partial {
                 Ok(_) => participant("scripted RAM image write failure (ENOSPC)"),
                 Err(failure) => failure,
@@ -1070,7 +1107,15 @@ impl NativeLifecycle for ScenarioNative {
             entry.retained = Some((ram, layout, changes));
             return Err(failure);
         }
-        let written = write_ram(&ram, &changes, length).and_then(|summary| {
+        let written = (if owned {
+            write_owned_ram(&ram, length)
+                .map(|()| crate::virt::lifecycle::CaptureRamChangesAuthority::None)
+        } else {
+            write_ram(&ram, &changes, length).map(|changes| {
+                crate::virt::lifecycle::CaptureRamChangesAuthority::Identified(Box::new(changes))
+            })
+        })
+        .and_then(|summary| {
             write_all_at(&layout, &layout_bytes, 0)?;
             Ok((
                 receipt(&ram)?,
@@ -1092,6 +1137,7 @@ impl NativeLifecycle for ScenarioNative {
         drop((ram, layout, changes));
         model.memory_generation += 1;
         let memory_generation = model.memory_generation;
+        let predecessor_generation = model.baseline_generation;
         let entry = self.capture(&mut model, capture)?;
         let memory = MemoryCapture {
             binding: Box::new(entry.binding.clone()),
@@ -1100,6 +1146,23 @@ impl NativeLifecycle for ScenarioNative {
             memory_generation,
             writers_closed: true,
             mode: vm_spec::lifecycle::CapturePolicy::Full,
+            identity_policy: if owned {
+                vm_spec::capture::CaptureIdentityPolicy::None
+            } else {
+                vm_spec::capture::CaptureIdentityPolicy::Full
+            },
+            identity_full_reason: (!owned).then_some(if preparation.baseline.is_some() {
+                if preparation.identity_policy == vm_spec::capture::CaptureIdentityPolicy::Full {
+                    vm_spec::capture::CaptureIdentityFullReason::Requested
+                } else {
+                    vm_spec::capture::CaptureIdentityFullReason::CoverageLost
+                }
+            } else if predecessor_generation == 0 {
+                vm_spec::capture::CaptureIdentityFullReason::NoIdentifiedAnchor
+            } else {
+                vm_spec::capture::CaptureIdentityFullReason::UnknownAnchorAfterFork
+            }),
+            predecessor_generation,
             baseline: None,
             full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
             identity_chunk_bytes: WRITE_CHUNK as u32,
@@ -1110,7 +1173,9 @@ impl NativeLifecycle for ScenarioNative {
                 live_bytes_read: length,
                 full_bytes_written: length,
                 layout_bytes_written: layout_bytes.len() as u64,
-                identity_bytes_hashed: length,
+                identity_bytes_hashed: if owned { 0 } else { length },
+                materialization_dirty_pages: length / PAGE,
+                identity_dirty_pages: if owned { 0 } else { length / PAGE },
                 ..Default::default()
             }),
         };
@@ -1166,7 +1231,7 @@ impl NativeLifecycle for ScenarioNative {
         binding: &CaptureStateBinding,
         ram: File,
         layout: File,
-        stream: Digest32,
+        authority: crate::virt::lifecycle::CaptureBaselineAuthority,
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<u64, NativeFailure> {
@@ -1180,7 +1245,19 @@ impl NativeLifecycle for ScenarioNative {
             (CaptureState::CandidateComplete, Some(memory)) => memory.clone(),
             _ => return Err(NativeFailure::new(NativeFailureKind::Busy)),
         };
-        if *binding != entry.binding || stream.is_zero() {
+        let valid_authority = match authority {
+            crate::virt::lifecycle::CaptureBaselineAuthority::Identified { stream } => {
+                !stream.is_zero()
+                    && memory.identity_policy != vm_spec::capture::CaptureIdentityPolicy::None
+            }
+            crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut {
+                materialization_generation,
+            } => {
+                materialization_generation == memory.memory_generation
+                    && memory.identity_policy == vm_spec::capture::CaptureIdentityPolicy::None
+            }
+        };
+        if *binding != entry.binding || !valid_authority {
             return Err(NativeFailure::new(NativeFailureKind::InvalidToken));
         }
         for (file, expected) in [(&ram, memory.ram), (&layout, memory.layout)] {
@@ -1196,6 +1273,7 @@ impl NativeLifecycle for ScenarioNative {
         reserve(&mut model, operation)?;
         let entry = self.capture(&mut model, capture)?;
         entry.state = CaptureState::Accepted(memory.memory_generation);
+        model.baseline_generation = memory.memory_generation;
         Ok(memory.memory_generation)
     }
 

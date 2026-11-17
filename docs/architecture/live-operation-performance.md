@@ -31,6 +31,32 @@ performance figure records both default image init and agent-as-PID-1
 (`--kernel-arg init=`), with the mode labeled. Historical rows keep their
 original evidence and are not silently converted to the new clock or mode.
 
+## Unhashed live forks (2026-11-17)
+
+Live forks compute no content hashes and publish no RAM/disk map nodes or
+new pool objects. This supersedes the historical fork identity descriptions
+below, not their retained measurements. Snapshot behavior and targets do not
+change. Files are Silo-owned complete inputs admitted by exact device/inode,
+length, mode and timestamp facts with held descriptors and closed writers.
+This local authority detects ordinary replacement/mutation, not bit rot;
+internal corruption is not detected until the child is snapshotted. That
+snapshot establishes identity for its current bytes, not proof of fork-time
+contents. Missing snapshot receipts never downgrade to local ownership.
+
+A fork child has known bytes but unknown content identity. Its first snapshot
+hashes full resulting RAM during its pause and full disk identity after resume;
+later snapshots are incremental. The source retains its identified RAM anchor
+and accumulated dirty union across forks, and retains its disk baseline and
+dirty history unchanged. Its next snapshot hashes what changed since its last
+identified snapshot, not since its latest fork.
+
+`make perf` retains every existing row and agent-ready clock. Three additional
+informational full-command rows run afterwards: `snapshot_fork_child_first`,
+`snapshot_fork_child_second`, and `snapshot_source_after_two_forks`. Untimed
+forks and workload conditioning cannot warm the original measurements.
+No target is loosened, and this change claims no new measured latency.
+
+
 ## Phase 30 baseline (2026-11-15)
 
 The baseline predates the improvements recorded under State after wave three.
@@ -408,8 +434,9 @@ hashes once. Stage-2 clean-stop sealing is planned, not implemented.
 
 Freshly formatted disks have no baseline at create; their first snapshot hashes
 written disk data once and seeds later captures in the same run. Unchanged
-image-backed disks and authenticated restore/fork children inherit source maps
+image-backed disks and identified snapshot-restored children inherit source maps
 without an extra baseline hash, rebound to their private destination inodes.
+Live-fork children explicitly do not inherit content identity.
 The planned stage-2 deterministic template avoids the first-snapshot hash
 without slowing create.
 Growth/resize, storage or attachment changes, boot-bundle changes and handoff
@@ -499,9 +526,9 @@ Silent local corruption between capture and restore is not detected at restore;
 explicit verification, export and handoff authenticate bytes independently.
 Payload seal synchronization and final catalog durability are unchanged; local
 capture now batches pool-directory barriers before the retention transaction.
-Local fork RAM restore trusts producer-computed identities and unchanged owned
-inode facts without rehashing RAM. These amendments do not remeasure historical
-batch results.
+Local snapshot RAM restore trusts producer-computed identities and unchanged
+owned inode facts without rehashing RAM. Live forks use the distinct unhashed
+local authority above. These amendments do not remeasure historical batch results.
 
 Measured effect on ext4: pause 5.51 → 2.52 s; manager 3.56 → 1.46 s; restore
 7.21 → 3.5–4.3 s. Child construction stayed at about 9 s for four children.

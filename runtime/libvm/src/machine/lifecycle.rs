@@ -112,7 +112,10 @@ impl Machine {
                     .await?;
             }
             let lower_started = std::time::Instant::now();
-            let storage = runtime.validate_machine_storage_for_launch(&config).await?;
+            let mut storage = runtime.validate_machine_storage_for_launch(&config).await?;
+            runtime
+                .admit_cold_launch_storage(&mut config, &mut storage)
+                .await?;
             let qualification = runtime.open_machine_boot(&config, &storage)?;
             timeline.lower_resolve_authentication += lower_started.elapsed();
 

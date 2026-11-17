@@ -36,6 +36,14 @@ delivery and host admission. Capture receipts carry `liveStateSchema` and
 and schema. Restore inspection rejects mismatched schema or architecture before
 activation, while the complete device inventory remains required:
 
+The inspection envelope uses `RESTORE_INSPECTION_VERSION` (v2), independently of
+the native `silo.live-state/1` metadata codec. Sender, report verifier and
+inspector must validate that shared envelope for both owned and identified
+authority. Invalid envelope/device-profile requests and native admission
+errors produce typed `restore-preflight` refusals, including the native reason;
+they are not machine-storage record errors. Real executable tests cover refusal
+framing without requiring a hypervisor.
+
 ```sh
 cargo test --locked -p vm-spec inspection_requires_complete_exact_devices_without_imposing_envelope_order
 ```
@@ -160,12 +168,19 @@ bounded control records and the state allowance. Retained and candidate roots
 have operation/run lifetimes, not a TTL; result release never discards the
 source's baseline or its shared nodes.
 
-The `native-live-api` command protocol is unchanged. Its capture command writes
-`memory.changes` and `memory.root` in addition to RAM, layout and state.
-`api-capture.json` keeps its harness schema and `ram_map` object identity,
-and reports `identity_chunk_bytes`, a bounded `changes` summary, and the
-absolute `map_node_store` directory. That immutable store is shared under
-the launch binding's `map-nodes/<sha256 hex>` and survives capture release.
+The `native-live-api` diagnostic supports `capture <directory> fork` for the
+same no-identity RAM path used by live forks. It writes complete RAM, layout,
+execution/device state and private disks, then records exact closed-file
+fingerprints in `api-capture.json` with explicit `owned-local-cut` authority.
+It emits no RAM map or change records and reports identity bytes, whole-file
+hash bytes and map nodes as zero. `accept` adopts owned byte authority without
+moving an identified anchor. A later snapshot selects full identity if that
+anchor is unknown, independently of incremental byte materialization.
+
+Identified diagnostic captures retain `memory.changes`, `memory.root`, their
+bounded change summary and the immutable shared `map_node_store`. Restore
+descriptor tables require exactly four objects for owned cuts or five for
+identified snapshots. No missing map or receipt switches authority.
 `guest-lifecycle-controller` command lines and output files are unchanged.
 
 Real-file module regressions cover identities independently recomputed from

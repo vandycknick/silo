@@ -34,8 +34,8 @@ pub(crate) fn parse_env(value: Option<&std::ffi::OsStr>) -> eyre::Result<Vec<Raw
     let fds: Vec<RawFd> = serde_json::from_str(value)
         .map_err(|error| eyre::eyre!("invalid restore descriptor list: {error}"))?;
     eyre::ensure!(
-        (5..=MAX_RESTORE_FDS).contains(&fds.len()),
-        "restore descriptor list must name 5..={MAX_RESTORE_FDS} descriptors"
+        (4..=MAX_RESTORE_FDS).contains(&fds.len()),
+        "restore descriptor list must name 4..={MAX_RESTORE_FDS} descriptors"
     );
     Ok(fds)
 }
@@ -95,7 +95,7 @@ pub(crate) struct LowerFiles {
 /// The monitor's owned restore objects, in request order.
 #[derive(Debug)]
 pub(crate) struct RestoreFiles {
-    pub(crate) objects: [File; 5],
+    pub(crate) objects: Vec<File>,
     pub(crate) lowers: Vec<LowerFiles>,
 }
 
@@ -152,11 +152,13 @@ fn check(raw: RawFd, expected_fd: i32, device: u64, inode: u64, length: u64) -> 
 /// Adopt the complete inherited set only after every descriptor matched the
 /// request. On refusal nothing is adopted; the CLOEXEC numbers die with exit.
 pub(crate) fn adopt(raw: Vec<RawFd>, request: &RestoreRequest) -> io::Result<RestoreFiles> {
-    let expected = 5 + request
-        .lowers
-        .iter()
-        .map(|lower| 1 + lower.extents.len())
-        .sum::<usize>();
+    request.validate().map_err(invalid)?;
+    let expected = request.objects.len()
+        + request
+            .lowers
+            .iter()
+            .map(|lower| 1 + lower.extents.len())
+            .sum::<usize>();
     if raw.len() != expected {
         return Err(invalid(
             "inherited restore descriptors do not cover the start request",
@@ -210,7 +212,12 @@ pub(crate) fn adopt(raw: Vec<RawFd>, request: &RestoreRequest) -> io::Result<Res
             .next()
             .ok_or_else(|| invalid("inherited restore descriptor is missing"))
     };
-    let objects = [take()?, take()?, take()?, take()?, take()?];
+    let objects = (0..request.objects.len())
+        .map(|_| take())
+        .collect::<io::Result<Vec<_>>>()?;
+    for (file, object) in objects.iter().zip(&request.objects) {
+        validate_object(file, object)?;
+    }
     let mut lowers = Vec::with_capacity(request.lowers.len());
     for lower in &request.lowers {
         let descriptor = take()?;
@@ -231,6 +238,63 @@ pub(crate) fn identity(file: &File) -> io::Result<(u64, u64)> {
     Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
+pub(crate) fn fingerprint(file: &File) -> io::Result<vm_spec::capture::SourceFingerprint> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(invalid("owned cut member is not a regular file"));
+    }
+    Ok(vm_spec::capture::SourceFingerprint {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        mode: metadata.mode(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+pub(crate) fn validate_object(
+    file: &File,
+    object: &vm_spec::restore::RestoreObject,
+) -> io::Result<()> {
+    use std::os::fd::AsFd;
+    let facts = readonly_regular(file.as_fd())?;
+    if facts != (object.file_device, object.file_inode, object.length) {
+        return Err(invalid("restore object differs from its held descriptor"));
+    }
+    if let vm_spec::restore::RestoreObjectAuthority::Owned {
+        fingerprint: expected,
+    } = &object.authority
+    {
+        expected.validate().map_err(invalid)?;
+        #[cfg(target_os = "linux")]
+        reject_surviving_writer(file)?;
+        if fingerprint(file)? != *expected {
+            return Err(invalid("owned restore object fingerprint changed"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn reject_surviving_writer(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // nix exposes no F_SETLEASE command. A read lease refuses existing writers;
+    // release immediately, before handing the held descriptor to native code.
+    if unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_SETLEASE, nix::libc::F_RDLCK) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_SETLEASE, nix::libc::F_UNLCK) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Decode the immutable inherited binary root and authenticate its exact bytes
 /// and role/profile against the seal, without scanning RAM or node descendants.
 pub(crate) fn verified_ram_map(
@@ -238,6 +302,11 @@ pub(crate) fn verified_ram_map(
     file: &File,
 ) -> io::Result<vm_spec::stream_map::StreamRoot> {
     use std::os::unix::fs::FileExt as _;
+    let vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } =
+        &request.authority
+    else {
+        return Err(invalid("owned cut cannot authorize an identified RAM map"));
+    };
     let object = request
         .objects
         .iter()
@@ -252,14 +321,17 @@ pub(crate) fn verified_ram_map(
     }
     let mut bytes = vec![0; object.length as usize];
     file.read_exact_at(&mut bytes, 0)?;
-    if vm_spec::capture::Sha256Digest::of_bytes(&bytes) != object.identity {
+    let vm_spec::restore::RestoreObjectAuthority::Identified { identity } = &object.authority
+    else {
+        return Err(invalid("RAM map lacks identified authority"));
+    };
+    if vm_spec::capture::Sha256Digest::of_bytes(&bytes) != *identity {
         return Err(invalid("restore RAM map differs from its sealed SHA"));
     }
     let map = vm_spec::stream_map::StreamRoot::decode(&bytes).map_err(io::Error::other)?;
     map.validate_role(vm_spec::stream_map::StreamRole::Ram)
         .map_err(io::Error::other)?;
-    let memory = request
-        .evidence
+    let memory = evidence
         .memory
         .as_ref()
         .ok_or_else(|| invalid("restore lacks RAM evidence"))?;
@@ -288,7 +360,11 @@ mod tests {
             parse_env(Some("[10,11,12,13,14]".as_ref())).unwrap(),
             vec![10, 11, 12, 13, 14]
         );
-        for refused in ["[10,11,12,13]", "not json", "{\"fd\":1}"] {
+        assert_eq!(
+            parse_env(Some("[10,11,12,13]".as_ref())).unwrap(),
+            vec![10, 11, 12, 13]
+        );
+        for refused in ["[10,11,12]", "not json", "{\"fd\":1}"] {
             assert!(parse_env(Some(refused.as_ref())).is_err(), "{refused}");
         }
         let oversized =
@@ -333,19 +409,89 @@ mod tests {
         let map = verified_ram_map(&launch.request, &launch.files.objects[4]).unwrap();
         assert_eq!(
             map.id(),
-            launch.request.evidence.memory.as_ref().unwrap().ram_stream
+            crate::krun::worker::restore::tests::evidence(&launch.request.authority)
+                .memory
+                .as_ref()
+                .unwrap()
+                .ram_stream
         );
         let mut wrong = launch.request.clone();
-        wrong.evidence.memory.as_mut().unwrap().ram_stream =
-            vm_spec::capture::Sha256Digest::of_bytes(b"different stream");
+        crate::krun::worker::restore::tests::evidence_mut(&mut wrong.authority)
+            .memory
+            .as_mut()
+            .unwrap()
+            .ram_stream = vm_spec::capture::Sha256Digest::of_bytes(b"different stream");
         assert!(verified_ram_map(&wrong, &launch.files.objects[4]).is_err());
         let mut wrong = launch.request.clone();
-        wrong.objects[4].identity =
-            vm_spec::capture::Sha256Digest::of_bytes(b"different full file");
+        wrong.objects[4].authority = vm_spec::restore::RestoreObjectAuthority::Identified {
+            identity: vm_spec::capture::Sha256Digest::of_bytes(b"different full file"),
+        };
         assert!(verified_ram_map(&wrong, &launch.files.objects[4]).is_err());
         let mut wrong = launch.request.clone();
         wrong.objects[4].length += 1;
         assert!(verified_ram_map(&wrong, &launch.files.objects[4]).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn owned_restore_rechecks_real_files_and_never_downgrades_authority() {
+        use crate::restore::inputs::validate_object;
+        let directory =
+            std::env::temp_dir().join(format!("silo-owned-restore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let launch = crate::krun::worker::restore::tests::owned_launch(&directory);
+        assert_eq!(launch.request.objects.len(), 4);
+        assert!(launch.request.map_node_store.is_none());
+        for (file, object) in launch.files.objects.iter().zip(&launch.request.objects) {
+            validate_object(file, object).unwrap();
+        }
+        assert!(crate::restore::inputs::verified_ram_map(
+            &launch.request,
+            &launch.files.objects[0]
+        )
+        .is_err());
+        let mut mixed = launch.request.clone();
+        mixed.objects[0].authority = vm_spec::restore::RestoreObjectAuthority::Identified {
+            identity: vm_spec::capture::Sha256Digest::of_bytes(b"not owned authority"),
+        };
+        assert!(mixed.validate().is_err());
+        let mut identified = crate::krun::worker::restore::tests::request();
+        identified.objects[0].authority = launch.request.objects[0].authority.clone();
+        assert!(identified.validate().is_err());
+        use std::os::unix::fs::PermissionsExt;
+        let mut object = launch.request.objects[2].clone();
+        let path = directory.join("restore-object-2");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        object.authority = vm_spec::restore::RestoreObjectAuthority::Owned {
+            fingerprint: crate::restore::inputs::fingerprint(&launch.files.objects[2]).unwrap(),
+        };
+        #[cfg(target_os = "linux")]
+        assert!(
+            validate_object(&launch.files.objects[2], &object).is_err(),
+            "a surviving writer must refuse local admission"
+        );
+        use std::os::unix::fs::FileExt;
+        writer.write_all_at(b"same!", 0).unwrap();
+        drop(writer);
+        assert!(
+            validate_object(&launch.files.objects[2], &object).is_err(),
+            "same-length edits invalidate exact fingerprints"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        assert!(
+            validate_object(&launch.files.objects[2], &object).is_err(),
+            "truncation invalidates the expected length"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"state").unwrap();
+        let replacement = std::fs::File::open(&path).unwrap();
+        assert!(
+            validate_object(&replacement, &object).is_err(),
+            "replacement inode is not admitted"
+        );
+        drop((replacement, launch));
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

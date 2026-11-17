@@ -9,7 +9,6 @@ use libvm::{
     ForkSourceOutcome, ForkStage, LiveForkChild, LiveForkOptions, LiveForkResult,
 };
 use silod_spec::daemon::v1 as w;
-use vm_spec::capture::Sha256Digest;
 use vm_spec::lifecycle::{Diagnostic, LiveId};
 
 use crate::{invalid, required, ConversionError};
@@ -247,9 +246,7 @@ fn capture_from_wire(value: w::ForkCaptureOutcome) -> Result<ForkCaptureOutcome,
     Ok(match required(value.outcome, "fork.capture.outcome")? {
         Outcome::Pending(()) => ForkCaptureOutcome::Pending,
         Outcome::SealedCutId(cut) => ForkCaptureOutcome::Sealed {
-            cut_id: cut
-                .parse::<Sha256Digest>()
-                .map_err(|_| invalid("fork.capture.sealed_cut_id", "invalid cut digest"))?,
+            cut_id: canonical_uuid(&cut, "fork.capture.sealed_cut_id")?,
         },
         Outcome::Failed(value) => ForkCaptureOutcome::Failed {
             diagnostic: diagnostic(value, "fork.capture.failed")?,
@@ -591,8 +588,8 @@ mod tests {
             .unwrap()
     }
 
-    fn cut() -> vm_spec::capture::Sha256Digest {
-        format!("sha256:{}", "e".repeat(64)).parse().unwrap()
+    fn cut() -> uuid::Uuid {
+        CAPTURE.parse().unwrap()
     }
 
     fn options() -> LiveForkOptions {

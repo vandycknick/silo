@@ -58,14 +58,14 @@ pub(crate) struct VmmLaunch<'a> {
 /// monitor's final startup outcome or actual failed-start cleanup.
 pub(crate) struct RestoreLaunch {
     pub(crate) request: vm_spec::restore::RestoreRequest,
-    pub(crate) objects: [std::fs::File; 5],
+    pub(crate) objects: Vec<std::fs::File>,
     pub(crate) executable: std::fs::File,
     pub(crate) executable_identity: crate::storage::identity_file::SourceFingerprint,
     pub(crate) lowers: Vec<std::fs::File>,
 }
 
 impl RestoreLaunch {
-    fn transfer_descriptors(&self) -> io::Result<Vec<Option<i32>>> {
+    pub(crate) fn transfer_descriptors(&self) -> io::Result<Vec<Option<i32>>> {
         self.request
             .validate()
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
@@ -75,7 +75,7 @@ impl RestoreLaunch {
             .iter()
             .map(|lower| 1 + lower.extents.len())
             .sum();
-        if self.lowers.len() != lower_count {
+        if self.objects.len() != self.request.objects.len() || self.lowers.len() != lower_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "restore lower descriptor set is incomplete",
@@ -87,7 +87,7 @@ impl RestoreLaunch {
                     .chain(lower.extents.iter().map(|extent| extent.fd))
             }),
         );
-        let mut descriptors = Vec::with_capacity(4 + lower_count + 6);
+        let mut descriptors = Vec::with_capacity(self.objects.len() + lower_count);
         for (file, expected) in self.objects.iter().chain(&self.lowers).zip(expected) {
             let flags =
                 nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_GETFD).map_err(io::Error::from)?;

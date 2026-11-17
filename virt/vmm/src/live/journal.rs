@@ -28,9 +28,9 @@ use std::num::NonZeroU64;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use vm_spec::capture::{
-    CaptureConfiguration, CaptureContinuation, CaptureEvidenceReference, CaptureLaunchLease,
-    CaptureObservation, CapturePauseAuthority, CapturePlan, CaptureReleaseDisposition,
-    CaptureReleaseState, CaptureReleased, Sha256Digest,
+    CaptureConfiguration, CaptureContinuation, CaptureLaunchLease, CaptureObservation,
+    CapturePauseAuthority, CapturePlan, CaptureReleaseDisposition, CaptureReleaseState,
+    CaptureReleased, Sha256Digest,
 };
 use vm_spec::lifecycle::{
     CancelCompleted, CancelOperationOutcome, CaptureCommand, CaptureOutcome, CapturePolicy,
@@ -185,8 +185,8 @@ pub(crate) struct CaptureFacts {
     pub(crate) plan: CapturePlan,
     pub(crate) continuation: CaptureContinuation,
     pub(crate) release: CaptureReleaseState,
-    pub(crate) evidence: Option<CaptureEvidenceReference>,
-    pub(crate) source_record: Option<Sha256Digest>,
+    pub(crate) evidence: Option<vm_spec::capture::CaptureRecordReference>,
+    pub(crate) source_record: Option<vm_spec::capture::CaptureSourceReference>,
     /// What the worker may retain for this operation; release resolves it.
     pub(crate) worker: WorkerPreparation,
     release_requests: Vec<LiveId>,
@@ -198,7 +198,7 @@ impl CaptureFacts {
             continuation: self.continuation.clone(),
             release: self.release.clone(),
             evidence: self.evidence.clone(),
-            source_record_sha256: self.source_record,
+            source_record: self.source_record.clone(),
         }
     }
 }
@@ -1010,6 +1010,7 @@ mod tests {
     fn plan(request: u8, pause: CapturePauseAuthority) -> CapturePlan {
         let binding = binding();
         CapturePlan {
+            identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
             version: CAPTURE_RECORD_VERSION,
             machine_id: id(MACHINE),
             run_id: id(RUN),

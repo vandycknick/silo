@@ -1322,8 +1322,8 @@ mod tests {
         .unwrap();
         pool.close().await;
 
-        let mut service =
-            crate::api::local::LocalVmService::new(libvm::RuntimeConfig::local(&home));
+        let config = crate::api::tests::isolated_runtime_config(temp.path(), &home);
+        let mut service = crate::api::local::LocalVmService::new(config);
         let error = service.list_machines().await.unwrap_err();
         assert!(matches!(
             error.downcast_ref::<libvm::LibVmError>(),

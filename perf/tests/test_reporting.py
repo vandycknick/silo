@@ -338,3 +338,15 @@ def test_create_and_run_clock_labels() -> None:
     assert "first create, includes image pull and preparation" in table
     assert "repeated create" in table
     assert "warm run" in table
+
+
+def test_fork_identity_cost_rows_are_informational_and_follow_existing_clocks() -> None:
+    from silo_perf.drivers import Action, INFORMATIONAL_METRICS
+    from silo_perf.scenario import SCENARIO
+
+    added = (Action.SNAPSHOT_SOURCE_AFTER_FORKS, Action.SNAPSHOT_FORK_CHILD_FIRST,
+             Action.SNAPSHOT_FORK_CHILD_SECOND)
+    assert SCENARIO[-3:] == added
+    assert SCENARIO.index(Action.SNAPSHOT_AFTER_RESTART) < SCENARIO.index(added[0])
+    assert {action.value for action in added} <= INFORMATIONAL_METRICS
+    assert not {action.value for action in added} & {key[-1] for key in load_targets()}

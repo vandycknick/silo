@@ -2854,14 +2854,15 @@ pub(crate) mod tests {
             };
             let (input, receiver) = tokio::sync::mpsc::unbounded_channel();
             let (lifetime, canceled) = tokio::sync::watch::channel(());
-            let _ = crate::ssh::agent::spawn_input_writer(
+            let writer = crate::ssh::agent::spawn_input_writer(
                 channel.id(),
                 receiver,
                 writer,
                 tokio::runtime::Handle::current(),
                 canceled,
                 None,
-            );
+            )
+            .unwrap();
             let payload = vec![b'b'; 1024 * 1024];
             let runtime_context = crate::lifecycle::RuntimeContext::for_tests();
             input
@@ -2883,6 +2884,10 @@ pub(crate) mod tests {
             released_rx
                 .await
                 .expect("cancellation must release the blocked input descriptor");
+            tokio::task::spawn_blocking(move || writer.join())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 Arc::strong_count(&runtime_context),
                 1,

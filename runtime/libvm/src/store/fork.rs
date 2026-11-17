@@ -1,12 +1,17 @@
 //! Durable fork identities, independent outcomes and operation-owned local cuts.
+//!
+//! `cut_retained` commits with the relocated owned-file inventory and its cut
+//! references, before any child `constructing` event. Source continuation is
+//! independent: `source_settled` may precede or follow retention. A lost manager
+//! never authorizes recapture; recovery settles the original capture and retires
+//! unsubmitted children under their reserved identities.
 use std::fs::File;
-use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
-use vm_spec::capture::{CaptureEvidence, CaptureRole, Sha256Digest};
+use vm_spec::capture::{CaptureRole, OwnedLocalCut};
 
 use crate::machine::live::MachineLiveObservation;
 use crate::machine::live_fork::{
@@ -90,7 +95,6 @@ pub(crate) struct LocalCutFile {
     pub device: u64,
     pub inode: u64,
     pub length: u64,
-    pub identity: Sha256Digest,
     pub fingerprint: crate::storage::identity_file::SourceFingerprint,
 }
 
@@ -99,8 +103,8 @@ pub(crate) struct LocalCutFile {
 pub(crate) struct LocalCut {
     pub operation_id: Uuid,
     pub capture_id: Uuid,
-    pub cut_id: Sha256Digest,
-    pub evidence: CaptureEvidence,
+    pub cut_id: Uuid,
+    pub evidence: OwnedLocalCut,
     pub plan: vm_spec::capture::CapturePlan,
     pub configuration: SnapshotConfiguration,
     pub storage: MachineStorageRecord,
@@ -109,47 +113,28 @@ pub(crate) struct LocalCut {
     pub relocated: bool,
 }
 
-/// Receipt-bound writable disk maps held through this operation's relocation.
-/// Each child's streaming copy authenticates its chunks on first use.
-pub(crate) struct AuthenticatedCutDisks {
-    operation_id: Uuid,
-    cut_id: Sha256Digest,
-    disks: Vec<(CaptureRole, crate::storage::stream::AuthenticatedStream)>,
-}
-
-impl AuthenticatedCutDisks {
-    pub(crate) fn new(
-        operation_id: Uuid,
-        cut_id: Sha256Digest,
-        disks: Vec<(CaptureRole, crate::storage::stream::AuthenticatedStream)>,
-    ) -> Self {
-        Self {
-            operation_id,
-            cut_id,
-            disks,
+impl LocalCut {
+    pub(crate) fn restore_evidence(&self) -> Result<OwnedLocalCut, LibVmError> {
+        let mut cut = self.evidence.clone();
+        if cut.members.len() != self.files.len() {
+            return Err(invalid("owned cut relocation inventory is incomplete"));
         }
-    }
-}
-
-/// One held descriptor per cut role, parallel to `LocalCut::files`.
-enum HeldCutRole {
-    State(File),
-    /// Writable disks also carry their canonical map, shared by every child.
-    Disk(crate::storage::stream::AuthenticatedStream),
-}
-
-impl HeldCutRole {
-    fn file(&self) -> &File {
-        match self {
-            Self::State(file) => file,
-            Self::Disk(stream) => stream.file(),
+        for (member, file) in cut.members.iter_mut().zip(&self.files) {
+            if member.role != file.role {
+                return Err(invalid(
+                    "owned cut relocation role differs from its producer",
+                ));
+            }
+            member.fingerprint = file.fingerprint.to_capture();
         }
+        cut.validate().map_err(invalid)?;
+        Ok(cut)
     }
 }
 
 pub(crate) struct VerifiedRestoreCut {
     pub record: LocalCut,
-    held: Vec<HeldCutRole>,
+    held: Vec<File>,
     directory: crate::paths::OwnedDirectory,
     pub _lease: crate::storage::locks::StorageLock,
     pub pool_streams: std::collections::BTreeMap<
@@ -163,30 +148,11 @@ impl VerifiedRestoreCut {
         &self.directory
     }
 
-    /// The held descriptor of one role, parallel to `record.files`.
-    #[cfg(test)]
-    pub(crate) fn held_file(&self, index: usize) -> Option<&File> {
-        self.held.get(index).map(HeldCutRole::file)
-    }
-
     /// Reopen through the pinned owned directory, not through evidence paths.
     /// Each child gets an independent open-file description: sparse-copy seeks
     /// and native metadata readers cannot disturb another child's descriptor.
     pub(crate) fn reopen_role(&self, role: &CaptureRole) -> Result<File, LibVmError> {
         self.open_role(self.role_index(role)?)
-    }
-
-    /// An independent descriptor of one writable cut disk, bound to the map
-    /// the seal verification derived. Children share that map, never clone it.
-    pub(crate) fn reopen_disk(
-        &self,
-        role: &CaptureRole,
-    ) -> Result<crate::storage::stream::AuthenticatedStream, LibVmError> {
-        let index = self.role_index(role)?;
-        let HeldCutRole::Disk(held) = &self.held[index] else {
-            return Err(invalid("local cut role is not a writable disk"));
-        };
-        Ok(held.reopen(self.open_role(index)?)?)
     }
 
     fn role_index(&self, role: &CaptureRole) -> Result<usize, LibVmError> {
@@ -195,7 +161,12 @@ impl VerifiedRestoreCut {
             .iter()
             .position(|file| &file.role == role)
             .filter(|index| *index < self.held.len())
-            .ok_or_else(|| invalid("local cut role missing"))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "owned local cut role {} is missing",
+                    role.relative_path()
+                ))
+            })
     }
 
     fn open_role(&self, index: usize) -> Result<File, LibVmError> {
@@ -205,44 +176,21 @@ impl VerifiedRestoreCut {
             Some((parent, name)) => self
                 .directory
                 .open_dir(parent)?
-                .ok_or_else(|| invalid("local cut role parent missing"))?
+                .ok_or_else(|| invalid(format!("owned local cut {relative} parent is missing")))?
                 .open_immutable_file(name)?,
             None => self.directory.open_immutable_file(&relative)?,
         }
-        .ok_or_else(|| invalid("local cut role missing"))?;
+        .ok_or_else(|| invalid(format!("owned local cut {relative} is missing")))?;
         if crate::storage::identity_file::SourceFingerprint::new(&file.metadata()?)
             != identity.fingerprint
-            || crate::storage::identity_file::SourceFingerprint::new(
-                &self.held[index].file().metadata()?,
-            ) != identity.fingerprint
+            || crate::storage::identity_file::SourceFingerprint::new(&self.held[index].metadata()?)
+                != identity.fingerprint
         {
-            return Err(invalid("local cut role was replaced or modified"));
+            return Err(invalid(format!(
+                "owned local cut {relative} was replaced or modified"
+            )));
         }
         Ok(file)
-    }
-}
-
-impl LocalCut {
-    pub(crate) fn identity(&self) -> Result<Sha256Digest, LibVmError> {
-        let inventory = self
-            .files
-            .iter()
-            .map(|file| (&file.role, file.length, file.identity))
-            .collect::<Vec<_>>();
-        let mut bytes = b"silo:local-fork-cut:v1\0".to_vec();
-        bytes.extend(
-            serde_json::to_vec(&(
-                self.operation_id,
-                self.capture_id,
-                &self.plan,
-                &self.evidence,
-                &self.configuration,
-                &self.storage,
-                inventory,
-            ))
-            .map_err(|error| invalid(error.to_string()))?,
-        );
-        Ok(Sha256Digest::of_bytes(&bytes))
     }
 }
 
@@ -567,16 +515,12 @@ impl Store {
             .map(|json| {
                 let record: LocalCut =
                     serde_json::from_str(json).map_err(|error| invalid(error.to_string()))?;
-                if record.operation_id != operation || record.identity()? != record.cut_id {
+                if record.operation_id != operation || record.cut_id != record.capture_id {
                     return Err(invalid("local cut identity contradiction"));
                 }
-                record.plan.validate().map_err(invalid)?;
                 record
                     .evidence
-                    .validate_against_plan(
-                        &record.plan,
-                        &Sha256Digest::of_bytes(&record.plan.canonical_bytes().map_err(invalid)?),
-                    )
+                    .validate_against_plan(&record.plan)
                     .map_err(invalid)?;
                 record.storage.validate()?;
                 let ram = record
@@ -587,7 +531,14 @@ impl Store {
                 if record.source_ram.role != CaptureRole::Ram
                     || record.source_ram.inode == 0
                     || record.source_ram.length != ram.length
-                    || record.source_ram.identity != ram.identity
+                    || record
+                        .evidence
+                        .members
+                        .iter()
+                        .find(|member| member.role == CaptureRole::Ram)
+                        .is_none_or(|member| {
+                            member.fingerprint != record.source_ram.fingerprint.to_capture()
+                        })
                 {
                     return Err(invalid(
                         "local cut source/final RAM identities contradict the seal",
@@ -595,15 +546,18 @@ impl Store {
                 }
                 if record.capture_id.to_string() != record.plan.capture_id.as_str()
                     || record.storage.snapshot.is_some()
-                    || record.files.len() != record.evidence.inventory.len()
+                    || record.files.len() != record.evidence.members.len()
                     || record
                         .files
                         .iter()
-                        .zip(&record.evidence.inventory)
+                        .zip(&record.evidence.members)
                         .any(|(file, entry)| {
                             file.role != entry.role
-                                || file.length != entry.length
-                                || Some(file.identity) != entry.identity.or(entry.sha256)
+                                || !entry.complete
+                                || file.length != entry.fingerprint.length
+                                || file.device != file.fingerprint.to_capture().device
+                                || file.inode != file.fingerprint.to_capture().inode
+                                || file.length != file.fingerprint.to_capture().length
                                 || file.inode == 0
                         })
                 {
@@ -635,12 +589,10 @@ impl Store {
         Ok(())
     }
 
-    /// Reopen the structurally accepted receipt and its immutable role inodes.
-    /// Stream bytes are authenticated while constructing each private child.
+    /// Reopen exact owned members under the operation lease without hashing.
     pub(crate) async fn open_local_cut(
         &self,
         operation: Uuid,
-        retained: Option<AuthenticatedCutDisks>,
     ) -> Result<VerifiedRestoreCut, LibVmError> {
         let pool = StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
@@ -654,19 +606,6 @@ impl Store {
             return Err(invalid("fork cut relocation remains incomplete"));
         }
         drop(_roots);
-        let mut retained = match retained {
-            Some(retained)
-                if retained.operation_id == operation && retained.cut_id == record.cut_id =>
-            {
-                retained.disks
-            }
-            Some(_) => {
-                return Err(invalid(
-                    "retained cut authentication belongs to another operation or cut",
-                ))
-            }
-            None => Vec::new(),
-        };
         let directory = crate::paths::OwnedDirectory::open_existing_root(
             &self
                 .images_dir
@@ -681,87 +620,30 @@ impl Store {
             let file = match relative.split_once('/') {
                 Some((parent, name)) => directory
                     .open_dir(parent)?
-                    .ok_or_else(|| invalid("local cut role parent missing"))?
+                    .ok_or_else(|| {
+                        invalid(format!("owned local cut {relative} parent is missing"))
+                    })?
                     .open_immutable_file(name)?,
                 None => directory.open_immutable_file(&relative)?,
             }
-            .ok_or_else(|| invalid("local cut role missing"))?;
+            .ok_or_else(|| invalid(format!("owned local cut {relative} is missing")))?;
             let metadata = file.metadata()?;
             if crate::storage::identity_file::SourceFingerprint::new(&metadata) != role.fingerprint
                 || metadata.nlink() != 1
                 || metadata.mode() & 0o7777 != 0o400
                 || metadata.uid() != nix::unistd::geteuid().as_raw()
             {
-                return Err(invalid("local cut immutable inode identity changed"));
+                return Err(invalid(format!(
+                    "owned local cut {relative} immutable inode facts changed"
+                )));
             }
-            if !matches!(role.role, CaptureRole::Disk(_)) {
-                held.push(HeldCutRole::State(file));
-                continue;
-            }
-            let stream = match retained.iter().position(|(disk, _)| disk == &role.role) {
-                Some(index) => {
-                    let (_, authenticated) = retained.swap_remove(index);
-                    if authenticated.fingerprint() != role.fingerprint {
-                        return Err(invalid(
-                            "retained cut disk authentication differs from the relocated inode",
-                        ));
-                    }
-                    // Checks the held and fresh descriptors, then shares the map.
-                    authenticated.reopen(file)?
-                }
-                None => {
-                    let map_role = match &role.role {
-                        CaptureRole::Disk(name) => CaptureRole::DiskMap(name.clone()),
-                        _ => return Err(invalid("local cut disk role is invalid")),
-                    };
-                    let map_entry = record
-                        .files
-                        .iter()
-                        .find(|entry| entry.role == map_role)
-                        .ok_or_else(|| invalid("local cut disk map is missing"))?;
-                    let relative = map_role.relative_path();
-                    let (parent, name) = relative
-                        .split_once('/')
-                        .ok_or_else(|| invalid("local cut disk map path is invalid"))?;
-                    let map_file = directory
-                        .open_dir(parent)?
-                        .ok_or_else(|| invalid("local cut disk map parent is missing"))?
-                        .open_immutable_file(name)?
-                        .ok_or_else(|| invalid("local cut disk map is missing"))?;
-                    if crate::storage::identity_file::SourceFingerprint::new(&map_file.metadata()?)
-                        != map_entry.fingerprint
-                    {
-                        return Err(invalid("local cut disk map inode changed"));
-                    }
-                    let mut bytes = Vec::new();
-                    std::io::Read::take(&map_file, map_entry.length + 1).read_to_end(&mut bytes)?;
-                    if Sha256Digest::of_bytes(&bytes) != map_entry.identity {
-                        return Err(invalid("local cut disk map digest differs from receipt"));
-                    }
-                    let root = vm_spec::stream_map::StreamRoot::decode(&bytes)
-                        .map_err(|error| invalid(error.to_string()))?;
-                    let authority =
-                        pool.map_authority(std::sync::Arc::new(pool.existing_lease(operation)?))?;
-                    let map = crate::storage::map::AuthenticatedMap::from_root(
-                        root,
-                        vm_spec::stream_map::StreamRole::Disk,
-                        authority,
-                    )?;
-                    if map.length() != role.length
-                        || map.id().as_bytes() != role.identity.as_bytes()
-                        || map.canonical_bytes()? != bytes
-                    {
-                        return Err(invalid("local cut disk identity differs from receipt"));
-                    }
-                    crate::storage::stream::AuthenticatedStream::from_receipt(file, map)?
-                }
-            };
-            held.push(HeldCutRole::Disk(stream));
-        }
-        if !retained.is_empty() {
-            return Err(invalid(
-                "retained cut authentication names a role outside the cut",
-            ));
+            crate::storage::identity_file::reject_surviving_writer(&file).map_err(|error| {
+                invalid(format!(
+                    "owned cut {} has a surviving writer: {error}",
+                    relative
+                ))
+            })?;
+            held.push(file);
         }
         let mut pool_streams: std::collections::BTreeMap<
             crate::storage::identity::StreamId,
@@ -810,8 +692,16 @@ impl Store {
             match pool_streams.entry(stream) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(
-                        crate::machine::stopped::open_immutable_stream(
-                            self, operation, &stream, length,
+                        self.reuse_local_stream(
+                            operation,
+                            &crate::store::models::snapshot::SnapshotStream {
+                                stream,
+                                map: crate::storage::identity::ObjectDigest::from_sha256(
+                                    *stream.as_bytes(),
+                                ),
+                                length,
+                                chunk_size: vm_spec::stream_map::ChunkSize::DISK.bytes(),
+                            },
                         )
                         .await?,
                     );
@@ -986,6 +876,51 @@ impl Store {
                 let dependent:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation o JOIN live_fork f ON o.operation_id=f.capture_id WHERE f.operation_id=?1 UNION ALL SELECT 1 FROM live_fork_child c JOIN storage_operation o ON o.operation_id=c.consumer_id OR o.operation_id=c.launch_id OR (o.machine_id=c.machine_id AND o.run_id=c.run_id) WHERE c.operation_id=?1 UNION ALL SELECT 1 FROM live_fork_child WHERE operation_id=?1 AND name_reserved=1 UNION ALL SELECT 1 FROM storage_operation_cut d JOIN local_cut l ON l.cut_id=d.cut_id WHERE l.operation_id=?1 AND d.operation_id!=?1)").bind(&cursor).fetch_one(&mut *tx).await?;
                 let constructed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM live_fork_child c JOIN machine_config m ON m.id=c.machine_id WHERE c.operation_id=?1 AND m.durability='constructed')")
                     .bind(&cursor).fetch_one(&mut *tx).await?;
+                let whole_cut_needed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_cut d JOIN local_cut l ON l.cut_id=d.cut_id WHERE l.operation_id=?1 AND d.operation_id!=?1 AND d.role='operation')")
+                    .bind(&cursor).fetch_one(&mut *tx).await?;
+                if finished && !whole_cut_needed && !constructed {
+                    let json: Option<String> = sqlx::query_scalar(
+                        "SELECT json(record_json) FROM local_cut WHERE operation_id=?1",
+                    )
+                    .bind(&cursor)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if let Some(json) = json {
+                        let cut: LocalCut = serde_json::from_str(&json)
+                            .map_err(|error| invalid(error.to_string()))?;
+                        if let Some(directory) = crate::paths::OwnedDirectory::open_existing_root(
+                            &self.images_dir.join("tmp").join(&cursor).join("cut"),
+                        )? {
+                            if let Some(disks) = directory.open_dir("disks")? {
+                                for payload in &cut.files {
+                                    let CaptureRole::Disk(name) = &payload.role else {
+                                        continue;
+                                    };
+                                    if let Some(file) =
+                                        disks.open_immutable_file(&name.file_name())?
+                                    {
+                                        if crate::storage::identity_file::SourceFingerprint::new(
+                                            &file.metadata()?,
+                                        ) != payload.fingerprint
+                                        {
+                                            return Err(invalid(format!(
+                                                "owned cut {} facts changed during retirement",
+                                                payload.role.relative_path()
+                                            )));
+                                        }
+                                        nix::unistd::unlinkat(
+                                            disks.fd(),
+                                            name.file_name().as_str(),
+                                            nix::unistd::UnlinkatFlags::NoRemoveDir,
+                                        )
+                                        .map_err(std::io::Error::from)?;
+                                    }
+                                }
+                                disks.sync()?;
+                            }
+                        }
+                    }
+                }
                 if !finished || dependent || constructed {
                     tx.commit().await?;
                     continue;
@@ -1128,7 +1063,7 @@ pub(crate) mod tests {
         store
             .update_fork(request.operation_id, |result| {
                 result.capture = ForkCaptureOutcome::Sealed {
-                    cut_id: vm_spec::capture::Sha256Digest::of_bytes(b"sealed cut"),
+                    cut_id: Uuid::new_v4(),
                 };
                 result.source = ForkSourceOutcome::Resumed;
                 Ok(())
@@ -1534,7 +1469,7 @@ pub(crate) mod tests {
         store
             .update_fork(operation, |result| {
                 result.capture = ForkCaptureOutcome::Sealed {
-                    cut_id: vm_spec::capture::Sha256Digest::of_bytes(b"sealed cut"),
+                    cut_id: Uuid::new_v4(),
                 };
                 result.source = ForkSourceOutcome::Resumed;
                 result.stage = ForkStage::Settling;
@@ -1620,7 +1555,7 @@ pub(crate) mod tests {
         store
             .update_fork(request.operation_id, |result| {
                 result.capture = ForkCaptureOutcome::Sealed {
-                    cut_id: vm_spec::capture::Sha256Digest::of_bytes(b"sealed cut"),
+                    cut_id: Uuid::new_v4(),
                 };
                 result.source = ForkSourceOutcome::Resumed;
                 Ok(())

@@ -67,7 +67,12 @@ pub(crate) struct RestoreStateFiles {
     pub(crate) layout: std::fs::File,
     pub(crate) execution: std::fs::File,
     pub(crate) devices: std::fs::File,
-    pub(crate) ram_map: std::fs::File,
+    pub(crate) ram_map: RestoreRamMap,
+}
+
+pub(crate) enum RestoreRamMap {
+    Identified(std::fs::File),
+    OwnedLocalCut,
 }
 
 pub(crate) struct Bootstrap {
@@ -107,28 +112,43 @@ impl Bootstrap {
     /// optional; whether they must be present is decided by the config, which
     /// is read afterwards.
     pub(crate) fn adopt_fixed() -> io::Result<Self> {
-        let restore = RESTORE_STATE_FDS
+        let first = RESTORE_STATE_FDS[..4]
             .iter()
             .map(|&raw| descriptor_open(raw))
             .collect::<io::Result<Vec<_>>>()?;
-        let restore = match (
-            restore.iter().all(|open| *open),
-            restore.iter().any(|open| *open),
-        ) {
-            (true, _) => true,
-            (false, false) => false,
-            (false, true) => return Err(invalid("restore state table is incomplete")),
+        let map = descriptor_open(RESTORE_STATE_FDS[4])?;
+        let count = if first.iter().all(|open| *open) {
+            if map {
+                5
+            } else {
+                4
+            }
+        } else if first.iter().any(|open| *open) || map {
+            return Err(invalid("restore state table is incomplete"));
+        } else {
+            0
         };
-        Self::adopt_fixed_mode(restore, false)
+        Self::adopt_fixed_mode(count, false)
     }
 
     /// Explicit proof entry only; normal worker launch never admits these roles.
     #[allow(dead_code)] // Not an extension of the normal worker wire.
     pub(crate) fn adopt_standalone_fixed(restore: bool) -> io::Result<Self> {
-        Self::adopt_fixed_mode(restore, true)
+        let count = if restore {
+            if descriptor_open(RESTORE_STATE_FDS[4])? {
+                5
+            } else {
+                4
+            }
+        } else {
+            0
+        };
+        Self::adopt_fixed_mode(count, true)
     }
 
-    fn adopt_fixed_mode(restore: bool, standalone: bool) -> io::Result<Self> {
+    fn adopt_fixed_mode(restore_count: usize, standalone: bool) -> io::Result<Self> {
+        let restore = restore_count != 0;
+        let state = restore.then_some(&RESTORE_STATE_FDS[..restore_count]);
         let mux = descriptor_open(MUX_FD)?.then_some(MUX_FD);
         let raw_handles = contiguous(
             FIRST_RAW_FD,
@@ -156,7 +176,7 @@ impl Bootstrap {
         .chain(mux)
         .chain(raw_handles.iter().copied())
         .chain(lifecycle)
-        .chain(restore.then_some(RESTORE_STATE_FDS).into_iter().flatten())
+        .chain(state.into_iter().flatten().copied())
         .chain(
             standalone
                 .then_some(STANDALONE_ENDPOINT_FDS)
@@ -175,7 +195,7 @@ impl Bootstrap {
             STORAGE_LEASE_FD,
             &raw_handles,
             lifecycle,
-            restore.then_some(RESTORE_STATE_FDS),
+            state,
             standalone.then_some(STANDALONE_ENDPOINT_FDS),
             &lowers,
         )
@@ -217,10 +237,15 @@ impl Bootstrap {
         storage_lease: RawFd,
         raw_handles: &[RawFd],
         lifecycle: Option<RawFd>,
-        state: Option<[RawFd; 5]>,
+        state: Option<&[RawFd]>,
         standalone: Option<[RawFd; 3]>,
         lowers: &[RawFd],
     ) -> io::Result<Self> {
+        if state.is_some_and(|fds| !matches!(fds.len(), 4 | 5)) {
+            return Err(invalid(
+                "restore state table must contain four or five objects",
+            ));
+        }
         if raw_handles.len() > MAX_RAW_HANDLES {
             return Err(invalid("too many inherited Raw backing handles"));
         }
@@ -246,7 +271,7 @@ impl Bootstrap {
             .chain(raw_handles.iter().map(|&raw| (raw, Role::Raw)))
             .chain(lifecycle.map(|raw| (raw, Role::Lifecycle)))
             .chain(state.into_iter().flat_map(|fds| {
-                fds.into_iter().zip([
+                fds.iter().copied().zip([
                     Role::State { maximum: 1 << 40 },
                     Role::State { maximum: 64 * 1024 },
                     Role::State {
@@ -379,14 +404,15 @@ impl Bootstrap {
                     .map(|&raw| OwnedFd::from_raw_fd(raw))
                     .collect(),
                 lifecycle: lifecycle.map(|raw| OwnedFd::from_raw_fd(raw)),
-                state_files: state.map(|[ram, layout, execution, devices, ram_map]| {
-                    RestoreStateFiles {
-                        ram: std::fs::File::from_raw_fd(ram),
-                        layout: std::fs::File::from_raw_fd(layout),
-                        execution: std::fs::File::from_raw_fd(execution),
-                        devices: std::fs::File::from_raw_fd(devices),
-                        ram_map: std::fs::File::from_raw_fd(ram_map),
-                    }
+                state_files: state.map(|fds| RestoreStateFiles {
+                    ram: std::fs::File::from_raw_fd(fds[0]),
+                    layout: std::fs::File::from_raw_fd(fds[1]),
+                    execution: std::fs::File::from_raw_fd(fds[2]),
+                    devices: std::fs::File::from_raw_fd(fds[3]),
+                    ram_map: match fds.get(4) {
+                        Some(raw) => RestoreRamMap::Identified(std::fs::File::from_raw_fd(*raw)),
+                        None => RestoreRamMap::OwnedLocalCut,
+                    },
                 }),
                 lowers: lowers
                     .iter()
@@ -709,8 +735,8 @@ mod tests {
             std::fs::write(&path, [1_u8; 8]).unwrap();
             files.push(std::fs::File::open(path).unwrap());
         }
-        let raw = std::array::from_fn(|index| files[index].as_raw_fd());
-        let refuse = |state, disks: &[std::os::fd::RawFd]| {
+        let raw: [std::os::fd::RawFd; 5] = std::array::from_fn(|index| files[index].as_raw_fd());
+        let refuse = |state: [std::os::fd::RawFd; 5], disks: &[std::os::fd::RawFd]| {
             assert!(Bootstrap::adopt_with_state(
                 config.as_raw_fd(),
                 events.as_raw_fd(),
@@ -720,7 +746,7 @@ mod tests {
                 lease.as_raw_fd(),
                 disks,
                 None,
-                Some(state),
+                Some(&state),
                 None,
                 &[],
             )
@@ -799,7 +825,7 @@ mod tests {
             lease.into_raw_fd(),
             &[],
             None,
-            Some(files.map(IntoRawFd::into_raw_fd)),
+            Some(&files.map(IntoRawFd::into_raw_fd)),
             None,
             &[],
         )
@@ -816,7 +842,12 @@ mod tests {
             state.layout.as_fd(),
             state.execution.as_fd(),
             state.devices.as_fd(),
-            state.ram_map.as_fd(),
+            match &state.ram_map {
+                crate::krun::worker::fds::RestoreRamMap::Identified(file) => file.as_fd(),
+                crate::krun::worker::fds::RestoreRamMap::OwnedLocalCut => {
+                    panic!("identified restore map")
+                }
+            },
         ] {
             assert!(
                 FdFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFD).unwrap())

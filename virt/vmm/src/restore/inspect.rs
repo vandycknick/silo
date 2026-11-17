@@ -1,7 +1,7 @@
 //! `silo-vmm inspect-restore`: descriptor-only native compatibility admission
 //! before the manager allocates any child resource. stdin carries exactly one
-//! newline-terminated `RestoreInspectionRequest`; the five state objects are
-//! inherited at their request numbers. stdout carries exactly one report line
+//! newline-terminated `RestoreInspectionRequest`; its four owned-cut or five
+//! identified state objects are inherited at their request numbers. stdout carries one report line
 //! or a typed bounded portability refusal on nonzero exit. No child VM is
 //! created: native may probe an empty host-profile VM only.
 
@@ -19,6 +19,66 @@ use vm_spec::restore::{
 const SUBCOMMAND: &str = "inspect-restore";
 const INSPECTION_BUDGET: Duration = Duration::from_secs(10);
 
+fn validate_request(
+    request: &RestoreInspectionRequest,
+) -> Result<(), vm_spec::restore::RestorePortabilityRefusal> {
+    request.validate().map_err(|reason| {
+        let (pin, expected, actual) = if request.version != RESTORE_INSPECTION_VERSION {
+            (
+                "inspection-schema",
+                RESTORE_INSPECTION_VERSION.to_string(),
+                request.version.to_string(),
+            )
+        } else if !request.restore.configuration.shares.is_empty()
+            || request.restore.configuration.rosetta
+        {
+            (
+                "topology.devices",
+                "restore-supported devices without shares or Rosetta".into(),
+                reason,
+            )
+        } else {
+            (
+                "restore-authority",
+                "complete matching identified snapshot or owned-cut authority".into(),
+                reason,
+            )
+        };
+        vm_spec::restore::RestorePortabilityRefusal::new(pin, expected, actual)
+    })
+}
+
+fn inspection_failure(error: &eyre::Report) -> vm_spec::restore::RestoreInspectionFailure {
+    let refusal = error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<vm_spec::restore::RestorePortabilityRefusal>()
+                .cloned()
+                .or_else(|| {
+                    cause.downcast_ref::<std::io::Error>().and_then(|error| {
+                        error
+                            .get_ref()
+                            .and_then(|inner| {
+                                inner.downcast_ref::<vm_spec::restore::RestorePortabilityRefusal>()
+                            })
+                            .cloned()
+                    })
+                })
+        })
+        .unwrap_or_else(|| {
+            vm_spec::restore::RestorePortabilityRefusal::new(
+                "restore-inputs",
+                "exact supported restore inputs",
+                format!("{error:#}"),
+            )
+        });
+    vm_spec::restore::RestoreInspectionFailure {
+        version: RESTORE_INSPECTION_VERSION,
+        refusal,
+    }
+}
+
 /// Called after private worker dispatch, before any launch initialization.
 pub(crate) fn dispatch() -> Option<eyre::Result<()>> {
     let mut args = std::env::args_os().skip(1);
@@ -35,24 +95,20 @@ pub(crate) fn dispatch() -> Option<eyre::Result<()>> {
         let report = match inspect(&encoded) {
             Ok(report) => report,
             Err(error) => {
-                let refusal = error.chain().find_map(|cause| {
-                    cause.downcast_ref::<vm_spec::restore::RestorePortabilityRefusal>().cloned()
-                        .or_else(|| cause.downcast_ref::<std::io::Error>().and_then(|error|
-                            error.get_ref().and_then(|inner| inner.downcast_ref::<vm_spec::restore::RestorePortabilityRefusal>()).cloned()))
-                });
-                if let Some(refusal) = refusal {
-                    let failure = vm_spec::restore::RestoreInspectionFailure {
-                        version: RESTORE_INSPECTION_VERSION,
-                        refusal,
-                    };
-                    let mut line = serde_json::to_vec(&failure)?;
-                    line.push(b'\n');
-                    std::io::stdout().lock().write_all(&line)?;
-                }
+                let failure = inspection_failure(&error);
+                let mut line = serde_json::to_vec(&failure)?;
+                line.push(b'\n');
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(&line)?;
+                stdout.flush()?;
                 return Err(error);
             }
         };
         let mut line = serde_json::to_vec(&report)?;
+        eyre::ensure!(
+            line.len() <= vm_spec::restore::MAX_RESTORE_INSPECTION_REPORT_BYTES,
+            "restore inspection report exceeds its bound"
+        );
         line.push(b'\n');
         let mut stdout = std::io::stdout().lock();
         stdout.write_all(&line)?;
@@ -74,7 +130,7 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
     );
     let request: RestoreInspectionRequest = serde_json::from_slice(record)
         .map_err(|error| eyre::eyre!("parse inspection request: {error}"))?;
-    request.validate().map_err(|error| eyre::eyre!(error))?;
+    validate_request(&request)?;
     let restore = &request.restore;
     // The objects are borrowed for fstat/pread only; ownership stays with the
     // inherited table, which ends with this process.
@@ -92,12 +148,27 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
             object.role
         );
         crate::startup::set_cloexec(object.fd, true)?;
+        crate::restore::inputs::validate_object(&file, object)?;
         files.push(file);
     }
-    let [_, layout, execution, devices, ram_map] = files.as_slice() else {
-        return Err(eyre::eyre!("inspection requires exactly five objects"));
+    let (layout, execution, devices) = match (&restore.authority, files.as_slice()) {
+        (
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { .. },
+            [_, layout, execution, devices, ram_map],
+        ) => {
+            crate::restore::inputs::verified_ram_map(restore, ram_map)?;
+            (layout, execution, devices)
+        }
+        (
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. },
+            [_, layout, execution, devices],
+        ) => (layout, execution, devices),
+        _ => {
+            return Err(eyre::eyre!(
+                "inspection object set differs from its authority"
+            ))
+        }
     };
-    crate::restore::inputs::verified_ram_map(restore, ram_map)?;
     let shape = crate::krun::restore::inspect(
         restore,
         request.network,
@@ -108,6 +179,9 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
         },
         Instant::now() + INSPECTION_BUDGET,
     )?;
+    for (file, object) in files.iter().zip(&restore.objects) {
+        crate::restore::inputs::validate_object(file, object)?;
+    }
     let selection = crate::capabilities::ResolvedSelection::from_start(None)?;
     eyre::ensure!(
         selection.backend_kind()? == crate::virt::BackendKind::Krun,
@@ -116,8 +190,30 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
     let host = selection.host_report()?;
     let report = RestoreInspectionReport {
         version: RESTORE_INSPECTION_VERSION,
-        request: Sha256Digest::of_bytes(record),
-        checkpoint: restore.checkpoint,
+        request: match &restore.authority {
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { .. } => {
+                vm_spec::restore::RestoreInspectionRequestBinding::Identified {
+                    sha256: Sha256Digest::of_bytes(record),
+                }
+            }
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. } => {
+                vm_spec::restore::RestoreInspectionRequestBinding::OwnedLocalCut {
+                    request: std::str::from_utf8(record)?.to_owned(),
+                }
+            }
+        },
+        authority: match &restore.authority {
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { checkpoint, .. } => {
+                vm_spec::restore::RestoreReference::IdentifiedSnapshot {
+                    checkpoint: *checkpoint,
+                }
+            }
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
+                vm_spec::restore::RestoreReference::OwnedLocalCut {
+                    capture_id: cut.capture_id.clone(),
+                }
+            }
+        },
         live_state_schema: libkrun::capabilities::LIVE_STATE_SCHEMA.to_string(),
         architecture: std::env::consts::ARCH.to_string(),
         lane: host.lane,
@@ -150,5 +246,73 @@ mod tests {
         ] {
             assert!(inspect(encoded).is_err());
         }
+    }
+
+    #[test]
+    fn inspection_schema_and_authority_validation_uses_the_real_shared_contract() {
+        use crate::restore::inspect::{inspection_failure, validate_request};
+        use vm_spec::restore::{RestoreInspectionRequest, RESTORE_INSPECTION_VERSION};
+        let directory =
+            std::env::temp_dir().join(format!("inspection-authorities-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let owned = crate::krun::worker::restore::tests::owned_launch(&directory);
+        for restore in [
+            crate::krun::worker::restore::tests::request(),
+            owned.request.clone(),
+        ] {
+            let mut request = RestoreInspectionRequest {
+                version: RESTORE_INSPECTION_VERSION,
+                restore,
+                network: false,
+            };
+            validate_request(&request).unwrap();
+            request.version = RESTORE_INSPECTION_VERSION - 1;
+            let mut bytes = serde_json::to_vec(&request).unwrap();
+            bytes.push(b'\n');
+            let error = inspect(&bytes).unwrap_err();
+            let failure = inspection_failure(&error);
+            failure.validate().unwrap();
+            assert_eq!(failure.refusal.pin, "inspection-schema");
+            assert_eq!(
+                failure.refusal.expected,
+                RESTORE_INSPECTION_VERSION.to_string()
+            );
+            assert_eq!(failure.refusal.actual, request.version.to_string());
+            request.version = RESTORE_INSPECTION_VERSION;
+            request.restore.configuration.rosetta = true;
+            assert_eq!(
+                validate_request(&request).unwrap_err().pin,
+                "topology.devices"
+            );
+            request.restore.configuration.rosetta = false;
+            request.restore.objects.pop();
+            assert_eq!(
+                validate_request(&request).unwrap_err().pin,
+                "restore-authority"
+            );
+        }
+        drop(owned);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn inspection_failure_keeps_native_reason_and_types_other_input_errors() {
+        use crate::restore::inspect::inspection_failure;
+        use vm_spec::restore::RestorePortabilityRefusal;
+        let expected = RestorePortabilityRefusal::new(
+            "cpu.profile",
+            "captured CPU",
+            "native profile mismatch",
+        );
+        let error = eyre::Report::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            expected.clone(),
+        ));
+        assert_eq!(inspection_failure(&error).refusal, expected);
+        let error = eyre::eyre!("owned restore member fingerprint changed");
+        let failure = inspection_failure(&error);
+        failure.validate().unwrap();
+        assert_eq!(failure.refusal.pin, "restore-inputs");
+        assert!(failure.refusal.actual.contains("fingerprint changed"));
     }
 }

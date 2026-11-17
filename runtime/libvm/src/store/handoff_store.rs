@@ -664,7 +664,7 @@ impl<'a> HandoffDestinationCommit<'a> {
         {
             return Err(HandoffError::InvalidState.into());
         }
-        published.invalidate_disk_baselines();
+        published.invalidate_disk_tracking();
         Store::write_machine_storage(&mut self.tx, intent.destination_machine, &published).await?;
         let receipt = TerminalReceipt {
             intent: intent.clone(),
@@ -702,7 +702,18 @@ mod tests {
             id,
             lock_id: crate::lock_manager::LockId::from(0),
             name: "handoff-test".into(),
-            spec: vm_spec::VmSpec::current(),
+            spec: vm_spec::VmSpec {
+                storage: Some(vm_spec::Storage {
+                    disks: vec![crate::machine::root_storage::disk(
+                        "root.raw",
+                        vm_spec::DiskRole::Root,
+                        512,
+                        "root".into(),
+                    )
+                    .unwrap()],
+                }),
+                ..vm_spec::VmSpec::current()
+            },
             retention: crate::MachineRetention::Persistent,
             process: crate::ProcessConfig::default(),
             template_name: None,
@@ -798,6 +809,7 @@ mod tests {
         )
         .unwrap();
         let boot = store.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
         storage.ownership_epoch = intent.destination_epoch().unwrap().get();
         let mut commit = store.begin_handoff_destination_commit(auth).await.unwrap();
         assert!(commit.terminal_receipt().is_none());
@@ -1456,6 +1468,7 @@ mod tests {
         )
         .unwrap();
         let _boot = b.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
         storage.ownership_epoch = 1;
         let commit = async {
             let mut publication = b.begin_handoff_destination_commit(&auth).await?;
@@ -1508,7 +1521,7 @@ mod tests {
     }
     #[tokio::test]
     async fn handoff_ownership_changes_invalidate_source_and_destination_baselines() {
-        use crate::store::models::storage::DiskBaselineState;
+        use crate::store::models::storage::{ContentIdentityState, DiskBaselineState};
         let (_source_home, source) = catalog().await;
         let (_destination_home, destination) = catalog().await;
         let machine = MachineId::new();
@@ -1563,6 +1576,16 @@ mod tests {
                 .state,
             DiskBaselineState::Invalid
         ));
+        assert_eq!(
+            source
+                .machine_storage(machine)
+                .await
+                .unwrap()
+                .unwrap()
+                .disk_identities[0]
+                .identity,
+            ContentIdentityState::Unknown
+        );
         let authorization = source.fence_handoff_source(&prepared).await.unwrap();
         let destination_directory = crate::paths::OwnedDirectory::open_root(
             &crate::paths::machine_data_dir_in(destination.home_path(), machine),
@@ -1603,6 +1626,18 @@ mod tests {
                 .state,
             DiskBaselineState::Invalid
         ));
+        assert_eq!(
+            destination
+                .machine_storage(machine)
+                .await
+                .unwrap()
+                .unwrap()
+                .disk_identities[0]
+                .identity,
+            ContentIdentityState::Identified {
+                root: map.root().id(),
+            }
+        );
     }
 
     #[tokio::test]

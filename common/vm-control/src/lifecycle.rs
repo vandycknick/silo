@@ -161,6 +161,7 @@ pub fn reference_from_wire(v: w::MachineRef) -> Result<libvm::MachineRef, Conver
         Reference::Name(v) => (v, 2),
         Reference::IdPrefix(v) => (v, 3),
     };
+    crate::images::reject_local_cut(&text)?;
     let native = match kind {
         2 => libvm::MachineRef::parse_exact(text),
         _ => libvm::MachineRef::parse(text),

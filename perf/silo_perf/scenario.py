@@ -26,6 +26,8 @@ def sample(driver: Driver) -> dict[str, float]:
             if action == Action.SNAPSHOT_INCREMENTAL:
                 driver.rewrite_source(snapshot=True)
                 driver.before_snapshot()
+            if action == Action.SNAPSHOT_SOURCE_AFTER_FORKS:
+                driver.prepare_fork_snapshots()
             measurements.update(driver.measure(action))
             if action == Action.EXEC:
                 driver.populate_source()

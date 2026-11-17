@@ -1,11 +1,10 @@
-//! One authenticated local cut, a durable batch journal and independent launches.
+//! One owned local cut, a durable batch journal and independent launches.
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use vm_spec::capture::Sha256Digest;
 use vm_spec::lifecycle::{CaptureResumePolicy, Diagnostic, LiveId};
 
 use crate::machine::live::MachineLiveObservation;
@@ -129,7 +128,7 @@ pub enum ForkStage {
 )]
 pub enum ForkCaptureOutcome {
     Pending,
-    Sealed { cut_id: Sha256Digest },
+    Sealed { cut_id: Uuid },
     Failed { diagnostic: Diagnostic },
     Abandoned { diagnostic: Diagnostic },
 }
@@ -352,11 +351,10 @@ async fn create_fork(
         crate::require_live_operation(&fresh, vm_spec::live::LiveOperation::Fork)?;
         options.policy = crate::machine::live_capture::resolve_policy(options.policy, &fresh);
         crate::machine::live_capture::admission(&fresh, options.resume_policy)?;
-        let storage = runtime.machine_storage_record(machine).await?;
-        if !config.spec.mounts.is_empty() || !storage.external_requirements.is_empty() {
+        if !config.spec.mounts.is_empty() {
             return Err(fork_error(
                 operation,
-                "fork profile cannot inherit host shares or external disk authority",
+                "fork profile cannot inherit host shares",
             ));
         }
         runtime
@@ -459,9 +457,6 @@ async fn create_fork(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     let mut launches = tokio::task::JoinSet::new();
     let mut launched = false;
-    // Disk authentication from this loop's own seal retention survives Pending
-    // iterations until the cut is opened; nothing else may hold it.
-    let mut retained = None;
     loop {
         let current = store
             .fork_result(operation)
@@ -470,11 +465,10 @@ async fn create_fork(
         if current.cancellation_requested && !launched {
             cancel_source_capture(&runtime, &current).await?;
         }
-        match crate::machine::live_capture::advance(
+        let capture_admissible = match crate::machine::live_capture::advance(
             &runtime,
             machine,
             capture,
-            &mut retained,
             progress.as_ref(),
             crate::storage::pool::PublicationLockPolicy::Wait,
         )
@@ -482,13 +476,16 @@ async fn create_fork(
         {
             Ok(crate::machine::live_capture::CaptureProgress::Abandoned(reason)) => {
                 fail_capture(&runtime, operation, diagnostic(reason), false).await?;
+                false
             }
-            Ok(_) => {}
+            Ok(_) => true,
             Err(error) => {
                 tracing::warn!(%operation,%error,"fork capture reconciliation retains exact ownership");
+                false
             }
-        }
-        if !launched
+        };
+        if capture_admissible
+            && !launched
             && store
                 .local_cut(operation)
                 .await?
@@ -498,7 +495,7 @@ async fn create_fork(
                 progress.as_ref(),
                 LiveOperationProgress::PreparingChildStorage,
             );
-            let cut = store.open_local_cut(operation, retained.take()).await?;
+            let cut = store.open_local_cut(operation).await?;
             if let Err(error) = store.bind_fork_resources(&cut).await {
                 for child in store.fork_children(operation).await? {
                     if matches!(child.result.outcome, ForkChildOutcome::Pending) {
@@ -1267,13 +1264,13 @@ async fn reconcile_one(
         Uuid::parse_str(result.capture_id.as_str()).map_err(|error| invalid(error.to_string()))?;
     let snapshots = crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
     if snapshots.capture_reservation(capture).await?.is_some() {
-        // Recovery settles children; it never opens the cut, so any disk
-        // authentication retained here is released immediately.
+        // Reconcile only the original capture and owned file journal. Even
+        // after cut_retained, a dead manager does not authorize another capture
+        // or a new child launch: unsubmitted children are retired below.
         match crate::machine::live_capture::advance(
             runtime,
             result.source_machine_id,
             capture,
-            &mut None,
             None,
             lock_policy,
         )

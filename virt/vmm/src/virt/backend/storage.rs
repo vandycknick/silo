@@ -420,8 +420,8 @@ mod tests {
                 read_only: disk.read_only,
             })
             .collect();
-        restore.request.evidence.configuration_digest =
-            restore.request.configuration.digest().unwrap();
+        crate::krun::worker::restore::tests::evidence_mut(&mut restore.request.authority)
+            .configuration_digest = restore.request.configuration.digest().unwrap();
         restore.request.validate().unwrap();
         let mut builder = VmConfig::builder("restore").base_directory(&fixture.directory);
         for disk in disks {

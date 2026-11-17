@@ -14,6 +14,7 @@ from pathlib import Path
 import select
 import shlex
 import struct
+import sqlite3
 import subprocess
 import sys
 from uuid import UUID, uuid4
@@ -34,8 +35,8 @@ def compile_probe(output: Path) -> Path:
     return output
 
 
-def install_disks(silo: Silo, name: str) -> list[str]:
-    """Use the stopped fixture's lifecycle-lock/current-schema construction pattern."""
+def install_disks(silo: Silo, name: str, *, external: bool = False) -> list[str]:
+    """Install managed disks, or one managed and one external writable disk, under the real lock."""
     config = stopped.configuration(silo, name)
     lock = silo.ws.run_root / "locks" / str(config["lockId"])
     fd = os.open(lock, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -53,7 +54,8 @@ def install_disks(silo: Silo, name: str) -> list[str]:
         directory.mkdir(mode=0o700)
         roles = []
         for number in range(2):
-            path = directory / f"data-{number}.raw"
+            is_external = external and number == 1
+            path = silo.ws.root / "external-data.raw" if is_external else directory / f"data-{number}.raw"
             with path.open("xb") as output:
                 output.truncate(32 * 1024**2)
             path.chmod(0o600)
@@ -63,22 +65,24 @@ def install_disks(silo: Silo, name: str) -> list[str]:
             silo.ws.record("capture-multidisk-mkfs", result.stdout + result.stderr)
             geometry = {"length": path.stat().st_size, "logicalSectorSize": 512}
             order = len(config["spec"]["storage"]["disks"])
-            storage["disks"].append({"id": str(uuid4()), "role": "data", "order": order,
-                                     "storage": {"kind": "managed-writable", "path": f"disks/{path.name}",
-                                                 "geometry": geometry}})
+            if not is_external:
+                storage["disks"].append({"id": str(uuid4()), "role": "data", "order": order,
+                                         "storage": {"kind": "managed-writable", "path": f"disks/{path.name}",
+                                                     "geometry": geometry}})
             config["spec"]["storage"]["disks"].append({
                 "path": str(path), "role": "data", "format": "raw", "geometry": geometry,
                 "blockId": f"silo-data-{number}", "readOnly": False,
             })
             roles.append(f"silo-data-{order}")
-        def literal(value: dict) -> str:
-            return "'" + json.dumps(value).replace("'", "''") + "'"
-        statement = (f"BEGIN IMMEDIATE; UPDATE machine_config SET config_json=jsonb({literal(config)}) "
-                     f"WHERE id='{machine_id}'; UPDATE machine_storage SET record_json=jsonb({literal(storage)}) "
-                     f"WHERE machine_id='{machine_id}'; COMMIT;")
-        result = subprocess.run(["sqlite3", str(silo.ws.state_db()), statement],
-                                check=True, capture_output=True, text=True, timeout=15)
-        silo.ws.record("capture-multidisk-fixture", result.stdout + result.stderr)
+        stopped.bind_fixture_disk_identity_inventory(config, storage)
+        with sqlite3.connect(silo.ws.state_db(), timeout=5) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("UPDATE machine_config SET config_json=jsonb(?) WHERE id=?",
+                               (json.dumps(config), machine_id))
+            connection.execute("UPDATE machine_storage SET record_json=jsonb(?) WHERE machine_id=?",
+                               (json.dumps(storage), machine_id))
+        silo.ws.record("capture-multidisk-fixture", json.dumps({
+            "configuration": config, "storage": storage, "externalWritable": external}) + "\n")
         assert stopped.configuration(silo, name) == config
         assert stopped.record(silo, name) == storage
         return roles

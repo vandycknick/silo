@@ -33,6 +33,7 @@ pub use crate::image::import_types::{
     ManagedSourceInfo, ManagedSourceRef, RawConversionKey, RawConversionOptions, RootCandidate,
     RootSelectionFailed,
 };
+pub use crate::machine::live_capture::SnapshotIdentityReason;
 pub use crate::machine::live_fork::{
     ForkCaptureOutcome, ForkChildOutcome, ForkChildResult, ForkDestination, ForkFailurePhase,
     ForkSourceOutcome, ForkStage, LiveForkChild, LiveForkOptions, LiveForkResult,
@@ -70,6 +71,7 @@ pub use crate::store::models::storage::{
     StorageOperationState, StorageProfile, StorageStopOutcome, TemporaryDirectoryPolicy,
     Translation,
 };
+pub use crate::store::models::storage::{ContentIdentityState, DiskContentIdentity};
 pub use crate::store::models::{MachineId, MachineIdParseError};
 pub use crate::store::snapshot_store::{
     CaptureNamingOutcome, SnapshotCaptureKindName, SnapshotCaptureProvenance, SnapshotInfo,

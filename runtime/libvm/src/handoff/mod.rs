@@ -9,6 +9,12 @@
 //! files are the immutable cut (no clone or copy is made). Only bytes the
 //! destination cannot verify locally travel, as exact objects, binary stream
 //! roots, map-node objects and root-authenticated decoded 8 MiB payloads.
+//!
+//! Admission binds configuration, ownership and stopped private-file
+//! fingerprints, not content identity or tracking evidence invalidated by the
+//! reservation. Every writable cut is hashed, including unknown-identity fork
+//! storage. Destination disk identities come from that authenticated manifest,
+//! never from source identity hints, and survive the ownership-only commit.
 pub mod destination;
 pub mod plan;
 pub mod service;

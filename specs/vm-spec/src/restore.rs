@@ -4,16 +4,18 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{
-    CaptureConfiguration, CaptureEvidence, CaptureRole, Sha256Digest, MAX_CAPTURE_RAM_BYTES,
+    CaptureConfiguration, CaptureEvidence, CaptureRole, CaptureStateBinding, OwnedLocalCut,
+    Sha256Digest, SourceFingerprint, MAX_CAPTURE_RAM_BYTES,
 };
 use crate::lifecycle::LiveId;
 
-pub const RESTORE_REQUEST_VERSION: u32 = 2;
+pub const RESTORE_REQUEST_VERSION: u32 = 3;
 pub const GENERATION_ACK_TIMEOUT_MS: u64 = 5_000;
 pub const ACTIVATE_TIMEOUT_MS: u64 = 30_000;
-pub const RESTORE_INSPECTION_VERSION: u32 = 1;
+pub const RESTORE_INSPECTION_VERSION: u32 = 2;
 pub const MAX_RESTORE_INSPECTION_BYTES: usize =
     crate::capture::MAX_CAPTURE_RECORD_BYTES + (1 << 20);
+pub const MAX_RESTORE_INSPECTION_REPORT_BYTES: usize = 2 * MAX_RESTORE_INSPECTION_BYTES + (1 << 20);
 pub const MAX_RESTORE_LOWER_EXTENTS: usize = 1536;
 pub const RESTORE_CONSOLE_ID: &str = "hvc0";
 pub const RESTORE_VSOCK_ID: &str = "vsock";
@@ -141,9 +143,64 @@ impl RestoreObjectRole {
     }
 }
 
-/// The sender duplicates an already authenticated, leased immutable object.
-/// Receivers must compare these facts with fstat and validate the complete FD
-/// set before adopting any descriptor. Numbers here never authorize path opens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RestoreAuthority {
+    IdentifiedSnapshot {
+        checkpoint: Sha256Digest,
+        evidence: Box<CaptureEvidence>,
+    },
+    OwnedLocalCut {
+        cut: Box<OwnedLocalCut>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RestoreReference {
+    IdentifiedSnapshot { checkpoint: Sha256Digest },
+    OwnedLocalCut { capture_id: LiveId },
+}
+
+impl RestoreAuthority {
+    pub fn reference(&self) -> RestoreReference {
+        match self {
+            Self::IdentifiedSnapshot { checkpoint, .. } => RestoreReference::IdentifiedSnapshot {
+                checkpoint: *checkpoint,
+            },
+            Self::OwnedLocalCut { cut } => RestoreReference::OwnedLocalCut {
+                capture_id: cut.capture_id.clone(),
+            },
+        }
+    }
+
+    pub fn binding(&self) -> Result<&CaptureStateBinding, String> {
+        match self {
+            Self::IdentifiedSnapshot { evidence, .. } => evidence
+                .memory
+                .as_ref()
+                .map(|memory| &memory.binding)
+                .ok_or_else(|| "identified restore lacks a memory binding".into()),
+            Self::OwnedLocalCut { cut } => Ok(&cut.binding),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RestoreObjectAuthority {
+    Identified { identity: Sha256Digest },
+    Owned { fingerprint: SourceFingerprint },
+}
+
+/// The sender duplicates an admitted, leased immutable object under explicit
+/// identified or owned authority. Receivers compare exact facts with fstat and
+/// validate the complete FD set before adoption; numbers never authorize path opens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestoreObject {
@@ -152,9 +209,7 @@ pub struct RestoreObject {
     pub file_device: u64,
     pub file_inode: u64,
     pub length: u64,
-    /// RAM uses its canonical chunk-list stream identity. Small state objects
-    /// use the whole-byte SHA-256 recorded for their role.
-    pub identity: Sha256Digest,
+    pub authority: RestoreObjectAuthority,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,17 +264,16 @@ pub fn validate_disk_tracking_seeds(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestoreRequest {
     pub version: u32,
-    pub checkpoint: Sha256Digest,
+    pub authority: RestoreAuthority,
     pub activation_id: LiveId,
     pub freeze_operation_id: LiveId,
     pub start_paused: bool,
     pub configuration: CaptureConfiguration,
-    pub evidence: CaptureEvidence,
     pub disk_tracking_seeds: Vec<crate::capture::DiskTrackingSeed>,
     #[serde(deserialize_with = "crate::capture::required")]
     pub map_node_store: Option<String>,
-    /// Exactly RAM, layout, execution, devices, complete RAM map, in that order.
-    pub objects: [RestoreObject; 5],
+    /// RAM, layout, execution, devices, then a RAM map for identified authority only.
+    pub objects: Vec<RestoreObject>,
     pub lowers: Vec<RestoreLower>,
     pub network: Option<RestoreNetwork>,
     /// Destination public SSH CA. Absent only during pre-allocation inspection.
@@ -229,6 +283,19 @@ pub struct RestoreRequest {
 
 impl RestoreRequest {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_destination_tracking(true)
+    }
+
+    /// Descriptor-only inspection precedes allocation of private child disks.
+    /// Omitted seeds are permitted here only; supplied seeds must be complete.
+    pub fn validate_for_inspection(&self) -> Result<(), String> {
+        self.validate_with_destination_tracking(false)
+    }
+
+    fn validate_with_destination_tracking(
+        &self,
+        require_destination_seeds: bool,
+    ) -> Result<(), String> {
         if self.version != RESTORE_REQUEST_VERSION || !self.start_paused {
             return Err("restore requires the current schema and startPaused=true".into());
         }
@@ -241,14 +308,69 @@ impl RestoreRequest {
         }
         self.configuration.validate()?;
         validate_disk_tracking_seeds(&self.disk_tracking_seeds, &self.configuration)?;
-        if !self.evidence.is_sealed() {
-            return Err("restore requires a coherent capture seal".into());
-        }
-        if self.configuration.digest()? != self.evidence.configuration_digest {
-            return Err("restore configuration differs from the captured cut".into());
-        }
-        if self.evidence.freeze_operation_id.as_ref() != Some(&self.freeze_operation_id) {
-            return Err("restore freeze operation differs from the captured cut".into());
+        let expected_count = match &self.authority {
+            RestoreAuthority::IdentifiedSnapshot { evidence, .. } => {
+                evidence.validate()?;
+                if !evidence.is_sealed()
+                    || self.configuration.digest()? != evidence.configuration_digest
+                    || evidence.freeze_operation_id.as_ref() != Some(&self.freeze_operation_id)
+                {
+                    return Err("restore requires the exact coherent identified capture".into());
+                }
+                5
+            }
+            RestoreAuthority::OwnedLocalCut { cut } => {
+                cut.validate()?;
+                if cut.configuration != self.configuration {
+                    return Err(
+                        "owned restore configuration differs from the captured execution pins"
+                            .into(),
+                    );
+                }
+                if cut.freeze_operation_id != self.freeze_operation_id {
+                    return Err("owned restore freeze operation differs from the cut".into());
+                }
+                if self.map_node_store.is_some() {
+                    return Err("owned restore must not carry an identified map node store".into());
+                }
+                if self
+                    .disk_tracking_seeds
+                    .iter()
+                    .any(|seed| seed.baseline.is_some())
+                {
+                    return Err(
+                        "owned restore destination seed carries an identified baseline".into(),
+                    );
+                }
+                let writable = self
+                    .configuration
+                    .attachments
+                    .iter()
+                    .filter(|attachment| !attachment.read_only)
+                    .count();
+                if (require_destination_seeds || !self.disk_tracking_seeds.is_empty())
+                    && self.disk_tracking_seeds.len() != writable
+                {
+                    return Err(format!(
+                        "owned restore destination seed count {} differs from {} writable attachments",
+                        self.disk_tracking_seeds.len(), writable
+                    ));
+                }
+                if self.disk_tracking_seeds.iter().any(|seed| {
+                    cut.members.iter().any(|member| {
+                        member.fingerprint.device == seed.file_device
+                            && member.fingerprint.inode == seed.file_inode
+                    })
+                }) {
+                    return Err(
+                        "owned restore writable destination inode aliases a cut member".into(),
+                    );
+                }
+                4
+            }
+        };
+        if self.objects.len() != expected_count {
+            return Err("restore object count does not match input authority".into());
         }
         let mut descriptors = BTreeSet::new();
         let mut inodes = BTreeSet::new();
@@ -263,18 +385,45 @@ impl RestoreRequest {
             {
                 return Err("restore object roles, descriptors or geometry are invalid".into());
             }
-            let inventory = self
-                .evidence
-                .inventory
-                .iter()
-                .find(|entry| entry.role == object.role.capture_role())
-                .ok_or_else(|| "restore object is absent from the captured cut".to_string())?;
-            let identity = match object.role {
-                RestoreObjectRole::Ram => inventory.identity,
-                _ => inventory.sha256,
-            };
-            if object.length != inventory.length || Some(object.identity) != identity {
-                return Err("restore object identity differs from the captured cut".into());
+            match (&self.authority, &object.authority) {
+                (
+                    RestoreAuthority::IdentifiedSnapshot { evidence, .. },
+                    RestoreObjectAuthority::Identified { identity },
+                ) => {
+                    let inventory = evidence
+                        .inventory
+                        .iter()
+                        .find(|entry| entry.role == object.role.capture_role())
+                        .ok_or_else(|| {
+                            "restore object is absent from the captured cut".to_string()
+                        })?;
+                    let expected = match object.role {
+                        RestoreObjectRole::Ram => inventory.identity,
+                        _ => inventory.sha256,
+                    };
+                    if object.length != inventory.length || Some(*identity) != expected {
+                        return Err("restore identity differs from identified evidence".into());
+                    }
+                }
+                (
+                    RestoreAuthority::OwnedLocalCut { cut },
+                    RestoreObjectAuthority::Owned { fingerprint },
+                ) => {
+                    fingerprint.validate()?;
+                    let member = cut
+                        .members
+                        .iter()
+                        .find(|member| member.role == object.role.capture_role())
+                        .ok_or_else(|| "restore object is absent from the owned cut".to_string())?;
+                    if fingerprint != &member.fingerprint
+                        || object.length != fingerprint.length
+                        || object.file_device != fingerprint.device
+                        || object.file_inode != fingerprint.inode
+                    {
+                        return Err("restore exact-file facts differ from owned evidence".into());
+                    }
+                }
+                _ => return Err("restore input authority cannot be downgraded or mixed".into()),
             }
         }
         self.validate_lowers(&mut descriptors, &mut inodes)?;
@@ -504,7 +653,7 @@ impl RestoreInspectionRequest {
         {
             return Err("unsupported restore inspection schema or device profile".into());
         }
-        self.restore.validate()
+        self.restore.validate_for_inspection()
     }
 
     pub fn expected_device_identities(&self) -> impl Iterator<Item = (&str, RestoreDeviceKind)> {
@@ -554,11 +703,18 @@ pub struct RestoreAdmittedDevice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RestoreInspectionRequestBinding {
+    Identified { sha256: Sha256Digest },
+    OwnedLocalCut { request: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestoreInspectionReport {
     pub version: u32,
-    pub request: Sha256Digest,
-    pub checkpoint: Sha256Digest,
+    pub request: RestoreInspectionRequestBinding,
+    pub authority: RestoreReference,
     pub live_state_schema: String,
     pub architecture: String,
     pub lane: crate::live::LiveLane,
@@ -650,20 +806,20 @@ impl RestoreInspectionReport {
         &self,
         request: &RestoreInspectionRequest,
     ) -> Option<RestorePortabilityRefusal> {
-        let memory = request.restore.evidence.memory.as_ref()?;
+        let binding = request.restore.authority.binding().ok()?;
         let mismatch = |pin: &str, expected: String, actual: String| {
             (expected != actual).then(|| RestorePortabilityRefusal::new(pin, expected, actual))
         };
         mismatch(
             "live-state-schema",
             self.live_state_schema.clone(),
-            memory.binding.live_state_schema.clone(),
+            binding.live_state_schema.clone(),
         )
         .or_else(|| {
             mismatch(
                 "architecture",
                 self.architecture.clone(),
-                memory.binding.architecture.clone(),
+                binding.architecture.clone(),
             )
         })
         .or_else(|| {
@@ -699,18 +855,24 @@ impl RestoreInspectionReport {
         if let Some(refusal) = self.portability_refusal(request) {
             return Err(refusal.to_string());
         }
-        let memory = request
-            .restore
-            .evidence
-            .memory
-            .as_ref()
-            .ok_or_else(|| "restore inspection lacks a memory binding".to_string())?;
+        let binding = request.restore.authority.binding()?;
+        let request_matches = match (&self.request, &request.restore.authority) {
+            (
+                RestoreInspectionRequestBinding::Identified { sha256 },
+                RestoreAuthority::IdentifiedSnapshot { .. },
+            ) => *sha256 == Sha256Digest::of_bytes(request_bytes),
+            (
+                RestoreInspectionRequestBinding::OwnedLocalCut { request: exact },
+                RestoreAuthority::OwnedLocalCut { .. },
+            ) => exact.as_bytes() == request_bytes,
+            _ => false,
+        };
         if request_bytes.len() > MAX_RESTORE_INSPECTION_BYTES
             || self.version != RESTORE_INSPECTION_VERSION
-            || self.request != Sha256Digest::of_bytes(request_bytes)
-            || self.checkpoint != request.restore.checkpoint
-            || self.live_state_schema != memory.binding.live_state_schema
-            || self.architecture != memory.binding.architecture
+            || !request_matches
+            || self.authority != request.restore.authority.reference()
+            || self.live_state_schema != binding.live_state_schema
+            || self.architecture != binding.architecture
             || self.lane == crate::live::LiveLane::NotApplicable
             || self.cpu_count != u32::from(request.restore.configuration.cpus)
             || self.ram_bytes != request.restore.configuration.ram_bytes()
@@ -878,5 +1040,222 @@ mod tests {
         let mut invalid = failure;
         invalid.refusal.actual.clear();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn owned_restore_requires_complete_private_unknown_identity_inputs_and_never_downgrades() {
+        use crate::capture::{DiskTrackingSeed, DISK_TRACKING_VERSION, STREAM_CHUNK_BYTES};
+        use crate::restore::*;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let fixture = crate::capture::tests::owned_cut_fixture("restore-owned-authority");
+        let cut = &fixture.cut;
+        let mut held = Vec::new();
+        let objects = RestoreObjectRole::ALL[..4]
+            .iter()
+            .copied()
+            .map(|role| {
+                let member = cut
+                    .members
+                    .iter()
+                    .find(|member| member.role == role.capture_role())
+                    .unwrap();
+                let file = std::fs::File::open(fixture.directory.join(member.role.relative_path()))
+                    .unwrap();
+                let fd = file.as_raw_fd();
+                held.push(file);
+                RestoreObject {
+                    role,
+                    fd,
+                    file_device: member.fingerprint.device,
+                    file_inode: member.fingerprint.inode,
+                    length: member.fingerprint.length,
+                    authority: RestoreObjectAuthority::Owned {
+                        fingerprint: member.fingerprint.clone(),
+                    },
+                }
+            })
+            .collect();
+        let mut seeds = Vec::new();
+        let mut lowers = Vec::new();
+        for (index, attachment) in cut.configuration.attachments.iter().enumerate() {
+            if attachment.read_only {
+                if attachment.format == crate::DiskFormat::Vmdk {
+                    let descriptor_path = fixture.directory.join(format!("lower-{index}.vmdk"));
+                    let extent_path = fixture.directory.join(format!("lower-{index}.raw"));
+                    std::fs::write(&descriptor_path, b"descriptor").unwrap();
+                    let extent = std::fs::File::create(&extent_path).unwrap();
+                    extent.set_len(attachment.geometry.length).unwrap();
+                    drop(extent);
+                    let descriptor = std::fs::File::open(&descriptor_path).unwrap();
+                    let extent = std::fs::File::open(&extent_path).unwrap();
+                    let metadata = descriptor.metadata().unwrap();
+                    let extent_metadata = extent.metadata().unwrap();
+                    lowers.push(RestoreLower {
+                        block_id: attachment.block_id.clone(),
+                        descriptor: RestoreDescriptor {
+                            fd: descriptor.as_raw_fd(),
+                            file_device: metadata.dev(),
+                            file_inode: metadata.ino(),
+                            length: metadata.len(),
+                        },
+                        extents: vec![RestoreExtent {
+                            path: extent_path.to_str().unwrap().to_owned(),
+                            fd: extent.as_raw_fd(),
+                            file_device: extent_metadata.dev(),
+                            file_inode: extent_metadata.ino(),
+                            length: extent_metadata.len(),
+                        }],
+                    });
+                    held.push(descriptor);
+                    held.push(extent);
+                }
+            } else {
+                let disk =
+                    std::fs::File::create(fixture.directory.join(format!("child-{index}.raw")))
+                        .unwrap();
+                disk.set_len(attachment.geometry.length).unwrap();
+                let metadata = disk.metadata().unwrap();
+                seeds.push(DiskTrackingSeed {
+                    version: DISK_TRACKING_VERSION,
+                    map_format: 2,
+                    chunk_shift: 23,
+                    role: attachment.role,
+                    attachment_index: index as u32,
+                    block_id: attachment.block_id.clone(),
+                    file_device: metadata.dev(),
+                    file_inode: metadata.ino(),
+                    length: metadata.len(),
+                    chunk_size: STREAM_CHUNK_BYTES,
+                    epoch: crate::lifecycle::LiveId::parse(&format!(
+                        "00000000-0000-4000-8000-{index:012x}"
+                    ))
+                    .unwrap(),
+                    baseline: None,
+                });
+                held.push(disk);
+            }
+        }
+        let request = RestoreRequest {
+            version: RESTORE_REQUEST_VERSION,
+            authority: RestoreAuthority::OwnedLocalCut {
+                cut: Box::new(cut.clone()),
+            },
+            activation_id: cut.capture_id.clone(),
+            freeze_operation_id: cut.freeze_operation_id.clone(),
+            start_paused: true,
+            configuration: cut.configuration.clone(),
+            disk_tracking_seeds: seeds,
+            map_node_store: None,
+            objects,
+            lowers,
+            network: None,
+            ssh_trusted_ca: None,
+            hook: None,
+        };
+        request.validate().unwrap();
+        let mut preallocation = request.clone();
+        preallocation.disk_tracking_seeds.clear();
+        preallocation.validate_for_inspection().unwrap();
+        assert!(preallocation
+            .validate()
+            .unwrap_err()
+            .contains("destination seed count"));
+        RestoreInspectionRequest {
+            version: RESTORE_INSPECTION_VERSION,
+            restore: preallocation,
+            network: false,
+        }
+        .validate()
+        .unwrap();
+        let mut wrong_configuration = request.clone();
+        wrong_configuration.configuration.cpus += 1;
+        assert!(wrong_configuration
+            .validate_for_inspection()
+            .unwrap_err()
+            .contains("configuration"));
+        let mut wrong_freeze = request.clone();
+        wrong_freeze.freeze_operation_id =
+            crate::lifecycle::LiveId::parse("88888888-8888-4888-8888-888888888888").unwrap();
+        assert!(wrong_freeze
+            .validate_for_inspection()
+            .unwrap_err()
+            .contains("freeze operation"));
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<RestoreRequest>(&bytes).unwrap(),
+            request
+        );
+        for mutation in 0..7 {
+            let mut bad = request.clone();
+            match mutation {
+                0 => {
+                    bad.objects[0].authority = RestoreObjectAuthority::Identified {
+                        identity: Sha256Digest::of_bytes(b"not an owned file capability"),
+                    }
+                }
+                1 => bad.disk_tracking_seeds.clear(),
+                2 => {
+                    bad.disk_tracking_seeds[0].baseline =
+                        Some(Sha256Digest::of_bytes(b"foreign root"))
+                }
+                3 => bad.objects[1].fd = bad.objects[0].fd,
+                4 => {
+                    if let RestoreObjectAuthority::Owned { fingerprint } =
+                        &mut bad.objects[0].authority
+                    {
+                        fingerprint.modified_nanoseconds =
+                            (fingerprint.modified_nanoseconds + 1) % 1_000_000_000;
+                    }
+                }
+                5 => bad.map_node_store = Some("/private/maps".into()),
+                _ => {
+                    bad.disk_tracking_seeds[0].file_device = cut.members[4].fingerprint.device;
+                    bad.disk_tracking_seeds[0].file_inode = cut.members[4].fingerprint.inode;
+                }
+            }
+            assert!(bad.validate().is_err(), "mutation {mutation}");
+        }
+        let inspection = RestoreInspectionRequest {
+            version: RESTORE_INSPECTION_VERSION,
+            restore: request,
+            network: false,
+        };
+        let bytes = serde_json::to_vec(&inspection).unwrap();
+        let mut report = RestoreInspectionReport {
+            version: RESTORE_INSPECTION_VERSION,
+            request: RestoreInspectionRequestBinding::OwnedLocalCut {
+                request: String::from_utf8(bytes.clone()).unwrap(),
+            },
+            authority: inspection.restore.authority.reference(),
+            live_state_schema: cut.binding.live_state_schema.clone(),
+            architecture: cut.binding.architecture.clone(),
+            lane: crate::live::LiveLane::KvmX86_64,
+            cpu_count: u32::from(cut.configuration.cpus),
+            ram_bytes: cut.packed_length,
+            devices: inspection
+                .expected_device_identities()
+                .enumerate()
+                .map(|(index, (id, kind))| RestoreAdmittedDevice {
+                    configured_id: id.into(),
+                    kind,
+                    address: (index as u64 + 1) * 4096,
+                    irq: index as u32 + 1,
+                })
+                .collect(),
+        };
+        report.validate_against(&bytes, &inspection).unwrap();
+        report.request = RestoreInspectionRequestBinding::Identified {
+            sha256: Sha256Digest::of_bytes(&bytes),
+        };
+        assert!(report.validate_against(&bytes, &inspection).is_err());
+        report.request = RestoreInspectionRequestBinding::OwnedLocalCut {
+            request: format!("{} ", String::from_utf8(bytes.clone()).unwrap()),
+        };
+        assert!(report.validate_against(&bytes, &inspection).is_err());
+        let mut unknown = serde_json::to_value(&inspection.restore).unwrap();
+        unknown["authority"]["digest"] = serde_json::json!("not permitted");
+        assert!(serde_json::from_value::<RestoreRequest>(unknown).is_err());
+        drop(held);
     }
 }

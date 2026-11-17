@@ -1443,8 +1443,16 @@ fn restore_worker_refuses_partial_state_or_cross_role_aliases_before_config() {
         .collect();
     for (state, lowers) in [
         (vec![&files[0], &files[1], &files[2]], vec![]),
-        (vec![&files[0], &files[1], &files[2], &files[3]], vec![]),
+        (vec![&files[0], &files[1], &files[2], &files[0]], vec![]),
         (vec![], vec![&files[5]]),
+        (
+            vec![&files[0], &files[1], &files[2], &files[3]],
+            vec![&files[0]],
+        ),
+        (
+            vec![&sources[0].file, &files[1], &files[2], &files[3]],
+            vec![],
+        ),
         (
             vec![&files[0], &files[1], &files[2], &files[3], &files[4]],
             vec![&files[0]],
@@ -1467,6 +1475,33 @@ fn restore_worker_refuses_partial_state_or_cross_role_aliases_before_config() {
         assert!(
             bytes.is_empty(),
             "invalid inherited roles fail before a worker event"
+        );
+    }
+}
+
+#[test]
+fn owned_and_identified_restore_tables_exit_and_close_events_on_config_refusal() {
+    let mut sources: Vec<_> = (0..5).map(|_| Lease::new()).collect();
+    for source in &mut sources {
+        source.file.write_all(b"state").unwrap();
+    }
+    let files: Vec<_> = sources
+        .iter()
+        .map(|source| std::fs::File::open(&source.path).unwrap())
+        .collect();
+    for count in [4, 5] {
+        let state: Vec<_> = files[..count].iter().collect();
+        let (child, config, _keepalive, mut events, _console) =
+            worker_with_tables(|_| {}, &[], None, &state, &[]);
+        // Both complete tables are valid before their typed config arrives.
+        // EOF refuses that config rather than leaving a worker or writer alive.
+        drop(config);
+        assert_eq!(child.output().status.code(), Some(1));
+        let mut bytes = Vec::new();
+        events.read_to_end(&mut bytes).unwrap();
+        assert!(
+            !bytes.is_empty(),
+            "a complete table reaches config admission"
         );
     }
 }
@@ -1739,4 +1774,41 @@ fn malformed_config_is_redacted_and_does_not_require_a_hypervisor() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("must-not-appear"));
+}
+
+#[test]
+fn real_inspector_emits_typed_preflight_failures_before_native_resources() {
+    for request in [
+        b"{}\n".as_slice(),
+        b"not json\n".as_slice(),
+        b"{}\n{}\n".as_slice(),
+    ] {
+        let mut command = command();
+        command.arg("inspect-restore").stdin(Stdio::piped());
+        let mut child = Process(
+            Some(command.spawn().expect("spawn real inspector")),
+            None,
+            None,
+        );
+        let mut stdin = child.0.as_mut().unwrap().stdin.take().unwrap();
+        stdin.write_all(request).unwrap();
+        drop(stdin);
+        let output = child.output();
+        assert!(!output.status.success());
+        assert!(output.stdout.ends_with(b"\n"));
+        assert_eq!(
+            output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+            1
+        );
+        let failure: vm_spec::restore::RestoreInspectionFailure =
+            serde_json::from_slice(&output.stdout).expect("one typed inspection refusal");
+        failure.validate().unwrap();
+        assert_eq!(
+            failure.version,
+            vm_spec::restore::RESTORE_INSPECTION_VERSION
+        );
+        assert_eq!(failure.refusal.stage, "restore-preflight");
+        assert_eq!(failure.refusal.pin, "restore-inputs");
+        assert!(!failure.refusal.actual.is_empty());
+    }
 }

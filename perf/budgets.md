@@ -4,6 +4,17 @@ These serial gates retain the 4 GiB and OCI fixtures alongside Phase 30's
 agent-ready scenario. Wave two measures capture pause exactly, separately from
 post-resume seal latency and workload gaps. `make smoke` does not collect them.
 
+The live scenario also records three informational full-command rows:
+`snapshot_fork_child_first`, `snapshot_fork_child_second`, and
+`snapshot_source_after_two_forks`. They run after every existing measurement;
+the two source forks and workload rewrites are outside snapshot timing.
+The first child snapshot establishes full RAM identity in its pause and full
+disk identity after resume. Its second snapshot is incremental. The source's
+snapshot uses its retained identified anchor and all writes since that anchor,
+not only writes since the last fork. Fork itself publishes no content maps or
+pool objects. Existing clocks, rows, allowances and targets are unchanged;
+these rows expose moved work rather than subtracting it from a gate.
+
 ### OCI ingest budget cohort (Phase 24)
 
 `tests/test_ingest_budget.py` measures ADR 0014 cold prepare and expanded-byte

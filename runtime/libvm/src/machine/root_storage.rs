@@ -590,6 +590,21 @@ pub(crate) fn seed_disk(
     };
     seed.validate().map_err(invalid)?;
     storage
+        .disk_identities
+        .retain(|identity| identity.attachment_index != seed.attachment_index);
+    storage
+        .disk_identities
+        .push(crate::store::models::storage::DiskContentIdentity {
+            attachment_index: seed.attachment_index,
+            block_id: seed.block_id.clone(),
+            identity: crate::store::models::storage::ContentIdentityState::Identified {
+                root: map.root().id(),
+            },
+        });
+    storage
+        .disk_identities
+        .sort_unstable_by_key(|identity| identity.attachment_index);
+    storage
         .disk_baselines
         .retain(|baseline| baseline.seed.attachment_index != seed.attachment_index);
     storage.disk_baselines.push(DiskBaseline {
@@ -623,7 +638,7 @@ pub(crate) fn launch_disk_seeds(
                 && baseline.storage_generation == storage.storage_generation
         })
         .peekable();
-    if ready.peek().is_none() {
+    if ready.peek().is_none() && storage.disk_identities.is_empty() {
         return Ok(Vec::new());
     }
     let directory = crate::paths::OwnedDirectory::open_existing_root(machine_dir)?
@@ -717,6 +732,59 @@ pub(crate) fn launch_disk_seeds(
             continue;
         }
         seeds.push(baseline.seed.clone());
+    }
+    for identity in &storage.disk_identities {
+        if !matches!(
+            identity.identity,
+            crate::store::models::storage::ContentIdentityState::UnknownAfterFork
+        ) || seeds
+            .iter()
+            .any(|seed| seed.attachment_index == identity.attachment_index)
+        {
+            continue;
+        }
+        let (role, path, length) = if identity.attachment_index == 0
+            && matches!(storage.root, MachineRoot::OpaqueRaw { .. })
+        {
+            let (path, geometry) = crate::machine::stopped::root_private(storage);
+            (DiskRole::Root, path, geometry)
+        } else if identity.attachment_index == 1
+            && matches!(storage.root, MachineRoot::LinuxOverlay { .. })
+        {
+            let (path, geometry) = crate::machine::stopped::root_private(storage);
+            (DiskRole::RootUpper, path, geometry)
+        } else {
+            match storage
+                .disks
+                .iter()
+                .find(|disk| disk.order == identity.attachment_index)
+            {
+                Some(crate::IncludedDisk {
+                    storage: crate::DiskStorage::ManagedWritable { path, geometry },
+                    ..
+                }) => (DiskRole::Data, path, geometry.length),
+                _ => continue,
+            }
+        };
+        let source = crate::machine::stopped::open_private(&directory, path, length)?;
+        let metadata = source.file.metadata()?;
+        let seed = vm_spec::capture::DiskTrackingSeed {
+            version: vm_spec::capture::DISK_TRACKING_VERSION,
+            map_format: 2,
+            chunk_shift: vm_spec::stream_map::ChunkSize::DISK.shift(),
+            role,
+            attachment_index: identity.attachment_index,
+            block_id: identity.block_id.clone(),
+            file_device: metadata.dev(),
+            file_inode: metadata.ino(),
+            length,
+            chunk_size: vm_spec::capture::STREAM_CHUNK_BYTES,
+            epoch: vm_spec::lifecycle::LiveId::parse(&uuid::Uuid::new_v4().to_string())
+                .map_err(invalid)?,
+            baseline: None,
+        };
+        seed.validate().map_err(invalid)?;
+        seeds.push(seed);
     }
     Ok(seeds)
 }
@@ -1669,5 +1737,68 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), before.ino());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(retain_disk_map(&pool, directory.path(), &map).is_err());
+    }
+
+    #[test]
+    fn fork_child_arms_unknown_disk_tracking_then_seeds_its_first_identified_snapshot() {
+        use crate::store::models::storage::ContentIdentityState;
+        let temporary = tempfile::tempdir().unwrap();
+        let directory =
+            crate::paths::OwnedDirectory::open_root(&temporary.path().join("machine")).unwrap();
+        directory.write_file("root.raw", &[0x51; 512]).unwrap();
+        let mut record = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        record.ram_identity = ContentIdentityState::UnknownAfterFork;
+        record.disk_identities[0].identity = ContentIdentityState::UnknownAfterFork;
+        let images = temporary.path().join("images");
+        let seeds =
+            crate::machine::root_storage::launch_disk_seeds(&record, directory.path(), &images)
+                .unwrap();
+        assert_eq!(seeds.len(), 1);
+        assert!(seeds[0].baseline.is_none());
+        assert!(record.disk_baselines.is_empty());
+        assert!(!images.exists());
+        let source = directory.open_file("root.raw").unwrap().unwrap();
+        let map = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_open_file(&source, 512)
+            .unwrap()
+            .map;
+        let pool = crate::storage::pool::StoragePool::open(&images).unwrap();
+        let disk = vm_spec::Disk {
+            path: "root.raw".into(),
+            role: vm_spec::DiskRole::Root,
+            format: vm_spec::DiskFormat::Raw,
+            geometry: vm_spec::DiskGeometry {
+                length: 512,
+                logical_sector_size: 512,
+            },
+            block_id: record.disk_identities[0].block_id.clone(),
+            read_only: false,
+        };
+        let _roots = crate::machine::root_storage::seed_disk(
+            &mut record,
+            &pool,
+            directory.path(),
+            0,
+            &disk,
+            &source,
+            &map,
+        )
+        .unwrap();
+        assert_eq!(
+            record.disk_identities[0].identity,
+            ContentIdentityState::Identified {
+                root: map.root().id()
+            }
+        );
+        let later =
+            crate::machine::root_storage::launch_disk_seeds(&record, directory.path(), &images)
+                .unwrap();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].baseline, Some(map.root().id()));
     }
 }

@@ -356,20 +356,49 @@ pub(crate) fn run(launch: Launch<'_>) -> eyre::Result<()> {
         devices,
         ram_map,
     } = state;
-    for (file, object) in [&ram, &layout, &execution, &devices, &ram_map]
-        .into_iter()
-        .zip(&request.objects)
-    {
-        same(file, object.file_device, object.file_inode, object.length)?;
+    let mut held = vec![
+        ram.try_clone()?,
+        layout.try_clone()?,
+        execution.try_clone()?,
+        devices.try_clone()?,
+    ];
+    let inherited_authority = match (&request.authority, &ram_map) {
+        (
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { .. },
+            fds::RestoreRamMap::Identified(map_file),
+        ) => {
+            let map = crate::restore::inputs::verified_ram_map(&request, map_file)?;
+            held.push(map_file.try_clone()?);
+            crate::virt::lifecycle::CaptureBaselineAuthority::Identified {
+                stream: crate::virt::lifecycle::Digest32(*map.id().as_bytes()),
+            }
+        }
+        (
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut },
+            fds::RestoreRamMap::OwnedLocalCut,
+        ) => {
+            if config
+                .disk_tracking_seeds
+                .iter()
+                .any(|seed| seed.baseline.is_some())
+            {
+                return Err(invalid(
+                    "owned restore cannot seed identified disk tracking",
+                ));
+            }
+            crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut {
+                materialization_generation: cut.materialization_generation.get(),
+            }
+        }
+        _ => return Err(invalid("restore map descriptor authority is mismatched")),
+    };
+    if held.len() != request.objects.len() {
+        return Err(invalid("restore object descriptors do not match authority"));
     }
-    let inherited_map = crate::restore::inputs::verified_ram_map(&request, &ram_map)?;
-    let inherited_layout = request
-        .evidence
-        .memory
-        .as_ref()
-        .ok_or_else(|| invalid("restore lacks RAM evidence"))?
-        .binding
-        .ram_layout;
+    for (file, object) in held.iter().zip(&request.objects) {
+        crate::restore::inputs::validate_object(file, object)?;
+    }
+    let inherited_layout = crate::krun::restore::binding(&request)?.ram_layout;
     let deadline = Instant::now() + CONSTRUCTION_BUDGET;
     let shape = crate::krun::restore::inspect(
         &request,
@@ -406,13 +435,16 @@ pub(crate) fn run(launch: Launch<'_>) -> eyre::Result<()> {
         resources,
         deadline,
         |control, token| {
+            for (file, object) in held.iter().zip(&request.objects) {
+                crate::restore::inputs::validate_object(file, object)?;
+            }
             // Serving starts a thread and returns: native dispatch runs only
             // after this callback, so no blocking native call happens here.
             let served = lifecycle::serve(
                 endpoint,
                 binding,
                 native::KrunNative::new(control.clone(), config).inherit_baseline(
-                    crate::virt::lifecycle::Digest32(*inherited_map.id().as_bytes()),
+                    inherited_authority,
                     crate::virt::lifecycle::Digest32(*inherited_layout.as_bytes()),
                 ),
                 Some(RestoreAuthority { activation, token }),
@@ -497,23 +529,27 @@ pub(crate) mod tests {
             attachments: vec![],
             shares: vec![],
         };
-        let objects = std::array::from_fn(|index| RestoreObject {
-            role: RestoreObjectRole::ALL[index],
-            fd: 100 + index as i32,
-            file_device: 1,
-            file_inode: 100 + index as u64,
-            length: match index {
-                0 => 4096,
-                4 => 25,
-                _ => 5,
-            },
-            identity: if index == 0 || index == 4 {
-                map.id()
-            } else {
-                digest
-            },
-        });
-        let evidence = CaptureEvidence {
+        let objects: Vec<_> = (0..5)
+            .map(|index| RestoreObject {
+                role: RestoreObjectRole::ALL[index],
+                fd: 100 + index as i32,
+                file_device: 1,
+                file_inode: 100 + index as u64,
+                length: match index {
+                    0 => 4096,
+                    4 => 25,
+                    _ => 5,
+                },
+                authority: vm_spec::restore::RestoreObjectAuthority::Identified {
+                    identity: if index == 0 || index == 4 {
+                        map.id()
+                    } else {
+                        digest
+                    },
+                },
+            })
+            .collect();
+        let sealed_evidence = CaptureEvidence {
             disk_stats: Vec::new(),
             disk_tracking_receipts: Vec::new(),
             version: vm_spec::capture::CAPTURE_RECORD_VERSION,
@@ -537,7 +573,7 @@ pub(crate) mod tests {
                 packed_length: 4096,
                 page_granule: 4096,
                 regions: 1,
-                ram_stream: objects[0].identity,
+                ram_stream: map.id(),
                 binding: CaptureStateBinding {
                     live_state_schema: "silo.live-state/1".to_string(),
                     architecture: std::env::consts::ARCH.into(),
@@ -549,6 +585,8 @@ pub(crate) mod tests {
                     capture: capture.clone(),
                 },
                 mode: vm_spec::lifecycle::CapturePolicy::Full,
+                identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
+                identity_full_reason: Some(vm_spec::capture::CaptureIdentityFullReason::Requested),
                 baseline: None,
                 full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
                 identity_chunk_bytes: 1 << 16,
@@ -565,8 +603,14 @@ pub(crate) mod tests {
                 .map(|object| CaptureInventoryEntry {
                     role: object.role.capture_role(),
                     length: object.length,
-                    sha256: (object.role != RestoreObjectRole::Ram).then_some(object.identity),
-                    identity: (object.role == RestoreObjectRole::Ram).then_some(object.identity),
+                    sha256: (object.role != RestoreObjectRole::Ram).then_some(
+                        if object.role == RestoreObjectRole::RamMap {
+                            map.id()
+                        } else {
+                            digest
+                        },
+                    ),
+                    identity: (object.role == RestoreObjectRole::Ram).then_some(map.id()),
                 })
                 .chain(std::iter::once(CaptureInventoryEntry {
                     role: vm_spec::capture::CaptureRole::RamChanges,
@@ -591,21 +635,43 @@ pub(crate) mod tests {
             disk_tracking_seeds: Vec::new(),
             map_node_store: None,
             version: vm_spec::restore::RESTORE_REQUEST_VERSION,
-            checkpoint: digest,
+            authority: vm_spec::restore::RestoreAuthority::IdentifiedSnapshot {
+                checkpoint: digest,
+                evidence: Box::new(sealed_evidence),
+            },
             activation_id: id(),
             freeze_operation_id: capture,
             start_paused: true,
             configuration,
-            evidence,
             objects,
             lowers: vec![],
             network: None,
             hook: None,
             ssh_trusted_ca: None,
         };
-        request.evidence.validate().unwrap();
+        evidence(&request.authority).validate().unwrap();
         request.validate().unwrap();
         request
+    }
+
+    pub(crate) fn evidence(authority: &vm_spec::restore::RestoreAuthority) -> &CaptureEvidence {
+        match authority {
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => evidence,
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. } => {
+                panic!("identified fixture authority")
+            }
+        }
+    }
+
+    pub(crate) fn evidence_mut(
+        authority: &mut vm_spec::restore::RestoreAuthority,
+    ) -> &mut CaptureEvidence {
+        match authority {
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => evidence,
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. } => {
+                panic!("identified fixture authority")
+            }
+        }
     }
 
     pub(crate) fn launch(directory: &std::path::Path) -> crate::virt::RestoreLaunch {
@@ -637,10 +703,13 @@ pub(crate) mod tests {
         request.map_node_store = Some(nodes.to_str().unwrap().to_owned());
         let map_bytes = map.canonical_bytes().unwrap();
         request.objects[4].length = map_bytes.len() as u64;
-        request.evidence.inventory[4].length = map_bytes.len() as u64;
-        request.evidence.memory.as_mut().unwrap().ram_stream = map.id();
-        request
-            .evidence
+        evidence_mut(&mut request.authority).inventory[4].length = map_bytes.len() as u64;
+        evidence_mut(&mut request.authority)
+            .memory
+            .as_mut()
+            .unwrap()
+            .ram_stream = map.id();
+        evidence_mut(&mut request.authority)
             .memory
             .as_mut()
             .unwrap()
@@ -653,36 +722,48 @@ pub(crate) mod tests {
         record[24..].copy_from_slice(Sha256Digest::of_bytes(&[1; 4096]).as_bytes());
         change_bytes.extend_from_slice(&record);
         std::fs::write(directory.join("memory.changes"), &change_bytes).unwrap();
-        let changes = &mut request.evidence.memory.as_mut().unwrap().changes;
+        let changes = &mut evidence_mut(&mut request.authority)
+            .memory
+            .as_mut()
+            .unwrap()
+            .changes;
         changes.byte_len = change_bytes.len() as u64;
         changes.sha256 = Sha256Digest::of_bytes(&change_bytes);
         changes.record_count = 1;
-        request.evidence.inventory[5].length = changes.byte_len;
-        request.evidence.inventory[5].sha256 = Some(changes.sha256);
-        let objects = std::array::from_fn(|index| {
-            let path = directory.join(format!("restore-object-{index}"));
-            let bytes = if index == 4 {
-                map_bytes.clone()
-            } else {
-                vec![index as u8 + 1; request.objects[index].length as usize]
-            };
-            std::fs::write(&path, &bytes).unwrap();
-            let file = File::open(path).unwrap();
-            let metadata = file.metadata().unwrap();
-            let object = &mut request.objects[index];
-            object.fd = file.as_raw_fd();
-            object.file_device = metadata.dev();
-            object.file_inode = metadata.ino();
-            if object.role == RestoreObjectRole::Ram {
-                object.identity = map.id();
-                request.evidence.inventory[index].identity = Some(object.identity);
-            } else {
-                object.identity = Sha256Digest::of_bytes(&bytes);
-                request.evidence.inventory[index].sha256 = Some(object.identity);
-            }
-            file
-        });
-        request.evidence.validate().unwrap();
+        let (change_length, change_sha256) = (changes.byte_len, changes.sha256);
+        evidence_mut(&mut request.authority).inventory[5].length = change_length;
+        evidence_mut(&mut request.authority).inventory[5].sha256 = Some(change_sha256);
+        let objects = (0..5)
+            .map(|index| {
+                let path = directory.join(format!("restore-object-{index}"));
+                let bytes = if index == 4 {
+                    map_bytes.clone()
+                } else {
+                    vec![index as u8 + 1; request.objects[index].length as usize]
+                };
+                std::fs::write(&path, &bytes).unwrap();
+                let file = File::open(path).unwrap();
+                let metadata = file.metadata().unwrap();
+                let object = &mut request.objects[index];
+                object.fd = file.as_raw_fd();
+                object.file_device = metadata.dev();
+                object.file_inode = metadata.ino();
+                let identity = if object.role == RestoreObjectRole::Ram {
+                    map.id()
+                } else {
+                    Sha256Digest::of_bytes(&bytes)
+                };
+                object.authority =
+                    vm_spec::restore::RestoreObjectAuthority::Identified { identity };
+                if object.role == RestoreObjectRole::Ram {
+                    evidence_mut(&mut request.authority).inventory[index].identity = Some(identity);
+                } else {
+                    evidence_mut(&mut request.authority).inventory[index].sha256 = Some(identity);
+                }
+                file
+            })
+            .collect();
+        evidence(&request.authority).validate().unwrap();
         request.validate().unwrap();
         crate::virt::RestoreLaunch {
             request,
@@ -691,6 +772,72 @@ pub(crate) mod tests {
                 lowers: vec![],
             }),
         }
+    }
+
+    pub(crate) fn owned_launch(directory: &std::path::Path) -> crate::virt::RestoreLaunch {
+        use vm_spec::capture::{CaptureMemoryStats, CaptureRole, OwnedCutMember, OwnedLocalCut};
+        let mut launch = launch(directory);
+        let old = evidence(&launch.request.authority).clone();
+        let memory = old.memory.as_ref().unwrap();
+        let packed_length = launch.request.configuration.ram_bytes();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.join("restore-object-0"))
+            .unwrap();
+        writer.set_len(packed_length).unwrap();
+        drop(writer);
+        let files = std::sync::Arc::get_mut(&mut launch.files).unwrap();
+        files.objects.truncate(4);
+        launch.request.objects.truncate(4);
+        let mut members = Vec::new();
+        for (object, file) in launch.request.objects.iter_mut().zip(&files.objects) {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o400))
+                .unwrap();
+            let fingerprint = crate::restore::inputs::fingerprint(file).unwrap();
+            object.length = fingerprint.length;
+            object.authority = vm_spec::restore::RestoreObjectAuthority::Owned {
+                fingerprint: fingerprint.clone(),
+            };
+            members.push(OwnedCutMember {
+                role: object.role.capture_role(),
+                fingerprint,
+                complete: true,
+            });
+        }
+        members.sort_by_key(|member| match member.role {
+            CaptureRole::Execution => 0,
+            CaptureRole::Devices => 1,
+            CaptureRole::Ram => 2,
+            CaptureRole::Layout => 3,
+            _ => 4,
+        });
+        let cut = OwnedLocalCut {
+            version: vm_spec::capture::CAPTURE_RECORD_VERSION,
+            machine_id: old.machine_id,
+            run_id: old.run_id,
+            capture_id: old.capture_id,
+            freeze_operation_id: old.freeze_operation_id.unwrap(),
+            freeze_epoch: old.freeze_epoch.unwrap(),
+            configuration: launch.request.configuration.clone(),
+            binding: memory.binding.clone(),
+            materialization_generation: NonZeroU64::new(1).unwrap(),
+            predecessor_generation: 0,
+            packed_length,
+            page_granule: 4096,
+            regions: 1,
+            members,
+            stats: CaptureMemoryStats {
+                logical_bytes: packed_length,
+                ..Default::default()
+            },
+        };
+        cut.validate().unwrap();
+        launch.request.map_node_store = None;
+        launch.request.authority =
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut: Box::new(cut) };
+        launch.request.validate().unwrap();
+        launch
     }
 
     pub(crate) fn config(request: RestoreRequest) -> KrunConfig {
@@ -712,8 +859,13 @@ pub(crate) mod tests {
         };
 
         let empty = request();
-        empty.evidence.validate().unwrap();
-        let empty_memory = empty.evidence.memory.as_ref().unwrap();
+        crate::krun::worker::restore::tests::evidence(&empty.authority)
+            .validate()
+            .unwrap();
+        let empty_memory = crate::krun::worker::restore::tests::evidence(&empty.authority)
+            .memory
+            .as_ref()
+            .unwrap();
         assert_eq!(empty_memory.stats.identity_bytes_hashed, 0);
         assert_eq!(empty_memory.changes.record_count, 0);
         assert_eq!(
@@ -724,8 +876,13 @@ pub(crate) mod tests {
             std::env::temp_dir().join(format!("restore-fixture-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let launch = launch(&directory);
-        launch.request.evidence.validate().unwrap();
-        let memory = launch.request.evidence.memory.as_ref().unwrap();
+        crate::krun::worker::restore::tests::evidence(&launch.request.authority)
+            .validate()
+            .unwrap();
+        let memory = crate::krun::worker::restore::tests::evidence(&launch.request.authority)
+            .memory
+            .as_ref()
+            .unwrap();
         let bytes = std::fs::read(directory.join("restore-object-0")).unwrap();
         let root = StreamRoot::decode(&std::fs::read(directory.join("restore-object-4")).unwrap())
             .unwrap();
@@ -772,7 +929,8 @@ pub(crate) mod tests {
         for vsock in [false, true] {
             let mut request = request();
             request.configuration.vsock = vsock;
-            request.evidence.configuration_digest = request.configuration.digest().unwrap();
+            crate::krun::worker::restore::tests::evidence_mut(&mut request.authority)
+                .configuration_digest = request.configuration.digest().unwrap();
             let destination = config(request.clone());
             assert!(!validate(&destination, &request).unwrap());
             crate::krun::validate_config(&destination).unwrap();
@@ -826,7 +984,8 @@ pub(crate) mod tests {
                 read_only: disk.read_only,
             })
             .collect();
-        request.evidence.configuration_digest = request.configuration.digest().unwrap();
+        crate::krun::worker::restore::tests::evidence_mut(&mut request.authority)
+            .configuration_digest = request.configuration.digest().unwrap();
         validate(&destination, &request).unwrap();
 
         type Change = fn(&mut KrunConfig, &mut RestoreRequest);
@@ -936,7 +1095,8 @@ pub(crate) mod tests {
             let mut destination = destination.clone();
             let mut request = request.clone();
             change(&mut destination, &mut request);
-            request.evidence.configuration_digest = request.configuration.digest().unwrap();
+            crate::krun::worker::restore::tests::evidence_mut(&mut request.authority)
+                .configuration_digest = request.configuration.digest().unwrap();
             assert_eq!(
                 validate(&destination, &request).unwrap_err().to_string(),
                 message,
@@ -1027,7 +1187,8 @@ pub(crate) mod tests {
             },
             read_only: false,
         });
-        request.evidence.configuration_digest = request.configuration.digest().unwrap();
+        crate::krun::worker::restore::tests::evidence_mut(&mut request.authority)
+            .configuration_digest = request.configuration.digest().unwrap();
         request.lowers.push(RestoreLower {
             block_id,
             descriptor: RestoreDescriptor {

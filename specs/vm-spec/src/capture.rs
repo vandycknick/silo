@@ -27,7 +27,7 @@ use crate::lifecycle::{
 use crate::{BlockId, DiskFormat, DiskGeometry, DiskRole, GuestOs, Storage, VmSpec};
 
 /// Version of `request.json`, `vm.capture.json` and `vm.capture-source.json`.
-pub const CAPTURE_RECORD_VERSION: u32 = 2;
+pub const CAPTURE_RECORD_VERSION: u32 = 3;
 /// Staging root below the machine data directory.
 pub const CAPTURES_DIRECTORY: &str = "captures";
 /// Writable disk captures below one capture directory.
@@ -601,6 +601,14 @@ pub enum CaptureDiskCopy {
     Copy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DiskIdentityState {
+    Unknown,
+    UnknownAfterFork,
+    Identified { root: Sha256Digest },
+}
+
 /// One included writable attachment, sealed into `disks/<name>.raw`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -610,6 +618,7 @@ pub struct CaptureDiskPlan {
     pub block_id: BlockId,
     pub length: u64,
     pub copy: CaptureDiskCopy,
+    pub identity: DiskIdentityState,
     /// Only exclusively managed backing may inherit a tracked predecessor.
     pub tracking_eligible: bool,
     /// Immutable canonical map supplied under the launch storage authority.
@@ -646,6 +655,15 @@ pub struct CaptureReservation {
     pub staging_bytes: u64,
 }
 
+/// Content authentication is independent of byte materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureIdentityPolicy {
+    None,
+    Full,
+    SinceAnchor,
+}
+
 /// The complete immutable capture plan. `request.json` is exactly
 /// [`CapturePlan::canonical_bytes`]; the capture ID is the Capture request
 /// and operation ID.
@@ -659,6 +677,7 @@ pub struct CapturePlan {
     pub configuration: CaptureConfiguration,
     pub configuration_digest: Sha256Digest,
     pub policy: CapturePolicy,
+    pub identity_policy: CaptureIdentityPolicy,
     pub dirty_crossover_percent: u8,
     pub resume_policy: CaptureResumePolicy,
     pub pause: CapturePauseAuthority,
@@ -672,6 +691,9 @@ pub struct CapturePlan {
 
 impl CapturePlan {
     pub fn validate(&self) -> Result<(), String> {
+        if self.identity_policy == CaptureIdentityPolicy::None && self.map_node_store.is_some() {
+            return Err(invalid("owned fork capture cannot publish map nodes"));
+        }
         if self
             .map_node_store
             .as_ref()
@@ -761,6 +783,11 @@ impl CapturePlan {
                     "disk baseline map path is not bounded and absolute",
                 ));
             }
+            if disk.baseline_map.is_some()
+                && !matches!(disk.identity, DiskIdentityState::Identified { .. })
+            {
+                return Err(invalid("disk map requires identified baseline authority"));
+            }
             if !disk.tracking_eligible && disk.baseline_map.is_some() {
                 return Err(invalid("external disk cannot carry baseline authority"));
             }
@@ -827,6 +854,20 @@ impl CapturePlan {
     /// The exact closed payload inventory of a coherent capture, in canonical
     /// order: execution, devices, RAM, layout, complete RAM map, then disks.
     pub fn roles(&self) -> Vec<CaptureRole> {
+        if self.identity_policy == CaptureIdentityPolicy::None {
+            let mut roles = vec![
+                CaptureRole::Execution,
+                CaptureRole::Devices,
+                CaptureRole::Ram,
+                CaptureRole::Layout,
+            ];
+            roles.extend(
+                self.disks
+                    .iter()
+                    .map(|disk| CaptureRole::Disk(disk.name.clone())),
+            );
+            return roles;
+        }
         let mut roles = vec![
             CaptureRole::Execution,
             CaptureRole::Devices,
@@ -877,6 +918,17 @@ pub enum CaptureSeedMethod {
     Rebuild,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureIdentityReadFallback {
+    #[default]
+    None,
+    CoverageLost,
+    BaselineMismatch,
+    ExtentsUnavailable,
+    ExtentLimit,
+}
+
 /// Native materialization and identity authentication costs, counted separately.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -897,12 +949,18 @@ pub struct CaptureMemoryStats {
     pub zero_run_bytes_covered: u64,
     /// Covered zero bytes deallocated from a seeded output, never the baseline.
     pub zero_bytes_punched: u64,
-    /// Live RAM bytes not read because cut-bound pagemap metadata proves zero origin.
+    /// Live RAM bytes not read because cut metadata or B holes plus complete D prove zero.
     pub known_zero_bytes_skipped: u64,
     pub extent_queries: u64,
     pub identity_bytes_hashed: u64,
     /// Always zero on local capture; byte SHA is reserved for transported blobs.
     pub whole_file_bytes_hashed: u64,
+    pub map_nodes_written: u64,
+    pub identity_dirty_pages: u64,
+    pub materialization_dirty_pages: u64,
+    pub live_pages_classified: u64,
+    pub identity_zero_bytes_filled: u64,
+    pub full_identity_read_fallback: CaptureIdentityReadFallback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -946,6 +1004,15 @@ impl CaptureRamChanges {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureIdentityFullReason {
+    Requested,
+    NoIdentifiedAnchor,
+    UnknownAnchorAfterFork,
+    CoverageLost,
+}
+
 /// RAM layout and geometry of `memory.ram`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -957,6 +1024,9 @@ pub struct CaptureMemoryEvidence {
     pub ram_stream: Sha256Digest,
     pub binding: CaptureStateBinding,
     pub mode: CapturePolicy,
+    pub identity_policy: CaptureIdentityPolicy,
+    #[serde(deserialize_with = "required")]
+    pub identity_full_reason: Option<CaptureIdentityFullReason>,
     #[serde(deserialize_with = "required")]
     pub baseline: Option<Sha256Digest>,
     #[serde(deserialize_with = "required")]
@@ -997,20 +1067,23 @@ impl CaptureMemoryEvidence {
         self.changes.validate(self.packed_length)?;
         if self.identity_chunk_bytes != 1 << 16
             || self.changes.baseline_stream != self.baseline
-            || (self.mode == CapturePolicy::Full)
+            || (self.identity_policy == CaptureIdentityPolicy::Full)
                 != (self.changes.coverage == CaptureRamCoverage::Full)
+            || self.identity_policy == CaptureIdentityPolicy::None
+            || (self.identity_policy == CaptureIdentityPolicy::Full)
+                != self.identity_full_reason.is_some()
         {
             return Err(invalid(
                 "RAM change summary differs from its capture binding",
             ));
         }
         match self.mode {
-            CapturePolicy::Full if self.baseline.is_some() || self.full_reason.is_none() => {
+            CapturePolicy::Full if self.full_reason.is_none() => {
                 return Err(invalid(
                     "full RAM capture requires a reason and no reused baseline",
                 ));
             }
-            CapturePolicy::Incremental if self.baseline.is_none() || self.full_reason.is_some() => {
+            CapturePolicy::Incremental if self.full_reason.is_some() => {
                 return Err(invalid(
                     "incremental RAM capture requires its exact baseline",
                 ));
@@ -1020,10 +1093,7 @@ impl CaptureMemoryEvidence {
         if self.stats.logical_bytes != self.packed_length
             || (self.stats.seed_method == CaptureSeedMethod::Clone
                 && (self.mode != CapturePolicy::Incremental
-                    || self.stats.baseline_bytes_read != 0
-                    || self.stats.baseline_bytes_written != 0
-                    || self.stats.baseline_hole_bytes != 0
-                    || self.stats.extent_queries != 0))
+                    || self.stats.baseline_bytes_written != 0))
             || self.stats.whole_file_bytes_hashed != 0
             || self.stats.identity_bytes_hashed > self.changes.record_count.saturating_mul(1 << 16)
             || self.stats.identity_bytes_hashed > self.packed_length
@@ -1277,6 +1347,7 @@ impl DiskTrackingSettlement {
 pub enum DiskFullScanReason {
     InvalidReceipt { reason: DiskTrackingInvalidReason },
     MissingBaseline,
+    UnknownAnchorAfterFork,
     Untracked,
     CopyLane,
     External,
@@ -1293,6 +1364,242 @@ pub struct CaptureDiskStats {
     pub baseline_reused: bool,
     #[serde(deserialize_with = "required")]
     pub full_scan_reason: Option<DiskFullScanReason>,
+}
+
+/// Exact-file facts, identical to the storage source fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceFingerprint {
+    pub device: u64,
+    pub inode: u64,
+    pub length: u64,
+    pub mode: u32,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+}
+
+impl SourceFingerprint {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.inode == 0
+            || self.length == 0
+            || self.length > MAX_STREAM_BYTES
+            || self.mode & 0o170000 != 0o100000
+            || self.mode & 0o222 != 0
+            || !(0..1_000_000_000).contains(&self.modified_nanoseconds)
+            || !(0..1_000_000_000).contains(&self.changed_nanoseconds)
+        {
+            return Err(invalid(
+                "owned member has invalid immutable regular-file facts",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnedCutMember {
+    pub role: CaptureRole,
+    pub fingerprint: SourceFingerprint,
+    pub complete: bool,
+}
+
+/// Local ownership evidence, never portable content authentication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnedLocalCut {
+    pub version: u32,
+    pub machine_id: LiveId,
+    pub run_id: LiveId,
+    pub capture_id: LiveId,
+    pub freeze_operation_id: LiveId,
+    pub freeze_epoch: NonZeroU64,
+    pub configuration: CaptureConfiguration,
+    pub binding: CaptureStateBinding,
+    pub materialization_generation: NonZeroU64,
+    pub predecessor_generation: u64,
+    pub packed_length: u64,
+    pub page_granule: u32,
+    pub regions: u32,
+    pub members: Vec<OwnedCutMember>,
+    pub stats: CaptureMemoryStats,
+}
+
+/// Closed-writer facts used by the monitor to produce a local cut record.
+pub struct OwnedCutCompletion {
+    pub freeze_operation_id: LiveId,
+    pub freeze_epoch: NonZeroU64,
+    pub binding: CaptureStateBinding,
+    pub materialization_generation: NonZeroU64,
+    pub predecessor_generation: u64,
+    pub packed_length: u64,
+    pub page_granule: u32,
+    pub regions: u32,
+    pub members: Vec<OwnedCutMember>,
+    pub stats: CaptureMemoryStats,
+}
+
+impl OwnedLocalCut {
+    pub fn from_completed(
+        plan: &CapturePlan,
+        completion: OwnedCutCompletion,
+    ) -> Result<Self, String> {
+        let cut = Self {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: plan.machine_id.clone(),
+            run_id: plan.run_id.clone(),
+            capture_id: plan.capture_id.clone(),
+            configuration: plan.configuration.clone(),
+            freeze_operation_id: completion.freeze_operation_id,
+            freeze_epoch: completion.freeze_epoch,
+            binding: completion.binding,
+            materialization_generation: completion.materialization_generation,
+            predecessor_generation: completion.predecessor_generation,
+            packed_length: completion.packed_length,
+            page_granule: completion.page_granule,
+            regions: completion.regions,
+            members: completion.members,
+            stats: completion.stats,
+        };
+        cut.validate_against_plan(plan)?;
+        Ok(cut)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.configuration.validate()?;
+        if self.version != CAPTURE_RECORD_VERSION
+            || self.binding.source_run != self.run_id
+            || self.binding.capture != self.capture_id
+            || self.binding.live_state_schema.is_empty()
+            || self.binding.live_state_schema.contains('\0')
+            || self.binding.live_state_schema.len() > MAX_LIVE_STATE_SCHEMA_BYTES
+            || self.binding.architecture.is_empty()
+            || self.binding.architecture.contains('\0')
+            || self.binding.architecture.len() > MAX_ARCHITECTURE_BYTES
+            || self.predecessor_generation >= self.materialization_generation.get()
+            || self.packed_length != self.configuration.ram_bytes()
+            || self.packed_length == 0
+            || self.packed_length > MAX_CAPTURE_RAM_BYTES
+            || !self.page_granule.is_power_of_two()
+            || !(4096..=65536).contains(&self.page_granule)
+            || !self
+                .packed_length
+                .is_multiple_of(u64::from(self.page_granule))
+            || self.regions == 0
+            || self.regions > 512
+            || u64::from(self.regions) > self.packed_length / u64::from(self.page_granule)
+            || self.stats.materialization_dirty_pages
+                > self.packed_length / u64::from(self.page_granule)
+            || self.stats.identity_dirty_pages > self.packed_length / u64::from(self.page_granule)
+            || self.stats.logical_bytes != self.packed_length
+            || self.stats.identity_bytes_hashed != 0
+            || self.stats.whole_file_bytes_hashed != 0
+            || self.stats.map_nodes_written != 0
+        {
+            return Err(invalid(
+                "owned cut has invalid binding, geometry, generation or identity work",
+            ));
+        }
+        let mut writable = self
+            .configuration
+            .attachments
+            .iter()
+            .filter(|attachment| !attachment.read_only);
+        if self.members.len() != 4 + writable.clone().count() {
+            return Err(invalid(
+                "owned cut does not cover its complete member inventory",
+            ));
+        }
+        let native = [
+            CaptureRole::Execution,
+            CaptureRole::Devices,
+            CaptureRole::Ram,
+            CaptureRole::Layout,
+        ];
+        let mut inodes = std::collections::BTreeSet::new();
+        let mut names = std::collections::HashSet::with_capacity(self.members.len());
+        for (index, member) in self.members.iter().enumerate() {
+            member.fingerprint.validate()?;
+            if !member.complete
+                || !inodes.insert((member.fingerprint.device, member.fingerprint.inode))
+                || !names.insert(&member.role)
+            {
+                return Err(invalid("owned cut members must be complete and distinct"));
+            }
+            if index < native.len() {
+                let maximum = match member.role {
+                    CaptureRole::Execution => 16 << 20,
+                    CaptureRole::Devices => 32 << 20,
+                    CaptureRole::Layout => 64 << 10,
+                    _ => MAX_CAPTURE_RAM_BYTES,
+                };
+                if member.role != native[index]
+                    || member.fingerprint.length > maximum
+                    || (member.role == CaptureRole::Ram
+                        && member.fingerprint.length != self.packed_length)
+                {
+                    return Err(invalid(
+                        "owned native members have invalid roles or lengths",
+                    ));
+                }
+            } else if !matches!(member.role, CaptureRole::Disk(_))
+                || writable.next().is_none_or(|attachment| {
+                    member.fingerprint.length != attachment.geometry.length
+                })
+            {
+                return Err(invalid("owned disk members have invalid roles or geometry"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_plan(&self, plan: &CapturePlan) -> Result<(), String> {
+        self.validate()?;
+        plan.validate()?;
+        let freeze_matches = match &plan.pause {
+            CapturePauseAuthority::Acquire => self.freeze_operation_id == plan.capture_id,
+            CapturePauseAuthority::Borrow {
+                token,
+                pause_operation_id,
+            } => {
+                self.freeze_operation_id == *pause_operation_id
+                    && self.binding.pause_generation == token.generation
+            }
+        };
+        if plan.identity_policy != CaptureIdentityPolicy::None
+            || !freeze_matches
+            || self.machine_id != plan.machine_id
+            || self.run_id != plan.run_id
+            || self.capture_id != plan.capture_id
+            || self.configuration != plan.configuration
+            || self
+                .members
+                .iter()
+                .map(|member| &member.role)
+                .ne(plan.roles().iter())
+        {
+            return Err(invalid("owned cut differs from its exact fork plan"));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_CAPTURE_RECORD_BYTES {
+            return Err(invalid("owned cut exceeds its record bound"));
+        }
+        let value: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if value.canonical_bytes()? != bytes {
+            return Err(invalid("owned cut bytes are not canonical"));
+        }
+        Ok(value)
+    }
 }
 
 /// Operation-owned clone fingerprint, sampled after the last writer closes.
@@ -1756,6 +2063,36 @@ impl CaptureEvidence {
         if self.capture_outcome == CaptureRecordOutcome::Failed {
             return Ok(());
         }
+        if plan.identity_policy == CaptureIdentityPolicy::None {
+            return Err(invalid(
+                "owned local cut cannot produce identified capture evidence",
+            ));
+        }
+        if self
+            .memory
+            .as_ref()
+            .is_some_and(|memory| match plan.identity_policy {
+                CaptureIdentityPolicy::None => true,
+                CaptureIdentityPolicy::Full => {
+                    memory.identity_policy != CaptureIdentityPolicy::Full
+                }
+                CaptureIdentityPolicy::SinceAnchor => {
+                    memory.identity_policy != CaptureIdentityPolicy::SinceAnchor
+                        && !matches!(
+                            memory.identity_full_reason,
+                            Some(
+                                CaptureIdentityFullReason::NoIdentifiedAnchor
+                                    | CaptureIdentityFullReason::UnknownAnchorAfterFork
+                                    | CaptureIdentityFullReason::CoverageLost
+                            )
+                        )
+                }
+            })
+        {
+            return Err(invalid(
+                "capture identity policy differs from its plan without a valid fallback",
+            ));
+        }
         if self.memory.as_ref().is_some_and(|memory| {
             plan.policy == CapturePolicy::Full
                 && (memory.mode != CapturePolicy::Full
@@ -1948,6 +2285,52 @@ pub struct CaptureSealed {
     pub cut_token: PauseToken,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum CaptureSuccess {
+    Identified {
+        sealed: CaptureSealed,
+    },
+    OwnedLocalCut {
+        cut: Box<OwnedLocalCut>,
+        cut_token: PauseToken,
+    },
+}
+
+impl CaptureSuccess {
+    pub fn capture_id(&self) -> &LiveId {
+        match self {
+            Self::Identified { sealed } => &sealed.capture_id,
+            Self::OwnedLocalCut { cut, .. } => &cut.capture_id,
+        }
+    }
+
+    pub fn cut_token(&self) -> &PauseToken {
+        match self {
+            Self::Identified { sealed } => &sealed.cut_token,
+            Self::OwnedLocalCut { cut_token, .. } => cut_token,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Self::OwnedLocalCut { cut, cut_token } = self {
+            cut.validate()?;
+            if cut_token.machine_id != cut.machine_id
+                || cut_token.run_id != cut.run_id
+                || cut_token.generation != cut.binding.pause_generation
+            {
+                return Err(invalid("owned capture success belongs to another pause"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Source continuation, independent of the capture outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -2023,6 +2406,30 @@ pub struct CaptureEvidenceReference {
     pub sha256: Sha256Digest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CaptureRecordReference {
+    Identified { evidence: CaptureEvidenceReference },
+    OwnedLocalCut { cut: Box<OwnedLocalCut> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum CaptureSourceReference {
+    Identified {
+        sha256: Sha256Digest,
+    },
+    OwnedLocalCut {
+        capture_id: LiveId,
+        outcome: CaptureSourceOutcome,
+    },
+}
+
 /// Capture-specific facts in `GetOperation` for a capture operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2031,15 +2438,37 @@ pub struct CaptureObservation {
     pub release: CaptureReleaseState,
     /// Present once `vm.capture.json` is complete.
     #[serde(deserialize_with = "required")]
-    pub evidence: Option<CaptureEvidenceReference>,
+    pub evidence: Option<CaptureRecordReference>,
     /// Present once a completed `vm.capture-source.json` exists.
     #[serde(deserialize_with = "required")]
-    pub source_record_sha256: Option<Sha256Digest>,
+    pub source_record: Option<CaptureSourceReference>,
 }
 
 impl CaptureObservation {
     pub fn validate(&self) -> Result<(), String> {
-        self.continuation.validate()
+        self.continuation.validate()?;
+        if let Some(CaptureRecordReference::OwnedLocalCut { cut }) = &self.evidence {
+            cut.validate()?;
+            if self.source_record.as_ref().is_some_and(|source| {
+                !matches!(
+                    source, CaptureSourceReference::OwnedLocalCut { capture_id, .. }
+                        if capture_id == &cut.capture_id
+                )
+            }) {
+                return Err(invalid(
+                    "owned cut has a foreign or identified source record",
+                ));
+            }
+        } else if matches!(
+            &self.evidence,
+            Some(CaptureRecordReference::Identified { .. })
+        ) && matches!(
+            &self.source_record,
+            Some(CaptureSourceReference::OwnedLocalCut { .. })
+        ) {
+            return Err(invalid("identified capture has an owned source reference"));
+        }
+        Ok(())
     }
 }
 
@@ -2054,7 +2483,7 @@ pub struct CaptureReleased {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::capture::*;
     use crate::lifecycle::{LiveFailureCode, LiveStage};
     use crate::{Disk, Hardware, Mount};
@@ -2308,6 +2737,7 @@ mod tests {
             ram_bytes: configuration.ram_bytes(),
             configuration,
             policy: CapturePolicy::Full,
+            identity_policy: CaptureIdentityPolicy::Full,
             dirty_crossover_percent: 60,
             resume_policy: CaptureResumePolicy::ResumeIfAcquired,
             pause: CapturePauseAuthority::Acquire,
@@ -2318,6 +2748,7 @@ mod tests {
                     block_id: BlockId::new("silo-root-upper").unwrap(),
                     length: 1 << 30,
                     copy: CaptureDiskCopy::Copy,
+                    identity: DiskIdentityState::Unknown,
                     baseline_map: None,
                     tracking_eligible: true,
                 },
@@ -2327,6 +2758,7 @@ mod tests {
                     block_id: BlockId::new("data0").unwrap(),
                     length: 1 << 20,
                     copy: CaptureDiskCopy::Clone,
+                    identity: DiskIdentityState::Unknown,
                     baseline_map: None,
                     tracking_eligible: true,
                 },
@@ -2391,6 +2823,8 @@ mod tests {
                     capture: capture(),
                 },
                 mode: CapturePolicy::Full,
+                identity_policy: CaptureIdentityPolicy::Full,
+                identity_full_reason: Some(CaptureIdentityFullReason::Requested),
                 baseline: None,
                 full_reason: Some(CaptureFullReason::Requested),
                 identity_chunk_bytes: 1 << 16,
@@ -2820,8 +3254,8 @@ mod tests {
 
     fn restore_request() -> crate::restore::RestoreRequest {
         use crate::restore::{
-            RestoreDescriptor, RestoreExtent, RestoreLower, RestoreObject, RestoreObjectRole,
-            RestoreRequest,
+            RestoreAuthority, RestoreDescriptor, RestoreExtent, RestoreLower, RestoreObject,
+            RestoreObjectAuthority, RestoreObjectRole, RestoreRequest,
         };
         let plan = plan();
         let evidence = evidence(&plan);
@@ -2841,20 +3275,24 @@ mod tests {
                 file_device: 1,
                 file_inode: 1 + index as u64,
                 length: entry.length,
-                identity: entry.identity.or(entry.sha256).unwrap(),
+                authority: RestoreObjectAuthority::Identified {
+                    identity: entry.identity.or(entry.sha256).unwrap(),
+                },
             }
         });
         RestoreRequest {
             disk_tracking_seeds: Vec::new(),
             map_node_store: None,
             version: crate::restore::RESTORE_REQUEST_VERSION,
-            checkpoint: Sha256Digest::of_bytes(b"checkpoint"),
+            authority: RestoreAuthority::IdentifiedSnapshot {
+                checkpoint: Sha256Digest::of_bytes(b"checkpoint"),
+                evidence: Box::new(evidence),
+            },
             activation_id: id("44444444-4444-4444-8444-444444444444"),
             freeze_operation_id: capture(),
             start_paused: true,
             configuration: plan.configuration.clone(),
-            evidence,
-            objects,
+            objects: objects.into(),
             ssh_trusted_ca: None,
             lowers: vec![RestoreLower {
                 block_id: BlockId::new("silo-root-lower").unwrap(),
@@ -2888,7 +3326,9 @@ mod tests {
         wrong.lowers[0].extents[0].file_inode = wrong.objects[0].file_inode;
         assert!(wrong.validate().is_err());
         let mut wrong = request.clone();
-        wrong.objects[2].identity = Sha256Digest::of_bytes(b"other execution");
+        wrong.objects[2].authority = crate::restore::RestoreObjectAuthority::Identified {
+            identity: Sha256Digest::of_bytes(b"other execution"),
+        };
         assert!(wrong.validate().is_err());
         let mut wrong = request.clone();
         wrong.start_paused = false;
@@ -2904,28 +3344,27 @@ mod tests {
     #[test]
     fn inspection_requires_complete_exact_devices_without_imposing_envelope_order() {
         use crate::restore::{
-            RestoreAdmittedDevice, RestoreDeviceKind as Kind, RestoreInspectionReport,
-            RestoreInspectionRequest,
+            RestoreAdmittedDevice, RestoreAuthority, RestoreDeviceKind as Kind,
+            RestoreInspectionReport, RestoreInspectionRequest, RestoreInspectionRequestBinding,
         };
         let mut request = RestoreInspectionRequest {
-            version: 1,
+            version: crate::restore::RESTORE_INSPECTION_VERSION,
             restore: restore_request(),
             network: false,
         };
-        request
-            .restore
-            .evidence
-            .memory
-            .as_mut()
-            .unwrap()
-            .binding
-            .live_state_schema = "silo.live-state/1".into();
+        let RestoreAuthority::IdentifiedSnapshot { evidence, .. } = &mut request.restore.authority
+        else {
+            panic!("identified restore fixture required")
+        };
+        evidence.memory.as_mut().unwrap().binding.live_state_schema = "silo.live-state/1".into();
         let bytes = serde_json::to_vec(&request).unwrap();
-        let binding = &request.restore.evidence.memory.as_ref().unwrap().binding;
+        let binding = request.restore.authority.binding().unwrap();
         let report = RestoreInspectionReport {
-            version: 1,
-            request: Sha256Digest::of_bytes(&bytes),
-            checkpoint: request.restore.checkpoint,
+            version: crate::restore::RESTORE_INSPECTION_VERSION,
+            request: RestoreInspectionRequestBinding::Identified {
+                sha256: Sha256Digest::of_bytes(&bytes),
+            },
+            authority: request.restore.authority.reference(),
             live_state_schema: binding.live_state_schema.clone(),
             architecture: binding.architecture.clone(),
             lane: crate::live::LiveLane::KvmX86_64,
@@ -2982,7 +3421,9 @@ mod tests {
         wrong.devices[1].irq = wrong.devices[0].irq;
         assert!(wrong.validate_against(&bytes, &request).is_err());
         let mut wrong = report;
-        wrong.request = Sha256Digest::of_bytes(b"another inspection");
+        wrong.request = RestoreInspectionRequestBinding::Identified {
+            sha256: Sha256Digest::of_bytes(b"another inspection"),
+        };
         assert!(wrong.validate_against(&bytes, &request).is_err());
     }
 
@@ -3067,8 +3508,10 @@ mod tests {
         let mut memory = seal.memory.clone().unwrap();
         memory.mode = CapturePolicy::Incremental;
         memory.full_reason = None;
-        assert!(memory.validate_capture().is_err());
+        memory.validate_capture().unwrap();
         memory.baseline = Some(Sha256Digest::of_bytes(b"exact predecessor stream"));
+        memory.identity_policy = CaptureIdentityPolicy::SinceAnchor;
+        memory.identity_full_reason = None;
         memory.changes.coverage = CaptureRamCoverage::Incremental;
         memory.changes.baseline_stream = memory.baseline;
         memory.validate_capture().unwrap();
@@ -3077,6 +3520,7 @@ mod tests {
             .validate_against_plan(&plan, &seal.request_digest)
             .is_err());
         plan.policy = CapturePolicy::Incremental;
+        plan.identity_policy = CaptureIdentityPolicy::SinceAnchor;
         seal.request_digest = Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap());
         seal.validate_against_plan(&plan, &seal.request_digest)
             .unwrap();
@@ -3108,8 +3552,14 @@ mod tests {
     fn stream_inventory_and_restore_use_only_stream_identity() {
         let mut request = restore_request();
         request.validate().unwrap();
-        let ram = request
-            .evidence
+        let crate::restore::RestoreAuthority::IdentifiedSnapshot {
+            evidence: identified,
+            ..
+        } = &request.authority
+        else {
+            panic!("identified restore fixture required")
+        };
+        let ram = identified
             .inventory
             .iter()
             .find(|entry| entry.role == CaptureRole::Ram)
@@ -3117,7 +3567,9 @@ mod tests {
         let encoded = serde_json::to_value(ram).unwrap();
         assert!(encoded.get("sha256").is_none());
         assert!(encoded.get("identity").is_some());
-        request.objects[0].identity = Sha256Digest::of_bytes(b"wrong stream");
+        request.objects[0].authority = crate::restore::RestoreObjectAuthority::Identified {
+            identity: Sha256Digest::of_bytes(b"wrong stream"),
+        };
         assert!(request.validate().is_err());
         let mut record = evidence(&plan());
         record.inventory[2].sha256 = Some(Sha256Digest::of_bytes(b"byte sha"));
@@ -3169,6 +3621,13 @@ mod tests {
             extent_queries: 14,
             identity_bytes_hashed: 15,
             whole_file_bytes_hashed: 16,
+            map_nodes_written: 17,
+            identity_dirty_pages: 18,
+            materialization_dirty_pages: 19,
+            live_pages_classified: 20,
+            identity_zero_bytes_filled: 21,
+            full_identity_read_fallback:
+                crate::capture::CaptureIdentityReadFallback::ExtentsUnavailable,
         };
         let value = serde_json::to_value(&stats).unwrap();
         assert_eq!(
@@ -3191,6 +3650,12 @@ mod tests {
                 "extentQueries": 14,
                 "identityBytesHashed": 15,
                 "wholeFileBytesHashed": 16,
+                "mapNodesWritten": 17,
+                "identityDirtyPages": 18,
+                "materializationDirtyPages": 19,
+                "livePagesClassified": 20,
+                "identityZeroBytesFilled": 21,
+                "fullIdentityReadFallback": "extents-unavailable",
             })
         );
         assert_eq!(
@@ -3222,7 +3687,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_seed_requires_incremental_capture_without_baseline_io() {
+    fn clone_seed_separates_identity_reads_from_materialization_writes() {
         use crate::capture::CaptureSeedMethod;
 
         let mut memory = evidence(&plan()).memory.unwrap();
@@ -3231,11 +3696,13 @@ mod tests {
         memory.mode = CapturePolicy::Incremental;
         memory.full_reason = None;
         memory.baseline = Some(Sha256Digest::of_bytes(b"predecessor"));
+        memory.identity_policy = CaptureIdentityPolicy::SinceAnchor;
+        memory.identity_full_reason = None;
         memory.changes.coverage = CaptureRamCoverage::Incremental;
         memory.changes.baseline_stream = memory.baseline;
         memory.validate_capture().unwrap();
         memory.stats.baseline_bytes_read = 1;
-        assert!(memory.validate_capture().is_err());
+        memory.validate_capture().unwrap();
         memory.stats.baseline_bytes_read = 0;
         memory.stats.baseline_bytes_written = 1;
         assert!(memory.validate_capture().is_err());
@@ -3451,5 +3918,243 @@ mod tests {
         full_summary.sha256 = Sha256Digest::of_bytes(&full_zero);
         assert!(read(&full_zero, &full_summary).is_err());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    pub(crate) struct OwnedCutFixture {
+        pub(crate) directory: std::path::PathBuf,
+        pub(crate) cut: OwnedLocalCut,
+        pub(crate) plan: CapturePlan,
+    }
+
+    impl Drop for OwnedCutFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    pub(crate) fn owned_cut_fixture(name: &str) -> OwnedCutFixture {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("silo-{name}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(directory.join(CAPTURE_DISKS_DIRECTORY)).unwrap();
+        let mut plan = plan();
+        plan.identity_policy = CaptureIdentityPolicy::None;
+        plan.map_node_store = None;
+        let binding = evidence(&plan).memory.unwrap().binding;
+        let members = plan
+            .roles()
+            .into_iter()
+            .map(|role| {
+                let length = match &role {
+                    CaptureRole::Ram => plan.ram_bytes,
+                    CaptureRole::Disk(name) => {
+                        plan.disks
+                            .iter()
+                            .find(|disk| &disk.name == name)
+                            .unwrap()
+                            .length
+                    }
+                    _ => 100,
+                };
+                let path = directory.join(role.relative_path());
+                let file = std::fs::File::create(&path).unwrap();
+                file.set_len(length).unwrap();
+                drop(file);
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+                let metadata = std::fs::metadata(&path).unwrap();
+                OwnedCutMember {
+                    role,
+                    complete: true,
+                    fingerprint: SourceFingerprint {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                        length: metadata.len(),
+                        mode: metadata.mode(),
+                        modified_seconds: metadata.mtime(),
+                        modified_nanoseconds: metadata.mtime_nsec(),
+                        changed_seconds: metadata.ctime(),
+                        changed_nanoseconds: metadata.ctime_nsec(),
+                    },
+                }
+            })
+            .collect();
+        let cut = OwnedLocalCut {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: plan.machine_id.clone(),
+            run_id: plan.run_id.clone(),
+            capture_id: plan.capture_id.clone(),
+            freeze_operation_id: plan.capture_id.clone(),
+            freeze_epoch: NonZeroU64::new(1).unwrap(),
+            configuration: plan.configuration.clone(),
+            binding,
+            materialization_generation: NonZeroU64::new(2).unwrap(),
+            predecessor_generation: 1,
+            packed_length: plan.ram_bytes,
+            page_granule: 4096,
+            regions: 1,
+            members,
+            stats: CaptureMemoryStats {
+                logical_bytes: plan.ram_bytes,
+                ..Default::default()
+            },
+        };
+        cut.validate_against_plan(&plan).unwrap();
+        OwnedCutFixture {
+            directory,
+            cut,
+            plan,
+        }
+    }
+
+    #[test]
+    fn owned_cut_is_strict_complete_exact_file_evidence_without_content_authority() {
+        let fixture = owned_cut_fixture("owned-cut-codec");
+        let cut = &fixture.cut;
+        let bytes = cut.canonical_bytes().unwrap();
+        assert_eq!(OwnedLocalCut::decode(&bytes).unwrap(), *cut);
+        assert!(serde_json::from_slice::<CaptureEvidence>(&bytes).is_err());
+        let text = String::from_utf8(bytes).unwrap();
+        for bad in [
+            format!("{text}\n"),
+            text.replacen('{', "{\"future\":true,", 1),
+            text.replacen("\"version\":3", "\"version\":3,\"version\":3", 1),
+            text.replace("\"complete\":true", "\"complete\":false"),
+            text.replace(
+                "\"materializationGeneration\":2",
+                "\"materializationGeneration\":0",
+            ),
+        ] {
+            assert_ne!(bad, text);
+            assert!(OwnedLocalCut::decode(bad.as_bytes()).is_err());
+        }
+        for mutation in 0..19 {
+            let mut bad = cut.clone();
+            match mutation {
+                0 => bad.version -= 1,
+                1 => bad.run_id = machine(),
+                2 => bad.capture_id = machine(),
+                3 => bad.predecessor_generation = bad.materialization_generation.get(),
+                4 => bad.members[0].complete = false,
+                5 => bad.members[0].role = CaptureRole::RamMap,
+                6 => bad.members[0].fingerprint.inode = 0,
+                7 => bad.members[0].fingerprint.mode |= 0o200,
+                8 => bad.members[0].fingerprint.modified_nanoseconds = 1_000_000_000,
+                9 => bad.members[0].fingerprint.changed_nanoseconds = -1,
+                10 => bad.members.swap(0, 1),
+                11 => {
+                    bad.members.pop();
+                }
+                12 => bad.stats.identity_bytes_hashed = 1,
+                13 => bad.stats.map_nodes_written = 1,
+                14 => bad.stats.whole_file_bytes_hashed = 1,
+                15 => bad.members[2].fingerprint.length -= 4096,
+                16 => bad.members[1].fingerprint = bad.members[0].fingerprint.clone(),
+                17 => bad.page_granule = 0,
+                _ => bad.binding.live_state_schema.push('\0'),
+            }
+            assert!(bad.validate().is_err(), "mutation {mutation}");
+        }
+        let mut wrong_plan = fixture.plan.clone();
+        wrong_plan.disks.swap(0, 1);
+        assert!(cut.validate_against_plan(&wrong_plan).is_err());
+        let mut foreign_freeze = cut.clone();
+        foreign_freeze.freeze_operation_id = machine();
+        foreign_freeze.validate().unwrap();
+        assert!(foreign_freeze.validate_against_plan(&fixture.plan).is_err());
+        let mut borrowed_plan = fixture.plan.clone();
+        let generation = NonZeroU64::new(7).unwrap();
+        borrowed_plan.pause = CapturePauseAuthority::Borrow {
+            token: PauseToken {
+                machine_id: cut.machine_id.clone(),
+                run_id: cut.run_id.clone(),
+                generation,
+                owner: PauseOwner::User,
+            },
+            pause_operation_id: machine(),
+        };
+        borrowed_plan.resume_policy = CaptureResumePolicy::Preserve;
+        foreign_freeze.binding.pause_generation = generation;
+        foreign_freeze
+            .validate_against_plan(&borrowed_plan)
+            .unwrap();
+        foreign_freeze.binding.pause_generation = NonZeroU64::MIN;
+        assert!(foreign_freeze
+            .validate_against_plan(&borrowed_plan)
+            .is_err());
+    }
+
+    #[test]
+    fn capture_success_keeps_owned_and_identified_journal_authorities_disjoint() {
+        let fixture = owned_cut_fixture("owned-success-codec");
+        let cut = fixture.cut.clone();
+        let token = PauseToken {
+            machine_id: cut.machine_id.clone(),
+            run_id: cut.run_id.clone(),
+            generation: cut.binding.pause_generation,
+            owner: PauseOwner::Capture {
+                operation_id: cut.capture_id.clone(),
+            },
+        };
+        let success = CaptureSuccess::OwnedLocalCut {
+            cut: Box::new(cut.clone()),
+            cut_token: token,
+        };
+        success.validate().unwrap();
+        let json = serde_json::to_value(&success).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CaptureSuccess>(json.clone()).unwrap(),
+            success
+        );
+        assert!(json.get("cutToken").is_some());
+        assert!(json.get("cut_token").is_none());
+        let mut snake_case = json.clone();
+        let token = snake_case
+            .as_object_mut()
+            .unwrap()
+            .remove("cutToken")
+            .unwrap();
+        snake_case["cut_token"] = token;
+        assert!(serde_json::from_value::<CaptureSuccess>(snake_case).is_err());
+        assert!(serde_json::from_value::<CaptureSealed>(json.clone()).is_err());
+        let mut wrong = json;
+        wrong["evidenceSha256"] = serde_json::json!(Sha256Digest::of_bytes(b"not owned authority"));
+        assert!(serde_json::from_value::<CaptureSuccess>(wrong).is_err());
+        let mut wrong = success.clone();
+        if let CaptureSuccess::OwnedLocalCut { cut_token, .. } = &mut wrong {
+            cut_token.generation = NonZeroU64::new(cut.binding.pause_generation.get() + 1).unwrap();
+        }
+        assert!(wrong.validate().is_err());
+        let mut observation = CaptureObservation {
+            continuation: CaptureContinuation::Pending,
+            release: CaptureReleaseState::Retained,
+            evidence: Some(CaptureRecordReference::OwnedLocalCut { cut: Box::new(cut) }),
+            source_record: None,
+        };
+        observation.validate().unwrap();
+        observation.source_record = Some(CaptureSourceReference::Identified {
+            sha256: Sha256Digest::of_bytes(b"foreign identified source"),
+        });
+        assert!(observation.validate().is_err());
+    }
+
+    #[test]
+    fn first_owned_child_snapshot_can_incrementally_materialize_full_identity() {
+        let mut memory = evidence(&plan()).memory.unwrap();
+        memory.mode = CapturePolicy::Incremental;
+        memory.full_reason = None;
+        memory.identity_full_reason = Some(CaptureIdentityFullReason::UnknownAnchorAfterFork);
+        memory.stats.seed_method = CaptureSeedMethod::Clone;
+        memory.stats.baseline_bytes_read = 65536;
+        memory.validate_capture().unwrap();
+        memory.identity_policy = CaptureIdentityPolicy::None;
+        assert!(memory.validate_capture().is_err());
+        memory.identity_policy = CaptureIdentityPolicy::SinceAnchor;
+        assert!(memory.validate_capture().is_err());
     }
 }

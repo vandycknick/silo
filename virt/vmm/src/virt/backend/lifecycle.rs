@@ -1866,6 +1866,7 @@ mod tests {
         LifecycleCommand::PrepareCapture {
             operation,
             preparation: CapturePreparation {
+                identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
                 outputs,
                 pin,
                 pause,
@@ -1986,7 +1987,9 @@ mod tests {
             operation,
             ram: outputs.ram,
             layout: outputs.layout,
-            stream: Digest32([9; 32]),
+            authority: crate::virt::lifecycle::CaptureBaselineAuthority::Identified {
+                stream: Digest32([9; 32]),
+            },
             timeout: BUDGET,
         }
     }
@@ -2135,6 +2138,10 @@ mod tests {
             changes_output.length,
             changes_file.metadata().unwrap().len()
         );
+        let crate::virt::lifecycle::CaptureRamChangesAuthority::Identified(changes) = changes
+        else {
+            panic!("identified capture returned owned change authority");
+        };
         let actual = vm_spec::capture::RamChangeReader::new(changes_file, ram.length, &changes)
             .unwrap()
             .collect::<std::io::Result<Vec<_>>>()
@@ -2563,6 +2570,7 @@ mod tests {
         let command = LifecycleCommand::PrepareCapture {
             operation,
             preparation: CapturePreparation {
+                identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
                 outputs,
                 pin,
                 pause: CapturePauseSource::Acquire,

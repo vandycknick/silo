@@ -119,6 +119,7 @@ pub fn name(value: Option<String>) -> Result<Option<String>, ConversionError> {
 }
 
 pub fn alias(value: &str) -> Result<String, ConversionError> {
+    crate::images::reject_local_cut(value)?;
     match format!("image:{value}").parse::<SnapshotRef>() {
         Ok(SnapshotRef::Image(alias)) if alias == value => Ok(alias),
         _ => Err(invalid("alias", "invalid image alias")),

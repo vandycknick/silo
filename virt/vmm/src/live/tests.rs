@@ -1098,6 +1098,7 @@ impl Harness {
             .capture_binding_for_tests()
             .expect("capture binding");
         CapturePlan {
+            identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
             version: CAPTURE_RECORD_VERSION,
             machine_id: self.machine_id.clone(),
             run_id: self.run_id.clone(),
@@ -1110,6 +1111,7 @@ impl Harness {
             resume_policy,
             pause,
             disks: vec![CaptureDiskPlan {
+                identity: vm_spec::capture::DiskIdentityState::Unknown,
                 name: CaptureDiskName::new("root").unwrap(),
                 attachment_index: 0,
                 block_id: vm_spec::BlockId::new("root").unwrap(),
@@ -1164,7 +1166,9 @@ impl Harness {
 
 fn sealed(observation: &OperationObservation) -> vm_spec::capture::CaptureSealed {
     match &observation.operation.outcome {
-        OperationOutcome::CaptureSealed { capture } => capture.clone(),
+        OperationOutcome::CaptureSealed {
+            capture: vm_spec::capture::CaptureSuccess::Identified { sealed },
+        } => sealed.clone(),
         outcome => panic!("capture did not seal: {outcome:?}"),
     }
 }
@@ -1521,7 +1525,11 @@ async fn live_capture_failure_before_seal_writes_diagnostics_and_continues() {
     assert_eq!(record.capture_outcome, CaptureRecordOutcome::Failed);
     assert!(!record.is_sealed(), "a failed record is never a seal");
     assert_eq!(
-        facts.evidence.map(|evidence| evidence.outcome),
+        facts.evidence.and_then(|reference| match reference {
+            vm_spec::capture::CaptureRecordReference::Identified { evidence } =>
+                Some(evidence.outcome),
+            vm_spec::capture::CaptureRecordReference::OwnedLocalCut { .. } => None,
+        }),
         Some(CaptureRecordOutcome::Failed)
     );
     harness.stop().await;
@@ -1743,7 +1751,11 @@ async fn live_capture_exceeding_the_reserved_total_fails_before_its_seal() {
         assert!(!record.is_sealed());
         let facts = observation.capture.clone().unwrap();
         assert_eq!(
-            facts.evidence.map(|evidence| evidence.outcome),
+            facts.evidence.and_then(|reference| match reference {
+                vm_spec::capture::CaptureRecordReference::Identified { evidence } =>
+                    Some(evidence.outcome),
+                vm_spec::capture::CaptureRecordReference::OwnedLocalCut { .. } => None,
+            }),
             Some(CaptureRecordOutcome::Failed)
         );
         match policy {
@@ -1920,4 +1932,286 @@ async fn live_stop_during_capture_never_continues_the_capture_pause() {
     }
     assert!(!harness.gate.reopen(), "stop seals fences permanently");
     harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_forks_have_owned_authority_and_preserve_source_identity_roots() {
+    use vm_spec::capture::*;
+    let harness = Harness::start_shaped(
+        Some(serde_json::json!({"capture":{"ramBytes":1 << 20}})),
+        timeouts(),
+        true,
+        Some(1),
+        ROOT_DISK_BYTES,
+    )
+    .await;
+    let snapshot = live_id(Uuid::new_v4());
+    let plan = harness.capture_plan(
+        &snapshot,
+        CapturePauseAuthority::Acquire,
+        CaptureResumePolicy::ResumeIfAcquired,
+    );
+    harness.capture(plan).await;
+    let first = harness.capture_settled(&snapshot).await;
+    sealed(&first);
+    let anchors = harness.live.retained_identity_roots_for_tests();
+    assert!(anchors.0.is_some());
+    for _ in 0..2 {
+        let request = live_id(Uuid::new_v4());
+        let mut plan = harness.capture_plan(
+            &request,
+            CapturePauseAuthority::Acquire,
+            CaptureResumePolicy::ResumeIfAcquired,
+        );
+        plan.identity_policy = CaptureIdentityPolicy::None;
+        harness.capture(plan).await;
+        let observation = harness.capture_settled(&request).await;
+        assert_eq!(observation.state, VmLifecycleState::Running);
+        let OperationOutcome::CaptureSealed {
+            capture: CaptureSuccess::OwnedLocalCut { cut, .. },
+        } = &observation.operation.outcome
+        else {
+            panic!("fork lacks owned success authority: {observation:?}");
+        };
+        let directory = harness.capture_dir(&request);
+        assert_eq!(
+            OwnedLocalCut::decode(&std::fs::read(directory.join(CAPTURE_EVIDENCE_FILE)).unwrap())
+                .unwrap(),
+            **cut
+        );
+        assert_eq!(cut.stats.identity_bytes_hashed, 0);
+        assert_eq!(cut.stats.whole_file_bytes_hashed, 0);
+        assert_eq!(cut.stats.map_nodes_written, 0);
+        assert_eq!(cut.stats.identity_dirty_pages, 0);
+        assert_eq!(
+            std::fs::metadata(directory.join(CAPTURE_RAM_CHANGES_FILE))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(!directory.join(CAPTURE_RAM_MAP_FILE).exists());
+        assert_eq!(
+            std::fs::read_dir(directory.join(CAPTURE_MAP_NODES_DIRECTORY))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.join("disks")).unwrap().count(),
+            1
+        );
+        for member in &cut.members {
+            let file = std::fs::File::open(directory.join(member.role.relative_path())).unwrap();
+            assert_eq!(
+                crate::restore::inputs::fingerprint(&file).unwrap(),
+                member.fingerprint
+            );
+        }
+        assert_eq!(harness.live.retained_identity_roots_for_tests(), anchors);
+        let response = harness
+            .native(crate::virt::lifecycle::LifecycleCommand::GetControl {
+                target: Some(crate::virt::lifecycle::CommandKey {
+                    request_id: Uuid::parse_str(request.as_str()).unwrap(),
+                    kind: crate::virt::lifecycle::CommandKind::FreezeCaptureDisks,
+                }),
+            })
+            .await;
+        assert!(matches!(
+            response,
+            Err(crate::virt::lifecycle::LifecycleError::Rejected(
+                crate::virt::lifecycle::LifecycleRejection::UnknownTarget
+            ))
+        ));
+    }
+    let next = live_id(Uuid::new_v4());
+    let mut plan = harness.capture_plan(
+        &next,
+        CapturePauseAuthority::Acquire,
+        CaptureResumePolicy::ResumeIfAcquired,
+    );
+    plan.identity_policy = CaptureIdentityPolicy::SinceAnchor;
+    harness.capture(plan).await;
+    let final_snapshot = sealed(&harness.capture_settled(&next).await);
+    let evidence = CaptureEvidence::decode(
+        &std::fs::read(harness.capture_dir(&next).join(CAPTURE_EVIDENCE_FILE)).unwrap(),
+    )
+    .unwrap();
+    let first_evidence = CaptureEvidence::decode(
+        &std::fs::read(harness.capture_dir(&snapshot).join(CAPTURE_EVIDENCE_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        evidence.memory.unwrap().ram_stream,
+        first_evidence.memory.unwrap().ram_stream
+    );
+    assert_eq!(final_snapshot.capture_id, next);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_owned_captures_abandon_without_advancing_the_byte_baseline() {
+    use vm_spec::capture::*;
+    for stage in ["execution", "memory"] {
+        let mut capture = serde_json::json!({"ramBytes":1 << 20});
+        capture[stage] = serde_json::json!([{"result":"fail"}]);
+        let harness = Harness::start_shaped(
+            Some(serde_json::json!({"capture":capture})),
+            timeouts(),
+            true,
+            Some(1),
+            ROOT_DISK_BYTES,
+        )
+        .await;
+        let request = live_id(Uuid::new_v4());
+        let mut plan = harness.capture_plan(
+            &request,
+            CapturePauseAuthority::Acquire,
+            CaptureResumePolicy::ResumeIfAcquired,
+        );
+        plan.identity_policy = CaptureIdentityPolicy::None;
+        harness.capture(plan).await;
+        let failed = harness.capture_settled(&request).await;
+        assert!(matches!(
+            failed.operation.outcome,
+            OperationOutcome::Failed { .. }
+        ));
+        assert_eq!(failed.state, VmLifecycleState::Running);
+        assert!(!harness
+            .capture_dir(&request)
+            .join(CAPTURE_EVIDENCE_FILE)
+            .exists());
+        assert_eq!(
+            harness.live.retained_identity_roots_for_tests(),
+            (None, Vec::new())
+        );
+        let retry = live_id(Uuid::new_v4());
+        let mut plan = harness.capture_plan(
+            &retry,
+            CapturePauseAuthority::Acquire,
+            CaptureResumePolicy::ResumeIfAcquired,
+        );
+        plan.identity_policy = CaptureIdentityPolicy::None;
+        harness.capture(plan).await;
+        let success = harness.capture_settled(&retry).await;
+        let OperationOutcome::CaptureSealed {
+            capture: CaptureSuccess::OwnedLocalCut { cut, .. },
+        } = success.operation.outcome
+        else {
+            panic!("retry failed: {success:?}");
+        };
+        assert_eq!(cut.predecessor_generation, 0);
+        assert_eq!(cut.stats.identity_bytes_hashed, 0);
+        harness.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owned_cut_keeps_the_exact_borrowed_pause_and_guest_freeze_epoch() {
+    use vm_spec::capture::*;
+    let harness = Harness::start_shaped(
+        Some(serde_json::json!({"capture":{"ramBytes":1 << 20}})),
+        timeouts(),
+        true,
+        Some(1),
+        ROOT_DISK_BYTES,
+    )
+    .await;
+    let pause = harness.pause().await;
+    let observation = harness.settled(&pause).await;
+    let current = observation.current_pause.unwrap();
+    let request = live_id(Uuid::new_v4());
+    let mut plan = harness.capture_plan(
+        &request,
+        CapturePauseAuthority::Borrow {
+            pause_operation_id: pause.clone(),
+            token: current.token.clone(),
+        },
+        CaptureResumePolicy::Preserve,
+    );
+    plan.identity_policy = CaptureIdentityPolicy::None;
+    harness.capture(plan).await;
+    let observation = harness.capture_settled(&request).await;
+    assert_eq!(observation.state, VmLifecycleState::Paused);
+    assert_eq!(observation.current_pause.as_ref(), Some(&current));
+    let OperationOutcome::CaptureSealed {
+        capture: CaptureSuccess::OwnedLocalCut { cut, cut_token },
+    } = observation.operation.outcome
+    else {
+        panic!("owned capture did not seal");
+    };
+    assert_eq!(cut.freeze_operation_id, pause);
+    assert_eq!(cut.freeze_epoch, current.freeze_epoch);
+    assert_eq!(cut_token, current.token);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owned_cut_cancel_and_record_collision_leave_the_source_baseline_unaccepted() {
+    use vm_spec::capture::*;
+    for collide in [false, true] {
+        let harness = Harness::start_shaped(
+            Some(serde_json::json!({
+                "capture":{"ramBytes":1 << 20,"memory":[{"delayMs":500,"result":"complete"}]}
+            })),
+            timeouts(),
+            true,
+            Some(1),
+            ROOT_DISK_BYTES,
+        )
+        .await;
+        let request = live_id(Uuid::new_v4());
+        let mut plan = harness.capture_plan(
+            &request,
+            CapturePauseAuthority::Acquire,
+            CaptureResumePolicy::ResumeIfAcquired,
+        );
+        plan.identity_policy = CaptureIdentityPolicy::None;
+        harness.capture(plan).await;
+        harness
+            .until("owned capture reached RAM", |snapshot| {
+                snapshot
+                    .lifecycle
+                    .activity
+                    .as_ref()
+                    .is_some_and(|activity| activity.stage == LiveStage::CaptureMemory)
+            })
+            .await;
+        if collide {
+            std::fs::write(
+                harness.capture_dir(&request).join(CAPTURE_EVIDENCE_FILE),
+                b"occupied",
+            )
+            .unwrap();
+        } else {
+            let CancelOperationOutcome::Completed { completed } = harness.cancel(&request).await
+            else {
+                panic!("owned capture cancellation did not complete");
+            };
+            assert!(completed.effective);
+        }
+        let failed = harness.capture_settled(&request).await;
+        assert_eq!(failed.state, VmLifecycleState::Running);
+        assert!(matches!(
+            failed.operation.outcome,
+            OperationOutcome::Failed { .. }
+        ));
+        let retry = live_id(Uuid::new_v4());
+        let mut plan = harness.capture_plan(
+            &retry,
+            CapturePauseAuthority::Acquire,
+            CaptureResumePolicy::ResumeIfAcquired,
+        );
+        plan.identity_policy = CaptureIdentityPolicy::None;
+        harness.capture(plan).await;
+        let success = harness.capture_settled(&retry).await;
+        let OperationOutcome::CaptureSealed {
+            capture: CaptureSuccess::OwnedLocalCut { cut, .. },
+        } = success.operation.outcome
+        else {
+            panic!("owned capture retry did not seal");
+        };
+        assert_eq!(cut.predecessor_generation, 0);
+        assert_eq!(cut.stats.identity_bytes_hashed, 0);
+        harness.stop().await;
+    }
 }

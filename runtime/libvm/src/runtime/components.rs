@@ -885,6 +885,18 @@ pub(crate) fn test_components(base: &Path) -> ResolvedRuntimeComponents {
     }
 }
 
+/// A real executable held as byte authority in tests that never spawn a VMM.
+#[cfg(test)]
+pub(crate) fn test_components_with_supervisor(
+    base: &Path,
+    executable: &Path,
+) -> ResolvedRuntimeComponents {
+    ResolvedRuntimeComponents {
+        supervisor: executable.to_path_buf(),
+        ..test_components(base)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn sdk_app_candidates() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
