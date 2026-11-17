@@ -271,8 +271,15 @@ def test_history_requires_gate_fields(tmp_path: Path, field: str) -> None:
 ])
 def test_disk_invariance_noise(first: float, second: float, expected: bool) -> None:
     cohort = Cohort("disk", "alpine", 2, 2)
-    assert invariant(first, second, cohort) is expected
-    assert invariant(second, first, cohort) is expected
+    assert invariant(first, second, cohort, "fork_first") is expected
+    assert invariant(second, first, cohort, "fork_first") is expected
+
+
+def test_disk_invariance_accepted_residual_applies_to_its_metric_only() -> None:
+    cohort = load_cohorts()["disk-invariance"]
+    assert invariant(0.595, 0.716, cohort, "snapshot_full")
+    assert not invariant(0.595, 0.716, cohort, "snapshot_incremental")
+    assert not invariant(0.595, 0.760, cohort, "snapshot_full")
 
 
 def test_catalog_observer_decodes_real_alias(tmp_path: Path) -> None:
@@ -329,6 +336,8 @@ def test_disk_invariance_rule_is_visible() -> None:
     current = replace(record(), cohort="disk-invariance/30gib")
     table = render([current], [], {}, {cohort.name: cohort})
     assert "max(0.05s, 10% of smaller median)" in table
+    accepted = replace(cohort, metric_noise_absolute_seconds={"snapshot_full": 0.15})
+    assert render([current], [], {}, {accepted.name: accepted}).endswith("; snapshot_full accepted up to 0.15s")
 
 
 def test_create_and_run_clock_labels() -> None:

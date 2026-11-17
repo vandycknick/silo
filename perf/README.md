@@ -174,6 +174,9 @@ The raw-root cohort does not qualify attached extra raw disks.
 Disk invariance compares medians of both fork, both snapshot and both restore
 metrics. Equality means absolute difference at most the larger of 0.05 seconds
 or 10% of the smaller median. The table prints this rule explicitly.
+One measured residual is accepted as cohort data: `snapshot_full` may differ by
+up to 0.15 seconds, because a fresh ext4 disk keeps a few backup superblock
+chunks that grow slowly with its size.
 Those values and written payload size are cohort data.
 The invariant fails the run when exceeded; no disk-copy allowance is subtracted.
 The payload is written and synced outside timing on each fresh source.

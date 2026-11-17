@@ -31,6 +31,12 @@ written_mib = 64
 noise_relative = 0.10
 noise_absolute_seconds = 0.05
 
+# A fresh ext4 disk keeps a few backup superblock chunks that grow slowly with
+# its size (12 chunks at 30 GiB, 21 at 500 GiB), so the first full snapshot
+# hashes slightly more. Measured 0.12 s on 2026-11-17; accepted by the owner.
+[disk-invariance.metric_noise_absolute_seconds]
+snapshot_full = 0.15
+
 [arch-30g-busy]
 image = "ghcr.io/vandycknick/archlinux:20260831.150324"
 cpus = 10
