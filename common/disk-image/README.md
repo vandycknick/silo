@@ -284,6 +284,26 @@ Internally, the formatter writes data sequentially and computes the final metada
 3. Block group layout is optimized to minimize group count.
 4. The internal journal, resize inode metadata, backup superblocks, group descriptors, inode tables, bitmaps, and the primary superblock are written.
 
+All freshly formatted filesystems, including managed uppers and generic OCI
+images, leave bitmaps covered by `BLOCK_UNINIT` or `INODE_UNINIT` unwritten.
+The existing `uninit_bg` (`GDT_CSUM`) feature lets ext4 reconstruct these from
+the descriptor's metadata locations. The final block group's block bitmap
+remains initialized, including unavailable blocks past the device end.
+Known-zero inode tables are marked `INODE_ZEROED` (`ITABLE_ZEROED` in
+`dumpe2fs`), including zero-padded tails of active tables, so mounting does not
+schedule background table zeroing. Addresses, free counts, backup placement,
+resize reservations and filesystem features are unchanged.
+
+For unmounted fresh 30/100/500 GiB managed uppers, the Linux sparse-file
+regression test expects 12/18/21 nonzero 8 MiB chunks (one chunk tolerance),
+instead of 240/800/3998. This is a small, near-constant initial footprint,
+not a guarantee of capacity-independent snapshot work: sparse-super backup
+counts still grow, and guest writes can populate further chunks.
+The reader already honors `INODE_UNINIT`; the offline grower only reads the
+initialized final block bitmap and retains its existing new-group writes.
+Real-guest qualification must still mount, write across groups, grow a managed
+upper online and grow a raw root offline.
+
 ## ext4 Feature Flags
 
 This table follows the feature list documented in [`ext4(5)`](https://www.man7.org/linux/man-pages/man5/ext4.5.html). Status describes what `ext4` currently emits or supports.
