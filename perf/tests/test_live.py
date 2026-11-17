@@ -119,10 +119,12 @@ def test_live_operations(config: SmokeConfig, registry: LoopbackRegistry) -> Non
                         first, second = (disk_medians[disk] for disk in cohort.disks)
                         for metric in ("snapshot_full", "snapshot_incremental", "fork_first", "fork_second",
                                        "restore_first", "restore_second"):
-                            if not invariant(first[metric], second[metric], cohort):
+                            if not invariant(first[metric], second[metric], cohort, metric):
+                                absolute = cohort.metric_noise_absolute_seconds.get(
+                                    metric, cohort.noise_absolute_seconds)
                                 failures.append(f"{cohort_name}/{mode}/{metric}: configured disk changed median "
                                                 f"{first[metric]:.3f}s vs {second[metric]:.3f}s beyond "
-                                                f"{cohort.noise_relative:.0%} or {cohort.noise_absolute_seconds:g}s noise")
+                                                f"{cohort.noise_relative:.0%} or {absolute:g}s noise")
     finally:
         records = [replace(record, msb_version=versions.get("msb")) for record in records]
         append(history_path(), records)

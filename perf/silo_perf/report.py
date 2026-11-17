@@ -58,6 +58,8 @@ def render(records: Sequence[Record], history: Sequence[Record],
         if len(cohort.disks) > 1 and any(entry.cohort.startswith(cohort.name + "/") for entry in records):
             table += (f"\n{cohort.name} timing invariant: absolute difference <= max("
                       f"{cohort.noise_absolute_seconds:g}s, {cohort.noise_relative:.0%} of smaller median)")
+            for metric, seconds in sorted(cohort.metric_noise_absolute_seconds.items()):
+                table += f"; {metric} accepted up to {seconds:g}s"
     return table
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import math
 from pathlib import Path
@@ -59,6 +59,8 @@ class Cohort:
     written_mib: int = 0
     noise_relative: float = 0.10
     noise_absolute_seconds: float = 0.05
+    # Accepted, measured residuals: metric name to its absolute allowance.
+    metric_noise_absolute_seconds: Mapping[str, float] = field(default_factory=dict)
     informational: bool = False
     raw_root: bool = False
     workload: Workload | None = None
@@ -151,9 +153,9 @@ def image_source(reference: str) -> str:
     return "local" if hostname in {"localhost", "127.0.0.1", "::1"} else "remote"
 
 
-def invariant(first: float, second: float, cohort: Cohort) -> bool:
+def invariant(first: float, second: float, cohort: Cohort, metric: str) -> bool:
     if not all(math.isfinite(value) and value >= 0 for value in (first, second)):
         raise ValueError("invariance medians must be finite and nonnegative")
     smaller = min(first, second)
-    return max(first, second) <= smaller + max(cohort.noise_absolute_seconds,
-                                               cohort.noise_relative * smaller)
+    absolute = cohort.metric_noise_absolute_seconds.get(metric, cohort.noise_absolute_seconds)
+    return max(first, second) <= smaller + max(absolute, cohort.noise_relative * smaller)
