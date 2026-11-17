@@ -54,7 +54,56 @@ identified snapshot, not since its latest fork.
 informational full-command rows run afterwards: `snapshot_fork_child_first`,
 `snapshot_fork_child_second`, and `snapshot_source_after_two_forks`. Untimed
 forks and workload conditioning cannot warm the original measurements.
-No target is loosened, and this change claims no new measured latency.
+No target is loosened.
+
+### Measured result (2026-11-17, commits `53658249` / libkrun `452813a9`)
+
+`make perf`, release build, medians of three, seconds, command start to agent
+ready, default image init. "Before" is the sparse-map cutover (`6bc7fba3`).
+
+| Arch 30 GiB RAM, 100 GiB disk | Before | After | Target |
+|---|---:|---:|---:|
+| create | 0.72 | 0.46 | 1 |
+| start | 0.78 | 0.78 | 1 |
+| `run -- true` | 1.59 | 1.43 | 2 |
+| fork, first / later | 2.36 / 1.33 | 1.56 / 0.86 | 2 / 1.25 |
+| fork of a fork | 1.49 | 1.36 | - |
+| snapshot, full | 2.19 | 1.52 | 3 |
+| snapshot, incremental | 1.17 | 0.82 | 1.5 |
+| restore, first / repeated | 0.55 / 0.34 | 0.51 / 0.34 | 0.75 / 0.5 |
+| snapshot after restart | 2.00 | 1.17 | - |
+| fork child's first / second snapshot | - | 1.65 / 0.71 | - |
+| source snapshot after two forks | - | 0.95 | - |
+
+Guest pause from one stage trace on the same guest: fork 0.14 s, full snapshot
+0.87 s, fork child's first snapshot 0.70 s, incremental snapshot 20 s after the
+previous one 0.44 s (281 MiB read; it read 15 GiB of guest-freed memory before
+absent pages were classified as zero).
+
+Same run, Alpine guests, Silo against msb 0.7.15 (Silo / msb):
+
+| Operation | 2 GiB | 8 GiB | 30 GiB |
+|---|---:|---:|---:|
+| create plus start | 0.66 / 0.31 | 0.78 / 0.44 | 1.01 / 0.41 |
+| `run -- true` | 0.85 / 0.43 | 0.96 / 0.60 | 1.22 / 0.53 |
+| fork, first | 0.80 / 1.04 | 0.96 / 3.15 | 1.20 / 10.15 |
+| fork, later | 0.53 / 0.50 | 0.58 / 1.06 | 0.66 / 2.42 |
+| snapshot, full | 0.54 / 1.20 | 0.72 / 3.52 | 1.12 / 11.17 |
+| snapshot, incremental | 0.39 / 0.38 | 0.44 / 0.76 | 0.56 / 1.61 |
+| restore, first | 0.39 / 0.21 | 0.41 / 0.25 | 0.44 / 0.36 |
+| restore, repeated | 0.28 / 0.21 | 0.28 / 0.25 | 0.28 / 0.36 |
+
+Known limits at this point:
+
+- Configured disk size is nearly, not strictly, without effect: a full snapshot
+  takes 0.60 s with a 30 GiB disk and 0.72 s with a 500 GiB disk, which exceeds
+  the suite's invariance tolerance (0.05 s or 10%). Every other row is within it.
+- The first snapshot after a stop and restart still hashes all written disk data.
+- Restored and forked machines still read every dirty RAM page in the pause,
+  including memory the guest has freed.
+- Under a memory-heavy workload (Arch 30 GiB busy cohort) a first fork takes
+  8.4 s and a full snapshot 13.5 s; these follow the dirtied memory and have
+  not been broken down.
 
 
 ## Phase 30 baseline (2026-11-15)
