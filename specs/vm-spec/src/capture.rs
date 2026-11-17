@@ -27,7 +27,7 @@ use crate::lifecycle::{
 use crate::{BlockId, DiskFormat, DiskGeometry, DiskRole, GuestOs, Storage, VmSpec};
 
 /// Version of `request.json`, `vm.capture.json` and `vm.capture-source.json`.
-pub const CAPTURE_RECORD_VERSION: u32 = 1;
+pub const CAPTURE_RECORD_VERSION: u32 = 2;
 /// Staging root below the machine data directory.
 pub const CAPTURES_DIRECTORY: &str = "captures";
 /// Writable disk captures below one capture directory.
@@ -37,10 +37,9 @@ pub const CAPTURE_EXECUTION_FILE: &str = "execution.state";
 pub const CAPTURE_DEVICES_FILE: &str = "devices.state";
 pub const CAPTURE_RAM_FILE: &str = "memory.ram";
 pub const CAPTURE_LAYOUT_FILE: &str = "memory-layout.json";
-pub const CAPTURE_RAM_MAP_FILE: &str = "memory.map.json";
-/// Complete canonical RAM map bound.
-pub const MAX_RAM_MAP_BYTES: usize =
-    (MAX_CAPTURE_RAM_BYTES / STREAM_CHUNK_BYTES) as usize * 74 + 256;
+pub const CAPTURE_RAM_MAP_FILE: &str = "memory.root";
+pub const CAPTURE_RAM_CHANGES_FILE: &str = "memory.changes";
+pub const CAPTURE_MAP_NODES_DIRECTORY: &str = "map-nodes";
 pub const CAPTURE_EVIDENCE_FILE: &str = "vm.capture.json";
 pub const CAPTURE_SOURCE_FILE: &str = "vm.capture-source.json";
 /// Immutable cut retained before post-continuation disk identity completion.
@@ -51,14 +50,14 @@ pub const CAPTURE_CUT_TEMPORARY_FILE: &str = ".vm.capture-cut.json.tmp";
 pub const CAPTURE_EVIDENCE_TEMPORARY_FILE: &str = ".vm.capture.json.tmp";
 pub const CAPTURE_SOURCE_TEMPORARY_FILE: &str = ".vm.capture-source.json.tmp";
 /// Upper bound for one JSON control record (plan, evidence, continuation).
-pub const MAX_CAPTURE_RECORD_BYTES: usize = (1 << 20) + MAX_RAM_MAP_BYTES + MAX_DISK_TRACKING_BYTES;
+pub const MAX_CAPTURE_RECORD_BYTES: usize = (1 << 20) + MAX_DISK_TRACKING_BYTES;
 /// ADR 0021 `Resource Limits`: staged state and evidence allowance.
 pub const CAPTURE_STATE_RESERVE_BYTES: u64 = 64 << 20;
 /// ADR 0021 `Resource Limits`: metadata charge of a qualified clone.
 pub const CAPTURE_CLONE_RESERVE_BYTES: u64 = 16 << 20;
 /// ADR 0021 `Resource Limits`: RAM per captured machine.
 pub const MAX_CAPTURE_RAM_BYTES: u64 = 1 << 40;
-/// ADR 0014 stream identity chunk.
+/// Disk identity and disk tracking unit, independent of RAM identity.
 pub const STREAM_CHUNK_BYTES: u64 = 8 << 20;
 /// ADR 0014 total logical stream admission bound.
 pub const MAX_STREAM_BYTES: u64 = 4 << 40;
@@ -80,7 +79,7 @@ fn invalid(message: impl Into<String>) -> String {
 }
 
 /// A known optional field must still be present (as `null` when absent).
-fn required<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+pub(crate) fn required<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
     Option::<T>::deserialize(deserializer)
@@ -171,217 +170,135 @@ pub fn is_all_zero(bytes: &[u8]) -> bool {
     blocks.remainder().iter().all(|byte| *byte == 0)
 }
 
-/// Streaming ADR 0014 `stream` identity: 8 MiB decoded chunks, `zero` only
-/// for an entirely zero chunk, SHA-256 of `silo:stream:v1\n` followed by the
-/// RFC 8785 canonical map. Holds no map, so a 1 TiB stream costs O(1) memory.
-pub struct StreamIdentity {
+/// A validated native change, independent of tree storage and retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRamChange {
+    Data { index: u64, digest: Sha256Digest },
+    Zero { first_index: u64, count: u64 },
+}
+
+/// Constant-memory reader authenticating the exact native change file.
+/// Consumers must exhaust it to observe its length and digest verification.
+pub struct RamChangeReader<R> {
+    input: R,
+    expected: CaptureRamChanges,
     hash: Sha256,
-    length: u64,
-    chunks: u64,
-    partial: bool,
+    remaining: u64,
+    chunk_count: u64,
+    previous_end: u64,
+    previous_zero: bool,
+    failed: bool,
 }
 
-impl Default for StreamIdentity {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StreamIdentity {
-    pub fn new() -> Self {
-        let mut hash = Sha256::new();
-        hash.update(b"silo:stream:v1\n");
-        hash.update(b"{\"chunkSize\":8388608,\"chunks\":[");
-        Self {
-            hash,
-            length: 0,
-            chunks: 0,
-            partial: false,
-        }
-    }
-
-    /// Feed the next decoded chunk. Every chunk but the last is exactly
-    /// [`STREAM_CHUNK_BYTES`]; empty chunks do not exist.
-    pub fn push_chunk(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let length = u64::try_from(bytes.len()).map_err(|_| invalid("chunk length overflow"))?;
-        let digest = if is_all_zero(bytes) {
-            None
-        } else {
-            Some(Sha256Digest::of_bytes(bytes))
+impl<R: std::io::Read> RamChangeReader<R> {
+    pub fn new(mut input: R, length: u64, expected: &CaptureRamChanges) -> std::io::Result<Self> {
+        expected.validate(length).map_err(std::io::Error::other)?;
+        let mut header = [0; 16];
+        input.read_exact(&mut header)?;
+        let coverage = match expected.coverage {
+            CaptureRamCoverage::Full => 0,
+            CaptureRamCoverage::Incremental => 1,
         };
-        self.push_digest(length, digest)
-    }
-
-    /// Feed an already classified chunk: `None` for an entirely zero chunk,
-    /// otherwise the SHA-256 of its decoded bytes.
-    pub fn push_digest(&mut self, length: u64, digest: Option<Sha256Digest>) -> Result<(), String> {
-        if length == 0 || length > STREAM_CHUNK_BYTES || self.partial {
-            return Err(invalid(
-                "stream chunks are 1..=8 MiB and only the final chunk is short",
+        if &header[..8] != b"KRUNRAM\0"
+            || header[8..10] != [1, 0]
+            || header[10] != 16
+            || header[11] != coverage
+            || header[12..] != [0; 4]
+        {
+            return Err(std::io::Error::other(
+                "invalid RAM changes header or identity profile",
             ));
         }
-        let total = self
-            .length
-            .checked_add(length)
-            .filter(|total| *total <= MAX_STREAM_BYTES)
-            .ok_or_else(|| invalid("stream exceeds its admitted length"))?;
-        if self.chunks != 0 {
-            self.hash.update(b",");
-        }
-        match digest {
-            None => self.hash.update(b"\"zero\""),
-            Some(digest) => self.hash.update(format!("\"{digest}\"").as_bytes()),
-        }
-        self.length = total;
-        self.chunks += 1;
-        self.partial = length < STREAM_CHUNK_BYTES;
-        Ok(())
+        let mut hash = Sha256::new();
+        hash.update(header);
+        Ok(Self {
+            input,
+            expected: expected.clone(),
+            hash,
+            remaining: expected.record_count,
+            chunk_count: length.div_ceil(1 << 16),
+            previous_end: 0,
+            previous_zero: false,
+            failed: false,
+        })
     }
 
-    pub fn length(&self) -> u64 {
-        self.length
-    }
-
-    pub fn finish(mut self) -> Sha256Digest {
-        self.hash.update(
-            format!(
-                "],\"kind\":\"stream\",\"length\":{},\"schema\":1}}",
-                self.length
-            )
-            .as_bytes(),
-        );
-        Sha256Digest(self.hash.finalize().into())
-    }
-}
-
-/// ADR 0014 complete canonical stream map. `None` denotes an entire zero chunk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamMap {
-    length: u64,
-    chunks: Vec<Option<Sha256Digest>>,
-}
-
-impl StreamMap {
-    pub fn new(length: u64, chunks: Vec<Option<Sha256Digest>>) -> Result<Self, String> {
-        if length > MAX_STREAM_BYTES || chunks.len() as u64 != length.div_ceil(STREAM_CHUNK_BYTES) {
-            return Err(invalid("stream map length or chunk count is invalid"));
-        }
-        Ok(Self { length, chunks })
-    }
-
-    pub fn length(&self) -> u64 {
-        self.length
-    }
-    pub fn chunks(&self) -> &[Option<Sha256Digest>] {
-        &self.chunks
-    }
-    pub fn into_chunks(self) -> Vec<Option<Sha256Digest>> {
-        self.chunks
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > (MAX_STREAM_BYTES / STREAM_CHUNK_BYTES) as usize * 74 + 256 {
-            return Err(invalid("stream map exceeds its encoded bound"));
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Record {
-            schema: u64,
-            kind: String,
-            length: u64,
-            chunk_size: u64,
-            #[serde(deserialize_with = "decode_map_chunks")]
-            chunks: Vec<Option<Sha256Digest>>,
-        }
-        struct ObjectRecord;
-        impl<'de> serde::de::Visitor<'de> for ObjectRecord {
-            type Value = Record;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a stream map object")
+    fn read_next(&mut self) -> std::io::Result<Option<CaptureRamChange>> {
+        if self.remaining == 0 {
+            let mut extra = [0; 1];
+            if self.input.read(&mut extra)? != 0 {
+                return Err(std::io::Error::other("RAM changes has trailing bytes"));
             }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Record, A::Error> {
-                Record::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            let actual = Sha256Digest::from_bytes(self.hash.clone().finalize().into());
+            if actual != self.expected.sha256 {
+                return Err(std::io::Error::other("RAM changes digest mismatch"));
             }
+            return Ok(None);
         }
-        let mut decoder = serde_json::Deserializer::from_slice(bytes);
-        let record = decoder
-            .deserialize_map(ObjectRecord)
-            .map_err(|error| error.to_string())?;
-        decoder.end().map_err(|error| error.to_string())?;
-        if record.schema != 1 || record.kind != "stream" || record.chunk_size != STREAM_CHUNK_BYTES
+        let mut bytes = [0; 56];
+        self.input.read_exact(&mut bytes)?;
+        self.hash.update(bytes);
+        let integer = |slice: &[u8]| -> std::io::Result<u64> {
+            let value: [u8; 8] = slice.try_into().map_err(std::io::Error::other)?;
+            Ok(u64::from_le_bytes(value))
+        };
+        let first = integer(&bytes[..8])?;
+        let count = integer(&bytes[8..16])?;
+        let end = first
+            .checked_add(count)
+            .filter(|end| *end <= self.chunk_count);
+        let zero = bytes[16] == 0;
+        if count == 0
+            || end.is_none()
+            || first < self.previous_end
+            || (zero && self.previous_zero && first == self.previous_end)
+            || bytes[17..24] != [0; 7]
+            || (zero
+                && (bytes[24..] != [0; 32] || self.expected.coverage == CaptureRamCoverage::Full))
+            || (!zero && (bytes[16] != 1 || count != 1 || bytes[24..] == [0; 32]))
         {
-            return Err(invalid("unsupported stream map schema, kind or chunk size"));
+            return Err(std::io::Error::other(
+                "RAM changes records are invalid, overlapping or unsorted",
+            ));
         }
-        Self::new(record.length, record.chunks)
-    }
-
-    pub fn write_canonical(&self, mut output: impl std::io::Write) -> std::io::Result<()> {
-        output.write_all(b"{\"chunkSize\":8388608,\"chunks\":[")?;
-        for (index, chunk) in self.chunks.iter().enumerate() {
-            if index != 0 {
-                output.write_all(b",")?;
-            }
-            match chunk {
-                None => output.write_all(b"\"zero\"")?,
-                Some(digest) => write!(output, "\"{digest}\"")?,
-            }
+        self.previous_end =
+            end.ok_or_else(|| std::io::Error::other("RAM changes range overflow"))?;
+        self.previous_zero = zero;
+        self.remaining -= 1;
+        if zero {
+            Ok(Some(CaptureRamChange::Zero {
+                first_index: first,
+                count,
+            }))
+        } else {
+            let digest = bytes[24..].try_into().map_err(std::io::Error::other)?;
+            Ok(Some(CaptureRamChange::Data {
+                index: first,
+                digest: Sha256Digest::from_bytes(digest),
+            }))
         }
-        write!(
-            output,
-            "],\"kind\":\"stream\",\"length\":{},\"schema\":1}}",
-            self.length
-        )
-    }
-
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
-        let mut bytes = Vec::new();
-        self.write_canonical(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        Ok(bytes)
-    }
-
-    pub fn id(&self) -> Sha256Digest {
-        let mut identity = StreamIdentity::new();
-        let mut remaining = self.length;
-        for digest in &self.chunks {
-            // Constructor enforces the exact count and final range.
-            let _ = identity.push_digest(remaining.min(STREAM_CHUNK_BYTES), *digest);
-            remaining = remaining.saturating_sub(STREAM_CHUNK_BYTES);
-        }
-        identity.finish()
     }
 }
 
-fn decode_map_chunks<'de, D: Deserializer<'de>>(
-    decoder: D,
-) -> Result<Vec<Option<Sha256Digest>>, D::Error> {
-    struct Chunks;
-    impl<'de> serde::de::Visitor<'de> for Chunks {
-        type Value = Vec<Option<Sha256Digest>>;
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a bounded array of zero or lowercase SHA-256 entries")
+impl<R: std::io::Read> Iterator for RamChangeReader<R> {
+    type Item = std::io::Result<CaptureRamChange>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
         }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut sequence: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut chunks = Vec::new();
-            while let Some(entry) = sequence.next_element::<String>()? {
-                if chunks.len() as u64 == MAX_STREAM_BYTES / STREAM_CHUNK_BYTES {
-                    return Err(serde::de::Error::custom("too many stream chunks"));
-                }
-                chunks.push(if entry == "zero" {
-                    None
-                } else {
-                    Some(entry.parse().map_err(serde::de::Error::custom)?)
-                });
+        match self.read_next() {
+            Ok(Some(change)) => Some(Ok(change)),
+            Ok(None) => {
+                self.failed = true;
+                None
             }
-            Ok(chunks)
+            Err(error) => {
+                self.failed = true;
+                Some(Err(error))
+            }
         }
     }
-    decoder.deserialize_seq(Chunks)
 }
 
 /// Name of one writable disk capture: `disks/<name>.raw`.
@@ -430,7 +347,7 @@ impl From<CaptureDiskName> for String {
 }
 
 /// One named staged payload. Native payloads use their fixed relative paths;
-/// `ram-map` selects the fixed `memory.map.json` sidecar, never an arbitrary path.
+/// `ram-map` selects the fixed binary `memory.root`, never an arbitrary path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CaptureRole {
     Execution,
@@ -438,6 +355,7 @@ pub enum CaptureRole {
     Ram,
     Layout,
     RamMap,
+    RamChanges,
     Disk(CaptureDiskName),
     DiskMap(CaptureDiskName),
 }
@@ -450,8 +368,9 @@ impl CaptureRole {
             Self::Ram => CAPTURE_RAM_FILE.into(),
             Self::Layout => CAPTURE_LAYOUT_FILE.into(),
             Self::RamMap => CAPTURE_RAM_MAP_FILE.into(),
+            Self::RamChanges => CAPTURE_RAM_CHANGES_FILE.into(),
             Self::Disk(name) => format!("{CAPTURE_DISKS_DIRECTORY}/{}", name.file_name()),
-            Self::DiskMap(name) => format!("{CAPTURE_DISKS_DIRECTORY}/{}.map.json", name.as_str()),
+            Self::DiskMap(name) => format!("{CAPTURE_DISKS_DIRECTORY}/{}.root", name.as_str()),
         }
     }
 }
@@ -466,6 +385,7 @@ impl FromStr for CaptureRole {
             CAPTURE_RAM_FILE => Self::Ram,
             CAPTURE_LAYOUT_FILE => Self::Layout,
             "ram-map" => Self::RamMap,
+            CAPTURE_RAM_CHANGES_FILE => Self::RamChanges,
             other => {
                 let name = other
                     .strip_prefix(CAPTURE_DISKS_DIRECTORY)
@@ -473,7 +393,7 @@ impl FromStr for CaptureRole {
                     .ok_or_else(|| invalid(format!("unknown capture role {other:?}")))?;
                 if let Some(name) = name.strip_suffix(".raw") {
                     Self::Disk(CaptureDiskName::new(name)?)
-                } else if let Some(name) = name.strip_suffix(".map.json") {
+                } else if let Some(name) = name.strip_suffix(".root") {
                     Self::DiskMap(CaptureDiskName::new(name)?)
                 } else {
                     return Err(invalid(format!("unknown capture role {other:?}")));
@@ -746,10 +666,19 @@ pub struct CapturePlan {
     pub disks: Vec<CaptureDiskPlan>,
     pub read_only_inputs: Vec<CaptureReadOnlyInput>,
     pub reservation: CaptureReservation,
+    #[serde(deserialize_with = "required")]
+    pub map_node_store: Option<String>,
 }
 
 impl CapturePlan {
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .map_node_store
+            .as_ref()
+            .is_some_and(|path| path.len() > 4096 || !std::path::Path::new(path).is_absolute())
+        {
+            return Err(invalid("map node store path must be bounded and absolute"));
+        }
         if self.version != CAPTURE_RECORD_VERSION {
             return Err(invalid("unsupported capture plan version"));
         }
@@ -904,6 +833,7 @@ impl CapturePlan {
             CaptureRole::Ram,
             CaptureRole::Layout,
             CaptureRole::RamMap,
+            CaptureRole::RamChanges,
         ];
         for disk in &self.disks {
             roles.push(CaptureRole::Disk(disk.name.clone()));
@@ -975,6 +905,47 @@ pub struct CaptureMemoryStats {
     pub whole_file_bytes_hashed: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureRamCoverage {
+    Full,
+    Incremental,
+}
+
+/// Bounded binding to the native change file, never a per-chunk receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureRamChanges {
+    pub byte_len: u64,
+    pub sha256: Sha256Digest,
+    pub record_count: u64,
+    pub coverage: CaptureRamCoverage,
+    #[serde(deserialize_with = "required")]
+    pub baseline_stream: Option<Sha256Digest>,
+}
+
+impl CaptureRamChanges {
+    pub fn validate(&self, length: u64) -> Result<(), String> {
+        let count = length.div_ceil(1 << 16);
+        if length == 0
+            || length > MAX_CAPTURE_RAM_BYTES
+            || self.record_count > count
+            || self
+                .record_count
+                .checked_mul(56)
+                .and_then(|bytes| bytes.checked_add(16))
+                != Some(self.byte_len)
+            || (self.coverage == CaptureRamCoverage::Full && self.baseline_stream.is_some())
+            || (self.coverage == CaptureRamCoverage::Incremental && self.baseline_stream.is_none())
+        {
+            return Err(invalid(
+                "RAM change summary has invalid length, count or coverage",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// RAM layout and geometry of `memory.ram`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -990,10 +961,8 @@ pub struct CaptureMemoryEvidence {
     pub baseline: Option<Sha256Digest>,
     #[serde(deserialize_with = "required")]
     pub full_reason: Option<CaptureFullReason>,
-    /// One bit per 8 MiB chunk, least-significant bit first, zero tail padding.
-    pub dirty_chunks: Vec<u8>,
-    /// Writer-computed digests; clean incremental chunks are non-authoritative `None`.
-    pub chunk_digests: Vec<Option<Sha256Digest>>,
+    pub identity_chunk_bytes: u32,
+    pub changes: CaptureRamChanges,
     pub stats: CaptureMemoryStats,
 }
 
@@ -1002,6 +971,7 @@ impl CaptureMemoryEvidence {
         if !self.page_granule.is_power_of_two()
             || self.page_granule < 4096
             || self.regions == 0
+            || self.page_granule > 65536
             || !self
                 .packed_length
                 .is_multiple_of(u64::from(self.page_granule))
@@ -1024,19 +994,14 @@ impl CaptureMemoryEvidence {
                 "RAM geometry or native producer binding is invalid",
             ));
         }
-        validate_dirty_chunks(self.packed_length, &self.dirty_chunks)?;
-        let count = self.packed_length.div_ceil(STREAM_CHUNK_BYTES) as usize;
-        if self.chunk_digests.len() != count
-            || self
-                .chunk_digests
-                .iter()
-                .enumerate()
-                .any(|(index, digest)| {
-                    self.dirty_chunks[index / 8] & (1 << (index % 8)) == 0 && digest.is_some()
-                })
+        self.changes.validate(self.packed_length)?;
+        if self.identity_chunk_bytes != 1 << 16
+            || self.changes.baseline_stream != self.baseline
+            || (self.mode == CapturePolicy::Full)
+                != (self.changes.coverage == CaptureRamCoverage::Full)
         {
             return Err(invalid(
-                "RAM receipt chunk count or clean chunk digest is invalid",
+                "RAM change summary differs from its capture binding",
             ));
         }
         match self.mode {
@@ -1052,30 +1017,6 @@ impl CaptureMemoryEvidence {
             }
             _ => {}
         }
-        if self.mode == CapturePolicy::Full {
-            if (0..count).any(|index| self.dirty_chunks[index / 8] & (1 << (index % 8)) == 0) {
-                return Err(invalid("full RAM capture must affect every chunk"));
-            }
-            let mut identity = StreamIdentity::new();
-            for (index, digest) in self.chunk_digests.iter().enumerate() {
-                identity.push_digest(
-                    (self.packed_length - index as u64 * STREAM_CHUNK_BYTES)
-                        .min(STREAM_CHUNK_BYTES),
-                    *digest,
-                )?;
-            }
-            if identity.finish() != self.ram_stream {
-                return Err(invalid(
-                    "full RAM receipt identity differs from its chunk digests",
-                ));
-            }
-        }
-        let identity_bytes: u64 = (0..count)
-            .filter(|index| self.dirty_chunks[index / 8] & (1 << (index % 8)) != 0)
-            .map(|index| {
-                (self.packed_length - index as u64 * STREAM_CHUNK_BYTES).min(STREAM_CHUNK_BYTES)
-            })
-            .sum();
         if self.stats.logical_bytes != self.packed_length
             || (self.stats.seed_method == CaptureSeedMethod::Clone
                 && (self.mode != CapturePolicy::Incremental
@@ -1084,7 +1025,8 @@ impl CaptureMemoryEvidence {
                     || self.stats.baseline_hole_bytes != 0
                     || self.stats.extent_queries != 0))
             || self.stats.whole_file_bytes_hashed != 0
-            || self.stats.identity_bytes_hashed != identity_bytes
+            || self.stats.identity_bytes_hashed > self.changes.record_count.saturating_mul(1 << 16)
+            || self.stats.identity_bytes_hashed > self.packed_length
             || self.stats.live_bytes_read > self.packed_length
             || self.stats.baseline_bytes_read > self.packed_length
             || self.stats.baseline_bytes_written > self.packed_length
@@ -1098,35 +1040,6 @@ impl CaptureMemoryEvidence {
         }
         Ok(())
     }
-}
-
-/// Validate exact dense coverage, including unused bits at the admitted 1 TiB bound.
-pub fn validate_dirty_chunks(length: u64, bitmap: &[u8]) -> Result<(), String> {
-    if length == 0 || length > MAX_CAPTURE_RAM_BYTES {
-        return Err(invalid("RAM coverage length is outside its bound"));
-    }
-    let chunks = length.div_ceil(STREAM_CHUNK_BYTES) as usize;
-    if bitmap.len() != chunks.div_ceil(8)
-        || (!chunks.is_multiple_of(8)
-            && bitmap.last().is_some_and(|last| *last >> (chunks % 8) != 0))
-    {
-        return Err(invalid("RAM chunk bitmap length or padding is invalid"));
-    }
-    Ok(())
-}
-
-pub fn full_dirty_chunks(length: u64) -> Result<Vec<u8>, String> {
-    if length == 0 || length > MAX_CAPTURE_RAM_BYTES {
-        return Err(invalid("RAM coverage length is outside its bound"));
-    }
-    let count = length.div_ceil(STREAM_CHUNK_BYTES) as usize;
-    let mut bitmap = vec![u8::MAX; count.div_ceil(8)];
-    if !count.is_multiple_of(8) {
-        if let Some(last) = bitmap.last_mut() {
-            *last = ((1u16 << (count % 8)) - 1) as u8;
-        }
-    }
-    Ok(bitmap)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1155,7 +1068,7 @@ pub enum CapturePauseDisposition {
 }
 
 /// Host-local write coverage, independent of portable disk stream identity.
-pub const DISK_TRACKING_VERSION: u32 = 1;
+pub const DISK_TRACKING_VERSION: u32 = 2;
 pub const MAX_DISK_TRACKING_BYTES: usize = 16 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1174,6 +1087,8 @@ pub enum DiskTrackingInvalidReason {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiskTrackingSeed {
     pub version: u32,
+    pub map_format: u32,
+    pub chunk_shift: u8,
     pub role: DiskRole,
     pub attachment_index: u32,
     pub block_id: BlockId,
@@ -1190,6 +1105,8 @@ pub struct DiskTrackingSeed {
 impl DiskTrackingSeed {
     pub fn validate(&self) -> Result<(), String> {
         if self.version != DISK_TRACKING_VERSION
+            || self.map_format != 2
+            || self.chunk_shift != 23
             || self.file_inode == 0
             || self.attachment_index >= 16
             || self.role == DiskRole::RootLower
@@ -1730,6 +1647,7 @@ impl CaptureEvidence {
                     CaptureRole::Ram,
                     CaptureRole::Layout,
                     CaptureRole::RamMap,
+                    CaptureRole::RamChanges,
                 ] {
                     if !self.inventory.iter().any(|entry| entry.role == role) {
                         return Err(invalid(
@@ -1748,6 +1666,18 @@ impl CaptureEvidence {
                     if entry.role == CaptureRole::Ram && entry.identity != Some(memory.ram_stream) {
                         return Err(invalid(
                             "RAM inventory identity differs from its memory receipt",
+                        ));
+                    }
+                    if entry.role == CaptureRole::RamMap && entry.sha256 != Some(memory.ram_stream)
+                    {
+                        return Err(invalid("RAM root object differs from its stream identity"));
+                    }
+                    if entry.role == CaptureRole::RamChanges
+                        && (entry.length != memory.changes.byte_len
+                            || entry.sha256 != Some(memory.changes.sha256))
+                    {
+                        return Err(invalid(
+                            "RAM changes object differs from its native summary",
                         ));
                     }
                     let paired = match &entry.role {
@@ -1771,9 +1701,8 @@ impl CaptureEvidence {
                         return Err(invalid("capture inventory repeats a role"));
                     }
                     let map_limit = match entry.role {
-                        CaptureRole::RamMap => Some(MAX_RAM_MAP_BYTES as u64),
-                        CaptureRole::DiskMap(_) => {
-                            Some((MAX_STREAM_BYTES / STREAM_CHUNK_BYTES) * 74 + 256)
+                        CaptureRole::RamMap | CaptureRole::DiskMap(_) => {
+                            Some(crate::stream_map::MAX_ROOT_BYTES as u64)
                         }
                         _ => None,
                     };
@@ -2133,6 +2062,8 @@ mod tests {
     fn tracking_receipt() -> DiskTrackingReceipt {
         let seed = DiskTrackingSeed {
             version: DISK_TRACKING_VERSION,
+            map_format: 2,
+            chunk_shift: 23,
             role: DiskRole::RootUpper,
             attachment_index: 1,
             block_id: BlockId::new("silo-root-upper").unwrap(),
@@ -2178,8 +2109,8 @@ mod tests {
         for malformed in [
             format!(" {json}"),
             format!("{json}\n"),
-            json.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
-            json.replacen("\"version\":1", "\"version\":1,\"future\":true", 1),
+            json.replacen("\"version\":2", "\"version\":2,\"version\":2", 1),
+            json.replacen("\"version\":2", "\"version\":2,\"future\":true", 1),
             json.replace(",\"invalidReason\":null", ""),
             json.replace(",\"baseline\":\"sha256:", ",\"baseline\":\"SHA256:"),
             json.replace("\"dirtyChunks\":2", "\"dirtyChunks\":2.0"),
@@ -2414,6 +2345,7 @@ mod tests {
                 },
                 staging_bytes: (1 << 30) + (64 << 20) + (16 << 20),
             },
+            map_node_store: None,
         }
     }
 
@@ -2442,9 +2374,12 @@ mod tests {
                 packed_length: 1 << 30,
                 page_granule: 4096,
                 regions: 1,
-                ram_stream: StreamMap::new(1 << 30, vec![Some(digest); 128])
-                    .unwrap()
-                    .id(),
+                ram_stream: crate::stream_map::StreamRoot::empty(
+                    1 << 30,
+                    crate::stream_map::ChunkSize::RAM,
+                )
+                .unwrap()
+                .id(),
                 binding: CaptureStateBinding {
                     live_state_schema: "silo.live-state/1".into(),
                     architecture: "x86_64".into(),
@@ -2458,15 +2393,18 @@ mod tests {
                 mode: CapturePolicy::Full,
                 baseline: None,
                 full_reason: Some(CaptureFullReason::Requested),
-                dirty_chunks: crate::capture::full_dirty_chunks(1 << 30).unwrap(),
-                chunk_digests: vec![
-                    Some(digest);
-                    (1u64 << 30).div_ceil(STREAM_CHUNK_BYTES) as usize
-                ],
+                identity_chunk_bytes: 1 << 16,
+                changes: CaptureRamChanges {
+                    byte_len: 16,
+                    sha256: digest,
+                    record_count: 0,
+                    coverage: CaptureRamCoverage::Full,
+                    baseline_stream: None,
+                },
                 stats: CaptureMemoryStats {
                     logical_bytes: 1 << 30,
                     whole_file_bytes_hashed: 0,
-                    identity_bytes_hashed: 1 << 30,
+                    identity_bytes_hashed: 0,
                     ..Default::default()
                 },
             }),
@@ -2483,15 +2421,30 @@ mod tests {
                                 .unwrap()
                                 .length
                         }
+                        CaptureRole::RamMap | CaptureRole::DiskMap(_) => 25,
+                        CaptureRole::RamChanges => 16,
                         _ => 100,
                     },
-                    sha256: (!matches!(role, CaptureRole::Ram | CaptureRole::Disk(_)))
-                        .then_some(digest),
+                    sha256: match role {
+                        CaptureRole::RamMap => Some(
+                            crate::stream_map::StreamRoot::empty(
+                                1 << 30,
+                                crate::stream_map::ChunkSize::RAM,
+                            )
+                            .unwrap()
+                            .id(),
+                        ),
+                        CaptureRole::Ram | CaptureRole::Disk(_) => None,
+                        _ => Some(digest),
+                    },
                     identity: match role {
                         CaptureRole::Ram => Some(
-                            StreamMap::new(1 << 30, vec![Some(digest); 128])
-                                .unwrap()
-                                .id(),
+                            crate::stream_map::StreamRoot::empty(
+                                1 << 30,
+                                crate::stream_map::ChunkSize::RAM,
+                            )
+                            .unwrap()
+                            .id(),
                         ),
                         CaptureRole::Disk(_) => Some(digest),
                         _ => None,
@@ -2555,39 +2508,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn stream_identity_matches_the_canonical_adr0014_map() {
-        let mut stream = StreamIdentity::new();
-        let mut first = vec![0u8; STREAM_CHUNK_BYTES as usize];
-        stream.push_chunk(&first).unwrap();
-        first[17] = 1;
-        stream.push_chunk(&first).unwrap();
-        stream.push_chunk(&[0, 0, 7]).unwrap();
-        assert!(
-            stream.push_chunk(&[1]).is_err(),
-            "nothing follows a short chunk"
-        );
-        let canonical = format!(
-            "silo:stream:v1\n{{\"chunkSize\":8388608,\"chunks\":[\"zero\",\"{}\",\"{}\"],\"kind\":\"stream\",\"length\":{},\"schema\":1}}",
-            Sha256Digest::of_bytes(&first),
-            Sha256Digest::of_bytes(&[0, 0, 7]),
-            2 * STREAM_CHUNK_BYTES + 3
-        );
-        assert_eq!(
-            stream.finish(),
-            Sha256Digest::of_bytes(canonical.as_bytes())
-        );
-
-        let empty = StreamIdentity::new().finish();
-        assert_eq!(
-            empty,
-            Sha256Digest::of_bytes(
-                b"silo:stream:v1\n{\"chunkSize\":8388608,\"chunks\":[],\"kind\":\"stream\",\"length\":0,\"schema\":1}"
-            )
-        );
-        assert!(StreamIdentity::new().push_chunk(&[]).is_err());
     }
 
     #[test]
@@ -2709,7 +2629,7 @@ mod tests {
     fn plan_rejects_every_inconsistent_binding() {
         type PlanMutation = Box<dyn Fn(&mut CapturePlan)>;
         let mutations: Vec<PlanMutation> = vec![
-            Box::new(|plan| plan.version = 2),
+            Box::new(|plan| plan.version = CAPTURE_RECORD_VERSION + 1),
             Box::new(|plan| plan.configuration_digest = Sha256Digest::of_bytes(b"other")),
             Box::new(|plan| plan.ram_bytes += 4096),
             Box::new(|plan| plan.disks.swap(0, 1)),
@@ -2926,7 +2846,8 @@ mod tests {
         });
         RestoreRequest {
             disk_tracking_seeds: Vec::new(),
-            version: 1,
+            map_node_store: None,
+            version: crate::restore::RESTORE_REQUEST_VERSION,
             checkpoint: Sha256Digest::of_bytes(b"checkpoint"),
             activation_id: id("44444444-4444-4444-8444-444444444444"),
             freeze_operation_id: capture(),
@@ -3090,67 +3011,43 @@ mod tests {
     }
 
     #[test]
-    fn complete_maps_share_identity_and_reject_malformed_encodings() {
-        let digest = Sha256Digest::of_bytes(b"short final chunk");
-        let map = StreamMap::new(STREAM_CHUNK_BYTES + 17, vec![None, Some(digest)]).unwrap();
-        let mut identity = StreamIdentity::new();
-        identity.push_digest(STREAM_CHUNK_BYTES, None).unwrap();
-        identity.push_digest(17, Some(digest)).unwrap();
-        assert_eq!(map.id(), identity.finish());
-        let encoded = map.canonical_bytes().unwrap();
-        assert_eq!(StreamMap::decode(&encoded).unwrap(), map);
-        assert!(StreamMap::new(STREAM_CHUNK_BYTES + 1, vec![None]).is_err());
-        for malformed in [
-            br#"{"chunkSize":8388608,"chunks":[],"kind":"stream","length":1,"schema":1}"#.as_slice(),
-            br#"{"chunkSize":8388608,"chunks":["zero"],"kind":"stream","length":1,"schema":1,"schema":1}"#,
-            br#"{"chunkSize":4096,"chunks":["zero"],"kind":"stream","length":1,"schema":1}"#,
-            br#"{"chunkSize":8388608,"chunks":[null],"kind":"stream","length":1,"schema":1}"#,
-        ] { assert!(StreamMap::decode(malformed).is_err()); }
-        assert_eq!(CaptureRole::RamMap.relative_path(), "memory.map.json");
+    fn binary_root_roles_reject_old_sidecars() {
+        assert_eq!(CaptureRole::RamMap.relative_path(), "memory.root");
         assert_eq!(
             "ram-map".parse::<CaptureRole>().unwrap(),
             CaptureRole::RamMap
         );
-        assert_eq!(
-            serde_json::to_string(&CaptureRole::RamMap).unwrap(),
-            "\"ram-map\""
-        );
         assert!("memory.map.json".parse::<CaptureRole>().is_err());
+        assert!("disks/root.map.json".parse::<CaptureRole>().is_err());
+        assert_eq!(
+            "disks/root.root"
+                .parse::<CaptureRole>()
+                .unwrap()
+                .relative_path(),
+            "disks/root.root"
+        );
     }
 
     #[test]
-    fn one_tib_ram_map_and_writer_receipt_fit_their_metadata_bounds() {
-        let count = (MAX_CAPTURE_RAM_BYTES / STREAM_CHUNK_BYTES) as usize;
-        let bitmap = full_dirty_chunks(MAX_CAPTURE_RAM_BYTES).unwrap();
-        assert_eq!(bitmap.len(), 16384);
-        validate_dirty_chunks(MAX_CAPTURE_RAM_BYTES, &bitmap).unwrap();
-        assert!(validate_dirty_chunks(MAX_CAPTURE_RAM_BYTES, &bitmap[..bitmap.len() - 1]).is_err());
-        assert!(validate_dirty_chunks(1, &[2]).is_err());
-        assert!(full_dirty_chunks(0).is_err());
-        assert!(full_dirty_chunks(MAX_CAPTURE_RAM_BYTES + 1).is_err());
-        let map = StreamMap::new(
-            MAX_CAPTURE_RAM_BYTES,
-            vec![Some(Sha256Digest::of_bytes(b"chunk")); count],
-        )
-        .unwrap();
-        let encoded = map.canonical_bytes().unwrap();
-        assert!(encoded.len() > (1 << 20));
-        assert!(encoded.len() < MAX_RAM_MAP_BYTES);
-        assert!((MAX_RAM_MAP_BYTES as u64) < CAPTURE_STATE_RESERVE_BYTES);
-        assert_eq!(StreamMap::decode(&encoded).unwrap(), map);
+    fn one_tib_geometry_keeps_control_evidence_bounded() {
         let mut record = evidence(&plan());
+        let before = record.canonical_bytes().unwrap().len();
         let memory = record.memory.as_mut().unwrap();
         memory.packed_length = MAX_CAPTURE_RAM_BYTES;
-        memory.dirty_chunks = bitmap;
-        memory.chunk_digests = map.chunks().to_vec();
-        memory.ram_stream = map.id();
+        let root = crate::stream_map::StreamRoot::empty(
+            MAX_CAPTURE_RAM_BYTES,
+            crate::stream_map::ChunkSize::RAM,
+        )
+        .unwrap();
+        memory.ram_stream = root.id();
         memory.stats.logical_bytes = MAX_CAPTURE_RAM_BYTES;
-        memory.stats.identity_bytes_hashed = MAX_CAPTURE_RAM_BYTES;
+        memory.stats.identity_bytes_hashed = 0;
         record.inventory[2].length = MAX_CAPTURE_RAM_BYTES;
-        record.inventory[2].identity = Some(map.id());
-        record.inventory[4].length = encoded.len() as u64;
+        record.inventory[2].identity = Some(root.id());
+        record.inventory[4].sha256 = Some(root.id());
         let bytes = record.canonical_bytes().unwrap();
-        assert!(bytes.len() < MAX_CAPTURE_RECORD_BYTES);
+        assert!(bytes.len() < before + 128);
+        assert!(bytes.len() < 16 * 1024);
         CaptureEvidence::decode(&bytes).unwrap();
     }
 
@@ -3172,6 +3069,8 @@ mod tests {
         memory.full_reason = None;
         assert!(memory.validate_capture().is_err());
         memory.baseline = Some(Sha256Digest::of_bytes(b"exact predecessor stream"));
+        memory.changes.coverage = CaptureRamCoverage::Incremental;
+        memory.changes.baseline_stream = memory.baseline;
         memory.validate_capture().unwrap();
         seal.memory = Some(memory.clone());
         assert!(seal
@@ -3181,9 +3080,9 @@ mod tests {
         seal.request_digest = Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap());
         seal.validate_against_plan(&plan, &seal.request_digest)
             .unwrap();
-        memory.stats.identity_bytes_hashed -= 1;
-        assert!(memory.validate_capture().is_err());
         memory.stats.identity_bytes_hashed += 1;
+        assert!(memory.validate_capture().is_err());
+        memory.stats.identity_bytes_hashed -= 1;
         memory.page_granule = 0;
         assert!(memory.validate_capture().is_err());
     }
@@ -3332,6 +3231,8 @@ mod tests {
         memory.mode = CapturePolicy::Incremental;
         memory.full_reason = None;
         memory.baseline = Some(Sha256Digest::of_bytes(b"predecessor"));
+        memory.changes.coverage = CaptureRamCoverage::Incremental;
+        memory.changes.baseline_stream = memory.baseline;
         memory.validate_capture().unwrap();
         memory.stats.baseline_bytes_read = 1;
         assert!(memory.validate_capture().is_err());
@@ -3440,7 +3341,7 @@ mod tests {
         let mut plan = plan();
         plan.disks[0].tracking_eligible = false;
         plan.validate().unwrap();
-        plan.disks[0].baseline_map = Some("/private/baseline.map.json".into());
+        plan.disks[0].baseline_map = Some("/private/baseline.root".into());
         assert!(plan.validate().is_err());
         plan.disks[0].baseline_map = None;
         let mut evidence = evidence(&plan);
@@ -3468,5 +3369,87 @@ mod tests {
         evidence.disk_stats[0].baseline_reused = false;
         evidence.disk_stats[0].full_scan_reason = Some(DiskFullScanReason::MissingBaseline);
         assert!(evidence.validate_against_plan(&plan, &request).is_err());
+    }
+
+    fn change_bytes(incremental: bool, records: &[(u64, u64, Option<Sha256Digest>)]) -> Vec<u8> {
+        let mut bytes = b"KRUNRAM\0\x01\0\x10\0\0\0\0\0".to_vec();
+        bytes[11] = u8::from(incremental);
+        for &(first, count, digest) in records {
+            bytes.extend(first.to_le_bytes());
+            bytes.extend(count.to_le_bytes());
+            bytes.push(u8::from(digest.is_some()));
+            bytes.extend([0; 7]);
+            bytes.extend(digest.map_or([0; 32], |digest| *digest.as_bytes()));
+        }
+        bytes
+    }
+
+    #[test]
+    fn native_change_reader_authenticates_real_files_and_rejects_invalid_records() {
+        let digest = Sha256Digest::of_bytes(b"nonzero");
+        let length = 4 << 16;
+        let valid = change_bytes(
+            true,
+            &[(0, 1, Some(digest)), (1, 2, None), (3, 1, Some(digest))],
+        );
+        let summary = |bytes: &[u8], count| CaptureRamChanges {
+            byte_len: 16 + count * 56,
+            sha256: Sha256Digest::of_bytes(bytes),
+            record_count: count,
+            coverage: CaptureRamCoverage::Incremental,
+            baseline_stream: Some(digest),
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "silo-change-reader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let read = |bytes: &[u8], expected: &CaptureRamChanges| {
+            let path = directory.join("changes");
+            std::fs::write(&path, bytes).unwrap();
+            RamChangeReader::new(std::fs::File::open(path).unwrap(), length, expected)
+                .and_then(|reader| reader.collect::<std::io::Result<Vec<_>>>())
+        };
+        assert_eq!(read(&valid, &summary(&valid, 3)).unwrap().len(), 3);
+        for truncated in [&valid[..8], &valid[..valid.len() - 1]] {
+            assert!(read(truncated, &summary(&valid, 3)).is_err());
+        }
+        for records in [
+            vec![(2, 1, Some(digest)), (1, 1, Some(digest))],
+            vec![(0, 3, None), (2, 1, Some(digest))],
+            vec![(0, 1, None), (1, 1, None)],
+            vec![(0, 0, None)],
+            vec![(4, 1, Some(digest))],
+            vec![(u64::MAX, 2, None)],
+        ] {
+            let bytes = change_bytes(true, &records);
+            assert!(read(&bytes, &summary(&bytes, records.len() as u64)).is_err());
+        }
+        for position in [8, 10, 11, 12, 16 + 17] {
+            let mut bytes = valid.clone();
+            bytes[position] ^= 0x40;
+            assert!(read(&bytes, &summary(&bytes, 3)).is_err());
+        }
+        let mut changed = valid.clone();
+        changed[16 + 24] ^= 1;
+        assert!(read(&changed, &summary(&valid, 3)).is_err());
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert!(read(&trailing, &summary(&trailing, 3)).is_err());
+        let empty = change_bytes(true, &[]);
+        assert!(read(&empty, &summary(&empty, 0)).unwrap().is_empty());
+        let mut full_summary = summary(&empty, 0);
+        full_summary.coverage = CaptureRamCoverage::Full;
+        full_summary.baseline_stream = None;
+        let full_zero = change_bytes(false, &[(0, 4, None)]);
+        full_summary.record_count = 1;
+        full_summary.byte_len = full_zero.len() as u64;
+        full_summary.sha256 = Sha256Digest::of_bytes(&full_zero);
+        assert!(read(&full_zero, &full_summary).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

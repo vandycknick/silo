@@ -28,13 +28,11 @@ import time
 from typing import Any
 from uuid import UUID, uuid4
 
-from . import procs, stopped
+from . import cloud_disk, procs, stopped, stream_map
 from .cli import Result, Silo
 from .daemon import Daemon
 from .errors import SmokeAssertion
 
-# silo-chunks-v1 logical chunk geometry (ADR 0014); never a frame size.
-CHUNK = 8 * 1024**2
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
@@ -238,40 +236,23 @@ def refuse_start(runtime: Runtime, name: str) -> str:
 
 # --- Independent payload oracle --------------------------------------------
 
-def _read_exact(fd: int, offset: int, length: int) -> bytes:
-    parts = []
-    while length:
-        block = os.pread(fd, length, offset)
-        assert block, (fd, offset, length)
-        parts.append(block)
-        offset += len(block)
-        length -= len(block)
-    return b"".join(parts)
-
-
-def chunk_digests(path: Path) -> dict[str, int]:
-    """Nonzero 8 MiB-aligned decoded chunk identities (hex -> length) of one private file."""
-    result: dict[str, int] = {}
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    try:
-        before = os.fstat(fd)
-        assert stat.S_ISREG(before.st_mode)
-        for offset in range(0, before.st_size, CHUNK):
-            block = _read_exact(fd, offset, min(CHUNK, before.st_size - offset))
-            if block.count(0) != len(block):
-                result[hashlib.sha256(block).hexdigest()] = len(block)
-        after = os.fstat(fd)
-        assert (before.st_ino, before.st_size, before.st_mtime_ns) == (after.st_ino, after.st_size, after.st_mtime_ns), path
-    finally:
-        os.close(fd)
-    return result
+def data_payloads(path: Path) -> dict[str, int]:
+    """Independent nonzero disk identities used by stopped handoff payload reuse."""
+    before = path.stat()
+    assert stat.S_ISREG(before.st_mode)
+    root, leaves = stream_map.from_file(path, stream_map.DISK_CHUNK)
+    after = path.stat()
+    assert (before.st_ino, before.st_size, before.st_mtime_ns) == (
+        after.st_ino, after.st_size, after.st_mtime_ns), path
+    return {identity[7:]: min(root.chunk_size, root.length - index * root.chunk_size)
+            for index, identity in leaves.items()}
 
 
 def writable_chunks(runtime: Runtime, name: str) -> dict[str, int]:
     """Captured writable streams: raw root or overlay upper, plus managed-writable disks."""
     result: dict[str, int] = {}
     for path in stopped.writable_paths(runtime.silo, name).values():
-        result.update(chunk_digests(path))
+        result.update(data_payloads(path))
     return result
 
 
@@ -319,8 +300,34 @@ def assert_immutable_warm(source: Runtime, name: str, destination: Runtime) -> N
     machine = procs.machine_id(source.ws, name)
     streams = [row[0] for row in procs.query(source.ws.state_db(), f"SELECT stream_id FROM machine_stream_dependency WHERE machine_id='{machine}'")]
     objects = [row[0] for row in procs.query(source.ws.state_db(), f"SELECT object_digest FROM machine_object_dependency WHERE machine_id='{machine}'")]
+    storage = stopped.record(source.silo, name)
+    baseline_maps = {baseline["map"] for baseline in storage["diskBaselines"]}
+    binding = storage["boot"]["binding"]
+    boot_objects = {binding[key] for key in ("kernel", "baseInitramfs", "agent") if binding[key] is not None}
+    boot_objects.add(cloud_disk.bundle_digest(binding))
+    # Dirty-tracking baselines are local authority, not immutable handoff
+    # payload. Preserve roots that also have boot, lower or read-only duties.
+    objects = list((set(objects) - baseline_maps) | boot_objects)
     lowers, lower_streams, lower_objects = _lower_closure(source, machine)
     streams = sorted({*streams, *lower_streams})
+    source_nodes = stream_map.object_source(source.ws.silo_home)
+    map_objects: set[str] = set()
+
+    def node(identity: str) -> bytes:
+        map_objects.add(identity)
+        return source_nodes(identity)
+
+    for stream in streams:
+        bindings = procs.query(source.ws.state_db(),
+            f"SELECT length,root_digest,chunk_shift FROM stream_map_root WHERE root_digest='{stream}'")
+        assert len(bindings) == 1
+        length, identity, shift = bindings[0]
+        root = stream_map.decode_root(node(identity))
+        assert (root.identity, root.length, root.chunk_size) == (stream, int(length), 1 << int(shift))
+        # Transport evidence authenticates the complete closure, unlike local
+        # trusted root admission. Missing named nodes cannot stand for zeros.
+        dict(stream_map.present_chunks(root, node))
+    objects.extend(map_objects)
     objects = sorted({*objects, *lower_objects})
     missing_lowers = [lower for lower in lowers if procs.query(destination.ws.state_db(), f"SELECT id FROM composition_result WHERE id='{lower}'") != [(lower,)]]
     missing_streams = [stream for stream in streams if not (_pool(destination, "streams") / _hex(stream)).is_file()]

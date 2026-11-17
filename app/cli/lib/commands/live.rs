@@ -943,6 +943,21 @@ fn snapshot_detail_rows(info: &libvm::SnapshotInfo) -> Vec<(String, String)> {
         ("Record digest".into(), info.record_digest.to_string()),
         ("Retained".into(), ui::yes_no(info.retained).into()),
     ];
+    for stream in &info.streams {
+        let role = verification_role(&stream.role);
+        rows.extend([
+            (format!("{role} stream"), stream.stream.to_string()),
+            (format!("{role} map root"), stream.map.to_string()),
+            (
+                format!("{role} length"),
+                ui::human_bytes(Some(stream.length)),
+            ),
+            (
+                format!("{role} identity chunk"),
+                format!("{} bytes", stream.chunk_size),
+            ),
+        ]);
+    }
     for (index, source) in info.provenance.iter().enumerate() {
         let suffix = if index == 0 {
             String::new()
@@ -1098,6 +1113,11 @@ fn managed_detail_rows(source: &libvm::ManagedSourceInfo) -> eyre::Result<Vec<(S
                     info.record.root.stream.stream.to_string(),
                 ),
                 ("Root map".into(), info.record.root.stream.map.to_string()),
+                (
+                    "Root identity chunk".into(),
+                    format!("{} bytes", info.record.root.stream.chunk_size),
+                ),
+                ("Map format".into(), "sparse Merkle v2".into()),
                 (
                     "Sector size".into(),
                     ui::human_bytes(Some(u64::from(
@@ -1399,10 +1419,10 @@ fn verification_role(role: &libvm::SnapshotVerificationRole) -> String {
     }
 }
 
-fn verification_chunk(chunk: &libvm::storage::stream::Chunk) -> String {
+fn verification_chunk(chunk: &vm_spec::stream_map::Chunk) -> String {
     match chunk {
-        libvm::storage::stream::Chunk::Zero => "zero".into(),
-        libvm::storage::stream::Chunk::Data(digest) => digest.to_string(),
+        vm_spec::stream_map::Chunk::Zero => "zero".into(),
+        vm_spec::stream_map::Chunk::Data(digest) => digest.to_string(),
     }
 }
 
@@ -1423,17 +1443,25 @@ fn verification_error_message(error: &libvm::SnapshotVerificationError) -> Strin
         SnapshotVerificationError::ChunkMismatch {
             role,
             stream,
+            chunk_size,
             index,
             start,
             end,
             expected,
             actual,
         } => format!(
-            "{} stream {stream} chunk {index} bytes {start}..{end}: expected {}, actual {}",
+            "{} stream {stream} data chunk {index} ({chunk_size} bytes) bytes {start}..{end}: expected {}, actual {}",
             verification_role(role),
             verification_chunk(expected),
             verification_chunk(actual),
         ),
+        SnapshotVerificationError::MapNode(error) => {
+            let libvm::SnapshotMapNodeFailure { role, stream, node, height, first_index, end_index, start, end, failure } = error.as_ref();
+            format!(
+                "{} stream {stream} map node {node} height {height} chunks {first_index}..{end_index} bytes {start}..{end}: {failure}",
+                verification_role(role),
+            )
+        }
         SnapshotVerificationError::ObjectMismatch {
             role,
             object,
@@ -1484,6 +1512,7 @@ fn verification_error_json(error: &libvm::SnapshotVerificationError) -> serde_js
         SnapshotVerificationError::ChunkMismatch {
             role,
             stream,
+            chunk_size,
             index,
             start,
             end,
@@ -1492,8 +1521,32 @@ fn verification_error_json(error: &libvm::SnapshotVerificationError) -> serde_js
         } => json!({
             "kind": "chunkMismatch", "role": verification_role(role),
             "stream": stream, "index": index, "start": start, "end": end,
+            "chunkSize": chunk_size,
             "expected": verification_chunk(expected), "actual": verification_chunk(actual),
         }),
+        SnapshotVerificationError::MapNode(error) => {
+            let libvm::SnapshotMapNodeFailure {
+                role,
+                stream,
+                node,
+                height,
+                first_index,
+                end_index,
+                start,
+                end,
+                failure,
+            } = error.as_ref();
+            json!({
+            "kind": "mapNode", "role": verification_role(role), "stream": stream,
+            "node": node, "height": height, "firstIndex": first_index, "endIndex": end_index,
+            "start": start, "end": end,
+            "failure": match failure {
+                SnapshotStructuralFailure::Missing => json!({"kind": "missing"}),
+                SnapshotStructuralFailure::Invalid { message } => json!({"kind": "invalid", "message": message}),
+                failure => json!({"kind": "structural", "message": failure.to_string()}),
+            },
+            })
+        }
         SnapshotVerificationError::ObjectMismatch {
             role,
             object,
@@ -2433,6 +2486,13 @@ mod tests {
             retained: true,
             aliases: alias.into_iter().map(str::to_owned).collect(),
             created_at: 1_000,
+            streams: vec![libvm::SnapshotStreamSummary {
+                role: libvm::SnapshotVerificationRole::Ram,
+                stream: format!("sha256:{}", "d".repeat(64)).parse().unwrap(),
+                map: format!("sha256:{}", "d".repeat(64)).parse().unwrap(),
+                length: 3 * 65_536,
+                chunk_size: 65_536,
+            }],
         }
     }
 
@@ -2659,14 +2719,14 @@ mod tests {
     fn plain_image_results_render_real_managed_image_fields() {
         let digest = libvm::ObjectDigest::of_bytes(b"image renderer");
         let record = libvm::ImageRecord {
-            schema: 1,
+            schema: 2,
             kind: libvm::ImageRecordKind::Image,
             root: serde_json::from_value(serde_json::json!({
                 "profile": {"kind": "opaque-raw"},
                 "stream": {
                     "stream": digest,
                     "map": digest,
-                    "mapPages": [digest],
+                    "chunkSize": 8_388_608,
                     "length": 512,
                 },
                 "geometry": {"length": 512, "logicalSectorSize": 512},
@@ -2707,6 +2767,11 @@ mod tests {
         assert!(rows.contains(&("Kind".into(), "image".into())));
         assert!(rows.contains(&("Aliases".into(), "base, second-alias".into())));
         assert!(rows.contains(&("Size".into(), crate::ui::human_bytes(Some(512)))));
+        assert!(rows.contains(&("Root identity chunk".into(), "8388608 bytes".into())));
+        let json = serde_json::to_value(&source).unwrap();
+        let record = &json["info"]["record"];
+        assert_eq!(record["root"]["stream"]["chunkSize"], 8_388_608);
+        assert!(record["root"]["stream"].get("mapPages").is_none());
         assert!(!rows.iter().any(|(label, _)| label.starts_with("info.")));
         assert!(rows.contains(&("Platform".into(), "linux/amd64".into())));
         assert!(rows.contains(&("Storage".into(), "opaque raw".into())));
@@ -2921,12 +2986,29 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_inspection_json_exposes_bounded_stream_roots() {
+        let info = snapshot_info(None);
+        let json = serde_json::to_value(&info).unwrap();
+        let stream = &json["streams"][0];
+        assert_eq!(stream["stream"], info.streams[0].stream.to_string());
+        assert_eq!(stream["map"], info.streams[0].map.to_string());
+        assert_eq!(stream["length"], 3 * 65_536);
+        assert_eq!(stream["chunkSize"], 65_536);
+        assert!(stream.get("role").is_some());
+        assert!(stream.get("chunks").is_none());
+        assert!(stream.get("mapPages").is_none());
+        let rows = crate::commands::live::snapshot_detail_rows(&info);
+        assert!(rows.contains(&("RAM identity chunk".into(), "65536 bytes".into())));
+        assert!(rows.contains(&("RAM map root".into(), info.streams[0].map.to_string())));
+    }
+
+    #[test]
     fn snapshot_verify_chunk_failures_render_role_range_and_identities() {
         use crate::commands::live::{
             verification_error_json, verification_error_message, VERIFICATION_GUIDANCE,
         };
-        use libvm::storage::stream::Chunk;
         use libvm::{SnapshotVerificationError, SnapshotVerificationRole};
+        use vm_spec::stream_map::Chunk;
         let expected = format!("sha256:{}", "a".repeat(64)).parse().unwrap();
         let actual = format!("sha256:{}", "b".repeat(64)).parse().unwrap();
         let stream = format!("sha256:{}", "c".repeat(64)).parse().unwrap();
@@ -2939,26 +3021,34 @@ mod tests {
             ),
             (SnapshotVerificationRole::Dependency, "dependency"),
         ] {
+            let chunk_size = if matches!(role, SnapshotVerificationRole::Ram) {
+                65_536
+            } else {
+                8_388_608
+            };
+            let start = 2 * chunk_size;
+            let end = 3 * chunk_size;
             let failure = SnapshotVerificationError::ChunkMismatch {
                 role,
                 stream,
+                chunk_size,
                 index: 2,
-                start: 16_777_216,
-                end: 25_165_824,
+                start,
+                end,
                 expected: Box::new(Chunk::Data(expected)),
                 actual: Box::new(Chunk::Data(actual)),
             };
             let text = verification_error_message(&failure);
             assert_eq!(
                 text,
-                format!("{label} stream {stream} chunk 2 bytes 16777216..25165824: expected {expected}, actual {actual}\n{VERIFICATION_GUIDANCE}")
+                format!("{label} stream {stream} data chunk 2 ({chunk_size} bytes) bytes {start}..{end}: expected {expected}, actual {actual}\n{VERIFICATION_GUIDANCE}")
             );
             assert_eq!(
                 verification_error_json(&failure),
                 serde_json::json!({
                     "error": {
                         "kind": "chunkMismatch", "role": label, "stream": stream,
-                        "index": 2, "start": 16_777_216, "end": 25_165_824,
+                        "index": 2, "start": start, "end": end, "chunkSize": chunk_size,
                         "expected": expected, "actual": actual,
                     },
                     "guidance": VERIFICATION_GUIDANCE,
@@ -2972,6 +3062,7 @@ mod tests {
             let failure = SnapshotVerificationError::ChunkMismatch {
                 role: SnapshotVerificationRole::Ram,
                 stream,
+                chunk_size: 65_536,
                 index: 0,
                 start: 0,
                 end: 512,
@@ -2981,6 +3072,41 @@ mod tests {
             assert!(verification_error_message(&failure).contains("zero"));
             let json = verification_error_json(&failure);
             assert!(json["error"]["expected"] == "zero" || json["error"]["actual"] == "zero");
+        }
+    }
+
+    #[test]
+    fn snapshot_verify_map_failures_do_not_invent_data_chunk_mismatches() {
+        use crate::commands::live::{verification_error_json, verification_error_message};
+        for failure in [
+            libvm::SnapshotStructuralFailure::Missing,
+            libvm::SnapshotStructuralFailure::Invalid {
+                message: "node digest mismatch".into(),
+            },
+        ] {
+            let error = libvm::SnapshotVerificationError::MapNode(Box::new(
+                libvm::SnapshotMapNodeFailure {
+                    role: libvm::SnapshotVerificationRole::Ram,
+                    stream: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
+                    node: libvm::ObjectDigest::of_bytes(b"node"),
+                    height: 1,
+                    first_index: 64,
+                    end_index: 128,
+                    start: 4_194_304,
+                    end: 8_388_608,
+                    failure,
+                },
+            ));
+            let text = verification_error_message(&error);
+            assert!(text.contains("RAM stream"));
+            assert!(text.contains("map node"));
+            assert!(text.contains("height 1 chunks 64..128 bytes 4194304..8388608"));
+            assert!(!text.contains("data chunk"));
+            let json = verification_error_json(&error);
+            assert_eq!(json["error"]["kind"], "mapNode");
+            assert_eq!(json["error"]["firstIndex"], 64);
+            assert_eq!(json["error"]["endIndex"], 128);
+            assert!(json["error"].get("index").is_none());
         }
     }
 

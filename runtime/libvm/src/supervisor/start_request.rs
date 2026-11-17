@@ -359,6 +359,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn start_request_round_trips_disk_root_tracking_profile() {
+        let root =
+            vm_spec::stream_map::StreamRoot::empty(512, vm_spec::stream_map::ChunkSize::DISK)
+                .unwrap();
+        let seed = vm_spec::capture::DiskTrackingSeed {
+            version: vm_spec::capture::DISK_TRACKING_VERSION,
+            map_format: 2,
+            chunk_shift: 23,
+            role: vm_spec::DiskRole::Root,
+            attachment_index: 0,
+            block_id: vm_spec::BlockId::new("root").unwrap(),
+            file_device: 1,
+            file_inode: 2,
+            length: root.length(),
+            chunk_size: root.chunk_size().bytes(),
+            epoch: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+            baseline: Some(root.id()),
+        };
+        seed.validate().unwrap();
+        let request = VmmStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+            lease(),
+            context(),
+        )
+        .with_disk_tracking_seeds(vec![seed.clone()]);
+        let value: serde_json::Value =
+            serde_json::from_slice(&encode_start_request(&request).unwrap()).unwrap();
+        let decoded: Vec<vm_spec::capture::DiskTrackingSeed> =
+            serde_json::from_value(value["diskTrackingSeeds"].clone()).unwrap();
+        assert_eq!(decoded, [seed]);
+        assert_eq!(decoded[0].baseline, Some(root.id()));
+    }
+
+    #[tokio::test]
+    async fn restore_start_round_trips_binary_ram_root_and_shared_node_store() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
+
+        let fixture = crate::store::capture::tests::fixture().await;
+        let (directory, evidence) = crate::store::capture::tests::seal(&fixture);
+        let plan = vm_spec::capture::CapturePlan::decode(
+            &std::fs::read(directory.path().join("request.json")).unwrap(),
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        let objects = RestoreObjectRole::ALL.map(|role| {
+            let file =
+                std::fs::File::open(directory.path().join(role.capture_role().relative_path()))
+                    .unwrap();
+            let metadata = file.metadata().unwrap();
+            let inventory = evidence
+                .inventory
+                .iter()
+                .find(|entry| entry.role == role.capture_role())
+                .unwrap();
+            let identity = if role == RestoreObjectRole::Ram {
+                inventory.identity.unwrap()
+            } else {
+                inventory.sha256.unwrap()
+            };
+            let object = RestoreObject {
+                role,
+                fd: file.as_raw_fd(),
+                file_device: metadata.dev(),
+                file_inode: metadata.ino(),
+                length: metadata.len(),
+                identity,
+            };
+            files.push(file);
+            object
+        });
+        let root = vm_spec::stream_map::StreamRoot::decode(
+            &std::fs::read(directory.path().join("memory.root")).unwrap(),
+        )
+        .unwrap();
+        root.validate_role(vm_spec::stream_map::StreamRole::Ram)
+            .unwrap();
+        let restore = RestoreRequest {
+            version: vm_spec::restore::RESTORE_REQUEST_VERSION,
+            checkpoint: vm_spec::capture::Sha256Digest::of_bytes(b"checkpoint"),
+            activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+            freeze_operation_id: evidence.freeze_operation_id.clone().unwrap(),
+            start_paused: true,
+            configuration: plan.configuration,
+            disk_tracking_seeds: Vec::new(),
+            map_node_store: Some(
+                directory
+                    .path()
+                    .join("map-nodes")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            objects,
+            evidence,
+            lowers: Vec::new(),
+            network: None,
+            ssh_trusted_ca: None,
+            hook: None,
+        };
+        restore.validate().unwrap();
+        let request = VmmStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+            lease(),
+            context(),
+        )
+        .with_restore(Some(restore.clone()));
+        let value: serde_json::Value =
+            serde_json::from_slice(&encode_start_request(&request).unwrap()).unwrap();
+        let decoded: RestoreRequest = serde_json::from_value(value["restore"].clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, restore);
+        assert_eq!(decoded.objects[0].identity, root.id());
+        assert_eq!(decoded.objects[4].identity, root.id());
+    }
+
     fn request_with_environment_value(value: String) -> VmmStartRequest {
         VmmStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",

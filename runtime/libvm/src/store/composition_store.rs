@@ -154,6 +154,32 @@ impl HeldComposition {
         &self.fsmeta
     }
 
+    /// Explicit byte authentication never reuses local validation receipts.
+    pub(crate) fn authenticate_bytes(&self, pool: &StoragePool) -> Result<(), LibVmError> {
+        self.recheck()?;
+        pool.verify_object(&self.retained.fsmeta())?;
+        let authority =
+            pool.map_authority(Arc::new(pool.existing_lease(self._owner.operation)?))?;
+        let mut hasher =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
+        let mut verified = BTreeSet::new();
+        for (layer, file) in &self.unique {
+            if !verified.insert(layer.pack.stream) {
+                continue;
+            }
+            let map = pool.load_map(
+                layer.pack.map,
+                vm_spec::stream_map::StreamRole::Pack,
+                Arc::clone(&authority),
+            )?;
+            if map.id() != layer.pack.stream || map.length() != layer.pack.length {
+                return Err(invalid("pack root contradicts its composition"));
+            }
+            hasher.verify_expected_map(file, &map).map_err(invalid)?;
+        }
+        self.recheck()
+    }
+
     pub(crate) fn recheck(&self) -> Result<(), LibVmError> {
         let current = CompositionValidation::capture(
             &self.retained.recipe,
@@ -189,14 +215,18 @@ pub struct LaunchLower {
     )>,
     pub(crate) maps: std::collections::BTreeMap<
         crate::storage::identity::StreamId,
-        Arc<crate::storage::stream::StreamMap>,
+        Arc<crate::storage::map::AuthenticatedMap>,
     >,
-    _authority: LowerAuthority,
+    _authority: Arc<LowerAuthority>,
 }
 
 enum LowerAuthority {
-    Launch,
-    Consumer { _owner: LayerReadOwner },
+    Launch {
+        _lease: crate::storage::locks::StorageLock,
+    },
+    Consumer {
+        _owner: LayerReadOwner,
+    },
     ExistingRoot,
 }
 
@@ -343,7 +373,7 @@ fn layer_refs<'a>(unique: &'a [HeldLayer], occurrences: &[usize]) -> Vec<oci::er
         .collect()
 }
 
-const COMPOSITION_VALIDATION_SCHEMA: i64 = 1;
+const COMPOSITION_VALIDATION_SCHEMA: i64 = 2;
 
 async fn save_validation(
     store: &Store,
@@ -361,23 +391,19 @@ async fn save_validation(
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphValidation {
+    schema: u32,
     graph: SnapshotComposition,
     metadata: Vec<(
         ObjectDigest,
         crate::storage::identity_file::SourceFingerprint,
     )>,
-    maps: Vec<(
-        crate::storage::identity::StreamId,
-        Vec<crate::storage::stream::Chunk>,
-    )>,
+    roots: Vec<(crate::storage::identity::StreamId, Vec<u8>)>,
 }
 
 fn graph_objects(graph: &SnapshotComposition) -> BTreeSet<ObjectDigest> {
     graph
         .objects()
-        .chain(graph.layers.iter().flat_map(|layer| {
-            std::iter::once(layer.pack.map).chain(layer.pack.map_pages.iter().copied())
-        }))
+        .chain(graph.layers.iter().map(|layer| layer.pack.map))
         .collect()
 }
 
@@ -400,19 +426,20 @@ async fn save_graph_validation(
     let authenticated =
         graph.authenticate(|digest, maximum| Ok(pool.read_object(digest, maximum)?))?;
     validation.check_records(&authenticated.recipe, &authenticated.result)?;
-    let mut maps = std::collections::BTreeMap::new();
+    let mut roots = std::collections::BTreeMap::new();
     for layer in &graph.layers {
-        let root = crate::storage::map::StreamMapRoot::decode(&pool.read_object(
-            &layer.pack.map,
-            crate::storage::limits::Resource::MetadataPageBytes.maximum(),
-        )?)?;
-        if root.stream != layer.pack.stream
-            || root.length != layer.pack.length
-            || root.pages != layer.pack.map_pages
+        let map = pool.load_map(
+            layer.pack.map,
+            vm_spec::stream_map::StreamRole::Pack,
+            pool.map_authority(Arc::new(()))?,
+        )?;
+        if map.id() != layer.pack.stream
+            || map.length() != layer.pack.length
+            || map.chunk_size().bytes() != layer.pack.chunk_size
         {
             return Err(invalid("composition receipt map contradicts its graph"));
         }
-        maps.insert(layer.pack.stream, root.read_map(pool)?.chunks().to_vec());
+        roots.insert(map.id(), map.canonical_bytes()?);
         validation.check_file(
             LowerBacking::Stream(layer.pack.stream),
             &pool.open_stream(&layer.pack.stream)?,
@@ -431,12 +458,13 @@ async fn save_graph_validation(
         }
     }
     let receipt = GraphValidation {
+        schema: 2,
         graph: graph.clone(),
         metadata: held
             .into_iter()
             .map(|(digest, _, fingerprint)| (digest, fingerprint))
             .collect(),
-        maps: maps.into_iter().collect(),
+        roots: roots.into_iter().collect(),
     };
     sqlx::query("UPDATE composition_validation SET graph_receipt=?3 WHERE lower_id=?1 AND schema=?2 AND receipt=?4")
         .bind(graph.result.to_string()).bind(COMPOSITION_VALIDATION_SCHEMA)
@@ -468,6 +496,9 @@ async fn load_graph_validation(
     let (Ok(validation), Some(receipt)) = (validation, graph) else {
         return Ok(None);
     };
+    if receipt.schema != 2 {
+        return Ok(None);
+    }
     if validation
         .check_records(&retained.recipe, &retained.result)
         .is_err()
@@ -476,6 +507,7 @@ async fn load_graph_validation(
     }
     let graph = receipt.graph;
     if graph.result != retained.id
+        || graph.validate_shape().is_err()
         || graph.recipe != retained.recipe_digest
         || graph.record != retained.record_digest
         || graph.fsmeta != retained.fsmeta()
@@ -483,7 +515,7 @@ async fn load_graph_validation(
     {
         return Ok(None);
     }
-    let rows = sqlx::query("SELECT c.position,c.layer_result_id,r.recipe_id,r.pack_stream,r.pack_length,r.pack_map,r.index_root,r.record_digest,r.record_bytes,p.diff_id,p.record_digest AS recipe_digest,p.record_bytes AS recipe_bytes FROM composition_layer c JOIN layer_result r ON r.id=c.layer_result_id JOIN layer_recipe p ON p.id=r.recipe_id WHERE c.result_id=?1 ORDER BY c.position")
+    let rows = sqlx::query("SELECT c.position,c.layer_result_id,r.recipe_id,r.pack_stream,r.pack_length,r.pack_map,r.index_root,r.record_digest,r.record_bytes,p.diff_id,p.record_digest AS recipe_digest,p.record_bytes AS recipe_bytes,m.length AS map_length,m.chunk_shift AS map_shift FROM composition_layer c JOIN layer_result r ON r.id=c.layer_result_id JOIN layer_recipe p ON p.id=r.recipe_id LEFT JOIN stream_map_root m ON m.root_digest=r.pack_map WHERE c.result_id=?1 ORDER BY c.position")
         .bind(retained.id.to_string()).fetch_all(&store.pool).await?;
     if rows.len() != graph.layers.len() {
         return Ok(None);
@@ -508,6 +540,8 @@ async fn load_graph_validation(
             || row.try_get::<String, _>("pack_stream")? != layer.pack.stream.to_string()
             || row.try_get::<i64, _>("pack_length")? != int(layer.pack.length)?
             || row.try_get::<String, _>("pack_map")? != layer.pack.map.to_string()
+            || row.try_get::<Option<i64>, _>("map_length")? != Some(int(layer.pack.length)?)
+            || row.try_get::<Option<i64>, _>("map_shift")? != Some(23)
             || row.try_get::<String, _>("index_root")? != binding.index_root.to_string()
             || content_object(binding.index_root)? != layer.index_root
         {
@@ -530,33 +564,11 @@ async fn load_graph_validation(
         for digest in [layer.recipe, layer.result, layer.index_root, layer.pack.map]
             .into_iter()
             .chain(layer.index_pages.iter().copied())
-            .chain(layer.pack.map_pages.iter().copied())
         {
             expected_dependencies.insert((id.to_string(), digest.to_string()));
         }
     }
     if actual != expected_dependencies {
-        return Ok(None);
-    }
-    let mut maps = std::collections::BTreeMap::new();
-    for (id, chunks) in receipt.maps {
-        let Some(layer) = graph.layers.iter().find(|layer| layer.pack.stream == id) else {
-            return Ok(None);
-        };
-        let map =
-            crate::storage::stream::StreamMap::from_validated_parts(layer.pack.length, chunks, id)?;
-        if maps.insert(id, Arc::new(map)).is_some() {
-            return Ok(None);
-        }
-    }
-    if maps.len()
-        != graph
-            .layers
-            .iter()
-            .map(|layer| layer.pack.stream)
-            .collect::<BTreeSet<_>>()
-            .len()
-    {
         return Ok(None);
     }
     let expected = graph_objects(&graph);
@@ -605,6 +617,47 @@ async fn load_graph_validation(
         }
         occurrences.push(pool.lower_occurrence(&layer.pack.stream)?);
     }
+    let mut roots = std::collections::BTreeMap::new();
+    for (id, bytes) in receipt.roots {
+        let Some(stream) = unique
+            .iter()
+            .find_map(|(stream, _)| (stream.stream == id).then_some(stream))
+        else {
+            return Ok(None);
+        };
+        let Ok(root) = vm_spec::stream_map::StreamRoot::decode(&bytes) else {
+            return Ok(None);
+        };
+        if root
+            .validate_role(vm_spec::stream_map::StreamRole::Pack)
+            .is_err()
+            || root.id().as_bytes() != stream.stream.as_bytes()
+            || root.length() != stream.length
+            || root.chunk_size().bytes() != stream.chunk_size
+            || roots.insert(id, root).is_some()
+        {
+            return Ok(None);
+        }
+    }
+    if roots.len() != unique.len() {
+        return Ok(None);
+    }
+    let authority = Arc::new(
+        authority
+            .take()
+            .ok_or_else(|| invalid("composition receipt has no retention authority"))?,
+    );
+    let maps = roots
+        .into_iter()
+        .map(|(id, root)| {
+            let map = crate::storage::map::AuthenticatedMap::from_admitted_root(
+                root,
+                vm_spec::stream_map::StreamRole::Pack,
+                pool.map_authority(authority.clone())?,
+            )?;
+            Ok((id, Arc::new(map)))
+        })
+        .collect::<Result<_, StorageError>>()?;
     let lower = LaunchLower {
         occurrences,
         retained: retained.clone(),
@@ -614,12 +667,15 @@ async fn load_graph_validation(
         fsmeta,
         metadata,
         maps,
-        _authority: authority
-            .take()
-            .ok_or_else(|| invalid("composition receipt has no retention authority"))?,
+        _authority: authority,
     };
     lower.recheck()?;
     Ok(Some(lower))
+}
+
+enum ValidationAuthority {
+    Retained,
+    Operation { id: uuid::Uuid, local: bool },
 }
 
 /// All byte work runs with held descriptors and leases, outside SQL/root locks.
@@ -630,9 +686,13 @@ async fn validate_composition(
     result: &CompositionResult,
     layers: &[oci::erofs::Layer<'_>],
     fsmeta: &File,
-    local: bool,
+    authority: ValidationAuthority,
 ) -> Result<CompositionValidation, LibVmError> {
     let before = CompositionValidation::capture(recipe, result, layers, fsmeta)?;
+    let local = matches!(
+        authority,
+        ValidationAuthority::Retained | ValidationAuthority::Operation { local: true, .. }
+    );
     let receipt: Option<Vec<u8>> = if local {
         sqlx::query_scalar(
             "SELECT receipt FROM composition_validation WHERE lower_id=?1 AND schema=?2",
@@ -652,6 +712,11 @@ async fn validate_composition(
         let loaded = crate::storage::composition::load_exact(recipe, layers, result, fsmeta)?;
         if loaded.result != *result {
             return Err(invalid("retained composition failed exact loading"));
+        }
+        if let ValidationAuthority::Operation { id: operation, .. } = authority {
+            store
+                .admit_published_map_root(operation, &loaded.map)
+                .await?;
         }
     }
     if CompositionValidation::capture(recipe, result, layers, fsmeta)? != before {
@@ -918,7 +983,7 @@ impl LayerStore {
                     &retained.result,
                     &layers,
                     &fsmeta,
-                    true,
+                    ValidationAuthority::Retained,
                 )
                 .await?;
                 (retained, fsmeta, validation)
@@ -937,6 +1002,9 @@ impl LayerStore {
                 {
                     return Err(invalid("published fsmeta differs from its composition"));
                 }
+                store
+                    .admit_published_map_root(owner.operation, &composed.map)
+                    .await?;
                 let recipe_digest = publish_record(
                     store,
                     &pool,
@@ -1048,7 +1116,7 @@ impl LayerStore {
                     &retained.result,
                     &layer_refs(&unique, &mapping),
                     &fsmeta,
-                    true,
+                    ValidationAuthority::Retained,
                 )
                 .await?;
                 if load_graph_validation(
@@ -1122,12 +1190,7 @@ impl LayerStore {
                 if !authorized {
                     return Err(invalid("launch lease does not root this retained lower"));
                 }
-                let resolved = store.resolve_lower(&lower, LowerAuthority::Launch, data_disks).await;
-                // Cancellation may drop the caller's typed lease while this
-                // blocking worker runs. Keep its duplicate until authentication
-                // completes, but do not obstruct failed-start reconciliation.
-                drop(lease);
-                resolved
+                store.resolve_lower(&lower, LowerAuthority::Launch { _lease: lease }, data_disks).await
             })
         })
         .await?
@@ -1226,7 +1289,7 @@ impl LayerStore {
             &retained.result,
             &layer_refs(&unique, &mapping),
             &fsmeta,
-            true,
+            ValidationAuthority::Retained,
         )
         .await?;
         let graph = snapshot_graph(&retained, &unique, &mapping)?;
@@ -1299,7 +1362,7 @@ impl LayerStore {
     }
 
     /// Register a received or restored exact graph. Every object (including
-    /// fsmeta and pack map pages) and every pack stream must already be in
+    /// fsmeta and pack map nodes) and every pack stream must already be in
     /// the pool, pinned by `operation`. The graph, fsmeta structure, pack
     /// bytes and logical lower identity are authenticated before any row is
     /// inserted; the lower is then pinned to `operation`. Idempotent.
@@ -1385,21 +1448,33 @@ impl LayerStore {
                 slots.push(slot);
                 continue;
             }
-            let map_root = crate::storage::map::StreamMapRoot::decode(
-                &pool
-                    .read_object(
-                        &layer.pack.map,
-                        crate::storage::limits::Resource::MetadataPageBytes.maximum(),
-                    )
-                    .map_err(retained(id))?,
-            )?;
-            if map_root.stream != layer.pack.stream
-                || map_root.length != layer.pack.length
-                || map_root.pages != layer.pack.map_pages
+            let map = pool
+                .load_map(
+                    layer.pack.map,
+                    vm_spec::stream_map::StreamRole::Pack,
+                    pool.map_authority(Arc::new(()))?,
+                )
+                .map_err(retained(id))?;
+            if map.id() != layer.pack.stream
+                || map.length() != layer.pack.length
+                || map.chunk_size().bytes() != layer.pack.chunk_size
             {
                 return Err(invalid("pack map root contradicts its snapshot stream"));
             }
-            map_root.read_map(&pool).map_err(retained(id))?;
+            if !local {
+                let admitted: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM stream_map_root WHERE root_digest=?1)",
+                )
+                .bind(layer.pack.map.to_string())
+                .fetch_one(&store.pool)
+                .await?;
+                if admitted {
+                    for node in map.nodes() {
+                        node.map_err(retained(id))?;
+                    }
+                }
+            }
+            crate::store::snapshot_store::publish_map(&pool, store, operation, &map).await?;
             slots.push(packs.len());
             packs.push((
                 layer.pack.clone(),
@@ -1426,7 +1501,10 @@ impl LayerStore {
             &authenticated.result,
             &refs,
             &fsmeta,
-            local,
+            ValidationAuthority::Operation {
+                id: operation,
+                local,
+            },
         )
         .await?;
         drop(refs);
@@ -1448,7 +1526,6 @@ impl LayerStore {
             let mut dependencies =
                 BTreeSet::from([layer.recipe, layer.result, layer.index_root, layer.pack.map]);
             dependencies.extend(layer.index_pages.iter().copied());
-            dependencies.extend(layer.pack.map_pages.iter().copied());
             self.commit_layer(&crate::store::layer_store::PublicationFacts {
                 retained: crate::store::layer_store::RetainedLayer {
                     id: *id,
@@ -1620,6 +1697,7 @@ mod tests {
     use oci::changeset::{ChangesetLimits, ContentDigest, LayerInput};
 
     use crate::paths::LocalPaths;
+    use crate::storage::identity::ObjectDigest;
     use crate::storage::pool::StoragePool;
     use crate::store::composition_store::HeldComposition;
     use crate::store::layer_store::LayerStore;
@@ -1674,7 +1752,7 @@ mod tests {
 
     async fn receipt(store: &Store, held: &HeldComposition) -> Vec<u8> {
         sqlx::query_scalar(
-            "SELECT receipt FROM composition_validation WHERE lower_id=?1 AND schema=1",
+            "SELECT receipt FROM composition_validation WHERE lower_id=?1 AND schema=2",
         )
         .bind(held.retained.id.to_string())
         .fetch_one(&store.pool)
@@ -1843,7 +1921,7 @@ mod tests {
             &held.retained.result,
             &held.layers(),
             &held.fsmeta,
-            true,
+            crate::store::composition_store::ValidationAuthority::Retained,
         )
         .await
         .unwrap();
@@ -1859,7 +1937,7 @@ mod tests {
             &held.retained.result,
             &held.layers(),
             &held.fsmeta,
-            true,
+            crate::store::composition_store::ValidationAuthority::Retained,
         )
         .await
         .is_err());
@@ -1914,7 +1992,7 @@ mod tests {
         let graph = held.snapshot_composition().unwrap();
         let lower = held.retained.overlay_lower();
         let receipt_query =
-            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=1";
+            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=2";
         let pack = pool.stream_path(&held.unique[0].0.pack.stream);
         let fsmeta = pool.object_path(&held.retained.fsmeta());
         for path in [&pack, &fsmeta] {
@@ -1972,20 +2050,20 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn malformed_or_different_schema_receipts_fall_back_to_exact_validation() {
+    async fn malformed_receipts_reauthenticate_and_other_schemas_are_rejected() {
         let (_temporary, paths, store, held) = fixture().await;
         let layers = LayerStore::from_store(store.clone());
         let pool = StoragePool::open_existing(paths.images_dir())
             .unwrap()
             .unwrap();
         let events = watch(&held, &pool);
-        sqlx::query("UPDATE composition_validation SET schema=2 WHERE lower_id=?1")
-            .bind(held.retained.id.to_string())
-            .execute(&store.pool)
-            .await
-            .unwrap();
-        layers.hold_composition(held.retained.id).await.unwrap();
-        assert!(!events.read_events().unwrap().is_empty());
+        assert!(
+            sqlx::query("UPDATE composition_validation SET schema=3 WHERE lower_id=?1")
+                .bind(held.retained.id.to_string())
+                .execute(&store.pool)
+                .await
+                .is_err()
+        );
         sqlx::query("UPDATE composition_validation SET receipt=?2 WHERE lower_id=?1")
             .bind(held.retained.id.to_string())
             .bind(b"not a receipt".as_slice())
@@ -2098,7 +2176,6 @@ mod tests {
             for digest in std::iter::once(layer.index_root)
                 .chain(layer.index_pages.iter().copied())
                 .chain(std::iter::once(layer.pack.map))
-                .chain(layer.pack.map_pages.iter().copied())
             {
                 metadata
                     .add_watch(&pool.object_path(&digest), AddWatchFlags::IN_ACCESS)
@@ -2193,5 +2270,88 @@ mod tests {
         assert_eq!(lower.snapshot_composition(), &graph);
         lower.recheck().unwrap();
         unread(&events);
+    }
+
+    #[tokio::test]
+    async fn composition_round_trip_binds_pack_and_lower_roots_without_flat_receipts() {
+        let (_temporary, paths, store, held) = fixture().await;
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        let graph = held.snapshot_composition().unwrap();
+        for layer in &graph.layers {
+            assert_eq!(layer.pack.map.as_bytes(), layer.pack.stream.as_bytes());
+            assert_eq!(
+                layer.pack.chunk_size,
+                vm_spec::stream_map::ChunkSize::DISK.bytes()
+            );
+        }
+        let lower_digest = ObjectDigest::from_sha256(*held.retained.result.lower_stream.as_bytes());
+        let root = vm_spec::stream_map::StreamRoot::decode(
+            &pool
+                .read_object(&lower_digest, vm_spec::stream_map::MAX_ROOT_BYTES as u64)
+                .unwrap(),
+        )
+        .unwrap();
+        root.validate_role(vm_spec::stream_map::StreamRole::Lower)
+            .unwrap();
+        assert_eq!(
+            root.id().as_bytes(),
+            held.retained.result.lower_stream.as_bytes()
+        );
+        assert_eq!(root.length(), held.retained.result.lower_length);
+        let receipt: Vec<u8> = sqlx::query_scalar(
+            "SELECT graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=2",
+        )
+        .bind(held.retained.id.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+        assert_eq!(decoded["schema"], 2);
+        assert!(decoded.get("maps").is_none());
+        let roots = decoded["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), held.unique.len());
+        for entry in roots {
+            assert!(entry[1].as_array().unwrap().len() <= vm_spec::stream_map::MAX_ROOT_BYTES);
+        }
+        let layers = LayerStore::from_store(store);
+        let resolved = layers
+            .hold_lower(&held.retained.overlay_lower())
+            .await
+            .unwrap();
+        assert_eq!(resolved.snapshot_composition(), &graph);
+        resolved.recheck().unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_authentication_rejects_corrupt_nodes_without_replacing_receipts() {
+        let (_temporary, paths, store, held) = fixture().await;
+        let pool = StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        held.authenticate_bytes(&pool).unwrap();
+        let before: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=2",
+        ).bind(held.retained.id.to_string()).fetch_one(&store.pool).await.unwrap();
+        let bytes = pool
+            .read_object(
+                &held.unique[0].0.pack.map,
+                vm_spec::stream_map::MAX_ROOT_BYTES as u64,
+            )
+            .unwrap();
+        let root = vm_spec::stream_map::StreamRoot::decode(&bytes).unwrap();
+        let node = ObjectDigest::from_sha256(*root.tree_digest().unwrap().as_bytes());
+        let path = pool.object_path(&node);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o400)).unwrap();
+        assert!(held.authenticate_bytes(&pool).is_err());
+        let after: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=2",
+        ).bind(held.retained.id.to_string()).fetch_one(&store.pool).await.unwrap();
+        assert_eq!(before, after);
     }
 }

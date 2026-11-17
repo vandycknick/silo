@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sqlite3
 
-from silo_smoke import image_cache, procs, stopped
+from silo_smoke import image_cache, procs, stopped, stream_map
 from silo_smoke.cli import Silo
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
@@ -41,6 +41,13 @@ def test_image_catalog_snapshot_seeds_cache_without_private_machine_state(
         packs = connection.execute(
             "SELECT l.pack_stream FROM image_composition_artifact a JOIN composition_layer c ON c.result_id=a.lower_id "
             "JOIN layer_result l ON l.id=c.layer_result_id").fetchall()
+        bindings = connection.execute("SELECT pack_stream,pack_length,pack_map FROM layer_result").fetchall()
+        assert connection.execute("SELECT COUNT(*) FROM stream_map_root").fetchone()[0] > 0
+        assert connection.execute("SELECT COUNT(*) FROM stream_map_edge").fetchone()[0] > 0
+    for stream, length, root_digest in bindings:
+        root, leaves = stream_map.catalog_root(destination, {
+            "stream": stream, "length": length, "map": root_digest, "chunkSize": stream_map.DISK_CHUNK})
+        assert stream_map.from_file(destination / "images/streams/sha256" / stream[7:], root.chunk_size) == (root, leaves)
     assert lowers and len(fsmeta) == len(lowers) and packs
     assert all((destination / "images/objects/sha256" / digest.removeprefix("sha256:")).is_file() for (digest,) in fsmeta)
     assert all((destination / "images/streams/sha256" / stream.removeprefix("sha256:")).is_file() for (stream,) in packs)

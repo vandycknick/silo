@@ -276,9 +276,6 @@ impl ManagedImageStore {
         drop(guard);
         let mut retained_objects = objects.clone();
         retained_objects.remove(&record.root.stream.map);
-        for page in &record.root.stream.map_pages {
-            retained_objects.remove(page);
-        }
         let (mut fingerprints, _closure) = verify_artifact_closure(
             &pool,
             &bytes,
@@ -288,6 +285,7 @@ impl ManagedImageStore {
             None,
             true,
             None,
+            Arc::new(lease.duplicate()?),
         )?;
         if pool.read_object(
             &bundle,
@@ -497,9 +495,6 @@ impl ManagedImageStore {
                 let mut retained_objects = observed.record.content_dependencies()?.1;
                 retained_objects.remove(&observed.record_digest);
                 retained_objects.remove(&observed.record.root.stream.map);
-                for page in &observed.record.root.stream.map_pages {
-                    retained_objects.remove(page);
-                }
                 let (_, closure) = verify_artifact_closure(
                     &pool,
                     &bytes,
@@ -509,6 +504,7 @@ impl ManagedImageStore {
                     Some(observed.record_digest),
                     true,
                     None,
+                    Arc::new(lease.duplicate()?),
                 )?;
                 let binding = observed.record.boot_binding()?;
                 if pool.read_object(
@@ -1363,7 +1359,7 @@ pub(crate) mod tests {
         let snapshot =
             crate::store::models::snapshot::tests::record(stream.id, map.map, kernel.digest);
         let mut record = ImageRecord {
-            schema: 1,
+            schema: 2,
             kind: ImageRecordKind::Image,
             root: snapshot.root,
             boot: snapshot.boot,
@@ -2168,10 +2164,16 @@ pub(crate) mod tests {
             let mut target = info.id;
             match table {
                 "image" => {
-                    target = crate::store::models::image::image_id(b"oversized-record");
-                    sqlx::query("INSERT INTO storage_image(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,zeroblob(?3),1,0)")
-                        .bind(target.to_string()).bind(ObjectDigest::of_bytes(b"record").to_string())
-                        .bind(oversized).execute(&images.store.pool).await.unwrap();
+                    let mut oversized_record = serde_json::to_value(&record).unwrap();
+                    oversized_record.as_object_mut().unwrap().insert(
+                        "oversized".into(),
+                        serde_json::Value::String("x".repeat(usize::try_from(oversized).unwrap())),
+                    );
+                    let bytes = serde_json::to_vec(&oversized_record).unwrap();
+                    target = crate::store::models::image::image_id(&bytes);
+                    sqlx::query("INSERT INTO storage_image(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,?3,1,0)")
+                        .bind(target.to_string()).bind(ObjectDigest::of_bytes(&bytes).to_string())
+                        .bind(bytes).execute(&images.store.pool).await.unwrap();
                 }
                 "provenance" => {
                     sqlx::query("INSERT INTO image_provenance(image_id,digest,record_bytes) VALUES(?1,?2,zeroblob(?3))")
@@ -2269,5 +2271,106 @@ pub(crate) mod tests {
             Err(crate::LibVmError::ImageAliasConflict { .. })
         ));
         tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_map_subtrees_survive_until_the_last_image_is_released() {
+        use std::io::Write;
+
+        let (temporary, images, mut record, initial_operation, initial_lease) = fixture().await;
+        let pool = StoragePool::open(&images.store.images_dir).unwrap();
+        let mut initial = Some((initial_operation, initial_lease));
+        let mut published = Vec::new();
+        let mut node_sets = Vec::new();
+        for length in [
+            vm_spec::stream_map::ChunkSize::DISK.bytes(),
+            2 * vm_spec::stream_map::ChunkSize::DISK.bytes(),
+        ] {
+            let (operation, lease) = match initial.take() {
+                Some(initial) => initial,
+                None => operation(&images, &record, "import").await,
+            };
+            let path = temporary.path().join(format!("root-{length}.raw"));
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.set_len(length).unwrap();
+            file.write_all(&[0x5a; 512]).unwrap();
+            drop(file);
+            let (stream, roots) = pool.publish_stream_for_catalog(&path).unwrap();
+            images
+                .store
+                .pin_published_storage_dependencies(operation, &[stream.id], &[])
+                .await
+                .unwrap();
+            drop(roots);
+            let map = publish_map(&pool, &images.store, operation, &stream.map)
+                .await
+                .unwrap();
+            let nodes = stream
+                .map
+                .nodes()
+                .map(|node| node.unwrap().digest)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(!nodes.is_empty());
+            node_sets.push(nodes);
+            record.root.stream = map;
+            record.root.geometry.length = length;
+            let info = images
+                .publish_owned(record.clone(), operation, lease, None, Vec::new(), None)
+                .await
+                .unwrap();
+            published.push(info);
+        }
+        assert_ne!(
+            published[0].record.root.stream.map,
+            published[1].record.root.stream.map
+        );
+        assert_eq!(
+            node_sets[0], node_sets[1],
+            "length-only roots share their entire tree"
+        );
+        for info in &published {
+            let dependencies: Vec<String> = sqlx::query_scalar(
+                "SELECT object_digest FROM image_object_dependency WHERE image_id=?1",
+            )
+            .bind(info.id.to_string())
+            .fetch_all(&images.store.pool)
+            .await
+            .unwrap();
+            assert!(dependencies.contains(&info.record.root.stream.map.to_string()));
+            assert!(node_sets[0]
+                .iter()
+                .all(|node| !dependencies.contains(&node.to_string())));
+        }
+        images
+            .release_retention(&ManagedSourceRef::Image(published[0].id))
+            .await
+            .unwrap();
+        images.store.recover_image_cache().await.unwrap();
+        assert!(!pool
+            .object_path(&published[0].record.root.stream.map)
+            .exists());
+        for node in &node_sets[0] {
+            pool.verify_object(node).unwrap();
+        }
+        let remaining = images
+            .consume(&ManagedSourceRef::Image(published[1].id))
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.info.record.root.stream,
+            published[1].record.root.stream
+        );
+        drop(remaining);
+        images
+            .release_retention(&ManagedSourceRef::Image(published[1].id))
+            .await
+            .unwrap();
+        images.store.recover_image_cache().await.unwrap();
+        for node in &node_sets[0] {
+            assert!(!pool.object_path(node).exists());
+        }
+        assert!(!pool
+            .object_path(&published[1].record.root.stream.map)
+            .exists());
     }
 }

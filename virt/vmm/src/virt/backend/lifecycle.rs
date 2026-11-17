@@ -1761,8 +1761,8 @@ mod tests {
     /// The writers are the monitor's originals; it closes them after
     /// PrepareCapture is admitted.
     struct Staging {
-        /// execution, devices, ram, layout.
-        writers: Option<[std::fs::File; 4]>,
+        /// execution, devices, ram, layout, changes.
+        writers: Option<[std::fs::File; 5]>,
         pin: std::fs::File,
         outputs: CaptureOutputIdentities,
         pin_identity: OutputIdentity,
@@ -1796,6 +1796,7 @@ mod tests {
                 "devices.state",
                 "memory.ram",
                 "memory-layout.json",
+                "memory.changes",
             ]
             .map(|name| create(&directory.join(name)));
             let pin = create(&directory.join("pin.lease"));
@@ -1806,6 +1807,7 @@ mod tests {
                     devices: id(&writers[1]),
                     ram: id(&writers[2]),
                     layout: id(&writers[3]),
+                    changes: id(&writers[4]),
                 },
                 pin_identity: id(&pin),
                 writers: Some(writers),
@@ -1833,6 +1835,7 @@ mod tests {
                 devices: dup(self.writer(1)),
                 ram: dup(self.writer(2)),
                 layout: dup(self.writer(3)),
+                changes: dup(self.writer(4)),
                 pin: dup(&self.pin),
             })
         }
@@ -2104,7 +2107,9 @@ mod tests {
             ram,
             layout,
             writers_closed,
-            chunk_digests,
+            identity_chunk_bytes,
+            changes,
+            changes_output,
             ..
         } = machine
             .stage(
@@ -2123,16 +2128,27 @@ mod tests {
         assert_eq!((ram.identity(), ram.length), (outputs.ram, 64 * 1024));
         assert_eq!(layout.identity(), outputs.layout);
         let ram_bytes = std::fs::read(staging.directory.join("memory.ram")).expect("RAM");
+        assert_eq!(identity_chunk_bytes, 1 << 16);
+        let changes_file = std::fs::File::open(staging.directory.join("memory.changes")).unwrap();
+        assert_eq!(changes_output.identity(), outputs.changes);
+        assert_eq!(
+            changes_output.length,
+            changes_file.metadata().unwrap().len()
+        );
+        let actual = vm_spec::capture::RamChangeReader::new(changes_file, ram.length, &changes)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
         let expected: Vec<_> = ram_bytes
-            .chunks(vm_spec::capture::STREAM_CHUNK_BYTES as usize)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .any(|byte| *byte != 0)
-                    .then(|| vm_spec::capture::Sha256Digest::of_bytes(chunk))
+            .chunks(identity_chunk_bytes as usize)
+            .enumerate()
+            .filter(|(_, chunk)| !vm_spec::capture::is_all_zero(chunk))
+            .map(|(index, chunk)| vm_spec::capture::CaptureRamChange::Data {
+                index: index as u64,
+                digest: vm_spec::capture::Sha256Digest::of_bytes(chunk),
             })
             .collect();
-        assert_eq!(chunk_digests, expected);
+        assert_eq!(actual, expected);
         let layout_bytes =
             std::fs::read(staging.directory.join("memory-layout.json")).expect("layout");
         assert_eq!(layout_bytes.len() as u64, layout.length);
@@ -2143,6 +2159,7 @@ mod tests {
             outputs.devices,
             outputs.ram,
             outputs.layout,
+            outputs.changes,
         ] {
             assert_eq!(open_copies(identity), 0, "no writer survives the candidate");
         }
@@ -2540,6 +2557,7 @@ mod tests {
             devices: staging.writer(1).try_clone().expect("dup"),
             ram: staging.writer(2).try_clone().expect("dup"),
             layout: staging.writer(2).try_clone().expect("dup"),
+            changes: staging.writer(4).try_clone().expect("dup"),
             pin: staging.pin.try_clone().expect("dup"),
         });
         let command = LifecycleCommand::PrepareCapture {

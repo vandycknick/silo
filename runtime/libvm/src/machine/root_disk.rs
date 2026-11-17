@@ -191,7 +191,7 @@ pub(crate) struct PreparedPrivateCopy {
     name: String,
     method: CloneDiskMethod,
     verification: Option<CopyVerification>,
-    map: Option<crate::storage::stream::StreamMap>,
+    map: Option<crate::storage::map::AuthenticatedMap>,
     preserve: bool,
 }
 
@@ -212,7 +212,7 @@ impl PreparedPrivateCopy {
         self.verification.as_ref()
     }
 
-    pub(crate) fn map(&self) -> Option<&crate::storage::stream::StreamMap> {
+    pub(crate) fn map(&self) -> Option<&crate::storage::map::AuthenticatedMap> {
         self.map.as_ref()
     }
 
@@ -337,7 +337,11 @@ pub(crate) fn copy_private(
         new_private_file(staging, name)?
     };
     if prepared.method == CloneDiskMethod::SparseCopy {
-        let mut hasher = StreamHasher::with_writeback(writeback);
+        let chunk_size = match source {
+            CopySource::Authenticated(stream) => stream.map().chunk_size(),
+            CopySource::Unscanned { .. } => vm_spec::stream_map::ChunkSize::DISK,
+        };
+        let mut hasher = StreamHasher::with_writeback(chunk_size, writeback);
         let scan = match source {
             CopySource::Unscanned { file, length } => {
                 hasher.copy_file_and_hash(file, length, &prepared.file)?
@@ -1141,7 +1145,7 @@ mod tests {
             .unwrap();
         file.sync_all().unwrap();
         drop(file);
-        let old = crate::storage::stream::StreamHasher::new()
+        let old = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_file(&source)
             .unwrap();
         let requested = 128 * 1024 * 1024 + 4096;
@@ -1152,9 +1156,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::metadata(&replacement_path).unwrap().len(), requested);
-        let prefix = crate::storage::stream::StreamHasher::new()
-            .hash_reader(&mut fs::File::open(&replacement_path).unwrap().take(old_length))
-            .unwrap();
+        let prefix =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_reader(&mut fs::File::open(&replacement_path).unwrap().take(old_length))
+                .unwrap();
         assert_eq!(old.id(), prefix.id());
         let superblock =
             disk_image::ext4::read_superblock(&fs::File::open(&replacement_path).unwrap()).unwrap();
@@ -1180,7 +1185,7 @@ mod tests {
             rootfs_spec::upper_geometry::UpperCapacity::new(length).unwrap(),
         )
         .unwrap();
-        let old = crate::storage::stream::StreamHasher::new()
+        let old = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_file(&source)
             .unwrap();
         assert!(crate::machine::root_disk::UpperReplacement::prepare(
@@ -1198,7 +1203,7 @@ mod tests {
         }
         assert!(!path.exists());
         assert_eq!(
-            crate::storage::stream::StreamHasher::new()
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                 .hash_file(&source)
                 .unwrap()
                 .id(),
@@ -1330,9 +1335,10 @@ mod tests {
         assert_eq!(first.file().metadata().unwrap().nlink(), 1);
         if first.method() == CloneDiskMethod::SparseCopy {
             let verification = first.verification().unwrap();
-            let expected_map = crate::storage::stream::StreamHasher::new()
-                .hash_reader(&expected[..])
-                .unwrap();
+            let expected_map =
+                crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                    .hash_reader(&expected[..])
+                    .unwrap();
             assert_eq!(verification.stream, expected_map.id());
             assert!(verification.source.logical_bytes_hashed > 0);
         } else {
@@ -1877,7 +1883,7 @@ mod tests {
         let verification = copy.verification().unwrap();
         assert_eq!(
             verification.stream,
-            crate::storage::stream::StreamHasher::new()
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                 .hash_reader(&b"cross-filesystem bytes"[..])
                 .unwrap()
                 .id()
@@ -1911,12 +1917,13 @@ mod tests {
         let mut expected = vec![0; length as usize];
         file.read_exact_at(&mut expected, 0).unwrap();
         drop(file);
-        let stream = crate::storage::stream::StreamHasher::new()
-            .authenticate(
-                crate::storage::stream::open_regular_source(&path).unwrap(),
-                length,
-            )
-            .unwrap();
+        let stream =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .authenticate(
+                    crate::storage::stream::open_regular_source(&path).unwrap(),
+                    length,
+                )
+                .unwrap();
         (path, expected, stream)
     }
 
@@ -1949,7 +1956,7 @@ mod tests {
             assert!(verification.source.logical_bytes_hashed > 0);
             assert!(verification.source.bytes_read > 0);
             assert_eq!(
-                crate::storage::stream::StreamHasher::new()
+                crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                     .hash_open_file(copy.file(), authenticated.length())
                     .unwrap()
                     .map,
@@ -1985,7 +1992,7 @@ mod tests {
         let staging = OwnedDirectory::open_root(&temp.path().join("staging")).unwrap();
         let source = tempfile::tempfile().unwrap();
         source.write_all_at(b"abc", 0).unwrap();
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         let map = hasher.hash_open_file(&source, 3).unwrap().map;
         source.write_all_at(b"bad", 0).unwrap();
         let receipt = AuthenticatedStream::from_receipt(source, map).unwrap();

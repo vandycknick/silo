@@ -293,70 +293,88 @@ pub fn validate_payload_length(
 pub fn descriptor_from_wire(
     value: w::HandoffPayloadDescriptor,
 ) -> Result<libvm::handoff::plan::PayloadDescriptor, ConversionError> {
+    use libvm::handoff::plan::PayloadDescriptor as Native;
     use w::handoff_payload_descriptor::Payload;
-    let (identity, chunk) = match required(value.payload, "handoff.payload")? {
-        Payload::Object(identity) => (identity, false),
-        Payload::Chunk(identity) => (identity, true),
-        Payload::StreamMap(stream) => {
-            return Ok(libvm::handoff::plan::PayloadDescriptor::StreamMap {
-                stream: stream
-                    .parse()
-                    .map_err(|_| invalid("handoff.payload.stream", "invalid stream identity"))?,
-            })
-        }
+    let value = match required(value.payload, "handoff.payload")? {
+        Payload::Object(identity) => Native::Object {
+            digest: identity
+                .digest
+                .parse()
+                .map_err(|_| invalid("handoff.payload.digest", "invalid digest"))?,
+            length: identity.length,
+        },
+        Payload::StreamMap(stream) => Native::StreamMap {
+            stream: stream
+                .parse()
+                .map_err(|_| invalid("handoff.payload.stream", "invalid stream identity"))?,
+        },
+        Payload::MapNode(value) => Native::MapNode {
+            digest: value
+                .digest
+                .parse()
+                .map_err(|_| invalid("handoff.payload.map_node", "invalid node digest"))?,
+            stream: value
+                .stream
+                .parse()
+                .map_err(|_| invalid("handoff.payload.stream", "invalid stream identity"))?,
+            height: libvm::handoff::plan::MapNodeHeight::new(
+                u8::try_from(value.height)
+                    .map_err(|_| invalid("handoff.payload.height", "invalid node height"))?,
+            )
+            .map_err(|_| invalid("handoff.payload.height", "invalid node height"))?,
+            first_index: libvm::handoff::plan::MapNodeIndex::new(value.first_index)
+                .map_err(|_| invalid("handoff.payload.first_index", "invalid node index"))?,
+        },
+        Payload::StreamChunk(value) => Native::StreamChunk {
+            stream: value
+                .stream
+                .parse()
+                .map_err(|_| invalid("handoff.payload.stream", "invalid stream identity"))?,
+            index: value.index,
+            length: value.length,
+        },
     };
-    if identity.length == 0
-        || identity.length > i64::MAX as u64
-        || chunk && identity.length > 8 * 1024 * 1024
-    {
-        return Err(invalid("handoff.payload.length", "invalid payload length"));
-    }
-    let digest = identity
-        .digest
-        .parse()
-        .map_err(|_| invalid("handoff.payload.digest", "invalid digest"))?;
-    Ok(if chunk {
-        libvm::handoff::plan::PayloadDescriptor::Chunk {
-            digest,
-            length: identity.length,
-        }
-    } else {
-        libvm::handoff::plan::PayloadDescriptor::Object {
-            digest,
-            length: identity.length,
-        }
-    })
+    value
+        .validate()
+        .map_err(|_| invalid("handoff.payload", "invalid descriptor"))?;
+    Ok(value)
 }
 
 pub fn descriptor_to_wire(
     value: &libvm::handoff::plan::PayloadDescriptor,
 ) -> Result<w::HandoffPayloadDescriptor, ConversionError> {
+    use libvm::handoff::plan::PayloadDescriptor as Native;
     use w::handoff_payload_descriptor::Payload;
-    let (digest, length, chunk) = match value {
-        libvm::handoff::plan::PayloadDescriptor::Object { digest, length } => {
-            (digest, *length, false)
-        }
-        libvm::handoff::plan::PayloadDescriptor::Chunk { digest, length } => {
-            (digest, *length, true)
-        }
-        libvm::handoff::plan::PayloadDescriptor::StreamMap { stream } => {
-            return Ok(w::HandoffPayloadDescriptor {
-                payload: Some(Payload::StreamMap(stream.to_string())),
-            })
-        }
-    };
-    if length == 0 || length > i64::MAX as u64 || chunk && length > 8 * 1024 * 1024 {
-        return Err(invalid("handoff.payload.length", "invalid payload length"));
-    }
-    let identity = w::HandoffPayloadIdentity {
-        digest: digest.to_string(),
-        length,
-    };
+    value
+        .validate()
+        .map_err(|_| invalid("handoff.payload", "invalid descriptor"))?;
     Ok(w::HandoffPayloadDescriptor {
-        payload: Some(if chunk {
-            Payload::Chunk(identity)
-        } else {
-            Payload::Object(identity)
+        payload: Some(match value {
+            Native::Object { digest, length } => Payload::Object(w::HandoffPayloadIdentity {
+                digest: digest.to_string(),
+                length: *length,
+            }),
+            Native::StreamMap { stream } => Payload::StreamMap(stream.to_string()),
+            Native::MapNode {
+                digest,
+                stream,
+                height,
+                first_index,
+            } => Payload::MapNode(w::HandoffMapNode {
+                digest: digest.to_string(),
+                stream: stream.to_string(),
+                height: u32::from(height.get()),
+                first_index: first_index.get(),
+            }),
+            Native::StreamChunk {
+                stream,
+                index,
+                length,
+            } => Payload::StreamChunk(w::HandoffStreamChunk {
+                stream: stream.to_string(),
+                index: *index,
+                length: *length,
+            }),
         }),
     })
 }
@@ -620,6 +638,7 @@ pub fn capabilities_to_wire(
     value: &libvm::handoff::plan::HandoffCapabilities,
 ) -> Result<w::HandoffCapabilities, ConversionError> {
     Ok(w::HandoffCapabilities {
+        protocol_version: value.protocol_version,
         runtime: value.runtime.to_string(),
         kernel_architecture: crate::boot::architecture_to_wire(value.kernel_architecture),
         backend: crate::live::backend_to_wire(value.backend),
@@ -632,6 +651,12 @@ pub fn capabilities_to_wire(
 pub fn capabilities_from_wire(
     value: w::HandoffCapabilities,
 ) -> Result<libvm::handoff::plan::HandoffCapabilities, ConversionError> {
+    if value.protocol_version != 2 {
+        return Err(invalid(
+            "handoff.capabilities.protocol_version",
+            "unsupported handoff format; both peers must use protocol version 2 (no old-format conversion)",
+        ));
+    }
     if value.max_frame_bytes == 0
         || value.max_frame_bytes > libvm::handoff::plan::MAX_FRAME_BYTES
         || value.max_page_entries == 0
@@ -642,6 +667,7 @@ pub fn capabilities_from_wire(
         return Err(invalid("handoff.capabilities", "invalid advertised bounds"));
     }
     Ok(libvm::handoff::plan::HandoffCapabilities {
+        protocol_version: value.protocol_version,
         runtime: h::RuntimeId::new(crate::boot::guid_from_wire(
             &value.runtime,
             "handoff.runtime",
@@ -812,7 +838,7 @@ mod tests {
         let mut intent = intent();
         intent.destination_machine = intent.source_machine;
         let record = h::HandoffRecord {
-            schema: 1,
+            schema: 2,
             role: h::HandoffRole::Source,
             intent,
             binding: None,
@@ -891,6 +917,80 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_round_trip_version_and_reject_old_peers() {
+        use crate::handoff::{capabilities_from_wire, capabilities_to_wire};
+        use prost::Message;
+        let wire = w::HandoffCapabilities {
+            protocol_version: 2,
+            runtime: uuid::Uuid::new_v4().to_string(),
+            kernel_architecture: w::GuestArchitecture::Amd64 as i32,
+            backend: w::LiveBackend::Krun as i32,
+            max_document_bytes: libvm::handoff::plan::MAX_DOCUMENT_BYTES,
+            max_frame_bytes: libvm::handoff::plan::MAX_FRAME_BYTES,
+            max_page_entries: libvm::handoff::plan::MAX_PAGE_ENTRIES,
+        };
+        let decoded = w::HandoffCapabilities::decode(wire.encode_to_vec().as_slice()).unwrap();
+        let native = capabilities_from_wire(decoded).unwrap();
+        assert_eq!(capabilities_to_wire(&native).unwrap(), wire);
+        for version in [0, 1, 3, u32::MAX] {
+            let mut old = wire.clone();
+            old.protocol_version = version;
+            let error = capabilities_from_wire(old).unwrap_err();
+            assert!(error.to_string().contains("unsupported handoff format"));
+        }
+    }
+
+    #[test]
+    fn map_descriptors_round_trip_with_independent_metadata_bounds() {
+        use crate::handoff::{descriptor_from_wire, descriptor_to_wire, validate_payload_length};
+        use libvm::handoff::plan::PayloadDescriptor;
+        use prost::Message;
+        let digest = libvm::ObjectDigest::of_bytes(b"map node");
+        for descriptor in [
+            PayloadDescriptor::MapNode {
+                digest,
+                stream: digest.to_string().parse().unwrap(),
+                height: libvm::handoff::plan::MapNodeHeight::new(0).unwrap(),
+                first_index: libvm::handoff::plan::MapNodeIndex::new(64).unwrap(),
+            },
+            PayloadDescriptor::StreamMap {
+                stream: digest.to_string().parse().unwrap(),
+            },
+            PayloadDescriptor::StreamChunk {
+                stream: digest.to_string().parse().unwrap(),
+                index: 2,
+                length: 8 * 1024 * 1024,
+            },
+        ] {
+            let wire = descriptor_to_wire(&descriptor).unwrap();
+            let decoded =
+                w::HandoffPayloadDescriptor::decode(wire.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(descriptor_from_wire(decoded).unwrap(), descriptor);
+            assert!(validate_payload_length(&descriptor, 0).is_err());
+            assert!(validate_payload_length(&descriptor, descriptor.max_length() + 1).is_err());
+        }
+        for (digest, stream, height, first_index) in [
+            ("invalid".to_owned(), digest.to_string(), 0, 0),
+            (digest.to_string(), "invalid".to_owned(), 0, 0),
+            (digest.to_string(), digest.to_string(), 256, 0),
+            (digest.to_string(), digest.to_string(), 5, 0),
+            (digest.to_string(), digest.to_string(), 0, 1),
+        ] {
+            assert!(descriptor_from_wire(w::HandoffPayloadDescriptor {
+                payload: Some(w::handoff_payload_descriptor::Payload::MapNode(
+                    w::HandoffMapNode {
+                        digest,
+                        stream,
+                        height,
+                        first_index,
+                    }
+                )),
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
     fn malformed_participants_enums_and_payload_bounds_are_rejected() {
         use crate::handoff::{
             descriptor_from_wire, frame_from_wire, intent_from_wire, needs_from_wire,
@@ -906,12 +1006,15 @@ mod tests {
         let mut wire = intent_to_wire(&native).unwrap();
         wire.mode = 99;
         assert!(intent_from_wire(wire).is_err());
-        let identity = w::HandoffPayloadIdentity {
-            digest: native.intent_digest.to_string(),
+        let identity = w::HandoffStreamChunk {
+            stream: native.intent_digest.to_string(),
+            index: 0,
             length: 8 * 1024 * 1024 + 1,
         };
         assert!(descriptor_from_wire(w::HandoffPayloadDescriptor {
-            payload: Some(w::handoff_payload_descriptor::Payload::Chunk(identity)),
+            payload: Some(w::handoff_payload_descriptor::Payload::StreamChunk(
+                identity
+            )),
         })
         .is_err());
         assert!(frame_from_wire(w::HandoffPayloadFrame {

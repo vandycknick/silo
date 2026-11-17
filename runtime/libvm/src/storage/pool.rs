@@ -1,3 +1,6 @@
+//! Immutable pool publication. Map batches sync only new files, with at most
+//! sixteen workers, before installing children and roots. Every batch syncs the
+//! object directory once; batches with new files also sync their staging directory.
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -14,16 +17,38 @@ use crate::storage::identity::{parse_hex, ObjectDigest, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
 use crate::storage::limits::Resource;
 use crate::storage::locks::{self, StorageLock};
-use crate::storage::stream::{
-    open_regular_source, AuthenticatedStream, StreamHasher, StreamMap, StreamStats,
-};
+use crate::storage::map::{AuthenticatedMap, MapAuthority, PoolMapAuthority, PublishedMapNode};
+use crate::storage::stream::{open_regular_source, AuthenticatedStream, StreamHasher, StreamStats};
 use crate::storage::StorageError;
+use std::sync::Arc;
+use vm_spec::capture::Sha256Digest;
+use vm_spec::stream_map::{
+    ChunkSize, StreamNode, StreamRole, StreamRoot, MAX_NODE_BYTES, MAX_ROOT_BYTES,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MapBatchEvent {
+    FileSynced(ObjectDigest),
+    Installed(ObjectDigest),
+    DirectorySynced,
+}
+
+struct NewMapObject {
+    digest: ObjectDigest,
+}
+
+enum MapPublication {
+    Required,
+    Admitted,
+}
+
+const MAP_SYNC_WORKERS: usize = 16;
 
 pub struct PublishedStream {
     pub id: StreamId,
     pub length: u64,
     pub path: PathBuf,
-    pub map: StreamMap,
+    pub map: AuthenticatedMap,
 }
 
 /// Payload-copy authority granted by admission, not clone capability.
@@ -44,13 +69,13 @@ pub(crate) enum PublicationLockPolicy {
 /// authentication. Only a held producer capability can seed restore trust.
 pub(crate) struct SealedStreamPublication {
     file: File,
-    map: StreamMap,
+    map: AuthenticatedMap,
     fingerprint: SourceFingerprint,
     scan_stats: StreamStats,
 }
 
 impl SealedStreamPublication {
-    pub(crate) fn map(&self) -> &StreamMap {
+    pub(crate) fn map(&self) -> &AuthenticatedMap {
         &self.map
     }
 
@@ -318,6 +343,364 @@ fn owned<T>(result: Result<T, crate::LibVmError>) -> Result<T, StorageError> {
 }
 
 impl StoragePool {
+    pub fn map_authority(
+        &self,
+        pin: Arc<dyn Send + Sync>,
+    ) -> Result<Arc<dyn MapAuthority>, StorageError> {
+        Ok(Arc::new(PoolMapAuthority {
+            directory: owned(self.objects.try_clone())?,
+            pin,
+        }))
+    }
+
+    pub fn load_map(
+        &self,
+        digest: ObjectDigest,
+        role: StreamRole,
+        authority: Arc<dyn MapAuthority>,
+    ) -> Result<AuthenticatedMap, StorageError> {
+        let bytes = self.read_object(&digest, MAX_ROOT_BYTES as u64)?;
+        let root = StreamRoot::decode(&bytes)?;
+        if root.id().as_bytes() != digest.as_bytes() {
+            return Err(StorageError::ContentMismatch(self.object_path(&digest)));
+        }
+        AuthenticatedMap::from_root(root, role, authority)
+    }
+
+    fn load_stream_map(
+        &self,
+        id: &StreamId,
+        authority: Arc<dyn MapAuthority>,
+    ) -> Result<AuthenticatedMap, StorageError> {
+        let digest = ObjectDigest::from_sha256(*id.as_bytes());
+        let bytes = self.read_object(&digest, MAX_ROOT_BYTES as u64)?;
+        let root = StreamRoot::decode(&bytes)?;
+        if root.id().as_bytes() != id.as_bytes() {
+            return Err(StorageError::ContentMismatch(self.object_path(&digest)));
+        }
+        let role = if root.chunk_size() == ChunkSize::RAM {
+            StreamRole::Ram
+        } else {
+            StreamRole::Disk
+        };
+        AuthenticatedMap::from_root(root, role, authority)
+    }
+
+    pub fn publish_map_for_catalog(
+        &self,
+        map: &AuthenticatedMap,
+    ) -> Result<(Vec<PublishedMapNode>, StorageLock), StorageError> {
+        self.publish_maps_for_catalog(&[map])
+    }
+
+    pub fn publish_maps_for_catalog(
+        &self,
+        maps: &[&AuthenticatedMap],
+    ) -> Result<(Vec<PublishedMapNode>, StorageLock), StorageError> {
+        let roots = self.lock_roots_shared()?;
+        let nodes = self.publish_maps_with_observer(maps, &|_| {})?;
+        Ok((nodes, roots))
+    }
+
+    /// Caller holds root coordination through graph admission. Existing objects
+    /// are authenticated but neither rewritten nor synchronized.
+    pub fn publish_map(
+        &self,
+        map: &AuthenticatedMap,
+    ) -> Result<Vec<PublishedMapNode>, StorageError> {
+        self.publish_maps_with_observer(&[map], &|_| {})
+    }
+
+    pub(crate) fn publish_maps_with_observer(
+        &self,
+        maps: &[&AuthenticatedMap],
+        observed: &(impl Fn(MapBatchEvent) + Sync),
+    ) -> Result<Vec<PublishedMapNode>, StorageError> {
+        let mut staged = Vec::new();
+        let mut batches = std::collections::HashSet::new();
+        for map in maps {
+            map.staged_nodes(&mut staged, &mut batches);
+        }
+        let mut levels: [Vec<(ObjectDigest, Arc<dyn MapAuthority>)>; 5] =
+            std::array::from_fn(|_| Vec::new());
+        let mut seen = std::collections::HashSet::new();
+        for (digest, authority) in staged {
+            if !seen.insert(digest) {
+                continue;
+            }
+            let height = authority.node_height(digest).ok_or_else(|| {
+                StorageError::InvalidPath("staged node has no producer geometry".into())
+            })?;
+            let level = levels
+                .get_mut(usize::from(height))
+                .ok_or(vm_spec::stream_map::MapError::InvalidHeight(height))?;
+            level.push((digest, authority));
+        }
+        let mut staging = None;
+        let mut new_objects = Vec::new();
+        let mut admitted = Vec::new();
+        for (height, nodes) in levels.into_iter().enumerate() {
+            for (digest, authority) in nodes {
+                let mut source = authority.open_node(digest)?;
+                let metadata = source.as_ref().map(File::metadata).transpose()?;
+                let fingerprint = metadata.as_ref().map(SourceFingerprint::new);
+                let mut buffer = [0; MAX_NODE_BYTES];
+                let length = if let Some(file) = source.as_mut() {
+                    let length = usize::try_from(
+                        metadata
+                            .as_ref()
+                            .ok_or_else(|| {
+                                StorageError::InvalidPath("staged node metadata is missing".into())
+                            })?
+                            .len(),
+                    )
+                    .map_err(|_| vm_spec::stream_map::MapError::ArithmeticOverflow)?;
+                    if length > MAX_NODE_BYTES {
+                        return Err(vm_spec::stream_map::MapError::NodeTooLarge(length).into());
+                    }
+                    file.read_exact(&mut buffer[..length])?;
+                    length
+                } else {
+                    authority
+                        .read_node(Sha256Digest::from_bytes(*digest.as_bytes()), &mut buffer)?
+                };
+                let bytes = buffer
+                    .get(..length)
+                    .ok_or(vm_spec::stream_map::MapError::NodeTooLarge(length))?;
+                let actual = Sha256Digest::of_bytes(bytes);
+                if actual.as_bytes() != digest.as_bytes() {
+                    return Err(vm_spec::stream_map::MapError::DigestMismatch {
+                        expected: Sha256Digest::from_bytes(*digest.as_bytes()),
+                        actual,
+                    }
+                    .into());
+                }
+                let node = StreamNode::decode(bytes, height as u8)?;
+                let children = if height == 0 {
+                    Vec::new()
+                } else {
+                    node.entries()
+                        .map(|(slot, digest)| (slot, ObjectDigest::from_sha256(*digest.as_bytes())))
+                        .collect()
+                };
+                self.stage_map_object(
+                    digest,
+                    bytes,
+                    source.as_ref(),
+                    &mut staging,
+                    &mut new_objects,
+                )?;
+                if let (Some(source), Some(before)) = (source.as_ref(), fingerprint) {
+                    if before != SourceFingerprint::new(&source.metadata()?) {
+                        return Err(StorageError::SourceChanged(self.object_path(&digest)));
+                    }
+                }
+                admitted.push(PublishedMapNode {
+                    digest,
+                    height: Some(height as u8),
+                    children,
+                });
+            }
+        }
+        for map in maps {
+            let digest = ObjectDigest::from_sha256(*map.id().as_bytes());
+            if !seen.insert(digest) {
+                continue;
+            }
+            self.stage_map_object(
+                digest,
+                &map.canonical_bytes()?,
+                None,
+                &mut staging,
+                &mut new_objects,
+            )?;
+            let children = map
+                .root()
+                .tree_digest()
+                .map(|digest| vec![(0, ObjectDigest::from_sha256(*digest.as_bytes()))])
+                .unwrap_or_default();
+            admitted.push(PublishedMapNode {
+                digest,
+                height: None,
+                children,
+            });
+        }
+        if let Some(staging) = &staging {
+            self.finish_map_batch(staging, &new_objects, observed)?;
+        } else {
+            // Existing data was synced before its canonical name was installed.
+            // Always commit the directory entry, including retries after a
+            // previous installation or directory barrier was interrupted.
+            owned(self.objects.sync())?;
+            observed(MapBatchEvent::DirectorySynced);
+        }
+        Ok(admitted)
+    }
+
+    fn stage_map_object<'a>(
+        &'a self,
+        digest: ObjectDigest,
+        bytes: &[u8],
+        source: Option<&File>,
+        staging: &mut Option<Staging<'a>>,
+        new_objects: &mut Vec<NewMapObject>,
+    ) -> Result<(), StorageError> {
+        if self.existing_map_object(digest, bytes)? {
+            return Ok(());
+        }
+        if staging.is_none() {
+            *staging = Some(self.stage_map_batch()?);
+        }
+        let staging = staging
+            .as_ref()
+            .ok_or_else(|| StorageError::InvalidPath("map batch staging is missing".into()))?;
+        let name = digest.hex();
+        let fd = openat(
+            staging.directory.fd(),
+            name.as_str(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::S_IRUSR,
+        )?;
+        let mut output = File::from(fd);
+        if fstat(&output)?.st_mode & 0o7777 != 0o400 {
+            return Err(StorageError::InvalidPath(
+                "umask removed immutable map permissions".into(),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let cloned = match source {
+            Some(source) => match crate::storage::clone::try_reflink(source, &output) {
+                Ok(()) => true,
+                Err(error) if crate::storage::clone::clone_error_allows_fallback(&error, true) => {
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            },
+            None => false,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let cloned = {
+            let _ = source;
+            false
+        };
+        if !cloned {
+            output.write_all(bytes)?;
+        }
+        new_objects.push(NewMapObject { digest });
+        Ok(())
+    }
+
+    fn existing_map_object(
+        &self,
+        digest: ObjectDigest,
+        bytes: &[u8],
+    ) -> Result<bool, StorageError> {
+        let Some(mut file) = existing(&self.objects, &digest.hex())? else {
+            return Ok(false);
+        };
+        if file.metadata()?.len() != bytes.len() as u64 || bytes.len() > MAX_NODE_BYTES {
+            return Err(StorageError::ContentMismatch(self.object_path(&digest)));
+        }
+        let mut buffer = [0; MAX_NODE_BYTES];
+        file.read_exact(&mut buffer[..bytes.len()])?;
+        if &buffer[..bytes.len()] != bytes {
+            return Err(StorageError::ContentMismatch(self.object_path(&digest)));
+        }
+        Ok(true)
+    }
+
+    fn stage_map_batch(&self) -> Result<Staging<'_>, StorageError> {
+        let name = format!("stage-{}", Uuid::new_v4());
+        let lease = locks::acquire_new_deferred(
+            &self.publication,
+            &format!("{name}.lock"),
+            FlockArg::LockSharedNonblock,
+        )?
+        .ok_or_else(|| StorageError::InvalidPath("fresh map staging lock is busy".into()))?;
+        let directory = owned(self.temporary.create_dir_deferred(&name))?
+            .ok_or_else(|| StorageError::InvalidPath("map staging ID collision".into()))?;
+        Ok(Staging {
+            parent: &self.temporary,
+            directory,
+            name,
+            _lease: lease,
+        })
+    }
+
+    /// File barriers happen concurrently, before any canonical name is installed.
+    /// Then publish child-first, and commit just the two changed directories.
+    fn finish_map_batch(
+        &self,
+        staging: &Staging<'_>,
+        objects: &[NewMapObject],
+        observed: &(impl Fn(MapBatchEvent) + Sync),
+    ) -> Result<(), StorageError> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| -> Result<(), StorageError> {
+            let mut workers = Vec::new();
+            for _ in 0..MAP_SYNC_WORKERS.min(objects.len()) {
+                let next = &next;
+                workers.push(
+                    std::thread::Builder::new()
+                        .name("map-sync".into())
+                        .spawn_scoped(scope, move || -> Result<(), StorageError> {
+                            loop {
+                                let index = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(object) = objects.get(index) else {
+                                    return Ok(());
+                                };
+                                let file = existing(&staging.directory, &object.digest.hex())?
+                                    .ok_or_else(|| {
+                                        StorageError::InvalidPath(
+                                            "staged map object disappeared".into(),
+                                        )
+                                    })?;
+                                file.sync_all()?;
+                                observed(MapBatchEvent::FileSynced(object.digest));
+                            }
+                        })?,
+                );
+            }
+            let mut failure = None;
+            for worker in workers {
+                let result = worker
+                    .join()
+                    .map_err(|_| {
+                        StorageError::Io(std::io::Error::other("map sync worker panicked"))
+                    })
+                    .and_then(|result| result);
+                if let Err(error) = result {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })?;
+        for object in objects {
+            let name = object.digest.hex();
+            match rename_component_no_replace(&staging.directory, &name, &self.objects, &name) {
+                Ok(()) => observed(MapBatchEvent::Installed(object.digest)),
+                Err(StorageError::Io(error))
+                    if error.raw_os_error() == Some(Errno::EEXIST as i32) =>
+                {
+                    // A non-map byte-object publisher can race our batch lock.
+                    // Its existing immutable object must independently match.
+                    self.read_object(&object.digest, MAX_NODE_BYTES as u64)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        owned(self.objects.sync())?;
+        observed(MapBatchEvent::DirectorySynced);
+        owned(staging.directory.sync())?;
+        observed(MapBatchEvent::DirectorySynced);
+        Ok(())
+    }
     /// `images_dir` is the canonical images/ directory, not SILO_HOME itself.
     pub fn open(images_dir: &Path) -> Result<Self, StorageError> {
         let root = owned(OwnedDirectory::open_root(images_dir))?;
@@ -422,13 +805,18 @@ impl StoragePool {
     }
 
     /// Validate the immutable pool file and its identity without modifying state.
-    pub fn verify_stream(&self, id: &StreamId) -> Result<StreamMap, StorageError> {
+    pub fn verify_stream(&self, id: &StreamId) -> Result<AuthenticatedMap, StorageError> {
+        let pin = Arc::new(self.lock_roots_shared()?);
+        let map = self.load_stream_map(id, self.map_authority(pin)?)?;
+        for node in map.nodes() {
+            node?;
+        }
         let file = self.open_stream(id)?;
-        let metadata = file.metadata()?;
-        Resource::ArtifactStreamBytes.check(metadata.len())?;
-        let before = SourceFingerprint::new(&metadata);
-        let scan = StreamHasher::new().hash_open_file(&file, metadata.len())?;
-        if scan.map.id() != *id || before != SourceFingerprint::new(&file.metadata()?) {
+        if file.metadata()?.len() != map.length() {
+            return Err(StorageError::ContentMismatch(self.stream_path(id)));
+        }
+        let scan = StreamHasher::new(map.chunk_size()).hash_open_file(&file, map.length())?;
+        if scan.map.id() != *id {
             return Err(StorageError::ContentMismatch(self.stream_path(id)));
         }
         Ok(scan.map)
@@ -440,11 +828,21 @@ impl StoragePool {
     pub(crate) fn authenticate_stream_full(
         &self,
         id: &StreamId,
+        role: StreamRole,
     ) -> Result<AuthenticatedStream, StorageError> {
+        let guard = Arc::new(self.lock_roots_shared()?);
+        let expected = self
+            .load_stream_map(id, self.map_authority(guard)?)?
+            .with_role(role)?;
+        for node in expected.nodes() {
+            node?;
+        }
         let file = self.open_stream(id)?;
-        let length = file.metadata()?.len();
-        Resource::ArtifactStreamBytes.check(length)?;
-        let authenticated = StreamHasher::new().authenticate(file, length)?;
+        if file.metadata()?.len() != expected.length() {
+            return Err(StorageError::ContentMismatch(self.stream_path(id)));
+        }
+        let authenticated =
+            StreamHasher::new(expected.chunk_size()).authenticate(file, expected.length())?;
         if authenticated.map().id() != *id {
             return Err(StorageError::ContentMismatch(self.stream_path(id)));
         }
@@ -586,7 +984,7 @@ impl StoragePool {
         let mut file = existing(&self.objects, &digest.hex())?.ok_or_else(|| {
             StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "missing immutable object",
+                format!("missing immutable object {digest}"),
             ))
         })?;
         let length = file.metadata()?.len();
@@ -628,7 +1026,7 @@ impl StoragePool {
         existing(&self.objects, &digest.hex())?.ok_or_else(|| {
             StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "missing immutable object",
+                format!("missing immutable object {digest}"),
             ))
         })
     }
@@ -763,8 +1161,6 @@ impl StoragePool {
         )
     }
 
-    // Native stat field types differ between Linux and Darwin.
-    #[allow(clippy::unnecessary_cast)]
     pub(crate) fn operation_lease_identity(
         &self,
         operation: Uuid,
@@ -784,7 +1180,18 @@ impl StoragePool {
                 "unsafe stable operation lease".into(),
             ));
         }
-        Ok((stat.st_dev as u64, stat.st_ino as u64))
+        #[cfg(target_os = "linux")]
+        {
+            Ok((stat.st_dev, stat.st_ino))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Ok((
+                u64::try_from(stat.st_dev)
+                    .map_err(|_| StorageError::InvalidPath("negative lease device".into()))?,
+                stat.st_ino,
+            ))
+        }
     }
 
     /// Canonical lease inventory is traversed outside roots coordination.
@@ -891,6 +1298,31 @@ impl StoragePool {
         input: File,
         length: u64,
     ) -> Result<(PublishedStream, StorageLock), StorageError> {
+        let (published, _, roots) = self.publish_stream_file_inner(input, length, false)?;
+        Ok((published, roots))
+    }
+
+    pub fn publish_stream_file_with_sha256_for_catalog(
+        &self,
+        input: File,
+        length: u64,
+    ) -> Result<(PublishedStream, Sha256Digest, StorageLock), StorageError> {
+        let (published, digest, roots) = self.publish_stream_file_inner(input, length, true)?;
+        let digest = digest.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing requested byte digest",
+            )
+        })?;
+        Ok((published, digest, roots))
+    }
+
+    fn publish_stream_file_inner(
+        &self,
+        input: File,
+        length: u64,
+        whole_sha256: bool,
+    ) -> Result<(PublishedStream, Option<Sha256Digest>, StorageLock), StorageError> {
         Resource::ArtifactStreamBytes.check(length)?;
         let metadata = input.metadata()?;
         if !metadata.is_file() || metadata.len() != length {
@@ -901,8 +1333,13 @@ impl StoragePool {
             .into());
         }
         let (staging, file) = self.stage()?;
-        let mut hasher = StreamHasher::new();
-        let map = hasher.copy_file_and_hash(&input, length, &file)?.map;
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
+        let (map, sha256) = if whole_sha256 {
+            let (scan, sha256) = hasher.copy_file_and_hash_with_sha256(&input, length, &file)?;
+            (scan.map, Some(sha256))
+        } else {
+            (hasher.copy_file_and_hash(&input, length, &file)?.map, None)
+        };
         let id = map.id();
         seal(&file)?;
         let name = id.hex();
@@ -919,16 +1356,17 @@ impl StoragePool {
         } else {
             None
         };
+        let (map_nodes, map_roots) = self.publish_map_for_catalog(&map)?;
+        drop(map_nodes);
         let roots = self.finish_publication(&self.streams, &staging, &name, verified)?;
-        Ok((
-            PublishedStream {
-                id,
-                length: map.length(),
-                path: self.stream_path(&id),
-                map,
-            },
-            roots,
-        ))
+        let published = PublishedStream {
+            id,
+            length: map.length(),
+            path: self.stream_path(&id),
+            map,
+        };
+        drop(map_roots);
+        Ok((published, sha256, roots))
     }
 
     /// Qualify one staging-filesystem/pool pair using bounded anonymous files.
@@ -971,10 +1409,46 @@ impl StoragePool {
     pub(crate) fn publish_sealed_stream_for_catalog(
         &self,
         input: &File,
-        map: &StreamMap,
+        map: &AuthenticatedMap,
         verified_receipt: Option<SourceFingerprint>,
         mode: SealedStreamPublicationMode,
     ) -> Result<(SealedStreamPublication, StorageLock), StorageError> {
+        self.publish_sealed_stream_inner(
+            input,
+            map,
+            verified_receipt,
+            mode,
+            MapPublication::Required,
+        )
+    }
+
+    /// Caller owns a catalog-retained map from the completed graph batch.
+    /// Publishing its flat inode must not repeat that graph's durability work.
+    pub(crate) fn publish_admitted_stream_for_catalog(
+        &self,
+        input: &File,
+        map: &AuthenticatedMap,
+        verified_receipt: Option<SourceFingerprint>,
+        mode: SealedStreamPublicationMode,
+    ) -> Result<(SealedStreamPublication, StorageLock), StorageError> {
+        self.publish_sealed_stream_inner(
+            input,
+            map,
+            verified_receipt,
+            mode,
+            MapPublication::Admitted,
+        )
+    }
+
+    fn publish_sealed_stream_inner(
+        &self,
+        input: &File,
+        map: &AuthenticatedMap,
+        verified_receipt: Option<SourceFingerprint>,
+        mode: SealedStreamPublicationMode,
+        map_publication: MapPublication,
+    ) -> Result<(SealedStreamPublication, StorageLock), StorageError> {
+        let map_admitted = matches!(map_publication, MapPublication::Admitted);
         let metadata = input.metadata()?;
         let before = SourceFingerprint::new(&metadata);
         let id = map.id();
@@ -991,13 +1465,24 @@ impl StoragePool {
             let stats = if verified_receipt == Some(fingerprint) {
                 StreamStats::default()
             } else {
-                let scan = StreamHasher::new().hash_open_file(&file, map.length())?;
+                let scan =
+                    StreamHasher::new(map.chunk_size()).hash_open_file(&file, map.length())?;
                 if scan.map != *map {
                     return Err(StorageError::ContentMismatch(self.stream_path(&id)));
                 }
                 scan.stats
             };
             let roots = self.lock_roots_shared()?;
+            if map_admitted || verified_receipt == Some(fingerprint) {
+                // Completed graph admission or verified receipt authority makes
+                // this a small root check, not another node-DAG publication.
+                self.read_object(
+                    &ObjectDigest::from_sha256(*id.as_bytes()),
+                    MAX_ROOT_BYTES as u64,
+                )?;
+            } else {
+                self.publish_map(map)?;
+            }
             if SourceFingerprint::new(&input.metadata()?) != before {
                 return Err(StorageError::ContentMismatch(self.stream_path(&id)));
             }
@@ -1023,11 +1508,20 @@ impl StoragePool {
             drop(file);
             drop(staging);
             let (staging, file) = self.stage()?;
-            let scan = StreamHasher::new().copy_file_and_hash(input, map.length(), &file)?;
+            let scan = StreamHasher::new(map.chunk_size()).copy_file_and_hash(
+                input,
+                map.length(),
+                &file,
+            )?;
             if scan.map != *map {
                 return Err(StorageError::ContentMismatch(self.stream_path(&id)));
             }
-            (staging, file, scan.map, scan.stats)
+            (
+                staging,
+                file,
+                if map_admitted { map.clone() } else { scan.map },
+                scan.stats,
+            )
         };
         if SourceFingerprint::new(&input.metadata()?) != before
             || file.metadata()?.len() != map.length()
@@ -1036,6 +1530,13 @@ impl StoragePool {
         }
         seal(&file)?;
         let sealed = SourceFingerprint::new(&file.metadata()?);
+        let map_roots = if map_admitted {
+            None
+        } else {
+            let (map_nodes, roots) = self.publish_map_for_catalog(map)?;
+            drop(map_nodes);
+            Some(roots)
+        };
         let roots = self.finish_publication(&self.streams, &staging, &name, None)?;
         let metadata = file.metadata()?;
         if !sealed.same_contents_after_metadata_change(&metadata) {
@@ -1048,6 +1549,54 @@ impl StoragePool {
             scan_stats: stats,
         };
         publication.recheck(self)?;
+        drop(map_roots);
+        Ok((publication, roots))
+    }
+
+    /// Admit a caller-produced file that is still owned by this pool's staging.
+    /// The producer has authenticated bytes while writing; do not reread them.
+    pub(crate) fn publish_staged_stream_for_catalog(
+        &self,
+        staging: Staging<'_>,
+        file: File,
+        map: &AuthenticatedMap,
+    ) -> Result<(SealedStreamPublication, StorageLock), StorageError> {
+        let metadata = file.metadata()?;
+        let staged_file = open_regular_source(&staging.directory.path().join("content"))?;
+        if SourceFingerprint::new(&metadata) != SourceFingerprint::new(&staged_file.metadata()?)
+            || metadata.len() != map.length()
+        {
+            return Err(StorageError::ContentMismatch(
+                staging.directory.path().join("content"),
+            ));
+        }
+        let name = map.id().hex();
+        let _publication = self.publication_lock(&format!("stream-{name}.lock"))?;
+        if existing(&self.streams, &name)?.is_some() {
+            drop(_publication);
+            return self.publish_sealed_stream_for_catalog(
+                &file,
+                map,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            );
+        }
+        seal(&file)?;
+        let sealed = SourceFingerprint::new(&file.metadata()?);
+        let (_nodes, map_guard) = self.publish_map_for_catalog(map)?;
+        let roots = self.finish_publication(&self.streams, &staging, &name, None)?;
+        let metadata = file.metadata()?;
+        if !sealed.same_contents_after_metadata_change(&metadata) {
+            return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
+        }
+        let publication = SealedStreamPublication {
+            file,
+            map: map.clone(),
+            fingerprint: SourceFingerprint::new(&metadata),
+            scan_stats: StreamStats::default(),
+        };
+        publication.recheck(self)?;
+        drop(map_guard);
         Ok((publication, roots))
     }
 
@@ -1253,12 +1802,6 @@ pub(crate) struct Staging<'a> {
     _lease: StorageLock,
 }
 
-impl Staging<'_> {
-    pub(crate) fn path(&self) -> PathBuf {
-        self.directory.path().join("content")
-    }
-}
-
 impl Drop for Staging<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.parent.remove_tree(&self.name) {
@@ -1410,7 +1953,10 @@ fn immutable_length(directory: &OwnedDirectory, name: &str) -> Result<Option<u64
     Ok(Some(stat.st_size as u64))
 }
 
-fn existing(directory: &OwnedDirectory, name: &str) -> Result<Option<File>, StorageError> {
+pub(crate) fn existing(
+    directory: &OwnedDirectory,
+    name: &str,
+) -> Result<Option<File>, StorageError> {
     let fd = match openat(
         directory.fd(),
         name,
@@ -1465,9 +2011,12 @@ mod tests {
     use std::sync::Arc;
 
     use crate::storage::identity::ObjectDigest;
+    use crate::storage::map::MapNodeWriter;
     use crate::storage::pool::{SealedStreamPublicationMode, StoragePool};
-    use crate::storage::stream::{StreamHasher, StreamMap};
+    use crate::storage::stream::StreamHasher;
     use crate::storage::StorageError;
+    use vm_spec::capture::Sha256Digest;
+    use vm_spec::stream_map::{Chunk, ChunkChange, ChunkSize, StreamRole, StreamRoot};
 
     fn ram_tempdir() -> tempfile::TempDir {
         match std::env::var_os("SILO_TEST_COPY_DIR") {
@@ -1501,7 +2050,10 @@ mod tests {
         assert_eq!(object.digest, ObjectDigest::of_bytes(b"raw bytes\0\0"));
         assert_eq!(
             stream.id,
-            StreamHasher::new().hash_file(&source).unwrap().id()
+            StreamHasher::new(ChunkSize::DISK)
+                .hash_file(&source)
+                .unwrap()
+                .id()
         );
         assert_ne!(stream.id.to_string(), object.digest.to_string());
         assert_eq!(
@@ -1600,7 +2152,6 @@ mod tests {
     #[test]
     fn zero_only_and_zero_tail_publications_keep_the_entire_logical_length() {
         use crate::storage::limits::CHUNK_SIZE;
-        use crate::storage::stream::Chunk;
         use std::io::{Seek, SeekFrom, Write};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1611,13 +2162,18 @@ mod tests {
         let pool = StoragePool::open(&dir.path().join("images")).unwrap();
         let zeros = pool.publish_stream(&source).unwrap();
         assert_eq!(std::fs::metadata(&zeros.path).unwrap().len(), length);
-        assert_eq!(zeros.map.chunks(), &[Chunk::Zero, Chunk::Zero]);
+        assert_eq!(zeros.map.present_chunks().count(), 0);
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&[1]).unwrap();
         let tail = pool.publish_stream(&source).unwrap();
         assert_eq!(std::fs::metadata(&tail.path).unwrap().len(), length);
-        assert_eq!(tail.map.chunks()[1], Chunk::Zero);
-        assert_eq!(StreamHasher::new().hash_file(&tail.path).unwrap(), tail.map);
+        assert_eq!(tail.map.lookup(1).unwrap(), Chunk::Zero);
+        assert_eq!(
+            StreamHasher::new(ChunkSize::DISK)
+                .hash_file(&tail.path)
+                .unwrap(),
+            tail.map
+        );
         assert_ne!(zeros.id, tail.id);
     }
 
@@ -1808,7 +2364,7 @@ mod tests {
         run_recovery_probe(&root, "published");
         let unknown = pool.streams.path().join("not-a-stream-id");
         std::fs::write(&unknown, b"not managed stream bytes").unwrap();
-        let expected = StreamHasher::new()
+        let expected = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_file(&dir.path().join("orphan-source"))
             .unwrap();
         let mut first = pool.scan_streams().unwrap();
@@ -1882,6 +2438,13 @@ mod tests {
             pool.verify_stream(&published.id),
             Err(StorageError::ContentMismatch(_))
         ));
+        std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&published.path, b"tampered").unwrap();
+        std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(matches!(
+            pool.verify_stream(&published.id),
+            Err(StorageError::ContentMismatch(_))
+        ));
         std::fs::remove_file(&published.path).unwrap();
         symlink(&source, &published.path).unwrap();
         assert!(pool.verify_stream(&published.id).is_err());
@@ -1945,27 +2508,44 @@ mod tests {
 
     #[test]
     fn sealed_ram_map_preserves_explicit_zero_and_short_final_chunk() {
-        use crate::storage::stream::{Chunk, StreamMap};
         let dir = tempfile::tempdir().unwrap();
         let pool = StoragePool::open(&dir.path().join("images")).unwrap();
-        let chunk_size = crate::storage::limits::CHUNK_SIZE;
+        let chunk_size = ChunkSize::RAM.bytes() as usize;
         let mut old = vec![0x61; 2 * chunk_size + 3];
         let old_path = dir.path().join("baseline");
         std::fs::write(&old_path, &old).unwrap();
-        let baseline = pool.publish_stream(&old_path).unwrap();
+        let baseline = StreamHasher::new(ChunkSize::RAM)
+            .hash_reader(old.as_slice())
+            .unwrap();
+        let (base_publication, base_guard) = pool
+            .publish_sealed_stream_for_catalog(
+                &File::open(&old_path).unwrap(),
+                &baseline,
+                None,
+                SealedStreamPublicationMode::CopyAllowed,
+            )
+            .unwrap();
+        drop(base_guard);
         old[chunk_size..2 * chunk_size].fill(0);
         old[2 * chunk_size..].copy_from_slice(&[0, 0, 7]);
         let candidate = dir.path().join("candidate");
         std::fs::write(&candidate, &old).unwrap();
-        let map = StreamMap::new(
-            old.len() as u64,
-            vec![
-                baseline.map.chunks()[0],
-                Chunk::Zero,
-                Chunk::Data(crate::storage::identity::ObjectDigest::of_bytes(&[0, 0, 7])),
-            ],
-        )
-        .unwrap();
+        let map = baseline
+            .update_sorted(
+                [
+                    Ok(ChunkChange {
+                        index: 1,
+                        value: Chunk::Zero,
+                    }),
+                    Ok(ChunkChange {
+                        index: 2,
+                        value: Chunk::Data(Sha256Digest::of_bytes(&[0, 0, 7])),
+                    }),
+                ],
+                &mut MapNodeWriter::new().unwrap(),
+            )
+            .unwrap()
+            .into_map();
         let (published, roots) = pool
             .publish_sealed_stream_for_catalog(
                 &std::fs::File::open(&candidate).unwrap(),
@@ -1975,11 +2555,11 @@ mod tests {
             )
             .unwrap();
         drop(roots);
-        std::fs::remove_file(&baseline.path).unwrap();
+        std::fs::remove_file(pool.stream_path(&base_publication.map().id())).unwrap();
         let id = published.map().id();
         assert_eq!(pool.verify_stream(&id).unwrap(), map);
         assert_eq!(std::fs::read(pool.stream_path(&id)).unwrap(), old);
-        assert_eq!(map.chunks()[1], Chunk::Zero);
+        assert_eq!(map.lookup(1).unwrap(), Chunk::Zero);
     }
 
     #[test]
@@ -1998,7 +2578,7 @@ mod tests {
         assert_eq!(pool.verify_stream(&published.id).unwrap(), published.map);
         assert_eq!(
             published.id,
-            StreamHasher::new()
+            StreamHasher::new(ChunkSize::DISK)
                 .hash_reader(b"original".as_slice())
                 .unwrap()
                 .id(),
@@ -2020,7 +2600,9 @@ mod tests {
         let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
         let source = temporary.path().join("ram");
         std::fs::write(&source, b"sealed RAM").unwrap();
-        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_file(&source)
+            .unwrap();
         let input = File::open(&source).unwrap();
         for bytes in [
             b"short".as_slice(),
@@ -2048,7 +2630,7 @@ mod tests {
         let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
         let source = temporary.path().join("ram");
         std::fs::write(&source, b"sealed RAM").unwrap();
-        let map = StreamHasher::new()
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_reader(b"sealed RAM".as_slice())
             .unwrap();
         let (proof, roots) = pool
@@ -2107,7 +2689,9 @@ mod tests {
         let source = temporary.path().join("ram");
         std::fs::write(&source, &bytes).unwrap();
         let input = File::open(&source).unwrap();
-        let map = StreamHasher::new().hash_reader(bytes.as_slice()).unwrap();
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_reader(bytes.as_slice())
+            .unwrap();
         let (staging, destination) = pool.stage().unwrap();
         if !reflink_or_skip(&input, &destination) {
             return;
@@ -2150,7 +2734,9 @@ mod tests {
                 vec![0x39; 4096]
             };
             std::fs::write(&source, &bytes).unwrap();
-            let map = StreamHasher::new().hash_reader(bytes.as_slice()).unwrap();
+            let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_reader(bytes.as_slice())
+                .unwrap();
             let input = File::open(&source).unwrap();
             let (staging, destination) = pool.stage().unwrap();
             if !reflink_or_skip(&input, &destination) {
@@ -2176,7 +2762,7 @@ mod tests {
             publication.recheck(&pool).unwrap();
             drop(roots);
             assert!(matches!(
-                pool.authenticate_stream_full(&map.id()),
+                pool.authenticate_stream_full(&map.id(), map.role()),
                 Err(StorageError::ContentMismatch(_))
             ));
         }
@@ -2189,7 +2775,9 @@ mod tests {
         let source = temporary.path().join("ram");
         std::fs::write(&source, b"sealed RAM").unwrap();
         let input = File::open(&source).unwrap();
-        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_file(&source)
+            .unwrap();
         let (staging, destination) = pool.stage().unwrap();
         if crate::storage::pool::try_clone_stream(&input, &destination).unwrap() {
             eprintln!(
@@ -2227,8 +2815,15 @@ mod tests {
                 SealedStreamPublicationMode::CopyAllowed
             )
             .is_err());
-        let zero_map =
-            StreamMap::new(map.length(), vec![crate::storage::stream::Chunk::Zero]).unwrap();
+        let zero_map = MapNodeWriter::new()
+            .unwrap()
+            .finish(
+                StreamRoot::empty(map.length(), map.chunk_size()).unwrap(),
+                map.role(),
+                None,
+            )
+            .unwrap()
+            .into_map();
         assert!(pool
             .publish_sealed_stream_for_catalog(
                 &input,
@@ -2254,7 +2849,9 @@ mod tests {
         let source = source_dir.path().join("ram");
         std::fs::write(&source, b"cross-filesystem RAM").unwrap();
         let input = File::open(&source).unwrap();
-        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_file(&source)
+            .unwrap();
         let (staging, destination) = pool.stage().unwrap();
         assert_ne!(
             input.metadata().unwrap().dev(),
@@ -2287,7 +2884,15 @@ mod tests {
         let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
         let source = temporary.path().join("ram");
         std::fs::write(&source, []).unwrap();
-        let map = StreamMap::new(0, Vec::new()).unwrap();
+        let map = MapNodeWriter::new()
+            .unwrap()
+            .finish(
+                StreamRoot::empty(0, ChunkSize::RAM).unwrap(),
+                StreamRole::Ram,
+                None,
+            )
+            .unwrap()
+            .into_map();
         let (proof, _roots) = pool
             .publish_sealed_stream_for_catalog(
                 &File::open(&source).unwrap(),
@@ -2332,7 +2937,9 @@ mod tests {
         let bytes = vec![0x51; 8192];
         std::fs::write(&source, &bytes).unwrap();
         let input = File::open(&source).unwrap();
-        let map = StreamHasher::new().hash_reader(bytes.as_slice()).unwrap();
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_reader(bytes.as_slice())
+            .unwrap();
         let (staging, probe) = pool.stage().unwrap();
         let reflink = crate::storage::pool::try_clone_stream(&input, &probe).unwrap();
         drop(probe);
@@ -2388,7 +2995,7 @@ mod tests {
         let next_source = temporary.path().join("distinct-sealed-disk.raw");
         let next_bytes = vec![0x53; bytes.len()];
         std::fs::write(&next_source, &next_bytes).unwrap();
-        let next_map = StreamHasher::new()
+        let next_map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_reader(next_bytes.as_slice())
             .unwrap();
         assert_ne!(next_map.id(), map.id());
@@ -2491,6 +3098,11 @@ mod tests {
             .unwrap();
         let input_reads = watch_stream_reads(&input);
         let retained_reads = watch_stream_reads(&published.path);
+        let node_reads: Vec<_> = published
+            .map
+            .nodes()
+            .map(|node| watch_stream_reads(&pool.object_path(&node.unwrap().digest)))
+            .collect();
         let (reused, roots) = pool
             .publish_sealed_stream_for_catalog(
                 &source,
@@ -2506,6 +3118,7 @@ mod tests {
         );
         assert!(!observed_stream_read(&input_reads));
         assert!(!observed_stream_read(&retained_reads));
+        assert!(!node_reads.iter().any(observed_stream_read));
         assert_eq!(
             staging.read_events().unwrap_err(),
             nix::errno::Errno::EAGAIN
@@ -2550,7 +3163,7 @@ mod tests {
         let bytes = vec![0x53; 4096];
         std::fs::write(&path, &bytes).unwrap();
         let source = std::fs::File::open(&path).unwrap();
-        let map = crate::storage::stream::StreamHasher::new()
+        let map = crate::storage::stream::StreamHasher::new(ChunkSize::DISK)
             .hash_reader(bytes.as_slice())
             .unwrap();
         let probe = tempfile::tempfile_in(pool.temporary.path()).unwrap();
@@ -2621,5 +3234,213 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+    }
+
+    fn graph_batch_fixture(
+        profile: ChunkSize,
+        count: u64,
+        seed: u8,
+    ) -> crate::storage::map::AuthenticatedMap {
+        use vm_spec::stream_map::{build_sorted, PresentChunk};
+        let mut writer = MapNodeWriter::new().unwrap();
+        let root = build_sorted(
+            (count * 64 + 1) * profile.bytes(),
+            profile,
+            (0..count).map(|index| {
+                Ok(PresentChunk {
+                    index: index * 64,
+                    digest: Sha256Digest::of_bytes(&[seed, index as u8]),
+                })
+            }),
+            &mut writer,
+        )
+        .unwrap();
+        let role = if profile == ChunkSize::RAM {
+            StreamRole::Ram
+        } else {
+            StreamRole::Disk
+        };
+        writer.finish(root, role, None).unwrap().into_map()
+    }
+
+    #[test]
+    fn graph_batch_syncs_new_files_before_install_and_only_two_directories() {
+        use crate::storage::pool::MapBatchEvent;
+        use std::sync::Mutex;
+        for count in [1, 96] {
+            let temporary = tempfile::tempdir().unwrap();
+            let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+            let ram = graph_batch_fixture(ChunkSize::RAM, count, 11);
+            let disk = graph_batch_fixture(ChunkSize::DISK, count, 22);
+            let events = Mutex::new(Vec::new());
+            let _roots = pool.lock_roots_shared().unwrap();
+            let rows = pool
+                .publish_maps_with_observer(&[&ram, &disk], &|event| {
+                    events.lock().unwrap().push(event);
+                })
+                .unwrap();
+            let events = events.into_inner().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, MapBatchEvent::FileSynced(_)))
+                    .count(),
+                rows.len()
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, MapBatchEvent::DirectorySynced))
+                    .count(),
+                2
+            );
+            let first_install = events
+                .iter()
+                .position(|event| matches!(event, MapBatchEvent::Installed(_)))
+                .unwrap();
+            assert!(events[..first_install]
+                .iter()
+                .all(|event| matches!(event, MapBatchEvent::FileSynced(_))));
+            assert_eq!(first_install, rows.len());
+            let first_directory = events
+                .iter()
+                .position(|event| matches!(event, MapBatchEvent::DirectorySynced))
+                .unwrap();
+            assert!(events[first_install..first_directory]
+                .iter()
+                .all(|event| matches!(event, MapBatchEvent::Installed(_))));
+            let levels: std::collections::BTreeMap<_, _> = rows
+                .iter()
+                .map(|row| (row.digest, row.height.unwrap_or(5)))
+                .collect();
+            let installed: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    MapBatchEvent::Installed(digest) => Some(levels[digest]),
+                    _ => None,
+                })
+                .collect();
+            assert!(installed.windows(2).all(|pair| pair[0] <= pair[1]));
+            let inodes: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    let metadata = std::fs::metadata(pool.object_path(&row.digest)).unwrap();
+                    assert_eq!(metadata.mode() & 0o7777, 0o400);
+                    assert_eq!(metadata.nlink(), 1);
+                    metadata.ino()
+                })
+                .collect();
+            let reused_events = Mutex::new(Vec::new());
+            let reused = pool
+                .publish_maps_with_observer(&[&ram, &disk], &|event| {
+                    reused_events.lock().unwrap().push(event);
+                })
+                .unwrap();
+            assert_eq!(
+                reused_events.into_inner().unwrap(),
+                vec![MapBatchEvent::DirectorySynced]
+            );
+            assert_eq!(reused.len(), rows.len());
+            for (row, inode) in reused.iter().zip(inodes) {
+                assert_eq!(
+                    std::fs::metadata(pool.object_path(&row.digest))
+                        .unwrap()
+                        .ino(),
+                    inode
+                );
+            }
+            assert!(std::fs::read_dir(pool.temporary.path())
+                .unwrap()
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn rejected_existing_graph_object_cleans_uninstalled_batch_files() {
+        use vm_spec::stream_map::StreamNode;
+        let temporary = tempfile::tempdir().unwrap();
+        let pool = StoragePool::open(&temporary.path().join("images")).unwrap();
+        let map = graph_batch_fixture(ChunkSize::RAM, 2, 33);
+        let leaf = StreamNode::new(0, [(0, Sha256Digest::of_bytes(&[33, 1]))]).unwrap();
+        let bad = ObjectDigest::of_bytes(&leaf.canonical_bytes().unwrap());
+        let path = pool.object_path(&bad);
+        std::fs::write(&path, b"corrupt").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let _roots = pool.lock_roots_shared().unwrap();
+        assert!(matches!(
+            pool.publish_maps_with_observer(&[&map], &|_| {}),
+            Err(StorageError::ContentMismatch(_))
+        ));
+        assert!(std::fs::read_dir(pool.temporary.path())
+            .unwrap()
+            .next()
+            .is_none());
+        assert_eq!(pool.scan_objects().unwrap().count(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(path).unwrap(), b"corrupt");
+    }
+
+    #[test]
+    fn installed_graph_retry_commits_directory_before_returning_admission_rows() {
+        use crate::storage::pool::MapBatchEvent;
+        use std::sync::Mutex;
+        const HOME: &str = "SILO_MAP_BATCH_BARRIER_CRASH_HOME";
+        if let Ok(home) = std::env::var(HOME) {
+            let pool = StoragePool::open(std::path::Path::new(&home)).unwrap();
+            let map = graph_batch_fixture(ChunkSize::RAM, 8, 77);
+            let root = ObjectDigest::from_sha256(*map.id().as_bytes());
+            let _roots = pool.lock_roots_shared().unwrap();
+            pool.publish_maps_with_observer(&[&map], &|event| {
+                if event == MapBatchEvent::Installed(root) {
+                    // All names exist, but neither directory barrier ran.
+                    std::process::exit(77);
+                }
+            })
+            .unwrap();
+            panic!("root installation must reach the crash checkpoint");
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let images = temporary.path().join("images");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "storage::pool::tests::installed_graph_retry_commits_directory_before_returning_admission_rows", "--nocapture"])
+            .env(HOME, &images).status().unwrap();
+        assert_eq!(status.code(), Some(77));
+        let pool = StoragePool::open(&images).unwrap();
+        let map = graph_batch_fixture(ChunkSize::RAM, 8, 77);
+        let existing: std::collections::BTreeMap<_, _> = pool
+            .scan_objects()
+            .unwrap()
+            .map(|digest| {
+                let digest = digest.unwrap();
+                (
+                    digest,
+                    std::fs::metadata(pool.object_path(&digest)).unwrap().ino(),
+                )
+            })
+            .collect();
+        let events = Mutex::new(Vec::new());
+        let roots = pool.lock_roots_shared().unwrap();
+        let rows = pool
+            .publish_maps_with_observer(&[&map], &|event| {
+                events.lock().unwrap().push(event);
+            })
+            .unwrap();
+        assert_eq!(
+            events.into_inner().unwrap(),
+            vec![MapBatchEvent::DirectorySynced]
+        );
+        assert_eq!(existing.len(), rows.len());
+        for row in rows {
+            assert_eq!(
+                std::fs::metadata(pool.object_path(&row.digest))
+                    .unwrap()
+                    .ino(),
+                existing[&row.digest]
+            );
+        }
+        drop(roots);
+        assert_eq!(pool.reap_temporary().unwrap(), 1);
     }
 }

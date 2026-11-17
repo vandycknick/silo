@@ -203,6 +203,18 @@ uv run --project smoke pytest smoke/tests/test_artifact_live.py -m slow
 
 ### Stopped handoff between runtimes
 
+The v2 handoff sends binary roots and map nodes qualified by digest, stream,
+height and first index, separately from root/index-bound 8 MiB payloads.
+Source authorization follows only the named root-to-node path; artifact object
+tables remain digest-only. The independent disk oracle uses the sparse
+map codec and raw decoded-byte SHA, preserving exact changed-chunk reuse,
+prior-owner return and payload-byte accounting. It never equates a RAM's
+64 KiB identity leaf to a transport object. Old protocol sessions are refused.
+The warm-closure oracle excludes dirty-tracking-only baseline roots, not boot,
+lower or managed read-only dependencies. It authenticates every required map
+node and still requires the destination's immutable flat streams.
+
+
 `test_handoff.py` drives two real daemons with independent Homes, runtime IDs,
 config directories and run roots. It covers raw relocation and growth, a
 deliberately stopped running-source fork, stale-plan refusal without catalog
@@ -377,6 +389,13 @@ run lives and becomes unknown after it ends; a pending cut is not published unti
 disk identities complete. Completed continuation evidence is retained unchanged
 across final seal settlement and cancellation. If stop interrupts a manager after
 publication, replay after exact-run death must finish release of the same capture.
+
+After an identity-pending cut, the unchanged-file oracle admits newly staged
+disk map nodes only after authenticating their exact closure from the sealed
+disk roots. Inherited nodes resolve through the pool; arbitrary extra files,
+unreachable nodes and missing or corrupt named nodes still fail. Every
+pre-existing file retains its byte and inode checks.
+
 Holding the worker's vsock muxer after cut publication, before continuation, exercises
 genuine deadlines without injected errors or changed timeouts. The failure
 oracle checks the coherent published seal, Error fences and the source's durable
@@ -681,16 +700,25 @@ workspaces retain their evidence.
 
 `test_incremental.py` pins guest tmpfs pages and independently reads their exact
 GPAs from sealed RAM after CPU stores, real O_DIRECT block-read DMA, repeated
-same-page writes and explicit nonzero-to-zero replacement. It checks canonical
-complete maps, full-file SHA evidence, catalog dependencies, bitmap/control
-record bounds, the lowered crossover, explicit full selection and worker-local
-baseline invalidation. Its first restored-child recapture must reuse the
-inherited map/token while retaining restore-time dirties. A real RAM-fsync
+same-page writes and explicit nonzero-to-zero replacement. The independent
+`silo_smoke.stream_map` oracle decodes binary roots and every authenticated node,
+rebuilds roots with hashlib from all output bytes, and validates native streamed
+change records. RAM identities are 64 KiB; disk identities and transport payloads
+remain 8 MiB. Root/control records are bounded, not dense digest arrays. Tests
+cover catalog bindings, exact changes within owned pinned pages, expected
+64 KiB leaf coverage, the lowered crossover, explicit full selection and
+worker-local baseline invalidation. Its first
+restored-child recapture must reuse the inherited root/token while retaining
+restore-time dirties. A real RAM-fsync
 pre-seal cancellation must preserve the abandoned dirty union. The separate
 coverage-loss case first observes an actual successful KVM_GET_DIRTY_LOG return
 (and its returned bitmap), substitutes only `-EIO`, then requires actual-state
 recovery, a full `coverage-lost` capture and renewed incremental reuse. This is
 an explicitly recorded syscall fault, never injected success or synthetic RAM.
+The canonical catalog authority is `stream_map_root`; a local capture or pack
+need not have a `storage_stream` representation row. When that optional row
+exists, its root, length and profile must agree with the admitted root.
+
 
 The host-writer case requires an observed `/dev/hvc0` serial token, byte-exact
 bidirectional vsock transport and actual balloon free-page-report completions.
@@ -698,9 +726,17 @@ The CLI's stderr also carries reconciliation diagnostics. The echo still require
 byte-identical stdout and exit zero; stderr may contain only the exact
 `ActiveLease` cache-cleanup deferral diagnostic, never guest errors.
 It decodes the bounded saved device queues, reads their real used indices and
-entries from sealed RAM and requires the reporting ring's chunks in the dirty
-bitmap. An explicit full capture at the same borrowed pause must have identical
+entries from sealed RAM and requires the reporting ring's 64 KiB identities in
+the native change coverage. An explicit full capture at the same borrowed pause must have identical
 complete RAM bytes, identity and layout before the source can resume.
+
+`tests/test_stream_map.py` supplies host-only real-file codec/oracle rejection,
+boundary, short-tail, zero and randomized-edit evidence. `test_raw_live.py`
+flips actual RAM/disk bytes after warming verification, then requires
+`snapshot verify` to report the exact 64 KiB/8 MiB index and range. It also
+refuses corrupt map-node closures. `test_harness.py` checks old-format home
+refusal without conversion or deletion. Existing homes and artifacts must be
+recreated for this hard-breaking cutover.
 
 The incremental artifact case reuses the source-free live-checkpoint pipeline:
 two incremental generations after full capture, both parent records/aliases
@@ -716,7 +752,7 @@ already collected, source home quarantined and source OCI unavailable.
 
 The existing real-closure corruption and exact-native-refusal matrices also run
 against genuinely incremental-derived snapshots. They cover byte corruption of
-RAM, root, layout, execution/device state, boot assets, map/root pages and
+RAM, root, layout, execution/device state, boot assets, map roots/nodes and
 provenance, plus exact CPU, XSAVE, native-producer, host-build, unscaled TSC-rate
 and captured MSR-model-value refusals before allocation. An empty actual MSR
 inventory refuses fixture preparation instead of inventing a register. These
@@ -1503,6 +1539,12 @@ Manager-forced exit records may omit `storageShutdown`: they are durable
 forced run fences, not invented monitor-finalizer certificates. The forced
 gate checks actual terminal owners, independent lease release and persisted
 forced classification without inferring attachment closure from missing facts.
+
+The netd-lifetime monitor-crash gate captures the registered monitor/worker
+identities and lease before SIGKILL. Within one 20-second bound it requires
+every holder to become terminal, monitor/netd reaping and an independent
+exclusive lease probe to succeed before requiring `info` to report stopped.
+Monitor/netd disappearance alone never proves writable attachment closure.
 
 The guest-panic case deliberately uses the controlled **image-owned PID1**
 fixture, not the agent-owned PID1 healthy-shutdown profile. Its `/sbin/init`

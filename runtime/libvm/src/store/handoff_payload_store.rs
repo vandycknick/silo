@@ -1,9 +1,9 @@
 //! Bulk roots and machine publication for stopped handoff transfer.
 //!
 //! One `storage_operation` row of kind `relocate` per handoff, keyed by the
-//! ledger's operation UUID, pins every immutable object, stream, received
-//! chunk and document the operation needs. The ownership ledger, not the
-//! process lease, decides when those pins may be retired.
+//! ledger's operation UUID, pins immutable map roots and each received 8 MiB
+//! transport payload and document. Shared map descendants are graph-reachable.
+//! The ownership ledger, not the process lease, decides when pins retire.
 
 use sqlx::{Row, Sqlite, Transaction};
 
@@ -78,8 +78,9 @@ impl Store {
         Ok(lease)
     }
 
-    /// Pin already published pool members. The caller keeps the publication
-    /// roots guard of any member it just published through this commit.
+    /// Pin published stream/map roots or individual transport payload objects.
+    /// The caller holds newly published members' roots guards through commit;
+    /// map descendants are never expanded into operation dependency rows.
     pub(crate) async fn pin_handoff_dependencies(
         &self,
         operation: OperationId,

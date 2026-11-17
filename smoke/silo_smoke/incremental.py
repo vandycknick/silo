@@ -6,7 +6,6 @@ separate facts. Nothing here installs a capability, baseline or fake receipt.
 from __future__ import annotations
 
 from dataclasses import replace
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,13 +14,13 @@ import subprocess
 
 import pytest
 
-from . import images, overlay, procs, restore, stopped
+from . import images, overlay, procs, restore, stopped, stream_map
 from .filesystem import reflink_probe
 from .cli import Silo
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
 
-CHUNK = 8 * 1024 * 1024
+CHUNK = stream_map.RAM_CHUNK
 PROBE = "/usr/local/bin/incremental-memory"
 
 
@@ -78,11 +77,10 @@ def pages_at_cut(silo: Silo, saved: restore.Checkpoint, expected: dict) -> set[i
 
 def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
                       baseline: restore.Checkpoint | None = None, reason: str | None = None,
-                      baseline_map: dict | None = None) -> dict:
-    """Decode the canonical complete map and hash every output byte independently.
+                      baseline_map: tuple[stream_map.Root, dict[int, str]] | None = None) -> dict:
+    """Authenticate binary roots, sparse changes and every immutable output byte.
 
-    The oracle intentionally scans immutable output. That scan is not a live
-    guest RAM read and is never included in the native savings assertion.
+    This independent scan is outside native capture and all timing assertions.
     """
     assert (saved.staging / "vm.capture.json").stat().st_size <= 1024 * 1024
     assert (saved.staging / "request.json").stat().st_size <= 1024 * 1024
@@ -95,53 +93,56 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
     assert (evidence["mode"], evidence["fullReason"]) == (mode, reason), evidence
     expected_baseline = baseline.seal["memory"]["ramStream"] if baseline is not None else None
     assert evidence["baseline"] == expected_baseline, evidence
-    path = saved.staging / "memory.map.json"
+    path = saved.staging / "memory.root"
     length = (saved.staging / "memory.ram").stat().st_size
-    chunks = (length + CHUNK - 1) // CHUNK
-    assert path.stat().st_size <= chunks * 74 + 256
     encoded = path.read_bytes()
-    complete = json.loads(encoded)
-    assert set(complete) == {"schema", "kind", "length", "chunkSize", "chunks"}
-    assert (complete["schema"], complete["kind"], complete["length"], complete["chunkSize"]) == (
-        1, "stream", length, CHUNK)
-    assert len(complete["chunks"]) == chunks
-    assert encoded == json.dumps(complete, sort_keys=True, separators=(",", ":")).encode()
-    stream = "sha256:" + hashlib.sha256(b"silo:stream:v1\n" + encoded).hexdigest()
-    assert stream == evidence["ramStream"]
-    bitmap = evidence["dirtyChunks"]
-    assert len(bitmap) == (chunks + 7) // 8 and len(bitmap) <= 16384
-    assert all(type(byte) is int and 0 <= byte < 256 for byte in bitmap)
-    if chunks % 8:
-        assert bitmap[-1] >> (chunks % 8) == 0
-    affected = {index for index in range(chunks) if bitmap[index // 8] & (1 << (index % 8))}
+    root = stream_map.decode_root(encoded)
+    assert root.length == length and root.chunk_size == CHUNK
+    stream = root.identity
+    assert stream == evidence["ramStream"] and evidence["identityChunkBytes"] == CHUNK
+    changes = stream_map.read_changes(saved.staging / "memory.changes", length)
+    summary = evidence["changes"]
+    assert (changes.mode, changes.byte_length, changes.identity, len(changes.records)) == (
+        mode, summary["byteLen"], summary["sha256"], summary["recordCount"])
+    assert summary["coverage"] == mode and summary["baselineStream"] == expected_baseline
+    actual_root, leaves = stream_map.from_file(saved.staging / "memory.ram", CHUNK)
+    assert actual_root == root, "native root differs from independent full-byte oracle"
+    source = stream_map.object_source(silo.ws.silo_home)
+
+    def node(identity: str) -> bytes:
+        staged = saved.staging / "map-nodes" / identity[7:]
+        return staged.read_bytes() if staged.is_file() else source(identity)
+
+    assert dict(stream_map.present_chunks(root, node)) == leaves
+    affected = changes.affected()
+    for change in changes.records:
+        for index in range(change.first, change.first + change.count):
+            assert leaves.get(index) == change.value, ("change differs from output bytes", change, index)
     if mode == "full":
-        assert affected == set(range(chunks))
+        assert {change.first: change.value for change in changes.records} == leaves
     else:
         assert baseline is not None
-        old = baseline_map if baseline_map is not None else catalog_map(
+        old_root, old_leaves = baseline_map if baseline_map is not None else catalog_map(
             silo, restore.snapshot_record(silo, baseline)["execution"]["memory"])
-        assert old["length"] == length
-        for index in set(range(chunks)) - affected:
-            assert complete["chunks"][index] == old["chunks"][index], "clean identity was not reused"
-    whole = hashlib.sha256()
-    with (saved.staging / "memory.ram").open("rb") as ram:
-        for index, expected in enumerate(complete["chunks"]):
-            data = ram.read(CHUNK)
-            assert len(data) == min(CHUNK, length - index * CHUNK)
-            whole.update(data)
-            actual = "zero" if not any(data) else "sha256:" + hashlib.sha256(data).hexdigest()
-            assert expected == actual, (index, expected, actual)
-        assert not ram.read(1)
+        assert old_root.length == length and old_root.chunk_size == CHUNK
+        changed = {index for index in old_leaves.keys() | leaves.keys()
+                   if old_leaves.get(index) != leaves.get(index)}
+        assert changed <= affected, "clean identity was not reused"
     ram_inventory = [entry for entry in saved.seal["inventory"] if entry["role"] == "memory.ram"]
     assert len(ram_inventory) == 1 and ram_inventory[0]["length"] == length
     assert ram_inventory[0]["identity"] == stream and ram_inventory[0].get("sha256") is None
     map_inventory = [entry for entry in saved.seal["inventory"] if entry["role"] == "ram-map"]
     assert len(map_inventory) == 1 and map_inventory[0]["length"] == len(encoded)
-    assert map_inventory[0]["sha256"] == "sha256:" + hashlib.sha256(encoded).hexdigest()
+    assert map_inventory[0]["sha256"] == stream_map.digest(encoded)
+    change_inventory = [entry for entry in saved.seal["inventory"] if entry["role"] == "memory.changes"]
+    assert len(change_inventory) == 1
+    assert (change_inventory[0]["length"], change_inventory[0]["sha256"]) == (changes.byte_length, changes.identity)
     stats = evidence["stats"]
     assert stats["logicalBytes"] == length and stats["wholeFileBytesHashed"] == 0
     coverage = sum(min(CHUNK, length - index * CHUNK) for index in affected)
-    assert stats["identityBytesHashed"] == coverage
+    hashed = sum(min(CHUNK, length - change.first * CHUNK)
+                 for change in changes.records if change.value is not None)
+    assert stats["identityBytesHashed"] == hashed
     probe = None
     if mode == "incremental":
         probe = reflink_probe(saved.staging)
@@ -162,48 +163,21 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
     dependencies = procs.query(silo.ws.state_db(),
         f"SELECT stream_id FROM snapshot_stream_dependency WHERE snapshot_id='{saved.snapshot}'")
     assert (stream,) in dependencies
-    assert catalog_map(silo, record["execution"]["memory"]) == complete
+    assert procs.query(silo.ws.state_db(),
+        f"SELECT changes_digest FROM snapshot_capture_change WHERE snapshot_id='{saved.snapshot}'") == [(changes.identity,)]
+    assert catalog_map(silo, record["execution"]["memory"]) == (root, leaves)
     immutable = silo.ws.silo_home / "images/streams/sha256" / stream[7:]
-    assert immutable.stat().st_size == length and overlay.digest(immutable) == whole.hexdigest()
+    assert immutable.stat().st_size == length
+    assert overlay.digest(immutable) == overlay.digest(saved.staging / "memory.ram")
     assert not immutable.samefile(saved.staging / "memory.ram")
     silo.ws.record("incremental-authentication", json.dumps({"snapshot": saved.snapshot,
-        "mapBytes": len(encoded), "chunks": chunks, "affectedChunks": sorted(affected),
+        "rootBytes": len(encoded), "changeRecords": len(changes.records), "affectedChunks": sorted(affected),
         "memory": evidence, "seedProbe": probe}, sort_keys=True) + "\n")
-    return {"map": complete, "affected": affected, "stats": stats}
+    return {"map": (root, leaves), "affected": affected, "stats": stats}
 
 
-def catalog_map(silo: Silo, binding: dict) -> dict:
-    stream = binding["stream"]
-    length, digest = binding["length"], binding["map"]
-
-    def object_record(digest: str) -> tuple[bytes, dict]:
-        path = silo.ws.silo_home / "images/objects/sha256" / digest.removeprefix("sha256:")
-        assert path.stat().st_size <= 4 * 1024 * 1024
-        encoded = path.read_bytes()
-        assert "sha256:" + hashlib.sha256(encoded).hexdigest() == digest
-        return encoded, json.loads(encoded)
-
-    _, root = object_record(digest)
-    assert set(root) == {"schema", "kind", "stream", "length", "pages"}
-    assert (root["schema"], root["kind"], root["stream"], root["length"]) == (1, "stream-map", stream, int(length))
-    count = (int(length) + CHUNK - 1) // CHUNK
-    assert len(root["pages"]) == (count + 4095) // 4096
-    chunks = []
-    remaining = int(length)
-    for digest in root["pages"]:
-        encoded, page = object_record(digest)
-        span = min(remaining, 4096 * CHUNK)
-        assert set(page) == {"schema", "kind", "length", "chunkSize", "chunks"}
-        assert (page["schema"], page["kind"], page["length"], page["chunkSize"]) == (1, "stream", span, CHUNK)
-        assert len(page["chunks"]) == (span + CHUNK - 1) // CHUNK
-        assert encoded == json.dumps(page, sort_keys=True, separators=(",", ":")).encode()
-        chunks.extend(page["chunks"])
-        remaining -= span
-    assert remaining == 0 and len(chunks) == count
-    value = {"schema": 1, "kind": "stream", "length": int(length), "chunkSize": CHUNK, "chunks": chunks}
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    assert "sha256:" + hashlib.sha256(b"silo:stream:v1\n" + encoded).hexdigest() == stream
-    return value
+def catalog_map(silo: Silo, binding: dict) -> tuple[stream_map.Root, dict[int, str]]:
+    return stream_map.catalog_root(silo.ws.silo_home, binding)
 
 
 def device_state(silo: Silo, saved: restore.Checkpoint) -> dict:

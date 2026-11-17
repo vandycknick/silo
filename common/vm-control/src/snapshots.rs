@@ -451,7 +451,7 @@ pub fn verification_from_wire(
     })
 }
 
-fn verification_role_to_wire(
+pub(crate) fn verification_role_to_wire(
     role: &libvm::SnapshotVerificationRole,
 ) -> (w::SnapshotVerificationRole, Option<u32>) {
     use libvm::SnapshotVerificationRole as Native;
@@ -467,7 +467,7 @@ fn verification_role_to_wire(
     }
 }
 
-fn verification_role_from_wire(
+pub(crate) fn verification_role_from_wire(
     role: i32,
     order: Option<u32>,
 ) -> Result<libvm::SnapshotVerificationRole, ConversionError> {
@@ -494,8 +494,58 @@ fn verification_role_from_wire(
     })
 }
 
-fn verification_chunk_to_wire(chunk: libvm::storage::stream::Chunk) -> w::VerificationChunk {
-    use libvm::storage::stream::Chunk;
+pub(crate) fn stream_summary_to_wire(
+    value: &libvm::SnapshotStreamSummary,
+) -> w::SnapshotStreamSummary {
+    let (role, disk_order) = verification_role_to_wire(&value.role);
+    w::SnapshotStreamSummary {
+        role: role.into(),
+        disk_order,
+        stream: value.stream.to_string(),
+        map: value.map.to_string(),
+        length: value.length,
+        chunk_size: value.chunk_size,
+    }
+}
+
+pub(crate) fn stream_summary_from_wire(
+    value: w::SnapshotStreamSummary,
+) -> Result<libvm::SnapshotStreamSummary, ConversionError> {
+    let role = verification_role_from_wire(value.role, value.disk_order)?;
+    let expected_chunk_size = match role {
+        libvm::SnapshotVerificationRole::Ram => 65_536,
+        libvm::SnapshotVerificationRole::RootDisk
+        | libvm::SnapshotVerificationRole::DataDisk { .. }
+        | libvm::SnapshotVerificationRole::Dependency => 8_388_608,
+        _ => return Err(invalid("stream.role", "state objects are not streams")),
+    };
+    if value.chunk_size != expected_chunk_size
+        || value.length > 4 << 40
+        || (matches!(role, libvm::SnapshotVerificationRole::Ram) && value.length > 1 << 40)
+        || value.stream != value.map
+    {
+        return Err(invalid(
+            "stream.summary",
+            "inconsistent root identity or geometry",
+        ));
+    }
+    Ok(libvm::SnapshotStreamSummary {
+        role,
+        stream: value
+            .stream
+            .parse()
+            .map_err(|_| invalid("stream.stream", "invalid stream root"))?,
+        map: value
+            .map
+            .parse()
+            .map_err(|_| invalid("stream.map", "invalid map root"))?,
+        length: value.length,
+        chunk_size: value.chunk_size,
+    })
+}
+
+fn verification_chunk_to_wire(chunk: vm_spec::stream_map::Chunk) -> w::VerificationChunk {
+    use vm_spec::stream_map::Chunk;
     use w::verification_chunk::Identity;
     w::VerificationChunk {
         identity: Some(match chunk {
@@ -507,8 +557,8 @@ fn verification_chunk_to_wire(chunk: libvm::storage::stream::Chunk) -> w::Verifi
 
 fn verification_chunk_from_wire(
     chunk: w::VerificationChunk,
-) -> Result<libvm::storage::stream::Chunk, ConversionError> {
-    use libvm::storage::stream::Chunk;
+) -> Result<vm_spec::stream_map::Chunk, ConversionError> {
+    use vm_spec::stream_map::Chunk;
     use w::verification_chunk::Identity;
     Ok(
         match required(chunk.identity, "verification.chunk.identity")? {
@@ -522,14 +572,56 @@ fn verification_chunk_from_wire(
     )
 }
 
+fn structural_failure_to_wire(
+    failure: &libvm::SnapshotStructuralFailure,
+) -> w::SnapshotStructuralFailure {
+    use libvm::SnapshotStructuralFailure as Failure;
+    use w::snapshot_structural_failure::Failure as Wire;
+    w::SnapshotStructuralFailure {
+        failure: Some(match failure {
+            Failure::Missing => Wire::Missing(()),
+            Failure::Truncated { expected, actual } => Wire::Truncated(w::VerificationLengths {
+                expected: *expected,
+                actual: *actual,
+            }),
+            Failure::Length { expected, actual } => Wire::Length(w::VerificationLengths {
+                expected: *expected,
+                actual: *actual,
+            }),
+            Failure::Writable { mode } => Wire::Writable(*mode),
+            Failure::Replaced => Wire::Replaced(()),
+            Failure::Invalid { message } => Wire::Invalid(message.clone()),
+        }),
+    }
+}
+
+fn structural_failure_from_wire(
+    value: w::SnapshotStructuralFailure,
+) -> Result<libvm::SnapshotStructuralFailure, ConversionError> {
+    use libvm::SnapshotStructuralFailure as Failure;
+    use w::snapshot_structural_failure::Failure as Wire;
+    Ok(
+        match required(value.failure, "verification.failure.kind")? {
+            Wire::Missing(()) => Failure::Missing,
+            Wire::Truncated(value) => Failure::Truncated {
+                expected: value.expected,
+                actual: value.actual,
+            },
+            Wire::Length(value) => Failure::Length {
+                expected: value.expected,
+                actual: value.actual,
+            },
+            Wire::Writable(mode) => Failure::Writable { mode },
+            Wire::Replaced(()) => Failure::Replaced,
+            Wire::Invalid(message) => Failure::Invalid { message },
+        },
+    )
+}
+
 fn verification_error_to_wire(
     error: &libvm::SnapshotVerificationError,
 ) -> w::SnapshotVerificationError {
-    use libvm::{
-        SnapshotStructuralFailure as Failure, SnapshotVerificationError as Native,
-        SnapshotVerificationMember as Member,
-    };
-    use w::snapshot_structural_failure::Failure as WireFailure;
+    use libvm::{SnapshotVerificationError as Native, SnapshotVerificationMember as Member};
     use w::snapshot_verification_error::Error as Wire;
     let (role, error) = match error {
         Native::Structural {
@@ -545,39 +637,20 @@ fn verification_error_to_wire(
                     w::snapshot_verification_member::Member::Object(id.to_string())
                 }
             };
-            let failure = match failure {
-                Failure::Missing => WireFailure::Missing(()),
-                Failure::Truncated { expected, actual } => {
-                    WireFailure::Truncated(w::VerificationLengths {
-                        expected: *expected,
-                        actual: *actual,
-                    })
-                }
-                Failure::Length { expected, actual } => {
-                    WireFailure::Length(w::VerificationLengths {
-                        expected: *expected,
-                        actual: *actual,
-                    })
-                }
-                Failure::Writable { mode } => WireFailure::Writable(*mode),
-                Failure::Replaced => WireFailure::Replaced(()),
-                Failure::Invalid { message } => WireFailure::Invalid(message.clone()),
-            };
             (
                 role,
                 Wire::Structural(w::SnapshotStructuralError {
                     member: Some(w::SnapshotVerificationMember {
                         member: Some(member),
                     }),
-                    failure: Some(w::SnapshotStructuralFailure {
-                        failure: Some(failure),
-                    }),
+                    failure: Some(structural_failure_to_wire(failure)),
                 }),
             )
         }
         Native::ChunkMismatch {
             role,
             stream,
+            chunk_size,
             index,
             start,
             end,
@@ -588,12 +661,39 @@ fn verification_error_to_wire(
             Wire::Chunk(w::SnapshotChunkMismatch {
                 stream: stream.to_string(),
                 index: *index,
+                chunk_size: *chunk_size,
                 start: *start,
                 end: *end,
                 expected: Some(verification_chunk_to_wire(**expected)),
                 actual: Some(verification_chunk_to_wire(**actual)),
             }),
         ),
+        Native::MapNode(error) => {
+            let libvm::SnapshotMapNodeFailure {
+                role,
+                stream,
+                node,
+                height,
+                first_index,
+                end_index,
+                start,
+                end,
+                failure,
+            } = error.as_ref();
+            (
+                role,
+                Wire::MapNode(w::SnapshotMapNodeError {
+                    stream: stream.to_string(),
+                    node: node.to_string(),
+                    height: u32::from(*height),
+                    first_index: *first_index,
+                    end_index: *end_index,
+                    start: *start,
+                    end: *end,
+                    failure: Some(structural_failure_to_wire(failure)),
+                }),
+            )
+        }
         Native::ObjectMismatch {
             role,
             object,
@@ -619,11 +719,7 @@ fn verification_error_to_wire(
 fn verification_error_from_wire(
     error: w::SnapshotVerificationError,
 ) -> Result<libvm::SnapshotVerificationError, ConversionError> {
-    use libvm::{
-        SnapshotStructuralFailure as Failure, SnapshotVerificationError as Native,
-        SnapshotVerificationMember as Member,
-    };
-    use w::snapshot_structural_failure::Failure as WireFailure;
+    use libvm::{SnapshotVerificationError as Native, SnapshotVerificationMember as Member};
     use w::snapshot_verification_error::Error as Wire;
     let role = verification_role_from_wire(error.role, error.disk_order)?;
     Ok(match required(error.error, "verification.error")? {
@@ -641,21 +737,8 @@ fn verification_error_from_wire(
                     })?)
                 }
             };
-            let failure = required(error.failure, "verification.failure")?;
-            let failure = match required(failure.failure, "verification.failure.kind")? {
-                WireFailure::Missing(()) => Failure::Missing,
-                WireFailure::Truncated(lengths) => Failure::Truncated {
-                    expected: lengths.expected,
-                    actual: lengths.actual,
-                },
-                WireFailure::Length(lengths) => Failure::Length {
-                    expected: lengths.expected,
-                    actual: lengths.actual,
-                },
-                WireFailure::Writable(mode) => Failure::Writable { mode },
-                WireFailure::Replaced(()) => Failure::Replaced,
-                WireFailure::Invalid(message) => Failure::Invalid { message },
-            };
+            let failure =
+                structural_failure_from_wire(required(error.failure, "verification.failure")?)?;
             Native::Structural {
                 role,
                 member,
@@ -663,7 +746,23 @@ fn verification_error_from_wire(
             }
         }
         Wire::Chunk(error) => {
-            if error.start >= error.end {
+            let chunk_size = match role {
+                libvm::SnapshotVerificationRole::Ram => 65_536,
+                libvm::SnapshotVerificationRole::RootDisk
+                | libvm::SnapshotVerificationRole::DataDisk { .. }
+                | libvm::SnapshotVerificationRole::Dependency => 8_388_608,
+                _ => {
+                    return Err(invalid(
+                        "verification.chunk.role",
+                        "state objects have no identity chunks",
+                    ))
+                }
+            };
+            if error.start >= error.end
+                || error.chunk_size != chunk_size
+                || error.index.checked_mul(error.chunk_size) != Some(error.start)
+                || error.end - error.start > error.chunk_size
+            {
                 return Err(invalid(
                     "verification.chunk.range",
                     "expected a nonempty byte range",
@@ -676,6 +775,7 @@ fn verification_error_from_wire(
                     .parse()
                     .map_err(|_| invalid("verification.stream", "invalid stream identity"))?,
                 index: error.index,
+                chunk_size: error.chunk_size,
                 start: error.start,
                 end: error.end,
                 expected: Box::new(verification_chunk_from_wire(required(
@@ -687,6 +787,35 @@ fn verification_error_from_wire(
                     "verification.actual",
                 )?)?),
             }
+        }
+        Wire::MapNode(error) => {
+            if error.height > 4 || error.first_index >= error.end_index || error.start >= error.end
+            {
+                return Err(invalid(
+                    "verification.map_node.range",
+                    "invalid node height or coverage",
+                ));
+            }
+            Native::MapNode(Box::new(libvm::SnapshotMapNodeFailure {
+                role,
+                stream: error
+                    .stream
+                    .parse()
+                    .map_err(|_| invalid("verification.stream", "invalid stream identity"))?,
+                node: error
+                    .node
+                    .parse()
+                    .map_err(|_| invalid("verification.node", "invalid node digest"))?,
+                height: error.height as u8,
+                first_index: error.first_index,
+                end_index: error.end_index,
+                start: error.start,
+                end: error.end,
+                failure: structural_failure_from_wire(required(
+                    error.failure,
+                    "verification.failure",
+                )?)?,
+            }))
         }
         Wire::Object(error) => Native::ObjectMismatch {
             role,
@@ -707,13 +836,13 @@ fn verification_error_from_wire(
 mod tests {
     use crate::snapshots::{verification_from_wire, verification_to_wire};
     use libvm::storage::identity::{ObjectDigest, StreamId};
-    use libvm::storage::stream::Chunk;
     use libvm::{
         LibVmError, SnapshotStructuralFailure, SnapshotVerificationError,
         SnapshotVerificationMember, SnapshotVerificationReport, SnapshotVerificationRole,
     };
     use prost::Message;
     use silod_spec::daemon::v1 as w;
+    use vm_spec::stream_map::Chunk;
 
     fn digest() -> ObjectDigest {
         format!("sha256:{}", "a".repeat(64)).parse().unwrap()
@@ -762,15 +891,29 @@ mod tests {
             SnapshotVerificationRole::Dependency,
         ] {
             for (expected, actual) in [
-                (Chunk::Zero, Chunk::Data(digest())),
-                (Chunk::Data(digest()), Chunk::Zero),
+                (
+                    Chunk::Zero,
+                    Chunk::Data(vm_spec::capture::Sha256Digest::of_bytes(b"data")),
+                ),
+                (
+                    Chunk::Data(vm_spec::capture::Sha256Digest::of_bytes(b"data")),
+                    Chunk::Zero,
+                ),
             ] {
+                let chunk_size = match role {
+                    SnapshotVerificationRole::Ram => 65_536,
+                    SnapshotVerificationRole::RootDisk
+                    | SnapshotVerificationRole::DataDisk { .. }
+                    | SnapshotVerificationRole::Dependency => 8_388_608,
+                    _ => continue,
+                };
                 roundtrip(&SnapshotVerificationError::ChunkMismatch {
                     role: role.clone(),
                     stream: stream(),
+                    chunk_size,
                     index: 2,
-                    start: 16_777_216,
-                    end: 25_165_824,
+                    start: 2 * chunk_size,
+                    end: 3 * chunk_size,
                     expected: Box::new(expected),
                     actual: Box::new(actual),
                 });
@@ -812,6 +955,105 @@ mod tests {
     }
 
     #[test]
+    fn map_node_errors_round_trip_all_heights_and_failures() {
+        for height in 0..=4 {
+            for failure in [
+                SnapshotStructuralFailure::Missing,
+                SnapshotStructuralFailure::Invalid {
+                    message: "node digest mismatch".into(),
+                },
+            ] {
+                roundtrip(&SnapshotVerificationError::MapNode(Box::new(
+                    libvm::SnapshotMapNodeFailure {
+                        role: SnapshotVerificationRole::Ram,
+                        stream: stream(),
+                        node: digest(),
+                        height,
+                        first_index: 64,
+                        end_index: 128,
+                        start: 64 * 65_536,
+                        end: 128 * 65_536,
+                        failure,
+                    },
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn stream_summaries_round_trip_and_reject_inconsistent_geometry() {
+        use crate::snapshots::{stream_summary_from_wire, stream_summary_to_wire};
+        for (role, chunk_size) in [
+            (SnapshotVerificationRole::Ram, 65_536),
+            (SnapshotVerificationRole::RootDisk, 8_388_608),
+            (SnapshotVerificationRole::DataDisk { order: 3 }, 8_388_608),
+            (SnapshotVerificationRole::Dependency, 8_388_608),
+        ] {
+            let value = libvm::SnapshotStreamSummary {
+                role,
+                stream: stream(),
+                map: stream().to_string().parse().unwrap(),
+                length: 3 * chunk_size,
+                chunk_size,
+            };
+            let wire = stream_summary_to_wire(&value);
+            let decoded =
+                w::SnapshotStreamSummary::decode(wire.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(stream_summary_from_wire(decoded).unwrap(), value);
+            for case in 0..4 {
+                let mut invalid = wire.clone();
+                match case {
+                    0 => invalid.chunk_size = 4096,
+                    1 => invalid.map = digest().to_string(),
+                    2 => invalid.role = 0,
+                    3 => invalid.length = u64::MAX,
+                    _ => unreachable!(),
+                }
+                assert!(stream_summary_from_wire(invalid).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn map_node_wire_rejects_missing_or_invalid_location() {
+        use w::snapshot_verification_result::Result;
+        let error = SnapshotVerificationError::MapNode(Box::new(libvm::SnapshotMapNodeFailure {
+            role: SnapshotVerificationRole::Ram,
+            stream: stream(),
+            node: digest(),
+            height: 0,
+            first_index: 0,
+            end_index: 64,
+            start: 0,
+            end: 64 * 65_536,
+            failure: SnapshotStructuralFailure::Missing,
+        }));
+        let Some(Result::Error(base)) = verification_to_wire(Err(&error)).result else {
+            panic!("expected map node error");
+        };
+        for case in 0..6 {
+            let mut invalid = base.clone();
+            let Some(w::snapshot_verification_error::Error::MapNode(node)) = invalid.error.as_mut()
+            else {
+                panic!("expected map node error");
+            };
+            match case {
+                0 => node.height = 5,
+                1 => node.end_index = node.first_index,
+                2 => node.end = node.start,
+                3 => node.stream = "invalid".into(),
+                4 => node.node = "invalid".into(),
+                5 => node.failure = None,
+                _ => unreachable!(),
+            }
+            assert!(verification_from_wire(w::SnapshotVerificationResult {
+                result: Some(Result::Error(invalid)),
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
     fn snapshot_verification_wire_rejects_missing_or_malformed_fields() {
         use w::snapshot_verification_result::Result as Wire;
         assert!(verification_from_wire(w::SnapshotVerificationResult { result: None }).is_err());
@@ -826,11 +1068,14 @@ mod tests {
         let error = SnapshotVerificationError::ChunkMismatch {
             role: SnapshotVerificationRole::Ram,
             stream: stream(),
+            chunk_size: 65_536,
             index: 0,
             start: 0,
             end: 512,
             expected: Box::new(Chunk::Zero),
-            actual: Box::new(Chunk::Data(digest())),
+            actual: Box::new(Chunk::Data(vm_spec::capture::Sha256Digest::of_bytes(
+                b"data",
+            ))),
         };
         let Some(Wire::Error(base)) = verification_to_wire(Err(&error)).result else {
             panic!("expected wire error");

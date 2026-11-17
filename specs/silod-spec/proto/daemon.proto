@@ -103,6 +103,7 @@ message HandoffCapabilities {
  uint32 max_document_bytes = 4;
  uint32 max_frame_bytes = 5;
  uint32 max_page_entries = 6;
+ uint32 protocol_version = 7;
 }
 message HandoffOperationRef { string operation = 1; }
 message HandoffBootSelection {
@@ -142,11 +143,15 @@ message HandoffCaptureRequest {
 message HandoffCaptureOffer { HandoffBinding binding = 1; HandoffDocument manifest = 2; }
 message HandoffReceiveRequest { string operation = 1; HandoffDocument approved_plan = 2; }
 message HandoffPayloadIdentity { string digest = 1; uint64 length = 2; }
+message HandoffStreamChunk { string stream = 1; uint64 index = 2; uint64 length = 3; }
+message HandoffMapNode { string digest = 1; string stream = 2; uint32 height = 3; uint64 first_index = 4; }
 message HandoffPayloadDescriptor {
+ reserved 2;
  oneof payload {
   HandoffPayloadIdentity object = 1;
-  HandoffPayloadIdentity chunk = 2;
   string stream_map = 3;
+  HandoffMapNode map_node = 4;
+  HandoffStreamChunk stream_chunk = 5;
  }
 }
 message HandoffPayloadRequest { string operation = 1; HandoffPayloadDescriptor descriptor = 2; uint64 length = 3; }
@@ -565,11 +570,13 @@ message CaptureMemoryEvidence {
  CapturePolicy mode = 6;
  optional string baseline = 7;
  optional CaptureFullReason full_reason = 8;
- bytes dirty_chunks = 9;
+ reserved 9, 11;
  CaptureMemoryStats stats = 10;
- // One entry per logical chunk: 32-byte SHA-256, or empty for zero/unaffected.
- repeated bytes chunk_digests = 11;
+ uint32 identity_chunk_bytes = 12;
+ CaptureRamChanges changes = 13;
 }
+enum CaptureRamCoverage { CAPTURE_RAM_COVERAGE_UNSPECIFIED = 0; CAPTURE_RAM_COVERAGE_FULL = 1; CAPTURE_RAM_COVERAGE_INCREMENTAL = 2; }
+message CaptureRamChanges { uint64 byte_len = 1; string sha256 = 2; uint64 record_count = 3; CaptureRamCoverage coverage = 4; optional string baseline_stream = 5; }
 message LiveCaptureSummary { string capture_id = 1; string machine_id = 2; string run_id = 3; CaptureResumePolicy resume_policy = 4; CapturePauseDisposition pause = 5; CaptureSourceOutcome source_outcome = 6; optional string source_error = 7; bool released = 8; string staging = 9; CaptureMemoryEvidence memory = 10; }
 message LiveSnapshotInfo { StorageSnapshotInfo snapshot = 1; LiveCaptureSummary capture = 2; optional string alias_conflict = 3; }
 enum MachineCaptureStage { MACHINE_CAPTURE_STAGE_UNSPECIFIED = 0; MACHINE_CAPTURE_STAGE_RESERVED = 1; MACHINE_CAPTURE_STAGE_SEALED = 2; MACHINE_CAPTURE_STAGE_PUBLISHED = 3; }
@@ -614,18 +621,20 @@ message LiveForkResult { string operation_id = 1; string source_machine_id = 2; 
 enum StorageCaptureKind { STORAGE_CAPTURE_KIND_UNSPECIFIED = 0; STORAGE_CAPTURE_KIND_STOPPED_STORAGE = 1; STORAGE_CAPTURE_KIND_LIVE_EXECUTION = 2; }
 // Capture provenance is catalog metadata outside snapshot identity.
 message SnapshotCaptureProvenance { string capture_id = 1; string machine_id = 2; string run_id = 3; string evidence_digest = 4; }
-message StorageSnapshotInfo { string id = 1; string record_digest = 2; optional bool retained = 3; repeated string aliases = 4; optional int64 created_at = 5; StorageCaptureKind capture_kind = 6; repeated SnapshotCaptureProvenance provenance = 7; }
+message StorageSnapshotInfo { string id = 1; string record_digest = 2; optional bool retained = 3; repeated string aliases = 4; optional int64 created_at = 5; StorageCaptureKind capture_kind = 6; repeated SnapshotCaptureProvenance provenance = 7; repeated SnapshotStreamSummary streams = 8; }
 message StorageSnapshotList { repeated StorageSnapshotInfo snapshots = 1; }
 message SnapshotVerificationReport { string snapshot = 1; uint64 streams = 2; uint64 bytes = 3; }
 enum SnapshotVerificationRole { SNAPSHOT_VERIFICATION_ROLE_UNSPECIFIED = 0; SNAPSHOT_VERIFICATION_ROLE_RAM = 1; SNAPSHOT_VERIFICATION_ROLE_LAYOUT = 2; SNAPSHOT_VERIFICATION_ROLE_EXECUTION = 3; SNAPSHOT_VERIFICATION_ROLE_DEVICES = 4; SNAPSHOT_VERIFICATION_ROLE_ROOT_DISK = 5; SNAPSHOT_VERIFICATION_ROLE_DATA_DISK = 6; SNAPSHOT_VERIFICATION_ROLE_DEPENDENCY = 7; }
+message SnapshotStreamSummary { SnapshotVerificationRole role = 1; optional uint32 disk_order = 2; string stream = 3; string map = 4; uint64 length = 5; uint64 chunk_size = 6; }
 message SnapshotVerificationMember { oneof member { string stream = 1; string object = 2; } }
 message VerificationLengths { uint64 expected = 1; uint64 actual = 2; }
 message SnapshotStructuralFailure { oneof failure { google.protobuf.Empty missing = 1; VerificationLengths truncated = 2; VerificationLengths length = 3; uint32 writable = 4; google.protobuf.Empty replaced = 5; string invalid = 6; } }
 message SnapshotStructuralError { SnapshotVerificationMember member = 1; SnapshotStructuralFailure failure = 2; }
 message VerificationChunk { oneof identity { google.protobuf.Empty zero = 1; string data = 2; } }
-message SnapshotChunkMismatch { string stream = 1; uint64 index = 2; uint64 start = 3; uint64 end = 4; VerificationChunk expected = 5; VerificationChunk actual = 6; }
+message SnapshotChunkMismatch { string stream = 1; uint64 index = 2; uint64 start = 3; uint64 end = 4; VerificationChunk expected = 5; VerificationChunk actual = 6; uint64 chunk_size = 7; }
 message SnapshotObjectMismatch { string object = 1; uint64 length = 2; string actual = 3; }
-message SnapshotVerificationError { SnapshotVerificationRole role = 1; optional uint32 disk_order = 2; oneof error { SnapshotStructuralError structural = 3; SnapshotChunkMismatch chunk = 4; SnapshotObjectMismatch object = 5; } }
+message SnapshotMapNodeError { string stream = 1; string node = 2; uint32 height = 3; uint64 first_index = 4; uint64 end_index = 5; uint64 start = 6; uint64 end = 7; SnapshotStructuralFailure failure = 8; }
+message SnapshotVerificationError { SnapshotVerificationRole role = 1; optional uint32 disk_order = 2; oneof error { SnapshotStructuralError structural = 3; SnapshotChunkMismatch chunk = 4; SnapshotObjectMismatch object = 5; SnapshotMapNodeError map_node = 6; } }
 message SnapshotVerificationResult { oneof result { SnapshotVerificationReport report = 1; SnapshotVerificationError error = 2; } }
 enum LiveOperation { LIVE_OPERATION_UNSPECIFIED = 0; LIVE_OPERATION_PAUSE = 1; LIVE_OPERATION_CAPTURE = 2; LIVE_OPERATION_RESTORE = 3; LIVE_OPERATION_FORK = 4; LIVE_OPERATION_INCREMENTAL = 5; }
 enum LiveBackend { LIVE_BACKEND_UNSPECIFIED = 0; LIVE_BACKEND_KRUN = 1; LIVE_BACKEND_VZ = 2; LIVE_BACKEND_MOCK = 3; }

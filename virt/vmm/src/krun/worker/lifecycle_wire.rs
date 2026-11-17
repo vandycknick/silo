@@ -10,7 +10,7 @@
 //!
 //! ```text
 //!   sendmsg([len0] + SCM_RIGHTS)   write([len1 len2 len3] payload…)
-//!   recvmsg(1 byte, rights ≤ 5)    exact-length reads, any rights = failure
+//!   recvmsg(1 byte, rights ≤ 6)    exact-length reads, any rights = failure
 //! ```
 //!
 //! The worker reads one frame at a time and never past its end, so rights
@@ -33,11 +33,11 @@ use crate::virt::lifecycle::{
     LifecycleCommand, LifecycleRejection, LifecycleRights,
 };
 
-pub(crate) const PROTOCOL_VERSION: u32 = 4;
-/// Bounded RAM digests plus sparse disk runs for the aggregate 4 TiB stream limit.
+pub(crate) const PROTOCOL_VERSION: u32 = 5;
+/// Bounded RAM summaries plus sparse disk runs for the aggregate 4 TiB stream limit.
 pub(crate) const MAX_FRAME: usize = vm_spec::capture::MAX_CAPTURE_RECORD_BYTES;
 /// The largest typed descriptor set of any command.
-pub(crate) const MAX_RIGHTS: usize = 5;
+pub(crate) const MAX_RIGHTS: usize = 6;
 
 /// Monitor-side backend to worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,8 +489,9 @@ mod tests {
                         devices: identity(2),
                         ram: identity(3),
                         layout: identity(4),
+                        changes: identity(5),
                     },
-                    pin: identity(5),
+                    pin: identity(6),
                     pause: CapturePauseSource::Acquire,
                     resume_policy: CaptureResumePolicy::ResumeIfAcquired,
                     binding: CaptureDigests {
@@ -534,7 +535,7 @@ mod tests {
         let first = prepare(1);
         let second = observe(2);
         let bytes = encode(&first).expect("encode");
-        let (fds, witnesses) = passengers(5);
+        let (fds, witnesses) = passengers(6);
         assert_eq!(
             send_first_with_rights(sender.as_fd(), bytes[0], &fds).expect("rights"),
             1
@@ -571,12 +572,12 @@ mod tests {
         type Case = (ParentFrame, usize, usize);
         let cases: [Case; 5] = [
             // Rights attached to a later frame byte.
-            (prepare(1), 5, 2),
-            (prepare(1), 5, 9),
+            (prepare(1), 6, 2),
+            (prepare(1), 6, 9),
             // Rights on a command that carries none.
             (observe(1), 1, 0),
             // Too few for the command.
-            (prepare(1), 4, 0),
+            (prepare(1), 5, 0),
             // More than any command carries.
             (prepare(1), MAX_RIGHTS + 1, 0),
         ];
@@ -605,6 +606,52 @@ mod tests {
     }
 
     #[test]
+    fn capture_rights_round_trip_three_memory_outputs_and_reject_wrong_order() {
+        use crate::virt::lifecycle::{CaptureOutputFiles, CaptureOutputIdentities, OutputIdentity};
+        let directory = std::env::temp_dir().join(format!("capture-wire-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let files = ["execution", "devices", "ram", "layout", "changes", "pin"]
+            .map(|role| std::fs::File::create(directory.join(role)).unwrap());
+        let identity = |index: usize| OutputIdentity::of(&files[index]).unwrap();
+        for order in [[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 3, 5], [0, 1, 2, 4, 3, 5]] {
+            let mut frame = prepare(1);
+            let ParentFrame::Command { command, .. } = &mut frame;
+            let LifecycleCommand::PrepareCapture { preparation, .. } = command else {
+                panic!("prepare");
+            };
+            preparation.outputs = CaptureOutputIdentities {
+                execution: identity(0),
+                devices: identity(1),
+                ram: identity(2),
+                layout: identity(3),
+                changes: identity(4),
+            };
+            preparation.pin = identity(5);
+            let dup = |index: usize| files[index].try_clone().unwrap();
+            let descriptors = LifecycleRights::CaptureOutputs(CaptureOutputFiles {
+                execution: dup(order[0]),
+                devices: dup(order[1]),
+                ram: dup(order[2]),
+                layout: dup(order[3]),
+                changes: dup(order[4]),
+                pin: dup(order[5]),
+            })
+            .into_descriptors();
+            let bytes = encode(&frame).unwrap();
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            send_first_with_rights(sender.as_fd(), bytes[0], &descriptors).unwrap();
+            (&sender).write_all(&bytes[1..]).unwrap();
+            let (received, rights) = read_parent_frame(receiver.as_fd(), Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, frame);
+            let ParentFrame::Command { command, .. } = received;
+            assert_eq!(rights.check(&command).is_ok(), order == [0, 1, 2, 3, 4, 5]);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn truncated_frames_fail_and_never_wait_forever() {
         let (sender, receiver) = UnixStream::pair().expect("pair");
         let bytes = encode(&observe(1)).expect("encode");
@@ -627,13 +674,13 @@ mod tests {
     }
 
     #[test]
-    fn one_tib_receipt_bitmap_and_exact_producer_fit_bounded_control_frame() {
+    fn one_tib_receipt_remains_bounded_without_inline_change_records() {
         use crate::virt::lifecycle::{
             CaptureStateBinding, CommandOutcome, NativePauseGeneration, OutputReceipt,
         };
         use vm_spec::capture::{
-            full_dirty_chunks, CaptureFullReason, CaptureMemoryStats, MAX_CAPTURE_RAM_BYTES,
-            MAX_LIVE_STATE_SCHEMA_BYTES,
+            CaptureFullReason, CaptureMemoryStats, CaptureRamChanges, CaptureRamCoverage,
+            Sha256Digest, MAX_CAPTURE_RAM_BYTES, MAX_LIVE_STATE_SCHEMA_BYTES,
         };
         let outcome = CommandOutcome::MemoryCaptured {
             binding: Box::new(CaptureStateBinding {
@@ -661,12 +708,19 @@ mod tests {
             mode: vm_spec::lifecycle::CapturePolicy::Full,
             baseline: None,
             full_reason: Some(CaptureFullReason::Requested),
-            dirty_chunks: full_dirty_chunks(MAX_CAPTURE_RAM_BYTES).unwrap(),
-            chunk_digests: vec![
-                Some(vm_spec::capture::Sha256Digest::from_bytes([0xff; 32]));
-                MAX_CAPTURE_RAM_BYTES.div_ceil(vm_spec::capture::STREAM_CHUNK_BYTES)
-                    as usize
-            ],
+            identity_chunk_bytes: 1 << 16,
+            changes: Box::new(CaptureRamChanges {
+                byte_len: 16 + 56 * (MAX_CAPTURE_RAM_BYTES >> 16),
+                sha256: Sha256Digest::from_bytes([0xff; 32]),
+                record_count: MAX_CAPTURE_RAM_BYTES >> 16,
+                coverage: CaptureRamCoverage::Full,
+                baseline_stream: None,
+            }),
+            changes_output: OutputReceipt {
+                device: 1,
+                inode: 4,
+                length: 16 + 56 * (MAX_CAPTURE_RAM_BYTES >> 16),
+            },
             stats: Box::new(CaptureMemoryStats {
                 logical_bytes: MAX_CAPTURE_RAM_BYTES,
                 identity_bytes_hashed: MAX_CAPTURE_RAM_BYTES,
@@ -675,7 +729,7 @@ mod tests {
             }),
         };
         let bytes = encode(&outcome).unwrap();
-        assert!(bytes.len() > 16 * 1024);
+        assert!(bytes.len() < 16 * 1024);
         assert!(bytes.len() <= MAX_FRAME + 4);
         let mut buffer = FrameBuffer::default();
         buffer.extend(&bytes).unwrap();
@@ -696,6 +750,8 @@ mod tests {
             .map(|index| {
                 let seed = DiskTrackingSeed {
                     version: DISK_TRACKING_VERSION,
+                    map_format: 2,
+                    chunk_shift: 23,
                     role: if index == 0 {
                         vm_spec::DiskRole::Root
                     } else {

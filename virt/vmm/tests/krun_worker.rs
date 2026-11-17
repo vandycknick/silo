@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 #[path = "../src/virt/backend/krun/inherit.rs"]
 mod fd_policy;
 
+#[path = "../examples/native_live_api/stream_map.rs"]
+mod native_stream_map;
+
 /// A spawned process, its storage lease and, for direct workers, the
 /// monitor-side lifecycle endpoint. Both outlive the child until it is reaped.
 struct Process(Option<Child>, Option<Lease>, Option<OwnedFd>);
@@ -190,15 +193,15 @@ fn worker_with_tables(
     mapping.extend(
         state
             .iter()
-            .enumerate()
-            .map(|(index, file)| (file.as_raw_fd(), 25 + index as i32)),
+            .zip([25, 26, 27, 28, 33])
+            .map(|(file, role)| (file.as_raw_fd(), role)),
     );
-    mapping.extend(
-        lowers
-            .iter()
-            .enumerate()
-            .map(|(index, file)| (file.as_raw_fd(), 33 + index as i32)),
-    );
+    mapping.extend(lowers.iter().enumerate().map(|(index, file)| {
+        (
+            file.as_raw_fd(),
+            fd_policy::FIRST_LOWER_CHILD_FD + index as i32,
+        )
+    }));
     fd_policy::install(&mut command, &mapping).expect("worker descriptors");
     let child = Process(
         Some(command.spawn().expect("spawn actual worker")),
@@ -1376,7 +1379,7 @@ fn worker_adopts_only_the_optional_mux_and_bounded_raw_table_before_config() {
 #[test]
 fn restore_worker_inherits_exactly_state_and_lower_roles_and_restores_cloexec() {
     use std::os::unix::fs::MetadataExt;
-    let mut sources: Vec<_> = (0..6).map(|_| Lease::new()).collect();
+    let mut sources: Vec<_> = (0..7).map(|_| Lease::new()).collect();
     for (index, source) in sources.iter_mut().enumerate() {
         source.file.write_all(&[index as u8 + 1; 8]).unwrap();
     }
@@ -1384,8 +1387,8 @@ fn restore_worker_inherits_exactly_state_and_lower_roles_and_restores_cloexec() 
         .iter()
         .map(|source| std::fs::File::open(&source.path).unwrap())
         .collect();
-    let state: Vec<_> = files[..4].iter().collect();
-    let lowers: Vec<_> = files[4..].iter().collect();
+    let state: Vec<_> = files[..5].iter().collect();
+    let lowers: Vec<_> = files[5..].iter().collect();
     let (mut child, _config, keepalive, _events, _console) =
         worker_with_tables(|_| {}, &[], None, &state, &lowers);
     let pid = child.0.as_ref().unwrap().id();
@@ -1407,10 +1410,10 @@ fn restore_worker_inherits_exactly_state_and_lower_roles_and_restores_cloexec() 
     assert_eq!(
         descriptors,
         (0..=6)
-            .chain([8, 25, 26, 27, 28, 32, 33, 34])
+            .chain([8, 25, 26, 27, 28, 32, 33, 34, 35])
             .collect::<Vec<_>>()
     );
-    for (file, role) in files.iter().zip([25, 26, 27, 28, 33, 34]) {
+    for (file, role) in files.iter().zip([25, 26, 27, 28, 33, 34, 35]) {
         let expected = file.metadata().unwrap();
         let actual = std::fs::metadata(format!("/proc/{pid}/fd/{role}")).unwrap();
         assert_eq!(
@@ -1430,7 +1433,7 @@ fn restore_worker_inherits_exactly_state_and_lower_roles_and_restores_cloexec() 
 
 #[test]
 fn restore_worker_refuses_partial_state_or_cross_role_aliases_before_config() {
-    let mut sources: Vec<_> = (0..5).map(|_| Lease::new()).collect();
+    let mut sources: Vec<_> = (0..6).map(|_| Lease::new()).collect();
     for source in &mut sources {
         source.file.write_all(b"state").unwrap();
     }
@@ -1440,13 +1443,18 @@ fn restore_worker_refuses_partial_state_or_cross_role_aliases_before_config() {
         .collect();
     for (state, lowers) in [
         (vec![&files[0], &files[1], &files[2]], vec![]),
-        (vec![], vec![&files[4]]),
+        (vec![&files[0], &files[1], &files[2], &files[3]], vec![]),
+        (vec![], vec![&files[5]]),
         (
-            vec![&files[0], &files[1], &files[2], &files[3]],
+            vec![&files[0], &files[1], &files[2], &files[3], &files[4]],
             vec![&files[0]],
         ),
         (
-            vec![&sources[0].file, &files[1], &files[2], &files[3]],
+            vec![&sources[0].file, &files[1], &files[2], &files[3], &files[4]],
+            vec![],
+        ),
+        (
+            vec![&files[0], &files[1], &files[2], &files[3], &files[0]],
             vec![],
         ),
     ] {

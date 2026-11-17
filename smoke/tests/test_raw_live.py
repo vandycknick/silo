@@ -7,12 +7,13 @@ lock, so these exercise included writable storage, not external --disk grants.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from silo_smoke import capture_multidisk as multidisk, fork, procs, reclaim, restore, stopped
+from silo_smoke import capture_multidisk as multidisk, fork, procs, reclaim, restore, stopped, stream_map
 from silo_smoke.cli import RootProfile, Silo
 
 pytestmark = pytest.mark.linux_only
@@ -131,3 +132,90 @@ sync
     restore.restore_child(silo, "image:" + snapshot, restored)
     assert silo.exec(restored, "cat", "/raw-live-marker", "/capture-a/raw-live-marker",
                      "/capture-b/raw-live-marker").stdout == "root-at-cut\ndata-a-at-cut\ndata-b-at-cut\n"
+
+
+@pytest.mark.parametrize(("member", "unit", "role"), [
+    ("memory", stream_map.RAM_CHUNK, "RAM"), ("root", stream_map.DISK_CHUNK, "root disk"),
+])
+def test_verify_localizes_flipped_payload_despite_warm_receipts(
+    silo: Silo, basic_image: str, member: str, unit: int, role: str,
+) -> None:
+    source = "verify-localization"
+    create(silo, basic_image, source, "raw")
+    silo.start(source)
+    silo.wait_ready(source)
+    snapshot, _ = live_snapshot(silo, source, "verify-localization-cut")
+    record = snapshot_record(silo, snapshot)
+    binding = record["execution"]["memory"] if member == "memory" else record["root"]["stream"]
+    root, _ = stream_map.catalog_root(silo.ws.silo_home, binding)
+    assert root.chunk_size == unit
+    path = silo.ws.silo_home / "images/streams/sha256" / binding["stream"][7:]
+    assert stream_map.from_file(path, unit)[0] == root
+    if member == "memory":
+        child = "verify-root-restored"
+        restore.restore_child(silo, "image:" + snapshot, child)
+        # This is the actual file mapped into the restored guest, not a second
+        # staging copy or a claimed stream ID from a CLI response.
+        mapping = fork.ram_mapping(fork.worker(silo, child), path)
+        assert mapping["inode"] == path.stat().st_ino and mapping["mappedBytes"] > 0
+        assert stream_map.from_file(path, unit)[0].identity == binding["stream"]
+        silo.stop(child)
+    silo.stop(source)
+    verify(silo, snapshot)
+    offset = unit + 123
+    index = offset // unit
+    mode = path.stat().st_mode & 0o7777
+    path.chmod(0o600)
+    fd = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+    original = os.pread(fd, 1, offset)
+    assert len(original) == 1
+    try:
+        assert os.pwrite(fd, bytes([original[0] ^ 0x80]), offset) == 1
+        os.fsync(fd)
+        os.fchmod(fd, mode)
+        failed = silo.run("snapshot", "verify", "image:" + snapshot, "--format", "json",
+                          expect=1, timeout=120)
+        error = json.loads(failed.stdout)["error"]
+        assert (error["kind"], error["role"], error["stream"]) == ("chunkMismatch", role, binding["stream"])
+        assert (error["chunkSize"], error["index"], error["start"], error["end"]) == (
+            unit, index, index * unit, min((index + 1) * unit, binding["length"]))
+        assert error["expected"] != error["actual"]
+    finally:
+        os.pwrite(fd, original, offset)
+        os.fsync(fd)
+        os.close(fd)
+        path.chmod(mode)
+    verify(silo, snapshot)
+
+
+@pytest.mark.parametrize("height", range(5))
+def test_verify_refuses_corrupt_map_node_closure(silo: Silo, basic_image: str, height: int) -> None:
+    source = "verify-node"
+    create(silo, basic_image, source, "raw")
+    silo.start(source)
+    silo.wait_ready(source)
+    snapshot, _ = live_snapshot(silo, source, "verify-node-cut")
+    binding = snapshot_record(silo, snapshot)["execution"]["memory"]
+    root, _ = stream_map.catalog_root(silo.ws.silo_home, binding)
+    source_bytes = stream_map.object_source(silo.ws.silo_home)
+    node = root.tree
+    assert node is not None
+    for level in range(4, height, -1):
+        node = next(iter(stream_map.decode_node(source_bytes(node), level).values()))
+    path = silo.ws.silo_home / "images/objects/sha256" / node[7:]
+    original = path.read_bytes()
+    mode = path.stat().st_mode & 0o7777
+    silo.stop(source)
+    try:
+        path.chmod(0o600)
+        path.write_bytes(original[:-1] + bytes([original[-1] ^ 0x80]))
+        path.chmod(mode)
+        failed = silo.run("snapshot", "verify", "image:" + snapshot, "--format", "json", expect=1, timeout=120)
+        error = json.loads(failed.stdout)["error"]
+        assert (error["kind"], error["role"], error["node"], error["height"]) == (
+            "mapNode", "RAM", node, height)
+        assert "index" not in error
+    finally:
+        path.chmod(0o600)
+        path.write_bytes(original)
+        path.chmod(mode)

@@ -1026,6 +1026,7 @@ mod tests {
             pause,
             disks: Vec::new(),
             read_only_inputs: Vec::new(),
+            map_node_store: None,
             reservation: CaptureReservation {
                 storage_operation_id: id(0x7b),
                 launch_lease: binding.launch,

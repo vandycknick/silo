@@ -7,8 +7,8 @@
 //! `Reserved(op)` under the lifecycle lock, after which no start, update,
 //! removal or offline write is admitted until a terminal decision, so those
 //! files are the immutable cut (no clone or copy is made). Only bytes the
-//! destination cannot verify locally travel, as exact objects, canonical
-//! stream maps and decoded 8 MiB chunks.
+//! destination cannot verify locally travel, as exact objects, binary stream
+//! roots, map-node objects and root-authenticated decoded 8 MiB payloads.
 pub mod destination;
 pub mod plan;
 pub mod service;

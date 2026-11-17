@@ -22,12 +22,13 @@ use crate::store::models::snapshot::{
 };
 use crate::LibVmError;
 
-const FIXED_ROLES: [CaptureRole; 5] = [
+const FIXED_ROLES: [CaptureRole; 6] = [
     CaptureRole::Execution,
     CaptureRole::Devices,
     CaptureRole::Ram,
     CaptureRole::Layout,
     CaptureRole::RamMap,
+    CaptureRole::RamChanges,
 ];
 const MAX_LAYOUT_BYTES: u64 = 65536;
 
@@ -38,7 +39,7 @@ fn failure(message: impl std::fmt::Display) -> LibVmError {
 /// `portable-capture-provenance`, direct record JSON in canonical form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PortableCaptureProvenanceV1 {
+pub(crate) struct PortableCaptureProvenanceV2 {
     pub(crate) schema: u32,
     pub(crate) kind: String,
     pub(crate) snapshot: SnapshotId,
@@ -56,7 +57,7 @@ pub(crate) struct PortableCaptureDisk {
     pub(crate) attachment_index: u32,
 }
 
-impl PortableCaptureProvenanceV1 {
+impl PortableCaptureProvenanceV2 {
     pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, LibVmError> {
         Ok(canonical_bytes(self)?)
     }
@@ -64,7 +65,7 @@ impl PortableCaptureProvenanceV1 {
     /// Strict closed decoding of exactly canonical bytes.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, LibVmError> {
         let wrapper: Self = decode_record(bytes)?;
-        if wrapper.schema != 1 || wrapper.kind != "portable-capture-provenance" {
+        if wrapper.schema != 2 || wrapper.kind != "portable-capture-provenance" {
             return Err(failure("unsupported provenance schema or kind"));
         }
         if wrapper.canonical_bytes()? != bytes {
@@ -99,6 +100,22 @@ pub(crate) fn decode_portable_evidence(bytes: &[u8]) -> Result<CaptureEvidence, 
         return Err(failure("capture evidence is not a coherent seal"));
     }
     Ok(evidence)
+}
+
+pub(crate) fn provenance_objects(
+    wrapper: &[u8],
+    evidence: &[u8],
+) -> Result<(ObjectDigest, ObjectDigest, ObjectDigest), LibVmError> {
+    let decoded = decode_portable_evidence(evidence)?;
+    let memory = decoded
+        .memory
+        .as_ref()
+        .ok_or_else(|| failure("portable checkpoint lacks RAM change evidence"))?;
+    Ok((
+        ObjectDigest::of_bytes(wrapper),
+        ObjectDigest::of_bytes(evidence),
+        ObjectDigest::from_sha256(*memory.changes.sha256.as_bytes()),
+    ))
 }
 
 fn execution(record: &SnapshotRecord) -> Result<&SnapshotExecution, LibVmError> {
@@ -178,8 +195,8 @@ pub(crate) fn build_local(
             "capture inventory disk count differs from writable attachments",
         ));
     }
-    let wrapper = PortableCaptureProvenanceV1 {
-        schema: 1,
+    let wrapper = PortableCaptureProvenanceV2 {
+        schema: 2,
         kind: "portable-capture-provenance".into(),
         snapshot,
         evidence: RecordRef::of_bytes(evidence_bytes),
@@ -207,7 +224,7 @@ pub(crate) fn verify_portable_binding(
     evidence_bytes: &[u8],
 ) -> Result<PortableBinding, LibVmError> {
     let execution = execution(record)?;
-    let wrapper = PortableCaptureProvenanceV1::decode(wrapper_bytes)?;
+    let wrapper = PortableCaptureProvenanceV2::decode(wrapper_bytes)?;
     if wrapper.snapshot != snapshot {
         return Err(failure("provenance names a different snapshot"));
     }
@@ -347,10 +364,11 @@ pub(crate) fn verify_portable_binding(
 /// Authenticated decoded chunk maps measured during ingest, never copied from
 /// the capture inventory. Whole-byte transport digests are checked separately.
 pub(crate) struct MeasuredCapture<'a> {
-    pub(crate) stream_maps: &'a BTreeMap<StreamId, Arc<crate::storage::stream::StreamMap>>,
+    pub(crate) stream_maps: &'a BTreeMap<StreamId, Arc<crate::storage::map::AuthenticatedMap>>,
     pub(crate) layout: &'a [u8],
     pub(crate) execution: &'a File,
     pub(crate) devices: &'a File,
+    pub(crate) changes: &'a File,
 }
 
 /// Byte-level checks of section 4.2 items 5 to 7, then the native header
@@ -422,6 +440,59 @@ pub(crate) fn verify_portable_capture(
     {
         return Err(failure("complete RAM map differs from its seal"));
     }
+    let changes = state(CaptureRole::RamChanges)?;
+    if changes.sha256 != Some(memory.changes.sha256)
+        || changes.length != memory.changes.byte_len
+        || measured.changes.metadata()?.len() != memory.changes.byte_len
+    {
+        return Err(failure("RAM change object differs from its seal"));
+    }
+    let mut changes_file = measured.changes.try_clone()?;
+    std::io::Seek::rewind(&mut changes_file)?;
+    let changes_reader =
+        vm_spec::capture::RamChangeReader::new(changes_file, ram_map.length(), &memory.changes)?;
+    let mut present = ram_map.present_chunks();
+    let mut next = present.next().transpose()?;
+    let full = memory.changes.coverage == vm_spec::capture::CaptureRamCoverage::Full;
+    for change in changes_reader {
+        let change = change?;
+        let (first, end, digest) = match change {
+            vm_spec::capture::CaptureRamChange::Data { index, digest } => {
+                (index, index + 1, Some(digest))
+            }
+            vm_spec::capture::CaptureRamChange::Zero { first_index, count } => {
+                (first_index, first_index + count, None)
+            }
+        };
+        while next.as_ref().is_some_and(|chunk| chunk.index < first) {
+            if full {
+                return Err(failure("full RAM changes omit a nonzero identity"));
+            }
+            next = present.next().transpose()?;
+        }
+        match digest {
+            Some(digest) => {
+                if next
+                    .as_ref()
+                    .is_none_or(|chunk| chunk.index != first || chunk.digest != digest)
+                {
+                    return Err(failure(
+                        "RAM change digest differs from authenticated bytes",
+                    ));
+                }
+                next = present.next().transpose()?;
+            }
+            None if next.as_ref().is_some_and(|chunk| chunk.index < end) => {
+                return Err(failure(
+                    "RAM zero change covers authenticated nonzero bytes",
+                ));
+            }
+            None => {}
+        }
+    }
+    if full && next.is_some() {
+        return Err(failure("full RAM changes omit trailing nonzero identities"));
+    }
     for (role, object, length, maximum) in [
         (
             CaptureRole::Execution,
@@ -485,11 +556,11 @@ mod tests {
 
     use crate::image::transport::provenance::{
         build_local, verify_portable_binding, verify_portable_capture, MeasuredCapture,
-        PortableCaptureProvenanceV1,
+        PortableCaptureProvenanceV2,
     };
     use crate::storage::identity::{SnapshotId, StreamId};
+    use crate::storage::map::AuthenticatedMap;
     use crate::storage::pool::StoragePool;
-    use crate::storage::stream::{Chunk, StreamMap};
     use crate::store::models::snapshot::{SnapshotCaptureKind, SnapshotRecord};
     use crate::store::snapshot_store::SnapshotRef;
 
@@ -541,8 +612,8 @@ mod tests {
         decoded.canonical_bytes().unwrap()
     }
 
-    fn rewrap(wrapper: &[u8], change: impl FnOnce(&mut PortableCaptureProvenanceV1)) -> Vec<u8> {
-        let mut decoded = PortableCaptureProvenanceV1::decode(wrapper).unwrap();
+    fn rewrap(wrapper: &[u8], change: impl FnOnce(&mut PortableCaptureProvenanceV2)) -> Vec<u8> {
+        let mut decoded = PortableCaptureProvenanceV2::decode(wrapper).unwrap();
         change(&mut decoded);
         decoded.canonical_bytes().unwrap()
     }
@@ -561,7 +632,7 @@ mod tests {
             binding.wrapper_digest,
             crate::storage::identity::ObjectDigest::of_bytes(&wrapper)
         );
-        let decoded = PortableCaptureProvenanceV1::decode(&wrapper).unwrap();
+        let decoded = PortableCaptureProvenanceV2::decode(&wrapper).unwrap();
         assert_eq!(decoded.snapshot, published.id);
         assert_eq!(decoded.plan, published.plan);
         assert_eq!(
@@ -738,7 +809,20 @@ mod tests {
             .unwrap();
         let execution_file = published.pool.verify_object(&execution.execution).unwrap();
         let devices_file = published.pool.verify_object(&execution.devices).unwrap();
-        let measured = |maps: &BTreeMap<StreamId, Arc<StreamMap>>,
+        let changes_file = published
+            .pool
+            .verify_object(&crate::storage::identity::ObjectDigest::from_sha256(
+                *binding
+                    .evidence
+                    .memory
+                    .as_ref()
+                    .unwrap()
+                    .changes
+                    .sha256
+                    .as_bytes(),
+            ))
+            .unwrap();
+        let measured = |maps: &BTreeMap<StreamId, Arc<AuthenticatedMap>>,
                         layout: &[u8],
                         swap: bool|
          -> Result<(), crate::LibVmError> {
@@ -755,6 +839,7 @@ mod tests {
                     layout,
                     execution: first,
                     devices: second,
+                    changes: &changes_file,
                 },
             )
         };
@@ -764,15 +849,22 @@ mod tests {
             "swapped state objects"
         );
         let wrong_map = |length: u64, bytes: &[u8]| {
+            let mut writer = crate::storage::map::MapNodeWriter::new().unwrap();
+            let root = vm_spec::stream_map::build_sorted(
+                length,
+                vm_spec::stream_map::ChunkSize::DISK,
+                [Ok(vm_spec::stream_map::PresentChunk {
+                    index: 0,
+                    digest: Sha256Digest::of_bytes(bytes),
+                })],
+                &mut writer,
+            )
+            .unwrap();
             Arc::new(
-                StreamMap::new(
-                    length,
-                    vec![
-                        Chunk::Data(crate::storage::identity::ObjectDigest::of_bytes(bytes));
-                        length.div_ceil(crate::storage::limits::CHUNK_SIZE as u64) as usize
-                    ],
-                )
-                .unwrap(),
+                writer
+                    .finish(root, vm_spec::stream_map::StreamRole::Disk, None)
+                    .unwrap()
+                    .into_map(),
             )
         };
         let mut ram = maps.clone();

@@ -1,5 +1,8 @@
 //! Atomic imported artifact publication. Remote capture provenance is never a
 //! local capture reservation and never advances the source lifecycle journal.
+//! Encoded payload membership is retained independently of identity-unit size.
+//! Admitted roots retain map-node DAGs; imported byte authority comes only from
+//! the locally authenticated decoded stream, never its acquisition receipt.
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -88,17 +91,24 @@ async fn commit_owned(
             stream: stream.id,
             length: stream.length,
             map: stream.canonical_map,
-            map_pages: stream.canonical_pages.clone(),
+            chunk_size: stream.map.chunk_size().bytes(),
         };
         bind_held(&stream.file, stream.fingerprint)?;
+        let retained = store
+            .admit_published_map_root(operation, &stream.map)
+            .await?;
         // Object-only transfer maps retain encoded chunks, not another
         // permanent whole-stream inode. In particular fsmeta remains one
         // ObjectDigest backing, irrespective of its chunked wire encoding.
         let flat = semantic_streams.contains(&stream.id);
         if flat {
-            let (published, roots) =
-                pool.publish_stream_file_for_catalog(stream.file.try_clone()?, stream.length)?;
-            if published.id != stream.id || published.map != *stream.map {
+            let (published, roots) = pool.publish_sealed_stream_for_catalog(
+                &stream.file,
+                &stream.map,
+                None,
+                crate::storage::pool::SealedStreamPublicationMode::CopyAllowed,
+            )?;
+            if published.map().id() != stream.id || published.map() != stream.map.as_ref() {
                 return Err(invalid(
                     "imported stream publication identity contradiction",
                 ));
@@ -107,12 +117,8 @@ async fn commit_owned(
                 .pin_published_storage_dependencies(operation, &[stream.id], &[])
                 .await?;
             mark_flat_present(&mut *store.pool.acquire().await?, &content).await?;
-            fingerprints.push((
-                published.path.clone(),
-                crate::storage::identity_file::SourceFingerprint::new(&std::fs::symlink_metadata(
-                    published.path,
-                )?),
-            ));
+            let path = pool.stream_path(&stream.id);
+            fingerprints.push((path, published.fingerprint()));
             drop(roots);
         }
         for descriptor in &stream.transport.chunks {
@@ -150,10 +156,10 @@ async fn commit_owned(
             drop(roots);
         }
         representations.push((
-            VerifiedStreamRepresentation::verify(&pool, content, stream.transport.root.0)?
-                .for_import(),
+            VerifiedStreamRepresentation::from_import(&pool, operation, stream)?,
             flat,
         ));
+        drop(retained);
     }
     let root = match &parts.content {
         VerifiedContent::Image { record, .. } => &record.root,
@@ -354,18 +360,30 @@ async fn commit_owned(
         .bind(operation.to_string()).bind(kind).bind(&id).execute(&mut *tx).await?;
     let provenance = capture.map(|capture| capture.provenance_digest);
     if let Some(capture) = capture {
-        let existing = sqlx::query("SELECT evidence_digest,provenance_bytes FROM snapshot_imported_capture WHERE snapshot_id=?1 AND provenance_digest=?2")
+        if !parts.objects.contains_key(&capture.changes_digest) {
+            return Err(invalid(
+                "imported capture lacks its authenticated RAM changes object",
+            ));
+        }
+        sqlx::query("INSERT OR IGNORE INTO snapshot_capture_change(snapshot_id,changes_digest) VALUES(?1,?2)")
+            .bind(&id)
+            .bind(capture.changes_digest.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let existing = sqlx::query("SELECT evidence_digest,changes_digest,provenance_bytes FROM snapshot_imported_capture WHERE snapshot_id=?1 AND provenance_digest=?2")
             .bind(&id).bind(capture.provenance_digest.to_string()).fetch_optional(&mut *tx).await?;
         if let Some(existing) = existing {
             if existing.try_get::<String, _>("evidence_digest")?
                 != capture.evidence_digest.to_string()
                 || existing.try_get::<Vec<u8>, _>("provenance_bytes")? != capture.provenance_bytes
+                || existing.try_get::<String, _>("changes_digest")?
+                    != capture.changes_digest.to_string()
             {
                 return Err(invalid("immutable imported capture contradiction"));
             }
         } else {
-            sqlx::query("INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,provenance_bytes) VALUES(?1,?2,?3,?4)")
-                .bind(&id).bind(capture.provenance_digest.to_string()).bind(capture.evidence_digest.to_string()).bind(&capture.provenance_bytes).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,changes_digest,provenance_bytes) VALUES(?1,?2,?3,?4,?5)")
+                .bind(&id).bind(capture.provenance_digest.to_string()).bind(capture.evidence_digest.to_string()).bind(capture.changes_digest.to_string()).bind(&capture.provenance_bytes).execute(&mut *tx).await?;
         }
     }
     sqlx::query("INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,provenance_digest,encoding_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING")
@@ -448,7 +466,7 @@ pub(crate) async fn acquisition_objects(
                     return Err(invalid("image has imported capture authority"));
                 }
                 let provenance_digest: ObjectDigest = provenance.parse().map_err(invalid)?;
-                let capture = sqlx::query("SELECT evidence_digest,provenance_bytes FROM snapshot_imported_capture WHERE snapshot_id=?1 AND provenance_digest=?2")
+                let capture = sqlx::query("SELECT evidence_digest,changes_digest,provenance_bytes FROM snapshot_imported_capture WHERE snapshot_id=?1 AND provenance_digest=?2")
                     .bind(id).bind(&provenance).fetch_one(&mut *connection).await?;
                 let evidence: ObjectDigest = capture
                     .try_get::<String, _>("evidence_digest")?
@@ -458,8 +476,28 @@ pub(crate) async fn acquisition_objects(
                 if ObjectDigest::of_bytes(&wrapper) != provenance_digest {
                     return Err(invalid("imported capture wrapper digest contradiction"));
                 }
-                objects.extend([provenance_digest, evidence]);
+                let changes: ObjectDigest = capture
+                    .try_get::<String, _>("changes_digest")?
+                    .parse()
+                    .map_err(invalid)?;
+                let rooted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM snapshot_capture_change WHERE snapshot_id=?1 AND changes_digest=?2)")
+                    .bind(id).bind(changes.to_string()).fetch_one(&mut *connection).await?;
+                if !rooted {
+                    return Err(invalid("imported capture RAM changes root is missing"));
+                }
+                objects.extend([provenance_digest, evidence, changes]);
             }
+        }
+    }
+    if kind == "snapshot" {
+        let changes = sqlx::query_scalar::<_, String>(
+            "SELECT changes_digest FROM snapshot_capture_change WHERE snapshot_id=?1",
+        )
+        .bind(id)
+        .fetch_all(&mut *connection)
+        .await?;
+        for change in changes {
+            objects.insert(change.parse().map_err(invalid)?);
         }
     }
     Ok(objects)
@@ -469,6 +507,7 @@ pub(crate) async fn acquisition_objects(
 pub(crate) struct ImportedCaptureRef {
     pub(crate) provenance_digest: ObjectDigest,
     pub(crate) evidence_digest: ObjectDigest,
+    pub(crate) changes_digest: ObjectDigest,
     pub(crate) receipt_digest: ObjectDigest,
     pub(crate) index_digest: ObjectDigest,
 }
@@ -480,7 +519,7 @@ pub(crate) async fn imported_capture_refs(
     let mut refs = Vec::new();
     let mut cursor = String::new();
     loop {
-        let rows = sqlx::query("SELECT provenance_digest,evidence_digest FROM snapshot_imported_capture WHERE snapshot_id=?1 AND provenance_digest>?2 ORDER BY provenance_digest LIMIT 1")
+        let rows = sqlx::query("SELECT provenance_digest,evidence_digest,changes_digest FROM snapshot_imported_capture WHERE snapshot_id=?1 AND provenance_digest>?2 ORDER BY provenance_digest LIMIT 1")
             .bind(id).bind(&cursor).fetch_all(&mut *connection).await?;
         if rows.is_empty() {
             break;
@@ -500,6 +539,10 @@ pub(crate) async fn imported_capture_refs(
             refs.push(ImportedCaptureRef {
                 provenance_digest: cursor.parse().map_err(invalid)?,
                 evidence_digest: evidence,
+                changes_digest: row
+                    .try_get::<String, _>("changes_digest")?
+                    .parse()
+                    .map_err(invalid)?,
                 receipt_digest: receipt
                     .try_get::<String, _>("receipt_digest")?
                     .parse()
@@ -692,11 +735,15 @@ mod tests {
                 .await;
         if preserve_raw {
             let pool = StoragePool::open(&store.images_dir).unwrap();
-            let verified =
-                VerifiedStreamRepresentation::verify(&pool, record.root.stream.clone(), root)
-                    .unwrap()
-                    .for_encoding(ChunkEncoding::Zstd)
-                    .unwrap();
+            let verified = VerifiedStreamRepresentation::verify(
+                &pool,
+                owner.id,
+                record.root.stream.clone(),
+                root,
+            )
+            .unwrap()
+            .for_encoding(ChunkEncoding::Zstd)
+            .unwrap();
             store
                 .register_stream_representation(owner.id, &verified)
                 .await
@@ -721,7 +768,7 @@ mod tests {
         let record = serde_json::json!({"digest":ObjectDigest::of_bytes(b"record"),"size":6});
         let live = provenance.is_some();
         let config=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
-            "schema":1,"kind":"vm-artifact","encoding":"silo-chunks-v1",
+            "schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
             "content":{"kind":"snapshot","id":id,"record":record},
             "purpose":"checkpoint","captureKind":if live{"live-execution"}else{"stopped-storage"},
             "rootFamily":"opaque-raw","backendRequirement":"raw-block",
@@ -733,11 +780,11 @@ mod tests {
             "captureProvenance":provenance.map(|digest|serde_json::json!({"digest":digest,"size":42}))
         })).unwrap();
         let child=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
-            "schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.silo.vm.metadata.v1",
-            "config":{"digest":ObjectDigest::of_bytes(&config),"size":config.len(),"mediaType":"application/vnd.silo.vm.config.v1+json"},"layers":[]
+            "schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.silo.vm.metadata.v2",
+            "config":{"digest":ObjectDigest::of_bytes(&config),"size":config.len(),"mediaType":"application/vnd.silo.vm.config.v2+json"},"layers":[]
         })).unwrap();
         let index=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
-            "schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","artifactType":"application/vnd.silo.vm.v1",
+            "schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","artifactType":"application/vnd.silo.vm.v2",
             "manifests":[{"digest":ObjectDigest::of_bytes(&child),"size":child.len(),"mediaType":"application/vnd.oci.image.manifest.v1+json"}]
         })).unwrap();
         (
@@ -873,11 +920,47 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(state, "present");
+            let nodes: Vec<String> = sqlx::query_scalar(
+                "WITH RECURSIVE nodes(digest) AS (SELECT ?1 UNION SELECT e.child_digest FROM stream_map_edge e JOIN nodes n ON e.parent_digest=n.digest) SELECT digest FROM nodes",
+            )
+            .bind(record.root.stream.map.to_string())
+            .fetch_all(&destination.pool)
+            .await
+            .unwrap();
+            assert!(nodes.len() > 1);
+            for node in &nodes {
+                let digest: ObjectDigest = node.parse().unwrap();
+                assert!(pool.object_path(&digest).exists());
+                let retained: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM retained_object WHERE object_digest=?1)",
+                )
+                .bind(node)
+                .fetch_one(&destination.pool)
+                .await
+                .unwrap();
+                assert!(retained);
+            }
+            let flattened_nodes: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM stream_representation_object r JOIN stream_map_object n ON n.digest=r.object_digest WHERE r.stream_id=?1 AND n.height IS NOT NULL)",
+            )
+            .bind(record.root.stream.stream.to_string())
+            .fetch_one(&destination.pool)
+            .await
+            .unwrap();
+            assert!(!flattened_nodes);
             drop(committed);
             destination
                 .retire_abandoned_storage_operations(&pool)
                 .await
                 .unwrap();
+            let retained_nodes: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM json_each(?1) n JOIN retained_object r ON r.object_digest=n.value",
+            )
+            .bind(serde_json::to_string(&nodes).unwrap())
+            .fetch_one(&destination.pool)
+            .await
+            .unwrap();
+            assert_eq!(retained_nodes as usize, nodes.len());
             destination.evict_flat_materializations().await.unwrap();
             assert!(!pool.stream_path(&record.root.stream.stream).exists());
             let state: String =
@@ -1004,6 +1087,7 @@ mod tests {
         let pool = StoragePool::open(&destination.images_dir).unwrap();
         assert!(VerifiedStreamRepresentation::verify(
             &pool,
+            consumer.operation_id,
             record.root.stream.clone(),
             retained.root.0
         )

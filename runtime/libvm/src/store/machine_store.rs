@@ -583,13 +583,12 @@ impl Store {
             let map_path = crate::machine::root_storage::baseline_map_path(&identity)?;
             let mut map_bytes = Vec::new();
             std::fs::File::open(directory.join(map_path.as_path()))?
-                .take(
-                    vm_spec::capture::MAX_STREAM_BYTES / vm_spec::capture::STREAM_CHUNK_BYTES * 74
-                        + 257,
-                )
+                .take(vm_spec::stream_map::MAX_ROOT_BYTES as u64 + 1)
                 .read_to_end(&mut map_bytes)?;
-            let map = vm_spec::capture::StreamMap::decode(&map_bytes)
-                .map_err(crate::machine::root_storage::invalid)?;
+            let map = vm_spec::stream_map::StreamRoot::decode(&map_bytes)
+                .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
+            map.validate_role(vm_spec::stream_map::StreamRole::Disk)
+                .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
             if map.id() != identity || map.length() != seed.length {
                 return Err(crate::machine::root_storage::invalid(
                     "sealed disk baseline map identity changed",
@@ -602,7 +601,7 @@ impl Store {
                 .retain(|baseline| baseline.seed.attachment_index != seed.attachment_index);
             storage.disk_baselines.push(DiskBaseline {
                 seed,
-                map: map_path,
+                map: crate::storage::identity::ObjectDigest::from_sha256(*identity.as_bytes()),
                 storage_generation: storage.storage_generation,
                 generation: receipt.token.generation,
                 state: DiskBaselineState::Running {
@@ -989,6 +988,43 @@ impl Store {
             objects,
             lowers,
         } = crate::store::cache_paths::storage_pool_dependencies(storage)?;
+        if storage.disk_baselines.iter().any(|baseline| {
+            !matches!(
+                baseline.state,
+                crate::store::models::storage::DiskBaselineState::Invalid
+            )
+        }) {
+            let database: String =
+                sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name='main'")
+                    .fetch_one(&mut **tx)
+                    .await?;
+            let home = std::path::Path::new(&database).parent().ok_or_else(|| {
+                crate::store::models::snapshot::invalid("catalog database has no home")
+            })?;
+            let pool = crate::storage::pool::StoragePool::open(&home.join("images"))?;
+            for baseline in &storage.disk_baselines {
+                if matches!(
+                    baseline.state,
+                    crate::store::models::storage::DiskBaselineState::Invalid
+                ) {
+                    continue;
+                }
+                let bytes =
+                    pool.read_object(&baseline.map, vm_spec::stream_map::MAX_ROOT_BYTES as u64)?;
+                let root = vm_spec::stream_map::StreamRoot::decode(&bytes)
+                    .map_err(crate::store::models::snapshot::invalid)?;
+                root.validate_role(vm_spec::stream_map::StreamRole::Disk)
+                    .map_err(crate::store::models::snapshot::invalid)?;
+                if root.id().as_bytes() != baseline.map.as_bytes()
+                    || root.length() != baseline.seed.length
+                {
+                    return Err(crate::store::models::snapshot::invalid(
+                        "machine baseline root contradicts tracking seed",
+                    ));
+                }
+                crate::store::map_store::admit_graph(&mut *tx, &pool, &root).await?;
+            }
+        }
         let generation =
             i64::try_from(storage.storage_generation).map_err(|error| LibVmError::StateDecode {
                 field: "machine_storage.storage_generation",

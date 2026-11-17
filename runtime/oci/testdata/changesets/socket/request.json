@@ -7,9 +7,9 @@
           "directory": "silo-artifacts/case-0000/layer-0000",
           "indexRoot": "sha256:85c862319badb92f19cc5f5a0574efa549a478490cbca1aeee32becc24ab77c1",
           "packLength": 0,
-          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "packStream": "sha256:258c0a4a58b975e94f88a228a9d8189998553caf5a13a504f092aa59e8ae3b15",
           "recipe": "sha256:fa3a5b4ab4b571f7a43d4094206627ef7330e2b6de8fdfb8814b75b3abaded8c",
-          "result": "sha256:e0cc7df6b684291f604d7c32c80f3f03fb44680ad76a04c33ea569bb54d11ece"
+          "result": "sha256:0bd888c4e58c37576765c3ab8dddf2bcd4650f107bd0b82784e3908f044eae30"
         }
       ],
       "expected": [

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use oci::changeset::model::{ContentDigest, StreamIdentity};
 use oci::vm_artifact::wire::{
     self, ContentKind, ContentRef, ExecutionRequirements, GuestPlatform, MinimumCapabilities,
-    PayloadMediaType, Purpose, RecordRef, VmArtifactConfigV1,
+    PayloadMediaType, Purpose, RecordRef, VmArtifactConfigV2,
 };
 
 use crate::image::import_types::ManagedSourceId;
@@ -43,20 +43,16 @@ pub(crate) fn stream_id(stream: StreamIdentity) -> StreamId {
     StreamId::from_sha256(*stream.as_bytes())
 }
 
-/// Exact canonical local map root and page bytes of a decoded map: the
-/// encoding the semantic record's `map`/`mapPages` digests name.
+/// Root and node bytes enumerated only at the full transport boundary.
+#[cfg(test)]
 pub(crate) fn canonical_map_bytes(
-    map: &crate::storage::stream::StreamMap,
+    map: &crate::storage::map::AuthenticatedMap,
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), LibVmError> {
-    let mut pages = Vec::new();
-    let mut digests = Vec::new();
-    for page in crate::storage::map::pages(map) {
-        let page = page?;
-        digests.push(ObjectDigest::of_bytes(&page));
-        pages.push(page);
-    }
-    let root = crate::storage::map::StreamMapRoot::new(map, digests)?.encode()?;
-    Ok((root, pages))
+    let nodes = map
+        .nodes()
+        .map(|node| node.map(|node| node.bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((map.canonical_bytes()?, nodes))
 }
 
 fn failure(message: impl std::fmt::Display) -> LibVmError {
@@ -71,6 +67,7 @@ pub(crate) enum ObjectRole {
         maximum: u64,
     },
     Execution,
+    Map,
     Devices,
     /// Opaque boot bytes: always reconstructed through a chunk stream.
     Streamed,
@@ -82,6 +79,7 @@ impl ObjectRole {
     pub(crate) fn media(self) -> Option<PayloadMediaType> {
         match self {
             Self::Record { .. } => Some(PayloadMediaType::Record),
+            Self::Map => Some(PayloadMediaType::StreamMap),
             Self::Execution => Some(PayloadMediaType::Execution),
             Self::Devices => Some(PayloadMediaType::DeviceState),
             Self::Streamed | Self::Fsmeta => None,
@@ -91,6 +89,7 @@ impl ObjectRole {
     pub(crate) fn maximum(self) -> u64 {
         match self {
             Self::Record { maximum } => maximum,
+            Self::Map => vm_spec::stream_map::MAX_NODE_BYTES as u64,
             Self::Execution => crate::store::capture_native::MAX_EXECUTION_BYTES,
             Self::Devices => crate::store::capture_native::MAX_DEVICE_BYTES,
             Self::Streamed => wire::MAX_STREAM_BYTES,
@@ -298,7 +297,7 @@ impl Semantic {
         streams: RecordRef,
         objects: RecordRef,
         capture_provenance: Option<RecordRef>,
-    ) -> Result<VmArtifactConfigV1, LibVmError> {
+    ) -> Result<VmArtifactConfigV2, LibVmError> {
         let (_, kernel_architecture, abi) = self.binding()?;
         let (root_family, backend_requirement, storage_profile) = match &self.root().profile {
             SnapshotRootProfile::OpaqueRaw => (
@@ -342,10 +341,10 @@ impl Semantic {
                 }
             },
         };
-        let config = VmArtifactConfigV1 {
-            schema: 1,
+        let config = VmArtifactConfigV2 {
+            schema: 2,
             kind: "vm-artifact".into(),
-            encoding: "silo-chunks-v1".into(),
+            encoding: "silo-chunks-v2".into(),
             content: self.content_ref(),
             purpose,
             capture_kind,
@@ -377,7 +376,7 @@ impl Semantic {
     /// streamed objects' maps are known.
     pub(crate) fn object_roles(
         &self,
-        provenance: Option<(ObjectDigest, ObjectDigest)>,
+        provenance: Option<(ObjectDigest, ObjectDigest, ObjectDigest)>,
     ) -> Result<BTreeMap<ObjectDigest, ObjectRole>, LibVmError> {
         if self.live() != provenance.is_some() {
             return Err(failure(
@@ -390,10 +389,7 @@ impl Semantic {
         let mut roles = BTreeMap::new();
         add_role(&mut roles, self.digest, metadata)?;
         for stream in self.streams() {
-            add_role(&mut roles, stream.map, metadata)?;
-            for page in &stream.map_pages {
-                add_role(&mut roles, *page, metadata)?;
-            }
+            add_role(&mut roles, stream.map, ObjectRole::Map)?;
         }
         if let Some(lower) = self.composition() {
             for digest in [lower.record, lower.recipe] {
@@ -441,7 +437,7 @@ impl Semantic {
             add_role(&mut roles, execution.execution, ObjectRole::Execution)?;
             add_role(&mut roles, execution.devices, ObjectRole::Devices)?;
         }
-        if let Some((wrapper, evidence)) = provenance {
+        if let Some((wrapper, evidence, changes)) = provenance {
             add_role(&mut roles, wrapper, metadata)?;
             add_role(
                 &mut roles,
@@ -450,6 +446,7 @@ impl Semantic {
                     maximum: vm_spec::capture::MAX_CAPTURE_RECORD_BYTES as u64,
                 },
             )?;
+            add_role(&mut roles, changes, ObjectRole::Streamed)?;
         }
         // Agreement with the record's own dependency derivation: the table
         // closure is exactly content dependencies plus record and provenance.
@@ -459,9 +456,10 @@ impl Semantic {
         };
         let mut expected = dependencies;
         expected.insert(self.digest);
-        if let Some((wrapper, evidence)) = provenance {
+        if let Some((wrapper, evidence, changes)) = provenance {
             expected.insert(wrapper);
             expected.insert(evidence);
+            expected.insert(changes);
         }
         if roles.keys().ne(expected.iter()) {
             return Err(failure(
@@ -521,14 +519,12 @@ mod tests {
     use crate::store::models::snapshot::tests::record;
 
     fn stream() -> StreamId {
-        crate::storage::stream::StreamMap::new(
-            512,
-            vec![crate::storage::stream::Chunk::Data(ObjectDigest::of_bytes(
-                b"data",
-            ))],
+        let root = vm_spec::stream_map::StreamRoot::empty(
+            crate::storage::limits::CHUNK_SIZE as u64,
+            vm_spec::stream_map::ChunkSize::DISK,
         )
-        .unwrap()
-        .id()
+        .unwrap();
+        StreamId::from_sha256(*root.id().as_bytes())
     }
 
     #[test]
@@ -553,7 +549,7 @@ mod tests {
     fn decode_requires_exact_canonical_bytes_and_preserves_identity() {
         let snapshot = record(
             stream(),
-            ObjectDigest::of_bytes(b"map"),
+            ObjectDigest::from_sha256(*stream().as_bytes()),
             ObjectDigest::of_bytes(b"kernel"),
         );
         let semantic = Semantic::snapshot(snapshot.clone()).unwrap();
@@ -573,7 +569,7 @@ mod tests {
     fn config_is_a_pure_projection_of_the_record() {
         let snapshot = record(
             stream(),
-            ObjectDigest::of_bytes(b"map"),
+            ObjectDigest::from_sha256(*stream().as_bytes()),
             ObjectDigest::of_bytes(b"kernel"),
         );
         let semantic = Semantic::snapshot(snapshot).unwrap();
@@ -597,7 +593,8 @@ mod tests {
         assert!(semantic
             .object_roles(Some((
                 ObjectDigest::of_bytes(b"w"),
-                ObjectDigest::of_bytes(b"e")
+                ObjectDigest::of_bytes(b"e"),
+                ObjectDigest::of_bytes(b"changes")
             )))
             .is_err());
     }
@@ -605,12 +602,12 @@ mod tests {
     #[test]
     fn object_roles_match_typed_dependencies_and_choose_representations() {
         let kernel = ObjectDigest::of_bytes(b"kernel");
-        let map = ObjectDigest::of_bytes(b"map");
+        let map = ObjectDigest::from_sha256(*stream().as_bytes());
         let snapshot = record(stream(), map, kernel);
         let semantic = Semantic::snapshot(snapshot.clone()).unwrap();
         let roles = semantic.object_roles(None).unwrap();
         assert_eq!(roles.get(&kernel), Some(&ObjectRole::Streamed));
-        assert!(matches!(roles.get(&map), Some(ObjectRole::Record { .. })));
+        assert_eq!(roles.get(&map), Some(&ObjectRole::Map));
         assert!(matches!(
             roles.get(&semantic.digest),
             Some(ObjectRole::Record { .. })

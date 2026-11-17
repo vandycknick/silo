@@ -448,7 +448,8 @@ async fn copy(
     match descriptor {
         PayloadDescriptor::Object { .. } => moved.objects += 1,
         PayloadDescriptor::StreamMap { .. } => moved.maps += 1,
-        PayloadDescriptor::Chunk { length, .. } => {
+        PayloadDescriptor::MapNode { .. } => {}
+        PayloadDescriptor::StreamChunk { length, .. } => {
             moved.chunks += 1;
             moved.chunk_bytes += length;
         }
@@ -861,8 +862,9 @@ async fn payload_writer_never_publishes_partial_oversized_or_foreign_bytes() {
     drop(writer);
     assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
     // Descriptors outside the inventory are refused before any staging.
-    let foreign = PayloadDescriptor::Chunk {
-        digest: crate::ObjectDigest::of_bytes(b"not part of this handoff"),
+    let foreign = PayloadDescriptor::StreamChunk {
+        stream: crate::storage::identity::StreamId::from_sha256([0x71; 32]),
+        index: 0,
         length: 24,
     };
     assert!(b.service.open_payload(op, foreign).await.is_err());
@@ -1369,4 +1371,163 @@ async fn removed_destination_mapping_is_stale_at_prepare_and_commit() {
     let aborted = b.service.abort(&plan.intent().unwrap()).await.unwrap();
     a.service.resolve_source(&aborted).await.unwrap();
     assert_eq!(a.storage(machine).await.ownership, MachineOwnership::Owned);
+}
+
+#[tokio::test]
+async fn corrupt_root_node_and_payload_and_missing_nodes_refuse_before_commit() {
+    let a = participant().await;
+    let b = participant().await;
+    let machine = a.create_raw("untrusted-root").await;
+    let op = operation();
+    let plan = approve(&a, &b, machine, &request(op, HandoffMode::Fork)).await;
+    a.service.begin_source(&plan).await.unwrap();
+    b.service.receive(&plan).await.unwrap();
+    let offer = a
+        .service
+        .capture_source(&plan, SourceStop::RequireStopped)
+        .await
+        .unwrap();
+    b.service.offer_capture(&offer).await.unwrap();
+    let stream = offer.manifest().body().files[0].stream;
+    let root = PayloadDescriptor::StreamMap { stream };
+    b.service.list_needs(op, None, 256).await.unwrap();
+    let frame = a
+        .service
+        .read_payload(op, root, 0, MAX_FRAME_BYTES)
+        .await
+        .unwrap();
+    let mut wrong = frame.bytes.clone();
+    wrong[16] ^= 1;
+    let mut writer = b.service.open_payload(op, root).await.unwrap();
+    writer.write_frame(&wrong).unwrap();
+    let error = writer.finish().await.unwrap_err();
+    assert!(error.to_string().contains("wrong stream root"));
+    let files =
+        crate::handoff::files::OperationFiles::existing(b.runtime.local_home(), op).unwrap();
+    assert!(!files.has_map(&stream).unwrap());
+    let pool = crate::storage::pool::StoragePool::open(b.runtime.local_images_dir()).unwrap();
+    assert!(!pool.stream_path(&stream).exists());
+    let mut moved = Moved::default();
+    copy(&a, &b, op, root, &mut moved).await;
+
+    let page = b.service.list_needs(op, None, 256).await.unwrap();
+    let node = page
+        .needs
+        .iter()
+        .copied()
+        .find(|entry| matches!(entry, PayloadDescriptor::MapNode { .. }))
+        .unwrap();
+    let error = b.service.prepare(offer.binding()).await.unwrap_err();
+    assert!(error.to_string().contains("missing"));
+    assert_eq!(
+        b.service.status(op).await.unwrap().unwrap().phase,
+        HandoffPhase::Receiving
+    );
+    let frame = a
+        .service
+        .read_payload(op, node, 0, MAX_FRAME_BYTES)
+        .await
+        .unwrap();
+    let mut corrupt = frame.bytes;
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    let mut writer = b.service.open_payload(op, node).await.unwrap();
+    writer.write_frame(&corrupt).unwrap();
+    let error = writer.finish().await.unwrap_err();
+    assert!(error.to_string().contains("corrupt map node"));
+    let PayloadDescriptor::MapNode { digest, .. } = node else {
+        panic!("node descriptor");
+    };
+    assert!(!pool.object_path(&digest).exists());
+    assert!(!pool.stream_path(&stream).exists());
+
+    let payload = loop {
+        let page = b.service.list_needs(op, None, 256).await.unwrap();
+        if let Some(payload) = page
+            .needs
+            .iter()
+            .copied()
+            .find(|entry| matches!(entry, PayloadDescriptor::StreamChunk { .. }))
+        {
+            break payload;
+        }
+        assert!(!page.needs.is_empty());
+        for descriptor in page.needs {
+            copy(&a, &b, op, descriptor, &mut moved).await;
+        }
+    };
+    let PayloadDescriptor::StreamChunk {
+        stream,
+        index,
+        length,
+    } = payload
+    else {
+        panic!("payload descriptor");
+    };
+    let map = files.load_map(&stream, &pool).unwrap().unwrap();
+    let vm_spec::stream_map::Chunk::Data(digest) = map.lookup(index).unwrap() else {
+        panic!("nonzero payload");
+    };
+    let digest = crate::ObjectDigest::from_sha256(*digest.as_bytes());
+    assert!(!pool.object_path(&digest).exists());
+    let mut writer = b.service.open_payload(op, payload).await.unwrap();
+    let mut offset = 0;
+    while offset < length {
+        let mut frame = a
+            .service
+            .read_payload(op, payload, offset, MAX_FRAME_BYTES)
+            .await
+            .unwrap();
+        if offset == 0 {
+            frame.bytes[0] ^= 1;
+        }
+        writer.write_frame(&frame.bytes).unwrap();
+        offset += frame.bytes.len() as u64;
+    }
+    assert!(writer.finish().await.is_err());
+    assert!(files.payload(stream, index).unwrap().is_none());
+    assert!(!pool.object_path(&digest).exists());
+    assert!(!pool.stream_path(&stream).exists());
+    assert!(b
+        .runtime
+        .machine_config(plan.plan().destination_machine())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        b.service.status(op).await.unwrap().unwrap().phase,
+        HandoffPhase::Receiving
+    );
+
+    // Restart loses every service-local cache, not the binding or the refusal.
+    let b = b.restart().await;
+    assert!(b.service.prepare(offer.binding()).await.is_err());
+    assert!(b
+        .runtime
+        .machine_config(plan.plan().destination_machine())
+        .await
+        .unwrap()
+        .is_none());
+    let aborted = b.service.abort(&plan.intent().unwrap()).await.unwrap();
+    a.service.resolve_source(&aborted).await.unwrap();
+    assert_eq!(a.storage(machine).await.ownership, MachineOwnership::Owned);
+}
+
+#[tokio::test]
+async fn old_format_peer_is_refused_before_creating_an_operation() {
+    let a = participant().await;
+    let machine = a.create_raw("old-format-peer").await;
+    let observation = a
+        .service
+        .observe_source(&MachineRef::id(machine))
+        .await
+        .unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(observation.document().bytes()).unwrap();
+    value["schema"] = serde_json::json!(1);
+    let old = crate::handoff::plan::SealedDocument::seal(&value).unwrap();
+    let error = crate::handoff::plan::SourceObservation::from_document(old).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unsupported handoff protocol version"));
 }

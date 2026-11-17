@@ -1,6 +1,7 @@
 """Real-file unit coverage for independent harness observations and ownership."""
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -122,3 +123,29 @@ def test_live_fork_argv_explicitly_selects_json(names: list[str]) -> None:
         *(argument for name in names for argument in ("--name", name)),
         "--operation-id", operation, "--preserve",
     ]
+
+
+def test_old_format_home_is_refused_without_conversion_or_deletion(silo: Silo) -> None:
+    home = silo.ws.root / "old-format-home"
+    home.mkdir(mode=0o700)
+    database = home / "state.db"
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript("""
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY, description TEXT NOT NULL,
+                installed_on TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL
+            );
+            INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time)
+                VALUES(1,'initial',TRUE,X'00',1);
+            CREATE TABLE old_stream_map (record BLOB NOT NULL);
+            INSERT INTO old_stream_map VALUES('old-format-home-marker');
+        """)
+    marker = home / "old-artifact"
+    marker.write_bytes(b'{"schema":1,"kind":"stream","chunks":[]}')
+    before = procs.catalog(database)
+    failed = silo.run("ls", expect=1, env=silo.ws.env(SILO_HOME=str(home)))
+    assert "incompatible state database" in failed.stderr.lower(), failed
+    assert "cannot be read or converted" in failed.stderr.lower(), failed
+    assert procs.catalog(database) == before
+    assert marker.read_bytes() == b'{"schema":1,"kind":"stream","chunks":[]}'

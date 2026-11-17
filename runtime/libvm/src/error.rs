@@ -142,7 +142,7 @@ pub enum LibVmError {
     #[error("catalog transaction committed but is not yet confirmed power-loss durable after 5 seconds; retrying the command is safe")]
     DurabilityPending,
 
-    #[error("incompatible state database; reinstall Silo and explicitly wipe its state before retrying: {source}")]
+    #[error("incompatible state database: this home was written by a different Silo state format and cannot be read or converted; remove the old state and start with a fresh home: {source}")]
     StateDatabaseIncompatible {
         #[source]
         source: sqlx::migrate::MigrateError,

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Breaking: stream identity is now a fixed-depth sparse Merkle map, with 64 KiB
+  RAM identities and 8 MiB disk/pack/lower identities. Transport payloads stay
+  8 MiB. Existing homes and artifacts must be recreated; there is no old-format
+  reader, migration or conversion. Native RAM receipts use a bounded summary
+  plus a streamed change file instead of dense digest arrays. Snapshot verify
+  bypasses receipts and localizes RAM corruption to 64 KiB units.
 - Live capture disk/descriptor refusal now leaves no pending capture, command,
   pins or staging. Definite first pre-send refusals are terminal; uncertain sends
   retain exact-identity recovery. Sealed publication charges remaining writes
@@ -56,9 +62,8 @@
   first fork 2 s, later fork 1.25 s; full snapshot under 3 s; incremental snapshot
   1.5 s with a 1 s pause. Medians up to 10 percent above target are accepted and
   reported as within tolerance; beyond that they fail. Fork and incremental
-  targets await new stage-1 tracking measurements and the planned map-format
-  change. A sparse authenticated stream map and a RAM identity unit smaller than
-  8 MiB remain approved directions, not yet implemented. Stage-2 clean-stop
+  targets await new measurements of stage-1 tracking and the sparse-map/64 KiB
+  RAM cutover. Stage-2 clean-stop
   sealing and a cached deterministic upper template are also planned to avoid
   restart and first-snapshot hashes without slowing create.
 - Incremental snapshot publication no longer rereads all RAM on owned reflink

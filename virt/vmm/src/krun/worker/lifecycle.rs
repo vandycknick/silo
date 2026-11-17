@@ -12,7 +12,7 @@
 //! never leave this module. Only CancelPause may run while its target Pause is
 //! still pending.
 //!
-//! A capture owns its five descriptors from PrepareCapture on:
+//! A capture owns its six descriptors from PrepareCapture on:
 //!
 //! ```text
 //!   Prepared ──Pause{Capture}──► Paused ──Flush──► Flushed ──Execution──► ExecutionCaptured
@@ -107,30 +107,27 @@ pub(crate) struct MemoryCapture {
     pub(crate) mode: vm_spec::lifecycle::CapturePolicy,
     pub(crate) baseline: Option<vm_spec::capture::Sha256Digest>,
     pub(crate) full_reason: Option<vm_spec::capture::CaptureFullReason>,
-    pub(crate) dirty_chunks: Vec<u8>,
-    pub(crate) chunk_digests: Vec<Option<vm_spec::capture::Sha256Digest>>,
+    pub(crate) identity_chunk_bytes: u32,
+    pub(crate) changes: vm_spec::capture::CaptureRamChanges,
+    pub(crate) changes_output: OutputReceipt,
     pub(crate) stats: Box<vm_spec::capture::CaptureMemoryStats>,
 }
 
 impl MemoryCapture {
     fn valid_for(&self, preparation: &CapturePreparation) -> bool {
-        use vm_spec::capture::{validate_dirty_chunks, CaptureFullReason, STREAM_CHUNK_BYTES};
+        use vm_spec::capture::{CaptureFullReason, CaptureRamCoverage};
         use vm_spec::lifecycle::CapturePolicy;
         if self.memory_generation == 0
             || self.stats.logical_bytes != self.ram.length
-            || validate_dirty_chunks(self.ram.length, &self.dirty_chunks).is_err()
-            || self.chunk_digests.len() as u64 != self.ram.length.div_ceil(STREAM_CHUNK_BYTES)
-            || self
-                .chunk_digests
-                .iter()
-                .enumerate()
-                .any(|(index, digest)| {
-                    digest.is_some()
-                        && self
-                            .dirty_chunks
-                            .get(index / 8)
-                            .is_none_or(|byte| byte & (1 << (index % 8)) == 0)
-                })
+            || self.identity_chunk_bytes != 1 << 16
+            || self.changes.validate(self.ram.length).is_err()
+            || self.changes.byte_len != self.changes_output.length
+            || self.changes.baseline_stream != self.baseline
+            || self.changes.coverage
+                != match self.mode {
+                    CapturePolicy::Full => CaptureRamCoverage::Full,
+                    CapturePolicy::Incremental => CaptureRamCoverage::Incremental,
+                }
         {
             return false;
         }
@@ -138,12 +135,7 @@ impl MemoryCapture {
             CapturePolicy::Full => {
                 self.baseline.is_none()
                     && self.full_reason.is_some()
-                    && self
-                        .dirty_chunks
-                        .iter()
-                        .map(|byte| u64::from(byte.count_ones()))
-                        .sum::<u64>()
-                        == self.ram.length.div_ceil(STREAM_CHUNK_BYTES)
+                    && self.changes.coverage == CaptureRamCoverage::Full
                     && match preparation.policy {
                         CapturePolicy::Full => {
                             self.full_reason == Some(CaptureFullReason::Requested)
@@ -304,6 +296,7 @@ pub(crate) trait NativeLifecycle: Send + Sync + 'static {
         capture: &Self::Capture,
         ram: File,
         layout: File,
+        changes: File,
         preparation: &CapturePreparation,
         operation: NativeOperation,
         deadline: Instant,
@@ -949,6 +942,7 @@ struct PreparedOutputs {
     devices: Option<File>,
     ram: Option<File>,
     layout: Option<File>,
+    changes: Option<File>,
 }
 
 impl<C> CaptureRecord<C> {
@@ -960,6 +954,7 @@ impl<C> CaptureRecord<C> {
             &mut self.holders.devices,
             &mut self.holders.ram,
             &mut self.holders.layout,
+            &mut self.holders.changes,
         ] {
             if *holder == OutputHolder::Prepared {
                 *holder = OutputHolder::Closed;
@@ -1071,6 +1066,7 @@ enum Admission<T, C> {
         ticket: C,
         ram: File,
         layout: File,
+        changes: File,
         deadline: Instant,
     },
     Accept {
@@ -1598,12 +1594,14 @@ impl<N: NativeLifecycle> Shared<N> {
                             devices: Some(files.devices),
                             ram: Some(files.ram),
                             layout: Some(files.layout),
+                            changes: Some(files.changes),
                         },
                         holders: CaptureOutputHolders {
                             execution: OutputHolder::Prepared,
                             devices: OutputHolder::Prepared,
                             ram: OutputHolder::Prepared,
                             layout: OutputHolder::Prepared,
+                            changes: OutputHolder::Prepared,
                         },
                         pin: Some(files.pin),
                         pin_holder: PinHolder::Capture,
@@ -1709,13 +1707,16 @@ impl<N: NativeLifecycle> Shared<N> {
                     (CaptureProgress::ExecutionCaptured, Some(ticket)) => ticket.clone(),
                     _ => return Err(LifecycleRejection::CaptureStage),
                 };
-                let (Some(ram), Some(layout)) =
-                    (record.outputs.ram.take(), record.outputs.layout.take())
-                else {
+                let (Some(ram), Some(layout), Some(changes)) = (
+                    record.outputs.ram.take(),
+                    record.outputs.layout.take(),
+                    record.outputs.changes.take(),
+                ) else {
                     return Err(LifecycleRejection::CaptureStage);
                 };
                 record.holders.ram = OutputHolder::Native;
                 record.holders.layout = OutputHolder::Native;
+                record.holders.changes = OutputHolder::Native;
                 record.progress = CaptureProgress::MemoryPending;
                 journal.mutator = Some(sequence);
                 Admitted::Run(Admission::Memory {
@@ -1723,6 +1724,7 @@ impl<N: NativeLifecycle> Shared<N> {
                     ticket,
                     ram,
                     layout,
+                    changes,
                     deadline: now + *timeout,
                 })
             }
@@ -2369,8 +2371,9 @@ impl<N: NativeLifecycle> Shared<N> {
                         ticket,
                         ram,
                         layout,
+                        changes,
                         deadline,
-                    } => shared.run_memory(capture, ticket, ram, layout, deadline),
+                    } => shared.run_memory(capture, ticket, ram, layout, changes, deadline),
                     Admission::Accept {
                         capture,
                         ticket,
@@ -2556,6 +2559,7 @@ impl<N: NativeLifecycle> Shared<N> {
             memory.writers_closed
                 && holders.ram == OutputHolder::Closed
                 && holders.layout == OutputHolder::Closed
+                && holders.changes == OutputHolder::Closed
         }) && matches!(
             record.progress,
             CaptureProgress::CandidateComplete
@@ -3339,6 +3343,7 @@ impl<N: NativeLifecycle> Shared<N> {
         ticket: N::Capture,
         ram: File,
         layout: File,
+        changes: File,
         deadline: Instant,
     ) -> CommandOutcome {
         let preparation = self.with_capture(capture, |record| record.preparation.clone());
@@ -3346,8 +3351,15 @@ impl<N: NativeLifecycle> Shared<N> {
             return Self::missing_capture();
         };
         let result = self.native_operation().and_then(|operation| {
-            self.native
-                .capture_memory(&ticket, ram, layout, &preparation, operation, deadline)
+            self.native.capture_memory(
+                &ticket,
+                ram,
+                layout,
+                changes,
+                &preparation,
+                operation,
+                deadline,
+            )
         });
         let status = match result {
             Ok(memory) => Ok(NativeCaptureStatus::CandidateComplete { ticket, memory }),
@@ -3373,8 +3385,9 @@ impl<N: NativeLifecycle> Shared<N> {
                             mode: memory.mode,
                             baseline: memory.baseline,
                             full_reason: memory.full_reason,
-                            dirty_chunks: memory.dirty_chunks.clone(),
-                            chunk_digests: memory.chunk_digests.clone(),
+                            identity_chunk_bytes: memory.identity_chunk_bytes,
+                            changes: Box::new(memory.changes.clone()),
+                            changes_output: memory.changes_output,
                             stats: memory.stats.clone(),
                         }
                     }
@@ -3400,6 +3413,7 @@ impl<N: NativeLifecycle> Shared<N> {
                     Some(NativeCaptureStatus::ExecutionComplete(_)) => {
                         record.holders.ram = OutputHolder::Closed;
                         record.holders.layout = OutputHolder::Closed;
+                        record.holders.changes = OutputHolder::Closed;
                     }
                     // Pending, or a failed write retaining its files natively.
                     Some(status) => apply_status(record, status),
@@ -3515,6 +3529,7 @@ impl<N: NativeLifecycle> Shared<N> {
                     devices: OutputHolder::Closed,
                     ram: OutputHolder::Closed,
                     layout: OutputHolder::Closed,
+                    changes: OutputHolder::Closed,
                 };
                 record.progress = CaptureProgress::Abandoned;
                 CommandOutcome::CaptureAbandoned
@@ -3760,11 +3775,13 @@ fn apply_status<C>(record: &mut CaptureRecord<C>, status: NativeCaptureStatus<C>
             if memory.writers_closed {
                 record.holders.ram = OutputHolder::Closed;
                 record.holders.layout = OutputHolder::Closed;
+                record.holders.changes = OutputHolder::Closed;
             }
             let problem = if !memory.writers_closed {
                 Some("native RAM writers are still open")
             } else if memory.ram.identity() != outputs.ram
                 || memory.layout.identity() != outputs.layout
+                || memory.changes_output.identity() != outputs.changes
             {
                 Some("native RAM receipt names foreign outputs")
             } else if record.binding.as_ref() != Some(memory.binding.as_ref()) {
@@ -3799,6 +3816,7 @@ fn apply_status<C>(record: &mut CaptureRecord<C>, status: NativeCaptureStatus<C>
                 CaptureStage::Memory => {
                     record.holders.ram = OutputHolder::Native;
                     record.holders.layout = OutputHolder::Native;
+                    record.holders.changes = OutputHolder::Native;
                 }
                 _ => {}
             }
@@ -3812,7 +3830,7 @@ fn apply_status<C>(record: &mut CaptureRecord<C>, status: NativeCaptureStatus<C>
     }
 }
 
-/// Whole-set preflight of the five capture descriptors before any freeze.
+/// Whole-set preflight of the six capture descriptors before any freeze.
 fn validate_outputs(
     files: &crate::virt::lifecycle::CaptureOutputFiles,
     preparation: &CapturePreparation,
@@ -3824,6 +3842,7 @@ fn validate_outputs(
         (OutputRole::Devices, &files.devices, declared.devices),
         (OutputRole::Ram, &files.ram, declared.ram),
         (OutputRole::Layout, &files.layout, declared.layout),
+        (OutputRole::Changes, &files.changes, declared.changes),
     ];
     let mut seen = Vec::with_capacity(5);
     for (role, file, identity) in outputs {
@@ -4028,8 +4047,9 @@ mod tests {
                         devices: identity(2),
                         ram: identity(3),
                         layout: identity(4),
+                        changes: identity(5),
                     },
-                    pin: identity(5),
+                    pin: identity(6),
                     pause: CapturePauseSource::Acquire,
                     resume_policy: CaptureResumePolicy::ResumeIfAcquired,
                     binding: CaptureDigests {
@@ -4048,6 +4068,7 @@ mod tests {
                     devices: OutputHolder::Closed,
                     ram: OutputHolder::Native,
                     layout: OutputHolder::Native,
+                    changes: OutputHolder::Native,
                 },
                 pin: None,
                 pin_holder: PinHolder::Capture,
@@ -4079,8 +4100,18 @@ mod tests {
                 mode: vm_spec::lifecycle::CapturePolicy::Full,
                 baseline: None,
                 full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
-                dirty_chunks: vec![1],
-                chunk_digests: vec![None],
+                identity_chunk_bytes: 1 << 16,
+                changes: vm_spec::capture::CaptureRamChanges {
+                    byte_len: 16,
+                    sha256: vm_spec::capture::Sha256Digest::of_bytes(b"changes"),
+                    record_count: 0,
+                    coverage: vm_spec::capture::CaptureRamCoverage::Full,
+                    baseline_stream: None,
+                },
+                changes_output: OutputReceipt {
+                    length: 16,
+                    ..receipt(5)
+                },
                 stats: Box::new(vm_spec::capture::CaptureMemoryStats {
                     logical_bytes: 4096,
                     ..Default::default()
@@ -4144,6 +4175,61 @@ mod tests {
             journal.pending_revision(capture),
             None,
             "a complete candidate is never refreshed again"
+        );
+    }
+
+    #[test]
+    fn capture_journal_replays_the_same_bounded_change_receipt() {
+        let mut journal = Journal::<(), u32>::default();
+        let capture = Uuid::new_v4();
+        let binding = memory_pending(&mut journal, capture);
+        let NativeCaptureStatus::CandidateComplete { memory, .. } = candidate(&binding) else {
+            panic!("candidate");
+        };
+        let outcome = CommandOutcome::MemoryCaptured {
+            binding: memory.binding,
+            ram: memory.ram,
+            layout: memory.layout,
+            memory_generation: memory.memory_generation,
+            writers_closed: memory.writers_closed,
+            mode: memory.mode,
+            baseline: memory.baseline,
+            full_reason: memory.full_reason,
+            identity_chunk_bytes: memory.identity_chunk_bytes,
+            changes: Box::new(memory.changes),
+            changes_output: memory.changes_output,
+            stats: memory.stats,
+        };
+        let sequence = CommandSequence::new(1).unwrap();
+        let key = CommandKey {
+            request_id: capture,
+            kind: crate::virt::lifecycle::CommandKind::CaptureMemory,
+        };
+        journal.admit_command(
+            key,
+            Entry {
+                sequence,
+                command: LifecycleCommand::CaptureMemory {
+                    operation: capture,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+                state: CommandState::Accepted,
+            },
+        );
+        journal.complete_command(key, sequence, &outcome);
+        let state = &journal.commands[&key].state;
+        assert_eq!(
+            state,
+            &CommandState::Completed {
+                outcome: outcome.clone()
+            }
+        );
+        let encoded = crate::krun::worker::lifecycle_wire::encode(state).unwrap();
+        let mut replay = crate::krun::worker::lifecycle_wire::FrameBuffer::default();
+        replay.extend(&encoded).unwrap();
+        assert_eq!(
+            replay.next::<CommandState>().unwrap(),
+            Some(CommandState::Completed { outcome })
         );
     }
 
@@ -4728,15 +4814,15 @@ mod tests {
                 panic!("candidate");
             };
             match defect {
-                0 => memory.dirty_chunks.clear(),
-                1 => memory.dirty_chunks[0] = 2,
+                0 => memory.changes.byte_len = 0,
+                1 => memory.identity_chunk_bytes = 8 << 20,
                 2 => memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental,
                 3 => {
                     memory.baseline =
                         Some(vm_spec::capture::Sha256Digest::of_bytes(b"wrong baseline"))
                 }
                 4 => memory.stats.logical_bytes += 1,
-                5 => memory.chunk_digests.clear(),
+                5 => memory.changes.record_count = 2,
                 _ => memory.full_reason = Some(vm_spec::capture::CaptureFullReason::NoBaseline),
             }
             let revision = journal.pending_revision(capture).unwrap();
@@ -4749,8 +4835,8 @@ mod tests {
     }
 
     #[test]
-    fn incremental_candidate_rejects_digests_for_unaffected_chunks() {
-        use vm_spec::capture::{Sha256Digest, STREAM_CHUNK_BYTES};
+    fn incremental_candidate_binds_change_coverage_and_predecessor() {
+        use vm_spec::capture::{CaptureRamCoverage, Sha256Digest};
         use vm_spec::lifecycle::CapturePolicy;
         let mut journal = Journal::<(), u32>::default();
         let capture = Uuid::new_v4();
@@ -4765,12 +4851,12 @@ mod tests {
         memory.mode = CapturePolicy::Incremental;
         memory.baseline = Some(baseline);
         memory.full_reason = None;
-        memory.ram.length = STREAM_CHUNK_BYTES + 4096;
+        memory.ram.length = (1 << 16) + 4096;
         memory.stats.logical_bytes = memory.ram.length;
-        memory.dirty_chunks = vec![1];
-        memory.chunk_digests = vec![None, None];
+        memory.changes.coverage = CaptureRamCoverage::Incremental;
+        memory.changes.baseline_stream = Some(baseline);
         assert!(memory.valid_for(&preparation));
-        memory.chunk_digests[1] = Some(Sha256Digest::of_bytes(b"unaffected"));
+        memory.changes.baseline_stream = Some(Sha256Digest::of_bytes(b"foreign"));
         assert!(!memory.valid_for(&preparation));
     }
 

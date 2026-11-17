@@ -30,7 +30,7 @@ pub struct RetainedLayer {
     pub recipe: LayerRecipeId,
     pub pack_stream: StreamId,
     pub pack_length: u64,
-    /// Retained paged map root of the pack stream; describing the pack in a
+    /// Retained Merkle root of the pack stream; describing the pack in a
     /// snapshot or transfer never rehashes its bytes.
     pub pack_map: ObjectDigest,
     pub index_root: ContentDigest,
@@ -557,11 +557,7 @@ impl LayerStore {
                     "retained layer pool is absent",
                 )
             })?;
-            let length = if authenticate_payload {
-                pool.verify_stream(&pack_stream)?.length()
-            } else {
-                pool.lower_occurrence(&pack_stream)?.length()
-            };
+            let length = pool.lower_occurrence(&pack_stream)?.length();
             if length != pack_length {
                 return Err(semantic("pack length contradiction"));
             }
@@ -603,18 +599,30 @@ impl LayerStore {
                 return Err(LibVmError::Storage(error));
             }
             let layer = decoded?;
-            // The paged pack map is authenticated against the pack identity
-            // itself, so describing the pack never needs its bytes.
-            let map_root = crate::storage::map::StreamMapRoot::decode(&pool.read_object(
-                &pack_map,
-                crate::storage::limits::Resource::MetadataPageBytes.maximum(),
-            )?)?;
-            if map_root.stream != pack_stream || map_root.length != pack_length {
+            let map = pool.load_map(
+                pack_map,
+                vm_spec::stream_map::StreamRole::Pack,
+                pool.map_authority(std::sync::Arc::new(()))?,
+            )?;
+            if map.id() != pack_stream || map.length() != pack_length {
                 return Err(semantic("pack map root contradicts its pack stream"));
             }
-            map_root.read_map(&pool)?;
+            if authenticate_payload {
+                crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                    .verify_expected_map(&pool.open_stream(&pack_stream)?, &map)
+                    .map_err(|error| match error {
+                        crate::storage::stream::ExpectedMapError::Storage(error) => {
+                            LibVmError::Storage(error)
+                        }
+                        crate::storage::stream::ExpectedMapError::ChunkMismatch { .. } => {
+                            LibVmError::Storage(crate::storage::StorageError::ContentMismatch(
+                                pool.stream_path(&pack_stream),
+                            ))
+                        }
+                        error => semantic(error),
+                    })?;
+            }
             observed.insert(pack_map);
-            observed.extend(map_root.pages.iter().copied());
             pages.remove(&root_digest);
             if layer.pack_length != pack_length || observed != dependencies {
                 return Err(semantic("index or dependency closure contradiction"));
@@ -629,7 +637,7 @@ impl LayerStore {
                 pack: crate::store::models::snapshot::SnapshotStream {
                     stream: pack_stream,
                     map: pack_map,
-                    map_pages: map_root.pages,
+                    chunk_size: vm_spec::stream_map::ChunkSize::DISK.bytes(),
                     length: pack_length,
                 },
             })
@@ -742,27 +750,19 @@ fn prepare(
     let result_bytes = result.canonical_bytes()?;
     let recipe_digest = ObjectDigest::of_bytes(&recipe_bytes);
     let result_digest = ObjectDigest::of_bytes(&result_bytes);
-    // The pack's paged map is retained once with its layer, so later snapshot,
-    // transfer and launch descriptions never rehash the pack bytes.
-    let mut map_pages = Vec::new();
-    let mut map_objects = Vec::new();
-    for page in crate::storage::map::pages(&stream.map) {
-        let page = page?;
-        map_pages.push(ObjectDigest::of_bytes(&page));
-        map_objects.push(page);
-    }
-    let map_root = crate::storage::map::StreamMapRoot::new(&stream.map, map_pages)?.encode()?;
-    let pack_map = ObjectDigest::of_bytes(&map_root);
-    map_objects.push(map_root);
-    for bytes in [&recipe_bytes, &result_bytes]
-        .into_iter()
-        .chain(map_objects.iter())
-    {
+    let pack = runtime.block_on(crate::store::snapshot_store::publish_map(
+        &pool,
+        store,
+        operation.0.id,
+        &stream.map,
+    ))?;
+    let pack_map = pack.map;
+    for bytes in [&recipe_bytes, &result_bytes] {
         let digest = ObjectDigest::of_bytes(bytes);
         std::fs::write(operation.temporary().join(digest.hex()), bytes)?;
         staged_objects.insert(digest.to_string().parse::<ContentDigest>()?);
     }
-    let mut dependencies = BTreeSet::new();
+    let mut dependencies = BTreeSet::from([pack_map]);
     for digest in staged_objects {
         let expected = object(digest)?;
         let (published, guard) =
@@ -1001,6 +1001,7 @@ pub(crate) mod tests {
         BeforeRoots,
         Cleanup,
         RecoveryDelete,
+        StreamRecoveryDelete,
         CatalogCheckpoint,
         CandidateAuthorized,
         CandidateDetached,
@@ -1209,7 +1210,7 @@ pub(crate) mod tests {
         let store = LayerStore::open(temp.path()).await.unwrap();
         let stage = staged(temp.path(), &store);
         let pool = StoragePool::open(&store.store.images_dir).unwrap();
-        let map = StreamHasher::new()
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_reader(&mut fs::File::open(stage.pack_path()).unwrap())
             .unwrap();
         let path = pool.stream_path(&map.id());
@@ -1342,7 +1343,7 @@ pub(crate) mod tests {
         let store = LayerStore::open(temp.path()).await.unwrap();
         let stage = staged(temp.path(), &store);
         let pool = StoragePool::open(&store.store.images_dir).unwrap();
-        let map = StreamHasher::new()
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_reader(&mut fs::File::open(stage.pack_path()).unwrap())
             .unwrap();
         let path = pool.stream_path(&map.id());
@@ -1741,7 +1742,7 @@ pub(crate) mod tests {
         let source = temp.path().join("orphan-stream");
         fs::write(&source, b"unretained stream").unwrap();
         let orphan = pool.publish_stream(&source).unwrap();
-        let (mut entered, release) = hook(&mut store, WorkerPoint::RecoveryDelete, false);
+        let (mut entered, release) = hook(&mut store, WorkerPoint::StreamRecoveryDelete, false);
         let recovery = store.clone();
         let task = tokio::spawn(async move { recovery.recover().await });
         arrived(&mut entered).await;
@@ -1806,7 +1807,7 @@ pub(crate) mod tests {
                         let value: serde_json::Value = serde_json::from_slice(
                             &pool.read_object(&digest, 4 * 1024 * 1024).unwrap(),
                         )
-                        .unwrap();
+                        .ok()?;
                         let kind = if member == "root" {
                             "changeset-index"
                         } else {
@@ -1888,5 +1889,65 @@ pub(crate) mod tests {
         let guard = exclusive_catalog(temp.path()).await;
         assert!(!private.exists());
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn layer_round_trip_retains_only_its_merkle_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = LayerStore::open(temporary.path()).await.unwrap();
+        let staged = staged(temporary.path(), &store);
+        let expected = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_file(staged.pack_path())
+            .unwrap();
+        let retained = store
+            .publish(staged, &ChangesetLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(retained.pack_stream, expected.id());
+        assert_eq!(retained.pack_map.as_bytes(), expected.id().as_bytes());
+        let held = store
+            .load_pinned_layer(retained.id, &ChangesetLimits::default(), true)
+            .await
+            .unwrap();
+        assert_eq!(held.pack.stream, expected.id());
+        assert_eq!(held.pack.map, retained.pack_map);
+        assert_eq!(
+            held.pack.chunk_size,
+            vm_spec::stream_map::ChunkSize::DISK.bytes()
+        );
+        let pool = StoragePool::open(&store.store.images_dir).unwrap();
+        let root = vm_spec::stream_map::StreamRoot::decode(
+            &pool
+                .read_object(
+                    &retained.pack_map,
+                    vm_spec::stream_map::MAX_ROOT_BYTES as u64,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&root, expected.root());
+        let dependencies: Vec<String> = sqlx::query_scalar(
+            "SELECT object_digest FROM layer_object_dependency WHERE result_id=?1",
+        )
+        .bind(retained.id.to_string())
+        .fetch_all(&store.store.pool)
+        .await
+        .unwrap();
+        assert!(dependencies.contains(&retained.pack_map.to_string()));
+        for node in expected.nodes() {
+            let digest = node.unwrap().digest;
+            assert!(!dependencies.contains(&digest.to_string()));
+            pool.verify_object(&digest).unwrap();
+        }
+        for chunk in expected.present_chunks() {
+            let digest = crate::storage::identity::ObjectDigest::from_sha256(
+                *chunk.unwrap().digest.as_bytes(),
+            );
+            assert!(!dependencies.contains(&digest.to_string()));
+            assert!(
+                !pool.object_path(&digest).exists(),
+                "leaf values are not payload objects"
+            );
+        }
     }
 }

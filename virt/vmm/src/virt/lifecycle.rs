@@ -60,7 +60,7 @@ pub enum LifecycleCommand {
     },
     /// Observe native control and, optionally, one retained command.
     GetControl { target: Option<CommandKey> },
-    /// Validate and retain the five capture descriptors before any freeze.
+    /// Validate and retain the six capture descriptors before any freeze.
     /// Carries [`LifecycleRights::CaptureOutputs`].
     PrepareCapture {
         operation: Uuid,
@@ -267,7 +267,7 @@ impl LifecycleCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RightsKind {
     None,
-    /// execution, devices, ram, layout, pin: five descriptors in this order.
+    /// execution, devices, ram, layout, changes, pin: six descriptors in this order.
     CaptureOutputs,
     /// ram, layout: two read-only descriptors in this order.
     SealedMemory,
@@ -277,7 +277,7 @@ impl RightsKind {
     pub fn count(self) -> usize {
         match self {
             Self::None => 0,
-            Self::CaptureOutputs => 5,
+            Self::CaptureOutputs => 6,
             Self::SealedMemory => 2,
         }
     }
@@ -298,6 +298,7 @@ pub struct CaptureOutputFiles {
     pub devices: std::fs::File,
     pub ram: std::fs::File,
     pub layout: std::fs::File,
+    pub changes: std::fs::File,
     /// Capture-lifetime storage lease (the run's launch lease duplicate).
     pub pin: std::fs::File,
 }
@@ -339,6 +340,7 @@ impl LifecycleRights {
                     && same(&files.devices, outputs.devices)
                     && same(&files.ram, outputs.ram)
                     && same(&files.layout, outputs.layout)
+                    && same(&files.changes, outputs.changes)
                     && same(&files.pin, preparation.pin)
             }
             (Self::SealedMemory(files), LifecycleCommand::AcceptCapture { ram, layout, .. }) => {
@@ -362,6 +364,7 @@ impl LifecycleRights {
                 files.devices.into(),
                 files.ram.into(),
                 files.layout.into(),
+                files.changes.into(),
                 files.pin.into(),
             ],
             Self::SealedMemory(files) => vec![files.ram.into(), files.layout.into()],
@@ -385,6 +388,7 @@ impl LifecycleRights {
                 devices: next()?,
                 ram: next()?,
                 layout: next()?,
+                changes: next()?,
                 pin: next()?,
             }),
             RightsKind::SealedMemory => Self::SealedMemory(SealedMemoryFiles {
@@ -420,15 +424,17 @@ pub struct CaptureOutputIdentities {
     pub devices: OutputIdentity,
     pub ram: OutputIdentity,
     pub layout: OutputIdentity,
+    pub changes: OutputIdentity,
 }
 
 impl CaptureOutputIdentities {
-    pub fn roles(&self) -> [(OutputRole, OutputIdentity); 4] {
+    pub fn roles(&self) -> [(OutputRole, OutputIdentity); 5] {
         [
             (OutputRole::Execution, self.execution),
             (OutputRole::Devices, self.devices),
             (OutputRole::Ram, self.ram),
             (OutputRole::Layout, self.layout),
+            (OutputRole::Changes, self.changes),
         ]
     }
 }
@@ -936,7 +942,7 @@ pub enum CommandOutcome {
         stage: CancelStage,
         failure: NativeFailure,
     },
-    /// The five descriptors are validated and retained by the worker.
+    /// The six descriptors are validated and retained by the worker.
     CapturePrepared {
         outputs: CaptureOutputIdentities,
         pin: OutputIdentity,
@@ -957,7 +963,7 @@ pub enum CommandOutcome {
         execution: OutputReceipt,
         devices: OutputReceipt,
     },
-    /// Complete RAM candidate; native closed both writers when `writers_closed`.
+    /// Complete RAM candidate; native closed all three writers when `writers_closed`.
     MemoryCaptured {
         binding: Box<CaptureStateBinding>,
         ram: OutputReceipt,
@@ -967,8 +973,10 @@ pub enum CommandOutcome {
         mode: vm_spec::lifecycle::CapturePolicy,
         baseline: Option<vm_spec::capture::Sha256Digest>,
         full_reason: Option<vm_spec::capture::CaptureFullReason>,
-        dirty_chunks: Vec<u8>,
-        chunk_digests: Vec<Option<vm_spec::capture::Sha256Digest>>,
+        identity_chunk_bytes: u32,
+        /// Boxed so capture metadata does not enlarge every retained command.
+        changes: Box<vm_spec::capture::CaptureRamChanges>,
+        changes_output: OutputReceipt,
         /// Keep capture-only counters out of every retained command's inline size.
         stats: Box<vm_spec::capture::CaptureMemoryStats>,
     },
@@ -1165,13 +1173,20 @@ pub struct CaptureOutputHolders {
     pub devices: OutputHolder,
     pub ram: OutputHolder,
     pub layout: OutputHolder,
+    pub changes: OutputHolder,
 }
 
 impl CaptureOutputHolders {
     pub fn all_closed(&self) -> bool {
-        [self.execution, self.devices, self.ram, self.layout]
-            .iter()
-            .all(|holder| *holder == OutputHolder::Closed)
+        [
+            self.execution,
+            self.devices,
+            self.ram,
+            self.layout,
+            self.changes,
+        ]
+        .iter()
+        .all(|holder| *holder == OutputHolder::Closed)
     }
 }
 
@@ -1415,6 +1430,7 @@ pub enum OutputRole {
     Devices,
     Ram,
     Layout,
+    Changes,
     Pin,
 }
 
@@ -1819,8 +1835,9 @@ mod tests {
                 devices: identity(2),
                 ram: identity(3),
                 layout: identity(4),
+                changes: identity(5),
             },
-            pin: identity(5),
+            pin: identity(6),
             pause,
             resume_policy,
             binding: CaptureDigests {
@@ -1877,7 +1894,7 @@ mod tests {
         );
         assert_eq!(request(command.clone(), operation).validate(), Ok(()));
         assert_eq!(command.rights(), RightsKind::CaptureOutputs);
-        assert_eq!(RightsKind::CaptureOutputs.count(), 5);
+        assert_eq!(RightsKind::CaptureOutputs.count(), 6);
         for stage in [
             command,
             LifecycleCommand::Pause {
@@ -1991,7 +2008,7 @@ mod tests {
                 .open(directory.join(name))
                 .expect("file")
         };
-        let files = ["execution", "devices", "ram", "layout", "pin"].map(file);
+        let files = ["execution", "devices", "ram", "layout", "changes", "pin"].map(file);
         let id = |index: usize| OutputIdentity::of(&files[index]).expect("identity");
         let operation = Uuid::new_v4();
         let mut preparation =
@@ -2001,39 +2018,53 @@ mod tests {
             devices: id(1),
             ram: id(2),
             layout: id(3),
+            changes: id(4),
         };
-        preparation.pin = id(4);
+        preparation.pin = id(5);
         let command = LifecycleCommand::PrepareCapture {
             operation,
             preparation,
             timeout: Duration::from_secs(1),
         };
-        let rights = |order: [usize; 5]| {
+        let rights = |order: [usize; 6]| {
             let dup = |index: usize| files[index].try_clone().expect("dup");
             LifecycleRights::CaptureOutputs(CaptureOutputFiles {
                 execution: dup(order[0]),
                 devices: dup(order[1]),
                 ram: dup(order[2]),
                 layout: dup(order[3]),
-                pin: dup(order[4]),
+                changes: dup(order[4]),
+                pin: dup(order[5]),
             })
         };
-        assert_eq!(rights([0, 1, 2, 3, 4]).check(&command), Ok(()));
+        assert_eq!(rights([0, 1, 2, 3, 4, 5]).check(&command), Ok(()));
         let mismatch = Err(LifecycleRejection::InvalidRequest(
             InvalidRequest::CaptureRights,
         ));
-        assert_eq!(rights([1, 0, 2, 3, 4]).check(&command), mismatch);
+        assert_eq!(rights([1, 0, 2, 3, 4, 5]).check(&command), mismatch);
+        assert_eq!(rights([0, 1, 2, 4, 3, 5]).check(&command), mismatch);
+        assert_eq!(rights([0, 1, 2, 3, 3, 5]).check(&command), mismatch);
         assert_eq!(LifecycleRights::None.check(&command), mismatch);
         assert_eq!(
-            rights([0, 1, 2, 3, 4]).check(&LifecycleCommand::GetControl { target: None }),
+            rights([0, 1, 2, 3, 4, 5]).check(&LifecycleCommand::GetControl { target: None }),
             mismatch
         );
-        let descriptors = rights([0, 1, 2, 3, 4]).into_descriptors();
-        assert_eq!(descriptors.len(), 5);
+        let descriptors = rights([0, 1, 2, 3, 4, 5]).into_descriptors();
+        assert_eq!(descriptors.len(), 6);
         let rebuilt = LifecycleRights::from_descriptors(RightsKind::CaptureOutputs, descriptors)
-            .expect("five descriptors");
+            .expect("six descriptors");
         assert_eq!(rebuilt.check(&command), Ok(()), "wire order is fixed");
         assert!(LifecycleRights::from_descriptors(RightsKind::SealedMemory, Vec::new()).is_none());
+        let mut descriptors = rights([0, 1, 2, 3, 4, 5]).into_descriptors();
+        drop(descriptors.remove(4));
+        assert!(
+            LifecycleRights::from_descriptors(RightsKind::CaptureOutputs, descriptors).is_none()
+        );
         std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    #[test]
+    fn retained_command_state_stays_small() {
+        assert!(std::mem::size_of::<CommandState>() <= 200);
     }
 }

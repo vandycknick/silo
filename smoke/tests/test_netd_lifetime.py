@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import signal
@@ -8,7 +9,7 @@ import time
 
 import pytest
 
-from silo_smoke import procs
+from silo_smoke import procs, shutdown
 from silo_smoke.cli import Silo
 from silo_smoke.workspace import Workspace
 
@@ -68,9 +69,23 @@ def test_netd_lifetime(silo: Silo, workspace: Workspace, basic_image: str) -> No
     silo.wait_ready(healthy)
     healthy_helper = _pid(procs.netd_pid(workspace, healthy))
     monitor = _pid(procs.vmm_pid(workspace, healthy))
-    os.kill(monitor, signal.SIGKILL)
-    procs.wait_gone(healthy_helper, timeout=20)
-    procs.wait_gone(monitor, timeout=20)
+    holders, lease = shutdown.holder(silo, healthy)
+    assert next(entry["pid"] for entry in holders["holders"] if entry["role"] == "monitor") == monitor
+    assert shutdown.lease_busy(lease), "running storage holders must retain their launch lease"
+    with ExitStack() as owned:
+        processes = []
+        for pid in {healthy_helper, *(entry["pid"] for entry in holders["holders"])}:
+            process = shutdown.Process(pid)
+            owned.callback(process.close)
+            processes.append(process)
+        os.kill(monitor, signal.SIGKILL)
+        # Monitor/netd disappearance alone does not establish backend closure.
+        # Require every registered holder to terminate and release its OFD.
+        shutdown.until(
+            lambda: (all(process.terminal() for process in processes)
+                     and not procs.alive(healthy_helper) and not procs.alive(monitor)
+                     and not shutdown.lease_busy(lease)),
+            timeout=20, description="monitor crash left a live storage holder or launch lease")
     assert silo.info(healthy)["state"] == "stopped"
     db = workspace.state_db()
     original = procs.query(db, "SELECT hex(state_json) FROM machine_state s JOIN machine_config c ON c.id=s.machine_id WHERE c.name='lifetime-healthy'")

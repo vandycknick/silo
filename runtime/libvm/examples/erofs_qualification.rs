@@ -61,7 +61,8 @@ fn regular(path: &[u8], offset: u64, length: u64) -> ChangeEntry {
 
 fn layer_result(changeset: &LayerChangeset, pack: &File) -> Result<LayerResult, Box<dyn Error>> {
     let root = encode_index_to(changeset, &ChangesetLimits::default(), |_| Ok(()))?;
-    let scan = StreamHasher::new().hash_open_file(pack, changeset.pack_length)?;
+    let scan = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+        .hash_open_file(pack, changeset.pack_length)?;
     Ok(LayerResult {
         recipe: LayerRecipe {
             diff_id: changeset.diff_id,
@@ -270,8 +271,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         directory.join("result.json"),
         composed.result.canonical_bytes()?,
     )?;
+    let (_nodes, _map_guard) = pool.publish_map_for_catalog(&composed.map)?;
     fs::write(
-        directory.join("lower-map.json"),
+        directory.join("lower.root"),
         composed.map.canonical_bytes()?,
     )?;
     println!(

@@ -38,6 +38,11 @@ pub(crate) enum FailedStartState {
     Error,
 }
 
+pub(crate) struct FailedStartStorage {
+    pub(crate) lease: crate::store::operation_store::LaunchStorageLease,
+    pub(crate) lower: Option<crate::store::composition_store::LaunchLower>,
+}
+
 impl Machine {
     /// Starts the machine and returns its acknowledged generation and snapshot.
     pub async fn start(&self) -> Result<MachineStart, LibVmError> {
@@ -64,6 +69,11 @@ impl Machine {
         &self,
         options: MachineStartOptions,
     ) -> Result<MachineStart, LibVmError> {
+        // Keep the public future small when callers compose several lifecycle operations.
+        Box::pin(self.start_inner(options)).await
+    }
+
+    async fn start_inner(&self, options: MachineStartOptions) -> Result<MachineStart, LibVmError> {
         let runtime = self.runtime();
         let supervisor = runtime.supervisor();
         let mut timeline = crate::runtime::start_timeline::StartTimeline::new(runtime.open_timing);
@@ -121,7 +131,7 @@ impl Machine {
                 .elapsed()
                 .saturating_sub(timeline.lower_resolve_authentication);
             let lower_started = std::time::Instant::now();
-            let prepared_root = match runtime
+            let mut prepared_root = match runtime
                 .prepare_machine_root(&config, &storage_lease, qualification)
                 .await
             {
@@ -133,7 +143,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
-                        storage_lease,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: None,
+                        },
                         error,
                     )
                     .await);
@@ -167,7 +180,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
-                        storage_lease,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         error,
                     )
                     .await);
@@ -191,7 +207,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
-                        storage_lease,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         error,
                     )
                     .await);
@@ -216,7 +235,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
-                        storage_lease,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         err,
                     )
                     .await);
@@ -233,7 +255,10 @@ impl Machine {
                     &run_id,
                     Some(FailedStartState::Stopped),
                     None,
-                    storage_lease,
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
                     error,
                 )
                 .await);
@@ -247,7 +272,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
-                        storage_lease,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         error,
                     )
                     .await)
@@ -263,7 +291,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
-                        storage_lease,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         error.into(),
                     )
                     .await)
@@ -273,6 +304,7 @@ impl Machine {
             let disk_tracking_seeds = match crate::machine::root_storage::launch_disk_seeds(
                 &runtime.machine_storage_record(config.id).await?,
                 &config.machine_dir,
+                runtime.local_images_dir(),
             ) {
                 Ok(seeds) => seeds,
                 Err(error) => {
@@ -282,7 +314,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
-                        storage_lease,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         error,
                     )
                     .await);
@@ -331,7 +366,10 @@ impl Machine {
                     &run_id,
                     Some(FailedStartState::Stopped),
                     None,
-                    storage_lease,
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
                     error,
                 )
                 .await);
@@ -354,7 +392,10 @@ impl Machine {
                     &run_id,
                     Some(FailedStartState::Stopped),
                     None,
-                    storage_lease,
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
                     err,
                 )
                 .await);
@@ -374,7 +415,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Error),
                         None,
-                        storage_lease,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         err,
                     )
                     .await);
@@ -388,7 +432,10 @@ impl Machine {
                     &run_id,
                     Some(FailedStartState::Error),
                     Some(&monitor),
-                    storage_lease,
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
                     LibVmError::MonitorConnection {
                         reference: config.name.clone(),
                         message: format!("silo-vmm pid {pid} has no stable process generation"),
@@ -406,7 +453,10 @@ impl Machine {
                     &run_id,
                     Some(FailedStartState::Error),
                     Some(&monitor),
-                    storage_lease,
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
                     err,
                 )
                 .await);
@@ -447,6 +497,15 @@ impl Machine {
     }
 
     async fn stop_impl(
+        &self,
+        expected_run_id: Option<&MachineRunId>,
+        options: MachineStopOptions,
+        for_removal: bool,
+    ) -> Result<MachineData, LibVmError> {
+        Box::pin(self.stop_inner(expected_run_id, options, for_removal)).await
+    }
+
+    async fn stop_inner(
         &self,
         expected_run_id: Option<&MachineRunId>,
         options: MachineStopOptions,
@@ -927,9 +986,13 @@ pub(crate) async fn finish_failed_start(
     run_id: &str,
     start_failure: Option<FailedStartState>,
     monitor: Option<&ProcessIdentity>,
-    storage_lease: crate::store::operation_store::LaunchStorageLease,
+    resources: FailedStartStorage,
     primary: LibVmError,
 ) -> LibVmError {
+    let FailedStartStorage {
+        lease: storage_lease,
+        lower,
+    } = resources;
     let primary_message = primary.to_string();
     let mut cleanup_errors = Vec::new();
 
@@ -962,6 +1025,8 @@ pub(crate) async fn finish_failed_start(
     }
     // Only release the manager's copy after actual startup owner cleanup. A
     // cancelled waiter leaves the durable operation for later reconciliation.
+    // Lazy lower maps retain a duplicate launch OFD, so retire them before probing the lease.
+    drop(lower);
     drop(storage_lease);
     let mut terminal_transitioned = false;
     if monitor_stopped {
@@ -1340,7 +1405,7 @@ fn unix_time(timestamp: i64) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use crate::machine::lifecycle::{
-        finish_failed_start, stop_failed_start_monitor, FailedStartState,
+        finish_failed_start, stop_failed_start_monitor, FailedStartState, FailedStartStorage,
     };
     use crate::runtime::Runtime;
     use crate::store::models::{MachineConfig, MachineRuntimeState};
@@ -1355,6 +1420,34 @@ mod tests {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, Stdio};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn public_lifecycle_futures_have_bounded_inline_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (runtime, config, _) =
+            crate::runtime::core::tests::shutdown_storage_fixture(&temporary).await;
+        let machine = crate::Machine::new(runtime, config.id);
+        let sizes = [
+            ("start", std::mem::size_of_val(&machine.start())),
+            (
+                "start_with_options",
+                std::mem::size_of_val(
+                    &machine.start_with_options(crate::MachineStartOptions::default()),
+                ),
+            ),
+            ("stop", std::mem::size_of_val(&machine.stop())),
+            (
+                "stop_with",
+                std::mem::size_of_val(&machine.stop_with(crate::MachineStopOptions::default())),
+            ),
+        ];
+        for (operation, bytes) in sizes {
+            assert!(
+                bytes <= 8 * 1024,
+                "{operation} future has {bytes} bytes of inline state; maximum is 8 KiB",
+            );
+        }
+    }
 
     const MONITOR_HOLDER_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_HOLDER";
     const MONITOR_MACHINE_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_MACHINE";
@@ -1724,6 +1817,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_layered_start_releases_lazy_map_authority_before_lease_reconciliation() {
+        for admitted in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, mut config, mut storage) =
+                crate::runtime::core::tests::shutdown_storage_fixture(&temp).await;
+            let store = runtime.native_store().unwrap();
+            let held =
+                crate::store::storage::tests::retained_lower(&store, temp.path(), b'L').await;
+            crate::store::storage::tests::layered_machine(&mut config, &mut storage, &held);
+            runtime
+                .save_machine_config_with_storage(&config, &storage)
+                .await
+                .unwrap();
+            let run = uuid::Uuid::new_v4();
+            let run_id = run.to_string();
+            let lease = runtime
+                .register_launch_storage(&config, run, &storage)
+                .await
+                .unwrap();
+            runtime
+                .request_machine_start(&config, &run_id)
+                .await
+                .unwrap();
+            let lower = crate::store::layer_store::LayerStore::from_store(store)
+                .launch_lower(&lease, &storage)
+                .await
+                .unwrap();
+            if admitted {
+                runtime
+                    .mark_launch_storage_admitted(lease.operation_id())
+                    .await
+                    .unwrap();
+            }
+            let error = finish_failed_start(
+                &runtime,
+                &config,
+                &run_id,
+                Some(FailedStartState::Stopped),
+                None,
+                FailedStartStorage {
+                    lease,
+                    lower: Some(lower),
+                },
+                rejected_start(&config),
+            )
+            .await;
+            assert_rejected_start(&error);
+            assert_retired(&runtime, &config, MachineRuntimeState::Stopped).await;
+        }
+    }
+
+    #[tokio::test]
     async fn failed_start_cleanup_never_signals_unrelated_process_from_stale_pid_evidence() {
         // Monitor died before publishing its holder, or published one whose
         // number now belongs to a process with another birth identity.
@@ -1760,7 +1905,7 @@ mod tests {
                     &run_id,
                     Some(FailedStartState::Stopped),
                     None,
-                    lease,
+                    FailedStartStorage { lease, lower: None },
                     rejected_start(&config),
                 ),
             )
@@ -1787,7 +1932,7 @@ mod tests {
                 &run_id,
                 Some(FailedStartState::Error),
                 None,
-                lease,
+                FailedStartStorage { lease, lower: None },
                 rejected_start(&config),
             ),
         )
@@ -1834,7 +1979,7 @@ mod tests {
                 &run_id,
                 Some(FailedStartState::Error),
                 None,
-                lease,
+                FailedStartStorage { lease, lower: None },
                 rejected_start(&config),
             ),
         )
@@ -1885,7 +2030,7 @@ mod tests {
             &run_id,
             Some(FailedStartState::Stopped),
             None,
-            lease,
+            FailedStartStorage { lease, lower: None },
             rejected_start(&config),
         );
         tokio::pin!(cleanup);

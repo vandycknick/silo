@@ -128,6 +128,7 @@ impl HandoffService {
 
     pub async fn capabilities(&self) -> Result<HandoffCapabilities, LibVmError> {
         Ok(HandoffCapabilities {
+            protocol_version: 2,
             runtime: self.runtime.native_store()?.runtime_id().await?,
             kernel_architecture: crate::handoff::destination::host_architecture()?,
             backend: self.runtime.effective_backend(),
@@ -211,6 +212,15 @@ impl HandoffService {
             }
             let slot = service.slot(operation)?;
             let mut slot = slot.lock().await;
+            if slot.lease.is_none() {
+                slot.lease = Some(
+                    service
+                        .runtime
+                        .native_store()?
+                        .begin_handoff_storage(operation)
+                        .await?,
+                );
+            }
             let index = match &slot.source {
                 Some(index) if index.captured || record.binding.is_none() => index.clone(),
                 _ => {
@@ -220,7 +230,7 @@ impl HandoffService {
                 }
             };
             let cached = match descriptor {
-                PayloadDescriptor::Chunk { .. } => service
+                PayloadDescriptor::StreamChunk { .. } => service
                     .chunk
                     .lock()
                     .map_err(|_| invalid("handoff service state is poisoned"))?

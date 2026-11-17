@@ -29,7 +29,7 @@ use std::ops::Range;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use nix::errno::Errno;
@@ -40,10 +40,14 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use vm_spec::capture::{
     CaptureDiskCopy, CaptureDiskStats, CaptureRole, DiskFullScanReason, DiskTrackingReceipt,
-    Sha256Digest, StreamMap, CAPTURES_DIRECTORY, CAPTURE_DISKS_DIRECTORY, CAPTURE_REQUEST_FILE,
+    Sha256Digest, CAPTURES_DIRECTORY, CAPTURE_DISKS_DIRECTORY, CAPTURE_REQUEST_FILE,
     MAX_CAPTURE_RAM_BYTES, MAX_CAPTURE_RECORD_BYTES, STREAM_CHUNK_BYTES,
 };
 use vm_spec::lifecycle::LiveId;
+use vm_spec::stream_map::{
+    build_sorted, Chunk, ChunkChange, ChunkSize, MapError, NodeSink, NodeSource, PresentChunk,
+    StreamRoot, MAX_NODE_BYTES,
+};
 
 /// Bounded copy buffer: one allocation per disk copy, never RAM-sized.
 const COPY_BUFFER_BYTES: usize = STREAM_CHUNK_BYTES as usize;
@@ -141,6 +145,10 @@ pub(crate) struct CaptureStaging {
     directory: OwnedFd,
     disks: OwnedFd,
     path: PathBuf,
+    nodes: std::sync::Arc<File>,
+    retained_nodes: std::sync::Arc<File>,
+    pool_nodes: std::sync::Mutex<Option<std::sync::Arc<File>>>,
+    node_allocation: std::sync::Arc<AtomicU64>,
 }
 
 /// Outcome of a write-once record.
@@ -192,6 +200,165 @@ impl From<Errno> for DiskCopyError {
     }
 }
 
+pub(crate) fn hashed_map_bytes(map: &StreamRoot, nodes: &mut impl NodeSource) -> io::Result<u64> {
+    map.present_chunks(nodes)
+        .try_fold(0, |total, chunk| {
+            let range = map.chunk_range(chunk?.index)?;
+            Ok::<_, MapError>(total + range.end - range.start)
+        })
+        .map_err(io::Error::other)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MapNodeFiles {
+    retained: std::sync::Arc<File>,
+    pool: Option<std::sync::Arc<File>>,
+}
+impl MapNodeFiles {
+    pub(crate) fn open(path: &str) -> io::Result<Self> {
+        let directory = std::sync::Arc::new(File::from(open(
+            Path::new(path),
+            directory_flags(),
+            Mode::empty(),
+        )?));
+        Ok(Self {
+            retained: directory,
+            pool: None,
+        })
+    }
+}
+
+fn node_name(digest: Sha256Digest) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::with_capacity(64);
+    for byte in digest.as_bytes() {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    name
+}
+
+impl NodeSource for MapNodeFiles {
+    fn read_node(
+        &mut self,
+        digest: Sha256Digest,
+        output: &mut [u8; MAX_NODE_BYTES],
+    ) -> Result<usize, MapError> {
+        let name = node_name(digest);
+        for directory in std::iter::once(&self.retained).chain(self.pool.iter()) {
+            match openat(
+                directory.as_ref(),
+                name.as_str(),
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    let file = File::from(fd);
+                    let metadata = file.metadata()?;
+                    if !metadata.is_file() {
+                        return Err(MapError::Io(invalid("map node is not a regular file")));
+                    }
+                    if metadata.len() > MAX_NODE_BYTES as u64 {
+                        return Err(MapError::NodeTooLarge(metadata.len() as usize));
+                    }
+                    let length = metadata.len() as usize;
+                    file.read_exact_at(&mut output[..length], 0)?;
+                    return Ok(length);
+                }
+                Err(Errno::ENOENT) => {}
+                Err(error) => return Err(MapError::Io(error.into())),
+            }
+        }
+        Err(MapError::MissingNode(digest))
+    }
+}
+
+pub(crate) struct MapNodeWriter {
+    staged: std::sync::Arc<File>,
+    retained: std::sync::Arc<File>,
+    allocation: std::sync::Arc<AtomicU64>,
+    retain_locally: bool,
+}
+
+impl NodeSink for MapNodeWriter {
+    fn write_node(&mut self, bytes: &[u8]) -> Result<Sha256Digest, MapError> {
+        if bytes.len() > MAX_NODE_BYTES {
+            return Err(MapError::NodeTooLarge(bytes.len()));
+        }
+        let digest = Sha256Digest::of_bytes(bytes);
+        let name = node_name(digest);
+        match openat(
+            self.staged.as_ref(),
+            name.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            private_mode(),
+        ) {
+            Ok(fd) => {
+                let file = File::from(fd);
+                fchmod(&file, private_mode()).map_err(io::Error::from)?;
+                file.write_all_at(bytes, 0)?;
+                self.allocation.fetch_add(
+                    file.metadata()?.blocks().saturating_mul(512),
+                    Ordering::Relaxed,
+                );
+            }
+            Err(Errno::EEXIST) => {
+                let file = File::from(
+                    openat(
+                        self.staged.as_ref(),
+                        name.as_str(),
+                        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(io::Error::from)?,
+                );
+                let mut existing = [0; MAX_NODE_BYTES];
+                if file.metadata()?.len() != bytes.len() as u64 {
+                    return Err(MapError::Io(invalid(
+                        "staged map node has a conflicting length",
+                    )));
+                }
+                file.read_exact_at(&mut existing[..bytes.len()], 0)?;
+                if &existing[..bytes.len()] != bytes {
+                    return Err(MapError::DigestMismatch {
+                        expected: digest,
+                        actual: Sha256Digest::of_bytes(&existing[..bytes.len()]),
+                    });
+                }
+            }
+            Err(error) => return Err(MapError::Io(error.into())),
+        }
+        if !self.retain_locally {
+            return Ok(digest);
+        }
+        match linkat(
+            self.staged.as_ref(),
+            name.as_str(),
+            self.retained.as_ref(),
+            name.as_str(),
+            AtFlags::empty(),
+        ) {
+            Ok(()) => {}
+            Err(Errno::EEXIST) => {
+                let mut source = MapNodeFiles {
+                    retained: self.retained.clone(),
+                    pool: None,
+                };
+                let mut existing = [0; MAX_NODE_BYTES];
+                let length = source.read_node(digest, &mut existing)?;
+                if &existing[..length] != bytes {
+                    return Err(MapError::DigestMismatch {
+                        expected: digest,
+                        actual: Sha256Digest::of_bytes(&existing[..length]),
+                    });
+                }
+            }
+            Err(error) => return Err(MapError::Io(error.into())),
+        }
+        Ok(digest)
+    }
+}
+
 impl CaptureStaging {
     /// Create `captures/<id>/` and `disks/` exclusively. A pre-existing capture
     /// directory is never adopted.
@@ -200,11 +367,65 @@ impl CaptureStaging {
         let captures = private_child(&data, CAPTURES_DIRECTORY, false)?;
         let directory = private_child(&captures, capture.as_str(), true)?;
         let disks = private_child(&directory, CAPTURE_DISKS_DIRECTORY, true)?;
+        let nodes = private_child(
+            &directory,
+            vm_spec::capture::CAPTURE_MAP_NODES_DIRECTORY,
+            true,
+        )?;
+        let retained_nodes =
+            private_child(&data, vm_spec::capture::CAPTURE_MAP_NODES_DIRECTORY, false)?;
         Ok(Self {
             directory,
             disks,
             path: data_dir.join(CAPTURES_DIRECTORY).join(capture.as_str()),
+            nodes: std::sync::Arc::new(File::from(nodes)),
+            retained_nodes: std::sync::Arc::new(File::from(retained_nodes)),
+            pool_nodes: std::sync::Mutex::new(None),
+            node_allocation: std::sync::Arc::new(AtomicU64::new(0)),
         })
+    }
+    pub(crate) fn set_node_store(&self, path: Option<&str>) -> io::Result<()> {
+        let pool = path
+            .map(|path| {
+                open(Path::new(path), directory_flags(), Mode::empty())
+                    .map(File::from)
+                    .map(std::sync::Arc::new)
+            })
+            .transpose()?;
+        *self
+            .pool_nodes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = pool;
+        Ok(())
+    }
+
+    pub(crate) fn node_source(&self) -> MapNodeFiles {
+        let pool = self
+            .pool_nodes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        MapNodeFiles {
+            retained: if pool.is_some() {
+                self.nodes.clone()
+            } else {
+                self.retained_nodes.clone()
+            },
+            pool,
+        }
+    }
+
+    pub(crate) fn node_sink(&self) -> MapNodeWriter {
+        MapNodeWriter {
+            staged: self.nodes.clone(),
+            retained: self.retained_nodes.clone(),
+            allocation: self.node_allocation.clone(),
+            retain_locally: self
+                .pool_nodes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none(),
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -270,7 +491,7 @@ impl CaptureStaging {
     fn locate(&self, role: &CaptureRole) -> (&OwnedFd, String) {
         match role {
             CaptureRole::Disk(name) => (&self.disks, name.file_name()),
-            CaptureRole::DiskMap(name) => (&self.disks, format!("{}.map.json", name.as_str())),
+            CaptureRole::DiskMap(name) => (&self.disks, format!("{}.root", name.as_str())),
             other => (&self.directory, other.relative_path()),
         }
     }
@@ -348,10 +569,10 @@ impl CaptureStaging {
     pub(crate) fn complete_disk_identity(
         &self,
         cut: &vm_spec::capture::CaptureDiskCut,
-        baseline: Option<&StreamMap>,
+        baseline: Option<&StreamRoot>,
         tracking_eligible: bool,
         cancel: &CancellationToken,
-    ) -> Result<(StreamMap, CaptureDiskStats), DiskCopyError> {
+    ) -> Result<(StreamRoot, CaptureDiskStats), DiskCopyError> {
         let fingerprint = self.disk_cut(&cut.name)?;
         if (
             fingerprint.device,
@@ -383,7 +604,14 @@ impl CaptureStaging {
                     }) =>
             {
                 let baseline = baseline.ok_or_else(|| invalid("disk baseline is missing"))?;
-                let (map, bytes) = seal_disk_incremental(&file, baseline, receipt, cancel)?;
+                let (map, bytes) = seal_disk_incremental(
+                    &file,
+                    baseline,
+                    receipt,
+                    cancel,
+                    &mut self.node_source(),
+                    &mut self.node_sink(),
+                )?;
                 (map, bytes, None)
             }
             receipt => {
@@ -403,8 +631,8 @@ impl CaptureStaging {
                         None => DiskFullScanReason::Untracked,
                     }
                 };
-                let map = seal_disk_parallel(&file, cut.length, cancel)?;
-                let bytes = hashed_map_bytes(&map);
+                let mut sink = self.node_sink();
+                let (map, bytes) = seal_disk_parallel(&file, cut.length, cancel, &mut sink)?;
                 (map, bytes, Some(reason))
             }
         };
@@ -493,7 +721,7 @@ impl CaptureStaging {
         name: &str,
         length: u64,
         cancel: &CancellationToken,
-    ) -> Result<StreamMap, DiskCopyError> {
+    ) -> Result<StreamRoot, DiskCopyError> {
         let destination = File::from(openat(
             &self.disks,
             name,
@@ -503,20 +731,31 @@ impl CaptureStaging {
         fchmod(&destination, private_mode())?;
         let total = i64::try_from(length).map_err(|_| invalid("disk length overflow"))?;
         ftruncate(&destination, total)?;
-        let map = stream_disk(source, Some(&destination), length, cancel)?;
+        let (map, _) = stream_disk(
+            source,
+            Some(&destination),
+            length,
+            cancel,
+            &mut self.node_sink(),
+        )?;
         Ok(map)
     }
 
-    pub(crate) fn publish_map(&self, role: &CaptureRole, map: &StreamMap) -> io::Result<()> {
+    pub(crate) fn publish_map(&self, role: &CaptureRole, map: &StreamRoot) -> io::Result<()> {
         let output = self.create_output(role)?;
-        map.write_canonical(&mut StagingWriter::new(&output, start_writeback))?;
+        map.write_canonical(&mut StagingWriter::new(&output, start_writeback))
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
     /// Allocated bytes of both held directories.
     pub(crate) fn directory_allocation(&self) -> io::Result<u64> {
-        let mut total = 0u64;
-        for directory in [&self.directory, &self.disks] {
+        let mut total = self.node_allocation.load(Ordering::Relaxed);
+        for directory in [
+            self.directory.as_fd(),
+            self.disks.as_fd(),
+            self.nodes.as_fd(),
+        ] {
             let stat = fstat(directory)?;
             let blocks = u64::try_from(stat.st_blocks).map_err(|_| invalid("negative blocks"))?;
             total = total.saturating_add(blocks.saturating_mul(512));
@@ -826,25 +1065,17 @@ fn classify_disk_chunk(bytes: &[u8]) -> Option<Sha256Digest> {
     }
 }
 
-pub(crate) fn hashed_map_bytes(map: &StreamMap) -> u64 {
-    map.chunks()
-        .iter()
-        .enumerate()
-        .filter(|(_, digest)| digest.is_some())
-        .map(|(index, _)| {
-            (map.length() - index as u64 * STREAM_CHUNK_BYTES).min(STREAM_CHUNK_BYTES)
-        })
-        .sum()
-}
-
 fn seal_disk_incremental(
     source: &File,
-    baseline: &StreamMap,
+    baseline: &StreamRoot,
     receipt: &DiskTrackingReceipt,
     cancel: &CancellationToken,
-) -> Result<(StreamMap, u64), DiskCopyError> {
+    nodes: &mut impl NodeSource,
+    sink: &mut impl NodeSink,
+) -> Result<(StreamRoot, u64), DiskCopyError> {
     receipt.validate().map_err(invalid)?;
     if receipt.invalid_reason.is_some()
+        || baseline.chunk_size() != ChunkSize::DISK
         || receipt.seed.length != baseline.length()
         || receipt.seed.baseline != Some(baseline.id())
         || source.metadata()?.len() != baseline.length()
@@ -860,7 +1091,7 @@ fn seal_disk_incremental(
         .flat_map(|run| run.first_chunk..run.first_chunk + run.chunk_count)
         .collect::<Vec<_>>();
     if dirty.is_empty() {
-        return Ok((baseline.clone(), 0));
+        return Ok((*baseline, 0));
     }
     // Same bound as the full scan: at most eight chunk buffers, one per worker.
     let workers = std::thread::available_parallelism()
@@ -896,18 +1127,23 @@ fn seal_disk_incremental(
             })
             .collect::<Result<Vec<_>, DiskCopyError>>()
     })?;
-    let mut chunks = baseline.chunks().to_vec();
     let mut bytes_hashed = 0;
-    for (index, digest, length) in batches.into_iter().flatten() {
-        if digest.is_some() {
-            bytes_hashed += length;
-        }
-        chunks[index as usize] = digest;
-    }
-    Ok((
-        StreamMap::new(baseline.length(), chunks).map_err(invalid)?,
-        bytes_hashed,
-    ))
+    let changes = batches
+        .into_iter()
+        .flatten()
+        .map(|(index, digest, length)| {
+            if digest.is_some() {
+                bytes_hashed += length;
+            }
+            Ok(ChunkChange {
+                index,
+                value: digest.map_or(Chunk::Zero, Chunk::Data),
+            })
+        });
+    let root = baseline
+        .update_sorted(changes, nodes, sink)
+        .map_err(io::Error::other)?;
+    Ok((root, bytes_hashed))
 }
 
 /// Reflink sealing never writes. Read independent chunk ranges with pread,
@@ -916,9 +1152,10 @@ fn seal_disk_parallel(
     source: &File,
     length: u64,
     cancel: &CancellationToken,
-) -> Result<StreamMap, DiskCopyError> {
+    sink: &mut impl NodeSink,
+) -> Result<(StreamRoot, u64), DiskCopyError> {
     let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(8));
-    seal_disk_with_workers(source, length, cancel, workers)
+    seal_disk_with_workers(source, length, cancel, workers, sink)
 }
 
 fn seal_disk_with_workers(
@@ -926,7 +1163,8 @@ fn seal_disk_with_workers(
     length: u64,
     cancel: &CancellationToken,
     workers: usize,
-) -> Result<StreamMap, DiskCopyError> {
+    sink: &mut impl NodeSink,
+) -> Result<(StreamRoot, u64), DiskCopyError> {
     if cancel.is_cancelled() {
         return Err(DiskCopyError::Cancelled);
     }
@@ -942,15 +1180,19 @@ fn seal_disk_with_workers(
         extents.push((data, end));
         offset = end;
     }
-    let mut chunks = vec![None; length.div_ceil(STREAM_CHUNK_BYTES) as usize];
     let mut work = Vec::new();
     let mut first = 0;
     let mut last = 0;
-    for index in 0..chunks.len() {
+    let mut index = 0usize;
+    while first < extents.len() {
+        index = index.max((extents[first].0 / STREAM_CHUNK_BYTES) as usize);
         let offset = index as u64 * STREAM_CHUNK_BYTES;
         let end = (offset + STREAM_CHUNK_BYTES).min(length);
         while first < extents.len() && extents[first].1 <= offset {
             first += 1;
+        }
+        if first == extents.len() {
+            break;
         }
         last = last.max(first);
         while last < extents.len() && extents[last].0 < end {
@@ -963,6 +1205,7 @@ fn seal_disk_with_workers(
                 digest: None,
             });
         }
+        index += 1;
     }
     if !work.is_empty() {
         let failed = AtomicBool::new(false);
@@ -1011,10 +1254,19 @@ fn seal_disk_with_workers(
     if source.metadata()?.len() != length {
         return Err(invalid("disk changed length during capture").into());
     }
-    for chunk in work {
-        chunks[chunk.index] = chunk.digest;
-    }
-    StreamMap::new(length, chunks).map_err(|error| invalid(error).into())
+    let mut bytes_hashed = 0;
+    let present = work.into_iter().filter_map(|chunk| {
+        chunk.digest.map(|digest| {
+            bytes_hashed +=
+                (length - chunk.index as u64 * STREAM_CHUNK_BYTES).min(STREAM_CHUNK_BYTES);
+            Ok(PresentChunk {
+                index: chunk.index as u64,
+                digest,
+            })
+        })
+    });
+    let root = build_sorted(length, ChunkSize::DISK, present, sink).map_err(io::Error::other)?;
+    Ok((root, bytes_hashed))
 }
 
 fn hash_disk_chunks(
@@ -1062,89 +1314,164 @@ fn stream_disk(
     destination: Option<&File>,
     length: u64,
     cancel: &CancellationToken,
-) -> Result<StreamMap, DiskCopyError> {
+    sink: &mut impl NodeSink,
+) -> Result<(StreamRoot, u64), DiskCopyError> {
     if cancel.is_cancelled() {
         return Err(DiskCopyError::Cancelled);
     }
     let mut destination = destination.map(|file| StagingWriter::new(file, start_writeback));
-    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
-    let mut chunks = Vec::with_capacity(length.div_ceil(STREAM_CHUNK_BYTES) as usize);
+    let mut buffer = vec![0u8; length.min(COPY_BUFFER_BYTES as u64) as usize];
     let mut extent = next_extent(source, 0, length)?;
     let mut offset = 0;
-    while offset < length {
-        if cancel.is_cancelled() {
-            return Err(DiskCopyError::Cancelled);
-        }
-        let end = (offset + STREAM_CHUNK_BYTES).min(length);
-        if extent.is_none_or(|(data, _)| data >= end) {
-            chunks.push(None);
-            offset = end;
-            continue;
-        }
-        let chunk = &mut buffer[..(end - offset) as usize];
-        chunk.fill(0);
-        while let Some((data, data_end)) = extent {
-            if data >= end {
-                break;
-            }
-            let start = data.max(offset);
-            let stop = data_end.min(end);
-            let bytes = &mut chunk[(start - offset) as usize..(stop - offset) as usize];
-            source.read_exact_at(bytes, start)?;
-            if let Some(destination) = destination.as_mut() {
-                if !vm_spec::capture::is_all_zero(bytes) {
-                    destination.write_all_at(bytes, start)?;
+    let mut bytes_hashed = 0;
+    let present = std::iter::from_fn(|| {
+        let mut next = || -> Result<Option<PresentChunk>, MapError> {
+            while let Some((data, _)) = extent {
+                if cancel.is_cancelled() {
+                    return Err(MapError::Io(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "disk copy cancelled",
+                    )));
+                }
+                offset = offset.max(data / STREAM_CHUNK_BYTES * STREAM_CHUNK_BYTES);
+                let end = (offset + STREAM_CHUNK_BYTES).min(length);
+                let chunk = &mut buffer[..(end - offset) as usize];
+                chunk.fill(0);
+                while let Some((data, data_end)) = extent {
+                    if data >= end {
+                        break;
+                    }
+                    let start = data.max(offset);
+                    let stop = data_end.min(end);
+                    let bytes = &mut chunk[(start - offset) as usize..(stop - offset) as usize];
+                    source.read_exact_at(bytes, start)?;
+                    if let Some(destination) = destination.as_mut() {
+                        if !vm_spec::capture::is_all_zero(bytes) {
+                            destination.write_all_at(bytes, start)?;
+                        }
+                    }
+                    if data_end > end {
+                        break;
+                    }
+                    extent = next_extent(source, data_end, length)?;
+                }
+                if let Some(destination) = destination.as_mut() {
+                    destination.complete_through(end);
+                }
+                let index = offset / STREAM_CHUNK_BYTES;
+                offset = end;
+                if let Some(digest) = classify_disk_chunk(chunk) {
+                    bytes_hashed += chunk.len() as u64;
+                    return Ok(Some(PresentChunk { index, digest }));
                 }
             }
-            if data_end > end {
-                break;
-            }
-            extent = next_extent(source, data_end, length)?;
+            Ok(None)
+        };
+        match next() {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
         }
-        if let Some(destination) = destination.as_mut() {
-            destination.complete_through(end);
-        }
-        chunks.push(classify_disk_chunk(chunk));
-        offset = end;
+    });
+    let root = build_sorted(length, ChunkSize::DISK, present, sink).map_err(io::Error::other);
+    if cancel.is_cancelled() {
+        return Err(DiskCopyError::Cancelled);
     }
+    let root = root?;
     if source.metadata()?.len() != length {
         return Err(invalid("disk changed length during capture").into());
     }
-    StreamMap::new(length, chunks).map_err(|error| invalid(error).into())
+    Ok((root, bytes_hashed))
 }
 
-/// Resolve writer receipts without opening RAM.
+/// Resolve the authenticated native change stream without opening RAM.
 pub(crate) fn assemble_ram_map(
     length: u64,
-    dirty: &[u8],
-    digests: &[Option<Sha256Digest>],
-    baseline: Option<&StreamMap>,
-) -> io::Result<StreamMap> {
-    vm_spec::capture::validate_dirty_chunks(length, dirty).map_err(invalid)?;
-    let count = length.div_ceil(STREAM_CHUNK_BYTES) as usize;
-    if digests.len() != count || baseline.is_some_and(|map| map.length() != length) {
+    changes: &File,
+    summary: &vm_spec::capture::CaptureRamChanges,
+    baseline: Option<&StreamRoot>,
+    nodes: MapNodeFiles,
+    sink: &mut impl NodeSink,
+    cancel: &CancellationToken,
+) -> io::Result<StreamRoot> {
+    use vm_spec::capture::{CaptureRamChange, CaptureRamCoverage, RamChangeReader};
+    if changes.metadata()?.len() != summary.byte_len {
         return Err(invalid(
-            "RAM receipt or baseline length differs from its layout",
+            "RAM changes length differs from its native receipt",
         ));
     }
-    let mut chunks = Vec::with_capacity(count);
-    for (index, digest) in digests.iter().enumerate() {
-        if dirty[index / 8] & (1 << (index % 8)) != 0 {
-            chunks.push(*digest);
-        } else {
-            if digest.is_some() {
-                return Err(invalid(
-                    "clean RAM receipt carries a non-authoritative digest",
-                ));
-            }
-            chunks.push(
-                *baseline
-                    .and_then(|map| map.chunks().get(index))
-                    .ok_or_else(|| invalid("clean RAM chunk lacks its baseline"))?,
-            );
+    let reader = RamChangeReader::new(std::io::BufReader::new(changes), length, summary)?;
+    if summary.coverage == CaptureRamCoverage::Full {
+        if baseline.is_some() {
+            return Err(invalid("full RAM capture cannot inherit a baseline"));
         }
+        let present = reader.map(|record| {
+            if cancel.is_cancelled() {
+                return Err(MapError::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "RAM map assembly cancelled",
+                )));
+            }
+            match record? {
+                CaptureRamChange::Data { index, digest } => Ok(PresentChunk { index, digest }),
+                CaptureRamChange::Zero { .. } => Err(MapError::Io(invalid(
+                    "full RAM changes cannot contain zero records",
+                ))),
+            }
+        });
+        return build_sorted(length, ChunkSize::RAM, present, sink).map_err(io::Error::other);
     }
-    StreamMap::new(length, chunks).map_err(invalid)
+    let root = baseline.ok_or_else(|| invalid("incremental RAM changes lack their baseline"))?;
+    if root.length() != length
+        || root.chunk_size() != ChunkSize::RAM
+        || summary.baseline_stream != Some(root.id())
+    {
+        return Err(invalid(
+            "RAM changes differ from the retained baseline geometry or identity",
+        ));
+    }
+    let mut zero_nodes = nodes.clone();
+    let mut update_nodes = nodes;
+    let mut reader = reader;
+    let mut pending = 0..0;
+    let changes = std::iter::from_fn(|| loop {
+        if cancel.is_cancelled() {
+            return Some(Err(MapError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "RAM map assembly cancelled",
+            ))));
+        }
+        if pending.start < pending.end {
+            let mut zeroes = match root.zero_range_changes(
+                pending.start,
+                pending.end - pending.start,
+                &mut zero_nodes,
+            ) {
+                Ok(zeroes) => zeroes,
+                Err(error) => return Some(Err(error)),
+            };
+            if let Some(change) = zeroes.next() {
+                return Some(change.inspect(|change| {
+                    pending.start = change.index + 1;
+                }));
+            }
+            pending.start = pending.end;
+        }
+        match reader.next()? {
+            Ok(CaptureRamChange::Data { index, digest }) => {
+                return Some(Ok(ChunkChange {
+                    index,
+                    value: Chunk::Data(digest),
+                }))
+            }
+            Ok(CaptureRamChange::Zero { first_index, count }) => {
+                pending = first_index..first_index + count
+            }
+            Err(error) => return Some(Err(MapError::Io(error))),
+        }
+    });
+    root.update_sorted(changes, &mut update_nodes, sink)
+        .map_err(io::Error::other)
 }
 
 /// Small state roles retain whole-file SHA-256 authentication.
@@ -1267,19 +1594,23 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
     use vm_spec::capture::{
-        CaptureDiskCopy, CaptureDiskName, CaptureRole, Sha256Digest, StreamIdentity, StreamMap,
-        CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE, CAPTURE_REQUEST_FILE,
-        STREAM_CHUNK_BYTES,
+        CaptureDiskCopy, CaptureDiskName, CaptureRole, Sha256Digest, CAPTURE_EVIDENCE_FILE,
+        CAPTURE_EVIDENCE_TEMPORARY_FILE, CAPTURE_REQUEST_FILE, STREAM_CHUNK_BYTES,
     };
     use vm_spec::lifecycle::LiveId;
+    use vm_spec::stream_map::{
+        build_sorted, Chunk, ChunkSize, MapError, NodeSource, PresentChunk, StreamRoot,
+        MAX_NODE_BYTES,
+    };
 
     use crate::live::staging::{
-        assemble_ram_map, parse_layout, seal_disk_parallel, seal_disk_with_workers, stream_disk,
-        CaptureStaging, DiskCopyError, DiskCopyMethod, FileFacts, RecordCommit, COPY_BUFFER_BYTES,
+        assemble_ram_map, parse_layout, CaptureStaging, DiskCopyError, DiskCopyMethod, FileFacts,
+        RecordCommit, COPY_BUFFER_BYTES,
     };
     #[cfg(target_os = "linux")]
     use crate::live::staging::{start_writeback, StagingWriter};
 
+    #[derive(Debug)]
     struct Root(PathBuf);
 
     impl Drop for Root {
@@ -1301,6 +1632,147 @@ mod tests {
             .create(&path)
             .unwrap();
         Root(path)
+    }
+
+    #[derive(Debug)]
+    struct TestNodes {
+        staging: CaptureStaging,
+        parent: Option<std::sync::Arc<TestNodes>>,
+        _directory: Root,
+    }
+
+    fn test_nodes(parent: Option<std::sync::Arc<TestNodes>>) -> std::sync::Arc<TestNodes> {
+        let directory = root();
+        let staging = CaptureStaging::create(&directory.0, &capture()).unwrap();
+        std::sync::Arc::new(TestNodes {
+            staging,
+            parent,
+            _directory: directory,
+        })
+    }
+
+    #[derive(Clone)]
+    struct TestSource(std::sync::Arc<TestNodes>);
+
+    impl NodeSource for TestSource {
+        fn read_node(
+            &mut self,
+            digest: Sha256Digest,
+            bytes: &mut [u8; MAX_NODE_BYTES],
+        ) -> Result<usize, MapError> {
+            match self.0.staging.node_source().read_node(digest, bytes) {
+                Err(MapError::MissingNode(_)) if self.0.parent.is_some() => {
+                    let parent = self
+                        .0
+                        .parent
+                        .as_ref()
+                        .ok_or(MapError::MissingNode(digest))?;
+                    TestSource(parent.clone()).read_node(digest, bytes)
+                }
+                result => result,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestMap {
+        root: StreamRoot,
+        nodes: std::sync::Arc<TestNodes>,
+    }
+
+    impl std::ops::Deref for TestMap {
+        type Target = StreamRoot;
+        fn deref(&self) -> &StreamRoot {
+            &self.root
+        }
+    }
+    impl PartialEq for TestMap {
+        fn eq(&self, other: &Self) -> bool {
+            self.root == other.root
+        }
+    }
+    impl PartialEq<TestMap> for StreamRoot {
+        fn eq(&self, other: &TestMap) -> bool {
+            *self == other.root
+        }
+    }
+    impl PartialEq<StreamRoot> for TestMap {
+        fn eq(&self, other: &StreamRoot) -> bool {
+            self.root == *other
+        }
+    }
+    impl TestMap {
+        fn chunks(&self) -> Vec<Option<Sha256Digest>> {
+            (0..self.root.chunk_count())
+                .map(|index| {
+                    match self
+                        .root
+                        .lookup(index, &mut TestSource(self.nodes.clone()))
+                        .unwrap()
+                    {
+                        Chunk::Zero => None,
+                        Chunk::Data(digest) => Some(digest),
+                    }
+                })
+                .collect()
+        }
+    }
+
+    fn seal_disk_with_workers(
+        file: &File,
+        length: u64,
+        cancel: &CancellationToken,
+        workers: usize,
+    ) -> Result<TestMap, DiskCopyError> {
+        let nodes = test_nodes(None);
+        let (root, _) = crate::live::staging::seal_disk_with_workers(
+            file,
+            length,
+            cancel,
+            workers,
+            &mut nodes.staging.node_sink(),
+        )?;
+        Ok(TestMap { root, nodes })
+    }
+    fn seal_disk_parallel(
+        file: &File,
+        length: u64,
+        cancel: &CancellationToken,
+    ) -> Result<TestMap, DiskCopyError> {
+        seal_disk_with_workers(file, length, cancel, 8)
+    }
+    fn stream_disk(
+        file: &File,
+        output: Option<&File>,
+        length: u64,
+        cancel: &CancellationToken,
+    ) -> Result<TestMap, DiskCopyError> {
+        let nodes = test_nodes(None);
+        let (root, _) = crate::live::staging::stream_disk(
+            file,
+            output,
+            length,
+            cancel,
+            &mut nodes.staging.node_sink(),
+        )?;
+        Ok(TestMap { root, nodes })
+    }
+    fn seal_disk_incremental(
+        file: &File,
+        baseline: &TestMap,
+        receipt: &vm_spec::capture::DiskTrackingReceipt,
+        cancel: &CancellationToken,
+    ) -> Result<(TestMap, u64), DiskCopyError> {
+        let nodes = test_nodes(Some(baseline.nodes.clone()));
+        let (root, bytes) = crate::live::staging::seal_disk_incremental(
+            file,
+            baseline,
+            receipt,
+            cancel,
+            &mut TestSource(baseline.nodes.clone()),
+            &mut nodes.staging.node_sink(),
+        )?;
+        Ok((TestMap { root, nodes }, bytes))
     }
 
     fn capture() -> LiveId {
@@ -1478,8 +1950,8 @@ mod tests {
         let left = independent_map(&file, length);
         let right = independent_map(&sealed, length);
         assert_eq!(left, right);
-        let map_bytes = std::fs::read(staging.path().join("disks/data0.map.json")).unwrap();
-        assert_eq!(StreamMap::decode(&map_bytes).unwrap(), left);
+        let map_bytes = std::fs::read(staging.path().join("disks/data0.root")).unwrap();
+        assert_eq!(StreamRoot::decode(&map_bytes).unwrap(), left);
         if method == DiskCopyMethod::SparseCopy {
             assert!(
                 sealed.metadata().unwrap().blocks() * 512 < length,
@@ -1746,22 +2218,28 @@ mod tests {
             .exists());
     }
 
-    fn independent_map(file: &File, length: u64) -> StreamMap {
+    fn independent_map(file: &File, length: u64) -> TestMap {
         let mut bytes = vec![0; length as usize];
         file.read_exact_at(&mut bytes, 0).unwrap();
-        let chunks = bytes
+        let nodes = test_nodes(None);
+        let present = bytes
             .chunks(STREAM_CHUNK_BYTES as usize)
-            .map(|chunk| {
-                (!vm_spec::capture::is_all_zero(chunk)).then(|| Sha256Digest::of_bytes(chunk))
-            })
-            .collect();
-        let map = StreamMap::new(length, chunks).unwrap();
-        let mut identity = StreamIdentity::new();
-        for chunk in bytes.chunks(STREAM_CHUNK_BYTES as usize) {
-            identity.push_chunk(chunk).unwrap();
-        }
-        assert_eq!(map.id(), identity.finish());
-        map
+            .enumerate()
+            .filter(|(_, chunk)| !vm_spec::capture::is_all_zero(chunk))
+            .map(|(index, chunk)| {
+                Ok(PresentChunk {
+                    index: index as u64,
+                    digest: Sha256Digest::of_bytes(chunk),
+                })
+            });
+        let root = build_sorted(
+            length,
+            ChunkSize::DISK,
+            present,
+            &mut nodes.staging.node_sink(),
+        )
+        .unwrap();
+        TestMap { root, nodes }
     }
 
     #[test]
@@ -1797,7 +2275,7 @@ mod tests {
         }
         let cut = staging.disk_cut(&name).unwrap();
         assert!(
-            !staging.path().join("disks/upper.map.json").exists(),
+            !staging.path().join("disks/upper.root").exists(),
             "the in-pause clone must not construct or publish an identity map"
         );
         file.write_all_at(b"guest writes after continuation", 0)
@@ -1812,7 +2290,7 @@ mod tests {
         let (map, facts) = staging.open_sealed(&CaptureRole::DiskMap(name)).unwrap();
         let mut bytes = vec![0; facts.length as usize];
         map.read_exact_at(&mut bytes, 0).unwrap();
-        assert_eq!(StreamMap::decode(&bytes).unwrap(), expected);
+        assert_eq!(StreamRoot::decode(&bytes).unwrap(), expected);
         assert_eq!(bytes, expected.canonical_bytes().unwrap());
         assert_eq!(independent_map(&cloned, length), expected);
     }
@@ -1855,7 +2333,7 @@ mod tests {
                 Err(DiskCopyError::Cancelled)
             ));
         });
-        assert!(!staging.path().join("disks/upper.map.json").exists());
+        assert!(!staging.path().join("disks/upper.root").exists());
         assert_eq!(staging.disk_cut(&name).unwrap(), cut);
     }
 
@@ -1879,44 +2357,138 @@ mod tests {
         assert!(copied.metadata().unwrap().blocks() * 512 < length);
     }
 
-    #[test]
-    fn full_ram_receipt_builds_map_without_a_file() {
-        let length = 2 * STREAM_CHUNK_BYTES + 4096;
-        let digests = [
-            Some(Sha256Digest::of_bytes(b"first")),
-            None,
-            Some(Sha256Digest::of_bytes(b"tail")),
-        ];
-        let map = assemble_ram_map(length, &[0b111], &digests, None).unwrap();
-        assert_eq!(map.length(), length);
-        assert_eq!(map.chunks(), &digests);
-        let mut identity = StreamIdentity::new();
-        identity
-            .push_digest(STREAM_CHUNK_BYTES, digests[0])
-            .unwrap();
-        identity.push_digest(STREAM_CHUNK_BYTES, None).unwrap();
-        identity.push_digest(4096, digests[2]).unwrap();
-        assert_eq!(map.id(), identity.finish());
-        assert!(assemble_ram_map(length, &[0b110], &digests, None).is_err());
-        assert!(assemble_ram_map(length, &[0b111], &digests[..2], None).is_err());
-        assert!(assemble_ram_map(length, &[0b1000_0111], &digests, None).is_err());
+    fn ram_changes(
+        staging: &CaptureStaging,
+        name: &str,
+        baseline: Option<Sha256Digest>,
+        records: &[(u64, u64, Option<Sha256Digest>)],
+    ) -> (File, vm_spec::capture::CaptureRamChanges) {
+        use vm_spec::capture::{CaptureRamChanges, CaptureRamCoverage};
+        let mut bytes = b"KRUNRAM\0\x01\0\x10\0\0\0\0\0".to_vec();
+        bytes[11] = u8::from(baseline.is_some());
+        for &(first, count, digest) in records {
+            bytes.extend(first.to_le_bytes());
+            bytes.extend(count.to_le_bytes());
+            bytes.push(u8::from(digest.is_some()));
+            bytes.extend([0; 7]);
+            bytes.extend(digest.map_or([0; 32], |digest| *digest.as_bytes()));
+        }
+        let path = staging.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        let summary = CaptureRamChanges {
+            byte_len: bytes.len() as u64,
+            sha256: Sha256Digest::of_bytes(&bytes),
+            record_count: records.len() as u64,
+            coverage: if baseline.is_some() {
+                CaptureRamCoverage::Incremental
+            } else {
+                CaptureRamCoverage::Full
+            },
+            baseline_stream: baseline,
+        };
+        (File::open(path).unwrap(), summary)
     }
 
     #[test]
-    fn incremental_ram_receipt_resolves_clean_zero_and_tail_chunks() {
-        let length = 2 * STREAM_CHUNK_BYTES + 4096;
-        let old = Some(Sha256Digest::of_bytes(b"baseline"));
-        let tail = Some(Sha256Digest::of_bytes(b"new-tail"));
-        let baseline = StreamMap::new(length, vec![old, old, old]).unwrap();
-        let receipt = [None, None, tail];
-        let map = assemble_ram_map(length, &[0b110], &receipt, Some(&baseline)).unwrap();
-        assert_eq!(map.chunks(), &[old, None, tail]);
-        let unchanged = assemble_ram_map(length, &[0], &[None; 3], Some(&map)).unwrap();
-        assert_eq!(unchanged, map);
-        assert!(assemble_ram_map(length, &[0b110], &[old, None, tail], Some(&baseline)).is_err());
-        assert!(assemble_ram_map(length, &[0b110], &receipt, None).is_err());
-        let short = StreamMap::new(STREAM_CHUNK_BYTES, vec![old]).unwrap();
-        assert!(assemble_ram_map(length, &[0b110], &receipt, Some(&short)).is_err());
+    fn full_and_incremental_ram_files_equal_fresh_build_and_zero_runs_clear_chunks() {
+        let directory = root();
+        let staging = CaptureStaging::create(&directory.0, &capture()).unwrap();
+        let length = 3 * ChunkSize::RAM.bytes() + 4096;
+        let memory = source(
+            &directory,
+            "ram",
+            length,
+            &[(0, b"first"), (2 * ChunkSize::RAM.bytes(), b"last")],
+        );
+        let digest_at = |index: u64| {
+            let mut bytes = vec![
+                0;
+                (length - index * ChunkSize::RAM.bytes()).min(ChunkSize::RAM.bytes())
+                    as usize
+            ];
+            memory
+                .read_exact_at(&mut bytes, index * ChunkSize::RAM.bytes())
+                .unwrap();
+            Sha256Digest::of_bytes(&bytes)
+        };
+        let (file, summary) = ram_changes(
+            &staging,
+            "full.changes",
+            None,
+            &[(0, 1, Some(digest_at(0))), (2, 1, Some(digest_at(2)))],
+        );
+        let full = assemble_ram_map(
+            length,
+            &file,
+            &summary,
+            None,
+            staging.node_source(),
+            &mut staging.node_sink(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        memory
+            .write_all_at(&vec![0; ChunkSize::RAM.bytes() as usize], 0)
+            .unwrap();
+        memory.write_all_at(b"new-tail", length - 8).unwrap();
+        let next = CaptureStaging::create(&directory.0, &capture()).unwrap();
+        let (file, summary) = ram_changes(
+            &next,
+            "incremental.changes",
+            Some(full.id()),
+            &[(0, 2, None), (3, 1, Some(digest_at(3)))],
+        );
+        let incremental = assemble_ram_map(
+            length,
+            &file,
+            &summary,
+            Some(&full),
+            next.node_source(),
+            &mut next.node_sink(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let fresh = CaptureStaging::create(&directory.0, &capture()).unwrap();
+        let (file, summary) = ram_changes(
+            &fresh,
+            "fresh.changes",
+            None,
+            &[(2, 1, Some(digest_at(2))), (3, 1, Some(digest_at(3)))],
+        );
+        let expected = assemble_ram_map(
+            length,
+            &file,
+            &summary,
+            None,
+            fresh.node_source(),
+            &mut fresh.node_sink(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(incremental, expected);
+        assert_eq!(
+            incremental.lookup(0, &mut next.node_source()).unwrap(),
+            Chunk::Zero
+        );
+        let idle = CaptureStaging::create(&directory.0, &capture()).unwrap();
+        let (file, summary) = ram_changes(&idle, "idle.changes", Some(incremental.id()), &[]);
+        let unchanged = assemble_ram_map(
+            length,
+            &file,
+            &summary,
+            Some(&incremental),
+            idle.node_source(),
+            &mut idle.node_sink(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(unchanged, incremental);
+        assert_eq!(
+            std::fs::read_dir(idle.path().join("map-nodes"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -1924,7 +2496,7 @@ mod tests {
         let root = root();
         let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
         staging.write_request(b"request").unwrap();
-        let map = StreamMap::new(4096, vec![None]).unwrap();
+        let map = StreamRoot::empty(4096, ChunkSize::RAM).unwrap();
         staging.publish_map(&CaptureRole::RamMap, &map).unwrap();
         assert!(matches!(
             staging
@@ -1941,7 +2513,7 @@ mod tests {
             b"fork-cut"
         );
         assert_eq!(
-            std::fs::read(staging.path().join("memory.map.json")).unwrap(),
+            std::fs::read(staging.path().join("memory.root")).unwrap(),
             map.canonical_bytes().unwrap()
         );
     }
@@ -2204,7 +2776,7 @@ mod tests {
 
     fn tracking_receipt(
         file: &File,
-        baseline: &StreamMap,
+        baseline: &TestMap,
         indices: &[u64],
     ) -> vm_spec::capture::DiskTrackingReceipt {
         use vm_spec::capture::{
@@ -2214,6 +2786,8 @@ mod tests {
         let metadata = file.metadata().unwrap();
         let seed = DiskTrackingSeed {
             version: DISK_TRACKING_VERSION,
+            map_format: 2,
+            chunk_shift: 23,
             role: vm_spec::DiskRole::Root,
             attachment_index: 0,
             block_id: vm_spec::BlockId::new("root").unwrap(),
@@ -2291,13 +2865,8 @@ mod tests {
         file.write_all_at(&zeros, 2 * STREAM_CHUNK_BYTES).unwrap();
         file.write_all_at(&[0; 512], length - 512).unwrap();
         let receipt = tracking_receipt(&file, &baseline, &dirty.into_iter().collect::<Vec<_>>());
-        let (incremental, bytes_hashed) = crate::live::staging::seal_disk_incremental(
-            &file,
-            &baseline,
-            &receipt,
-            &CancellationToken::new(),
-        )
-        .unwrap();
+        let (incremental, bytes_hashed) =
+            seal_disk_incremental(&file, &baseline, &receipt, &CancellationToken::new()).unwrap();
         let full = independent_map(&file, length);
         assert_eq!(incremental, full);
         assert_eq!(
@@ -2346,13 +2915,8 @@ mod tests {
         }
         nix::fcntl::fallocate(&file, flags, (2 * STREAM_CHUNK_BYTES + 4096) as i64, 8192).unwrap();
         let receipt = tracking_receipt(&file, &baseline, &[1, 2]);
-        let (map, _) = crate::live::staging::seal_disk_incremental(
-            &file,
-            &baseline,
-            &receipt,
-            &CancellationToken::new(),
-        )
-        .unwrap();
+        let (map, _) =
+            seal_disk_incremental(&file, &baseline, &receipt, &CancellationToken::new()).unwrap();
         assert_eq!(map, independent_map(&file, length));
         assert_eq!(map.chunks()[1], None);
         assert!(map.chunks()[2].is_some());
@@ -2373,13 +2937,9 @@ mod tests {
             .write(true)
             .open(root.0.join("unchanged.raw"))
             .unwrap();
-        let (map, bytes) = crate::live::staging::seal_disk_incremental(
-            &write_only,
-            &baseline,
-            &receipt,
-            &CancellationToken::new(),
-        )
-        .unwrap();
+        let (map, bytes) =
+            seal_disk_incremental(&write_only, &baseline, &receipt, &CancellationToken::new())
+                .unwrap();
         assert_eq!(map, baseline);
         assert_eq!(bytes, 0);
     }
@@ -2417,7 +2977,7 @@ mod tests {
                 receipt.dirty_chunks = 1;
             }
             cut.tracking_receipt = Some(receipt);
-            let supplied = (case != 1).then_some(&baseline);
+            let supplied = (case != 1).then_some(&baseline.root);
             let (map, stats) = staging
                 .complete_disk_identity(&cut, supplied, case != 3, &CancellationToken::new())
                 .unwrap();
@@ -2456,6 +3016,17 @@ mod tests {
         let receipt = tracking_receipt(&file, &baseline, &[0, 3]);
         let expected = independent_map(&file, length);
         let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+        staging
+            .set_node_store(Some(
+                baseline
+                    .nodes
+                    .staging
+                    .path()
+                    .join("map-nodes")
+                    .to_str()
+                    .unwrap(),
+            ))
+            .unwrap();
         let name = CaptureDiskName::new("upper").unwrap();
         match staging.copy_disk(
             &CaptureRole::Disk(name.clone()),

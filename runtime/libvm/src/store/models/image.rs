@@ -153,20 +153,14 @@ impl ImageRecord {
     pub fn validate(&self) -> Result<(), crate::LibVmError> {
         use crate::store::models::snapshot::{invalid, validate_geometry, SnapshotRootProfile};
         use crate::store::models::storage::{validate_root_selection, BootBinding, BootProfile};
-        if self.schema != 1 {
+        if self.schema != 2 {
             return Err(invalid("image requires current schema"));
         }
         validate_geometry(&self.root.stream, &self.root.geometry)?;
         self.root.validate_lower()?;
-        let expected_pages = self
-            .root
+        self.root
             .stream
-            .length
-            .div_ceil(crate::storage::limits::CHUNK_SIZE as u64)
-            .div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
-        if self.root.stream.map_pages.len() as u64 != expected_pages {
-            return Err(invalid("image map page count contradicts stream length"));
-        }
+            .validate_profile(vm_spec::stream_map::StreamRole::Disk)?;
         self.boot.validate()?;
         let BootProfile::LinuxDirect {
             binding: BootBinding::Pinned { abi, .. },
@@ -256,7 +250,6 @@ impl ImageRecord {
         use crate::store::models::storage::BootBinding;
         let mut streams = std::collections::BTreeSet::from([self.root.stream.stream]);
         let mut objects = std::collections::BTreeSet::from([self.root.stream.map]);
-        objects.extend(self.root.stream.map_pages.iter().copied());
         if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay { lower, .. } =
             &self.root.profile
         {
@@ -264,7 +257,6 @@ impl ImageRecord {
             for layer in &lower.layers {
                 streams.insert(layer.pack.stream);
                 objects.insert(layer.pack.map);
-                objects.extend(layer.pack.map_pages.iter().copied());
             }
         }
         let binding = self.boot_binding()?;
@@ -288,7 +280,7 @@ impl ImageRecord {
 pub(crate) fn image_id(canonical: &[u8]) -> crate::storage::identity::ImageId {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
-    hash.update(b"silo:image:v1\n");
+    hash.update(b"silo:image:v2\n");
     hash.update(canonical);
     crate::storage::identity::ImageId::from_sha256(hash.finalize().into())
 }
@@ -308,7 +300,7 @@ mod tests {
             ObjectDigest::of_bytes(b"kernel"),
         );
         ImageRecord {
-            schema: 1,
+            schema: 2,
             kind: ImageRecordKind::Image,
             root: snapshot.root,
             boot: snapshot.boot,
@@ -423,7 +415,7 @@ mod tests {
         changed.root.geometry.length += 512;
         assert!(changed.validate().is_err());
         changed = record.clone();
-        changed.root.stream.map_pages.clear();
+        changed.root.stream.chunk_size = vm_spec::stream_map::ChunkSize::RAM.bytes();
         assert!(changed.validate().is_err());
         for selector in [
             RootSelector::GptPartition {
@@ -482,11 +474,6 @@ mod tests {
         for layer in &lower.layers {
             assert!(streams.contains(&layer.pack.stream));
             assert!(objects.contains(&layer.pack.map));
-            assert!(layer
-                .pack
-                .map_pages
-                .iter()
-                .all(|page| objects.contains(page)));
         }
         assert!(lower.objects().all(|object| objects.contains(&object)));
         let mut malformed = record.clone();

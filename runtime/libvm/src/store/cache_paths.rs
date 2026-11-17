@@ -25,9 +25,19 @@ pub(crate) fn storage_pool_dependencies(
     if let crate::MachineRoot::LinuxOverlay { lower, .. } = &storage.root {
         dependencies.lowers.insert(lower.record());
     }
+    // Invalid baselines are never trusted, but their diagnostic references
+    // retain the same machine-lifetime ownership until admission drops them.
+    dependencies
+        .objects
+        .extend(storage.disk_baselines.iter().map(|baseline| baseline.map));
     for disk in &storage.disks {
         if let crate::DiskStorage::ManagedReadOnly { stream, .. } = &disk.storage {
             dependencies.streams.insert(*stream);
+            dependencies
+                .objects
+                .insert(crate::storage::identity::ObjectDigest::from_sha256(
+                    *stream.as_bytes(),
+                ));
         }
     }
     if let crate::BootProfile::LinuxDirect {

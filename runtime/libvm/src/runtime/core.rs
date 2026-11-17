@@ -1794,7 +1794,14 @@ impl Runtime {
                     })?,
                     self.live_query.selection().backend,
                     self.components.supervisor(),
-                )?
+                )
+                .map_err(|error| LibVmError::InvalidStorageRecord {
+                    record: "machine-boot",
+                    message: format!(
+                        "machine {} ({}) boot object: {error}",
+                        config.id, config.name
+                    ),
+                })?
                 .ok_or_else(|| {
                     crate::machine::root_storage::invalid("pinned boot selection disappeared")
                 })?,
@@ -1838,7 +1845,14 @@ impl Runtime {
             crate::MachineRoot::LinuxOverlay { .. } if qualification.is_some() => Some(
                 crate::store::layer_store::LayerStore::from_store(self.native_store()?)
                     .launch_lower(lease, storage)
-                    .await?,
+                    .await
+                    .map_err(|error| LibVmError::InvalidStorageRecord {
+                        record: "machine-lower",
+                        message: format!(
+                            "machine {} ({}) layer/composition object: {error}",
+                            config.id, config.name,
+                        ),
+                    })?,
             ),
             _ => None,
         };
@@ -4735,10 +4749,11 @@ pub(crate) mod tests {
         let root_path = config
             .machine_dir
             .join(crate::paths::root_disk_relative_path());
-        let original_root = crate::storage::stream::StreamHasher::new()
-            .hash_file(&root_path)
-            .unwrap()
-            .id();
+        let original_root =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_file(&root_path)
+                .unwrap()
+                .id();
         let store = Store::open(&paths.state_db_path())
             .await
             .expect("open real catalog");
@@ -4782,7 +4797,7 @@ pub(crate) mod tests {
             Some(original_storage)
         );
         assert_eq!(
-            crate::storage::stream::StreamHasher::new()
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                 .hash_file(&root_path)
                 .unwrap()
                 .id(),

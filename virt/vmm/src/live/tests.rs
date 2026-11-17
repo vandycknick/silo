@@ -1119,6 +1119,7 @@ impl Harness {
                 tracking_eligible: true,
             }],
             read_only_inputs: Vec::new(),
+            map_node_store: None,
             reservation: CaptureReservation {
                 storage_operation_id: live_id(Uuid::new_v4()),
                 launch_lease: binding.launch,
@@ -1215,6 +1216,9 @@ async fn live_capture_seals_exact_evidence_then_resumes_the_source() {
         }
     );
     // Stream entries bind canonical chunk identities; small state binds bytes.
+    let oracle =
+        crate::live::staging::CaptureStaging::create(&harness.root, &live_id(Uuid::new_v4()))
+            .unwrap();
     for entry in &evidence.inventory {
         let bytes = std::fs::read(directory.join(entry.role.relative_path())).unwrap();
         assert_eq!(
@@ -1227,11 +1231,30 @@ async fn live_capture_seals_exact_evidence_then_resumes_the_source() {
             assert_eq!(Sha256Digest::of_bytes(&bytes), digest);
             assert!(entry.identity.is_none());
         } else {
-            let mut identity = StreamIdentity::new();
-            for chunk in bytes.chunks(STREAM_CHUNK_BYTES as usize) {
-                identity.push_chunk(chunk).unwrap();
-            }
-            assert_eq!(Some(identity.finish()), entry.identity);
+            use vm_spec::stream_map::{build_sorted, ChunkSize, PresentChunk};
+            let chunk_size = if entry.role == CaptureRole::Ram {
+                ChunkSize::RAM
+            } else {
+                ChunkSize::DISK
+            };
+            let present = bytes
+                .chunks(chunk_size.bytes() as usize)
+                .enumerate()
+                .filter(|(_, bytes)| !is_all_zero(bytes))
+                .map(|(index, bytes)| {
+                    Ok(PresentChunk {
+                        index: index as u64,
+                        digest: Sha256Digest::of_bytes(bytes),
+                    })
+                });
+            let root = build_sorted(
+                bytes.len() as u64,
+                chunk_size,
+                present,
+                &mut oracle.node_sink(),
+            )
+            .unwrap();
+            assert_eq!(Some(root.id()), entry.identity);
         }
     }
     // The sealed disk is the paused source's bytes, in a private inode.
@@ -1359,7 +1382,7 @@ async fn live_capture_records_all_facts_and_stream_identities() {
             assert!(entry.sha256.is_none());
         }
     }
-    assert!(directory.join("disks/root.map.json").exists());
+    assert!(directory.join("disks/root.root").exists());
     harness.stop().await;
 }
 

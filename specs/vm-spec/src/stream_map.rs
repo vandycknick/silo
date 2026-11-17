@@ -66,6 +66,13 @@ const BRANCH_PREFIX: &[u8] = b"silo:stream-map:branch:v2\n";
 #[derive(Debug)]
 pub enum MapError {
     Io(io::Error),
+    Node {
+        digest: Sha256Digest,
+        height: u8,
+        first_index: u64,
+        end_index: u64,
+        source: Box<MapError>,
+    },
     InvalidMagic,
     InvalidChunkShift(u8),
     LengthLimit {
@@ -123,6 +130,16 @@ impl fmt::Display for MapError {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(output, "map I/O: {error}"),
+            Self::Node {
+                digest,
+                height,
+                first_index,
+                end_index,
+                source,
+            } => write!(
+                output,
+                "map node {digest} height {height} indices {first_index}..{end_index}: {source}"
+            ),
             Self::InvalidMagic => output.write_str("invalid stream-map domain or version"),
             Self::InvalidChunkShift(shift) => write!(output, "invalid chunk shift {shift}"),
             Self::LengthLimit { length, maximum } => {
@@ -188,6 +205,7 @@ impl std::error::Error for MapError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Node { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -207,6 +225,12 @@ impl ChunkSize {
     pub const RAM: Self = Self(16);
     pub const DISK: Self = Self(23);
 
+    pub fn from_bytes(bytes: u64) -> Result<Self, MapError> {
+        if !bytes.is_power_of_two() {
+            return Err(MapError::InvalidChunkShift(0));
+        }
+        Self::from_shift(bytes.trailing_zeros() as u8)
+    }
     pub fn from_shift(shift: u8) -> Result<Self, MapError> {
         if !(12..=23).contains(&shift) {
             return Err(MapError::InvalidChunkShift(shift));
@@ -457,13 +481,48 @@ impl StreamRoot {
     }
 
     pub fn present_chunks<'a>(&self, source: &'a mut impl NodeSource) -> PresentChunks<'a> {
-        PresentChunks {
+        self.present_chunks_from(0, source)
+    }
+
+    pub fn present_chunks_from<'a>(
+        &self,
+        first: u64,
+        source: &'a mut impl NodeSource,
+    ) -> PresentChunks<'a> {
+        let mut cursor = self.present_chunk_cursor();
+        cursor.first = first;
+        PresentChunks { cursor, source }
+    }
+
+    pub fn present_chunk_cursor(&self) -> PresentChunkCursor {
+        PresentChunkCursor {
             root: *self,
-            source,
             stack: Vec::with_capacity(usize::from(TREE_DEPTH)),
             started: false,
             failed: false,
+            first: 0,
+            end: self.chunk_count(),
         }
+    }
+
+    pub fn zero_range_changes<'a>(
+        &self,
+        first: u64,
+        count: u64,
+        source: &'a mut impl NodeSource,
+    ) -> Result<ZeroRangeChanges<'a>, MapError> {
+        let end = first
+            .checked_add(count)
+            .ok_or(MapError::ArithmeticOverflow)?;
+        if end > self.chunk_count() {
+            return Err(MapError::IndexOutOfRange {
+                index: end,
+                count: self.chunk_count(),
+            });
+        }
+        let mut chunks = self.present_chunks_from(first, source);
+        chunks.cursor.end = end;
+        Ok(ZeroRangeChanges { chunks })
     }
 
     /// Sorted unique changes only. Geometry is unchanged; resize needs explicit
@@ -871,19 +930,30 @@ fn read_node(
     base: u64,
     count: u64,
 ) -> Result<StreamNode, MapError> {
-    let mut bytes = [0u8; MAX_NODE_BYTES];
-    let length = source.read_node(digest, &mut bytes)?;
-    let bytes = bytes.get(..length).ok_or(MapError::NodeTooLarge(length))?;
-    let actual = Sha256Digest::of_bytes(bytes);
-    if actual != digest {
-        return Err(MapError::DigestMismatch {
-            expected: digest,
-            actual,
-        });
-    }
-    let node = StreamNode::decode(bytes, height)?;
-    node.validate_range(base, count)?;
-    Ok(node)
+    let result = (|| {
+        let mut bytes = [0u8; MAX_NODE_BYTES];
+        let length = source.read_node(digest, &mut bytes)?;
+        let bytes = bytes.get(..length).ok_or(MapError::NodeTooLarge(length))?;
+        let actual = Sha256Digest::of_bytes(bytes);
+        if actual != digest {
+            return Err(MapError::DigestMismatch {
+                expected: digest,
+                actual,
+            });
+        }
+        let node = StreamNode::decode(bytes, height)?;
+        node.validate_range(base, count)?;
+        Ok(node)
+    })();
+    result.map_err(|source| MapError::Node {
+        digest,
+        height,
+        first_index: base,
+        end_index: base
+            .saturating_add(1u64 << (6 * u32::from(height + 1)))
+            .min(count),
+        source: Box::new(source),
+    })
 }
 
 struct ChangeCursor<I> {
@@ -1000,19 +1070,43 @@ struct WalkFrame {
 /// Ordered, fallible, fused traversal of present chunks. Each visited node is
 /// hash-checked, structurally decoded and range-checked before using its values.
 pub struct PresentChunks<'a> {
-    root: StreamRoot,
+    cursor: PresentChunkCursor,
     source: &'a mut dyn NodeSource,
+}
+
+/// Owned traversal state; the caller supplies its retained source at each step.
+pub struct PresentChunkCursor {
+    root: StreamRoot,
     stack: Vec<WalkFrame>,
     started: bool,
     failed: bool,
+    first: u64,
+    end: u64,
 }
 
-impl PresentChunks<'_> {
-    fn next_chunk(&mut self) -> Result<Option<PresentChunk>, MapError> {
+impl PresentChunkCursor {
+    pub fn next_chunk(
+        &mut self,
+        source: &mut dyn NodeSource,
+    ) -> Result<Option<PresentChunk>, MapError> {
+        if self.failed {
+            return Ok(None);
+        }
+        let result = self.advance(source);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn advance(&mut self, source: &mut dyn NodeSource) -> Result<Option<PresentChunk>, MapError> {
+        if self.first >= self.end {
+            return Ok(None);
+        }
         if !self.started {
             self.started = true;
             if let Some(digest) = self.root.tree {
-                let node = read_node(self.source, digest, ROOT_HEIGHT, 0, self.root.chunk_count())?;
+                let node = read_node(source, digest, ROOT_HEIGHT, 0, self.root.chunk_count())?;
                 self.stack.push(WalkFrame {
                     node,
                     base: 0,
@@ -1030,19 +1124,17 @@ impl PresentChunks<'_> {
             let base = child_base(frame.base, height, slot)?;
             frame.next_slot = slot + 1;
             self.stack.push(frame);
+            let width = 1u64 << (6 * u32::from(height));
+            if base >= self.end || base + width <= self.first {
+                continue;
+            }
             if height == 0 {
                 return Ok(Some(PresentChunk {
                     index: base,
                     digest,
                 }));
             }
-            let node = read_node(
-                self.source,
-                digest,
-                height - 1,
-                base,
-                self.root.chunk_count(),
-            )?;
+            let node = read_node(source, digest, height - 1, base, self.root.chunk_count())?;
             self.stack.push(WalkFrame {
                 node,
                 base,
@@ -1057,21 +1149,30 @@ impl Iterator for PresentChunks<'_> {
     type Item = Result<PresentChunk, MapError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-        match self.next_chunk() {
+        match self.cursor.next_chunk(self.source) {
             Ok(Some(chunk)) => Some(Ok(chunk)),
             Ok(None) => None,
-            Err(error) => {
-                self.failed = true;
-                Some(Err(error))
-            }
+            Err(error) => Some(Err(error)),
         }
     }
 }
 
 impl std::iter::FusedIterator for PresentChunks<'_> {}
+
+pub struct ZeroRangeChanges<'a> {
+    chunks: PresentChunks<'a>,
+}
+impl Iterator for ZeroRangeChanges<'_> {
+    type Item = Result<ChunkChange, MapError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.chunks.next().map(|chunk| {
+            chunk.map(|chunk| ChunkChange {
+                index: chunk.index,
+                value: Chunk::Zero,
+            })
+        })
+    }
+}
 
 struct DiffFrame {
     before: Option<StreamNode>,
@@ -1856,11 +1957,11 @@ mod tests {
             let root = tree_with_bad_node(height, &bad, &mut store);
             assert!(matches!(
                 root.lookup(0, &mut store),
-                Err(MapError::IndexOutOfRange { .. })
+                Err(MapError::Node { source, .. }) if matches!(*source, MapError::IndexOutOfRange { .. })
             ));
             assert!(matches!(
                 root.present_chunks(&mut store).next(),
-                Some(Err(MapError::IndexOutOfRange { .. }))
+                Some(Err(MapError::Node { source, .. })) if matches!(*source, MapError::IndexOutOfRange { .. })
             ));
             let mut sink = NodeStore::default();
             assert!(matches!(
@@ -1872,7 +1973,7 @@ mod tests {
                     &mut store,
                     &mut sink
                 ),
-                Err(MapError::IndexOutOfRange { .. })
+                Err(MapError::Node { source, .. }) if matches!(*source, MapError::IndexOutOfRange { .. })
             ));
         }
     }
@@ -1898,13 +1999,13 @@ mod tests {
             corrupt.bytes.get_mut(&target).unwrap()[0] ^= 1;
             assert!(matches!(
                 root.lookup(0, &mut corrupt),
-                Err(MapError::DigestMismatch { .. })
+                Err(MapError::Node { height: actual_height, source, .. }) if actual_height == height && matches!(*source, MapError::DigestMismatch { .. })
             ));
             let mut missing = clean.clone();
             missing.bytes.remove(&target);
             assert!(matches!(
                 root.lookup(0, &mut missing),
-                Err(MapError::MissingNode(_))
+                Err(MapError::Node { height: actual_height, source, .. }) if actual_height == height && matches!(*source, MapError::MissingNode(_))
             ));
             let mut invalid_bytes = clean.bytes[&target].clone();
             invalid_bytes.push(0);
@@ -1912,7 +2013,7 @@ mod tests {
             let invalid_root = tree_with_bad_node(height, &invalid_bytes, &mut invalid);
             assert!(matches!(
                 invalid_root.lookup(0, &mut invalid),
-                Err(MapError::TrailingBytes)
+                Err(MapError::Node { source, .. }) if matches!(*source, MapError::TrailingBytes)
             ));
             let wrong_height = if height == 0 { 1 } else { 0 };
             let bad = StreamNode::new(wrong_height, [(0, digest(X))])
@@ -1923,7 +2024,7 @@ mod tests {
             let invalid_root = tree_with_bad_node(height, &bad, &mut invalid);
             assert!(matches!(
                 invalid_root.lookup(0, &mut invalid),
-                Err(MapError::WrongHeight { .. })
+                Err(MapError::Node { source, .. }) if matches!(*source, MapError::WrongHeight { .. })
             ));
         }
         let mut corrupt = clean.clone();
@@ -2337,5 +2438,50 @@ mod tests {
         assert_eq!(after, rebuilt);
         assert_eq!(after.lookup(0, &mut store).unwrap(), Chunk::Zero);
         assert_eq!(after.lookup(2, &mut store).unwrap(), Chunk::Zero);
+    }
+
+    #[test]
+    fn zero_ranges_skip_absent_indices_and_unrelated_populated_subtrees() {
+        let mut store = NodeStore::default();
+        let entries = BTreeMap::from([(0, digest(X)), (64, digest(Y)), (1 << 20, digest(X))]);
+        let root = rebuild(MAX_RAM_BYTES, &entries, &mut store);
+        store.reads = 0;
+        let changes = root
+            .zero_range_changes(0, 65, &mut store)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            changes,
+            vec![
+                ChunkChange {
+                    index: 0,
+                    value: Chunk::Zero
+                },
+                ChunkChange {
+                    index: 64,
+                    value: Chunk::Zero
+                }
+            ]
+        );
+        assert!(store.reads <= 6);
+        store.reads = 0;
+        assert!(root
+            .zero_range_changes(1, 0, &mut store)
+            .unwrap()
+            .next()
+            .is_none());
+        assert_eq!(store.reads, 0);
+        assert!(root.zero_range_changes(u64::MAX, 2, &mut store).is_err());
+        assert!(root
+            .zero_range_changes(root.chunk_count(), 1, &mut store)
+            .is_err());
+        let mut cursor = root.present_chunk_cursor();
+        let mut seen = Vec::new();
+        while let Some(chunk) = cursor.next_chunk(&mut store).unwrap() {
+            seen.push(chunk.index);
+        }
+        assert_eq!(seen, vec![0, 64, 1 << 20]);
+        assert!(cursor.next_chunk(&mut store).unwrap().is_none());
     }
 }

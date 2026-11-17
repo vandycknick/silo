@@ -37,6 +37,20 @@ after those arguments. The benchmark also rejects xdist workers. `PERF_SHELL=`
 is available when already inside the required shell. No host-global cache drop
 or privileged operation is performed.
 
+## Stream-map format accounting
+
+The fresh-state format uses sparse Merkle roots, 64 KiB RAM identities and
+8 MiB disk/pack/lower identities. Transport payloads remain 8 MiB. Existing
+homes and artifacts cannot be reused. Capture evidence records actual nonzero
+`identityBytesHashed` and the native change-file `recordCount`, rather than
+interpreting a dense digest vector or treating SHA volume as dirty coverage.
+The incremental budget retains the full bounded receipt. Ingest evidence
+counts all distinct root/node objects through catalog metadata outside the
+timed create; it does not decode a tree just to report its size. Targets,
+agent-ready clocks and tolerance are unchanged. No new measured results are
+claimed by this format change.
+
+
 ## Clock and sequence
 
 Start, fork and restore are timed from command start until the command returns

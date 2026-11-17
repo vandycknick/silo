@@ -1559,6 +1559,7 @@ mod tests {
                 pause: CapturePauseAuthority::Acquire,
                 disks: Vec::new(),
                 read_only_inputs: Vec::new(),
+                map_node_store: None,
                 reservation: CaptureReservation {
                     storage_operation_id: id(Some(&uuid::Uuid::new_v4().to_string())),
                     launch_lease: CaptureLaunchLease {

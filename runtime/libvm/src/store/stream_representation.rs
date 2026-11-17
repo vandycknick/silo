@@ -1,9 +1,8 @@
-//! Complete canonical chunk representations and shared flat materializations.
-//! Operation stream pins protect both representations and flat inodes. Neither
-//! canonical objects nor representation edges participate in cache age policy.
-use std::collections::{BTreeSet, HashMap};
-use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
+//! Retained encoded transport payloads and shared flat materializations.
+//! Payload geometry is independent of the authenticated stream identity profile.
+//! Operation stream pins protect representations, map roots and flat inodes.
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use oci::vm_artifact::wire::{ChunkEntry, TransferRoot};
 use sqlx::Row;
@@ -11,12 +10,19 @@ use uuid::Uuid;
 
 use crate::storage::identity::{ObjectDigest, StreamId};
 use crate::storage::limits::Resource;
+use crate::storage::map::{AuthenticatedMap, MapAuthority};
 use crate::storage::pool::StoragePool;
-use crate::storage::stream::{Chunk, StreamMap};
 use crate::store::models::snapshot::{invalid, SnapshotStream};
 use crate::store::snapshot_store::{recheck_closure, ClosureFingerprints};
 use crate::store::Store;
 use crate::LibVmError;
+use vm_spec::stream_map::{ChunkSize, StreamRole};
+
+#[derive(Clone, Copy)]
+enum FlatAuthority {
+    Unverified,
+    Exported(Option<crate::storage::identity_file::SourceFingerprint>),
+}
 
 /// Constructible only by authenticating the complete local canonical closure.
 /// This carries no lease: the containing acquisition must retain its one owner.
@@ -27,6 +33,7 @@ pub(crate) struct VerifiedStreamRepresentation {
     fingerprints: ClosureFingerprints,
     encoding: oci::vm_artifact::codec::ChunkEncoding,
     raw_only: bool,
+    flat: FlatAuthority,
 }
 
 fn digest(value: oci::changeset::model::ContentDigest) -> ObjectDigest {
@@ -35,9 +42,24 @@ fn digest(value: oci::changeset::model::ContentDigest) -> ObjectDigest {
 
 fn transfer(
     pool: &StoragePool,
+    operation: Uuid,
     content: &SnapshotStream,
     root_digest: ObjectDigest,
-) -> Result<(Vec<ChunkEntry>, BTreeSet<ObjectDigest>), LibVmError> {
+) -> Result<(Vec<ChunkEntry>, BTreeSet<ObjectDigest>, AuthenticatedMap), LibVmError> {
+    transfer_with_authority(
+        pool,
+        content,
+        root_digest,
+        pool.map_authority(Arc::new(pool.existing_lease(operation)?))?,
+    )
+}
+
+fn transfer_with_authority(
+    pool: &StoragePool,
+    content: &SnapshotStream,
+    root_digest: ObjectDigest,
+    authority: Arc<dyn MapAuthority>,
+) -> Result<(Vec<ChunkEntry>, BTreeSet<ObjectDigest>, AuthenticatedMap), LibVmError> {
     let root_bytes = pool.read_object(&root_digest, Resource::MetadataPageBytes.maximum())?;
     let root: TransferRoot = oci::vm_artifact::wire::decode_record(&root_bytes).map_err(invalid)?;
     if root.stream.as_bytes() != content.stream.as_bytes() || root.length != content.length {
@@ -46,7 +68,6 @@ fn transfer(
         ));
     }
     let mut members = BTreeSet::from([root_digest, content.map]);
-    members.extend(content.map_pages.iter().copied());
     let entries = oci::vm_artifact::wire::verify_transfer(&root, |page| {
         let page = digest(page);
         members.insert(page);
@@ -54,46 +75,161 @@ fn transfer(
             .map_err(|error| oci::vm_artifact::Error::Invalid(error.to_string()))
     })
     .map_err(invalid)?;
-    let mut chunks = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        chunks.push(match entry {
-            ChunkEntry::Zero { .. } => Chunk::Zero,
-            ChunkEntry::Data {
-                digest: decoded,
-                encoded,
-                ..
-            } => {
-                members.insert(digest(encoded.digest));
-                Chunk::Data(digest(*decoded))
-            }
-        });
-    }
-    let projected = StreamMap::new(content.length, chunks)?;
-    let canonical = crate::storage::map::StreamMapRoot::decode(
-        &pool.read_object(&content.map, Resource::MetadataPageBytes.maximum())?,
-    )?;
-    if projected.id() != content.stream
-        || canonical.stream != content.stream
-        || canonical.length != content.length
-        || canonical.pages != content.map_pages
-        || canonical.read_map(pool)? != projected
+    let role = representation_role(content)?;
+    let map = pool.load_map(content.map, role, authority)?;
+    if map.id() != content.stream
+        || map.length() != content.length
+        || map.chunk_size().bytes() != content.chunk_size
     {
         return Err(invalid(
-            "retained representation changes canonical stream map",
+            "retained representation changes canonical stream root",
         ));
     }
-    Ok((entries, members))
+    for entry in &entries {
+        if let ChunkEntry::Data { encoded, .. } = entry {
+            members.insert(digest(encoded.digest));
+        }
+    }
+    Ok((entries, members, map))
+}
+
+fn representation_role(content: &SnapshotStream) -> Result<StreamRole, LibVmError> {
+    let role = match content.chunk_size {
+        65536 => StreamRole::Ram,
+        8388608 => StreamRole::Disk,
+        _ => return Err(invalid("unsupported retained stream identity profile")),
+    };
+    content.validate_profile(role)?;
+    Ok(role)
+}
+
+/// Every occurrence is checked at its logical position, even when encoded
+/// payload objects are shared. Only the current decoded 8 MiB payload is held.
+fn authenticate_payloads(
+    pool: &StoragePool,
+    map: &AuthenticatedMap,
+    entries: &[ChunkEntry],
+    output: Option<&std::fs::File>,
+) -> Result<(), LibVmError> {
+    let mut bytes = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        bytes.clear();
+        match entry {
+            ChunkEntry::Zero { length } => {
+                bytes.resize(usize::try_from(*length).map_err(invalid)?, 0)
+            }
+            ChunkEntry::Data { encoded, .. } => {
+                oci::vm_artifact::codec::decode_chunk(
+                    entry,
+                    pool.open_object(&digest(encoded.digest))?,
+                    &mut bytes,
+                )
+                .map_err(invalid)?;
+            }
+        }
+        crate::image::transport::identity::verify_payload(map, index as u64, &bytes)?;
+        if let Some(output) = output {
+            crate::storage::stream::write_sparse_at(
+                output,
+                &bytes,
+                index as u64 * oci::vm_artifact::wire::CHUNK_SIZE,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl VerifiedStreamRepresentation {
     pub(crate) fn verify(
         pool: &StoragePool,
+        operation: Uuid,
         content: SnapshotStream,
         root: ObjectDigest,
     ) -> Result<Self, LibVmError> {
+        Self::verify_with_authority(
+            pool,
+            content,
+            root,
+            pool.map_authority(Arc::new(pool.existing_lease(operation)?))?,
+        )
+    }
+
+    fn verify_with_authority(
+        pool: &StoragePool,
+        content: SnapshotStream,
+        root: ObjectDigest,
+        authority: Arc<dyn MapAuthority>,
+    ) -> Result<Self, LibVmError> {
+        let (verified, map, entries) = Self::metadata(pool, content, root, authority)?;
+        authenticate_payloads(pool, &map, &entries, None)?;
+        recheck_closure(&verified.fingerprints)?;
+        Ok(verified)
+    }
+
+    /// The local exporter has hashed these identity units from its held input
+    /// while publishing the encoded payloads. This is not imported authority.
+    pub(crate) fn from_export(
+        pool: &StoragePool,
+        operation: Uuid,
+        content: SnapshotStream,
+        root: ObjectDigest,
+        produced: &AuthenticatedMap,
+        flat_fingerprint: Option<crate::storage::identity_file::SourceFingerprint>,
+    ) -> Result<Self, LibVmError> {
+        let (mut verified, map, _) = Self::metadata(
+            pool,
+            content,
+            root,
+            pool.map_authority(Arc::new(pool.existing_lease(operation)?))?,
+        )?;
+        if map != *produced {
+            return Err(invalid(
+                "exported representation contradicts measured stream root",
+            ));
+        }
+        recheck_closure(&verified.fingerprints)?;
+        verified.flat = FlatAuthority::Exported(flat_fingerprint);
+        Ok(verified)
+    }
+
+    /// Import already authenticated every decoded occurrence while writing
+    /// this exact held inode. Its capability cannot be supplied by a receipt.
+    pub(crate) fn from_import(
+        pool: &StoragePool,
+        operation: Uuid,
+        stream: &crate::image::transport::import::VerifiedStream,
+    ) -> Result<Self, LibVmError> {
+        crate::store::snapshot_store::bind_held(&stream.file, stream.fingerprint)?;
+        let content = SnapshotStream {
+            stream: stream.id,
+            length: stream.length,
+            map: stream.canonical_map,
+            chunk_size: stream.map.chunk_size().bytes(),
+        };
+        let (verified, map, _) = Self::metadata(
+            pool,
+            content,
+            stream.transport.root.0,
+            pool.map_authority(Arc::new(pool.existing_lease(operation)?))?,
+        )?;
+        if map != *stream.map {
+            return Err(invalid(
+                "imported representation contradicts authenticated root",
+            ));
+        }
+        recheck_closure(&verified.fingerprints)?;
+        Ok(verified.for_import())
+    }
+
+    fn metadata(
+        pool: &StoragePool,
+        content: SnapshotStream,
+        root: ObjectDigest,
+        authority: Arc<dyn MapAuthority>,
+    ) -> Result<(Self, AuthenticatedMap, Vec<ChunkEntry>), LibVmError> {
         crate::storage::limits::preflight_fd_budget(2)
             .map_err(crate::storage::StorageError::from)?;
-        let (entries, members) = transfer(pool, &content, root)?;
+        let (entries, members, map) = transfer_with_authority(pool, &content, root, authority)?;
         let mut fingerprints = Vec::with_capacity(members.len());
         let encoded = entries
             .iter()
@@ -119,29 +255,6 @@ impl VerifiedStreamRepresentation {
             )?;
             fingerprints.push((path, fingerprint));
         }
-        let mut decoded = HashMap::new();
-        for entry in &entries {
-            if let ChunkEntry::Data {
-                digest,
-                length,
-                encoded,
-            } = entry
-            {
-                let facts = (*digest, *length, encoded.media_type);
-                if let Some(previous) = decoded.insert(encoded.digest, facts) {
-                    if previous != facts {
-                        return Err(invalid(
-                            "one encoded chunk has contradictory decoded assertions",
-                        ));
-                    }
-                    continue;
-                }
-                let input =
-                    pool.open_object(&crate::store::stream_representation::digest(encoded.digest))?;
-                oci::vm_artifact::codec::decode_chunk(entry, input, std::io::sink())
-                    .map_err(invalid)?;
-            }
-        }
         recheck_closure(&fingerprints)?;
         let raw_only=entries.iter().all(|entry| !matches!(entry,ChunkEntry::Data{encoded,..} if encoded.media_type==oci::vm_artifact::wire::PayloadMediaType::ZstdChunk));
         let encoding = if raw_only {
@@ -149,14 +262,19 @@ impl VerifiedStreamRepresentation {
         } else {
             oci::vm_artifact::codec::ChunkEncoding::Zstd
         };
-        Ok(Self {
-            content,
-            root,
-            members,
-            fingerprints,
-            encoding,
-            raw_only,
-        })
+        Ok((
+            Self {
+                content,
+                root,
+                members,
+                fingerprints,
+                encoding,
+                raw_only,
+                flat: FlatAuthority::Unverified,
+            },
+            map,
+            entries,
+        ))
     }
     pub(crate) fn for_encoding(
         mut self,
@@ -199,12 +317,11 @@ impl Store {
         content: &SnapshotStream,
         encoding: oci::vm_artifact::codec::ChunkEncoding,
     ) -> Result<Option<RetainedStreamRepresentation>, LibVmError> {
-        crate::store::snapshot_store::require_operation_closure(
+        crate::store::snapshot_store::require_consumer_closure(
             self,
             operation,
             &BTreeSet::from([content.stream]),
             &BTreeSet::new(),
-            None,
         )
         .await?;
         let root=sqlx::query_scalar::<_,String>("SELECT root_digest FROM stream_representation_profile WHERE stream_id=?1 AND encoding=?2 ORDER BY root_digest LIMIT 1")
@@ -213,8 +330,9 @@ impl Store {
         let root: ObjectDigest = root.parse().map_err(invalid)?;
         let pool = StoragePool::open_existing(&self.images_dir)?
             .ok_or_else(|| invalid("retained representation pool is missing"))?;
-        let verified = VerifiedStreamRepresentation::verify(&pool, content.clone(), root)?
-            .for_encoding(encoding)?;
+        let verified =
+            VerifiedStreamRepresentation::verify(&pool, operation, content.clone(), root)?
+                .for_encoding(encoding)?;
         exact_members(
             &mut *self.pool.acquire().await?,
             content.stream,
@@ -236,7 +354,7 @@ impl Store {
                 ))
             })
             .collect::<Result<Vec<_>, LibVmError>>()?;
-        let (entries, _) = transfer(&pool, content, root)?;
+        let (entries, _, _) = transfer(&pool, operation, content, root)?;
         Ok(Some(RetainedStreamRepresentation {
             root: (root, root_bytes),
             pages,
@@ -250,12 +368,11 @@ impl Store {
         object: ObjectDigest,
         stream: StreamId,
     ) -> Result<(), LibVmError> {
-        crate::store::snapshot_store::require_operation_closure(
+        crate::store::snapshot_store::require_consumer_closure(
             self,
             operation,
             &BTreeSet::from([stream]),
             &BTreeSet::from([object]),
-            None,
         )
         .await?;
         let pool = StoragePool::open(&self.images_dir)?;
@@ -274,22 +391,28 @@ impl Store {
         operation: Uuid,
         verified: &VerifiedStreamRepresentation,
     ) -> Result<(), LibVmError> {
-        crate::store::snapshot_store::require_operation_closure(
+        crate::store::snapshot_store::require_consumer_closure(
             self,
             operation,
             &BTreeSet::from([verified.content.stream]),
             &verified.members,
-            None,
         )
         .await?;
         let pool = StoragePool::open(&self.images_dir)?;
-        let flat = authenticate_flat_if_present(&pool, &verified.content)?;
+        let (_, _, map) = transfer(&pool, operation, &verified.content, verified.root)?;
+        let retained = self.admit_published_map_root(operation, &map).await?;
+        let flat = match verified.flat {
+            FlatAuthority::Unverified => authenticate_flat_if_present(&pool, &verified.content)?,
+            FlatAuthority::Exported(fingerprint) => fingerprint
+                .map(|fingerprint| (pool.stream_path(&verified.content.stream), fingerprint)),
+        };
         let _roots = pool.lock_roots_shared()?;
         recheck_closure(flat.as_slice())?;
         recheck_closure(&verified.fingerprints)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         insert_representation(&mut tx, verified, flat.is_some()).await?;
         tx.commit().await?;
+        drop(retained);
         Ok(())
     }
 
@@ -301,19 +424,18 @@ impl Store {
         operation: Uuid,
         content: &SnapshotStream,
     ) -> Result<(), LibVmError> {
-        crate::store::snapshot_store::require_operation_closure(
+        crate::store::snapshot_store::require_consumer_closure(
             self,
             operation,
             &BTreeSet::from([content.stream]),
             &BTreeSet::new(),
-            None,
         )
         .await?;
         crate::storage::limits::preflight_fd_budget(4)
             .map_err(crate::storage::StorageError::from)?;
         let pool = StoragePool::open(&self.images_dir)?;
         let row = sqlx::query(
-            "SELECT length,map_digest,flat_state FROM storage_stream WHERE stream_id=?1",
+            "SELECT length,map_digest,chunk_shift,flat_state FROM storage_stream WHERE stream_id=?1",
         )
         .bind(content.stream.to_string())
         .fetch_optional(&self.pool)
@@ -321,6 +443,7 @@ impl Store {
         let Some(row) = row else { return Ok(()) };
         if row.try_get::<i64, _>("length")? != content.length as i64
             || row.try_get::<String, _>("map_digest")? != content.map.to_string()
+            || (1u64 << row.try_get::<u32, _>("chunk_shift")?) != content.chunk_size
         {
             return Err(invalid("stream catalog contradicts semantic map"));
         }
@@ -349,7 +472,7 @@ impl Store {
             .bind(content.stream.to_string()).fetch_optional(&self.pool).await?
             .ok_or_else(|| invalid("evicted stream has no retained representation"))?;
         let root = root.parse().map_err(invalid)?;
-        let (entries, members) = transfer(&pool, content, root)?;
+        let (entries, members, map) = transfer(&pool, operation, content, root)?;
         exact_members(
             &mut *self.pool.acquire().await?,
             content.stream,
@@ -359,54 +482,16 @@ impl Store {
         .await?;
         // Disposable reconstruction bytes use the pool's publication lease,
         // not the consumer's operation directory, which restore owns later.
-        let (input, mut output) = pool.stage()?;
+        let (staging, output) = pool.stage()?;
         output.set_len(content.length)?;
-        let mut decoded = HashMap::new();
-        let mut repeated = Vec::new();
-        let mut offset = 0u64;
-        for entry in &entries {
-            let length = match entry {
-                ChunkEntry::Zero { length } => {
-                    output.seek(SeekFrom::Current(i64::try_from(*length).map_err(invalid)?))?;
-                    *length
-                }
-                ChunkEntry::Data {
-                    digest: expected,
-                    length,
-                    encoded,
-                } => {
-                    let facts = (*expected, *length, encoded.media_type);
-                    if let Some((previous_offset, previous)) = decoded.get(&encoded.digest) {
-                        if *previous != facts {
-                            return Err(invalid(
-                                "one encoded chunk has contradictory decoded assertions",
-                            ));
-                        }
-                        repeated.resize(usize::try_from(*length).map_err(invalid)?, 0);
-                        output.read_exact_at(&mut repeated, *previous_offset)?;
-                        output.write_all(&repeated)?;
-                    } else {
-                        oci::vm_artifact::codec::decode_chunk(
-                            entry,
-                            pool.open_object(&digest(encoded.digest))?,
-                            &mut output,
-                        )
-                        .map_err(invalid)?;
-                        decoded.insert(encoded.digest, (offset, facts));
-                    }
-                    *length
-                }
-            };
-            offset = offset
-                .checked_add(length)
-                .ok_or_else(|| invalid("reconstruction offset overflow"))?;
-        }
+        authenticate_payloads(&pool, &map, &entries, Some(&output))?;
         output.sync_all()?;
-        drop(output);
-        let (published, roots) = pool.publish_stream_for_catalog(&input.path())?;
-        if published.id != content.stream || published.length != content.length {
+        let retained = self.admit_published_map_root(operation, &map).await?;
+        let (published, roots) = pool.publish_staged_stream_for_catalog(staging, output, &map)?;
+        if published.map().id() != content.stream || published.map().length() != content.length {
             return Err(invalid("reconstructed stream identity mismatch"));
         }
+        drop(retained);
         mark_flat_present(&mut *self.pool.acquire().await?, content).await?;
         drop(roots);
         Ok(())
@@ -418,7 +503,7 @@ impl Store {
         let mut cursor = String::new();
         let mut removed = 0u64;
         loop {
-            let rows = sqlx::query("SELECT stream_id,length,map_digest FROM storage_stream WHERE stream_id>?1 AND flat_state IN ('present','evicting') ORDER BY stream_id LIMIT 256")
+            let rows = sqlx::query("SELECT stream_id,length,map_digest,chunk_shift FROM storage_stream WHERE stream_id>?1 AND flat_state IN ('present','evicting') ORDER BY stream_id LIMIT 256")
                 .bind(&cursor).fetch_all(&self.pool).await?;
             if rows.is_empty() {
                 break;
@@ -433,20 +518,19 @@ impl Store {
                     .try_get::<String, _>("map_digest")?
                     .parse()
                     .map_err(invalid)?;
-                let canonical = crate::storage::map::StreamMapRoot::decode(
-                    &pool.read_object(&map, Resource::MetadataPageBytes.maximum())?,
-                )?;
                 let content = SnapshotStream {
                     stream,
                     length: u64::try_from(row.try_get::<i64, _>("length")?).map_err(invalid)?,
                     map,
-                    map_pages: canonical.pages,
+                    chunk_size: 1u64 << row.try_get::<u32, _>("chunk_shift")?,
                 };
-                // Authenticate the complete sole-copy alternative outside roots.
-                let verified = VerifiedStreamRepresentation::verify(
+                // A scoped collection guard owns the graph during the sole-copy
+                // byte check; release it before the exclusive eviction fence.
+                let verified = VerifiedStreamRepresentation::verify_with_authority(
                     &pool,
                     content,
                     root.parse().map_err(invalid)?,
+                    pool.map_authority(Arc::new(pool.lock_roots_shared()?))?,
                 )?;
                 let _roots = pool.lock_roots()?;
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -524,7 +608,8 @@ fn authenticate_flat_if_present(
     if !path.try_exists()? {
         return Ok(None);
     }
-    let authenticated = pool.authenticate_stream_full(&content.stream)?;
+    let authenticated =
+        pool.authenticate_stream_full(&content.stream, representation_role(content)?)?;
     if authenticated.map().length() != content.length {
         return Err(invalid("flat stream contradicts canonical length"));
     }
@@ -537,13 +622,15 @@ pub(crate) async fn mark_flat_present(
     connection: &mut sqlx::SqliteConnection,
     content: &SnapshotStream,
 ) -> Result<(), LibVmError> {
-    let row = sqlx::query("SELECT length,map_digest FROM storage_stream WHERE stream_id=?1")
-        .bind(content.stream.to_string())
-        .fetch_optional(&mut *connection)
-        .await?;
+    let row =
+        sqlx::query("SELECT length,map_digest,chunk_shift FROM storage_stream WHERE stream_id=?1")
+            .bind(content.stream.to_string())
+            .fetch_optional(&mut *connection)
+            .await?;
     if let Some(row) = row {
         if row.try_get::<i64, _>("length")? != content.length as i64
             || row.try_get::<String, _>("map_digest")? != content.map.to_string()
+            || (1u64 << row.try_get::<u32, _>("chunk_shift")?) != content.chunk_size
         {
             return Err(invalid("immutable stream catalog identity contradiction"));
         }
@@ -562,15 +649,19 @@ pub(crate) async fn insert_representation(
 ) -> Result<(), LibVmError> {
     recheck_closure(&verified.fingerprints)?;
     let content = &verified.content;
-    sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,flat_state) VALUES(?1,?2,?3,?4) ON CONFLICT DO NOTHING")
+    let role = representation_role(content)?;
+    sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,chunk_shift,flat_state) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING")
         .bind(content.stream.to_string()).bind(content.length as i64).bind(content.map.to_string())
+        .bind(role.chunk_size().shift())
         .bind(if flat_present { "present" } else { "absent" }).execute(&mut *connection).await?;
-    let row = sqlx::query("SELECT length,map_digest FROM storage_stream WHERE stream_id=?1")
-        .bind(content.stream.to_string())
-        .fetch_one(&mut *connection)
-        .await?;
+    let row =
+        sqlx::query("SELECT length,map_digest,chunk_shift FROM storage_stream WHERE stream_id=?1")
+            .bind(content.stream.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
     if row.try_get::<i64, _>("length")? != content.length as i64
         || row.try_get::<String, _>("map_digest")? != content.map.to_string()
+        || row.try_get::<u8, _>("chunk_shift")? != role.chunk_size().shift()
     {
         return Err(invalid("immutable stream catalog identity contradiction"));
     }
@@ -626,7 +717,7 @@ pub(crate) async fn check_catalog(store: &Store) -> Result<(), LibVmError> {
     }
     let mut cursor = (String::new(), String::new());
     loop {
-        let rows = sqlx::query("SELECT s.stream_id,s.length,s.map_digest,r.root_digest FROM storage_stream s JOIN stream_representation r USING(stream_id) WHERE (s.stream_id,r.root_digest)>(?1,?2) ORDER BY s.stream_id,r.root_digest LIMIT 256")
+        let rows = sqlx::query("SELECT s.stream_id,s.length,s.map_digest,s.chunk_shift,r.root_digest FROM storage_stream s JOIN stream_representation r USING(stream_id) WHERE (s.stream_id,r.root_digest)>(?1,?2) ORDER BY s.stream_id,r.root_digest LIMIT 256")
             .bind(&cursor.0).bind(&cursor.1).fetch_all(&store.pool).await?;
         if rows.is_empty() {
             break;
@@ -637,17 +728,19 @@ pub(crate) async fn check_catalog(store: &Store) -> Result<(), LibVmError> {
                 .try_get::<String, _>("map_digest")?
                 .parse()
                 .map_err(invalid)?;
-            let canonical = crate::storage::map::StreamMapRoot::decode(
-                &pool.read_object(&map, Resource::MetadataPageBytes.maximum())?,
-            )?;
             let content = SnapshotStream {
                 stream: cursor.0.parse().map_err(invalid)?,
                 length: u64::try_from(row.try_get::<i64, _>("length")?).map_err(invalid)?,
                 map,
-                map_pages: canonical.pages,
+                chunk_size: 1u64 << row.try_get::<u32, _>("chunk_shift")?,
             };
             let root = cursor.1.parse().map_err(invalid)?;
-            let (entries, members) = transfer(&pool, &content, root)?;
+            let (entries, members, _) = transfer_with_authority(
+                &pool,
+                &content,
+                root,
+                pool.map_authority(Arc::new(pool.lock_roots_shared()?))?,
+            )?;
             exact_members(
                 &mut *store.pool.acquire().await?,
                 content.stream,
@@ -722,8 +815,8 @@ fn authenticate_object_binding(
     crate::storage::limits::preflight_fd_budget(1).map_err(crate::storage::StorageError::from)?;
     let file = pool.open_object(&object)?;
     let length = file.metadata()?.len();
-    let (authenticated, sha) =
-        crate::storage::stream::StreamHasher::new().authenticate_with_sha256(file, length)?;
+    let (authenticated, sha) = crate::storage::stream::StreamHasher::new(ChunkSize::DISK)
+        .authenticate_with_sha256(file, length)?;
     if authenticated.map().id() != stream || sha.as_bytes() != object.as_bytes() {
         return Err(invalid(
             "whole-object stream representation contradicts byte identity",
@@ -757,6 +850,7 @@ pub(crate) async fn retire_unrooted(store: &Store, pool: &StoragePool) -> Result
     )
     .execute(&mut *tx)
     .await?;
+    crate::store::map_store::retire_unreachable_graph(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -999,16 +1093,16 @@ pub(crate) mod tests {
         let mut pages = Vec::new();
         for (index, entries) in entries.chunks(entries_per_page).enumerate() {
             let page = oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
-                "schema":1,"kind":"silo-chunk-map",
+                "schema":2,"kind":"silo-chunk-map",
                 "firstChunk":index * entries_per_page,"entries":entries
             }))
             .unwrap();
             pages.push(publish_object(&store, &pool, operation, &page).await);
         }
-        let root_bytes=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":1,"kind":"silo-chunks-v1","stream":stream.id,"length":bytes.len(),"chunkSize":8388608,"pages":pages})).unwrap();
+        let root_bytes=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":2,"kind":"silo-chunks-v2","stream":stream.id,"length":bytes.len(),"chunkSize":8388608,"pages":pages})).unwrap();
         let root = publish_object(&store, &pool, operation, &root_bytes).await;
         let representation =
-            VerifiedStreamRepresentation::verify(&pool, content.clone(), root).unwrap();
+            VerifiedStreamRepresentation::verify(&pool, operation, content.clone(), root).unwrap();
         store
             .register_stream_representation(operation, &representation)
             .await
@@ -1425,7 +1519,7 @@ pub(crate) mod tests {
             .unwrap()
             .is_none());
         let verified =
-            VerifiedStreamRepresentation::verify(&pool, record.root.stream.clone(), root)
+            VerifiedStreamRepresentation::verify(&pool, owner.id, record.root.stream.clone(), root)
                 .unwrap()
                 .for_encoding(ChunkEncoding::Zstd)
                 .unwrap();
@@ -1451,18 +1545,19 @@ pub(crate) mod tests {
         let bytes = b"retained exact boot";
         let object = ObjectDigest::of_bytes(bytes);
         let file = pool.verify_object(&object).unwrap();
-        let map = crate::storage::stream::StreamHasher::new()
+        let map = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_open_file(&file, bytes.len() as u64)
             .unwrap()
             .map;
         let content = crate::store::snapshot_store::publish_map(&pool, &store, owner.id, &map)
             .await
             .unwrap();
-        let page=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":1,"kind":"silo-chunk-map","firstChunk":0,"entries":[{"kind":"data","length":bytes.len(),"digest":object,"encoded":{"mediaType":"application/vnd.silo.vm.chunk.v1","digest":object,"size":bytes.len()}}]})).unwrap();
+        let page=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":2,"kind":"silo-chunk-map","firstChunk":0,"entries":[{"kind":"data","length":bytes.len(),"digest":object,"encoded":{"mediaType":"application/vnd.silo.vm.chunk.v1","digest":object,"size":bytes.len()}}]})).unwrap();
         let page = publish_object(&store, &pool, owner.id, &page).await;
-        let root_bytes=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":1,"kind":"silo-chunks-v1","stream":map.id(),"length":bytes.len(),"chunkSize":8388608,"pages":[page]})).unwrap();
+        let root_bytes=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":2,"kind":"silo-chunks-v2","stream":map.id(),"length":bytes.len(),"chunkSize":8388608,"pages":[page]})).unwrap();
         let root = publish_object(&store, &pool, owner.id, &root_bytes).await;
-        let verified = VerifiedStreamRepresentation::verify(&pool, content, root).unwrap();
+        let verified =
+            VerifiedStreamRepresentation::verify(&pool, owner.id, content, root).unwrap();
         store
             .register_stream_representation(owner.id, &verified)
             .await
@@ -1642,5 +1737,486 @@ pub(crate) mod tests {
                 assert!(!pool.stream_path(&record.root.stream.stream).exists());
             }
         }
+    }
+
+    struct RepresentationFixture {
+        _temporary: tempfile::TempDir,
+        store: Arc<Store>,
+        owner: OperationPaths,
+        content: crate::store::models::snapshot::SnapshotStream,
+        root: ObjectDigest,
+    }
+
+    async fn publish_entries(
+        store: &Store,
+        pool: &StoragePool,
+        operation: uuid::Uuid,
+        content: &crate::store::models::snapshot::SnapshotStream,
+        entries: &[oci::vm_artifact::wire::ChunkEntry],
+    ) -> ObjectDigest {
+        let table = oci::vm_artifact::wire::encode_transfer(
+            content.stream.to_string().parse().unwrap(),
+            content.length,
+            entries,
+        )
+        .unwrap();
+        for page in table.pages {
+            publish_object(store, pool, operation, &page.bytes).await;
+        }
+        publish_object(store, pool, operation, &table.root.bytes).await
+    }
+
+    async fn encode_payloads(
+        store: &Store,
+        pool: &StoragePool,
+        operation: uuid::Uuid,
+        bytes: &[u8],
+        encoding: oci::vm_artifact::codec::ChunkEncoding,
+    ) -> Vec<oci::vm_artifact::wire::ChunkEntry> {
+        let mut encoder = oci::vm_artifact::codec::ChunkEncoder::new(encoding).unwrap();
+        let mut entries = Vec::new();
+        for payload in bytes.chunks(oci::vm_artifact::wire::CHUNK_SIZE as usize) {
+            let encoded = encoder.encode(payload).unwrap();
+            if let oci::vm_artifact::wire::ChunkEntry::Data {
+                encoded: descriptor,
+                ..
+            } = &encoded.entry
+            {
+                let digest = publish_object(store, pool, operation, &encoded.bytes).await;
+                assert_eq!(digest.as_bytes(), descriptor.digest.as_bytes());
+            }
+            entries.push(encoded.entry);
+        }
+        entries
+    }
+
+    async fn representation_fixture(
+        bytes: &[u8],
+        profile: vm_spec::stream_map::ChunkSize,
+        encoding: oci::vm_artifact::codec::ChunkEncoding,
+    ) -> RepresentationFixture {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::new(&LocalPaths::new(temporary.path().join("home")))
+                .await
+                .unwrap(),
+        );
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let owner = pool.create_operation_with_lease(operation, lease).unwrap();
+        let (staging, mut file) = pool.stage().unwrap();
+        std::io::Write::write_all(&mut file, bytes).unwrap();
+        file.sync_all().unwrap();
+        let map = crate::storage::stream::StreamHasher::new(profile)
+            .hash_open_file(&file, bytes.len() as u64)
+            .unwrap()
+            .map;
+        let (_stream, roots) = pool
+            .publish_staged_stream_for_catalog(staging, file, &map)
+            .unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[map.id()], &[])
+            .await
+            .unwrap();
+        drop(roots);
+        let content = crate::store::snapshot_store::publish_map(&pool, &store, operation, &map)
+            .await
+            .unwrap();
+        let entries = encode_payloads(&store, &pool, operation, bytes, encoding).await;
+        let root = publish_entries(&store, &pool, operation, &content, &entries).await;
+        let verified =
+            VerifiedStreamRepresentation::verify(&pool, operation, content.clone(), root)
+                .unwrap()
+                .for_encoding(encoding)
+                .unwrap();
+        store
+            .register_stream_representation(operation, &verified)
+            .await
+            .unwrap();
+        RepresentationFixture {
+            _temporary: temporary,
+            store,
+            owner,
+            content,
+            root,
+        }
+    }
+
+    async fn reconstruct_fixture(fixture: RepresentationFixture, bytes: &[u8]) {
+        let RepresentationFixture {
+            _temporary,
+            store,
+            owner,
+            content,
+            root,
+        } = fixture;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        drop(owner);
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.evict_flat_materializations().await.unwrap(),
+            bytes.len() as u64
+        );
+        let (operation, lease) = store
+            .begin_stopped_operation("raw-export", &[content.stream], &[content.map])
+            .await
+            .unwrap();
+        let _owner = pool.create_operation_with_lease(operation, lease).unwrap();
+        store.materialize_stream(operation, &content).await.unwrap();
+        assert_eq!(
+            std::fs::read(pool.stream_path(&content.stream)).unwrap(),
+            bytes
+        );
+        let actual = crate::storage::stream::StreamHasher::new(
+            vm_spec::stream_map::ChunkSize::from_shift(if content.chunk_size == 65536 {
+                16
+            } else {
+                23
+            })
+            .unwrap(),
+        )
+        .hash_file(&pool.stream_path(&content.stream))
+        .unwrap();
+        assert_eq!(actual.id(), content.stream);
+        VerifiedStreamRepresentation::verify(&pool, operation, content, root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ram_and_disk_representations_round_trip_raw_zstd_zero_gaps_and_short_tails() {
+        use oci::vm_artifact::codec::ChunkEncoding;
+        use vm_spec::stream_map::ChunkSize;
+        let payload = oci::vm_artifact::wire::CHUNK_SIZE as usize;
+        let mut bytes = vec![0; payload * 2 + 65536 + 17];
+        bytes[4096..8192].fill(7);
+        bytes[payload * 2 + 65536..].fill(9);
+        for profile in [ChunkSize::RAM, ChunkSize::DISK] {
+            for encoding in [ChunkEncoding::Raw, ChunkEncoding::Zstd] {
+                let fixture = representation_fixture(&bytes, profile, encoding).await;
+                let pool = StoragePool::open(&fixture.store.images_dir).unwrap();
+                let (entries, members, map) = crate::store::stream_representation::transfer(
+                    &pool,
+                    fixture.owner.id,
+                    &fixture.content,
+                    fixture.root,
+                )
+                .unwrap();
+                assert_eq!(entries.len(), 3);
+                assert!(matches!(
+                    entries[1],
+                    oci::vm_artifact::wire::ChunkEntry::Zero { .. }
+                ));
+                assert_eq!(map.chunk_size(), profile);
+                for chunk in map.present_chunks() {
+                    let leaf = ObjectDigest::from_sha256(*chunk.unwrap().digest.as_bytes());
+                    if profile == ChunkSize::RAM {
+                        assert!(!members.contains(&leaf));
+                        assert!(!pool.object_path(&leaf).exists());
+                    }
+                }
+                drop(map);
+                reconstruct_fixture(fixture, &bytes).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_payload_sha_does_not_authorize_bytes_under_another_root() {
+        use oci::vm_artifact::codec::ChunkEncoding;
+        use vm_spec::stream_map::ChunkSize;
+        for profile in [ChunkSize::RAM, ChunkSize::DISK] {
+            let bytes = vec![7; 65536 + 17];
+            let fixture = representation_fixture(&bytes, profile, ChunkEncoding::Raw).await;
+            let pool = StoragePool::open(&fixture.store.images_dir).unwrap();
+            let mut wrong = bytes.clone();
+            wrong[4096..8192].fill(8);
+            let entries = encode_payloads(
+                &fixture.store,
+                &pool,
+                fixture.owner.id,
+                &wrong,
+                ChunkEncoding::Raw,
+            )
+            .await;
+            let root = publish_entries(
+                &fixture.store,
+                &pool,
+                fixture.owner.id,
+                &fixture.content,
+                &entries,
+            )
+            .await;
+            assert!(VerifiedStreamRepresentation::verify(
+                &pool,
+                fixture.owner.id,
+                fixture.content.clone(),
+                root
+            )
+            .is_err());
+            let (_, _, map) = crate::store::stream_representation::transfer(
+                &pool,
+                fixture.owner.id,
+                &fixture.content,
+                root,
+            )
+            .unwrap();
+            let output = tempfile::tempfile().unwrap();
+            output.set_len(bytes.len() as u64).unwrap();
+            assert!(crate::store::stream_representation::authenticate_payloads(
+                &pool,
+                &map,
+                &entries,
+                Some(&output)
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_reordered_members_and_wrong_profile_are_refused() {
+        use oci::vm_artifact::codec::ChunkEncoding;
+        use oci::vm_artifact::wire::ChunkEntry;
+        use vm_spec::stream_map::ChunkSize;
+        let payload = oci::vm_artifact::wire::CHUNK_SIZE as usize;
+        let mut bytes = vec![7; payload * 2];
+        bytes[payload..].fill(8);
+        for profile in [ChunkSize::RAM, ChunkSize::DISK] {
+            let fixture = representation_fixture(&bytes, profile, ChunkEncoding::Raw).await;
+            let pool = StoragePool::open(&fixture.store.images_dir).unwrap();
+            let (mut entries, _, _) = crate::store::stream_representation::transfer(
+                &pool,
+                fixture.owner.id,
+                &fixture.content,
+                fixture.root,
+            )
+            .unwrap();
+            entries.swap(0, 1);
+            let reordered = publish_entries(
+                &fixture.store,
+                &pool,
+                fixture.owner.id,
+                &fixture.content,
+                &entries,
+            )
+            .await;
+            assert!(VerifiedStreamRepresentation::verify(
+                &pool,
+                fixture.owner.id,
+                fixture.content.clone(),
+                reordered
+            )
+            .is_err());
+            let mut wrong_profile = fixture.content.clone();
+            wrong_profile.chunk_size = if profile == ChunkSize::RAM {
+                8388608
+            } else {
+                65536
+            };
+            assert!(VerifiedStreamRepresentation::verify(
+                &pool,
+                fixture.owner.id,
+                wrong_profile,
+                fixture.root
+            )
+            .is_err());
+            let ChunkEntry::Data { encoded, .. } = entries[0] else {
+                panic!("data fixture")
+            };
+            std::fs::remove_file(
+                pool.object_path(&ObjectDigest::from_sha256(*encoded.digest.as_bytes())),
+            )
+            .unwrap();
+            assert!(VerifiedStreamRepresentation::verify(
+                &pool,
+                fixture.owner.id,
+                fixture.content,
+                fixture.root
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn scattered_ram_pages_change_only_their_transport_payloads() {
+        use oci::vm_artifact::codec::ChunkEncoding;
+        use vm_spec::stream_map::ChunkSize;
+        let payload = oci::vm_artifact::wire::CHUNK_SIZE as usize;
+        let before = vec![3; payload * 4 + 17];
+        let mut after = before.clone();
+        after[4096..8192].fill(5);
+        after[payload * 2 + 65536..payload * 2 + 65536 + 4096].fill(6);
+        let baseline = representation_fixture(&before, ChunkSize::RAM, ChunkEncoding::Raw).await;
+        let changed = representation_fixture(&after, ChunkSize::RAM, ChunkEncoding::Raw).await;
+        assert_ne!(baseline.content.stream, changed.content.stream);
+        let baseline_pool = StoragePool::open(&baseline.store.images_dir).unwrap();
+        let changed_pool = StoragePool::open(&changed.store.images_dir).unwrap();
+        let (before_entries, _, before_map) = crate::store::stream_representation::transfer(
+            &baseline_pool,
+            baseline.owner.id,
+            &baseline.content,
+            baseline.root,
+        )
+        .unwrap();
+        let (after_entries, _, after_map) = crate::store::stream_representation::transfer(
+            &changed_pool,
+            changed.owner.id,
+            &changed.content,
+            changed.root,
+        )
+        .unwrap();
+        let changed_payloads = before_entries
+            .iter()
+            .zip(&after_entries)
+            .enumerate()
+            .filter_map(|(index, (before, after))| (before != after).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(changed_payloads, [0, 2]);
+        let changed_units = before_map
+            .present_chunks()
+            .zip(after_map.present_chunks())
+            .filter_map(|(before, after)| {
+                let before = before.unwrap();
+                let after = after.unwrap();
+                (before.digest != after.digest).then_some(after.index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(changed_units, [0, 257]);
+        drop(after_map);
+        reconstruct_fixture(changed, &after).await;
+    }
+
+    #[tokio::test]
+    async fn empty_and_all_zero_profiles_authenticate_without_payload_objects() {
+        use oci::vm_artifact::codec::ChunkEncoding;
+        use vm_spec::stream_map::ChunkSize;
+        for profile in [ChunkSize::RAM, ChunkSize::DISK] {
+            for length in [0, oci::vm_artifact::wire::CHUNK_SIZE as usize + 17] {
+                let bytes = vec![0; length];
+                let fixture = representation_fixture(&bytes, profile, ChunkEncoding::Zstd).await;
+                let pool = StoragePool::open(&fixture.store.images_dir).unwrap();
+                let (entries, members, map) = crate::store::stream_representation::transfer(
+                    &pool,
+                    fixture.owner.id,
+                    &fixture.content,
+                    fixture.root,
+                )
+                .unwrap();
+                assert!(entries
+                    .iter()
+                    .all(|entry| matches!(entry, oci::vm_artifact::wire::ChunkEntry::Zero { .. })));
+                assert!(map.root().tree_digest().is_none());
+                assert_eq!(members.len(), 2 + usize::from(!entries.is_empty()));
+                drop(map);
+                reconstruct_fixture(fixture, &bytes).await;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn measured_export_reuses_exact_flat_fingerprint_without_another_payload_scan() {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        use oci::vm_artifact::codec::ChunkEncoding;
+        use std::os::unix::fs::PermissionsExt;
+        use vm_spec::stream_map::ChunkSize;
+
+        let fixture =
+            representation_fixture(&[7; 65536 + 17], ChunkSize::RAM, ChunkEncoding::Raw).await;
+        let pool = StoragePool::open(&fixture.store.images_dir).unwrap();
+        let path = pool.stream_path(&fixture.content.stream);
+        let file = pool.open_stream(&fixture.content.stream).unwrap();
+        let map = crate::storage::stream::StreamHasher::new(ChunkSize::RAM)
+            .hash_open_file(&file, fixture.content.length)
+            .unwrap()
+            .map;
+        let fingerprint =
+            crate::storage::identity_file::SourceFingerprint::new(&file.metadata().unwrap());
+        let watcher = Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK).unwrap();
+        watcher
+            .add_watch(&path, AddWatchFlags::IN_OPEN | AddWatchFlags::IN_ACCESS)
+            .unwrap();
+        let verified = VerifiedStreamRepresentation::from_export(
+            &pool,
+            fixture.owner.id,
+            fixture.content.clone(),
+            fixture.root,
+            &map,
+            Some(fingerprint),
+        )
+        .unwrap();
+        fixture
+            .store
+            .register_stream_representation(fixture.owner.id, &verified)
+            .await
+            .unwrap();
+        assert_eq!(
+            watcher.read_events().unwrap_err(),
+            nix::errno::Errno::EAGAIN
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, vec![8; fixture.content.length as usize]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(fixture
+            .store
+            .register_stream_representation(fixture.owner.id, &verified)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_export_materialization_requires_the_exact_stream_pin() {
+        use oci::vm_artifact::codec::ChunkEncoding;
+        use vm_spec::stream_map::ChunkSize;
+
+        let bytes = [7; 512];
+        let RepresentationFixture {
+            _temporary,
+            store,
+            owner,
+            content,
+            ..
+        } = representation_fixture(&bytes, ChunkSize::RAM, ChunkEncoding::Raw).await;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        drop(owner);
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.evict_flat_materializations().await.unwrap(),
+            bytes.len() as u64
+        );
+        let (operation, lease) = store
+            .begin_stopped_operation("raw-export", &[], &[content.map])
+            .await
+            .unwrap();
+        let _owner = pool.create_operation_with_lease(operation, lease).unwrap();
+
+        let error = store
+            .materialize_stream(operation, &content)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::LibVmError::InvalidStorageRecord { message, .. }
+                if message == "snapshot stream was not pinned before access"
+        ));
+        assert!(!pool.stream_path(&content.stream).exists());
+
+        store
+            .pin_published_storage_dependencies(operation, &[content.stream], &[])
+            .await
+            .unwrap();
+        store.materialize_stream(operation, &content).await.unwrap();
+        assert_eq!(
+            std::fs::read(pool.stream_path(&content.stream)).unwrap(),
+            bytes
+        );
     }
 }

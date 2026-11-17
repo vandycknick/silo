@@ -14,7 +14,9 @@ use vm_spec::capture::{CaptureConfiguration, Sha256Digest};
 use vm_spec::live::{LiveHostReport, LiveOperation};
 use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
 
-use crate::machine::lifecycle::{finish_failed_start, started_run_monitor, FailedStartState};
+use crate::machine::lifecycle::{
+    finish_failed_start, started_run_monitor, FailedStartState, FailedStartStorage,
+};
 use crate::machine::live_operations::{
     report_progress, LiveOperationProgress, LiveOperationProgressSender,
 };
@@ -163,31 +165,8 @@ async fn restore_consumer(
         consumer.operation_id,
         &consumer.lease,
     )?;
-    let roots = pool.lock_roots_shared()?;
-    let (ram_map, ram_map_file) =
-        if let Some(held) = shape.held_restore_map(&pool, execution.memory.stream)? {
-            store_ram_map_pin(runtime, consumer.operation_id, held.0).await?;
-            drop(roots);
-            held
-        } else {
-            drop(roots);
-            let bytes = shape
-                .stream_map(&execution.memory.stream)?
-                .canonical_bytes()?;
-            let input = crate::store::snapshot_store::RecordInput::new(
-                runtime.local_images_dir(),
-                consumer.operation_id,
-                &bytes,
-            )?;
-            let (published, roots) = pool.publish_object_for_catalog(&input.path())?;
-            store_ram_map_pin(runtime, consumer.operation_id, published.digest).await?;
-            snapshots
-                .cache_restore_map(shape, execution.memory.stream, &published)
-                .await?;
-            let file = pool.open_object(&published.digest)?;
-            drop(roots);
-            (published.digest, file)
-        };
+    let ram_map = execution.memory.map;
+    let ram_map_file = shape.open_object(&pool, &ram_map)?;
     let objects = [
         ram,
         shape.open_object(&pool, &execution.layout)?,
@@ -225,6 +204,14 @@ async fn restore_consumer(
     let lower_inputs = prepare_lower(&pool, consumer, map_stage, shape)?;
     let request = RestoreRequest {
         disk_tracking_seeds: Vec::new(),
+        map_node_store: Some(
+            runtime
+                .local_images_dir()
+                .join("objects/sha256")
+                .to_str()
+                .ok_or_else(|| invalid("restore map node store path is not UTF-8"))?
+                .to_owned(),
+        ),
         version: vm_spec::restore::RESTORE_REQUEST_VERSION,
         checkpoint: Sha256Digest::from_bytes(*consumer.info.id.as_bytes()),
         activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string())
@@ -556,7 +543,7 @@ async fn execute_prepared(
                     &run.to_string(),
                     Some(FailedStartState::Error),
                     None,
-                    lease,
+                    FailedStartStorage { lease, lower: None },
                     error,
                 )
                 .await;
@@ -1207,8 +1194,11 @@ async fn launch_restored(
     let socket = paths.vmm_socket_path();
     let serial = paths.serial_log_path();
     let trace = paths.vm_trace_log_path();
-    restore.request.disk_tracking_seeds =
-        crate::machine::root_storage::launch_disk_seeds(storage, &config.machine_dir)?;
+    restore.request.disk_tracking_seeds = crate::machine::root_storage::launch_disk_seeds(
+        storage,
+        &config.machine_dir,
+        runtime.local_images_dir(),
+    )?;
     let launch = crate::supervisor::VmmLaunch {
         machine_id: config.id,
         name: &config.name,
@@ -1245,17 +1235,6 @@ async fn launch_restored(
         .await?;
     let pending = runtime.supervisor().spawn(&launch, None).await?;
     Ok((pending, lifetime))
-}
-
-async fn store_ram_map_pin(
-    runtime: &Runtime,
-    operation: Uuid,
-    digest: crate::storage::identity::ObjectDigest,
-) -> Result<(), LibVmError> {
-    runtime
-        .native_store()?
-        .pin_published_storage_dependencies(operation, &[], &[digest])
-        .await
 }
 
 async fn inspect(
@@ -1551,6 +1530,14 @@ pub(crate) async fn restore_reserved_fork_child(
     }
     let request = RestoreRequest {
         disk_tracking_seeds: Vec::new(),
+        map_node_store: Some(
+            runtime
+                .local_images_dir()
+                .join("objects/sha256")
+                .to_str()
+                .ok_or_else(|| invalid("fork map node store path is not UTF-8"))?
+                .to_owned(),
+        ),
         version: vm_spec::restore::RESTORE_REQUEST_VERSION,
         checkpoint: cut.record.cut_id,
         activation_id: vm_spec::lifecycle::LiveId::parse(&child.activation_id.to_string())
@@ -1678,7 +1665,9 @@ mod tests {
         file.sync_all().unwrap();
         let allocated = file.metadata().unwrap().blocks().checked_mul(512).unwrap();
         assert!(allocated > 0 && allocated < length / 1000);
-        let map = StreamHasher::new().hash_file(&source).unwrap();
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_file(&source)
+            .unwrap();
         let sources = [PrivateSource::Authenticated {
             path: crate::PrivatePath::new("upper.raw").unwrap(),
             stream: AuthenticatedStream::from_receipt(std::fs::File::open(&source).unwrap(), map)

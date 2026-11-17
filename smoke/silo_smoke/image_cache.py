@@ -29,6 +29,7 @@ CATALOG_TABLES = {
     "composition_recipe", "composition_result", "composition_layer",
     "layer_recipe", "layer_result", "layer_object_dependency",
     "layer_occurrence_set", "layer_occurrence",
+    "storage_stream", "stream_map_object", "stream_map_root", "stream_map_edge",
 }
 
 

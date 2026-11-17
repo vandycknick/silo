@@ -306,7 +306,7 @@ def checkpoint_for_policy(silo: Silo, policy: str) -> restore.Checkpoint:
 # Execution members are root-independent; the root stream is exercised for
 # both families, and the layered closure adds every composition graph member.
 EXECUTION_MEMBERS = ("ram", "root", "layout", "execution", "devices", "kernel",
-                     "baseInitramfs", "agent", "map", "map-page", "provenance")
+                     "baseInitramfs", "agent", "map", "provenance")
 COMPOSITION_MEMBERS = ("lower-record", "lower-recipe", "lower-fsmeta", "layer-recipe",
                        "layer-result", "layer-index", "layer-pack", "layer-pack-map")
 CLOSURE_CASES = ([("layered", member) for member in (*EXECUTION_MEMBERS, *COMPOSITION_MEMBERS)]
@@ -331,7 +331,6 @@ def test_restore_corrupt_real_closure_refuses_before_child_allocation(
     objects = {key: execution[key] for key in ("layout", "execution", "devices")}
     objects.update({key: record["boot"]["binding"][key] for key in ("kernel", "baseInitramfs", "agent")})
     objects["map"] = execution["memory"]["map"]
-    objects["map-page"] = execution["memory"]["mapPages"][0]
     root_profile = record["root"]["profile"]
     if profile == "layered":
         assert root_profile["kind"] == "linux-overlay", root_profile

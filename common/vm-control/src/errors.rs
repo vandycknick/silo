@@ -57,6 +57,16 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
         ..Default::default()
     };
     let code = match v {
+        E::StateDatabaseIncompatible { .. } => {
+            d.kind = 4;
+            d.safe_message = "incompatible state database: this home was written by a different Silo state format and cannot be read or converted; remove the old state and start with a fresh home".into();
+            tonic::Code::FailedPrecondition
+        }
+        E::Storage(libvm::storage::StorageError::Map(error)) => {
+            d.kind = 8;
+            d.safe_message = format!("stream map rejected: {error}");
+            tonic::Code::DataLoss
+        }
         E::IncompatibleRootProfile { profile } => {
             d.kind = 4;
             d.code = 16;
@@ -277,7 +287,7 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
         }
         E::ArtifactInvalid { .. } | E::ArtifactWire(_) => {
             d.kind = 1;
-            d.safe_message = "artifact integrity or semantic validation failed".into();
+            d.safe_message = v.to_string();
             tonic::Code::InvalidArgument
         }
         E::ArtifactTrustMismatch { .. } => {
@@ -1345,5 +1355,38 @@ mod tests {
             encoded.details().to_vec().into(),
         );
         assert!(status_to_native_error(&contradictory).is_err());
+    }
+    #[test]
+    fn format_and_map_refusals_preserve_actionable_daemon_diagnostics() {
+        use crate::errors::status_error_detail;
+        use vm_spec::stream_map::MapError;
+        let digest = vm_spec::capture::Sha256Digest::of_bytes(b"map node");
+        for failure in [
+            MapError::InvalidMagic,
+            MapError::MissingNode(digest),
+            MapError::DigestMismatch {
+                expected: digest,
+                actual: vm_spec::capture::Sha256Digest::of_bytes(b"changed"),
+            },
+            MapError::ProfileMismatch {
+                expected: vm_spec::stream_map::ChunkSize::RAM,
+                actual: vm_spec::stream_map::ChunkSize::DISK,
+            },
+        ] {
+            let error = libvm::LibVmError::Storage(libvm::storage::StorageError::Map(failure));
+            let status = native_error_to_status(&error);
+            assert_eq!(status.code(), tonic::Code::DataLoss);
+            let detail = status_error_detail(&status).unwrap().unwrap();
+            assert_eq!(detail.native_variant.as_deref(), Some("Storage"));
+            assert_eq!(detail.safe_message, status.message());
+            assert!(detail.safe_message.starts_with("stream map rejected:"));
+        }
+        let artifact = libvm::LibVmError::ArtifactInvalid {
+            boundary: "format",
+            message: "unsupported artifact format 1; fresh-state format 2 is required".into(),
+        };
+        let status = native_error_to_status(&artifact);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("unsupported artifact format 1"));
     }
 }

@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 
-Updated: 2026-11-15
+Updated: 2026-11-16
 
 ## Status
 
@@ -307,7 +307,7 @@ label an arbitrary filesystem image as bootable by every cloud provider.
 | `diff_id`           | Digest of the complete uncompressed OCI layer tar stream, not an abstract directory tree.                                            |
 | Recipe ID           | Digest of canonical inputs, policies and encoder ABI used to derive an artifact.                                                     |
 | Object digest       | SHA-256 of a complete byte object's bytes, unchanged by whole-object or chunked transport.                                           |
-| Stream ID           | Typed hash of a logical stream's chunk map: length plus per-8 MiB entries of `zero` or the chunk's SHA-256.                           |
+| Stream ID           | SHA-256 of a binary sparse Merkle root binding exact length, identity-unit size and complete decoded content.                         |
 | Layer record        | Recipe plus exact payload-pack stream ID and changeset-index identity.                                                                |
 | Fsmeta              | EROFS metadata describing the merged namespace and referencing layer payload blocks.                                                 |
 | Flattened EROFS     | The Linux 6.4+ EROFS mode that reads a multi-device image from one block device, locating each extra device at its `mapped_blkaddr`. |
@@ -900,68 +900,82 @@ that wire boundary. Parsing an ID alone does not authenticate its stream map.
 
 ### Stream identity
 
-A logical stream's identity is the typed ID of its decoded chunk map, kind
-`stream`. The canonical identity input is distinct from its paged transport map:
+A stream uses the canonical binary **stream-map v2**, not JSON, a flat digest
+list, or its whole-file byte SHA. Integers are unsigned little-endian; digests
+are raw 32-byte SHA-256 values. These are the exact identity bytes:
 
 ```text
-stream record = { schema: 1, kind: "stream", length, chunkSize: 8388608,
-                  chunks: [ "zero" | "sha256:HEX", ... ] }
-stream ID     = sha256("silo:stream:v1\n" || JCS(stream record))
+root   = "silo:stream:v2\n" || u8(chunk_shift) || u64(length)
+         || u8(tree_present) || [height-4 node digest iff present]
+leaf   = "silo:stream-map:leaf:v2\n" || u64(bitmap) || data digests
+branch = "silo:stream-map:branch:v2\n" || u8(height) || u64(bitmap)
+         || child node digests
+stream ID = SHA256(root)
 ```
 
-Chunk `n` covers bytes `[n * chunkSize, min((n + 1) * chunkSize, length))`. An
-entry is `zero` when every byte of the range is zero, whether the host file
-holds a hole or allocated zeros; otherwise it is the SHA-256 of the decoded
-bytes. For an uncompressed transport chunk that digest is also its OCI blob
-digest, so one hash per chunk serves identity, dedup and transfer.
+There are always five 64-way levels, heights 4 through 0. Slot
+`(index >> (6 * height)) & 63` selects the path. Digests follow set bits in
+ascending slot order. A leaf contains at most 64 decoded-byte identities, not
+64 separately stored payload objects. An absent edge means zero bytes; a
+missing named node is corruption, never a zero fallback. Empty nodes, explicit
+default-subtree edges, wrong heights, out-of-range leaves and trailing bytes
+are rejected. Roots occupy 25 bytes for zero/empty streams and 57 otherwise;
+leaf and branch nodes are bounded by 2080 and 2083 bytes.
 
-Extent discovery can avoid reading known holes; unsupported or conservative
-extent reporting falls back to reading bytes, never assuming zeros. Each
-nonzero 8 MiB chunk is hashed in full, including zero regions within it.
-Physical bytes read, logical bytes hashed and bytes sent are separate costs:
-one allocated block per chunk can require hashing the entire virtual length.
-A receiver verifies stream identity from the canonical decoded map and every
-chunk, without a second whole-file pass. A raw stream's whole-file SHA-256 is
-optional export metadata, not its identity.
+The root authenticates identity-unit size as well as exact length. The codec
+admits shifts 12 through 23, but role admission fixes RAM to **64 KiB** (shift
+16), and disks, layer packs, concatenated lowers and object-only stream
+projections to **8 MiB** (shift 23). There is no user tuning knob. Unit `i`
+covers `[i*C, min((i+1)*C, length))`. Entirely zero bytes have no stored
+digest; nonzero bytes use raw SHA-256, including interior zeros. A short tail
+hashes its actual bytes without padding. Different lengths or profiles have
+different identities even when their payload bytes agree.
 
-For local snapshot, fork and restore disk steps, neither extent discovery nor
-identity construction may walk configured capacity. Cloning an already sealed
-stream carries its identity without a payload pass. A fresh live disk clone
-records only ownership facts in the pause; its initial extent walk and identity
-hashing happen after source continuation, before the final seal. A required
-non-reflink copy works only on written upper bytes and computes digests inline
-inside the pause. Sealing then passes identities through publication without
-another data pass. The general byte-authentication rules above still apply to
-import, pull, transport,
-export, handoff and explicit verification; they do not authorize repeated scans
-on trusted local live paths.
+Construction enumerates present data and emits nodes child-first. Incremental
+updates authenticate only changed paths and preserve untouched child references;
+an unchanged update reuses the root exactly. Neither creates a logical-length
+vector. Full byte admission still discovers and authenticates actual content,
+with conservative reads where extent or cut-bound zero authority is unavailable.
+Non-reflink RAM rebuilds still copy the complete required baseline data.
 
-The concatenated lower's chunk boundaries need not align with pack boundaries.
-Its stream map therefore may require scanning shared payloads again; pack hashes
-alone cannot derive shifted chunk hashes. V1 accepts and measures this cost
-rather than introducing another hashing scheme.
+Root headers and nondefault nodes are ordinary content-addressed pool objects.
+The root object's digest equals the stream ID, while object and stream types
+and namespaces remain distinct. Catalog roots retain an immutable node-edge
+DAG for snapshots, live baselines, pending cuts and operation leases. Adding
+one snapshot pins its roots, not an expanded descendant list. Prune traverses
+reachability; leaf data digests are values, not fictitious object references.
+Structural sharing creates no predecessor replay dependency.
 
-A captured RAM image is a logical stream under the same identity: 8 MiB
-decoded chunks over the packed sparse image, `zero` only for an entirely zero
-chunk. Its layout record, identified separately, maps stream offsets to
-guest-physical regions; equal bytes at different guest addresses are different
-memory. An incremental checkpoint publishes a complete resolved chunk map that
-reuses unchanged chunk objects; its parent is lineage, not a replay
-dependency. A changed page rehashes its whole 8 MiB chunk unless that chunk is
-entirely zero. That amplification is accepted; the dirty-tracking granule is
-the hypervisor's, not the chunk. A changed-to-zero page is an explicit zero
-range, represented by a hole with a format-level zero marker, never a hole
-that inherits baseline bytes. Zero chunks are never hashed or stored.
+Local publication seeds small receipts binding root, profile and exact flat
+inode fingerprint. A hit opens the root without traversing every descendant;
+nodes are authenticated when accessed. Changed fingerprints require byte
+authentication. Receipts are neither retention roots nor imported trust.
+Import, pull, transport, export, handoff and explicit snapshot verification
+authenticate the complete closure and bytes. Verification bypasses receipts,
+reads zero ranges too, reports payload failures at the identity-unit index/range,
+and identifies corrupt metadata by node/height/covered range instead of inventing
+a bad payload index.
 
-#### Planned Phase 30 identity changes
+Normal local RAM capture remains one complete sparse file plus map metadata,
+restored with private mappings. Its separate layout binds packed offsets to
+guest-physical geometry. Changed-to-zero data is punched or explicitly zeroed
+in seeded files, never inherited. Disk tracking retains 8 MiB indices and
+hashes frozen dirty units after continuation on the eligible reflink lane.
+Unknown coverage uses full authentication.
 
-The owner approved the following direction on 2026-11-15; it is not yet
-implemented. Per-chunk write tracking in the block device with inherited maps
-lets a seal hash only chunks written since the last seal. A temporary
-create-time hash of a fresh upper is removed by a cached upper template in a
-later stage, so create must not end up slower. A sparse authenticated stream map
-has size and work that do not grow with configured length. RAM uses a smaller
-identity unit than 8 MiB.
+Transport payloads deliberately remain **8 MiB**, raw or zstd. Import/export
+slice decoded RAM payloads into 64 KiB identities; an 8 MiB SHA cannot derive
+their root. Actual encoded payload objects remain retained by representation
+edges, but a RAM identity leaf does not create its own object. Transfer dedup
+therefore stays 8 MiB, not 64 KiB. Concatenated lower boundaries need not align
+with pack boundaries, so lower identities cannot be obtained by concatenating
+pack roots. Whole-object/provenance SHA keeps its distinct raw-byte meaning.
+
+This is one hard-breaking fresh-state cutover across homes, packs, lower
+results, checkpoints and artifacts. Existing homes and artifacts must be
+recreated; there is no v1 reader, conversion, alias or compatibility shim.
+Stage-2 clean-stop disk sealing and cached upper templates remain separate
+work, not a consequence of changing the identity format.
 
 ### Identity layers
 
@@ -2198,7 +2212,7 @@ identity is reserved for the relocation protocol, not a normal registry pull or
 
 Silo uses OCI 1.1 image manifests and an OCI image index, not a custom registry
 API. The top-level index has
-`artifactType=application/vnd.silo.vm.v1` and identifies exactly one VM image
+`artifactType=application/vnd.silo.vm.v2` and identifies exactly one VM image
 encoding. It is not a multi-architecture container selection list. Silo inspects
 this type before applying ordinary OCI platform resolution.
 
@@ -2217,8 +2231,8 @@ OCI index (Silo VM artifact)
 ```
 
 The metadata manifest is first and has artifact type
-`application/vnd.silo.vm.metadata.v1`; remaining manifests have type
-`application/vnd.silo.vm.payloads.v1`. Empty descriptors use OCI's defined
+`application/vnd.silo.vm.metadata.v2`; remaining manifests have type
+`application/vnd.silo.vm.payloads.v2`. Empty descriptors use OCI's defined
 `application/vnd.oci.empty.v1+json` two-byte `{}` blob. The metadata descriptor
 carries the guest platform (`os` is `linux` or `darwin`, `architecture` per
 OCI); payload descriptors are platform-neutral. Stream
@@ -2245,8 +2259,9 @@ V1 media types are:
 | -------------------- | ------------------------------------------------------------------------- |
 | Top-level envelope   | `application/vnd.oci.image.index.v1+json` with Silo artifact type         |
 | Child manifest       | `application/vnd.oci.image.manifest.v1+json` with the child artifact type |
-| VM config            | `application/vnd.silo.vm.config.v1+json`                                  |
-| Record/map page      | `application/vnd.silo.vm.record.v1+json`                                  |
+| VM config            | `application/vnd.silo.vm.config.v2+json`                                  |
+| Record page          | `application/vnd.silo.vm.record.v2+json`                                  |
+| Binary map root/node | `application/vnd.silo.vm.stream-map.v2`                                   |
 | Raw transport chunk  | `application/vnd.silo.vm.chunk.v1`                                        |
 | Zstd transport chunk | `application/vnd.silo.vm.chunk.v1+zstd`                                   |
 | Execution envelope   | `application/vnd.silo.vm.execution.v1` (opaque native VM and vCPU state)  |
@@ -2262,22 +2277,21 @@ graph instead of a container-shaped manifest.
 
 ### Logical streams and chunks
 
-Portable disk, upper and large immutable-object transfer uses `silo-chunks-v1`,
-the transport form of the stream identity above: fixed 8 MiB ranges from
-stream offset zero, with one shorter final range. Each stream record carries
-its exact logical length, geometry where applicable, and ordered chunk-map page
-digests. A map page contains at most 4096 consecutive entries. Offset is
-derived from chunk number; arbitrary overlapping offsets are not accepted. An
-empty stream has zero entries.
+Portable transfer uses `silo-chunks-v2`: fixed **8 MiB payload** ranges from
+offset zero, with one shorter final range. Each binding also names its binary
+map root, exact logical length and **identity** chunk size. RAM identity is
+64 KiB, independent of payload geometry. Paged transport tables remain bounded
+metadata, not the stream identity; binary map roots and nodes are separately
+addressed members of the complete object closure.
 
 An entry is either `zero` or a data range. Both name decoded length; data also
 names the decoded SHA-256 and an encoded OCI blob descriptor. Zero entries send
 no payload and explicitly mean zeros, not inherited destination content. Final
 length must equal the stream length, with no gaps, duplicate chunk numbers or
-implicit tail. To verify a stream ID, reconstruct the canonical identity record:
-retain length and chunk size, project each entry to `zero` or its decoded digest,
-and exclude encoded descriptors, geometry and page boundaries. Page digests
-are transport metadata, never a substitute for the stream ID.
+implicit tail. To verify a stream ID, slice authenticated decoded bytes at the
+identity size and reconstruct the canonical sparse tree and root. Payload
+digests alone cannot derive a RAM root. Transport page boundaries and encoded
+descriptors are never identity inputs.
 
 Senders emit either raw bytes or one independent zstd frame per chunk. The
 initial encoder uses zstd level 3, no dictionary, explicit content size, checksum
@@ -2349,6 +2363,23 @@ Signing provider integration and encryption/key management are separate security
 features, not properties implied by content addressing.
 
 ## Local-To-Cloud Handoff
+
+The handoff protocol is v2; schema-1 sessions are refused. It transfers small
+binary root headers and path-qualified
+`MapNode { digest, stream, height, first_index }` objects rather than whole flat
+maps. Height and first index are validated strong types. Source authorization
+authenticates only the named stream's root-to-node path, bounded by tree depth;
+it does not enumerate all map nodes per request. OCI artifact object tables
+remain digest-addressed, without these handoff-specific path fields.
+A `StreamChunk { stream, index, length }` is bound to its stream root and
+identifies an 8 MiB decoded payload range. Stopped disk
+identity stays 8 MiB; generic RAM handling authenticates 64 KiB leaves from
+decoded payload bytes. Handoff remains stopped storage, not live RAM migration.
+Diff skips unchanged Merkle subtrees; changed nonzero payloads already verified
+in the destination object pool, or reusable from the recorded prior owner,
+are not sent again. Staged nodes and payloads acquire authority only after
+authentication, never merely from their filenames or claimed descriptors.
+
 
 ### Acquisition without uploading the lower
 
@@ -2589,14 +2620,12 @@ read no lower payload: canonical metadata and current fingerprints establish the
 hit. A changed fingerprint invalidates reuse and forces exact authentication or
 refusal, never substitution of another lower.
 
-`composition_validation.graph_receipt` additionally binds the canonical catalog
-graph, fingerprints of its authenticated record, index and map objects, and the
-decoded pack maps. A hit checks that graph against current ordered catalog rows
-and dependency edges, opens and retains the metadata/backing descriptors, and
-rechecks their fingerprints. Local restore, fork and snapshot paths then skip
-`load_pinned_layer` index decoding and pack-map reconstruction; those index/map
-checks reduce to fingerprint checks on held descriptors, not payload reads.
-Recipe/result and catalog-graph bindings still apply.
+`composition_validation.graph_receipt` binds the canonical catalog graph,
+recipe/result/index facts, ordered pack occurrences, pack roots and exact
+unique pack/fsmeta fingerprints. It contains neither decoded pack chunk
+vectors nor descendant node fingerprints. A local hit reuses root handles
+and retains the necessary metadata/backing descriptors without traversing all
+map descendants. Node reads still authenticate their hashes on access.
 
 Changed fingerprints or an undecodable cached receipt miss the graph cache and
 take exact validation; corrupt canonical metadata can still fail closed.
@@ -2619,6 +2648,15 @@ operation before using them and keeps them pinned until the final
 image/machine record commits. New changeset outputs follow the fail-closed
 unreachable-publication protocol above until their result is registered.
 
+Seed and publication capabilities initially hold shared roots guards. Before
+machine boot-operation admission, or any acquisition of exclusive roots
+coordination, transfer their root ownership to admitted operation-root pins
+and release those shared guards. Create reuses its `copy_reservation`
+operation and retains that operation's lease through machine commit. Restore
+and fork child copies pin each root before joining concurrent authentication.
+This ordering protects shared nodes without attempting an exclusive roots
+acquisition while retaining a shared guard from the same operation.
+
 Launch passes a bounded closure-lifetime descriptor set to `silo-vmm` through
 [ADR 0018](0018-silo-vmm-contract.md)'s planned `_VM_STORAGE_LEASES` contract alongside `vm.lock`. Holders keep
 it alive through terminal backend attachment closure, including worker survival
@@ -2628,6 +2666,23 @@ is scoped to the one spawn that owns it, so a concurrent unrelated spawn, the
 exit runner or any later child inherits none of the storage lease descriptors.
 libvm releases its launch descriptors only after startup succeeds or failure
 cleanup completes.
+
+Failed-start cleanup owns every launch-lease holder, including the duplicated
+open file description carried by `LowerAuthority::Launch` in the prepared
+lower. Move that lower authority into the failed-start storage bundle rather
+than leaving it alive in `PreparedRoot`. After monitor/backend cleanup, drop
+both the lower authority and primary launch lease before probing exclusive
+lease ownership and reconciling terminal storage state. Otherwise cleanup
+waits on its own surviving descriptor and can leave a rejected launch
+incorrectly blocking a retry.
+
+Start and stop keep their inner asynchronous operations behind explicit
+`Box::pin` boundaries. Retained root authority and failed-start storage
+capabilities enlarge composed future state even while suspended; keeping
+that state out of callers' inline future storage avoids stack growth across
+nested lifecycle/API calls. Public-future size regression tests enforce the
+boundary. This is not a thread-stack increase or a claim of measured
+post-change latency or allocation savings.
 
 A short root-coordination lock serializes closure registration, root replacement
 and GC deletion. Readers register an operation retention root and acquire its

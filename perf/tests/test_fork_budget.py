@@ -399,9 +399,10 @@ def test_fork_budget_incremental_ten_percent_dirty(
             assert stats["seedMethod"] == (
                 "clone" if host["reflinkProbe"]["reflink"] else "rebuild"), stats
             assert stats["wholeFileBytesHashed"] == 0, stats
-            assert stats["overlayBytesWritten"] <= stats["liveBytesRead"] <= stats["identityBytesHashed"], stats
+            assert stats["overlayBytesWritten"] <= stats["liveBytesRead"] <= stats["logicalBytes"], stats
+            assert 0 <= stats["identityBytesHashed"] <= stats["logicalBytes"], stats
+            assert memory["identityChunkBytes"] == 65536 and memory["changes"]["recordCount"] >= 0
             if host["reflinkProbe"]["reflink"]:
-                assert stats["liveBytesRead"] == stats["identityBytesHashed"], stats
                 assert all(stats[field] == 0 for field in (
                     "baselineBytesRead", "baselineBytesWritten", "baselineHoleBytes", "extentQueries")), stats
             else:
@@ -422,7 +423,9 @@ def test_fork_budget_incremental_ten_percent_dirty(
                     "dirtyWorkloadFraction": dirty_bytes / (4096 * 1024 * 1024),
                     "dirtyMethod": "overwrite preallocated tmpfs with dd /dev/urandom bs=1M count=410",
                     "productDirtyFraction": dirty_fraction,
-                    "productDirtyFractionBasis": "memory.stats.identityBytesHashed / logicalBytes (8 MiB chunks)",
+                    "productDirtyFractionBasis": "memory.stats.identityBytesHashed / logicalBytes (nonzero 64 KiB identities)",
+                    "identityBytesHashed": stats["identityBytesHashed"],
+                    "changeRecords": memory["changes"]["recordCount"],
                     "memory": memory,
                     "seedProbe": host["reflinkProbe"],
                     "pauseToDiskSealedSeconds": [(stamp - pause_stamp) / 1e9

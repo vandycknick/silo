@@ -246,7 +246,7 @@ async fn convert_owned(
     )
     .await?;
     let record = ImageRecord {
-        schema: 1,
+        schema: 2,
         kind: ImageRecordKind::Image,
         root: SnapshotRoot {
             profile: SnapshotRootProfile::OpaqueRaw,

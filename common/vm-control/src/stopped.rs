@@ -297,6 +297,11 @@ pub fn info_to_wire(value: &SnapshotInfo) -> Result<w::StorageSnapshotInfo, Conv
         retained: Some(value.retained),
         aliases: value.aliases.clone(),
         created_at: Some(value.created_at),
+        streams: value
+            .streams
+            .iter()
+            .map(crate::snapshots::stream_summary_to_wire)
+            .collect(),
         capture_kind: match value.capture_kind {
             libvm::SnapshotCaptureKindName::StoppedStorage => w::StorageCaptureKind::StoppedStorage,
             libvm::SnapshotCaptureKindName::LiveExecution => w::StorageCaptureKind::LiveExecution,
@@ -328,6 +333,9 @@ pub fn info_from_wire(value: w::StorageSnapshotInfo) -> Result<SnapshotInfo, Con
     };
     if value.aliases.len() > 4096 {
         return Err(invalid("snapshot.aliases", "too many aliases"));
+    }
+    if value.streams.len() > 4096 {
+        return Err(invalid("snapshot.streams", "too many stream summaries"));
     }
     let mut aliases = std::collections::BTreeSet::new();
     for value in &value.aliases {
@@ -384,6 +392,11 @@ pub fn info_from_wire(value: w::StorageSnapshotInfo) -> Result<SnapshotInfo, Con
         retained: required(value.retained, "snapshot.retained")?,
         aliases: value.aliases,
         created_at,
+        streams: value
+            .streams
+            .into_iter()
+            .map(crate::snapshots::stream_summary_from_wire)
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -483,6 +496,7 @@ mod tests {
             created_at: Some(1),
             capture_kind: w::StorageCaptureKind::StoppedStorage as i32,
             provenance: vec![],
+            streams: Vec::new(),
         };
         assert!(info_from_wire(wire.clone()).is_ok());
         wire.capture_kind = 0;

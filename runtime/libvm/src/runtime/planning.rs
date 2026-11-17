@@ -384,7 +384,10 @@ mod tests {
             .await
             .expect_err("dry run must reject an old state database");
 
-        assert!(error.to_string().contains("reinstall"));
+        assert!(matches!(
+            error,
+            crate::LibVmError::StateDatabaseIncompatible { .. }
+        ));
         assert_eq!(logical_catalog::snapshot(&data_root).await, logical_before);
         assert_eq!(before, snapshot(temp.path(), &data_root));
     }

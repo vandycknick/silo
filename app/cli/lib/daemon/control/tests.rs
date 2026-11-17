@@ -906,9 +906,10 @@ async fn handoff_rejects_malformed_streams_over_private_socket_without_native_ef
                 w::HandoffPayloadRequest {
                     operation: uuid::Uuid::new_v4().to_string(),
                     descriptor: Some(w::HandoffPayloadDescriptor {
-                        payload: Some(w::handoff_payload_descriptor::Payload::Chunk(
-                            w::HandoffPayloadIdentity {
-                                digest: format!("sha256:{}", "ab".repeat(32)),
+                        payload: Some(w::handoff_payload_descriptor::Payload::StreamChunk(
+                            w::HandoffStreamChunk {
+                                stream: format!("sha256:{}", "ab".repeat(32)),
+                                index: 0,
                                 length: 1,
                             },
                         )),

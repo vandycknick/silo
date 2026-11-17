@@ -169,11 +169,8 @@ impl Machine {
                     let (geometry, kind) = match &source.storage.root {
                         MachineRoot::OpaqueRaw { geometry, .. } => {
                             let file = output.create_disk()?;
-                            StreamHasher::new().copy_file_and_hash(
-                                &root.file,
-                                root.length,
-                                &file,
-                            )?;
+                            StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                                .copy_file_and_hash(&root.file, root.length, &file)?;
                             file.sync_all()?;
                             (*geometry, RawDiskExportKind::OpaqueExact)
                         }
@@ -181,6 +178,7 @@ impl Machine {
                             let held = held
                                 .as_ref()
                                 .ok_or_else(|| unsupported("held lower is missing"))?;
+                            held.authenticate_bytes(&pool)?;
                             let occurrences = held.layers();
                             let flattened = oci::overlay_flatten::flatten_overlay(
                                 oci::overlay_flatten::FlattenLower {
@@ -816,7 +814,7 @@ mod tests {
         let file = File::open(path).unwrap();
         (
             crate::storage::identity_file::SourceFingerprint::new(&file.metadata().unwrap()),
-            crate::storage::stream::StreamHasher::new()
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                 .hash_file(path)
                 .unwrap()
                 .id(),
@@ -857,6 +855,19 @@ mod tests {
         assert_eq!(report.kind, RawDiskExportKind::OpaqueExact);
         assert_eq!(source_identity(&fixture.root), before);
         assert_eq!(source_identity(&path).1, before.1);
+        let expected =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_file(&fixture.root)
+                .unwrap();
+        assert_eq!(expected.chunk_size().bytes(), 8 << 20);
+        crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .verify_expected_map(&File::open(&path).unwrap(), &expected)
+            .unwrap();
+        assert!(matches!(
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::RAM)
+                .verify_expected_map(&File::open(&path).unwrap(), &expected),
+            Err(crate::storage::stream::ExpectedMapError::Profile { .. }),
+        ));
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&report.metadata_path).unwrap()).unwrap();
         use std::os::unix::ffi::OsStrExt;
@@ -884,6 +895,48 @@ mod tests {
             .is_err());
         assert!(!sidecar_collision.exists());
         assert_eq!(source_identity(&fixture.root), before);
+    }
+
+    #[tokio::test]
+    async fn raw_export_authenticates_pack_nodes_despite_a_warm_composition_receipt() {
+        let mut fixture = Fixture::new().await;
+        fixture.overlay(false).await;
+        let storage = fixture
+            .runtime
+            .machine_storage_record(fixture.machine.machine_id())
+            .await
+            .unwrap();
+        let crate::MachineRoot::LinuxOverlay { lower, .. } = storage.root else {
+            panic!("expected overlay fixture");
+        };
+        let layers = LayerStore::from_store(fixture.runtime.native_store().unwrap());
+        let held = layers.hold_composition(lower.record()).await.unwrap();
+        let stream = held.layers()[0].result.pack_stream;
+        let pool =
+            crate::storage::pool::StoragePool::open(fixture.runtime.local_images_dir()).unwrap();
+        let map = pool
+            .load_map(
+                crate::storage::identity::ObjectDigest::from_sha256(*stream.as_bytes()),
+                vm_spec::stream_map::StreamRole::Pack,
+                pool.map_authority(std::sync::Arc::new(())).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(map.chunk_size().bytes(), 8 << 20);
+        let node = map.nodes().next().unwrap().unwrap();
+        let path = pool.object_path(&node.digest);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, b"corrupt admitted map node").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let destination = fixture.destination("corrupt-pack.raw");
+        assert!(fixture
+            .machine
+            .export_raw_disk(RawDiskExportOptions {
+                destination: destination.clone(),
+                flatten_filesystem: true,
+            })
+            .await
+            .is_err());
+        assert!(!destination.exists());
     }
 
     #[tokio::test]

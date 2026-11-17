@@ -15,12 +15,14 @@ pub const MAX_PAGE_ENTRIES: usize = 4096;
 pub const MAX_STREAM_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 4 * MAX_STREAM_BYTES;
 pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
-pub const CONFIG_MEDIA_TYPE: &str = "application/vnd.silo.vm.config.v1+json";
+pub const CONFIG_MEDIA_TYPE: &str = "application/vnd.silo.vm.config.v2+json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PayloadMediaType {
-    #[serde(rename = "application/vnd.silo.vm.record.v1+json")]
+    #[serde(rename = "application/vnd.silo.vm.record.v2+json")]
     Record,
+    #[serde(rename = "application/vnd.silo.vm.stream-map.v2")]
+    StreamMap,
     #[serde(rename = "application/vnd.silo.vm.chunk.v1")]
     RawChunk,
     #[serde(rename = "application/vnd.silo.vm.chunk.v1+zstd")]
@@ -33,7 +35,8 @@ pub enum PayloadMediaType {
 impl PayloadMediaType {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Record => "application/vnd.silo.vm.record.v1+json",
+            Self::Record => "application/vnd.silo.vm.record.v2+json",
+            Self::StreamMap => "application/vnd.silo.vm.stream-map.v2",
             Self::RawChunk => "application/vnd.silo.vm.chunk.v1",
             Self::ZstdChunk => "application/vnd.silo.vm.chunk.v1+zstd",
             Self::Execution => "application/vnd.silo.vm.execution.v1",
@@ -43,6 +46,7 @@ impl PayloadMediaType {
     pub const fn maximum_size(self) -> u64 {
         match self {
             Self::Record => MAX_METADATA_BYTES as u64,
+            Self::StreamMap => 2083,
             Self::RawChunk | Self::ZstdChunk => CHUNK_SIZE,
             Self::Execution => 16 * 1024 * 1024,
             Self::DeviceState => 32 * 1024 * 1024,
@@ -149,7 +153,7 @@ fn required_nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct VmArtifactConfigV1 {
+pub struct VmArtifactConfigV2 {
     pub schema: u32,
     pub kind: String,
     pub encoding: String,
@@ -168,10 +172,12 @@ pub struct VmArtifactConfigV1 {
     #[serde(deserialize_with = "required_nullable")]
     pub capture_provenance: Option<RecordRef>,
 }
-impl VmArtifactConfigV1 {
+impl VmArtifactConfigV2 {
     pub fn validate(&self) -> Result<()> {
-        if self.schema != 1 || self.kind != "vm-artifact" || self.encoding != "silo-chunks-v1" {
-            return Err(invalid("unsupported config schema/kind/encoding"));
+        if self.schema != 2 || self.kind != "vm-artifact" || self.encoding != "silo-chunks-v2" {
+            return Err(invalid(
+                "unsupported artifact format: fresh-state v2 required",
+            ));
         }
         let live = self.capture_kind == Some(CaptureKind::LiveExecution);
         match (self.content.kind, self.purpose, self.capture_kind) {
@@ -234,7 +240,7 @@ impl VmArtifactConfigV1 {
         Ok(())
     }
 }
-pub fn decode_vm_config(bytes: &[u8]) -> Result<VmArtifactConfigV1> {
+pub fn decode_vm_config(bytes: &[u8]) -> Result<VmArtifactConfigV2> {
     let value: Value = decode_record(bytes)?;
     if let Some(profile) = value
         .pointer("/minimumCapabilities/storageProfile")
@@ -246,7 +252,7 @@ pub fn decode_vm_config(bytes: &[u8]) -> Result<VmArtifactConfigV1> {
             });
         }
     }
-    let config: VmArtifactConfigV1 = serde_json::from_value(value)?;
+    let config: VmArtifactConfigV2 = serde_json::from_value(value)?;
     config.validate()?;
     Ok(config)
 }
@@ -257,7 +263,7 @@ pub struct StreamBinding {
     pub stream: StreamIdentity,
     pub length: u64,
     pub map: ContentDigest,
-    pub map_pages: Vec<ContentDigest>,
+    pub chunk_size: u64,
     pub transport: RecordRef,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,8 +400,8 @@ pub fn verify_transfer_to(
     mut fetch_record: impl FnMut(ContentDigest) -> Result<Vec<u8>>,
     mut visit: impl FnMut(u64, ChunkEntry) -> Result<()>,
 ) -> Result<()> {
-    if root.schema != 1
-        || root.kind != "silo-chunks-v1"
+    if root.schema != 2
+        || root.kind != "silo-chunks-v2"
         || root.chunk_size != CHUNK_SIZE
         || root.length > MAX_STREAM_BYTES
         || root.pages.len() > MAX_PAGE_ENTRIES
@@ -417,7 +423,7 @@ pub fn verify_transfer_to(
             return Err(invalid("transfer page digest mismatch"));
         }
         let page: TransferPage = decode_record(&bytes)?;
-        if page.schema != 1
+        if page.schema != 2
             || page.kind != "silo-chunk-map"
             || page.first_chunk != count
             || page.entries.is_empty()
@@ -476,7 +482,8 @@ pub fn encode_stream_table(entries: &[StreamBinding]) -> Result<EncodedTable> {
     for entry in entries {
         if previous.is_some_and(|id| id >= entry.stream)
             || entry.length > MAX_STREAM_BYTES
-            || entry.map_pages.len() > MAX_PAGE_ENTRIES
+            || !matches!(entry.chunk_size, 65536 | CHUNK_SIZE)
+            || entry.map.as_bytes() != entry.stream.as_bytes()
         {
             return Err(invalid("stream table order/bounds"));
         }
@@ -491,7 +498,7 @@ pub fn encode_stream_table(entries: &[StreamBinding]) -> Result<EncodedTable> {
     }
     let pages = paginate(entries, "stream-table-page", "firstEntry")?;
     let root = RecordBlob::encode(&StreamTableRoot {
-        schema: 1,
+        schema: 2,
         kind: "stream-table".into(),
         entries: entries.len() as u64,
         pages: pages.iter().map(|page| page.reference).collect(),
@@ -526,7 +533,7 @@ pub fn encode_object_table(entries: &[ObjectBinding]) -> Result<EncodedTable> {
     }
     let pages = paginate(entries, "object-table-page", "firstEntry")?;
     let root = RecordBlob::encode(&ObjectTableRoot {
-        schema: 1,
+        schema: 2,
         kind: "object-table".into(),
         entries: entries.len() as u64,
         pages: pages.iter().map(|page| page.reference).collect(),
@@ -550,8 +557,8 @@ pub fn encode_transfer(
     }
     let pages = paginate(entries, "silo-chunk-map", "firstChunk")?;
     let root = RecordBlob::encode(&TransferRoot {
-        schema: 1,
-        kind: "silo-chunks-v1".into(),
+        schema: 2,
+        kind: "silo-chunks-v2".into(),
         stream,
         length,
         chunk_size: CHUNK_SIZE,
@@ -567,7 +574,7 @@ fn page_value<T: Serialize>(
     first: usize,
 ) -> Result<Value> {
     let mut object = serde_json::Map::new();
-    object.insert("schema".into(), Value::from(1));
+    object.insert("schema".into(), Value::from(2));
     object.insert("kind".into(), Value::String(kind.into()));
     object.insert(first_field.into(), Value::from(first as u64));
     object.insert("entries".into(), serde_json::to_value(entries)?);
@@ -721,12 +728,21 @@ mod tests {
 
     fn config_value() -> serde_json::Value {
         let reference = RecordRef::of_bytes(b"record");
-        json!({"schema":1,"kind":"vm-artifact","encoding":"silo-chunks-v1",
+        json!({"schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
             "content":{"kind":"image","id":reference.digest,"record":reference},
             "purpose":"image","captureKind":null,"rootFamily":"opaque-raw","backendRequirement":"raw-block",
             "guestPlatform":{"os":"linux","architecture":"arm64"},
             "minimumCapabilities":{"storageProfile":"opaque-raw-v1","bootAbi":"linux-direct-v1","liveRestore":false},
             "executionRequirements":null,"streams":reference,"objects":reference,"captureProvenance":null})
+    }
+
+    #[test]
+    fn old_artifact_format_is_refused_clearly() {
+        let mut value = config_value();
+        value["schema"] = json!(1);
+        value["encoding"] = json!("silo-chunks-v1");
+        let error = wire::decode_vm_config(&wire::canonical_bytes(&value).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("fresh-state v2 required"));
     }
 
     #[test]
@@ -769,7 +785,7 @@ mod tests {
             );
         }
         for (field, replacement) in [
-            ("schema", json!(2)),
+            ("schema", json!(1)),
             ("rootFamily", json!("unknown")),
             ("backendRequirement", json!("krun-overlay")),
             ("captureKind", json!("live-execution")),
@@ -893,22 +909,22 @@ mod tests {
         ];
         for split in [1, 2] {
             let first = RecordBlob::encode(&TransferPage {
-                schema: 1,
+                schema: 2,
                 kind: "silo-chunk-map".into(),
                 first_chunk: 0,
                 entries: entries[..split].to_vec(),
             })
             .unwrap();
             let last = RecordBlob::encode(&TransferPage {
-                schema: 1,
+                schema: 2,
                 kind: "silo-chunk-map".into(),
                 first_chunk: split as u64,
                 entries: entries[split..].to_vec(),
             })
             .unwrap();
             let mut root = TransferRoot {
-                schema: 1,
-                kind: "silo-chunks-v1".into(),
+                schema: 2,
+                kind: "silo-chunks-v2".into(),
                 stream,
                 length,
                 chunk_size: CHUNK_SIZE,
@@ -940,15 +956,15 @@ mod tests {
             (0, vec![ChunkEntry::Zero { length: CHUNK_SIZE }; 4]),
         ] {
             let page = RecordBlob::encode(&TransferPage {
-                schema: 1,
+                schema: 2,
                 kind: "silo-chunk-map".into(),
                 first_chunk,
                 entries,
             })
             .unwrap();
             let root = TransferRoot {
-                schema: 1,
-                kind: "silo-chunks-v1".into(),
+                schema: 2,
+                kind: "silo-chunks-v2".into(),
                 stream,
                 length,
                 chunk_size: CHUNK_SIZE,
@@ -957,8 +973,8 @@ mod tests {
             assert!(wire::verify_transfer(&root, |_| Ok(page.bytes.clone())).is_err());
         }
         let root = TransferRoot {
-            schema: 1,
-            kind: "silo-chunks-v1".into(),
+            schema: 2,
+            kind: "silo-chunks-v2".into(),
             stream,
             length,
             chunk_size: CHUNK_SIZE,

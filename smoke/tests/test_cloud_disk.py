@@ -17,7 +17,7 @@ from uuid import uuid4
 
 import pytest
 
-from silo_smoke import cloud_disk, images, overlay, shutdown, stopped
+from silo_smoke import cloud_disk, images, overlay, shutdown, stopped, stream_map
 from silo_smoke.cli import Silo
 from silo_smoke.cloud_disk import Disk, Guids, Part, Roots
 
@@ -66,11 +66,14 @@ def test_raw_and_qcow2_imports_share_decoded_identity_and_aliases(silo: Silo, cl
 
     raw = cloud_disk.import_disk(silo, disk.path, root="auto", name="cloud-raw")
     record = raw["record"]
-    assert record["schema"] == 1 and record["kind"] == "image"
+    assert record["schema"] == 2 and record["kind"] == "image"
     assert record["root"]["profile"] == {"kind": "opaque-raw"}
     assert record["root"]["geometry"] == {"length": size, "logicalSectorSize": 512}
     assert record["root"]["layout"] == {"kind": "partitioned", "table": "gpt"}
     assert record["root"]["stream"]["length"] == size
+    imported_root, _ = stream_map.catalog_root(silo.ws.silo_home, record["root"]["stream"])
+    assert imported_root.chunk_size == stream_map.DISK_CHUNK
+    assert stream_map.from_file(disk.path, stream_map.DISK_CHUNK)[0] == imported_root
     boot = record["boot"]
     assert boot["kind"] == "linux-direct" and boot["rootSelector"] == selector(guids.root), boot
     assert boot["rootFilesystem"] == "ext4" and boot["translation"] == "none"

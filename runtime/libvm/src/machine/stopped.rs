@@ -464,6 +464,37 @@ impl PrivateSource {
     }
 }
 
+fn private_copy_source(
+    pool: &StoragePool,
+    storage: &MachineStorageRecord,
+    seeds: &[vm_spec::capture::DiskTrackingSeed],
+    source: FencedSource,
+    lease: &StorageLock,
+) -> Result<PrivateSource, LibVmError> {
+    let fingerprint =
+        crate::storage::identity_file::SourceFingerprint::new(&source.file.metadata()?);
+    let baseline = storage.disk_baselines.iter().find(|baseline| {
+        baseline.fingerprint == fingerprint && seeds.iter().any(|seed| seed == &baseline.seed)
+    });
+    let Some(baseline) = baseline else {
+        return Ok(PrivateSource::Fenced(source));
+    };
+    let map = pool.load_map(
+        baseline.map,
+        vm_spec::stream_map::StreamRole::Disk,
+        pool.map_authority(std::sync::Arc::new(lease.duplicate()?))?,
+    )?;
+    let stream = crate::storage::stream::AuthenticatedStream::from_verified_fingerprint(
+        source.file,
+        std::sync::Arc::new(map),
+        baseline.fingerprint,
+    )?;
+    Ok(PrivateSource::Authenticated {
+        path: source.path,
+        stream,
+    })
+}
+
 pub(crate) async fn admit_stopped(
     runtime: &Runtime,
     id: MachineId,
@@ -894,6 +925,15 @@ async fn fork_owned(
     for file in &source.files {
         file.file.sync_all()?;
     }
+    let seeds = crate::machine::root_storage::launch_disk_seeds(
+        &source.storage,
+        &source.config.machine_dir,
+        runtime.local_images_dir(),
+    )?;
+    let files = std::mem::take(&mut source.files)
+        .into_iter()
+        .map(|file| private_copy_source(&pool, &source.storage, &seeds, file, &lease))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut storage = source.storage;
     storage.boot = capture_boot(
         &storage,
@@ -910,10 +950,6 @@ async fn fork_owned(
         &options.external_resources,
     )?;
     reset_child_storage(&mut storage);
-    let files = std::mem::take(&mut source.files)
-        .into_iter()
-        .map(PrivateSource::Fenced)
-        .collect();
     let config = crate::machine::builder::publish_stopped_child(
         &runtime,
         name,
@@ -974,9 +1010,15 @@ async fn snapshot_owned(
         &requirements,
         &ExternalResourcePolicy::RequireMappings,
     )?;
+    let seeds = crate::machine::root_storage::launch_disk_seeds(
+        &source.storage,
+        &source.config.machine_dir,
+        runtime.local_images_dir(),
+    )?;
     let mut published = Vec::with_capacity(source.files.len());
     for file in std::mem::take(&mut source.files) {
-        published.push(publish_private_stream(&pool, &store, operation_id, file).await?);
+        let source = private_copy_source(&pool, &source.storage, &seeds, file, &lease)?;
+        published.push(publish_private_stream(&pool, &store, operation_id, source).await?);
     }
     let mut writable = published.into_iter();
     let root_content = writable
@@ -1033,7 +1075,8 @@ async fn snapshot_owned(
                 true,
             ),
             DiskStorage::ManagedReadOnly { stream, geometry } => {
-                let authenticated = open_immutable_stream(&pool, stream, geometry.length)?;
+                let authenticated =
+                    open_immutable_stream(&store, operation_id, stream, geometry.length).await?;
                 let content = publish_map(&pool, &store, operation_id, authenticated.map()).await?;
                 (content, *geometry, false)
             }
@@ -1047,7 +1090,7 @@ async fn snapshot_owned(
         });
     }
     let record = SnapshotRecord {
-        schema: 1,
+        schema: 2,
         kind: SnapshotKind::Snapshot,
         capture: SnapshotCaptureKind::StoppedStorage {
             stop_outcome: source.storage.stop_outcome,
@@ -1112,7 +1155,6 @@ async fn stopped_closure(
             for layer in &graph.layers {
                 streams.insert(layer.pack.stream);
                 objects.insert(layer.pack.map);
-                objects.extend(layer.pack.map_pages.iter().copied());
             }
             objects.extend(graph.objects());
             Some(graph)
@@ -1130,14 +1172,73 @@ async fn publish_private_stream(
     pool: &StoragePool,
     store: &Store,
     operation: Uuid,
-    source: FencedSource,
+    source: PrivateSource,
 ) -> Result<SnapshotStream, LibVmError> {
-    let (stream, roots) = pool.publish_stream_file_for_catalog(source.file, source.length)?;
-    store
-        .pin_published_storage_dependencies(operation, &[stream.id], &[])
-        .await?;
-    drop(roots);
-    publish_map(pool, store, operation, &stream.map).await
+    match source {
+        PrivateSource::Fenced(source) => {
+            let (stream, roots) =
+                pool.publish_stream_file_for_catalog(source.file, source.length)?;
+            store
+                .pin_published_storage_dependencies(operation, &[stream.id], &[])
+                .await?;
+            let content = publish_map(pool, store, operation, &stream.map).await?;
+            drop(roots);
+            Ok(content)
+        }
+        PrivateSource::Authenticated { stream, .. } => {
+            if crate::storage::identity_file::SourceFingerprint::new(&stream.file().metadata()?)
+                != stream.fingerprint()
+            {
+                return Err(invalid(
+                    "stopped baseline source changed before publication",
+                ));
+            }
+            let dedup_roots = pool.lock_roots_shared()?;
+            let receipt = match std::fs::symlink_metadata(pool.stream_path(&stream.map().id())) {
+                Ok(_) => {
+                    let content = SnapshotStream {
+                        stream: stream.map().id(),
+                        map: crate::storage::identity::ObjectDigest::from_sha256(
+                            *stream.map().id().as_bytes(),
+                        ),
+                        length: stream.length(),
+                        chunk_size: stream.map().chunk_size().bytes(),
+                    };
+                    store
+                        .pin_published_storage_dependencies(
+                            operation,
+                            &[content.stream],
+                            &[content.map],
+                        )
+                        .await?;
+                    Some(
+                        store
+                            .authenticate_local_stream(operation, &content)
+                            .await?
+                            .fingerprint(),
+                    )
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            drop(dedup_roots);
+            let (publication, roots) = pool.publish_sealed_stream_for_catalog(
+                stream.file(),
+                stream.map(),
+                receipt,
+                crate::storage::pool::SealedStreamPublicationMode::CopyAllowed,
+            )?;
+            store
+                .pin_published_storage_dependencies(operation, &[publication.map().id()], &[])
+                .await?;
+            let content = publish_map(pool, store, operation, publication.map()).await?;
+            SnapshotStore::from_store(std::sync::Arc::new(store.clone()))
+                .seed_map_receipt(&content, &publication)
+                .await?;
+            drop(roots);
+            Ok(content)
+        }
+    }
 }
 
 fn reset_child_storage(storage: &mut MachineStorageRecord) {
@@ -1488,30 +1589,23 @@ impl Drop for OperationStaging {
     }
 }
 
-pub(crate) fn open_immutable_stream(
-    pool: &StoragePool,
+pub(crate) async fn open_immutable_stream(
+    store: &Store,
+    operation: Uuid,
     stream: &crate::storage::identity::StreamId,
     length: u64,
 ) -> Result<crate::storage::stream::AuthenticatedStream, LibVmError> {
-    let file = crate::storage::stream::open_regular_source(&pool.stream_path(stream))?;
-    let metadata = file.metadata()?;
-    if metadata.uid() != nix::unistd::geteuid().as_raw()
-        || metadata.mode() & 0o7777 != 0o400
-        || metadata.nlink() != 1
-        || metadata.len() != length
-    {
-        return Err(invalid(
-            "immutable Data backing has invalid owner, mode, links or geometry",
-        ));
-    }
-    // Binds the map to this descriptor's fingerprint before and after scanning.
-    let authenticated = crate::storage::stream::StreamHasher::new().authenticate(file, length)?;
-    if authenticated.map().id() != *stream {
-        return Err(invalid(
-            "immutable stream backing does not match its authenticated identity",
-        ));
-    }
-    Ok(authenticated)
+    store
+        .authenticate_local_stream(
+            operation,
+            &SnapshotStream {
+                stream: *stream,
+                map: crate::storage::identity::ObjectDigest::from_sha256(*stream.as_bytes()),
+                length,
+                chunk_size: vm_spec::stream_map::ChunkSize::DISK.bytes(),
+            },
+        )
+        .await
 }
 
 /// Rebuild private/read-only attachment paths from semantic ownership, never
@@ -1895,6 +1989,7 @@ mod tests {
         let seeds = crate::machine::root_storage::launch_disk_seeds(
             &child_storage,
             &child_config.machine_dir,
+            runtime.local_images_dir(),
         )
         .unwrap();
         assert_eq!(seeds.len(), 2);
@@ -2013,5 +2108,130 @@ mod tests {
             assert!(open_private(&directory, &PrivatePath::new(name).unwrap(), 512).is_err());
         }
         assert_eq!(std::fs::read(&file).unwrap(), [0x55; 512]);
+    }
+
+    #[tokio::test]
+    async fn stopped_copy_inherits_disk_root_and_nodes_without_payload_reads() {
+        use crate::machine::stopped::{private_copy_source, FencedSource, PrivateSource};
+        use crate::storage::stream::StreamHasher;
+        use vm_spec::stream_map::ChunkSize;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = crate::paths::LocalPaths::new(temporary.path());
+        let store = crate::store::Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let directory =
+            crate::paths::OwnedDirectory::open_root(&temporary.path().join("private")).unwrap();
+        directory.write_file("root.raw", &[0x41; 512]).unwrap();
+        let path = directory.path().join("root.raw");
+        let file = std::fs::File::open(&path).unwrap();
+        let map = StreamHasher::new(ChunkSize::DISK)
+            .hash_open_file(&file, 512)
+            .unwrap()
+            .map;
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        let disk = crate::machine::root_storage::disk(
+            "root.raw",
+            vm_spec::DiskRole::Root,
+            512,
+            "root".into(),
+        )
+        .unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("fork", &[], &[])
+            .await
+            .unwrap();
+        let roots = crate::machine::root_storage::seed_disk(
+            &mut storage,
+            &pool,
+            directory.path(),
+            0,
+            &disk,
+            &file,
+            &map,
+        )
+        .unwrap();
+        store
+            .admit_published_map_root(operation, &map)
+            .await
+            .unwrap();
+        drop(roots);
+        let (publication, publication_roots) = pool
+            .publish_sealed_stream_for_catalog(
+                &file,
+                &map,
+                None,
+                crate::storage::pool::SealedStreamPublicationMode::CopyAllowed,
+            )
+            .unwrap();
+        let content = crate::store::snapshot_store::publish_map(&pool, &store, operation, &map)
+            .await
+            .unwrap();
+        crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()))
+            .seed_map_receipt(&content, &publication)
+            .await
+            .unwrap();
+        drop(publication_roots);
+        #[cfg(target_os = "linux")]
+        let reads = crate::store::snapshot_store::tests::watch_stream_reads(&path);
+        #[cfg(target_os = "linux")]
+        let pool_reads =
+            crate::store::snapshot_store::tests::watch_stream_reads(&pool.stream_path(&map.id()));
+        let seeds = crate::machine::root_storage::launch_disk_seeds(
+            &storage,
+            directory.path(),
+            paths.images_dir(),
+        )
+        .unwrap();
+        let source = private_copy_source(
+            &pool,
+            &storage,
+            &seeds,
+            FencedSource {
+                path: crate::PrivatePath::new("root.raw").unwrap(),
+                file,
+                length: 512,
+            },
+            &lease,
+        )
+        .unwrap();
+        let PrivateSource::Authenticated { stream, .. } = source else {
+            panic!("ready stopped baseline was not inherited");
+        };
+        assert_eq!(stream.map().id(), map.id());
+        assert_eq!(stream.map().chunk_size(), ChunkSize::DISK);
+        assert_eq!(stream.map().root().tree_digest(), map.root().tree_digest());
+        assert_eq!(stream.map().lookup(0).unwrap(), map.lookup(0).unwrap());
+        #[cfg(target_os = "linux")]
+        assert!(!crate::store::snapshot_store::tests::observed_stream_read(
+            &reads
+        ));
+        let published = crate::machine::stopped::publish_private_stream(
+            &pool,
+            &store,
+            operation,
+            PrivateSource::Authenticated {
+                path: crate::PrivatePath::new("root.raw").unwrap(),
+                stream,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(published, content);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(!crate::store::snapshot_store::tests::observed_stream_read(
+                &reads
+            ));
+            assert!(!crate::store::snapshot_store::tests::observed_stream_read(
+                &pool_reads
+            ));
+        }
+        store.finish_stopped_operation(operation).await.unwrap();
     }
 }

@@ -66,7 +66,7 @@ impl LayerResult {
             return Err(invalid("unaligned result pack length"));
         }
         canonical(
-            &json!({"indexRoot":self.index_root,"kind":"layer-result","packLength":self.pack_length,"packStream":self.pack_stream,"recipe":self.recipe,"schema":1}),
+            &json!({"indexRoot":self.index_root,"kind":"layer-result","packLength":self.pack_length,"packStream":self.pack_stream,"recipe":self.recipe,"schema":2}),
         )
     }
     pub fn id(&self) -> ChangesetResult<LayerResultId> {
@@ -873,11 +873,11 @@ mod tests {
             recipe.id().unwrap().to_string(),
             ContentDigest::of_bytes(expected.as_bytes()).to_string()
         );
-        let stream_record =
-            br#"{"chunkSize":8388608,"chunks":[],"kind":"stream","length":0,"schema":1}"#;
         let mut stream_hash = Sha256::new();
-        stream_hash.update(b"silo:stream:v1\n");
-        stream_hash.update(stream_record);
+        stream_hash.update(b"silo:stream:v2\n");
+        stream_hash.update([23]);
+        stream_hash.update(0u64.to_le_bytes());
+        stream_hash.update([0]);
         let stream = hash_spelling(stream_hash.finalize());
         assert_ne!(stream, ContentDigest::of_bytes(b"").to_string());
         let result = LayerResult {
@@ -887,12 +887,12 @@ mod tests {
             index_root: encoded.root.digest,
         };
         let expected = format!(
-            r#"{{"indexRoot":"{}","kind":"layer-result","packLength":0,"packStream":"{}","recipe":"{}","schema":1}}"#,
+            r#"{{"indexRoot":"{}","kind":"layer-result","packLength":0,"packStream":"{}","recipe":"{}","schema":2}}"#,
             result.index_root, result.pack_stream, result.recipe
         );
         assert_eq!(result.canonical_bytes().unwrap(), expected.as_bytes());
         let mut hash = Sha256::new();
-        hash.update(b"silo:layer-result:v1\n");
+        hash.update(b"silo:layer-result:v2\n");
         hash.update(expected.as_bytes());
         assert_eq!(
             result.id().unwrap().to_string(),
@@ -1803,13 +1803,36 @@ mod tests {
                 },
             ),
         ] {
-            let record = expected_bytes(
-                json!({"chunkSize":8_388_608,"chunks":chunks,"kind":"stream","length":length,"schema":1}),
-            );
-            let mut hash = Sha256::new();
-            hash.update(b"silo:stream:v1\n");
-            hash.update(&record);
-            let stream = hash_spelling(hash.finalize());
+            let mut root = b"silo:stream:v2\n".to_vec();
+            root.push(23);
+            root.extend_from_slice(&length.to_le_bytes());
+            let present: Vec<_> = chunks
+                .iter()
+                .enumerate()
+                .filter(|(_, digest)| digest.as_str() != "zero")
+                .collect();
+            root.push(u8::from(!present.is_empty()));
+            if !present.is_empty() {
+                let mut leaf = b"silo:stream-map:leaf:v2\n".to_vec();
+                let bitmap = present
+                    .iter()
+                    .fold(0u64, |bits, (slot, _)| bits | (1u64 << slot));
+                leaf.extend_from_slice(&bitmap.to_le_bytes());
+                for (_, spelling) in present {
+                    let digest: ContentDigest = spelling.parse().unwrap();
+                    leaf.extend_from_slice(digest.as_bytes());
+                }
+                let mut digest: [u8; 32] = Sha256::digest(leaf).into();
+                for height in 1..=4 {
+                    let mut branch = b"silo:stream-map:branch:v2\n".to_vec();
+                    branch.push(height);
+                    branch.extend_from_slice(&1u64.to_le_bytes());
+                    branch.extend_from_slice(&digest);
+                    digest = Sha256::digest(branch).into();
+                }
+                root.extend_from_slice(&digest);
+            }
+            let stream = hash_spelling(Sha256::digest(root));
             assert_ne!(stream, hash_spelling(Sha256::digest(&logical)));
             let result = LayerResult {
                 recipe,
@@ -1818,11 +1841,11 @@ mod tests {
                 index_root: ContentDigest::of_bytes(b"index"),
             };
             let expected = expected_bytes(
-                json!({"indexRoot":result.index_root,"kind":"layer-result","packLength":length,"packStream":stream,"recipe":recipe,"schema":1}),
+                json!({"indexRoot":result.index_root,"kind":"layer-result","packLength":length,"packStream":stream,"recipe":recipe,"schema":2}),
             );
             assert_eq!(result.canonical_bytes().unwrap(), expected);
             let mut hash = Sha256::new();
-            hash.update(b"silo:layer-result:v1\n");
+            hash.update(b"silo:layer-result:v2\n");
             hash.update(expected);
             assert_eq!(
                 result.id().unwrap().to_string(),

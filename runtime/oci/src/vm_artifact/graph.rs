@@ -6,16 +6,16 @@ use crate::changeset::model::{ContentDigest, StreamIdentity};
 use crate::vm_artifact::wire::{
     self, ChunkEntry, GuestPlatform, ObjectBinding, ObjectTablePage, ObjectTableRoot,
     PayloadMediaType, PayloadRef, RecordBlob, RecordRef, StreamBinding, StreamTablePage,
-    StreamTableRoot, TransferPage, TransferRoot, VmArtifactConfigV1, CHUNK_SIZE, CONFIG_MEDIA_TYPE,
+    StreamTableRoot, TransferPage, TransferRoot, VmArtifactConfigV2, CHUNK_SIZE, CONFIG_MEDIA_TYPE,
     MAX_ARTIFACT_BYTES, MAX_METADATA_BYTES, MAX_PAGE_ENTRIES, MAX_STREAM_BYTES,
 };
 use crate::vm_artifact::{invalid, Error, Result};
 
 pub const INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
-pub const ARTIFACT_TYPE: &str = "application/vnd.silo.vm.v1";
-pub const METADATA_ARTIFACT_TYPE: &str = "application/vnd.silo.vm.metadata.v1";
-pub const PAYLOAD_ARTIFACT_TYPE: &str = "application/vnd.silo.vm.payloads.v1";
+pub const ARTIFACT_TYPE: &str = "application/vnd.silo.vm.v2";
+pub const METADATA_ARTIFACT_TYPE: &str = "application/vnd.silo.vm.metadata.v2";
+pub const PAYLOAD_ARTIFACT_TYPE: &str = "application/vnd.silo.vm.payloads.v2";
 pub const EMPTY_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 
 /// OCI descriptors, unlike closed Silo records, can carry standard optional
@@ -119,7 +119,7 @@ struct Manifest {
 pub struct VerifiedVmGraph {
     index_bytes: Vec<u8>,
     index_digest: ContentDigest,
-    config: VmArtifactConfigV1,
+    config: VmArtifactConfigV2,
     config_bytes: Vec<u8>,
     metadata_manifest_bytes: Vec<u8>,
     inventory: BTreeMap<ContentDigest, PayloadRef>,
@@ -134,7 +134,7 @@ impl VerifiedVmGraph {
     pub fn index_digest(&self) -> ContentDigest {
         self.index_digest
     }
-    pub fn config(&self) -> &VmArtifactConfigV1 {
+    pub fn config(&self) -> &VmArtifactConfigV2 {
         &self.config
     }
     pub fn config_bytes(&self) -> &[u8] {
@@ -184,7 +184,7 @@ pub struct GraphVerifier {
     index: Index,
     pending: VecDeque<Pending>,
     metadata_config: Option<Descriptor>,
-    config: Option<VmArtifactConfigV1>,
+    config: Option<VmArtifactConfigV2>,
     config_bytes: Vec<u8>,
     metadata_manifest_bytes: Vec<u8>,
     inventory: BTreeMap<ContentDigest, PayloadRef>,
@@ -208,7 +208,9 @@ impl GraphVerifier {
             || index.manifests.is_empty()
             || index.manifests.len() > MAX_PAGE_ENTRIES + 1
         {
-            return Err(invalid("invalid VM index type/schema/child count"));
+            return Err(invalid(
+                "unsupported VM artifact: fresh-state v2 index required",
+            ));
         }
         let mut pending = VecDeque::new();
         let mut seen = BTreeSet::new();
@@ -363,9 +365,10 @@ impl GraphVerifier {
                         .last()
                         .is_some_and(|previous| previous.stream >= binding.stream)
                         || binding.length > MAX_STREAM_BYTES
-                        || binding.map_pages.len() > MAX_PAGE_ENTRIES
+                        || !matches!(binding.chunk_size, 65536 | CHUNK_SIZE)
+                        || binding.map.as_bytes() != binding.stream.as_bytes()
                     {
-                        return Err(invalid("stream table order/length/map-page bound"));
+                        return Err(invalid("stream table order/length/identity profile"));
                     }
                     self.stream_bytes = self
                         .stream_bytes
@@ -423,8 +426,8 @@ impl GraphVerifier {
             }
             Task::TransferRoot(stream, length) => {
                 let root: TransferRoot = wire::decode_record(bytes)?;
-                if root.schema != 1
-                    || root.kind != "silo-chunks-v1"
+                if root.schema != 2
+                    || root.kind != "silo-chunks-v2"
                     || root.stream != stream
                     || root.length != length
                     || root.chunk_size != CHUNK_SIZE
@@ -473,7 +476,7 @@ impl GraphVerifier {
                     .ok_or_else(|| invalid("missing transfer coverage state"))?;
                 let length = root.length;
                 let expected = length.div_ceil(CHUNK_SIZE);
-                if page.schema != 1
+                if page.schema != 2
                     || page.kind != "silo-chunk-map"
                     || page.first_chunk != count
                     || page.entries.is_empty()
@@ -621,18 +624,18 @@ impl GraphVerifier {
             .map(|binding| (binding.object(), binding))
             .collect();
         for binding in &self.streams {
-            for digest in std::iter::once(&binding.map).chain(&binding.map_pages) {
+            for digest in std::iter::once(&binding.map) {
                 if !matches!(
                     objects.get(digest),
                     Some(ObjectBinding::Direct {
                         payload: PayloadRef {
-                            media_type: PayloadMediaType::Record,
+                            media_type: PayloadMediaType::StreamMap,
                             ..
                         },
                         ..
                     })
                 ) {
-                    return Err(invalid("canonical map missing direct record binding"));
+                    return Err(invalid("stream root missing binary map binding"));
                 }
             }
         }
@@ -694,7 +697,7 @@ fn validate_table_root(
     entries: u64,
     pages: &[RecordRef],
 ) -> Result<()> {
-    if schema != 1
+    if schema != 2
         || kind != expected
         || pages.len() > MAX_PAGE_ENTRIES
         || entries > (MAX_PAGE_ENTRIES * MAX_PAGE_ENTRIES) as u64
@@ -722,7 +725,7 @@ fn validate_table_page(
     total: Option<u64>,
 ) -> Result<()> {
     let total = total.ok_or_else(|| invalid("table page before root"))?;
-    if schema != 1
+    if schema != 2
         || kind != expected
         || first != consumed as u64
         || entries == 0
@@ -771,7 +774,7 @@ pub struct EncodedVmGraph {
 /// Build one fixed byte encoding. Caller-supplied payload descriptors must refer
 /// to verified held bytes; the graph builder does not acquire or own bulk data.
 pub fn encode_vm_graph(
-    config: &VmArtifactConfigV1,
+    config: &VmArtifactConfigV2,
     records: &[RecordBlob],
     payloads: &[PayloadRef],
 ) -> Result<EncodedVmGraph> {
@@ -782,6 +785,9 @@ pub fn encode_vm_graph(
         bytes: config_bytes,
     };
     let mut inventory = BTreeMap::new();
+    for payload in payloads {
+        insert_payload(&mut inventory, *payload)?;
+    }
     let mut record_bytes = BTreeMap::new();
     for record in records {
         record.reference.payload().validate()?;
@@ -795,10 +801,12 @@ pub fn encode_vm_graph(
                 return Err(invalid("contradictory duplicate record"));
             }
         }
-        insert_payload(&mut inventory, record.reference.payload())?;
-    }
-    for payload in payloads {
-        insert_payload(&mut inventory, *payload)?;
+        let payload = inventory
+            .get(&record.reference.digest)
+            .copied()
+            .filter(|payload| payload.media_type == PayloadMediaType::StreamMap)
+            .unwrap_or_else(|| record.reference.payload());
+        insert_payload(&mut inventory, payload)?;
     }
     let metadata = Manifest {
         schema_version: 2,
@@ -945,16 +953,20 @@ mod tests {
     };
     use crate::vm_artifact::wire::{
         self, ChunkEntry, ObjectBinding, PayloadMediaType, PayloadRef, RecordBlob, StreamBinding,
-        TransferRoot, VmArtifactConfigV1, CHUNK_SIZE,
+        TransferRoot, VmArtifactConfigV2, CHUNK_SIZE,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
 
-    fn fixture(chunks: usize) -> (VmArtifactConfigV1, Vec<RecordBlob>, Vec<PayloadRef>) {
+    fn fixture(chunks: usize) -> (VmArtifactConfigV2, Vec<RecordBlob>, Vec<PayloadRef>) {
         let semantic = RecordBlob::new(br#"{"kind":"semantic-record"}"#.to_vec()).unwrap();
-        let map = RecordBlob::new(br#"{"kind":"canonical-map"}"#.to_vec()).unwrap();
-        let stream = StreamIdentity::from_sha256([9; 32]);
-        let payloads: Vec<_> = (0..chunks)
+        let mut map_bytes = b"silo:stream:v2\n".to_vec();
+        map_bytes.push(23);
+        map_bytes.extend_from_slice(&(chunks as u64 * CHUNK_SIZE).to_le_bytes());
+        map_bytes.push(0);
+        let map = RecordBlob::new(map_bytes).unwrap();
+        let stream = StreamIdentity::from_sha256(*map.reference.digest.as_bytes());
+        let mut payloads: Vec<_> = (0..chunks)
             .map(|index| {
                 let mut bytes = [0; 32];
                 bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
@@ -978,7 +990,7 @@ mod tests {
             stream,
             length: chunks as u64 * CHUNK_SIZE,
             map: map.reference.digest,
-            map_pages: vec![],
+            chunk_size: CHUNK_SIZE,
             transport: transfer.root.reference,
         }])
         .unwrap();
@@ -987,20 +999,33 @@ mod tests {
             .map(|record| ObjectBinding::Direct {
                 object: record.reference.digest,
                 size: record.reference.size,
-                payload: record.reference.payload(),
+                payload: PayloadRef {
+                    media_type: if record.reference == map.reference {
+                        PayloadMediaType::StreamMap
+                    } else {
+                        PayloadMediaType::Record
+                    },
+                    digest: record.reference.digest,
+                    size: record.reference.size,
+                },
             })
             .collect();
         bindings.sort_by_key(ObjectBinding::object);
         let objects = wire::encode_object_table(&bindings).unwrap();
         let config = wire::decode_vm_config(&serde_json::to_vec(&json!({
-            "schema":1,"kind":"vm-artifact","encoding":"silo-chunks-v1",
+            "schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
             "content":{"kind":"image","id":ContentDigest::from_sha256([4;32]),"record":semantic.reference},
             "purpose":"image","captureKind":null,"rootFamily":"opaque-raw","backendRequirement":"raw-block",
             "guestPlatform":{"os":"linux","architecture":"amd64"},
             "minimumCapabilities":{"storageProfile":"opaque-raw-v1","bootAbi":"linux-direct-v1","liveRestore":false},
             "executionRequirements":null,"streams":streams.root.reference,"objects":objects.root.reference,"captureProvenance":null
         })).unwrap()).unwrap();
-        let mut records = vec![semantic, map, transfer.root, streams.root, objects.root];
+        payloads.push(PayloadRef {
+            media_type: PayloadMediaType::StreamMap,
+            digest: map.reference.digest,
+            size: map.reference.size,
+        });
+        let mut records = vec![semantic, transfer.root, streams.root, objects.root];
         records.extend(transfer.pages);
         records.extend(streams.pages);
         records.extend(objects.pages);
@@ -1088,15 +1113,12 @@ mod tests {
         different.size -= 1;
         conflicting.push(different);
         assert!(graph::encode_vm_graph(&config, &records, &conflicting).is_err());
-        let mut records = records;
-        let canonical_map = records
+        let missing_maps = payloads
             .iter()
-            .find(|record| record.bytes == br#"{"kind":"canonical-map"}"#)
-            .unwrap()
-            .reference
-            .digest;
-        records.retain(|record| record.reference.digest != canonical_map);
-        assert!(graph::encode_vm_graph(&config, &records, &payloads).is_err());
+            .copied()
+            .filter(|payload| payload.media_type != PayloadMediaType::StreamMap)
+            .collect::<Vec<_>>();
+        assert!(graph::encode_vm_graph(&config, &records, &missing_maps).is_err());
     }
     #[test]
     fn payload_manifest_partition_is_sorted_unique_and_bounded() {
@@ -1167,24 +1189,24 @@ mod tests {
     #[test]
     fn table_roots_and_pages_enforce_every_count_boundary() {
         let reference = wire::RecordRef::of_bytes(b"page");
-        assert!(graph::validate_table_root(1, "stream-table", "stream-table", 0, &[]).is_ok());
+        assert!(graph::validate_table_root(2, "stream-table", "stream-table", 0, &[]).is_ok());
         assert!(
-            graph::validate_table_root(1, "stream-table", "stream-table", 1, &[reference]).is_ok()
+            graph::validate_table_root(2, "stream-table", "stream-table", 1, &[reference]).is_ok()
         );
         for (schema, kind, count, pages) in [
-            (2, "stream-table", 1, vec![reference]),
-            (1, "wrong", 1, vec![reference]),
-            (1, "stream-table", 0, vec![reference]),
-            (1, "stream-table", 1, vec![]),
-            (1, "stream-table", 2, vec![reference, reference]),
-            (1, "stream-table", 1, vec![reference; MAX_PAGE_ENTRIES + 1]),
+            (1, "stream-table", 1, vec![reference]),
+            (2, "wrong", 1, vec![reference]),
+            (2, "stream-table", 0, vec![reference]),
+            (2, "stream-table", 1, vec![]),
+            (2, "stream-table", 2, vec![reference, reference]),
+            (2, "stream-table", 1, vec![reference; MAX_PAGE_ENTRIES + 1]),
         ] {
             assert!(
                 graph::validate_table_root(schema, kind, "stream-table", count, &pages).is_err()
             );
         }
         assert!(graph::validate_table_page(
-            1,
+            2,
             "object-table-page",
             "object-table-page",
             0,
@@ -1194,7 +1216,7 @@ mod tests {
         )
         .is_ok());
         assert!(graph::validate_table_page(
-            1,
+            2,
             "object-table-page",
             "object-table-page",
             0,
@@ -1211,7 +1233,7 @@ mod tests {
             (0, 1, 0, None),
         ] {
             assert!(graph::validate_table_page(
-                1,
+                2,
                 "object-table-page",
                 "object-table-page",
                 first,

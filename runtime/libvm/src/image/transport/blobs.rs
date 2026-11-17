@@ -36,6 +36,7 @@ const MAX_PAYLOAD_BYTES: u64 = max_payload_bytes();
 const fn max_payload_bytes() -> u64 {
     let media = [
         PayloadMediaType::Record,
+        PayloadMediaType::StreamMap,
         PayloadMediaType::RawChunk,
         PayloadMediaType::ZstdChunk,
         PayloadMediaType::Execution,
@@ -98,6 +99,10 @@ impl StagedBlobs {
                 .ensure_dir("sha256")?,
             publication: Some(Arc::new(pool)),
         })
+    }
+
+    pub(crate) fn directory(&self) -> &OwnedDirectory {
+        &self.directory
     }
 
     /// Diagnostic location of this directory; never reopened by path.
@@ -219,11 +224,6 @@ impl StagedBlobs {
             ));
         }
         Ok(bytes)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn directory(&self) -> &OwnedDirectory {
-        &self.directory
     }
 }
 

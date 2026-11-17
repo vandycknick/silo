@@ -29,7 +29,7 @@ pytestmark = pytest.mark.linux_only
 
 RAW_CHUNK = "application/vnd.silo.vm.chunk.v1"
 ZSTD_CHUNK = RAW_CHUNK + "+zstd"
-RECORD = "application/vnd.silo.vm.record.v1+json"
+RECORD = "application/vnd.silo.vm.record.v2+json"
 
 
 @pytest.fixture
@@ -109,7 +109,7 @@ def _graph(registry: DistributionRegistry, repository: str, index_digest: str) -
     index = client.manifest(repository, index_digest)
     assert index is not None and index.media_type == OCI_INDEX
     top = json.loads(index.body)
-    assert top["artifactType"] == "application/vnd.silo.vm.v1"
+    assert top["artifactType"] == "application/vnd.silo.vm.v2"
     assert 2 <= len(top["manifests"]) <= 4097
     reachable = {index_digest}
     payloads: dict[str, dict] = {}
@@ -121,19 +121,19 @@ def _graph(registry: DistributionRegistry, repository: str, index_digest: str) -
         reachable.add(child.digest)
         manifest = json.loads(child.body)
         expected_type = "metadata" if position == 0 else "payloads"
-        assert manifest["artifactType"] == f"application/vnd.silo.vm.{expected_type}.v1"
+        assert manifest["artifactType"] == f"application/vnd.silo.vm.{expected_type}.v2"
         assert len(manifest["layers"]) <= 4096
         for blob in [manifest["config"], *manifest["layers"]]:
             content = client.blob(repository, blob["digest"])
             assert content is not None and len(content) == blob["size"]
             reachable.add(blob["digest"])
-            if blob["mediaType"] == "application/vnd.silo.vm.config.v1+json":
+            if blob["mediaType"] == "application/vnd.silo.vm.config.v2+json":
                 assert position == 0 and config is None
                 config = json.loads(content)
             elif position > 0 and blob["mediaType"] != "application/vnd.oci.empty.v1+json":
                 assert blob["digest"] not in payloads, "payload descriptors must be unique across children"
                 payloads[blob["digest"]] = blob
-    assert config is not None and config["encoding"] == "silo-chunks-v1"
+    assert config is not None and config["encoding"] == "silo-chunks-v2"
     assert any(item["mediaType"] == RECORD for item in payloads.values())
     assert any(item["mediaType"] in {RAW_CHUNK, ZSTD_CHUNK} for item in payloads.values())
     return Graph(index_digest, config, payloads, frozenset(reachable))

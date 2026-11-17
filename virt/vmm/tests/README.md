@@ -78,7 +78,7 @@ unit-test harness. The worker is that same executable spawned with argv[0]
 | 25..28 | restore-only RAM, layout, execution and devices objects |
 | 29..31 | forbidden in normal workers (standalone-native endpoints only) |
 | 32 | monitor lifecycle stream, required in every normal worker |
-| 33 | restore-only complete canonical RAM map |
+| 33 | restore-only binary RAM stream root (`memory.root`) |
 | 34+ | restore-only VMDK descriptors and inherited extents, at most 16 + 1536 |
 
 The tests cover:
@@ -133,17 +133,19 @@ unless requested, rather than silently passing when assets or a hypervisor are a
 ## Capture verification ownership
 
 At `CaptureVerify`, native execution/RAM completion must already have closed
-all four output writers. RAM is never read back: the monitor resolves the
-worker's chunk digests and affected-chunk bitmap against the exact retained
-baseline map, then checks the prepared inode, layout and length. Full capture
-requires every chunk to be authoritative; incremental zero receipts replace
-dirty baseline chunks, including a short final chunk.
+all five output writers (execution, devices, RAM, layout and changes). RAM is
+never read back: the monitor streams the authenticated `memory.changes` records
+into the sparse Merkle codec against the exact retained baseline root, then
+checks the prepared inode, layout and length. Full coverage builds from an
+implicit zero root; incremental zero runs replace affected baseline units,
+including a short final unit. RAM identity units are 64 KiB.
 
-Sparse disk copies hash each 8 MiB logical chunk while copying, skip complete
-holes without reading, and publish `disks/<name>.map.json`. Clones retain a
-single chunk-authentication scan because no copy bytes traverse the monitor.
-RAM and disk inventory entries carry stream `identity`, never byte `sha256`;
-small state and complete map entries retain whole-file SHA-256.
+Sparse disk copies hash data-bearing 8 MiB identity units while copying, skip
+complete holes without reading, and publish `disks/<name>.root` with binary
+nodes in `map-nodes/<sha256 hex>`. Clones retain a single authentication scan
+because no copy bytes traverse the monitor. RAM and disk inventory entries
+carry stream `identity`, never byte `sha256`; state, roots and the change file
+retain whole-file SHA-256.
 
 Capture writes and closes files, maps and the coherent `vm.capture.json` record
 without file or directory durability barriers. There is no `cut` field or
@@ -151,17 +153,25 @@ durability mode. Coherence still requires all seven observed cut facts.
 Checkpoint pool publication owns durability; fork children retain their
 independent background barriers.
 
-The complete `memory.map.json` (wire role `ram-map`) and disk maps use ADR
-0014's canonical stream schema. The evidence bound includes a complete 1 TiB
-RAM chunk receipt in addition to its control metadata. Maps and bounded
-evidence remain charged against the pre-freeze staging reservation and the
-64 MiB state allowance. Retained and candidate maps have operation/run
-lifetimes, not a TTL; result release never discards the source's baseline.
+The binary `memory.root` (wire role `ram-map`) and disk roots use ADR 0014's
+canonical stream-map v2 codec. Evidence contains bounded change-file summaries,
+not per-unit digest lists. Root/node/change storage is charged separately from
+bounded control records and the state allowance. Retained and candidate roots
+have operation/run lifetimes, not a TTL; result release never discards the
+source's baseline or its shared nodes.
 
-Real-file module regressions cover stream identities independently recomputed
-from sparse disk source bytes, full/incremental RAM receipt assembly, private
-inodes, cancellation, layout/length failures, staged allocation accounting,
-canonical map inventory and write-once publication:
+The `native-live-api` command protocol is unchanged. Its capture command writes
+`memory.changes` and `memory.root` in addition to RAM, layout and state.
+`api-capture.json` keeps its harness schema and `ram_map` object identity,
+and reports `identity_chunk_bytes`, a bounded `changes` summary, and the
+absolute `map_node_store` directory. That immutable store is shared under
+the launch binding's `map-nodes/<sha256 hex>` and survives capture release.
+`guest-lifecycle-controller` command lines and output files are unchanged.
+
+Real-file module regressions cover identities independently recomputed from
+sparse disk bytes, full/incremental RAM change assembly, private inodes,
+cancellation, layout/length failures, staged allocation accounting,
+canonical root/node inventory and write-once publication:
 
 ```sh
 cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm live::coordinator::capture::tests::

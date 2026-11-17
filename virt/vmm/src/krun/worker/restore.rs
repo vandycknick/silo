@@ -477,6 +477,15 @@ pub(crate) mod tests {
         let run = id();
         let capture = id();
         let digest = Sha256Digest::of_bytes(b"state");
+        let map = vm_spec::stream_map::StreamRoot::empty(4096, vm_spec::stream_map::ChunkSize::RAM)
+            .unwrap();
+        let changes = vm_spec::capture::CaptureRamChanges {
+            byte_len: 16,
+            sha256: Sha256Digest::of_bytes(b"KRUNRAM\0\x01\0\x10\0\0\0\0\0"),
+            record_count: 0,
+            coverage: vm_spec::capture::CaptureRamCoverage::Full,
+            baseline_stream: None,
+        };
         let configuration = CaptureConfiguration {
             guest_os: None,
             cpus: 1,
@@ -493,11 +502,13 @@ pub(crate) mod tests {
             fd: 100 + index as i32,
             file_device: 1,
             file_inode: 100 + index as u64,
-            length: if index == 0 { 4096 } else { 5 },
-            identity: if index == 0 {
-                vm_spec::capture::StreamMap::new(4096, vec![Some(digest)])
-                    .unwrap()
-                    .id()
+            length: match index {
+                0 => 4096,
+                4 => 25,
+                _ => 5,
+            },
+            identity: if index == 0 || index == 4 {
+                map.id()
             } else {
                 digest
             },
@@ -505,7 +516,7 @@ pub(crate) mod tests {
         let evidence = CaptureEvidence {
             disk_stats: Vec::new(),
             disk_tracking_receipts: Vec::new(),
-            version: 1,
+            version: vm_spec::capture::CAPTURE_RECORD_VERSION,
             machine_id: machine.clone(),
             run_id: run.clone(),
             capture_id: capture.clone(),
@@ -540,12 +551,12 @@ pub(crate) mod tests {
                 mode: vm_spec::lifecycle::CapturePolicy::Full,
                 baseline: None,
                 full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
-                dirty_chunks: vm_spec::capture::full_dirty_chunks(4096).unwrap(),
-                chunk_digests: vec![Some(digest)],
+                identity_chunk_bytes: 1 << 16,
+                changes: changes.clone(),
                 stats: vm_spec::capture::CaptureMemoryStats {
                     logical_bytes: 4096,
                     whole_file_bytes_hashed: 0,
-                    identity_bytes_hashed: 4096,
+                    identity_bytes_hashed: 0,
                     ..Default::default()
                 },
             }),
@@ -557,6 +568,12 @@ pub(crate) mod tests {
                     sha256: (object.role != RestoreObjectRole::Ram).then_some(object.identity),
                     identity: (object.role == RestoreObjectRole::Ram).then_some(object.identity),
                 })
+                .chain(std::iter::once(CaptureInventoryEntry {
+                    role: vm_spec::capture::CaptureRole::RamChanges,
+                    length: changes.byte_len,
+                    sha256: Some(changes.sha256),
+                    identity: None,
+                }))
                 .collect(),
             started_at_unix_ms: 1,
             completed_at_unix_ms: 2,
@@ -572,7 +589,8 @@ pub(crate) mod tests {
         };
         let request = RestoreRequest {
             disk_tracking_seeds: Vec::new(),
-            version: 1,
+            map_node_store: None,
+            version: vm_spec::restore::RESTORE_REQUEST_VERSION,
             checkpoint: digest,
             activation_id: id(),
             freeze_operation_id: capture,
@@ -585,20 +603,62 @@ pub(crate) mod tests {
             hook: None,
             ssh_trusted_ca: None,
         };
+        request.evidence.validate().unwrap();
         request.validate().unwrap();
         request
     }
 
     pub(crate) fn launch(directory: &std::path::Path) -> crate::virt::RestoreLaunch {
         let mut request = request();
-        let map =
-            vm_spec::capture::StreamMap::new(4096, vec![Some(Sha256Digest::of_bytes(&[1; 4096]))])
-                .unwrap();
+        let nodes = directory.join("map-nodes");
+        std::fs::create_dir(&nodes).unwrap();
+        struct FixtureNodes(std::path::PathBuf);
+        impl vm_spec::stream_map::NodeSink for FixtureNodes {
+            fn write_node(
+                &mut self,
+                bytes: &[u8],
+            ) -> Result<Sha256Digest, vm_spec::stream_map::MapError> {
+                let digest = Sha256Digest::of_bytes(bytes);
+                let spelling = digest.to_string();
+                std::fs::write(self.0.join(&spelling[7..]), bytes)?;
+                Ok(digest)
+            }
+        }
+        let map = vm_spec::stream_map::build_sorted(
+            4096,
+            vm_spec::stream_map::ChunkSize::RAM,
+            [Ok(vm_spec::stream_map::PresentChunk {
+                index: 0,
+                digest: Sha256Digest::of_bytes(&[1; 4096]),
+            })],
+            &mut FixtureNodes(nodes.clone()),
+        )
+        .unwrap();
+        request.map_node_store = Some(nodes.to_str().unwrap().to_owned());
         let map_bytes = map.canonical_bytes().unwrap();
         request.objects[4].length = map_bytes.len() as u64;
         request.evidence.inventory[4].length = map_bytes.len() as u64;
         request.evidence.memory.as_mut().unwrap().ram_stream = map.id();
-        request.evidence.memory.as_mut().unwrap().chunk_digests = map.chunks().to_vec();
+        request
+            .evidence
+            .memory
+            .as_mut()
+            .unwrap()
+            .stats
+            .identity_bytes_hashed = 4096;
+        let mut change_bytes = b"KRUNRAM\0\x01\0\x10\0\0\0\0\0".to_vec();
+        let mut record = [0; 56];
+        record[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        record[16] = 1;
+        record[24..].copy_from_slice(Sha256Digest::of_bytes(&[1; 4096]).as_bytes());
+        change_bytes.extend_from_slice(&record);
+        std::fs::write(directory.join("memory.changes"), &change_bytes).unwrap();
+        let changes = &mut request.evidence.memory.as_mut().unwrap().changes;
+        changes.byte_len = change_bytes.len() as u64;
+        changes.sha256 = Sha256Digest::of_bytes(&change_bytes);
+        changes.record_count = 1;
+        request.evidence.inventory[5].length = changes.byte_len;
+        request.evidence.inventory[5].sha256 = Some(changes.sha256);
         let objects = std::array::from_fn(|index| {
             let path = directory.join(format!("restore-object-{index}"));
             let bytes = if index == 4 {
@@ -622,6 +682,7 @@ pub(crate) mod tests {
             }
             file
         });
+        request.evidence.validate().unwrap();
         request.validate().unwrap();
         crate::virt::RestoreLaunch {
             request,
@@ -642,6 +703,68 @@ pub(crate) mod tests {
             restore: Some(request),
             ..KrunConfig::default()
         }
+    }
+
+    #[test]
+    fn restore_fixture_seals_bind_real_roots_and_change_statistics() {
+        use vm_spec::stream_map::{
+            Chunk, ChunkSize, MapError, NodeSource, StreamRoot, MAX_NODE_BYTES,
+        };
+
+        let empty = request();
+        empty.evidence.validate().unwrap();
+        let empty_memory = empty.evidence.memory.as_ref().unwrap();
+        assert_eq!(empty_memory.stats.identity_bytes_hashed, 0);
+        assert_eq!(empty_memory.changes.record_count, 0);
+        assert_eq!(
+            empty_memory.ram_stream,
+            StreamRoot::empty(4096, ChunkSize::RAM).unwrap().id(),
+        );
+        let directory =
+            std::env::temp_dir().join(format!("restore-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let launch = launch(&directory);
+        launch.request.evidence.validate().unwrap();
+        let memory = launch.request.evidence.memory.as_ref().unwrap();
+        let bytes = std::fs::read(directory.join("restore-object-0")).unwrap();
+        let root = StreamRoot::decode(&std::fs::read(directory.join("restore-object-4")).unwrap())
+            .unwrap();
+        assert_eq!(root.id(), memory.ram_stream);
+        struct Nodes(std::path::PathBuf);
+        impl NodeSource for Nodes {
+            fn read_node(
+                &mut self,
+                digest: Sha256Digest,
+                output: &mut [u8; MAX_NODE_BYTES],
+            ) -> Result<usize, MapError> {
+                let bytes = std::fs::read(self.0.join(&digest.to_string()[7..]))?;
+                assert!(bytes.len() <= output.len());
+                output[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+        }
+        let value = root
+            .lookup(0, &mut Nodes(directory.join("map-nodes")))
+            .unwrap();
+        assert_eq!(value, Chunk::Data(Sha256Digest::of_bytes(&bytes)));
+        root.verify_chunk(0, value, &bytes).unwrap();
+        assert_eq!(memory.stats.identity_bytes_hashed, bytes.len() as u64);
+        let changes = vm_spec::capture::RamChangeReader::new(
+            File::open(directory.join("memory.changes")).unwrap(),
+            bytes.len() as u64,
+            &memory.changes,
+        )
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+        assert_eq!(
+            changes,
+            vec![vm_spec::capture::CaptureRamChange::Data {
+                index: 0,
+                digest: Sha256Digest::of_bytes(&bytes),
+            }]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
