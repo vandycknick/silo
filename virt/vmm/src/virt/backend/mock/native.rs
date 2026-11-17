@@ -5,10 +5,10 @@
 //! operations, one opaque run-bound token per pause generation carrying its
 //! owner, explicit cancellation through rollback, ClockOnly release whose
 //! acknowledgement arrives separately, and whole-machine capture with real
-//! files: execution/device outputs and the full RAM image are written to the
-//! actual descriptors and closed before every terminal reply, except that a
-//! failed RAM write keeps its files until abandonment, like native error
-//! objects. Failures and latencies are scripted by
+//! files: execution/device outputs, the full RAM image and native change file
+//! are written to the actual descriptors and closed before every terminal
+//! reply, except that a failed RAM write keeps its files until abandonment,
+//! like native error objects. Failures and latencies are scripted by
 //! [`test_utils::LifecycleScenario`]. The worker lifecycle server runs over it
 //! unchanged, so its linearization, ownership and recovery logic is exercised
 //! here.
@@ -121,7 +121,7 @@ struct Capture {
     execution: ExecutionCapture<ScenarioCapture>,
     memory: Option<MemoryCapture>,
     /// A failed RAM write owns its outputs until abandonment.
-    retained: Option<(File, File)>,
+    retained: Option<(File, File, File)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,15 +495,18 @@ fn receipt(file: &File) -> Result<OutputReceipt, NativeFailure> {
     })
 }
 
-/// Deterministic guest RAM content, written in bounded chunks.
+/// Deterministic guest RAM and the native full-coverage change stream.
 fn write_ram(
     file: &File,
+    changes: &File,
     length: u64,
-) -> Result<Vec<Option<vm_spec::capture::Sha256Digest>>, NativeFailure> {
-    use vm_spec::capture::{is_all_zero, Sha256Digest, STREAM_CHUNK_BYTES};
-    let mut digests = Vec::with_capacity(length.div_ceil(STREAM_CHUNK_BYTES) as usize);
-    let mut hasher = sha2::Sha256::new();
-    let mut zero = true;
+) -> Result<vm_spec::capture::CaptureRamChanges, NativeFailure> {
+    use vm_spec::capture::{is_all_zero, CaptureRamChanges, CaptureRamCoverage, Sha256Digest};
+    let header = *b"KRUNRAM\0\x01\0\x10\0\0\0\0\0";
+    write_all_at(changes, &header, 0)?;
+    let mut change_hasher = sha2::Sha256::new();
+    change_hasher.update(header);
+    let mut record_count = 0;
     let mut chunk = vec![0_u8; WRITE_CHUNK];
     let mut offset = 0;
     while offset < length {
@@ -514,16 +517,25 @@ fn write_ram(
             *byte = (page % 251) as u8 ^ (index as u8);
         }
         write_all_at(file, &chunk[..count], offset)?;
-        hasher.update(&chunk[..count]);
-        zero &= is_all_zero(&chunk[..count]);
-        offset += count as u64;
-        if offset % STREAM_CHUNK_BYTES == 0 || offset == length {
-            let digest = hasher.finalize_reset().into();
-            digests.push((!zero).then(|| Sha256Digest::from_bytes(digest)));
-            zero = true;
+        if !is_all_zero(&chunk[..count]) {
+            let mut record = [0_u8; 56];
+            record[..8].copy_from_slice(&(offset / WRITE_CHUNK as u64).to_le_bytes());
+            record[8..16].copy_from_slice(&1_u64.to_le_bytes());
+            record[16] = 1;
+            record[24..].copy_from_slice(&sha2::Sha256::digest(&chunk[..count]));
+            write_all_at(changes, &record, 16 + record_count * 56)?;
+            change_hasher.update(record);
+            record_count += 1;
         }
+        offset += count as u64;
     }
-    Ok(digests)
+    Ok(CaptureRamChanges {
+        byte_len: 16 + record_count * 56,
+        sha256: Sha256Digest::from_bytes(change_hasher.finalize().into()),
+        record_count,
+        coverage: CaptureRamCoverage::Full,
+        baseline_stream: None,
+    })
 }
 
 impl NativeLifecycle for ScenarioNative {
@@ -1016,6 +1028,7 @@ impl NativeLifecycle for ScenarioNative {
         capture: &ScenarioCapture,
         ram: File,
         layout: File,
+        changes: File,
         _preparation: &crate::virt::lifecycle::CapturePreparation,
         operation: NativeOperation,
         deadline: Instant,
@@ -1024,8 +1037,16 @@ impl NativeLifecycle for ScenarioNative {
         if self.capture(&mut model, capture)?.state != CaptureState::ExecutionComplete {
             return Err(NativeFailure::new(NativeFailureKind::Busy));
         }
-        let identities = [empty_output(&ram)?, empty_output(&layout)?];
-        if identities[0] == identities[1] {
+        let identities = [
+            empty_output(&ram)?,
+            empty_output(&layout)?,
+            empty_output(&changes)?,
+        ];
+        if identities
+            .iter()
+            .enumerate()
+            .any(|(index, id)| identities[..index].contains(id))
+        {
             return Err(participant("RAM outputs alias"));
         }
         reserve(&mut model, operation)?;
@@ -1038,32 +1059,37 @@ impl NativeLifecycle for ScenarioNative {
         let length = self.ram_bytes();
         let layout_bytes = self.layout_bytes();
         if step.result == NativeCaptureResult::Fail {
-            // A partial image: the failure retains both writers.
-            let partial = write_ram(&ram, (length / 2).max(PAGE).min(length));
+            // A partial image: the failure retains all three writers.
+            let partial = write_ram(&ram, &changes, (length / 2).max(PAGE).min(length));
             let failure = match partial {
                 Ok(_) => participant("scripted RAM image write failure (ENOSPC)"),
                 Err(failure) => failure,
             };
             let entry = self.capture(&mut model, capture)?;
             entry.state = CaptureState::Failed(CaptureStage::Memory, failure.clone());
-            entry.retained = Some((ram, layout));
+            entry.retained = Some((ram, layout, changes));
             return Err(failure);
         }
-        let written = write_ram(&ram, length).and_then(|chunk_digests| {
+        let written = write_ram(&ram, &changes, length).and_then(|summary| {
             write_all_at(&layout, &layout_bytes, 0)?;
-            Ok((receipt(&ram)?, receipt(&layout)?, chunk_digests))
+            Ok((
+                receipt(&ram)?,
+                receipt(&layout)?,
+                receipt(&changes)?,
+                summary,
+            ))
         });
-        let (ram_receipt, layout_receipt, chunk_digests) = match written {
+        let (ram_receipt, layout_receipt, changes_output, changes_summary) = match written {
             Ok(receipts) => receipts,
             Err(failure) => {
                 let entry = self.capture(&mut model, capture)?;
                 entry.state = CaptureState::Failed(CaptureStage::Memory, failure.clone());
-                entry.retained = Some((ram, layout));
+                entry.retained = Some((ram, layout, changes));
                 return Err(failure);
             }
         };
-        // Completion follows closure of both RAM outputs.
-        drop((ram, layout));
+        // Completion follows closure of all three RAM outputs.
+        drop((ram, layout, changes));
         model.memory_generation += 1;
         let memory_generation = model.memory_generation;
         let entry = self.capture(&mut model, capture)?;
@@ -1076,9 +1102,9 @@ impl NativeLifecycle for ScenarioNative {
             mode: vm_spec::lifecycle::CapturePolicy::Full,
             baseline: None,
             full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
-            dirty_chunks: vm_spec::capture::full_dirty_chunks(length)
-                .map_err(|error| participant(&error))?,
-            chunk_digests,
+            identity_chunk_bytes: WRITE_CHUNK as u32,
+            changes: changes_summary,
+            changes_output,
             stats: Box::new(vm_spec::capture::CaptureMemoryStats {
                 logical_bytes: length,
                 live_bytes_read: length,
@@ -1311,4 +1337,64 @@ fn receipt_of(file: &File) -> Result<OutputReceipt, NativeFailure> {
         inode: metadata.ino(),
         length: metadata.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::virt::backend::mock::native::write_ram;
+    use std::fs::File;
+    use std::os::unix::fs::OpenOptionsExt;
+    use vm_spec::capture::{CaptureRamChange, RamChangeReader, Sha256Digest};
+
+    #[test]
+    fn synthetic_ram_changes_match_native_reader_and_independent_hashes() {
+        let directory =
+            std::env::temp_dir().join(format!("scenario-changes-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        for length in [0, 1, 4096, 65536, 65536 + 4096] {
+            let open = |role: &str| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.join(format!("{length}-{role}")))
+                    .unwrap()
+            };
+            let ram = open("ram");
+            let changes = open("changes");
+            let summary = write_ram(&ram, &changes, length).unwrap();
+            drop((ram, changes));
+            let bytes = std::fs::read(directory.join(format!("{length}-changes"))).unwrap();
+            assert_eq!(&bytes[..16], b"KRUNRAM\0\x01\0\x10\0\0\0\0\0");
+            assert_eq!(bytes.len() as u64, summary.byte_len);
+            assert_eq!(Sha256Digest::of_bytes(&bytes), summary.sha256);
+            if length == 0 {
+                assert_eq!(summary.record_count, 0);
+                continue;
+            }
+            let actual = RamChangeReader::new(
+                File::open(directory.join(format!("{length}-changes"))).unwrap(),
+                length,
+                &summary,
+            )
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+            let memory = std::fs::read(directory.join(format!("{length}-ram"))).unwrap();
+            assert_eq!(memory.len() as u64, length);
+            let expected: Vec<_> = memory
+                .chunks(65536)
+                .enumerate()
+                .filter(|(_, bytes)| bytes.iter().any(|byte| *byte != 0))
+                .map(|(index, bytes)| CaptureRamChange::Data {
+                    index: index as u64,
+                    digest: Sha256Digest::of_bytes(bytes),
+                })
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(summary.record_count, actual.len() as u64);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

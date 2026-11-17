@@ -99,15 +99,19 @@ fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
         mode: policy_to_wire(value.mode),
         baseline: value.baseline.as_ref().map(ToString::to_string),
         full_reason: value.full_reason.map(full_reason_to_wire),
-        dirty_chunks: value.dirty_chunks.clone(),
-        chunk_digests: value
-            .chunk_digests
-            .iter()
-            .map(|digest| match digest {
-                Some(digest) => digest.as_bytes().to_vec(),
-                None => Vec::new(),
-            })
-            .collect(),
+        identity_chunk_bytes: value.identity_chunk_bytes,
+        changes: Some(w::CaptureRamChanges {
+            byte_len: value.changes.byte_len,
+            sha256: value.changes.sha256.to_string(),
+            record_count: value.changes.record_count,
+            coverage: match value.changes.coverage {
+                vm_spec::capture::CaptureRamCoverage::Full => w::CaptureRamCoverage::Full,
+                vm_spec::capture::CaptureRamCoverage::Incremental => {
+                    w::CaptureRamCoverage::Incremental
+                }
+            } as i32,
+            baseline_stream: value.changes.baseline_stream.map(|value| value.to_string()),
+        }),
         stats: Some(w::CaptureMemoryStats {
             seed_method: seed_method_to_wire(stats.seed_method),
             logical_bytes: stats.logical_bytes,
@@ -141,6 +145,7 @@ fn memory_from_wire(
 ) -> Result<CaptureMemoryEvidence, ConversionError> {
     let binding = required(value.binding, "capture.memory.binding")?;
     let stats = required(value.stats, "capture.memory.stats")?;
+    let changes = required(value.changes, "capture.memory.changes")?;
     let memory = CaptureMemoryEvidence {
         packed_length: value.packed_length,
         page_granule: value.page_granule,
@@ -169,23 +174,28 @@ fn memory_from_wire(
             .map(|value| digest(value, "capture.memory.baseline"))
             .transpose()?,
         full_reason: value.full_reason.map(full_reason_from_wire).transpose()?,
-        dirty_chunks: value.dirty_chunks,
-        chunk_digests: value
-            .chunk_digests
-            .into_iter()
-            .map(|bytes| {
-                if bytes.is_empty() {
-                    return Ok(None);
+        identity_chunk_bytes: value.identity_chunk_bytes,
+        changes: vm_spec::capture::CaptureRamChanges {
+            byte_len: changes.byte_len,
+            sha256: digest(changes.sha256, "capture.memory.changes.sha256")?,
+            record_count: changes.record_count,
+            coverage: match w::CaptureRamCoverage::try_from(changes.coverage) {
+                Ok(w::CaptureRamCoverage::Full) => vm_spec::capture::CaptureRamCoverage::Full,
+                Ok(w::CaptureRamCoverage::Incremental) => {
+                    vm_spec::capture::CaptureRamCoverage::Incremental
                 }
-                let digest: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                    invalid(
-                        "capture.memory.chunk_digests",
-                        "expected an empty entry or exactly 32 digest bytes",
-                    )
-                })?;
-                Ok(Some(Sha256Digest::from_bytes(digest)))
-            })
-            .collect::<Result<Vec<_>, ConversionError>>()?,
+                _ => {
+                    return Err(invalid(
+                        "capture.memory.changes.coverage",
+                        "unknown or unspecified coverage",
+                    ))
+                }
+            },
+            baseline_stream: changes
+                .baseline_stream
+                .map(|value| digest(value, "capture.memory.changes.baseline_stream"))
+                .transpose()?,
+        },
         stats: CaptureMemoryStats {
             seed_method: seed_method_from_wire(stats.seed_method)?,
             logical_bytes: stats.logical_bytes,
@@ -518,29 +528,24 @@ mod tests {
             retained: true,
             aliases: vec!["checkpoint".into()],
             created_at: 1,
+            streams: Vec::new(),
         }
     }
 
     fn memory() -> vm_spec::capture::CaptureMemoryEvidence {
         let digest: vm_spec::capture::Sha256Digest =
             format!("sha256:{}", "d".repeat(64)).parse().unwrap();
-        let length = 3 * vm_spec::capture::STREAM_CHUNK_BYTES;
-        let chunk_digests = vec![
-            Some(digest),
-            None,
-            Some(vm_spec::capture::Sha256Digest::of_bytes(b"last chunk")),
-        ];
-        let mut identity = vm_spec::capture::StreamIdentity::new();
-        for chunk in &chunk_digests {
-            identity
-                .push_digest(vm_spec::capture::STREAM_CHUNK_BYTES, *chunk)
-                .unwrap();
-        }
+        let length = 3 * 65_536;
         vm_spec::capture::CaptureMemoryEvidence {
             packed_length: length,
             page_granule: 4096,
             regions: 1,
-            ram_stream: identity.finish(),
+            ram_stream: vm_spec::stream_map::StreamRoot::empty(
+                length,
+                vm_spec::stream_map::ChunkSize::RAM,
+            )
+            .unwrap()
+            .id(),
             binding: vm_spec::capture::CaptureStateBinding {
                 live_state_schema: "silo.live-state/1".into(),
                 architecture: "x86_64".into(),
@@ -554,13 +559,20 @@ mod tests {
             mode: vm_spec::lifecycle::CapturePolicy::Full,
             baseline: None,
             full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
-            dirty_chunks: vec![7],
-            chunk_digests,
+            identity_chunk_bytes: 65_536,
+            changes: vm_spec::capture::CaptureRamChanges {
+                byte_len: 16,
+                sha256: vm_spec::capture::Sha256Digest::of_bytes(b"KRUNRAM\0\x01\0\x10\0\0\0\0\0"),
+                record_count: 0,
+                coverage: vm_spec::capture::CaptureRamCoverage::Full,
+                baseline_stream: None,
+            },
             stats: vm_spec::capture::CaptureMemoryStats {
                 logical_bytes: length,
                 live_bytes_read: length,
-                full_bytes_written: length,
-                identity_bytes_hashed: length,
+                full_bytes_written: 0,
+                zero_bytes_omitted: length,
+                identity_bytes_hashed: 0,
                 whole_file_bytes_hashed: 0,
                 ..Default::default()
             },
@@ -657,8 +669,8 @@ mod tests {
                 1 => memory.full_reason = Some(w::CaptureFullReason::Unspecified as i32),
                 2 => memory.full_reason = None,
                 3 => memory.baseline = Some(memory.ram_stream.clone()),
-                4 => memory.dirty_chunks = vec![0],
-                5 => memory.dirty_chunks = vec![3],
+                4 => memory.identity_chunk_bytes = 8 * 1024 * 1024,
+                5 => memory.changes = None,
                 6 => memory.stats.as_mut().unwrap().logical_bytes -= 1,
                 7 => memory.stats.as_mut().unwrap().identity_bytes_hashed += 1,
                 8 => memory.binding.as_mut().unwrap().source_run = MACHINE.into(),
@@ -683,83 +695,47 @@ mod tests {
     }
 
     #[test]
-    fn memory_chunk_digests_round_trip_mixed_entries_and_reject_wrong_widths() {
-        let value = live();
+    fn memory_change_reference_round_trips_without_per_chunk_entries() {
+        use prost::Message;
+        let mut value = live();
         let wire = live_snapshot_to_wire(&value).unwrap();
-        let chunks = &wire
-            .capture
-            .as_ref()
-            .unwrap()
-            .memory
-            .as_ref()
-            .unwrap()
-            .chunk_digests;
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(
-            chunks[0].as_slice(),
-            value.capture.memory.chunk_digests[0].unwrap().as_bytes()
-        );
-        assert!(chunks[1].is_empty());
-        assert_eq!(
-            chunks[2].as_slice(),
-            value.capture.memory.chunk_digests[2].unwrap().as_bytes()
-        );
-        assert_eq!(live_snapshot_from_wire(wire.clone()).unwrap(), value);
-        for length in [1, 31, 33, 64] {
+        let encoded = wire.encode_to_vec();
+        assert!(encoded.len() < 4096);
+        let decoded = w::LiveSnapshotInfo::decode(encoded.as_slice()).unwrap();
+        assert_eq!(live_snapshot_from_wire(decoded).unwrap(), value);
+        for case in 0..5 {
             let mut invalid = wire.clone();
-            invalid
+            let changes = invalid
                 .capture
                 .as_mut()
                 .unwrap()
                 .memory
                 .as_mut()
                 .unwrap()
-                .chunk_digests[1] = vec![0x51; length];
-            assert!(
-                live_snapshot_from_wire(invalid).is_err(),
-                "digest width {length}"
-            );
+                .changes
+                .as_mut()
+                .unwrap();
+            match case {
+                0 => changes.coverage = 0,
+                1 => changes.sha256 = "invalid".into(),
+                2 => changes.byte_len = 15,
+                3 => changes.record_count = 1,
+                4 => changes.baseline_stream = Some("invalid".into()),
+                _ => unreachable!(),
+            }
+            assert!(live_snapshot_from_wire(invalid).is_err(), "case {case}");
         }
-        let mut missing = wire;
-        missing
-            .capture
-            .as_mut()
-            .unwrap()
-            .memory
-            .as_mut()
-            .unwrap()
-            .chunk_digests
-            .pop();
-        assert!(
-            live_snapshot_from_wire(missing).is_err(),
-            "chunk count is part of the receipt"
-        );
-    }
-
-    #[test]
-    fn incremental_receipt_preserves_unaffected_chunk_digest_entries() {
-        let mut value = live();
         let memory = &mut value.capture.memory;
         memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
-        memory.baseline = Some(vm_spec::capture::Sha256Digest::of_bytes(
-            b"retained baseline",
-        ));
+        memory.baseline = Some(vm_spec::capture::Sha256Digest::of_bytes(b"baseline"));
         memory.full_reason = None;
-        memory.dirty_chunks = vec![0b101];
+        memory.changes.coverage = vm_spec::capture::CaptureRamCoverage::Incremental;
+        memory.changes.baseline_stream = memory.baseline;
         memory.stats.full_bytes_written = 0;
-        memory.stats.overlay_bytes_written = 2 * vm_spec::capture::STREAM_CHUNK_BYTES;
-        memory.stats.identity_bytes_hashed = 2 * vm_spec::capture::STREAM_CHUNK_BYTES;
-        memory.validate_capture().unwrap();
+        memory.stats.live_bytes_read = 0;
+        memory.stats.identity_bytes_hashed = 0;
+        memory.stats.zero_bytes_omitted = 0;
         let wire = live_snapshot_to_wire(&value).unwrap();
-        assert!(wire
-            .capture
-            .as_ref()
-            .unwrap()
-            .memory
-            .as_ref()
-            .unwrap()
-            .chunk_digests[1]
-            .is_empty());
         assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
     }
 
@@ -938,9 +914,13 @@ mod tests {
             memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
             memory.baseline = Some(vm_spec::capture::Sha256Digest::of_bytes(b"baseline"));
             memory.full_reason = None;
+            memory.changes.coverage = vm_spec::capture::CaptureRamCoverage::Incremental;
+            memory.changes.baseline_stream = memory.baseline;
             memory.stats.seed_method = method;
             memory.stats.full_bytes_written = 0;
-            memory.stats.overlay_bytes_written = 4096;
+            memory.stats.overlay_bytes_written = 0;
+            memory.stats.live_bytes_read = 0;
+            memory.stats.zero_bytes_omitted = 0;
             let wire = live_snapshot_to_wire(&value).unwrap();
             assert_eq!(
                 wire.capture

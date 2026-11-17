@@ -8,7 +8,7 @@ use crate::capture::{
 };
 use crate::lifecycle::LiveId;
 
-pub const RESTORE_REQUEST_VERSION: u32 = 1;
+pub const RESTORE_REQUEST_VERSION: u32 = 2;
 pub const GENERATION_ACK_TIMEOUT_MS: u64 = 5_000;
 pub const ACTIVATE_TIMEOUT_MS: u64 = 30_000;
 pub const RESTORE_INSPECTION_VERSION: u32 = 1;
@@ -136,7 +136,7 @@ impl RestoreObjectRole {
             Self::Layout => 64 << 10,
             Self::Execution => 16 << 20,
             Self::Devices => 32 << 20,
-            Self::RamMap => crate::capture::MAX_RAM_MAP_BYTES as u64,
+            Self::RamMap => crate::stream_map::MAX_ROOT_BYTES as u64,
         }
     }
 }
@@ -216,6 +216,8 @@ pub struct RestoreRequest {
     pub configuration: CaptureConfiguration,
     pub evidence: CaptureEvidence,
     pub disk_tracking_seeds: Vec<crate::capture::DiskTrackingSeed>,
+    #[serde(deserialize_with = "crate::capture::required")]
+    pub map_node_store: Option<String>,
     /// Exactly RAM, layout, execution, devices, complete RAM map, in that order.
     pub objects: [RestoreObject; 5],
     pub lowers: Vec<RestoreLower>,
@@ -229,6 +231,13 @@ impl RestoreRequest {
     pub fn validate(&self) -> Result<(), String> {
         if self.version != RESTORE_REQUEST_VERSION || !self.start_paused {
             return Err("restore requires the current schema and startPaused=true".into());
+        }
+        if self
+            .map_node_store
+            .as_ref()
+            .is_some_and(|path| path.len() > 4096 || !std::path::Path::new(path).is_absolute())
+        {
+            return Err("restore map node store path must be bounded and absolute".into());
         }
         self.configuration.validate()?;
         validate_disk_tracking_seeds(&self.disk_tracking_seeds, &self.configuration)?;
@@ -759,6 +768,8 @@ mod tests {
         use crate::{BlockId, DiskFormat, DiskGeometry, DiskRole};
         let seed = DiskTrackingSeed {
             version: DISK_TRACKING_VERSION,
+            map_format: 2,
+            chunk_shift: 23,
             role: DiskRole::Root,
             attachment_index: 0,
             block_id: BlockId::new("root").unwrap(),
@@ -810,10 +821,18 @@ mod tests {
         let bytes = seeds.canonical_bytes().unwrap();
         assert_eq!(RestoreDiskTrackingSeeds::decode(&bytes).unwrap(), seeds);
         let json = String::from_utf8(bytes).unwrap();
+        let mut duplicate_destination = seeds.clone();
+        duplicate_destination.seeds.push(seeds.seeds[0].clone());
         for invalid in [
             format!("{json}\n"),
-            json.replacen("\"version\":1", "\"version\":1,\"unexpected\":0", 1),
+            json.replacen('{', "{\"unexpected\":0,", 1),
+            json.replace(",\"mapFormat\":2", ""),
+            json.replace("\"mapFormat\":2", "\"mapFormat\":1"),
+            json.replace(",\"chunkShift\":23", ""),
+            json.replace("\"chunkShift\":23", "\"chunkShift\":16"),
+            serde_json::to_string(&duplicate_destination).unwrap(),
         ] {
+            assert_ne!(invalid, json, "negative case must change the valid input");
             assert!(RestoreDiskTrackingSeeds::decode(invalid.as_bytes()).is_err());
         }
         for mutation in 0..8 {

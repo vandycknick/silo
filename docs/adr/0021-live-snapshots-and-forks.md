@@ -2,7 +2,7 @@
 
 Date: 2026-10-25
 
-Updated: 2026-11-15
+Updated: 2026-11-16
 
 ## Status
 
@@ -95,8 +95,8 @@ the eligible reflink lane. Freshly formatted disks have no baseline at create;
 their first snapshot hashes written disk data once and seeds later captures in
 the same run.
 Every ended run invalidates its baseline; clean-stop sealing and deterministic
-upper templates remain planned stage 2. Flat-map metadata work still prevents
-claiming the complete configured-size scaling contract.
+upper templates remain planned stage 2. Stream-map v2 now replaces flat-map
+metadata; remaining runtime costs still require measured scaling qualification.
 
 ## The Problem
 
@@ -217,8 +217,8 @@ libkrun backend**, built from five commitments:
   checkpoint's memory is one complete sparse RAM image with a separate layout
   record. Every durable restore maps it `MAP_PRIVATE` from a read-only descriptor, so
   children share clean pages through the page cache and own only the pages
-  they write. Incremental captures chain through complete resolved chunk maps,
-  never through a replayed delta chain at restore.
+  they write. Incremental captures publish complete sparse Merkle roots,
+  never a replayed delta chain at restore.
 - **Fail-closed activation.** A restored guest does not run its workload or
   expose an endpoint until the kernel has acknowledged a fresh VM generation
   identity, the agent has bound the new run, destination networking is
@@ -585,7 +585,7 @@ A capture runs in this order; each step completes before the next begins:
 4. **Capture memory.** Full, or incremental against a valid baseline. The
    worker freezes host writers, harvests dirty coverage, and pipelines RAM reads
    through bounded 32 MiB packs to two hash/write workers (96 MiB pack scratch).
-   Identity remains the ordered 8 MiB chunk map. Eligible private anonymous boot
+   Identity uses the fixed-depth sparse Merkle map with 64 KiB RAM units.
    RAM uses cut-bound pagemap metadata to skip known-zero pages; all other
    backing and metadata fallbacks read in full, as specified under Memory Model.
    Workers join before return, including on cancellation or failure.
@@ -875,28 +875,38 @@ separately qualified; their inclusion or fallback is not a qualification claim.
 
 ### Identity and chains
 
-RAM is a logical stream under [ADR 0014](0014-layered-oci-image-storage.md)'s `stream` identity: 8 MiB decoded
-chunks, `zero` only for an entirely zero chunk. The stream's identity is the
-SHA-256 of its ordered chunk-digest list with the stream length, computed
-from the chunk map; it is not the SHA-256 of the file's bytes. An all-zero
-chunk uses the format's `zero` marker, never a stored or freshly hashed zero
-payload. Hashing a sparse RAM image costs its nonzero data chunks only, and an
-incremental capture hashes only affected nonzero chunks.
-A transported artifact blob additionally records the whole-file SHA-256 of the
-bytes it transports, computed at export, never on the pause path. The
-layout record is identified separately and binds the stream to its
-guest-physical geometry; identical bytes at different addresses are different
-memory.
+RAM uses [ADR 0014](0014-layered-oci-image-storage.md#stream-identity)'s binary
+stream-map v2 with **64 KiB** decoded identity units. Its root authenticates
+exact packed length and unit size, not a flat digest list or whole-file SHA.
+All-zero units are absent; mixed units hash their exact bytes, including
+interior zeros, and tails are never padded. The separately hashed layout maps
+packed offsets to guest addresses.
 
-An incremental checkpoint is published with a complete resolved chunk map that
-reuses unchanged chunk identities from its predecessor. The parent is lineage,
-not a dependency to replay. Capture produces one complete immutable RAM file,
-using a retained-baseline reflink plus dirty overlays where supported, without
-work proportional to configured RAM. That complete file is the restore mapping
-target. A changed page costs a rehash of its 8 MiB identity chunk unless the
-whole chunk becomes zero; this is accepted hash and transfer amplification,
-not the dirty-tracking granule. Explicit zero ranges within a nonzero chunk
-remain part of that chunk's logical bytes.
+Native capture writes `memory.changes` through an owned descriptor alongside
+RAM and layout. Every file, including an empty update, has a 16-byte header:
+`KRUNRAM\\0`, little-endian version u16=1, shift u8=16, coverage u8
+(0 full, 1 incremental), and four reserved zero bytes. Each 56-byte record is
+first index u64, count u64, kind u8 (0 zero, 1 data), seven reserved zero bytes
+and a raw 32-byte digest. Data count is one; zero runs have positive counts
+and a zero digest field. Records are sorted, disjoint and in bounds; adjacent
+zero runs coalesce. Full coverage omits zeros under complete cut-bound authority;
+incremental coverage records exactly affected units, never ambiguous clean nulls.
+
+The worker sends a bounded receipt binding file length, digest, record count,
+coverage and baseline, not records in control JSON. The monitor consumes the
+stream and updates changed Merkle paths. Staging uses `memory.root`, disk
+`disks/<name>.root`, and newly produced `map-nodes/<hex>` files. Inherited
+nodes are not copied into each capture directory. Root ownership survives
+acceptance and staging release.
+
+Each checkpoint still has a complete immutable RAM file, reflink-seeded where
+supported, with no restore replay chain. A small dirty page rehashes its 64 KiB
+unit unless zero; the hypervisor's actual dirty granule is independent. Zero
+overlays punch or zero seeded output rather than exposing predecessor bytes.
+Disk, pack and lower identity stay **8 MiB**. Raw/zstd transport payloads also
+stay **8 MiB** to bound object counts and registry work: transfer dedup remains
+8 MiB, while capture identity and RAM corruption localization become 64 KiB.
+Transport rebuilds smaller identities from decoded bytes, never payload SHA alone.
 
 First publication of closed, owned, sealed producer RAM and writable disks uses
 the same `SealedStreamPublication` capability in `storage/pool.rs`. Canonical
@@ -924,12 +934,11 @@ local restores skip hashing those streams while the receipt matches. Silent
 local corruption between capture and restore is not detected at restore under
 this trust boundary; explicit verification, export and handoff authenticate
 bytes independently.
-The 1 s incremental budget below is measured on the defined fixture: one
-contiguous 410 MiB dirty region in a 4 GiB guest, under this unchanged 8 MiB
-chunk identity. Scattered dirty placement can legitimately affect every chunk
-and require up to a full-RAM rehash, even at the same dirty-page fraction.
-`identityBytesHashed` reports the affected identity-byte coverage so this
-placement-dependent cost is visible, not hidden by the fixture's target.
+The retained incremental budget uses a contiguous dirty workload; scattered
+placement may still affect many units. `identityBytesHashed` counts actual
+nonzero decoded bytes passed to SHA-256, not dirty coverage or zero reads.
+Record native change-record counts separately. The format removes dense
+identity/receipt work, not dirty-log harvesting, clone metadata or real copying.
 
 Lazy restore through `userfaultfd` is not part of this contract. File-private
 mapping already demand-pages local memory. Local snapshots trust the receipt
@@ -938,15 +947,13 @@ snapshots authenticate every byte before execution. Local forks trust owned
 producer identity as described below.
 A materialization from chunk storage is not presented as remote lazy restore.
 
-### Planned Phase 30 identity changes
+### Remaining disk work
 
-The owner approved block-device write tracking with inherited maps on
-2026-11-15; the stage-1 implementation above is now present. The remaining
-direction is not yet implemented: stage-2 clean-stop sealing and a cached
-deterministic upper template avoid restart and first-snapshot hashes without
-slowing create. A sparse authenticated stream map must have
-size and work that do not grow with configured length. RAM must use a smaller
-identity unit than 8 MiB.
+Stage-1 tracking and inherited sparse roots are present. Stage-2 clean-stop
+sealing and a cached deterministic upper template remain separate work to
+avoid restart and first-snapshot hashes without slowing create. All identity
+changes land as one fresh-state format; old homes and artifacts are refused,
+not converted.
 
 ### Accounting
 
@@ -1155,21 +1162,24 @@ trusted at publication: publication seeds the warm receipt, so neither its
 first nor repeated local restore hashes RAM. Reuse requires the recorded inode,
 length, mode `0400` and change time to match; a mismatch re-authenticates.
 
-`verified_object.map_receipt` caches the validated stream geometry and decoded
-chunks, fingerprints of held map-root/page objects, and the fingerprints of
-authenticated closure objects. A local hit binds these to the current stream
-and held descriptors instead of rereading or decoding the map objects and
-reauthenticating unchanged closure objects. Changed fingerprints take the
-validation path; an unusable receipt never overrides a malformed snapshot.
+`verified_object.map_receipt` is a small versioned binding of stream/root,
+exact length, chunk shift, admitted-root authority and the exact flat-inode
+fingerprint. A local hit returns a root handle without decoding a vector or
+statting every descendant. It never overrides a malformed snapshot or wrong
+role/profile. Nodes are authenticated when accessed; later descendant bit rot
+is detected on access and by explicit verification, not eagerly on every local
+restore. Changed flat fingerprints force byte authentication.
 
-For RAM the receipt also binds a reusable canonical map object by digest and
-inode fingerprint. Publication seeds that binding; restore pins and passes the
-held canonical map directly, without serializing, hashing and publishing it on
-every restore. If that cache object is absent or its fingerprint changes,
-restore rebuilds it from the validated stream map and refreshes the binding.
-The receipt and cached map are not additional retention roots or transported
-authority. Import, pull, transport, export, handoff, explicit verification and
-capture replay without the producer capability still authenticate bytes.
+Restore passes the binary root plus an operation-scoped node-store capability,
+not a serialized complete map. Roots and shared edges retain descendants;
+receipts are not retention roots or transported authority. Import, pull,
+transport, export, handoff, explicit verification and capture replay without
+the producer capability still authenticate bytes.
+
+Child-copy admission transfers shared seed/publication root guards to admitted
+operation-root pins before boot-operation admission or exclusive roots
+coordination. Restore and fork pin each copied root before joining concurrent
+authentication; the operation lease protects it through machine commit.
 
 Imported, pulled or transported snapshots still authenticate every byte;
 required byte authentication runs concurrently with private disk construction.
@@ -1712,9 +1722,9 @@ write the final seal. A crash after the seal permits ordinary publication from
 the sealed files; no pending cut is reported sealed early.
 
 libvm reconciles `vm.capture.json` by validating run and configuration
-correlation and the structural consistency of the inventory (roles, lengths,
-chunk counts, chunk-list identities recomputed from the recorded chunk
-digests) and committing. Owned reflink RAM and writable-disk publication use
+correlation and structural consistency of the inventory (roles, exact lengths,
+root identity profiles and authenticated changed paths) and committing.
+Owned reflink RAM and writable-disk publication use
 producer identity and unchanged inode facts, not a staged payload reread. Copy
 publication hashes inline; recovery/replay authenticate bytes. The publication
 transaction seeds warm receipts for RAM and those disks, including for their

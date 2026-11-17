@@ -4,7 +4,6 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::time::Duration;
 
-use crate::handoff::chunks::extents;
 use crate::handoff::files::{DocumentName, OperationFiles};
 use crate::handoff::plan::{PayloadDescriptor, SourceStop, MAX_FRAME_BYTES};
 use crate::handoff::service::HandoffService;
@@ -13,7 +12,6 @@ use crate::handoff::tests::{approve, operation, participant, request, Participan
 use crate::handoff::types::{HandoffMode, HandoffPhase, OperationId};
 use crate::paths::OwnedDirectory;
 use crate::storage::locks::StorageLock;
-use crate::storage::stream::Chunk;
 use crate::store::MachineStore;
 use crate::{DiskStorage, IncludedDisk, MachineId, MachineOwnership, PrivatePath};
 
@@ -284,11 +282,15 @@ async fn warm_and_cold_chunks_require_exact_authorized_length() {
         })
         .unwrap();
     let files = OperationFiles::existing(source.runtime.local_home(), operation).unwrap();
-    let map = files.load_map(&data.stream).unwrap().unwrap();
-    let (_, length, Chunk::Data(digest)) = extents(&map).next().unwrap() else {
-        panic!("managed data must produce a nonzero chunk");
+    let pool = crate::storage::pool::StoragePool::open(source.runtime.local_images_dir()).unwrap();
+    let map = files.load_map(&data.stream, &pool).unwrap().unwrap();
+    let index = map.present_chunks().next().unwrap().unwrap().index;
+    let length = crate::handoff::chunks::payload_length(&map, index).unwrap();
+    let descriptor = PayloadDescriptor::StreamChunk {
+        stream: data.stream,
+        index,
+        length,
     };
-    let descriptor = PayloadDescriptor::Chunk { digest, length };
     let frame = source
         .service
         .read_payload(operation, descriptor, 0, 17)
@@ -297,10 +299,11 @@ async fn warm_and_cold_chunks_require_exact_authorized_length() {
     assert_eq!(frame.bytes, [0x91; 17]);
     assert_eq!(frame.total_length, length);
     assert!(!frame.end);
-    let index = SourceIndex::build(&source.runtime, operation).unwrap();
+    let source_index = SourceIndex::build(&source.runtime, operation).unwrap();
     for wrong_length in [1, length + 1] {
-        let wrong = PayloadDescriptor::Chunk {
-            digest,
+        let wrong = PayloadDescriptor::StreamChunk {
+            stream: data.stream,
+            index,
             length: wrong_length,
         };
         let cold = HandoffService::new(source.runtime.clone());
@@ -314,7 +317,7 @@ async fn warm_and_cold_chunks_require_exact_authorized_length() {
             .await
             .is_err());
         // Membership is enforced inside the index even when bytes are cached.
-        assert!(index
+        assert!(source_index
             .frame(
                 &source.runtime,
                 wrong,

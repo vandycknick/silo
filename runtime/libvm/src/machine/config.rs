@@ -1039,14 +1039,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let root = crate::storage::stream::StreamHasher::new()
+        let root = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_file(&config.machine_dir.join("root.raw"))
             .unwrap()
             .id();
-        let source = crate::storage::stream::StreamHasher::new()
-            .hash_file(&home.path().join("source.raw"))
-            .unwrap()
-            .id();
+        let source =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_file(&home.path().join("source.raw"))
+                .unwrap()
+                .id();
         let kernel = home.path().join("replacement-kernel");
         let kernel_bytes = host_kernel("explicit new kernel");
         std::fs::write(&kernel, &kernel_bytes).unwrap();
@@ -1089,14 +1090,14 @@ mod tests {
         );
         assert!(agent.is_none());
         assert_eq!(
-            crate::storage::stream::StreamHasher::new()
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                 .hash_file(&config.machine_dir.join("root.raw"))
                 .unwrap()
                 .id(),
             root
         );
         assert_eq!(
-            crate::storage::stream::StreamHasher::new()
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                 .hash_file(&home.path().join("source.raw"))
                 .unwrap()
                 .id(),
@@ -1204,9 +1205,10 @@ mod tests {
             DiskBaselineState::Ready
         ));
         let root = config.machine_dir.join("root.raw");
-        let before = crate::storage::stream::StreamHasher::new()
-            .hash_file(&root)
-            .unwrap();
+        let before =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_file(&root)
+                .unwrap();
         config.root_disk_size = Some(before.length() + 512);
         let store = runtime.native_store().unwrap();
         sqlx::query("CREATE TRIGGER reject_disk_baseline_invalidation BEFORE UPDATE ON machine_storage BEGIN SELECT RAISE(ABORT,'baseline invalidation interrupted'); END")
@@ -1219,7 +1221,7 @@ mod tests {
         .await
         .is_err());
         assert_eq!(
-            crate::storage::stream::StreamHasher::new()
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                 .hash_file(&root)
                 .unwrap(),
             before

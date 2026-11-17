@@ -29,8 +29,9 @@ use vm_spec::capture::Sha256Digest;
 
 use crate::image::transport::blobs::{create_private_file, invalid, StagedBlobs};
 use crate::image::transport::closure::{
-    canonical_map_bytes, content, identity, object, stream_id, ObjectRole, Semantic, SemanticRecord,
+    content, identity, object, stream_id, ObjectRole, Semantic, SemanticRecord,
 };
+use crate::image::transport::identity::IdentityBuilder;
 use crate::image::transport::provenance::{
     verify_portable_binding, verify_portable_capture, MeasuredCapture,
 };
@@ -38,12 +39,14 @@ use crate::image::transport::trust::{AcquisitionReceipt, ApprovedArtifactDigest}
 use crate::paths::OwnedDirectory;
 use crate::storage::identity::{ImageId, ObjectDigest, SnapshotId, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
+use crate::storage::map::AuthenticatedMap;
 use crate::storage::pool::OperationPaths;
-use crate::storage::stream::{write_sparse_at, Chunk, StreamMap};
+use crate::storage::stream::write_sparse_at;
 use crate::store::models::image::ImageRecord;
 use crate::store::models::snapshot::{SnapshotCaptureKind, SnapshotRecord};
 use crate::store::Store;
 use crate::LibVmError;
+use vm_spec::stream_map::{ChunkSize, StreamRole};
 
 /// The verified semantic root of an import. Exact bytes and both identities
 /// travel together so the catalog never reserializes a different identity.
@@ -78,6 +81,7 @@ pub(crate) struct VerifiedPortableCapture {
     pub(crate) provenance_digest: ObjectDigest,
     pub(crate) provenance_bytes: Vec<u8>,
     pub(crate) evidence_digest: ObjectDigest,
+    pub(crate) changes_digest: ObjectDigest,
 }
 
 /// The selected transfer representation of one stream, retained so the
@@ -95,9 +99,8 @@ pub(crate) struct VerifiedTransport {
 pub(crate) struct VerifiedStream {
     pub(crate) id: StreamId,
     pub(crate) length: u64,
-    pub(crate) map: Arc<StreamMap>,
+    pub(crate) map: Arc<AuthenticatedMap>,
     pub(crate) canonical_map: ObjectDigest,
-    pub(crate) canonical_pages: Vec<ObjectDigest>,
     pub(crate) file: File,
     pub(crate) fingerprint: SourceFingerprint,
     /// Whole decoded bytes, measured while placing them.
@@ -184,7 +187,7 @@ pub(crate) fn verify_imported_artifact(
         Some(reference) => {
             let bytes = blobs.read(&reference.payload())?;
             let wrapper =
-                crate::image::transport::provenance::PortableCaptureProvenanceV1::decode(&bytes)?;
+                crate::image::transport::provenance::PortableCaptureProvenanceV2::decode(&bytes)?;
             let evidence = blobs.read(&wrapper.evidence.payload())?;
             Some((bytes, evidence))
         }
@@ -197,12 +200,14 @@ pub(crate) fn verify_imported_artifact(
             "VM config differs from the projection of its canonical record",
         ));
     }
-    let roles = semantic.object_roles(provenance.as_ref().map(|(wrapper, evidence)| {
-        (
-            ObjectDigest::of_bytes(wrapper),
-            ObjectDigest::of_bytes(evidence),
-        )
-    }))?;
+    let roles = semantic.object_roles(
+        provenance
+            .as_ref()
+            .map(|(wrapper, evidence)| {
+                crate::image::transport::provenance::provenance_objects(wrapper, evidence)
+            })
+            .transpose()?,
+    )?;
     let plan = closure_plan(&semantic, roles, graph.streams(), graph.objects())?;
     crate::storage::limits::preflight_fd_budget(
         (plan.streams.len() + plan.objects.len()) as u64 + 2,
@@ -216,6 +221,33 @@ pub(crate) fn verify_imported_artifact(
     for row in graph.streams() {
         let stream = materialize_stream(graph, &blobs, &materialized, row)?;
         streams.insert(stream.id, stream);
+    }
+    let mut expected_maps = BTreeSet::new();
+    for stream in streams.values() {
+        expected_maps.insert(stream.canonical_map);
+        for node in stream.map.nodes() {
+            expected_maps.insert(node?.digest);
+        }
+    }
+    let received_maps = graph
+        .objects()
+        .iter()
+        .filter_map(|row| match row {
+            ObjectBinding::Direct {
+                object: digest,
+                payload,
+                ..
+            } if payload.media_type == oci::vm_artifact::wire::PayloadMediaType::StreamMap => {
+                Some(object(*digest))
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if expected_maps != received_maps {
+        return Err(invalid(
+            "stream map",
+            "missing or surplus authenticated map nodes",
+        ));
     }
     let mut objects = BTreeMap::new();
     for row in graph.objects() {
@@ -340,6 +372,18 @@ pub(crate) fn verify_imported_artifact(
                             layout: &layout,
                             execution: held(&execution.execution)?,
                             devices: held(&execution.devices)?,
+                            changes: held(&ObjectDigest::from_sha256(
+                                *binding
+                                    .evidence
+                                    .memory
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        invalid("capture provenance", "RAM changes missing")
+                                    })?
+                                    .changes
+                                    .sha256
+                                    .as_bytes(),
+                            ))?,
                         },
                     )?;
                     VerifiedContent::LiveCheckpoint {
@@ -351,6 +395,18 @@ pub(crate) fn verify_imported_artifact(
                             provenance_digest: binding.wrapper_digest,
                             provenance_bytes: wrapper,
                             evidence_digest: binding.evidence_digest,
+                            changes_digest: ObjectDigest::from_sha256(
+                                *binding
+                                    .evidence
+                                    .memory
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        invalid("capture provenance", "RAM changes missing")
+                                    })?
+                                    .changes
+                                    .sha256
+                                    .as_bytes(),
+                            ),
                         },
                     }
                 }
@@ -421,12 +477,7 @@ pub(crate) fn closure_plan(
         })?;
         if row.length != stream.length
             || object(row.map) != stream.map
-            || row.map_pages.len() != stream.map_pages.len()
-            || row
-                .map_pages
-                .iter()
-                .zip(&stream.map_pages)
-                .any(|(left, right)| object(*left) != *right)
+            || row.chunk_size != stream.chunk_size
         {
             return Err(invalid(
                 "stream table",
@@ -467,12 +518,32 @@ pub(crate) fn closure_plan(
                 ));
             }
             expected_streams.insert(id);
-            let metadata = ObjectRole::Record {
-                maximum: crate::storage::limits::Resource::MetadataPageBytes.maximum(),
-            };
-            crate::image::transport::closure::add_role(&mut roles, object(binding.map), metadata)?;
-            for page in &binding.map_pages {
-                crate::image::transport::closure::add_role(&mut roles, object(*page), metadata)?;
+            if binding.chunk_size != ChunkSize::DISK.bytes() {
+                return Err(invalid(
+                    "stream table",
+                    "object stream requires 8 MiB identities",
+                ));
+            }
+            crate::image::transport::closure::add_role(
+                &mut roles,
+                object(binding.map),
+                ObjectRole::Map,
+            )?;
+        }
+    }
+    for row in object_rows {
+        if let ObjectBinding::Direct {
+            object: digest,
+            payload,
+            ..
+        } = row
+        {
+            if payload.media_type == oci::vm_artifact::wire::PayloadMediaType::StreamMap {
+                crate::image::transport::closure::add_role(
+                    &mut roles,
+                    object(*digest),
+                    ObjectRole::Map,
+                )?;
             }
         }
     }
@@ -521,6 +592,8 @@ pub(crate) fn closure_plan(
 /// ```text
 /// transport cache        Σ inventory payloads        fetched encoded blobs
 /// decoded staging        Σ stream rows               zero-filled stream files
+/// identity staging       Σ identity units × 40       ordered index/digest spool
+///                      + Σ worst-case map bytes      rebuilt roots and nodes
 /// catalog publication    Σ stream rows               immutable stream copies
 ///                      + Σ object rows               direct and streamed objects
 ///                      + 2 × Σ inventory payloads    chunk copies; transport
@@ -538,11 +611,18 @@ pub(crate) fn acquisition_space_charge(graph: &VerifiedVmGraph) -> Result<u64, L
         let inventory = total(graph.inventory().values().map(|payload| payload.size))?;
         let streams = total(graph.streams().iter().map(|row| row.length))?;
         let objects = total(graph.objects().iter().map(ObjectBinding::size))?;
+        let identity_staging = graph.streams().iter().try_fold(0u64, |sum, row| {
+            let profile = ChunkSize::from_bytes(row.chunk_size).ok()?;
+            let records = row.length.div_ceil(profile.bytes()).checked_mul(40)?;
+            let nodes = vm_spec::stream_map::worst_case_map_bytes(row.length, profile).ok()?;
+            sum.checked_add(records)?.checked_add(nodes)
+        })?;
         let receipt = crate::storage::limits::Resource::MetadataPageBytes.maximum();
         inventory
             .checked_mul(3)?
             .checked_add(streams.checked_mul(2)?)?
             .checked_add(objects)?
+            .checked_add(identity_staging)?
             .checked_add(receipt.checked_mul(2)?)
     }
     charge(graph).ok_or_else(|| invalid("space reservation", "acquisition charge overflow"))
@@ -566,12 +646,12 @@ fn materialize_stream(
     let root_bytes = blobs.read(&row.transport.payload())?;
     let file = create_private_file(directory, &id.hex())?;
     file.set_len(row.length)?;
-    let count = usize::try_from(row.length.div_ceil(CHUNK_SIZE))
-        .map_err(|error| invalid("transfer map", error))?;
-    let mut chunks = Vec::new();
-    chunks
-        .try_reserve_exact(count)
-        .map_err(|error| invalid("transfer map", error))?;
+    let role = match row.chunk_size {
+        65536 => StreamRole::Ram,
+        CHUNK_SIZE => StreamRole::Disk,
+        _ => return Err(invalid("stream identity", "unsupported identity profile")),
+    };
+    let mut identities = IdentityBuilder::new(directory, row.length, role)?;
     let mut hash = Sha256::new();
     let zeros = vec![0u8; CHUNK_SIZE as usize];
     let mut buffer = Vec::with_capacity(CHUNK_SIZE as usize);
@@ -602,7 +682,7 @@ fn materialize_stream(
                 match &entry {
                     ChunkEntry::Zero { length } => {
                         hash.update(&zeros[..*length as usize]);
-                        chunks.push(Chunk::Zero);
+                        identities.push_zeros(*length)?;
                     }
                     ChunkEntry::Data {
                         length,
@@ -633,7 +713,7 @@ fn materialize_stream(
                         }
                         write_sparse_at(&file, &buffer, offset)?;
                         hash.update(&buffer);
-                        chunks.push(Chunk::Data(object(*digest)));
+                        identities.push(&buffer)?;
                         encoded.insert(descriptor.digest, *descriptor);
                     }
                 }
@@ -651,32 +731,38 @@ fn materialize_stream(
     }
     result?;
     file.sync_all()?;
-    let map = StreamMap::new(row.length, chunks)?;
+    let map = identities.finish()?;
     if map.id() != id {
         return Err(invalid(
             "transfer map",
             format!("decoded identity {} differs from stream {id}", map.id()),
         ));
     }
-    // Regenerate the canonical local map: transport repagination may differ,
-    // the canonical root/pages named by the semantic tables may not.
-    let (canonical_root, canonical_page_bytes) = canonical_map_bytes(&map)?;
-    let canonical_pages: Vec<ObjectDigest> = canonical_page_bytes
-        .iter()
-        .map(|page| ObjectDigest::of_bytes(page))
-        .collect();
+    // Compare every regenerated node byte with its separately authenticated
+    // received object. A missing node never supplies implicit-zero authority.
+    let canonical_root = map.canonical_bytes()?;
     let canonical_map = ObjectDigest::of_bytes(&canonical_root);
-    if canonical_map != object(row.map)
-        || canonical_pages.len() != row.map_pages.len()
-        || canonical_pages
-            .iter()
-            .zip(&row.map_pages)
-            .any(|(left, right)| *left != object(*right))
-    {
+    if canonical_map != object(row.map) || map.chunk_size().bytes() != row.chunk_size {
         return Err(invalid(
-            "stream table",
-            format!("{id} canonical map differs from its regenerated local map"),
+            "stream map",
+            "decoded root/profile differs from table",
         ));
+    }
+    let check_map_object = |digest: ObjectDigest, bytes: &[u8]| -> Result<(), LibVmError> {
+        let payload = graph
+            .payload(content(digest))
+            .ok_or_else(|| invalid("stream map", format!("missing node {digest}")))?;
+        if payload.media_type != oci::vm_artifact::wire::PayloadMediaType::StreamMap
+            || blobs.read(payload)? != bytes
+        {
+            return Err(invalid("stream map", format!("corrupt node {digest}")));
+        }
+        Ok(())
+    };
+    check_map_object(canonical_map, &canonical_root)?;
+    for node in map.nodes() {
+        let node = node?;
+        check_map_object(node.digest, &node.bytes)?;
     }
     if root.stream != identity(id) || root.length != row.length {
         return Err(invalid(
@@ -690,7 +776,6 @@ fn materialize_stream(
         length: row.length,
         map: Arc::new(map),
         canonical_map,
-        canonical_pages,
         fingerprint,
         file,
         sha256: Sha256Digest::from_bytes(hash.finalize().into()),
@@ -700,4 +785,222 @@ fn materialize_stream(
             chunks: encoded.into_values().collect(),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::FileExt;
+
+    use oci::vm_artifact::codec::{ChunkEncoder, ChunkEncoding};
+    use oci::vm_artifact::graph::{encode_vm_graph, verify_vm_graph, VerifiedVmGraph};
+    use oci::vm_artifact::wire::{
+        self, ObjectBinding, PayloadMediaType, PayloadRef, RecordBlob, StreamBinding, CHUNK_SIZE,
+    };
+    use vm_spec::stream_map::StreamRole;
+
+    use crate::image::transport::blobs::StagedBlobs;
+    use crate::image::transport::closure::{content, identity};
+    use crate::image::transport::import::materialize_stream;
+    use crate::paths::OwnedDirectory;
+    use crate::storage::stream::StreamHasher;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        graph: VerifiedVmGraph,
+        blobs: StagedBlobs,
+        outputs: OwnedDirectory,
+        row: StreamBinding,
+        bytes: Vec<u8>,
+        payload: PayloadRef,
+        node: PayloadRef,
+    }
+
+    fn fixture(role: StreamRole, encoding: ChunkEncoding, wrong_root: bool) -> Fixture {
+        let directory = tempfile::tempdir().unwrap();
+        let root = OwnedDirectory::open_root(directory.path()).unwrap();
+        let blobs = StagedBlobs::join(&root, "blobs").unwrap();
+        let outputs = root.ensure_dir("outputs").unwrap();
+        let mut bytes = vec![0; (2 * CHUNK_SIZE + 65537) as usize];
+        for offset in [
+            4096,
+            2 * 65536,
+            CHUNK_SIZE as usize + 7 * 65536,
+            2 * CHUNK_SIZE as usize + 65536,
+        ] {
+            let end = (offset + 4096).min(bytes.len());
+            bytes[offset..end].fill((offset / 4096 % 251 + 1) as u8);
+        }
+        let mut asserted = bytes.clone();
+        if wrong_root {
+            asserted[4096] ^= 1;
+        }
+        let map = StreamHasher::new(role.chunk_size())
+            .hash_reader(&asserted[..])
+            .unwrap();
+        let mut encoder = ChunkEncoder::new(encoding).unwrap();
+        let mut entries = Vec::new();
+        let mut payloads = BTreeMap::new();
+        let mut held = BTreeMap::new();
+        let mut data_payload = None;
+        for bytes in bytes.chunks(CHUNK_SIZE as usize) {
+            let encoded = encoder.encode(bytes).unwrap();
+            if let wire::ChunkEntry::Data {
+                encoded: payload, ..
+            } = &encoded.entry
+            {
+                data_payload.get_or_insert(*payload);
+                payloads.insert(payload.digest, *payload);
+                held.insert(payload.digest, encoded.bytes);
+            }
+            entries.push(encoded.entry);
+        }
+        let semantic = RecordBlob::new(br#"{"kind":"transport-test"}"#.to_vec()).unwrap();
+        let mut objects = vec![ObjectBinding::Direct {
+            object: semantic.reference.digest,
+            size: semantic.reference.size,
+            payload: semantic.reference.payload(),
+        }];
+        let mut records = vec![semantic.clone()];
+        let mut node_payload = None;
+        let map_objects = std::iter::once((
+            content(crate::storage::identity::ObjectDigest::from_sha256(
+                *map.id().as_bytes(),
+            )),
+            map.canonical_bytes().unwrap(),
+        ))
+        .chain(map.nodes().map(|node| {
+            let node = node.unwrap();
+            (content(node.digest), node.bytes)
+        }));
+        for (digest, bytes) in map_objects {
+            let payload = PayloadRef {
+                media_type: PayloadMediaType::StreamMap,
+                digest,
+                size: bytes.len() as u64,
+            };
+            if bytes.starts_with(b"silo:stream-map:leaf:") {
+                node_payload = Some(payload);
+            }
+            payloads.insert(digest, payload);
+            held.insert(digest, bytes.clone());
+            objects.push(ObjectBinding::Direct {
+                object: digest,
+                size: payload.size,
+                payload,
+            });
+            records.push(RecordBlob::new(bytes).unwrap());
+        }
+        let transfer =
+            wire::encode_transfer(identity(map.id()), bytes.len() as u64, &entries).unwrap();
+        let row = StreamBinding {
+            stream: identity(map.id()),
+            length: bytes.len() as u64,
+            map: oci::changeset::ContentDigest::from_sha256(*map.id().as_bytes()),
+            chunk_size: role.chunk_size().bytes(),
+            transport: transfer.root.reference,
+        };
+        let streams = wire::encode_stream_table(std::slice::from_ref(&row)).unwrap();
+        objects.sort_by_key(ObjectBinding::object);
+        let objects = wire::encode_object_table(&objects).unwrap();
+        let config = wire::decode_vm_config(&wire::canonical_bytes(&serde_json::json!({
+            "schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
+            "content":{"kind":"image","id":semantic.reference.digest,"record":semantic.reference},
+            "purpose":"image","captureKind":null,"rootFamily":"opaque-raw","backendRequirement":"raw-block",
+            "guestPlatform":{"os":"linux","architecture":"amd64"},
+            "minimumCapabilities":{"storageProfile":"opaque-raw-v1","bootAbi":"linux-direct-v1","liveRestore":false},
+            "executionRequirements":null,"streams":streams.root.reference,"objects":objects.root.reference,"captureProvenance":null
+        })).unwrap()).unwrap();
+        for table in [transfer, streams, objects] {
+            records.push(table.root);
+            records.extend(table.pages);
+        }
+        let encoded = encode_vm_graph(
+            &config,
+            &records,
+            &payloads.into_values().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for record in &encoded.records {
+            held.insert(record.reference.digest, record.bytes.clone());
+        }
+        for blob in encoded
+            .children
+            .iter()
+            .chain([&encoded.config, &encoded.empty])
+        {
+            held.insert(blob.descriptor.digest, blob.bytes.clone());
+        }
+        let graph = verify_vm_graph(&encoded.index.bytes, |descriptor| {
+            Ok(held[&descriptor.digest].clone())
+        })
+        .unwrap();
+        for payload in graph.inventory().values() {
+            blobs.insert(payload, &held[&payload.digest]).unwrap();
+        }
+        Fixture {
+            _directory: directory,
+            graph,
+            blobs,
+            outputs,
+            row,
+            bytes,
+            payload: data_payload.unwrap(),
+            node: node_payload.unwrap(),
+        }
+    }
+
+    #[test]
+    fn raw_and_zstd_preserve_ram_and_disk_roots_and_decoded_bytes() {
+        for role in [StreamRole::Ram, StreamRole::Disk] {
+            for encoding in [ChunkEncoding::Raw, ChunkEncoding::Zstd] {
+                let fixture = fixture(role, encoding, false);
+                let stream = materialize_stream(
+                    &fixture.graph,
+                    &fixture.blobs,
+                    &fixture.outputs,
+                    &fixture.row,
+                )
+                .unwrap();
+                assert_eq!(stream.id.as_bytes(), fixture.row.stream.as_bytes());
+                assert_eq!(stream.map.chunk_size(), role.chunk_size());
+                assert_eq!(stream.transport.chunks.len(), 3);
+                let mut decoded = vec![0; fixture.bytes.len()];
+                stream.file.read_exact_at(&mut decoded, 0).unwrap();
+                assert_eq!(decoded, fixture.bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn corrupted_payload_node_missing_node_and_wrong_root_are_refused() {
+        for failure in 0..4 {
+            let fixture = fixture(StreamRole::Ram, ChunkEncoding::Zstd, failure == 3);
+            let payload = if failure == 0 {
+                fixture.payload
+            } else {
+                fixture.node
+            };
+            let path = fixture.blobs.path().join(&payload.digest.to_string()[7..]);
+            match failure {
+                0 | 1 => {
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    bytes[0] ^= 1;
+                    std::fs::write(&path, bytes).unwrap();
+                }
+                2 => std::fs::remove_file(path).unwrap(),
+                _ => {}
+            }
+            assert!(
+                materialize_stream(
+                    &fixture.graph,
+                    &fixture.blobs,
+                    &fixture.outputs,
+                    &fixture.row
+                )
+                .is_err(),
+                "failure {failure}"
+            );
+        }
+    }
 }

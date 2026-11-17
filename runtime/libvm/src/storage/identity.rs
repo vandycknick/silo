@@ -107,7 +107,7 @@ digest_type!(
 );
 digest_type!(
     StreamId,
-    "Domain-separated SHA-256 of a canonical logical stream map."
+    "SHA-256 of the exact authenticated stream-map v2 binary root header."
 );
 digest_type!(
     ImageId,

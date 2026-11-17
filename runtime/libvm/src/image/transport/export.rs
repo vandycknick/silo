@@ -26,23 +26,24 @@ use uuid::Uuid;
 
 use crate::image::import_types::ManagedSourceId;
 use crate::image::transport::blobs::{invalid, StagedBlobs};
-use crate::image::transport::closure::{
-    canonical_map_bytes, content, identity, object, ObjectRole, Semantic,
-};
+use crate::image::transport::closure::{content, identity, object, ObjectRole, Semantic};
+use crate::image::transport::identity::IdentityBuilder;
 use crate::image::transport::provenance::{build_local, verify_portable_binding};
 use crate::paths::OwnedDirectory;
 use crate::storage::identity::{ObjectDigest, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
 use crate::storage::limits::Resource;
 use crate::storage::locks::StorageLock;
+use crate::storage::map::AuthenticatedMap;
 use crate::storage::pool::{OperationPaths, StoragePool};
-use crate::storage::stream::{AuthenticatedStream, Chunk, StreamHasher, StreamMap};
+use crate::storage::stream::{AuthenticatedStream, StreamHasher};
 use crate::store::managed_image_store::ManagedImageConsumer;
 use crate::store::models::snapshot::SnapshotStream;
 use crate::store::snapshot_store::{RecordInput, SnapshotConsumer};
 use crate::store::stream_representation::VerifiedStreamRepresentation;
 use crate::store::Store;
 use crate::LibVmError;
+use vm_spec::stream_map::{ChunkSize, StreamRole};
 
 /// The held managed source. Dropping it releases the closure lease, so the
 /// prepared artifact owns it until upload has finished.
@@ -94,11 +95,11 @@ impl ExportSource {
                 if !member {
                     return Err(invalid("record", "image exports only its semantic streams"));
                 }
-                let map = pool.verify_stream(&stream.stream)?;
-                if map.length() != stream.length {
+                let file = pool.open_stream(&stream.stream)?;
+                if file.metadata()?.len() != stream.length {
                     return Err(invalid("record", "image stream length mismatch"));
                 }
-                Ok(pool.open_stream(&stream.stream)?)
+                Ok(file)
             }
             Self::Snapshot(consumer) => consumer.open_stream(pool, &stream.stream, stream.length),
         }
@@ -173,6 +174,7 @@ fn prepare_export_within(
     let images = store.images_path().to_path_buf();
     let pool = StoragePool::open(&images)?;
     let (operation_id, lease) = source.operation()?;
+    let map_authority = pool.map_authority(std::sync::Arc::new(lease.duplicate()?))?;
     let operation = pool.create_operation_with_lease(operation_id, lease)?;
     semantic.authenticate_lower(
         |digest, maximum| Ok(pool.read_object(digest, maximum)?),
@@ -185,12 +187,14 @@ fn prepare_export_within(
         )?),
         _ => None,
     };
-    let roles = semantic.object_roles(provenance.as_ref().map(|(wrapper, evidence)| {
-        (
-            ObjectDigest::of_bytes(wrapper),
-            ObjectDigest::of_bytes(evidence),
-        )
-    }))?;
+    let roles = semantic.object_roles(
+        provenance
+            .as_ref()
+            .map(|(wrapper, evidence)| {
+                crate::image::transport::provenance::provenance_objects(wrapper, evidence)
+            })
+            .transpose()?,
+    )?;
     let mut object_streams = plan_object_streams(&pool, &roles)?;
     check_transport_streams(
         semantic
@@ -215,6 +219,7 @@ fn prepare_export_within(
             operation: operation_id,
             encoding,
             staged: &staged,
+            map_authority,
         },
         encoder: ChunkEncoder::new(encoding)?,
         records: Vec::new(),
@@ -229,7 +234,9 @@ fn prepare_export_within(
         if builder.streams.contains_key(&stream.stream) {
             continue;
         }
-        builder.add_stream(stream, || source.open_stream(&pool, stream))?;
+        builder.add_stream(stream, StreamBacking::PooledStream, || {
+            source.open_stream(&pool, stream)
+        })?;
     }
     for (digest, role) in &roles {
         match role {
@@ -246,6 +253,10 @@ fn prepare_export_within(
                     pool.read_object(digest, *maximum)?
                 };
                 builder.add_record_object(*digest, bytes, *maximum)?;
+            }
+            ObjectRole::Map => {
+                let bytes = pool.read_object(digest, role.maximum())?;
+                builder.add_map_object(*digest, &bytes)?;
             }
             ObjectRole::Execution | ObjectRole::Devices => {
                 let media = role
@@ -321,15 +332,13 @@ struct ObjectStream {
     digest: ObjectDigest,
     source: AuthenticatedStream,
     stream: SnapshotStream,
-    root: Vec<u8>,
-    pages: Vec<Vec<u8>>,
 }
 
 fn plan_object_streams(
     pool: &StoragePool,
     roles: &BTreeMap<ObjectDigest, ObjectRole>,
 ) -> Result<BTreeMap<ObjectDigest, ObjectStream>, LibVmError> {
-    let mut hasher = StreamHasher::new();
+    let mut hasher = StreamHasher::new(ChunkSize::DISK);
     let mut planned = BTreeMap::new();
     for (digest, role) in roles {
         if !matches!(role, ObjectRole::Streamed | ObjectRole::Fsmeta) {
@@ -350,14 +359,10 @@ fn plan_object_streams(
                 format!("{digest} differs from its pooled bytes"),
             ));
         }
-        let (root, pages) = canonical_map_bytes(source.map())?;
         let stream = SnapshotStream {
             stream: source.map().id(),
-            map: ObjectDigest::of_bytes(&root),
-            map_pages: pages
-                .iter()
-                .map(|page| ObjectDigest::of_bytes(page))
-                .collect(),
+            map: ObjectDigest::from_sha256(*source.map().id().as_bytes()),
+            chunk_size: source.map().chunk_size().bytes(),
             length,
         };
         planned.insert(
@@ -366,8 +371,6 @@ fn plan_object_streams(
                 digest: *digest,
                 source,
                 stream,
-                root,
-                pages,
             },
         );
     }
@@ -486,6 +489,7 @@ struct Context<'a> {
     operation: Uuid,
     encoding: ChunkEncoding,
     staged: &'a StagedBlobs,
+    map_authority: std::sync::Arc<dyn crate::storage::map::MapAuthority>,
 }
 
 impl Context<'_> {
@@ -540,12 +544,18 @@ struct Builder<'a> {
     buffer: Vec<u8>,
 }
 
+enum StreamBacking {
+    PooledStream,
+    ByteObject,
+}
+
 impl Builder<'_> {
     /// Select the retained representation for the requested encoding, or
     /// encode and register one. `open` is called only when encoding.
     fn add_stream(
         &mut self,
         stream: &SnapshotStream,
+        backing: StreamBacking,
         open: impl FnOnce() -> Result<File, LibVmError>,
     ) -> Result<(), LibVmError> {
         let context = &self.context;
@@ -580,12 +590,30 @@ impl Builder<'_> {
             }
             None => {
                 let file = open()?;
-                let entries = self.encode_stream(&file, stream.length)?;
+                let (map, entries, fingerprint) = self.encode_stream(&file, stream)?;
+                self.add_map_graph(&map)?;
                 let table = encode_transfer(identity(stream.stream), stream.length, &entries)?;
-                self.register(stream, &table, &entries)?;
+                let flat_fingerprint = match backing {
+                    StreamBacking::PooledStream => Some(fingerprint),
+                    StreamBacking::ByteObject => None,
+                };
+                self.register(stream, &table, &entries, &map, flat_fingerprint)?;
                 (table.root, table.pages, entries)
             }
         };
+        if !self.objects.contains_key(&stream.map) {
+            let role = if stream.chunk_size == ChunkSize::RAM.bytes() {
+                StreamRole::Ram
+            } else {
+                StreamRole::Disk
+            };
+            let map = self.context.pool.load_map(
+                stream.map,
+                role,
+                std::sync::Arc::clone(&self.context.map_authority),
+            )?;
+            self.add_map_graph(&map)?;
+        }
         self.add_stream_row(stream, root, pages, &entries)
     }
 
@@ -597,32 +625,22 @@ impl Builder<'_> {
             digest,
             source,
             stream,
-            root,
-            pages,
         } = object;
         let length = stream.length;
-        let context = &self.context;
-        context
+        self.add_map_graph(source.map())?;
+        self.context
             .runtime
-            .block_on(context.store.pin_published_storage_dependencies(
-                context.operation,
+            .block_on(self.context.store.pin_published_storage_dependencies(
+                self.context.operation,
                 &[stream.stream],
                 &[],
             ))?;
-        // The canonical map objects must exist before a representation of
-        // this stream can be verified or registered against them.
-        context.publish_record(&root)?;
-        for page in &pages {
-            context.publish_record(page)?;
-        }
         if !self.streams.contains_key(&stream.stream) {
             let reopened = source.file().try_clone()?;
-            self.add_stream(&stream, || Ok(reopened))?;
+            self.add_stream(&stream, StreamBacking::ByteObject, || Ok(reopened))?;
         }
-        // No second whole-object hash: the selected representation projects
-        // exactly the map measured together with this digest (checked on
-        // registration and on the stream row), so the transported chunks
-        // are those bytes. The measured inode must still be unchanged.
+        // The same decoded bytes authenticate the whole object and its root.
+        // Registration preserves that binding without another payload pass.
         if SourceFingerprint::new(&source.file().metadata()?) != source.fingerprint() {
             return Err(invalid(
                 "object",
@@ -637,11 +655,6 @@ impl Builder<'_> {
                 digest,
                 stream.stream,
             ))?;
-        let metadata = Resource::MetadataPageBytes.maximum();
-        self.add_record_object(stream.map, root, metadata)?;
-        for page in pages {
-            self.add_record_object(ObjectDigest::of_bytes(&page), page, metadata)?;
-        }
         self.add_object_row(ObjectBinding::Stream {
             object: content(digest),
             size: length,
@@ -649,9 +662,19 @@ impl Builder<'_> {
         })
     }
 
-    /// Encode a held, authenticated source in one read. The canonical map is
-    /// checked against the record when the row is added.
-    fn encode_stream(&mut self, file: &File, length: u64) -> Result<Vec<ChunkEntry>, LibVmError> {
+    /// Encode and hash identity units from the same decoded read buffers.
+    fn encode_stream(
+        &mut self,
+        file: &File,
+        stream: &SnapshotStream,
+    ) -> Result<(AuthenticatedMap, Vec<ChunkEntry>, SourceFingerprint), LibVmError> {
+        let length = stream.length;
+        let role = if stream.chunk_size == ChunkSize::RAM.bytes() {
+            StreamRole::Ram
+        } else {
+            StreamRole::Disk
+        };
+        let mut identity = IdentityBuilder::new(self.context.staged.directory(), length, role)?;
         let before = SourceFingerprint::new(&file.metadata()?);
         if file.metadata()?.len() != length {
             return Err(invalid("stream", "source length differs from its record"));
@@ -664,6 +687,7 @@ impl Builder<'_> {
             let size = (length - offset).min(CHUNK_SIZE) as usize;
             let chunk = &mut self.buffer[..size];
             file.read_exact_at(chunk, offset)?;
+            identity.push(chunk)?;
             let encoded = self.encoder.encode(chunk)?;
             if let ChunkEntry::Data {
                 encoded: payload, ..
@@ -682,7 +706,14 @@ impl Builder<'_> {
                 "authenticated source changed while encoding",
             ));
         }
-        Ok(entries)
+        let map = identity.finish()?;
+        if map.id() != stream.stream || map.chunk_size().bytes() != stream.chunk_size {
+            return Err(invalid(
+                "stream identity",
+                "encoded bytes differ from declared root/profile",
+            ));
+        }
+        Ok((map, entries, before))
     }
 
     /// Publish a newly encoded representation into the canonical pool and
@@ -692,6 +723,8 @@ impl Builder<'_> {
         stream: &SnapshotStream,
         table: &EncodedTable,
         entries: &[ChunkEntry],
+        map: &AuthenticatedMap,
+        flat_fingerprint: Option<SourceFingerprint>,
     ) -> Result<(), LibVmError> {
         for entry in entries {
             if let ChunkEntry::Data { encoded, .. } = entry {
@@ -704,10 +737,13 @@ impl Builder<'_> {
             self.context.publish_record(&record.bytes)?;
         }
         let context = &self.context;
-        let verified = VerifiedStreamRepresentation::verify(
+        let verified = VerifiedStreamRepresentation::from_export(
             context.pool,
+            context.operation,
             stream.clone(),
             object(table.root.reference.digest),
+            map,
+            flat_fingerprint,
         )?
         .for_encoding(context.encoding)?;
         context.runtime.block_on(
@@ -717,8 +753,7 @@ impl Builder<'_> {
         )
     }
 
-    /// Check the transfer representation projects to exactly the canonical
-    /// map named by the semantic stream, then add its row and payloads.
+    /// Add a representation already authenticated against its decoded root.
     fn add_stream_row(
         &mut self,
         stream: &SnapshotStream,
@@ -726,47 +761,68 @@ impl Builder<'_> {
         pages: Vec<RecordBlob>,
         entries: &[ChunkEntry],
     ) -> Result<(), LibVmError> {
-        let mut chunks = Vec::with_capacity(entries.len());
         for entry in entries {
-            match entry {
-                ChunkEntry::Zero { .. } => chunks.push(Chunk::Zero),
-                ChunkEntry::Data {
-                    digest, encoded, ..
-                } => {
-                    chunks.push(Chunk::Data(object(*digest)));
-                    self.payloads.insert(encoded.digest, *encoded);
-                }
+            if let ChunkEntry::Data { encoded, .. } = entry {
+                self.payloads.insert(encoded.digest, *encoded);
             }
-        }
-        let map = StreamMap::new(stream.length, chunks)?;
-        let (canonical_root, canonical_pages) = canonical_map_bytes(&map)?;
-        if map.id() != stream.stream
-            || ObjectDigest::of_bytes(&canonical_root) != stream.map
-            || canonical_pages.len() != stream.map_pages.len()
-            || canonical_pages
-                .iter()
-                .zip(&stream.map_pages)
-                .any(|(page, digest)| ObjectDigest::of_bytes(page) != *digest)
-        {
-            return Err(invalid(
-                "stream table",
-                format!(
-                    "{} transfer representation differs from its canonical map",
-                    stream.stream
-                ),
-            ));
         }
         let row = StreamBinding {
             stream: identity(stream.stream),
             length: stream.length,
             map: content(stream.map),
-            map_pages: stream.map_pages.iter().map(|page| content(*page)).collect(),
+            chunk_size: stream.chunk_size,
             transport: root.reference,
         };
         self.records.push(root);
         self.records.extend(pages);
         self.streams.insert(stream.stream, row);
         Ok(())
+    }
+
+    fn add_map_graph(&mut self, map: &AuthenticatedMap) -> Result<(), LibVmError> {
+        if self
+            .objects
+            .contains_key(&ObjectDigest::from_sha256(*map.id().as_bytes()))
+        {
+            return Ok(());
+        }
+        let _retained = self.context.runtime.block_on(
+            self.context
+                .store
+                .admit_published_map_root(self.context.operation, map),
+        )?;
+        self.add_map_object(
+            ObjectDigest::from_sha256(*map.id().as_bytes()),
+            &map.canonical_bytes()?,
+        )?;
+        for node in map.nodes() {
+            let node = node?;
+            self.add_map_object(node.digest, &node.bytes)?;
+        }
+        Ok(())
+    }
+
+    fn add_map_object(&mut self, digest: ObjectDigest, bytes: &[u8]) -> Result<(), LibVmError> {
+        if ObjectDigest::of_bytes(bytes) != digest {
+            return Err(invalid("stream map", "map bytes differ from digest"));
+        }
+        if self.objects.contains_key(&digest) {
+            return Ok(());
+        }
+        self.context.publish_record(bytes)?;
+        let payload = PayloadRef {
+            media_type: oci::vm_artifact::wire::PayloadMediaType::StreamMap,
+            digest: content(digest),
+            size: bytes.len() as u64,
+        };
+        payload.validate()?;
+        self.payloads.insert(payload.digest, payload);
+        self.records.push(RecordBlob::new(bytes.to_vec())?);
+        self.add_object_row(ObjectBinding::Direct {
+            object: payload.digest,
+            size: payload.size,
+            payload,
+        })
     }
 
     fn add_record_object(

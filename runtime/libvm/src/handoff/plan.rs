@@ -82,6 +82,11 @@ impl SealedDocument {
 
     fn open<T: Serialize + DeserializeOwned>(&self) -> Result<T, LibVmError> {
         let value = crate::store::models::snapshot::decode_identity_value(&self.bytes)?;
+        if value.get("schema").and_then(serde_json::Value::as_u64) != Some(2) {
+            return Err(invalid(
+                "unsupported handoff protocol version: expected version 2",
+            ));
+        }
         let decoded: T = serde_json::from_value(value.clone()).map_err(invalid)?;
         if serde_json::to_value(&decoded).map_err(invalid)? != value {
             return Err(invalid("handoff document is not its closed canonical form"));
@@ -209,8 +214,15 @@ impl SourceObservation {
 
 impl ObservationBody {
     fn validate(&self) -> Result<(), LibVmError> {
-        if self.schema != 1 || uuid::Uuid::from(self.machine).is_nil() {
-            return Err(invalid("unsupported source observation"));
+        if self.schema != 2 {
+            return Err(invalid(
+                "unsupported handoff protocol version: expected version 2",
+            ));
+        }
+        if uuid::Uuid::from(self.machine).is_nil() {
+            return Err(invalid(
+                "source observation has an invalid machine identity",
+            ));
         }
         self.storage.validate()?;
         self.storage.ownership.ensure_owned(self.machine)?;
@@ -280,18 +292,7 @@ impl ObservationBody {
             expected_objects.extend(lower.objects());
             for layer in &lower.layers {
                 expected_objects.insert(layer.pack.map);
-                expected_objects.extend(layer.pack.map_pages.iter().copied());
                 expected_streams.insert(layer.pack.stream);
-                let expected_pages = layer
-                    .pack
-                    .length
-                    .div_ceil(crate::storage::limits::CHUNK_SIZE as u64)
-                    .div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
-                if layer.pack.map_pages.len() as u64 != expected_pages {
-                    return Err(invalid(
-                        "immutable pack map coverage contradicts its length",
-                    ));
-                }
                 if self
                     .immutable
                     .streams
@@ -423,7 +424,7 @@ pub(crate) struct PlanBody {
 impl PlanBody {
     fn validate(&self) -> Result<(), LibVmError> {
         self.observation.validate()?;
-        if self.schema != 1
+        if self.schema != 2
             || SealedDocument::seal(&self.observation)?.digest() != self.observation_digest
         {
             return Err(invalid("handoff plan observation binding is invalid"));
@@ -739,7 +740,7 @@ impl CaptureManifest {
 impl ManifestBody {
     fn validate(&self) -> Result<(), LibVmError> {
         let mut roles = std::collections::BTreeSet::new();
-        if self.schema != 1
+        if self.schema != 2
             || self.files.first().map(|file| file.role) != Some(WritableRole::Root)
             || !self.files.iter().all(|file| roles.insert(file.role))
         {
@@ -793,27 +794,112 @@ impl CaptureOffer {
     }
 }
 
-/// What travels as payload: verified immutable objects, canonical stream maps
-/// and decoded chunks. Never a path.
+/// A validated height in the fixed-depth stream tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct MapNodeHeight(u8);
+impl MapNodeHeight {
+    pub fn new(value: u8) -> Result<Self, LibVmError> {
+        if value >= vm_spec::stream_map::TREE_DEPTH {
+            return Err(invalid("map node height exceeds tree depth"));
+        }
+        Ok(Self(value))
+    }
+    pub fn get(self) -> u8 {
+        self.0
+    }
+    pub fn span(self) -> u64 {
+        1u64 << (6 * (u32::from(self.0) + 1))
+    }
+}
+impl TryFrom<u8> for MapNodeHeight {
+    type Error = LibVmError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<MapNodeHeight> for u8 {
+    fn from(value: MapNodeHeight) -> Self {
+        value.get()
+    }
+}
+
+/// Logical identity index, not a byte or transport-payload offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct MapNodeIndex(u64);
+impl MapNodeIndex {
+    pub fn new(value: u64) -> Result<Self, LibVmError> {
+        if value >= vm_spec::stream_map::MAX_INDICES {
+            return Err(invalid("map node index exceeds stream-map geometry"));
+        }
+        Ok(Self(value))
+    }
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+impl TryFrom<u64> for MapNodeIndex {
+    type Error = LibVmError;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<MapNodeIndex> for u64 {
+    fn from(value: MapNodeIndex) -> Self {
+        value.get()
+    }
+}
+
+/// Verified objects, binary root headers, map nodes and decoded 8 MiB payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum PayloadDescriptor {
-    /// Exact object bytes, verified by SHA-256 and length.
-    Object { digest: ObjectDigest, length: u64 },
-    /// The canonical `silo-chunks-v1` map of `stream`, verified by its identity.
-    StreamMap { stream: StreamId },
-    /// One decoded nonzero chunk (at most 8 MiB), verified by SHA-256 and length.
-    Chunk { digest: ObjectDigest, length: u64 },
+    Object {
+        digest: ObjectDigest,
+        length: u64,
+    },
+    StreamMap {
+        stream: StreamId,
+    },
+    MapNode {
+        digest: ObjectDigest,
+        stream: StreamId,
+        height: MapNodeHeight,
+        first_index: MapNodeIndex,
+    },
+    /// An 8 MiB payload authenticated by the root's smaller identity units.
+    StreamChunk {
+        stream: StreamId,
+        index: u64,
+        length: u64,
+    },
 }
 
 impl PayloadDescriptor {
     pub fn validate(&self) -> Result<(), LibVmError> {
         match *self {
-            Self::Object { length: 0, .. } => Err(invalid("empty immutable object descriptor")),
-            Self::Chunk { length, .. }
+            Self::Object { length, .. } if length == 0 || length > i64::MAX as u64 => Err(invalid(
+                "immutable object length is outside supported bounds",
+            )),
+            Self::StreamChunk { length, .. }
                 if length == 0 || length > crate::storage::limits::CHUNK_SIZE as u64 =>
             {
                 Err(invalid("chunk descriptor length is outside 1..=8 MiB"))
+            }
+            Self::StreamChunk { index, .. }
+                if index
+                    .checked_mul(crate::storage::limits::CHUNK_SIZE as u64)
+                    .is_none() =>
+            {
+                Err(invalid("payload index overflows its byte offset"))
+            }
+            Self::MapNode {
+                height,
+                first_index,
+                ..
+            } if first_index.get() % height.span() != 0 => {
+                Err(invalid("map node first index is not subtree-aligned"))
             }
             _ => Ok(()),
         }
@@ -822,26 +908,19 @@ impl PayloadDescriptor {
     /// Exact payload length, when the descriptor names it.
     pub fn exact_length(&self) -> Option<u64> {
         match *self {
-            Self::Object { length, .. } | Self::Chunk { length, .. } => Some(length),
-            Self::StreamMap { .. } => None,
+            Self::Object { length, .. } | Self::StreamChunk { length, .. } => Some(length),
+            Self::StreamMap { .. } | Self::MapNode { .. } => None,
         }
     }
 
     /// Largest payload a writer accepts for this descriptor.
     pub fn max_length(&self) -> u64 {
-        self.exact_length().unwrap_or_else(max_map_bytes)
+        match self {
+            Self::StreamMap { .. } => vm_spec::stream_map::MAX_ROOT_BYTES as u64,
+            Self::MapNode { .. } => vm_spec::stream_map::MAX_NODE_BYTES as u64,
+            _ => self.exact_length().unwrap_or(0),
+        }
     }
-}
-
-/// Bound on canonical `silo-chunks-v1` map bytes for the largest admitted
-/// stream: a fixed header plus one quoted digest and separator per chunk.
-pub fn max_map_bytes() -> u64 {
-    const HEADER_BYTES: u64 = 128;
-    const ENTRY_BYTES: u64 = 76;
-    let chunks = crate::storage::limits::Resource::ArtifactStreamBytes
-        .maximum()
-        .div_ceil(crate::storage::limits::CHUNK_SIZE as u64);
-    HEADER_BYTES + chunks * ENTRY_BYTES
 }
 
 /// Opaque cursor into the destination's complete inventory for one operation.
@@ -850,10 +929,9 @@ pub fn max_map_bytes() -> u64 {
 pub struct NeedCursor(pub u64);
 
 /// One bounded page of descriptors the destination cannot satisfy locally.
-/// `next` indexes the complete inventory, not the filtered list, so filling
-/// earlier needs never shifts later pages. A pass ends at `next == None`;
-/// coordinators repeat passes until one returns no needs at all, because
-/// received maps reveal further chunk needs.
+/// `next` indexes the current graph frontier, not the filtered needs. Repeat
+/// complete passes until no needs remain: received roots and nodes reveal
+/// further subtree and payload needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NeedsPage {
     pub needs: Vec<PayloadDescriptor>,
@@ -888,6 +966,7 @@ pub enum SourceStop {
 /// This runtime's identity and handoff bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandoffCapabilities {
+    pub protocol_version: u32,
     pub runtime: RuntimeId,
     pub kernel_architecture: GuestArchitecture,
     pub backend: vm_spec::live::LiveBackend,

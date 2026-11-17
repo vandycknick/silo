@@ -153,8 +153,8 @@ disks or seed their baseline; the first snapshot hashes written disk data once
 and seeds later captures in the same run. The remaining owner-approved direction
 of 2026-11-15 is still planned: clean-stop sealing and a cached deterministic
 upper template avoid restart and first-snapshot hashes without slowing create.
-A sparse authenticated stream map must eliminate work that grows with configured
-length. RAM must use a smaller identity unit than 8 MiB.
+The sparse-map/64 KiB RAM cutover removes flat-map configured-length work.
+Its performance effects require new paired measurements, not reused wave-three numbers.
 
 Image init as PID 1 stays the default, with both init modes reported. The
 existing 4 GiB fixture gates remain in force alongside this cohort. The
@@ -162,6 +162,28 @@ standalone perf suite reports Silo versus target as gating pass/fail, Silo
 versus msb on a roughly equal setup as informational, and appends run history.
 msb is skipped with a reason when unavailable. Reaching msb's 0.3-0.4 s start
 latency is a later stretch goal, not a Phase 30 gate.
+
+## Sparse stream-map cutover (2026-11-16, measurement pending)
+
+RAM identity is 64 KiB; disk, pack and lower identity and raw/zstd transport
+payloads remain 8 MiB. Sparse Merkle updates authenticate and rebuild changed
+paths rather than serialize full maps or dense receipts. Expected effects are
+less scattered-write hash amplification, bounded change-file control framing,
+root-only receipt hits and shared-node retention. These are mechanism
+expectations, not measured speedups or target acceptance.
+
+Record actual nonzero `identityBytesHashed`, native change records, live reads,
+zero coverage, seed method, node reads/writes and metadata bytes separately.
+Compare fixed changed sets across both configured size and historical occupied
+content. A no-dirty update must reuse its root without producing nodes. Full
+verification still scans zeros and payloads; transport still deduplicates at
+8 MiB and must compute RAM identities from decoded bytes.
+
+Remaining costs include dirty-log harvesting, full-capture discovery,
+non-reflink copies, clone metadata, durability and dense-map storage. Smaller
+RAM identity does not establish that the whole operation is independent of
+configured memory. Supervisor measurements must label both init modes and keep
+the existing agent-ready clocks, targets and grace unchanged.
 
 ## State after wave three (2026-11-15)
 
@@ -293,13 +315,12 @@ than these mechanisms alone, determine whether an end-to-end target is met.
 
 ### Wave three: graph and map receipts
 
-Local composition graph receipts now bind catalog facts, index/map fingerprints
-and decoded pack maps. Hits on local restore, fork and snapshot paths keep held
-descriptors and skip index decoding and pack-map reconstruction. Stream map
-receipts bind map and authenticated-object fingerprints; local restore reuses
-the canonical RAM-map object rather than serializing, hashing and publishing it
-again. Misses validate exact bytes or rebuild the canonical-map cache, as
-applicable.
+The wave-three implementation introduced graph/map reuse; the subsequent
+sparse-map cutover stores root handles instead of decoded pack maps or dense
+canonical-map caches. Local hits bind exact pack/fsmeta fingerprints and
+recipe/result/index facts without walking map descendants. Node access and
+explicit verification still authenticate node bytes. Receipts are small
+root/profile/flat-inode bindings, not duplicated content maps.
 
 Sealed-stream deduplication checks an existing inode and its receipt before
 creating a clone. Local capture keeps each immutable payload's seal `fsync`,

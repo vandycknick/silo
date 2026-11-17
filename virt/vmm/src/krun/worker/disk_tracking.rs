@@ -4,6 +4,9 @@ use vm_spec::capture::{
     DiskTrackingSeed, Sha256Digest,
 };
 
+/// Native tracking describes coverage only, not the Silo map encoding.
+const NATIVE_TRACKING_VERSION: u32 = 1;
+
 fn role(value: vm_spec::DiskRole) -> &'static str {
     match value {
         vm_spec::DiskRole::Root => "root",
@@ -16,7 +19,7 @@ fn role(value: vm_spec::DiskRole) -> &'static str {
 pub(crate) fn seed(value: &DiskTrackingSeed) -> Result<libkrun::live::DiskTrackingSeed, String> {
     value.validate()?;
     Ok(libkrun::live::DiskTrackingSeed {
-        version: value.version,
+        version: NATIVE_TRACKING_VERSION,
         role: role(value.role).into(),
         attachment_index: value.attachment_index,
         file_device: value.file_device,
@@ -51,10 +54,12 @@ pub(crate) fn receipt(
     value: &libkrun::live::DiskTrackingReceipt,
     binding: &DiskTrackingSeed,
 ) -> Result<DiskTrackingReceipt, String> {
+    binding.validate()?;
     let epoch = *uuid::Uuid::parse_str(binding.epoch.as_str())
         .map_err(|error| error.to_string())?
         .as_bytes();
-    if value.seed.version != binding.version
+    if value.version != NATIVE_TRACKING_VERSION
+        || value.seed.version != NATIVE_TRACKING_VERSION
         || value.seed.role != role(binding.role)
         || value.seed.attachment_index != binding.attachment_index
         || value.seed.file_device != binding.file_device
@@ -68,7 +73,7 @@ pub(crate) fn receipt(
     let mut binding = binding.clone();
     binding.baseline = value.seed.baseline.map(Sha256Digest::from_bytes);
     let result = DiskTrackingReceipt {
-        version: value.version,
+        version: vm_spec::capture::DISK_TRACKING_VERSION,
         seed: binding,
         token: DiskGenerationToken {
             capture_id: vm_spec::lifecycle::LiveId::parse(
@@ -142,6 +147,8 @@ mod tests {
         let metadata = file.metadata().unwrap();
         let seed = DiskTrackingSeed {
             version: DISK_TRACKING_VERSION,
+            map_format: 2,
+            chunk_shift: 23,
             role: vm_spec::DiskRole::Data,
             attachment_index: 2,
             block_id: vm_spec::BlockId::new("data2").unwrap(),
@@ -158,7 +165,7 @@ mod tests {
     fn native(seed: &DiskTrackingSeed) -> libkrun::live::DiskTrackingReceipt {
         let seed = crate::krun::worker::disk_tracking::seed(seed).unwrap();
         libkrun::live::DiskTrackingReceipt {
-            version: DISK_TRACKING_VERSION,
+            version: crate::krun::worker::disk_tracking::NATIVE_TRACKING_VERSION,
             token: libkrun::live::DiskGenerationToken {
                 capture_id: *uuid::Uuid::new_v4().as_bytes(),
                 pause_generation: 5,
@@ -222,6 +229,21 @@ mod tests {
                 _ => native.total_chunks += 1,
             }
             assert!(receipt(&native, &binding).is_err(), "defect {defect}");
+        }
+    }
+
+    #[test]
+    fn disk_tracking_adapter_rejects_wrong_map_profiles_before_native_arm() {
+        let (_backing, binding) = backing();
+        for defect in 0..3 {
+            let mut invalid = binding.clone();
+            match defect {
+                0 => invalid.map_format = 1,
+                1 => invalid.chunk_shift = 16,
+                _ => invalid.version = 1,
+            }
+            assert!(seed(&invalid).is_err());
+            assert!(receipt(&native(&binding), &invalid).is_err());
         }
     }
 }

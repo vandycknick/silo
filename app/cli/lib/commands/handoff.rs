@@ -215,7 +215,10 @@ impl Sessions {
                     let length = self
                         .transfer_payload(operation, descriptor, &native)
                         .await?;
-                    if matches!(native, PayloadDescriptor::StreamMap { .. }) {
+                    if matches!(
+                        native,
+                        PayloadDescriptor::StreamMap { .. } | PayloadDescriptor::MapNode { .. }
+                    ) {
                         metadata.add(length)?;
                     } else {
                         counts.add(length)?;

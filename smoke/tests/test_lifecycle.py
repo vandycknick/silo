@@ -4,7 +4,9 @@ import platform
 import stat
 from uuid import UUID
 
-from silo_smoke import overlay, shutdown, stopped
+import pytest
+
+from silo_smoke import fork, overlay, restore, shutdown, stopped
 from silo_smoke.cli import Silo
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
@@ -96,3 +98,69 @@ def test_boot_failure_leaves_machine_stopped(
     assert result.returncode != 0
     assert silo.info(name)["state"] == "stopped"
     assert silo.run("rm", name, "--force").returncode == 0
+
+
+@pytest.mark.linux_only
+@pytest.mark.slow
+def test_restart_after_live_lineage_snapshot_removal_and_prune(
+    silo: Silo, basic_image: str,
+) -> None:
+    source = "restart-lineage"
+    silo.create(source, basic_image, "--cpus", "1", "--memory", "512mib",
+                "--disk-size", "512mib", "--vsock", "--network", "none")
+    silo.start(source)
+    silo.wait_ready(source)
+    silo.exec(source, "sh", "-ec", "echo before >/restart-marker; sync", user="root")
+    first = restore.checkpoint(silo, source, alias="restart-first", policy="full")
+    assert first.seal["memory"]["mode"] == "full"
+    silo.run("resume", source)
+    silo.exec(source, "sh", "-ec", "echo after >/restart-marker; sync", user="root")
+    second = restore.checkpoint(silo, source, alias="restart-second")
+    assert second.seal["memory"]["mode"] == "incremental"
+    silo.run("resume", source)
+    restore.restore_child(silo, second, "restart-restored")
+    call = fork.run(silo, source, ["restart-fork"], expect=0)
+    assert fork.outcomes(call.result) == ["running"]
+    for child in ("restart-restored", "restart-fork"):
+        assert silo.exec(child, "cat", "/restart-marker").stdout.strip() == "after"
+    silo.rm("restart-fork", force=True)
+    for alias, saved in (("restart-first", first), ("restart-second", second)):
+        silo.run("image", "remove", "image:" + alias)
+        silo.run("snapshot", "remove", saved.reference)
+    shutdown.storage_tool(silo, "prune")
+    # The restored child's cold boot must not depend on its removed snapshot
+    # or the force-removed sibling's capture ownership.
+    silo.stop("restart-restored")
+    silo.start("restart-restored")
+    silo.wait_ready("restart-restored")
+    assert silo.exec("restart-restored", "cat", "/restart-marker").stdout.strip() == "after"
+    silo.rm("restart-restored", force=True)
+    shutdown.storage_tool(silo, "prune")
+    silo.stop(source)
+    silo.start(source)
+    silo.wait_ready(source)
+    assert silo.exec(source, "cat", "/restart-marker").stdout.strip() == "after"
+    third = restore.checkpoint(silo, source, alias="restart-after-stop")
+    assert third.seal["memory"]["mode"] == "full"
+    silo.run("resume", source)
+
+    # Machine-lifetime lower and boot ownership must also survive removal of
+    # the original source and the final snapshot, not just a sibling.
+    restore.restore_child(silo, third, "restart-orphan-restored")
+    call = fork.run(silo, source, ["restart-orphan-fork"], expect=0)
+    assert fork.outcomes(call.result) == ["running"]
+    silo.rm(source, force=True)
+    silo.run("image", "remove", "image:restart-after-stop")
+    silo.run("snapshot", "remove", third.reference)
+    shutdown.storage_tool(silo, "prune")
+    for child in ("restart-orphan-restored", "restart-orphan-fork"):
+        silo.stop(child)
+        silo.start(child)
+        silo.wait_ready(child)
+        assert silo.exec(child, "cat", "/restart-marker").stdout.strip() == "after"
+    silo.rm("restart-orphan-restored", force=True)
+    shutdown.storage_tool(silo, "prune")
+    silo.stop("restart-orphan-fork")
+    silo.start("restart-orphan-fork")
+    silo.wait_ready("restart-orphan-fork")
+    assert silo.exec("restart-orphan-fork", "cat", "/restart-marker").stdout.strip() == "after"

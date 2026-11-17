@@ -696,7 +696,8 @@ fn complete_cut_identity(staging: &OwnedDirectory, plan: &CapturePlan) -> Result
     let disks = staging
         .open_dir("disks")?
         .ok_or_else(|| protocol("cut disks are missing"))?;
-    let mut hasher = crate::storage::stream::StreamHasher::new();
+    let mut hasher =
+        crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
     for pending in &cut.disks {
         let file = disks
             .open_file(&pending.name.file_name())?
@@ -709,13 +710,14 @@ fn complete_cut_identity(staging: &OwnedDirectory, plan: &CapturePlan) -> Result
             .ok_or_else(|| protocol("pending capture disk disappeared"))?;
         cut_disk_fingerprint(&fresh, pending)?;
         let map_bytes = scan.map.canonical_bytes()?;
-        let map_name = format!("{}.map.json", pending.name.as_str());
+        let map_name = format!("{}.root", pending.name.as_str());
         if let Some(existing) = disks.open_file(&map_name)? {
             if existing.metadata()?.nlink() != 1 {
                 return Err(protocol("pending capture disk map has extra links"));
             }
         }
         disks.write_file(&map_name, &map_bytes)?;
+        crate::store::capture::stage_map_nodes(staging, &scan.map)?;
         cut.evidence
             .disk_stats
             .retain(|stats| stats.name != pending.name);
@@ -806,9 +808,7 @@ fn complete_cut_identity(staging: &OwnedDirectory, plan: &CapturePlan) -> Result
     for entry in &cut.evidence.inventory {
         let file = match &entry.role {
             CaptureRole::Disk(name) => disks.open_file(&name.file_name())?,
-            CaptureRole::DiskMap(name) => {
-                disks.open_file(&format!("{}.map.json", name.as_str()))?
-            }
+            CaptureRole::DiskMap(name) => disks.open_file(&format!("{}.root", name.as_str()))?,
             role => staging.open_file(&role.relative_path())?,
         }
         .ok_or_else(|| protocol("capture output disappeared"))?;
@@ -820,6 +820,9 @@ fn complete_cut_identity(staging: &OwnedDirectory, plan: &CapturePlan) -> Result
             file.metadata()?.blocks().saturating_mul(512)
         });
     }
+    charged = charged
+        .checked_add(crate::store::capture::staged_node_bytes(staging)?)
+        .ok_or_else(|| protocol("recovered node allocation overflow"))?;
     if charged > plan.reservation.staging_bytes {
         return Err(protocol(
             "recovered capture exceeds its staging reservation",
@@ -2100,6 +2103,7 @@ mod tests {
             shares: Vec::new(),
         };
         let plan = CapturePlan {
+            map_node_store: None,
             version: CAPTURE_RECORD_VERSION,
             machine_id: id(1),
             run_id: id(2),
@@ -2158,11 +2162,14 @@ mod tests {
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
         };
-        let mut hasher = crate::storage::stream::StreamHasher::new();
+        let mut hasher =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         let expected_map = hasher
             .hash_reader(std::fs::File::open(&path).unwrap())
             .unwrap();
-        let ram = StreamMap::new(4096, vec![None]).unwrap();
+        let ram = vm_spec::stream_map::StreamRoot::empty(4096, vm_spec::stream_map::ChunkSize::RAM)
+            .unwrap();
+        let changes = b"KRUNRAM\0\x01\0\x10\0\0\0\0\0".to_vec();
         let mut inventory = Vec::new();
         for (role, bytes) in [
             (CaptureRole::Execution, b"execution".to_vec()),
@@ -2170,6 +2177,7 @@ mod tests {
             (CaptureRole::Ram, vec![0; 4096]),
             (CaptureRole::Layout, br#"{"architecture":"x86_64","kind":"ram-layout","magic":"KRUNRAML","packedLength":4096,"pageGranule":4096,"regions":[{"guestPhysicalAddress":0,"length":4096,"streamOffset":0}],"schema":1,"topology":{"ramBelowGap":4096}}"#.to_vec()),
             (CaptureRole::RamMap, ram.canonical_bytes().unwrap()),
+            (CaptureRole::RamChanges, changes.clone()),
         ] {
             staging.write_file(&role.relative_path(), &bytes).unwrap();
             let stream = role == CaptureRole::Ram;
@@ -2208,11 +2216,17 @@ mod tests {
                 mode: CapturePolicy::Full,
                 baseline: None,
                 full_reason: Some(CaptureFullReason::Requested),
-                dirty_chunks: vec![1],
-                chunk_digests: vec![None],
+                identity_chunk_bytes: 1 << 16,
+                changes: CaptureRamChanges {
+                    byte_len: changes.len() as u64,
+                    sha256: Sha256Digest::of_bytes(&changes),
+                    record_count: 0,
+                    coverage: CaptureRamCoverage::Full,
+                    baseline_stream: None,
+                },
                 stats: CaptureMemoryStats {
                     logical_bytes: 4096,
-                    identity_bytes_hashed: 4096,
+                    identity_bytes_hashed: 0,
                     ..Default::default()
                 },
                 binding: CaptureStateBinding {
@@ -2257,12 +2271,10 @@ mod tests {
             dirty_chunks: length.div_ceil(STREAM_CHUNK_BYTES),
             total_chunks: length.div_ceil(STREAM_CHUNK_BYTES),
             bytes_hashed: expected_map
-                .chunks()
-                .iter()
-                .enumerate()
-                .filter(|(_, chunk)| matches!(chunk, crate::storage::stream::Chunk::Data(_)))
-                .map(|(index, _)| {
-                    (length - index as u64 * STREAM_CHUNK_BYTES).min(STREAM_CHUNK_BYTES)
+                .present_chunks()
+                .map(|chunk| {
+                    let index = chunk.unwrap().index;
+                    (length - index * STREAM_CHUNK_BYTES).min(STREAM_CHUNK_BYTES)
                 })
                 .sum(),
             baseline_reused: false,
@@ -2295,9 +2307,7 @@ mod tests {
         let (_root, staging, plan, expected) = identity_pending_files();
         assert!(staging.open_file(CAPTURE_EVIDENCE_FILE).unwrap().is_none());
         let disks = staging.open_dir("disks").unwrap().unwrap();
-        disks
-            .write_file("root.map.json", b"interrupted map")
-            .unwrap();
+        disks.write_file("root.root", b"interrupted root").unwrap();
         staging
             .write_file(CAPTURE_EVIDENCE_TEMPORARY_FILE, b"interrupted seal")
             .unwrap();
@@ -2377,6 +2387,6 @@ mod tests {
             std::fs::read(staging.path().join(CAPTURE_EVIDENCE_FILE)).unwrap(),
             bytes
         );
-        assert!(!staging.path().join("disks/root.map.json").exists());
+        assert!(!staging.path().join("disks/root.root").exists());
     }
 }

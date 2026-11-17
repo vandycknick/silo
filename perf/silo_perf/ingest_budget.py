@@ -419,6 +419,11 @@ def lower_proof(silo: Silo, payload: int) -> dict[str, Json]:
             "SELECT fsmeta_digest,fsmeta_length,record_digest FROM composition_result").fetchall()
         layers = connection.execute(
             "SELECT pack_stream,pack_length,index_root,record_digest,pack_map FROM layer_result").fetchall()
+        map_objects = connection.execute(
+            "WITH RECURSIVE map_closure(digest) AS ("
+            "SELECT pack_map FROM layer_result UNION "
+            "SELECT e.child_digest FROM stream_map_edge e JOIN map_closure c ON e.parent_digest=c.digest"
+            ") SELECT digest FROM map_closure ORDER BY digest").fetchall()
     assert len(lower) == 1 and len(layers) == 2, (lower, layers)
     files: list[Json] = []
     for fsmeta, length, record in lower:
@@ -436,12 +441,19 @@ def lower_proof(silo: Silo, payload: int) -> dict[str, Json]:
         pack_bytes += length
         files.append({"role": "pack", "digest": stream, "logicalBytes": length,
                       "allocatedBytes": path.stat().st_blocks * 512})
-        for role, digest in (("index", index), ("layer-result", result), ("pack-map", stream_map)):
+        for role, digest in (("index", index), ("layer-result", result)):
             path = pool / "objects/sha256" / digest.removeprefix("sha256:")
             assert path.is_file() and path.stat().st_size > 0, path
             files.append({"role": role, "digest": digest, "logicalBytes": path.stat().st_size})
+    map_bytes = 0
+    for (digest,) in map_objects:
+        path = pool / "objects/sha256" / digest.removeprefix("sha256:")
+        size = path.stat().st_size
+        map_bytes += size
+        files.append({"role": "stream-map-metadata", "digest": digest, "logicalBytes": size})
     assert pack_bytes >= payload, "full incompressible payload was not packed"
-    return {"files": files, "packBytes": pack_bytes, "layerCount": len(layers)}
+    return {"files": files, "packBytes": pack_bytes, "layerCount": len(layers),
+            "mapObjects": len(map_objects), "mapBytes": map_bytes}
 
 
 def _create(silo: Silo, image: CorpusImage, name: str) -> float:

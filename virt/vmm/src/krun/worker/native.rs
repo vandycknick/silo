@@ -536,6 +536,7 @@ impl NativeLifecycle for KrunNative {
         capture: &CaptureTicket,
         ram: File,
         layout: File,
+        changes: File,
         preparation: &crate::virt::lifecycle::CapturePreparation,
         operation: NativeOperation,
         deadline: Instant,
@@ -568,7 +569,11 @@ impl NativeLifecycle for KrunNative {
                     preparation.dirty_crossover_percent,
                     token,
                 ),
-                MemoryOutputs { ram, layout },
+                MemoryOutputs {
+                    ram,
+                    layout,
+                    changes,
+                },
                 OperationId(operation.get()),
                 deadline,
             )
@@ -887,7 +892,9 @@ fn memory_capture(
     completed: &CompletedCapture,
     baseline: Option<vm_spec::capture::Sha256Digest>,
 ) -> Result<MemoryCapture, NativeFailure> {
-    use vm_spec::capture::{CaptureFullReason, CaptureMemoryStats, STREAM_CHUNK_BYTES};
+    use vm_spec::capture::{
+        CaptureFullReason, CaptureMemoryStats, CaptureRamChanges, CaptureRamCoverage, Sha256Digest,
+    };
     use vm_spec::lifecycle::CapturePolicy;
     let mode = match completed.ram.mode() {
         libkrun::live::RamCaptureMode::Full => CapturePolicy::Full,
@@ -900,7 +907,6 @@ fn memory_capture(
         libkrun::live::FullCaptureReason::CoverageLost => CaptureFullReason::CoverageLost,
         libkrun::live::FullCaptureReason::DirtyCrossover => CaptureFullReason::DirtyCrossover,
     });
-    let chunks = completed.ram.packed_len().div_ceil(STREAM_CHUNK_BYTES) as usize;
     if completed.ram.packed_len() == 0
         || completed.ram.packed_len() > vm_spec::capture::MAX_CAPTURE_RAM_BYTES
     {
@@ -909,34 +915,16 @@ fn memory_capture(
             "native RAM length is outside its bound",
         ));
     }
-    let mut dirty_chunks = vec![0u8; chunks.div_ceil(8)];
-    let mut identity_bytes_hashed = 0;
-    for index in completed.ram.affected_chunks() {
-        if index >= chunks {
-            return Err(NativeFailure::with_detail(
-                NativeFailureKind::Unexpected,
-                "native affected chunk is outside RAM",
-            ));
-        }
-        dirty_chunks[index / 8] |= 1 << (index % 8);
-        identity_bytes_hashed += (completed.ram.packed_len() - index as u64 * STREAM_CHUNK_BYTES)
-            .min(STREAM_CHUNK_BYTES);
-    }
-    if completed.ram.chunk_digests().len() != chunks {
-        return Err(NativeFailure::with_detail(
-            NativeFailureKind::Unexpected,
-            "native chunk digest count does not match RAM",
-        ));
-    }
     let stats = completed.ram.stats();
-    let [ram, layout] = completed
-        .ram
-        .output_identities()
-        .map(|(device, inode, length)| OutputReceipt {
-            device,
-            inode,
-            length,
-        });
+    let [ram, layout, changes_output] =
+        completed
+            .ram
+            .output_identities()
+            .map(|(device, inode, length)| OutputReceipt {
+                device,
+                inode,
+                length,
+            });
     Ok(MemoryCapture {
         binding: Box::new(capture_binding(completed.ram.binding())?),
         ram,
@@ -950,13 +938,22 @@ fn memory_capture(
             None
         },
         full_reason,
-        dirty_chunks,
-        chunk_digests: completed
-            .ram
-            .chunk_digests()
-            .iter()
-            .map(|digest| digest.map(vm_spec::capture::Sha256Digest::from_bytes))
-            .collect(),
+        identity_chunk_bytes: completed.ram.identity_chunk_bytes(),
+        changes: CaptureRamChanges {
+            byte_len: completed.ram.changes().byte_len(),
+            sha256: Sha256Digest::from_bytes(*completed.ram.changes().sha256()),
+            record_count: completed.ram.changes().record_count(),
+            coverage: match completed.ram.changes().coverage() {
+                libkrun::live::RamCaptureMode::Full => CaptureRamCoverage::Full,
+                libkrun::live::RamCaptureMode::Incremental => CaptureRamCoverage::Incremental,
+            },
+            baseline_stream: completed
+                .ram
+                .changes()
+                .baseline_stream()
+                .map(Sha256Digest::from_bytes),
+        },
+        changes_output,
         stats: Box::new(CaptureMemoryStats {
             seed_method: match stats.seed_method {
                 libkrun::live::RamSeedMethod::Clone => vm_spec::capture::CaptureSeedMethod::Clone,
@@ -978,7 +975,7 @@ fn memory_capture(
             zero_bytes_punched: stats.zero_bytes_punched,
             known_zero_bytes_skipped: stats.known_zero_bytes_skipped,
             extent_queries: stats.extent_queries,
-            identity_bytes_hashed,
+            identity_bytes_hashed: stats.identity_bytes_hashed,
             ..CaptureMemoryStats::default()
         }),
     })

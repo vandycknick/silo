@@ -22,7 +22,12 @@ pub struct ExpectedLayer {
 
 pub fn domain(kind: &str, record: &[u8]) -> String {
     let mut digest = Sha256::new();
-    digest.update(format!("silo:{kind}:v1\n"));
+    let version = if kind == "layer-result" || kind == "composition-result" {
+        2
+    } else {
+        1
+    };
+    digest.update(format!("silo:{kind}:v{version}\n"));
     digest.update(record);
     crate::support::oracle::digest_text(&digest.finalize())
 }
@@ -31,23 +36,52 @@ fn encoded(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).expect("fixed fixture JSON")
 }
 
-/// The test-only identity writer intentionally does not call StreamMap or OCI.
-pub fn stream_identity(pack: &[u8]) -> (Vec<u8>, String) {
-    let chunks: Vec<_> = pack
-        .chunks(8_388_608)
-        .map(|chunk| {
-            if chunk.iter().all(|byte| *byte == 0) {
-                "zero".into()
+/// Independent binary Merkle writer, without production stream/OCI codecs.
+fn stream_root(length: u64, mut leaves: BTreeMap<u64, [u8; 32]>) -> (Vec<u8>, String) {
+    for height in 0_u8..5 {
+        let mut groups = BTreeMap::<u64, BTreeMap<u64, [u8; 32]>>::new();
+        for (index, digest) in leaves {
+            groups
+                .entry(index / 64)
+                .or_default()
+                .insert(index % 64, digest);
+        }
+        leaves = BTreeMap::new();
+        for (index, entries) in groups {
+            let mut node = if height == 0 {
+                b"silo:stream-map:leaf:v2\n".to_vec()
             } else {
-                hash(chunk)
+                let mut prefix = b"silo:stream-map:branch:v2\n".to_vec();
+                prefix.push(height);
+                prefix
+            };
+            let bitmap = entries.keys().fold(0_u64, |bits, slot| bits | (1 << slot));
+            node.extend_from_slice(&bitmap.to_le_bytes());
+            for digest in entries.values() {
+                node.extend_from_slice(digest);
             }
-        })
-        .collect();
-    let record = encoded(
-        &json!({"chunkSize":8388608,"chunks":chunks,"kind":"stream","length":pack.len(),"schema":1}),
-    );
-    let identity = domain("stream", &record);
-    (record, identity)
+            leaves.insert(index, Sha256::digest(&node).into());
+        }
+    }
+    let mut root = b"silo:stream:v2\n".to_vec();
+    root.push(23);
+    root.extend_from_slice(&length.to_le_bytes());
+    root.push(u8::from(!leaves.is_empty()));
+    if let Some(tree) = leaves.get(&0) {
+        root.extend_from_slice(tree);
+    }
+    let identity = hash(&root);
+    (root, identity)
+}
+
+pub fn stream_identity(pack: &[u8]) -> (Vec<u8>, String) {
+    let mut leaves = BTreeMap::new();
+    for (index, chunk) in pack.chunks(8_388_608).enumerate() {
+        if chunk.iter().any(|byte| *byte != 0) {
+            leaves.insert(index as u64, Sha256::digest(chunk).into());
+        }
+    }
+    stream_root(pack.len() as u64, leaves)
 }
 
 pub fn stream_file_identity(path: &std::path::Path) -> (Vec<u8>, String) {
@@ -56,25 +90,21 @@ pub fn stream_file_identity(path: &std::path::Path) -> (Vec<u8>, String) {
     let length = file.metadata().expect("pack metadata").len();
     let mut remaining = length;
     let mut buffer = vec![0_u8; 8_388_608];
-    let mut chunks = Vec::<String>::new();
+    let mut leaves = BTreeMap::new();
+    let mut index = 0;
     while remaining != 0 {
         let count = remaining.min(buffer.len() as u64) as usize;
         file.read_exact(&mut buffer[..count])
             .expect("complete immutable pack chunk");
-        chunks.push(if buffer[..count].iter().all(|byte| *byte == 0) {
-            "zero".into()
-        } else {
-            hash(&buffer[..count])
-        });
+        if buffer[..count].iter().any(|byte| *byte != 0) {
+            leaves.insert(index, Sha256::digest(&buffer[..count]).into());
+        }
+        index += 1;
         remaining -= count as u64;
     }
     let mut suffix = [0_u8; 1];
     assert_eq!(file.read(&mut suffix).expect("pack EOF"), 0);
-    let record = encoded(
-        &json!({"chunkSize":8388608,"chunks":chunks,"kind":"stream","length":length,"schema":1}),
-    );
-    let identity = domain("stream", &record);
-    (record, identity)
+    stream_root(length, leaves)
 }
 
 pub fn expected(operations: &[Operation], tar: &[u8]) -> ExpectedLayer {
@@ -183,7 +213,7 @@ pub fn expected(operations: &[Operation], tar: &[u8]) -> ExpectedLayer {
     );
     let recipe = domain("layer-recipe", &recipe_record);
     let result_record = encoded(
-        &json!({"indexRoot":hash(&root),"kind":"layer-result","packLength":pack.len(),"packStream":stream,"recipe":recipe,"schema":1}),
+        &json!({"indexRoot":hash(&root),"kind":"layer-result","packLength":pack.len(),"packStream":stream,"recipe":recipe,"schema":2}),
     );
     let result = domain("layer-result", &result_record);
     ExpectedLayer {

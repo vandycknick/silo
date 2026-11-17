@@ -34,7 +34,7 @@ import sys
 import time
 
 MIB = 1024 * 1024
-CAPTURE_OUTPUTS = ("memory.ram", "memory-layout.json", "execution.state", "devices.state", "memory.map.json")
+CAPTURE_OUTPUTS = ("memory.ram", "memory-layout.json", "execution.state", "devices.state", "memory.root", "memory.changes")
 BINDING_FIELDS = ("profile", "topology", "ram-layout", "source-run", "capture")
 
 
@@ -241,6 +241,24 @@ def make_session_type():
                                                   bytes(record["binding"]["ram_layout"]))
             save(directory / "memory-authentication.json", authentication)
             write_authentication(directory / "memory-authentication.bin", authentication)
+            from silo_smoke import stream_map
+            root_bytes = (directory / "memory.root").read_bytes()
+            root = stream_map.decode_root(root_bytes)
+            require(root_bytes.hex() == authentication["stream_root"], "native root differs from independent full-byte root")
+            changes = stream_map.read_changes(directory / "memory.changes", root.length)
+            summary = record["changes"]
+            require((changes.mode, changes.byte_length, changes.identity, len(changes.records)) == (
+                summary["coverage"], summary["byte_len"], summary["sha256"], summary["record_count"]),
+                "native sparse changes differ from bounded receipt")
+            store = Path(record["map_node_store"])
+            require(store.is_absolute(), "standalone node capability must be absolute")
+            leaves = dict(stream_map.present_chunks(root, lambda identity: (store / identity[7:]).read_bytes()))
+            for change in changes.records:
+                require(all(leaves.get(index) == change.value for index in range(change.first, change.first + change.count)),
+                        "native changes differ from independently authenticated map")
+            if changes.mode == "full":
+                require({change.first: change.value for change in changes.records} == leaves,
+                        "full native changes omit nonzero map leaves")
             sealed = {}
             for name in CAPTURE_OUTPUTS:
                 path = directory / name

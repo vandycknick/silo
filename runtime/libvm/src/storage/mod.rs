@@ -25,6 +25,8 @@ pub enum StorageError {
     Bound(#[from] limits::BoundViolation),
     #[error(transparent)]
     FileDescriptorBudget(#[from] limits::FileDescriptorBudgetError),
+    #[error(transparent)]
+    Map(#[from] vm_spec::stream_map::MapError),
     #[error("restore disk budget requires {}, available {} (short by {})", utils::format_storage_size(*required), utils::format_storage_size(*available), utils::format_storage_size(required.saturating_sub(*available)))]
     RestoreDiskBudget { required: u64, available: u64 },
     #[error("capture {phase} on filesystem {filesystem:?}: requires {required} bytes, available {available} bytes (RAM staging {ram_staging}, disk staging {disk_staging}, publication {publication}, reserves {reserves}, other reservations {other})")]
@@ -45,8 +47,6 @@ pub enum StorageError {
     PublicationBusy { resource: String },
     #[error("invalid owned storage path: {0}")]
     InvalidPath(String),
-    #[error("stream map has {actual} chunks, expected {expected} for its length")]
-    ChunkCount { expected: u64, actual: u64 },
     #[error("immutable content at {0} does not match its identity")]
     ContentMismatch(std::path::PathBuf),
     #[error("source is not a regular file: {0}")]

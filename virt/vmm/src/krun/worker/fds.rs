@@ -256,7 +256,7 @@ impl Bootstrap {
                         maximum: 32 * 1024 * 1024,
                     },
                     Role::State {
-                        maximum: vm_spec::capture::MAX_RAM_MAP_BYTES as u64,
+                        maximum: vm_spec::stream_map::MAX_ROOT_BYTES as u64,
                     },
                 ])
             }))

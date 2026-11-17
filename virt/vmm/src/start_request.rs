@@ -858,6 +858,8 @@ mod tests {
         let run = Uuid::new_v4().to_string();
         let seed = DiskTrackingSeed {
             version: DISK_TRACKING_VERSION,
+            map_format: 2,
+            chunk_shift: 23,
             role: vm_spec::DiskRole::Root,
             attachment_index: 0,
             block_id: vm_spec::BlockId::new("root").unwrap(),

@@ -107,7 +107,7 @@ def test_capture_multidisk_dirty_matched_cut_and_independent_sealed_bytes(
                 "workloadsFrozen", "vcpusPaused", "devicesQuiesced", "hostWritersDrained",
                 "hostFlushCompleted", "diskCopiesSealed", "memoryStateSealed"))
             sealed = capture.inventory(directory)
-            # Each sealed disk image has a sibling `<role>.map.json` chunk map.
+            # Each sealed disk has a sibling binary `<role>.root` descriptor.
             images = {key: value for key, value in sealed.items()
                       if key.startswith("disks/") and key.endswith(".raw")}
             assert {key.removeprefix("disks/").removesuffix(".raw") for key in images} == expected_roles

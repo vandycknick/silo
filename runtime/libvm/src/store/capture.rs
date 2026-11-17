@@ -59,7 +59,8 @@ impl SnapshotStore {
                     let directory = capture_directory(&this.store, &record)?
                         .ok_or_else(|| invalid("accepted capture staging disappeared"))?;
                     settle_capture_seal(&directory)?;
-                    let verified = validate_receipt(&directory, &record)?;
+                    let mut verified = validate_receipt(&directory, &record)?;
+                    verified.admit_maps(&this.store, record.capture_id).await?;
                     verified.retain_disk_baselines(
                         &crate::paths::machine_data_dir_in(
                             this.store.home_path(),
@@ -70,7 +71,25 @@ impl SnapshotStore {
                     record.evidence =
                         Some(String::from_utf8(verified.evidence_bytes).map_err(invalid)?);
                 }
-                this.store.accept_capture_disk_baselines(&record).await
+                let evidence = CaptureEvidence::decode(
+                    record
+                        .evidence
+                        .as_deref()
+                        .ok_or_else(|| invalid("accepted capture evidence is missing"))?
+                        .as_bytes(),
+                )
+                .map_err(invalid)?;
+                let memory = evidence
+                    .memory
+                    .as_ref()
+                    .ok_or_else(|| invalid("accepted RAM identity is missing"))?;
+                this.store.accept_capture_disk_baselines(&record).await?;
+                this.store
+                    .retain_memory_baseline(
+                        record.launch_operation_id,
+                        ObjectDigest::from_sha256(*memory.ram_stream.as_bytes()),
+                    )
+                    .await
             })
         })
         .await?
@@ -135,9 +154,9 @@ impl SnapshotStore {
                 _lease: lease,
             });
         }
-        crate::storage::limits::preflight_fd_budget(
-            request.configuration.attachments.len() as u64 * 3 + 12,
-        )
+        crate::storage::limits::preflight_fd_budget(capture_descriptor_budget(
+            &request.configuration,
+        )?)
         .map_err(StorageError::from)?;
         let config = self
             .store
@@ -193,6 +212,17 @@ impl SnapshotStore {
             .checked_add(vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
             .ok_or_else(|| invalid("capture budget overflow"))?;
         let map_bytes = capture_map_budget(&request.configuration)?;
+        let changes_bytes = request
+            .configuration
+            .ram_bytes()
+            .div_ceil(vm_spec::stream_map::ChunkSize::RAM.bytes())
+            .checked_mul(56)
+            .and_then(|bytes| bytes.checked_add(16))
+            .ok_or_else(|| invalid("RAM changes budget overflow"))?;
+        stage = stage
+            .checked_add(map_bytes)
+            .and_then(|bytes| bytes.checked_add(changes_bytes))
+            .ok_or_else(|| invalid("capture metadata staging overflow"))?;
         let fork_operation_id = self.store.fork_for_capture(request.capture_id).await?;
         let local_fork = fork_operation_id.is_some();
         let clone_publication = !local_fork
@@ -206,6 +236,7 @@ impl SnapshotStore {
             publication_stream_bytes(request.configuration.ram_bytes(), clone_publication)
                 .checked_add(2 * vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
                 .and_then(|bytes| bytes.checked_add(2 * map_bytes))
+                .and_then(|bytes| bytes.checked_add(changes_bytes))
                 .ok_or_else(|| invalid("capture publication budget overflow"))?;
         let mut disks = Vec::new();
         let mut disk_allocations = BTreeMap::new();
@@ -298,7 +329,10 @@ impl SnapshotStore {
                             && baseline.seed.file_device == metadata.dev()
                             && baseline.seed.file_inode == metadata.ino()
                             && baseline.seed.length == metadata.len()
-                    }).map(|baseline| machine.path().join(baseline.map.as_path()).to_string_lossy().into_owned()),
+                    }).map(|baseline| crate::machine::root_storage::baseline_map_path(
+                        &vm_spec::capture::Sha256Digest::from_bytes(*baseline.map.as_bytes()))
+                        .map(|path| machine.path().join(path.as_path()).to_string_lossy().into_owned()))
+                        .transpose()?,
                     copy: CaptureDiskCopy::Copy,
                 });
             }
@@ -313,7 +347,14 @@ impl SnapshotStore {
             .ok_or_else(|| invalid("capture peak overflow"))?;
         let ram = request.configuration.ram_bytes();
         let plan = CapturePlan {
-            version: 1,
+            map_node_store: Some(
+                self.store
+                    .images_dir
+                    .join("objects/sha256")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            version: vm_spec::capture::CAPTURE_RECORD_VERSION,
             machine_id: LiveId::parse(&Uuid::from(request.machine_id).to_string())
                 .map_err(invalid)?,
             run_id: LiveId::parse(&request.run_id.to_string()).map_err(invalid)?,
@@ -778,6 +819,9 @@ impl SnapshotStore {
         };
         let mut verified = verify_capture(&directory, &record, authentication)?;
         let mut publication = 2 * vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
+        publication = publication
+            .checked_add(staged_node_charge(&directory, true)?)
+            .ok_or_else(|| invalid("capture node publication budget overflow"))?;
         let mut publication_clones = BTreeSet::new();
         let source_device = nix::sys::stat::fstat(directory.fd())
             .map_err(std::io::Error::from)?
@@ -825,8 +869,13 @@ impl SnapshotStore {
                 }
                 CaptureRole::RamMap | CaptureRole::DiskMap(_) => {
                     publication = publication
-                        .checked_add(2 * payload.length)
+                        .checked_add(MAP_NODE_RESERVE_BYTES)
                         .ok_or_else(|| invalid("publication map budget overflow"))?;
+                }
+                CaptureRole::RamChanges => {
+                    publication = publication
+                        .checked_add(payload.length)
+                        .ok_or_else(|| invalid("RAM changes publication overflow"))?;
                 }
                 _ => {}
             }
@@ -857,6 +906,7 @@ impl SnapshotStore {
         self.store
             .reserve_capture_publication(&record, publication)
             .await?;
+        verified.admit_maps(&self.store, capture).await?;
         verified.retain_disk_baselines(
             &crate::paths::machine_data_dir_in(self.store.home_path(), record.machine_id),
             &record.plan,
@@ -889,7 +939,7 @@ impl SnapshotStore {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                         Err(error) => return Err(error.into()),
                     };
-                    let (publication, roots) = pool.publish_sealed_stream_for_catalog(
+                    let (publication, roots) = pool.publish_admitted_stream_for_catalog(
                         payload.file(),
                         map,
                         receipt,
@@ -922,7 +972,10 @@ impl SnapshotStore {
                         verified.publications.insert(id, publication);
                     }
                 }
-                CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout => {
+                CaptureRole::Execution
+                | CaptureRole::Devices
+                | CaptureRole::Layout
+                | CaptureRole::RamChanges => {
                     let (published, roots) = pool.publish_object_file_for_catalog(
                         payload.file().try_clone()?,
                         &directory.path().join(payload.role.relative_path()),
@@ -960,7 +1013,8 @@ impl SnapshotStore {
                 );
                 continue;
             }
-            let stream = input.identity.parse().map_err(invalid)?;
+            let stream: crate::storage::identity::StreamId =
+                input.identity.parse().map_err(invalid)?;
             let pinned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_stream WHERE operation_id=?1 AND stream_id=?2)")
                 .bind(capture.to_string()).bind(input.identity.clone()).fetch_one(&self.store.pool).await?;
             if !pinned {
@@ -968,14 +1022,23 @@ impl SnapshotStore {
                     "read-only capture input was not pinned before access",
                 ));
             }
-            let map = pool.verify_stream(&stream)?;
+            let content = crate::store::models::snapshot::SnapshotStream {
+                stream,
+                map: ObjectDigest::from_sha256(*stream.as_bytes()),
+                length: attachment.geometry.length,
+                chunk_size: vm_spec::stream_map::ChunkSize::DISK.bytes(),
+            };
+            let authenticated = self
+                .store
+                .authenticate_local_stream(capture, &content)
+                .await?;
+            let map = authenticated.map();
             if map.length() != attachment.geometry.length {
                 return Err(invalid("read-only input geometry changed"));
             }
             immutable.insert(
                 input.attachment_index,
-                crate::store::snapshot_store::publish_map(&pool, &self.store, capture, &map)
-                    .await?,
+                crate::store::snapshot_store::publish_map(&pool, &self.store, capture, map).await?,
             );
         }
         let root_index = if matches!(record.storage.root, MachineRoot::LinuxOverlay { .. }) {
@@ -1079,7 +1142,7 @@ impl SnapshotStore {
                 .ok_or_else(|| invalid("capture state object is missing"))
         };
         let snapshot = SnapshotRecord {
-            schema: 1,
+            schema: 2,
             kind: SnapshotKind::Snapshot,
             purpose: SnapshotPurpose::Checkpoint,
             capture: SnapshotCaptureKind::LiveExecution {
@@ -1191,7 +1254,6 @@ impl SnapshotStore {
         for layer in &graph.layers {
             streams.push(layer.pack.stream);
             objects.push(layer.pack.map);
-            objects.extend(layer.pack.map_pages.iter().copied());
         }
         self.store
             .pin_published_storage_dependencies(capture, &streams, &objects)
@@ -1211,11 +1273,21 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
     record
         .storage
         .validate_for_machine(record.machine_id.into())?;
+    let maps = capture_map_budget(&record.plan.configuration)?;
+    let changes = record
+        .plan
+        .ram_bytes
+        .div_ceil(vm_spec::stream_map::ChunkSize::RAM.bytes())
+        .checked_mul(56)
+        .and_then(|bytes| bytes.checked_add(16))
+        .ok_or_else(|| invalid("RAM changes budget overflow"))?;
     let expected_staging = record.disk_allocations.values().try_fold(
         record
             .plan
             .ram_bytes
             .checked_add(vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
+            .and_then(|bytes| bytes.checked_add(maps))
+            .and_then(|bytes| bytes.checked_add(changes))
             .ok_or_else(|| invalid("capture staging overflow"))?,
         |bytes, allocated| {
             bytes
@@ -1236,6 +1308,7 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
             )
             .checked_add(2 * vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES)
             .and_then(|bytes| bytes.checked_add(2 * maps))
+            .and_then(|bytes| bytes.checked_add(changes))
             .ok_or_else(|| invalid("capture publication overflow"))?;
             for disk in &record.plan.disks {
                 let allocated = record
@@ -1408,30 +1481,116 @@ fn publication_stream_bytes(copy_bound: u64, clone_required: bool) -> u64 {
     }
 }
 
+// Covers a rounded node object plus its catalog node and positional edge rows.
+const MAP_NODE_RESERVE_BYTES: u64 = 8192;
+const MAP_CATALOG_ROW_RESERVE_BYTES: u64 = 512;
+
 fn capture_map_budget(
     configuration: &vm_spec::capture::CaptureConfiguration,
 ) -> Result<u64, LibVmError> {
-    std::iter::once(configuration.ram_bytes())
-        .chain(
-            configuration
-                .attachments
-                .iter()
-                .map(|disk| disk.geometry.length),
-        )
-        .try_fold(0u64, |total, length| {
-            let chunks = length.div_ceil(crate::storage::limits::CHUNK_SIZE as u64);
-            let pages = chunks.div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
-            chunks
-                .checked_mul(74)
-                .and_then(|bytes| {
-                    pages
-                        .checked_mul(330)
-                        .and_then(|pages| bytes.checked_add(pages))
-                })
-                .and_then(|bytes| bytes.checked_add(256))
-                .and_then(|bytes| total.checked_add(bytes))
-                .ok_or_else(|| invalid("capture map budget overflow"))
-        })
+    std::iter::once((
+        configuration.ram_bytes(),
+        vm_spec::stream_map::ChunkSize::RAM,
+    ))
+    .chain(
+        configuration
+            .attachments
+            .iter()
+            .map(|disk| (disk.geometry.length, vm_spec::stream_map::ChunkSize::DISK)),
+    )
+    .try_fold(0u64, |total, (length, profile)| {
+        vm_spec::stream_map::worst_case_node_count(length, profile)
+            .map_err(invalid)?
+            .checked_add(1)
+            .and_then(|nodes| nodes.checked_mul(MAP_NODE_RESERVE_BYTES))
+            .and_then(|bytes| total.checked_add(bytes))
+            .ok_or_else(|| invalid("capture map budget overflow"))
+    })
+}
+
+pub(crate) fn capture_descriptor_budget(
+    configuration: &vm_spec::capture::CaptureConfiguration,
+) -> Result<u64, LibVmError> {
+    // Includes the changes file, root files, shared node batch and pool capability.
+    (configuration.attachments.len() as u64)
+        .checked_mul(3)
+        .and_then(|descriptors| descriptors.checked_add(20))
+        .ok_or_else(|| invalid("capture descriptor budget overflow"))
+}
+
+pub(crate) fn staged_node_bytes(directory: &OwnedDirectory) -> Result<u64, LibVmError> {
+    staged_node_charge(directory, false)
+}
+
+fn staged_node_charge(directory: &OwnedDirectory, catalog: bool) -> Result<u64, LibVmError> {
+    let Some(nodes) = directory.open_dir("map-nodes")? else {
+        return Ok(0);
+    };
+    let mut entries = nix::dir::Dir::openat(
+        nodes.fd(),
+        ".",
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let mut total = 0u64;
+    for entry in entries.iter() {
+        let entry = entry.map_err(std::io::Error::from)?;
+        let name = entry.file_name().to_str().map_err(invalid)?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        let file = nodes
+            .open_file(name)?
+            .ok_or_else(|| invalid("staged map node disappeared"))?;
+        let metadata = file.metadata()?;
+        let mut bytes = metadata
+            .blocks()
+            .checked_mul(512)
+            .ok_or_else(|| invalid("staged map allocation overflow"))?;
+        if catalog {
+            let length = usize::try_from(metadata.len()).map_err(invalid)?;
+            let mut buffer = [0; vm_spec::stream_map::MAX_NODE_BYTES];
+            let encoded = buffer
+                .get_mut(..length)
+                .ok_or_else(|| invalid("staged map node exceeds its format bound"))?;
+            std::os::unix::fs::FileExt::read_exact_at(&file, encoded, 0)?;
+            let height = if encoded.starts_with(b"silo:stream-map:leaf:v2\n") {
+                0
+            } else {
+                *encoded
+                    .get(26)
+                    .ok_or_else(|| invalid("staged branch is truncated"))?
+            };
+            let node = vm_spec::stream_map::StreamNode::decode(encoded, height).map_err(invalid)?;
+            let edges = if height == 0 {
+                0
+            } else {
+                node.entries().count() as u64
+            };
+            bytes = edges
+                .checked_add(1)
+                .and_then(|rows| rows.checked_mul(MAP_CATALOG_ROW_RESERVE_BYTES))
+                .and_then(|catalog| bytes.checked_add(catalog))
+                .ok_or_else(|| invalid("map catalog allocation overflow"))?;
+        }
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("staged map allocation overflow"))?;
+    }
+    Ok(total)
+}
+
+pub(crate) fn stage_map_nodes(
+    directory: &OwnedDirectory,
+    map: &crate::storage::map::AuthenticatedMap,
+) -> Result<(), LibVmError> {
+    let nodes = directory.ensure_dir_deferred("map-nodes")?;
+    for node in map.nodes() {
+        let node = node?;
+        nodes.write_file(&node.digest.hex(), &node.bytes)?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn register_capture(
@@ -1482,6 +1641,9 @@ pub(crate) async fn register_capture(
         sqlx::query(statement)
             .bind(record.capture_id.to_string()).bind(record.launch_operation_id.to_string()).execute(&mut *connection).await?;
     }
+    sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,root_digest FROM storage_operation_memory_baseline WHERE operation_id=?2")
+        .bind(record.capture_id.to_string()).bind(record.launch_operation_id.to_string())
+        .execute(&mut *connection).await?;
     Ok(())
 }
 
@@ -1844,13 +2006,47 @@ pub(crate) struct VerifiedCapture {
     evidence: CaptureEvidence,
     evidence_bytes: Vec<u8>,
     files: Vec<VerifiedPayload>,
-    ram_map: crate::storage::stream::StreamMap,
+    ram_map: crate::storage::map::AuthenticatedMap,
     publications:
         BTreeMap<crate::storage::identity::StreamId, crate::storage::pool::SealedStreamPublication>,
     directory_identity: (u64, u64),
     control_fingerprints: Vec<(&'static str, SourceFingerprint)>,
 }
 impl VerifiedCapture {
+    async fn admit_maps(&mut self, store: &Store, operation: Uuid) -> Result<(), LibVmError> {
+        let mut maps = vec![&self.ram_map];
+        for payload in &self.files {
+            if let VerifiedBytes::Stream(stream) = &payload.bytes {
+                if matches!(payload.role, CaptureRole::Disk(_)) {
+                    maps.push(stream.map());
+                }
+            }
+        }
+        let retained = store.admit_published_map_roots(operation, &maps).await?;
+        drop(maps);
+        let mut retained = retained.into_iter().map(|map| map.into_map());
+        self.ram_map = retained
+            .next()
+            .ok_or_else(|| invalid("RAM root admission returned no retained map"))?;
+        for payload in &mut self.files {
+            if matches!(payload.role, CaptureRole::Disk(_)) {
+                if let VerifiedBytes::Stream(stream) = &payload.bytes {
+                    let map = retained
+                        .next()
+                        .ok_or_else(|| invalid("disk root admission returned no retained map"))?;
+                    payload.bytes = VerifiedBytes::Stream(
+                        crate::storage::stream::AuthenticatedStream::from_verified_fingerprint(
+                            stream.file().try_clone()?,
+                            std::sync::Arc::new(map),
+                            stream.fingerprint(),
+                        )?,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn retain_disk_baselines(
         &self,
         machine_dir: &Path,
@@ -1866,7 +2062,10 @@ impl VerifiedCapture {
                     continue;
                 }
                 if let VerifiedBytes::Stream(stream) = &payload.bytes {
-                    crate::machine::root_storage::retain_disk_map(machine_dir, stream.map())?;
+                    crate::machine::root_storage::retain_admitted_disk_map(
+                        machine_dir,
+                        stream.map(),
+                    )?;
                 }
             }
         }
@@ -1967,6 +2166,90 @@ impl VerifiedCapture {
     }
 }
 
+pub(crate) fn staged_map(
+    directory: &OwnedDirectory,
+    plan: &CapturePlan,
+    bytes: &[u8],
+    role: vm_spec::stream_map::StreamRole,
+) -> Result<crate::storage::map::AuthenticatedMap, LibVmError> {
+    let root = vm_spec::stream_map::StreamRoot::decode(bytes).map_err(invalid)?;
+    let nodes = plan
+        .map_node_store
+        .as_deref()
+        .ok_or_else(|| invalid("capture map node capability is missing"))?;
+    let images = Path::new(nodes)
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| invalid("capture map node capability has no pool root"))?;
+    let pool = StoragePool::open_existing(images)?
+        .ok_or_else(|| invalid("capture map pool disappeared"))?;
+    let operation =
+        Uuid::parse_str(plan.reservation.storage_operation_id.as_str()).map_err(invalid)?;
+    let authority = pool.map_authority(std::sync::Arc::new(pool.existing_lease(operation)?))?;
+    let writer = match directory.open_dir("map-nodes")? {
+        Some(nodes) => crate::storage::map::MapNodeWriter::adopt_directory(nodes.path())?,
+        None => crate::storage::map::MapNodeWriter::new()?,
+    };
+    Ok(writer
+        .with_authority(authority)
+        .finish(root, role, None)?
+        .into_map())
+}
+
+fn validate_ram_changes(
+    file: &File,
+    memory: &vm_spec::capture::CaptureMemoryEvidence,
+    map: &crate::storage::map::AuthenticatedMap,
+) -> Result<(), LibVmError> {
+    if memory.identity_chunk_bytes as u64 != map.chunk_size().bytes() {
+        return Err(invalid("RAM change profile differs from its root"));
+    }
+    let mut input = file;
+    input.seek(SeekFrom::Start(0))?;
+    let mut present = (memory.changes.coverage == vm_spec::capture::CaptureRamCoverage::Full)
+        .then(|| map.present_chunks());
+    let mut nodes = map.node_source();
+    for change in vm_spec::capture::RamChangeReader::new(input, map.length(), &memory.changes)? {
+        match change? {
+            vm_spec::capture::CaptureRamChange::Data { index, digest } => {
+                let matches = if let Some(present) = &mut present {
+                    present
+                        .next()
+                        .transpose()?
+                        .is_some_and(|chunk| chunk.index == index && chunk.digest == digest)
+                } else {
+                    map.root()
+                        .lookup(index, &mut nodes)
+                        .map_err(StorageError::from)?
+                        == vm_spec::stream_map::Chunk::Data(digest)
+                };
+                if !matches {
+                    return Err(invalid("RAM change digest differs from sealed root"));
+                }
+            }
+            vm_spec::capture::CaptureRamChange::Zero { first_index, count } => {
+                if map
+                    .root()
+                    .zero_range_changes(first_index, count, &mut nodes)
+                    .map_err(StorageError::from)?
+                    .next()
+                    .transpose()
+                    .map_err(StorageError::from)?
+                    .is_some()
+                {
+                    return Err(invalid("RAM zero change differs from sealed root"));
+                }
+            }
+        }
+    }
+    if let Some(mut present) = present {
+        if present.next().transpose()?.is_some() {
+            return Err(invalid("full RAM changes omit nonzero root entries"));
+        }
+    }
+    Ok(())
+}
+
 /// Validate the coherent monitor receipt without reading stream payload bytes.
 pub(crate) fn validate_receipt(
     directory: &OwnedDirectory,
@@ -2035,6 +2318,7 @@ fn verify_capture(
     top.insert(vm_spec::capture::CAPTURE_SOURCE_TEMPORARY_FILE.to_owned());
     top.insert(vm_spec::capture::CAPTURE_CUT_FILE.to_owned());
     top.insert(vm_spec::capture::CAPTURE_CUT_TEMPORARY_FILE.to_owned());
+    top.insert("map-nodes".to_owned());
     check_entries(directory, &top)?;
     let disk_names = record
         .plan
@@ -2043,7 +2327,7 @@ fn verify_capture(
         .flat_map(|disk| {
             [
                 disk.name.file_name(),
-                format!("{}.map.json", disk.name.as_str()),
+                format!("{}.root", disk.name.as_str()),
             ]
         })
         .collect();
@@ -2076,16 +2360,16 @@ fn verify_capture(
             CaptureRole::Devices => crate::store::capture_native::MAX_DEVICE_BYTES,
             CaptureRole::Layout => 65536,
             CaptureRole::Ram => record.plan.ram_bytes,
-            CaptureRole::RamMap => {
-                (vm_spec::capture::MAX_CAPTURE_RAM_BYTES
-                    .div_ceil(crate::storage::limits::CHUNK_SIZE as u64)
-                    * 74)
-                    + 256
+            CaptureRole::RamMap | CaptureRole::DiskMap(_) => {
+                vm_spec::stream_map::MAX_ROOT_BYTES as u64
             }
-            CaptureRole::DiskMap(_) => {
-                (vm_spec::capture::MAX_STREAM_BYTES / vm_spec::capture::STREAM_CHUNK_BYTES) * 74
-                    + 256
-            }
+            CaptureRole::RamChanges => record
+                .plan
+                .ram_bytes
+                .div_ceil(vm_spec::stream_map::ChunkSize::RAM.bytes())
+                .checked_mul(56)
+                .and_then(|bytes| bytes.checked_add(16))
+                .ok_or_else(|| invalid("RAM changes bound overflow"))?,
             CaptureRole::Disk(_) => Resource::VirtualDiskBytes.maximum(),
         };
         if entry.length > maximum {
@@ -2158,7 +2442,12 @@ fn verify_capture(
     map_file
         .take(map_payload.length + 1)
         .read_to_end(&mut map_bytes)?;
-    let ram_map = crate::storage::stream::StreamMap::decode(&map_bytes)?;
+    let ram_map = staged_map(
+        directory,
+        &record.plan,
+        &map_bytes,
+        vm_spec::stream_map::StreamRole::Ram,
+    )?;
     if ram_map.length() != memory.packed_length
         || ram_map.id().as_bytes() != memory.ram_stream.as_bytes()
         || ram_map.canonical_bytes()? != map_bytes
@@ -2167,29 +2456,11 @@ fn verify_capture(
             "complete RAM map differs from sealed memory identity",
         ));
     }
-    if memory.chunk_digests.len() != ram_map.chunks().len() {
-        return Err(invalid("RAM receipt chunk count differs from complete map"));
-    }
-    for (index, (digest, chunk)) in memory
-        .chunk_digests
+    let changes = files
         .iter()
-        .zip(ram_map.chunks())
-        .enumerate()
-    {
-        let affected = memory
-            .dirty_chunks
-            .get(index / 8)
-            .is_some_and(|byte| byte & (1 << (index % 8)) != 0);
-        let expected = match chunk {
-            crate::storage::stream::Chunk::Zero => None,
-            crate::storage::stream::Chunk::Data(digest) => {
-                Some(Sha256Digest::from_bytes(*digest.as_bytes()))
-            }
-        };
-        if (affected && *digest != expected) || (!affected && digest.is_some()) {
-            return Err(invalid("RAM receipt chunks differ from complete map"));
-        }
-    }
+        .find(|file| file.role == CaptureRole::RamChanges)
+        .ok_or_else(|| invalid("RAM changes role is missing"))?;
+    validate_ram_changes(changes.file(), memory, &ram_map)?;
     for index in 0..files.len() {
         let payload = &files[index];
         let entry = evidence
@@ -2202,9 +2473,7 @@ fn verify_capture(
                 if payload.length != ram_map.length()
                     || Some(Sha256Digest::from_bytes(*ram_map.id().as_bytes())) != entry.identity
                 {
-                    return Err(invalid(
-                        "RAM receipt identity differs from recorded chunk list",
-                    ));
+                    return Err(invalid("RAM receipt identity differs from its stream root"));
                 }
                 continue;
             }
@@ -2219,13 +2488,14 @@ fn verify_capture(
         let mut input = map_payload.file();
         input.seek(SeekFrom::Start(0))?;
         input.take(map_payload.length + 1).read_to_end(&mut bytes)?;
-        let map = crate::storage::stream::StreamMap::decode(&bytes)?;
+        let root = vm_spec::stream_map::StreamRoot::decode(&bytes).map_err(invalid)?;
+        let map = ram_map.with_root(root, vm_spec::stream_map::StreamRole::Disk)?;
         if map.length() != payload.length
             || Some(Sha256Digest::from_bytes(*map.id().as_bytes())) != entry.identity
             || map.canonical_bytes()? != bytes
         {
             return Err(invalid(
-                "stream receipt identity differs from recorded chunk list",
+                "stream receipt identity differs from its stream root",
             ));
         }
         if !matches!(payload.bytes, VerifiedBytes::Stream(_)) {
@@ -2298,7 +2568,10 @@ fn verify_payload(
     payload: AdmittedPayload<'_>,
     authentication: CaptureAuthentication,
     buffer: &mut [u8],
-    hasher: &mut Option<crate::storage::stream::StreamHasher>,
+    hasher: &mut Option<(
+        vm_spec::stream_map::ChunkSize,
+        crate::storage::stream::StreamHasher,
+    )>,
     stop: &AtomicBool,
 ) -> Result<Option<VerifiedPayload>, LibVmError> {
     let AdmittedPayload {
@@ -2311,9 +2584,18 @@ fn verify_payload(
     }
     let bytes = match (&entry.role, authentication) {
         (CaptureRole::Disk(_) | CaptureRole::Ram, CaptureAuthentication::Bytes) => {
-            let stream = hasher
-                .get_or_insert_with(crate::storage::stream::StreamHasher::new)
-                .authenticate(file, entry.length)?;
+            let profile = if entry.role == CaptureRole::Ram {
+                vm_spec::stream_map::ChunkSize::RAM
+            } else {
+                vm_spec::stream_map::ChunkSize::DISK
+            };
+            if hasher.as_ref().is_some_and(|(size, _)| *size != profile) {
+                *hasher = None;
+            }
+            let (_, scanner) = hasher.get_or_insert_with(|| {
+                (profile, crate::storage::stream::StreamHasher::new(profile))
+            });
+            let stream = scanner.authenticate(file, entry.length)?;
             if Some(Sha256Digest::from_bytes(*stream.map().id().as_bytes())) != entry.identity {
                 return Err(invalid("capture staged stream identity mismatch"));
             }
@@ -2591,8 +2873,9 @@ impl SnapshotStore {
                 Some(cut) => cut,
                 None => {
                     settle_capture_seal(&source)?;
-                    let verified = validate_receipt(&source, &record)?;
+                    let mut verified = validate_receipt(&source, &record)?;
                     verified.recheck_registered(&this.store, capture)?;
+                    verified.admit_maps(&this.store, capture).await?;
                     verified.retain_disk_baselines(&crate::paths::machine_data_dir_in(this.store.home_path(), record.machine_id), &record.plan)?;
                     let mut storage = record.storage.clone();
                     storage.disk_baselines.clear();
@@ -2624,15 +2907,26 @@ impl SnapshotStore {
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_cut(operation_id,cut_id) VALUES(?1,?2)").bind(capture.to_string()).bind(cut.cut_id.to_string()).execute(&mut *tx).await?;
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
+                    sqlx::query("DELETE FROM storage_operation_object WHERE operation_id=?1 AND object_digest<>?3 AND object_digest IN (SELECT root_digest FROM storage_operation_memory_baseline WHERE operation_id=?2)")
+                        .bind(operation.to_string()).bind(record.launch_operation_id.to_string())
+                        .bind(ObjectDigest::from_sha256(*verified.ram_map.id().as_bytes()).to_string())
+                        .execute(&mut *tx).await?;
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
                     tx.commit().await?;
                     // Only the disks' held inodes and maps outlive verification;
                     // state-role descriptors close here exactly as before.
+                    let authority = pool.map_authority(std::sync::Arc::new(pool.existing_lease(operation)?))?;
                     for payload in verified.files {
                         if matches!(payload.role, CaptureRole::Disk(_)) {
                             if let VerifiedBytes::Stream(stream) = payload.bytes {
-                                verified_disks.push((payload.role, stream));
+                                let map = crate::storage::map::AuthenticatedMap::from_admitted_root(
+                                    *stream.map().root(), vm_spec::stream_map::StreamRole::Disk, authority.clone(),
+                                )?;
+                                let transferred = crate::storage::stream::AuthenticatedStream::from_verified_fingerprint(
+                                    stream.file().try_clone()?, std::sync::Arc::new(map), stream.fingerprint(),
+                                )?;
+                                verified_disks.push((payload.role, transferred));
                             }
                         }
                     }
@@ -2655,6 +2949,17 @@ impl SnapshotStore {
                 for index in 0..cut.files.len() {
                     let payload=&mut cut.files[index];
                     let mut carrier = verified_disks.iter().position(|(role,_)| role==&payload.role).map(|position| verified_disks.swap_remove(position).1);
+                    if payload.role == CaptureRole::Ram {
+                        let root = ObjectDigest::from_sha256(*payload.identity.as_bytes());
+                        let authority = pool.map_authority(std::sync::Arc::new(pool.existing_lease(operation)?))?;
+                        let map = pool.load_map(root, vm_spec::stream_map::StreamRole::Ram, authority)?;
+                        let file = match source.open_capture_payload(vm_spec::capture::CAPTURE_RAM_FILE)? {
+                            Some(file) => file,
+                            None => destination.open_capture_payload(vm_spec::capture::CAPTURE_RAM_FILE)?
+                                .ok_or_else(|| invalid("relocation lost its RAM source and destination"))?,
+                        };
+                        carrier = Some(crate::storage::stream::AuthenticatedStream::from_receipt(file, map)?);
+                    }
                     let relative = payload.role.relative_path();
                     let (source_parent,destination_parent,name) = match relative.split_once('/') {
                         Some((parent,name)) => (source.open_dir(parent)?.ok_or_else(|| invalid("capture role parent missing"))?, destination.ensure_dir_deferred(parent)?, name),
@@ -2750,8 +3055,10 @@ impl SnapshotStore {
                     }
                     payload.device=metadata.dev(); payload.inode=metadata.ino();
                     payload.fingerprint=SourceFingerprint::new(&metadata);
-                    if let Some(held) = carrier {
-                        relocated_disks.push((cut.files[index].role.clone(), held));
+                    if matches!(payload.role, CaptureRole::Disk(_)) {
+                        if let Some(held) = carrier {
+                            relocated_disks.push((cut.files[index].role.clone(), held));
+                        }
                     }
                 }
                 for (name, bytes) in [
@@ -2874,6 +3181,7 @@ pub(crate) mod tests {
     use std::io::Cursor;
     use std::num::NonZeroU64;
     use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
     use std::sync::Arc;
 
     use uuid::Uuid;
@@ -2895,6 +3203,7 @@ pub(crate) mod tests {
         AUTHENTICATION_BUFFER_BYTES,
     };
 
+    use crate::store::models::snapshot::SnapshotCaptureKind;
     use crate::store::models::{
         MachineConfig, MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
     };
@@ -3122,12 +3431,13 @@ pub(crate) mod tests {
             geometry.length = disk_length;
         }
         let file = std::fs::File::open(directory.path().join("root.raw")).unwrap();
-        let map = StreamHasher::new()
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_open_file(&file, disk_length)
             .unwrap()
             .map;
-        crate::machine::root_storage::seed_disk(
+        let baseline_roots = crate::machine::root_storage::seed_disk(
             &mut storage,
+            &StoragePool::open(&store.images_dir).unwrap(),
             directory.path(),
             0,
             &config.spec.storage.as_ref().unwrap().disks[0],
@@ -3139,6 +3449,7 @@ pub(crate) mod tests {
             .save_machine_config_with_storage(&config, &storage)
             .await
             .unwrap();
+        drop(baseline_roots);
         let launch = store
             .register_launch_storage(id, run, &storage, &config.spec)
             .await
@@ -3279,7 +3590,9 @@ pub(crate) mod tests {
             "schema": 1, "topology": {"firmwareAddress": 0, "initrdAddress": 0, "ramAboveGap": 0, "ramBelowGap": 4096, "ramLastAddress": 4095, "shmStartAddress": 0}
         })).unwrap();
         let ram = vec![0x32; 4096];
-        let ram_map = StreamHasher::new().hash_reader(Cursor::new(&ram)).unwrap();
+        let ram_map = StreamHasher::new(vm_spec::stream_map::ChunkSize::RAM)
+            .hash_reader(Cursor::new(&ram))
+            .unwrap();
         let ram_map_bytes = ram_map.canonical_bytes().unwrap();
         let binding = CaptureStateBinding {
             live_state_schema: "silo.live-state/1".into(),
@@ -3294,10 +3607,17 @@ pub(crate) mod tests {
         let native_execution = native_header_fixture(true, &binding, &record.plan);
         let native_devices = native_header_fixture(false, &binding, &record.plan);
         let mut inventory = Vec::new();
-        let disk_map = StreamHasher::new()
+        let disk_map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_reader(Cursor::new([0x51; 512]))
             .unwrap();
         let disk_map_bytes = disk_map.canonical_bytes().unwrap();
+        crate::store::capture::stage_map_nodes(&directory, &ram_map).unwrap();
+        crate::store::capture::stage_map_nodes(&directory, &disk_map).unwrap();
+        let mut changes = b"KRUNRAM\0\x01\0\x10\0\0\0\0\0".to_vec();
+        changes.extend_from_slice(&0u64.to_le_bytes());
+        changes.extend_from_slice(&1u64.to_le_bytes());
+        changes.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        changes.extend_from_slice(Sha256Digest::of_bytes(&ram).as_bytes());
         for role in record.plan.roles() {
             let bytes: &[u8] = match &role {
                 CaptureRole::Execution => &native_execution,
@@ -3305,13 +3625,14 @@ pub(crate) mod tests {
                 CaptureRole::Ram => &ram,
                 CaptureRole::Layout => &layout,
                 CaptureRole::RamMap => &ram_map_bytes,
+                CaptureRole::RamChanges => &changes,
                 CaptureRole::Disk(_) => &[0x51; 512],
                 CaptureRole::DiskMap(_) => &disk_map_bytes,
             };
             match &role {
                 CaptureRole::Disk(name) => disks.write_file(&name.file_name(), bytes).unwrap(),
                 CaptureRole::DiskMap(name) => disks
-                    .write_file(&format!("{}.map.json", name.as_str()), bytes)
+                    .write_file(&format!("{}.root", name.as_str()), bytes)
                     .unwrap(),
                 _ => directory.write_file(&role.relative_path(), bytes).unwrap(),
             }
@@ -3335,7 +3656,7 @@ pub(crate) mod tests {
         let evidence = CaptureEvidence {
             disk_stats: Vec::new(),
             disk_tracking_receipts: Vec::new(),
-            version: 1,
+            version: vm_spec::capture::CAPTURE_RECORD_VERSION,
             machine_id: record.plan.machine_id.clone(),
             run_id: record.plan.run_id.clone(),
             capture_id: record.plan.capture_id.clone(),
@@ -3364,8 +3685,14 @@ pub(crate) mod tests {
                     CapturePolicy::Full => vm_spec::capture::CaptureFullReason::Requested,
                     CapturePolicy::Incremental => vm_spec::capture::CaptureFullReason::NoBaseline,
                 }),
-                dirty_chunks: vec![1],
-                chunk_digests: vec![Some(Sha256Digest::of_bytes(&ram))],
+                identity_chunk_bytes: 1 << 16,
+                changes: vm_spec::capture::CaptureRamChanges {
+                    byte_len: changes.len() as u64,
+                    sha256: Sha256Digest::of_bytes(&changes),
+                    record_count: 1,
+                    coverage: vm_spec::capture::CaptureRamCoverage::Full,
+                    baseline_stream: None,
+                },
                 stats: vm_spec::capture::CaptureMemoryStats {
                     logical_bytes: 4096,
                     live_bytes_read: 4096,
@@ -3407,24 +3734,25 @@ pub(crate) mod tests {
         assert_eq!(metadata.len(), length);
         assert!(allocated > 0 && allocated < length / 1000);
         let record = &fixture.reservation.record;
-        let maps = [record.plan.ram_bytes, length]
-            .into_iter()
-            .map(|bytes| {
-                let chunks = bytes.div_ceil(crate::storage::limits::CHUNK_SIZE as u64);
-                let pages = chunks.div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
-                chunks * 74 + pages * 330 + 256
-            })
-            .sum::<u64>();
+        let maps = crate::store::capture::capture_map_budget(&record.plan.configuration).unwrap();
+        let changes = record
+            .plan
+            .ram_bytes
+            .div_ceil(vm_spec::stream_map::ChunkSize::RAM.bytes())
+            * 56
+            + 16;
         let state = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
         assert_eq!(
             record.plan.reservation.staging_bytes,
-            record.plan.ram_bytes + allocated + state
+            record.plan.ram_bytes + allocated + state + maps + changes
         );
         assert_eq!(
             record.reservation_bytes,
             record.plan.ram_bytes
                 + allocated
                 + state
+                + maps
+                + changes
                 + crate::store::capture::publication_stream_bytes(
                     record.plan.ram_bytes,
                     record
@@ -3439,6 +3767,7 @@ pub(crate) mod tests {
                 )
                 + 2 * state
                 + 2 * maps
+                + changes
         );
         assert_eq!(record.disk_charges.len(), 1);
         assert_eq!(record.disk_charges[0].bytes, record.reservation_bytes);
@@ -4321,7 +4650,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let source = vm_spec::capture::CaptureSourceRecord {
-            version: 1,
+            version: vm_spec::capture::CAPTURE_RECORD_VERSION,
             machine_id: evidence.machine_id,
             run_id: evidence.run_id,
             capture_id: evidence.capture_id,
@@ -4619,7 +4948,7 @@ pub(crate) mod tests {
         let source = fixture.config.machine_dir.join("root.raw");
         assert_eq!(
             Some(Sha256Digest::from_bytes(
-                *StreamHasher::new()
+                *StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                     .hash_reader(Cursor::new(std::fs::read(&source).unwrap()))
                     .unwrap()
                     .id()
@@ -4695,7 +5024,7 @@ pub(crate) mod tests {
             length: 4096,
             sha256: None,
             identity: Some(Sha256Digest::from_bytes(
-                *StreamHasher::new()
+                *StreamHasher::new(vm_spec::stream_map::ChunkSize::RAM)
                     .hash_reader(Cursor::new([0x32; 4096]))
                     .unwrap()
                     .id()
@@ -5655,7 +5984,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let retained = retained.expect("seal verification derived the writable disk maps");
-        let expected = StreamHasher::new().hash_reader(&[0x51; 512][..]).unwrap();
+        let expected = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_reader(&[0x51; 512][..])
+            .unwrap();
         let disks = cut
             .files
             .iter()
@@ -5759,7 +6090,7 @@ pub(crate) mod tests {
         let disk = recovered.reopen_disk(&record.files[index].role).unwrap();
         let private = tempfile::tempfile().unwrap();
         assert!(
-            StreamHasher::new()
+            StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                 .copy_authenticated(&disk, &private)
                 .is_err(),
             "first byte use checks the receipt map, not the rewritten fingerprint"
@@ -5776,6 +6107,25 @@ pub(crate) mod tests {
         memory.full_reason = None;
         memory.stats.full_bytes_written = 0;
         memory.stats.overlay_bytes_written = memory.packed_length;
+        let mut changes = std::fs::read(
+            directory
+                .path()
+                .join(CaptureRole::RamChanges.relative_path()),
+        )
+        .unwrap();
+        changes[11] = 1;
+        memory.changes.coverage = vm_spec::capture::CaptureRamCoverage::Incremental;
+        memory.changes.baseline_stream = memory.baseline;
+        memory.changes.sha256 = Sha256Digest::of_bytes(&changes);
+        directory
+            .write_file(&CaptureRole::RamChanges.relative_path(), &changes)
+            .unwrap();
+        evidence
+            .inventory
+            .iter_mut()
+            .find(|entry| entry.role == CaptureRole::RamChanges)
+            .unwrap()
+            .sha256 = Some(Sha256Digest::of_bytes(&changes));
         directory
             .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
             .unwrap();
@@ -5809,8 +6159,8 @@ pub(crate) mod tests {
                 .authenticated_stream(&execution.memory.stream, 4096)
                 .unwrap()
                 .map()
-                .chunks()
-                .len(),
+                .present_chunks()
+                .count(),
             1
         );
         assert_eq!(
@@ -5907,7 +6257,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let private = tempfile::tempfile().unwrap();
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         hasher.copy_authenticated(&source, &private).unwrap();
         use std::os::unix::fs::FileExt;
         private.write_all_at(b"private child", 0).unwrap();
@@ -6063,12 +6413,16 @@ pub(crate) mod tests {
                 let file = std::fs::File::open(destination.join(&relative)).unwrap();
                 let identity = if matches!(payload.role, CaptureRole::Ram | CaptureRole::Disk(_)) {
                     Sha256Digest::from_bytes(
-                        *StreamHasher::new()
-                            .authenticate(file, payload.length)
-                            .unwrap()
-                            .map()
-                            .id()
-                            .as_bytes(),
+                        *StreamHasher::new(if payload.role == CaptureRole::Ram {
+                            vm_spec::stream_map::ChunkSize::RAM
+                        } else {
+                            vm_spec::stream_map::ChunkSize::DISK
+                        })
+                        .authenticate(file, payload.length)
+                        .unwrap()
+                        .map()
+                        .id()
+                        .as_bytes(),
                     )
                 } else {
                     crate::storage::stream::whole_file_sha256(&file).unwrap()
@@ -6185,7 +6539,7 @@ pub(crate) mod tests {
                 length: 512,
                 sha256: None,
                 identity: Some(Sha256Digest::from_bytes(
-                    *StreamHasher::new()
+                    *StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                         .hash_reader(Cursor::new([0x51; 512]))
                         .unwrap()
                         .id()
@@ -6754,7 +7108,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let record = crate::ImageRecord {
-            schema: 1,
+            schema: 2,
             kind: crate::ImageRecordKind::Image,
             root: consumer.record.root.clone(),
             boot: consumer.record.boot.clone(),
@@ -7105,7 +7459,8 @@ pub(crate) mod tests {
         assert!(record.plan.disks[0].baseline_map.is_some());
         assert!(crate::machine::root_storage::launch_disk_seeds(
             &initial,
-            &fixture.config.machine_dir
+            &fixture.config.machine_dir,
+            &store.images_dir,
         )
         .unwrap()
         .is_empty());
@@ -7129,8 +7484,9 @@ pub(crate) mod tests {
         directory
             .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
             .unwrap();
-        let verified =
+        let mut verified =
             verify_capture(&directory, &record, CaptureAuthentication::Publication).unwrap();
+        verified.admit_maps(store, record.capture_id).await.unwrap();
         verified
             .retain_disk_baselines(&fixture.config.machine_dir, &record.plan)
             .unwrap();
@@ -7190,7 +7546,13 @@ pub(crate) mod tests {
             &fixture
                 .config
                 .machine_dir
-                .join(accepted.disk_baselines[0].map.as_path())
+                .join(
+                    crate::machine::root_storage::baseline_map_path(&Sha256Digest::from_bytes(
+                        *accepted.disk_baselines[0].map.as_bytes()
+                    ))
+                    .unwrap()
+                    .as_path()
+                )
                 .to_string_lossy()
                 .into_owned()
         );
@@ -7231,7 +7593,8 @@ pub(crate) mod tests {
         ));
         assert!(crate::machine::root_storage::launch_disk_seeds(
             &ended,
-            &fixture.config.machine_dir
+            &fixture.config.machine_dir,
+            &store.images_dir,
         )
         .unwrap()
         .is_empty());
@@ -7248,16 +7611,13 @@ pub(crate) mod tests {
             .mark_launch_storage_admitted(next.operation_id())
             .await
             .unwrap();
-        assert!(matches!(
-            store
-                .machine_storage(record.machine_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .disk_baselines[0]
-                .state,
-            DiskBaselineState::Running { seeded: false, .. }
-        ));
+        assert!(store
+            .machine_storage(record.machine_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .disk_baselines
+            .is_empty());
     }
 
     #[tokio::test]
@@ -7380,9 +7740,13 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         let file = std::fs::File::open(fixture.config.machine_dir.join("root.raw")).unwrap();
-        let map = StreamHasher::new().hash_open_file(&file, 512).unwrap().map;
-        crate::machine::root_storage::seed_disk(
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_open_file(&file, 512)
+            .unwrap()
+            .map;
+        let baseline_roots = crate::machine::root_storage::seed_disk(
             &mut storage,
+            &StoragePool::open(&store.images_dir).unwrap(),
             &fixture.config.machine_dir,
             0,
             &fixture.config.spec.storage.as_ref().unwrap().disks[0],
@@ -7394,6 +7758,7 @@ pub(crate) mod tests {
             .save_machine_config_with_storage(&fixture.config, &storage)
             .await
             .unwrap();
+        drop(baseline_roots);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "store::capture::tests::disk_baseline_crash_between_admission_and_stop_never_reuses_ready", "--nocapture"])
             .env(HOME, store.home_path()).env(MACHINE, original.machine_id.to_string()).status().unwrap();
@@ -7409,7 +7774,8 @@ pub(crate) mod tests {
         ));
         assert!(crate::machine::root_storage::launch_disk_seeds(
             &crashed,
-            &fixture.config.machine_dir
+            &fixture.config.machine_dir,
+            &store.images_dir,
         )
         .unwrap()
         .is_empty());
@@ -7441,7 +7807,8 @@ pub(crate) mod tests {
         ));
         assert!(crate::machine::root_storage::launch_disk_seeds(
             &restart,
-            &fixture.config.machine_dir
+            &fixture.config.machine_dir,
+            &store.images_dir,
         )
         .unwrap()
         .is_empty());
@@ -8470,6 +8837,8 @@ pub(crate) mod tests {
     async fn forced_discard_control_write_failure_preserves_staging_for_retry() {
         let fixture = fixture().await;
         let (directory, _) = seal(&fixture);
+        let staged_nodes = directory.path().join("map-nodes");
+        assert!(std::fs::read_dir(&staged_nodes).unwrap().next().is_some());
         let Fixture {
             _temporary,
             snapshots,
@@ -8512,6 +8881,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(!directory.path().exists());
+        assert!(!staged_nodes.exists());
     }
 
     #[tokio::test]
@@ -8546,5 +8916,396 @@ pub(crate) mod tests {
             .await
             .is_err());
         assert!(directory.path().exists());
+    }
+
+    #[tokio::test]
+    async fn live_full_incremental_and_unchanged_roots_publish_both_profiles() {
+        use vm_spec::stream_map::{
+            Chunk, ChunkChange, ChunkSize, NodeSource, StreamRole, MAX_NODE_BYTES,
+        };
+
+        let mut fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let first = fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await
+            .unwrap();
+        let accepted = fixture
+            .snapshots
+            .capture_reservation(fixture.reservation.record.capture_id)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .snapshots
+            .accept_live_disk_baselines(&accepted)
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .finish_capture_release(accepted.capture_id, true)
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
+        let first_consumer = fixture
+            .snapshots
+            .consume(&SnapshotRef::Id(first.id))
+            .await
+            .unwrap();
+        let SnapshotCaptureKind::LiveExecution { execution } = &first_consumer.record.capture
+        else {
+            panic!("live execution checkpoint required");
+        };
+        let authority = pool
+            .map_authority(Arc::new(
+                pool.existing_lease(first_consumer.operation_id).unwrap(),
+            ))
+            .unwrap();
+        let mut ram = pool
+            .load_map(execution.memory.map, StreamRole::Ram, authority.clone())
+            .unwrap();
+        let mut disk = pool
+            .load_map(
+                first_consumer.record.root.stream.map,
+                StreamRole::Disk,
+                authority,
+            )
+            .unwrap();
+        assert_eq!(ram.chunk_size(), ChunkSize::RAM);
+        assert_eq!(disk.chunk_size(), ChunkSize::DISK);
+
+        for changed in [true, false] {
+            let before: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM stream_map_object WHERE height IS NOT NULL",
+            )
+            .fetch_one(&fixture.snapshots.store.pool)
+            .await
+            .unwrap();
+            let mut request = fixture.reservation.record.request.clone();
+            request.capture_id = Uuid::new_v4();
+            request.policy = CapturePolicy::Incremental;
+            request.alias = None;
+            fixture.reservation = fixture.snapshots.reserve_capture(&request).await.unwrap();
+            fixture
+                .snapshots
+                .bind_capture_boot(request.capture_id, first_consumer.record.boot.clone())
+                .await
+                .unwrap();
+            let (directory, mut evidence) = seal(&fixture);
+            directory.remove_tree("map-nodes").unwrap();
+            let nodes = directory.ensure_dir("map-nodes").unwrap();
+            let ram_bytes = [0x66; 4096];
+            let disk_bytes = [0x77; 512];
+            let mut ram_writer = crate::storage::map::MapNodeWriter::new().unwrap();
+            let ram_update = ram
+                .update_sorted(
+                    changed.then_some(Ok(ChunkChange {
+                        index: 0,
+                        value: Chunk::Data(Sha256Digest::of_bytes(&ram_bytes)),
+                    })),
+                    &mut ram_writer,
+                )
+                .unwrap();
+            let mut disk_writer = crate::storage::map::MapNodeWriter::new().unwrap();
+            let disk_update = disk
+                .update_sorted(
+                    changed.then_some(Ok(ChunkChange {
+                        index: 0,
+                        value: Chunk::Data(Sha256Digest::of_bytes(&disk_bytes)),
+                    })),
+                    &mut disk_writer,
+                )
+                .unwrap();
+            let new_nodes = ram_update.new_nodes().len() + disk_update.new_nodes().len();
+            assert!(new_nodes <= 10);
+            if !changed {
+                assert_eq!(new_nodes, 0);
+                assert_eq!(ram_update.map, ram);
+                assert_eq!(disk_update.map, disk);
+            }
+            for produced in [&ram_update, &disk_update] {
+                let mut source = produced.map.node_source();
+                let mut scratch = [0; MAX_NODE_BYTES];
+                for digest in produced.new_nodes() {
+                    let length = source
+                        .read_node(Sha256Digest::from_bytes(*digest.as_bytes()), &mut scratch)
+                        .unwrap();
+                    nodes.write_file(&digest.hex(), &scratch[..length]).unwrap();
+                }
+            }
+            let disk_role =
+                CaptureRole::Disk(fixture.reservation.record.plan.disks[0].name.clone());
+            directory
+                .write_file(&CaptureRole::Ram.relative_path(), &ram_bytes)
+                .unwrap();
+            let disks = directory.open_dir("disks").unwrap().unwrap();
+            disks
+                .write_file(
+                    &fixture.reservation.record.plan.disks[0].name.file_name(),
+                    &disk_bytes,
+                )
+                .unwrap();
+            let ram_root = ram_update.map.canonical_bytes().unwrap();
+            let disk_root = disk_update.map.canonical_bytes().unwrap();
+            directory
+                .write_file(&CaptureRole::RamMap.relative_path(), &ram_root)
+                .unwrap();
+            disks
+                .write_file(
+                    &format!(
+                        "{}.root",
+                        fixture.reservation.record.plan.disks[0].name.as_str()
+                    ),
+                    &disk_root,
+                )
+                .unwrap();
+            let mut changes = b"KRUNRAM\0\x01\0\x10\x01\0\0\0\0".to_vec();
+            if changed {
+                changes.extend_from_slice(&0u64.to_le_bytes());
+                changes.extend_from_slice(&1u64.to_le_bytes());
+                changes.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+                changes.extend_from_slice(Sha256Digest::of_bytes(&ram_bytes).as_bytes());
+            }
+            directory
+                .write_file(&CaptureRole::RamChanges.relative_path(), &changes)
+                .unwrap();
+            let memory = evidence.memory.as_mut().unwrap();
+            memory.ram_stream = ram_update.map.root().id();
+            memory.mode = CapturePolicy::Incremental;
+            memory.baseline = Some(ram.root().id());
+            memory.full_reason = None;
+            memory.stats.full_bytes_written = 0;
+            memory.stats.overlay_bytes_written = if changed { 4096 } else { 0 };
+            memory.stats.identity_bytes_hashed = if changed { 4096 } else { 0 };
+            memory.changes = vm_spec::capture::CaptureRamChanges {
+                byte_len: changes.len() as u64,
+                sha256: Sha256Digest::of_bytes(&changes),
+                record_count: u64::from(changed),
+                coverage: vm_spec::capture::CaptureRamCoverage::Incremental,
+                baseline_stream: memory.baseline,
+            };
+            for entry in &mut evidence.inventory {
+                if entry.role == CaptureRole::Ram {
+                    entry.identity = Some(ram_update.map.root().id());
+                } else if entry.role == disk_role {
+                    entry.identity = Some(disk_update.map.root().id());
+                } else {
+                    let bytes = match entry.role {
+                        CaptureRole::RamMap => Some(ram_root.as_slice()),
+                        CaptureRole::DiskMap(_) => Some(disk_root.as_slice()),
+                        CaptureRole::RamChanges => Some(changes.as_slice()),
+                        _ => None,
+                    };
+                    if let Some(bytes) = bytes {
+                        entry.length = bytes.len() as u64;
+                        entry.sha256 = Some(Sha256Digest::of_bytes(bytes));
+                    }
+                }
+            }
+            directory
+                .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
+                .unwrap();
+            let published = fixture
+                .snapshots
+                .publish_capture(
+                    request.capture_id,
+                    directory.path(),
+                    None,
+                    crate::storage::pool::PublicationLockPolicy::Wait,
+                )
+                .await
+                .unwrap();
+            let accepted = fixture
+                .snapshots
+                .capture_reservation(request.capture_id)
+                .await
+                .unwrap()
+                .unwrap();
+            fixture
+                .snapshots
+                .accept_live_disk_baselines(&accepted)
+                .await
+                .unwrap();
+            let retained: String = sqlx::query_scalar(
+                "SELECT root_digest FROM storage_operation_memory_baseline WHERE operation_id=?1",
+            )
+            .bind(accepted.launch_operation_id.to_string())
+            .fetch_one(&fixture.snapshots.store.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                retained,
+                ObjectDigest::from_sha256(*ram_update.map.id().as_bytes()).to_string()
+            );
+            let consumer = fixture
+                .snapshots
+                .consume(&SnapshotRef::Id(published.id))
+                .await
+                .unwrap();
+            let SnapshotCaptureKind::LiveExecution { execution } = &consumer.record.capture else {
+                panic!("live execution checkpoint required");
+            };
+            assert_eq!(execution.memory.chunk_size, ChunkSize::RAM.bytes());
+            assert_eq!(
+                consumer.record.root.stream.chunk_size,
+                ChunkSize::DISK.bytes()
+            );
+            assert_eq!(execution.memory.stream, ram_update.map.id());
+            assert_eq!(consumer.record.root.stream.stream, disk_update.map.id());
+            let after: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM stream_map_object WHERE height IS NOT NULL",
+            )
+            .fetch_one(&fixture.snapshots.store.pool)
+            .await
+            .unwrap();
+            if !changed {
+                assert_eq!(after, before);
+            }
+            assert_eq!(std::fs::read_dir(nodes.path()).unwrap().count(), new_nodes);
+            let authority = pool
+                .map_authority(Arc::new(
+                    pool.existing_lease(consumer.operation_id).unwrap(),
+                ))
+                .unwrap();
+            ram = pool
+                .load_map(execution.memory.map, StreamRole::Ram, authority.clone())
+                .unwrap();
+            disk = pool
+                .load_map(consumer.record.root.stream.map, StreamRole::Disk, authority)
+                .unwrap();
+            fixture
+                .snapshots
+                .finish_capture_release(request.capture_id, true)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_recovers_process_loss_after_node_publication_before_admission() {
+        const HOME: &str = "SILO_MAP_ADMISSION_CRASH_HOME";
+        const CAPTURE: &str = "SILO_MAP_ADMISSION_CRASH_CAPTURE";
+        if let Ok(home) = std::env::var(HOME) {
+            let snapshots = SnapshotStore::open(Path::new(&home)).await.unwrap();
+            let capture = Uuid::parse_str(&std::env::var(CAPTURE).unwrap()).unwrap();
+            let record = snapshots
+                .capture_reservation(capture)
+                .await
+                .unwrap()
+                .unwrap();
+            let directory = capture_directory(&snapshots.store, &record)
+                .unwrap()
+                .unwrap();
+            let error = snapshots
+                .publish_capture(
+                    capture,
+                    directory.path(),
+                    record.alias,
+                    crate::storage::pool::PublicationLockPolicy::Wait,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("interrupted map admission"));
+            std::process::exit(77);
+        }
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let capture = fixture.reservation.record.capture_id;
+        sqlx::raw_sql("CREATE TRIGGER interrupt_map_admission BEFORE INSERT ON stream_map_root BEGIN SELECT RAISE(ABORT,'interrupted map admission'); END")
+            .execute(&fixture.snapshots.store.pool).await.unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::capture::tests::capture_recovers_process_loss_after_node_publication_before_admission", "--nocapture"])
+            .env(HOME, fixture.snapshots.store.home_path()).env(CAPTURE, capture.to_string())
+            .status().unwrap();
+        assert_eq!(status.code(), Some(77));
+        let record = fixture
+            .snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, CaptureState::Sealed);
+        assert!(directory.path().join("map-nodes").is_dir());
+        sqlx::raw_sql("DROP TRIGGER interrupt_map_admission")
+            .execute(&fixture.snapshots.store.pool)
+            .await
+            .unwrap();
+        let reopened = SnapshotStore::open(fixture.snapshots.store.home_path())
+            .await
+            .unwrap();
+        let published = reopened
+            .publish_capture(
+                capture,
+                directory.path(),
+                record.alias,
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await
+            .unwrap();
+        reopened
+            .finish_capture_release(capture, false)
+            .await
+            .unwrap();
+        drop(fixture.reservation);
+        drop(fixture.launch);
+        reopened.store.recover_image_cache().await.unwrap();
+        assert!(!directory.path().exists());
+        let consumer = reopened
+            .consume(&SnapshotRef::Id(published.id))
+            .await
+            .unwrap();
+        let SnapshotCaptureKind::LiveExecution { execution } = &consumer.record.capture else {
+            panic!("live execution checkpoint required");
+        };
+        let pool = StoragePool::open(&reopened.store.images_dir).unwrap();
+        assert_eq!(
+            std::fs::read(pool.stream_path(&execution.memory.stream)).unwrap(),
+            [0x32; 4096]
+        );
+        assert_eq!(
+            std::fs::read(pool.stream_path(&consumer.record.root.stream.stream)).unwrap(),
+            [0x51; 512]
+        );
+    }
+
+    #[tokio::test]
+    async fn full_capture_changes_cannot_omit_a_nonzero_root_entry() {
+        let fixture = fixture().await;
+        let (directory, mut evidence) = seal(&fixture);
+        let changes = b"KRUNRAM\0\x01\0\x10\0\0\0\0\0";
+        directory
+            .write_file(&CaptureRole::RamChanges.relative_path(), changes)
+            .unwrap();
+        let memory = evidence.memory.as_mut().unwrap();
+        memory.changes.byte_len = changes.len() as u64;
+        memory.changes.record_count = 0;
+        memory.changes.sha256 = Sha256Digest::of_bytes(changes);
+        memory.stats.identity_bytes_hashed = 0;
+        let entry = evidence
+            .inventory
+            .iter_mut()
+            .find(|entry| entry.role == CaptureRole::RamChanges)
+            .unwrap();
+        entry.length = changes.len() as u64;
+        entry.sha256 = Some(Sha256Digest::of_bytes(changes));
+        directory
+            .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
+            .unwrap();
+        let error = verify_capture(
+            &directory,
+            &fixture.reservation.record,
+            CaptureAuthentication::Receipt,
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("full RAM changes omit nonzero root entries"));
     }
 }

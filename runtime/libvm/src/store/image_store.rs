@@ -650,7 +650,7 @@ impl Store {
             .await?;
             #[cfg(test)]
             if let Some(hook) = &self.layer_hook {
-                hook.hit(crate::store::layer_store::tests::WorkerPoint::RecoveryDelete)?;
+                hook.hit(crate::store::layer_store::tests::WorkerPoint::StreamRecoveryDelete)?;
             }
             // The blocking owner keeps Store, transaction, roots and directory
             // capabilities through actual unlink, directory sync and commit.
@@ -1838,6 +1838,12 @@ mod tests {
                     .await
                     .unwrap();
                 retained.push(stream.path);
+                retained.push(pool.object_path(
+                    &crate::storage::identity::ObjectDigest::from_sha256(*stream.id.as_bytes()),
+                ));
+                for node in stream.map.nodes() {
+                    retained.push(pool.object_path(&node.unwrap().digest));
+                }
                 drop(roots);
             }
             db.checkpoint_catalog().await.unwrap();

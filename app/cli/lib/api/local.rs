@@ -70,8 +70,7 @@ impl LocalVmService {
                     .await
                 }
                 None => Box::pin(Runtime::new_with_mode(config, requested)).await,
-            }
-            .context("initialize local libvm adapter")?;
+            }?;
             let provider = libvm::HostCommand::new(
                 std::env::current_exe().context("resolve CLI binary path")?,
             )
@@ -1280,6 +1279,60 @@ mod tests {
             retention: libvm::MachineRetention::Persistent,
             cleanup: CleanupPlan::RetainMachine,
         }
+    }
+
+    #[tokio::test]
+    async fn incompatible_home_keeps_fresh_state_guidance_in_default_error_message() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(home.join("catalog.lock"))
+            .unwrap();
+        let database = home.join("state.db");
+        std::fs::File::create(&database).unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations
+                (version, description, success, checksum, execution_time)
+             VALUES (1, 'initial', TRUE, x'00', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let mut service =
+            crate::api::local::LocalVmService::new(libvm::RuntimeConfig::local(&home));
+        let error = service.list_machines().await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<libvm::LibVmError>(),
+            Some(libvm::LibVmError::StateDatabaseIncompatible { .. })
+        ));
+        let message = error.to_string();
+        assert!(message.contains("incompatible state database"));
+        assert!(message.contains("cannot be read or converted"));
+        assert!(message.contains("fresh home"));
     }
 
     #[test]

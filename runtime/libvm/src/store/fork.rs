@@ -738,7 +738,15 @@ impl Store {
                     if Sha256Digest::of_bytes(&bytes) != map_entry.identity {
                         return Err(invalid("local cut disk map digest differs from receipt"));
                     }
-                    let map = crate::storage::stream::StreamMap::decode(&bytes)?;
+                    let root = vm_spec::stream_map::StreamRoot::decode(&bytes)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    let authority =
+                        pool.map_authority(std::sync::Arc::new(pool.existing_lease(operation)?))?;
+                    let map = crate::storage::map::AuthenticatedMap::from_root(
+                        root,
+                        vm_spec::stream_map::StreamRole::Disk,
+                        authority,
+                    )?;
                     if map.length() != role.length
                         || map.id().as_bytes() != role.identity.as_bytes()
                         || map.canonical_bytes()? != bytes
@@ -801,9 +809,12 @@ impl Store {
             let length = attachment.geometry.length;
             match pool_streams.entry(stream) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(crate::machine::stopped::open_immutable_stream(
-                        &pool, &stream, length,
-                    )?);
+                    entry.insert(
+                        crate::machine::stopped::open_immutable_stream(
+                            self, operation, &stream, length,
+                        )
+                        .await?,
+                    );
                 }
                 std::collections::btree_map::Entry::Occupied(entry)
                     if entry.get().length() != length =>

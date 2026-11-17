@@ -358,7 +358,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
     # is emitted. This is the RFC 8785 spelling of this real captured record.
     canonical = json.dumps(record, sort_keys=True, ensure_ascii=False,
                            separators=(",", ":"), allow_nan=False).encode()
-    snapshot = "sha256:" + hashlib.sha256(b"silo:snapshot:v1\n" + canonical).hexdigest()
+    snapshot = "sha256:" + hashlib.sha256(b"silo:snapshot:v2\n" + canonical).hexdigest()
     record_digest, path = object_bytes(silo, canonical)
     created.append(path)
     seal_bytes = json.dumps(seal, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
@@ -378,6 +378,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
         "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;",
         f"INSERT INTO storage_snapshot(id,record_digest,record_bytes,retained,created_at) SELECT '{snapshot}','{record_digest}',X'{canonical.hex()}',1,created_at FROM storage_snapshot WHERE id='{saved.snapshot}';",
         f"INSERT INTO snapshot_stream_dependency SELECT '{snapshot}',stream_id FROM snapshot_stream_dependency WHERE snapshot_id='{saved.snapshot}';",
+        f"INSERT INTO snapshot_capture_change SELECT '{snapshot}',changes_digest FROM snapshot_capture_change WHERE snapshot_id='{saved.snapshot}';",
         *[f"INSERT INTO snapshot_object_dependency VALUES('{snapshot}','{digest}');" for digest in sorted(objects)],
         f"DELETE FROM snapshot_capture_provenance WHERE capture_id='{capture_id}';",
         f"INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes,plan_bytes) VALUES('{capture_id}','{snapshot}','{evidence_digest}',X'{seal_bytes.hex()}',X'{plan_hex}');",

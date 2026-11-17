@@ -1385,6 +1385,24 @@ impl Store {
                 "published dependency has no active registered operation",
             ));
         }
+        if !streams.is_empty() {
+            let pool = StoragePool::open(&self.images_dir)?;
+            for stream in streams {
+                let digest =
+                    crate::storage::identity::ObjectDigest::from_sha256(*stream.as_bytes());
+                let bytes =
+                    pool.read_object(&digest, vm_spec::stream_map::MAX_ROOT_BYTES as u64)?;
+                let root = vm_spec::stream_map::StreamRoot::decode(&bytes)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if root.id().as_bytes() != stream.as_bytes() {
+                    return Err(invalid("published stream root differs from its identity"));
+                }
+                crate::store::map_store::admit_graph(&mut tx, &pool, &root).await?;
+                sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) VALUES(?1,?2)")
+                    .bind(operation_id.to_string()).bind(digest.to_string())
+                    .execute(&mut *tx).await?;
+            }
+        }
         sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,value FROM json_each(?2)")
             .bind(operation_id.to_string()).bind(serde_json::to_string(streams).map_err(invalid)?)
             .execute(&mut *tx).await?;
@@ -1963,11 +1981,21 @@ impl Store {
                 return Err(invalid("disk baseline launch generation changed"));
             }
             let directory = crate::paths::machine_data_dir_in(&self.home, record.machine_id);
-            let seeds = crate::machine::root_storage::launch_disk_seeds(&storage, &directory)?;
+            let seeds = crate::machine::root_storage::launch_disk_seeds(
+                &storage,
+                &directory,
+                &self.images_dir,
+            )?;
+            // A rejected optimization has no authority in this generation.
+            // Drop its reference and pin together instead of resurrecting a
+            // stopped/collected map as an unseeded Running baseline.
+            storage
+                .disk_baselines
+                .retain(|baseline| seeds.iter().any(|seed| seed == &baseline.seed));
             for baseline in &mut storage.disk_baselines {
                 baseline.state = crate::store::models::storage::DiskBaselineState::Running {
                     run_id: record.run_id,
-                    seeded: seeds.iter().any(|seed| seed == &baseline.seed),
+                    seeded: true,
                 };
             }
             storage.stop_outcome = StorageStopOutcome::Unknown;
@@ -2795,5 +2823,51 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn published_stream_pin_retains_map_graph_before_later_map_publication() {
+        use crate::store::ImageStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temp.path().join("home")))
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("snapshot", &[], &[])
+            .await
+            .unwrap();
+        let source = temp.path().join("source");
+        std::fs::write(&source, b"stream and Merkle metadata share retention").unwrap();
+        let (published, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        let root = crate::storage::identity::ObjectDigest::from_sha256(*published.id.as_bytes());
+        let nodes = published
+            .map
+            .nodes()
+            .map(|node| node.unwrap().digest)
+            .collect::<Vec<_>>();
+        assert!(!nodes.is_empty());
+        store
+            .pin_published_storage_dependencies(operation, &[published.id], &[])
+            .await
+            .unwrap();
+        drop(roots);
+
+        let rooted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_object WHERE operation_id=?1 AND object_digest=?2)")
+            .bind(operation.to_string()).bind(root.to_string()).fetch_one(&store.pool).await.unwrap();
+        assert!(rooted);
+        let _report = store.prune_images().await.unwrap();
+        assert!(pool.verify_stream(&published.id).is_ok());
+        assert!(pool.verify_object(&root).is_ok());
+        for node in &nodes {
+            assert!(pool.verify_object(node).is_ok());
+        }
+
+        drop(lease);
+        let _report = store.prune_images().await.unwrap();
+        assert!(!pool.stream_path(&published.id).exists());
+        assert!(!pool.object_path(&root).exists());
+        assert!(nodes.iter().all(|node| !pool.object_path(node).exists()));
     }
 }

@@ -578,6 +578,8 @@ pub enum DiskBaselineState {
         /// False retains predecessor provenance only and requires a full cut hash.
         seeded: bool,
     },
+    /// Never authorizes reuse. Its referenced graph stays machine-pinned for
+    /// provenance until launch admission drops the entry or a capture replaces it.
     Invalid,
 }
 
@@ -585,7 +587,7 @@ pub enum DiskBaselineState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiskBaseline {
     pub seed: vm_spec::capture::DiskTrackingSeed,
-    pub map: PrivatePath,
+    pub map: crate::storage::identity::ObjectDigest,
     pub storage_generation: u64,
     pub generation: u64,
     pub state: DiskBaselineState,
@@ -795,7 +797,8 @@ impl MachineStorageRecord {
                     ));
                 }
             }
-            if baseline.seed.baseline.is_none()
+            if baseline.seed.baseline.as_ref().map(|id| id.as_bytes())
+                != Some(baseline.map.as_bytes())
                 || self.disk_baselines[..index].iter().any(|other| {
                     other.seed.attachment_index == baseline.seed.attachment_index
                         || other.seed.block_id == baseline.seed.block_id
@@ -1285,10 +1288,11 @@ mod tests {
     fn included_disks_distinguish_private_writers_from_immutable_streams() {
         use crate::{DiskOwnership, DiskStorage, IncludedDisk};
         use vm_spec::{DiskGeometry, DiskRole};
-        let stream = crate::storage::stream::StreamHasher::new()
-            .hash_reader(std::io::Cursor::new([0x64; 512]))
-            .unwrap()
-            .id();
+        let stream =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_reader(std::io::Cursor::new([0x64; 512]))
+                .unwrap()
+                .id();
         let mut record = MachineStorageRecord::opaque_raw(
             PrivatePath::new("root.raw").unwrap(),
             512,
@@ -1742,7 +1746,7 @@ mod tests {
             crate::paths::OwnedDirectory::open_root(&temp.path().join("machine")).unwrap();
         directory.write_file("root.raw", &[0x31; 512]).unwrap();
         let file = std::fs::File::open(directory.path().join("root.raw")).unwrap();
-        let map = crate::storage::stream::StreamHasher::new()
+        let map = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_open_file(&file, 512)
             .unwrap()
             .map;
@@ -1760,8 +1764,9 @@ mod tests {
             "root".into(),
         )
         .unwrap();
-        crate::machine::root_storage::seed_disk(
+        let _guard = crate::machine::root_storage::seed_disk(
             &mut record,
+            &crate::storage::pool::StoragePool::open(&temp.path().join("images")).unwrap(),
             directory.path(),
             0,
             &disk,

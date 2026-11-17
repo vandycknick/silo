@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from silo_smoke import capture, fork, incremental, overlay, pause, procs, reclaim, restore, shutdown, stopped
+from silo_smoke import capture, fork, incremental, overlay, pause, procs, reclaim, restore, shutdown, stopped, stream_map
 from silo_smoke import contained_init as contained
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO
@@ -44,13 +44,43 @@ def test_incremental_fork_preserves_pause_and_child_baseline(
     assert memory["mode"] == "incremental" and memory["fullReason"] is None
     assert memory["baseline"] == baseline.seal["memory"]["ramStream"]
     assert memory["ramStream"] == baseline.seal["memory"]["ramStream"]
-    assert json.loads((cut.staging / "memory.map.json").read_bytes()) == baseline_map
+    assert stream_map.decode_root((cut.staging / "memory.root").read_bytes()) == baseline_map[0]
     assert incremental.witness(silo, child, previous=initial) == initial
     changed = incremental.witness(silo, child, "first", previous=initial)
     saved = restore.checkpoint(silo, child, alias="fork-child-incremental")
     incremental.authenticated_map(silo, saved, mode="incremental", baseline=cut, baseline_map=baseline_map)
     incremental.pages_at_cut(silo, saved, changed)
 
+
+
+def test_scattered_writes_cover_expected_64k_leaves_and_preserve_owned_pages(silo: Silo, incremental_image: str) -> None:
+    create(silo, incremental_image)
+    initial = incremental.witness(silo, SOURCE, "start")
+    reclaim.settled(silo, SOURCE)
+    baseline = restore.checkpoint(silo, SOURCE, alias="scattered-64k-baseline")
+    old = incremental.authenticated_map(silo, baseline, mode="full", reason="no-baseline")
+    witness_indices = incremental.pages_at_cut(silo, baseline, initial)
+    assert len(witness_indices) == 4, "fixture must scatter its pinned pages across distinct 64KiB leaves"
+    old_pages = {page["guestPhysicalAddress"]: restore.sealed_ram(
+        baseline, page["guestPhysicalAddress"], initial["pageSize"])[0] for page in initial["pages"]}
+    silo.run("resume", SOURCE)
+    written = incremental.witness(silo, SOURCE, "first", previous=initial)
+    saved = restore.checkpoint(silo, SOURCE, alias="scattered-64k-changed")
+    new = incremental.authenticated_map(silo, saved, mode="incremental", baseline=baseline)
+    expected = incremental.pages_at_cut(silo, saved, {**written, "pages": written["pages"][:2]})
+    changed = {index for index in witness_indices if old["map"][1].get(index) != new["map"][1].get(index)}
+    # A pinned page need not own its entire physical 64KiB container, especially
+    # the last allocation's leaf. Assert exact changes only in pages we own.
+    new_pages = {page["guestPhysicalAddress"]: restore.sealed_ram(
+        saved, page["guestPhysicalAddress"], written["pageSize"])[0] for page in written["pages"]}
+    owned_changes = {address for address in old_pages if old_pages[address] != new_pages[address]}
+    assert owned_changes == {page["guestPhysicalAddress"] for page in written["pages"][:2]}
+    assert len(expected) == 2 and expected <= changed <= new["affected"]
+    incremental.pages_at_cut(silo, saved, written)
+    silo.ws.record("incremental-owned-page-changes", json.dumps({
+        "snapshot": saved.snapshot, "ownedPageChanges": sorted(owned_changes),
+        "expected64KiBLeaves": sorted(expected), "containingLeafChanges": sorted(changed),
+    }, sort_keys=True) + "\n")
 
 def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
     silo: Silo, incremental_image: str,
@@ -89,7 +119,7 @@ def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
     assert zero_chunk <= facts["affected"]
     assert facts["stats"]["zeroRunBytesCovered"] >= zero_pages["pageSize"]
     for index in zero_chunk:
-        assert facts["map"]["chunks"][index] != "zero", "one page incorrectly zeroed its mixed 8MiB chunk"
+        assert index in facts["map"][1], "one page incorrectly zeroed its mixed 64KiB chunk"
     sealed = capture.inventory(zero.staging)
 
     # A fresh worker must inherit the verified complete map and a child-local

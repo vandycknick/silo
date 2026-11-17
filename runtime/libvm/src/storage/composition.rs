@@ -13,7 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::storage::identity::StreamId;
 use crate::storage::identity_file::SourceFingerprint;
-use crate::storage::stream::{StreamHasher, StreamMap};
+use crate::storage::map::AuthenticatedMap;
+use crate::storage::stream::StreamHasher;
 use crate::storage::StorageError;
 
 /// Local validation cache. Canonical records bind all ordered occurrences,
@@ -140,7 +141,7 @@ impl CompositionValidation {
 
 pub struct ComposedLower {
     pub result: CompositionResult,
-    pub map: StreamMap,
+    pub map: AuthenticatedMap,
     pack_fingerprints: Vec<SourceFingerprint>,
 }
 
@@ -208,7 +209,7 @@ fn authenticate_packs(layers: &[Layer<'_>]) -> Result<Vec<SourceFingerprint>, St
         .sum(layers.iter().map(|layer| layer.result.pack_length))?;
     let mut verified = BTreeMap::new();
     let mut fingerprints = Vec::with_capacity(layers.len());
-    let mut hasher = StreamHasher::new();
+    let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
     for layer in layers {
         let metadata = layer.pack.metadata()?;
         if !metadata.is_file() || metadata.len() != layer.result.pack_length {
@@ -268,7 +269,9 @@ fn finish(
         offset: 0,
         fsmeta_hash: Sha256::new(),
     };
-    let map = StreamHasher::new().hash_reader(&mut input)?;
+    let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+        .hash_reader(&mut input)?
+        .with_role(vm_spec::stream_map::StreamRole::Lower)?;
     recheck(fsmeta, fingerprint)?;
     for (layer, fingerprint) in layers.iter().zip(&fingerprints) {
         recheck(layer.pack, *fingerprint)?;
@@ -389,9 +392,11 @@ mod tests {
             offset: 0,
             fsmeta_hash: Sha256::new(),
         };
-        let actual = StreamHasher::new().hash_reader(&mut input).unwrap();
+        let actual = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_reader(&mut input)
+            .unwrap();
         let expected_bytes = [metadata.as_slice(), bytes.as_slice(), bytes.as_slice()].concat();
-        let expected = StreamHasher::new()
+        let expected = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_reader(expected_bytes.as_slice())
             .unwrap();
         assert_eq!(actual, expected);
@@ -426,7 +431,7 @@ mod tests {
             entries: Vec::new(),
         };
         let root = encode_index_to(&changeset, &ChangesetLimits::default(), |_| Ok(())).unwrap();
-        let stream = StreamHasher::new()
+        let stream = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_open_file(file, 0)
             .unwrap()
             .map

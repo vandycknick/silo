@@ -13,7 +13,7 @@ BEGIN SELECT RAISE(ABORT, 'runtime identity is immutable'); END;
 -- storage-operation rows. Terminal decisions survive both kinds of cleanup.
 CREATE TABLE handoff_operation (
     operation_id TEXT PRIMARY KEY NOT NULL,
-    schema INTEGER NOT NULL CHECK(schema=1),
+    schema INTEGER NOT NULL CHECK(schema=2),
     role TEXT NOT NULL CHECK(role IN ('source','destination')),
     mode TEXT NOT NULL CHECK(mode IN ('fork','relocate')),
     source_runtime TEXT NOT NULL,
@@ -107,7 +107,13 @@ CREATE TABLE verified_object (
     mode INTEGER NOT NULL,
     ctime_sec INTEGER NOT NULL,
     ctime_nsec INTEGER NOT NULL,
-    map_receipt BLOB,
+    map_receipt BLOB CHECK(map_receipt IS NULL OR (
+        json_valid(CAST(map_receipt AS TEXT),1) AND json_extract(CAST(map_receipt AS TEXT),'$.schema') IS 2
+        AND json_type(CAST(map_receipt AS TEXT),'$.chunks') IS NULL
+        AND json_type(CAST(map_receipt AS TEXT),'$.content.mapPages') IS NULL
+        AND json_type(CAST(map_receipt AS TEXT),'$.canonical') IS NULL
+        AND json_extract(CAST(map_receipt AS TEXT),'$.content.chunkSize') IN (65536,8388608)
+    )),
     verified_at TEXT NOT NULL
 );
 
@@ -359,6 +365,29 @@ CREATE TABLE machine_storage (
         json_type(record_json, '$.diskBaselines') IS 'array'
     )
 );
+CREATE TRIGGER machine_baseline_format_insert BEFORE INSERT ON machine_storage
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.record_json,'$.diskBaselines') b
+    WHERE json_type(b.value,'$.map') IS NOT 'text'
+       OR length(json_extract(b.value,'$.map')) != 71
+       OR substr(json_extract(b.value,'$.map'),1,7) != 'sha256:'
+       OR json_extract(b.value,'$.seed.mapFormat') IS NOT 2
+       OR json_extract(b.value,'$.seed.chunkShift') IS NOT 23
+       OR json_extract(b.value,'$.seed.baseline') IS NOT json_extract(b.value,'$.map')
+)
+BEGIN SELECT RAISE(ABORT,'machine baseline requires a stream-map v2 root'); END;
+CREATE TRIGGER machine_baseline_format_update BEFORE UPDATE OF record_json ON machine_storage
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.record_json,'$.diskBaselines') b
+    WHERE json_type(b.value,'$.map') IS NOT 'text'
+       OR length(json_extract(b.value,'$.map')) != 71
+       OR substr(json_extract(b.value,'$.map'),1,7) != 'sha256:'
+       OR json_extract(b.value,'$.seed.mapFormat') IS NOT 2
+       OR json_extract(b.value,'$.seed.chunkShift') IS NOT 23
+       OR json_extract(b.value,'$.seed.baseline') IS NOT json_extract(b.value,'$.map')
+)
+BEGIN SELECT RAISE(ABORT,'machine baseline requires a stream-map v2 root'); END;
+
 CREATE TABLE machine_stream_dependency (
     machine_id TEXT NOT NULL REFERENCES machine_storage(machine_id) ON DELETE CASCADE,
     generation INTEGER NOT NULL CHECK(generation>=0),
@@ -420,6 +449,10 @@ CREATE TABLE storage_operation_object (
     PRIMARY KEY (operation_id, object_digest)
 );
 CREATE INDEX storage_operation_object_reverse_idx ON storage_operation_object(object_digest, operation_id);
+CREATE TABLE storage_operation_memory_baseline (
+    operation_id TEXT PRIMARY KEY NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    root_digest TEXT NOT NULL REFERENCES stream_map_root(root_digest) ON DELETE RESTRICT
+);
 CREATE TABLE storage_operation_managed (
     operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
     managed_kind TEXT NOT NULL CHECK(managed_kind IN ('image','snapshot')),
@@ -444,10 +477,47 @@ CREATE TABLE storage_operation_cache (
 );
 CREATE INDEX storage_operation_cache_reverse ON storage_operation_cache(kind,digest,operation_id);
 
+-- Only canonical root and node objects are edges. Leaf payload digests are
+-- values, never references to fictitious objects in the immutable pool.
+CREATE TABLE stream_map_object (
+    digest TEXT PRIMARY KEY NOT NULL CHECK(length(digest)=71 AND substr(digest,1,7)='sha256:'),
+    height INTEGER CHECK(height BETWEEN 0 AND 4)
+);
+CREATE TABLE stream_map_edge (
+    parent_digest TEXT NOT NULL REFERENCES stream_map_object(digest) ON DELETE CASCADE,
+    slot INTEGER NOT NULL CHECK(slot BETWEEN 0 AND 63),
+    child_digest TEXT NOT NULL REFERENCES stream_map_object(digest) ON DELETE RESTRICT,
+    PRIMARY KEY(parent_digest,slot)
+);
+CREATE INDEX stream_map_edge_child ON stream_map_edge(child_digest);
+CREATE TABLE stream_map_root (
+    root_digest TEXT PRIMARY KEY NOT NULL REFERENCES stream_map_object(digest) ON DELETE CASCADE,
+    length INTEGER NOT NULL CHECK(length BETWEEN 0 AND 4398046511104),
+    chunk_shift INTEGER NOT NULL CHECK(chunk_shift BETWEEN 12 AND 23)
+);
+CREATE TRIGGER stream_map_object_immutable BEFORE UPDATE ON stream_map_object
+BEGIN SELECT RAISE(ABORT,'stream map object is immutable'); END;
+CREATE TRIGGER stream_map_root_immutable BEFORE UPDATE ON stream_map_root
+BEGIN SELECT RAISE(ABORT,'stream map root is immutable'); END;
+CREATE TRIGGER stream_map_edge_immutable BEFORE UPDATE ON stream_map_edge
+BEGIN SELECT RAISE(ABORT,'stream map edge is immutable'); END;
+CREATE TRIGGER stream_map_edge_geometry BEFORE INSERT ON stream_map_edge
+WHEN NOT EXISTS (
+    SELECT 1 FROM stream_map_object p JOIN stream_map_object c
+    WHERE p.digest=NEW.parent_digest AND c.digest=NEW.child_digest
+      AND ((p.height IS NULL AND NEW.slot=0 AND c.height=4)
+           OR (p.height>0 AND c.height=p.height-1))
+)
+BEGIN SELECT RAISE(ABORT,'invalid stream map edge geometry'); END;
+CREATE TRIGGER stream_map_root_geometry BEFORE INSERT ON stream_map_root
+WHEN NOT EXISTS(SELECT 1 FROM stream_map_object WHERE digest=NEW.root_digest AND height IS NULL)
+BEGIN SELECT RAISE(ABORT,'stream map root must reference a root object'); END;
+
 CREATE TABLE storage_stream (
     stream_id TEXT PRIMARY KEY NOT NULL,
     length INTEGER NOT NULL CHECK(length >= 0),
-    map_digest TEXT NOT NULL,
+    map_digest TEXT NOT NULL CHECK(map_digest=stream_id),
+    chunk_shift INTEGER NOT NULL CHECK(chunk_shift IN (16,23)),
     flat_state TEXT NOT NULL CHECK(flat_state IN ('present','evicting','absent'))
 );
 CREATE TABLE stream_representation (
@@ -478,7 +548,7 @@ CREATE TABLE stream_representation_object (
     FOREIGN KEY(stream_id,root_digest) REFERENCES stream_representation(stream_id,root_digest) ON DELETE CASCADE
 );
 CREATE INDEX stream_representation_object_reverse ON stream_representation_object(object_digest,stream_id);
-CREATE TRIGGER storage_stream_identity_immutable BEFORE UPDATE OF stream_id,length,map_digest ON storage_stream
+CREATE TRIGGER storage_stream_identity_immutable BEFORE UPDATE OF stream_id,length,map_digest,chunk_shift ON storage_stream
 BEGIN SELECT RAISE(ABORT,'stream identity is immutable'); END;
 CREATE TRIGGER stream_representation_immutable BEFORE UPDATE ON stream_representation
 BEGIN SELECT RAISE(ABORT,'stream representation is immutable'); END;
@@ -575,7 +645,8 @@ CREATE TABLE layer_result (
     recipe_id TEXT NOT NULL UNIQUE REFERENCES layer_recipe(id) ON DELETE RESTRICT,
     pack_stream TEXT NOT NULL,
     pack_length INTEGER NOT NULL CHECK (pack_length >= 0),
-    pack_map TEXT NOT NULL,
+    pack_map TEXT NOT NULL CHECK(pack_map=pack_stream),
+    pack_chunk_shift INTEGER NOT NULL DEFAULT 23 CHECK(pack_chunk_shift=23),
     index_root TEXT NOT NULL,
     record_digest TEXT NOT NULL,
     record_bytes BLOB NOT NULL
@@ -635,9 +706,13 @@ CREATE INDEX composition_recipe_record_idx ON composition_recipe(record_digest);
 -- A local validation cache, never a retention root or transported authority.
 CREATE TABLE composition_validation (
     lower_id TEXT NOT NULL REFERENCES composition_result(id) ON DELETE CASCADE,
-    schema INTEGER NOT NULL CHECK(schema > 0),
+    schema INTEGER NOT NULL CHECK(schema=2),
     receipt BLOB NOT NULL,
-    graph_receipt BLOB,
+    graph_receipt BLOB CHECK(graph_receipt IS NULL OR (
+        json_valid(CAST(graph_receipt AS TEXT),1) AND json_extract(CAST(graph_receipt AS TEXT),'$.schema') IS 2
+        AND json_type(CAST(graph_receipt AS TEXT),'$.chunks') IS NULL
+        AND json_type(CAST(graph_receipt AS TEXT),'$.maps') IS NULL
+    )),
     PRIMARY KEY(lower_id,schema)
 );
 -- Exact ordered occurrences, including repetitions of one layer result.
@@ -666,14 +741,24 @@ BEGIN SELECT RAISE(ABORT, 'composition occurrence is immutable'); END;
 CREATE TABLE storage_snapshot (
     id TEXT PRIMARY KEY NOT NULL,
     record_digest TEXT NOT NULL,
-    record_bytes BLOB NOT NULL,
+    record_bytes BLOB NOT NULL CHECK(
+        json_valid(CAST(record_bytes AS TEXT),1)
+        AND json_extract(CAST(record_bytes AS TEXT),'$.schema') IS 2
+        AND json_extract(CAST(record_bytes AS TEXT),'$.root.stream.chunkSize') IS 8388608
+        AND json_type(CAST(record_bytes AS TEXT),'$.root.stream.mapPages') IS NULL
+    ),
     retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
     created_at INTEGER NOT NULL
 );
 CREATE TABLE storage_image (
     id TEXT PRIMARY KEY NOT NULL,
     record_digest TEXT NOT NULL,
-    record_bytes BLOB NOT NULL,
+    record_bytes BLOB NOT NULL CHECK(
+        json_valid(CAST(record_bytes AS TEXT),1)
+        AND json_extract(CAST(record_bytes AS TEXT),'$.schema') IS 2
+        AND json_extract(CAST(record_bytes AS TEXT),'$.root.stream.chunkSize') IS 8388608
+        AND json_type(CAST(record_bytes AS TEXT),'$.root.stream.mapPages') IS NULL
+    ),
     retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
     created_at INTEGER NOT NULL
 );
@@ -757,11 +842,19 @@ CREATE TABLE snapshot_capture_provenance (
 CREATE INDEX snapshot_capture_provenance_reverse_idx ON snapshot_capture_provenance(evidence_digest, snapshot_id);
 CREATE TRIGGER snapshot_capture_provenance_immutable BEFORE UPDATE ON snapshot_capture_provenance
 BEGIN SELECT RAISE(ABORT, 'capture provenance is immutable'); END;
+CREATE TABLE snapshot_capture_change (
+    snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE CASCADE,
+    changes_digest TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id,changes_digest)
+);
+CREATE TRIGGER snapshot_capture_change_immutable BEFORE UPDATE ON snapshot_capture_change
+BEGIN SELECT RAISE(ABORT,'capture change provenance is immutable'); END;
 
 CREATE TABLE snapshot_imported_capture (
     snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE CASCADE,
     provenance_digest TEXT NOT NULL,
     evidence_digest TEXT NOT NULL,
+    changes_digest TEXT NOT NULL,
     provenance_bytes BLOB NOT NULL,
     PRIMARY KEY(snapshot_id,provenance_digest)
 );
@@ -793,12 +886,16 @@ UNION SELECT object_digest FROM layer_object_dependency
 UNION SELECT record_digest FROM composition_recipe
 UNION SELECT record_digest FROM composition_result
 UNION SELECT fsmeta_digest FROM composition_result
+UNION SELECT lower_stream FROM composition_result
 UNION SELECT object_digest FROM storage_operation_object
+UNION SELECT root_digest FROM storage_operation_memory_baseline
 UNION SELECT object_digest FROM snapshot_object_dependency
 UNION SELECT object_digest FROM image_object_dependency
 UNION SELECT evidence_digest FROM snapshot_capture_provenance
+UNION SELECT changes_digest FROM snapshot_capture_change
 UNION SELECT provenance_digest FROM snapshot_imported_capture
 UNION SELECT evidence_digest FROM snapshot_imported_capture
+UNION SELECT changes_digest FROM snapshot_imported_capture
 UNION SELECT receipt_digest FROM managed_artifact_acquisition a
 WHERE (managed_kind='image' AND EXISTS(SELECT 1 FROM storage_image WHERE id=a.managed_id))
    OR (managed_kind='snapshot' AND EXISTS(SELECT 1 FROM storage_snapshot WHERE id=a.managed_id));
@@ -810,7 +907,20 @@ UNION SELECT stream_id FROM image_stream_dependency
 UNION SELECT pack_stream FROM layer_result
 UNION SELECT b.stream_id FROM object_stream_representation b
 JOIN retained_base_object r ON r.object_digest=b.object_digest;
+CREATE VIEW retained_map_object AS
+WITH RECURSIVE reachable(object_digest) AS (
+    SELECT r.object_digest FROM retained_base_object r
+    JOIN stream_map_object m ON m.digest=r.object_digest
+    UNION SELECT s.map_digest FROM storage_stream s
+    JOIN retained_stream r ON r.stream_id=s.stream_id
+    UNION SELECT s.map_digest FROM storage_stream s
+    WHERE EXISTS(SELECT 1 FROM stream_representation r WHERE r.stream_id=s.stream_id)
+    UNION SELECT e.child_digest FROM stream_map_edge e
+    JOIN reachable r ON r.object_digest=e.parent_digest
+)
+SELECT object_digest FROM reachable;
 CREATE VIEW retained_object AS
 SELECT object_digest FROM retained_base_object
-UNION SELECT object_digest FROM stream_representation_object;
+UNION SELECT object_digest FROM stream_representation_object
+UNION SELECT object_digest FROM retained_map_object;
 

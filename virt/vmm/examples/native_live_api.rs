@@ -55,6 +55,10 @@ mod virt;
 mod vsock;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "native_live_api/stream_map.rs"]
+mod native_stream_map;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[path = "native_live_api/entry.rs"]
 mod entry;
 

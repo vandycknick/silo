@@ -6,13 +6,13 @@
 //!      │
 //!      ▼ begin_stopped_operation("import"): original operation OFD
 //!  blocking worker (owns a duplicate of that OFD and the catalog)
-//!      raw:   held fd ─copy+verify─► pool stream ─authenticate, SHA-256─┐
+//!      raw:   held fd ─copy+tree+SHA-256─► pool stream ────────────────┐
 //!      qcow2: SHA-256(container); decode ─SparseSink─► op staging ──────┤
 //!                                                                       ▼
 //!             owned bytes: table (StrictImport) → Linux table policy →
 //!             concrete selector → bounded ext4 superblock admission
 //!      qcow2: owned staging ─copy+verify─► pool stream
-//!      publish_map ─► SnapshotRoot (stream, map, pages: operation-pinned)
+//!      publish_map ─► SnapshotRoot (stream root: operation-pinned)
 //!      │
 //!      ▼
 //!  direct_boot_profile → pin_image_boot (same operation) → ImageRecord
@@ -39,7 +39,7 @@ use crate::image::local_disk::{AdmittedInput, OpenDiskSource};
 use crate::paths::OwnedDirectory;
 use crate::storage::identity::ObjectDigest;
 use crate::storage::pool::{OperationPaths, StoragePool};
-use crate::storage::stream::{write_sparse_at, StreamHasher};
+use crate::storage::stream::write_sparse_at;
 use crate::storage::StorageError;
 use crate::store::managed_image_store::ManagedImageStore;
 use crate::store::models::image::{ImageRecord, ImageRecordKind};
@@ -242,7 +242,7 @@ async fn import_disk_owned(
     )
     .await?;
     let record = ImageRecord {
-        schema: 1,
+        schema: 2,
         kind: ImageRecordKind::Image,
         root: prepared.root,
         boot,
@@ -328,15 +328,10 @@ fn import_space_charge(source: &OpenDiskSource) -> Result<u64, LibVmError> {
         AdmittedInput::Raw { .. } => 1,
         AdmittedInput::Qcow2(_) => 2,
     };
-    let chunks = length.div_ceil(crate::storage::limits::CHUNK_SIZE as u64);
-    let pages = chunks.div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
-    // Same conservative canonical map allowance used by capture admission,
-    // including simultaneous object staging and final map objects.
-    let maps = chunks
-        .checked_mul(74)
-        .and_then(|bytes| bytes.checked_add(pages.checked_mul(330)?))
-        .and_then(|bytes| bytes.checked_add(256))
-        .and_then(|bytes| bytes.checked_mul(2));
+    let maps =
+        vm_spec::stream_map::worst_case_map_bytes(length, vm_spec::stream_map::ChunkSize::DISK)
+            .map_err(StorageError::from)?
+            .checked_mul(2);
     length
         .checked_mul(copies)
         .and_then(|bytes| bytes.checked_add(maps?))
@@ -357,8 +352,8 @@ fn prepare_blocking(
         AdmittedInput::Raw { .. } => {
             // The duplicate shares the held open file; no path is resolved.
             let input = source.file().try_clone()?;
-            let (published, roots) = pool
-                .publish_stream_file_for_catalog(input, length)
+            let (published, sha256, roots) = pool
+                .publish_stream_file_with_sha256_for_catalog(input, length)
                 .map_err(|error| source.storage_error(error))?;
             runtime.block_on(store.pin_published_storage_dependencies(
                 operation.id,
@@ -367,14 +362,8 @@ fn prepare_blocking(
             ))?;
             drop(roots);
             source.ensure_unchanged()?;
-            // Facts come from the owned pool bytes, authenticated against the
-            // published map, never from the caller's still-mutable file.
-            let (owned, sha256) = StreamHasher::new()
-                .authenticate_with_sha256(pool.open_stream(&published.id)?, length)?;
-            if *owned.map() != published.map {
-                return Err(StorageError::ContentMismatch(published.path).into());
-            }
-            let root = admit_owned_root(owned.file(), length, requested, userspace)?;
+            let owned = pool.open_stream(&published.id)?;
+            let root = admit_owned_root(&owned, length, requested, userspace)?;
             // Raw container bytes are the decoded stream.
             let digest = ObjectDigest::from_sha256(*sha256.as_bytes());
             (published.map, root, digest)
@@ -1148,6 +1137,16 @@ pub(crate) mod tests {
         assert_eq!(
             from_raw.root, from_qcow2.root,
             "identity ignores the container"
+        );
+        let rebuilt =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_reader(&mut std::io::Cursor::new(&raw))
+                .unwrap();
+        assert_eq!(from_raw.root.stream.stream, rebuilt.id());
+        assert_eq!(from_raw.root.stream.map.as_bytes(), rebuilt.id().as_bytes());
+        assert_eq!(
+            from_raw.root.stream.chunk_size,
+            vm_spec::stream_map::ChunkSize::DISK.bytes()
         );
         assert_eq!(from_raw.selector, RootSelector::WholeDisk);
         assert_eq!(from_raw.root.layout, RawLayout::WholeDisk);

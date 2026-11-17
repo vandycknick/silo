@@ -1,5 +1,6 @@
-//! ADR 0014 v1 compatibility limits. Bounds are inclusive, not resource promises.
+//! Fresh-state stream-map v2 bounds. Limits are inclusive, not resource promises.
 
+/// Transport payload geometry, not the identity-unit size of RAM streams.
 pub const CHUNK_SIZE: usize = oci::vm_artifact::wire::CHUNK_SIZE as usize;
 const GIB: u64 = 1024 * 1024 * 1024;
 pub const JSON_SAFE_INTEGER_MAX: u64 = oci::changeset::limits::JSON_SAFE_INTEGER_MAX;
@@ -8,6 +9,21 @@ pub const MTIME_FRACTIONAL_DIGITS: usize = 9;
 pub const NANOSECONDS_PER_SECOND: u64 = 10_u64.pow(MTIME_FRACTIONAL_DIGITS as u32);
 pub const FD_RESERVED_OVERHEAD: u64 = 256;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapSize {
+    pub nodes: u64,
+    pub bytes: u64,
+}
+
+pub fn map_size(
+    length: u64,
+    chunk_size: vm_spec::stream_map::ChunkSize,
+) -> Result<MapSize, vm_spec::stream_map::MapError> {
+    Ok(MapSize {
+        nodes: vm_spec::stream_map::worst_case_node_count(length, chunk_size)?,
+        bytes: vm_spec::stream_map::worst_case_map_bytes(length, chunk_size)?,
+    })
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resource {
     LayerOccurrences,
@@ -135,7 +151,7 @@ impl Resource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BoundViolation {
-    #[error("{resource:?} is {}, exceeding v1 maximum {}", resource.format_value(*actual), resource.format_value(*maximum))]
+    #[error("{resource:?} is {}, exceeding format maximum {}", resource.format_value(*actual), resource.format_value(*maximum))]
     Exceeded {
         resource: Resource,
         actual: u64,
@@ -284,7 +300,7 @@ mod tests {
                 maximum: 1 << 30,
             }
             .to_string(),
-            "CapturedRamBytes is 2GiB, exceeding v1 maximum 1GiB"
+            "CapturedRamBytes is 2GiB, exceeding format maximum 1GiB"
         );
         assert_eq!(
             BoundViolation::Exceeded {
@@ -293,7 +309,7 @@ mod tests {
                 maximum: 1_000_000,
             }
             .to_string(),
-            "LayerEntries is 2000000, exceeding v1 maximum 1000000"
+            "LayerEntries is 2000000, exceeding format maximum 1000000"
         );
     }
 
@@ -477,5 +493,25 @@ mod tests {
             .unwrap(),
             1792
         );
+    }
+    #[test]
+    fn merkle_map_bounds_preserve_existing_stream_admission() {
+        use crate::storage::limits::map_size;
+        use vm_spec::stream_map::{ChunkSize, MAX_NODE_BYTES, MAX_ROOT_BYTES};
+        for (length, profile) in [
+            (1 << 40, ChunkSize::RAM),
+            (1 << 40, ChunkSize::DISK),
+            (4 << 40, ChunkSize::DISK),
+        ] {
+            let size = map_size(length, profile).unwrap();
+            assert!(size.nodes > 0);
+            assert_eq!(
+                size.bytes,
+                size.nodes * MAX_NODE_BYTES as u64 + MAX_ROOT_BYTES as u64
+            );
+        }
+        assert_eq!(map_size(0, ChunkSize::RAM).unwrap().nodes, 0);
+        assert!(map_size((4 << 40) + 1, ChunkSize::DISK).is_err());
+        assert!(map_size(1 << 40, ChunkSize::RAM).unwrap().bytes > 64 << 20);
     }
 }

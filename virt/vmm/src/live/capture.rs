@@ -37,7 +37,7 @@ use vm_spec::capture::{
     CaptureInventoryEntry, CaptureLaunchLease, CaptureMemoryEvidence, CapturePauseAuthority,
     CapturePauseDisposition, CapturePlan, CaptureRecordOutcome, CaptureReleaseDisposition,
     CaptureReleaseState, CaptureReleased, CaptureRole, CaptureSealed, CaptureSourceOutcome,
-    CaptureSourceRecord, CaptureStateBinding, Sha256Digest, StreamMap, CAPTURE_CLONE_RESERVE_BYTES,
+    CaptureSourceRecord, CaptureStateBinding, Sha256Digest, CAPTURE_CLONE_RESERVE_BYTES,
     CAPTURE_CUT_FILE, CAPTURE_CUT_TEMPORARY_FILE, CAPTURE_EVIDENCE_FILE,
     CAPTURE_EVIDENCE_TEMPORARY_FILE, CAPTURE_LAYOUT_FILE, CAPTURE_RECORD_VERSION,
     CAPTURE_SOURCE_FILE, CAPTURE_SOURCE_TEMPORARY_FILE, CAPTURE_STATE_RESERVE_BYTES,
@@ -50,6 +50,7 @@ use vm_spec::lifecycle::{
     ReleaseCaptureOutcome, ReleaseFailed, VmLifecycleState,
 };
 use vm_spec::live::{LiveBackend, LiveDeviceSubject, LiveLane, LiveOperation};
+use vm_spec::stream_map::{StreamRole, StreamRoot, MAX_ROOT_BYTES};
 
 use crate::live::coordinator::{
     failure, guest_observation, resume_code, resume_stage, stopped_cancel, wire_uuid, Continued,
@@ -85,12 +86,13 @@ pub(crate) struct CaptureContext {
     lease: Arc<OwnedFd>,
     digests: CaptureDigests,
     baseline: std::sync::Mutex<Option<AcceptedMap>>,
-    disk_baselines: std::sync::Mutex<std::collections::BTreeMap<vm_spec::BlockId, Arc<StreamMap>>>,
+    disk_baselines: std::sync::Mutex<std::collections::BTreeMap<vm_spec::BlockId, Arc<StreamRoot>>>,
 }
 
 #[derive(Debug, Clone)]
 struct AcceptedMap {
-    map: Arc<vm_spec::capture::StreamMap>,
+    map: Arc<StreamRoot>,
+    nodes: Option<crate::live::staging::MapNodeFiles>,
     layout: Sha256Digest,
     stream: Sha256Digest,
 }
@@ -148,6 +150,12 @@ impl CaptureContext {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(AcceptedMap {
             map: Arc::new(map),
+            nodes: restore
+                .request
+                .map_node_store
+                .as_deref()
+                .map(crate::live::staging::MapNodeFiles::open)
+                .transpose()?,
             layout: memory.binding.ram_layout,
             stream: memory.ram_stream,
         });
@@ -250,14 +258,14 @@ struct Run {
     memory: Option<CaptureMemoryEvidence>,
     inventory: Vec<CaptureInventoryEntry>,
     native_memory: Option<CommandOutcome>,
-    resolved_map: Option<Arc<vm_spec::capture::StreamMap>>,
+    resolved_map: Option<Arc<StreamRoot>>,
     pending_disks: Vec<CaptureDiskCut>,
     continued: Option<Finish>,
     source_continued: bool,
     disk_freeze_attempted: bool,
     disk_receipts: Vec<vm_spec::capture::DiskTrackingReceipt>,
     disk_stats: Vec<vm_spec::capture::CaptureDiskStats>,
-    disk_maps: Vec<(vm_spec::BlockId, Arc<StreamMap>)>,
+    disk_maps: Vec<(vm_spec::BlockId, Arc<StreamRoot>)>,
 }
 
 impl Run {
@@ -346,19 +354,18 @@ struct Verified {
     ram_stream: Sha256Digest,
     /// Actual staged bytes charged against the reservation, before the seal.
     staged_bytes: u64,
-    map: Arc<vm_spec::capture::StreamMap>,
+    map: Arc<StreamRoot>,
 }
 
 struct DiskIdentityResult {
     inventory: Vec<CaptureInventoryEntry>,
     bytes: u64,
-    maps: Vec<(vm_spec::BlockId, Arc<StreamMap>)>,
+    maps: Vec<(vm_spec::BlockId, Arc<StreamRoot>)>,
     stats: Vec<vm_spec::capture::CaptureDiskStats>,
 }
 
-fn read_disk_map(file: File) -> io::Result<StreamMap> {
-    let maximum =
-        (vm_spec::capture::MAX_STREAM_BYTES / vm_spec::capture::STREAM_CHUNK_BYTES) * 74 + 256;
+fn read_disk_map(file: File) -> io::Result<StreamRoot> {
+    let maximum = MAX_ROOT_BYTES as u64;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > maximum {
         return Err(io::Error::new(
@@ -368,7 +375,9 @@ fn read_disk_map(file: File) -> io::Result<StreamMap> {
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(maximum + 1).read_to_end(&mut bytes)?;
-    let map = StreamMap::decode(&bytes).map_err(io::Error::other)?;
+    let map = StreamRoot::decode(&bytes).map_err(io::Error::other)?;
+    map.validate_role(StreamRole::Disk)
+        .map_err(io::Error::other)?;
     if map.canonical_bytes().map_err(io::Error::other)? != bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -654,14 +663,17 @@ impl LiveCoordinator {
         let created = tokio::task::spawn_blocking({
             let context = context.clone();
             let capture = run.plan.capture_id.clone();
+            let map_node_store = run.plan.map_node_store.clone();
             move || -> io::Result<_> {
                 let staging = CaptureStaging::create(&context.data_dir, &capture)?;
+                staging.set_node_store(map_node_store.as_deref())?;
                 let request = staging.write_request(&bytes)?;
                 let files = CaptureOutputFiles {
                     execution: staging.create_output(&CaptureRole::Execution)?,
                     devices: staging.create_output(&CaptureRole::Devices)?,
                     ram: staging.create_output(&CaptureRole::Ram)?,
                     layout: staging.create_output(&CaptureRole::Layout)?,
+                    changes: staging.create_output(&CaptureRole::RamChanges)?,
                     pin: File::from(context.lease.try_clone()?),
                 };
                 Ok((staging, request, files))
@@ -682,6 +694,7 @@ impl LiveCoordinator {
                     devices: OutputIdentity::of(&files.devices)?,
                     ram: OutputIdentity::of(&files.ram)?,
                     layout: OutputIdentity::of(&files.layout)?,
+                    changes: OutputIdentity::of(&files.changes)?,
                 },
                 OutputIdentity::of(&files.pin)?,
             ))
@@ -736,6 +749,7 @@ impl LiveCoordinator {
                     devices: files.devices.try_clone()?,
                     ram: files.ram.try_clone()?,
                     layout: files.layout.try_clone()?,
+                    changes: files.changes.try_clone()?,
                     pin: files.pin.try_clone()?,
                 }))
             })
@@ -1171,7 +1185,10 @@ impl LiveCoordinator {
                     name: disk.name,
                     dirty_chunks,
                     total_chunks: disk.length.div_ceil(vm_spec::capture::STREAM_CHUNK_BYTES),
-                    bytes_hashed: crate::live::staging::hashed_map_bytes(&map),
+                    bytes_hashed: crate::live::staging::hashed_map_bytes(
+                        &map,
+                        &mut staging.node_source(),
+                    )?,
                     baseline_reused: false,
                     full_scan_reason: Some(if disk.tracking_eligible {
                         vm_spec::capture::DiskFullScanReason::CopyLane
@@ -1393,6 +1410,7 @@ impl LiveCoordinator {
                 ..
             } => {
                 let baseline = baseline
+                    .as_ref()
                     .ok_or_else(|| fail("incremental receipt lacks its retained map".into()))?;
                 if baseline.stream != *expected
                     || baseline.layout.as_bytes() != &binding.ram_layout.0
@@ -1401,7 +1419,7 @@ impl LiveCoordinator {
                         "incremental receipt differs from the exact retained map/layout".into(),
                     ));
                 }
-                Some(baseline.map)
+                Some(baseline.map.clone())
             }
             CommandOutcome::MemoryCaptured {
                 mode: vm_spec::lifecycle::CapturePolicy::Full,
@@ -1411,21 +1429,59 @@ impl LiveCoordinator {
         };
         let CommandOutcome::MemoryCaptured {
             ram,
-            dirty_chunks,
-            chunk_digests,
+            changes,
+            changes_output,
             ..
         } = &receipt
         else {
             return Err(fail("native memory receipt has the wrong role".into()));
         };
-        let map = Arc::new(
-            assemble_ram_map(ram.length, dirty_chunks, chunk_digests, retained.as_deref())
-                .map_err(|error| fail(error.to_string()))?,
-        );
+        let (change_file, change_facts) = staging
+            .open_sealed(&CaptureRole::RamChanges)
+            .map_err(|error| fail(error.to_string()))?;
+        if (change_facts.device, change_facts.inode, change_facts.length)
+            != (
+                changes_output.device,
+                changes_output.inode,
+                changes_output.length,
+            )
+        {
+            return Err(fail(
+                "RAM changes differ from the native output receipt".into(),
+            ));
+        }
+        let nodes = baseline
+            .as_ref()
+            .and_then(|baseline| baseline.nodes.clone())
+            .unwrap_or_else(|| staging.node_source());
+        let length = ram.length;
+        let changes = changes.as_ref().clone();
         let (abort, watcher) = abort_token(&run.cancel, &self.stop);
         let verified = tokio::task::spawn_blocking({
             let abort = abort.clone();
-            move || verify_staging(&staging, &roles, &disks, outputs, ram_limit, map, &abort)
+            move || {
+                let map = Arc::new(assemble_ram_map(
+                    length,
+                    &change_file,
+                    &changes,
+                    retained.as_deref(),
+                    nodes,
+                    &mut staging.node_sink(),
+                    &abort,
+                )?);
+                verify_staging(
+                    &staging,
+                    &roles,
+                    &disks,
+                    outputs,
+                    RamVerification {
+                        limit: ram_limit,
+                        map,
+                        authenticated_changes: Some(&changes),
+                    },
+                    &abort,
+                )
+            }
         })
         .await;
         watcher.abort();
@@ -1452,8 +1508,8 @@ impl LiveCoordinator {
             mode,
             baseline,
             full_reason,
-            dirty_chunks,
-            chunk_digests,
+            identity_chunk_bytes,
+            changes,
             stats,
             ..
         } = receipt
@@ -1469,8 +1525,8 @@ impl LiveCoordinator {
             mode,
             baseline,
             full_reason,
-            dirty_chunks,
-            chunk_digests,
+            identity_chunk_bytes,
+            changes: *changes,
             stats: *stats,
             binding: CaptureStateBinding {
                 live_state_schema: binding.live_state_schema,
@@ -1602,6 +1658,7 @@ impl LiveCoordinator {
                 let mut inventory = Vec::with_capacity(pending.len() * 2);
                 let mut bytes = staged;
                 let mut maps = Vec::with_capacity(pending.len());
+                let metadata_before = staging.directory_allocation()?;
                 let mut stats = Vec::with_capacity(pending.len());
                 for cut in pending {
                     let planned = disks.iter().find(|disk| disk.name == cut.name)
@@ -1639,13 +1696,14 @@ impl LiveCoordinator {
                         CaptureRole::Disk(cut.name.clone()),
                         CaptureRole::DiskMap(cut.name),
                     ] {
-                        let verified = verify_role(&staging, &role, &disks, outputs, &map, &abort)?;
+                        let verified = verify_role(&staging, &role, &disks, outputs, &map, None, &abort)?;
                         if matches!(role, CaptureRole::DiskMap(_)) {
                             bytes = bytes.saturating_add(verified.staged_bytes);
                         }
                         inventory.push(verified.entry);
                     }
                 }
+                bytes = bytes.saturating_add(staging.directory_allocation()?.saturating_sub(metadata_before));
                 let cut = staging.open_entry_allocation(CAPTURE_CUT_FILE)?;
                 Ok(DiskIdentityResult { inventory, bytes: bytes.saturating_add(cut), maps, stats })
             }
@@ -2066,6 +2124,7 @@ impl LiveCoordinator {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()) = Some(AcceptedMap {
                         map: map.clone(),
+                        nodes: run.staging.as_ref().map(|staging| staging.node_source()),
                         layout: memory.binding.ram_layout,
                         stream: memory.ram_stream,
                     });
@@ -2992,6 +3051,12 @@ impl LiveCoordinator {
     }
 }
 
+struct RamVerification<'a> {
+    limit: u64,
+    map: Arc<StreamRoot>,
+    authenticated_changes: Option<&'a vm_spec::capture::CaptureRamChanges>,
+}
+
 /// Validate closed writer fingerprints and lengths, resolve stream identities
 /// from the recorded maps, and authenticate only the small state roles.
 fn verify_staging(
@@ -2999,11 +3064,17 @@ fn verify_staging(
     roles: &[CaptureRole],
     disks: &[CaptureDiskPlan],
     outputs: CaptureOutputIdentities,
-    ram_limit: u64,
-    map: Arc<StreamMap>,
+    ram: RamVerification<'_>,
     abort: &CancellationToken,
 ) -> io::Result<Verified> {
+    let RamVerification {
+        limit: ram_limit,
+        map,
+        authenticated_changes,
+    } = ram;
     let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+    map.validate_role(StreamRole::Ram)
+        .map_err(io::Error::other)?;
     let staged_request_bytes = staging.request_allocation()?;
     if roles.contains(&CaptureRole::RamMap) {
         staging.publish_map(&CaptureRole::RamMap, &map)?;
@@ -3014,7 +3085,15 @@ fn verify_staging(
     let mut geometry = None;
     let mut ram = None;
     for role in roles {
-        let verified = verify_role(staging, role, disks, outputs, &map, abort)?;
+        let verified = verify_role(
+            staging,
+            role,
+            disks,
+            outputs,
+            &map,
+            authenticated_changes,
+            abort,
+        )?;
         state_bytes = state_bytes.saturating_add(verified.state_bytes);
         staged_bytes = staged_bytes.saturating_add(verified.staged_bytes);
         geometry = verified.geometry.or(geometry);
@@ -3063,7 +3142,8 @@ fn verify_role(
     role: &CaptureRole,
     disks: &[CaptureDiskPlan],
     outputs: CaptureOutputIdentities,
-    ram_map: &StreamMap,
+    ram_map: &StreamRoot,
+    authenticated_changes: Option<&vm_spec::capture::CaptureRamChanges>,
     abort: &CancellationToken,
 ) -> io::Result<VerifiedRole> {
     let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
@@ -3079,6 +3159,7 @@ fn verify_role(
         CaptureRole::Devices => Some(outputs.devices),
         CaptureRole::Ram => Some(outputs.ram),
         CaptureRole::Layout => Some(outputs.layout),
+        CaptureRole::RamChanges => Some(outputs.changes),
         CaptureRole::Disk(_) | CaptureRole::RamMap | CaptureRole::DiskMap(_) => None,
     };
     if let Some(expected) = prepared {
@@ -3105,8 +3186,7 @@ fn verify_role(
         )));
     }
     if matches!(role, CaptureRole::RamMap | CaptureRole::DiskMap(_))
-        && facts.length
-            > (vm_spec::capture::MAX_STREAM_BYTES / vm_spec::capture::STREAM_CHUNK_BYTES) * 74 + 256
+        && facts.length > MAX_ROOT_BYTES as u64
     {
         return Err(invalid(
             "complete RAM map exceeds its metadata bound".into(),
@@ -3148,17 +3228,27 @@ fn verify_role(
             }
             (None, Some(ram_map.id()))
         }
+        CaptureRole::RamChanges if authenticated_changes.is_some() => {
+            let summary = authenticated_changes
+                .ok_or_else(|| invalid("RAM change summary missing".into()))?;
+            if facts.length != summary.byte_len {
+                return Err(invalid(
+                    "RAM change file changed length after assembly".into(),
+                ));
+            }
+            (Some(summary.sha256), None)
+        }
         CaptureRole::Disk(name) => {
             let (map_file, map_facts) = staging.open_sealed(&CaptureRole::DiskMap(name.clone()))?;
-            let limit = (vm_spec::capture::MAX_STREAM_BYTES / vm_spec::capture::STREAM_CHUNK_BYTES)
-                * 74
-                + 256;
+            let limit = MAX_ROOT_BYTES as u64;
             if map_facts.length > limit {
                 return Err(invalid("disk map exceeds its metadata bound".into()));
             }
             let mut bytes = vec![0; map_facts.length as usize];
             std::os::unix::fs::FileExt::read_exact_at(&map_file, &mut bytes, 0)?;
-            let map = StreamMap::decode(&bytes).map_err(invalid)?;
+            let map = StreamRoot::decode(&bytes).map_err(io::Error::other)?;
+            map.validate_role(StreamRole::Disk)
+                .map_err(io::Error::other)?;
             if map.length() != facts.length {
                 return Err(invalid(
                     "disk map length differs from its closed file".into(),
@@ -3236,13 +3326,14 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
     use vm_spec::capture::{
-        CaptureDiskCopy, CaptureDiskName, CaptureDiskPlan, CaptureRole, Sha256Digest, StreamMap,
+        CaptureDiskCopy, CaptureDiskName, CaptureDiskPlan, CaptureRole, Sha256Digest,
         CAPTURE_CLONE_RESERVE_BYTES, CAPTURE_REQUEST_FILE, CAPTURE_STATE_RESERVE_BYTES,
         MAX_CAPTURE_RECORD_BYTES,
     };
     use vm_spec::lifecycle::{LiveFailureCode, LiveId, LiveStage};
+    use vm_spec::stream_map::{build_sorted, ChunkSize, PresentChunk, StreamRoot};
 
-    use crate::live::coordinator::capture::{staging_budget, verify_staging};
+    use crate::live::coordinator::capture::{staging_budget, RamVerification, Verified};
     use crate::live::staging::CaptureStaging;
     use crate::virt::lifecycle::{CaptureOutputIdentities, OutputIdentity};
 
@@ -3309,6 +3400,7 @@ mod tests {
             devices: write(&CaptureRole::Devices, b"devices"),
             ram: write(&CaptureRole::Ram, &[7u8; 8192]),
             layout: write(&CaptureRole::Layout, LAYOUT),
+            changes: write(&CaptureRole::RamChanges, b"KRUNRAM\0\x01\0\x10\0\0\0\0\0"),
         };
         let source = root.0.join("source.raw");
         let file = OpenOptions::new()
@@ -3378,8 +3470,43 @@ mod tests {
         }]
     }
 
-    fn ram_map() -> Arc<StreamMap> {
-        Arc::new(StreamMap::new(8192, vec![Some(Sha256Digest::of_bytes(&[7; 8192]))]).unwrap())
+    fn ram_map() -> Arc<StreamRoot> {
+        let (_directory, staging, _, _) = staged();
+        Arc::new(
+            build_sorted(
+                8192,
+                ChunkSize::RAM,
+                [Ok(PresentChunk {
+                    index: 0,
+                    digest: Sha256Digest::of_bytes(&[7; 8192]),
+                })],
+                &mut staging.node_sink(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn verify_staging(
+        staging: &CaptureStaging,
+        roles: &[CaptureRole],
+        disks: &[CaptureDiskPlan],
+        outputs: CaptureOutputIdentities,
+        ram_limit: u64,
+        map: Arc<StreamRoot>,
+        abort: &CancellationToken,
+    ) -> std::io::Result<Verified> {
+        crate::live::coordinator::capture::verify_staging(
+            staging,
+            roles,
+            disks,
+            outputs,
+            RamVerification {
+                limit: ram_limit,
+                map,
+                authenticated_changes: None,
+            },
+            abort,
+        )
     }
 
     fn allocated(path: &Path) -> u64 {
@@ -3416,11 +3543,29 @@ mod tests {
                 assert_eq!(digest, Sha256Digest::of_bytes(&bytes));
                 assert!(entry.identity.is_none());
             } else {
-                let mut identity = vm_spec::capture::StreamIdentity::new();
-                for chunk in bytes.chunks(vm_spec::capture::STREAM_CHUNK_BYTES as usize) {
-                    identity.push_chunk(chunk).unwrap();
-                }
-                assert_eq!(entry.identity, Some(identity.finish()));
+                let chunk_size = if entry.role == CaptureRole::Ram {
+                    ChunkSize::RAM
+                } else {
+                    ChunkSize::DISK
+                };
+                let present = bytes
+                    .chunks(chunk_size.bytes() as usize)
+                    .enumerate()
+                    .filter(|(_, chunk)| !vm_spec::capture::is_all_zero(chunk))
+                    .map(|(index, chunk)| {
+                        Ok(PresentChunk {
+                            index: index as u64,
+                            digest: Sha256Digest::of_bytes(chunk),
+                        })
+                    });
+                let root = build_sorted(
+                    bytes.len() as u64,
+                    chunk_size,
+                    present,
+                    &mut staging.node_sink(),
+                )
+                .unwrap();
+                assert_eq!(entry.identity, Some(root.id()));
             }
         }
         assert_eq!(verified.packed_length, 8192);
@@ -3521,8 +3666,6 @@ mod tests {
         let copied = verify(CaptureDiskCopy::Copy);
         let directory = staged.staging.path();
         let state: u64 = [
-            directory.to_path_buf(),
-            directory.join("disks"),
             directory.join(CAPTURE_REQUEST_FILE),
             directory.join(staged.roles[5].relative_path()),
         ]
@@ -3533,7 +3676,8 @@ mod tests {
                 .map(|role| directory.join(role.relative_path())),
         )
         .map(|path| allocated(&path))
-        .sum();
+        .sum::<u64>()
+            + staged.staging.directory_allocation().unwrap();
         let disk = allocated(&directory.join(staged.roles[4].relative_path()));
         assert!(disk > 0 && state > 0);
         assert_eq!(copied.staged_bytes, state + disk);
@@ -3623,6 +3767,7 @@ mod tests {
             devices: identity,
             ram: identity,
             layout: identity,
+            changes: identity,
         };
         assert_eq!(
             prepared_ownership(&Ok(CommandOutcome::CapturePrepared {
@@ -3683,8 +3828,8 @@ mod tests {
             &CancellationToken::new(),
         )
         .unwrap();
-        let bytes = std::fs::read(staging.path().join("memory.map.json")).unwrap();
-        let map = vm_spec::capture::StreamMap::decode(&bytes).unwrap();
+        let bytes = std::fs::read(staging.path().join("memory.root")).unwrap();
+        let map = StreamRoot::decode(&bytes).unwrap();
         assert_eq!(map.canonical_bytes().unwrap(), bytes);
         assert_eq!(map.id(), verified.ram_stream);
         assert_eq!(&map, verified.map.as_ref());
@@ -3695,7 +3840,7 @@ mod tests {
             Some(vm_spec::capture::Sha256Digest::of_bytes(&bytes))
         );
         assert_eq!(
-            std::fs::metadata(staging.path().join("memory.map.json"))
+            std::fs::metadata(staging.path().join("memory.root"))
                 .unwrap()
                 .mode()
                 & 0o7777,

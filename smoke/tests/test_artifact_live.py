@@ -32,7 +32,7 @@ from urllib.request import urlopen
 
 import pytest
 
-from silo_smoke import capture, incremental, overlay, procs, reclaim, restore, shutdown, stopped
+from silo_smoke import capture, incremental, overlay, procs, reclaim, restore, shutdown, stopped, stream_map
 from silo_smoke.cli import ROOT_PROFILES, TIMINGS_PROPERTY, Result, RootProfile, Silo, release
 from silo_smoke.config import SmokeConfig
 from silo_smoke.distribution_registry import (
@@ -45,16 +45,17 @@ pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 
 REPOSITORY = "silo-smoke/live-checkpoint"
 SOURCE = "artifact-source"
-ARTIFACT_TYPE = "application/vnd.silo.vm.v1"
-METADATA_TYPE = "application/vnd.silo.vm.metadata.v1"
-PAYLOAD_TYPE = "application/vnd.silo.vm.payloads.v1"
-CONFIG_MEDIA = "application/vnd.silo.vm.config.v1+json"
-RECORD_MEDIA = "application/vnd.silo.vm.record.v1+json"
+ARTIFACT_TYPE = "application/vnd.silo.vm.v2"
+METADATA_TYPE = "application/vnd.silo.vm.metadata.v2"
+PAYLOAD_TYPE = "application/vnd.silo.vm.payloads.v2"
+CONFIG_MEDIA = "application/vnd.silo.vm.config.v2+json"
+RECORD_MEDIA = "application/vnd.silo.vm.record.v2+json"
 RAW_CHUNK = "application/vnd.silo.vm.chunk.v1"
 ZSTD_CHUNK = "application/vnd.silo.vm.chunk.v1+zstd"
 EXECUTION_MEDIA = "application/vnd.silo.vm.execution.v1"
 DEVICE_MEDIA = "application/vnd.silo.vm.device-state.v1"
-PAYLOAD_MEDIA = {RECORD_MEDIA, RAW_CHUNK, ZSTD_CHUNK, EXECUTION_MEDIA, DEVICE_MEDIA}
+MAP_MEDIA = "application/vnd.silo.vm.stream-map.v2"
+PAYLOAD_MEDIA = {RECORD_MEDIA, MAP_MEDIA, RAW_CHUNK, ZSTD_CHUNK, EXECUTION_MEDIA, DEVICE_MEDIA}
 CHUNK_BYTES = 8 * 1024 * 1024
 TRANSFER = 600
 BOOT_ASSETS = {"kernel": "kernel-default", "baseInitramfs": "initramfs", "agent": "agent"}
@@ -223,7 +224,7 @@ def published_graph(client: DistributionClient, reference: str) -> PublishedGrap
         return json.loads(payload(reference["digest"], RECORD_MEDIA, reference["size"]))
 
     def pages(root: dict, kind: str) -> list[dict]:
-        assert root["schema"] == 1 and root["kind"] == kind, root
+        assert root["schema"] == 2 and root["kind"] == kind, root
         entries = []
         for page_reference in root["pages"]:
             page = record(page_reference)
@@ -240,6 +241,13 @@ def published_graph(client: DistributionClient, reference: str) -> PublishedGrap
         transfer = record(binding["transport"])
         assert transfer["stream"] == binding["stream"] and transfer["length"] == binding["length"], transfer
         assert transfer["chunkSize"] == CHUNK_BYTES
+        encoded_root = payload(binding["map"], MAP_MEDIA)
+        root = stream_map.decode_root(encoded_root)
+        assert root.identity == binding["stream"]
+        assert (root.length, root.chunk_size) == (binding["length"], binding["chunkSize"])
+        # Authenticate every node through the independent binary codec. Every
+        # traversed metadata blob must also occur in the exact object table.
+        dict(stream_map.present_chunks(root, lambda identity: payload(identity, MAP_MEDIA)))
         decoded = 0
         for page_digest in transfer["pages"]:
             for entry in json.loads(payload(page_digest, RECORD_MEDIA))["entries"]:
@@ -268,7 +276,7 @@ def published_graph(client: DistributionClient, reference: str) -> PublishedGrap
         else:
             assert binding["kind"] == "stream" and binding["stream"] in streams, binding
     provenance = record(config["captureProvenance"])
-    assert provenance["schema"] == 1 and provenance["kind"] == "portable-capture-provenance", provenance
+    assert provenance["schema"] == 2 and provenance["kind"] == "portable-capture-provenance", provenance
     assert provenance["snapshot"] == config["content"]["id"]
     evidence = payload(provenance["evidence"]["digest"], RECORD_MEDIA, provenance["evidence"]["size"])
     # No surplus payload: every descriptor is reachable from the config's typed
@@ -290,7 +298,7 @@ def source_closure(silo: Silo, saved: restore.Checkpoint) -> tuple[bytes, bytes,
 def verify_graph(graph: PublishedGraph, saved: restore.Checkpoint, record_bytes: bytes, evidence: bytes,
                  record: dict, *, profile: RootProfile, encoding: str, state_digests: dict[str, str]) -> None:
     config = graph.config
-    assert (config["schema"], config["kind"], config["encoding"]) == (1, "vm-artifact", "silo-chunks-v1")
+    assert (config["schema"], config["kind"], config["encoding"]) == (2, "vm-artifact", "silo-chunks-v2")
     assert config["purpose"] == "checkpoint" and config["captureKind"] == "live-execution"
     assert config["content"]["kind"] == "snapshot" and config["content"]["id"] == saved.snapshot
     family, backend, storage = (("opaque-raw", "raw-block", "opaque-raw-v1") if profile == "raw"
@@ -599,7 +607,8 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
             # expected complete map to the independently retained source map.
             inherited = incremental.authenticated_map(destination, child_checkpoint,
                                                        mode="incremental", baseline=saved, baseline_map=captured_map)
-            assert inherited["stats"]["liveBytesRead"] <= inherited["stats"]["identityBytesHashed"]
+            assert inherited["stats"]["liveBytesRead"] <= inherited["stats"]["logicalBytes"]
+            assert inherited["stats"]["identityBytesHashed"] <= inherited["stats"]["logicalBytes"]
             child_cut = restore.matched_cut(destination, child_checkpoint, initial, profile=profile)
             destination.run("resume", child)
             restore.resumed(destination, child, initial, child_cut)

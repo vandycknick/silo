@@ -98,6 +98,8 @@ struct SourceOwnership {
     _managed: Option<crate::store::managed_image_store::ManagedImageConsumer>,
     /// Consumer lease over the layered lower until the machine row roots it.
     _lower: Option<crate::store::composition_store::HeldComposition>,
+    /// Retain the construction operation after publication locks become root pins.
+    _baseline_lease: Option<crate::storage::locks::StorageLock>,
 }
 
 struct MachineCreatePlan {
@@ -1124,6 +1126,8 @@ async fn create_machine_config_with_name(
                 }
             }
         }
+        let baseline_pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
+        let mut baseline_lease = None;
         let map = match &root {
             CreateRoot::Raw {
                 authenticated,
@@ -1155,14 +1159,22 @@ async fn create_machine_config_with_name(
                 .ok_or_else(|| {
                     crate::machine::root_storage::invalid("created private root attachment missing")
                 })?;
-            crate::machine::root_storage::seed_disk(
+            let roots = crate::machine::root_storage::seed_disk(
                 &mut storage,
+                &baseline_pool,
                 create.dir(),
                 index,
                 disk,
                 &std::fs::File::open(&rootfs_path)?,
                 map,
             )?;
+            let (store, operation, lease, _, _) = reservation.ok_or_else(|| {
+                crate::machine::root_storage::invalid("disk baseline has no construction operation")
+            })?;
+            // Boot admission takes exclusive roots; retain the operation, not a shared roots lock.
+            store.admit_published_map_root(*operation, map).await?;
+            baseline_lease = Some(lease.duplicate()?);
+            drop(roots);
         }
         if lower_length.is_some() {
             crate::machine::root_storage::validate_spec(&storage, &create.spec)?;
@@ -1195,6 +1207,7 @@ async fn create_machine_config_with_name(
                     _lease: source_lease,
                     _managed: managed,
                     _lower: lower,
+                    _baseline_lease: baseline_lease,
                 },
             )
             .await
@@ -1777,6 +1790,8 @@ async fn publish_checkpoint_child(
     )
     .await?;
     storage.disk_baselines.clear();
+    let baseline_pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
+    let store = runtime.native_store()?;
     let directory = OwnedDirectory::open_existing_root(create.dir())?.ok_or_else(|| {
         crate::machine::root_storage::invalid("new machine directory disappeared")
     })?;
@@ -1799,30 +1814,35 @@ async fn publish_checkpoint_child(
     };
     let handle = tokio::runtime::Handle::current();
     let private_files = std::thread::scope(|scope| {
+        let authentication_handle = handle.clone();
         let authentication = authentication
             .map(|authentication| {
                 std::thread::Builder::new()
                     .name("restore-authentication".into())
                     .stack_size(256 * 1024)
                     .spawn_scoped(scope, move || {
-                        handle.block_on(authentication.authenticate())
+                        authentication_handle.block_on(authentication.authenticate())
                     })
             })
             .transpose()?;
-        let copied = (|| -> Result<Vec<std::fs::File>, LibVmError> {
-            let mut private_files = Vec::with_capacity(sources.len());
-            for (index, source) in sources.into_iter().enumerate() {
-                let target = match &mut storage.root {
-                    crate::MachineRoot::OpaqueRaw { path, .. } if index == 0 => {
-                        *path = crate::PrivatePath::new("root.raw")?;
-                        path.clone()
-                    }
-                    crate::MachineRoot::LinuxOverlay { upper, .. } if index == 0 => {
-                        *upper = crate::PrivatePath::new("upper.raw")?;
-                        upper.clone()
-                    }
-                    _ => {
-                        let disk = storage
+        // Admit each copied root before waiting for authentication, which may acquire exclusive roots.
+        let copied = std::thread::Builder::new()
+            .name("checkpoint-private-copy".into())
+            .stack_size(256 * 1024)
+            .spawn_scoped(scope, || -> Result<Vec<std::fs::File>, LibVmError> {
+                let mut private_files = Vec::with_capacity(sources.len());
+                for (index, source) in sources.into_iter().enumerate() {
+                    let target = match &mut storage.root {
+                        crate::MachineRoot::OpaqueRaw { path, .. } if index == 0 => {
+                            *path = crate::PrivatePath::new("root.raw")?;
+                            path.clone()
+                        }
+                        crate::MachineRoot::LinuxOverlay { upper, .. } if index == 0 => {
+                            *upper = crate::PrivatePath::new("upper.raw")?;
+                            upper.clone()
+                        }
+                        _ => {
+                            let disk = storage
                     .disks
                     .iter_mut()
                     .find(|disk| {
@@ -1834,88 +1854,100 @@ async fn publish_checkpoint_child(
                             "private capture has no managed disk role",
                         )
                     })?;
-                        let target = crate::PrivatePath::new(format!("disk-{}.raw", disk.id))?;
-                        if let crate::DiskStorage::ManagedWritable { path, .. } = &mut disk.storage
-                        {
-                            *path = target.clone();
-                        }
-                        target
-                    }
-                };
-                let target_name = target.as_path().to_str().ok_or_else(|| {
-                    crate::machine::root_storage::invalid("child private path is not UTF-8")
-                })?;
-                let length = source.length();
-                let mut prepared = source.prepare(
-                    stage.try_clone()?,
-                    &format!("file-{index}"),
-                    &mut qualification,
-                    writeback,
-                )?;
-                tracing::debug!(
-                    method = ?prepared.method(),
-                    verification = ?prepared.verification(),
-                    file = ?prepared.file(),
-                    length,
-                    "prepared stopped private attachment",
-                );
-                private_files.push(prepared.file().try_clone()?);
-                prepared.publish_constructed(directory.try_clone()?, target_name)?;
-                let order = if index == 0 {
-                    usize::from(matches!(
-                        storage.root,
-                        crate::MachineRoot::LinuxOverlay { .. }
-                    ))
-                } else {
-                    storage
-                        .disks
-                        .iter()
-                        .find_map(|disk| match &disk.storage {
-                            crate::DiskStorage::ManagedWritable { path, .. } if path == &target => {
-                                Some(disk.order as usize)
+                            let target = crate::PrivatePath::new(format!("disk-{}.raw", disk.id))?;
+                            if let crate::DiskStorage::ManagedWritable { path, .. } =
+                                &mut disk.storage
+                            {
+                                *path = target.clone();
                             }
-                            _ => None,
-                        })
-                        .ok_or_else(|| {
-                            crate::machine::root_storage::invalid(
-                                "child managed disk order missing",
-                            )
-                        })?
-                };
-                let disk = create
-                    .spec
-                    .storage
-                    .as_ref()
-                    .and_then(|spec| spec.disks.get(order))
-                    .ok_or_else(|| {
-                        crate::machine::root_storage::invalid("child disk attachment missing")
+                            target
+                        }
+                    };
+                    let target_name = target.as_path().to_str().ok_or_else(|| {
+                        crate::machine::root_storage::invalid("child private path is not UTF-8")
                     })?;
-                let scanned;
-                let map = match prepared.map() {
-                    Some(map) => map,
-                    None => {
-                        tracing::info!(
-                            disk_baseline_full_scans = 1u64,
-                            reason = "stopped-copy",
-                            "hashing unscanned stopped clone for child baseline"
-                        );
-                        scanned = crate::storage::stream::StreamHasher::new()
+                    let length = source.length();
+                    let mut prepared = source.prepare(
+                        stage.try_clone()?,
+                        &format!("file-{index}"),
+                        &mut qualification,
+                        writeback,
+                    )?;
+                    tracing::debug!(
+                        method = ?prepared.method(),
+                        verification = ?prepared.verification(),
+                        file = ?prepared.file(),
+                        length,
+                        "prepared stopped private attachment",
+                    );
+                    private_files.push(prepared.file().try_clone()?);
+                    prepared.publish_constructed(directory.try_clone()?, target_name)?;
+                    let order = if index == 0 {
+                        usize::from(matches!(
+                            storage.root,
+                            crate::MachineRoot::LinuxOverlay { .. }
+                        ))
+                    } else {
+                        storage
+                            .disks
+                            .iter()
+                            .find_map(|disk| match &disk.storage {
+                                crate::DiskStorage::ManagedWritable { path, .. }
+                                    if path == &target =>
+                                {
+                                    Some(disk.order as usize)
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                crate::machine::root_storage::invalid(
+                                    "child managed disk order missing",
+                                )
+                            })?
+                    };
+                    let disk = create
+                        .spec
+                        .storage
+                        .as_ref()
+                        .and_then(|spec| spec.disks.get(order))
+                        .ok_or_else(|| {
+                            crate::machine::root_storage::invalid("child disk attachment missing")
+                        })?;
+                    let scanned;
+                    let map = match prepared.map() {
+                        Some(map) => map,
+                        None => {
+                            tracing::info!(
+                                disk_baseline_full_scans = 1u64,
+                                reason = "stopped-copy",
+                                "hashing unscanned stopped clone for child baseline"
+                            );
+                            scanned = crate::storage::stream::StreamHasher::new(
+                                vm_spec::stream_map::ChunkSize::DISK,
+                            )
                             .hash_open_file(prepared.file(), length)?;
-                        &scanned.map
-                    }
-                };
-                crate::machine::root_storage::seed_disk(
-                    &mut storage,
-                    create.dir(),
-                    order,
-                    disk,
-                    prepared.file(),
-                    map,
-                )?;
-                prepared.retain();
-            }
-            Ok(private_files)
-        })();
+                            &scanned.map
+                        }
+                    };
+                    let roots = crate::machine::root_storage::seed_disk(
+                        &mut storage,
+                        &baseline_pool,
+                        create.dir(),
+                        order,
+                        disk,
+                        prepared.file(),
+                        map,
+                    )?;
+                    let retained =
+                        handle.block_on(store.admit_published_map_root(operation_id, map));
+                    drop(roots);
+                    retained?;
+                    prepared.retain();
+                }
+                Ok(private_files)
+            })?
+            .join()
+            .map_err(|_| std::io::Error::other("checkpoint private copy worker panicked"))?;
         if let Some(authentication) = authentication {
             let authenticated = authentication
                 .join()
@@ -2001,7 +2033,6 @@ async fn publish_checkpoint_child(
         .ok_or_else(|| crate::machine::root_storage::invalid("child has no owned parent"))?
         .try_clone()?;
     create.preserve = true;
-    let store = runtime.native_store()?;
     store
         .add_machine_with_rootfs_inner(
             &config,
@@ -2322,15 +2353,25 @@ mod tests {
                 ));
                 let storage = store.machine_storage(child.id).await.unwrap().unwrap();
                 assert_eq!(
-                    crate::machine::root_storage::launch_disk_seeds(&storage, &child.machine_dir)
-                        .unwrap()
-                        .len(),
+                    crate::machine::root_storage::launch_disk_seeds(
+                        &storage,
+                        &child.machine_dir,
+                        runtime.local_images_dir()
+                    )
+                    .unwrap()
+                    .len(),
                     1
                 );
                 std::fs::remove_file(
-                    child
-                        .machine_dir
-                        .join(storage.disk_baselines[0].map.as_path()),
+                    child.machine_dir.join(
+                        crate::machine::root_storage::baseline_map_path(
+                            &vm_spec::capture::Sha256Digest::from_bytes(
+                                *storage.disk_baselines[0].map.as_bytes(),
+                            ),
+                        )
+                        .unwrap()
+                        .as_path(),
+                    ),
                 )
                 .unwrap();
                 let lease = store
@@ -2350,10 +2391,10 @@ mod tests {
                 .expect("constructed child admission must not wait for a catalog checkpoint")
                 .unwrap();
                 let admitted = store.machine_storage(child.id).await.unwrap().unwrap();
-                assert!(matches!(
-                    admitted.disk_baselines[0].state,
-                    crate::store::models::storage::DiskBaselineState::Running { seeded: false, .. }
-                ));
+                assert!(
+                    admitted.disk_baselines.is_empty(),
+                    "a baseline whose cached map is gone is dropped at admission"
+                );
                 reader.rollback().await.unwrap();
                 durability.complete().await.unwrap();
                 assert_eq!(
@@ -2616,6 +2657,58 @@ mod tests {
             reservations, 0,
             "successful create releases its private-copy capacity"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_image_baseline_is_pinned_before_boot_operation_and_machine_commit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temporary.path().join("silo"));
+        let (runtime, store) = runtime_with_sqlite_store(paths).await;
+        let source = write_base_rootfs(temporary.path());
+        let ImageSource::Disk(import) = ImageSource::disk(source) else {
+            panic!("expected disk import");
+        };
+        let image = runtime.images().import_disk(import).await.unwrap();
+        let machine = runtime
+            .machine()
+            .name("baseline-lock-transfer")
+            .image_source(ImageSource::Managed(crate::ManagedSourceRef::Image(
+                image.id,
+            )))
+            .create()
+            .await
+            .unwrap();
+        let config = store
+            .machine_config(machine.machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let storage = store.machine_storage(config.id).await.unwrap().unwrap();
+        let seeds = crate::machine::root_storage::launch_disk_seeds(
+            &storage,
+            &config.machine_dir,
+            runtime.local_images_dir(),
+        )
+        .unwrap();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(
+            seeds[0].baseline.unwrap().as_bytes(),
+            image.record.root.stream.stream.as_bytes()
+        );
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM machine_object_dependency WHERE machine_id=?1 AND object_digest=?2",
+        ).bind(config.id.to_string()).bind(storage.disk_baselines[0].map.to_string())
+            .fetch_one(store.test_pool()).await.unwrap();
+        assert_eq!(retained, 1);
+        let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir()).unwrap();
+        let roots = pool.lock_roots().unwrap();
+        let operations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation WHERE kind='import'")
+                .fetch_one(store.test_pool())
+                .await
+                .unwrap();
+        assert_eq!(operations, 0);
+        drop(roots);
     }
 
     #[tokio::test]
@@ -3251,11 +3344,13 @@ mod tests {
             if path.as_path() == Path::new("root.raw") && geometry.length == requested_length)
         );
         assert!(storage.disk_baselines.is_empty());
-        assert!(
-            crate::machine::root_storage::launch_disk_seeds(&storage, paths.machine(id).dir())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(crate::machine::root_storage::launch_disk_seeds(
+            &storage,
+            paths.machine(id).dir(),
+            runtime.local_images_dir()
+        )
+        .unwrap()
+        .is_empty());
         assert!(std::fs::read_dir(paths.machine(id).dir())
             .unwrap()
             .all(|entry| !entry
@@ -3501,7 +3596,7 @@ mod tests {
             storage.disk_baselines[0].state,
             crate::store::models::storage::DiskBaselineState::Ready
         ));
-        let map = crate::storage::stream::StreamHasher::new()
+        let map = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_file(&directory.join(root_disk_relative_path()))
             .unwrap();
         assert_eq!(
@@ -3509,9 +3604,13 @@ mod tests {
             map.id().as_bytes()
         );
         assert_eq!(
-            crate::machine::root_storage::launch_disk_seeds(&storage, &directory)
-                .unwrap()
-                .len(),
+            crate::machine::root_storage::launch_disk_seeds(
+                &storage,
+                &directory,
+                runtime.local_images_dir()
+            )
+            .unwrap()
+            .len(),
             1
         );
     }
@@ -3629,10 +3728,11 @@ mod tests {
         };
         let source = create_machine_config(&runtime, request).await.unwrap();
         let source_storage = store.machine_storage(source.id).await.unwrap().unwrap();
-        let source_stream = crate::storage::stream::StreamHasher::new()
-            .hash_file(&source.machine_dir.join("root.raw"))
-            .unwrap()
-            .id();
+        let source_stream =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_file(&source.machine_dir.join("root.raw"))
+                .unwrap()
+                .id();
         let machine = crate::machine::Machine::new(runtime.clone(), source.id);
         let snapshot = machine
             .snapshot_stopped(crate::SnapshotOptions {
@@ -3687,7 +3787,7 @@ mod tests {
                 if stream == source_stream
         ));
         assert_eq!(
-            crate::storage::stream::StreamHasher::new()
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
                 .hash_file(&config.machine_dir.join("root.raw"))
                 .unwrap()
                 .id(),

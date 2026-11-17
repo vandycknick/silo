@@ -13,7 +13,6 @@ use uuid::Uuid;
 use crate::paths::OwnedDirectory;
 use crate::storage::identity::{ObjectDigest, SnapshotId, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
-use crate::storage::limits::Resource;
 use crate::storage::locks::StorageLock;
 use crate::storage::pool::StoragePool;
 use crate::storage::stream::AuthenticatedStream;
@@ -73,6 +72,48 @@ pub struct SnapshotInfo {
     pub retained: bool,
     pub aliases: Vec<String>,
     pub created_at: i64,
+    pub streams: Vec<SnapshotStreamSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotStreamSummary {
+    pub role: SnapshotVerificationRole,
+    pub stream: StreamId,
+    pub map: ObjectDigest,
+    pub length: u64,
+    pub chunk_size: u64,
+}
+
+fn stream_summaries(record: &SnapshotRecord) -> Vec<SnapshotStreamSummary> {
+    let mut result = Vec::new();
+    let mut push = |role, content: &SnapshotStream| {
+        result.push(SnapshotStreamSummary {
+            role,
+            stream: content.stream,
+            map: content.map,
+            length: content.length,
+            chunk_size: content.chunk_size,
+        })
+    };
+    if let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+        &record.capture
+    {
+        push(SnapshotVerificationRole::Ram, &execution.memory);
+    }
+    push(SnapshotVerificationRole::RootDisk, &record.root.stream);
+    for disk in &record.disks {
+        push(
+            SnapshotVerificationRole::DataDisk { order: disk.order },
+            &disk.content,
+        );
+    }
+    if let Some(lower) = record.lower() {
+        for layer in &lower.layers {
+            push(SnapshotVerificationRole::Dependency, &layer.pack);
+        }
+    }
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +125,8 @@ pub struct SnapshotVerificationReport {
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SnapshotVerificationRole {
     Ram,
     Layout,
@@ -132,9 +174,12 @@ pub enum SnapshotVerificationError {
         index: u64,
         start: u64,
         end: u64,
-        expected: Box<crate::storage::stream::Chunk>,
-        actual: Box<crate::storage::stream::Chunk>,
+        chunk_size: u64,
+        expected: Box<vm_spec::stream_map::Chunk>,
+        actual: Box<vm_spec::stream_map::Chunk>,
     },
+    #[error(transparent)]
+    MapNode(Box<SnapshotMapNodeFailure>),
     #[error("{role:?} object {object} ({length} bytes): expected {object}, actual {actual}")]
     ObjectMismatch {
         role: SnapshotVerificationRole,
@@ -142,6 +187,20 @@ pub enum SnapshotVerificationError {
         length: u64,
         actual: ObjectDigest,
     },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{role:?} stream {stream} node {node} height {height} indices {first_index}..{end_index} bytes {start}..{end}: {failure}")]
+pub struct SnapshotMapNodeFailure {
+    pub role: SnapshotVerificationRole,
+    pub stream: StreamId,
+    pub node: ObjectDigest,
+    pub height: u8,
+    pub first_index: u64,
+    pub end_index: u64,
+    pub start: u64,
+    pub end: u64,
+    pub failure: SnapshotStructuralFailure,
 }
 
 /// A checkpoint is retained even when its optional requested name loses a race.
@@ -377,18 +436,20 @@ pub(crate) fn bind_reopened(
     Ok(())
 }
 
-/// Closure members whose authenticated descriptors a consumer holds. Map roots
-/// and pages are consumed through digest-checked reads only, so retention
-/// stays bounded by record roles rather than stream length.
+/// Closure members whose descriptors a consumer holds. Live restore transfers
+/// the small RAM root header as an FD; all other map roots and every descendant
+/// remain lazy operation-owned metadata, not copy-input descriptors.
 fn retained_members(
     record: &SnapshotRecord,
 ) -> Result<(BTreeSet<StreamId>, BTreeSet<ObjectDigest>), LibVmError> {
     let (streams, mut objects) = record.content_dependencies()?;
     for stream in record.streams() {
         objects.remove(&stream.map);
-        for page in &stream.map_pages {
-            objects.remove(page);
-        }
+    }
+    if let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+        &record.capture
+    {
+        objects.insert(execution.memory.map);
     }
     Ok((streams, objects))
 }
@@ -612,10 +673,25 @@ impl SnapshotStore {
             .await?;
         let mut fingerprints = match inputs {
             Some(inputs) => {
-                verify_publication_closure(&self.store, &pool, record, inputs.publications())
-                    .await?
+                verify_publication_closure(
+                    &self.store,
+                    &pool,
+                    record,
+                    inputs.publications(),
+                    operation_id,
+                )
+                .await?
             }
-            None => verify_closure(&pool, record, None, false)?.0,
+            None => {
+                verify_closure(
+                    &pool,
+                    record,
+                    None,
+                    false,
+                    Arc::new(pool.existing_lease(operation_id)?),
+                )?
+                .0
+            }
         };
         let input = RecordInput::new(&self.store.images_dir, operation_id, &bytes)?;
         let (published, roots) = pool.publish_object_for_catalog(&input.path())?;
@@ -668,7 +744,6 @@ impl SnapshotStore {
                     .streams()
                     .find(|content| content.stream == *stream)
                     .ok_or_else(|| invalid("publication stream is outside snapshot"))?;
-                let canonical = matches!(&record.capture, crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } if execution.memory.stream == *stream);
                 map_receipts.insert(
                     *stream,
                     map_validation(
@@ -676,7 +751,6 @@ impl SnapshotStore {
                         content,
                         publication.map(),
                         publication.fingerprint(),
-                        canonical,
                         &authenticated_objects,
                     )?,
                 );
@@ -765,6 +839,24 @@ impl SnapshotStore {
             let mut capture = crate::store::capture::decode_record(&json)?;
             let plan_bytes = capture.plan.canonical_bytes().map_err(invalid)?;
             authenticate_capture_plan(&plan_bytes, &evidence, operation_id)?;
+            let capture_evidence =
+                vm_spec::capture::CaptureEvidence::decode(&evidence).map_err(invalid)?;
+            let changes = capture_evidence
+                .memory
+                .as_ref()
+                .ok_or_else(|| invalid("live capture provenance has no RAM change evidence"))?
+                .changes
+                .sha256;
+            let changes = ObjectDigest::from_sha256(*changes.as_bytes());
+            let pinned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_object WHERE operation_id=?1 AND object_digest=?2)")
+                .bind(operation_id.to_string()).bind(changes.to_string()).fetch_one(&mut *tx).await?;
+            if !pinned {
+                return Err(invalid(
+                    "RAM change provenance was not retained before snapshot publication",
+                ));
+            }
+            sqlx::query("INSERT INTO snapshot_capture_change(snapshot_id,changes_digest) VALUES(?1,?2) ON CONFLICT DO NOTHING")
+                .bind(id.to_string()).bind(changes.to_string()).execute(&mut *tx).await?;
             let existing = sqlx::query("SELECT snapshot_id,evidence_digest,CASE WHEN typeof(evidence_bytes)='blob' AND length(evidence_bytes)<=?2 THEN evidence_bytes END AS evidence_bytes,CASE WHEN typeof(plan_bytes)='blob' AND length(plan_bytes)<=?2 THEN plan_bytes END AS plan_bytes FROM snapshot_capture_provenance WHERE capture_id=?1")
                 .bind(operation_id.to_string()).bind(vm_spec::capture::MAX_CAPTURE_RECORD_BYTES as i64)
                 .fetch_optional(&mut *tx).await?;
@@ -841,28 +933,6 @@ impl SnapshotStore {
         self.consume_selected(reference, false, false, true).await
     }
 
-    pub(crate) async fn cache_restore_map(
-        &self,
-        shape: &ShapeVerifiedClosure,
-        stream: StreamId,
-        object: &crate::storage::pool::PublishedObject,
-    ) -> Result<(), LibVmError> {
-        if !shape.receipt_maps.contains(&stream) {
-            return Ok(());
-        }
-        let fingerprint = shape
-            .stream_states
-            .get(&stream)
-            .ok_or_else(|| invalid("restore map stream is outside its verified shape"))?;
-        let [dev, ino, len, mode, ctime_sec, ctime_nsec] = fingerprint.verification_key();
-        let canonical =
-            serde_json::to_string(&(object.digest, object.fingerprint)).map_err(invalid)?;
-        sqlx::query("UPDATE verified_object SET map_receipt=CAST(json_set(CAST(map_receipt AS TEXT),'$.canonical',json(?8)) AS BLOB) WHERE stream_sha256=?1 AND dev=?2 AND ino=?3 AND len=?4 AND mode=?5 AND ctime_sec=?6 AND ctime_nsec=?7 AND map_receipt IS NOT NULL")
-            .bind(stream.to_string()).bind(dev).bind(ino).bind(len).bind(mode)
-            .bind(ctime_sec).bind(ctime_nsec).bind(canonical).execute(&self.store.pool).await?;
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) async fn verify_closure_shape(
         &self,
@@ -920,11 +990,7 @@ impl SnapshotStore {
         crate::storage::limits::preflight_fd_budget(
             2 * (objects.len() + consumer.record.streams().count()) as u64
                 + retained.len() as u64
-                + consumer
-                    .record
-                    .streams()
-                    .map(|stream| stream.map_pages.len() as u64 + 1)
-                    .sum::<u64>()
+                + consumer.record.streams().count() as u64
                 + 4,
         )
         .map_err(crate::storage::StorageError::from)?;
@@ -993,6 +1059,7 @@ impl SnapshotStore {
             } else {
                 None
             };
+        let pin: Arc<dyn Send + Sync> = Arc::new(consumer.lease.duplicate()?);
         let mut cached = BTreeMap::new();
         let mut deferred = deferred_maps.clone();
         if let Some(held) = &held_lower {
@@ -1005,7 +1072,9 @@ impl SnapshotStore {
             {
                 continue;
             }
-            if let Some(receipt) = load_map_validation(&self.store, &pool, content).await? {
+            if let Some(receipt) =
+                load_map_validation(&self.store, &pool, content, Arc::clone(&pin)).await?
+            {
                 deferred.insert(content.stream);
                 cached.insert(content.stream, receipt);
             }
@@ -1020,6 +1089,7 @@ impl SnapshotStore {
             true,
             ram,
             &deferred,
+            pin,
         )?;
         for (stream, receipt) in cached {
             shape.apply_map_validation(&pool, stream, receipt)?;
@@ -1091,9 +1161,7 @@ impl SnapshotStore {
                     }
                 }
                 let graph = held.snapshot_composition();
-                for object in graph.objects().chain(graph.layers.iter().flat_map(|layer| {
-                    std::iter::once(layer.pack.map).chain(layer.pack.map_pages.iter().copied())
-                })) {
+                for object in graph.objects().chain(graph.layers.iter().map(|layer| layer.pack.map)) {
                     shape.objects.remove(&object);
                 }
                 for layer in &graph.layers {
@@ -1120,7 +1188,7 @@ impl SnapshotStore {
                         authenticated.fingerprint().verification_key();
                     let content = shape.contents.iter().find(|content| content.stream == *stream)
                         .ok_or_else(|| invalid("authenticated stream is outside snapshot shape"))?;
-                    let receipt = map_validation(&pool, content, authenticated.map(), authenticated.fingerprint(), shape.ram_stream == Some(*stream), &shape.object_states)?;
+                    let receipt = map_validation(&pool, content, authenticated.map(), authenticated.fingerprint(), &shape.object_states)?;
                     sqlx::query(
                         "INSERT INTO verified_object(stream_sha256,dev,ino,len,mode,ctime_sec,ctime_nsec,map_receipt,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(stream_sha256) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,len=excluded.len,mode=excluded.mode,ctime_sec=excluded.ctime_sec,ctime_nsec=excluded.ctime_nsec,map_receipt=excluded.map_receipt,verified_at=excluded.verified_at",
                     )
@@ -1223,9 +1291,6 @@ impl SnapshotStore {
                     let mut retained = objects.clone();
                     for content in &contents {
                         retained.remove(&content.map);
-                        for page in &content.map_pages {
-                            retained.remove(page);
-                        }
                     }
                     verify_artifact_closure(
                         &pool,
@@ -1236,9 +1301,16 @@ impl SnapshotStore {
                         Some(info.record_digest),
                         true,
                         None,
+                        Arc::new(lease.duplicate()?),
                     )?
                 } else {
-                    verify_closure(&pool, &record, Some(info.record_digest), true)?
+                    verify_closure(
+                        &pool,
+                        &record,
+                        Some(info.record_digest),
+                        true,
+                        Arc::new(lease.duplicate()?),
+                    )?
                 };
                 for provenance in &info.provenance {
                     pool.verify_object(&provenance.evidence_digest)?;
@@ -1439,6 +1511,7 @@ pub(crate) fn authenticate_catalog(
     if capture_kind == SnapshotCaptureKindName::StoppedStorage && !provenance.is_empty() {
         return Err(invalid("stopped snapshot has live capture provenance"));
     }
+    let summaries = stream_summaries(&record);
     Ok((
         record,
         SnapshotInfo {
@@ -1449,6 +1522,7 @@ pub(crate) fn authenticate_catalog(
             retained: facts.retained == 1,
             aliases: facts.aliases,
             created_at: facts.created_at,
+            streams: summaries,
         },
     ))
 }
@@ -1458,7 +1532,7 @@ async fn catalog_info(
     id: SnapshotId,
     digest: ObjectDigest,
 ) -> Result<SnapshotInfo, LibVmError> {
-    let row = sqlx::query("SELECT retained,created_at,json_extract(CAST(record_bytes AS TEXT),'$.captureKind') AS capture_kind,(EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) OR EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='snapshot' AND managed_id=storage_snapshot.id)) AS capture_owned FROM storage_snapshot WHERE id=?1")
+    let row = sqlx::query("SELECT record_bytes,retained,created_at,json_extract(CAST(record_bytes AS TEXT),'$.captureKind') AS capture_kind,(EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) OR EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='snapshot' AND managed_id=storage_snapshot.id)) AS capture_owned FROM storage_snapshot WHERE id=?1")
         .bind(id.to_string())
         .fetch_one(&mut *connection)
         .await?;
@@ -1489,6 +1563,9 @@ async fn catalog_info(
         retained: retained == 1,
         aliases,
         created_at: row.try_get("created_at")?,
+        streams: stream_summaries(&SnapshotRecord::decode(
+            &row.try_get::<Vec<u8>, _>("record_bytes")?,
+        )?),
     })
 }
 async fn provenance_facts(
@@ -1727,9 +1804,51 @@ pub(crate) async fn require_operation_closure(
     objects: &BTreeSet<ObjectDigest>,
     pending: Option<ObjectDigest>,
 ) -> Result<(), LibVmError> {
+    require_closure(
+        store,
+        operation,
+        streams,
+        objects,
+        pending,
+        ClosureUse::Publication,
+    )
+    .await
+}
+
+pub(crate) async fn require_consumer_closure(
+    store: &Store,
+    operation: Uuid,
+    streams: &BTreeSet<StreamId>,
+    objects: &BTreeSet<ObjectDigest>,
+) -> Result<(), LibVmError> {
+    require_closure(
+        store,
+        operation,
+        streams,
+        objects,
+        None,
+        ClosureUse::Consumer,
+    )
+    .await
+}
+
+enum ClosureUse {
+    Publication,
+    Consumer,
+}
+
+async fn require_closure(
+    store: &Store,
+    operation: Uuid,
+    streams: &BTreeSet<StreamId>,
+    objects: &BTreeSet<ObjectDigest>,
+    pending: Option<ObjectDigest>,
+    usage: ClosureUse,
+) -> Result<(), LibVmError> {
     let mut tx = store.pool.begin().await?;
-    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('import','convert','snapshot','capture','update-boot-assets') AND state IN ('staging','committing'))")
-        .bind(operation.to_string()).fetch_one(&mut *tx).await?;
+    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND (?2=0 OR kind IN ('import','convert','snapshot','capture','update-boot-assets')) AND state IN ('staging','committing'))")
+        .bind(operation.to_string()).bind(matches!(usage, ClosureUse::Publication))
+        .fetch_one(&mut *tx).await?;
     if !active {
         return Err(invalid("snapshot has no active retained operation"));
     }
@@ -1756,74 +1875,126 @@ pub(crate) async fn require_operation_closure(
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MapValidation {
+    schema: u32,
     content: SnapshotStream,
     stream: SourceFingerprint,
-    chunks: Vec<crate::storage::stream::Chunk>,
-    metadata: Vec<(ObjectDigest, SourceFingerprint)>,
-    canonical: Option<(ObjectDigest, SourceFingerprint)>,
+    root: SourceFingerprint,
     objects: Vec<(ObjectDigest, SourceFingerprint)>,
 }
 
 struct HeldMapValidation {
-    map: Arc<crate::storage::stream::StreamMap>,
+    map: Arc<crate::storage::map::AuthenticatedMap>,
     stream: SourceFingerprint,
-    metadata: Vec<(ObjectDigest, File, SourceFingerprint)>,
-    canonical: Option<(ObjectDigest, SourceFingerprint)>,
+    metadata: (ObjectDigest, File, SourceFingerprint),
     objects: Vec<(ObjectDigest, SourceFingerprint)>,
+}
+
+impl SnapshotStore {
+    pub(crate) async fn seed_map_receipt(
+        &self,
+        content: &SnapshotStream,
+        publication: &crate::storage::pool::SealedStreamPublication,
+    ) -> Result<(), LibVmError> {
+        let pool = StoragePool::open(&self.store.images_dir)?;
+        publication.recheck(&pool)?;
+        save_map_receipt(
+            &self.store,
+            &pool,
+            content,
+            publication.map(),
+            publication.fingerprint(),
+        )
+        .await
+    }
+}
+
+impl Store {
+    pub(crate) async fn authenticate_local_stream(
+        &self,
+        operation: Uuid,
+        content: &SnapshotStream,
+    ) -> Result<AuthenticatedStream, LibVmError> {
+        require_consumer_closure(
+            self,
+            operation,
+            &BTreeSet::from([content.stream]),
+            &BTreeSet::from([content.map]),
+        )
+        .await?;
+        let pool = StoragePool::open(self.images_path())?;
+        let pin: Arc<dyn Send + Sync> = Arc::new(pool.existing_lease(operation)?);
+        let cached = load_map_validation(self, &pool, content, Arc::clone(&pin)).await?;
+        let (map, fingerprint) = match cached {
+            Some(receipt) => (receipt.map, receipt.stream),
+            None => {
+                let map = Arc::new(load_root_map(&pool, content, pin)?);
+                let file = pool.open_stream(&content.stream)?;
+                let before = SourceFingerprint::new(&file.metadata()?);
+                crate::storage::stream::StreamHasher::new(map.chunk_size())
+                    .verify_expected_map(&file, &map)
+                    .map_err(invalid)?;
+                bind_held(&file, before)?;
+                save_map_receipt(self, &pool, content, &map, before).await?;
+                (map, before)
+            }
+        };
+        let file = pool.open_stream(&content.stream)?;
+        Ok(AuthenticatedStream::from_verified_fingerprint(
+            file,
+            map,
+            fingerprint,
+        )?)
+    }
+}
+
+async fn save_map_receipt(
+    store: &Store,
+    pool: &StoragePool,
+    content: &SnapshotStream,
+    map: &crate::storage::map::AuthenticatedMap,
+    fingerprint: SourceFingerprint,
+) -> Result<(), LibVmError> {
+    let receipt = map_validation(pool, content, map, fingerprint, &BTreeMap::new())?;
+    let [dev, ino, len, mode, ctime_sec, ctime_nsec] = fingerprint.verification_key();
+    sqlx::query("INSERT INTO verified_object(stream_sha256,dev,ino,len,mode,ctime_sec,ctime_nsec,map_receipt,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(stream_sha256) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,len=excluded.len,mode=excluded.mode,ctime_sec=excluded.ctime_sec,ctime_nsec=excluded.ctime_nsec,map_receipt=excluded.map_receipt,verified_at=excluded.verified_at")
+        .bind(content.stream.to_string()).bind(dev).bind(ino).bind(len).bind(mode)
+        .bind(ctime_sec).bind(ctime_nsec).bind(receipt).execute(&store.pool).await?;
+    Ok(())
 }
 
 fn map_validation(
     pool: &StoragePool,
     content: &SnapshotStream,
-    map: &crate::storage::stream::StreamMap,
+    map: &crate::storage::map::AuthenticatedMap,
     stream: SourceFingerprint,
-    canonical: bool,
     objects: &BTreeMap<ObjectDigest, SourceFingerprint>,
 ) -> Result<Vec<u8>, LibVmError> {
-    if map.id() != content.stream || map.length() != content.length {
+    if map.id() != content.stream
+        || map.length() != content.length
+        || map.chunk_size().bytes() != content.chunk_size
+        || content.map.as_bytes() != content.stream.as_bytes()
+    {
         return Err(invalid("map receipt contradicts its stream"));
     }
-    let mut metadata = Vec::with_capacity(content.map_pages.len() + 1);
-    for digest in std::iter::once(content.map).chain(content.map_pages.iter().copied()) {
-        let file = pool.open_object(&digest)?;
-        let fingerprint = SourceFingerprint::new(&file.metadata()?);
-        metadata.push((digest, file, fingerprint));
+    let root_file = pool.open_object(&content.map)?;
+    let root_fingerprint = SourceFingerprint::new(&root_file.metadata()?);
+    let root = vm_spec::stream_map::StreamRoot::decode(
+        &pool.read_object(&content.map, vm_spec::stream_map::MAX_ROOT_BYTES as u64)?,
+    )
+    .map_err(invalid)?;
+    if &root != map.root() {
+        return Err(invalid("map receipt contradicts retained root bytes"));
     }
-    let root = crate::storage::map::StreamMapRoot::decode(
-        &pool.read_object(&content.map, Resource::MetadataPageBytes.maximum())?,
-    )?;
-    if root.stream != content.stream
-        || root.length != content.length
-        || root.pages != content.map_pages
-        || root.read_map(pool)? != *map
-    {
-        return Err(invalid("map receipt contradicts retained map bytes"));
-    }
-    for (_, file, expected) in &metadata {
-        bind_held(file, *expected)?;
-    }
+    bind_held(&root_file, root_fingerprint)?;
     bind_held(&pool.open_stream(&content.stream)?, stream)?;
-    let canonical = if canonical {
-        let (object, _roots, ()) = pool.publish_produced_object_for_catalog(|file| {
-            map.write_canonical(file)?;
-            Ok::<_, crate::storage::StorageError>(())
-        })?;
-        Some((object.digest, object.fingerprint))
-    } else {
-        None
-    };
     for (digest, expected) in objects {
         bind_held(&pool.open_object(digest)?, *expected)?;
     }
     serde_json::to_vec(&MapValidation {
+        schema: 2,
         content: content.clone(),
         stream,
-        chunks: map.chunks().to_vec(),
-        metadata: metadata
-            .into_iter()
-            .map(|(digest, _, fingerprint)| (digest, fingerprint))
-            .collect(),
-        canonical,
+        root: root_fingerprint,
         objects: objects
             .iter()
             .map(|(digest, fingerprint)| (*digest, *fingerprint))
@@ -1836,52 +2007,47 @@ async fn load_map_validation(
     store: &Store,
     pool: &StoragePool,
     content: &SnapshotStream,
+    pin: Arc<dyn Send + Sync>,
 ) -> Result<Option<HeldMapValidation>, LibVmError> {
     let file = pool.open_stream(&content.stream)?;
     let fingerprint = SourceFingerprint::new(&file.metadata()?);
     let [dev, ino, len, mode, ctime_sec, ctime_nsec] = fingerprint.verification_key();
-    let bytes: Option<Vec<u8>> = sqlx::query_scalar("SELECT map_receipt FROM verified_object WHERE stream_sha256=?1 AND dev=?2 AND ino=?3 AND len=?4 AND mode=?5 AND ctime_sec=?6 AND ctime_nsec=?7")
+    let bytes: Option<Vec<u8>> = sqlx::query_scalar("SELECT map_receipt FROM verified_object WHERE stream_sha256=?1 AND dev=?2 AND ino=?3 AND len=?4 AND mode=?5 AND ctime_sec=?6 AND ctime_nsec=?7 AND EXISTS(SELECT 1 FROM stream_map_root WHERE root_digest=?8)")
         .bind(content.stream.to_string()).bind(dev).bind(ino).bind(len).bind(mode)
-        .bind(ctime_sec).bind(ctime_nsec).fetch_optional(&store.pool).await?.flatten();
+        .bind(ctime_sec).bind(ctime_nsec).bind(content.map.to_string())
+        .fetch_optional(&store.pool).await?.flatten();
     let Some(receipt) =
         bytes.and_then(|bytes| serde_json::from_slice::<MapValidation>(&bytes).ok())
     else {
         return Ok(None);
     };
-    if receipt.content != *content || receipt.stream != fingerprint {
+    if receipt.schema != 2 || receipt.content != *content || receipt.stream != fingerprint {
         return Ok(None);
     }
-    let expected = std::iter::once(content.map)
-        .chain(content.map_pages.iter().copied())
-        .collect::<BTreeSet<_>>();
-    if receipt
-        .metadata
-        .iter()
-        .map(|(digest, _)| *digest)
-        .collect::<BTreeSet<_>>()
-        != expected
-        || receipt.metadata.len() != expected.len()
+    let root_file = pool.open_object(&content.map)?;
+    if SourceFingerprint::new(&root_file.metadata()?) != receipt.root {
+        return Ok(None);
+    }
+    let root = vm_spec::stream_map::StreamRoot::decode(
+        &pool.read_object(&content.map, vm_spec::stream_map::MAX_ROOT_BYTES as u64)?,
+    )
+    .map_err(invalid)?;
+    if root.id().as_bytes() != content.stream.as_bytes()
+        || root.length() != content.length
+        || root.chunk_size().bytes() != content.chunk_size
     {
-        return Ok(None);
-    }
-    let mut metadata = Vec::with_capacity(expected.len());
-    for (digest, expected) in receipt.metadata {
-        let file = pool.open_object(&digest)?;
-        if SourceFingerprint::new(&file.metadata()?) != expected {
-            return Ok(None);
-        }
-        metadata.push((digest, file, expected));
+        return Err(invalid("receipt root contradicts its stream"));
     }
     bind_held(&file, fingerprint)?;
+    bind_held(&root_file, receipt.root)?;
     Ok(Some(HeldMapValidation {
-        map: Arc::new(crate::storage::stream::StreamMap::from_validated_parts(
-            content.length,
-            receipt.chunks,
-            content.stream,
+        map: Arc::new(crate::storage::map::AuthenticatedMap::from_admitted_root(
+            root,
+            stream_role(content)?,
+            pool.map_authority(pin)?,
         )?),
         stream: fingerprint,
-        metadata,
-        canonical: receipt.canonical,
+        metadata: (content.map, root_file, receipt.root),
         objects: receipt.objects,
     }))
 }
@@ -2015,7 +2181,7 @@ fn recheck_verification_member(
 
 struct SnapshotByteVerifier<'a> {
     pool: &'a StoragePool,
-    hasher: crate::storage::stream::StreamHasher,
+    pin: Arc<dyn Send + Sync>,
     streams: BTreeSet<StreamId>,
     objects: BTreeSet<ObjectDigest>,
     report: SnapshotVerificationReport,
@@ -2034,7 +2200,13 @@ impl SnapshotByteVerifier<'_> {
         let (file, before) =
             open_verification_member(self.pool, &role, member, Some(content.length))?;
         let mut maps = BTreeMap::new();
-        read_shape_maps(self.pool, std::iter::once(content), &mut maps).map_err(|error| {
+        read_shape_maps(
+            self.pool,
+            std::iter::once(content),
+            &mut maps,
+            Arc::clone(&self.pin),
+        )
+        .map_err(|error| {
             structural(
                 &role,
                 member,
@@ -2046,7 +2218,8 @@ impl SnapshotByteVerifier<'_> {
         let map = maps
             .get(&content.stream)
             .ok_or_else(|| invalid("verification map is missing"))?;
-        let result = self.hasher.verify_expected_map(&file, map);
+        let result = crate::storage::stream::StreamHasher::new(map.chunk_size())
+            .verify_expected_map(&file, map);
         recheck_verification_member(self.pool, &role, member, &file, before)?;
         result.map_err(|error| match error {
             crate::storage::stream::ExpectedMapError::ChunkMismatch {
@@ -2055,12 +2228,14 @@ impl SnapshotByteVerifier<'_> {
                 end,
                 expected,
                 actual,
+                ..
             } => SnapshotVerificationError::ChunkMismatch {
                 role: role.clone(),
                 stream: content.stream,
                 index,
                 start,
                 end,
+                chunk_size: content.chunk_size,
                 expected: Box::new(expected),
                 actual: Box::new(actual),
             }
@@ -2082,6 +2257,44 @@ impl SnapshotByteVerifier<'_> {
                 member,
                 SnapshotStructuralFailure::Invalid {
                     message: error.to_string(),
+                },
+            ),
+            crate::storage::stream::ExpectedMapError::Metadata {
+                digest,
+                height,
+                first_index,
+                end_index,
+                start,
+                end,
+                reason,
+                ..
+            } => SnapshotVerificationError::MapNode(Box::new(SnapshotMapNodeFailure {
+                role: role.clone(),
+                stream: content.stream,
+                node: ObjectDigest::from_sha256(*digest.as_bytes()),
+                height,
+                first_index,
+                end_index,
+                start,
+                end,
+                failure: match std::fs::symlink_metadata(
+                    self.pool
+                        .object_path(&ObjectDigest::from_sha256(*digest.as_bytes())),
+                ) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        SnapshotStructuralFailure::Missing
+                    }
+                    _ => SnapshotStructuralFailure::Invalid { message: reason },
+                },
+            }))
+            .into(),
+            crate::storage::stream::ExpectedMapError::Profile { expected, actual } => structural(
+                &role,
+                member,
+                SnapshotStructuralFailure::Invalid {
+                    message: format!(
+                        "identity profile mismatch: expected {expected:?}, actual {actual:?}"
+                    ),
                 },
             ),
         })?;
@@ -2136,7 +2349,7 @@ fn verify_snapshot_bytes(
     let record = &consumer.record;
     let mut verifier = SnapshotByteVerifier {
         pool: &pool,
-        hasher: crate::storage::stream::StreamHasher::new(),
+        pin: Arc::new(consumer.lease.duplicate()?),
         streams: BTreeSet::new(),
         objects: BTreeSet::new(),
         report: SnapshotVerificationReport {
@@ -2178,6 +2391,17 @@ fn verify_snapshot_bytes(
             }
             verifier.object(role, object, Some(entry.length))?;
         }
+        let changes = &capture
+            .evidence
+            .memory
+            .as_ref()
+            .ok_or_else(|| invalid("capture provenance omitted RAM changes"))?
+            .changes;
+        verifier.object(
+            SnapshotVerificationRole::Dependency,
+            ObjectDigest::from_sha256(*changes.sha256.as_bytes()),
+            Some(changes.byte_len),
+        )?;
     }
     verifier.stream(SnapshotVerificationRole::RootDisk, &record.root.stream)?;
     for disk in &record.disks {
@@ -2203,6 +2427,7 @@ fn verify_snapshot_bytes(
             imported.provenance_digest,
             imported.evidence_digest,
             imported.receipt_digest,
+            imported.changes_digest,
         ]);
     }
     for object in objects {
@@ -2223,6 +2448,7 @@ fn verify_closure(
     record: &SnapshotRecord,
     digest: Option<ObjectDigest>,
     retain: bool,
+    pin: Arc<dyn Send + Sync>,
 ) -> Result<(ClosureFingerprints, AuthenticatedClosure), LibVmError> {
     let bytes = record.canonical_bytes()?;
     let (_, objects) = record.content_dependencies()?;
@@ -2244,6 +2470,7 @@ fn verify_closure(
         digest,
         retain,
         ram,
+        pin,
     )
 }
 
@@ -2254,20 +2481,23 @@ async fn verify_publication_closure(
     pool: &StoragePool,
     record: &SnapshotRecord,
     publications: &BTreeMap<StreamId, crate::storage::pool::SealedStreamPublication>,
+    operation: Uuid,
 ) -> Result<ClosureFingerprints, LibVmError> {
     if publications.is_empty() {
-        return Ok(verify_closure(pool, record, None, false)?.0);
+        return Ok(verify_closure(
+            pool,
+            record,
+            None,
+            false,
+            Arc::new(pool.existing_lease(operation)?),
+        )?
+        .0);
     }
     let bytes = record.canonical_bytes()?;
     let (_, objects) = record.content_dependencies()?;
     let (_, retained_objects) = retained_members(record)?;
     crate::storage::limits::preflight_fd_budget(
-        2 * (objects.len() + record.streams().count()) as u64
-            + record
-                .streams()
-                .map(|stream| stream.map_pages.len() as u64 + 1)
-                .sum::<u64>()
-            + 4,
+        2 * (objects.len() + record.streams().count()) as u64 + record.streams().count() as u64 + 4,
     )
     .map_err(crate::storage::StorageError::from)?;
     let lower = if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
@@ -2297,12 +2527,13 @@ async fn verify_publication_closure(
         .as_ref()
         .map(|lower| lower.maps.keys().copied().collect())
         .unwrap_or_default();
+    let pin: Arc<dyn Send + Sync> = Arc::new(pool.existing_lease(operation)?);
     let mut cached = BTreeMap::new();
     for content in record.streams() {
         if deferred.contains(&content.stream) {
             continue;
         }
-        if let Some(receipt) = load_map_validation(store, pool, content).await? {
+        if let Some(receipt) = load_map_validation(store, pool, content, Arc::clone(&pin)).await? {
             deferred.insert(content.stream);
             cached.insert(content.stream, receipt);
         }
@@ -2317,6 +2548,7 @@ async fn verify_publication_closure(
         false,
         None,
         &deferred,
+        pin,
     )?;
     for (stream, receipt) in cached {
         shape.apply_map_validation(pool, stream, receipt)?;
@@ -2363,10 +2595,10 @@ async fn verify_publication_closure(
 }
 
 /// A metadata-validated closure, with no stream-byte authentication authority.
-/// Map roots/pages are bounded metadata and are authenticated while decoding.
+/// Only root headers are eagerly read; node access authenticates bounded paths.
 pub(crate) struct ShapeVerifiedClosure {
     contents: Vec<SnapshotStream>,
-    maps: BTreeMap<StreamId, Arc<crate::storage::stream::StreamMap>>,
+    maps: BTreeMap<StreamId, Arc<crate::storage::map::AuthenticatedMap>>,
     objects: BTreeSet<ObjectDigest>,
     object_pins: BTreeMap<ObjectDigest, File>,
     retain: bool,
@@ -2378,7 +2610,7 @@ pub(crate) struct ShapeVerifiedClosure {
     held_lower: Option<crate::store::composition_store::LaunchLower>,
     receipt_pins: Vec<(File, SourceFingerprint)>,
     receipt_maps: BTreeSet<StreamId>,
-    restore_maps: BTreeMap<StreamId, (ObjectDigest, SourceFingerprint)>,
+    pin: Arc<dyn Send + Sync>,
 }
 
 pub(crate) struct RestoreInspectionShape {
@@ -2395,7 +2627,12 @@ impl RestoreInspectionShape {
         images: &std::path::Path,
     ) -> Result<ShapeVerifiedClosure, LibVmError> {
         let pool = StoragePool::open(images)?;
-        read_shape_maps(&pool, self.shape.contents.iter(), &mut self.shape.maps)?;
+        read_shape_maps(
+            &pool,
+            self.shape.contents.iter(),
+            &mut self.shape.maps,
+            Arc::clone(&self.shape.pin),
+        )?;
         recheck_closure(&self.shape.fingerprints)?;
         Ok(self.shape)
     }
@@ -2413,15 +2650,14 @@ impl ShapeVerifiedClosure {
                 "receipt-backed stream changed during shape validation",
             ));
         }
-        for (digest, file, expected) in receipt.metadata {
-            if self.object_states.get(&digest) != Some(&expected) {
-                return Err(invalid(
-                    "receipt-backed map changed during shape validation",
-                ));
-            }
-            if self.objects.remove(&digest) {
-                self.receipt_pins.push((file, expected));
-            }
+        let (digest, file, expected) = receipt.metadata;
+        if self.object_states.get(&digest) != Some(&expected) {
+            return Err(invalid(
+                "receipt-backed root changed during shape validation",
+            ));
+        }
+        if self.objects.remove(&digest) && !self.object_pins.contains_key(&digest) {
+            self.receipt_pins.push((file, expected));
         }
         for (digest, expected) in receipt.objects {
             if self.object_states.get(&digest) == Some(&expected) && self.objects.contains(&digest)
@@ -2433,34 +2669,8 @@ impl ShapeVerifiedClosure {
             }
         }
         self.maps.insert(stream, receipt.map);
-        if let Some(canonical) = receipt.canonical {
-            self.restore_maps.insert(stream, canonical);
-        }
         self.receipt_maps.insert(stream);
         Ok(())
-    }
-
-    pub(crate) fn held_restore_map(
-        &self,
-        pool: &StoragePool,
-        stream: StreamId,
-    ) -> Result<Option<(ObjectDigest, File)>, LibVmError> {
-        let Some((digest, fingerprint)) = self.restore_maps.get(&stream) else {
-            return Ok(None);
-        };
-        let file = match pool.open_object(digest) {
-            Ok(file) => file,
-            Err(crate::storage::StorageError::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound =>
-            {
-                return Ok(None)
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if SourceFingerprint::new(&file.metadata()?) != *fingerprint {
-            return Ok(None);
-        }
-        Ok(Some((*digest, file)))
     }
 
     /// Peak held descriptors: shape-pinned objects plus authenticated streams.
@@ -2479,7 +2689,7 @@ impl ShapeVerifiedClosure {
     pub(crate) fn stream_map(
         &self,
         stream: &StreamId,
-    ) -> Result<&crate::storage::stream::StreamMap, LibVmError> {
+    ) -> Result<&crate::storage::map::AuthenticatedMap, LibVmError> {
         self.maps
             .get(stream)
             .map(Arc::as_ref)
@@ -2572,6 +2782,7 @@ impl ShapeVerifiedClosure {
             object_states: &self.object_states,
             maps: Some(&self.maps),
             warm,
+            pin: &self.pin,
         }
         .authenticate(parallel)?;
         recheck_closure(&self.fingerprints)?;
@@ -2596,6 +2807,7 @@ fn verify_artifact_shape(
     retain: bool,
     ram_stream: Option<StreamId>,
     deferred_maps: &BTreeSet<StreamId>,
+    pin: Arc<dyn Send + Sync>,
 ) -> Result<ShapeVerifiedClosure, LibVmError> {
     let record_digest = ObjectDigest::of_bytes(bytes);
     if digest.is_some_and(|digest| digest != record_digest) {
@@ -2652,6 +2864,7 @@ fn verify_artifact_shape(
             .copied()
             .filter(|content| !deferred_maps.contains(&content.stream)),
         &mut maps,
+        Arc::clone(&pin),
     )?;
     recheck_closure(&fingerprints)?;
     Ok(ShapeVerifiedClosure {
@@ -2667,7 +2880,7 @@ fn verify_artifact_shape(
         held_lower: None,
         receipt_pins: Vec::new(),
         receipt_maps: BTreeSet::new(),
-        restore_maps: BTreeMap::new(),
+        pin,
         object_states,
     })
 }
@@ -2675,28 +2888,46 @@ fn verify_artifact_shape(
 fn read_shape_maps<'a>(
     pool: &StoragePool,
     contents: impl Iterator<Item = &'a SnapshotStream>,
-    maps: &mut BTreeMap<StreamId, Arc<crate::storage::stream::StreamMap>>,
+    maps: &mut BTreeMap<StreamId, Arc<crate::storage::map::AuthenticatedMap>>,
+    pin: Arc<dyn Send + Sync>,
 ) -> Result<(), LibVmError> {
     for content in contents {
         if maps.contains_key(&content.stream) {
             continue;
         }
-        let root = crate::storage::map::StreamMapRoot::decode(
-            &pool.read_object(&content.map, Resource::MetadataPageBytes.maximum())?,
-        )?;
-        if root.pages != content.map_pages
-            || root.stream != content.stream
-            || root.length != content.length
-        {
-            return Err(invalid("snapshot map root contradicts content"));
-        }
-        let map = root.read_map(pool)?;
-        if map.id() != content.stream || map.length() != content.length {
-            return Err(invalid("snapshot stream/map/backing contradiction"));
-        }
+        let map = load_root_map(pool, content, Arc::clone(&pin))?;
         maps.insert(content.stream, Arc::new(map));
     }
     Ok(())
+}
+
+fn stream_role(content: &SnapshotStream) -> Result<vm_spec::stream_map::StreamRole, LibVmError> {
+    match content.chunk_size {
+        65536 => Ok(vm_spec::stream_map::StreamRole::Ram),
+        8388608 => Ok(vm_spec::stream_map::StreamRole::Disk),
+        _ => Err(invalid("unsupported stream identity profile")),
+    }
+}
+
+fn load_root_map(
+    pool: &StoragePool,
+    content: &SnapshotStream,
+    pin: Arc<dyn Send + Sync>,
+) -> Result<crate::storage::map::AuthenticatedMap, LibVmError> {
+    let bytes = pool.read_object(&content.map, vm_spec::stream_map::MAX_ROOT_BYTES as u64)?;
+    let root = vm_spec::stream_map::StreamRoot::decode(&bytes).map_err(invalid)?;
+    if ObjectDigest::of_bytes(&bytes) != content.map
+        || root.id().as_bytes() != content.stream.as_bytes()
+        || root.length() != content.length
+        || root.chunk_size().bytes() != content.chunk_size
+    {
+        return Err(invalid("snapshot root contradicts its semantic stream"));
+    }
+    Ok(crate::storage::map::AuthenticatedMap::from_admitted_root(
+        root,
+        stream_role(content)?,
+        pool.map_authority(pin)?,
+    )?)
 }
 
 /// Recovery, export and handoff authenticate every stream byte without receipts.
@@ -2710,6 +2941,7 @@ pub(crate) fn verify_artifact_closure(
     digest: Option<ObjectDigest>,
     retain: bool,
     ram_stream: Option<StreamId>,
+    pin: Arc<dyn Send + Sync>,
 ) -> Result<(ClosureFingerprints, AuthenticatedClosure), LibVmError> {
     let shape = verify_artifact_shape(
         pool,
@@ -2721,6 +2953,7 @@ pub(crate) fn verify_artifact_closure(
         retain,
         ram_stream,
         &BTreeSet::new(),
+        pin,
     )?;
     let closure = shape.authenticate(pool, None)?;
     Ok((shape.fingerprints, closure))
@@ -2771,8 +3004,9 @@ struct ClosureVerification<'a> {
     ram_stream: Option<StreamId>,
     stream_states: &'a BTreeMap<StreamId, SourceFingerprint>,
     object_states: &'a BTreeMap<ObjectDigest, SourceFingerprint>,
-    maps: Option<&'a BTreeMap<StreamId, Arc<crate::storage::stream::StreamMap>>>,
+    maps: Option<&'a BTreeMap<StreamId, Arc<crate::storage::map::AuthenticatedMap>>>,
     warm: Option<&'a BTreeMap<StreamId, SourceFingerprint>>,
+    pin: &'a Arc<dyn Send + Sync>,
 }
 
 impl ClosureVerification<'_> {
@@ -2840,18 +3074,7 @@ impl ClosureVerification<'_> {
                             .ok_or_else(|| invalid("closure map is missing"))?,
                     )
                 } else {
-                    let root = crate::storage::map::StreamMapRoot::decode(
-                        &self
-                            .pool
-                            .read_object(&content.map, Resource::MetadataPageBytes.maximum())?,
-                    )?;
-                    if root.pages != content.map_pages
-                        || root.stream != content.stream
-                        || root.length != content.length
-                    {
-                        return Err(invalid("snapshot map root contradicts content"));
-                    }
-                    Arc::new(root.read_map(self.pool)?)
+                    Arc::new(load_root_map(self.pool, content, Arc::clone(self.pin))?)
                 };
                 if map.id() != content.stream || map.length() != content.length {
                     return Err(invalid("snapshot stream/map/backing contradiction"));
@@ -2863,7 +3086,20 @@ impl ClosureVerification<'_> {
                             Arc::clone(&map),
                             *fingerprint,
                         )?,
-                        None => self.pool.authenticate_stream_full(&content.stream)?,
+                        None => {
+                            let file = self.pool.open_stream(&content.stream)?;
+                            crate::storage::stream::StreamHasher::new(map.chunk_size())
+                                .verify_expected_map(&file, &map)
+                                .map_err(|error| {
+                                    invalid(format!("stream {}: {error}", content.stream))
+                                })?;
+                            let fingerprint = SourceFingerprint::new(&file.metadata()?);
+                            AuthenticatedStream::from_verified_fingerprint(
+                                file,
+                                Arc::clone(&map),
+                                fingerprint,
+                            )?
+                        }
                     };
                     if verified.map() != map.as_ref() {
                         return Err(invalid("snapshot stream/map/backing contradiction"));
@@ -2955,38 +3191,27 @@ pub(crate) async fn publish_map(
     pool: &StoragePool,
     store: &Store,
     operation: Uuid,
-    map: &crate::storage::stream::StreamMap,
+    map: &crate::storage::map::AuthenticatedMap,
 ) -> Result<SnapshotStream, LibVmError> {
+    let map = store
+        .admit_published_map_root(operation, map)
+        .await?
+        .into_map();
     store
-        .pin_published_storage_dependencies(operation, &[], &[])
+        .pin_published_storage_dependencies(operation, &[map.id()], &[])
         .await?;
-    let mut map_pages = Vec::new();
-    for page in crate::storage::map::pages(map) {
-        let page = page?;
-        let (object, roots, ()) = pool.publish_produced_object_for_catalog(|file| {
-            std::io::Write::write_all(file, &page)?;
-            Ok::<_, crate::storage::StorageError>(())
-        })?;
-        store
-            .pin_published_storage_dependencies(operation, &[], &[object.digest])
-            .await?;
-        map_pages.push(object.digest);
-        drop(roots);
+    let root = ObjectDigest::from_sha256(*map.id().as_bytes());
+    if pool.read_object(&root, vm_spec::stream_map::MAX_ROOT_BYTES as u64)?
+        != map.canonical_bytes()?
+    {
+        return Err(invalid(
+            "published stream root changed before catalog transfer",
+        ));
     }
-    let root = crate::storage::map::StreamMapRoot::new(map, map_pages.clone())?;
-    let bytes = root.encode()?;
-    let (object, roots, ()) = pool.publish_produced_object_for_catalog(|file| {
-        std::io::Write::write_all(file, &bytes)?;
-        Ok::<_, crate::storage::StorageError>(())
-    })?;
-    store
-        .pin_published_storage_dependencies(operation, &[map.id()], &[object.digest])
-        .await?;
-    drop(roots);
     Ok(SnapshotStream {
         stream: map.id(),
-        map: object.digest,
-        map_pages,
+        map: root,
+        chunk_size: map.chunk_size().bytes(),
         length: map.length(),
     })
 }
@@ -3003,6 +3228,20 @@ pub(crate) mod tests {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
+
+    #[cfg(target_os = "linux")]
+    fn shape_map_for_test(
+        pool: &StoragePool,
+        consumer: &crate::store::snapshot_store::SnapshotConsumer,
+        content: &crate::store::models::snapshot::SnapshotStream,
+    ) -> crate::storage::map::AuthenticatedMap {
+        crate::store::snapshot_store::load_root_map(
+            pool,
+            content,
+            Arc::new(consumer.lease.duplicate().unwrap()),
+        )
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn shape_consumer_materializes_evicted_streams_under_its_lease() {
@@ -3206,22 +3445,28 @@ pub(crate) mod tests {
                 .streams()
                 .find(|content| content.stream == stream)
                 .unwrap();
-            for digest in std::iter::once(content.map).chain(content.map_pages.iter().copied()) {
-                watchers.push(watch_stream_reads(&pool.object_path(&digest)));
+            let map = shape_map_for_test(&pool, &consumer, content);
+            for node in map.nodes() {
+                watchers.push(watch_stream_reads(&pool.object_path(&node.unwrap().digest)));
             }
         }
         let (_, dependencies) = consumer.record.content_dependencies().unwrap();
         for object in dependencies {
-            watchers.push(watch_stream_reads(&pool.object_path(&object)));
+            if !consumer
+                .record
+                .streams()
+                .any(|content| content.map == object)
+            {
+                watchers.push(watch_stream_reads(&pool.object_path(&object)));
+            }
+        }
+        for watcher in &watchers {
+            observed_stream_read(watcher);
         }
         let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
-        let (canonical, file) = shape.held_restore_map(&pool, ram).unwrap().unwrap();
-        drop(file);
-        let canonical_watcher = watch_stream_reads(&pool.object_path(&canonical));
-        drop(shape.held_restore_map(&pool, ram).unwrap().unwrap());
-        assert!(
-            !observed_stream_read(&canonical_watcher),
-            "canonical RAM map reuse is fingerprint-only"
+        assert_eq!(
+            shape.stream_map(&ram).unwrap().root().id().as_bytes(),
+            ram.as_bytes()
         );
         let mut publications = std::collections::BTreeMap::new();
         for content in consumer.record.streams() {
@@ -3246,6 +3491,7 @@ pub(crate) mod tests {
             &pool,
             &consumer.record,
             &publications,
+            consumer.operation_id,
         )
         .await
         .unwrap();
@@ -3256,7 +3502,7 @@ pub(crate) mod tests {
                 "first restore must not read RAM, disk, or retained maps"
             );
         }
-        assert_eq!(execution.memory.map_pages, vec![canonical]);
+        assert_eq!(execution.memory.map.as_bytes(), ram.as_bytes());
         drop(snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap());
         for watcher in &watchers {
             assert!(
@@ -3311,9 +3557,16 @@ pub(crate) mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(
-            error.to_string(),
-            crate::storage::StorageError::ContentMismatch(path).to_string()
+        let expected = vm_spec::capture::Sha256Digest::of_bytes(&[0x32; 4096]).to_string();
+        let mut changed = [0x32; 4096];
+        changed[4095] = 0xff;
+        let actual = vm_spec::capture::Sha256Digest::of_bytes(&changed).to_string();
+        assert!(
+            matches!(&error, crate::LibVmError::InvalidStorageRecord { record: "snapshot", message }
+            if message.contains(&execution.memory.stream.to_string())
+                && message.contains("unit 65536 bytes chunk 0 bytes 0..4096")
+                && message.contains(&expected) && message.contains(&actual)),
+            "{error}"
         );
         assert!(snapshots.consume(&SnapshotRef::Id(info.id)).await.is_err());
         let receipts: i64 =
@@ -3525,9 +3778,14 @@ pub(crate) mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(
-            error.to_string(),
-            crate::storage::StorageError::ContentMismatch(path).to_string(),
+        let expected = vm_spec::capture::Sha256Digest::of_bytes(&[0x5a; 512]).to_string();
+        let actual = vm_spec::capture::Sha256Digest::of_bytes(&[0x99; 512]).to_string();
+        assert!(
+            matches!(&error, crate::LibVmError::InvalidStorageRecord { record: "snapshot", message }
+            if message.contains(&record.root.stream.stream.to_string())
+                && message.contains("unit 8388608 bytes chunk 0 bytes 0..512")
+                && message.contains(&expected) && message.contains(&actual)),
+            "{error}"
         );
         assert!(observed_stream_read(&watcher));
         let stored: (i64, i64) = sqlx::query_as(
@@ -3947,15 +4205,8 @@ pub(crate) mod tests {
         object.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"exact boot fixture");
         drop(object);
-        // Map roots/pages and the record are digest-checked metadata, never
-        // retained by the shape as reusable object descriptors.
-        for unretained in record
-            .root
-            .stream
-            .map_pages
-            .iter()
-            .chain([&record.root.stream.map, &info.record_digest])
-        {
+        // Root headers and the record are validated metadata, not copy inputs.
+        for unretained in [&record.root.stream.map, &info.record_digest] {
             assert!(!shape.object_pins.contains_key(unretained));
             assert!(shape.open_object(&pool, unretained).is_err());
         }
@@ -3997,7 +4248,8 @@ pub(crate) mod tests {
         assert!(consumer.open_stream(&pool, &stream, 512).is_err());
         assert!(consumer.open_copy_source(&pool, &stream, 512).is_err());
         let output = tempfile::tempfile().unwrap();
-        let mut hasher = crate::storage::stream::StreamHasher::new();
+        let mut hasher =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         hasher.copy_authenticated(&kept_copy, &output).unwrap();
         assert!(consumer.authenticated_stream(&stream, 512).is_err());
         let mut bytes = Vec::new();
@@ -4023,7 +4275,29 @@ pub(crate) mod tests {
         let info = snapshots.publish(&record, operation, None).await.unwrap();
         let mut consumer = snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap();
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
-        let memory = record.root.stream.clone();
+        let source = pool.open_stream(&record.root.stream.stream).unwrap();
+        let ram_map =
+            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::RAM)
+                .hash_open_file(&source, record.root.stream.length)
+                .unwrap()
+                .map;
+        let (publication, roots) = pool
+            .publish_sealed_stream_for_catalog(
+                &source,
+                &ram_map,
+                None,
+                crate::storage::pool::SealedStreamPublicationMode::CopyAllowed,
+            )
+            .unwrap();
+        let memory = crate::store::snapshot_store::publish_map(
+            &pool,
+            &snapshots.store,
+            consumer.operation_id,
+            publication.map(),
+        )
+        .await
+        .unwrap();
+        drop(roots);
         let crate::BootProfile::LinuxDirect {
             binding: crate::BootBinding::Pinned { kernel, .. },
             ..
@@ -4031,7 +4305,6 @@ pub(crate) mod tests {
         else {
             panic!("fixture boot is pinned");
         };
-        // Reuse a disk stream as RAM: duplicate roles retain one inode/map.
         consumer.record.capture = SnapshotCaptureKind::LiveExecution {
             execution: Box::new(SnapshotExecution {
                 memory: memory.clone(),
@@ -4047,12 +4320,25 @@ pub(crate) mod tests {
                 },
             }),
         };
-        let (_, unretained) = verify_closure(&pool, &consumer.record, None, false).unwrap();
+        let (_, unretained) = verify_closure(
+            &pool,
+            &consumer.record,
+            None,
+            false,
+            Arc::new(consumer.lease.duplicate().unwrap()),
+        )
+        .unwrap();
         assert!(unretained.streams.is_empty());
         consumer.closure = Some(
-            verify_closure(&pool, &consumer.record, None, true)
-                .unwrap()
-                .1,
+            verify_closure(
+                &pool,
+                &consumer.record,
+                None,
+                true,
+                Arc::new(consumer.lease.duplicate().unwrap()),
+            )
+            .unwrap()
+            .1,
         );
         let file = consumer
             .open_stream(&pool, &memory.stream, memory.length)
@@ -4086,9 +4372,15 @@ pub(crate) mod tests {
             .open_stream(&pool, &memory.stream, memory.length)
             .is_err());
         consumer.closure = Some(
-            verify_closure(&pool, &consumer.record, None, true)
-                .unwrap()
-                .1,
+            verify_closure(
+                &pool,
+                &consumer.record,
+                None,
+                true,
+                Arc::new(consumer.lease.duplicate().unwrap()),
+            )
+            .unwrap()
+            .1,
         );
         // An in-place identical rewrite also invalidates the authenticated state.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -4098,9 +4390,15 @@ pub(crate) mod tests {
             .open_stream(&pool, &memory.stream, memory.length)
             .is_err());
         consumer.closure = Some(
-            verify_closure(&pool, &consumer.record, None, true)
-                .unwrap()
-                .1,
+            verify_closure(
+                &pool,
+                &consumer.record,
+                None,
+                true,
+                Arc::new(consumer.lease.duplicate().unwrap()),
+            )
+            .unwrap()
+            .1,
         );
         let kept = consumer
             .open_stream(&pool, &memory.stream, memory.length)
@@ -4588,13 +4886,15 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn snapshot_catalog_fetch_transports_plain_facts_before_json_authentication() {
-        let (_temp, snapshots, _record, operation, lease) = fixture("snapshot").await;
+        let (_temp, snapshots, record, operation, lease) = fixture("snapshot").await;
         let id = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             .parse()
             .unwrap();
-        let malformed = b"{not json";
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["purpose"] = serde_json::json!("unsupported-purpose");
+        let malformed = crate::store::models::snapshot::canonical_value(&value).unwrap();
         sqlx::query("INSERT INTO storage_snapshot(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,?3,1,1)")
-            .bind(format!("{id}")).bind(ObjectDigest::of_bytes(malformed).to_string()).bind(malformed.as_slice())
+            .bind(format!("{id}")).bind(ObjectDigest::of_bytes(&malformed).to_string()).bind(malformed.as_slice())
             .execute(&snapshots.store.pool).await.unwrap();
         let mut tx = snapshots.store.pool.begin().await.unwrap();
         let facts = crate::store::snapshot_store::fetch_catalog(&mut tx, &SnapshotRef::Id(id))
@@ -4885,6 +5185,7 @@ pub(crate) mod tests {
         objects: &std::collections::BTreeSet<ObjectDigest>,
         ram: crate::storage::identity::StreamId,
         parallel: bool,
+        operation: uuid::Uuid,
     ) -> Result<crate::store::snapshot_store::AuthenticatedClosure, crate::LibVmError> {
         let stream_states = contents
             .iter()
@@ -4907,6 +5208,7 @@ pub(crate) mod tests {
                 )
             })
             .collect();
+        let pin: Arc<dyn Send + Sync> = Arc::new(pool.existing_lease(operation).unwrap());
         crate::store::snapshot_store::ClosureVerification {
             pool,
             contents,
@@ -4917,6 +5219,7 @@ pub(crate) mod tests {
             object_states: &object_states,
             maps: None,
             warm: None,
+            pin: &pin,
         }
         .authenticate(parallel)
     }
@@ -4926,7 +5229,6 @@ pub(crate) mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         use crate::storage::limits::{FileDescriptorLimits, FD_RESERVED_OVERHEAD};
-        use crate::storage::StorageError;
         use crate::store::snapshot_store::{
             closure_lane_budget_fits, publish_map, verify_artifact_closure,
         };
@@ -4948,7 +5250,6 @@ pub(crate) mod tests {
         let upper = &record.root.stream;
         let mut objects = record.content_dependencies().unwrap().1;
         objects.insert(ram.map);
-        objects.extend(ram.map_pages.iter().copied());
         let held = 2;
         let required = FD_RESERVED_OVERHEAD + held + 2;
         let limits = FileDescriptorLimits {
@@ -4969,9 +5270,15 @@ pub(crate) mod tests {
         assert!(!descriptor_fallback);
         assert!(!closure_lane_budget_fits(u64::MAX, limits,));
         for mode in [parallel, descriptor_fallback] {
-            let closure =
-                authenticate_test_closure(&pool, &[upper, &ram, &ram], &objects, ram.stream, mode)
-                    .unwrap();
+            let closure = authenticate_test_closure(
+                &pool,
+                &[upper, &ram, &ram],
+                &objects,
+                ram.stream,
+                mode,
+                operation,
+            )
+            .unwrap();
             assert_eq!(closure.streams.len(), 2);
             assert_eq!(
                 closure.streams.get(&ram.stream).unwrap().map().id(),
@@ -4985,13 +5292,16 @@ pub(crate) mod tests {
                 &objects,
                 ram.stream,
                 mode,
+                operation,
             )
             .err()
             .unwrap();
             assert_eq!(
                 error.to_string(),
-                crate::store::models::snapshot::invalid("snapshot map root contradicts content",)
-                    .to_string(),
+                crate::store::models::snapshot::invalid(
+                    "snapshot root contradicts its semantic stream",
+                )
+                .to_string(),
             );
         }
 
@@ -5013,13 +5323,14 @@ pub(crate) mod tests {
                             || (content.stream == ram.stream && bad_ram)
                     })
                     .unwrap();
-                let expected = StorageError::ContentMismatch(pool.stream_path(&first_bad.stream));
+                let expected = first_bad.stream.to_string();
                 for mode in [parallel, descriptor_fallback] {
-                    let error =
-                        authenticate_test_closure(&pool, &contents, &objects, ram.stream, mode)
-                            .err()
-                            .unwrap();
-                    assert_eq!(error.to_string(), expected.to_string());
+                    let error = authenticate_test_closure(
+                        &pool, &contents, &objects, ram.stream, mode, operation,
+                    )
+                    .err()
+                    .unwrap();
+                    assert!(error.to_string().contains(&expected), "{error}");
                 }
                 let error = verify_artifact_closure(
                     &pool,
@@ -5030,10 +5341,11 @@ pub(crate) mod tests {
                     None,
                     true,
                     Some(ram.stream),
+                    Arc::new(pool.existing_lease(operation).unwrap()),
                 )
                 .err()
                 .unwrap();
-                assert_eq!(error.to_string(), expected.to_string());
+                assert!(error.to_string().contains(&expected), "{error}");
             }
         }
         snapshots
@@ -5103,7 +5415,7 @@ pub(crate) mod tests {
                     role: SnapshotVerificationRole::RootDisk,
                     stream, index: 0, start: 0, end: 512, expected, ..
                 }) if stream == record.root.stream.stream
-                    && matches!(*expected, crate::storage::stream::Chunk::Zero) == zero
+                    && matches!(*expected, vm_spec::stream_map::Chunk::Zero) == zero
             ));
         }
     }
@@ -5255,7 +5567,7 @@ pub(crate) mod tests {
         use crate::store::snapshot_store::verify_artifact_shape;
         use std::collections::{BTreeMap, BTreeSet};
         use std::os::unix::fs::PermissionsExt;
-        let (temporary, snapshots, record, _operation, _lease) = fixture("snapshot").await;
+        let (temporary, snapshots, record, operation, _lease) = fixture("snapshot").await;
         let held =
             crate::store::storage::tests::retained_lower(&snapshots.store, temporary.path(), 0x47)
                 .await;
@@ -5272,7 +5584,6 @@ pub(crate) mod tests {
         objects.extend(graph.objects());
         for content in &contents {
             objects.insert(content.map);
-            objects.extend(content.map_pages.iter().copied());
         }
         let bytes = record.canonical_bytes().unwrap();
         let shape = || {
@@ -5286,6 +5597,7 @@ pub(crate) mod tests {
                 true,
                 None,
                 &BTreeSet::new(),
+                Arc::new(pool.existing_lease(operation).unwrap()),
             )
             .unwrap();
             shape.local_lower = Some(graph.clone());
@@ -5340,7 +5652,7 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn map_receipt_hits_skip_map_reads_and_changed_fingerprints_revalidate() {
+    async fn map_receipt_hits_skip_node_reads_and_changed_root_fingerprints_revalidate() {
         use std::os::unix::fs::PermissionsExt;
         let (_temporary, snapshots, record, operation, _lease) = fixture("snapshot").await;
         let info = snapshots.publish(&record, operation, None).await.unwrap();
@@ -5352,9 +5664,12 @@ pub(crate) mod tests {
         snapshots.authenticate_closure_bytes(shape).await.unwrap();
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
         let stream = watch_stream_reads(&pool.stream_path(&record.root.stream.stream));
-        let maps = std::iter::once(record.root.stream.map)
-            .chain(record.root.stream.map_pages.iter().copied())
-            .map(|digest| watch_stream_reads(&pool.object_path(&digest)))
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        let maps = shape
+            .stream_map(&record.root.stream.stream)
+            .unwrap()
+            .nodes()
+            .map(|node| watch_stream_reads(&pool.object_path(&node.unwrap().digest)))
             .collect::<Vec<_>>();
         let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
         snapshots.authenticate_closure_bytes(shape).await.unwrap();
@@ -5368,7 +5683,7 @@ pub(crate) mod tests {
             .unwrap();
         let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
         snapshots.authenticate_closure_bytes(shape).await.unwrap();
-        assert!(maps.iter().all(observed_stream_read));
+        assert!(maps.iter().all(|watcher| !observed_stream_read(watcher)));
         assert!(!observed_stream_read(&stream));
 
         let path = pool.object_path(&record.root.stream.map);
@@ -5376,7 +5691,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
         let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
         snapshots.authenticate_closure_bytes(shape).await.unwrap();
-        assert!(maps.iter().all(observed_stream_read));
+        assert!(maps.iter().all(|watcher| !observed_stream_read(watcher)));
         assert!(!observed_stream_read(&stream));
         let length = std::fs::metadata(&path).unwrap().len() as usize;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -5385,113 +5700,234 @@ pub(crate) mod tests {
         assert!(snapshots.verify_closure_shape(&consumer).await.is_err());
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn canonical_map_cache_eviction_preserves_retained_pages_and_recovers_without_reads() {
-        let (temporary, snapshots, mut record, operation, _lease) = fixture("snapshot").await;
-        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
-        let length = (crate::storage::map::MAP_PAGE_ENTRIES as u64 + 1)
-            * crate::storage::limits::CHUNK_SIZE as u64;
-        let source = std::fs::File::create(temporary.path().join("sparse-root")).unwrap();
-        source.set_len(length).unwrap();
-        drop(source);
-        let (published, roots) = pool
-            .publish_stream_for_catalog(&temporary.path().join("sparse-root"))
-            .unwrap();
-        snapshots
-            .store
-            .pin_published_storage_dependencies(operation, &[published.id], &[])
+    async fn root_receipts_are_small_and_explicit_verify_names_corrupt_nodes() {
+        use crate::store::snapshot_store::{SnapshotVerificationError, SnapshotVerificationRole};
+        for height in 0..5 {
+            let (_temporary, snapshots, record, operation, _lease) = fixture("snapshot").await;
+            let info = snapshots.publish(&record, operation, None).await.unwrap();
+            let consumer = snapshots
+                .consume_shape(&SnapshotRef::Id(info.id))
+                .await
+                .unwrap();
+            let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+            snapshots.authenticate_closure_bytes(shape).await.unwrap();
+            let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+            let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+            let map = shape.stream_map(&record.root.stream.stream).unwrap();
+            let node = map
+                .nodes()
+                .map(Result::unwrap)
+                .find(|node| node.height == height)
+                .unwrap();
+            let receipt: Vec<u8> = sqlx::query_scalar(
+                "SELECT map_receipt FROM verified_object WHERE stream_sha256=?1",
+            )
+            .bind(record.root.stream.stream.to_string())
+            .fetch_one(&snapshots.store.pool)
             .await
             .unwrap();
-        drop(roots);
-        record.root.stream = crate::store::snapshot_store::publish_map(
-            &pool,
-            &snapshots.store,
-            operation,
-            &published.map,
-        )
-        .await
-        .unwrap();
-        record.root.geometry.length = length;
-        let info = snapshots.publish(&record, operation, None).await.unwrap();
+            assert!(receipt.len() < 4096);
+            let value: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+            assert_eq!(value["schema"], 2);
+            assert!(value.get("chunks").is_none());
+            corrupt_member(&pool.object_path(&node.digest));
+            // Local shape admission does not stat or decode every descendant.
+            snapshots.verify_closure_shape(&consumer).await.unwrap();
+            let error = snapshots
+                .verify(&SnapshotRef::Id(info.id))
+                .await
+                .unwrap_err();
+            let crate::LibVmError::SnapshotVerification(SnapshotVerificationError::MapNode(
+                failure,
+            )) = error
+            else {
+                panic!("expected map node corruption");
+            };
+            assert_eq!(failure.role, SnapshotVerificationRole::RootDisk);
+            assert_eq!(failure.node, node.digest);
+            assert_eq!(failure.height, height);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_verify_reports_corrupt_and_missing_ram_nodes_at_each_height() {
+        use crate::store::snapshot_store::{
+            SnapshotStructuralFailure, SnapshotVerificationError, SnapshotVerificationRole,
+        };
+        for height in 0..5 {
+            let fixture = crate::store::capture::tests::fixture().await;
+            let (directory, _) = crate::store::capture::tests::seal(&fixture);
+            let snapshots = &fixture.snapshots;
+            let info = snapshots
+                .publish_capture(
+                    fixture.reservation.record.capture_id,
+                    directory.path(),
+                    fixture.reservation.record.alias.clone(),
+                    crate::storage::pool::PublicationLockPolicy::Wait,
+                )
+                .await
+                .unwrap();
+            let consumer = snapshots
+                .consume_shape(&SnapshotRef::Id(info.id))
+                .await
+                .unwrap();
+            let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+                &consumer.record.capture
+            else {
+                panic!("live capture fixture");
+            };
+            let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+            let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+            let node = shape
+                .stream_map(&execution.memory.stream)
+                .unwrap()
+                .nodes()
+                .map(Result::unwrap)
+                .find(|node| node.height == height)
+                .unwrap();
+            assert_eq!(execution.memory.chunk_size, 65536);
+            let path = pool.object_path(&node.digest);
+            corrupt_member(&path);
+            let error = snapshots
+                .verify(&SnapshotRef::Id(info.id))
+                .await
+                .unwrap_err();
+            let crate::LibVmError::SnapshotVerification(SnapshotVerificationError::MapNode(
+                failure,
+            )) = error
+            else {
+                panic!("expected RAM map node corruption");
+            };
+            assert_eq!(failure.role, SnapshotVerificationRole::Ram);
+            assert_eq!(failure.node, node.digest);
+            assert_eq!(failure.height, height);
+            std::fs::remove_file(&path).unwrap();
+            let error = snapshots
+                .verify(&SnapshotRef::Id(info.id))
+                .await
+                .unwrap_err();
+            let crate::LibVmError::SnapshotVerification(SnapshotVerificationError::MapNode(
+                failure,
+            )) = error
+            else {
+                panic!("expected missing RAM map node");
+            };
+            assert_eq!(failure.role, SnapshotVerificationRole::Ram);
+            assert_eq!(failure.node, node.digest);
+            assert!(matches!(
+                failure.failure,
+                SnapshotStructuralFailure::Missing
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_consumer_pins_do_not_grant_publication_or_terminal_operation_authority() {
+        use crate::store::snapshot_store::{require_consumer_closure, require_operation_closure};
+        use std::collections::BTreeSet;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temporary.path()))
+            .await
+            .unwrap();
+        for kind in ["raw-export", "fork"] {
+            let (operation, _lease) = store.begin_stopped_operation(kind, &[], &[]).await.unwrap();
+            require_consumer_closure(&store, operation, &BTreeSet::new(), &BTreeSet::new())
+                .await
+                .unwrap();
+            assert!(require_operation_closure(
+                &store,
+                operation,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                None,
+            )
+            .await
+            .is_err());
+            store.finish_stopped_operation(operation).await.unwrap();
+            assert!(require_consumer_closure(
+                &store,
+                operation,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_capture_restore_shape_retains_the_binary_ram_root_and_state_roles() {
+        let fixture = crate::store::capture::tests::fixture().await;
+        let (directory, _) = crate::store::capture::tests::seal(&fixture);
+        let snapshots = &fixture.snapshots;
+        let info = snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await
+            .unwrap();
         let consumer = snapshots
             .consume_shape(&SnapshotRef::Id(info.id))
             .await
             .unwrap();
-        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
-        let objects = shape.object_states.clone();
-        let closure = snapshots.authenticate_closure_bytes(shape).await.unwrap();
-        let stream = closure.streams.get(&published.id).unwrap();
-        let receipt = crate::store::snapshot_store::map_validation(
-            &pool,
-            &record.root.stream,
-            stream.map(),
-            stream.fingerprint(),
-            true,
-            &objects,
-        )
-        .unwrap();
-        sqlx::query("UPDATE verified_object SET map_receipt=?2 WHERE stream_sha256=?1")
-            .bind(published.id.to_string())
-            .bind(receipt)
-            .execute(&snapshots.store.pool)
-            .await
+        let inspection = snapshots.prepare_restore_shape(&consumer).await.unwrap();
+        let shape = inspection.shape();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &consumer.record.capture
+        else {
+            panic!("live capture fixture");
+        };
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let ram = shape
+            .open_stream(&pool, &execution.memory.stream, execution.memory.length)
             .unwrap();
-        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
-        let (canonical, file) = shape
-            .held_restore_map(&pool, published.id)
-            .unwrap()
-            .unwrap();
-        drop(file);
-        let (_, dependencies) = record.content_dependencies().unwrap();
-        assert!(!dependencies.contains(&canonical));
-        assert_eq!(record.root.stream.map_pages.len(), 2);
-        let maps = std::iter::once(record.root.stream.map)
-            .chain(record.root.stream.map_pages.iter().copied())
-            .map(|digest| watch_stream_reads(&pool.object_path(&digest)))
-            .collect::<Vec<_>>();
-        let payload = watch_stream_reads(&pool.stream_path(&published.id));
-        {
-            let _roots = pool.lock_roots().unwrap();
-            let retained: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM retained_object WHERE object_digest=?1)",
-            )
-            .bind(canonical.to_string())
-            .fetch_one(&snapshots.store.pool)
-            .await
-            .unwrap();
-            assert!(!retained);
-            pool.remove_object(&canonical).unwrap();
+        assert_eq!(ram.metadata().unwrap().len(), execution.memory.length);
+        for object in [execution.layout, execution.execution, execution.devices] {
+            shape.open_object(&pool, &object).unwrap();
         }
-        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
-        assert!(shape
-            .held_restore_map(&pool, published.id)
+        let mut root_file = shape.open_object(&pool, &execution.memory.map).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut root_file, &mut bytes).unwrap();
+        assert!(bytes.len() <= vm_spec::stream_map::MAX_ROOT_BYTES);
+        assert_eq!(
+            bytes,
+            shape
+                .stream_map(&execution.memory.stream)
+                .unwrap()
+                .canonical_bytes()
+                .unwrap()
+        );
+        assert!(
+            shape
+                .open_object(&pool, &consumer.record.root.stream.map)
+                .is_err(),
+            "a disk root is not a native restore FD role"
+        );
+        let evidence = snapshots
+            .restore_evidence(&consumer, &pool)
             .unwrap()
-            .is_none());
-        let (recreated, roots, ()) = pool
-            .publish_produced_object_for_catalog(|file| {
-                shape
-                    .stream_map(&published.id)
-                    .unwrap()
-                    .write_canonical(file)?;
-                Ok::<_, crate::storage::StorageError>(())
-            })
-            .unwrap();
+            .evidence;
+        let changes = crate::storage::identity::ObjectDigest::from_sha256(
+            *evidence.memory.as_ref().unwrap().changes.sha256.as_bytes(),
+        );
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM storage_operation_object WHERE operation_id=?1 AND object_digest=?2)",
+        ).bind(consumer.operation_id.to_string()).bind(changes.to_string())
+            .fetch_one(&snapshots.store.pool).await.unwrap(),
+            "restore consumer retains the change provenance independently of FD roles");
+        assert!(
+            shape.open_object(&pool, &changes).is_err(),
+            "change provenance is not a native restore FD role"
+        );
+        let completed = inspection.complete(&snapshots.store.images_dir).unwrap();
         snapshots
-            .cache_restore_map(&shape, published.id, &recreated)
+            .authenticate_closure_bytes(completed)
             .await
             .unwrap();
-        drop(roots);
-        let refreshed = snapshots.verify_closure_shape(&consumer).await.unwrap();
-        assert_eq!(
-            refreshed
-                .held_restore_map(&pool, published.id)
-                .unwrap()
-                .unwrap()
-                .0,
-            recreated.digest,
-        );
-        assert!(!observed_stream_read(&payload));
-        assert!(maps.iter().all(|watcher| !observed_stream_read(watcher)));
     }
 }

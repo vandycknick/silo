@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use sha2::Digest;
 
-use crate::handoff::chunks::{extents, ChunkIndex};
+use crate::handoff::chunks::{changed_payloads, payload_length};
 use crate::handoff::files::{DocumentName, OperationFiles};
 use crate::handoff::plan::{
     boot_bundle, invalid, ApprovedPlan, BootSelection, CaptureManifest, CaptureOffer,
@@ -39,8 +39,9 @@ use crate::handoff::types::{
 };
 use crate::paths::OwnedDirectory;
 use crate::storage::identity::{ObjectDigest, StreamId};
+use crate::storage::map::AuthenticatedMap;
 use crate::storage::pool::StoragePool;
-use crate::storage::stream::{Chunk, StreamHasher, StreamMap};
+use crate::storage::stream::StreamHasher;
 use crate::store::handoff_payload_store::HandoffPublication;
 use crate::store::models::{MachineConfig, MachineRootfsRecord};
 use crate::store::Store;
@@ -48,6 +49,7 @@ use crate::{
     BootBinding, BootProfile, DiskStorage, GuestArchitecture, LibVmError, MachineId,
     MachineOwnership, MachineRoot, MachineStorageRecord, Runtime, Translation,
 };
+use vm_spec::stream_map::{Chunk, ChunkSize, StreamNode, ROOT_HEIGHT};
 
 /// Kernel architecture of this host. A destination never boots another.
 pub(crate) fn host_architecture() -> Result<GuestArchitecture, LibVmError> {
@@ -270,7 +272,7 @@ pub(crate) async fn preflight(
         &request.resources,
     )?;
     let plan = HandoffPlan::new(PlanBody {
-        schema: 1,
+        schema: 2,
         operation: request.operation,
         mode: request.mode,
         observation: source.clone(),
@@ -346,6 +348,7 @@ struct SpaceDemand {
     missing_streams: u64,
     missing_objects: u64,
     largest_object: u64,
+    metadata: u64,
 }
 
 impl SpaceDemand {
@@ -357,6 +360,7 @@ impl SpaceDemand {
             .saturating_mul(2)
             .saturating_add(self.missing_streams.saturating_mul(3))
             .saturating_add(self.missing_objects)
+            .saturating_add(self.metadata.saturating_mul(3))
             .saturating_add(transient)
     }
 }
@@ -374,10 +378,10 @@ fn admit_space(required: u64, available: u64) -> Result<(), LibVmError> {
 }
 
 // statvfs field widths differ between Linux and Darwin.
-#[allow(clippy::unnecessary_cast)]
 fn available_bytes(runtime: &Runtime) -> Result<u64, LibVmError> {
     let stat = nix::sys::statvfs::statvfs(runtime.local_home()).map_err(std::io::Error::from)?;
-    Ok((stat.blocks_available() as u64).saturating_mul(stat.fragment_size() as u64))
+    let bytes = u128::from(stat.blocks_available()) * u128::from(stat.fragment_size());
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
 }
 
 fn estimate(
@@ -408,6 +412,19 @@ fn estimate(
             estimate.missing_immutable_bytes += stream.length;
             demand.missing_streams += stream.length;
         }
+    }
+    for length in body
+        .writable
+        .iter()
+        .map(|file| file.length)
+        .chain(body.immutable.streams.iter().map(|stream| stream.length))
+    {
+        let bytes =
+            vm_spec::stream_map::worst_case_map_bytes(length, ChunkSize::DISK).map_err(invalid)?;
+        demand.metadata = demand
+            .metadata
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("handoff metadata reservation overflow"))?;
     }
     estimate.available_bytes = available_bytes(runtime)?;
     Ok((estimate, demand))
@@ -493,16 +510,12 @@ pub(crate) async fn offer(
     store.offer_handoff_capture(offer.binding()).await
 }
 
-/// Direct-return reuse: the prior-owner record's own private files.
+/// Prior files are root handles paired with held immutable file descriptors.
 pub(crate) struct PriorOwner {
-    machine_dir: std::path::PathBuf,
-    files: Vec<(crate::PrivatePath, u64)>,
-    index: ChunkIndex,
+    files: Vec<(WritableRole, std::fs::File, AuthenticatedMap)>,
 }
 
 impl PriorOwner {
-    /// Only for a relocation whose destination holds the exact fenced prior
-    /// owner the ledger admits. Unchanged chunks are verified when read.
     pub(crate) async fn load(
         runtime: &Runtime,
         plan: &ApprovedPlan,
@@ -528,76 +541,54 @@ impl PriorOwner {
         {
             return Ok(None);
         }
-        let machine_dir = config.machine_dir.clone();
-        let files = writable_files(&storage)
-            .into_iter()
-            .map(|(_, path, length)| (path, length))
-            .collect::<Vec<_>>();
-        let directory = match OwnedDirectory::open_existing_root(&machine_dir)? {
-            Some(directory) => directory,
-            None => return Ok(None),
+        let Some(directory) = OwnedDirectory::open_existing_root(&config.machine_dir)? else {
+            return Ok(None);
         };
-        let mut index = ChunkIndex::default();
-        let mut retained = Vec::new();
-        for (path, length) in files {
-            // A missing or changed prior file is simply not a reuse source.
+        let mut files = Vec::new();
+        for (role, path, length) in writable_files(&storage) {
             let Ok(source) = crate::machine::stopped::open_private(&directory, &path, length)
             else {
                 continue;
             };
-            let map = StreamHasher::new()
+            let map = StreamHasher::new(ChunkSize::DISK)
                 .hash_open_file(&source.file, length)?
                 .map;
-            index.add(retained.len(), &map);
-            retained.push((path, length));
+            let pool = StoragePool::open(runtime.local_images_dir())?;
+            crate::store::snapshot_store::publish_map(
+                &pool,
+                &runtime.native_store()?,
+                body.operation.as_uuid(),
+                &map,
+            )
+            .await?;
+            files.push((role, source.file, map));
         }
-        Ok(Some(Self {
-            machine_dir,
-            files: retained,
-            index,
-        }))
+        Ok(Some(Self { files }))
     }
 
-    fn has(&self, digest: &ObjectDigest, length: u64) -> bool {
-        self.index.get(digest, length).is_some()
-    }
-
-    fn read(&self, digest: &ObjectDigest, length: u64) -> Result<Option<Vec<u8>>, LibVmError> {
-        let Some(place) = self.index.get(digest, length) else {
-            return Ok(None);
-        };
-        let Some(directory) = OwnedDirectory::open_existing_root(&self.machine_dir)? else {
-            return Ok(None);
-        };
-        let Some((path, file_length)) = self.files.get(place.file) else {
-            return Ok(None);
-        };
-        let Ok(source) = crate::machine::stopped::open_private(&directory, path, *file_length)
-        else {
-            return Ok(None);
-        };
-        crate::handoff::chunks::read_verified(&source.file, place.offset, length, digest)
+    fn baseline(&self, role: WritableRole) -> Option<(&std::fs::File, &AuthenticatedMap)> {
+        self.files
+            .iter()
+            .find(|(candidate, _, _)| *candidate == role)
+            .map(|(_, file, map)| (file, map))
     }
 }
 
-/// The complete inventory of one operation for the current set of maps.
 pub(crate) struct Inventory {
     key: InventoryKey,
     entries: Vec<PayloadDescriptor>,
     members: HashSet<PayloadDescriptor>,
-    /// Streams already verified whole in the local pool.
     whole: BTreeSet<StreamId>,
+    baselines: std::collections::BTreeMap<StreamId, WritableRole>,
 }
 
-/// What an inventory was built from: whether a manifest was offered and
-/// which needed stream maps were present. Cheap to recompute (stat only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InventoryKey {
     manifest: bool,
     maps: BTreeSet<StreamId>,
+    revision: u64,
 }
 
-/// Streams of the plan's closure and, once offered, the cut.
 fn inventory_streams(
     plan: &ApprovedPlan,
     files: &OperationFiles,
@@ -610,13 +601,12 @@ fn inventory_streams(
         .iter()
         .map(|entry| entry.stream)
         .collect::<Vec<_>>();
-    let manifest = match files.load_document(DocumentName::Manifest)? {
-        Some(document) => {
-            let manifest = CaptureManifest::from_document(document)?;
-            streams.extend(manifest.body().files.iter().map(|file| file.stream));
-            true
-        }
-        None => false,
+    let manifest = if let Some(document) = files.load_document(DocumentName::Manifest)? {
+        let manifest = CaptureManifest::from_document(document)?;
+        streams.extend(manifest.body().files.iter().map(|file| file.stream));
+        true
+    } else {
+        false
     };
     Ok((manifest, streams))
 }
@@ -633,53 +623,159 @@ fn inventory_key(
             maps.insert(*stream);
         }
     }
-    Ok((InventoryKey { manifest, maps }, streams))
+    Ok((
+        InventoryKey {
+            manifest,
+            maps,
+            revision: files.revision()?,
+        },
+        streams,
+    ))
+}
+
+/// Missing nodes are requests, never implicit-zero authority.
+struct NodeInventory<'a> {
+    files: &'a OperationFiles,
+    pool: &'a StoragePool,
+    root: vm_spec::stream_map::StreamRoot,
+    baseline: Option<&'a AuthenticatedMap>,
+    entries: &'a mut Vec<PayloadDescriptor>,
+}
+
+impl NodeInventory<'_> {
+    fn discover(
+        &mut self,
+        after: Option<vm_spec::capture::Sha256Digest>,
+        before: Option<vm_spec::capture::Sha256Digest>,
+        height: u8,
+        first_index: u64,
+    ) -> Result<bool, LibVmError> {
+        if after == before {
+            return Ok(true);
+        }
+        let Some(after) = after else {
+            return Ok(true);
+        };
+        if first_index >= self.root.chunk_count() {
+            return Err(invalid("map node lies outside agreed stream length"));
+        }
+        let digest = ObjectDigest::from_sha256(*after.as_bytes());
+        self.entries.push(PayloadDescriptor::MapNode {
+            digest,
+            stream: StreamId::from_sha256(*self.root.id().as_bytes()),
+            height: crate::handoff::plan::MapNodeHeight::new(height)?,
+            first_index: crate::handoff::plan::MapNodeIndex::new(first_index)?,
+        });
+        let Some(bytes) = self.files.node_bytes(digest, self.pool)? else {
+            return Ok(false);
+        };
+        let node = StreamNode::decode(&bytes, height).map_err(invalid)?;
+        if height == 0 {
+            return Ok(true);
+        }
+        let old = match (before, self.baseline) {
+            (Some(digest), Some(map)) => {
+                let bytes = crate::handoff::chunks::read_node(
+                    map,
+                    ObjectDigest::from_sha256(*digest.as_bytes()),
+                    crate::handoff::plan::MapNodeHeight::new(height)?,
+                    crate::handoff::plan::MapNodeIndex::new(first_index)?,
+                )?;
+                Some(StreamNode::decode(&bytes, height).map_err(invalid)?)
+            }
+            _ => None,
+        };
+        let mut complete = true;
+        for (slot, child) in node.entries() {
+            let first = first_index + u64::from(slot) * (1u64 << (6 * u32::from(height)));
+            complete &= self.discover(
+                Some(child),
+                old.as_ref().and_then(|node| node.entry(slot)),
+                height - 1,
+                first,
+            )?;
+        }
+        Ok(complete)
+    }
 }
 
 impl Inventory {
     fn build(
         plan: &ApprovedPlan,
         files: &OperationFiles,
+        pool: &StoragePool,
         whole: &BTreeSet<StreamId>,
+        prior: Option<&PriorOwner>,
     ) -> Result<Self, LibVmError> {
         let (key, streams) = inventory_key(plan, files, whole)?;
-        let mut entries = Vec::new();
-        for object in &plan.body().observation.immutable.objects {
-            entries.push(PayloadDescriptor::Object {
+        let mut entries = plan
+            .body()
+            .observation
+            .immutable
+            .objects
+            .iter()
+            .map(|object| PayloadDescriptor::Object {
                 digest: object.digest,
                 length: object.length,
-            });
+            })
+            .collect::<Vec<_>>();
+        let mut baselines = std::collections::BTreeMap::new();
+        if let Some(document) = files.load_document(DocumentName::Manifest)? {
+            for file in CaptureManifest::from_document(document)?
+                .body()
+                .files
+                .iter()
+            {
+                baselines.insert(file.stream, file.role);
+            }
         }
-        let mut loaded = Vec::new();
-        for stream in &streams {
-            if whole.contains(stream) {
+        for stream in streams {
+            if whole.contains(&stream) {
                 continue;
             }
-            entries.push(PayloadDescriptor::StreamMap { stream: *stream });
-            if key.maps.contains(stream) {
-                loaded.push(
-                    files
-                        .load_map(stream)?
-                        .ok_or_else(|| invalid("stream map disappeared"))?,
-                );
+            entries.push(PayloadDescriptor::StreamMap { stream });
+            let Some(root) = files.load_root(&stream)? else {
+                continue;
+            };
+            let baseline = baselines
+                .get(&stream)
+                .and_then(|role| prior.and_then(|prior| prior.baseline(*role)))
+                .map(|(_, map)| map);
+            let mut nodes = NodeInventory {
+                files,
+                pool,
+                root,
+                baseline,
+                entries: &mut entries,
+            };
+            if !nodes.discover(
+                root.tree_digest(),
+                baseline.and_then(|map| map.root().tree_digest()),
+                ROOT_HEIGHT,
+                0,
+            )? {
+                continue;
+            }
+            let map = files
+                .load_map(&stream, pool)?
+                .ok_or_else(|| invalid("agreed root disappeared"))?;
+            for index in changed_payloads(baseline, &map)? {
+                entries.push(PayloadDescriptor::StreamChunk {
+                    stream,
+                    index,
+                    length: payload_length(&map, index)?,
+                });
             }
         }
         let mut seen = HashSet::new();
-        for map in &loaded {
-            for (_, length, chunk) in extents(map) {
-                if let Chunk::Data(digest) = chunk {
-                    if seen.insert(digest) {
-                        entries.push(PayloadDescriptor::Chunk { digest, length });
-                    }
-                }
-            }
-        }
+        entries.retain(|entry| seen.insert(*entry));
         let members = entries.iter().copied().collect();
         Ok(Self {
             key,
             entries,
             members,
             whole: whole.clone(),
+            baselines,
         })
     }
 
@@ -714,7 +810,6 @@ impl PendingCompositionAcquisition {
         for layer in &lower.layers {
             metadata.extend([layer.recipe, layer.result, layer.index_root, layer.pack.map]);
             metadata.extend(layer.index_pages.iter().copied());
-            metadata.extend(layer.pack.map_pages.iter().copied());
         }
         Some(Self {
             metadata,
@@ -725,7 +820,9 @@ impl PendingCompositionAcquisition {
     fn defers(&self, descriptor: &PayloadDescriptor) -> bool {
         match descriptor {
             PayloadDescriptor::Object { digest, .. } => *digest == self.fsmeta,
-            PayloadDescriptor::StreamMap { .. } | PayloadDescriptor::Chunk { .. } => true,
+            PayloadDescriptor::StreamMap { .. }
+            | PayloadDescriptor::MapNode { .. }
+            | PayloadDescriptor::StreamChunk { .. } => true,
         }
     }
 }
@@ -768,9 +865,17 @@ impl DestinationState {
         let plan = crate::handoff::source::stored_plan(runtime, operation)?;
         let files = OperationFiles::existing(runtime.local_home(), operation)?;
         let whole = retain_whole(runtime, operation, whole_streams(runtime, &plan)?).await?;
+        let pool = StoragePool::open(runtime.local_images_dir())?;
+        let prior = PriorOwner::load(runtime, &plan).await?.map(Arc::new);
         Ok(Self {
-            inventory: Arc::new(Inventory::build(&plan, &files, &whole)?),
-            prior: PriorOwner::load(runtime, &plan).await?.map(Arc::new),
+            inventory: Arc::new(Inventory::build(
+                &plan,
+                &files,
+                &pool,
+                &whole,
+                prior.as_deref(),
+            )?),
+            prior,
             verified: HashSet::new(),
             acquisition: PendingCompositionAcquisition::for_plan(&plan),
         })
@@ -786,7 +891,14 @@ impl DestinationState {
         let files = OperationFiles::existing(runtime.local_home(), operation)?;
         let (key, _) = inventory_key(&plan, &files, &self.inventory.whole)?;
         if key != self.inventory.key {
-            self.inventory = Arc::new(Inventory::build(&plan, &files, &self.inventory.whole)?);
+            let pool = StoragePool::open(runtime.local_images_dir())?;
+            self.inventory = Arc::new(Inventory::build(
+                &plan,
+                &files,
+                &pool,
+                &self.inventory.whole,
+                self.prior.as_deref(),
+            )?);
         }
         Ok(())
     }
@@ -847,7 +959,13 @@ impl DestinationState {
                 let whole =
                     retain_whole(runtime, operation, whole_streams(runtime, &plan)?).await?;
                 let files = OperationFiles::existing(runtime.local_home(), operation)?;
-                self.inventory = Arc::new(Inventory::build(&plan, &files, &whole)?);
+                self.inventory = Arc::new(Inventory::build(
+                    &plan,
+                    &files,
+                    &pool,
+                    &whole,
+                    self.prior.as_deref(),
+                )?);
             }
             Err(error) => {
                 tracing::debug!(%operation, %error, "OCI lower preparation unavailable; requesting retained exact artifacts");
@@ -906,15 +1024,37 @@ impl DestinationState {
             } else {
                 Local::Missing
             }),
-            PayloadDescriptor::Chunk { digest, length } => {
-                if self
-                    .prior
-                    .as_ref()
-                    .is_some_and(|prior| prior.has(&digest, length))
-                {
+            PayloadDescriptor::MapNode { digest, .. } => {
+                Ok(if files.node_bytes(digest, pool)?.is_some() {
+                    Local::Satisfied
+                } else {
+                    Local::Missing
+                })
+            }
+            PayloadDescriptor::StreamChunk {
+                stream,
+                index,
+                length,
+            } => {
+                if files.payload(stream, index)?.is_some_and(|file| {
+                    file.metadata()
+                        .is_ok_and(|metadata| metadata.len() == length)
+                }) {
                     return Ok(Local::Satisfied);
                 }
-                self.object_local(pool, &digest, length)
+                let map = files
+                    .load_map(&stream, pool)?
+                    .ok_or_else(|| invalid("payload root is missing"))?;
+                if map.chunk_size() == ChunkSize::DISK {
+                    if let Chunk::Data(digest) = map.lookup(index)? {
+                        return self.object_local(
+                            pool,
+                            &ObjectDigest::from_sha256(*digest.as_bytes()),
+                            length,
+                        );
+                    }
+                }
+                Ok(Local::Missing)
             }
         }
     }
@@ -935,7 +1075,9 @@ impl DestinationState {
         if cursor.is_none() {
             self.acquire_composition(runtime, operation).await?;
         }
-        self.refresh(runtime, operation)?;
+        if cursor.is_none() {
+            self.refresh(runtime, operation)?;
+        }
         let inventory = self.inventory.clone();
         let start = usize::try_from(cursor.map_or(0, |cursor| cursor.0))
             .ok()
@@ -946,6 +1088,8 @@ impl DestinationState {
         let mut needs = Vec::new();
         let mut candidates = Vec::new();
         let mut index = start;
+        let mut seen_payloads = HashSet::new();
+        let mut seen_nodes = HashSet::new();
         while let Some(descriptor) = inventory.entries.get(index).copied() {
             if needs.len() + candidates.len() == limit as usize {
                 break;
@@ -957,6 +1101,30 @@ impl DestinationState {
             {
                 index += 1;
                 continue;
+            }
+            if let PayloadDescriptor::MapNode { digest, .. } = descriptor {
+                if !seen_nodes.insert(digest) {
+                    index += 1;
+                    continue;
+                }
+            }
+            if let PayloadDescriptor::StreamChunk {
+                stream,
+                index: payload,
+                length,
+            } = descriptor
+            {
+                let map = files
+                    .load_map(&stream, &pool)?
+                    .ok_or_else(|| invalid("payload root disappeared"))?;
+                if map.chunk_size() == ChunkSize::DISK {
+                    if let Chunk::Data(digest) = map.lookup(payload)? {
+                        if !seen_payloads.insert((digest, length)) {
+                            index += 1;
+                            continue;
+                        }
+                    }
+                }
             }
             match self.local(&pool, &files, &descriptor)? {
                 Local::Satisfied => {}
@@ -1026,27 +1194,46 @@ impl DestinationState {
         }
     }
 
-    /// Verified bytes of one chunk from a local source.
+    /// Operation-owned payloads, or root-authenticated prior ranges.
     fn chunk(
-        &mut self,
+        &self,
         pool: &StoragePool,
-        digest: &ObjectDigest,
-        length: u64,
+        files: &OperationFiles,
+        map: &AuthenticatedMap,
+        index: u64,
     ) -> Result<Vec<u8>, LibVmError> {
-        if let Some(bytes) = self
-            .prior
-            .as_ref()
-            .map(|prior| prior.read(digest, length))
-            .transpose()?
-            .flatten()
-        {
+        if let Some(file) = files.payload(map.id(), index)? {
+            let length = payload_length(map, index)?;
+            let mut bytes = vec![0; length as usize];
+            file.read_exact_at(&mut bytes, 0)?;
             return Ok(bytes);
         }
-        let bytes = pool.read_object(digest, length)?;
-        if bytes.len() as u64 != length {
-            return Err(invalid("chunk object length differs from its descriptor"));
+        if map.chunk_size() == ChunkSize::DISK {
+            if let Chunk::Data(digest) = map.lookup(index)? {
+                let digest = ObjectDigest::from_sha256(*digest.as_bytes());
+                if pool.object_path(&digest).is_file() {
+                    let bytes = pool.read_object(&digest, payload_length(map, index)?)?;
+                    return Ok(bytes);
+                }
+            }
         }
-        Ok(bytes)
+        if let Some((file, _)) = self
+            .inventory
+            .baselines
+            .get(&map.id())
+            .and_then(|role| self.prior.as_ref().and_then(|prior| prior.baseline(*role)))
+        {
+            let mut bytes = vec![0; payload_length(map, index)? as usize];
+            file.read_exact_at(
+                &mut bytes,
+                index * crate::storage::limits::CHUNK_SIZE as u64,
+            )?;
+            return Ok(bytes);
+        }
+        Err(invalid(format!(
+            "missing decoded payload {} index {index}",
+            map.id()
+        )))
     }
 }
 
@@ -1057,7 +1244,7 @@ fn whole_streams(runtime: &Runtime, plan: &ApprovedPlan) -> Result<BTreeSet<Stre
     for entry in &plan.body().observation.immutable.streams {
         if pool.stream_path(&entry.stream).is_file() {
             match pool.verify_stream(&entry.stream) {
-                Ok(map) if map.length() == entry.length => {
+                Ok(map) if map.length() == entry.length && map.chunk_size() == ChunkSize::DISK => {
                     whole.insert(entry.stream);
                 }
                 Ok(_) | Err(crate::storage::StorageError::ContentMismatch(_)) => {}
@@ -1196,7 +1383,7 @@ impl HandoffPayloadWriter {
         }
         file.sync_all()?;
         match self.descriptor {
-            PayloadDescriptor::Object { digest, .. } | PayloadDescriptor::Chunk { digest, .. } => {
+            PayloadDescriptor::Object { digest, .. } => {
                 let actual = ObjectDigest::from_sha256(self.hasher.clone().finalize().into());
                 if actual != digest {
                     return Err(invalid("payload bytes do not match their digest"));
@@ -1217,7 +1404,77 @@ impl HandoffPayloadWriter {
                 let mut bytes = Vec::new();
                 file.seek(SeekFrom::Start(0))?;
                 file.take(self.written).read_to_end(&mut bytes)?;
+                let root = crate::handoff::files::decode_map(&stream, &bytes)?;
+                root.validate_role(vm_spec::stream_map::StreamRole::Disk)
+                    .map_err(invalid)?;
+                let plan = crate::handoff::source::stored_plan(&self.runtime, self.operation)?;
+                let mut expected = plan
+                    .body()
+                    .observation
+                    .immutable
+                    .streams
+                    .iter()
+                    .find(|entry| entry.stream == stream)
+                    .map(|entry| entry.length);
+                if let Some(document) = files.load_document(DocumentName::Manifest)? {
+                    let manifest = CaptureManifest::from_document(document)?;
+                    expected = expected.or_else(|| {
+                        manifest
+                            .body()
+                            .files
+                            .iter()
+                            .find(|entry| entry.stream == stream)
+                            .map(|entry| entry.length)
+                    });
+                }
+                if expected != Some(root.length()) {
+                    return Err(invalid(
+                        "stream root length contradicts agreed plan or manifest",
+                    ));
+                }
+                files.advance()?;
                 files.store_map(&stream, &bytes)?;
+            }
+            PayloadDescriptor::MapNode { digest, height, .. } => {
+                let mut bytes = Vec::new();
+                file.seek(SeekFrom::Start(0))?;
+                file.take(self.written).read_to_end(&mut bytes)?;
+                StreamNode::decode(&bytes, height.get())
+                    .map_err(|error| invalid(format!("corrupt map node {digest}: {error}")))?;
+                files.advance()?;
+                files.store_node(digest, &bytes)?;
+            }
+            PayloadDescriptor::StreamChunk {
+                stream,
+                index,
+                length,
+            } => {
+                let pool = StoragePool::open(self.runtime.local_images_dir())?;
+                let map = files
+                    .load_map(&stream, &pool)?
+                    .ok_or_else(|| invalid("payload has no agreed root"))?;
+                if payload_length(&map, index)? != length {
+                    return Err(invalid("payload geometry contradicts root"));
+                }
+                let mut bytes = Vec::with_capacity(length as usize);
+                file.seek(SeekFrom::Start(0))?;
+                (&mut file).take(length).read_to_end(&mut bytes)?;
+                crate::image::transport::identity::verify_payload(&map, index, &bytes)?;
+                if map.chunk_size() == ChunkSize::DISK {
+                    let digest = ObjectDigest::from_sha256(self.hasher.clone().finalize().into());
+                    file.seek(SeekFrom::Start(0))?;
+                    let path = self.staging.path().join(&self.name);
+                    let (published, roots) = pool.publish_object_file_for_catalog(file, &path)?;
+                    if published.digest != digest {
+                        return Err(invalid("published payload SHA mismatch"));
+                    }
+                    store
+                        .pin_handoff_dependencies(self.operation, &[], &[digest])
+                        .await?;
+                    drop(roots);
+                } else {
+                    files.store_payload(stream, index, &bytes)?;
+                }
             }
         }
         self.staging.remove_tree(&self.name)?;
@@ -1241,26 +1498,57 @@ impl Drop for HandoffPayloadWriter {
     }
 }
 
-/// Build one stream's exact bytes into `file` from local verified sources.
+/// Authenticate decoded identities while materializing, without a second file pass.
 fn assemble(
-    state: &mut DestinationState,
+    state: &DestinationState,
     pool: &StoragePool,
-    map: &StreamMap,
+    files: &OperationFiles,
+    map: &AuthenticatedMap,
     file: &std::fs::File,
-) -> Result<(), LibVmError> {
+) -> Result<AuthenticatedMap, LibVmError> {
+    let staging = files.staging()?;
+    let mut identity = crate::image::transport::identity::IdentityBuilder::new(
+        &staging,
+        map.length(),
+        map.role(),
+    )?;
+    let mut present = map.present_chunks().peekable();
     file.set_len(map.length())?;
-    for (offset, length, chunk) in extents(map) {
-        if let Chunk::Data(digest) = chunk {
-            let bytes = state.chunk(pool, &digest, length)?;
-            file.write_all_at(&bytes, offset)?;
+    let mut written = 0;
+    while let Some(chunk) = present.next() {
+        let chunk = chunk?;
+        let index =
+            chunk.index * map.chunk_size().bytes() / crate::storage::limits::CHUNK_SIZE as u64;
+        let offset = index * crate::storage::limits::CHUNK_SIZE as u64;
+        if offset > written {
+            identity.push_zeros(offset - written)?;
+        }
+        let bytes = state.chunk(pool, files, map, index)?;
+        identity.push(&bytes)?;
+        file.write_all_at(&bytes, offset)?;
+        written = offset + bytes.len() as u64;
+        loop {
+            if let Some(Err(error)) = present.peek() {
+                return Err(invalid(error));
+            }
+            let Some(Ok(next)) = present.peek() else {
+                break;
+            };
+            if next.index * map.chunk_size().bytes() >= written {
+                break;
+            }
+            present.next();
         }
     }
-    file.sync_all()?;
-    let rehashed = StreamHasher::new().hash_open_file(file, map.length())?.map;
-    if rehashed != *map {
-        return Err(invalid("assembled stream does not reproduce its map"));
+    if written < map.length() {
+        identity.push_zeros(map.length() - written)?;
     }
-    Ok(())
+    let produced = identity.finish()?;
+    if produced.id() != map.id() {
+        return Err(invalid("assembled stream does not reproduce agreed root"));
+    }
+    file.sync_all()?;
+    Ok(produced)
 }
 
 /// Destination storage for this plan and cut. Deterministic, so commit can
@@ -1363,26 +1651,47 @@ pub(crate) async fn prepare(
     readmit(runtime, &plan).await?;
     let missing = state.missing(runtime, store, operation).await?;
     if missing != 0 {
+        let pool = StoragePool::open(runtime.local_images_dir())?;
+        for descriptor in &state.inventory.entries {
+            if let PayloadDescriptor::MapNode { digest, .. } = descriptor {
+                if files.node_bytes(*digest, &pool)?.is_none() {
+                    return Err(invalid(format!(
+                        "missing map node {digest}: handoff cannot prepare"
+                    )));
+                }
+            }
+        }
         return Err(invalid(format!(
             "handoff payload is incomplete: {missing} descriptors missing"
         )));
     }
     let body = plan.body();
+    let pool = StoragePool::open(runtime.local_images_dir())?;
     let mut rebuilt = Vec::new();
     for entry in &body.observation.immutable.streams {
         // Whole streams were pinned when the destination state was loaded.
         if !state.inventory.whole.contains(&entry.stream) {
             let map = files
-                .load_map(&entry.stream)?
+                .load_map(&entry.stream, &pool)?
                 .ok_or_else(|| invalid("immutable stream map is missing"))?;
+            if map.length() != entry.length || map.chunk_size() != ChunkSize::DISK {
+                return Err(invalid(
+                    "immutable root profile or length contradicts agreed plan",
+                ));
+            }
             rebuilt.push((entry.stream, map));
         }
     }
     let mut outputs = Vec::new();
     for captured in &manifest.body().files {
         let map = files
-            .load_map(&captured.stream)?
+            .load_map(&captured.stream, &pool)?
             .ok_or_else(|| invalid("captured stream map is missing"))?;
+        if map.length() != captured.length || map.chunk_size() != ChunkSize::DISK {
+            return Err(invalid(
+                "captured root profile or length contradicts agreed manifest",
+            ));
+        }
         let name = prepared_name(manifest.capture(), captured.role, &body.observation.storage);
         outputs.push((name, captured.length, map));
     }
@@ -1390,34 +1699,14 @@ pub(crate) async fn prepare(
         prepare_demand(runtime, body.destination_machine, &rebuilt, &outputs)?,
         available_bytes(runtime)?,
     )?;
-    let pool = StoragePool::open(runtime.local_images_dir())?;
-    // Immutable streams absent as whole files are rebuilt and published.
-    for (stream, map) in &rebuilt {
+    let mut staged_streams = Vec::new();
+    for (_, map) in &rebuilt {
         let staging = files.staging()?;
         let name = format!("{}.stream", uuid::Uuid::new_v4());
         let file = crate::image::transport::blobs::create_private_file(&staging, &name)?;
-        let result = (|| {
-            assemble(state, &pool, map, &file)?;
-            Ok::<_, LibVmError>(pool.publish_stream_file_for_catalog(file, map.length())?)
-        })();
         staging.remove_tree(&name)?;
-        let (published, roots) = result?;
-        if published.id != *stream {
-            return Err(invalid(
-                "rebuilt immutable stream differs from its identity",
-            ));
-        }
-        store
-            .pin_handoff_dependencies(operation, &[*stream], &[])
-            .await?;
-        drop(roots);
-    }
-    if let Some(lower) = &body.observation.immutable.composition {
-        authenticate_lower(lower, &pool, &body.observation.storage)?;
-        crate::store::layer_store::LayerStore::open(runtime.local_home())
-            .await?
-            .publish_snapshot_composition(operation.as_uuid(), lower)
-            .await?;
+        let produced = assemble(state, &pool, &files, map, &file)?;
+        staged_streams.push((file, produced));
     }
     // Pin and qualify the approved boot tuple from this pool only.
     let prior = match runtime.machine_config(body.destination_machine).await? {
@@ -1440,9 +1729,10 @@ pub(crate) async fn prepare(
     storage.boot = pinned;
     // Private writable files, named by capture, beside any prior-owner files.
     let directory = machine_directory(runtime, body.destination_machine)?;
+    let mut admitted_maps = Vec::new();
     for (name, length, map) in &outputs {
         if let Some(existing) = directory.open_file(name)? {
-            let rehashed = StreamHasher::new()
+            let rehashed = StreamHasher::new(map.chunk_size())
                 .hash_open_file(&existing, *length)
                 .map(|scan| scan.map);
             if existing.metadata()?.len() == *length
@@ -1451,27 +1741,65 @@ pub(crate) async fn prepare(
                 // Equal bytes may still be dirty pages of an interrupted
                 // write; the prepared receipt promises durable data.
                 existing.sync_all()?;
+                admitted_maps.push(rehashed.map_err(invalid)?);
                 continue;
             }
             directory.remove_tree(name)?;
         }
         let file = crate::image::transport::blobs::create_private_file(&directory, name)?;
-        if let Err(error) = assemble(state, &pool, map, &file) {
-            directory.remove_tree(name)?;
-            return Err(error);
+        match assemble(state, &pool, &files, map, &file) {
+            Ok(produced) => admitted_maps.push(produced),
+            Err(error) => {
+                directory.remove_tree(name)?;
+                return Err(error);
+            }
         }
     }
     validate_prepared_upper(&storage, &directory)?;
     directory.sync()?;
+    for map in admitted_maps
+        .iter()
+        .chain(staged_streams.iter().map(|(_, map)| map))
+    {
+        crate::store::snapshot_store::publish_map(&pool, store, operation.as_uuid(), map).await?;
+    }
+    for (file, map) in staged_streams {
+        let (published, roots) = pool.publish_sealed_stream_for_catalog(
+            &file,
+            &map,
+            None,
+            crate::storage::pool::SealedStreamPublicationMode::CopyAllowed,
+        )?;
+        if published.map().id() != map.id() {
+            return Err(invalid(
+                "published immutable stream differs from agreed root",
+            ));
+        }
+        store
+            .pin_handoff_dependencies(operation, &[map.id()], &[])
+            .await?;
+        drop(roots);
+    }
+    if let Some(lower) = &body.observation.immutable.composition {
+        authenticate_lower(lower, &pool, &body.observation.storage)?;
+        crate::store::layer_store::LayerStore::open(runtime.local_home())
+            .await?
+            .publish_snapshot_composition(operation.as_uuid(), lower)
+            .await?;
+    }
     store.prepare_handoff_destination(binding).await
 }
 
 /// Nonzero bytes of one stream; private outputs are written sparse.
-fn data_bytes(map: &StreamMap) -> u64 {
-    extents(map)
-        .filter(|(_, _, chunk)| matches!(chunk, Chunk::Data(_)))
-        .map(|(_, length, _)| length)
-        .sum()
+fn data_bytes(map: &AuthenticatedMap) -> Result<u64, LibVmError> {
+    let mut total = 0u64;
+    for chunk in map.present_chunks() {
+        let range = map.root().chunk_range(chunk?.index).map_err(invalid)?;
+        total = total
+            .checked_add(range.end - range.start)
+            .ok_or_else(|| invalid("stream data size overflow"))?;
+    }
+    Ok(total)
 }
 
 /// Bytes prepare may still allocate while every received chunk stays pinned:
@@ -1480,8 +1808,8 @@ fn data_bytes(map: &StreamMap) -> u64 {
 fn prepare_demand(
     runtime: &Runtime,
     machine: MachineId,
-    rebuilt: &[(StreamId, StreamMap)],
-    outputs: &[(String, u64, StreamMap)],
+    rebuilt: &[(StreamId, AuthenticatedMap)],
+    outputs: &[(String, u64, AuthenticatedMap)],
 ) -> Result<u64, LibVmError> {
     let existing = OwnedDirectory::open_existing_root(&crate::paths::machine_data_dir_in(
         runtime.local_home(),
@@ -1490,7 +1818,7 @@ fn prepare_demand(
     let mut required = 0u64;
     for (_, map) in rebuilt {
         required = required
-            .saturating_add(data_bytes(map))
+            .saturating_add(data_bytes(map)?)
             .saturating_add(map.length());
     }
     for (name, _, map) in outputs {
@@ -1499,7 +1827,7 @@ fn prepare_demand(
             None => false,
         };
         if !present {
-            required = required.saturating_add(data_bytes(map));
+            required = required.saturating_add(data_bytes(map)?);
         }
     }
     Ok(required)
@@ -1667,10 +1995,12 @@ pub(crate) async fn commit(
         authorization,
         &plan,
         &storage,
-        publication,
-        prior.as_ref().map(|(config, _)| config.lock_id),
-        lock.as_ref().map(|lock| lock.id()),
-        created_at,
+        PublicationContext {
+            publication,
+            prior_lock: prior.as_ref().map(|(config, _)| config.lock_id),
+            new_lock: lock.as_ref().map(|lock| lock.id()),
+            created_at,
+        },
     )
     .await;
     match result {
@@ -1703,18 +2033,27 @@ pub(crate) async fn commit(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct PublicationContext {
+    publication: HandoffPublication,
+    prior_lock: Option<crate::lock_manager::LockId>,
+    new_lock: Option<crate::lock_manager::LockId>,
+    created_at: i64,
+}
+
 async fn publish(
     runtime: &Runtime,
     store: &Store,
     authorization: &CommitAuthorization,
     plan: &ApprovedPlan,
     storage: &MachineStorageRecord,
-    publication: HandoffPublication,
-    prior_lock: Option<crate::lock_manager::LockId>,
-    new_lock: Option<crate::lock_manager::LockId>,
-    created_at: i64,
+    context: PublicationContext,
 ) -> Result<TerminalReceipt, LibVmError> {
+    let PublicationContext {
+        publication,
+        prior_lock,
+        new_lock,
+        created_at,
+    } = context;
     let body = plan.body();
     let machine = body.destination_machine;
     let machine_dir = crate::paths::machine_data_dir_in(runtime.local_home(), machine);
@@ -1798,11 +2137,14 @@ struct EntryIdentity {
 
 impl EntryIdentity {
     // stat field widths differ between Linux and Darwin.
-    #[allow(clippy::unnecessary_cast)]
     fn of(stat: &nix::sys::stat::FileStat) -> Self {
+        #[cfg(target_os = "macos")]
+        let device = stat.st_dev as u64;
+        #[cfg(not(target_os = "macos"))]
+        let device = stat.st_dev;
         Self {
-            device: stat.st_dev as u64,
-            inode: stat.st_ino as u64,
+            device,
+            inode: stat.st_ino,
         }
     }
 
@@ -2136,6 +2478,7 @@ pub(crate) async fn abort(
 mod tests {
     use crate::handoff::destination::{admit_space, data_bytes, SpaceDemand};
     use crate::storage::limits::CHUNK_SIZE;
+    use vm_spec::stream_map::ChunkSize;
 
     const MIB: u64 = 1024 * 1024;
 
@@ -2161,6 +2504,7 @@ mod tests {
             missing_streams: 32 * MIB,
             missing_objects: 40 * MIB,
             largest_object: 24 * MIB,
+            metadata: 0,
         };
         assert_eq!(cold.required(), 128 * MIB + 96 * MIB + 40 * MIB + 24 * MIB);
         let saturated = SpaceDemand {
@@ -2176,11 +2520,11 @@ mod tests {
         let mut bytes = vec![0u8; chunk * 3 + 4096];
         bytes[chunk + 7] = 1;
         bytes[chunk * 3 + 1] = 2;
-        let map = crate::storage::stream::StreamHasher::new()
+        let map = crate::storage::stream::StreamHasher::new(ChunkSize::DISK)
             .hash_reader(&bytes[..])
             .unwrap();
         assert_eq!(map.length(), bytes.len() as u64);
-        assert_eq!(data_bytes(&map), CHUNK_SIZE as u64 + 4096);
+        assert_eq!(data_bytes(&map).unwrap(), CHUNK_SIZE as u64 + 4096);
     }
 
     #[cfg(target_os = "linux")]
@@ -2213,7 +2557,7 @@ mod tests {
             published.digest
         };
         let digest = publish();
-        let descriptor = PayloadDescriptor::Chunk {
+        let descriptor = PayloadDescriptor::Object {
             digest,
             length: bytes.len() as u64,
         };
@@ -2254,5 +2598,119 @@ mod tests {
             state.local(&pool, &files, &descriptor).unwrap(),
             Local::Satisfied
         ));
+    }
+
+    #[test]
+    fn relocation_payloads_follow_root_differences_at_both_profiles() {
+        use crate::handoff::chunks::changed_payloads;
+        use crate::handoff::destination::{
+            assemble, DestinationState, Inventory, InventoryKey, PriorOwner,
+        };
+        use crate::handoff::files::OperationFiles;
+        use crate::handoff::plan::WritableRole;
+        use crate::handoff::types::OperationId;
+        use crate::storage::pool::StoragePool;
+        use crate::storage::stream::StreamHasher;
+        use std::collections::{BTreeMap, BTreeSet, HashSet};
+        use std::os::unix::fs::FileExt;
+        use std::sync::Arc;
+
+        for profile in [ChunkSize::DISK, ChunkSize::RAM] {
+            let home = tempfile::tempdir().unwrap();
+            let files = OperationFiles::create(
+                home.path(),
+                OperationId::new(uuid::Uuid::new_v4()).unwrap(),
+            )
+            .unwrap();
+            let pool = StoragePool::open(&home.path().join("images")).unwrap();
+            let size = CHUNK_SIZE * 3 + 4096;
+            let mut bytes = vec![0x37; size];
+            let mut baseline = StreamHasher::new(profile).hash_reader(&bytes[..]).unwrap();
+            let mut prior = tempfile::tempfile().unwrap();
+            prior.write_all_at(&bytes, 0).unwrap();
+            for cycle in 0..3 {
+                // Two scattered 4 KiB edits in payload 0 and one in payload 2.
+                bytes[4096..8192].fill(0x51 + cycle);
+                bytes[2 * 65536 + 4096..2 * 65536 + 8192].fill(0x61 + cycle);
+                bytes[CHUNK_SIZE * 2 + 4096..CHUNK_SIZE * 2 + 8192].fill(0x71 + cycle);
+                if cycle == 1 {
+                    bytes[CHUNK_SIZE..CHUNK_SIZE * 2].fill(0);
+                    bytes[CHUNK_SIZE * 3..].fill(0);
+                }
+                let map = StreamHasher::new(profile).hash_reader(&bytes[..]).unwrap();
+                let changed = changed_payloads(Some(&baseline), &map).unwrap();
+                assert_eq!(changed, BTreeSet::from([0, 2]));
+                let mut sent = 0;
+                for index in changed {
+                    let start = index as usize * CHUNK_SIZE;
+                    let end = (start + CHUNK_SIZE).min(size);
+                    crate::image::transport::identity::verify_payload(
+                        &map,
+                        index,
+                        &bytes[start..end],
+                    )
+                    .unwrap();
+                    files
+                        .store_payload(map.id(), index, &bytes[start..end])
+                        .unwrap();
+                    sent += 1;
+                }
+                assert_eq!(sent, 2);
+                let inventory = Inventory {
+                    key: InventoryKey {
+                        manifest: true,
+                        maps: BTreeSet::from([map.id()]),
+                        revision: 0,
+                    },
+                    entries: Vec::new(),
+                    members: HashSet::new(),
+                    whole: BTreeSet::new(),
+                    baselines: BTreeMap::from([(map.id(), WritableRole::Root)]),
+                };
+                let state = DestinationState {
+                    inventory: Arc::new(inventory),
+                    prior: Some(Arc::new(PriorOwner {
+                        files: vec![(WritableRole::Root, prior, baseline)],
+                    })),
+                    verified: HashSet::new(),
+                    acquisition: None,
+                };
+                let output = tempfile::tempfile().unwrap();
+                let reproduced = assemble(&state, &pool, &files, &map, &output).unwrap();
+                assert_eq!(reproduced.id(), map.id());
+                assert_eq!(reproduced.chunk_size(), profile);
+                let mut actual = vec![0; size];
+                output.read_exact_at(&mut actual, 0).unwrap();
+                assert_eq!(actual, bytes);
+                assert!(changed_payloads(Some(&reproduced), &map)
+                    .unwrap()
+                    .is_empty());
+                baseline = reproduced;
+                prior = output;
+            }
+        }
+    }
+
+    #[test]
+    fn zero_transitions_preserve_mixed_payloads_and_short_tails() {
+        use crate::handoff::chunks::changed_payloads;
+        use crate::storage::stream::StreamHasher;
+        for profile in [ChunkSize::RAM, ChunkSize::DISK] {
+            let mut bytes = vec![0x29; CHUNK_SIZE + 4096];
+            let before = StreamHasher::new(profile).hash_reader(&bytes[..]).unwrap();
+            bytes[..profile.bytes() as usize].fill(0);
+            let mixed = StreamHasher::new(profile).hash_reader(&bytes[..]).unwrap();
+            let changed = changed_payloads(Some(&before), &mixed).unwrap();
+            if profile == ChunkSize::RAM {
+                assert_eq!(changed, std::collections::BTreeSet::from([0]));
+            } else {
+                assert!(changed.is_empty());
+            }
+            bytes[CHUNK_SIZE..].fill(0);
+            let zero_tail = StreamHasher::new(profile).hash_reader(&bytes[..]).unwrap();
+            assert!(changed_payloads(Some(&mixed), &zero_tail)
+                .unwrap()
+                .is_empty());
+        }
     }
 }

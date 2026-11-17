@@ -118,7 +118,7 @@ fn check_fixture(fixture: &Fixture, output: Option<&Path>) -> Value {
             )
             .expect("save index");
             std::fs::write(
-                out.join(format!("layer-{index}.stream.json")),
+                out.join(format!("layer-{index}.stream.root")),
                 &expected.stream_record,
             )
             .expect("save stream record");
@@ -236,7 +236,7 @@ fn retain_actual(stage: &StagedChangeset, directory: &Path) -> Value {
         );
     }
     let (stream_record, stream) = crate::support::abi::stream_file_identity(&pack);
-    retain("stream.json", &stream_record);
+    retain("stream.root", &stream_record);
     let recipe = LayerRecipe {
         diff_id: stage.changeset().diff_id,
     };
@@ -251,7 +251,7 @@ fn retain_actual(stage: &StagedChangeset, directory: &Path) -> Value {
         pack_length: stage.pack_length(),
         index_root: encoded.root.digest,
     };
-    let result_record = serde_json::to_vec(&json!({"indexRoot":encoded.root.digest,"kind":"layer-result","packLength":stage.pack_length(),"packStream":stream,"recipe":independent_recipe,"schema":1})).unwrap();
+    let result_record = serde_json::to_vec(&json!({"indexRoot":encoded.root.digest,"kind":"layer-result","packLength":stage.pack_length(),"packStream":stream,"recipe":independent_recipe,"schema":2})).unwrap();
     assert_eq!(result.canonical_bytes().unwrap(), result_record);
     let independent_result = crate::support::abi::domain("layer-result", &result_record);
     assert_eq!(result.id().unwrap().to_string(), independent_result);
@@ -562,7 +562,7 @@ mod tests {
                     expected.root
                 );
                 assert_eq!(
-                    std::fs::read(prefix.join(format!("layer-{index}.stream.json"))).unwrap(),
+                    std::fs::read(prefix.join(format!("layer-{index}.stream.root"))).unwrap(),
                     expected.stream_record
                 );
                 assert_eq!(

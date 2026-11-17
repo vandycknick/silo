@@ -282,6 +282,8 @@ fn bind_raw_handles(config: &mut crate::krun::KrunConfig, handles: &[OwnedFd]) -
                 .disk_tracking_seeds
                 .push(vm_spec::capture::DiskTrackingSeed {
                     version: vm_spec::capture::DISK_TRACKING_VERSION,
+                    map_format: 2,
+                    chunk_shift: 23,
                     role: disk.role,
                     attachment_index: disk_index as u32,
                     block_id: disk.block_id.clone(),

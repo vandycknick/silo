@@ -66,8 +66,26 @@ pub enum SnapshotPurpose {
 pub struct SnapshotStream {
     pub stream: StreamId,
     pub map: ObjectDigest,
-    pub map_pages: Vec<ObjectDigest>,
+    pub chunk_size: u64,
     pub length: u64,
+}
+
+impl SnapshotStream {
+    pub(crate) fn validate_profile(
+        &self,
+        role: vm_spec::stream_map::StreamRole,
+    ) -> Result<(), LibVmError> {
+        if self.map.as_bytes() != self.stream.as_bytes()
+            || self.chunk_size != role.chunk_size().bytes()
+        {
+            return Err(invalid(
+                "stream root identity or identity profile is invalid",
+            ));
+        }
+        vm_spec::stream_map::StreamRoot::empty(self.length, role.chunk_size())
+            .and_then(|root| root.validate_role(role))
+            .map_err(invalid)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -169,14 +187,9 @@ impl SnapshotComposition {
             .check(self.layers.len() as u64)
             .map_err(crate::storage::StorageError::from)?;
         for layer in &self.layers {
-            let expected_pages = layer
+            layer
                 .pack
-                .length
-                .div_ceil(crate::storage::limits::CHUNK_SIZE as u64)
-                .div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
-            if layer.pack.map_pages.len() as u64 != expected_pages {
-                return Err(invalid("layer pack map page count contradicts its length"));
-            }
+                .validate_profile(vm_spec::stream_map::StreamRole::Pack)?;
             if layer.index_pages.windows(2).any(|pair| pair[0] >= pair[1])
                 || layer.index_pages.contains(&layer.index_root)
             {
@@ -481,7 +494,7 @@ impl SnapshotRecord {
     }
 
     fn validate_semantics(&self) -> Result<(), LibVmError> {
-        if self.schema != 1 {
+        if self.schema != 2 {
             return Err(invalid("unsupported snapshot schema"));
         }
         Resource::IncludedDisks
@@ -501,15 +514,15 @@ impl SnapshotRecord {
             logical = logical
                 .checked_add(stream.length)
                 .ok_or_else(|| invalid("snapshot closure length overflow"))?;
-            let expected_pages = stream
-                .length
-                .div_ceil(crate::storage::limits::CHUNK_SIZE as u64)
-                .div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
-            if stream.map_pages.len() as u64 != expected_pages {
-                return Err(invalid(
-                    "snapshot stream map page count contradicts its length",
-                ));
-            }
+            let role = match &self.capture {
+                SnapshotCaptureKind::LiveExecution { execution }
+                    if stream.stream == execution.memory.stream =>
+                {
+                    vm_spec::stream_map::StreamRole::Ram
+                }
+                _ => vm_spec::stream_map::StreamRole::Disk,
+            };
+            stream.validate_profile(role)?;
         }
         Resource::ArtifactStreamBytes
             .check(logical)
@@ -709,7 +722,6 @@ impl SnapshotRecord {
         for stream in self.storage_streams() {
             streams.insert(stream.stream);
             objects.insert(stream.map);
-            objects.extend(stream.map_pages.iter().copied());
         }
         if let Some(lower) = self.lower() {
             objects.extend(lower.objects());
@@ -741,7 +753,6 @@ impl SnapshotRecord {
         if let SnapshotCaptureKind::LiveExecution { execution } = &self.capture {
             streams.insert(execution.memory.stream);
             objects.insert(execution.memory.map);
-            objects.extend(execution.memory.map_pages.iter().copied());
             objects.extend([execution.layout, execution.execution, execution.devices]);
         }
         Ok((streams, objects))
@@ -750,7 +761,7 @@ impl SnapshotRecord {
 
 pub(crate) fn snapshot_id(canonical: &[u8]) -> SnapshotId {
     let mut hash = Sha256::new();
-    hash.update(b"silo:snapshot:v1\n");
+    hash.update(b"silo:snapshot:v2\n");
     hash.update(canonical);
     SnapshotId::from_sha256(hash.finalize().into())
 }
@@ -1063,11 +1074,11 @@ pub(crate) mod tests {
 
     pub(crate) fn record(
         stream: StreamId,
-        map: ObjectDigest,
+        _map: ObjectDigest,
         kernel: ObjectDigest,
     ) -> SnapshotRecord {
         SnapshotRecord {
-            schema: 1,
+            schema: 2,
             kind: SnapshotKind::Snapshot,
             capture: SnapshotCaptureKind::StoppedStorage {
                 stop_outcome: StorageStopOutcome::Unknown,
@@ -1077,8 +1088,8 @@ pub(crate) mod tests {
                 profile: crate::store::models::snapshot::SnapshotRootProfile::OpaqueRaw,
                 stream: SnapshotStream {
                     stream,
-                    map,
-                    map_pages: vec![map],
+                    map: ObjectDigest::from_sha256(*stream.as_bytes()),
+                    chunk_size: vm_spec::stream_map::ChunkSize::DISK.bytes(),
                     length: 512,
                 },
                 geometry: vm_spec::DiskGeometry {
@@ -1207,7 +1218,7 @@ pub(crate) mod tests {
         );
         let value = serde_json::to_value(&record).unwrap();
         for (field, replacement) in [
-            ("schema", serde_json::json!(2)),
+            ("schema", serde_json::json!(1)),
             ("captureKind", serde_json::json!("stopped")),
             ("captureKind", serde_json::json!("live-execution")),
             ("purpose", serde_json::json!("generalized-image")),
@@ -1294,8 +1305,10 @@ pub(crate) mod tests {
             .unwrap();
         let mut record = record(stream, digest, digest);
         let mut memory = record.root.stream.clone();
+        memory.stream = StreamId::from_sha256([1; 32]);
+        memory.map = ObjectDigest::from_sha256([1; 32]);
         memory.length = 1 << 40;
-        memory.map_pages = vec![digest; 32];
+        memory.chunk_size = vm_spec::stream_map::ChunkSize::RAM.bytes();
         record.capture = SnapshotCaptureKind::LiveExecution {
             execution: Box::new(SnapshotExecution {
                 memory,
@@ -1327,7 +1340,6 @@ pub(crate) mod tests {
         }
         if let SnapshotCaptureKind::LiveExecution { execution } = &mut record.capture {
             execution.memory.length += crate::storage::limits::CHUNK_SIZE as u64;
-            execution.memory.map_pages.push(digest);
         }
         assert!(record.validate().is_err());
     }
@@ -1348,8 +1360,8 @@ pub(crate) mod tests {
                 index_pages: vec![digest(7)],
                 pack: SnapshotStream {
                     stream: StreamId::from_sha256([8; 32]),
-                    map: digest(9),
-                    map_pages: vec![digest(10)],
+                    map: digest(8),
+                    chunk_size: vm_spec::stream_map::ChunkSize::DISK.bytes(),
                     length: 4096,
                 },
             }],

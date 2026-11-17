@@ -243,15 +243,13 @@ checkpoint establishes the baseline. The current memory probe has fixed
 and overwrites exactly 410 MiB there using `dd if=/dev/urandom bs=1M count=410
 conv=notrunc` before each timed checkpoint. This is 10.009765625 percent of
 configured 4096 MiB RAM, the requested whole-MiB rounding of ten percent.
-The 1 s target applies to this defined contiguous 410 MiB region under the
-unchanged 8 MiB chunk identity, not arbitrary dirty-page placement. Scattered
-dirty pages can require up to a full-RAM rehash, visible through
-`identityBytesHashed`. Guest kernel, agent and witness activity can dirty
-additional pages. Samples
-record the exact workload byte count and fraction separately from
-`productDirtyFraction`, derived from the product's
-`memory.stats.identityBytesHashed / logicalBytes` at its 8 MiB chunk resolution;
-the product exposes no separate page-granular dirty-fraction field.
+The 1 s target applies to this defined contiguous 410 MiB region, not arbitrary
+dirty-page placement. RAM now uses 64 KiB identities; scattered dirty pages can
+still require up to a full-RAM rehash. Guest kernel, agent and witness activity
+can dirty additional pages. Samples record exact workload bytes and fraction
+separately from `productDirtyFraction`, derived from actual nonzero
+`memory.stats.identityBytesHashed / logicalBytes`. This is SHA input volume,
+not page-granular dirty coverage. Native change records are recorded separately.
 They retain the complete memory receipt, exact pause, independent workload gap,
 pause-to-seal latency and separate one-upper copy and disk-sealing allowance
 inputs. Copy allowance is zero on reflink filesystems or allocated source-upper

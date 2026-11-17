@@ -14,6 +14,7 @@ use libkrun::live::restore::*;
 use libkrun::live::*;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use vm_spec::capture::{CaptureRamChanges, CaptureRamCoverage, Sha256Digest};
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -216,8 +217,20 @@ pub(crate) fn main() -> eyre::Result<()> {
     let mux = mux.ok_or_else(|| eyre::eyre!("mux role missing"))?;
     let mut worker = None;
     let mut queued_public = None;
+    let map_node_store = if let Some(directory) = &launch.restore {
+        let manifest = load(&directory.join("api-capture.json"))?;
+        let path: PathBuf = serde_json::from_value(manifest["map_node_store"].clone())?;
+        ensure!(
+            path.is_absolute() && path.is_dir(),
+            "retained restore node store"
+        );
+        path
+    } else {
+        std::fs::canonicalize(&launch.binding)?.join(vm_spec::capture::CAPTURE_MAP_NODES_DIRECTORY)
+    };
     let mut install_thread = |control: Control, token: Option<RestoreToken>| -> io::Result<()> {
         let binding = launch.binding.clone();
+        let map_node_store = map_node_store.clone();
         let disks: Vec<PathBuf> = raw_handles
             .iter()
             .map(|fd| PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())))
@@ -227,7 +240,7 @@ pub(crate) fn main() -> eyre::Result<()> {
                 .name("native-api-proof-control".into())
                 .spawn(move || {
                     let cleanup = control.clone();
-                    let outcome = command_loop(control, token, binding, disks);
+                    let outcome = command_loop(control, token, binding, disks, map_node_store);
                     if outcome.is_err() {
                         // Malformed input never strands a native event-loop owner.
                         cleanup.stop(OperationId(u64::MAX), deadline())?;
@@ -550,25 +563,23 @@ fn restored_inputs(
         binding,
     };
     let map_identity = object_identity(&files.ram_map, &manifest["ram_map"])?;
-    ensure!(
-        map_identity.length <= vm_spec::capture::MAX_RAM_MAP_BYTES as u64,
-        "complete map bound"
-    );
-    let mut map_bytes = vec![0; map_identity.length as usize];
-    std::os::unix::fs::FileExt::read_exact_at(&files.ram_map, &mut map_bytes, 0)?;
-    ensure!(
-        map_bytes.len() as u64 == map_identity.length
-            && <[u8; 32]>::from(Sha256::digest(&map_bytes)) == map_identity.sha256,
-        "complete map file SHA"
-    );
-    let map =
-        vm_spec::capture::StreamMap::decode(&map_bytes).map_err(|error| eyre::eyre!(error))?;
+    let map = crate::native_stream_map::read_root(&files.ram_map)?;
     ensure!(
         map.length() == files.ram.metadata()?.len()
             && map.id().as_bytes() == &expected.ram_image.stream
-            && map.canonical_bytes().map_err(|error| eyre::eyre!(error))? == map_bytes,
-        "exact canonical restored map authority"
+            && map.id().as_bytes() == &map_identity.sha256
+            && map.canonical_bytes()?.len() as u64 == map_identity.length,
+        "exact canonical restored root authority"
     );
+    let node_store: PathBuf = serde_json::from_value(manifest["map_node_store"].clone())?;
+    ensure!(
+        node_store.is_absolute() && node_store.is_dir(),
+        "retained restore node store"
+    );
+    let mut nodes = crate::native_stream_map::DirectoryNodes::new(node_store)?;
+    for chunk in map.present_chunks(&mut nodes) {
+        chunk?;
+    }
     let attachment = |id: &str| -> eyre::Result<RestoreAttachment> {
         let values = manifest["attachments"]
             .as_array()
@@ -659,6 +670,7 @@ struct Commands {
     disks: Vec<PathBuf>,
     current: Option<(CaptureTicket, PathBuf)>,
     baselines: Vec<BaselineToken>,
+    map_node_store: PathBuf,
 }
 impl Commands {
     fn operation(&mut self) -> eyre::Result<OperationId> {
@@ -769,11 +781,14 @@ impl Commands {
         let output_directory = mode.strip_prefix("enospc:").map_or(directory, Path::new);
         let ram = new_output(&output_directory.join("memory.ram"))?;
         let layout_output = new_output(&output_directory.join("memory-layout.json"))?;
+        let changes_output =
+            new_output(&output_directory.join(vm_spec::capture::CAPTURE_RAM_CHANGES_FILE))?;
         reply(
             "OUTPUTS",
             &json!({"directory":output_directory,
             "ram":[ram.metadata()?.dev(),ram.metadata()?.ino()],
-            "layout":[layout_output.metadata()?.dev(),layout_output.metadata()?.ino()]}),
+            "layout":[layout_output.metadata()?.dev(),layout_output.metadata()?.ino()],
+            "changes":[changes_output.metadata()?.dev(),changes_output.metadata()?.ino()]}),
         )?;
         let memory = self.control.capture_memory(
             &execution.ticket,
@@ -781,6 +796,7 @@ impl Commands {
             MemoryOutputs {
                 ram,
                 layout: layout_output,
+                changes: changes_output,
             },
             operation,
             if mode == "timeout" {
@@ -790,25 +806,31 @@ impl Commands {
             },
         )?;
         ensure!(memory.ram.writers_closed(), "native RAM writers still open");
-        // The raw native harness uses the same mandatory complete-map restore
-        // role as managed launches. This reads immutable output, never live RAM.
-        let mut input = File::open(output_directory.join("memory.ram"))?;
-        let length = input.metadata()?.len();
-        let mut chunks = Vec::new();
-        let mut scratch = vec![0; vm_spec::capture::STREAM_CHUNK_BYTES as usize];
-        let mut offset = 0;
-        while offset < length {
-            let span = (length - offset).min(scratch.len() as u64) as usize;
-            input.read_exact(&mut scratch[..span])?;
-            chunks.push(if scratch[..span].iter().all(|byte| *byte == 0) {
-                None
-            } else {
-                Some(vm_spec::capture::Sha256Digest::of_bytes(&scratch[..span]))
-            });
-            offset += span as u64;
-        }
-        let map =
-            vm_spec::capture::StreamMap::new(length, chunks).map_err(|error| eyre::eyre!(error))?;
+        ensure!(
+            u64::from(memory.ram.identity_chunk_bytes())
+                == vm_spec::stream_map::ChunkSize::RAM.bytes(),
+            "native RAM identity profile"
+        );
+        let native_changes = memory.ram.changes();
+        let changes = CaptureRamChanges {
+            byte_len: native_changes.byte_len(),
+            sha256: Sha256Digest::from_bytes(*native_changes.sha256()),
+            record_count: native_changes.record_count(),
+            coverage: match native_changes.coverage() {
+                libkrun::live::RamCaptureMode::Full => CaptureRamCoverage::Full,
+                libkrun::live::RamCaptureMode::Incremental => CaptureRamCoverage::Incremental,
+            },
+            baseline_stream: native_changes
+                .baseline_stream()
+                .map(Sha256Digest::from_bytes),
+        };
+        let mut nodes = crate::native_stream_map::DirectoryNodes::new(self.map_node_store.clone())?;
+        let map = crate::native_stream_map::assemble(
+            output_directory,
+            memory.ram.packed_len(),
+            &changes,
+            &mut nodes,
+        )?;
         let mut map_output = new_output(&directory.join(vm_spec::capture::CAPTURE_RAM_MAP_FILE))?;
         map.write_canonical(&mut map_output)?;
         map_output.sync_all()?;
@@ -830,8 +852,10 @@ impl Commands {
             "ram_map":object(&directory.join(vm_spec::capture::CAPTURE_RAM_MAP_FILE), map_length)?,
             "writers_closed":memory.ram.writers_closed(),"mode":format!("{:?}",memory.ram.mode()),
             "full_reason":format!("{:?}",memory.full_reason),"memory_generation":memory.memory_generation,
-            "output_identities":memory.ram.output_identities(),"affected_chunks":memory.ram.affected_chunks().collect::<Vec<_>>(),
-            "chunk_digests":memory.ram.chunk_digests(),
+            "output_identities":memory.ram.output_identities(),
+            "identity_chunk_bytes":memory.ram.identity_chunk_bytes(),"map_node_store":self.map_node_store,
+            "changes":{"byte_len":changes.byte_len,"sha256":changes.sha256,"record_count":changes.record_count,
+                "coverage":changes.coverage,"baseline_stream":changes.baseline_stream},
             "stats":{"logical_bytes":stats.logical_bytes,"live_bytes_read":stats.live_bytes_read,
                 "baseline_bytes_read":stats.baseline_bytes_read,"baseline_bytes_written":stats.baseline_bytes_written,
                 "overlay_bytes_written":stats.overlay_bytes_written,"full_bytes_written":stats.full_bytes_written,
@@ -1078,6 +1102,7 @@ fn command_loop(
     restore: Option<RestoreToken>,
     binding: PathBuf,
     disks: Vec<PathBuf>,
+    map_node_store: PathBuf,
 ) -> eyre::Result<()> {
     let mut commands = Commands {
         control,
@@ -1089,6 +1114,7 @@ fn command_loop(
         disks,
         current: None,
         baselines: Vec::new(),
+        map_node_store,
     };
     if let Some(baseline) = commands.control.baseline(deadline())? {
         commands.baselines.push(baseline);

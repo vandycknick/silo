@@ -585,7 +585,7 @@ pub(crate) mod tests {
         let lower = retained_lower(&store, store.home_path(), b'G').await;
         let fsmeta = pool.object_path(&lower.retained().fsmeta());
         let image_record = crate::ImageRecord {
-            schema: 1,
+            schema: 2,
             kind: crate::ImageRecordKind::Image,
             root: record.root.clone(),
             boot: record.boot.clone(),
@@ -739,8 +739,10 @@ pub(crate) mod tests {
             UNION ALL SELECT 'snapshot-object',object_digest FROM snapshot_object_dependency
             UNION ALL SELECT 'image-object',object_digest FROM image_object_dependency
             UNION ALL SELECT 'capture-evidence',evidence_digest FROM snapshot_capture_provenance
+            UNION ALL SELECT 'capture-changes',changes_digest FROM snapshot_capture_change
             UNION ALL SELECT 'imported-provenance',provenance_digest FROM snapshot_imported_capture
             UNION ALL SELECT 'imported-evidence',evidence_digest FROM snapshot_imported_capture
+            UNION ALL SELECT 'imported-changes',changes_digest FROM snapshot_imported_capture
             UNION ALL SELECT 'image-acquisition',receipt_digest FROM managed_artifact_acquisition a WHERE managed_kind='image' AND EXISTS(SELECT 1 FROM storage_image WHERE id=a.managed_id)
             UNION ALL SELECT 'snapshot-acquisition',receipt_digest FROM managed_artifact_acquisition a WHERE managed_kind='snapshot' AND EXISTS(SELECT 1 FROM storage_snapshot WHERE id=a.managed_id)
             ) SELECT DISTINCT kind FROM original_roots WHERE object_digest=?1 ORDER BY kind";
@@ -766,8 +768,10 @@ pub(crate) mod tests {
             ("snapshot-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_object_dependency(snapshot_id,object_digest) SELECT json_extract(parents,'$.snapshot'),digest FROM candidate"), true, true),
             ("image-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO image_object_dependency(image_id,object_digest) SELECT json_extract(parents,'$.image'),digest FROM candidate"), true, true),
             ("capture-evidence", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes,plan_bytes) SELECT json_extract(parents,'$.operation'),json_extract(parents,'$.snapshot'),digest,bytes,bytes FROM candidate"), true, true),
-            ("imported-provenance", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),digest,json_extract(parents,'$.auxiliary'),bytes FROM candidate"), true, true),
-            ("imported-evidence", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),json_extract(parents,'$.auxiliary'),digest,bytes FROM candidate"), true, true),
+            ("capture-changes", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_capture_change(snapshot_id,changes_digest) SELECT json_extract(parents,'$.snapshot'),digest FROM candidate"), true, true),
+            ("imported-provenance", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,changes_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),digest,json_extract(parents,'$.auxiliary'),json_extract(parents,'$.auxiliary'),bytes FROM candidate"), true, true),
+            ("imported-evidence", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,changes_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),json_extract(parents,'$.auxiliary'),digest,json_extract(parents,'$.auxiliary'),bytes FROM candidate"), true, true),
+            ("imported-changes", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,changes_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),json_extract(parents,'$.auxiliary'),json_extract(parents,'$.auxiliary'),digest,bytes FROM candidate"), true, true),
             ("image-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'image',json_extract(parents,'$.image'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), true, true),
             ("snapshot-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'snapshot',json_extract(parents,'$.snapshot'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), true, true),
             ("missing-image-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'image',json_extract(parents,'$.missing'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), false, false),
@@ -803,7 +807,7 @@ pub(crate) mod tests {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
-            sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,flat_state) VALUES(?1,?2,?3,'present') ON CONFLICT DO NOTHING")
+            sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,chunk_shift,flat_state) VALUES(?1,?2,?3,23,'present') ON CONFLICT DO NOTHING")
                 .bind(stream.id.to_string()).bind(stream.length as i64).bind(content.map.to_string())
                 .execute(&mut *tx).await.unwrap();
             insert_object_binding(&mut tx, object, stream.id)
@@ -917,7 +921,7 @@ pub(crate) mod tests {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
-            sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,flat_state) VALUES(?1,?2,?3,'present') ON CONFLICT DO NOTHING")
+            sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,chunk_shift,flat_state) VALUES(?1,?2,?3,23,'present') ON CONFLICT DO NOTHING")
                 .bind(stream.to_string()).bind(published.length as i64).bind(content.map.to_string())
                 .execute(&mut *tx).await.unwrap();
             sqlx::query(
@@ -1253,8 +1257,6 @@ pub(crate) mod tests {
             error,
             LibVmError::StateDatabaseIncompatible { .. }
         ));
-        assert!(error.to_string().contains("reinstall"));
-        assert!(error.to_string().contains("wipe"));
         let retained = sqlx::SqlitePool::connect(&format!("sqlite://{}", state_db.display()))
             .await
             .unwrap();
@@ -3491,6 +3493,284 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn layered_restart_survives_child_snapshot_prune_and_missing_invalid_baseline() {
+        use crate::storage::pool::StoragePool;
+        use crate::storage::stream::StreamHasher;
+        use crate::store::models::snapshot::SnapshotRootProfile;
+        use crate::store::models::storage::DiskBaselineState;
+        use crate::store::snapshot_store::{publish_map, SnapshotRef};
+        use crate::store::ImageStore;
+
+        let (_temporary, snapshots, mut record, publication, publication_lease) =
+            crate::store::snapshot_store::tests::fixture("snapshot").await;
+        let db = &snapshots.store;
+        let paths = LocalPaths::new(db.home_path());
+        let pool = StoragePool::open(paths.images_dir()).unwrap();
+        let held = retained_lower(db, paths.home(), b'R').await;
+        let graph = held.snapshot_composition().unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "restart-parent".into(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        seed_machine(db, &config).await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        layered_machine(&mut config, &mut storage, &held);
+        if let (
+            crate::BootProfile::LinuxDirect { binding, .. },
+            crate::BootProfile::LinuxDirect {
+                binding: captured, ..
+            },
+        ) = (&mut storage.boot, &record.boot)
+        {
+            *binding = captured.clone();
+        }
+        let upper = config.machine_dir.join("upper.raw");
+        let file = std::fs::File::open(&upper).unwrap();
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_open_file(&file, file.metadata().unwrap().len())
+            .unwrap()
+            .map;
+        let roots = crate::machine::root_storage::seed_disk(
+            &mut storage,
+            &pool,
+            &config.machine_dir,
+            1,
+            &config.spec.storage.as_ref().unwrap().disks[1],
+            &file,
+            &map,
+        )
+        .unwrap();
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        drop(roots);
+        let baseline = storage.disk_baselines[0].map;
+
+        // Every persisted reference, including Invalid provenance, owns its
+        // graph independently of a publication, child or running generation.
+        for state in [
+            DiskBaselineState::Ready,
+            DiskBaselineState::Running {
+                run_id: uuid::Uuid::new_v4(),
+                seeded: true,
+            },
+            DiskBaselineState::Running {
+                run_id: uuid::Uuid::new_v4(),
+                seeded: false,
+            },
+            DiskBaselineState::Invalid,
+        ] {
+            storage.disk_baselines[0].state = state;
+            db.save_machine_config_with_storage(&config, &storage)
+                .await
+                .unwrap();
+            db.prune_images().await.unwrap();
+            assert!(pool.verify_object(&baseline).is_ok());
+            assert!(sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM machine_object_dependency WHERE machine_id=?1 AND object_digest=?2)",
+            ).bind(id.to_string()).bind(baseline.to_string()).fetch_one(&db.pool).await.unwrap());
+            let retained = pool
+                .load_map(
+                    baseline,
+                    vm_spec::stream_map::StreamRole::Disk,
+                    pool.map_authority(std::sync::Arc::new(())).unwrap(),
+                )
+                .unwrap();
+            for node in retained.nodes() {
+                node.unwrap();
+            }
+        }
+        storage.disk_baselines[0].state = DiskBaselineState::Ready;
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        let run = uuid::Uuid::new_v4();
+        let launch = db
+            .register_launch_storage(id, run, &storage, &config.spec)
+            .await
+            .unwrap();
+        db.mark_launch_storage_admitted(launch.operation_id())
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.machine_storage(id).await.unwrap().unwrap().disk_baselines[0].state,
+            DiskBaselineState::Running { run_id, seeded: true } if run_id == run
+        ));
+
+        let (stream, roots) = pool.publish_stream_for_catalog(&upper).unwrap();
+        db.pin_published_storage_dependencies(publication, &[stream.id], &[])
+            .await
+            .unwrap();
+        drop(roots);
+        record.root.stream = publish_map(&pool, db, publication, &stream.map)
+            .await
+            .unwrap();
+        let crate::MachineRoot::LinuxOverlay {
+            lower,
+            upper_uuid,
+            capacity,
+            ext4_profile,
+            overlay_profile,
+            temporary_directory,
+            ..
+        } = &storage.root
+        else {
+            panic!("layered fixture")
+        };
+        record.root.profile = SnapshotRootProfile::LinuxOverlay {
+            lower: Box::new(graph.clone()),
+            lower_geometry: lower.geometry(),
+            lower_filesystem_uuid: lower.filesystem_uuid(),
+            upper_uuid: *upper_uuid,
+            ext4_profile: *ext4_profile,
+            overlay_profile: *overlay_profile,
+            temporary_directory: *temporary_directory,
+        };
+        record.root.geometry.length = *capacity;
+        record.configuration = crate::SnapshotConfiguration::capture(&config).unwrap();
+        record.boot = storage.boot.clone();
+        let (streams, objects) = record.content_dependencies().unwrap();
+        db.pin_published_storage_dependencies(
+            publication,
+            &streams.into_iter().collect::<Vec<_>>(),
+            &objects.into_iter().collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        let saved = snapshots
+            .publish(&record, publication, Some("restart-first"))
+            .await
+            .unwrap();
+        snapshots
+            .publish(&record, publication, Some("restart-second"))
+            .await
+            .unwrap();
+
+        let child_id = MachineId::new();
+        let mut child = machine_from_path(
+            child_id,
+            "restart-child".into(),
+            paths.machine(child_id).dir(),
+        );
+        std::fs::create_dir_all(&child.machine_dir).unwrap();
+        seed_machine(db, &child).await;
+        child.spec = config.spec.clone();
+        std::fs::copy(&upper, child.machine_dir.join("upper.raw")).unwrap();
+        let child_file = std::fs::File::open(child.machine_dir.join("upper.raw")).unwrap();
+        let mut child_storage = storage.clone();
+        let roots = crate::machine::root_storage::seed_disk(
+            &mut child_storage,
+            &pool,
+            &child.machine_dir,
+            1,
+            &child.spec.storage.as_ref().unwrap().disks[1],
+            &child_file,
+            &map,
+        )
+        .unwrap();
+        db.save_machine_config_with_storage(&child, &child_storage)
+            .await
+            .unwrap();
+        drop(roots);
+        db.remove_machine(&child).await.unwrap();
+        std::fs::remove_dir_all(&child.machine_dir).unwrap();
+        snapshots.remove_alias("restart-first").await.unwrap();
+        snapshots.remove_alias("restart-second").await.unwrap();
+        snapshots
+            .release_retention(&SnapshotRef::Id(saved.id))
+            .await
+            .unwrap();
+        db.finish_stopped_operation(publication).await.unwrap();
+        drop(publication_lease);
+        drop(held);
+        db.prune_images().await.unwrap();
+
+        let operation = launch.operation_id();
+        drop(launch);
+        let mut stopped = machine_state(id, MachineRuntimeState::Stopped);
+        stopped.run_id = Some(run.to_string());
+        assert!(db
+            .try_retire_launch_storage(
+                operation,
+                run,
+                storage.storage_generation,
+                &stopped,
+                crate::StorageStopOutcome::Clean,
+            )
+            .await
+            .unwrap());
+        db.prune_images().await.unwrap();
+        let ended = db.machine_storage(id).await.unwrap().unwrap();
+        assert!(matches!(
+            ended.disk_baselines[0].state,
+            DiskBaselineState::Invalid
+        ));
+        assert!(pool.verify_object(&baseline).is_ok());
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM machine_lower_dependency WHERE machine_id=?1 AND lower_id=?2)",
+        ).bind(id.to_string()).bind(graph.result.to_string()).fetch_one(&db.pool).await.unwrap());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM storage_operation_lower WHERE lower_id=?1",
+            )
+            .bind(graph.result.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            0
+        );
+
+        // Reproduce an old home's already-collected optional root. Invalid
+        // provenance must not be opened or promoted back to Running.
+        std::fs::remove_file(pool.object_path(&baseline)).unwrap();
+        let next = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &ended, &config.spec)
+            .await
+            .unwrap();
+        db.mark_launch_storage_admitted(next.operation_id())
+            .await
+            .unwrap();
+        assert!(db
+            .machine_storage(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .disk_baselines
+            .is_empty());
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM machine_object_dependency WHERE machine_id=?1 AND object_digest=?2)",
+        ).bind(id.to_string()).bind(baseline.to_string()).fetch_one(&db.pool).await.unwrap());
+        let layers = crate::store::layer_store::LayerStore::from_store(db.as_ref().clone());
+        let resolved = layers
+            .launch_lower(&next, next.storage_record())
+            .await
+            .unwrap();
+        resolved.recheck().unwrap();
+        let lower_root = crate::storage::identity::ObjectDigest::from_sha256(
+            *resolved.retained.result.lower_stream.as_bytes(),
+        );
+        for (root, role) in graph
+            .layers
+            .iter()
+            .map(|layer| (layer.pack.map, vm_spec::stream_map::StreamRole::Pack))
+            .chain(std::iter::once((
+                lower_root,
+                vm_spec::stream_map::StreamRole::Lower,
+            )))
+        {
+            let retained = pool
+                .load_map(
+                    root,
+                    role,
+                    pool.map_authority(std::sync::Arc::new(())).unwrap(),
+                )
+                .unwrap();
+            for node in retained.nodes() {
+                node.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn launch_lease_alone_roots_lower_through_gc_and_prune() {
         use crate::store::ImageStore;
 
@@ -3801,7 +4081,15 @@ pub(crate) mod tests {
         let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
         let source = paths.home().join("source");
         std::fs::write(&source, [7; 512]).unwrap();
-        let stream = pool.publish_stream(&source).unwrap();
+        let (publication, publication_lease) = db
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let (stream, publication_roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        db.pin_published_storage_dependencies(publication, &[stream.id], &[])
+            .await
+            .unwrap();
+        drop(publication_roots);
         let object = pool.publish_object(&source).unwrap();
         let id = MachineId::new();
         let config = machine_from_path(id, "closure-pins".into(), paths.machine(id).dir());
@@ -3845,6 +4133,8 @@ pub(crate) mod tests {
             .await
             .unwrap();
         drop(roots);
+        db.finish_stopped_operation(publication).await.unwrap();
+        drop(publication_lease);
         // Committed semantic roots protect the same projection before launch.
         db.prune_images().await.unwrap();
         assert!(object.path.exists());
@@ -3866,14 +4156,23 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&stream.path).unwrap(), [7; 512]);
         assert_eq!(std::fs::read(&object.path).unwrap(), [7; 512]);
         assert!(bundle.path.exists());
-        let links: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM storage_operation_object WHERE operation_id=?1",
+        let links: BTreeSet<String> = sqlx::query_scalar(
+            "SELECT object_digest FROM storage_operation_object WHERE operation_id=?1",
         )
         .bind(op.to_string())
-        .fetch_one(&db.pool)
+        .fetch_all(&db.pool)
         .await
-        .unwrap();
-        assert_eq!(links, 2);
+        .unwrap()
+        .into_iter()
+        .collect();
+        assert_eq!(
+            links,
+            BTreeSet::from([
+                stream.id.to_string(),
+                object.digest.to_string(),
+                bundle.digest.to_string(),
+            ])
+        );
         drop(duplicate);
         // Launch roots remain until explicit terminal reconciliation, not EX alone.
         db.prune_images().await.unwrap();

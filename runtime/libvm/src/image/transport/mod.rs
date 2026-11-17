@@ -3,10 +3,10 @@
 //! exact bytes; this module owns semantic export, verified import and the
 //! public orchestration around them.
 //!
-//! RAM and disk identities are hashes of their canonical chunk lists and logical
-//! lengths, not whole-file byte hashes. Export computes each transported blob's
-//! digest over its exact encoded bytes; import verifies those blob digests before
-//! accepting the decoded stream identity. Small state objects retain byte hashes.
+//! RAM and disk identities authenticate sparse Merkle maps, exact lengths and
+//! identity-unit profiles independently of the 8 MiB transport payloads.
+//! Import hashes decoded identity units before accepting the declared root.
+//! Small state objects retain whole-byte hashes.
 //!
 //! Admission: before any payload is fetched, an acquisition reserves its
 //! logical worst-case disk peak (cache, decoded staging and catalog copies)
@@ -54,6 +54,7 @@ use crate::LibVmError;
 pub(crate) mod blobs;
 pub(crate) mod closure;
 pub(crate) mod export;
+pub(crate) mod identity;
 pub(crate) mod import;
 pub(crate) mod provenance;
 pub(crate) mod trust;
@@ -497,7 +498,7 @@ async fn settle<T>(
 
 fn inspection(
     resolution: &ArtifactResolution,
-    config: &oci::vm_artifact::wire::VmArtifactConfigV1,
+    config: &oci::vm_artifact::wire::VmArtifactConfigV2,
 ) -> ArtifactInspection {
     use oci::vm_artifact::wire;
     let id = *config.content.id.as_bytes();
@@ -598,7 +599,7 @@ pub(crate) mod tests {
         decode_record, decode_vm_config, encode_object_table, encode_stream_table, encode_transfer,
         verify_transfer, ChunkEntry, ObjectBinding, ObjectTablePage, ObjectTableRoot,
         PayloadMediaType, RecordBlob, StreamBinding, StreamTablePage, StreamTableRoot,
-        TransferRoot, VmArtifactConfigV1, CHUNK_SIZE, MAX_STREAM_BYTES,
+        TransferRoot, VmArtifactConfigV2, CHUNK_SIZE, MAX_STREAM_BYTES,
     };
 
     use crate::image::import_types::{ManagedSourceId, ManagedSourceInfo, ManagedSourceRef};
@@ -617,9 +618,9 @@ pub(crate) mod tests {
         begin_acquisition, commit_acquisition, parse_destination, trust, ArtifactTrust,
     };
     use crate::paths::{LocalPaths, OwnedDirectory};
-    use crate::storage::identity::{ImageId, ObjectDigest, StreamId};
+    use crate::storage::identity::{ImageId, ObjectDigest};
+    use crate::storage::map::{AuthenticatedMap, MapNodeWriter};
     use crate::storage::pool::StoragePool;
-    use crate::storage::stream::{Chunk, StreamMap};
     use crate::store::artifact_store::commit_imported_artifact;
     use crate::store::managed_image_store::ManagedImageStore;
     use crate::store::models::image::{ImageRecord, ImageRecordKind};
@@ -627,6 +628,10 @@ pub(crate) mod tests {
     use crate::store::snapshot_store::SnapshotRef;
     use crate::store::Store;
     use crate::LibVmError;
+    use vm_spec::capture::Sha256Digest;
+    use vm_spec::stream_map::{
+        build_sorted, ChunkSize, PresentChunk, StreamNode, StreamRole, StreamRoot,
+    };
 
     pub(crate) const REPOSITORY: &str = "registry.example/team/vm";
 
@@ -843,7 +848,15 @@ pub(crate) mod tests {
         ObjectBinding::Direct {
             object: record.reference.digest,
             size: record.reference.size,
-            payload: record.reference.payload(),
+            payload: oci::vm_artifact::wire::PayloadRef {
+                media_type: if record.bytes.starts_with(b"silo:stream") {
+                    PayloadMediaType::StreamMap
+                } else {
+                    PayloadMediaType::Record
+                },
+                digest: record.reference.digest,
+                size: record.reference.size,
+            },
         }
     }
 
@@ -853,7 +866,7 @@ pub(crate) mod tests {
     /// so only importer semantics, never graph structure, can reject it.
     fn finish(
         graph: &EncodedVmGraph,
-        mut config: VmArtifactConfigV1,
+        mut config: VmArtifactConfigV2,
         mut streams: Vec<StreamBinding>,
         mut objects: Vec<ObjectBinding>,
         mut records: Vec<RecordBlob>,
@@ -890,16 +903,24 @@ pub(crate) mod tests {
                 referenced.insert(payload.digest);
             }
         }
-        let bulk = graph
+        let mut bulk = graph
             .payloads
             .iter()
+            .copied()
             .filter(|payload| {
                 payload.media_type != PayloadMediaType::Record
                     && referenced.contains(&payload.digest)
             })
-            .copied()
-            .collect::<Vec<_>>();
-        encode_vm_graph(&config, &records, &bulk).unwrap()
+            .map(|payload| (payload.digest, payload))
+            .collect::<BTreeMap<_, _>>();
+        for row in &objects {
+            if let ObjectBinding::Direct { payload, .. } = row {
+                if payload.media_type != PayloadMediaType::Record {
+                    bulk.insert(payload.digest, *payload);
+                }
+            }
+        }
+        encode_vm_graph(&config, &records, &bulk.into_values().collect::<Vec<_>>()).unwrap()
     }
 
     /// Add `count` structurally valid all-zero streams of the maximum stream
@@ -919,17 +940,29 @@ pub(crate) mod tests {
         let zeros =
             vec![ChunkEntry::Zero { length: CHUNK_SIZE }; (MAX_STREAM_BYTES / CHUNK_SIZE) as usize];
         for index in 0..count {
-            let stream = identity(StreamId::from_sha256(
-                *ObjectDigest::of_bytes(format!("zero stream {index}").as_bytes()).as_bytes(),
-            ));
-            let transport = encode_transfer(stream, MAX_STREAM_BYTES, &zeros).unwrap();
-            let map = RecordBlob::new(format!("{{\"zeroMap\":{index}}}").into_bytes()).unwrap();
+            let length = MAX_STREAM_BYTES - index as u64 * CHUNK_SIZE;
+            let map = RecordBlob::new(
+                StreamRoot::empty(length, ChunkSize::DISK)
+                    .unwrap()
+                    .canonical_bytes()
+                    .unwrap(),
+            )
+            .unwrap();
+            let stream = oci::changeset::model::StreamIdentity::from_sha256(
+                *map.reference.digest.as_bytes(),
+            );
+            let transport = encode_transfer(
+                stream,
+                length,
+                &zeros[..length.div_ceil(CHUNK_SIZE) as usize],
+            )
+            .unwrap();
             objects.push(direct(&map));
             streams.push(StreamBinding {
                 stream,
-                length: MAX_STREAM_BYTES,
+                length,
                 map: map.reference.digest,
-                map_pages: Vec::new(),
+                chunk_size: CHUNK_SIZE,
                 transport: transport.root.reference,
             });
             records.push(map);
@@ -937,6 +970,48 @@ pub(crate) mod tests {
             records.extend(transport.pages);
         }
         finish(graph, config, streams, objects, records)
+    }
+
+    fn map_from_entries(length: u64, entries: &[ChunkEntry]) -> AuthenticatedMap {
+        let mut nodes = MapNodeWriter::new().unwrap();
+        let root = build_sorted(
+            length,
+            ChunkSize::DISK,
+            entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| match entry {
+                    ChunkEntry::Data { digest, .. } => Some(Ok(PresentChunk {
+                        index: index as u64,
+                        digest: Sha256Digest::from_bytes(*digest.as_bytes()),
+                    })),
+                    ChunkEntry::Zero { .. } => None,
+                }),
+            &mut nodes,
+        )
+        .unwrap();
+        nodes
+            .finish(root, StreamRole::Disk, None)
+            .unwrap()
+            .into_map()
+    }
+
+    fn map_digests(graph: &EncodedVmGraph, digest: ObjectDigest) -> Vec<ContentDigest> {
+        let root = StreamRoot::decode(&record_bytes(graph, content(digest))).unwrap();
+        let mut result = Vec::new();
+        let mut pending = root
+            .tree_digest()
+            .map(|digest| vec![(digest, 4)])
+            .unwrap_or_default();
+        while let Some((digest, height)) = pending.pop() {
+            let digest = ContentDigest::from_sha256(*digest.as_bytes());
+            result.push(digest);
+            let node = StreamNode::decode(&record_bytes(graph, digest), height).unwrap();
+            if height > 0 {
+                pending.extend(node.entries().map(|(_, child)| (child, height - 1)));
+            }
+        }
+        result
     }
 
     /// Rewrite an exported image's root transfer with `forge`, then derive
@@ -963,7 +1038,7 @@ pub(crate) mod tests {
         replaced.extend(object_tables);
         replaced.push(honest_record);
         replaced.push(content(honest.map));
-        replaced.extend(honest.map_pages.iter().map(|page| content(*page)));
+        replaced.extend(map_digests(graph, honest.map));
         let position = streams
             .iter()
             .position(|row| row.stream == identity(honest.stream))
@@ -972,27 +1047,17 @@ pub(crate) mod tests {
         let (mut entries, transfer_records) = transfer_entries(graph, &row);
         replaced.extend(transfer_records);
         forge(&mut entries);
-        let chunks = entries
-            .iter()
-            .map(|entry| match entry {
-                ChunkEntry::Zero { .. } => Chunk::Zero,
-                ChunkEntry::Data { digest, .. } => Chunk::Data(object(*digest)),
-            })
-            .collect();
-        let map = StreamMap::new(honest.length, chunks).unwrap();
-        let (map_root, map_pages) = canonical_map_bytes(&map).unwrap();
+        let map = map_from_entries(honest.length, &entries);
+        let (map_root, map_nodes) = canonical_map_bytes(&map).unwrap();
         let map_root = RecordBlob::new(map_root).unwrap();
-        let map_pages = map_pages
+        let map_nodes = map_nodes
             .into_iter()
             .map(|page| RecordBlob::new(page).unwrap())
             .collect::<Vec<_>>();
         record.root.stream = SnapshotStream {
             stream: map.id(),
             map: object(map_root.reference.digest),
-            map_pages: map_pages
-                .iter()
-                .map(|page| object(page.reference.digest))
-                .collect(),
+            chunk_size: CHUNK_SIZE,
             length: honest.length,
         };
         let forged = Semantic::image(*record).unwrap();
@@ -1002,7 +1067,7 @@ pub(crate) mod tests {
             stream: identity(map.id()),
             length: honest.length,
             map: map_root.reference.digest,
-            map_pages: map_pages.iter().map(|page| page.reference.digest).collect(),
+            chunk_size: CHUNK_SIZE,
             transport: transport.root.reference,
         });
         objects.retain(|row| !replaced.contains(&row.object()));
@@ -1014,7 +1079,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         for blob in [RecordBlob::new(forged.bytes).unwrap(), map_root]
             .into_iter()
-            .chain(map_pages)
+            .chain(map_nodes)
         {
             objects.push(direct(&blob));
             records.push(blob);
@@ -1221,7 +1286,7 @@ pub(crate) mod tests {
         };
         *root_selector = crate::RootSelector::ManagedOverlay;
         let record = ImageRecord {
-            schema: 1,
+            schema: 2,
             kind: ImageRecordKind::Image,
             root: snapshot.root,
             boot: snapshot.boot,
@@ -1564,7 +1629,7 @@ pub(crate) mod tests {
         let snapshot =
             crate::store::models::snapshot::tests::record(stream.id, map.map, kernel.digest);
         let mut record = ImageRecord {
-            schema: 1,
+            schema: 2,
             kind: ImageRecordKind::Image,
             root: snapshot.root,
             boot: snapshot.boot,
@@ -1585,7 +1650,7 @@ pub(crate) mod tests {
     /// checks, not the graph layer's, reject a well-formed contradiction.
     fn reencode(
         graph: &EncodedVmGraph,
-        mutate: impl FnOnce(&mut VmArtifactConfigV1),
+        mutate: impl FnOnce(&mut VmArtifactConfigV2),
         surplus: Vec<RecordBlob>,
     ) -> EncodedVmGraph {
         let mut config = decode_vm_config(&graph.config.bytes).unwrap();
@@ -1844,7 +1909,6 @@ pub(crate) mod tests {
         for stream in record.streams() {
             let held = &parts.streams[&stream.stream];
             assert_eq!(held.canonical_map, stream.map);
-            assert_eq!(held.canonical_pages, stream.map_pages);
             assert_eq!(held.map.id(), stream.stream);
         }
         let (_, objects) = record.content_dependencies().unwrap();
@@ -1859,6 +1923,13 @@ pub(crate) mod tests {
     async fn live_checkpoint_imports_portable_seal_without_local_capture_authority() {
         let fixture = crate::store::capture::tests::fixture().await;
         let (directory, _) = crate::store::capture::tests::seal(&fixture);
+        let changes = std::fs::read(
+            directory
+                .path()
+                .join(vm_spec::capture::CAPTURE_RAM_CHANGES_FILE),
+        )
+        .unwrap();
+        let changes_digest = ObjectDigest::of_bytes(&changes);
         let capture = fixture.reservation.record.capture_id;
         let info = fixture
             .snapshots
@@ -1888,7 +1959,7 @@ pub(crate) mod tests {
         assert!(config.capture_provenance.is_some());
         let good = transfer(&prepared.graph, &prepared.payloads());
         // Blob digests measure the transported encoding at export, independently
-        // of RAM and disk chunk-list identities in the capture inventory.
+        // of RAM and disk Merkle identities in the capture inventory.
         let (rows, _) = stream_rows(&prepared.graph, config.streams.digest);
         for row in &rows {
             for entry in transfer_entries(&prepared.graph, row).0 {
@@ -1939,6 +2010,17 @@ pub(crate) mod tests {
         };
         assert_eq!(imported.id, info.id);
         assert!(imported.provenance.is_empty());
+        drop(committed);
+        let pool = StoragePool::open(destination.images_path()).unwrap();
+        destination
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            pool.read_object(&changes_digest, changes.len() as u64)
+                .unwrap(),
+            changes
+        );
         let catalog = database(&destination).await;
         let bytes: Vec<u8> =
             sqlx::query_scalar("SELECT record_bytes FROM storage_snapshot WHERE id=?1")
@@ -1949,6 +2031,7 @@ pub(crate) mod tests {
         assert_eq!(bytes, source_record.canonical_bytes().unwrap());
         for (query, expected) in [
             ("SELECT COUNT(*) FROM snapshot_imported_capture", 1),
+            ("SELECT COUNT(*) FROM snapshot_capture_change", 1),
             ("SELECT COUNT(*) FROM snapshot_capture_provenance", 0),
             ("SELECT COUNT(*) FROM managed_artifact_acquisition", 1),
             (
@@ -2053,12 +2136,33 @@ pub(crate) mod tests {
         let inventory: u64 = graph.inventory().values().map(|payload| payload.size).sum();
         let streams: u64 = graph.streams().iter().map(|row| row.length).sum();
         let objects: u64 = graph.objects().iter().map(ObjectBinding::size).sum();
+        let identity_records: u64 = graph
+            .streams()
+            .iter()
+            .map(|row| {
+                row.length.div_ceil(row.chunk_size) * (std::mem::size_of::<u64>() + 32) as u64
+            })
+            .sum();
+        let identity_maps: u64 = graph
+            .streams()
+            .iter()
+            .map(|row| {
+                vm_spec::stream_map::worst_case_map_bytes(
+                    row.length,
+                    ChunkSize::from_bytes(row.chunk_size).unwrap(),
+                )
+                .unwrap()
+            })
+            .sum();
         let receipt = crate::storage::limits::Resource::MetadataPageBytes.maximum();
         let charge = acquisition_space_charge(&graph).unwrap();
-        // Decoded staging and every catalog copy are charged, never only the
-        // encoded download.
-        assert!(streams > 0 && objects > 0);
-        assert_eq!(charge, 3 * inventory + 2 * streams + objects + 2 * receipt);
+        // Admission covers decoded staging, identity construction scratch and
+        // catalog copies, independently of sparsity and content deduplication.
+        assert!(streams > 0 && objects > 0 && identity_records > 0 && identity_maps > 0);
+        assert_eq!(
+            charge,
+            3 * inventory + 2 * streams + objects + identity_records + identity_maps + 2 * receipt
+        );
         let (_destination_temp, destination) = home().await;
         let pool = StoragePool::open(destination.images_path()).unwrap();
         let catalog = database(&destination).await;
@@ -2278,15 +2382,26 @@ pub(crate) mod tests {
         let held = &parts.streams[&record.root.stream.stream];
         assert_eq!(
             *held.map,
-            StreamMap::new(
+            map_from_entries(
                 disk.len() as u64,
-                vec![
-                    Chunk::Data(object(*first)),
-                    Chunk::Data(object(*first)),
-                    Chunk::Data(object(*tail_digest)),
-                ],
+                &[
+                    ChunkEntry::Data {
+                        length: CHUNK_SIZE,
+                        digest: *first,
+                        encoded: repeated
+                    },
+                    ChunkEntry::Data {
+                        length: CHUNK_SIZE,
+                        digest: *first,
+                        encoded: repeated
+                    },
+                    ChunkEntry::Data {
+                        length: *tail,
+                        digest: *tail_digest,
+                        encoded: *tail_encoded
+                    },
+                ]
             )
-            .unwrap()
         );
         let mut chunks = vec![repeated.digest, tail_encoded.digest];
         chunks.sort();

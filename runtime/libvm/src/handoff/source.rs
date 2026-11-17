@@ -6,10 +6,9 @@
 //! or offline write is admitted, so the stopped private files themselves are
 //! the immutable cut. Every chunk served is re-hashed against the sealed map,
 //! so a violated reservation can only fail a read, never send other bytes.
-use std::collections::BTreeSet;
 use std::os::unix::fs::FileExt;
 
-use crate::handoff::chunks::ChunkIndex;
+use crate::handoff::chunks::{payload_length, read_payload};
 use crate::handoff::files::{DocumentName, OperationFiles};
 use crate::handoff::plan::{
     invalid, ApprovedPlan, CaptureManifest, CaptureOffer, CapturedFile, ImmutableClosure,
@@ -115,7 +114,6 @@ pub(crate) async fn observation_body(
         objects.extend(lower.objects());
         for layer in &lower.layers {
             objects.insert(layer.pack.map);
-            objects.extend(layer.pack.map_pages.iter().copied());
             streams.insert(layer.pack.stream);
         }
     }
@@ -143,7 +141,7 @@ pub(crate) async fn observation_body(
         .map(|(role, _, length)| WritableFile { role, length })
         .collect();
     Ok(ObservationBody {
-        schema: 1,
+        schema: 2,
         runtime: runtime_id,
         machine: config.id,
         name: config.name.clone(),
@@ -316,7 +314,8 @@ pub(crate) async fn begin(
             continue;
         }
         let map = pool.verify_stream(&entry.stream)?;
-        if map.length() != entry.length {
+        if map.length() != entry.length || map.chunk_size() != vm_spec::stream_map::ChunkSize::DISK
+        {
             return Err(HandoffError::AdmissionStale.into());
         }
         files.store_map(&entry.stream, &map.canonical_bytes()?)?;
@@ -438,15 +437,18 @@ async fn seal_cut(
     if roles.len() != guard.files.len() {
         return Err(invalid("stopped guard does not hold every writable role"));
     }
+    let pool = StoragePool::open(runtime.local_images_dir())?;
+    let store = runtime.native_store()?;
     let mut captured = Vec::with_capacity(roles.len());
     for ((role, path, length), source) in roles.into_iter().zip(&guard.files) {
         if source.path != path || source.length != length {
             return Err(invalid("stopped guard role order contradicts the record"));
         }
         source.file.sync_all()?;
-        let map = crate::storage::stream::StreamHasher::new()
+        let map = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_open_file(&source.file, length)?
             .map;
+        crate::store::snapshot_store::publish_map(&pool, &store, operation.as_uuid(), &map).await?;
         let stream = map.id();
         files.store_map(&stream, &map.canonical_bytes()?)?;
         captured.push(CapturedFile {
@@ -456,7 +458,7 @@ async fn seal_cut(
         });
     }
     let manifest = CaptureManifest::new(ManifestBody {
-        schema: 1,
+        schema: 2,
         capture: CaptureId::new(uuid::Uuid::new_v4())?,
         operation,
         approved_plan_digest: plan.digest(),
@@ -468,27 +470,26 @@ async fn seal_cut(
     Ok(manifest)
 }
 
-/// Everything a source may serve for one operation, built once per manifest.
+/// Authorized root handles, never a per-chunk digest table.
 pub(crate) struct SourceIndex {
     operation: OperationId,
     machine: MachineId,
     objects: std::collections::BTreeMap<ObjectDigest, u64>,
-    streams: BTreeSet<StreamId>,
-    /// Files: captured roles first (manifest order), then immutable streams.
-    origins: Vec<ChunkOrigin>,
-    chunks: ChunkIndex,
+    streams:
+        std::collections::BTreeMap<StreamId, (crate::storage::map::AuthenticatedMap, ChunkOrigin)>,
     pub(crate) captured: bool,
 }
 
 enum ChunkOrigin {
     Captured { role: WritableRole, length: u64 },
-    Immutable { stream: StreamId },
+    Immutable,
 }
 
 impl SourceIndex {
     pub(crate) fn build(runtime: &Runtime, operation: OperationId) -> Result<Self, LibVmError> {
         let plan = stored_plan(runtime, operation)?;
         let files = OperationFiles::existing(runtime.local_home(), operation)?;
+        let pool = StoragePool::open(runtime.local_images_dir())?;
         let mut index = Self {
             operation,
             machine: plan.plan().source_machine(),
@@ -500,9 +501,7 @@ impl SourceIndex {
                 .iter()
                 .map(|entry| (entry.digest, entry.length))
                 .collect(),
-            streams: BTreeSet::new(),
-            origins: Vec::new(),
-            chunks: ChunkIndex::default(),
+            streams: std::collections::BTreeMap::new(),
             captured: false,
         };
         if let Some(document) = files.load_document(DocumentName::Manifest)? {
@@ -510,48 +509,49 @@ impl SourceIndex {
             manifest.body().check_plan(&plan)?;
             for file in &manifest.body().files {
                 let map = files
-                    .load_map(&file.stream)?
-                    .ok_or_else(|| invalid("captured stream map is missing"))?;
-                index.chunks.add(index.origins.len(), &map);
-                index.origins.push(ChunkOrigin::Captured {
-                    role: file.role,
-                    length: file.length,
-                });
-                index.streams.insert(file.stream);
+                    .load_map(&file.stream, &pool)?
+                    .ok_or_else(|| invalid("captured stream root is missing"))?;
+                index.streams.insert(
+                    file.stream,
+                    (
+                        map,
+                        ChunkOrigin::Captured {
+                            role: file.role,
+                            length: file.length,
+                        },
+                    ),
+                );
             }
             index.captured = true;
         }
         for entry in &plan.body().observation.immutable.streams {
             let map = files
-                .load_map(&entry.stream)?
-                .ok_or_else(|| invalid("immutable stream map is missing"))?;
-            index.chunks.add(index.origins.len(), &map);
-            index.origins.push(ChunkOrigin::Immutable {
-                stream: entry.stream,
-            });
-            index.streams.insert(entry.stream);
+                .load_map(&entry.stream, &pool)?
+                .ok_or_else(|| invalid("immutable stream root is missing"))?;
+            index
+                .streams
+                .insert(entry.stream, (map, ChunkOrigin::Immutable));
         }
         Ok(index)
     }
 
-    /// Verified bytes of one whole chunk named by this operation's closure.
     pub(crate) async fn chunk(
         &self,
         runtime: &Runtime,
-        digest: &ObjectDigest,
+        stream: StreamId,
+        index: u64,
         length: u64,
     ) -> Result<Vec<u8>, LibVmError> {
-        let place = self
-            .chunks
-            .get(digest, length)
-            .ok_or_else(|| invalid("chunk is not part of this handoff"))?;
-        let origin = self
-            .origins
-            .get(place.file)
-            .ok_or_else(|| invalid("chunk index names no source file"))?;
+        let (map, origin) = self
+            .streams
+            .get(&stream)
+            .ok_or_else(|| invalid("stream is not part of this handoff"))?;
+        if payload_length(map, index)? != length {
+            return Err(invalid("payload length contradicts agreed root"));
+        }
         let file = match origin {
-            ChunkOrigin::Immutable { stream } => {
-                StoragePool::open(runtime.local_images_dir())?.open_stream(stream)?
+            ChunkOrigin::Immutable => {
+                StoragePool::open(runtime.local_images_dir())?.open_stream(&stream)?
             }
             ChunkOrigin::Captured { role, length } => {
                 let storage = runtime.machine_storage_record(self.machine).await?;
@@ -571,11 +571,9 @@ impl SourceIndex {
                 crate::machine::stopped::open_private(&directory, &path, *length)?.file
             }
         };
-        crate::handoff::chunks::read_verified(&file, place.offset, length, digest)?
-            .ok_or_else(|| invalid("source chunk changed after the stopped cut"))
+        read_payload(&file, map, index)
     }
 
-    /// One bounded frame of a descriptor this operation is allowed to serve.
     pub(crate) async fn frame(
         &self,
         runtime: &Runtime,
@@ -588,58 +586,80 @@ impl SourceIndex {
         if max_bytes == 0 || max_bytes > MAX_FRAME_BYTES {
             return Err(invalid("frame size is outside 1..=1 MiB"));
         }
+        let pool = StoragePool::open(runtime.local_images_dir())?;
+        let files = OperationFiles::existing(runtime.local_home(), self.operation)?;
         let (bytes, total, chunk) = match descriptor {
             PayloadDescriptor::Object { digest, length } => {
                 if self.objects.get(&digest) != Some(&length) {
                     return Err(invalid("object is not part of this handoff"));
                 }
-                let file = StoragePool::open(runtime.local_images_dir())?.open_object(&digest)?;
+                let file = pool.verify_object(&digest)?;
                 if file.metadata()?.len() != length {
                     return Err(invalid("immutable object length changed"));
                 }
                 (range(&file, offset, max_bytes, length)?, length, None)
             }
             PayloadDescriptor::StreamMap { stream } => {
-                if !self.streams.contains(&stream) {
-                    return Err(invalid("stream map is not part of this handoff"));
+                if !self.streams.contains_key(&stream) {
+                    return Err(invalid("stream root is not part of this handoff"));
                 }
-                let files = OperationFiles::existing(runtime.local_home(), self.operation)?;
                 let file = files
                     .map_file(&stream)?
-                    .ok_or_else(|| invalid("stream map is missing"))?;
+                    .ok_or_else(|| invalid("stream root is missing"))?;
                 let total = file.metadata()?.len();
                 (range(&file, offset, max_bytes, total)?, total, None)
             }
-            PayloadDescriptor::Chunk { digest, length } => {
-                if self.chunks.get(&digest, length).is_none() {
-                    return Err(invalid("chunk is not part of this handoff"));
+            PayloadDescriptor::MapNode {
+                digest,
+                stream,
+                height,
+                first_index,
+            } => {
+                let (map, _) = self
+                    .streams
+                    .get(&stream)
+                    .ok_or_else(|| invalid("map node stream is not part of this handoff"))?;
+                let bytes = crate::handoff::chunks::read_node(map, digest, height, first_index)?;
+                let total = bytes.len() as u64;
+                let start = usize::try_from(offset)
+                    .ok()
+                    .filter(|start| *start < bytes.len())
+                    .ok_or_else(|| invalid("frame offset outside node"))?;
+                let end = (start + max_bytes as usize).min(bytes.len());
+                (bytes[start..end].to_vec(), total, None)
+            }
+            PayloadDescriptor::StreamChunk {
+                stream,
+                index,
+                length,
+            } => {
+                let (map, _) = self
+                    .streams
+                    .get(&stream)
+                    .ok_or_else(|| invalid("stream is not part of this handoff"))?;
+                if payload_length(map, index)? != length {
+                    return Err(invalid("payload length contradicts agreed root"));
                 }
-                // Cache identity includes the full authorized descriptor.
                 let bytes = match cached_chunk {
                     Some(bytes) => bytes,
-                    None => std::sync::Arc::new(self.chunk(runtime, &digest, length).await?),
+                    None => std::sync::Arc::new(self.chunk(runtime, stream, index, length).await?),
                 };
                 if bytes.len() as u64 != length {
-                    return Err(invalid("cached chunk length differs from its descriptor"));
+                    return Err(invalid("cached payload length mismatch"));
                 }
                 let start = usize::try_from(offset)
                     .ok()
                     .filter(|start| *start < bytes.len())
-                    .ok_or_else(|| invalid("frame offset is outside the payload"))?;
+                    .ok_or_else(|| invalid("frame offset outside payload"))?;
                 let end = (start + max_bytes as usize).min(bytes.len());
-                let slice = bytes
-                    .get(start..end)
-                    .ok_or_else(|| invalid("frame range is outside the chunk"))?
-                    .to_vec();
-                (slice, length, Some(bytes))
+                (bytes[start..end].to_vec(), length, Some(bytes))
             }
         };
-        let end = offset + bytes.len() as u64 == total;
         Ok((
             PayloadFrame {
+                end: offset + bytes.len() as u64 == total,
                 bytes,
                 total_length: total,
-                end,
             },
             chunk,
         ))

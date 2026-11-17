@@ -13,7 +13,7 @@ import time
 
 from .cli import RootProfile, Silo
 from .config import REPO
-from . import stopped
+from . import stopped, stream_map
 
 
 def compile_probe(output: Path) -> Path:
@@ -156,8 +156,9 @@ def inventory(directory: Path) -> dict[str, stopped.Bytes]:
 def unchanged(silo: Silo, directory: Path, before: dict[str, stopped.Bytes],
               *, added: set[str] | None = None) -> None:
     after = inventory(directory)
-    assert set(before) <= set(after)
-    assert set(after) - set(before) <= {"vm.capture-source.json"} | (added or set())
+    assert set(before) <= set(after), f"capture files disappeared: {sorted(set(before) - set(after))}"
+    unexpected = set(after) - set(before) - {"vm.capture-source.json"} - (added or set())
+    assert not unexpected, f"unexpected capture files: {sorted(unexpected)}"
     for name, original in before.items():
         observed = after[name]
         # Read-only faults can allocate tmpfs holes without changing file bytes.
@@ -166,3 +167,29 @@ def unchanged(silo: Silo, directory: Path, before: dict[str, stopped.Bytes],
         ), f"sealed capture file mutated: {name}: {original!r} -> {observed!r}"
     silo.ws.record("capture-sealed-inventory", json.dumps({
         name: asdict(value) for name, value in after.items()}, sort_keys=True) + "\n")
+
+
+def completed_disk_node_files(home: Path, directory: Path, seal: dict) -> set[str]:
+    """Authenticate exactly the disk-node closure allowed after an identity-pending cut."""
+    staged_nodes: set[str] = set()
+    pool = stream_map.object_source(home)
+
+    def source(identity: str) -> bytes:
+        relative = "map-nodes/" + identity.removeprefix("sha256:")
+        path = directory / relative
+        if path.is_file():
+            staged_nodes.add(relative)
+            return path.read_bytes()
+        return pool(identity)
+
+    for entry in seal["inventory"]:
+        role = entry["role"]
+        if not role.startswith("disks/") or not role.endswith(".root"):
+            continue
+        encoded = (directory / role).read_bytes()
+        root = stream_map.decode_root(encoded)
+        assert len(encoded) == entry["length"] and root.identity == entry["sha256"]
+        assert root.chunk_size == stream_map.DISK_CHUNK
+        assert root.length == (directory / Path(role).with_suffix(".raw")).stat().st_size
+        dict(stream_map.present_chunks(root, source))
+    return staged_nodes

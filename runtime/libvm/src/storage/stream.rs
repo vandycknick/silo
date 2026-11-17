@@ -1,10 +1,4 @@
-//! Canonical 8 MiB stream identity and bounded sparse file capture.
-//!
-//! File scans use one chunk buffer and one monotonic extent cursor. Ordinary
-//! scans do no byte hashing proportional to hole length; optional whole-file
-//! SHA-256 also feeds logical holes without reading them from the filesystem.
-//! Streaming copies authenticate their source chunks while writing; durability
-//! and publication belong to the caller.
+//! Profile-aware sparse stream hashing, authenticated copying and verification.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -20,23 +14,41 @@ use nix::unistd::{lseek, Whence};
 use sha2::{Digest, Sha256};
 use vm_spec::capture::Sha256Digest;
 
-use crate::storage::identity::{ObjectDigest, StreamId};
+use crate::storage::identity::StreamId;
 use crate::storage::identity_file::SourceFingerprint;
-use crate::storage::limits::{Resource, CHUNK_SIZE};
+use crate::storage::limits::Resource;
+use crate::storage::map::{AuthenticatedMap, MapNodeWriter};
 use crate::storage::StorageError;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Chunk {
-    Zero,
-    Data(ObjectDigest),
-}
+use vm_spec::stream_map::{
+    build_sorted, Chunk, ChunkSize, MapError, PresentChunk, StreamRole, StreamRoot,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExpectedMapError {
+    #[error("verification profile mismatch: expected {expected:?}, actual {actual:?}")]
+    Profile {
+        expected: ChunkSize,
+        actual: ChunkSize,
+    },
+    #[error("{role:?} stream {stream} node {digest} height {height} indices {first_index}..{end_index} bytes {start}..{end}: {reason}")]
+    Metadata {
+        role: StreamRole,
+        stream: StreamId,
+        digest: Sha256Digest,
+        height: u8,
+        first_index: u64,
+        end_index: u64,
+        start: u64,
+        end: u64,
+        reason: String,
+    },
     #[error("stream length changed: expected {expected}, actual {actual}")]
     Length { expected: u64, actual: u64 },
-    #[error("chunk {index} bytes {start}..{end}: expected {expected:?}, actual {actual:?}")]
+    #[error("{role:?} stream {stream} unit {} bytes chunk {index} bytes {start}..{end}: expected {expected:?}, actual {actual:?}", chunk_size.bytes())]
     ChunkMismatch {
+        role: StreamRole,
+        stream: StreamId,
+        chunk_size: ChunkSize,
         index: u64,
         start: u64,
         end: u64,
@@ -47,125 +59,6 @@ pub enum ExpectedMapError {
     Changed,
     #[error(transparent)]
     Storage(#[from] StorageError),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamMap {
-    length: u64,
-    chunks: Vec<Chunk>,
-    id: StreamId,
-}
-
-impl StreamMap {
-    pub fn new(length: u64, chunks: Vec<Chunk>) -> Result<Self, StorageError> {
-        Resource::ArtifactStreamBytes.check(length)?;
-        let expected = length.div_ceil(CHUNK_SIZE as u64);
-        if chunks.len() as u64 != expected {
-            return Err(StorageError::ChunkCount {
-                expected,
-                actual: chunks.len() as u64,
-            });
-        }
-        let id = Self::identity(length, &chunks);
-        Ok(Self { length, chunks, id })
-    }
-
-    pub fn length(&self) -> u64 {
-        self.length
-    }
-
-    pub fn chunks(&self) -> &[Chunk] {
-        &self.chunks
-    }
-
-    /// Decode only the bounded current record. Duplicate, unknown and missing
-    /// fields, noninteger numbers and noncanonical digest spellings are errors.
-    pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let map = vm_spec::capture::StreamMap::decode(bytes).map_err(invalid_data)?;
-        let length = map.length();
-        Self::new(
-            length,
-            map.into_chunks()
-                .into_iter()
-                .map(|chunk| match chunk {
-                    None => Chunk::Zero,
-                    Some(digest) => Chunk::Data(ObjectDigest::from_sha256(*digest.as_bytes())),
-                })
-                .collect(),
-        )
-    }
-
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, StorageError> {
-        let mut bytes = Vec::new();
-        self.write_canonical(&mut bytes)?;
-        Ok(bytes)
-    }
-
-    pub fn id(&self) -> StreamId {
-        self.id
-    }
-
-    /// Reuse only a local receipt whose held inode fingerprints all match.
-    /// The receipt already authenticated this identity and its decoded chunks.
-    pub(crate) fn from_validated_parts(
-        length: u64,
-        chunks: Vec<Chunk>,
-        id: StreamId,
-    ) -> Result<Self, StorageError> {
-        Resource::ArtifactStreamBytes.check(length)?;
-        let expected = length.div_ceil(CHUNK_SIZE as u64);
-        if chunks.len() as u64 != expected {
-            return Err(StorageError::ChunkCount {
-                expected,
-                actual: chunks.len() as u64,
-            });
-        }
-        Ok(Self { length, chunks, id })
-    }
-
-    fn identity(length: u64, chunks: &[Chunk]) -> StreamId {
-        let mut identity = vm_spec::capture::StreamIdentity::new();
-        let mut remaining = length;
-        for chunk in chunks {
-            let digest = match chunk {
-                Chunk::Zero => None,
-                Chunk::Data(digest) => Some(vm_spec::capture::Sha256Digest::from_bytes(
-                    *digest.as_bytes(),
-                )),
-            };
-            // StreamMap::new and every scanner enforce the same chunk count,
-            // final-chunk length and 4 TiB bound, so this feed cannot fail.
-            let _ = identity.push_digest(remaining.min(CHUNK_SIZE as u64), digest);
-            remaining = remaining.saturating_sub(CHUNK_SIZE as u64);
-        }
-        StreamId::from_sha256(*identity.finish().as_bytes())
-    }
-
-    /// RFC 8785 serialization for this closed schema, not a general JSON encoder.
-    ///
-    /// All property names and string values are ASCII, so UTF-16 property sorting
-    /// gives exactly chunkSize, chunks, kind, length, schema. The only admitted
-    /// strings are fixed literals or validated lowercase digest text and require
-    /// no escaping. Integers are nonnegative and bounded by 4 TiB (below 2^53-1),
-    /// for which decimal integer formatting is identical to ECMAScript/JCS number
-    /// serialization. No user keys, Unicode, floats or duplicate keys are admitted.
-    pub fn write_canonical(&self, mut output: impl Write) -> io::Result<()> {
-        output.write_all(b"{\"chunkSize\":8388608,\"chunks\":[")?;
-        for (index, chunk) in self.chunks.iter().enumerate() {
-            if index != 0 {
-                output.write_all(b",")?;
-            }
-            match chunk {
-                Chunk::Zero => output.write_all(b"\"zero\"")?,
-                Chunk::Data(digest) => write!(output, "\"{digest}\"")?,
-            }
-        }
-        write!(
-            output,
-            "],\"kind\":\"stream\",\"length\":{},\"schema\":1}}",
-            self.length
-        )
-    }
 }
 
 /// Costs of one file scan, not the logical file length or bytes sent.
@@ -183,7 +76,7 @@ pub struct StreamStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamScan {
-    pub map: StreamMap,
+    pub map: AuthenticatedMap,
     pub stats: StreamStats,
 }
 
@@ -193,13 +86,13 @@ pub struct StreamScan {
 pub(crate) struct AuthenticatedStream {
     file: File,
     fingerprint: SourceFingerprint,
-    map: Arc<StreamMap>,
+    map: Arc<AuthenticatedMap>,
 }
 
 impl AuthenticatedStream {
     /// Adopt a structurally verified receipt while byte authentication runs
     /// concurrently. This does not independently authenticate the file's bytes.
-    pub(crate) fn from_receipt(file: File, map: StreamMap) -> Result<Self, StorageError> {
+    pub(crate) fn from_receipt(file: File, map: AuthenticatedMap) -> Result<Self, StorageError> {
         let fingerprint = SourceFingerprint::new(&file.metadata()?);
         Self::from_verified_fingerprint(file, Arc::new(map), fingerprint)
     }
@@ -208,7 +101,7 @@ impl AuthenticatedStream {
     /// the caller, without reading its bytes again.
     pub(crate) fn from_verified_fingerprint(
         file: File,
-        map: Arc<StreamMap>,
+        map: Arc<AuthenticatedMap>,
         fingerprint: SourceFingerprint,
     ) -> Result<Self, StorageError> {
         let metadata = file.metadata()?;
@@ -233,7 +126,7 @@ impl AuthenticatedStream {
         self.fingerprint
     }
 
-    pub(crate) fn map(&self) -> &StreamMap {
+    pub(crate) fn map(&self) -> &AuthenticatedMap {
         &self.map
     }
 
@@ -335,35 +228,30 @@ impl DerefMut for ChunkBuffer {
     }
 }
 
-/// Reuses one fixed 8 MiB allocation across chunks and successive streams.
-/// The decoded map is bounded by the 4 TiB artifact admission bound.
+/// One aligned identity-unit buffer, independent of logical stream length.
 pub struct StreamHasher {
     buffer: ChunkBuffer,
+    chunk_size: ChunkSize,
     writeback: CopyWriteback,
 }
 
-impl Default for StreamHasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl StreamHasher {
-    pub fn new() -> Self {
-        Self::with_writeback(CopyWriteback::Buffered)
+    pub fn new(chunk_size: ChunkSize) -> Self {
+        Self::with_writeback(chunk_size, CopyWriteback::Buffered)
     }
 
-    pub(crate) fn with_writeback(writeback: CopyWriteback) -> Self {
+    pub(crate) fn with_writeback(chunk_size: ChunkSize, writeback: CopyWriteback) -> Self {
         Self {
             buffer: ChunkBuffer(vec![
                 AlignedBlock([0; COPY_BLOCK_SIZE]);
-                CHUNK_SIZE / COPY_BLOCK_SIZE
+                chunk_size.bytes() as usize / COPY_BLOCK_SIZE
             ]),
+            chunk_size,
             writeback,
         }
     }
 
-    pub fn hash_file(&mut self, path: &Path) -> Result<StreamMap, StorageError> {
+    pub fn hash_file(&mut self, path: &Path) -> Result<AuthenticatedMap, StorageError> {
         let file = open_regular_source(path)?;
         let before = SourceFingerprint::new(&file.metadata()?);
         let scan = self.hash_open_file(&file, file.metadata()?.len())?;
@@ -373,7 +261,7 @@ impl StreamHasher {
         Ok(scan.map)
     }
 
-    pub fn hash_reader(&mut self, reader: impl Read) -> Result<StreamMap, StorageError> {
+    pub fn hash_reader(&mut self, reader: impl Read) -> Result<AuthenticatedMap, StorageError> {
         self.scan(reader)
     }
 
@@ -393,8 +281,14 @@ impl StreamHasher {
     pub fn verify_expected_map(
         &mut self,
         source: &File,
-        expected: &StreamMap,
+        expected: &AuthenticatedMap,
     ) -> Result<StreamStats, ExpectedMapError> {
+        if self.chunk_size != expected.chunk_size() {
+            return Err(ExpectedMapError::Profile {
+                expected: expected.chunk_size(),
+                actual: self.chunk_size,
+            });
+        }
         let metadata = source.metadata().map_err(StorageError::from)?;
         if !metadata.is_file() {
             return Err(
@@ -410,8 +304,20 @@ impl StreamHasher {
         let fingerprint = SourceFingerprint::new(&metadata);
         let mut stats = StreamStats::default();
         let mut start = 0;
-        for (index, expected) in expected.chunks().iter().enumerate() {
-            let end = (start + CHUNK_SIZE as u64).min(metadata.len());
+        let mut present = expected.present_chunks();
+        let mut next = present
+            .next()
+            .transpose()
+            .map_err(|error| metadata_error(expected, error))?;
+        for index in 0..expected.root().chunk_count() {
+            let consumed = next.as_ref().is_some_and(|chunk| chunk.index == index);
+            let wanted = if consumed {
+                next.as_ref()
+                    .map_or(Chunk::Zero, |chunk| Chunk::Data(chunk.digest))
+            } else {
+                Chunk::Zero
+            };
+            let end = (start + self.chunk_size.bytes()).min(metadata.len());
             let bytes = &mut self.buffer[..(end - start) as usize];
             read_exact_at(source, bytes, start).map_err(StorageError::from)?;
             stats.bytes_read += end - start;
@@ -419,19 +325,28 @@ impl StreamHasher {
             if matches!(actual, Chunk::Data(_)) {
                 stats.logical_bytes_hashed += end - start;
             }
-            if actual != *expected {
+            if actual != wanted {
                 if fingerprint
                     != SourceFingerprint::new(&source.metadata().map_err(StorageError::from)?)
                 {
                     return Err(ExpectedMapError::Changed);
                 }
                 return Err(ExpectedMapError::ChunkMismatch {
-                    index: index as u64,
+                    role: expected.role(),
+                    stream: expected.id(),
+                    chunk_size: expected.chunk_size(),
+                    index,
                     start,
                     end,
-                    expected: *expected,
+                    expected: wanted,
                     actual,
                 });
+            }
+            if consumed {
+                next = present
+                    .next()
+                    .transpose()
+                    .map_err(|error| metadata_error(expected, error))?;
             }
             start = end;
         }
@@ -506,6 +421,13 @@ impl StreamHasher {
         source: &AuthenticatedStream,
         output: &File,
     ) -> Result<StreamScan, StorageError> {
+        if self.chunk_size != source.map().chunk_size() {
+            return Err(MapError::ProfileMismatch {
+                expected: source.map().chunk_size(),
+                actual: self.chunk_size,
+            }
+            .into());
+        }
         let metadata = source.file().metadata()?;
         if SourceFingerprint::new(&metadata) != source.fingerprint() {
             return Err(invalid_data("authenticated copy source changed").into());
@@ -555,6 +477,26 @@ impl StreamHasher {
         Ok(scan)
     }
 
+    pub fn copy_file_and_hash_with_sha256(
+        &mut self,
+        source: &File,
+        length: u64,
+        output: &File,
+    ) -> Result<(StreamScan, Sha256Digest), StorageError> {
+        let metadata = source.metadata()?;
+        validate_copy_output(&metadata, output)?;
+        let mut sha256 = Sha256::new();
+        let scan = self.scan_file(
+            source,
+            length,
+            Some(output),
+            Extents::new(source, length),
+            Some(&mut sha256),
+        )?;
+        output.set_len(length)?;
+        Ok((scan, Sha256Digest::from_bytes(sha256.finalize().into())))
+    }
+
     fn scan_file(
         &mut self,
         source: &File,
@@ -583,69 +525,107 @@ impl StreamHasher {
                 .ok_or_else(|| invalid_data("allocated stream length overflow"))?,
             ..StreamStats::default()
         };
+        let geometry = StreamRoot::empty(length, self.chunk_size)?;
+        geometry.validate_role(role_for_profile(self.chunk_size))?;
+        let mut nodes = MapNodeWriter::new()?;
         let mut data = extents.next(0)?;
-        let mut chunks = Vec::with_capacity(length.div_ceil(CHUNK_SIZE as u64) as usize);
         let mut offset = 0;
-        while offset < length {
-            let end = (offset + CHUNK_SIZE as u64).min(length);
-            if data.as_ref().is_none_or(|range| range.start >= end) {
-                if let Some(sha256) = sha256.as_mut() {
-                    let bytes = &mut self.buffer[..(end - offset) as usize];
-                    bytes.fill(0);
-                    sha256.update(&*bytes);
-                    stats.whole_bytes_hashed += bytes.len() as u64;
-                }
-                chunks.push(Chunk::Zero);
-                offset = end;
-                continue;
+        let mut failed = false;
+        let chunks = std::iter::from_fn(|| {
+            if failed {
+                return None;
             }
-            let logical_length = (end - offset) as usize;
-            let buffer_length = if output.as_ref().is_some_and(|output| output.direct) {
-                logical_length.div_ceil(COPY_BLOCK_SIZE) * COPY_BLOCK_SIZE
-            } else {
-                logical_length
-            };
-            let bytes = &mut self.buffer[..buffer_length];
-            bytes.fill(0);
-            while let Some(range) = data.as_ref() {
-                if range.start >= end {
-                    break;
-                }
-                let start = range.start;
-                let read_end = range.end.min(end);
-                let extent_end = range.end;
-                read_exact_at(
-                    source,
-                    &mut bytes[(start - offset) as usize..(read_end - offset) as usize],
-                    start,
-                )?;
-                stats.bytes_read += read_end - start;
-                data = if read_end == extent_end {
-                    extents.next(read_end)?
-                } else {
-                    Some(read_end..extent_end)
-                };
-            }
-            if let Some(sha256) = sha256.as_mut() {
-                sha256.update(&bytes[..logical_length]);
-                stats.whole_bytes_hashed += logical_length as u64;
-            }
-            let chunk = classify_chunk(&bytes[..logical_length]);
-            if matches!(chunk, Chunk::Data(_)) {
-                stats.logical_bytes_hashed += logical_length as u64;
-                if let Some(output) = output.as_mut() {
-                    output.write(bytes, offset)?;
-                    #[cfg(target_os = "linux")]
-                    if !output.direct {
-                        if let Err(error) = start_writeback(output.file, offset, end - offset) {
-                            tracing::debug!(%error, offset, length = end - offset, "start private copy writeback");
+            let result: Result<Option<PresentChunk>, StorageError> = (|| {
+                while offset < length {
+                    if data
+                        .as_ref()
+                        .is_none_or(|range| range.start >= offset + self.chunk_size.bytes())
+                    {
+                        let next = data
+                            .as_ref()
+                            .map_or(length, |range| {
+                                range.start / self.chunk_size.bytes() * self.chunk_size.bytes()
+                            })
+                            .min(length);
+                        if let Some(hash) = sha256.as_mut() {
+                            self.buffer.fill(0);
+                            let mut remaining = next - offset;
+                            while remaining != 0 {
+                                let count = remaining.min(self.buffer.len() as u64) as usize;
+                                hash.update(&self.buffer[..count]);
+                                remaining -= count as u64;
+                                stats.whole_bytes_hashed += count as u64;
+                            }
+                        }
+                        offset = next;
+                        if offset == length {
+                            break;
                         }
                     }
+                    let end = (offset + self.chunk_size.bytes()).min(length);
+                    let logical = (end - offset) as usize;
+                    let buffered = if output.as_ref().is_some_and(|output| output.direct) {
+                        logical.div_ceil(COPY_BLOCK_SIZE) * COPY_BLOCK_SIZE
+                    } else {
+                        logical
+                    };
+                    let bytes = &mut self.buffer[..buffered];
+                    bytes.fill(0);
+                    while let Some(range) = data.as_ref() {
+                        if range.start >= end {
+                            break;
+                        }
+                        let start = range.start.max(offset);
+                        let read_end = range.end.min(end);
+                        let extent_end = range.end;
+                        read_exact_at(
+                            source,
+                            &mut bytes[(start - offset) as usize..(read_end - offset) as usize],
+                            start,
+                        )?;
+                        stats.bytes_read += read_end - start;
+                        data = if read_end == extent_end {
+                            extents.next(read_end)?
+                        } else {
+                            Some(read_end..extent_end)
+                        };
+                    }
+                    if let Some(hash) = sha256.as_mut() {
+                        hash.update(&bytes[..logical]);
+                        stats.whole_bytes_hashed += logical as u64;
+                    }
+                    let index = offset / self.chunk_size.bytes();
+                    let value = geometry.classify_chunk(index, &bytes[..logical])?;
+                    if let Chunk::Data(digest) = value {
+                        stats.logical_bytes_hashed += logical as u64;
+                        if let Some(output) = output.as_mut() {
+                            output.write(bytes, offset)?;
+                            #[cfg(target_os = "linux")]
+                            if !output.direct {
+                                if let Err(error) =
+                                    start_writeback(output.file, offset, end - offset)
+                                {
+                                    tracing::debug!(%error, offset, "start stream copy writeback");
+                                }
+                            }
+                        }
+                        offset = end;
+                        return Ok(Some(PresentChunk { index, digest }));
+                    }
+                    offset = end;
+                }
+                Ok(None)
+            })();
+            match result {
+                Ok(Some(chunk)) => Some(Ok(chunk)),
+                Ok(None) => None,
+                Err(error) => {
+                    failed = true;
+                    Some(Err(storage_map_error(error)))
                 }
             }
-            chunks.push(chunk);
-            offset = end;
-        }
+        });
+        let root = build_sorted(length, self.chunk_size, chunks, &mut nodes)?;
         if let Some(output) = output {
             output.finish()?;
         }
@@ -654,15 +634,19 @@ impl StreamHasher {
         }
         stats.extent_queries = extents.queries;
         Ok(StreamScan {
-            map: StreamMap::new(length, chunks)?,
+            map: nodes
+                .finish(root, role_for_profile(self.chunk_size), None)?
+                .into_map(),
             stats,
         })
     }
 
-    // Short reads accumulate into the same canonical logical chunk.
-    fn scan(&mut self, mut reader: impl Read) -> Result<StreamMap, StorageError> {
-        let mut length = 0_u64;
-        let mut chunks = Vec::new();
+    fn scan(&mut self, mut reader: impl Read) -> Result<AuthenticatedMap, StorageError> {
+        use std::io::{Seek, SeekFrom};
+        StreamRoot::empty(0, self.chunk_size)?.validate_role(role_for_profile(self.chunk_size))?;
+        let mut nodes = MapNodeWriter::new()?;
+        let mut records = nodes.scratch()?;
+        let mut length = 0u64;
         loop {
             let mut filled = 0;
             while filled < self.buffer.len() {
@@ -676,10 +660,78 @@ impl StreamHasher {
             if filled == 0 {
                 break;
             }
+            let index = length / self.chunk_size.bytes();
             length = Resource::ArtifactStreamBytes.sum([length, filled as u64])?;
-            chunks.push(classify_chunk(&self.buffer[..filled]));
+            if let Chunk::Data(digest) = classify_chunk(&self.buffer[..filled]) {
+                records.write_all(&index.to_le_bytes())?;
+                records.write_all(digest.as_bytes())?;
+            }
         }
-        StreamMap::new(length, chunks)
+        records.seek(SeekFrom::Start(0))?;
+        let mut remaining = records.metadata()?.len() / 40;
+        let chunks = std::iter::from_fn(|| {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            let mut index = [0; 8];
+            let mut digest = [0; 32];
+            Some((|| {
+                records.read_exact(&mut index)?;
+                records.read_exact(&mut digest)?;
+                Ok(PresentChunk {
+                    index: u64::from_le_bytes(index),
+                    digest: Sha256Digest::from_bytes(digest),
+                })
+            })())
+        });
+        let root = build_sorted(length, self.chunk_size, chunks, &mut nodes)?;
+        Ok(nodes
+            .finish(root, role_for_profile(self.chunk_size), None)?
+            .into_map())
+    }
+}
+
+fn role_for_profile(chunk_size: ChunkSize) -> StreamRole {
+    if chunk_size == ChunkSize::RAM {
+        StreamRole::Ram
+    } else {
+        StreamRole::Disk
+    }
+}
+
+fn storage_map_error(error: StorageError) -> MapError {
+    match error {
+        StorageError::Map(error) => error,
+        StorageError::Io(error) => MapError::Io(error),
+        error => MapError::Io(io::Error::new(io::ErrorKind::InvalidData, error)),
+    }
+}
+
+fn metadata_error(map: &AuthenticatedMap, error: StorageError) -> ExpectedMapError {
+    match error {
+        StorageError::Map(MapError::Node {
+            digest,
+            height,
+            first_index,
+            end_index,
+            source,
+        }) => ExpectedMapError::Metadata {
+            role: map.role(),
+            stream: map.id(),
+            digest,
+            height,
+            first_index,
+            end_index,
+            start: first_index
+                .saturating_mul(map.chunk_size().bytes())
+                .min(map.length()),
+            end: end_index
+                .saturating_mul(map.chunk_size().bytes())
+                .min(map.length()),
+            reason: source.to_string(),
+        },
+        error => ExpectedMapError::Storage(error),
     }
 }
 
@@ -702,7 +754,7 @@ fn classify_chunk(bytes: &[u8]) -> Chunk {
     if vm_spec::capture::is_all_zero(bytes) {
         Chunk::Zero
     } else {
-        Chunk::Data(ObjectDigest::of_bytes(bytes))
+        Chunk::Data(Sha256Digest::of_bytes(bytes))
     }
 }
 
@@ -988,63 +1040,42 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
-    use crate::storage::identity::ObjectDigest;
     use crate::storage::limits::CHUNK_SIZE;
+    use crate::storage::map::{AuthenticatedMap, MapNodeWriter};
     use crate::storage::stream::{
-        read_exact_at, write_exact_at, AuthenticatedStream, Chunk, Extents, StreamHasher, StreamMap,
+        read_exact_at, write_exact_at, AuthenticatedStream, Chunk, Extents, StreamHasher,
     };
-    use crate::storage::StorageError;
+    use vm_spec::capture::Sha256Digest;
+    use vm_spec::stream_map::{build_sorted, ChunkSize, PresentChunk, StreamRole, StreamRoot};
 
-    #[test]
-    fn empty_stream_has_exact_jcs_and_domain_separated_identity() {
-        let map = StreamHasher::new().hash_reader(&b""[..]).unwrap();
-        let expected =
-            b"{\"chunkSize\":8388608,\"chunks\":[],\"kind\":\"stream\",\"length\":0,\"schema\":1}";
-        let mut canonical = Vec::new();
-        map.write_canonical(&mut canonical).unwrap();
-        assert_eq!(canonical, expected);
-        let mut hash = Sha256::new();
-        hash.update(b"silo:stream:v1\n");
-        hash.update(expected);
-        assert_eq!(
-            map.id().to_string(),
-            ObjectDigest::from_sha256(hash.finalize().into()).to_string()
-        );
-        assert_eq!(
-            map.id().to_string(),
-            "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e"
-        );
-        assert_ne!(
-            map.id().to_string(),
-            ObjectDigest::of_bytes(expected).to_string()
-        );
-        assert_ne!(
-            map.id().to_string(),
-            ObjectDigest::of_bytes(b"").to_string()
-        );
+    fn zero_map(length: u64) -> AuthenticatedMap {
+        MapNodeWriter::new()
+            .unwrap()
+            .finish(
+                StreamRoot::empty(length, ChunkSize::DISK).unwrap(),
+                StreamRole::Disk,
+                None,
+            )
+            .unwrap()
+            .into_map()
     }
 
     #[test]
-    fn fixed_schema_jcs_vectors_cover_data_and_zero_values() {
-        let mut hasher = StreamHasher::new();
+    fn empty_and_sparse_roots_are_binary_and_length_bound() {
+        let map = StreamHasher::new(ChunkSize::DISK)
+            .hash_reader(&b""[..])
+            .unwrap();
+        let bytes = map.canonical_bytes().unwrap();
+        assert_eq!(bytes.len(), 25);
+        assert_eq!(StreamRoot::decode(&bytes).unwrap(), *map.root());
         assert_eq!(
-            hasher.hash_reader(&[0][..]).unwrap().id().to_string(),
-            "sha256:d4c6dbfe1fb7e9dd71187064b171abd82da93c63ec89527933825dcad6caa286"
+            map.id().as_bytes(),
+            Sha256Digest::of_bytes(&bytes).as_bytes()
         );
-        assert_eq!(
-            hasher.hash_reader(&b"abc"[..]).unwrap().id().to_string(),
-            "sha256:008c32bed56a222e714747dafa5eff7e2191b87799eabf3d8b11fbb0eb4e057e"
-        );
-        let length = 4 * 1024_u64.pow(4);
-        let map = StreamMap::new(length, vec![Chunk::Zero; 524288]).unwrap();
-        let mut canonical = Vec::new();
-        map.write_canonical(&mut canonical).unwrap();
-        assert!(
-            canonical.ends_with(b"],\"kind\":\"stream\",\"length\":4398046511104,\"schema\":1}")
-        );
-        let value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
-        assert_eq!(value["length"].as_u64(), Some(length));
-        assert_eq!(value["chunks"].as_array().unwrap().len(), 524288);
+        let maximum = zero_map(4 << 40);
+        assert_eq!(maximum.canonical_bytes().unwrap().len(), 25);
+        assert_ne!(map.id(), maximum.id());
+        assert!(StreamRoot::decode(br#"{"schema":1,"kind":"stream"}"#).is_err());
     }
 
     #[test]
@@ -1052,28 +1083,27 @@ mod tests {
         let mut bytes = vec![0; 2 * CHUNK_SIZE + 3];
         bytes[CHUNK_SIZE + 17] = 9;
         bytes[2 * CHUNK_SIZE + 2] = 7;
-        let map = StreamHasher::new().hash_reader(&bytes[..]).unwrap();
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_reader(&bytes[..])
+            .unwrap();
         assert_eq!(map.length(), bytes.len() as u64);
+        assert_eq!(map.lookup(0).unwrap(), Chunk::Zero);
         assert_eq!(
-            map.chunks(),
-            &[
-                Chunk::Zero,
-                Chunk::Data(ObjectDigest::of_bytes(&bytes[CHUNK_SIZE..2 * CHUNK_SIZE])),
-                Chunk::Data(ObjectDigest::of_bytes(&[0, 0, 7])),
-            ]
+            map.lookup(1).unwrap(),
+            Chunk::Data(Sha256Digest::of_bytes(&bytes[CHUNK_SIZE..2 * CHUNK_SIZE]))
         );
-        let mut canonical = Vec::new();
-        map.write_canonical(&mut canonical).unwrap();
-        let expected = format!("{{\"chunkSize\":8388608,\"chunks\":[\"zero\",\"{}\",\"{}\"],\"kind\":\"stream\",\"length\":{},\"schema\":1}}", ObjectDigest::of_bytes(&bytes[CHUNK_SIZE..2 * CHUNK_SIZE]), ObjectDigest::of_bytes(&[0, 0, 7]), bytes.len());
-        assert_eq!(canonical, expected.as_bytes());
-        let exact = StreamHasher::new()
+        assert_eq!(
+            map.lookup(2).unwrap(),
+            Chunk::Data(Sha256Digest::of_bytes(&[0, 0, 7]))
+        );
+        let exact = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_reader(&bytes[..2 * CHUNK_SIZE])
             .unwrap();
-        assert_eq!(exact.chunks().len(), 2);
-        let zero_tail = StreamHasher::new()
+        assert_eq!(exact.root().chunk_count(), 2);
+        let zero_tail = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_reader(&bytes[..CHUNK_SIZE + 1])
             .unwrap();
-        assert_eq!(zero_tail.chunks(), &[Chunk::Zero, Chunk::Zero]);
+        assert_eq!(zero_tail.present_chunks().count(), 0);
         assert_ne!(exact.id(), zero_tail.id());
     }
 
@@ -1081,18 +1111,13 @@ mod tests {
     fn short_real_reads_do_not_create_short_nonfinal_chunks() {
         let bytes = vec![5; CHUNK_SIZE + 19];
         // Chain's first slice forces a 17-byte read before the remaining bytes.
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         let expected = hasher.hash_reader(&bytes[..]).unwrap();
         let actual = hasher
             .hash_reader((&bytes[..17]).chain(&bytes[17..]))
             .unwrap();
         assert_eq!(actual, expected);
-        assert!(matches!(
-            StreamMap::new(1, vec![]),
-            Err(StorageError::ChunkCount { .. })
-        ));
-        assert!(StreamMap::new(0, vec![Chunk::Zero]).is_err());
-        assert!(StreamMap::new(4 * 1024_u64.pow(4) + 1, vec![]).is_err());
+        assert!(StreamRoot::empty((4 << 40) + 1, ChunkSize::DISK).is_err());
     }
 
     #[test]
@@ -1109,7 +1134,7 @@ mod tests {
         let mut bytes = vec![0; length as usize];
         bytes[length as usize - 1] = 1;
         std::fs::write(&allocated, bytes).unwrap();
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         assert_eq!(
             hasher.hash_file(&sparse).unwrap(),
             hasher.hash_file(&allocated).unwrap()
@@ -1119,7 +1144,7 @@ mod tests {
 
     #[test]
     fn fused_sha_matches_logical_bytes_for_sparse_mixed_chunks_holes_and_tails() {
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         for length in [0, 1, CHUNK_SIZE, 2 * CHUNK_SIZE + 19] {
             for nonzero in [false, true] {
                 let source = tempfile::tempfile().unwrap();
@@ -1145,59 +1170,10 @@ mod tests {
                 assert_eq!(sha256, vm_spec::capture::Sha256Digest::of_bytes(&bytes));
                 assert_ne!(fused.map.id().as_bytes(), sha256.as_bytes());
                 if length > CHUNK_SIZE && nonzero {
-                    assert_eq!(fused.map.chunks()[1], Chunk::Zero);
+                    assert_eq!(fused.map.lookup(1).unwrap(), Chunk::Zero);
                 }
             }
         }
-    }
-
-    #[test]
-    fn strict_stream_map_decode_preserves_identity_and_rejects_invalid_records() {
-        let map = StreamHasher::new().hash_reader(b"abc".as_slice()).unwrap();
-        let canonical = map.canonical_bytes().unwrap();
-        assert_eq!(StreamMap::decode(&canonical).unwrap(), map);
-        assert_ne!(
-            ObjectDigest::of_bytes(&canonical).to_string(),
-            map.id().to_string()
-        );
-        let empty = r#"{"schema":1,"kind":"stream","length":0,"chunkSize":8388608,"chunks":[]}"#;
-        assert_eq!(StreamMap::decode(empty.as_bytes()).unwrap().length(), 0);
-        for invalid in [
-            empty.replace("\"schema\":1", "\"schema\":1,\"schema\":1"),
-            empty.replace("\"chunks\":[]", "\"chunks\":[],\"extra\":0"),
-            empty.replace("\"kind\":\"stream\",", ""),
-            empty.replace("\"schema\":1", "\"schema\":2"),
-            empty.replace("\"kind\":\"stream\"", "\"kind\":\"snapshot\""),
-            empty.replace("8388608", "4096"),
-            empty.replace("\"length\":0", "\"length\":0.0"),
-            empty.replace("\"length\":0", "\"length\":-1"),
-            empty.replace("\"length\":0", "\"length\":9007199254740992"),
-            empty.replace("\"chunks\":[]", "\"chunks\":[\"zero\"]"),
-            empty.replace("\"length\":0", "\"length\":1"),
-            empty.replace("\"length\":0", "\"length\":4398046511105"),
-            empty.replace("\"chunks\":[]", "\"chunks\":[null]"),
-            format!("{empty} trailing"),
-        ] {
-            assert!(StreamMap::decode(invalid.as_bytes()).is_err(), "{invalid}");
-        }
-        for entry in [
-            "ZERO".to_owned(),
-            format!("sha512:{}", "0".repeat(64)),
-            format!("sha256:{}", "A".repeat(64)),
-            format!("sha256:{}", "0".repeat(63)),
-        ] {
-            let invalid = format!(
-                "{{\"schema\":1,\"kind\":\"stream\",\"length\":1,\"chunkSize\":8388608,\"chunks\":[\"{entry}\"]}}"
-            );
-            assert!(StreamMap::decode(invalid.as_bytes()).is_err());
-        }
-        let maximum = StreamMap::new(4 * 1024_u64.pow(4), vec![Chunk::Zero; 524288]).unwrap();
-        assert_eq!(
-            StreamMap::decode(&maximum.canonical_bytes().unwrap()).unwrap(),
-            maximum,
-        );
-        let oversized = vec![b' '; 524288 * 74 + 257];
-        assert!(StreamMap::decode(&oversized).is_err());
     }
 
     #[test]
@@ -1212,7 +1188,7 @@ mod tests {
         // Real allocated zeros and nonzero data; no fabricated extent replies.
         source.write_all(&bytes).unwrap();
         source.seek(SeekFrom::Start(123)).unwrap();
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         let expected = hasher.hash_reader(bytes.as_slice()).unwrap();
         let scan = hasher
             .copy_file_and_hash(&source, bytes.len() as u64, &output)
@@ -1239,7 +1215,7 @@ mod tests {
 
     #[test]
     fn empty_zero_and_trailing_hole_outputs_have_exact_lengths_and_maps() {
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         for length in [0, 1, CHUNK_SIZE as u64, CHUNK_SIZE as u64 + 3] {
             let source = tempfile::tempfile().unwrap();
             source.set_len(length).unwrap();
@@ -1247,7 +1223,7 @@ mod tests {
             let scan = hasher.copy_file_and_hash(&source, length, &output).unwrap();
             assert_eq!(output.metadata().unwrap().len(), length);
             assert_eq!(scan.map.length(), length);
-            assert!(scan.map.chunks().iter().all(|chunk| *chunk == Chunk::Zero));
+            assert_eq!(scan.map.present_chunks().count(), 0);
             assert_eq!(scan.stats.logical_bytes_hashed, 0);
             assert_eq!(output.metadata().unwrap().blocks(), 0);
         }
@@ -1258,7 +1234,8 @@ mod tests {
         let scan = hasher
             .copy_file_and_hash(&source, 2 * CHUNK_SIZE as u64 + 3, &output)
             .unwrap();
-        assert_eq!(&scan.map.chunks()[1..], &[Chunk::Zero, Chunk::Zero]);
+        assert_eq!(scan.map.lookup(1).unwrap(), Chunk::Zero);
+        assert_eq!(scan.map.lookup(2).unwrap(), Chunk::Zero);
         assert_eq!(output.metadata().unwrap().len(), 2 * CHUNK_SIZE as u64 + 3);
     }
 
@@ -1290,19 +1267,21 @@ mod tests {
             );
             cursor = range.end;
         }
-        let mut expected = vec![Chunk::Zero; (length / CHUNK_SIZE as u64) as usize];
-        for (offset, bytes) in writes {
+        let mut nodes = MapNodeWriter::new().unwrap();
+        let present = writes.iter().map(|(offset, bytes)| {
             let mut chunk = vec![0; CHUNK_SIZE];
             let local = (offset % CHUNK_SIZE as u64) as usize;
             chunk[local..local + bytes.len()].copy_from_slice(bytes);
-            expected[(offset / CHUNK_SIZE as u64) as usize] =
-                Chunk::Data(ObjectDigest::of_bytes(&chunk));
-        }
-        let expected = StreamMap::new(length, expected).unwrap();
-        let scan = StreamHasher::new()
+            Ok(PresentChunk {
+                index: offset / CHUNK_SIZE as u64,
+                digest: Sha256Digest::of_bytes(&chunk),
+            })
+        });
+        let expected = build_sorted(length, ChunkSize::DISK, present, &mut nodes).unwrap();
+        let scan = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .copy_file_and_hash(&source, length, &output)
             .unwrap();
-        assert_eq!(scan.map, expected);
+        assert_eq!(*scan.map.root(), expected);
         assert!(scan.stats.bytes_read < 1024 * 1024);
         assert_eq!(scan.stats.logical_bytes_hashed, 3 * CHUNK_SIZE as u64);
         assert!(scan.stats.allocated_bytes < 1024 * 1024);
@@ -1328,13 +1307,15 @@ mod tests {
         assert!(write_exact_at(&source, b"no", 0).is_err());
         let write_only = OpenOptions::new().write(true).open(&path).unwrap();
         assert!(read_exact_at(&write_only, &mut [0; 3], 0).is_err());
-        assert!(StreamHasher::new().hash_open_file(&write_only, 3).is_err());
-        assert!(StreamHasher::new()
+        assert!(StreamHasher::new(ChunkSize::DISK)
+            .hash_open_file(&write_only, 3)
+            .is_err());
+        assert!(StreamHasher::new(ChunkSize::DISK)
             .hash_open_file_with_sha256(&write_only, 3)
             .is_err());
         let output = tempfile::tempfile().unwrap();
         output.write_all_at(b"owned", 0).unwrap();
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         assert!(hasher.copy_file_and_hash(&source, 3, &output).is_err());
         assert!(hasher.copy_file_and_hash(&source, 3, &source).is_err());
         assert!(hasher.hash_open_file(&source, 2).is_err());
@@ -1347,8 +1328,8 @@ mod tests {
         let fresh = tempfile::tempfile().unwrap();
         let copied = hasher.copy_file_and_hash(&source, 3, &fresh).unwrap();
         assert_eq!(
-            copied.map.chunks(),
-            &[Chunk::Data(ObjectDigest::of_bytes(b"abc"))]
+            copied.map.lookup(0).unwrap(),
+            Chunk::Data(Sha256Digest::of_bytes(b"abc"))
         );
         let mut actual = [0; 3];
         fresh.read_exact_at(&mut actual, 0).unwrap();
@@ -1367,22 +1348,22 @@ mod tests {
         // Disable the optimization, not file I/O: this exercises the same
         // all-data cursor selected by a real unsupported extent syscall.
         extents.supported = false;
-        let scan = StreamHasher::new()
+        let scan = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .scan_file(&source, length, None, extents, None)
             .unwrap();
         assert_eq!(scan.stats.bytes_read, length);
         assert_eq!(scan.stats.logical_bytes_hashed, 23);
         assert_eq!(scan.stats.extent_queries, 0);
-        assert_eq!(scan.map.chunks()[0], Chunk::Zero);
+        assert_eq!(scan.map.lookup(0).unwrap(), Chunk::Zero);
         let mut tail = [0; 23];
         tail[7..17].copy_from_slice(b"not a hole");
         assert_eq!(
-            scan.map.chunks()[1],
-            Chunk::Data(ObjectDigest::of_bytes(&tail))
+            scan.map.lookup(1).unwrap(),
+            Chunk::Data(Sha256Digest::of_bytes(&tail))
         );
         assert_eq!(
             scan.map,
-            StreamHasher::new()
+            StreamHasher::new(ChunkSize::DISK)
                 .hash_open_file(&source, length)
                 .unwrap()
                 .map
@@ -1390,7 +1371,7 @@ mod tests {
         let mut extents = Extents::new(&source, length);
         extents.supported = false;
         let mut sha256 = Sha256::new();
-        let fused = StreamHasher::new()
+        let fused = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .scan_file(&source, length, None, extents, Some(&mut sha256))
             .unwrap();
         let mut expected = vec![0; length as usize];
@@ -1425,17 +1406,6 @@ mod tests {
     }
 
     #[test]
-    fn map_decoder_requires_an_object_and_bounds_decoded_chunk_count() {
-        assert!(StreamMap::decode(br#"[1,"stream",0,8388608,[]]"#).is_err());
-        assert!(StreamMap::decode(b"").is_err());
-        let chunks = "\"zero\",".repeat(524288) + "\"zero\"";
-        let record = format!(
-            "{{\"schema\":1,\"kind\":\"stream\",\"length\":4398046511104,\"chunkSize\":8388608,\"chunks\":[{chunks}]}}"
-        );
-        assert!(StreamMap::decode(record.as_bytes()).is_err());
-    }
-
-    #[test]
     fn authenticated_copy_shares_map_but_reopens_offsets_and_verifies_sparse_output() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source");
@@ -1449,7 +1419,7 @@ mod tests {
         source.set_len(length).unwrap();
         source.write_all_at(b"head", 17).unwrap();
         source.write_all_at(b"tail", length - 4).unwrap();
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         let authenticated = hasher.authenticate(source, length).unwrap();
         let reopened = authenticated.reopen(File::open(&path).unwrap()).unwrap();
         assert!(std::sync::Arc::ptr_eq(&authenticated.map, &reopened.map));
@@ -1478,7 +1448,7 @@ mod tests {
 
     #[test]
     fn authenticated_copy_zero_lengths_and_holes_still_verify_exact_outputs() {
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         for length in [0, 1, CHUNK_SIZE as u64, CHUNK_SIZE as u64 + 3] {
             let source = tempfile::tempfile().unwrap();
             source.set_len(length).unwrap();
@@ -1493,13 +1463,13 @@ mod tests {
 
     #[test]
     fn authenticated_copy_rejects_wrong_maps_after_copy_and_changed_sources_before_copy() {
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         let source = tempfile::tempfile().unwrap();
         source.write_all_at(b"abc", 0).unwrap();
         let mut authenticated = hasher.authenticate(source, 3).unwrap();
         // Inject contradictory authority only inside this unit test. Even a
         // map-zero chunk cannot suppress reading/copying real source extents.
-        authenticated.map = std::sync::Arc::new(StreamMap::new(3, vec![Chunk::Zero]).unwrap());
+        authenticated.map = std::sync::Arc::new(zero_map(3));
         let output = tempfile::tempfile().unwrap();
         let error = hasher
             .copy_authenticated(&authenticated, &output)
@@ -1532,7 +1502,7 @@ mod tests {
 
     #[test]
     fn receipt_copy_rejects_corrupt_source_without_reading_output() {
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         let source = tempfile::tempfile().unwrap();
         source.write_all_at(b"original", 0).unwrap();
         let expected = hasher.hash_open_file(&source, 8).unwrap().map;
@@ -1566,7 +1536,12 @@ mod tests {
 
         let file = tempfile::tempfile().unwrap();
         file.write_all_at(b"abc", 0).unwrap();
-        let map = Arc::new(StreamHasher::new().hash_open_file(&file, 3).unwrap().map);
+        let map = Arc::new(
+            StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_open_file(&file, 3)
+                .unwrap()
+                .map,
+        );
         let fingerprint = SourceFingerprint::new(&file.metadata().unwrap());
         let held = AuthenticatedStream::from_verified_fingerprint(
             file.try_clone().unwrap(),
@@ -1583,7 +1558,7 @@ mod tests {
             fingerprint,
         )
         .is_err());
-        let wrong_length = StreamMap::new(2, vec![Chunk::Zero]).unwrap();
+        let wrong_length = zero_map(2);
         assert!(
             AuthenticatedStream::from_receipt(file.try_clone().unwrap(), wrong_length,).is_err()
         );
@@ -1598,7 +1573,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source");
         std::fs::write(&path, b"abc").unwrap();
-        let mut hasher = StreamHasher::new();
+        let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
         let mut authenticated = hasher.authenticate(File::open(&path).unwrap(), 3).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(authenticated.reopen(File::open(&path).unwrap()).is_err());
@@ -1619,7 +1594,10 @@ mod tests {
         use crate::storage::stream::CopyWriteback;
         use nix::fcntl::{fcntl, FcntlArg};
 
-        let mut hasher = StreamHasher::with_writeback(CopyWriteback::Direct);
+        let mut hasher = StreamHasher::with_writeback(
+            vm_spec::stream_map::ChunkSize::DISK,
+            CopyWriteback::Direct,
+        );
         assert!((hasher.buffer.as_ptr() as usize).is_multiple_of(4096));
         assert_eq!(hasher.buffer.len(), CHUNK_SIZE);
         for length in [0, 1, 4095, 4096, 4097, CHUNK_SIZE + 19] {
@@ -1630,7 +1608,9 @@ mod tests {
             }
             let source = tempfile::tempfile().unwrap();
             source.write_all_at(&bytes, 0).unwrap();
-            let expected = StreamHasher::new().hash_reader(bytes.as_slice()).unwrap();
+            let expected = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+                .hash_reader(bytes.as_slice())
+                .unwrap();
             let receipt = AuthenticatedStream::from_receipt(source, expected.clone()).unwrap();
             let output = tempfile::tempfile().unwrap();
             let flags = fcntl(&output, FcntlArg::F_GETFL).unwrap();
@@ -1674,14 +1654,20 @@ mod tests {
 
         let source = tempfile::tempfile().unwrap();
         source.write_all_at(b"original", 0).unwrap();
-        let map = StreamHasher::new().hash_open_file(&source, 8).unwrap().map;
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_open_file(&source, 8)
+            .unwrap()
+            .map;
         source.write_all_at(b"corrupt!", 0).unwrap();
         let receipt = AuthenticatedStream::from_receipt(source, map).unwrap();
         let output = tempfile::tempfile().unwrap();
         let flags = fcntl(&output, FcntlArg::F_GETFL).unwrap();
-        let error = StreamHasher::with_writeback(CopyWriteback::Direct)
-            .copy_authenticated(&receipt, &output)
-            .unwrap_err();
+        let error = StreamHasher::with_writeback(
+            vm_spec::stream_map::ChunkSize::DISK,
+            CopyWriteback::Direct,
+        )
+        .copy_authenticated(&receipt, &output)
+        .unwrap_err();
         assert!(error.to_string().contains("copy-time stream chunks"));
         assert_eq!(fcntl(&output, FcntlArg::F_GETFL).unwrap(), flags);
     }
@@ -1692,30 +1678,130 @@ mod tests {
         let source = tempfile::tempfile().unwrap();
         let length = 2 * CHUNK_SIZE as u64 + 7;
         source.set_len(length).unwrap();
-        let map = StreamMap::new(length, vec![Chunk::Zero; 3]).unwrap();
+        let map = zero_map(length);
         assert_eq!(
-            StreamHasher::new()
+            StreamHasher::new(ChunkSize::DISK)
                 .verify_expected_map(&source, &map)
                 .unwrap()
                 .bytes_read,
             length
         );
         source.write_all_at(&[1], length - 1).unwrap();
-        let error = StreamHasher::new()
+        let error = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .verify_expected_map(&source, &map)
             .unwrap_err();
         assert!(matches!(error, ExpectedMapError::ChunkMismatch {
-            index: 2, start, end, expected: Chunk::Zero, actual: Chunk::Data(_)
+            index: 2, start, end, expected: Chunk::Zero, actual: Chunk::Data(_), ..
         } if start == 2 * CHUNK_SIZE as u64 && end == length));
         source.write_all_at(&[2], 0).unwrap();
         assert!(matches!(
-            StreamHasher::new().verify_expected_map(&source, &map),
+            StreamHasher::new(ChunkSize::DISK).verify_expected_map(&source, &map),
             Err(ExpectedMapError::ChunkMismatch { index: 0, .. })
         ));
         source.set_len(length - 1).unwrap();
         assert!(matches!(
-            StreamHasher::new().verify_expected_map(&source, &map),
+            StreamHasher::new(ChunkSize::DISK).verify_expected_map(&source, &map),
             Err(ExpectedMapError::Length { expected, actual }) if expected == length && actual == length - 1
         ));
+    }
+
+    #[test]
+    fn real_sparse_edits_full_builds_and_updates_have_identical_roots() {
+        use vm_spec::stream_map::ChunkChange;
+        for profile in [ChunkSize::RAM, ChunkSize::DISK] {
+            let source = tempfile::tempfile().unwrap();
+            let length = 2 * profile.bytes() + 19;
+            source.set_len(length).unwrap();
+            let mut hasher = StreamHasher::new(profile);
+            let mut map = hasher.hash_open_file(&source, length).unwrap().map;
+            let mut state = 0x1a2b3c4du64;
+            for step in 0..18 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let index = (state >> 32) % 3;
+                let range = map.root().chunk_range(index).unwrap();
+                let mut bytes = vec![0; (range.end - range.start) as usize];
+                if step % 3 != 0 {
+                    let position = (state as usize) % bytes.len();
+                    bytes[position] = 1 + (state % 254) as u8;
+                }
+                source.write_all_at(&bytes, range.start).unwrap();
+                let value = map.root().classify_chunk(index, &bytes).unwrap();
+                let produced = map
+                    .update_sorted(
+                        [Ok(ChunkChange { index, value })],
+                        &mut MapNodeWriter::new().unwrap(),
+                    )
+                    .unwrap();
+                assert!(produced.new_nodes().len() <= 5);
+                let rebuilt = hasher.hash_open_file(&source, length).unwrap().map;
+                assert_eq!(produced.map, rebuilt);
+                // An admitted predecessor has independent root authority, not a
+                // snapshot-parent identity requirement.
+                map = produced.into_map();
+            }
+            let stats = hasher.verify_expected_map(&source, &map).unwrap();
+            assert_eq!(stats.bytes_read, length);
+            let output = tempfile::tempfile().unwrap();
+            let (copied, whole) = hasher
+                .copy_file_and_hash_with_sha256(&source, length, &output)
+                .unwrap();
+            assert_eq!(copied.map, map);
+            assert_eq!(
+                whole,
+                crate::storage::stream::whole_file_sha256(&source).unwrap()
+            );
+            assert_eq!(hasher.hash_open_file(&output, length).unwrap().map, map);
+        }
+    }
+
+    #[test]
+    fn same_real_bytes_different_profiles_have_different_roots_and_golden_empty_ram() {
+        let source = tempfile::tempfile().unwrap();
+        let length = ChunkSize::DISK.bytes() + 3;
+        source.set_len(length).unwrap();
+        source.write_all_at(b"head", 17).unwrap();
+        source.write_all_at(&[7], length - 1).unwrap();
+        let ram = StreamHasher::new(ChunkSize::RAM)
+            .hash_open_file(&source, length)
+            .unwrap()
+            .map;
+        let disk = StreamHasher::new(ChunkSize::DISK)
+            .hash_open_file(&source, length)
+            .unwrap()
+            .map;
+        assert_ne!(ram.id(), disk.id());
+        assert_eq!(ram.present_chunks().count(), 2);
+        assert_eq!(disk.present_chunks().count(), 2);
+        assert_eq!(
+            StreamHasher::new(ChunkSize::RAM)
+                .hash_reader(&[][..])
+                .unwrap()
+                .id()
+                .to_string(),
+            "sha256:8105ecb94483de323a5b839ea425e11e2270d9b5ae54fe5ab72ee75beed03f02"
+        );
+        assert_eq!(
+            StreamHasher::new(ChunkSize::RAM)
+                .hash_reader(&[0][..])
+                .unwrap()
+                .id()
+                .to_string(),
+            "sha256:0471c42fb5674f3d0950b535aebe6712afd9b09ca40891364a9042e0b2c9a23a"
+        );
+        source
+            .write_all_at(&[1], ChunkSize::RAM.bytes() + 37)
+            .unwrap();
+        assert!(
+            matches!(StreamHasher::new(ChunkSize::RAM).verify_expected_map(&source, &ram),
+            Err(crate::storage::stream::ExpectedMapError::ChunkMismatch { role: StreamRole::Ram, stream, chunk_size: ChunkSize::RAM, index: 1, start: 65536, end: 131072, expected: Chunk::Zero, actual: Chunk::Data(_) }) if stream == ram.id())
+        );
+        source
+            .write_all_at(&[0], ChunkSize::RAM.bytes() + 37)
+            .unwrap();
+        source.write_all_at(&[0], length - 1).unwrap();
+        assert!(
+            matches!(StreamHasher::new(ChunkSize::RAM).verify_expected_map(&source, &ram),
+            Err(crate::storage::stream::ExpectedMapError::ChunkMismatch { index: 128, start, end, expected: Chunk::Data(_), actual: Chunk::Zero, .. }) if start == ChunkSize::DISK.bytes() && end == length)
+        );
     }
 }

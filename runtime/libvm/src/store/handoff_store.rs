@@ -61,7 +61,7 @@ async fn write(
         HandoffPhase::Aborted => "aborted",
     };
     if insert {
-        sqlx::query("INSERT INTO handoff_operation(operation_id,schema,role,mode,source_machine,destination_machine,phase,terminal,record_json,source_runtime,destination_runtime,from_epoch,next_epoch) VALUES(?1,1,?2,?3,?4,?5,?6,?7,jsonb(?8),?9,?10,?11,?12)")
+        sqlx::query("INSERT INTO handoff_operation(operation_id,schema,role,mode,source_machine,destination_machine,phase,terminal,record_json,source_runtime,destination_runtime,from_epoch,next_epoch) VALUES(?1,2,?2,?3,?4,?5,?6,?7,jsonb(?8),?9,?10,?11,?12)")
             .bind(record.intent.operation.to_string()).bind(role).bind(mode).bind(record.intent.source_machine.to_string()).bind(record.intent.destination_machine.to_string()).bind(phase).bind(record.phase.is_terminal()).bind(json)
             .bind(record.intent.source_runtime.to_string()).bind(record.intent.destination_runtime.to_string())
             .bind(record.intent.from_epoch.get() as i64).bind(record.intent.destination_epoch()?.get() as i64)
@@ -113,7 +113,7 @@ fn check(
 }
 fn fresh(intent: &HandoffIntent, role: HandoffRole) -> HandoffRecord {
     HandoffRecord {
-        schema: 1,
+        schema: 2,
         role,
         intent: intent.clone(),
         binding: None,
@@ -1512,6 +1512,9 @@ mod tests {
         let (_source_home, source) = catalog().await;
         let (_destination_home, destination) = catalog().await;
         let machine = MachineId::new();
+        let source_pool = crate::storage::pool::StoragePool::open(&source.images_dir).unwrap();
+        let destination_pool =
+            crate::storage::pool::StoragePool::open(&destination.images_dir).unwrap();
         let source_directory = crate::paths::OwnedDirectory::open_root(
             &crate::paths::machine_data_dir_in(source.home_path(), machine),
         )
@@ -1529,12 +1532,13 @@ mod tests {
         )
         .unwrap();
         let file = std::fs::File::open(source_directory.path().join("root.raw")).unwrap();
-        let map = crate::storage::stream::StreamHasher::new()
+        let map = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
             .hash_open_file(&file, 512)
             .unwrap()
             .map;
-        crate::machine::root_storage::seed_disk(
+        let source_map_guard = crate::machine::root_storage::seed_disk(
             &mut source_storage,
+            &source_pool,
             source_directory.path(),
             0,
             &disk,
@@ -1546,6 +1550,7 @@ mod tests {
             .save_machine_config_with_storage(&config(&source, machine), &source_storage)
             .await
             .unwrap();
+        drop(source_map_guard);
         let intent = new_intent(&source, &destination, machine, 0).await;
         let prepared = prepared(&source, &destination, &intent).await;
         assert!(matches!(
@@ -1573,8 +1578,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let file = std::fs::File::open(destination_directory.path().join("root.raw")).unwrap();
-        crate::machine::root_storage::seed_disk(
+        let destination_map_guard = crate::machine::root_storage::seed_disk(
             &mut received,
+            &destination_pool,
             destination_directory.path(),
             0,
             &disk,
@@ -1586,6 +1592,7 @@ mod tests {
             .await
             .unwrap();
         commit.commit().await.unwrap();
+        drop(destination_map_guard);
         assert!(matches!(
             destination
                 .machine_storage(machine)
@@ -1596,5 +1603,150 @@ mod tests {
                 .state,
             DiskBaselineState::Invalid
         ));
+    }
+
+    #[tokio::test]
+    async fn root_bound_handoff_reservation_and_commit_survive_participant_restarts() {
+        use crate::handoff::plan::{CaptureManifest, CapturedFile, ManifestBody, WritableRole};
+        use crate::storage::pool::StoragePool;
+        use std::io::Write;
+
+        let (source_home, source) = catalog().await;
+        let (destination_home, destination) = catalog().await;
+        let machine = MachineId::new();
+        seed(&source, machine).await;
+        let intent = new_intent(&source, &destination, machine, 0).await;
+        source.reserve_handoff_source(&intent).await.unwrap();
+        destination.receive_handoff(&intent).await.unwrap();
+        let source_lease = source
+            .begin_handoff_storage(intent.operation)
+            .await
+            .unwrap();
+        let destination_lease = destination
+            .begin_handoff_storage(intent.operation)
+            .await
+            .unwrap();
+        let input = source_home.path().join("handoff-input.raw");
+        std::fs::write(&input, [0x6d; 512]).unwrap();
+        let mut root = None;
+        for store in [&source, &destination] {
+            let pool = StoragePool::open(&store.images_dir).unwrap();
+            let (published, guard) = pool.publish_stream_for_catalog(&input).unwrap();
+            store
+                .pin_handoff_dependencies(intent.operation, &[published.id], &[])
+                .await
+                .unwrap();
+            drop(guard);
+            let stream = crate::store::snapshot_store::publish_map(
+                &pool,
+                store,
+                intent.operation.as_uuid(),
+                &published.map,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stream.map.as_bytes(), stream.stream.as_bytes());
+            if let Some(previous) = &root {
+                assert_eq!(&stream, previous);
+            } else {
+                root = Some(stream);
+            }
+        }
+        let root = root.unwrap();
+        let capture = CaptureId::new(uuid::Uuid::new_v4()).unwrap();
+        let manifest = CaptureManifest::new(ManifestBody {
+            schema: 2,
+            capture,
+            operation: intent.operation,
+            approved_plan_digest: intent.approved_plan_digest,
+            stop_outcome: crate::StorageStopOutcome::Clean,
+            files: vec![CapturedFile {
+                role: WritableRole::Root,
+                stream: root.stream,
+                length: root.length,
+            }],
+        })
+        .unwrap();
+        for store in [&source, &destination] {
+            let pool = StoragePool::open(&store.images_dir).unwrap();
+            let (object, guard, ()) = pool
+                .publish_produced_object_for_catalog(|file| {
+                    file.write_all(manifest.document().bytes())?;
+                    Ok::<_, crate::storage::StorageError>(())
+                })
+                .unwrap();
+            assert_eq!(object.digest, manifest.document().digest());
+            store
+                .pin_handoff_dependencies(intent.operation, &[], &[object.digest])
+                .await
+                .unwrap();
+            drop(guard);
+        }
+        let binding = HandoffBinding {
+            intent: intent.clone(),
+            capture,
+            capture_manifest_digest: manifest.document().digest(),
+        };
+        source.bind_handoff_capture(&binding).await.unwrap();
+        destination.offer_handoff_capture(&binding).await.unwrap();
+        drop(source_lease);
+        drop(destination_lease);
+        source.close().await;
+        destination.close().await;
+        let source = Store::new(&crate::paths::LocalPaths::new(source_home.path()))
+            .await
+            .unwrap();
+        let destination = Store::new(&crate::paths::LocalPaths::new(destination_home.path()))
+            .await
+            .unwrap();
+        for store in [&source, &destination] {
+            assert_eq!(
+                store
+                    .get_handoff(intent.operation)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .binding,
+                Some(binding.clone())
+            );
+            assert!(store
+                .handoff_pins_object(intent.operation, &root.map)
+                .await
+                .unwrap());
+            let pool = StoragePool::open(&store.images_dir).unwrap();
+            let restored = CaptureManifest::from_document(
+                crate::handoff::plan::SealedDocument::new(
+                    binding.capture_manifest_digest,
+                    pool.read_object(&binding.capture_manifest_digest, 65536)
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(restored.body().files[0].stream, root.stream);
+        }
+        let prepared = destination
+            .prepare_handoff_destination(&binding)
+            .await
+            .unwrap();
+        let authorization = source.fence_handoff_source(&prepared).await.unwrap();
+        let directory = crate::paths::OwnedDirectory::open_root(
+            &crate::paths::machine_data_dir_in(destination.home_path(), machine),
+        )
+        .unwrap();
+        directory.write_file("root.raw", &[0x6d; 512]).unwrap();
+        let committed = publish(&destination, &authorization, &intent).await;
+        destination.close().await;
+        let destination = Store::new(&crate::paths::LocalPaths::new(destination_home.path()))
+            .await
+            .unwrap();
+        let replay = destination
+            .begin_handoff_destination_commit(&authorization)
+            .await
+            .unwrap();
+        assert_eq!(replay.terminal_receipt(), Some(&committed));
+        assert_eq!(replay.commit().await.unwrap(), committed);
+        assert_eq!(committed.binding, Some(binding));
+        source.resolve_handoff_source(&committed).await.unwrap();
     }
 }

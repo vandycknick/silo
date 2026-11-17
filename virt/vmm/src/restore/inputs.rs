@@ -231,19 +231,19 @@ pub(crate) fn identity(file: &File) -> io::Result<(u64, u64)> {
     Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
-/// Decode the already immutable inherited map and authenticate its whole file
-/// and complete stream identity against the seal, never against live child RAM.
+/// Decode the immutable inherited binary root and authenticate its exact bytes
+/// and role/profile against the seal, without scanning RAM or node descendants.
 pub(crate) fn verified_ram_map(
     request: &RestoreRequest,
     file: &File,
-) -> io::Result<vm_spec::capture::StreamMap> {
+) -> io::Result<vm_spec::stream_map::StreamRoot> {
     use std::os::unix::fs::FileExt as _;
     let object = request
         .objects
         .iter()
         .find(|object| object.role == vm_spec::restore::RestoreObjectRole::RamMap)
         .ok_or_else(|| invalid("restore lacks its complete RAM map"))?;
-    if object.length > vm_spec::capture::MAX_RAM_MAP_BYTES as u64
+    if object.length > vm_spec::stream_map::MAX_ROOT_BYTES as u64
         || file.metadata()?.len() != object.length
     {
         return Err(invalid(
@@ -255,7 +255,9 @@ pub(crate) fn verified_ram_map(
     if vm_spec::capture::Sha256Digest::of_bytes(&bytes) != object.identity {
         return Err(invalid("restore RAM map differs from its sealed SHA"));
     }
-    let map = vm_spec::capture::StreamMap::decode(&bytes).map_err(invalid)?;
+    let map = vm_spec::stream_map::StreamRoot::decode(&bytes).map_err(io::Error::other)?;
+    map.validate_role(vm_spec::stream_map::StreamRole::Ram)
+        .map_err(io::Error::other)?;
     let memory = request
         .evidence
         .memory
@@ -263,7 +265,7 @@ pub(crate) fn verified_ram_map(
         .ok_or_else(|| invalid("restore lacks RAM evidence"))?;
     if map.length() != memory.packed_length
         || map.id() != memory.ram_stream
-        || map.canonical_bytes().map_err(invalid)? != bytes
+        || map.chunk_size().bytes() != u64::from(memory.identity_chunk_bytes)
     {
         return Err(invalid(
             "restore RAM map differs from the complete canonical stream",

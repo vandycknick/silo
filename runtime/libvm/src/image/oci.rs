@@ -1161,7 +1161,6 @@ pub(crate) mod tests {
         for layer in &graph.layers {
             objects.extend([layer.recipe, layer.result, layer.index_root, layer.pack.map]);
             objects.extend(layer.index_pages.iter().copied());
-            objects.extend(layer.pack.map_pages.iter().copied());
         }
         objects.sort();
         objects.dedup();

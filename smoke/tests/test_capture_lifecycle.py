@@ -764,6 +764,8 @@ def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
         assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command") == intents
         assert silo.info(NAME)["state"] == "error"
         added = {"vm.capture.json", *(entry["role"] for entry in seal["inventory"])}
+        if cut is not None:
+            added |= capture.completed_disk_node_files(silo.ws.silo_home, run.directory, seal)
         capture.unchanged(silo, run.directory, before, added=added if cut is not None else None)
         assert run.resume_requests() == 0
         run.finish()

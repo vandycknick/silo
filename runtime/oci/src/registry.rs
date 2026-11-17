@@ -143,7 +143,11 @@ impl RegistryClient {
         let (manifest, manifest_digest) = match manifest {
             OciManifest::Image(manifest) => (manifest, digest),
             OciManifest::ImageIndex(index) => {
-                if index.artifact_type.as_deref() == Some("application/vnd.silo.vm.v1") {
+                if index
+                    .artifact_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.starts_with("application/vnd.silo.vm."))
+                {
                     return Err(OciError::VmArtifactRequiresAcquisition {
                         reference: requested_ref,
                         index_digest: digest,
@@ -1011,8 +1015,8 @@ mod tests {
             "size": 5
         });
         for (artifact_type, count, admitted) in [
-            ("application/vnd.silo.vm.v1", 4097, true),
-            ("application/vnd.silo.vm.v1", 4098, false),
+            ("application/vnd.silo.vm.v2", 4097, true),
+            ("application/vnd.silo.vm.v2", 4098, false),
             ("application/vnd.example.other", 4097, false),
         ] {
             let bytes = serde_json::to_vec(&serde_json::json!({
