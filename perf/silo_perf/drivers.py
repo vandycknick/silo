@@ -38,11 +38,16 @@ class Action(StrEnum):
     RESTORE_SECOND_EXEC = "restore_second_exec"
     SNAPSHOT_OF_RESTORED = "snapshot_of_restored"
     SNAPSHOT_AFTER_RESTART = "snapshot_after_restart"
+    SNAPSHOT_SOURCE_AFTER_FORKS = "snapshot_source_after_two_forks"
+    SNAPSHOT_FORK_CHILD_FIRST = "snapshot_fork_child_first"
+    SNAPSHOT_FORK_CHILD_SECOND = "snapshot_fork_child_second"
 
 
 INFORMATIONAL_METRICS = frozenset({
     Action.IMAGE_CONVERT_RAW.value, Action.CREATE_FIRST.value, Action.FORK_OF_FORK.value,
     Action.SNAPSHOT_OF_RESTORED.value, Action.SNAPSHOT_AFTER_RESTART.value, Action.SNAPSHOT_VERIFY.value,
+    Action.SNAPSHOT_SOURCE_AFTER_FORKS.value, Action.SNAPSHOT_FORK_CHILD_FIRST.value,
+    Action.SNAPSHOT_FORK_CHILD_SECOND.value,
 })
 
 
@@ -83,6 +88,7 @@ class Driver(Protocol):
     def measure(self, action: Action) -> dict[str, float]: ...
     def prepare_snapshots(self) -> None: ...
     def remove_fork_sources(self) -> None: ...
+    def prepare_fork_snapshots(self) -> None: ...
     def cleanup(self) -> None: ...
 
 
@@ -228,6 +234,14 @@ class CommandDriver:
         name = EXEC_NAMES[action](self.context.names.source, self.context.names.snapshot_source)
         self.guest(name, marker_check("before-snapshot"))
 
+    def prepare_fork_snapshots(self) -> None:
+        # Run after all existing rows so this conditioning cannot warm their clocks.
+        source = self.context.names.snapshot_source
+        for suffix in ("-identity-f1", "-identity-f2"):
+            self.workload(source, initialize=False)
+            self.fork(source, source + suffix)
+        self.workload(source, initialize=False)
+
     def fork(self, source: str, name: str) -> float:
         raise NotImplementedError
 
@@ -327,15 +341,24 @@ class SiloDriver(CommandDriver):
         elif action == Action.FORK_OF_FORK:
             seconds = self.fork(a + "-f1", a + "-f1-f1")
         elif action in (Action.SNAPSHOT_FULL, Action.SNAPSHOT_INCREMENTAL,
-                        Action.SNAPSHOT_OF_RESTORED, Action.SNAPSHOT_AFTER_RESTART):
-            source = b + "-r1" if action == Action.SNAPSHOT_OF_RESTORED else b
+                        Action.SNAPSHOT_OF_RESTORED, Action.SNAPSHOT_AFTER_RESTART,
+                        Action.SNAPSHOT_SOURCE_AFTER_FORKS, Action.SNAPSHOT_FORK_CHILD_FIRST,
+                        Action.SNAPSHOT_FORK_CHILD_SECOND):
+            source = (b + "-r1" if action == Action.SNAPSHOT_OF_RESTORED else
+                      b + "-identity-f1" if action in (Action.SNAPSHOT_FORK_CHILD_FIRST,
+                                                      Action.SNAPSHOT_FORK_CHILD_SECOND) else b)
+            if action == Action.SNAPSHOT_FORK_CHILD_SECOND:
+                self.workload(source, initialize=False)
             if action == Action.SNAPSHOT_AFTER_RESTART:
                 self.call("stop", source)
                 self.call("start", source)
                 self.call("exec", source, "--", "/bin/true")
                 self.populate(source)
             suffix = {Action.SNAPSHOT_FULL: "-s1", Action.SNAPSHOT_INCREMENTAL: "-s2",
-                      Action.SNAPSHOT_OF_RESTORED: "-restored", Action.SNAPSHOT_AFTER_RESTART: "-restarted"}[action]
+                      Action.SNAPSHOT_OF_RESTORED: "-restored", Action.SNAPSHOT_AFTER_RESTART: "-restarted",
+                      Action.SNAPSHOT_SOURCE_AFTER_FORKS: "-after-forks",
+                      Action.SNAPSHOT_FORK_CHILD_FIRST: "-fork-first",
+                      Action.SNAPSHOT_FORK_CHILD_SECOND: "-fork-second"}[action]
             name = b + suffix
             self.snapshots.append(name)
             seconds = self.call("snapshot", "create", source, "--live", "--name", name,
@@ -480,15 +503,24 @@ class MsbDriver(CommandDriver):
         elif action == Action.FORK_OF_FORK:
             seconds = self.fork(a + "-f1", a + "-f1-f1")
         elif action in (Action.SNAPSHOT_FULL, Action.SNAPSHOT_INCREMENTAL,
-                        Action.SNAPSHOT_OF_RESTORED, Action.SNAPSHOT_AFTER_RESTART):
-            source = b + "-r1" if action == Action.SNAPSHOT_OF_RESTORED else b
+                        Action.SNAPSHOT_OF_RESTORED, Action.SNAPSHOT_AFTER_RESTART,
+                        Action.SNAPSHOT_SOURCE_AFTER_FORKS, Action.SNAPSHOT_FORK_CHILD_FIRST,
+                        Action.SNAPSHOT_FORK_CHILD_SECOND):
+            source = (b + "-r1" if action == Action.SNAPSHOT_OF_RESTORED else
+                      b + "-identity-f1" if action in (Action.SNAPSHOT_FORK_CHILD_FIRST,
+                                                      Action.SNAPSHOT_FORK_CHILD_SECOND) else b)
+            if action == Action.SNAPSHOT_FORK_CHILD_SECOND:
+                self.workload(source, initialize=False)
             if action == Action.SNAPSHOT_AFTER_RESTART:
                 self.call("stop", source)
                 self.call("start", source)
                 self.call("exec", source, "--", "/bin/true")
                 self.populate(source)
             name = {Action.SNAPSHOT_FULL: "s1", Action.SNAPSHOT_INCREMENTAL: "s2",
-                    Action.SNAPSHOT_OF_RESTORED: "restored", Action.SNAPSHOT_AFTER_RESTART: "restarted"}[action]
+                    Action.SNAPSHOT_OF_RESTORED: "restored", Action.SNAPSHOT_AFTER_RESTART: "restarted",
+                    Action.SNAPSHOT_SOURCE_AFTER_FORKS: "after-forks",
+                    Action.SNAPSHOT_FORK_CHILD_FIRST: "fork-first",
+                    Action.SNAPSHOT_FORK_CHILD_SECOND: "fork-second"}[action]
             self.snapshots.append(source + ":" + name)
             seconds = self.call("snap", "create", name, "--sandbox", source, "--full")
         elif action in (Action.RESTORE_FIRST, Action.RESTORE_SECOND):

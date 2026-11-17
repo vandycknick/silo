@@ -49,6 +49,7 @@ impl Cmd {
                 flatten_filesystem,
                 format,
             } => {
+                silo_vm_control::images::reject_local_cut(&machine)?;
                 let options = libvm::RawDiskExportOptions {
                     destination: std::path::absolute(destination)?,
                     flatten_filesystem,

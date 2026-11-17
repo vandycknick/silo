@@ -286,7 +286,11 @@ def main() -> None:
                     continue
                 record = json.loads(path.read_bytes())
                 evidence_record = record["evidence"] if filename == "vm.capture-cut.json" else record
-                if evidence_record["captureOutcome"] == "coherent":
+                if "members" in evidence_record:
+                    if (evidence_record["materializationGeneration"] > 0
+                            and all(member["complete"] for member in evidence_record["members"])):
+                        return path.parent
+                elif evidence_record["captureOutcome"] == "coherent":
                     return path.parent
         return None
 

@@ -1133,6 +1133,7 @@ pub(crate) mod tests {
         if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
             *root_selector = crate::RootSelector::ManagedOverlay;
         }
+        storage.bind_disk_identity_inventory(&config.spec);
         storage.validate().unwrap();
     }
 
@@ -1349,6 +1350,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let _boot = db.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&machine.spec);
         db.add_machine_with_rootfs(
             &machine,
             &machine_state(id, MachineRuntimeState::Stopped),
@@ -2819,12 +2821,14 @@ pub(crate) mod tests {
             root_disk_size_bytes: 512,
             created_at: 1,
         };
-        let storage = crate::MachineStorageRecord::opaque_raw(
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
             crate::PrivatePath::new("root.raw").unwrap(),
             512,
             &oci::Platform::host().unwrap(),
         )
         .unwrap();
+        let _boot = db.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
         assert!(db
             .add_machine_with_rootfs(
                 &config,
@@ -2932,7 +2936,11 @@ pub(crate) mod tests {
                 },
             ],
         });
-        db.save_machine_config(&config).await.unwrap();
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
         let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         assert!(matches!(
             crate::store::ensure_cache_paths_unreferenced(
@@ -2955,7 +2963,10 @@ pub(crate) mod tests {
             }),
             userdata: None,
         });
-        db.save_machine_config(&config).await.unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
         let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         assert!(crate::store::ensure_cache_paths_unreferenced(
             &mut tx,
@@ -4345,6 +4356,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let _boot = store.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
         let rootfs = MachineRootfsRecord {
             machine_id: id,
             source_kind: crate::ImageSourceKind::Disk,

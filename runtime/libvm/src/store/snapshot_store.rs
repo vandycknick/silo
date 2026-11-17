@@ -28,6 +28,11 @@ pub enum SnapshotRef {
 impl FromStr for SnapshotRef {
     type Err = LibVmError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.starts_with("fork:") {
+            return Err(invalid(
+                "local fork cut is not an identified snapshot; snapshot the child first",
+            ));
+        }
         let value = value
             .strip_prefix("image:")
             .ok_or_else(|| invalid("expected image:NAME or image:sha256:HEX"))?;
@@ -236,8 +241,8 @@ pub(crate) enum CaptureState {
     Sealed,
     Published { snapshot: SnapshotId },
     Released { snapshot: Option<SnapshotId> },
-    Local { cut: vm_spec::capture::Sha256Digest },
-    ReleasedLocal { cut: vm_spec::capture::Sha256Digest },
+    Local { cut: Uuid },
+    ReleasedLocal { cut: Uuid },
     Abandoned,
 }
 
@@ -1909,6 +1914,32 @@ impl SnapshotStore {
 }
 
 impl Store {
+    /// Transfer existing identified authority into a fork without a receipt-miss scan.
+    pub(crate) async fn reuse_local_stream(
+        &self,
+        operation: Uuid,
+        content: &SnapshotStream,
+    ) -> Result<AuthenticatedStream, LibVmError> {
+        require_consumer_closure(
+            self,
+            operation,
+            &BTreeSet::from([content.stream]),
+            &BTreeSet::from([content.map]),
+        )
+        .await?;
+        let pool = StoragePool::open(self.images_path())?;
+        let pin: Arc<dyn Send + Sync> = Arc::new(pool.existing_lease(operation)?);
+        let receipt = load_map_validation(self, &pool, content, pin)
+            .await?
+            .ok_or_else(|| {
+                invalid("fork read-only dependency lost its exact identified receipt")
+            })?;
+        Ok(AuthenticatedStream::from_verified_fingerprint(
+            pool.open_stream(&content.stream)?,
+            receipt.map,
+            receipt.stream,
+        )?)
+    }
     pub(crate) async fn authenticate_local_stream(
         &self,
         operation: Uuid,
@@ -5929,5 +5960,13 @@ pub(crate) mod tests {
             .authenticate_closure_bytes(completed)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn local_fork_references_cannot_select_snapshot_authority() {
+        let error = format!("fork:{}", uuid::Uuid::new_v4())
+            .parse::<crate::SnapshotRef>()
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot the child first"));
     }
 }

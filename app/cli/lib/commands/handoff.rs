@@ -370,6 +370,7 @@ struct PayloadCounts {
 
 impl PlanArgs {
     fn request(&mut self) -> eyre::Result<DestinationRequest> {
+        silo_vm_control::images::reject_local_cut(&self.machine)?;
         // Consume the shared CLI resource parser once, with no second mapping convention.
         let resources = std::mem::take(&mut self.resources).policy()?;
         Ok(DestinationRequest {

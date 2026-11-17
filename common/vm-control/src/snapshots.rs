@@ -185,6 +185,36 @@ fn storage_stop_outcome_from_wire(v: i32) -> Result<libvm::StorageStopOutcome, C
         }
     }
 }
+fn identity_to_wire(value: &libvm::ContentIdentityState) -> w::ContentIdentityState {
+    use w::content_identity_state::State;
+    w::ContentIdentityState {
+        state: Some(match value {
+            libvm::ContentIdentityState::UnknownAfterFork => State::UnknownAfterFork(()),
+            libvm::ContentIdentityState::Unknown => State::Unknown(()),
+            libvm::ContentIdentityState::Identified { root } => {
+                State::IdentifiedRoot(root.to_string())
+            }
+        }),
+    }
+}
+
+fn identity_from_wire(
+    value: w::ContentIdentityState,
+) -> Result<libvm::ContentIdentityState, ConversionError> {
+    use w::content_identity_state::State;
+    Ok(
+        match required(value.state, "machine.content_identity.state")? {
+            State::UnknownAfterFork(()) => libvm::ContentIdentityState::UnknownAfterFork,
+            State::Unknown(()) => libvm::ContentIdentityState::Unknown,
+            State::IdentifiedRoot(root) => libvm::ContentIdentityState::Identified {
+                root: root.parse().map_err(|_| {
+                    invalid("machine.content_identity.root", "invalid content root")
+                })?,
+            },
+        },
+    )
+}
+
 pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, ConversionError> {
     if v.live.is_some() && v.prospective_live.is_some() {
         return Err(invalid(
@@ -267,6 +297,16 @@ pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, Co
         storage_stop_outcome: v
             .storage_stop_outcome
             .map(|outcome| storage_stop_outcome_to_wire(outcome) as i32),
+        ram_identity: Some(identity_to_wire(&v.ram_identity)),
+        disk_identities: v
+            .disk_identities
+            .iter()
+            .map(|disk| w::DiskContentIdentity {
+                attachment_index: disk.attachment_index,
+                block_id: disk.block_id.as_str().to_owned(),
+                identity: Some(identity_to_wire(&disk.identity)),
+            })
+            .collect(),
     })
 }
 pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, ConversionError> {
@@ -373,6 +413,19 @@ pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, C
         .storage_stop_outcome
         .map(storage_stop_outcome_from_wire)
         .transpose()?;
+    out.ram_identity = identity_from_wire(required(v.ram_identity, "machine.ram_identity")?)?;
+    out.disk_identities = v
+        .disk_identities
+        .into_iter()
+        .map(|disk| {
+            Ok(libvm::DiskContentIdentity {
+                attachment_index: disk.attachment_index,
+                block_id: vm_spec::BlockId::new(disk.block_id)
+                    .map_err(|_| invalid("machine.disk_identity.block_id", "invalid block ID"))?,
+                identity: identity_from_wire(required(disk.identity, "machine.disk_identity")?)?,
+            })
+        })
+        .collect::<Result<_, ConversionError>>()?;
     if let Some(live) = &out.live {
         if !crate::live::same_machine_identity(&live.machine_id, &out.id)
             || Some(live.run_id.as_str())
@@ -1132,5 +1185,32 @@ mod tests {
             })
             .is_err());
         }
+    }
+    #[test]
+    fn content_identity_round_trips_without_unknown_digest_sentinels() {
+        for identity in [
+            libvm::ContentIdentityState::Unknown,
+            libvm::ContentIdentityState::UnknownAfterFork,
+            libvm::ContentIdentityState::Identified {
+                root: vm_spec::capture::Sha256Digest::of_bytes(b"identified"),
+            },
+        ] {
+            let wire = crate::snapshots::identity_to_wire(&identity);
+            assert_eq!(
+                crate::snapshots::identity_from_wire(wire).unwrap(),
+                identity
+            );
+        }
+        assert!(
+            crate::snapshots::identity_from_wire(w::ContentIdentityState { state: None }).is_err()
+        );
+        assert!(
+            crate::snapshots::identity_from_wire(w::ContentIdentityState {
+                state: Some(w::content_identity_state::State::IdentifiedRoot(
+                    "unknown".into()
+                )),
+            })
+            .is_err()
+        );
     }
 }

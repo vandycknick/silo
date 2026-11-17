@@ -287,8 +287,8 @@ pub fn lifecycle_from_wire(value: w::LiveLifecycle) -> Result<d::LiveLifecycle, 
         error: value.error.map(failure_from).transpose()?,
     })
 }
-fn operation_to(value: &d::LiveOperationRecord) -> w::LiveOperationRecord {
-    w::LiveOperationRecord {
+fn operation_to(value: &d::LiveOperationRecord) -> Result<w::LiveOperationRecord, ConversionError> {
+    Ok(w::LiveOperationRecord {
         operation_id: value.operation_id.to_string(),
         kind: operation_kind_to(value.kind),
         outcome: Some(match &value.outcome {
@@ -305,14 +305,31 @@ fn operation_to(value: &d::LiveOperationRecord) -> w::LiveOperationRecord {
                 })
             }
             d::OperationOutcome::CaptureSealed { capture } => {
-                w::live_operation_record::Outcome::CaptureSealed(w::CaptureSealed {
-                    capture_id: capture.capture_id.to_string(),
-                    evidence_sha256: capture.evidence_sha256.to_string(),
-                    cut_token: Some(token_to(&capture.cut_token)),
+                use vm_spec::capture::CaptureSuccess;
+                use w::capture_success::Authority;
+                let authority = match capture {
+                    CaptureSuccess::Identified { sealed } => {
+                        Authority::Identified(w::CaptureSealed {
+                            capture_id: sealed.capture_id.to_string(),
+                            evidence_sha256: sealed.evidence_sha256.to_string(),
+                            cut_token: Some(token_to(&sealed.cut_token)),
+                        })
+                    }
+                    CaptureSuccess::OwnedLocalCut { cut, cut_token } => {
+                        Authority::OwnedLocalCut(w::OwnedLocalCapture {
+                            cut: cut
+                                .canonical_bytes()
+                                .map_err(|_| invalid("operation.cut", "invalid owned local cut"))?,
+                            cut_token: Some(token_to(cut_token)),
+                        })
+                    }
+                };
+                w::live_operation_record::Outcome::CaptureSealed(w::CaptureSuccess {
+                    authority: Some(authority),
                 })
             }
         }),
-    }
+    })
 }
 fn operation_from(
     value: w::LiveOperationRecord,
@@ -334,15 +351,30 @@ fn operation_from(
                 },
             },
             w::live_operation_record::Outcome::CaptureSealed(value) => {
-                d::OperationOutcome::CaptureSealed {
-                    capture: vm_spec::capture::CaptureSealed {
-                        capture_id: id(value.capture_id)?,
-                        evidence_sha256: value.evidence_sha256.parse().map_err(|_| {
-                            invalid("operation.evidence_sha256", "invalid SHA-256 digest")
-                        })?,
+                use vm_spec::capture::CaptureSuccess;
+                use w::capture_success::Authority;
+                let capture = match required(value.authority, "operation.capture.authority")? {
+                    Authority::Identified(value) => CaptureSuccess::Identified {
+                        sealed: vm_spec::capture::CaptureSealed {
+                            capture_id: id(value.capture_id)?,
+                            evidence_sha256: value.evidence_sha256.parse().map_err(|_| {
+                                invalid("operation.evidence_sha256", "invalid SHA-256 digest")
+                            })?,
+                            cut_token: token_from(required(
+                                value.cut_token,
+                                "operation.cut_token",
+                            )?)?,
+                        },
+                    },
+                    Authority::OwnedLocalCut(value) => CaptureSuccess::OwnedLocalCut {
+                        cut: Box::new(
+                            vm_spec::capture::OwnedLocalCut::decode(&value.cut)
+                                .map_err(|_| invalid("operation.cut", "invalid owned local cut"))?,
+                        ),
                         cut_token: token_from(required(value.cut_token, "operation.cut_token")?)?,
                     },
-                }
+                };
+                d::OperationOutcome::CaptureSealed { capture }
             }
         },
     };
@@ -359,7 +391,7 @@ pub fn projection_to_wire(
         report: Some(crate::live::machine_to_wire(&value.report)?),
         state: state_to(value.state),
         lifecycle: Some(lifecycle_to_wire(&value.lifecycle)),
-        operation: value.operation.as_ref().map(operation_to),
+        operation: value.operation.as_ref().map(operation_to).transpose()?,
     })
 }
 pub fn projection_from_wire(
@@ -516,5 +548,121 @@ mod tests {
         assert!(stage_from(i32::MAX).is_err());
         assert!(nonzero(0).is_err());
         assert!(id("00000000-0000-0000-0000-000000000000".into()).is_err());
+    }
+    #[test]
+    fn owned_capture_authority_round_trips_real_file_facts_without_digests() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use vm_spec::capture::{
+            CaptureConfiguration, CaptureMemoryStats, CaptureRole, CaptureStateBinding,
+            CaptureSuccess, OwnedCutMember, OwnedLocalCut, Sha256Digest, SourceFingerprint,
+            CAPTURE_RECORD_VERSION,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let packed_length = 1024 * 1024;
+        let members = [
+            CaptureRole::Execution,
+            CaptureRole::Devices,
+            CaptureRole::Ram,
+            CaptureRole::Layout,
+        ]
+        .into_iter()
+        .map(|role| {
+            let path = directory.path().join(role.relative_path());
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(if role == CaptureRole::Ram {
+                packed_length
+            } else {
+                16
+            })
+            .unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o400))
+                .unwrap();
+            let metadata = file.metadata().unwrap();
+            OwnedCutMember {
+                role,
+                fingerprint: SourceFingerprint {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    length: metadata.len(),
+                    mode: metadata.mode(),
+                    modified_seconds: metadata.mtime(),
+                    modified_nanoseconds: metadata.mtime_nsec(),
+                    changed_seconds: metadata.ctime(),
+                    changed_nanoseconds: metadata.ctime_nsec(),
+                },
+                complete: true,
+            }
+        })
+        .collect();
+        let machine = id("11111111-1111-4111-8111-111111111111".into()).unwrap();
+        let run = id("22222222-2222-4222-8222-222222222222".into()).unwrap();
+        let capture = id("33333333-3333-4333-8333-333333333333".into()).unwrap();
+        let generation = NonZeroU64::new(1).unwrap();
+        let compatibility = Sha256Digest::of_bytes(b"existing compatibility");
+        let cut = OwnedLocalCut {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: machine.clone(),
+            run_id: run.clone(),
+            capture_id: capture.clone(),
+            freeze_operation_id: capture.clone(),
+            freeze_epoch: generation,
+            configuration: CaptureConfiguration {
+                guest_os: None,
+                cpus: 1,
+                memory_mib: 1,
+                nested_virtualization: false,
+                rosetta: false,
+                kernel_cmdline: Vec::new(),
+                vsock: false,
+                attachments: Vec::new(),
+                shares: Vec::new(),
+            },
+            binding: CaptureStateBinding {
+                live_state_schema: "silo.live-state/1".into(),
+                architecture: "x86_64".into(),
+                profile: compatibility,
+                topology: compatibility,
+                ram_layout: compatibility,
+                source_run: run.clone(),
+                pause_generation: generation,
+                capture: capture.clone(),
+            },
+            materialization_generation: generation,
+            predecessor_generation: 0,
+            packed_length,
+            page_granule: 4096,
+            regions: 1,
+            members,
+            stats: CaptureMemoryStats {
+                logical_bytes: packed_length,
+                ..Default::default()
+            },
+        };
+        let record = d::LiveOperationRecord {
+            operation_id: capture,
+            kind: d::OperationKind::Capture,
+            outcome: d::OperationOutcome::CaptureSealed {
+                capture: CaptureSuccess::OwnedLocalCut {
+                    cut: Box::new(cut),
+                    cut_token: d::PauseToken {
+                        machine_id: machine,
+                        run_id: run,
+                        generation,
+                        owner: d::PauseOwner::User,
+                    },
+                },
+            },
+        };
+        record.validate().unwrap();
+        let wire = operation_to(&record).unwrap();
+        assert_eq!(operation_from(wire).unwrap(), record);
+        let mut malformed = operation_to(&record).unwrap();
+        if let Some(w::live_operation_record::Outcome::CaptureSealed(success)) =
+            &mut malformed.outcome
+        {
+            success.authority = None;
+        }
+        assert!(operation_from(malformed).is_err());
     }
 }

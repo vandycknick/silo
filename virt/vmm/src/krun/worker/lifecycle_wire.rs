@@ -33,7 +33,7 @@ use crate::virt::lifecycle::{
     LifecycleCommand, LifecycleRejection, LifecycleRights,
 };
 
-pub(crate) const PROTOCOL_VERSION: u32 = 5;
+pub(crate) const PROTOCOL_VERSION: u32 = 6;
 /// Bounded RAM summaries plus sparse disk runs for the aggregate 4 TiB stream limit.
 pub(crate) const MAX_FRAME: usize = vm_spec::capture::MAX_CAPTURE_RECORD_BYTES;
 /// The largest typed descriptor set of any command.
@@ -484,6 +484,7 @@ mod tests {
             command: LifecycleCommand::PrepareCapture {
                 operation,
                 preparation: CapturePreparation {
+                    identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
                     outputs: CaptureOutputIdentities {
                         execution: identity(1),
                         devices: identity(2),
@@ -706,16 +707,21 @@ mod tests {
             memory_generation: 1,
             writers_closed: true,
             mode: vm_spec::lifecycle::CapturePolicy::Full,
+            identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
+            identity_full_reason: Some(vm_spec::capture::CaptureIdentityFullReason::Requested),
+            predecessor_generation: 0,
             baseline: None,
             full_reason: Some(CaptureFullReason::Requested),
             identity_chunk_bytes: 1 << 16,
-            changes: Box::new(CaptureRamChanges {
-                byte_len: 16 + 56 * (MAX_CAPTURE_RAM_BYTES >> 16),
-                sha256: Sha256Digest::from_bytes([0xff; 32]),
-                record_count: MAX_CAPTURE_RAM_BYTES >> 16,
-                coverage: CaptureRamCoverage::Full,
-                baseline_stream: None,
-            }),
+            changes: crate::virt::lifecycle::CaptureRamChangesAuthority::Identified(Box::new(
+                CaptureRamChanges {
+                    byte_len: 16 + 56 * (MAX_CAPTURE_RAM_BYTES >> 16),
+                    sha256: Sha256Digest::from_bytes([0xff; 32]),
+                    record_count: MAX_CAPTURE_RAM_BYTES >> 16,
+                    coverage: CaptureRamCoverage::Full,
+                    baseline_stream: None,
+                },
+            )),
             changes_output: OutputReceipt {
                 device: 1,
                 inode: 4,

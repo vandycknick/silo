@@ -175,6 +175,14 @@ impl Snapshot {
                     OutputFormat::Json => ui::print_json(&snapshot)?,
                     OutputFormat::Plain => {
                         ui::success(snapshot_result_line(&snapshot.snapshot, elapsed));
+                        if let Some(reason) = &snapshot.capture.first_snapshot_full_identity_reason
+                        {
+                            match reason {
+                                libvm::SnapshotIdentityReason::UnknownAfterFork => ui::secondary(
+                                    "Full content identity computed: this fork child's identity was not yet known",
+                                ),
+                            }
+                        }
                         let source = match snapshot.capture.source_outcome {
                             libvm::LiveCaptureSource::Resumed => "resumed",
                             libvm::LiveCaptureSource::Preserved => "left paused",
@@ -2288,7 +2296,7 @@ mod tests {
             stage: libvm::ForkStage::Finished,
             cancellation_requested: false,
             capture: libvm::ForkCaptureOutcome::Sealed {
-                cut_id: format!("sha256:{}", "e".repeat(64)).parse().unwrap(),
+                cut_id: "00000000-0000-4000-8000-0000000000bb".parse().unwrap(),
             },
             source,
             children: outcomes

@@ -594,6 +594,25 @@ pub struct DiskBaseline {
     pub(crate) fingerprint: crate::storage::identity_file::SourceFingerprint,
 }
 
+/// Content authority is independent of complete owned bytes and dirty tracking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ContentIdentityState {
+    Unknown,
+    UnknownAfterFork,
+    Identified {
+        root: vm_spec::capture::Sha256Digest,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskContentIdentity {
+    pub attachment_index: u32,
+    pub block_id: vm_spec::BlockId,
+    pub identity: ContentIdentityState,
+}
+
 /// Durable storage meaning, independent of source provenance and launch files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -605,6 +624,9 @@ pub struct MachineStorageRecord {
     pub backend: BackendRequirement,
     pub disks: Vec<IncludedDisk>,
     pub disk_baselines: Vec<DiskBaseline>,
+    pub ram_identity: ContentIdentityState,
+    /// Writable attachment identities, strictly ascending by attachment index.
+    pub disk_identities: Vec<DiskContentIdentity>,
     pub external_requirements: Vec<crate::ExternalResourceRequirement>,
     pub storage_generation: u64,
     pub ownership_epoch: u64,
@@ -616,6 +638,82 @@ pub struct MachineStorageRecord {
 }
 
 impl MachineStorageRecord {
+    /// Check persisted inventory against final attachment names, without rewriting it.
+    pub(crate) fn validate_disk_identity_inventory(
+        &self,
+        spec: &vm_spec::VmSpec,
+    ) -> Result<(), LibVmError> {
+        self.validate()?;
+        let mut identities = self.disk_identities.iter();
+        for (index, disk) in spec
+            .storage
+            .iter()
+            .flat_map(|storage| storage.disks.iter().enumerate())
+            .filter(|(_, disk)| !disk.read_only)
+        {
+            if identities.next().is_none_or(|identity| {
+                identity.attachment_index as usize != index || identity.block_id != disk.block_id
+            }) {
+                return Err(invalid(
+                    "disk identity inventory differs from writable attachments",
+                ));
+            }
+        }
+        if identities.next().is_some() {
+            return Err(invalid("disk identity inventory has an extra attachment"));
+        }
+        Ok(())
+    }
+
+    /// Construct an inventory for final disk names. External writable files
+    /// start unknown even when their path is unchanged: ownership does not
+    /// exclude independent writes to that backing.
+    pub(crate) fn bind_disk_identity_inventory(&mut self, spec: &vm_spec::VmSpec) {
+        let Some(storage) = &spec.storage else {
+            self.disk_identities.clear();
+            return;
+        };
+        self.disk_identities.retain(|identity| {
+            storage
+                .disks
+                .get(identity.attachment_index as usize)
+                .is_some_and(|disk| !disk.read_only)
+        });
+        for (index, disk) in storage
+            .disks
+            .iter()
+            .enumerate()
+            .filter(|(_, disk)| !disk.read_only)
+        {
+            let managed = matches!(disk.role, DiskRole::Root | DiskRole::RootUpper)
+                || self.disks.iter().any(|included| {
+                    included.order as usize == index
+                        && matches!(included.storage, DiskStorage::ManagedWritable { .. })
+                });
+            match self
+                .disk_identities
+                .iter_mut()
+                .find(|identity| identity.attachment_index == index as u32)
+            {
+                Some(identity) => {
+                    identity.block_id = disk.block_id.clone();
+                    // Even the same external path may have unrelated writers.
+                    // A new machine cannot inherit its source's identity hint.
+                    if !managed {
+                        identity.identity = ContentIdentityState::Unknown;
+                    }
+                }
+                None => self.disk_identities.push(DiskContentIdentity {
+                    attachment_index: index as u32,
+                    block_id: disk.block_id.clone(),
+                    identity: ContentIdentityState::Unknown,
+                }),
+            }
+        }
+        self.disk_identities
+            .sort_unstable_by_key(|identity| identity.attachment_index);
+    }
+
     pub(crate) fn matches_launch_storage(&self, launch: &Self) -> bool {
         let Self {
             schema,
@@ -625,6 +723,8 @@ impl MachineStorageRecord {
             backend,
             disks,
             disk_baselines: _,
+            ram_identity: _,
+            disk_identities: _,
             external_requirements,
             storage_generation,
             ownership_epoch,
@@ -650,9 +750,19 @@ impl MachineStorageRecord {
             && *snapshot == launch.snapshot
     }
 
-    pub(crate) fn invalidate_disk_baselines(&mut self) {
+    /// Discard run-local tracking without discarding authenticated stopped bytes.
+    pub(crate) fn invalidate_disk_tracking(&mut self) {
         for baseline in &mut self.disk_baselines {
             baseline.state = DiskBaselineState::Invalid;
+        }
+    }
+
+    pub(crate) fn invalidate_disk_baselines(&mut self) {
+        self.invalidate_disk_tracking();
+        for identity in &mut self.disk_identities {
+            if matches!(identity.identity, ContentIdentityState::Identified { .. }) {
+                identity.identity = ContentIdentityState::Unknown;
+            }
         }
     }
 
@@ -680,6 +790,12 @@ impl MachineStorageRecord {
             backend: BackendRequirement::RawBlock,
             disks: Vec::new(),
             disk_baselines: Vec::new(),
+            ram_identity: ContentIdentityState::Unknown,
+            disk_identities: vec![DiskContentIdentity {
+                attachment_index: 0,
+                block_id: vm_spec::BlockId::new("silo-root").map_err(invalid)?,
+                identity: ContentIdentityState::Unknown,
+            }],
             external_requirements: Vec::new(),
             storage_generation: 0,
             ownership_epoch: 0,
@@ -746,6 +862,23 @@ impl MachineStorageRecord {
                 .map_err(crate::storage::StorageError::from)?;
         }
         validate_root(&self.root)?;
+        if !self
+            .disk_identities
+            .windows(2)
+            .all(|pair| pair[0].attachment_index < pair[1].attachment_index)
+        {
+            return Err(invalid(
+                "disk identities are not in strict attachment order",
+            ));
+        }
+        for (index, disk) in self.disk_identities.iter().enumerate() {
+            if self.disk_identities[..index]
+                .iter()
+                .any(|other| other.block_id == disk.block_id)
+            {
+                return Err(invalid("disk identity roles are not unique"));
+            }
+        }
         for (index, baseline) in self.disk_baselines.iter().enumerate() {
             baseline.seed.validate().map_err(invalid)?;
             if matches!(baseline.state, DiskBaselineState::Running { run_id, .. } if run_id.is_nil())
@@ -1803,5 +1936,106 @@ mod tests {
         let mut value = serde_json::to_value(&record).unwrap();
         value.as_object_mut().unwrap().remove("diskBaselines");
         assert!(MachineStorageRecord::decode(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn disk_identities_require_canonical_attachment_order() {
+        use crate::store::models::storage::{ContentIdentityState, DiskContentIdentity};
+
+        let mut record = MachineStorageRecord::opaque_raw(
+            PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        pin(&mut record);
+        record.disk_identities.push(DiskContentIdentity {
+            attachment_index: 1,
+            block_id: vm_spec::BlockId::new("data").unwrap(),
+            identity: ContentIdentityState::UnknownAfterFork,
+        });
+        record.validate().unwrap();
+        let json = serde_json::to_string(&record).unwrap();
+        assert_eq!(MachineStorageRecord::decode(&json).unwrap(), record);
+        record.disk_identities.reverse();
+        assert!(record.validate().is_err());
+        assert!(MachineStorageRecord::decode(&serde_json::to_string(&record).unwrap()).is_err());
+        record.disk_identities.reverse();
+        record.disk_identities[1].attachment_index = 0;
+        assert!(record.validate().is_err());
+        record.disk_identities[1].attachment_index = 1;
+        record.disk_identities[1].block_id = record.disk_identities[0].block_id.clone();
+        assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn disk_identity_inventory_matches_final_writable_attachments_exactly() {
+        use crate::store::models::storage::DiskContentIdentity;
+
+        let mut record = MachineStorageRecord::opaque_raw(
+            PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        let mut read_only = crate::machine::root_storage::disk(
+            "read-only.raw",
+            vm_spec::DiskRole::Data,
+            512,
+            "read-only".into(),
+        )
+        .unwrap();
+        read_only.read_only = true;
+        let spec = vm_spec::VmSpec {
+            storage: Some(vm_spec::Storage {
+                disks: vec![
+                    crate::machine::root_storage::disk(
+                        "root.raw",
+                        vm_spec::DiskRole::Root,
+                        512,
+                        "silo-root".into(),
+                    )
+                    .unwrap(),
+                    read_only,
+                    crate::machine::root_storage::disk(
+                        "/external.raw",
+                        vm_spec::DiskRole::Data,
+                        512,
+                        "external".into(),
+                    )
+                    .unwrap(),
+                ],
+            }),
+            ..vm_spec::VmSpec::current()
+        };
+        record.bind_disk_identity_inventory(&spec);
+        record.validate_disk_identity_inventory(&spec).unwrap();
+        for case in 0..5 {
+            let mut malformed = record.clone();
+            match case {
+                0 => {
+                    malformed.disk_identities.pop();
+                }
+                1 => {
+                    malformed.disk_identities[1].block_id =
+                        vm_spec::BlockId::new("wrong-device").unwrap()
+                }
+                2 => malformed.disk_identities[1].attachment_index = 1,
+                3 => malformed.disk_identities.reverse(),
+                _ => malformed.disk_identities.push(DiskContentIdentity {
+                    attachment_index: 3,
+                    block_id: vm_spec::BlockId::new("extra").unwrap(),
+                    identity: crate::store::models::storage::ContentIdentityState::Unknown,
+                }),
+            }
+            assert!(
+                malformed.validate_disk_identity_inventory(&spec).is_err(),
+                "case {case}"
+            );
+        }
+        record.disk_identities.clear();
+        record
+            .validate_disk_identity_inventory(&vm_spec::VmSpec::current())
+            .unwrap();
     }
 }

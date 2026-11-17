@@ -136,6 +136,46 @@ fn authentication(binding: StateBinding, path: &Path) -> eyre::Result<RamImageAu
     })
 }
 
+fn owned_object(file: &File, expected: &Value) -> eyre::Result<StateObjectAuthority> {
+    let expected: vm_spec::capture::SourceFingerprint = serde_json::from_value(expected.clone())?;
+    ensure!(
+        crate::restore::inputs::fingerprint(file)? == expected,
+        "owned input fingerprint changed"
+    );
+    Ok(StateObjectAuthority::OwnedLocalFile {
+        fingerprint: NativeFileFingerprint {
+            device: expected.device,
+            inode: expected.inode,
+            length: expected.length,
+            mode: expected.mode,
+            modified_seconds: expected.modified_seconds,
+            modified_nanoseconds: expected.modified_nanoseconds,
+            changed_seconds: expected.changed_seconds,
+            changed_nanoseconds: expected.changed_nanoseconds,
+        },
+    })
+}
+
+fn input_authority(
+    binding: StateBinding,
+    directory: &Path,
+    manifest: &Value,
+) -> eyre::Result<RamInputAuthority> {
+    match manifest["authority"].as_str() {
+        Some("identified-snapshot") => Ok(RamInputAuthority::IdentifiedSnapshot(authentication(
+            binding,
+            &directory.join("memory-authentication.bin"),
+        )?)),
+        Some("owned-local-cut") => Ok(RamInputAuthority::OwnedLocalCut {
+            state: binding,
+            materialization_generation: serde_json::from_value(
+                manifest["memory_generation"].clone(),
+            )?,
+        }),
+        _ => eyre::bail!("explicit capture input authority is missing"),
+    }
+}
+
 #[path = "mutate.rs"]
 mod mutate;
 
@@ -219,12 +259,19 @@ pub(crate) fn main() -> eyre::Result<()> {
     let mut queued_public = None;
     let map_node_store = if let Some(directory) = &launch.restore {
         let manifest = load(&directory.join("api-capture.json"))?;
-        let path: PathBuf = serde_json::from_value(manifest["map_node_store"].clone())?;
-        ensure!(
-            path.is_absolute() && path.is_dir(),
-            "retained restore node store"
-        );
-        path
+        match manifest["authority"].as_str() {
+            Some("identified-snapshot") => {
+                let path: PathBuf = serde_json::from_value(manifest["map_node_store"].clone())?;
+                ensure!(
+                    path.is_absolute() && path.is_dir(),
+                    "retained restore node store"
+                );
+                path
+            }
+            Some("owned-local-cut") => std::fs::canonicalize(&launch.binding)?
+                .join(vm_spec::capture::CAPTURE_MAP_NODES_DIRECTORY),
+            _ => eyre::bail!("explicit restore capture authority is missing"),
+        }
     } else {
         std::fs::canonicalize(&launch.binding)?.join(vm_spec::capture::CAPTURE_MAP_NODES_DIRECTORY)
     };
@@ -554,31 +601,57 @@ fn restored_inputs(
     let manifest = load(&directory.join("api-capture.json"))?;
     let binding = parse_binding(&manifest["binding"])?;
     let expected = RestoreIdentity {
-        ram_image: authentication(
-            binding.clone(),
-            &directory.join("memory-authentication.bin"),
-        )?,
-        execution_object: object_identity(&files.execution, &manifest["execution"])?,
-        devices_object: object_identity(&files.devices, &manifest["devices"])?,
+        ram_image: input_authority(binding.clone(), directory, &manifest)?,
+        execution_object: match manifest["authority"].as_str() {
+            Some("identified-snapshot") => StateObjectAuthority::Identified(object_identity(
+                &files.execution,
+                &manifest["execution"],
+            )?),
+            Some("owned-local-cut") => owned_object(&files.execution, &manifest["execution"])?,
+            _ => eyre::bail!("explicit execution authority is missing"),
+        },
+        devices_object: match manifest["authority"].as_str() {
+            Some("identified-snapshot") => StateObjectAuthority::Identified(object_identity(
+                &files.devices,
+                &manifest["devices"],
+            )?),
+            Some("owned-local-cut") => owned_object(&files.devices, &manifest["devices"])?,
+            _ => eyre::bail!("explicit devices authority is missing"),
+        },
         binding,
     };
-    let map_identity = object_identity(&files.ram_map, &manifest["ram_map"])?;
-    let map = crate::native_stream_map::read_root(&files.ram_map)?;
-    ensure!(
-        map.length() == files.ram.metadata()?.len()
-            && map.id().as_bytes() == &expected.ram_image.stream
-            && map.id().as_bytes() == &map_identity.sha256
-            && map.canonical_bytes()?.len() as u64 == map_identity.length,
-        "exact canonical restored root authority"
-    );
-    let node_store: PathBuf = serde_json::from_value(manifest["map_node_store"].clone())?;
-    ensure!(
-        node_store.is_absolute() && node_store.is_dir(),
-        "retained restore node store"
-    );
-    let mut nodes = crate::native_stream_map::DirectoryNodes::new(node_store)?;
-    for chunk in map.present_chunks(&mut nodes) {
-        chunk?;
+    match (&expected.ram_image, &files.ram_map) {
+        (
+            RamInputAuthority::IdentifiedSnapshot(authentication),
+            crate::krun::worker::fds::RestoreRamMap::Identified(map_file),
+        ) => {
+            let map_identity = object_identity(map_file, &manifest["ram_map"])?;
+            let map = crate::native_stream_map::read_root(map_file)?;
+            ensure!(
+                map.length() == files.ram.metadata()?.len()
+                    && map.id().as_bytes() == &authentication.stream
+                    && map.id().as_bytes() == &map_identity.sha256
+                    && map.canonical_bytes()?.len() as u64 == map_identity.length,
+                "exact canonical restored root authority"
+            );
+            let node_store: PathBuf = serde_json::from_value(manifest["map_node_store"].clone())?;
+            ensure!(
+                node_store.is_absolute() && node_store.is_dir(),
+                "retained restore node store"
+            );
+            let mut nodes = crate::native_stream_map::DirectoryNodes::new(node_store)?;
+            for chunk in map.present_chunks(&mut nodes) {
+                chunk?;
+            }
+        }
+        (
+            RamInputAuthority::OwnedLocalCut { .. },
+            crate::krun::worker::fds::RestoreRamMap::OwnedLocalCut,
+        ) => {
+            owned_object(&files.ram, &manifest["ram"])?;
+            owned_object(&files.layout, &manifest["layout"])?;
+        }
+        _ => eyre::bail!("restore descriptors have mismatched authority"),
     }
     let attachment = |id: &str| -> eyre::Result<RestoreAttachment> {
         let values = manifest["attachments"]
@@ -671,6 +744,7 @@ struct Commands {
     current: Option<(CaptureTicket, PathBuf)>,
     baselines: Vec<BaselineToken>,
     map_node_store: PathBuf,
+    layout_digest: [u8; 32],
 }
 impl Commands {
     fn operation(&mut self) -> eyre::Result<OperationId> {
@@ -745,13 +819,12 @@ impl Commands {
         for (index, disk) in self.disks.iter().enumerate() {
             std::fs::copy(disk, directory.join(format!("disk{index}.raw")))?;
         }
-        let layout = self.control.ram_layout(deadline())?;
         let binding = StateBinding {
             live_state_schema: libkrun::capabilities::LIVE_STATE_SCHEMA.to_string(),
             architecture: std::env::consts::ARCH.to_string(),
             profile: field(&self.binding.join("profile"))?,
             topology: field(&self.binding.join("topology"))?,
-            ram_layout: Sha256::digest(layout.canonical_bytes()).into(),
+            ram_layout: self.layout_digest,
             source_run: field(&self.binding.join("source-run"))?,
             capture: *uuid::Uuid::new_v4().as_bytes(),
             pause_generation: self.pause()?.generation().0,
@@ -774,8 +847,19 @@ impl Commands {
         } else {
             self.baselines.last().cloned()
         };
+        let identity_policy = if mode == "fork" {
+            RamIdentityPolicy::None
+        } else {
+            match baseline.as_ref().map(BaselineToken::identity_anchor) {
+                Some(RamIdentityAnchor::Identified { stream }) => {
+                    RamIdentityPolicy::SinceAnchor { stream }
+                }
+                _ => RamIdentityPolicy::Full,
+            }
+        };
         let request = MemoryCaptureRequest {
             baseline,
+            identity_policy,
             full_at_dirty_percent: if mode == "full" { 0 } else { 60 },
         };
         let output_directory = mode.strip_prefix("enospc:").map_or(directory, Path::new);
@@ -806,12 +890,66 @@ impl Commands {
             },
         )?;
         ensure!(memory.ram.writers_closed(), "native RAM writers still open");
+        if matches!(memory.ram.changes(), RamChangeAuthority::None) {
+            let stats = memory.ram.stats();
+            ensure!(
+                mode == "fork"
+                    && stats.identity_bytes_hashed == 0
+                    && stats.whole_file_bytes_hashed == 0
+                    && stats.map_nodes_written == 0,
+                "fork must not compute content identity"
+            );
+            let member = |name: &str| -> eyre::Result<Value> {
+                use std::os::unix::fs::PermissionsExt;
+                let file = File::open(directory.join(name))?;
+                crate::restore::inputs::reject_surviving_writer(&file)?;
+                file.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+                Ok(serde_json::to_value(crate::restore::inputs::fingerprint(
+                    &file,
+                )?)?)
+            };
+            let attachments: Vec<Value> = flush
+                .attachments
+                .iter()
+                .map(|item| {
+                    json!({
+                        "configured_id":item.configured_id,"address":item.address,"irq":item.irq,
+                    })
+                })
+                .collect();
+            let disks = (0..self.disks.len())
+                .map(|index| member(&format!("disk{index}.raw")))
+                .collect::<eyre::Result<Vec<_>>>()?;
+            save(
+                &directory.join("api-capture.json"),
+                &json!({
+                    "schema":1,"api":"Silo engine / public libkrun::live","authority":"owned-local-cut",
+                    "binding":binding_json(&binding),"attachments":attachments,
+                    "execution":member("execution.state")?,"devices":member("devices.state")?,
+                    "ram":member("memory.ram")?,"layout":member("memory-layout.json")?,"disks":disks,
+                    "writers_closed":true,"mode":format!("{:?}",memory.ram.mode()),
+                    "identity_policy":"none","memory_generation":memory.memory_generation,
+                    "predecessor_generation":memory.ram.predecessor_generation(),
+                    "stats":{"logical_bytes":stats.logical_bytes,"live_bytes_read":stats.live_bytes_read,
+                        "baseline_bytes_read":stats.baseline_bytes_read,"baseline_bytes_written":stats.baseline_bytes_written,
+                        "overlay_bytes_written":stats.overlay_bytes_written,"full_bytes_written":stats.full_bytes_written,
+                        "identity_bytes_hashed":stats.identity_bytes_hashed,"whole_file_bytes_hashed":stats.whole_file_bytes_hashed,
+                        "map_nodes_written":stats.map_nodes_written,"identity_dirty_pages":stats.identity_dirty_pages,
+                        "materialization_dirty_pages":stats.materialization_dirty_pages}
+                }),
+            )?;
+            reply("CAPTURE", &load(&directory.join("api-capture.json"))?)?;
+            self.snapshot()?;
+            return Ok(());
+        }
         ensure!(
             u64::from(memory.ram.identity_chunk_bytes())
                 == vm_spec::stream_map::ChunkSize::RAM.bytes(),
             "native RAM identity profile"
         );
-        let native_changes = memory.ram.changes();
+        let RamChangeAuthority::Identified(native_changes) = memory.ram.changes() else {
+            eyre::bail!("identified capture requires identified changes");
+        };
         let changes = CaptureRamChanges {
             byte_len: native_changes.byte_len(),
             sha256: Sha256Digest::from_bytes(*native_changes.sha256()),
@@ -844,7 +982,7 @@ impl Commands {
         let stats = memory.ram.stats();
         save(
             &directory.join("api-capture.json"),
-            &json!({"schema":1,"api":"Silo engine / public libkrun::live",
+            &json!({"schema":1,"api":"Silo engine / public libkrun::live","authority":"identified-snapshot",
             "binding":binding_json(&binding),"attachments":attachments,
             "execution_evidence":execution_evidence(&directory.join("execution.state"))?,
             "execution":object(&directory.join("execution.state"), execution.execution.length)?,
@@ -857,6 +995,9 @@ impl Commands {
             "changes":{"byte_len":changes.byte_len,"sha256":changes.sha256,"record_count":changes.record_count,
                 "coverage":changes.coverage,"baseline_stream":changes.baseline_stream},
             "stats":{"logical_bytes":stats.logical_bytes,"live_bytes_read":stats.live_bytes_read,
+                "identity_bytes_hashed":stats.identity_bytes_hashed,"whole_file_bytes_hashed":stats.whole_file_bytes_hashed,
+                "map_nodes_written":stats.map_nodes_written,"identity_dirty_pages":stats.identity_dirty_pages,
+                "materialization_dirty_pages":stats.materialization_dirty_pages,
                 "baseline_bytes_read":stats.baseline_bytes_read,"baseline_bytes_written":stats.baseline_bytes_written,
                 "overlay_bytes_written":stats.overlay_bytes_written,"full_bytes_written":stats.full_bytes_written,
                 "zero_run_bytes_covered":stats.zero_run_bytes_covered,"zero_bytes_punched":stats.zero_bytes_punched,
@@ -1001,10 +1142,7 @@ impl Commands {
                             directory.join("memory.ram")
                         })?,
                         layout: File::open(directory.join("memory-layout.json"))?,
-                        authentication: authentication(
-                            binding,
-                            &directory.join("memory-authentication.bin"),
-                        )?,
+                        authentication: input_authority(binding, directory, &manifest)?,
                     },
                     operation,
                     deadline(),
@@ -1104,6 +1242,7 @@ fn command_loop(
     disks: Vec<PathBuf>,
     map_node_store: PathBuf,
 ) -> eyre::Result<()> {
+    let layout_digest = Sha256::digest(control.ram_layout(deadline())?.canonical_bytes()).into();
     let mut commands = Commands {
         control,
         restore,
@@ -1115,6 +1254,7 @@ fn command_loop(
         current: None,
         baselines: Vec::new(),
         map_node_store,
+        layout_digest,
     };
     if let Some(baseline) = commands.control.baseline(deadline())? {
         commands.baselines.push(baseline);

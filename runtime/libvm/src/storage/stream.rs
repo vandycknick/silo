@@ -146,22 +146,6 @@ impl AuthenticatedStream {
             map: Arc::clone(&self.map),
         })
     }
-
-    /// Only the owner of an authenticated rename/permission transition may
-    /// refresh ctime. An inode, length or mtime change still fails closed.
-    pub(crate) fn refresh_after_owned_metadata_change(&mut self) -> Result<(), StorageError> {
-        let metadata = self.file.metadata()?;
-        if !self
-            .fingerprint
-            .same_contents_after_metadata_change(&metadata)
-        {
-            return Err(
-                invalid_data("authenticated stream changed during owned transition").into(),
-            );
-        }
-        self.fingerprint = SourceFingerprint::new(&metadata);
-        Ok(())
-    }
 }
 
 /// Whole-byte authentication, independent of stream chunk identity.
@@ -1567,26 +1551,23 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_source_reopen_and_owned_metadata_refresh_fail_closed() {
+    fn authenticated_source_reopen_rejects_metadata_changes_and_replacement() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source");
         std::fs::write(&path, b"abc").unwrap();
         let mut hasher = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK);
-        let mut authenticated = hasher.authenticate(File::open(&path).unwrap(), 3).unwrap();
+        let authenticated = hasher.authenticate(File::open(&path).unwrap(), 3).unwrap();
+        assert!(authenticated.reopen(File::open(&path).unwrap()).is_ok());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(authenticated.reopen(File::open(&path).unwrap()).is_err());
-        authenticated.refresh_after_owned_metadata_change().unwrap();
         let renamed = directory.path().join("renamed");
         std::fs::rename(&path, &renamed).unwrap();
-        authenticated.refresh_after_owned_metadata_change().unwrap();
-        assert!(authenticated.reopen(File::open(&renamed).unwrap()).is_ok());
         std::fs::write(&path, b"abc").unwrap();
         assert!(authenticated.reopen(File::open(&path).unwrap()).is_err());
         std::fs::set_permissions(&renamed, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&renamed, b"changed").unwrap();
-        assert!(authenticated.refresh_after_owned_metadata_change().is_err());
         assert!(authenticated.reopen(File::open(&renamed).unwrap()).is_err());
     }
     #[test]

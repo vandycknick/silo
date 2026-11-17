@@ -8,8 +8,8 @@ use std::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{
-    CaptureObservation, CapturePlan, CaptureRecordOutcome, CaptureReleaseDisposition,
-    CaptureReleased, CaptureSealed,
+    CaptureObservation, CapturePlan, CaptureRecordOutcome, CaptureRecordReference,
+    CaptureReleaseDisposition, CaptureReleased, CaptureSourceReference, CaptureSuccess,
 };
 use crate::live::LiveOperationUnsupported;
 
@@ -460,7 +460,7 @@ impl fmt::Display for LiveFailure {
 pub enum OperationOutcome {
     InProgress,
     Succeeded { pause: PauseEstablished },
-    CaptureSealed { capture: CaptureSealed },
+    CaptureSealed { capture: CaptureSuccess },
     Failed { failure: LiveFailure },
 }
 
@@ -493,10 +493,11 @@ impl LiveOperationRecord {
                 pause.guest.validate()
             }
             OperationOutcome::CaptureSealed { capture } => {
-                if self.kind != OperationKind::Capture || capture.capture_id != self.operation_id {
-                    return Err("only its own capture operation succeeds with a seal".into());
+                if self.kind != OperationKind::Capture || capture.capture_id() != &self.operation_id
+                {
+                    return Err("only its own capture operation succeeds with cut authority".into());
                 }
-                Ok(())
+                capture.validate()
             }
             OperationOutcome::Failed { failure } => failure.validate(),
         }
@@ -848,14 +849,39 @@ impl OperationObservation {
         }
         if let Some(capture) = &self.capture {
             capture.validate()?;
+            if matches!(&capture.source_record,
+                Some(CaptureSourceReference::OwnedLocalCut { capture_id, .. })
+                    if capture_id != &self.operation.operation_id)
+            {
+                return Err("owned source record belongs to another operation".into());
+            }
             let sealed = matches!(
                 self.operation.outcome,
                 OperationOutcome::CaptureSealed { .. }
             );
-            let coherent = capture
-                .evidence
-                .as_ref()
-                .is_some_and(|evidence| evidence.outcome == CaptureRecordOutcome::Coherent);
+            let coherent = match &capture.evidence {
+                Some(CaptureRecordReference::Identified { evidence }) => {
+                    evidence.outcome == CaptureRecordOutcome::Coherent
+                }
+                Some(CaptureRecordReference::OwnedLocalCut { .. }) => true,
+                None => false,
+            };
+            if let OperationOutcome::CaptureSealed { capture: success } = &self.operation.outcome {
+                let matches = match (success, &capture.evidence) {
+                    (
+                        CaptureSuccess::Identified { sealed },
+                        Some(CaptureRecordReference::Identified { evidence }),
+                    ) => sealed.evidence_sha256 == evidence.sha256,
+                    (
+                        CaptureSuccess::OwnedLocalCut { cut, .. },
+                        Some(CaptureRecordReference::OwnedLocalCut { cut: record }),
+                    ) => cut == record,
+                    _ => false,
+                };
+                if !matches {
+                    return Err("capture success authority differs from its durable record".into());
+                }
+            }
             if sealed != coherent {
                 return Err(
                     "a capture succeeds exactly when its coherent record is durable".into(),

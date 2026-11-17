@@ -419,7 +419,18 @@ pub enum ManagedSpelling {
     Digest(ObjectDigest),
 }
 
+pub fn reject_local_cut(value: &str) -> Result<(), ConversionError> {
+    if value.starts_with("fork:") {
+        return Err(invalid(
+            "source",
+            "local fork cut is not an identified snapshot; snapshot the child first",
+        ));
+    }
+    Ok(())
+}
+
 pub fn parse_managed(value: &str) -> Result<ManagedSpelling, ConversionError> {
+    reject_local_cut(value)?;
     let value = value
         .strip_prefix("image:")
         .ok_or_else(|| invalid("image", "expected image:NAME or image:sha256:HEX"))?;
@@ -809,4 +820,17 @@ pub fn managed_event_image(
             value,
         )?)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn local_cut_spelling_never_grants_managed_authority() {
+        let error =
+            crate::images::parse_managed("fork:00000000-0000-4000-8000-000000000001").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("local fork cut is not an identified snapshot; snapshot the child first"));
+        assert!(crate::images::parse_managed("image:ordinary-alias").is_ok());
+    }
 }

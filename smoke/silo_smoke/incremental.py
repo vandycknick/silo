@@ -24,6 +24,12 @@ CHUNK = stream_map.RAM_CHUNK
 PROBE = "/usr/local/bin/incremental-memory"
 
 
+def disk_full_scan_reason(stats: dict) -> str | None:
+    """Read the tagged disk reason; null denotes a reused identity baseline."""
+    reason = stats["fullScanReason"]
+    return None if reason is None else reason["kind"]
+
+
 def incremental_image(config: SmokeConfig, registry: LoopbackRegistry,
                       tmp_path_factory: pytest.TempPathFactory) -> str:
     """Use the existing execution oracle plus a pinned CPU/block-DMA witness."""
@@ -91,6 +97,7 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
     assert binding["architecture"] == layout["architecture"]
     assert layout["magic"] == "KRUNRAML" and layout["schema"] == 1
     assert (evidence["mode"], evidence["fullReason"]) == (mode, reason), evidence
+    identity_mode = {"full": "full", "since-anchor": "incremental"}[evidence["identityPolicy"]]
     expected_baseline = baseline.seal["memory"]["ramStream"] if baseline is not None else None
     assert evidence["baseline"] == expected_baseline, evidence
     path = saved.staging / "memory.root"
@@ -103,8 +110,8 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
     changes = stream_map.read_changes(saved.staging / "memory.changes", length)
     summary = evidence["changes"]
     assert (changes.mode, changes.byte_length, changes.identity, len(changes.records)) == (
-        mode, summary["byteLen"], summary["sha256"], summary["recordCount"])
-    assert summary["coverage"] == mode and summary["baselineStream"] == expected_baseline
+        identity_mode, summary["byteLen"], summary["sha256"], summary["recordCount"])
+    assert summary["coverage"] == identity_mode and summary["baselineStream"] == expected_baseline
     actual_root, leaves = stream_map.from_file(saved.staging / "memory.ram", CHUNK)
     assert actual_root == root, "native root differs from independent full-byte oracle"
     source = stream_map.object_source(silo.ws.silo_home)
@@ -118,7 +125,7 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
     for change in changes.records:
         for index in range(change.first, change.first + change.count):
             assert leaves.get(index) == change.value, ("change differs from output bytes", change, index)
-    if mode == "full":
+    if identity_mode == "full":
         assert {change.first: change.value for change in changes.records} == leaves
     else:
         assert baseline is not None
@@ -150,7 +157,18 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
         assert stats["fullBytesWritten"] == 0
         assert stats["overlayBytesWritten"] <= stats["liveBytesRead"] <= coverage <= length
         if probe["reflink"]:
-            assert stats["liveBytesRead"] == coverage
+            # Every selected identity-unit byte is either read or proven absent.
+            # Output zero runs/punches overlap those bytes and are not read savings.
+            assert stats["liveBytesRead"] + stats["knownZeroBytesSkipped"] == coverage, stats
+            launch = procs.query(silo.ws.state_db(),
+                "SELECT json_type(record_json,'$.restore') FROM storage_operation "
+                f"WHERE kind='launch' AND json_extract(record_json,'$.machineId')='{saved.source_info['id']}' "
+                f"AND json_extract(record_json,'$.runId')='{saved.source_info['run_id']}'")
+            assert len(launch) == 1 and launch[0][0] in {"null", "object"}, launch
+            if launch[0][0] == "object":
+                # Restore/fork RAM can expose nonzero file bytes after a discard.
+                assert stats["knownZeroBytesSkipped"] == 0, stats
+                assert stats["liveBytesRead"] == coverage, stats
             assert all(stats[field] == 0 for field in (
                 "baselineBytesRead", "baselineBytesWritten", "baselineHoleBytes", "extentQueries"))
         else:
@@ -174,6 +192,32 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
         "rootBytes": len(encoded), "changeRecords": len(changes.records), "affectedChunks": sorted(affected),
         "memory": evidence, "seedProbe": probe}, sort_keys=True) + "\n")
     return {"map": (root, leaves), "affected": affected, "stats": stats}
+
+
+def full_file_oracle(silo: Silo, saved: restore.Checkpoint, *, full_identity: bool = False) -> dict:
+    """Independently scan every RAM/disk byte and authenticate catalog map closures."""
+    home = silo.ws.silo_home
+    evidence = saved.seal["memory"]
+    files = [(saved.staging / "memory.ram", stream_map.RAM_CHUNK)]
+    files.extend((path, stream_map.DISK_CHUNK) for path in sorted((saved.staging / "disks").glob("*.raw")))
+    for path, chunk in files:
+        root, leaves = stream_map.from_file(path, chunk)
+        members = [entry for entry in saved.seal["inventory"]
+                   if entry["role"] == str(path.relative_to(saved.staging))]
+        assert len(members) == 1 and members[0]["identity"] == root.identity, (path, members)
+        binding = {"stream": root.identity, "map": root.identity,
+                   "length": root.length, "chunkSize": chunk}
+        assert stream_map.catalog_root(home, binding) == (root, leaves), path
+        if path.name == "memory.ram":
+            assert evidence["ramStream"] == root.identity
+            if full_identity:
+                assert evidence["identityPolicy"] == "full" and evidence["baseline"] is None, evidence
+                assert evidence["identityFullReason"] == "unknown-anchor-after-fork", evidence
+                expected_hash_bytes = sum(min(chunk, root.length - index * chunk) for index in leaves)
+                assert evidence["stats"]["identityBytesHashed"] == expected_hash_bytes, evidence
+    verified = silo.json("snapshot", "verify", saved.reference, timeout=240)
+    assert verified["snapshot"] == saved.snapshot and verified["bytes"] > 0, verified
+    return evidence["stats"]
 
 
 def catalog_map(silo: Silo, binding: dict) -> tuple[stream_map.Root, dict[int, str]]:

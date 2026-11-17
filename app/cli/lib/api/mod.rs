@@ -191,6 +191,7 @@ impl AppApi {
         options: libvm::RestoreOptions,
         progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<MachineData> {
+        silo_vm_control::images::reject_local_cut(reference)?;
         let reference: libvm::SnapshotRef = if reference.starts_with("image:") {
             reference.parse()?
         } else {
@@ -207,6 +208,7 @@ impl AppApi {
         reference: &str,
         options: libvm::RecoverDisksOptions,
     ) -> eyre::Result<MachineData> {
+        silo_vm_control::images::reject_local_cut(reference)?;
         let reference: libvm::SnapshotRef = if reference.starts_with("image:") {
             reference.parse()?
         } else {
@@ -760,7 +762,7 @@ mod tests {
         );
     }
 
-    fn isolated_runtime_config(root: &Path, home: &Path) -> RuntimeConfig {
+    pub(crate) fn isolated_runtime_config(root: &Path, home: &Path) -> RuntimeConfig {
         let components = root.join("components");
         let bin = components.join("bin");
         let assets = components.join("assets");

@@ -1574,10 +1574,11 @@ impl MachineCreateGuard {
         runtime: Runtime,
         config: MachineConfig,
         rootfs: MachineRootfsRecord,
-        storage: crate::MachineStorageRecord,
+        mut storage: crate::MachineStorageRecord,
         source: SourceOwnership,
         boot_operation: Option<crate::storage::pool::OperationPaths>,
     ) -> tokio::task::JoinHandle<Result<MachineConfig, LibVmError>> {
+        storage.bind_disk_identity_inventory(&config.spec);
         let initial_state = stopped_machine_state(config.id, None);
         // The whole guard, not just its Copy preservation flag, moves into
         // this task before its caller can lose the publication JoinHandle.
@@ -1790,6 +1791,10 @@ async fn publish_checkpoint_child(
     )
     .await?;
     storage.disk_baselines.clear();
+    if restore_run.is_none() {
+        // A stopped copy transfers disks, never an execution/RAM checkpoint.
+        storage.ram_identity = crate::store::models::storage::ContentIdentityState::Unknown;
+    }
     let baseline_pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
     let store = runtime.native_store()?;
     let directory = OwnedDirectory::open_existing_root(create.dir())?.ok_or_else(|| {
@@ -1867,6 +1872,10 @@ async fn publish_checkpoint_child(
                         crate::machine::root_storage::invalid("child private path is not UTF-8")
                     })?;
                     let length = source.length();
+                    let owned = matches!(
+                        &source,
+                        crate::machine::stopped::PrivateSource::Owned { .. }
+                    );
                     let mut prepared = source.prepare(
                         stage.try_clone()?,
                         &format!("file-{index}"),
@@ -1913,6 +1922,11 @@ async fn publish_checkpoint_child(
                         .ok_or_else(|| {
                             crate::machine::root_storage::invalid("child disk attachment missing")
                         })?;
+                    if owned {
+                        // Owned-byte construction never establishes content identity.
+                        prepared.retain();
+                        continue;
+                    }
                     let scanned;
                     let map = match prepared.map() {
                         Some(map) => map,
@@ -1980,6 +1994,7 @@ async fn publish_checkpoint_child(
             .ok_or_else(|| crate::machine::root_storage::invalid("projected child disk missing"))?;
         baseline.seed.block_id = disk.block_id.clone();
     }
+    storage.bind_disk_identity_inventory(&create.spec);
     write_owned_machine_config(create.dir(), &create.name, &create.spec, durability)?;
     storage.validate()?;
     let (root, length) = match &storage.root {
@@ -2257,7 +2272,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let storage = store.machine_storage(source.id).await.unwrap().unwrap();
+        let mut storage = store.machine_storage(source.id).await.unwrap().unwrap();
+        storage.ram_identity = crate::store::models::storage::ContentIdentityState::Identified {
+            root: vm_spec::capture::Sha256Digest::of_bytes(b"source execution anchor"),
+        };
         let configuration = crate::SnapshotConfiguration::capture(&source).unwrap();
         let pool = StoragePool::open(runtime.local_images_dir()).unwrap();
         for live in [false, true] {
@@ -2352,6 +2370,10 @@ mod tests {
                     |directory| directory.path() == launch.serial_log_path().parent().unwrap()
                 ));
                 let storage = store.machine_storage(child.id).await.unwrap().unwrap();
+                assert!(matches!(
+                    storage.ram_identity,
+                    crate::store::models::storage::ContentIdentityState::Identified { .. }
+                ));
                 assert_eq!(
                     crate::machine::root_storage::launch_disk_seeds(
                         &storage,
@@ -2412,6 +2434,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                assert_eq!(
+                    store
+                        .machine_storage(child.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .ram_identity,
+                    crate::store::models::storage::ContentIdentityState::Unknown
+                );
                 assert_eq!(
                     store.machine_durability(child.id).await.unwrap(),
                     Some(crate::MachineDurability::Durable),
@@ -3171,6 +3202,9 @@ mod tests {
             &reads
         ));
         let storage = store.machine_storage(config.id).await.unwrap().unwrap();
+        storage
+            .validate_disk_identity_inventory(&config.spec)
+            .unwrap();
         assert!(storage.disk_baselines.is_empty());
         assert!(matches!(
             storage.root,
@@ -4000,5 +4034,721 @@ mod tests {
         ));
         assert!(store.machine_config(source.id).await.unwrap().is_some());
         assert!(source.machine_dir.join("root.raw").is_file());
+    }
+
+    async fn assert_created_cold_launch_bindings(runtime: &Runtime, id: MachineId) {
+        let store = runtime.native_store().unwrap();
+        let (_lock, mut config) = runtime.lock_machine_config(id).await.unwrap();
+        let mut storage = runtime
+            .validate_machine_storage_for_launch(&config)
+            .await
+            .unwrap();
+        runtime
+            .admit_cold_launch_storage(&mut config, &mut storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.machine_config(id).await.unwrap(),
+            Some(config.clone())
+        );
+        assert_eq!(
+            store.machine_storage(id).await.unwrap(),
+            Some(storage.clone())
+        );
+        let qualification = runtime.open_machine_boot(&config, &storage).unwrap();
+        let run = uuid::Uuid::new_v4();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .request_machine_start(&config, &run.to_string())
+            .await
+            .unwrap();
+        runtime.ensure_machine_runtime_directories(id).unwrap();
+        let mut root = runtime
+            .prepare_machine_root(&config, &lease, qualification)
+            .await
+            .unwrap();
+        let secrets = runtime
+            .resolve_machine_secrets(&config, &run.to_string(), &Default::default())
+            .unwrap();
+        let inputs = runtime
+            .prepare_vmm_launch_inputs(
+                &config,
+                &run.to_string(),
+                &crate::network::VmmNetworkAttachment::None,
+                false,
+                &secrets,
+                &root,
+            )
+            .unwrap();
+        let launched: VmSpec = serde_json::from_slice(
+            &std::fs::read(runtime.machine_paths(id).vm_spec_path()).unwrap(),
+        )
+        .unwrap();
+        storage.validate_disk_identity_inventory(&launched).unwrap();
+        let seeds = crate::machine::root_storage::launch_disk_seeds(
+            &storage,
+            &config.machine_dir,
+            runtime.local_images_dir(),
+        )
+        .unwrap();
+        assert_eq!(seeds.len(), storage.disk_baselines.len());
+        for identity in &storage.disk_identities {
+            let index = identity.attachment_index as usize;
+            assert_eq!(
+                identity.block_id,
+                config.spec.storage.as_ref().unwrap().disks[index].block_id
+            );
+        }
+        for seed in seeds {
+            let attachment =
+                &launched.storage.as_ref().unwrap().disks[seed.attachment_index as usize];
+            assert!(!attachment.read_only);
+            assert_eq!(seed.block_id, attachment.block_id);
+            assert_eq!(seed.role, attachment.role);
+            assert_eq!(
+                seed.block_id,
+                storage
+                    .disk_identities
+                    .iter()
+                    .find(|identity| identity.attachment_index == seed.attachment_index)
+                    .unwrap()
+                    .block_id
+            );
+        }
+        drop(inputs);
+        let lower = root._lower.take();
+        drop(root);
+        let error = crate::machine::lifecycle::finish_failed_start(
+            runtime,
+            &config,
+            &run.to_string(),
+            Some(crate::machine::lifecycle::FailedStartState::Stopped),
+            None,
+            crate::machine::lifecycle::FailedStartStorage { lease, lower },
+            std::io::Error::other("host test completes launch preparation without spawning").into(),
+        )
+        .await;
+        assert!(
+            !matches!(error, LibVmError::MachineStartCleanupFailed { .. }),
+            "{error}"
+        );
+        // A later cold admission uses the persisted records, not the first
+        // admission's in-memory projections.
+        let mut config = store.machine_config(id).await.unwrap().unwrap();
+        let mut storage = runtime
+            .validate_machine_storage_for_launch(&config)
+            .await
+            .unwrap();
+        runtime
+            .admit_cold_launch_storage(&mut config, &mut storage)
+            .await
+            .unwrap();
+    }
+
+    async fn create_data_disks_then_cold_launch(layered: bool) {
+        use crate::machine::builder::publish_stopped_child;
+        use crate::machine::stopped::{FencedSource, OperationStaging, PrivateSource};
+        use crate::storage::pool::StoragePool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let (asset_owner, store) = runtime_with_sqlite_store(paths.clone()).await;
+        let runtime = Runtime::from_store(
+            paths.clone(),
+            store.clone(),
+            RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
+            crate::runtime::components::test_components_with_supervisor(
+                paths.home(),
+                &std::env::current_exe().unwrap(),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(asset_owner);
+        #[cfg(target_arch = "x86_64")]
+        if layered {
+            std::fs::write(
+                runtime.asset_directory().join("kernel-default"),
+                crate::owned_boot_assets::tests::elf_kernel_with_banner("6.6.0"),
+            )
+            .unwrap();
+        }
+        let source = write_base_rootfs(temp.path());
+        let resolved = if layered {
+            let reference = "example.test/create-data:1";
+            let (record, held) = crate::image::oci::tests::cache_layered_image(
+                &store,
+                reference,
+                crate::image::oci::tests::MANIFEST,
+            )
+            .await;
+            drop(held);
+            Some(crate::image::oci::cached_resolved_oci_image(
+                &record,
+                reference.into(),
+            ))
+        } else {
+            None
+        };
+        for data_count in [0, 1, 3] {
+            let name = format!("created-data-{data_count}");
+            let mut request = create_request(source.clone(), &name);
+            request.kernel = None;
+            request.initramfs = None;
+            request.guest.agent = crate::MachineAgent::Disabled;
+            request.agent_mode = Some(crate::MachineAgent::Disabled);
+            request.disk_size_bytes = Some(if layered {
+                64 << 20
+            } else {
+                std::fs::metadata(&source).unwrap().len()
+            });
+            if let Some(resolved) = &resolved {
+                request.image_source = Some(ImageSource::oci(resolved.requested_reference.clone()));
+                request.resolved_oci_image = Some(resolved.clone());
+            }
+            for number in 0..data_count {
+                let path = temp
+                    .path()
+                    .join(format!("external-{data_count}-{number}.raw"));
+                let file = std::fs::File::create_new(&path).unwrap();
+                file.set_len(4096).unwrap();
+                file.sync_all().unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                request.disks.push(path);
+            }
+            let config = create_machine_config(&runtime, request).await.unwrap();
+            let storage = store.machine_storage(config.id).await.unwrap().unwrap();
+            let root_index = usize::from(layered);
+            assert_eq!(storage.disk_identities.len(), data_count + 1);
+            assert!(storage.disks.is_empty(), "--disk is external, not managed");
+            assert_eq!(
+                storage.disk_identities[0].attachment_index as usize,
+                root_index
+            );
+            for number in 0..data_count {
+                let identity = &storage.disk_identities[number + 1];
+                assert_eq!(identity.attachment_index as usize, root_index + 1 + number);
+                assert_eq!(identity.block_id.as_str(), format!("silo-data-{number}"));
+            }
+            assert_created_cold_launch_bindings(&runtime, config.id).await;
+            if data_count == 0 {
+                continue;
+            }
+            // Managed Data is created by child publication, not --disk.
+            // Add external writable and read-only attachments to cover mixed
+            // ownership without giving either one a managed baseline.
+            let mut child_storage = store.machine_storage(config.id).await.unwrap().unwrap();
+            let (root_path, length) = crate::machine::stopped::root_private(&child_storage);
+            let mut sources = vec![PrivateSource::Fenced(FencedSource {
+                path: root_path.clone(),
+                file: std::fs::File::open(config.machine_dir.join(root_path.as_path())).unwrap(),
+                length,
+            })];
+            for number in 0..data_count {
+                let index = root_index + 1 + number;
+                let disk = &config.spec.storage.as_ref().unwrap().disks[index];
+                let path = crate::PrivatePath::new(format!("data-{number}.raw")).unwrap();
+                child_storage.disks.push(crate::IncludedDisk {
+                    id: uuid::Uuid::new_v4(),
+                    role: vm_spec::DiskRole::Data,
+                    order: index as u32,
+                    storage: crate::DiskStorage::ManagedWritable {
+                        path: path.clone(),
+                        geometry: disk.geometry,
+                    },
+                });
+                sources.push(PrivateSource::Fenced(FencedSource {
+                    path,
+                    file: std::fs::File::open(&disk.path).unwrap(),
+                    length: disk.geometry.length,
+                }));
+            }
+            let mut configuration = crate::SnapshotConfiguration::capture(&config).unwrap();
+            let mut external = configuration
+                .spec
+                .storage
+                .as_ref()
+                .unwrap()
+                .disks
+                .last()
+                .unwrap()
+                .clone();
+            external.block_id = vm_spec::BlockId::new("extra-external").unwrap();
+            let mut read_only = external.clone();
+            read_only.block_id = vm_spec::BlockId::new("read-only-external").unwrap();
+            read_only.read_only = true;
+            configuration
+                .spec
+                .storage
+                .as_mut()
+                .unwrap()
+                .disks
+                .extend([external, read_only]);
+            child_storage.bind_disk_identity_inventory(&configuration.spec);
+            let pool = StoragePool::open(runtime.local_images_dir()).unwrap();
+            let (operation, lease) = store
+                .begin_stopped_operation("fork", &[], &[])
+                .await
+                .unwrap();
+            let staging = OperationStaging::new(&pool, operation, &lease).unwrap();
+            let child = publish_stopped_child(
+                &runtime,
+                format!("managed-data-{data_count}"),
+                configuration,
+                child_storage,
+                sources,
+                operation,
+            )
+            .await
+            .unwrap();
+            let stored = store.machine_storage(child.id).await.unwrap().unwrap();
+            assert_eq!(stored.disks.len(), data_count);
+            assert_eq!(stored.disk_baselines.len(), data_count + 1);
+            assert_created_cold_launch_bindings(&runtime, child.id).await;
+            drop(staging);
+            store.finish_stopped_operation(operation).await.unwrap();
+            drop(lease);
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_create_with_data_disks_and_managed_children_keeps_cold_launch_inventory_bound() {
+        create_data_disks_then_cold_launch(false).await;
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn layered_create_with_data_disks_and_managed_children_keeps_cold_launch_inventory_bound()
+    {
+        create_data_disks_then_cold_launch(true).await;
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn real_fork_child_requests_bind_raw_and_layered_private_disks_before_launch() {
+        use crate::store::capture::tests::{seal_owned, Fixture};
+        use crate::store::snapshot_store::{CaptureReservationRequest, SnapshotStore};
+        use vm_spec::capture::{CaptureConfiguration, CapturePauseAuthority};
+        use vm_spec::lifecycle::{CapturePolicy, CaptureResumePolicy};
+
+        for layered in [false, true] {
+            for child_count in [1, 2] {
+                let temp = tempfile::tempdir().unwrap();
+                let paths = LocalPaths::new(temp.path().join("home"));
+                let (asset_owner, store) = runtime_with_sqlite_store(paths.clone()).await;
+                let runtime = Runtime::from_store(
+                    paths.clone(),
+                    store.clone(),
+                    RuntimeNetworkingConfig::default(),
+                    crate::RegistryPolicy::default(),
+                    crate::runtime::components::test_components_with_supervisor(
+                        paths.home(),
+                        &std::env::current_exe().unwrap(),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+                drop(asset_owner);
+                std::fs::write(
+                    runtime.asset_directory().join("kernel-default"),
+                    crate::owned_boot_assets::tests::elf_kernel_with_banner("6.6.0"),
+                )
+                .unwrap();
+                let mut request =
+                    create_request(write_base_rootfs(temp.path()), "fork-request-source");
+                request.kernel = None;
+                request.initramfs = None;
+                request.guest.agent = crate::MachineAgent::Disabled;
+                request.agent_mode = Some(crate::MachineAgent::Disabled);
+                if layered {
+                    let reference = "example.test/fork-request:1";
+                    let (record, held) = crate::image::oci::tests::cache_layered_image(
+                        &store,
+                        reference,
+                        crate::image::oci::tests::MANIFEST,
+                    )
+                    .await;
+                    drop(held);
+                    request.image_source = Some(ImageSource::oci(reference));
+                    request.resolved_oci_image = Some(
+                        crate::image::oci::cached_resolved_oci_image(&record, reference.into()),
+                    );
+                    request.disk_size_bytes = Some(64 << 20);
+                }
+                let config = create_machine_config(&runtime, request).await.unwrap();
+                let storage = store.machine_storage(config.id).await.unwrap().unwrap();
+                let run = uuid::Uuid::new_v4();
+                let launch = store
+                    .register_launch_storage(config.id, run, &storage, &config.spec)
+                    .await
+                    .unwrap();
+                store
+                    .mark_launch_storage_admitted(launch.operation_id())
+                    .await
+                    .unwrap();
+                let mut state = crate::runtime::core::stopped_machine_state(config.id, None);
+                state.status = crate::store::models::MachineRuntimeState::Running;
+                state.run_id = Some(run.to_string());
+                store.save_machine_state(&state).await.unwrap();
+                let mut options =
+                    crate::store::fork::tests::options(&["request-first", "request-second"]);
+                options.children.truncate(child_count);
+                let capture = uuid::Uuid::new_v4();
+                let (_, owner) = store
+                    .admit_fork(
+                        config.id,
+                        &crate::store::fork::tests::observation(config.id, run),
+                        &options,
+                        capture,
+                    )
+                    .await
+                    .unwrap();
+                let snapshots = SnapshotStore::from_store(store.clone());
+                let reservation = snapshots
+                    .reserve_capture(&CaptureReservationRequest {
+                        machine_id: config.id,
+                        run_id: run,
+                        capture_id: capture,
+                        configuration: CaptureConfiguration::from_spec(&config.spec).unwrap(),
+                        alias: None,
+                        policy: CapturePolicy::Full,
+                        dirty_crossover_percent: 60,
+                        resume_policy: CaptureResumePolicy::ResumeIfAcquired,
+                        pause: CapturePauseAuthority::Acquire,
+                    })
+                    .await
+                    .unwrap();
+                snapshots
+                    .bind_capture_boot(capture, storage.boot)
+                    .await
+                    .unwrap();
+                let fixture = Fixture {
+                    _temporary: temp,
+                    snapshots,
+                    config,
+                    reservation,
+                    launch,
+                };
+                seal_owned(&fixture);
+                fixture
+                    .snapshots
+                    .retain_local_capture(capture)
+                    .await
+                    .unwrap();
+                crate::machine::restore::tests::assert_real_fork_child_requests(
+                    &runtime,
+                    &fixture.snapshots,
+                    options.operation_id,
+                    child_count,
+                )
+                .await;
+                drop(owner);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_restore_cold_admission_keeps_disk_files_roots_and_launch_seeds_bound() {
+        use crate::machine::builder::{publish_restored_child, ChildConstruction};
+        use crate::machine::restore::{storage_from_snapshot, RestoreAuthentication};
+        use crate::machine::stopped::PrivateSource;
+        use crate::storage::pool::StoragePool;
+        use crate::store::capture::tests::{fixture_source_with_disk_length, seal};
+
+        let fixture = fixture_source_with_disk_length(
+            true,
+            false,
+            vm_spec::lifecycle::CapturePolicy::Full,
+            512,
+        )
+        .await;
+        let snapshots = &fixture.snapshots;
+        let store = &snapshots.store;
+        let (sealed, _) = seal(&fixture);
+        let info = snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                sealed.path(),
+                fixture.reservation.record.alias.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await
+            .unwrap();
+        let consumer = snapshots
+            .consume_shape(&crate::SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        let pool = StoragePool::open(store.images_path()).unwrap();
+        let mut sources = vec![PrivateSource::Authenticated {
+            path: crate::PrivatePath::new("root.raw").unwrap(),
+            stream: shape
+                .open_copy_source(
+                    &pool,
+                    &consumer.record.root.stream.stream,
+                    consumer.record.root.geometry.length,
+                )
+                .unwrap(),
+        }];
+        for disk in consumer.record.disks.iter().filter(|disk| disk.writable) {
+            sources.push(PrivateSource::Authenticated {
+                path: crate::PrivatePath::new(format!("disk-{}.raw", disk.order)).unwrap(),
+                stream: shape
+                    .open_copy_source(&pool, &disk.content.stream, disk.geometry.length)
+                    .unwrap(),
+            });
+        }
+        let paths = crate::paths::LocalPaths::new(store.home_path());
+        let runtime = crate::Runtime::from_store(
+            paths.clone(),
+            store.clone(),
+            crate::RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
+            crate::runtime::components::test_components_with_supervisor(
+                paths.home(),
+                &std::env::current_exe().unwrap(),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut configuration = consumer.record.configuration.clone();
+        configuration.guest.agent = crate::MachineAgent::Disabled;
+        configuration.spec.boot = Some(vm_spec::Boot {
+            kernel: Some(vm_spec::Kernel {
+                path: None,
+                initramfs: None,
+                cmdline: Vec::new(),
+            }),
+            userdata: None,
+        });
+        let original_ids: Vec<_> = configuration
+            .spec
+            .storage
+            .as_ref()
+            .unwrap()
+            .disks
+            .iter()
+            .map(|disk| disk.block_id.clone())
+            .collect();
+        assert_eq!(original_ids[0].as_str(), "exact-native-root-id");
+        assert_eq!(original_ids[1].as_str(), "external-data-serial");
+        let restored_run = uuid::Uuid::new_v4();
+        let (mut config, durability) = publish_restored_child(
+            &runtime,
+            ChildConstruction {
+                name: "noncanonical-restored".into(),
+                configuration,
+                storage: storage_from_snapshot(&consumer.record, info.id).unwrap(),
+                sources,
+                operation_id: consumer.operation_id,
+                shared_qualification: None,
+            },
+            restored_run,
+            Some(RestoreAuthentication::new(snapshots.clone(), shape)),
+        )
+        .await
+        .unwrap();
+        durability.spawn().await.unwrap().unwrap();
+        let mut storage = runtime.machine_storage_record(config.id).await.unwrap();
+        let original_roots: Vec<_> = storage
+            .disk_identities
+            .iter()
+            .map(|disk| disk.identity.clone())
+            .collect();
+        let original_files = (storage.root.clone(), storage.disks.clone());
+        let original_baselines: Vec<_> = storage
+            .disk_baselines
+            .iter()
+            .map(|baseline| {
+                (
+                    baseline.seed.attachment_index,
+                    baseline.fingerprint,
+                    baseline.map,
+                )
+            })
+            .collect();
+        runtime
+            .mark_machine_monitor_ready(config.id, restored_run.to_string(), i32::MAX, 1)
+            .await
+            .unwrap();
+        store
+            .save_machine_state(&crate::runtime::core::stopped_machine_state(
+                config.id, None,
+            ))
+            .await
+            .unwrap();
+        store
+            .preflight_restored_cold_start(config.id)
+            .await
+            .unwrap();
+        let (_lifecycle, _) = runtime.lock_machine_config(config.id).await.unwrap();
+        let mut wrong_path = config.clone();
+        wrong_path.spec.storage.as_mut().unwrap().disks[0].path = "unrelated.raw".into();
+        assert!(runtime
+            .admit_cold_launch_storage(&mut wrong_path, &mut storage.clone())
+            .await
+            .is_err());
+        runtime
+            .admit_cold_launch_storage(&mut config, &mut storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .disk_identities
+                .iter()
+                .map(|disk| disk.identity.clone())
+                .collect::<Vec<_>>(),
+            original_roots
+        );
+        assert_eq!(
+            (&storage.root, &storage.disks),
+            (&original_files.0, &original_files.1)
+        );
+        assert_eq!(
+            store.machine_storage(config.id).await.unwrap(),
+            Some(storage.clone())
+        );
+        assert_eq!(
+            storage
+                .disk_baselines
+                .iter()
+                .map(|baseline| (
+                    baseline.seed.attachment_index,
+                    baseline.fingerprint,
+                    baseline.map
+                ))
+                .collect::<Vec<_>>(),
+            original_baselines
+        );
+        assert_eq!(storage.snapshot, Some(info.id));
+        config = store.machine_config(config.id).await.unwrap().unwrap();
+        storage = store.machine_storage(config.id).await.unwrap().unwrap();
+        store
+            .preflight_restored_cold_start(config.id)
+            .await
+            .unwrap();
+        // A replay after a crash before launch accepts the committed canonical
+        // record without another write.
+        sqlx::query("CREATE TRIGGER reject_repeated_cold_rebind BEFORE UPDATE ON machine_storage BEGIN SELECT RAISE(ABORT, 'unexpected cold rebind'); END")
+            .execute(store.test_pool()).await.unwrap();
+        runtime
+            .admit_cold_launch_storage(&mut config, &mut storage)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER reject_repeated_cold_rebind")
+            .execute(store.test_pool())
+            .await
+            .unwrap();
+        let cold_run = uuid::Uuid::new_v4();
+        let lease = runtime
+            .register_launch_storage(&config, cold_run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .request_machine_start(&config, &cold_run.to_string())
+            .await
+            .unwrap();
+        config.image_ref = "stopped-storage".into();
+        runtime
+            .ensure_machine_runtime_directories(config.id)
+            .unwrap();
+        let root = runtime
+            .prepare_machine_root(&config, &lease, None)
+            .await
+            .unwrap();
+        let secrets = runtime
+            .resolve_machine_secrets(&config, &cold_run.to_string(), &Default::default())
+            .unwrap();
+        let _inputs = runtime
+            .prepare_vmm_launch_inputs(
+                &config,
+                &cold_run.to_string(),
+                &crate::network::VmmNetworkAttachment::None,
+                false,
+                &secrets,
+                &root,
+            )
+            .unwrap();
+        let launched: vm_spec::VmSpec = serde_json::from_slice(
+            &std::fs::read(runtime.machine_paths(config.id).vm_spec_path()).unwrap(),
+        )
+        .unwrap();
+        let seeds = crate::machine::root_storage::launch_disk_seeds(
+            &storage,
+            &config.machine_dir,
+            runtime.local_images_dir(),
+        )
+        .unwrap();
+        assert_eq!(seeds.len(), 2);
+        for identity in &storage.disk_identities {
+            let index = identity.attachment_index as usize;
+            assert_eq!(
+                identity.block_id,
+                launched.storage.as_ref().unwrap().disks[index].block_id
+            );
+            assert_eq!(
+                identity.block_id,
+                seeds
+                    .iter()
+                    .find(|seed| seed.attachment_index == identity.attachment_index)
+                    .unwrap()
+                    .block_id
+            );
+        }
+        assert_eq!(storage.disk_identities[0].block_id.as_str(), "silo-root");
+        assert_eq!(storage.disk_identities[1].block_id.as_str(), "silo-data-0");
+        runtime
+            .mark_launch_storage_admitted(lease.operation_id())
+            .await
+            .unwrap();
+        let admitted = store.machine_storage(config.id).await.unwrap().unwrap();
+        let launch = store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|launch| launch.run_id == cold_run)
+            .unwrap();
+        assert!(admitted.matches_launch_storage(&launch.storage));
+        assert!(admitted.snapshot.is_none());
+        drop(_inputs);
+        drop(root);
+        let error = crate::machine::lifecycle::finish_failed_start(
+            &runtime,
+            &config,
+            &cold_run.to_string(),
+            Some(crate::machine::lifecycle::FailedStartState::Stopped),
+            None,
+            crate::machine::lifecycle::FailedStartStorage { lease, lower: None },
+            std::io::Error::other("real cold launch preparation failed before spawn").into(),
+        )
+        .await;
+        assert!(
+            !matches!(error, crate::LibVmError::MachineStartCleanupFailed { .. }),
+            "{error}"
+        );
+        config = store.machine_config(config.id).await.unwrap().unwrap();
+        storage = store.machine_storage(config.id).await.unwrap().unwrap();
+        runtime
+            .admit_cold_launch_storage(&mut config, &mut storage)
+            .await
+            .unwrap();
+        let retry = uuid::Uuid::new_v4();
+        let retry_lease = runtime
+            .register_launch_storage(&config, retry, &storage)
+            .await
+            .unwrap();
+        runtime
+            .request_machine_start(&config, &retry.to_string())
+            .await
+            .unwrap();
+        drop(retry_lease);
     }
 }

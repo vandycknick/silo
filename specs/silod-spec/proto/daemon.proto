@@ -425,7 +425,10 @@ message ProvisionStepReport { string id = 1; ProvisionStepStatus status = 2; Pro
 message ProvisionReport { ProvisionStatus status = 1; google.protobuf.Timestamp started_at = 2; google.protobuf.Timestamp finished_at = 3; google.protobuf.Duration duration = 4; repeated ProvisionStepReport steps = 5; optional string message = 6; }
 // Observed terminal storage result; absent when storage metadata is unavailable.
 enum StorageStopOutcome { STORAGE_STOP_OUTCOME_UNSPECIFIED = 0; STORAGE_STOP_OUTCOME_CLEAN = 1; STORAGE_STOP_OUTCOME_FORCED = 2; STORAGE_STOP_OUTCOME_UNKNOWN = 3; }
-message MachineSnapshot { string id = 1; string name = 2; VmSpec spec = 3; Retention retention = 4; ProcessConfig process = 5; optional string template_name = 6; Agent agent_mode = 7; bytes machine_dir = 8; google.protobuf.Timestamp created_at = 9; google.protobuf.Timestamp modified_at = 10; string image_ref = 11; Rootfs rootfs = 12; optional uint64 root_disk_size = 13; map<string,string> labels = 14; map<string,string> metadata = 15; ResolvedNetwork network = 16; MachineTailscale tailscale = 17; GuestConfig guest = 18; MachineStatus status = 19; Observation observation = 20; repeated MachineIssue issues = 21; optional string run_id = 22; BootReport boot_report = 23; ProvisionReport provision_report = 24; google.protobuf.Timestamp started_at = 25; optional string last_error = 26; google.protobuf.Timestamp updated_at = 27; NetworkObservation network_observation = 28; LiveMachineReport live = 29; LiveHostReport prospective_live = 30; optional LiveEvidenceState live_evidence = 31; MachineLifecycle lifecycle = 32; repeated MachineCapture captures = 33; MachineBoot boot = 34; optional StorageStopOutcome storage_stop_outcome = 35; }
+// Required typed identity state. Unknown-after-fork is not a zero digest.
+message ContentIdentityState { oneof state { google.protobuf.Empty unknown_after_fork = 1; google.protobuf.Empty unknown = 2; string identified_root = 3; } }
+message DiskContentIdentity { uint32 attachment_index = 1; string block_id = 2; ContentIdentityState identity = 3; }
+message MachineSnapshot { string id = 1; string name = 2; VmSpec spec = 3; Retention retention = 4; ProcessConfig process = 5; optional string template_name = 6; Agent agent_mode = 7; bytes machine_dir = 8; google.protobuf.Timestamp created_at = 9; google.protobuf.Timestamp modified_at = 10; string image_ref = 11; Rootfs rootfs = 12; optional uint64 root_disk_size = 13; map<string,string> labels = 14; map<string,string> metadata = 15; ResolvedNetwork network = 16; MachineTailscale tailscale = 17; GuestConfig guest = 18; MachineStatus status = 19; Observation observation = 20; repeated MachineIssue issues = 21; optional string run_id = 22; BootReport boot_report = 23; ProvisionReport provision_report = 24; google.protobuf.Timestamp started_at = 25; optional string last_error = 26; google.protobuf.Timestamp updated_at = 27; NetworkObservation network_observation = 28; LiveMachineReport live = 29; LiveHostReport prospective_live = 30; optional LiveEvidenceState live_evidence = 31; MachineLifecycle lifecycle = 32; repeated MachineCapture captures = 33; MachineBoot boot = 34; optional StorageStopOutcome storage_stop_outcome = 35; ContentIdentityState ram_identity = 36; repeated DiskContentIdentity disk_identities = 37; }
 message MachineInventoryEntry { string id = 1; string name = 2; MachineSnapshot data = 3; repeated MachineIssue issues = 4; }
 message MachineStart { string run_id = 1; MachineSnapshot data = 2; }
 enum ReadinessOutcome { READINESS_OUTCOME_UNSPECIFIED = 0; READINESS_OUTCOME_READY = 1; READINESS_OUTCOME_TERMINAL = 2; READINESS_OUTCOME_TIMED_OUT = 3; }
@@ -526,7 +529,9 @@ enum OperationKind { OPERATION_KIND_UNSPECIFIED = 0; OPERATION_KIND_PAUSE = 1; O
 // A Capture succeeds exactly when its coherent vm.capture.json record is complete. The cut
 // token is historical evidence, never current Resume authority.
 message CaptureSealed { string capture_id = 1; string evidence_sha256 = 2; PauseToken cut_token = 3; }
-message LiveOperationRecord { string operation_id = 1; OperationKind kind = 2; oneof outcome { google.protobuf.Empty in_progress = 3; PauseEstablished succeeded = 4; LiveFailure failed = 5; CaptureSealed capture_sealed = 6; } }
+message OwnedLocalCapture { bytes cut = 1; PauseToken cut_token = 2; }
+message CaptureSuccess { oneof authority { CaptureSealed identified = 1; OwnedLocalCapture owned_local_cut = 2; } }
+message LiveOperationRecord { string operation_id = 1; OperationKind kind = 2; oneof outcome { google.protobuf.Empty in_progress = 3; PauseEstablished succeeded = 4; LiveFailure failed = 5; CaptureSuccess capture_sealed = 6; } }
 message MachineLifecycle { LiveMachineReport report = 1; VmState state = 2; LiveLifecycle lifecycle = 3; LiveOperationRecord operation = 4; }
 // Capture requests carry an explicit preference. CLI/libvm default to INCREMENTAL,
 // which resolves to FULL when incremental capability is unavailable, and otherwise
@@ -542,6 +547,7 @@ enum CaptureSourceOutcome { CAPTURE_SOURCE_OUTCOME_UNSPECIFIED = 0; CAPTURE_SOUR
 enum CaptureFullReason { CAPTURE_FULL_REASON_UNSPECIFIED = 0; CAPTURE_FULL_REASON_REQUESTED = 1; CAPTURE_FULL_REASON_NO_BASELINE = 2; CAPTURE_FULL_REASON_BASELINE_TOKEN = 3; CAPTURE_FULL_REASON_COVERAGE_LOST = 4; CAPTURE_FULL_REASON_DIRTY_CROSSOVER = 5; }
 message CaptureStateBinding { reserved 1, 2; string profile = 3; string topology = 4; string ram_layout = 5; string source_run = 6; uint64 pause_generation = 7; string capture = 8; string live_state_schema = 9; string architecture = 10; }
 enum CaptureSeedMethod { CAPTURE_SEED_METHOD_UNSPECIFIED = 0; CAPTURE_SEED_METHOD_CLONE = 1; CAPTURE_SEED_METHOD_REBUILD = 2; }
+enum CaptureIdentityReadFallback { CAPTURE_IDENTITY_READ_FALLBACK_UNSPECIFIED = 0; CAPTURE_IDENTITY_READ_FALLBACK_NONE = 1; CAPTURE_IDENTITY_READ_FALLBACK_COVERAGE_LOST = 2; CAPTURE_IDENTITY_READ_FALLBACK_BASELINE_MISMATCH = 3; CAPTURE_IDENTITY_READ_FALLBACK_EXTENTS_UNAVAILABLE = 4; CAPTURE_IDENTITY_READ_FALLBACK_EXTENT_LIMIT = 5; }
 message CaptureMemoryStats {
  uint64 logical_bytes = 1;
  uint64 live_bytes_read = 2;
@@ -560,7 +566,15 @@ message CaptureMemoryStats {
  uint64 zero_run_bytes_covered = 15;
  uint64 zero_bytes_punched = 16;
  uint64 known_zero_bytes_skipped = 17;
+ uint64 map_nodes_written = 18;
+ uint64 identity_dirty_pages = 19;
+ uint64 materialization_dirty_pages = 20;
+ uint64 live_pages_classified = 21;
+ uint64 identity_zero_bytes_filled = 22;
+ CaptureIdentityReadFallback full_identity_read_fallback = 23;
 }
+enum CaptureIdentityPolicy { CAPTURE_IDENTITY_POLICY_UNSPECIFIED = 0; CAPTURE_IDENTITY_POLICY_NONE = 1; CAPTURE_IDENTITY_POLICY_FULL = 2; CAPTURE_IDENTITY_POLICY_SINCE_ANCHOR = 3; }
+enum CaptureIdentityFullReason { CAPTURE_IDENTITY_FULL_REASON_UNSPECIFIED = 0; CAPTURE_IDENTITY_FULL_REASON_REQUESTED = 1; CAPTURE_IDENTITY_FULL_REASON_UNKNOWN_ANCHOR_AFTER_FORK = 2; CAPTURE_IDENTITY_FULL_REASON_COVERAGE_LOST = 3; CAPTURE_IDENTITY_FULL_REASON_NO_IDENTIFIED_ANCHOR = 4; }
 message CaptureMemoryEvidence {
  uint64 packed_length = 1;
  uint32 page_granule = 2;
@@ -574,10 +588,13 @@ message CaptureMemoryEvidence {
  CaptureMemoryStats stats = 10;
  uint32 identity_chunk_bytes = 12;
  CaptureRamChanges changes = 13;
+ CaptureIdentityPolicy identity_policy = 14;
+ optional CaptureIdentityFullReason identity_full_reason = 15;
 }
 enum CaptureRamCoverage { CAPTURE_RAM_COVERAGE_UNSPECIFIED = 0; CAPTURE_RAM_COVERAGE_FULL = 1; CAPTURE_RAM_COVERAGE_INCREMENTAL = 2; }
 message CaptureRamChanges { uint64 byte_len = 1; string sha256 = 2; uint64 record_count = 3; CaptureRamCoverage coverage = 4; optional string baseline_stream = 5; }
-message LiveCaptureSummary { string capture_id = 1; string machine_id = 2; string run_id = 3; CaptureResumePolicy resume_policy = 4; CapturePauseDisposition pause = 5; CaptureSourceOutcome source_outcome = 6; optional string source_error = 7; bool released = 8; string staging = 9; CaptureMemoryEvidence memory = 10; }
+enum SnapshotIdentityReason { SNAPSHOT_IDENTITY_REASON_UNSPECIFIED = 0; SNAPSHOT_IDENTITY_REASON_UNKNOWN_AFTER_FORK = 1; }
+message LiveCaptureSummary { string capture_id = 1; string machine_id = 2; string run_id = 3; CaptureResumePolicy resume_policy = 4; CapturePauseDisposition pause = 5; CaptureSourceOutcome source_outcome = 6; optional string source_error = 7; bool released = 8; string staging = 9; CaptureMemoryEvidence memory = 10; optional SnapshotIdentityReason first_snapshot_full_identity_reason = 11; }
 message LiveSnapshotInfo { StorageSnapshotInfo snapshot = 1; LiveCaptureSummary capture = 2; optional string alias_conflict = 3; }
 enum MachineCaptureStage { MACHINE_CAPTURE_STAGE_UNSPECIFIED = 0; MACHINE_CAPTURE_STAGE_RESERVED = 1; MACHINE_CAPTURE_STAGE_SEALED = 2; MACHINE_CAPTURE_STAGE_PUBLISHED = 3; }
 // A retained, not yet released capture of this machine. source_outcome is
@@ -607,7 +624,7 @@ message LiveForkRequest { MachineRef machine = 1; string operation_id = 2; repea
 message ForkOperationRef { string operation_id = 1; }
 enum ForkStage { FORK_STAGE_UNSPECIFIED = 0; FORK_STAGE_ADMITTED = 1; FORK_STAGE_CAPTURING = 2; FORK_STAGE_RESTORING = 3; FORK_STAGE_SETTLING = 4; FORK_STAGE_FINISHED = 5; }
 enum ForkFailurePhase { FORK_FAILURE_PHASE_UNSPECIFIED = 0; FORK_FAILURE_PHASE_CAPTURE = 1; FORK_FAILURE_PHASE_CONSTRUCTION = 2; FORK_FAILURE_PHASE_ACTIVATION = 3; FORK_FAILURE_PHASE_CLEANUP = 4; }
-// String alternatives carry the bounded diagnostic; sealed carries the local cut digest.
+// String alternatives carry diagnostics; sealed carries an opaque local cut UUID, never content identity.
 message ForkCaptureOutcome { oneof outcome { google.protobuf.Empty pending = 1; string sealed_cut_id = 2; string failed = 3; string abandoned = 4; } }
 message ForkSourceOutcome { oneof outcome { google.protobuf.Empty pending = 1; google.protobuf.Empty unchanged = 2; google.protobuf.Empty resumed = 3; google.protobuf.Empty preserved = 4; string resume_failed = 5; string unknown = 6; } }
 message ForkChildFailure { ForkFailurePhase phase = 1; string diagnostic = 2; }

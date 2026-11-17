@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Breaking: live forks now retain owned local cuts without computing content
+  hashes or publishing RAM/disk maps or pool objects. Capture/restore records
+  and the initial catalog format change in place; recreate existing homes,
+  with no migration or compatibility reader. Snapshots remain content-identified.
+  Inspect explains a fork child's unknown identity; its first snapshot computes
+  full RAM identity during the pause and disk identity after resume. Later
+  snapshots are incremental. Forks preserve the source's last identified anchor
+  and dirty history. Internal fork files use exact-file checks and held
+  descriptors, not bit-rot authentication; snapshot the child before verify,
+  export or push. Perf separately reports the first and second child snapshots
+  and the source snapshot after two forks without loosening existing targets.
+- Fixed: restore inspection validates the pre-allocation intent separately from
+  activation. Fork children bind their own complete, unidentified disk tracking
+  seeds before activation admission. Host construction tests exercise raw and
+  layered restores, sibling isolation, external disks and fork descendants
+  without starting a VMM; final activation still requires exact cut authority.
 - Breaking: stream identity is now a fixed-depth sparse Merkle map, with 64 KiB
   RAM identities and 8 MiB disk/pack/lower identities. Transport payloads stay
   8 MiB. Existing homes and artifacts must be recreated; there is no old-format

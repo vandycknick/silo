@@ -98,6 +98,70 @@ Every ended run invalidates its baseline; clean-stop sealing and deterministic
 upper templates remain planned stage 2. Stream-map v2 now replaces flat-map
 metadata; remaining runtime costs still require measured scaling qualification.
 
+### Live fork identity authority (2026-11-17)
+
+Only **live forks** omit content identity. This decision supersedes any older
+fork requirement below to hash, publish maps, inherit a source content root,
+or wait for disk identity. Live and stopped snapshots keep their existing
+content-identified capture, verify, restore and transport behavior.
+
+A live child is launched from complete files Silo owns: immutable RAM and
+execution/device state, with distinct private writable disk clones or sparse
+copies. Exact file identity (device/inode, length, mode, mtime and ctime),
+closed-writer completion, run/cut generation and held descriptors grant local
+ownership authority. Neither RAM, disks, state nor the local record is content
+hashed, and fork publishes no content map nodes or new pool objects. This
+applies to raw and layered roots, data and external disks, reflink and copy
+filesystems, borrowed pauses, and forks of forks.
+
+This is not cryptographic authentication. Bit rot in internal owned fork files
+is not detected until the child is snapshotted, when identity is established
+for the resulting bytes, not retroactively verified against its fork cut.
+Adversarial same-UID/root mutation is outside this trust boundary. A local cut
+is never a snapshot: verify, export, push and snapshot-authority handoff refuse
+it with "local fork cut is not an identified snapshot; snapshot the child first".
+A missing identified snapshot receipt never selects owned-cut authority.
+Normal stopped-machine handoff still seals and authenticates its storage.
+
+A fork child starts with known bytes and typed unknown-after-fork content
+identity. Its first snapshot hashes complete resulting RAM during the pause
+(even if byte materialization is incremental), and complete resulting disk
+identity after resume. Inspect and snapshot creation report this reason.
+Later snapshots use the ordinary incremental identity path. There is no hidden
+background hashing or optional fast mode.
+
+Full RAM identity does not require reading every logical byte. With a complete
+immutable byte baseline B and complete dirty coverage D, native capture reads
+only 64 KiB identity units intersecting B's data extents or D. A bounded
+`SEEK_DATA`/`SEEK_HOLE` walk supplies the extent proof, without reading baseline
+payload on the reflink lane. All other units are zero by construction. Lost
+coverage, baseline mismatch, unavailable/invalid extent metadata or the
+65,536-extent bound retain the correct full-read path and report
+`fullIdentityReadFallback` in memory statistics.
+
+Full and incremental live reads also reuse the paused-cut pagemap proof for
+owned private anonymous zero-origin Boot RAM. Pages neither present nor
+swapped are recorded as zero without reading their bytes, including free-page
+reports discarded with `MADV_DONTNEED`. A later write makes the page present;
+no discard/write history is needed. File-backed/restored RAM, swapped pages,
+explicit hugetlb mappings and unavailable metadata retain reads. Restored balloon
+reclaim replaces file-private ranges with anonymous mappings, but these
+replacement islands do not yet carry the domain's zero-origin proof.
+`livePagesClassified` counts pages whose live bytes were inspected;
+`identityZeroBytesFilled` counts only scratch zeros needed inside nonzero
+hashed units. Known-zero spans never trigger RAM-sized scratch clearing.
+
+The source retains its last identified RAM anchor and map independently of its
+latest owned byte baseline, accumulating dirty pages across successful forks.
+Fork updates only the byte baseline. Its next snapshot hashes the union of
+changes since its last identified snapshot, not just since the last fork.
+Disk forks leave the source's identified map and dirty history untouched;
+frozen generations, if any, merge back rather than commit a new identity.
+Source/child removal cannot retire independently retained descendant inputs
+or the source's identified anchor. Capture/restore record v3 and the initial
+catalog format are a breaking fresh-home change, with no compatibility reader.
+
+
 ## The Problem
 
 [ADR 0014](0014-layered-oci-image-storage.md) gives Silo snapshots and forks of **stopped** machines: a machine's
@@ -614,8 +678,9 @@ A capture runs in this order; each step completes before the next begins:
    discovering whole-file extents. Otherwise it fully hashes the clone and
    records the fallback reason. This is post-continuation seal latency, not
    pause time on a resumed source. Preserved sources remain paused by policy.
-   Fork children still wait for complete identities; neither the cut record nor
-   an incomplete map is restore authority. Freshly formatted disks have no
+   Snapshot consumers still wait for complete identities. Live forks instead
+   use the distinct owned-cut authority above and skip this identity phase.
+   Freshly formatted disks have no
    baseline at create; their first snapshot hashes written disk data once and
    seeds later captures in the same run. After a restart the first capture must
    hash once again.
@@ -751,9 +816,10 @@ same-run incremental reuse can resume. Stage 2's clean-stop seal would preserve
 the final accepted map for a later launch; it is planned, not implemented.
 Freshly formatted disks have no baseline at create; their first snapshot hashes
 written disk data once and seeds later captures in the same run. Unchanged
-image-backed disks and authenticated restore/fork children inherit source maps
+image-backed disks and identified snapshot-restored children inherit source maps
 in deferred private caches, rebound to their own private inodes, without reading
-or hashing the disk. Launch authenticates the cache before issuing a seed.
+or hashing the disk. Live-fork children do not inherit identity or source maps.
+Launch authenticates identified caches before issuing a seed.
 A stopped copy without authenticated map authority still needs a hash. The
 deterministic upper template that avoids the first-snapshot hash is also planned
 stage 2, not implemented; create must not end up slower.

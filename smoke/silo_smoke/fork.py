@@ -38,7 +38,7 @@ CHILD_KINDS = {"pending", "constructing", "activating", "running", "failed", "ca
 FAILURE_PHASES = {"capture", "construction", "activation", "cleanup"}
 # Lifecycle diagnostics use the shared bounded UTF-8 string wire representation.
 _DIAGNOSED = {"failed", "abandoned", "recovery-pending", "resume-failed", "unknown"}
-PARENT_PHASES = ("api_entered", "admission_committed", "capture_submitted", "seal_authenticated",
+PARENT_PHASES = ("api_entered", "admission_committed", "capture_submitted", "cut_retained",
                  "source_settled", "finished")
 CHILD_PHASES = ("constructing", "prepared", "activating", "running")
 # Durability completes in the background after `prepared`; it is ordered
@@ -83,8 +83,7 @@ def validate(result: object, *, operation: str, names: list[str]) -> dict:
         assert result["resumePolicy"] == "preserve", result
     capture = _outcome(result["capture"], CAPTURE_KINDS, "capture")
     if capture == "sealed":
-        cut = result["capture"].get("cutId")
-        assert isinstance(cut, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", cut), result["capture"]
+        _uuid(result["capture"].get("cutId"), "local cutId")
     _outcome(result["source"], SOURCE_KINDS, "source")
     children = result["children"]
     assert isinstance(children, list) and len(children) == len(names), (children, names)
@@ -369,11 +368,12 @@ def ordered_events(call: Call, stamps: dict[tuple[int | None, str], int], *,
         assert (None, phase) in stamps, (phase, stamps)
     parent = [stamps[(None, phase)] for phase in PARENT_PHASES[:4]]
     assert parent == sorted(parent), stamps
+    # Source continuation settles independently of local-cut retention.
     assert all(stamps[(None, phase)] <= stamps[(None, "finished")] for phase in PARENT_PHASES)
     for index in running:
         child = [stamps[(index, phase)] for phase in CHILD_PHASES]
         assert child == sorted(child), (index, stamps)
-        assert stamps[(None, "seal_authenticated")] <= child[0], "child construction preceded the seal"
+        assert stamps[(None, "cut_retained")] <= child[0], "child construction preceded owned-cut retention"
         assert child[-1] <= stamps[(None, "finished")]
         if (index, "durable") in stamps:
             assert stamps[(index, "prepared")] <= stamps[(index, "durable")], (index, stamps)
@@ -392,13 +392,32 @@ def cut_directory(silo: Silo, operation: str) -> Path:
 
 def cut(silo: Silo, call: Call, source_info: dict, boot_id: str,
         generation: dict[str, str]) -> restore.Checkpoint:
-    """The authenticated local cut as a matched-cut oracle input; never a snapshot."""
+    """Owned local cut as a matched-byte oracle input, never snapshot authority."""
     directory = cut_directory(silo, call.operation)
     seal = json.loads((directory / "vm.capture.json").read_bytes())
-    assert seal["captureOutcome"] == "coherent" and seal["error"] is None, seal
     assert UUID(seal["captureId"]) == UUID(call.result["captureId"])
     assert seal["runId"] == source_info["run_id"]
-    assert seal["freezeOperationId"] and seal["freezeEpoch"] > 0
+    assert seal["freezeOperationId"] and seal["binding"]["pauseGeneration"] > 0
+    assert seal["binding"]["sourceRun"] == source_info["run_id"]
+    assert seal["binding"]["capture"] == seal["captureId"]
+    assert seal["materializationGeneration"] > seal["predecessorGeneration"]
+    assert all(member["complete"] for member in seal["members"])
+    assert all(seal["stats"][field] == 0 for field in (
+        "identityBytesHashed", "wholeFileBytesHashed", "mapNodesWritten"))
+    ram_root = directory / "memory.root"
+    assert not ram_root.exists() or ram_root.stat().st_size == 0
+    assert not (directory / "map-nodes").exists() or not any((directory / "map-nodes").iterdir())
+    assert all(path.stat().st_size == 0 for path in (directory / "disks").glob("*.root"))
+    def no_content_digests(value: object) -> None:
+        if isinstance(value, dict):
+            assert not {"sha256", "identity", "ramStream", "evidenceSha256"} & value.keys(), value
+            for child in value.values():
+                no_content_digests(child)
+        elif isinstance(value, list):
+            for child in value:
+                no_content_digests(child)
+    no_content_digests({key: value for key, value in seal.items()
+                       if key not in ("binding", "configuration")})
     return restore.Checkpoint("", f"fork:{call.operation}", directory, seal, source_info, boot_id,
                               generation)
 
@@ -644,7 +663,7 @@ def product_interruption(found: dict[str, list[tuple[int, str]]]) -> dict:
         "interruptionSeconds": (stamp[PAUSE_RELEASED] - stamp[PAUSE_ESTABLISHED]) / 1e9,
         "vcpuPausedSeconds": (stamp[PAUSE_RELEASED] - stamp[PAUSE_ESTABLISHED]) / 1e9,
         "pauseToSealSeconds": (stamp[SEALED] - stamp[PAUSE_ESTABLISHED]) / 1e9,
-        "diskIdentityInPause": stamp[SEALED] <= stamp[PAUSE_RELEASED],
+        "diskIdentityInPause": bool(found[DISK_SEALED]) and stamp[SEALED] <= stamp[PAUSE_RELEASED],
         "clock": "monitor trace CLOCK_REALTIME",
     }
 

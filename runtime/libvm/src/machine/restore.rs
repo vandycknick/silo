@@ -174,68 +174,15 @@ async fn restore_consumer(
         shape.open_object(&pool, &execution.devices)?,
         ram_map_file,
     ];
-    let digests = [
-        Sha256Digest::from_bytes(*execution.memory.stream.as_bytes()),
-        Sha256Digest::from_bytes(*execution.layout.as_bytes()),
-        Sha256Digest::from_bytes(*execution.execution.as_bytes()),
-        Sha256Digest::from_bytes(*execution.devices.as_bytes()),
-        Sha256Digest::from_bytes(*ram_map.as_bytes()),
-    ];
-    let mut descriptors = Vec::with_capacity(5);
-    for ((file, role), identity) in objects.iter().zip(RestoreObjectRole::ALL).zip(digests) {
-        let metadata = file.metadata()?;
-        if metadata.mode() & 0o7777 != 0o400
-            || metadata.nlink() != 1
-            || metadata.uid() != nix::unistd::geteuid().as_raw()
-        {
-            return Err(invalid(
-                "restore state backing lost its immutable pool identity",
-            ));
-        }
-        descriptors.push(RestoreObject {
-            role,
-            fd: file.as_raw_fd(),
-            file_device: metadata.dev(),
-            file_inode: metadata.ino(),
-            length: metadata.len(),
-            identity,
-        });
-    }
     let lower_inputs = prepare_lower(&pool, consumer, map_stage, shape)?;
-    let request = RestoreRequest {
-        disk_tracking_seeds: Vec::new(),
-        map_node_store: Some(
-            runtime
-                .local_images_dir()
-                .join("objects/sha256")
-                .to_str()
-                .ok_or_else(|| invalid("restore map node store path is not UTF-8"))?
-                .to_owned(),
-        ),
-        version: vm_spec::restore::RESTORE_REQUEST_VERSION,
-        checkpoint: Sha256Digest::from_bytes(*consumer.info.id.as_bytes()),
-        activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string())
-            .map_err(invalid)?,
-        freeze_operation_id: evidence
-            .freeze_operation_id
-            .clone()
-            .ok_or_else(|| invalid("capture seal omitted the frozen operation identity"))?,
-        start_paused: true,
-        configuration: CaptureConfiguration::from_spec(&consumer.record.configuration.spec)
-            .map_err(invalid)?,
+    let request = snapshot_restore_request(
+        runtime,
+        consumer,
         evidence,
-        objects: descriptors
-            .try_into()
-            .map_err(|_| invalid("restore requires exactly five descriptors"))?,
-        lowers: lower_inputs
-            .as_ref()
-            .map(|lower| vec![lower.request.clone()])
-            .unwrap_or_default(),
-        network: None,
-        ssh_trusted_ca: None,
-        hook: options.activation_hook,
-    };
-    request.validate().map_err(invalid)?;
+        &objects,
+        lower_inputs.as_ref(),
+        options.activation_hook,
+    )?;
     let executable =
         crate::storage::stream::open_regular_source(runtime.supervisor().executable())?;
     let executable_identity =
@@ -289,29 +236,7 @@ async fn restore_consumer(
         .map_err(crate::storage::StorageError::from)?;
     // Copy against structurally verified maps while full byte authentication
     // runs concurrently. Both must succeed before publication.
-    let mut sources = vec![PrivateSource::Authenticated {
-        path: crate::PrivatePath::new(match &storage.root {
-            MachineRoot::OpaqueRaw { .. } => "root.raw",
-            _ => "upper.raw",
-        })?,
-        stream: shape.open_copy_source(
-            &pool,
-            &consumer.record.root.stream.stream,
-            consumer.record.root.geometry.length,
-        )?,
-    }];
-    for disk in &consumer.record.disks {
-        if disk.writable {
-            sources.push(PrivateSource::Authenticated {
-                path: crate::PrivatePath::new(format!("disk-{}.raw", disk.order))?,
-                stream: shape.open_copy_source(
-                    &pool,
-                    &disk.content.stream,
-                    disk.geometry.length,
-                )?,
-            });
-        }
-    }
+    let sources = snapshot_private_sources(&pool, &consumer.record, &shape, &storage)?;
     let disk_peak = restore_disk_peak(runtime.local_images_dir(), &sources, &consumer.record)?;
     let resources = snapshots
         .reserve_restore_resources(consumer, disk_peak, descriptor_peak)
@@ -339,7 +264,7 @@ async fn restore_consumer(
             sources,
             intent,
             request,
-            objects,
+            objects: objects.into(),
             executable,
             executable_identity,
             lower_inputs,
@@ -355,13 +280,116 @@ async fn restore_consumer(
     .await
 }
 
+fn snapshot_private_sources(
+    pool: &StoragePool,
+    record: &SnapshotRecord,
+    shape: &crate::store::snapshot_store::ShapeVerifiedClosure,
+    storage: &MachineStorageRecord,
+) -> Result<Vec<PrivateSource>, LibVmError> {
+    let mut sources = vec![PrivateSource::Authenticated {
+        path: crate::PrivatePath::new(match &storage.root {
+            MachineRoot::OpaqueRaw { .. } => "root.raw",
+            _ => "upper.raw",
+        })?,
+        stream: shape.open_copy_source(
+            pool,
+            &record.root.stream.stream,
+            record.root.geometry.length,
+        )?,
+    }];
+    for disk in &record.disks {
+        if disk.writable {
+            sources.push(PrivateSource::Authenticated {
+                path: crate::PrivatePath::new(format!("disk-{}.raw", disk.order))?,
+                stream: shape.open_copy_source(pool, &disk.content.stream, disk.geometry.length)?,
+            });
+        }
+    }
+    Ok(sources)
+}
+
+pub(crate) fn snapshot_restore_request(
+    runtime: &Runtime,
+    consumer: &crate::store::snapshot_store::SnapshotConsumer,
+    evidence: vm_spec::capture::CaptureEvidence,
+    objects: &[File; 5],
+    lower_inputs: Option<&LowerInputs>,
+    hook: Option<crate::RestoreHook>,
+) -> Result<RestoreRequest, LibVmError> {
+    let SnapshotCaptureKind::LiveExecution { execution } = &consumer.record.capture else {
+        return Err(invalid("checkpoint capture kind changed"));
+    };
+    let digests = [
+        Sha256Digest::from_bytes(*execution.memory.stream.as_bytes()),
+        Sha256Digest::from_bytes(*execution.layout.as_bytes()),
+        Sha256Digest::from_bytes(*execution.execution.as_bytes()),
+        Sha256Digest::from_bytes(*execution.devices.as_bytes()),
+        Sha256Digest::from_bytes(*execution.memory.map.as_bytes()),
+    ];
+    let mut descriptors = Vec::with_capacity(objects.len());
+    for ((file, role), identity) in objects.iter().zip(RestoreObjectRole::ALL).zip(digests) {
+        let metadata = file.metadata()?;
+        if metadata.mode() & 0o7777 != 0o400
+            || metadata.nlink() != 1
+            || metadata.uid() != nix::unistd::geteuid().as_raw()
+        {
+            return Err(invalid(
+                "restore state backing lost its immutable pool identity",
+            ));
+        }
+        descriptors.push(RestoreObject {
+            role,
+            fd: file.as_raw_fd(),
+            file_device: metadata.dev(),
+            file_inode: metadata.ino(),
+            length: metadata.len(),
+            authority: vm_spec::restore::RestoreObjectAuthority::Identified { identity },
+        });
+    }
+    let freeze_operation_id = evidence
+        .freeze_operation_id
+        .clone()
+        .ok_or_else(|| invalid("capture seal omitted the frozen operation identity"))?;
+    let request = RestoreRequest {
+        disk_tracking_seeds: Vec::new(),
+        map_node_store: Some(
+            runtime
+                .local_images_dir()
+                .join("objects/sha256")
+                .to_str()
+                .ok_or_else(|| invalid("restore map node store path is not UTF-8"))?
+                .to_owned(),
+        ),
+        version: vm_spec::restore::RESTORE_REQUEST_VERSION,
+        authority: vm_spec::restore::RestoreAuthority::IdentifiedSnapshot {
+            checkpoint: Sha256Digest::from_bytes(*consumer.info.id.as_bytes()),
+            evidence: Box::new(evidence),
+        },
+        activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string())
+            .map_err(invalid)?,
+        freeze_operation_id,
+        start_paused: true,
+        configuration: CaptureConfiguration::from_spec(&consumer.record.configuration.spec)
+            .map_err(invalid)?,
+        objects: descriptors,
+        lowers: lower_inputs
+            .map(|lower| vec![lower.request.clone()])
+            .unwrap_or_default(),
+        network: None,
+        ssh_trusted_ca: None,
+        hook,
+    };
+    request.validate_for_inspection().map_err(invalid)?;
+    Ok(request)
+}
+
 struct PreparedRestore {
     configuration: crate::SnapshotConfiguration,
     storage: MachineStorageRecord,
     sources: Vec<PrivateSource>,
     intent: RestoreIntent,
     request: RestoreRequest,
-    objects: [File; 5],
+    objects: Vec<File>,
     executable: File,
     executable_identity: crate::storage::identity_file::SourceFingerprint,
     lower_inputs: Option<LowerInputs>,
@@ -643,7 +671,7 @@ pub(crate) fn project_restore_disks(
     Ok(())
 }
 
-struct LowerInputs {
+pub(crate) struct LowerInputs {
     request: vm_spec::restore::RestoreLower,
     files: Vec<File>,
     native_records: u64,
@@ -902,13 +930,22 @@ pub(crate) fn storage_from_snapshot(
             crate::BackendRequirement::KrunOverlay,
         ),
     };
-    let storage = MachineStorageRecord {
+    let mut storage = MachineStorageRecord {
         schema: 1,
         root,
         boot: record.boot.clone(),
         profile,
         backend,
         disk_baselines: Vec::new(),
+        ram_identity: match &record.capture {
+            SnapshotCaptureKind::LiveExecution { execution } => {
+                crate::store::models::storage::ContentIdentityState::Identified {
+                    root: Sha256Digest::from_bytes(*execution.memory.stream.as_bytes()),
+                }
+            }
+            _ => crate::store::models::storage::ContentIdentityState::Unknown,
+        },
+        disk_identities: Vec::new(),
         disks: record
             .disks
             .iter()
@@ -940,6 +977,7 @@ pub(crate) fn storage_from_snapshot(
         image: None,
         snapshot: Some(checkpoint),
     };
+    storage.bind_disk_identity_inventory(&record.configuration.spec);
     storage.validate()?;
     Ok(storage)
 }
@@ -1003,6 +1041,20 @@ pub(crate) fn publish_restore_launch_files(
             .map_err(|error| invalid(error.to_string()))?,
     );
     Ok(())
+}
+
+fn bind_restore_disk_tracking(
+    runtime: &Runtime,
+    config: &crate::store::models::MachineConfig,
+    storage: &MachineStorageRecord,
+    request: &mut RestoreRequest,
+) -> Result<(), LibVmError> {
+    request.disk_tracking_seeds = crate::machine::root_storage::launch_disk_seeds(
+        storage,
+        &config.machine_dir,
+        runtime.local_images_dir(),
+    )?;
+    request.validate().map_err(invalid)
 }
 
 async fn launch_restored(
@@ -1085,7 +1137,7 @@ async fn launch_restored(
             })
         }
     };
-    restore.request.validate().map_err(invalid)?;
+    bind_restore_disk_tracking(runtime, config, storage, &mut restore.request)?;
     runtime
         .native_store()?
         .bind_restore_activation(lease.operation_id(), &restore.request)
@@ -1194,11 +1246,6 @@ async fn launch_restored(
     let socket = paths.vmm_socket_path();
     let serial = paths.serial_log_path();
     let trace = paths.vm_trace_log_path();
-    restore.request.disk_tracking_seeds = crate::machine::root_storage::launch_disk_seeds(
-        storage,
-        &config.machine_dir,
-        runtime.local_images_dir(),
-    )?;
     let launch = crate::supervisor::VmmLaunch {
         machine_id: config.id,
         name: &config.name,
@@ -1237,20 +1284,73 @@ async fn launch_restored(
     Ok((pending, lifetime))
 }
 
+fn restore_authority_name(authority: &vm_spec::restore::RestoreAuthority) -> String {
+    match authority {
+        vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { checkpoint, .. } => {
+            checkpoint.to_string()
+        }
+        vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
+            format!("fork:{}", cut.capture_id)
+        }
+    }
+}
+
+fn inspection_refusal(
+    restore: &RestoreRequest,
+    pin: &str,
+    expected: &str,
+    actual: impl Into<String>,
+) -> LibVmError {
+    LibVmError::CheckpointPortability {
+        checkpoint: restore_authority_name(&restore.authority),
+        refusal: Box::new(vm_spec::restore::RestorePortabilityRefusal::new(
+            pin,
+            expected,
+            actual.into().replace('\0', "\\0"),
+        )),
+    }
+}
+
+pub(crate) fn inspection_request(
+    restore: RestoreRequest,
+    network: bool,
+) -> Result<vm_spec::restore::RestoreInspectionRequest, LibVmError> {
+    let request = vm_spec::restore::RestoreInspectionRequest {
+        version: vm_spec::restore::RESTORE_INSPECTION_VERSION,
+        restore,
+        network,
+    };
+    request.validate().map_err(|error| {
+        inspection_refusal(
+            &request.restore,
+            "inspection.request",
+            "a valid current-schema restore inspection request",
+            error,
+        )
+    })?;
+    Ok(request)
+}
+
 async fn inspect(
     executable: &File,
     restore: &RestoreRequest,
     network: bool,
 ) -> Result<vm_spec::restore::RestoreInspectionReport, LibVmError> {
-    let request = vm_spec::restore::RestoreInspectionRequest {
-        version: 1,
-        restore: restore.clone(),
-        network,
-    };
-    let bytes = serde_json::to_vec(&request).map_err(|error| invalid(error.to_string()))?;
+    let request = inspection_request(restore.clone(), network)?;
+    let bytes = serde_json::to_vec(&request).map_err(|error| {
+        inspection_refusal(
+            restore,
+            "inspection.request",
+            "a serializable restore inspection request",
+            error.to_string(),
+        )
+    })?;
     if bytes.len() >= vm_spec::restore::MAX_RESTORE_INSPECTION_BYTES {
-        return Err(invalid(
-            "restore inspection request exceeds its control-record bound",
+        return Err(inspection_refusal(
+            restore,
+            "inspection.request",
+            "a request within the restore inspection control-record bound",
+            format!("{} encoded bytes", bytes.len()),
         ));
     }
     let mut command = pinned_command(executable);
@@ -1268,16 +1368,36 @@ async fn inspect(
                 .chain(lower.extents.iter().map(|extent| Some(extent.fd)))
         }))
         .collect();
-    install_child_inheritance(&mut command, descriptors)?;
+    install_child_inheritance(&mut command, descriptors).map_err(|error| {
+        inspection_refusal(
+            restore,
+            "inspection.descriptors",
+            "inheritable restore input descriptors",
+            error.to_string(),
+        )
+    })?;
     let mut child = tokio::process::Command::from(command)
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+        .map_err(|error| {
+            inspection_refusal(
+                restore,
+                "inspection.process",
+                "a running native restore inspector",
+                error.to_string(),
+            )
+        })?;
     let (Some(mut stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        return Err(invalid("native inspection pipes are unavailable"));
+        return Err(inspection_refusal(
+            restore,
+            "inspection.process",
+            "native restore inspection input and output pipes",
+            "native inspection pipes are unavailable",
+        ));
     };
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         let write = async {
@@ -1289,7 +1409,10 @@ async fn inspect(
         };
         tokio::try_join!(
             write,
-            bounded_output(stdout, 1 << 20),
+            bounded_output(
+                stdout,
+                vm_spec::restore::MAX_RESTORE_INSPECTION_REPORT_BYTES as u64
+            ),
             bounded_output(stderr, 16 << 10),
             child.wait()
         )
@@ -1300,9 +1423,12 @@ async fn inspect(
         other => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(invalid(format!(
-                "native restore inspection failed: {other:?}"
-            )));
+            return Err(inspection_refusal(
+                restore,
+                "inspection.process",
+                "completed native restore inspection within 30 seconds",
+                format!("native restore inspection failed: {other:?}"),
+            ));
         }
     };
     if !status.success() {
@@ -1310,33 +1436,69 @@ async fn inspect(
             if let Ok(failure) =
                 serde_json::from_slice::<vm_spec::restore::RestoreInspectionFailure>(&stdout)
             {
-                failure.validate().map_err(invalid)?;
+                failure.validate().map_err(|error| {
+                    inspection_refusal(
+                        restore,
+                        "inspection.refusal",
+                        "a valid current-schema native restore refusal",
+                        error,
+                    )
+                })?;
                 return Err(LibVmError::CheckpointPortability {
-                    checkpoint: restore.checkpoint.to_string(),
+                    checkpoint: restore_authority_name(&restore.authority),
                     refusal: Box::new(failure.refusal),
                 });
             }
         }
-        return Err(invalid(format!(
-            "native restore inspection failed without a typed refusal: {}",
-            String::from_utf8_lossy(&stderr)
-        )));
+        return Err(inspection_refusal(
+            restore,
+            "inspection.process",
+            "successful native inspection or a typed restore refusal",
+            format!(
+                "native restore inspection failed without a typed refusal ({status}): {}",
+                String::from_utf8_lossy(&stderr)
+            ),
+        ));
     }
     if !stdout.ends_with(b"\n") || stdout[..stdout.len().saturating_sub(1)].contains(&b'\n') {
-        return Err(invalid(
+        return Err(inspection_refusal(
+            restore,
+            "inspection.report",
+            "one bounded native restore inspection report",
             "native restore inspection did not return one bounded report",
         ));
     }
-    let report: vm_spec::restore::RestoreInspectionReport =
-        serde_json::from_slice(&stdout).map_err(|error| invalid(error.to_string()))?;
+    let report: vm_spec::restore::RestoreInspectionReport = serde_json::from_slice(&stdout)
+        .map_err(|error| {
+            inspection_refusal(
+                restore,
+                "inspection.report",
+                "a valid native restore inspection report",
+                error.to_string(),
+            )
+        })?;
     if let Some(refusal) = report.portability_refusal(&request) {
-        refusal.validate().map_err(invalid)?;
+        refusal.validate().map_err(|error| {
+            inspection_refusal(
+                restore,
+                "inspection.refusal",
+                "a valid restore portability refusal",
+                error,
+            )
+        })?;
         return Err(LibVmError::CheckpointPortability {
-            checkpoint: restore.checkpoint.to_string(),
+            checkpoint: restore_authority_name(&restore.authority),
             refusal: Box::new(refusal),
         });
     }
-    report.validate_against(&bytes, &request).map_err(invalid)?;
+    report.validate_against(&bytes, &request).map_err(|error| {
+        inspection_refusal(
+            restore,
+            "inspection.binding",
+            "a native inspection report admitting these exact restore inputs",
+            error,
+        )
+    })?;
     Ok(report)
 }
 
@@ -1404,16 +1566,22 @@ pub(crate) async fn prepare_fork_restore(
     })
 }
 
-pub(crate) async fn restore_reserved_fork_child(
+struct ForkChildInputs {
+    configuration: crate::SnapshotConfiguration,
+    storage: MachineStorageRecord,
+    sources: Vec<PrivateSource>,
+    request: RestoreRequest,
+    objects: Vec<File>,
+    lower_inputs: Option<LowerInputs>,
+    _consumer_lease: crate::storage::locks::StorageLock,
+}
+
+fn prepare_fork_child_inputs(
     runtime: &Runtime,
-    prepared: Arc<VerifiedForkRestore>,
-    child: crate::store::fork::ForkChildIdentity,
-    options: crate::LiveForkChild,
-    progress: Option<&LiveOperationProgressSender>,
-    total: usize,
-) -> Result<Machine, LibVmError> {
-    let cut = &prepared.cut;
-    let store = runtime.native_store()?;
+    cut: &crate::store::fork::VerifiedRestoreCut,
+    child: &crate::store::fork::ForkChildIdentity,
+    options: &crate::LiveForkChild,
+) -> Result<ForkChildInputs, LibVmError> {
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let consumer_lease = pool.existing_lease(child.consumer_id)?;
     let configuration = crate::machine::live_fork::project_destination(
@@ -1462,12 +1630,17 @@ pub(crate) async fn restore_reserved_fork_child(
                 });
             }
         }
-        // An independent descriptor sharing the cut's seal-derived map.
-        let stream = cut.reopen_disk(&role)?;
-        if stream.length() != disk.length {
+        let file = cut.reopen_role(&role)?;
+        let fingerprint = crate::storage::identity_file::SourceFingerprint::new(&file.metadata()?);
+        if file.metadata()?.len() != disk.length {
             return Err(invalid("fork cut disk geometry differs from its plan"));
         }
-        sources.push(PrivateSource::Authenticated { path, stream });
+        sources.push(PrivateSource::Owned {
+            path,
+            file,
+            length: disk.length,
+            fingerprint,
+        });
     }
     // The constructor expects root first, then the remaining private roles.
     sources.sort_by_key(|source| {
@@ -1501,9 +1674,14 @@ pub(crate) async fn restore_reserved_fork_child(
             prepare_lower_descriptor(lower, stage)
         })
         .transpose()?;
-    let mut files = Vec::with_capacity(5);
-    let mut descriptors = Vec::with_capacity(5);
-    for role in RestoreObjectRole::ALL {
+    let mut files = Vec::with_capacity(4);
+    let mut descriptors = Vec::with_capacity(4);
+    for role in [
+        RestoreObjectRole::Ram,
+        RestoreObjectRole::Layout,
+        RestoreObjectRole::Execution,
+        RestoreObjectRole::Devices,
+    ] {
         let index = cut
             .record
             .files
@@ -1524,45 +1702,64 @@ pub(crate) async fn restore_reserved_fork_child(
             file_device: identity.device,
             file_inode: identity.inode,
             length: identity.length,
-            identity: identity.identity,
+            authority: vm_spec::restore::RestoreObjectAuthority::Owned {
+                fingerprint: identity.fingerprint.to_capture(),
+            },
         });
         files.push(file);
     }
     let request = RestoreRequest {
         disk_tracking_seeds: Vec::new(),
-        map_node_store: Some(
-            runtime
-                .local_images_dir()
-                .join("objects/sha256")
-                .to_str()
-                .ok_or_else(|| invalid("fork map node store path is not UTF-8"))?
-                .to_owned(),
-        ),
+        map_node_store: None,
         version: vm_spec::restore::RESTORE_REQUEST_VERSION,
-        checkpoint: cut.record.cut_id,
+        authority: vm_spec::restore::RestoreAuthority::OwnedLocalCut {
+            cut: Box::new(cut.record.restore_evidence()?),
+        },
         activation_id: vm_spec::lifecycle::LiveId::parse(&child.activation_id.to_string())
             .map_err(invalid)?,
-        freeze_operation_id: cut
-            .record
-            .evidence
-            .freeze_operation_id
-            .clone()
-            .ok_or_else(|| invalid("fork freeze operation missing"))?,
+        freeze_operation_id: cut.record.evidence.freeze_operation_id.clone(),
         start_paused: true,
         configuration: cut.record.plan.configuration.clone(),
-        evidence: cut.record.evidence.clone(),
-        objects: descriptors
-            .try_into()
-            .map_err(|_| invalid("fork restore needs five objects"))?,
+        objects: descriptors,
         lowers: lower_inputs
             .as_ref()
             .map(|lower| vec![lower.request.clone()])
             .unwrap_or_default(),
         network: None,
         ssh_trusted_ca: None,
-        hook: options.activation_hook,
+        hook: options.activation_hook.clone(),
     };
-    request.validate().map_err(invalid)?;
+    request.validate_for_inspection().map_err(invalid)?;
+    Ok(ForkChildInputs {
+        configuration,
+        storage,
+        sources,
+        request,
+        objects: files,
+        lower_inputs,
+        _consumer_lease: consumer_lease,
+    })
+}
+
+pub(crate) async fn restore_reserved_fork_child(
+    runtime: &Runtime,
+    prepared: Arc<VerifiedForkRestore>,
+    child: crate::store::fork::ForkChildIdentity,
+    options: crate::LiveForkChild,
+    progress: Option<&LiveOperationProgressSender>,
+    total: usize,
+) -> Result<Machine, LibVmError> {
+    let ForkChildInputs {
+        configuration,
+        storage,
+        sources,
+        request,
+        objects: files,
+        lower_inputs,
+        _consumer_lease,
+    } = prepare_fork_child_inputs(runtime, &prepared.cut, &child, &options)?;
+    let store = runtime.native_store()?;
+    let cut = &prepared.cut;
     let executable = prepared.executable.try_clone()?;
     let executable_identity = prepared.executable_identity;
     let inspected_executable = prepared.inspected_executable;
@@ -1597,9 +1794,7 @@ pub(crate) async fn restore_reserved_fork_child(
             sources,
             intent,
             request,
-            objects: files
-                .try_into()
-                .map_err(|_| invalid("fork restore needs five files"))?,
+            objects: files,
             executable,
             executable_identity,
             lower_inputs,
@@ -1617,8 +1812,371 @@ pub(crate) async fn restore_reserved_fork_child(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::storage::stream::whole_file_sha256;
+
+    pub(crate) async fn assert_real_snapshot_child_requests(
+        runtime: &crate::Runtime,
+        snapshots: &crate::SnapshotStore,
+        snapshot: crate::SnapshotId,
+        count: usize,
+    ) {
+        use crate::machine::restore::{
+            bind_restore_disk_tracking, prepare_lower, snapshot_private_sources,
+            snapshot_restore_request, storage_from_snapshot, RestoreAuthentication,
+        };
+        use crate::store::MachineStore;
+        let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir()).unwrap();
+        let store = runtime.native_store().unwrap();
+        let mut inodes = std::collections::BTreeSet::new();
+        for index in 0..count {
+            let consumer = snapshots
+                .consume_shape(&crate::SnapshotRef::Id(snapshot))
+                .await
+                .unwrap();
+            let shape = snapshots
+                .prepare_restore_shape(&consumer)
+                .await
+                .unwrap()
+                .complete(runtime.local_images_dir())
+                .unwrap();
+            let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+                &consumer.record.capture
+            else {
+                panic!("execution snapshot required");
+            };
+            let objects = [
+                shape
+                    .open_stream(&pool, &execution.memory.stream, execution.memory.length)
+                    .unwrap(),
+                shape.open_object(&pool, &execution.layout).unwrap(),
+                shape.open_object(&pool, &execution.execution).unwrap(),
+                shape.open_object(&pool, &execution.devices).unwrap(),
+                shape.open_object(&pool, &execution.memory.map).unwrap(),
+            ];
+            let stage = crate::machine::stopped::OperationStaging::new_deferred(
+                &pool,
+                consumer.operation_id,
+                &consumer.lease,
+            )
+            .unwrap();
+            let lower = prepare_lower(&pool, &consumer, stage, &shape).unwrap();
+            let evidence = snapshots
+                .restore_evidence(&consumer, &pool)
+                .unwrap()
+                .evidence;
+            let mut request = snapshot_restore_request(
+                runtime,
+                &consumer,
+                evidence,
+                &objects,
+                lower.as_ref(),
+                None,
+            )
+            .unwrap();
+            let inspection =
+                crate::machine::restore::inspection_request(request.clone(), false).unwrap();
+            inspection.validate().unwrap();
+            let storage = storage_from_snapshot(&consumer.record, snapshot).unwrap();
+            let sources =
+                snapshot_private_sources(&pool, &consumer.record, &shape, &storage).unwrap();
+            let disk_peak = crate::machine::restore::restore_disk_peak(
+                runtime.local_images_dir(),
+                &sources,
+                &consumer.record,
+            )
+            .unwrap();
+            let resources = snapshots
+                .reserve_restore_resources(&consumer, disk_peak, 64)
+                .await
+                .unwrap();
+            let intent = crate::store::restore::RestoreIntent {
+                checkpoint: crate::store::restore::RestoreIdentity::Snapshot { id: snapshot },
+                consumer_operation: consumer.operation_id,
+                request: request.clone(),
+                resources,
+                inspected_executable: crate::storage::identity::ObjectDigest::of_bytes(
+                    b"host construction only",
+                ),
+                inspection: inspection_report(&inspection),
+                network_attachment: false,
+            };
+            intent.validate().unwrap();
+            let run = uuid::Uuid::new_v4();
+            let name = format!("snapshot-child-{index}");
+            store
+                .persist_restore_construction(&crate::store::restore::RestoreConstruction {
+                    run_id: run,
+                    name: name.clone(),
+                    intent: intent.clone(),
+                })
+                .await
+                .unwrap();
+            let (config, durability) = crate::machine::builder::publish_restored_child(
+                runtime,
+                crate::machine::builder::ChildConstruction {
+                    name,
+                    configuration: consumer.record.configuration.clone(),
+                    storage,
+                    sources,
+                    operation_id: consumer.operation_id,
+                    shared_qualification: None,
+                },
+                run,
+                Some(RestoreAuthentication::new(snapshots.clone(), shape)),
+            )
+            .await
+            .unwrap();
+            durability.spawn().await.unwrap().unwrap();
+            let storage = store.machine_storage(config.id).await.unwrap().unwrap();
+            let lease = snapshots
+                .register_restore_generation(&config, run, &storage, &intent)
+                .await
+                .unwrap();
+            bind_restore_disk_tracking(runtime, &config, &storage, &mut request).unwrap();
+            request.ssh_trusted_ca = Some("host-construction-public-ca".into());
+            request.validate().unwrap();
+            assert_inspection_binding(&intent, &request);
+            store
+                .bind_restore_activation(lease.operation_id(), &request)
+                .await
+                .unwrap();
+            assert_eq!(
+                request.disk_tracking_seeds.len(),
+                request
+                    .configuration
+                    .attachments
+                    .iter()
+                    .filter(|disk| !disk.read_only)
+                    .count()
+            );
+            for seed in &request.disk_tracking_seeds {
+                assert!(seed.baseline.is_some());
+                assert!(inodes.insert((seed.file_device, seed.file_inode)));
+            }
+            assert_transfer_descriptors(
+                request,
+                objects.into(),
+                lower.map(|lower| lower.files).unwrap_or_default(),
+            );
+        }
+    }
+
+    fn assert_inspection_binding(
+        intent: &crate::store::restore::RestoreIntent,
+        request: &vm_spec::restore::RestoreRequest,
+    ) {
+        let mut activated = intent.clone();
+        activated.request = request.clone();
+        activated.validate().unwrap();
+        activated.request.activation_id =
+            vm_spec::lifecycle::LiveId::parse(&uuid::Uuid::new_v4().to_string()).unwrap();
+        activated.request.validate().unwrap();
+        assert!(
+            activated.validate().is_err(),
+            "only destination resources may change after inspection"
+        );
+    }
+
+    fn assert_transfer_descriptors(
+        request: vm_spec::restore::RestoreRequest,
+        objects: Vec<std::fs::File>,
+        lowers: Vec<std::fs::File>,
+    ) {
+        let executable = tempfile::tempfile().unwrap();
+        let executable_identity =
+            crate::storage::identity_file::SourceFingerprint::new(&executable.metadata().unwrap());
+        let mut launch = crate::supervisor::launch::RestoreLaunch {
+            request,
+            objects,
+            lowers,
+            executable,
+            executable_identity,
+        };
+        let descriptors = launch.transfer_descriptors().unwrap();
+        assert_eq!(
+            descriptors.len(),
+            launch.objects.len() + launch.lowers.len()
+        );
+        let file = launch.objects.pop().unwrap();
+        assert!(launch.transfer_descriptors().is_err());
+        launch.objects.push(file);
+        launch.objects.swap(0, 1);
+        assert!(launch.transfer_descriptors().is_err());
+    }
+
+    pub(crate) async fn assert_real_fork_child_requests(
+        runtime: &crate::Runtime,
+        snapshots: &crate::SnapshotStore,
+        operation: uuid::Uuid,
+        child_count: usize,
+    ) -> Vec<(
+        crate::store::models::MachineConfig,
+        crate::store::operation_store::LaunchStorageLease,
+    )> {
+        use crate::machine::restore::{
+            bind_restore_disk_tracking, prepare_fork_child_inputs, ForkChildInputs,
+        };
+        use crate::store::MachineStore;
+
+        let store = runtime.native_store().unwrap();
+        let cut = store.open_local_cut(operation).await.unwrap();
+        store.bind_fork_resources(&cut).await.unwrap();
+        let options = store.fork_options(operation).await.unwrap();
+        let children = store.fork_children(operation).await.unwrap();
+        assert_eq!(children.len(), child_count);
+        let mut writable_inodes = std::collections::BTreeSet::new();
+        let mut constructed = Vec::new();
+        for child in children {
+            let option = &options.children[child.result.index as usize];
+            let ForkChildInputs {
+                configuration,
+                storage,
+                sources,
+                mut request,
+                objects: _objects,
+                lower_inputs: _lower_inputs,
+                _consumer_lease,
+            } = prepare_fork_child_inputs(runtime, &cut, &child, option).unwrap();
+            assert!(request.disk_tracking_seeds.is_empty());
+            request.validate_for_inspection().unwrap();
+            assert!(request
+                .validate()
+                .unwrap_err()
+                .contains("destination seed count"));
+            let inspection =
+                crate::machine::restore::inspection_request(request.clone(), false).unwrap();
+            let intent = crate::store::restore::RestoreIntent {
+                checkpoint: crate::store::restore::RestoreIdentity::LocalCut {
+                    id: cut.record.cut_id,
+                },
+                consumer_operation: child.consumer_id,
+                request: request.clone(),
+                resources: store.fork_child_charge(child.consumer_id).await.unwrap(),
+                inspected_executable: crate::storage::identity::ObjectDigest::of_bytes(
+                    b"host construction only",
+                ),
+                inspection: inspection_report(&inspection),
+                network_attachment: false,
+            };
+            intent.validate().unwrap();
+            let run = uuid::Uuid::parse_str(child.result.run_id.as_str()).unwrap();
+            store
+                .persist_restore_construction(&crate::store::restore::RestoreConstruction {
+                    run_id: run,
+                    name: child.result.name.clone(),
+                    intent: intent.clone(),
+                })
+                .await
+                .unwrap();
+            let (config, durability) = crate::machine::builder::publish_restored_child(
+                runtime,
+                crate::machine::builder::ChildConstruction {
+                    name: child.result.name.clone(),
+                    configuration,
+                    storage,
+                    sources,
+                    operation_id: child.consumer_id,
+                    shared_qualification: None,
+                },
+                run,
+                None,
+            )
+            .await
+            .unwrap();
+            durability.spawn().await.unwrap().unwrap();
+            assert_eq!(config.id, child.result.machine_id);
+            let storage = store.machine_storage(config.id).await.unwrap().unwrap();
+            let lease = snapshots
+                .register_restore_generation(&config, run, &storage, &intent)
+                .await
+                .unwrap();
+            bind_restore_disk_tracking(runtime, &config, &storage, &mut request).unwrap();
+            request.ssh_trusted_ca = Some("host-construction-public-ca".into());
+            store
+                .bind_restore_activation(lease.operation_id(), &request)
+                .await
+                .unwrap();
+            store
+                .mark_launch_storage_admitted(lease.operation_id())
+                .await
+                .unwrap();
+            request.validate().unwrap();
+            assert_inspection_binding(&intent, &request);
+            assert_eq!(
+                vm_spec::capture::CaptureConfiguration::from_spec(&config.spec).unwrap(),
+                request.configuration
+            );
+            let encoded = serde_json::to_vec(&request).unwrap();
+            let decoded: vm_spec::restore::RestoreRequest =
+                serde_json::from_slice(&encoded).unwrap();
+            decoded.validate().unwrap();
+            for seed in &request.disk_tracking_seeds {
+                assert!(seed.baseline.is_none());
+                assert!(
+                    writable_inodes.insert((seed.file_device, seed.file_inode)),
+                    "siblings must not share writable disk inodes"
+                );
+                assert!(
+                    !cut.record.files.iter().any(|member| {
+                        member.device == seed.file_device && member.inode == seed.file_inode
+                    }),
+                    "a child must not write its owned cut"
+                );
+            }
+            assert!(snapshots.list().await.unwrap().is_empty());
+            assert_transfer_descriptors(
+                request,
+                _objects,
+                _lower_inputs.map(|lower| lower.files).unwrap_or_default(),
+            );
+            constructed.push((config, lease));
+        }
+        constructed
+    }
+
+    pub(crate) fn inspection_report(
+        request: &vm_spec::restore::RestoreInspectionRequest,
+    ) -> vm_spec::restore::RestoreInspectionReport {
+        use vm_spec::restore::{
+            RestoreAdmittedDevice, RestoreAuthority, RestoreInspectionReport,
+            RestoreInspectionRequestBinding,
+        };
+        let bytes = serde_json::to_vec(request).unwrap();
+        let binding = request.restore.authority.binding().unwrap();
+        RestoreInspectionReport {
+            version: vm_spec::restore::RESTORE_INSPECTION_VERSION,
+            request: match &request.restore.authority {
+                RestoreAuthority::IdentifiedSnapshot { .. } => {
+                    RestoreInspectionRequestBinding::Identified {
+                        sha256: vm_spec::capture::Sha256Digest::of_bytes(&bytes),
+                    }
+                }
+                RestoreAuthority::OwnedLocalCut { .. } => {
+                    RestoreInspectionRequestBinding::OwnedLocalCut {
+                        request: String::from_utf8(bytes).unwrap(),
+                    }
+                }
+            },
+            authority: request.restore.authority.reference(),
+            live_state_schema: binding.live_state_schema.clone(),
+            architecture: binding.architecture.clone(),
+            lane: vm_spec::live::LiveLane::KvmX86_64,
+            cpu_count: u32::from(request.restore.configuration.cpus),
+            ram_bytes: request.restore.configuration.ram_bytes(),
+            devices: request
+                .expected_device_identities()
+                .enumerate()
+                .map(|(index, (id, kind))| RestoreAdmittedDevice {
+                    configured_id: id.into(),
+                    kind,
+                    address: (index as u64 + 1) * 4096,
+                    irq: index as u32 + 1,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn restore_full_byte_hash_preserves_descriptor_position_for_receiver() {
         use std::io::{Seek, Write};
@@ -1842,5 +2400,107 @@ mod tests {
         assert!(disks[0].read_only);
         assert_eq!(disks[0].path, std::path::Path::new("lower.vmdk"));
         assert_eq!(disks[1].path, std::path::Path::new("upper.raw"));
+    }
+
+    async fn owned_inspection_fixture() -> (
+        crate::store::capture::tests::Fixture,
+        Vec<std::fs::File>,
+        vm_spec::restore::RestoreRequest,
+    ) {
+        use std::os::fd::AsRawFd;
+        use vm_spec::restore::{RestoreAuthority, RestoreObject, RestoreObjectAuthority};
+
+        let fixture = crate::store::capture::tests::fork_fixture().await;
+        let (directory, cut) = crate::store::capture::tests::seal_owned(&fixture);
+        let mut files = Vec::new();
+        let objects = vm_spec::restore::RestoreObjectRole::ALL[..4]
+            .iter()
+            .copied()
+            .map(|role| {
+                let member = cut
+                    .members
+                    .iter()
+                    .find(|member| member.role == role.capture_role())
+                    .unwrap();
+                let file = std::fs::File::open(directory.path().join(member.role.relative_path()))
+                    .unwrap();
+                let object = RestoreObject {
+                    role,
+                    fd: file.as_raw_fd(),
+                    file_device: member.fingerprint.device,
+                    file_inode: member.fingerprint.inode,
+                    length: member.fingerprint.length,
+                    authority: RestoreObjectAuthority::Owned {
+                        fingerprint: member.fingerprint.clone(),
+                    },
+                };
+                files.push(file);
+                object
+            })
+            .collect();
+        let request = vm_spec::restore::RestoreRequest {
+            version: vm_spec::restore::RESTORE_REQUEST_VERSION,
+            activation_id: cut.capture_id.clone(),
+            freeze_operation_id: cut.freeze_operation_id.clone(),
+            start_paused: true,
+            configuration: cut.configuration.clone(),
+            authority: RestoreAuthority::OwnedLocalCut { cut: Box::new(cut) },
+            disk_tracking_seeds: Vec::new(),
+            map_node_store: None,
+            objects,
+            lowers: Vec::new(),
+            network: None,
+            ssh_trusted_ca: None,
+            hook: None,
+        };
+        request.validate_for_inspection().unwrap();
+        (fixture, files, request)
+    }
+
+    #[tokio::test]
+    async fn inspection_sender_uses_current_schema_and_validates_before_spawn() {
+        use crate::machine::restore::{inspect, inspection_request};
+
+        let (_fixture, _files, mut request) = owned_inspection_fixture().await;
+        let outbound = inspection_request(request.clone(), false).unwrap();
+        assert_eq!(
+            outbound.version,
+            vm_spec::restore::RESTORE_INSPECTION_VERSION
+        );
+        let bytes = serde_json::to_vec(&outbound).unwrap();
+        let decoded: vm_spec::restore::RestoreInspectionRequest =
+            serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+
+        request.version = 0;
+        // This real file cannot execute. The request error must precede spawn.
+        let executable = tempfile::tempfile().unwrap();
+        let error = inspect(&executable, &request, false).await.unwrap_err();
+        let crate::LibVmError::CheckpointPortability { refusal, .. } = error else {
+            panic!("inspection request failure must be a restore-preflight refusal");
+        };
+        refusal.validate().unwrap();
+        assert_eq!(refusal.stage, "restore-preflight");
+        assert_eq!(refusal.pin, "inspection.request");
+    }
+
+    #[tokio::test]
+    async fn inspection_process_failure_is_a_restore_preflight_refusal() {
+        let (_fixture, _files, request) = owned_inspection_fixture().await;
+        let executable = tempfile::tempfile().unwrap();
+        let error = crate::machine::restore::inspect(&executable, &request, false)
+            .await
+            .unwrap_err();
+        let crate::LibVmError::CheckpointPortability {
+            checkpoint,
+            refusal,
+        } = error
+        else {
+            panic!("inspection process failure must be a restore-preflight refusal");
+        };
+        refusal.validate().unwrap();
+        assert!(checkpoint.starts_with("fork:"));
+        assert_eq!(refusal.stage, "restore-preflight");
+        assert_eq!(refusal.pin, "inspection.process");
     }
 }

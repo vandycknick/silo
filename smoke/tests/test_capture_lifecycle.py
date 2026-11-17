@@ -56,6 +56,12 @@ def digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
+def identified_capture(outcome: dict) -> dict:
+    authority = outcome["capture"]
+    assert set(authority) == {"kind", "sealed"} and authority["kind"] == "identified", authority
+    return authority["sealed"]
+
+
 def acceptance_binary(silo: Silo) -> Path:
     binary = silo.ws.config.bin_dir / "examples/live_acceptance"
     assert binary.is_file(), "missing live_acceptance helper; run make smoke-prereqs"
@@ -339,9 +345,9 @@ def test_capture_manager_death_leaves_the_recorded_policy_to_the_monitor(
         run.published(seal, value)
         observed = run.operation()
         assert observed["operation"]["outcome"]["status"] == "captureSealed", observed
-        assert observed["operation"]["outcome"]["capture"]["evidenceSha256"] == digest(seal_bytes)
+        assert identified_capture(observed["operation"]["outcome"])["evidenceSha256"] == digest(seal_bytes)
         assert observed["capture"]["continuation"]["status"] == source["sourceOutcome"], observed
-        assert observed["capture"]["sourceRecordSha256"] == digest(source_bytes), observed
+        assert observed["capture"]["sourceRecord"] == {"kind": "identified", "sha256": digest(source_bytes)}, observed
         release = observed["capture"]["release"]
         assert release["status"] == "released" and release["disposition"] == "published", release
         current = silo.info(NAME)
@@ -544,9 +550,10 @@ def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_
         assert cancelled["completed"]["state"] == ("running" if continued else "capturing"), cancelled
         outcome = cancelled["completed"]["operation"]["outcome"]
         assert outcome["status"] == "captureSealed", outcome
-        assert outcome["capture"]["captureId"] == run.plan["captureId"]
-        assert outcome["capture"]["evidenceSha256"] == digest(seal_bytes)
-        assert outcome["capture"]["cutToken"] == seal["pauseToken"]
+        sealed = identified_capture(outcome)
+        assert sealed["captureId"] == run.plan["captureId"]
+        assert sealed["evidenceSha256"] == digest(seal_bytes)
+        assert sealed["cutToken"] == seal["pauseToken"]
 
         value = run.manager_snapshot()
         summary = run.summary(value, "resume", "resumed")
@@ -603,12 +610,12 @@ def test_capture_absent_continuation_record_is_pending_while_run_lives_then_unkn
         assert observed["state"] == "capturing", observed
         if cut is None:
             assert observed["operation"]["outcome"]["status"] == "captureSealed", observed
-            assert observed["operation"]["outcome"]["capture"]["evidenceSha256"] == digest(seal_bytes)
+            assert identified_capture(observed["operation"]["outcome"])["evidenceSha256"] == digest(seal_bytes)
         else:
             assert observed["operation"]["outcome"]["status"] == "inProgress", observed
             assert observed["capture"]["evidence"] is None, observed
         assert observed["capture"]["continuation"] == {"status": "pending"}, observed
-        assert observed["capture"]["sourceRecordSha256"] is None, observed
+        assert observed["capture"]["sourceRecord"] is None, observed
         assert observed["capture"]["release"] == {"status": "retained"}, observed
         assert run.capture_record()["sourceOutcome"] is None, (
             "reconciliation invented a continuation outcome for a live run")
@@ -729,9 +736,11 @@ def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
         assert observed["currentPause"] is None, observed
         outcome = observed["operation"]["outcome"]
         assert outcome["status"] == "captureSealed", outcome
-        assert outcome["capture"]["evidenceSha256"] == digest(seal_bytes)
-        assert outcome["capture"]["cutToken"] == seal["pauseToken"]
-        assert observed["capture"]["evidence"] == {"outcome": "coherent", "sha256": digest(seal_bytes)}
+        sealed = identified_capture(outcome)
+        assert sealed["evidenceSha256"] == digest(seal_bytes)
+        assert sealed["cutToken"] == seal["pauseToken"]
+        assert observed["capture"]["evidence"] == {
+            "kind": "identified", "evidence": {"outcome": "coherent", "sha256": digest(seal_bytes)}}
         continuation = observed["capture"]["continuation"]
         assert continuation["status"] == "resume-failed" and continuation["state"] == "error", continuation
         failure = continuation["failure"]
@@ -741,7 +750,7 @@ def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
         assert source["sourceOutcome"] == "resume-failed", source
         assert source["error"] and source["currentPause"] is None, source
         assert source["pauseToken"] == seal["pauseToken"], source
-        assert observed["capture"]["sourceRecordSha256"] == digest(source_bytes)
+        assert observed["capture"]["sourceRecord"] == {"kind": "identified", "sha256": digest(source_bytes)}, observed
 
         run.trace.release()
         value = run.manager_snapshot()

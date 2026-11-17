@@ -103,8 +103,7 @@ pub enum LifecycleCommand {
         operation: Uuid,
         ram: OutputIdentity,
         layout: OutputIdentity,
-        /// ADR 0014 RAM StreamId, not a whole-file digest.
-        stream: Digest32,
+        authority: CaptureBaselineAuthority,
         #[serde(with = "millis")]
         timeout: Duration,
     },
@@ -450,8 +449,28 @@ pub struct CapturePreparation {
     pub resume_policy: CaptureResumePolicy,
     pub binding: CaptureDigests,
     pub policy: vm_spec::lifecycle::CapturePolicy,
+    pub identity_policy: vm_spec::capture::CaptureIdentityPolicy,
     pub dirty_crossover_percent: u8,
     pub baseline: Option<Digest32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CaptureBaselineAuthority {
+    Identified { stream: Digest32 },
+    OwnedLocalCut { materialization_generation: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "changes",
+    rename_all = "kebab-case",
+    deny_unknown_fields
+)]
+pub enum CaptureRamChangesAuthority {
+    None,
+    Identified(Box<vm_spec::capture::CaptureRamChanges>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -971,11 +990,14 @@ pub enum CommandOutcome {
         memory_generation: u64,
         writers_closed: bool,
         mode: vm_spec::lifecycle::CapturePolicy,
+        identity_policy: vm_spec::capture::CaptureIdentityPolicy,
+        identity_full_reason: Option<vm_spec::capture::CaptureIdentityFullReason>,
+        predecessor_generation: u64,
         baseline: Option<vm_spec::capture::Sha256Digest>,
         full_reason: Option<vm_spec::capture::CaptureFullReason>,
         identity_chunk_bytes: u32,
         /// Boxed so capture metadata does not enlarge every retained command.
-        changes: Box<vm_spec::capture::CaptureRamChanges>,
+        changes: CaptureRamChangesAuthority,
         changes_output: OutputReceipt,
         /// Keep capture-only counters out of every retained command's inline size.
         stats: Box<vm_spec::capture::CaptureMemoryStats>,
@@ -1539,6 +1561,16 @@ impl LifecycleRequest {
             if !(1..=60).contains(&preparation.dirty_crossover_percent) {
                 return invalid(InvalidRequest::CapturePolicy);
             }
+            if preparation.identity_policy == vm_spec::capture::CaptureIdentityPolicy::SinceAnchor
+                && preparation.baseline.is_none_or(|stream| stream.is_zero())
+            {
+                return invalid(InvalidRequest::CaptureBinding);
+            }
+            if preparation.identity_policy == vm_spec::capture::CaptureIdentityPolicy::None
+                && preparation.baseline.is_some()
+            {
+                return invalid(InvalidRequest::CaptureBinding);
+            }
             if let CapturePauseSource::Borrow { operation, .. } = preparation.pause {
                 if operation.is_nil() {
                     return invalid(InvalidRequest::NilIdentity);
@@ -1552,8 +1584,14 @@ impl LifecycleRequest {
                 return invalid(InvalidRequest::CaptureBinding);
             }
         }
-        if let LifecycleCommand::AcceptCapture { stream, .. } = &self.command {
-            if stream.is_zero() {
+        if let LifecycleCommand::AcceptCapture { authority, .. } = &self.command {
+            let valid = match authority {
+                CaptureBaselineAuthority::Identified { stream } => !stream.is_zero(),
+                CaptureBaselineAuthority::OwnedLocalCut {
+                    materialization_generation,
+                } => *materialization_generation != 0,
+            };
+            if !valid {
                 return invalid(InvalidRequest::CaptureBinding);
             }
         }
@@ -1830,6 +1868,7 @@ mod tests {
     ) -> CapturePreparation {
         let identity = |inode| OutputIdentity { device: 7, inode };
         CapturePreparation {
+            identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
             outputs: CaptureOutputIdentities {
                 execution: identity(1),
                 devices: identity(2),
@@ -1982,7 +2021,9 @@ mod tests {
                 device: 1,
                 inode: 3,
             },
-            stream: Digest32([0; 32]),
+            authority: crate::virt::lifecycle::CaptureBaselineAuthority::Identified {
+                stream: Digest32([0; 32]),
+            },
             timeout: ok,
         };
         assert_eq!(accept.rights(), RightsKind::SealedMemory);

@@ -9,8 +9,9 @@ use libkrun::control::{ControlFailure, ControlState, OperationId, PauseOwner, Pa
 use libkrun::live::{
     BaselineImage, CaptureId, CaptureStatus, CaptureTicket, CompletedCapture, DirtyEffect,
     ExecutionCaptureReceipt, ExecutionOutputs, GenerationKind, GenerationObservation,
-    GenerationTicket, LiveError, MemoryCaptureRequest, MemoryOutputs, RamImageAuthentication,
-    StateBinding, StoppedOwner, TrackingMode,
+    GenerationTicket, LiveError, MemoryCaptureRequest, MemoryOutputs, RamIdentityAnchor,
+    RamIdentityPolicy, RamImageAuthentication, RamInputAuthority, StateBinding, StoppedOwner,
+    TrackingMode,
 };
 use sha2::Digest;
 use uuid::Uuid;
@@ -34,16 +35,17 @@ pub(crate) struct KrunNative {
     blocks: HashMap<String, (BlockBacking, bool)>,
     /// Launch raw disk handles and the launch storage lease.
     protected: Vec<OutputIdentity>,
-    baseline: Mutex<Option<NativeBaseline>>,
-    accepting: Mutex<Option<(Uuid, Digest32, Digest32)>>,
+    accepting: Mutex<
+        Option<(
+            Uuid,
+            crate::virt::lifecycle::CaptureBaselineAuthority,
+            Digest32,
+        )>,
+    >,
+    anchor: Mutex<RamIdentityAnchor>,
+    layout_digest: Mutex<Option<Digest32>>,
     disk_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
     disk_cuts: Mutex<HashMap<Uuid, libkrun::live::DiskTrackingCut>>,
-}
-
-struct NativeBaseline {
-    token: Option<libkrun::live::BaselineToken>,
-    stream: Digest32,
-    layout: Digest32,
 }
 
 impl KrunNative {
@@ -81,30 +83,62 @@ impl KrunNative {
             control,
             blocks,
             protected,
-            baseline: Mutex::new(None),
             accepting: Mutex::new(None),
+            anchor: Mutex::new(RamIdentityAnchor::Unknown),
             disk_seeds: config.disk_tracking_seeds.clone(),
+            layout_digest: Mutex::new(None),
             disk_cuts: Mutex::new(HashMap::new()),
         }
     }
 
     /// Verified restore authority only; the native child token already predates
     /// state installation writes. Looking it up later never resets its union.
-    pub(crate) fn inherit_baseline(mut self, stream: Digest32, layout: Digest32) -> Self {
-        self.baseline = Mutex::new(Some(NativeBaseline {
-            token: None,
-            stream,
-            layout,
-        }));
+    pub(crate) fn inherit_baseline(
+        mut self,
+        authority: crate::virt::lifecycle::CaptureBaselineAuthority,
+        layout: Digest32,
+    ) -> Self {
+        self.anchor = Mutex::new(match authority {
+            crate::virt::lifecycle::CaptureBaselineAuthority::Identified { stream } => {
+                RamIdentityAnchor::Identified { stream: stream.0 }
+            }
+            crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut { .. } => {
+                RamIdentityAnchor::Unknown
+            }
+        });
+        self.layout_digest = Mutex::new(Some(layout));
         self
     }
 
     fn baseline_stream(&self) -> Option<vm_spec::capture::Sha256Digest> {
-        self.baseline
+        match *self
+            .anchor
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|baseline| vm_spec::capture::Sha256Digest::from_bytes(baseline.stream.0))
+        {
+            RamIdentityAnchor::Unknown => None,
+            RamIdentityAnchor::Identified { stream } => {
+                Some(vm_spec::capture::Sha256Digest::from_bytes(stream))
+            }
+        }
+    }
+
+    fn remember_baseline(
+        &self,
+        authority: crate::virt::lifecycle::CaptureBaselineAuthority,
+        layout: Digest32,
+    ) {
+        if let crate::virt::lifecycle::CaptureBaselineAuthority::Identified { stream } = authority {
+            *self
+                .anchor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                RamIdentityAnchor::Identified { stream: stream.0 };
+        }
+        *self
+            .layout_digest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(layout);
     }
 }
 
@@ -112,9 +146,11 @@ fn memory_capture_request(
     policy: vm_spec::lifecycle::CapturePolicy,
     dirty_crossover_percent: u8,
     baseline: Option<libkrun::live::BaselineToken>,
+    identity_policy: RamIdentityPolicy,
 ) -> MemoryCaptureRequest {
     MemoryCaptureRequest {
         baseline,
+        identity_policy,
         // A missing baseline is still an incremental request: libkrun reports
         // NoBaseline, not Requested, when it selects the initial full capture.
         full_at_dirty_percent: match policy {
@@ -290,6 +326,9 @@ impl NativeLifecycle for KrunNative {
     }
 
     fn inventory(&self, deadline: Instant) -> InventoryObservation {
+        if let Err(failure) = self.ram_layout_digest(deadline) {
+            return InventoryObservation::Unavailable { failure };
+        }
         let snapshot = match self.control.live_snapshot(deadline) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -354,10 +393,17 @@ impl NativeLifecycle for KrunNative {
     }
 
     fn ram_layout_digest(&self, deadline: Instant) -> Result<Digest32, NativeFailure> {
+        let mut cached = self
+            .layout_digest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(digest) = *cached {
+            return Ok(digest);
+        }
         let layout = self.control.ram_layout(deadline).map_err(live_failure)?;
-        Ok(Digest32(
-            sha2::Sha256::digest(layout.canonical_bytes()).into(),
-        ))
+        let digest = Digest32(sha2::Sha256::digest(layout.canonical_bytes()).into());
+        *cached = Some(digest);
+        Ok(digest)
     }
 
     fn flush_capture(
@@ -541,25 +587,21 @@ impl NativeLifecycle for KrunNative {
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<MemoryCapture, NativeFailure> {
-        let mut baseline = self
-            .baseline
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(baseline) = baseline.as_mut() {
-            if baseline.token.is_none() {
-                baseline.token = self.control.baseline(deadline).map_err(live_failure)?;
-            }
-        }
-        let layout_digest = self.ram_layout_digest(deadline)?;
-        let token = baseline
-            .as_ref()
-            .filter(|baseline| {
-                preparation.baseline == Some(baseline.stream) && baseline.layout == layout_digest
-            })
-            .and_then(|baseline| baseline.token.clone());
-        let stream = baseline
-            .as_ref()
-            .map(|baseline| vm_spec::capture::Sha256Digest::from_bytes(baseline.stream.0));
+        let token = self.control.baseline(deadline).map_err(live_failure)?;
+        let stream = self.baseline_stream();
+        let identity_policy = match preparation.identity_policy {
+            vm_spec::capture::CaptureIdentityPolicy::None => RamIdentityPolicy::None,
+            vm_spec::capture::CaptureIdentityPolicy::SinceAnchor => match stream {
+                Some(stream) if preparation.baseline == Some(Digest32(*stream.as_bytes()))
+                    && token.as_ref().is_some_and(|token| matches!(
+                        token.identity_anchor(), RamIdentityAnchor::Identified { stream: native } if native == *stream.as_bytes()
+                    )) => {
+                    RamIdentityPolicy::SinceAnchor { stream: *stream.as_bytes() }
+                }
+                _ => RamIdentityPolicy::Full,
+            },
+            vm_spec::capture::CaptureIdentityPolicy::Full => RamIdentityPolicy::Full,
+        };
         let completed = self
             .control
             .capture_memory(
@@ -568,6 +610,7 @@ impl NativeLifecycle for KrunNative {
                     preparation.policy,
                     preparation.dirty_crossover_percent,
                     token,
+                    identity_policy,
                 ),
                 MemoryOutputs {
                     ram,
@@ -614,15 +657,8 @@ impl NativeLifecycle for KrunNative {
                     .as_ref()
                     .is_some_and(|(pending, _, _)| *pending == capture)
                 {
-                    if let Some((_, stream, layout)) = accepting.take() {
-                        *self
-                            .baseline
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner()) = Some(NativeBaseline {
-                            token: Some(baseline.clone()),
-                            stream,
-                            layout,
-                        });
+                    if let Some((_, authority, layout)) = accepting.take() {
+                        self.remember_baseline(authority, layout);
                     }
                 }
                 NativeCaptureStatus::Accepted {
@@ -654,7 +690,7 @@ impl NativeLifecycle for KrunNative {
         binding: &CaptureStateBinding,
         ram: File,
         layout: File,
-        stream: Digest32,
+        authority: crate::virt::lifecycle::CaptureBaselineAuthority,
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<u64, NativeFailure> {
@@ -662,15 +698,25 @@ impl NativeLifecycle for KrunNative {
             .accepting
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
-            Some((binding.capture, stream, binding.ram_layout));
+            Some((binding.capture, authority, binding.ram_layout));
         let result = self.control.accept_baseline(
             capture,
             BaselineImage {
                 ram,
                 layout,
-                authentication: RamImageAuthentication {
-                    state: state_binding(binding),
-                    stream: stream.0,
+                authentication: match authority {
+                    crate::virt::lifecycle::CaptureBaselineAuthority::Identified { stream } => {
+                        RamInputAuthority::IdentifiedSnapshot(RamImageAuthentication {
+                            state: state_binding(binding),
+                            stream: stream.0,
+                        })
+                    }
+                    crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut {
+                        materialization_generation,
+                    } => RamInputAuthority::OwnedLocalCut {
+                        state: state_binding(binding),
+                        materialization_generation,
+                    },
                 },
             },
             OperationId(operation.get()),
@@ -686,14 +732,7 @@ impl NativeLifecycle for KrunNative {
                 _ => return Err(live_failure(error)),
             },
         };
-        *self
-            .baseline
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(NativeBaseline {
-            token: Some(baseline.clone()),
-            stream,
-            layout: binding.ram_layout,
-        });
+        self.remember_baseline(authority, binding.ram_layout);
         self.accepting
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -900,6 +939,13 @@ fn memory_capture(
         libkrun::live::RamCaptureMode::Full => CapturePolicy::Full,
         libkrun::live::RamCaptureMode::Incremental => CapturePolicy::Incremental,
     };
+    let identity_policy = match completed.ram.identity_policy() {
+        RamIdentityPolicy::None => vm_spec::capture::CaptureIdentityPolicy::None,
+        RamIdentityPolicy::Full => vm_spec::capture::CaptureIdentityPolicy::Full,
+        RamIdentityPolicy::SinceAnchor { .. } => {
+            vm_spec::capture::CaptureIdentityPolicy::SinceAnchor
+        }
+    };
     let full_reason = completed.full_reason.map(|reason| match reason {
         libkrun::live::FullCaptureReason::Requested => CaptureFullReason::Requested,
         libkrun::live::FullCaptureReason::NoBaseline => CaptureFullReason::NoBaseline,
@@ -932,26 +978,53 @@ fn memory_capture(
         memory_generation: completed.memory_generation,
         writers_closed: completed.ram.writers_closed(),
         mode,
-        baseline: if mode == CapturePolicy::Incremental {
+        identity_policy,
+        identity_full_reason: if identity_policy == vm_spec::capture::CaptureIdentityPolicy::Full {
+            Some(if baseline.is_some() {
+                match completed.ram.identity_anchor() {
+                    RamIdentityAnchor::Unknown => {
+                        vm_spec::capture::CaptureIdentityFullReason::CoverageLost
+                    }
+                    RamIdentityAnchor::Identified { .. } => {
+                        vm_spec::capture::CaptureIdentityFullReason::Requested
+                    }
+                }
+            } else if completed.ram.predecessor_generation() != 0 {
+                vm_spec::capture::CaptureIdentityFullReason::UnknownAnchorAfterFork
+            } else {
+                vm_spec::capture::CaptureIdentityFullReason::NoIdentifiedAnchor
+            })
+        } else {
+            None
+        },
+        predecessor_generation: completed.ram.predecessor_generation(),
+        baseline: if identity_policy == vm_spec::capture::CaptureIdentityPolicy::SinceAnchor {
             baseline
         } else {
             None
         },
         full_reason,
         identity_chunk_bytes: completed.ram.identity_chunk_bytes(),
-        changes: CaptureRamChanges {
-            byte_len: completed.ram.changes().byte_len(),
-            sha256: Sha256Digest::from_bytes(*completed.ram.changes().sha256()),
-            record_count: completed.ram.changes().record_count(),
-            coverage: match completed.ram.changes().coverage() {
-                libkrun::live::RamCaptureMode::Full => CaptureRamCoverage::Full,
-                libkrun::live::RamCaptureMode::Incremental => CaptureRamCoverage::Incremental,
-            },
-            baseline_stream: completed
-                .ram
-                .changes()
-                .baseline_stream()
-                .map(Sha256Digest::from_bytes),
+        changes: match completed.ram.changes() {
+            libkrun::live::RamChangeAuthority::None => {
+                crate::virt::lifecycle::CaptureRamChangesAuthority::None
+            }
+            libkrun::live::RamChangeAuthority::Identified(changes) => {
+                crate::virt::lifecycle::CaptureRamChangesAuthority::Identified(Box::new(
+                    CaptureRamChanges {
+                        byte_len: changes.byte_len(),
+                        sha256: Sha256Digest::from_bytes(*changes.sha256()),
+                        record_count: changes.record_count(),
+                        coverage: match changes.coverage() {
+                            libkrun::live::RamCaptureMode::Full => CaptureRamCoverage::Full,
+                            libkrun::live::RamCaptureMode::Incremental => {
+                                CaptureRamCoverage::Incremental
+                            }
+                        },
+                        baseline_stream: changes.baseline_stream().map(Sha256Digest::from_bytes),
+                    },
+                ))
+            }
         },
         changes_output,
         stats: Box::new(CaptureMemoryStats {
@@ -976,7 +1049,27 @@ fn memory_capture(
             known_zero_bytes_skipped: stats.known_zero_bytes_skipped,
             extent_queries: stats.extent_queries,
             identity_bytes_hashed: stats.identity_bytes_hashed,
-            ..CaptureMemoryStats::default()
+            identity_dirty_pages: stats.identity_dirty_pages,
+            materialization_dirty_pages: stats.materialization_dirty_pages,
+            live_pages_classified: stats.live_pages_classified,
+            identity_zero_bytes_filled: stats.identity_zero_bytes_filled,
+            full_identity_read_fallback: match stats.full_identity_read_fallback {
+                None => vm_spec::capture::CaptureIdentityReadFallback::None,
+                Some(libkrun::live::RamIdentityReadFallback::CoverageLost) => {
+                    vm_spec::capture::CaptureIdentityReadFallback::CoverageLost
+                }
+                Some(libkrun::live::RamIdentityReadFallback::BaselineMismatch) => {
+                    vm_spec::capture::CaptureIdentityReadFallback::BaselineMismatch
+                }
+                Some(libkrun::live::RamIdentityReadFallback::ExtentsUnavailable) => {
+                    vm_spec::capture::CaptureIdentityReadFallback::ExtentsUnavailable
+                }
+                Some(libkrun::live::RamIdentityReadFallback::ExtentLimit) => {
+                    vm_spec::capture::CaptureIdentityReadFallback::ExtentLimit
+                }
+            },
+            map_nodes_written: stats.map_nodes_written,
+            whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
         }),
     })
 }
@@ -1093,13 +1186,29 @@ mod tests {
             CapturePolicy::Incremental,
             60,
             None,
+            libkrun::live::RamIdentityPolicy::Full,
         );
         assert!(request.baseline.is_none());
         assert_eq!(request.full_at_dirty_percent, 60);
-        let full =
-            crate::krun::worker::native::memory_capture_request(CapturePolicy::Full, 60, None);
+        let full = crate::krun::worker::native::memory_capture_request(
+            CapturePolicy::Full,
+            60,
+            None,
+            libkrun::live::RamIdentityPolicy::Full,
+        );
         assert!(full.baseline.is_none());
         assert_eq!(full.full_at_dirty_percent, 0);
+        let fork = crate::krun::worker::native::memory_capture_request(
+            CapturePolicy::Incremental,
+            60,
+            None,
+            libkrun::live::RamIdentityPolicy::None,
+        );
+        assert!(matches!(
+            fork.identity_policy,
+            libkrun::live::RamIdentityPolicy::None
+        ));
+        assert_eq!(fork.full_at_dirty_percent, 60);
     }
 
     #[test]

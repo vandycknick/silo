@@ -191,7 +191,7 @@ fn validate_lease_metadata(
 async fn bind_fork_child_handoff(
     connection: &mut sqlx::SqliteConnection,
     consumer: Uuid,
-    cut: &vm_spec::capture::Sha256Digest,
+    cut: &Uuid,
     machine: MachineId,
     run: Uuid,
     launch: Uuid,
@@ -283,7 +283,7 @@ pub(crate) fn preflight_launch_storage(
     storage: &MachineStorageRecord,
     spec: &vm_spec::VmSpec,
 ) -> Result<(), LibVmError> {
-    storage.validate()?;
+    storage.validate_disk_identity_inventory(spec)?;
     if let Some(disks) = &spec.storage {
         disks.validate().map_err(invalid)?;
     }
@@ -1543,13 +1543,22 @@ impl Store {
                                 }
                             )
                         );
-                        let unused = capture.evidence.is_none()
+                        let anchor_only = matches!(capture.state, crate::store::snapshot_store::CaptureState::Released { snapshot: Some(_) })
+                            && sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM storage_operation_cut WHERE operation_id=?1 AND role='ram-baseline')")
+                                .bind(capture.launch_operation_id.to_string()).fetch_one(&mut *tx).await?;
+                        let unused = (capture.evidence.is_none()
                             && (matches!(
                                 capture.state,
                                 crate::store::snapshot_store::CaptureState::Released {
                                     snapshot: None
                                 }
-                            ) || (never_submitted && unchanged));
+                            ) || (never_submitted && unchanged)))
+                            || (matches!(
+                                capture.state,
+                                crate::store::snapshot_store::CaptureState::ReleasedLocal { .. }
+                            ) && capture.plan.identity_policy
+                                == vm_spec::capture::CaptureIdentityPolicy::None)
+                            || anchor_only;
                         let launch_lease = if unused {
                             None
                         } else {
@@ -1576,8 +1585,8 @@ impl Store {
                                 return Err(invalid("capture generation lease was replaced"));
                             }
                         }
-                        // An inherited baseline needs both exclusive OFDs.
-                        // A fenced no-cut capture has positive no-use proof.
+                        // Owned cuts have independent roots after relocation.
+                        // The capture OFD still fences any native byte-baseline use.
                         tx.commit().await?;
                         drop(_roots);
                         let cleanup = CaptureCleanup::prepare(self, &capture, state == "cleaning")?;
@@ -1919,7 +1928,7 @@ impl Store {
             }
             sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT OR IGNORE INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
-            sqlx::query("INSERT OR IGNORE INTO storage_operation_cut(operation_id,cut_id) SELECT ?1,cut_id FROM storage_operation_cut WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_cut(operation_id,cut_id,role) SELECT ?1,cut_id,'ram-mapping' FROM storage_operation_cut WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             if let crate::store::restore::RestoreIdentity::LocalCut { id } = &restore.checkpoint {
                 bind_fork_child_handoff(
                     &mut tx,
@@ -2116,6 +2125,12 @@ impl Store {
         }
         storage.stop_outcome = outcome;
         storage.invalidate_disk_baselines();
+        if matches!(
+            storage.ram_identity,
+            crate::store::models::storage::ContentIdentityState::Identified { .. }
+        ) {
+            storage.ram_identity = crate::store::models::storage::ContentIdentityState::Unknown;
+        }
         tracing::info!(machine_id = %next_state.machine_id, "disk tracking baseline invalidated at stop; stage 1 restart requires one full capture hash");
         Self::write_machine_storage(&mut tx, next_state.machine_id, &storage).await?;
         sqlx::query("INSERT INTO machine_state(machine_id,status,state_json) VALUES(?1,?2,jsonb(?3)) ON CONFLICT(machine_id) DO UPDATE SET status=excluded.status,state_json=excluded.state_json")
@@ -2609,16 +2624,16 @@ mod tests {
         crate::store::fork::VerifiedRestoreCut,
     ) {
         let fixture = crate::store::capture::tests::fork_fixture().await;
-        crate::store::capture::tests::seal(&fixture);
+        crate::store::capture::tests::seal_owned(&fixture);
         let store = &fixture.snapshots.store;
         let capture = fixture.reservation.record.capture_id;
         let operation = fixture.reservation.record.fork_operation_id.unwrap();
-        let (_, retained) = fixture
+        fixture
             .snapshots
-            .retain_local_capture(capture, crate::storage::pool::PublicationLockPolicy::Wait)
+            .retain_local_capture(capture)
             .await
             .unwrap();
-        let cut = store.open_local_cut(operation, retained).await.unwrap();
+        let cut = store.open_local_cut(operation).await.unwrap();
         store.bind_fork_resources(&cut).await.unwrap();
         (fixture, cut)
     }

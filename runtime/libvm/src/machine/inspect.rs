@@ -173,6 +173,8 @@ pub struct MachineData {
     pub rootfs: Option<MachineRootfs>,
     /// Typed root, boot, storage and ownership meaning.
     pub storage: Option<crate::MachineStorageRecord>,
+    pub ram_identity: crate::store::models::storage::ContentIdentityState,
+    pub disk_identities: Vec<crate::store::models::storage::DiskContentIdentity>,
     /// Observed terminal storage result, also available through daemon inspection.
     /// Absent when storage metadata is unavailable.
     pub storage_stop_outcome: Option<crate::StorageStopOutcome>,
@@ -249,6 +251,8 @@ impl MachineData {
             image_ref: String::new(),
             rootfs: None,
             storage: None,
+            ram_identity: crate::store::models::storage::ContentIdentityState::Unknown,
+            disk_identities: Vec::new(),
             storage_stop_outcome: None,
             boot_profile: None,
             boot_replacement: None,
@@ -315,6 +319,8 @@ impl MachineData {
             image_ref: config.image_ref,
             rootfs: rootfs.map(Into::into),
             storage: None,
+            ram_identity: crate::store::models::storage::ContentIdentityState::Unknown,
+            disk_identities: Vec::new(),
             storage_stop_outcome: None,
             boot_profile: None,
             boot_replacement: None,

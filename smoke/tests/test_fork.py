@@ -97,19 +97,21 @@ def dirty(silo: Silo, name: str) -> None:
 
 
 def private_inodes(silo: Silo, names: list[str], cut: Path) -> None:
-    identities = {(path.stat().st_dev, path.stat().st_ino) for path in (cut / "disks").glob("*.raw")}
-    assert identities, "local cut lacks its sealed disk"
-    count = len(identities)
+    """Writable disks stay private even after obsolete cut disks are retired."""
+    identities = []
+    for path in (cut / "disks").glob("*.raw"):
+        metadata = path.stat()
+        assert metadata.st_nlink == 1, ("cut", path)
+        identities.append((metadata.st_dev, metadata.st_ino))
     for name in names:
         for role, path in stopped.writable_paths(silo, name).items():
             metadata = path.stat()
             assert metadata.st_nlink == 1, (name, role)
-            identities.add((metadata.st_dev, metadata.st_ino))
-            count += 1
+            identities.append((metadata.st_dev, metadata.st_ino))
             silo.ws.record("fork-private-inode", json.dumps({
                 "machine": name, "role": role, "path": str(path),
                 "device": metadata.st_dev, "inode": metadata.st_ino}) + "\n")
-    assert len(identities) == count, "writable source/sibling/cut inode alias"
+    assert len(identities) == len(set(identities)), "writable source/sibling/cut inode alias"
 
 
 def continued(silo: Silo, call: fork.Call, prepared: Prepared, *, profile: RootProfile
@@ -212,6 +214,12 @@ def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
     stamps = fork.events(silo, call.operation)
     fork.ordered_events(call, stamps, running=list(range(len(NAMES))))
     saved, cut = continued(silo, call, prepared, profile=profile)
+    private_inodes(silo, [SOURCE, *NAMES], saved.staging)
+    # Finished cut disks retire on a maintenance pass, not at command completion.
+    shutdown.storage_tool(silo, "prune")
+    cut_disks = saved.staging / "disks"
+    assert not cut_disks.exists() or not any(cut_disks.iterdir()), "obsolete cut disks retained"
+    assert (saved.staging / "memory.ram").is_file(), "mapped cut RAM was retired"
     sealed = capture.inventory(saved.staging)
 
     identities = {SOURCE: source_identity}
@@ -556,7 +564,7 @@ def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest
         traced.fork()
         directory = Path(traced.wait("boundary-held.json")["target"])
         seal = json.loads((directory / "vm.capture.json").read_bytes())
-        assert seal["captureOutcome"] == "coherent", seal
+        assert seal["members"] and seal["materializationGeneration"] > 0, seal
         cancelled = fork.observe(silo, traced.operation, cancel=True)
         assert cancelled["cancellationRequested"] is True, cancelled
         traced.release()
@@ -641,7 +649,7 @@ def test_fork_manager_killed_during_child_construction_recovers_without_orphans(
         call = fork.finish(silo, process, args, operation, dispatched, names=NAMES, timeout=60)
     assert call.returncode == -signal.SIGKILL, call
     at_kill = fork.events(silo, operation)
-    assert (None, "finished") not in at_kill and (None, "seal_authenticated") in at_kill, at_kill
+    assert (None, "finished") not in at_kill and (None, "cut_retained") in at_kill, at_kill
     result = fork.settle(silo, operation)
     assert result["capture"]["kind"] == "sealed" and result["source"] == {"kind": "resumed"}, result
     assert set(fork.outcomes(result)) <= {"running", "abandoned", "failed"}, result

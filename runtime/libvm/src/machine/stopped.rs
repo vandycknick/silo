@@ -404,6 +404,12 @@ pub(crate) struct FencedSource {
 /// One writable role of a constructed child and the authority its bytes carry.
 pub(crate) enum PrivateSource {
     Fenced(FencedSource),
+    Owned {
+        path: crate::PrivatePath,
+        file: File,
+        length: u64,
+        fingerprint: crate::storage::identity_file::SourceFingerprint,
+    },
     /// A recorded stream map whose chunks the streaming copy checks while writing.
     Authenticated {
         path: crate::PrivatePath,
@@ -415,13 +421,14 @@ impl PrivateSource {
     pub(crate) fn path(&self) -> &crate::PrivatePath {
         match self {
             Self::Fenced(source) => &source.path,
-            Self::Authenticated { path, .. } => path,
+            Self::Authenticated { path, .. } | Self::Owned { path, .. } => path,
         }
     }
 
     pub(crate) fn file(&self) -> &File {
         match self {
             Self::Fenced(source) => &source.file,
+            Self::Owned { file, .. } => file,
             Self::Authenticated { stream, .. } => stream.file(),
         }
     }
@@ -429,6 +436,7 @@ impl PrivateSource {
     pub(crate) fn length(&self) -> u64 {
         match self {
             Self::Fenced(source) => source.length,
+            Self::Owned { length, .. } => *length,
             Self::Authenticated { stream, .. } => stream.length(),
         }
     }
@@ -442,6 +450,22 @@ impl PrivateSource {
     ) -> Result<crate::machine::root_disk::PreparedPrivateCopy, LibVmError> {
         use crate::machine::root_disk::{copy_private, CopySource};
         let copy = match self {
+            Self::Owned {
+                file,
+                length,
+                fingerprint,
+                ..
+            } => copy_private(
+                CopySource::Owned {
+                    file: &file,
+                    length,
+                    fingerprint,
+                },
+                directory,
+                name,
+                qualification,
+                writeback,
+            )?,
             Self::Fenced(source) => copy_private(
                 CopySource::Unscanned {
                     file: &source.file,
@@ -1175,6 +1199,9 @@ async fn publish_private_stream(
     source: PrivateSource,
 ) -> Result<SnapshotStream, LibVmError> {
     match source {
+        PrivateSource::Owned { .. } => Err(invalid(
+            "local fork cut is not an identified snapshot; snapshot the child first",
+        )),
         PrivateSource::Fenced(source) => {
             let (stream, roots) =
                 pool.publish_stream_file_for_catalog(source.file, source.length)?;
@@ -1278,6 +1305,8 @@ fn storage_from_snapshot(record: &SnapshotRecord) -> Result<MachineStorageRecord
         profile,
         backend,
         disk_baselines: Vec::new(),
+        ram_identity: crate::store::models::storage::ContentIdentityState::Unknown,
+        disk_identities: Vec::new(),
         disks: record
             .disks
             .iter()
@@ -1310,6 +1339,7 @@ fn storage_from_snapshot(record: &SnapshotRecord) -> Result<MachineStorageRecord
         snapshot: None,
     };
     reset_child_storage(&mut storage);
+    storage.bind_disk_identity_inventory(&record.configuration.spec);
     validate_capture_shape(&storage, StoppedAdmission::Ordinary)?;
     if !matches!(
         storage.boot,
@@ -1922,6 +1952,7 @@ mod tests {
                 },
             },
         });
+        storage.bind_disk_identity_inventory(&config.spec);
         config.process.entrypoint = None;
         config.process.command = Some(Vec::new());
         config
@@ -2233,5 +2264,96 @@ mod tests {
             ));
         }
         store.finish_stopped_operation(operation).await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stopped_fork_never_inherits_external_mapping_identity_even_for_the_same_path() {
+        use crate::store::models::storage::ContentIdentityState;
+        use crate::store::MachineStore;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (home, runtime, source) = raw_source("external-identity-parent").await;
+        let external = home.path().join("external.raw");
+        let replacement = home.path().join("replacement.raw");
+        for (path, byte) in [(&external, 0x31), (&replacement, 0x72)] {
+            std::fs::write(path, [byte; 512]).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut config = runtime
+            .machine_config(source.machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        config.spec.storage.as_mut().unwrap().disks.push(
+            crate::machine::root_storage::disk(
+                &external,
+                vm_spec::DiskRole::Data,
+                512,
+                "source-external".into(),
+            )
+            .unwrap(),
+        );
+        let mut storage = runtime
+            .machine_storage_record(source.machine_id())
+            .await
+            .unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
+        let map = crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_file(&external)
+            .unwrap();
+        storage.disk_identities[1].identity = ContentIdentityState::Identified {
+            root: map.root().id(),
+        };
+        let store = runtime.native_store().unwrap();
+        store
+            .save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        for (name, path) in [("same-external", external), ("new-external", replacement)] {
+            let child = source
+                .fork_stopped(crate::ForkOptions {
+                    name: Some(name.into()),
+                    external_resources: ExternalResourcePolicy::Map {
+                        mappings: vec![ExternalResourceMapping {
+                            resource: ExternalResourceKey::Disk { order: 1 },
+                            path: path.clone(),
+                        }],
+                    },
+                })
+                .await
+                .unwrap();
+            let child_config = runtime
+                .machine_config(child.machine_id())
+                .await
+                .unwrap()
+                .unwrap();
+            let child_storage = runtime
+                .machine_storage_record(child.machine_id())
+                .await
+                .unwrap();
+            assert_eq!(
+                child_config.spec.storage.as_ref().unwrap().disks[1].path,
+                path
+            );
+            assert_eq!(
+                child_storage.disk_identities[1].identity,
+                ContentIdentityState::Unknown
+            );
+            assert!(child_storage
+                .disk_baselines
+                .iter()
+                .all(|baseline| baseline.seed.attachment_index != 1));
+            child_storage
+                .validate_disk_identity_inventory(&child_config.spec)
+                .unwrap();
+        }
+        assert_eq!(
+            runtime
+                .machine_storage_record(source.machine_id())
+                .await
+                .unwrap(),
+            storage
+        );
     }
 }

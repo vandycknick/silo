@@ -509,6 +509,19 @@ message CaptureSealed {
   PauseToken cut_token = 3;
 }
 
+message OwnedCaptureSuccess {
+  // Strict bounded canonical vm-spec OwnedLocalCut JSON, never a content digest.
+  optional bytes cut = 1;
+  PauseToken cut_token = 2;
+}
+
+message CaptureSuccess {
+  oneof authority {
+    CaptureSealed identified = 1;
+    OwnedCaptureSuccess owned_local_cut = 2;
+  }
+}
+
 message LiveOperationRecord {
   optional string operation_id = 1;
   optional OperationKind kind = 2;
@@ -516,7 +529,7 @@ message LiveOperationRecord {
   oneof result {
     PauseEstablished pause = 4;
     LiveFailure failure = 5;
-    CaptureSealed capture = 6;
+    CaptureSuccess capture = 6;
   }
 }
 
@@ -626,6 +639,26 @@ message CaptureEvidenceReference {
   optional string sha256 = 2;
 }
 
+message CaptureRecordReference {
+  oneof authority {
+    CaptureEvidenceReference identified = 1;
+    bytes owned_local_cut = 2;
+  }
+}
+
+message OwnedCaptureSourceReference {
+  optional string capture_id = 1;
+  // Canonical CaptureSourceOutcome spelling, strictly decoded.
+  optional string outcome = 2;
+}
+
+message CaptureSourceReference {
+  oneof authority {
+    string identified = 1;
+    OwnedCaptureSourceReference owned_local_cut = 2;
+  }
+}
+
 message CaptureResumeFailed {
   LiveFailure failure = 1;
   optional VmState state = 2;
@@ -657,8 +690,8 @@ message CaptureReleaseState {
 message CaptureObservation {
   CaptureContinuation continuation = 1;
   CaptureReleaseState release = 2;
-  CaptureEvidenceReference evidence = 3;
-  optional string source_record_sha256 = 4;
+  CaptureRecordReference evidence = 3;
+  CaptureSourceReference source_record = 4;
 }
 
 message OperationObservation {

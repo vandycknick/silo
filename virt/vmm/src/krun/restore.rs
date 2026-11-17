@@ -10,8 +10,10 @@ use std::time::Instant;
 use libkrun::live::inspection::{
     AdmittedDeviceKind, AdmittedShape, ExpectedDevice, ExpectedDeviceKind, InspectionInputs,
 };
-use libkrun::live::restore::{RestoreIdentity, StateObjectIdentity};
-use libkrun::live::{RamImageAuthentication, StateBinding};
+use libkrun::live::restore::{
+    NativeFileFingerprint, RestoreIdentity, StateObjectAuthority, StateObjectIdentity,
+};
+use libkrun::live::{RamImageAuthentication, RamInputAuthority, StateBinding};
 use vm_spec::capture::CaptureConfiguration;
 use vm_spec::lifecycle::LiveId;
 use vm_spec::restore::{
@@ -35,29 +37,55 @@ fn uuid_bytes(id: &LiveId) -> io::Result<[u8; 16]> {
         .map_err(|error| invalid(format!("restore identity is not a UUID: {error}")))
 }
 
-fn object(request: &RestoreRequest, role: RestoreObjectRole) -> io::Result<StateObjectIdentity> {
+fn object(request: &RestoreRequest, role: RestoreObjectRole) -> io::Result<StateObjectAuthority> {
     let object = request
         .objects
         .iter()
         .find(|object| object.role == role)
         .ok_or_else(|| invalid(format!("restore object {role:?} is missing")))?;
-    Ok(StateObjectIdentity {
-        length: object.length,
-        sha256: *object.identity.as_bytes(),
+    Ok(match &object.authority {
+        vm_spec::restore::RestoreObjectAuthority::Identified { identity } => {
+            StateObjectAuthority::Identified(StateObjectIdentity {
+                length: object.length,
+                sha256: *identity.as_bytes(),
+            })
+        }
+        vm_spec::restore::RestoreObjectAuthority::Owned { fingerprint } => {
+            StateObjectAuthority::OwnedLocalFile {
+                fingerprint: NativeFileFingerprint {
+                    device: fingerprint.device,
+                    inode: fingerprint.inode,
+                    length: fingerprint.length,
+                    mode: fingerprint.mode,
+                    modified_seconds: fingerprint.modified_seconds,
+                    modified_nanoseconds: fingerprint.modified_nanoseconds,
+                    changed_seconds: fingerprint.changed_seconds,
+                    changed_nanoseconds: fingerprint.changed_nanoseconds,
+                },
+            }
+        }
     })
+}
+
+pub(crate) fn binding(
+    request: &RestoreRequest,
+) -> io::Result<&vm_spec::capture::CaptureStateBinding> {
+    match &request.authority {
+        vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => evidence
+            .memory
+            .as_ref()
+            .map(|memory| &memory.binding)
+            .ok_or_else(|| invalid("restore seal has no memory binding")),
+        vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => Ok(&cut.binding),
+    }
 }
 
 /// Native identities bound by the seal: the state binding, RAM stream and the
 /// exact execution, devices and layout objects.
 pub(crate) fn identity(
     request: &RestoreRequest,
-) -> io::Result<(RestoreIdentity, StateObjectIdentity)> {
-    let memory = request
-        .evidence
-        .memory
-        .as_ref()
-        .ok_or_else(|| invalid("restore seal has no memory binding"))?;
-    let binding = &memory.binding;
+) -> io::Result<(RestoreIdentity, StateObjectAuthority)> {
+    let binding = binding(request)?;
     let binding = StateBinding {
         live_state_schema: binding.live_state_schema.clone(),
         architecture: binding.architecture.clone(),
@@ -70,9 +98,23 @@ pub(crate) fn identity(
     };
     Ok((
         RestoreIdentity {
-            ram_image: RamImageAuthentication {
-                state: binding.clone(),
-                stream: *memory.ram_stream.as_bytes(),
+            ram_image: match &request.authority {
+                vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => {
+                    let memory = evidence
+                        .memory
+                        .as_ref()
+                        .ok_or_else(|| invalid("restore lacks identified memory"))?;
+                    RamInputAuthority::IdentifiedSnapshot(RamImageAuthentication {
+                        state: binding.clone(),
+                        stream: *memory.ram_stream.as_bytes(),
+                    })
+                }
+                vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
+                    RamInputAuthority::OwnedLocalCut {
+                        state: binding.clone(),
+                        materialization_generation: cut.materialization_generation.get(),
+                    }
+                }
             },
             binding,
             execution_object: object(request, RestoreObjectRole::Execution)?,
@@ -241,17 +283,14 @@ pub(crate) fn inspect(
             InspectionError::Descriptor(_) => "storage",
             InspectionError::Deadline => "host-build",
         };
-        let expected = request
-            .evidence
-            .memory
-            .as_ref()
-            .map(|memory| match pin {
-                "live-state-schema" => memory.binding.live_state_schema.clone(),
-                "architecture" => memory.binding.architecture.clone(),
-                "ram-layout" => memory.binding.ram_layout.to_string(),
-                _ => memory.binding.profile.to_string(),
+        let expected = binding(request)
+            .map(|binding| match pin {
+                "live-state-schema" => binding.live_state_schema.clone(),
+                "architecture" => binding.architecture.clone(),
+                "ram-layout" => binding.ram_layout.to_string(),
+                _ => binding.profile.to_string(),
             })
-            .unwrap_or_else(|| "captured execution contract".into());
+            .unwrap_or_else(|_| "captured execution contract".into());
         io::Error::new(
             io::ErrorKind::InvalidData,
             vm_spec::restore::RestorePortabilityRefusal::new(pin, expected, error.to_string()),

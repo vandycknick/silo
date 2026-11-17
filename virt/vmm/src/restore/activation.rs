@@ -343,18 +343,25 @@ impl Activation {
     }
 
     fn source_freeze_ref(&self) -> Result<(FreezeRef, NonZeroU64), Failure> {
-        let evidence = &self.request.evidence;
-        let epoch = evidence.freeze_epoch.ok_or_else(|| {
-            fail(
-                ActivationStage::Acknowledgement,
-                "handshake-failed",
-                "seal has no freeze epoch",
-            )
-        })?;
+        let (machine, run, epoch) = match &self.request.authority {
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => {
+                let epoch = evidence.freeze_epoch.ok_or_else(|| {
+                    fail(
+                        ActivationStage::Acknowledgement,
+                        "handshake-failed",
+                        "seal has no freeze epoch",
+                    )
+                })?;
+                (&evidence.machine_id, &evidence.run_id, epoch)
+            }
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
+                (&cut.machine_id, &cut.run_id, cut.freeze_epoch)
+            }
+        };
         Ok((
             FreezeRef {
-                machine_id: evidence.machine_id.as_str().to_string(),
-                run_id: evidence.run_id.as_str().to_string(),
+                machine_id: machine.as_str().to_string(),
+                run_id: run.as_str().to_string(),
                 operation_id: self.request.freeze_operation_id.as_str().to_string(),
                 freeze_epoch: Some(epoch.get()),
             },

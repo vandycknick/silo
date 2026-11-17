@@ -279,6 +279,24 @@ owned output descriptors over its lifecycle socket. Capture staging is private
 have one capture mode: writers close without synchronizing files or directories.
 Coherent records require all seven positively observed cut facts.
 
+Live fork is a distinct identity policy, not a different snapshot mode.
+It materializes complete owned RAM/state and private disk clones or sparse
+copies without content hashing, map nodes or pool publication. Held descriptors,
+exact device/inode/length/mode/mtime/ctime checks and native closed-writer,
+run/cut-generation bindings admit these internal files. They are not
+cryptographically authenticated: bit rot is not detected until the child is
+snapshotted, which establishes identity at that later cut. Snapshot capture
+and authentication below are unchanged; missing snapshot receipts never fall
+back to owned-local-cut authority.
+
+The source retains separate latest byte and identified RAM baselines, plus
+dirty-page coverage accumulated across forks. Disk baseline/history do not
+advance on fork. Its next snapshot hashes changes since its last identified
+snapshot. Children begin with typed unknown-after-fork RAM/disk identity;
+the first snapshot hashes full resulting RAM during the pause and full disk
+identity after resume, reports why, and seeds ordinary later incrementals.
+Fork-of-fork needs only complete owned byte authority.
+
 The worker supplies RAM chunk digests with an affected-chunk bitmap. The
 monitor resolves clean incremental chunks from its exact retained baseline
 map, checks the closed RAM inode and layout length, and never reads RAM back.
@@ -323,19 +341,30 @@ retains its independent background durability barrier.
 Restore verifies retained closure shape and native compatibility before
 allocating a child. Cold durable byte authentication overlaps private disk
 construction and must finish before child publication; warm restores may reuse
-matching independently verified inode receipts. Local forks instead trust
-producer identities and unchanged owned RAM inodes, without a first-use RAM
-rehash. Export and handoff authenticate bytes independently. The worker
-reconstructs private RAM mappings and disk
+matching independently verified inode receipts. Local forks instead use exact
+owned-file authority without producer content identities or a first-use RAM
+rehash. A local cut cannot be verified, exported, pushed or substituted for
+identified snapshot handoff authority; snapshot the child first. Normal
+stopped-machine handoff authenticates its current storage independently.
+The worker reconstructs private RAM mappings and disk
 attachments from held descriptors, starts paused, and keeps network and vsock
 providers fenced. Activation requires the exact fresh VM-generation
 acknowledgement, destination guest identity and SSH CA, listener preparation,
 and exact Thaw acknowledgement before native exposure commits.
 
-Pre-allocation inspection requires all four state descriptors, including RAM,
-to be read-only buffered regular files with their declared identities and sizes.
-It uses the same descriptor admission checks as launch, before native compatibility
-inspection, so inspection cannot approve writable RAM that launch would reject.
+Pre-allocation inspection requires four owned-cut state descriptors, or five
+identified-snapshot descriptors including the RAM map, to be read-only buffered
+regular files with their declared identities and sizes. It uses the same
+descriptor admission checks as launch, before native compatibility inspection,
+so inspection cannot approve writable RAM that launch would reject.
+
+Inspection precedes private disk allocation and may omit destination tracking
+seeds. Final activation binds the child's real private disk seeds before strict
+validation. An owned cut requires exactly one unidentified seed per writable
+attachment, no identified baseline or map store, and no writable inode alias
+with any cut member. The retained inspection binding excludes destination seeds,
+network and public SSH CA only; source authority and every state descriptor
+remain exact.
 
 Capture bindings and checkpoint compatibility profiles carry `liveStateSchema`
 and guest `architecture`. The restoring monitor compares those with the native

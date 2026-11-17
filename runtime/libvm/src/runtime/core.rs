@@ -1692,6 +1692,139 @@ impl Runtime {
         Ok(storage)
     }
 
+    /// Caller holds lifecycle and lifetime exclusion before registering a cold
+    /// launch. Rebind serials atomically; never change backing paths or roots.
+    pub(crate) async fn admit_cold_launch_storage(
+        &self,
+        config: &mut MachineConfig,
+        storage: &mut crate::MachineStorageRecord,
+    ) -> Result<(), LibVmError> {
+        let invalid = |message: &str| crate::machine::root_storage::invalid(message);
+        storage.validate_disk_identity_inventory(&config.spec)?;
+        let root_index = usize::from(matches!(
+            storage.root,
+            crate::MachineRoot::LinuxOverlay { .. }
+        ));
+        for identity in &storage.disk_identities {
+            let index = identity.attachment_index as usize;
+            let path = if index == root_index {
+                Some(crate::machine::stopped::root_private(storage).0)
+            } else {
+                storage
+                    .disks
+                    .iter()
+                    .find_map(|included| match &included.storage {
+                        crate::DiskStorage::ManagedWritable { path, .. }
+                            if included.order as usize == index =>
+                        {
+                            Some(path)
+                        }
+                        _ => None,
+                    })
+            };
+            if let Some(path) = path {
+                let disk = config
+                    .spec
+                    .storage
+                    .as_ref()
+                    .and_then(|spec| spec.disks.get(index))
+                    .ok_or_else(|| invalid("cold launch writable attachment is missing"))?;
+                let observed = disk
+                    .path
+                    .strip_prefix(&config.machine_dir)
+                    .unwrap_or(disk.path.as_path());
+                if observed != path.as_path() {
+                    return Err(invalid(
+                        "cold launch identity refers to a different backing path",
+                    ));
+                }
+            }
+        }
+        let Some(attachments) = config.spec.storage.as_mut() else {
+            return Ok(());
+        };
+        let root_count = root_index + 1;
+        let mut changed = false;
+        for (index, disk) in attachments.disks.iter_mut().enumerate() {
+            let serial = match disk.role {
+                vm_spec::DiskRole::Root => Some("silo-root"),
+                vm_spec::DiskRole::RootLower => Some("silo-root-lower"),
+                vm_spec::DiskRole::RootUpper => Some("silo-root-upper"),
+                vm_spec::DiskRole::Data => None,
+            };
+            let replacement = if let Some(serial) = serial {
+                if disk.block_id.as_str() == serial {
+                    None
+                } else {
+                    Some(vm_spec::BlockId::new(serial).map_err(|error| invalid(&error))?)
+                }
+            } else if storage
+                .disks
+                .iter()
+                .any(|included| included.order as usize == index)
+            {
+                let ordinal = index
+                    .checked_sub(root_count)
+                    .ok_or_else(|| invalid("cold launch data attachment precedes its root"))?;
+                let canonical = disk
+                    .block_id
+                    .as_str()
+                    .strip_prefix("silo-data-")
+                    .is_some_and(|suffix| {
+                        suffix.parse::<usize>().ok() == Some(ordinal)
+                            && (suffix == "0" || !suffix.starts_with('0'))
+                    });
+                if canonical {
+                    None
+                } else {
+                    Some(
+                        vm_spec::BlockId::new(format!("silo-data-{ordinal}"))
+                            .map_err(|error| invalid(&error))?,
+                    )
+                }
+            } else {
+                None
+            };
+            let Some(replacement) = replacement else {
+                continue;
+            };
+            for baseline in storage
+                .disk_baselines
+                .iter_mut()
+                .filter(|baseline| baseline.seed.attachment_index as usize == index)
+            {
+                // Invalid entries retain predecessor provenance only. A prior
+                // configuration rename must not make them usable or block start.
+                if matches!(
+                    baseline.state,
+                    crate::store::models::storage::DiskBaselineState::Invalid
+                ) {
+                    continue;
+                }
+                if baseline.seed.block_id != disk.block_id || baseline.seed.role != disk.role {
+                    return Err(invalid(
+                        "cold launch baseline differs from its configured attachment",
+                    ));
+                }
+                baseline.seed.block_id = replacement.clone();
+            }
+            for identity in storage
+                .disk_identities
+                .iter_mut()
+                .filter(|identity| identity.attachment_index as usize == index)
+            {
+                identity.block_id = replacement.clone();
+            }
+            disk.block_id = replacement;
+            changed = true;
+        }
+        if changed {
+            self.save_machine_config_with_storage(config, storage)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn register_launch_storage(
         &self,
         config: &MachineConfig,
@@ -2773,6 +2906,10 @@ impl Runtime {
             })?;
         }
         data.storage = storage;
+        if let Some(storage) = &data.storage {
+            data.ram_identity = storage.ram_identity.clone();
+            data.disk_identities = storage.disk_identities.clone();
+        }
         data.storage_stop_outcome = data.storage.as_ref().map(|storage| storage.stop_outcome);
         data.boot_profile = data.storage.as_ref().map(|storage| storage.boot.clone());
         if let Some(storage) = data.storage.as_ref() {
@@ -4001,7 +4138,7 @@ pub(crate) mod tests {
             .expect("read machine config")
             .expect("machine config exists");
         config.guest.agent = crate::machine::MachineAgent::Disabled;
-        let storage = runtime.machine_storage_record(config.id).await.unwrap();
+        let mut storage = runtime.machine_storage_record(config.id).await.unwrap();
         config.spec.storage = Some(vm_spec::Storage {
             disks: vec![crate::machine::root_storage::disk(
                 "root.raw",
@@ -4011,6 +4148,7 @@ pub(crate) mod tests {
             )
             .unwrap()],
         });
+        storage.bind_disk_identity_inventory(&config.spec);
         std::fs::set_permissions(
             config.machine_dir.join("root.raw"),
             std::fs::Permissions::from_mode(0o600),
@@ -4876,6 +5014,7 @@ pub(crate) mod tests {
             .pin_test_boot(&mut storage)
             .await
             .unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
         runtime
             .add_machine_record_with_rootfs(
                 &config,
@@ -6994,7 +7133,7 @@ pub(crate) mod tests {
             .commit(&runtime)
             .await
             .unwrap();
-        let storage = runtime.machine_storage_record(config.id).await.unwrap();
+        let mut storage = runtime.machine_storage_record(config.id).await.unwrap();
         config.spec.storage = Some(vm_spec::Storage {
             disks: vec![crate::machine::root_storage::disk(
                 "root.raw",
@@ -7004,6 +7143,7 @@ pub(crate) mod tests {
             )
             .unwrap()],
         });
+        storage.bind_disk_identity_inventory(&config.spec);
         std::fs::set_permissions(
             config.machine_dir.join("root.raw"),
             std::fs::Permissions::from_mode(0o600),

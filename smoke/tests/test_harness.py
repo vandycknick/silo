@@ -149,3 +149,55 @@ def test_old_format_home_is_refused_without_conversion_or_deletion(silo: Silo) -
     assert "cannot be read or converted" in failed.stderr.lower(), failed
     assert procs.catalog(database) == before
     assert marker.read_bytes() == b'{"schema":1,"kind":"stream","chunks":[]}'
+
+
+@pytest.mark.parametrize("layered", [False, True], ids=["raw", "layered"])
+@pytest.mark.parametrize("data_count", [1, 3])
+def test_managed_fixture_inventory_tracks_writable_attachment_indices(layered: bool, data_count: int) -> None:
+    from silo_smoke import stopped
+
+    root_index = int(layered)
+    disks = ([{"blockId": "silo-root-lower", "readOnly": True}] if layered else [])
+    disks.append({"blockId": "silo-root-upper" if layered else "silo-root", "readOnly": False})
+    root_identity = {
+        "attachmentIndex": root_index, "blockId": disks[root_index]["blockId"],
+        "identity": {"kind": "identified", "root": "sha256:" + "ab" * 32},
+    }
+    storage = {"diskIdentities": [root_identity]}
+    for number in range(data_count):
+        disks.append({"blockId": f"silo-data-{number}", "readOnly": False})
+    disks.append({"blockId": "external-read-only", "readOnly": True})
+    disks.append({"blockId": "external-writable", "readOnly": False})
+    config = {"spec": {"storage": {"disks": disks}}}
+
+    stopped.bind_fixture_disk_identity_inventory(config, storage)
+    expected = [(index, disk["blockId"]) for index, disk in enumerate(disks) if not disk["readOnly"]]
+    assert [(entry["attachmentIndex"], entry["blockId"]) for entry in storage["diskIdentities"]] == expected
+    assert storage["diskIdentities"][0] == root_identity
+    assert all(entry["identity"] == {"kind": "unknown"} for entry in storage["diskIdentities"][1:])
+    before = list(storage["diskIdentities"])
+    stopped.bind_fixture_disk_identity_inventory(config, storage)
+    assert storage["diskIdentities"] == before
+
+
+def test_managed_fixture_inventory_rejects_existing_mismatched_binding() -> None:
+    from silo_smoke import stopped
+
+    config = {"spec": {"storage": {"disks": [{"blockId": "silo-root", "readOnly": False}]}}}
+    storage = {"diskIdentities": [{
+        "attachmentIndex": 0, "blockId": "different-root", "identity": {"kind": "unknown"},
+    }]}
+    with pytest.raises(AssertionError):
+        stopped.bind_fixture_disk_identity_inventory(config, storage)
+
+
+@pytest.mark.parametrize(("reason", "kind"), [
+    (None, None),
+    ({"kind": "external"}, "external"),
+    ({"kind": "copy-lane"}, "copy-lane"),
+    ({"kind": "invalid-receipt", "reason": "never-armed"}, "invalid-receipt"),
+])
+def test_disk_full_scan_reason_reads_tagged_variant(reason: dict | None, kind: str | None) -> None:
+    from silo_smoke.incremental import disk_full_scan_reason
+
+    assert disk_full_scan_reason({"fullScanReason": reason}) == kind

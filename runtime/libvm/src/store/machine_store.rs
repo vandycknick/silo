@@ -160,6 +160,7 @@ impl MachineStore for Store {
             &platform,
         )?;
         let _boot = self.pin_test_boot(&mut storage).await?;
+        storage.bind_disk_identity_inventory(&config.spec);
         let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
         let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots_shared()?;
@@ -309,12 +310,13 @@ impl MachineStore for Store {
                 reference: config.id.to_string(),
             });
         }
+        let json = sqlx::query_scalar::<_, String>(
+            "SELECT CASE WHEN json_valid(record_json, 8) THEN json(record_json) ELSE '{}' END FROM machine_storage WHERE machine_id = ?1",
+        ).bind(config.id.to_string()).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| LibVmError::InvalidStorageRecord { record: "machine-storage", message: "machine has no storage record".to_string() })?;
+        let mut storage = crate::MachineStorageRecord::decode(&json)?;
+        storage.validate_disk_identity_inventory(&config.spec)?;
         if let Some(length) = config.root_disk_size {
-            let json = sqlx::query_scalar::<_, String>(
-                "SELECT CASE WHEN json_valid(record_json, 8) THEN json(record_json) ELSE '{}' END FROM machine_storage WHERE machine_id = ?1",
-            ).bind(config.id.to_string()).fetch_optional(&mut *tx).await?
-                .ok_or_else(|| LibVmError::InvalidStorageRecord { record: "machine-storage", message: "machine has no storage record".to_string() })?;
-            let mut storage = crate::MachineStorageRecord::decode(&json)?;
             match &mut storage.root {
                 crate::MachineRoot::OpaqueRaw { geometry, .. } => geometry.length = length,
                 crate::MachineRoot::LinuxOverlay {
@@ -455,6 +457,9 @@ impl Store {
         &self,
         record: &crate::store::snapshot_store::CaptureRecord,
     ) -> Result<(), LibVmError> {
+        if record.plan.identity_policy == vm_spec::capture::CaptureIdentityPolicy::None {
+            return Ok(());
+        }
         use crate::store::models::storage::{DiskBaseline, DiskBaselineState};
         use std::io::Read;
         use std::os::unix::fs::MetadataExt;
@@ -474,9 +479,6 @@ impl Store {
                 ),
             )
             .map_err(crate::machine::root_storage::invalid)?;
-        if evidence.disk_tracking_receipts.is_empty() {
-            return Ok(());
-        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND machine_id=?2 AND run_id=?3 AND kind='launch')")
             .bind(record.launch_operation_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *tx).await?;
@@ -492,6 +494,37 @@ impl Store {
         if storage.storage_generation != record.storage.storage_generation {
             return Ok(());
         }
+        if let Some(memory) = &evidence.memory {
+            storage.ram_identity =
+                crate::store::models::storage::ContentIdentityState::Identified {
+                    root: memory.ram_stream,
+                };
+        }
+        for disk in &record.plan.disks {
+            let root = evidence
+                .inventory
+                .iter()
+                .find(|entry| entry.role == vm_spec::capture::CaptureRole::Disk(disk.name.clone()))
+                .and_then(|entry| entry.identity)
+                .ok_or_else(|| {
+                    crate::machine::root_storage::invalid("identified capture disk root missing")
+                })?;
+            storage
+                .disk_identities
+                .retain(|identity| identity.attachment_index != disk.attachment_index);
+            storage
+                .disk_identities
+                .push(crate::store::models::storage::DiskContentIdentity {
+                    attachment_index: disk.attachment_index,
+                    block_id: disk.block_id.clone(),
+                    identity: crate::store::models::storage::ContentIdentityState::Identified {
+                        root,
+                    },
+                });
+        }
+        storage
+            .disk_identities
+            .sort_unstable_by_key(|identity| identity.attachment_index);
         let directory = crate::paths::machine_data_dir_in(&self.home, record.machine_id);
         let owned_directory = crate::paths::OwnedDirectory::open_existing_root(&directory)?
             .ok_or_else(|| {
@@ -858,7 +891,7 @@ impl Store {
                 reason: "machine rootfs id does not match machine config id".to_string(),
             });
         }
-        storage.validate()?;
+        storage.validate_disk_identity_inventory(&config.spec)?;
         let machine_dir = crate::paths::machine_data_dir_in(&self.home, config.id);
         let matches_root = match &storage.root {
             crate::MachineRoot::OpaqueRaw { path, geometry, .. } => {
@@ -913,7 +946,7 @@ impl Store {
         config: &MachineConfig,
         storage: &crate::MachineStorageRecord,
     ) -> Result<(), LibVmError> {
-        storage.validate()?;
+        storage.validate_disk_identity_inventory(&config.spec)?;
         let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
         let pool = if has_pool_roots(storage) {
             Some(
@@ -1252,4 +1285,97 @@ fn machine_rootfs_from_row(
         root_disk_size_bytes: length,
         created_at: row.try_get("created_at")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::traits::MachineStore;
+
+    #[tokio::test]
+    async fn semantic_save_preserves_the_supplied_identity_record_exactly() {
+        let fixture = crate::store::capture::tests::fixture_source_with_disk_length(
+            true,
+            false,
+            vm_spec::lifecycle::CapturePolicy::Full,
+            512,
+        )
+        .await;
+        let store = &fixture.snapshots.store;
+        let mut storage = store
+            .machine_storage(fixture.config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage.disk_identities.len(), 2);
+        storage.disk_identities[0].identity =
+            crate::store::models::storage::ContentIdentityState::UnknownAfterFork;
+        storage.validate().unwrap();
+
+        store
+            .save_machine_config_with_storage(&fixture.config, &storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.machine_storage(fixture.config.id).await.unwrap(),
+            Some(storage.clone())
+        );
+        storage.disk_identities.reverse();
+        assert!(storage.validate().is_err());
+        assert!(store
+            .save_machine_config_with_storage(&fixture.config, &storage)
+            .await
+            .is_err());
+        storage.disk_identities.reverse();
+        assert_eq!(
+            store.machine_storage(fixture.config.id).await.unwrap(),
+            Some(storage)
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_saves_reject_identity_inventory_mismatches_without_rewriting_records() {
+        let fixture = crate::store::capture::tests::fixture_source_with_disk_length(
+            true,
+            false,
+            vm_spec::lifecycle::CapturePolicy::Full,
+            512,
+        )
+        .await;
+        let store = &fixture.snapshots.store;
+        let original = store
+            .machine_storage(fixture.config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        for case in 0..3 {
+            let mut changed = original.clone();
+            match case {
+                0 => {
+                    changed.disk_identities.pop();
+                }
+                1 => changed.disk_identities[1].block_id = vm_spec::BlockId::new("wrong").unwrap(),
+                _ => changed.disk_identities[1].attachment_index = 9,
+            }
+            assert!(store
+                .save_machine_config_with_storage(&fixture.config, &changed)
+                .await
+                .is_err());
+            assert_eq!(
+                store.machine_storage(fixture.config.id).await.unwrap(),
+                Some(original.clone())
+            );
+        }
+        let mut config = fixture.config.clone();
+        config.spec.storage.as_mut().unwrap().disks[1].block_id =
+            vm_spec::BlockId::new("renamed-unbound").unwrap();
+        assert!(store.save_machine_config(&config).await.is_err());
+        assert_eq!(
+            store.machine_config(config.id).await.unwrap(),
+            Some(fixture.config.clone())
+        );
+        assert_eq!(
+            store.machine_storage(config.id).await.unwrap(),
+            Some(original)
+        );
+    }
 }

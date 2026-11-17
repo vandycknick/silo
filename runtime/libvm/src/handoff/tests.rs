@@ -28,20 +28,30 @@ pub(crate) struct Participant {
 }
 
 async fn open_runtime(root: &std::path::Path) -> Runtime {
-    let runtime = Runtime::open(
-        crate::paths::LocalPaths::new(root.join("silo")),
+    let paths = crate::paths::LocalPaths::new(root.join("silo"));
+    let store = crate::store::Store::new(&paths).await.unwrap();
+    let components = crate::runtime::components::test_components_with_supervisor(
+        paths.home(),
+        &std::env::current_exe().unwrap(),
+    );
+    let runtime = Runtime::from_store(
+        paths,
+        std::sync::Arc::new(store),
         crate::RuntimeNetworkingConfig::default(),
+        crate::RegistryPolicy::default(),
+        components,
+        None,
     )
     .await
     .unwrap();
     std::fs::create_dir_all(runtime.asset_directory()).unwrap();
     let kernel = runtime.asset_directory().join("kernel-default");
     let init = runtime.asset_directory().join("initramfs");
-    std::fs::write(
-        &kernel,
-        test_utils::direct_kernel::host_kernel("handoff packaged kernel"),
-    )
-    .unwrap();
+    #[cfg(target_arch = "x86_64")]
+    let kernel_bytes = crate::owned_boot_assets::tests::elf_kernel_with_banner("6.6.0");
+    #[cfg(not(target_arch = "x86_64"))]
+    let kernel_bytes = test_utils::direct_kernel::host_kernel("handoff packaged kernel");
+    std::fs::write(&kernel, kernel_bytes).unwrap();
     std::fs::write(&init, b"handoff packaged base-init bytes").unwrap();
     for asset in [&kernel, &init] {
         std::fs::set_permissions(asset, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -236,6 +246,7 @@ async fn install_layered_root(
         .unwrap()
         .cmdline
         .push("silo.rootfs=linux-erofs-overlay-v1".into());
+    storage.bind_disk_identity_inventory(&config.spec);
     let mut transaction = store
         .test_pool()
         .begin_with("BEGIN IMMEDIATE")
@@ -647,6 +658,10 @@ async fn fork_creates_distinct_stopped_destination_and_keeps_source_owned() {
     let destination = b.storage(child).await;
     assert_eq!(destination.ownership, MachineOwnership::Owned);
     assert_eq!(destination.ownership_epoch, 0);
+    assert!(matches!(
+        destination.disk_identities[0].identity,
+        crate::store::models::storage::ContentIdentityState::Identified { .. }
+    ));
     assert_eq!(
         b.runtime.machine_config(child).await.unwrap().unwrap().name,
         "child"
@@ -1511,6 +1526,99 @@ async fn corrupt_root_node_and_payload_and_missing_nodes_refuse_before_commit() 
     let aborted = b.service.abort(&plan.intent().unwrap()).await.unwrap();
     a.service.resolve_source(&aborted).await.unwrap();
     assert_eq!(a.storage(machine).await.ownership, MachineOwnership::Owned);
+}
+
+#[tokio::test]
+async fn unknown_identity_handoff_seals_root_and_data_disks_before_publication() {
+    use crate::store::models::storage::ContentIdentityState;
+
+    for (identity, mode, layered) in [
+        (ContentIdentityState::Unknown, HandoffMode::Relocate, false),
+        (
+            ContentIdentityState::UnknownAfterFork,
+            HandoffMode::Fork,
+            false,
+        ),
+        (
+            ContentIdentityState::UnknownAfterFork,
+            HandoffMode::Relocate,
+            true,
+        ),
+    ] {
+        let source = participant().await;
+        let destination = participant().await;
+        let machine = source.create_raw("unidentified").await;
+        if layered {
+            install_layered_root(&source, machine).await;
+        } else {
+            crate::handoff::control_tests::add_managed_disk(&source, machine).await;
+        }
+        let config = source
+            .runtime
+            .machine_config(machine)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut storage = source.storage(machine).await;
+        storage.ram_identity = identity.clone();
+        let writable_count = if layered { 1 } else { 2 };
+        assert_eq!(storage.disk_identities.len(), writable_count);
+        for disk in &mut storage.disk_identities {
+            disk.identity = identity.clone();
+        }
+        source
+            .runtime
+            .native_store()
+            .unwrap()
+            .save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        let plan = approve(&source, &destination, machine, &request(operation(), mode)).await;
+        let (offer, _) = offered(&source, &destination, &plan).await;
+        assert_eq!(offer.manifest().body().files.len(), writable_count);
+        let prepared = destination.service.prepare(offer.binding()).await.unwrap();
+        let authorization = source.service.fence_source(&prepared).await.unwrap();
+        let receipt = destination.service.commit(&authorization).await.unwrap();
+        source.service.resolve_source(&receipt).await.unwrap();
+        let destination = destination.restart().await;
+        let received = destination.storage(plan.plan().destination_machine()).await;
+        let destination_config = destination
+            .runtime
+            .machine_config(plan.plan().destination_machine())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.ram_identity, ContentIdentityState::Unknown);
+        assert_eq!(received.disk_identities.len(), writable_count);
+        assert!(received.disk_baselines.is_empty());
+        for captured in &offer.manifest().body().files {
+            let index = match captured.role {
+                WritableRole::Root => u32::from(layered),
+                WritableRole::Disk { order } => order,
+            };
+            let disk = received
+                .disk_identities
+                .iter()
+                .find(|disk| disk.attachment_index == index)
+                .unwrap();
+            assert_eq!(
+                disk.block_id,
+                destination_config.spec.storage.as_ref().unwrap().disks[index as usize].block_id
+            );
+            assert_eq!(
+                disk.identity,
+                ContentIdentityState::Identified {
+                    root: vm_spec::capture::Sha256Digest::from_bytes(*captured.stream.as_bytes()),
+                }
+            );
+        }
+        assert_eq!(
+            source.root_digest(machine).await,
+            destination
+                .root_digest(plan.plan().destination_machine())
+                .await
+        );
+    }
 }
 
 #[tokio::test]

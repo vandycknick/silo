@@ -6,10 +6,10 @@
 //! with `O_NOFOLLOW`. Directories are 0700 and files 0600, owned by the
 //! monitor's euid. Records use no-replace `linkat` and single-link settlement.
 //! Capture writers close without durability barriers; publication belongs to libvm.
-//! RAM identity comes from the worker receipt; disk copies hash while writing.
-//! Reflinks close without traversing extents or constructing maps in the pause.
-//! After continuation, tracked seals read only dirty chunks and inherit clean map
-//! entries. Unknown coverage walks allocated extents and hashes in scoped workers.
+//! Snapshot RAM identity comes from the worker receipt; identified disk copies
+//! hash while writing. Owned fork copies only bytes, never hashes or map nodes.
+//! Snapshot reflinks are identified after continuation, using retained dirty
+//! coverage or a complete allocated-extent scan when identity coverage is unknown.
 //! On Linux, monitor-written output starts nonblocking writeback after each complete
 //! 8 MiB region containing writes. Holes, short tails and reflinks need no hint;
 //! hint failures never affect capture success or establish durability.
@@ -149,6 +149,7 @@ pub(crate) struct CaptureStaging {
     retained_nodes: std::sync::Arc<File>,
     pool_nodes: std::sync::Mutex<Option<std::sync::Arc<File>>>,
     node_allocation: std::sync::Arc<AtomicU64>,
+    node_count: std::sync::Arc<AtomicU64>,
 }
 
 /// Outcome of a write-once record.
@@ -277,6 +278,7 @@ pub(crate) struct MapNodeWriter {
     staged: std::sync::Arc<File>,
     retained: std::sync::Arc<File>,
     allocation: std::sync::Arc<AtomicU64>,
+    count: std::sync::Arc<AtomicU64>,
     retain_locally: bool,
 }
 
@@ -297,6 +299,7 @@ impl NodeSink for MapNodeWriter {
                 let file = File::from(fd);
                 fchmod(&file, private_mode()).map_err(io::Error::from)?;
                 file.write_all_at(bytes, 0)?;
+                self.count.fetch_add(1, Ordering::Relaxed);
                 self.allocation.fetch_add(
                     file.metadata()?.blocks().saturating_mul(512),
                     Ordering::Relaxed,
@@ -382,6 +385,7 @@ impl CaptureStaging {
             retained_nodes: std::sync::Arc::new(File::from(retained_nodes)),
             pool_nodes: std::sync::Mutex::new(None),
             node_allocation: std::sync::Arc::new(AtomicU64::new(0)),
+            node_count: std::sync::Arc::new(AtomicU64::new(0)),
         })
     }
     pub(crate) fn set_node_store(&self, path: Option<&str>) -> io::Result<()> {
@@ -420,6 +424,7 @@ impl CaptureStaging {
             staged: self.nodes.clone(),
             retained: self.retained_nodes.clone(),
             allocation: self.node_allocation.clone(),
+            count: self.node_count.clone(),
             retain_locally: self
                 .pool_nodes
                 .lock()
@@ -432,8 +437,17 @@ impl CaptureStaging {
         &self.path
     }
 
+    pub(crate) fn map_nodes_written(&self) -> u64 {
+        self.node_count.load(Ordering::Relaxed)
+    }
+
     /// Write and close `request.json` exactly once.
     pub(crate) fn write_request(&self, bytes: &[u8]) -> io::Result<Sha256Digest> {
+        self.write_owned_request(bytes)?;
+        Ok(Sha256Digest::of_bytes(bytes))
+    }
+
+    pub(crate) fn write_owned_request(&self, bytes: &[u8]) -> io::Result<()> {
         let file = File::from(openat(
             &self.directory,
             CAPTURE_REQUEST_FILE,
@@ -443,7 +457,7 @@ impl CaptureStaging {
         fchmod(&file, private_mode())?;
         StagingWriter::new(&file, start_writeback).write_all(bytes)?;
         drop(file);
-        Ok(Sha256Digest::of_bytes(bytes))
+        Ok(())
     }
 
     /// Allocated bytes of the private `request.json`, reopened read-only
@@ -488,6 +502,36 @@ impl CaptureStaging {
         Ok((file, facts))
     }
 
+    pub(crate) fn seal_owned(&self, role: &CaptureRole) -> io::Result<(File, FileFacts)> {
+        let (file, facts) = self.open_sealed(role)?;
+        #[cfg(target_os = "linux")]
+        crate::restore::inputs::reject_surviving_writer(&file)?;
+        fchmod(&file, Mode::S_IRUSR)?;
+        Ok((file, facts))
+    }
+
+    pub(crate) fn open_owned(&self, role: &CaptureRole) -> io::Result<(File, FileFacts)> {
+        let (directory, name) = self.locate(role);
+        let file = File::from(openat(
+            directory,
+            name.as_str(),
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?);
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != geteuid().as_raw()
+            || metadata.mode() & 0o7777 != 0o400
+            || metadata.nlink() != 1
+        {
+            return Err(invalid(
+                "owned member is not a private immutable single-link regular file",
+            ));
+        }
+        let facts = FileFacts::of(&file)?;
+        Ok((file, facts))
+    }
+
     fn locate(&self, role: &CaptureRole) -> (&OwnedFd, String) {
         match role {
             CaptureRole::Disk(name) => (&self.disks, name.file_name()),
@@ -497,7 +541,7 @@ impl CaptureStaging {
     }
 
     /// Clone or sparse-copy exactly `length` bytes from the held paused source.
-    /// Clones retain ownership facts only; copies publish their inline chunk map.
+    /// Identified copies publish an inline map; owned copies never hash bytes.
     /// Holes stay holes; zero data is not written into a fresh destination.
     pub(crate) fn copy_disk(
         &self,
@@ -505,6 +549,7 @@ impl CaptureStaging {
         source: &File,
         length: u64,
         copy: CaptureDiskCopy,
+        identity: vm_spec::capture::CaptureIdentityPolicy,
         cancel: &CancellationToken,
     ) -> Result<DiskCopyMethod, DiskCopyError> {
         let (_, name) = self.locate(role);
@@ -521,10 +566,17 @@ impl CaptureStaging {
             Ok(()) => (DiskCopyMethod::Clone, None),
             Err(error) if clone_unsupported(&error) => match copy {
                 CaptureDiskCopy::Clone => return Err(DiskCopyError::CloneRequired(error)),
-                CaptureDiskCopy::Copy => (
-                    DiskCopyMethod::SparseCopy,
-                    Some(self.sparse_copy(source, &name, length, cancel)?),
-                ),
+                CaptureDiskCopy::Copy => {
+                    if identity == vm_spec::capture::CaptureIdentityPolicy::None {
+                        self.sparse_copy_owned(source, &name, length, cancel)?;
+                        (DiskCopyMethod::SparseCopy, None)
+                    } else {
+                        (
+                            DiskCopyMethod::SparseCopy,
+                            Some(self.sparse_copy(source, &name, length, cancel)?),
+                        )
+                    }
+                }
             },
             Err(error) => return Err(error.into()),
         };
@@ -739,6 +791,27 @@ impl CaptureStaging {
             &mut self.node_sink(),
         )?;
         Ok(map)
+    }
+
+    fn sparse_copy_owned(
+        &self,
+        source: &File,
+        name: &str,
+        length: u64,
+        cancel: &CancellationToken,
+    ) -> Result<(), DiskCopyError> {
+        let destination = File::from(openat(
+            &self.disks,
+            name,
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            private_mode(),
+        )?);
+        fchmod(&destination, private_mode())?;
+        ftruncate(
+            &destination,
+            i64::try_from(length).map_err(|_| invalid("disk length overflow"))?,
+        )?;
+        copy_sparse_bytes(source, &destination, length, cancel)
     }
 
     pub(crate) fn publish_map(&self, role: &CaptureRole, map: &StreamRoot) -> io::Result<()> {
@@ -1308,6 +1381,40 @@ fn hash_disk_chunks(
     Ok(())
 }
 
+/// Copy only allocated bytes. No digest or map is constructed for local cuts.
+fn copy_sparse_bytes(
+    source: &File,
+    destination: &File,
+    length: u64,
+    cancel: &CancellationToken,
+) -> Result<(), DiskCopyError> {
+    let mut buffer = vec![0u8; length.min(COPY_BUFFER_BYTES as u64) as usize];
+    let mut destination = StagingWriter::new(destination, start_writeback);
+    let mut offset = 0;
+    while let Some((start, end)) = next_extent(source, offset, length)? {
+        offset = start;
+        while offset < end {
+            if cancel.is_cancelled() {
+                return Err(DiskCopyError::Cancelled);
+            }
+            let stop = (offset + COPY_BUFFER_BYTES as u64).min(end);
+            let bytes = &mut buffer[..(stop - offset) as usize];
+            source.read_exact_at(bytes, offset)?;
+            if !vm_spec::capture::is_all_zero(bytes) {
+                destination.write_all_at(bytes, offset)?;
+            }
+            destination.complete_through(stop);
+            offset = stop;
+        }
+    }
+    if cancel.is_cancelled() {
+        return Err(DiskCopyError::Cancelled);
+    }
+    if source.metadata()?.len() != length {
+        return Err(invalid("disk changed length during capture").into());
+    }
+    Ok(())
+}
 /// Copy and classify each disk chunk once. Whole holes need no reads.
 fn stream_disk(
     source: &File,
@@ -1923,6 +2030,7 @@ mod tests {
                 &file,
                 length,
                 CaptureDiskCopy::Copy,
+                vm_spec::capture::CaptureIdentityPolicy::Full,
                 &CancellationToken::new(),
             )
             .unwrap();
@@ -1963,7 +2071,14 @@ mod tests {
         assert_eq!(independent_map(&sealed, length), right);
         assert!(
             staging
-                .copy_disk(&role, &file, length, CaptureDiskCopy::Copy, &cancel)
+                .copy_disk(
+                    &role,
+                    &file,
+                    length,
+                    CaptureDiskCopy::Copy,
+                    vm_spec::capture::CaptureIdentityPolicy::Full,
+                    &cancel
+                )
                 .is_err(),
             "a sealed role is never overwritten"
         );
@@ -1980,6 +2095,7 @@ mod tests {
                 &file,
                 2 << 20,
                 CaptureDiskCopy::Copy,
+                vm_spec::capture::CaptureIdentityPolicy::Full,
                 &CancellationToken::new()
             )
             .is_err());
@@ -1991,6 +2107,7 @@ mod tests {
                 &file,
                 1 << 20,
                 CaptureDiskCopy::Copy,
+                vm_spec::capture::CaptureIdentityPolicy::Full,
                 &cancel
             ),
             Err(DiskCopyError::Cancelled)
@@ -2009,6 +2126,7 @@ mod tests {
             &file,
             1 << 20,
             CaptureDiskCopy::Clone,
+            vm_spec::capture::CaptureIdentityPolicy::Full,
             &CancellationToken::new(),
         ) {
             // Reflink-capable filesystem: a real clone.
@@ -2264,6 +2382,7 @@ mod tests {
             &file,
             length,
             CaptureDiskCopy::Clone,
+            vm_spec::capture::CaptureIdentityPolicy::Full,
             &CancellationToken::new(),
         ) {
             Ok(DiskCopyMethod::Clone) => {}
@@ -2310,6 +2429,7 @@ mod tests {
             &file,
             length,
             CaptureDiskCopy::Clone,
+            vm_spec::capture::CaptureIdentityPolicy::Full,
             &CancellationToken::new(),
         ) {
             Ok(DiskCopyMethod::Clone) => {}
@@ -3033,6 +3153,7 @@ mod tests {
             &file,
             length,
             CaptureDiskCopy::Clone,
+            vm_spec::capture::CaptureIdentityPolicy::Full,
             &CancellationToken::new(),
         ) {
             Ok(DiskCopyMethod::Clone) => {}
@@ -3060,5 +3181,46 @@ mod tests {
         let mut bytes = vec![0; facts.length as usize];
         stored.read_exact_at(&mut bytes, 0).unwrap();
         assert_eq!(bytes, expected.canonical_bytes().unwrap());
+    }
+    #[test]
+    fn owned_sparse_copy_preserves_bytes_without_map_output() {
+        let root = root();
+        let length = 3 * STREAM_CHUNK_BYTES + 4096;
+        let file = source(
+            &root,
+            "source.raw",
+            length,
+            &[(4096, b"head"), (length - 4, b"tail")],
+        );
+        let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+        staging
+            .sparse_copy_owned(&file, "owned.raw", length, &CancellationToken::new())
+            .unwrap();
+        let (copied, facts) = staging.open_sealed(&disk("owned")).unwrap();
+        assert_eq!(facts.length, length);
+        let mut original = vec![0u8; length as usize];
+        let mut actual = vec![0u8; length as usize];
+        file.read_exact_at(&mut original, 0).unwrap();
+        copied.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, original);
+        assert_ne!(FileFacts::of(&file).unwrap().inode, facts.inode);
+        assert_eq!(staging.map_nodes_written(), 0);
+        assert_eq!(
+            std::fs::read_dir(
+                staging
+                    .path()
+                    .join(vm_spec::capture::CAPTURE_MAP_NODES_DIRECTORY)
+            )
+            .unwrap()
+            .count(),
+            0
+        );
+        assert!(!staging.path().join("disks/owned.root").exists());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            staging.sparse_copy_owned(&file, "cancelled.raw", length, &cancel),
+            Err(DiskCopyError::Cancelled)
+        ));
     }
 }

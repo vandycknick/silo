@@ -1598,6 +1598,26 @@ fn destination_storage(
     storage.operation = None;
     storage.image = None;
     storage.snapshot = None;
+    storage.ram_identity = crate::store::models::storage::ContentIdentityState::Unknown;
+    storage.disk_identities.clear();
+    storage.bind_disk_identity_inventory(&body.configuration.spec);
+    for captured in &manifest.body().files {
+        let attachment_index = match captured.role {
+            WritableRole::Root => match &storage.root {
+                MachineRoot::OpaqueRaw { .. } => 0,
+                MachineRoot::LinuxOverlay { .. } => 1,
+            },
+            WritableRole::Disk { order } => order,
+        };
+        let identity = storage
+            .disk_identities
+            .iter_mut()
+            .find(|identity| identity.attachment_index == attachment_index)
+            .ok_or_else(|| invalid("captured disk has no writable destination attachment"))?;
+        identity.identity = crate::store::models::storage::ContentIdentityState::Identified {
+            root: vm_spec::capture::Sha256Digest::from_bytes(*captured.stream.as_bytes()),
+        };
+    }
     storage.validate()?;
     Ok(storage)
 }
@@ -1994,7 +2014,7 @@ pub(crate) async fn commit(
         store,
         authorization,
         &plan,
-        &storage,
+        storage,
         PublicationContext {
             publication,
             prior_lock: prior.as_ref().map(|(config, _)| config.lock_id),
@@ -2045,7 +2065,7 @@ async fn publish(
     store: &Store,
     authorization: &CommitAuthorization,
     plan: &ApprovedPlan,
-    storage: &MachineStorageRecord,
+    mut storage: MachineStorageRecord,
     context: PublicationContext,
 ) -> Result<TerminalReceipt, LibVmError> {
     let PublicationContext {
@@ -2061,7 +2081,10 @@ async fn publish(
         .or(new_lock)
         .ok_or_else(|| invalid("handoff publication has no machine lock"))?;
     let mut spec = body.configuration.spec.clone();
-    crate::machine::stopped::project_child_disks(&mut spec, storage, runtime.local_images_dir())?;
+    crate::machine::stopped::project_child_disks(&mut spec, &storage, runtime.local_images_dir())?;
+    // Projection assigns destination disk serials; content roots stay bound
+    // to the same attachment indices, not the capture's temporary serials.
+    storage.bind_disk_identity_inventory(&spec);
     crate::ssh_ca::resolve(runtime.secret_store(), machine, true).map_err(|error| {
         LibVmError::MachinePreparationFailed {
             reference: body.destination_name.clone(),
@@ -2069,7 +2092,7 @@ async fn publish(
         }
     })?;
     crate::runtime::core::write_machine_config(&machine_dir, &body.destination_name, &spec)?;
-    let (root, length) = crate::machine::stopped::root_private(storage);
+    let (root, length) = crate::machine::stopped::root_private(&storage);
     let now = crate::utils::now_unix();
     let config = MachineConfig {
         secret_scope: body.configuration.secret_scope,
@@ -2120,7 +2143,7 @@ async fn publish(
             &config,
             &state,
             &rootfs,
-            storage,
+            &storage,
         )
         .await?;
     commit.commit().await

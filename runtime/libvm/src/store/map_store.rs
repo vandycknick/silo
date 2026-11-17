@@ -44,6 +44,12 @@ impl Store {
         }
         sqlx::query("INSERT INTO storage_operation_memory_baseline(operation_id,root_digest) VALUES(?1,?2) ON CONFLICT(operation_id) DO UPDATE SET root_digest=excluded.root_digest")
             .bind(operation.to_string()).bind(root.to_string()).execute(&mut *tx).await?;
+        sqlx::query(
+            "DELETE FROM storage_operation_cut WHERE operation_id=?1 AND role='ram-baseline'",
+        )
+        .bind(operation.to_string())
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

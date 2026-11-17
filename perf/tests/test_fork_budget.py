@@ -193,7 +193,7 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
                     "apiEntryToRunningSeconds": (running - stamps[(None, "api_entered")]) / 1e9,
                     "admissionSeconds": (stamps[(None, "admission_committed")]
                                          - stamps[(None, "api_entered")]) / 1e9,
-                    "sealToRunningSeconds": (running - stamps[(None, "seal_authenticated")]) / 1e9,
+                    "sealToRunningSeconds": (running - stamps[(None, "cut_retained")]) / 1e9,
                     "callerEndToEndSeconds": call.caller_seconds,
                     "phases": {f"{key[0]}:{key[1]}": value for key, value in stamps.items()},
                 },
@@ -798,18 +798,20 @@ def test_budget_gate_excludes_post_resume_disk_sealing_from_pause_allowance() ->
 
 
 @pytest.mark.parametrize("seal", [2_000_000_000, 5_000_000_000], ids=["inline", "deferred"])
-def test_pause_interval_does_not_include_post_resume_identity(seal: int) -> None:
+@pytest.mark.parametrize("identified", [False, True], ids=["unhashed-fork", "snapshot"])
+def test_pause_interval_does_not_include_post_resume_identity(seal: int, identified: bool) -> None:
     found = {
         fork.STAGING_WRITTEN: [(1_000_000_000, "staging")],
         fork.PAUSE_ESTABLISHED: [(1_500_000_000, "pause")],
         fork.PAUSE_RELEASED: [(3_000_000_000, "resume")],
         fork.SEALED: [(seal, "seal")],
         fork.CONTINUATION_FINISHED: [(6_000_000_000, "finished")],
+        fork.DISK_SEALED: [(seal, "disk identity")] if identified else [],
     }
     measured = fork.product_interruption(found)
     assert measured["interruptionSeconds"] == measured["vcpuPausedSeconds"] == 1.5
     assert measured["pauseToSealSeconds"] == (seal - 1_500_000_000) / 1e9
-    assert measured["diskIdentityInPause"] is (seal <= 3_000_000_000)
+    assert measured["diskIdentityInPause"] is (identified and seal <= 3_000_000_000)
 
 
 @pytest.mark.parametrize("seconds", [2.0, 2.0000001], ids=["boundary", "over"])

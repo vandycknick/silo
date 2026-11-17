@@ -1,10 +1,10 @@
-//! ADR 0021 full capture on the run's single live coordinator.
+//! Snapshot identity and owned live forks on the run's single live coordinator.
 //!
 //! ```text
-//!  admit ─► prepare[staging, request.json, 4 outputs + launch-lease pin ─► worker]
+//!  admit ─► prepare[staging, request.json, 5 outputs + launch-lease pin ─► worker]
 //!        ─► pause[acquire: drain → freeze(e) → native Capture pause | borrow user pause]
-//!        ─► flush[exact cut] ─► disks[clone only | sparse copy + inline map]
-//!        ─► freeze disk generations ─► execution+devices ─► RAM receipt ─► verify
+//!        ─► flush[exact cut] ─► disks[clone | sparse copy; hash only snapshots]
+//!        ─► snapshots: freeze disk generations ─► execution+devices ─► RAM receipt ─► verify
 //!        ─► reflink lane: IdentityPending cut record ─► accept RAM baseline
 //!             ─► continue[resume-if-acquired | preserve; publish source, open sessions if Running]
 //!             ─► clone identities (new lifecycle operations remain fenced)
@@ -12,9 +12,12 @@
 //!        ─► commit disk generations + retain source maps independently of staging
 //!        ═══ capture succeeded ═══ (cancel no longer has effect)
 //!        ─► copy-only lane: accept baseline + continue ─► final source projection
+//!  fork: prepare → pause/drain → flush → private disks → state + unhashed RAM
+//!       → close writers → immutable exact-file record → accept owned byte baseline
+//!       → continue source; identified RAM anchor and disk tracking history stay retained.
 //!
-//!  unsealed failure/cancel ─► abort frozen disk generations ─► resolve RAM candidate
-//!       ─► failed vm.capture.json ─► continue once under policy
+//!  unsealed failure/cancel ─► abort any frozen disk generations ─► resolve RAM candidate
+//!       ─► snapshot-only failed evidence ─► continue once under policy
 //! ```
 //!
 //! Capture success and source continuation are distinct facts: a failed
@@ -34,14 +37,15 @@ use uuid::Uuid;
 use vm_spec::capture::{
     CaptureConfiguration, CaptureContinuation, CaptureCutPhase, CaptureCutRecord, CaptureDiskCopy,
     CaptureDiskCut, CaptureDiskPlan, CaptureEvidence, CaptureEvidenceReference,
-    CaptureInventoryEntry, CaptureLaunchLease, CaptureMemoryEvidence, CapturePauseAuthority,
-    CapturePauseDisposition, CapturePlan, CaptureRecordOutcome, CaptureReleaseDisposition,
-    CaptureReleaseState, CaptureReleased, CaptureRole, CaptureSealed, CaptureSourceOutcome,
-    CaptureSourceRecord, CaptureStateBinding, Sha256Digest, CAPTURE_CLONE_RESERVE_BYTES,
-    CAPTURE_CUT_FILE, CAPTURE_CUT_TEMPORARY_FILE, CAPTURE_EVIDENCE_FILE,
-    CAPTURE_EVIDENCE_TEMPORARY_FILE, CAPTURE_LAYOUT_FILE, CAPTURE_RECORD_VERSION,
-    CAPTURE_SOURCE_FILE, CAPTURE_SOURCE_TEMPORARY_FILE, CAPTURE_STATE_RESERVE_BYTES,
-    MAX_CAPTURE_RECORD_BYTES,
+    CaptureIdentityPolicy, CaptureInventoryEntry, CaptureLaunchLease, CaptureMemoryEvidence,
+    CapturePauseAuthority, CapturePauseDisposition, CapturePlan, CaptureRecordOutcome,
+    CaptureRecordReference, CaptureReleaseDisposition, CaptureReleaseState, CaptureReleased,
+    CaptureRole, CaptureSealed, CaptureSourceOutcome, CaptureSourceRecord, CaptureSourceReference,
+    CaptureStateBinding, CaptureSuccess, OwnedCutCompletion, OwnedCutMember, OwnedLocalCut,
+    Sha256Digest, CAPTURE_CLONE_RESERVE_BYTES, CAPTURE_CUT_FILE, CAPTURE_CUT_TEMPORARY_FILE,
+    CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE, CAPTURE_LAYOUT_FILE,
+    CAPTURE_RECORD_VERSION, CAPTURE_SOURCE_FILE, CAPTURE_SOURCE_TEMPORARY_FILE,
+    CAPTURE_STATE_RESERVE_BYTES, MAX_CAPTURE_RECORD_BYTES,
 };
 use vm_spec::lifecycle::{
     CancelCompleted, CancelOperationOutcome, CaptureResumePolicy, CurrentPause, Diagnostic,
@@ -85,7 +89,7 @@ pub(crate) struct CaptureContext {
     launch: CaptureLaunchLease,
     lease: Arc<OwnedFd>,
     digests: CaptureDigests,
-    baseline: std::sync::Mutex<Option<AcceptedMap>>,
+    baseline: std::sync::Mutex<IdentityAnchor>,
     disk_baselines: std::sync::Mutex<std::collections::BTreeMap<vm_spec::BlockId, Arc<StreamRoot>>>,
 }
 
@@ -95,6 +99,21 @@ struct AcceptedMap {
     nodes: Option<crate::live::staging::MapNodeFiles>,
     layout: Sha256Digest,
     stream: Sha256Digest,
+}
+
+#[derive(Debug, Clone)]
+enum IdentityAnchor {
+    Unknown,
+    Identified(AcceptedMap),
+}
+
+impl IdentityAnchor {
+    fn identified(&self) -> Option<&AcceptedMap> {
+        match self {
+            Self::Unknown => None,
+            Self::Identified(anchor) => Some(anchor),
+        }
+    }
 }
 
 impl CaptureContext {
@@ -131,24 +150,31 @@ impl CaptureContext {
             configuration_digest,
             launch: launch_lease,
             lease: launch.lease.clone(),
-            baseline: std::sync::Mutex::new(None),
+            baseline: std::sync::Mutex::new(IdentityAnchor::Unknown),
             disk_baselines: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
     pub(crate) fn inherit(&self, restore: &crate::virt::RestoreLaunch) -> io::Result<()> {
+        let vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } =
+            &restore.request.authority
+        else {
+            *self
+                .baseline
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = IdentityAnchor::Unknown;
+            return Ok(());
+        };
         let map =
             crate::restore::inputs::verified_ram_map(&restore.request, &restore.files.objects[4])?;
-        let memory = restore
-            .request
-            .evidence
+        let memory = evidence
             .memory
             .as_ref()
             .ok_or_else(|| io::Error::other("restore lacks RAM evidence"))?;
         *self
             .baseline
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(AcceptedMap {
+            .unwrap_or_else(|error| error.into_inner()) = IdentityAnchor::Identified(AcceptedMap {
             map: Arc::new(map),
             nodes: restore
                 .request
@@ -256,6 +282,7 @@ struct Run {
     facts: Facts,
     binding: Option<NativeBinding>,
     memory: Option<CaptureMemoryEvidence>,
+    owned_cut: Option<OwnedLocalCut>,
     inventory: Vec<CaptureInventoryEntry>,
     native_memory: Option<CommandOutcome>,
     resolved_map: Option<Arc<StreamRoot>>,
@@ -266,6 +293,11 @@ struct Run {
     disk_receipts: Vec<vm_spec::capture::DiskTrackingReceipt>,
     disk_stats: Vec<vm_spec::capture::CaptureDiskStats>,
     disk_maps: Vec<(vm_spec::BlockId, Arc<StreamRoot>)>,
+}
+
+enum CompletedRecord {
+    Identified(Box<CaptureEvidence>),
+    Owned(Box<OwnedLocalCut>),
 }
 
 impl Run {
@@ -297,6 +329,9 @@ impl Run {
         error: Option<Diagnostic>,
     ) -> Option<CaptureEvidence> {
         let request_digest = self.request_digest?;
+        if self.plan.identity_policy == CaptureIdentityPolicy::None {
+            return None;
+        }
         let token = self.cut.clone();
         Some(CaptureEvidence {
             disk_stats: self.disk_stats.clone(),
@@ -432,6 +467,28 @@ fn prepared_ownership(result: &Result<CommandOutcome, NativeError>) -> WorkerPre
 }
 
 impl LiveCoordinator {
+    #[cfg(test)]
+    pub(crate) fn retained_identity_roots_for_tests(
+        &self,
+    ) -> (Option<Sha256Digest>, Vec<Sha256Digest>) {
+        let Some(context) = &self.capture else {
+            return (None, Vec::new());
+        };
+        let ram = context
+            .baseline
+            .lock()
+            .unwrap()
+            .identified()
+            .map(|anchor| anchor.stream);
+        let disks = context
+            .disk_baselines
+            .lock()
+            .unwrap()
+            .values()
+            .map(|map| map.id())
+            .collect();
+        (ram, disks)
+    }
     // ------------------------------------------------------------ preflight
 
     /// Asynchronous admission preflight, before any effect: native provider
@@ -545,6 +602,7 @@ impl LiveCoordinator {
             facts: Facts::default(),
             binding: None,
             memory: None,
+            owned_cut: None,
             inventory: Vec::new(),
             native_memory: None,
             resolved_map: None,
@@ -562,13 +620,20 @@ impl LiveCoordinator {
         }
     }
 
-    async fn capture_stages(&self, run: &mut Run) -> Result<CaptureEvidence, Abort> {
+    async fn capture_stages(&self, run: &mut Run) -> Result<CompletedRecord, Abort> {
         self.stage_prepare(run).await?;
         self.stage_pause(run).await?;
         self.stage_flush(run).await?;
         self.stage_disks(run).await?;
-        self.stage_freeze_disks(run).await?;
+        if run.plan.identity_policy != CaptureIdentityPolicy::None {
+            self.stage_freeze_disks(run).await?;
+        }
         self.stage_execution_and_memory(run).await?;
+        if run.plan.identity_policy == CaptureIdentityPolicy::None {
+            let owned = self.verify_owned_cut(run).await?;
+            run.owned_cut = Some(owned.clone());
+            return Ok(CompletedRecord::Owned(Box::new(owned)));
+        }
         let staged = self.stage_verify(run).await?;
         staging_budget(run.plan.reservation.staging_bytes, staged).map_err(Abort::Failed)?;
         if !run.pending_disks.is_empty() {
@@ -608,6 +673,7 @@ impl LiveCoordinator {
             self.stage_disk_identity(run, staged).await?;
         }
         run.evidence(CaptureRecordOutcome::Coherent, None)
+            .map(|evidence| CompletedRecord::Identified(Box::new(evidence)))
             .ok_or_else(|| {
                 Abort::Failed(failure(
                     LiveFailureCode::CaptureVerificationFailed,
@@ -664,10 +730,16 @@ impl LiveCoordinator {
             let context = context.clone();
             let capture = run.plan.capture_id.clone();
             let map_node_store = run.plan.map_node_store.clone();
+            let run_identity = run.plan.identity_policy;
             move || -> io::Result<_> {
                 let staging = CaptureStaging::create(&context.data_dir, &capture)?;
-                staging.set_node_store(map_node_store.as_deref())?;
-                let request = staging.write_request(&bytes)?;
+                let request = if run_identity == CaptureIdentityPolicy::None {
+                    staging.write_owned_request(&bytes)?;
+                    None
+                } else {
+                    staging.set_node_store(map_node_store.as_deref())?;
+                    Some(staging.write_request(&bytes)?)
+                };
                 let files = CaptureOutputFiles {
                     execution: staging.create_output(&CaptureRole::Execution)?,
                     devices: staging.create_output(&CaptureRole::Devices)?,
@@ -685,7 +757,7 @@ impl LiveCoordinator {
             created.map_err(|error| staging_failed(format!("create capture staging: {error}")))?;
         tracing::info!(operation = %run.operation, path = %staging.path().display(), "capture staging and request.json are written");
         run.staging = Some(Arc::new(staging));
-        run.request_digest = Some(request);
+        run.request_digest = request;
 
         let identities = (|| -> io::Result<_> {
             Ok((
@@ -727,13 +799,31 @@ impl LiveCoordinator {
                 pin,
                 pause,
                 policy: run.plan.policy,
+                identity_policy: match run.plan.identity_policy {
+                    CaptureIdentityPolicy::None => CaptureIdentityPolicy::None,
+                    CaptureIdentityPolicy::Full => CaptureIdentityPolicy::Full,
+                    _ if context
+                        .baseline
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .identified()
+                        .is_some() =>
+                    {
+                        CaptureIdentityPolicy::SinceAnchor
+                    }
+                    _ => CaptureIdentityPolicy::Full,
+                },
                 dirty_crossover_percent: run.plan.dirty_crossover_percent,
-                baseline: context
-                    .baseline
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .as_ref()
-                    .map(|baseline| Digest32(*baseline.stream.as_bytes())),
+                baseline: if run.plan.identity_policy == CaptureIdentityPolicy::None {
+                    None
+                } else {
+                    context
+                        .baseline
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .identified()
+                        .map(|baseline| Digest32(*baseline.stream.as_bytes()))
+                },
                 resume_policy: match run.plan.resume_policy {
                     CaptureResumePolicy::ResumeIfAcquired => NativeResumePolicy::ResumeIfAcquired,
                     CaptureResumePolicy::Preserve => NativeResumePolicy::Preserve,
@@ -1014,19 +1104,24 @@ impl LiveCoordinator {
         }
         drop(sources);
         let (abort, watcher) = abort_token(&run.cancel, &self.stop);
+        let identity_policy = run.plan.identity_policy;
         let copied = tokio::task::spawn_blocking({
             let abort = abort.clone();
             move || -> Result<Vec<CaptureDiskCut>, DiskCopyError> {
                 let mut pending = Vec::with_capacity(work.len());
                 for (role, source, length, copy) in &work {
-                    let method = staging.copy_disk(role, source, *length, *copy, &abort)?;
-                    if method == DiskCopyMethod::Clone {
+                    let method = staging.copy_disk(role, source, *length, *copy, identity_policy, &abort)?;
+                    if identity_policy != CaptureIdentityPolicy::None && method == DiskCopyMethod::Clone {
                         let CaptureRole::Disk(name) = role else {
                             return Err(io::Error::new(io::ErrorKind::InvalidData, "disk role required").into());
                         };
                         pending.push(staging.disk_cut(name)?);
                     }
-                    tracing::info!(role = %role.relative_path(), ?method, length, "sealed writable disk role");
+                    if identity_policy == CaptureIdentityPolicy::None {
+                        tracing::info!(role = %role.relative_path(), ?method, length, "owned writable disk bytes closed");
+                    } else {
+                        tracing::info!(role = %role.relative_path(), ?method, length, "sealed writable disk role");
+                    }
                 }
                 Ok(pending)
             }
@@ -1190,11 +1285,15 @@ impl LiveCoordinator {
                         &mut staging.node_source(),
                     )?,
                     baseline_reused: false,
-                    full_scan_reason: Some(if disk.tracking_eligible {
-                        vm_spec::capture::DiskFullScanReason::CopyLane
-                    } else {
-                        vm_spec::capture::DiskFullScanReason::External
-                    }),
+                    full_scan_reason: Some(
+                        if disk.identity == vm_spec::capture::DiskIdentityState::UnknownAfterFork {
+                            vm_spec::capture::DiskFullScanReason::UnknownAnchorAfterFork
+                        } else if disk.tracking_eligible {
+                            vm_spec::capture::DiskFullScanReason::CopyLane
+                        } else {
+                            vm_spec::capture::DiskFullScanReason::External
+                        },
+                    ),
                 });
                 maps.push((disk.block_id, Arc::new(map)));
             }
@@ -1359,6 +1458,194 @@ impl LiveCoordinator {
         self.checkpoint(run, LiveStage::CaptureMemory)
     }
 
+    async fn verify_owned_cut(&self, run: &mut Run) -> Result<OwnedLocalCut, Abort> {
+        self.capture_stage(run, LiveStage::CaptureVerify);
+        let fail = |message: String| {
+            Abort::Failed(failure(
+                LiveFailureCode::CaptureVerificationFailed,
+                LiveStage::CaptureVerify,
+                message,
+            ))
+        };
+        if !(run.facts.workloads_frozen
+            && run.facts.vcpus_paused
+            && run.facts.devices_quiesced
+            && run.facts.host_writers_drained
+            && run.facts.host_flush_completed
+            && run.facts.disk_copies_sealed
+            && run.facts.memory_state_sealed)
+        {
+            return Err(fail(
+                "owned cut lacks complete pause, drain, flush or closed-writer evidence".into(),
+            ));
+        }
+        let receipt = run
+            .native_memory
+            .take()
+            .ok_or_else(|| fail("missing native RAM receipt".into()))?;
+        let CommandOutcome::MemoryCaptured {
+            ram,
+            layout,
+            memory_generation,
+            predecessor_generation,
+            identity_policy,
+            changes,
+            stats,
+            ..
+        } = receipt
+        else {
+            return Err(fail("unexpected owned RAM receipt".into()));
+        };
+        if identity_policy != CaptureIdentityPolicy::None
+            || changes != crate::virt::lifecycle::CaptureRamChangesAuthority::None
+            || stats.identity_bytes_hashed != 0
+            || stats.whole_file_bytes_hashed != 0
+            || stats.map_nodes_written != 0
+        {
+            return Err(fail(
+                "owned capture unexpectedly computed content identity".into(),
+            ));
+        }
+        let binding = run
+            .binding
+            .as_ref()
+            .ok_or_else(|| fail("missing state binding".into()))?;
+        let staging = run
+            .staging
+            .clone()
+            .ok_or_else(|| fail("missing capture staging".into()))?;
+        let outputs = run
+            .outputs
+            .ok_or_else(|| fail("missing capture output identities".into()))?;
+        let disks = run.plan.disks.clone();
+        let limit = run.plan.ram_bytes;
+        let (members, geometry, staged) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            use std::os::unix::fs::MetadataExt;
+            let mut roles = vec![
+                CaptureRole::Execution,
+                CaptureRole::Devices,
+                CaptureRole::Ram,
+                CaptureRole::Layout,
+            ];
+            roles.extend(
+                disks
+                    .iter()
+                    .map(|disk| CaptureRole::Disk(disk.name.clone())),
+            );
+            let mut members = Vec::with_capacity(roles.len());
+            let mut staged = staging
+                .request_allocation()?
+                .saturating_add(staging.directory_allocation()?);
+            let mut state_bytes = 0u64;
+            for role in roles {
+                let (file, facts) = staging.seal_owned(&role)?;
+                let expected = match role {
+                    CaptureRole::Execution => Some(outputs.execution),
+                    CaptureRole::Devices => Some(outputs.devices),
+                    CaptureRole::Ram => Some(outputs.ram),
+                    CaptureRole::Layout => Some(outputs.layout),
+                    _ => None,
+                };
+                if expected.is_some_and(|expected| {
+                    (expected.device, expected.inode) != (facts.device, facts.inode)
+                }) {
+                    return Err(io::Error::other(
+                        "owned member differs from prepared output",
+                    ));
+                }
+                let metadata = file.metadata()?;
+                let charge = match &role {
+                    CaptureRole::Disk(name) => {
+                        let disk = disks
+                            .iter()
+                            .find(|disk| disk.name == *name)
+                            .ok_or_else(|| io::Error::other("owned disk has no plan"))?;
+                        if facts.length != disk.length {
+                            return Err(io::Error::other("owned disk length differs from plan"));
+                        }
+                        match disk.copy {
+                            CaptureDiskCopy::Clone => CAPTURE_CLONE_RESERVE_BYTES,
+                            CaptureDiskCopy::Copy => metadata.blocks().saturating_mul(512),
+                        }
+                    }
+                    CaptureRole::Ram => metadata.blocks().saturating_mul(512),
+                    _ => {
+                        state_bytes = state_bytes.saturating_add(facts.length);
+                        metadata.blocks().saturating_mul(512)
+                    }
+                };
+                staged = staged.saturating_add(charge);
+                members.push(OwnedCutMember {
+                    role,
+                    fingerprint: crate::restore::inputs::fingerprint(&file)?,
+                    complete: true,
+                });
+            }
+            if state_bytes > CAPTURE_STATE_RESERVE_BYTES {
+                return Err(io::Error::other("owned state exceeds its reserve"));
+            }
+            let (layout_file, layout_facts) = staging.open_owned(&CaptureRole::Layout)?;
+            let (_, ram_facts) = staging.open_owned(&CaptureRole::Ram)?;
+            if layout_facts.length > MAX_LAYOUT_BYTES
+                || (layout.device, layout.inode, layout.length)
+                    != (layout_facts.device, layout_facts.inode, layout_facts.length)
+                || (ram.device, ram.inode, ram.length)
+                    != (ram_facts.device, ram_facts.inode, ram_facts.length)
+            {
+                return Err(io::Error::other(
+                    "owned RAM/layout differs from native completion",
+                ));
+            }
+            let mut bytes = Vec::new();
+            layout_file
+                .take(MAX_LAYOUT_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            let geometry = parse_layout(&bytes)?;
+            if geometry.packed_length != ram.length || ram.length > limit {
+                return Err(io::Error::other("owned RAM geometry differs from its plan"));
+            }
+            Ok((members, geometry, staged))
+        })
+        .await
+        .map_err(|error| fail(error.to_string()))?
+        .map_err(|error| fail(error.to_string()))?;
+        staging_budget(run.plan.reservation.staging_bytes, staged).map_err(Abort::Failed)?;
+        let cut = OwnedLocalCut::from_completed(
+            &run.plan,
+            OwnedCutCompletion {
+                freeze_operation_id: run
+                    .borrowed
+                    .as_ref()
+                    .map_or_else(|| run.operation.clone(), |pause| pause.operation_id.clone()),
+                freeze_epoch: run
+                    .freeze_epoch
+                    .ok_or_else(|| fail("missing guest freeze epoch".into()))?,
+                binding: CaptureStateBinding {
+                    live_state_schema: binding.live_state_schema.clone(),
+                    architecture: binding.architecture.clone(),
+                    profile: digest(binding.profile),
+                    topology: digest(binding.topology),
+                    ram_layout: digest(binding.ram_layout),
+                    source_run: run.plan.run_id.clone(),
+                    pause_generation: NonZeroU64::new(binding.pause_generation.get())
+                        .ok_or_else(|| fail("zero pause generation".into()))?,
+                    capture: run.plan.capture_id.clone(),
+                },
+                materialization_generation: NonZeroU64::new(memory_generation)
+                    .ok_or_else(|| fail("zero materialization generation".into()))?,
+                predecessor_generation,
+                packed_length: geometry.packed_length,
+                page_granule: geometry.page_granule,
+                regions: geometry.regions,
+                members,
+                stats: *stats,
+            },
+        )
+        .map_err(fail)?;
+        self.checkpoint(run, LiveStage::CaptureVerify)?;
+        Ok(cut)
+    }
+
     /// Verify every staged role and return the actual staged bytes charged
     /// against the reservation (see [`verify_staging`]).
     async fn stage_verify(&self, run: &mut Run) -> Result<u64, Abort> {
@@ -1400,11 +1687,12 @@ impl LiveCoordinator {
                 .baseline
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .clone()
+                .identified()
+                .cloned()
         });
         let retained = match &receipt {
             CommandOutcome::MemoryCaptured {
-                mode: vm_spec::lifecycle::CapturePolicy::Incremental,
+                identity_policy: CaptureIdentityPolicy::SinceAnchor,
                 baseline: Some(expected),
                 binding,
                 ..
@@ -1422,7 +1710,7 @@ impl LiveCoordinator {
                 Some(baseline.map.clone())
             }
             CommandOutcome::MemoryCaptured {
-                mode: vm_spec::lifecycle::CapturePolicy::Full,
+                identity_policy: CaptureIdentityPolicy::Full,
                 ..
             } => None,
             _ => return Err(fail("native memory mode or baseline is malformed".into())),
@@ -1455,6 +1743,10 @@ impl LiveCoordinator {
             .and_then(|baseline| baseline.nodes.clone())
             .unwrap_or_else(|| staging.node_source());
         let length = ram.length;
+        let crate::virt::lifecycle::CaptureRamChangesAuthority::Identified(changes) = changes
+        else {
+            return Err(fail("snapshot RAM receipt lacks identified changes".into()));
+        };
         let changes = changes.as_ref().clone();
         let (abort, watcher) = abort_token(&run.cancel, &self.stop);
         let verified = tokio::task::spawn_blocking({
@@ -1506,6 +1798,8 @@ impl LiveCoordinator {
         };
         let CommandOutcome::MemoryCaptured {
             mode,
+            identity_policy,
+            identity_full_reason,
             baseline,
             full_reason,
             identity_chunk_bytes,
@@ -1523,10 +1817,17 @@ impl LiveCoordinator {
             regions: verified.regions,
             ram_stream: verified.ram_stream,
             mode,
+            identity_policy,
+            identity_full_reason,
             baseline,
             full_reason,
             identity_chunk_bytes,
-            changes: *changes,
+            changes: match changes {
+                crate::virt::lifecycle::CaptureRamChangesAuthority::Identified(changes) => *changes,
+                crate::virt::lifecycle::CaptureRamChangesAuthority::None => {
+                    return Err(fail("snapshot has owned change authority".into()))
+                }
+            },
             stats: *stats,
             binding: CaptureStateBinding {
                 live_state_schema: binding.live_state_schema,
@@ -1684,8 +1985,11 @@ impl LiveCoordinator {
                             }
                         });
                     }
-                    let (disk_map, disk_stats) = staging.complete_disk_identity(
+                    let (disk_map, mut disk_stats) = staging.complete_disk_identity(
                         &cut, baseline.as_deref(), planned.tracking_eligible, &abort)?;
+                    if !disk_stats.baseline_reused && planned.identity == vm_spec::capture::DiskIdentityState::UnknownAfterFork {
+                        disk_stats.full_scan_reason = Some(vm_spec::capture::DiskFullScanReason::UnknownAnchorAfterFork);
+                    }
                     tracing::info!(disk = %cut.name.as_str(), dirty_chunks = disk_stats.dirty_chunks,
                         total_chunks = disk_stats.total_chunks, bytes_hashed = disk_stats.bytes_hashed,
                         baseline_reused = disk_stats.baseline_reused, full_scan_reason = ?disk_stats.full_scan_reason,
@@ -1867,7 +2171,7 @@ impl LiveCoordinator {
 
     // ----------------------------------------------------------------- seal
 
-    async fn seal(&self, mut run: Run, evidence: CaptureEvidence) {
+    async fn seal(&self, mut run: Run, evidence: CompletedRecord) {
         // Linearization: cancel or stop admitted before this point wins and no
         // coherent record is ever linked; afterwards cancel waits and loses.
         let decided = {
@@ -1891,21 +2195,57 @@ impl LiveCoordinator {
             return self.unwind(run, abort).await;
         }
         self.capture_stage(&run, LiveStage::CaptureSeal);
-        let checked = match (&run.request_digest, &run.staging) {
-            (Some(request), Some(staging)) => evidence
-                .validate_against_plan(&run.plan, request)
-                .and_then(|()| {
-                    if evidence.is_sealed() {
-                        Ok(())
-                    } else {
-                        Err("coherent evidence is incomplete".into())
+        let checked = (|| -> Result<_, String> {
+            let staging = run
+                .staging
+                .clone()
+                .ok_or("capture staging is not prepared")?;
+            let cut_token = run.cut.clone().ok_or("capture pause token is missing")?;
+            match evidence {
+                CompletedRecord::Identified(mut evidence) => {
+                    if let Some(memory) = evidence.memory.as_mut() {
+                        memory.stats.map_nodes_written = staging.map_nodes_written();
                     }
-                })
-                .and_then(|()| evidence.canonical_bytes())
-                .map(|bytes| (staging.clone(), bytes)),
-            _ => Err("capture staging is not prepared".into()),
-        };
-        let (staging, bytes) = match checked {
+                    let request = run
+                        .request_digest
+                        .ok_or("capture request identity is missing")?;
+                    evidence.validate_against_plan(&run.plan, &request)?;
+                    if !evidence.is_sealed() {
+                        return Err("coherent evidence is incomplete".into());
+                    }
+                    let bytes = evidence.canonical_bytes()?;
+                    let sha256 = Sha256Digest::of_bytes(&bytes);
+                    Ok((
+                        staging,
+                        bytes,
+                        CaptureRecordReference::Identified {
+                            evidence: CaptureEvidenceReference {
+                                outcome: CaptureRecordOutcome::Coherent,
+                                sha256,
+                            },
+                        },
+                        CaptureSuccess::Identified {
+                            sealed: CaptureSealed {
+                                capture_id: run.plan.capture_id.clone(),
+                                evidence_sha256: sha256,
+                                cut_token,
+                            },
+                        },
+                    ))
+                }
+                CompletedRecord::Owned(cut) => {
+                    cut.validate_against_plan(&run.plan)?;
+                    let bytes = cut.canonical_bytes()?;
+                    Ok((
+                        staging,
+                        bytes,
+                        CaptureRecordReference::OwnedLocalCut { cut: cut.clone() },
+                        CaptureSuccess::OwnedLocalCut { cut, cut_token },
+                    ))
+                }
+            }
+        })();
+        let (staging, bytes, reference, success) = match checked {
             Ok(checked) => checked,
             Err(error) => {
                 self.reopen_pipeline(&run);
@@ -1921,7 +2261,6 @@ impl LiveCoordinator {
                     .await;
             }
         };
-        let evidence_sha256 = Sha256Digest::of_bytes(&bytes);
         // The commit is bounded blocking work that is never abandoned midway.
         // Complete means that the record's final name is its only link.
         let committed = tokio::task::spawn_blocking({
@@ -1960,34 +2299,25 @@ impl LiveCoordinator {
                     .await;
             }
         }
-        let Some(cut) = run.cut.clone() else {
+        if run.cut.is_none() {
             return self
                 .seal_uncertain(run, "sealed without a cut token".into())
                 .await;
-        };
+        }
         let disk_settlement = self.settle_disks(&mut run, true).await;
         {
             let mut inner = self.lock();
             let sealed = LiveOperationRecord {
                 operation_id: run.operation.clone(),
                 kind: OperationKind::Capture,
-                outcome: OperationOutcome::CaptureSealed {
-                    capture: CaptureSealed {
-                        capture_id: run.plan.capture_id.clone(),
-                        evidence_sha256,
-                        cut_token: cut,
-                    },
-                },
+                outcome: OperationOutcome::CaptureSealed { capture: success },
             };
             if let Some(record) = inner.journal.operation_mut(&run.operation) {
                 record.record = sealed.clone();
                 record.phase = Phase::Continuing;
             }
             if let Some(facts) = inner.journal.capture_mut(&run.operation) {
-                facts.evidence = Some(CaptureEvidenceReference {
-                    outcome: CaptureRecordOutcome::Coherent,
-                    sha256: evidence_sha256,
-                });
+                facts.evidence = Some(reference);
             }
             // Cancels that joined before the seal see the unchanged success.
             for request in inner.journal.take_cancel_requests(&run.operation) {
@@ -2009,7 +2339,7 @@ impl LiveCoordinator {
             self.finish(&mut run, Finish::Error(cause)).await;
             return;
         }
-        tracing::info!(operation = %run.operation, evidence = %evidence_sha256, "capture sealed");
+        tracing::info!(operation = %run.operation, "capture sealed");
         if let Some(finish) = run.continued.take() {
             self.finish(&mut run, finish).await;
         } else {
@@ -2087,14 +2417,37 @@ impl LiveCoordinator {
                 message,
             ))
         };
-        let (Some(outputs), Some(memory)) = (run.outputs, run.memory.as_ref()) else {
-            return Err(fail("sealed capture has no RAM identity".into()));
+        let outputs = run
+            .outputs
+            .ok_or_else(|| fail("capture outputs are missing".into()))?;
+        let authority = match (&run.memory, &run.owned_cut) {
+            (Some(memory), None) => crate::virt::lifecycle::CaptureBaselineAuthority::Identified {
+                stream: Digest32(*memory.ram_stream.as_bytes()),
+            },
+            (None, Some(cut)) => crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut {
+                materialization_generation: cut.materialization_generation.get(),
+            },
+            _ => return Err(fail("sealed capture authority is missing or mixed".into())),
         };
         let (ram, layout) = tokio::task::spawn_blocking({
             let staging = staging.clone();
             move || -> io::Result<(File, File)> {
-                let (ram, _) = staging.open_sealed(&CaptureRole::Ram)?;
-                let (layout, _) = staging.open_sealed(&CaptureRole::Layout)?;
+                let (ram, _) = match authority {
+                    crate::virt::lifecycle::CaptureBaselineAuthority::Identified { .. } => {
+                        staging.open_sealed(&CaptureRole::Ram)?
+                    }
+                    crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut { .. } => {
+                        staging.open_owned(&CaptureRole::Ram)?
+                    }
+                };
+                let (layout, _) = match authority {
+                    crate::virt::lifecycle::CaptureBaselineAuthority::Identified { .. } => {
+                        staging.open_sealed(&CaptureRole::Layout)?
+                    }
+                    crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut { .. } => {
+                        staging.open_owned(&CaptureRole::Layout)?
+                    }
+                };
                 Ok((ram, layout))
             }
         })
@@ -2105,7 +2458,7 @@ impl LiveCoordinator {
             operation: wire_uuid(&run.operation),
             ram: outputs.ram,
             layout: outputs.layout,
-            stream: Digest32(*memory.ram_stream.as_bytes()),
+            authority,
             timeout: self.timeouts.native,
         };
         let result = self
@@ -2118,16 +2471,19 @@ impl LiveCoordinator {
             .await;
         match result {
             Ok(CommandOutcome::CaptureAccepted { memory_generation }) => {
-                if let (Some(context), Some(map)) = (&self.capture, &run.resolved_map) {
+                if let (Some(context), Some(map), Some(memory)) =
+                    (&self.capture, &run.resolved_map, &run.memory)
+                {
                     *context
                         .baseline
                         .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = Some(AcceptedMap {
-                        map: map.clone(),
-                        nodes: run.staging.as_ref().map(|staging| staging.node_source()),
-                        layout: memory.binding.ram_layout,
-                        stream: memory.ram_stream,
-                    });
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        IdentityAnchor::Identified(AcceptedMap {
+                            map: map.clone(),
+                            nodes: run.staging.as_ref().map(|staging| staging.node_source()),
+                            layout: memory.binding.ram_layout,
+                            stream: memory.ram_stream,
+                        });
                 }
                 tracing::info!(operation = %run.operation, memory_generation, "sealed RAM accepted as the source baseline");
                 Ok(())
@@ -2679,9 +3035,11 @@ impl LiveCoordinator {
         match committed {
             Ok(Ok(RecordCommit::Complete)) => {
                 if let Some(facts) = self.lock().journal.capture_mut(&run.operation) {
-                    facts.evidence = Some(CaptureEvidenceReference {
-                        outcome: CaptureRecordOutcome::Failed,
-                        sha256,
+                    facts.evidence = Some(CaptureRecordReference::Identified {
+                        evidence: CaptureEvidenceReference {
+                            outcome: CaptureRecordOutcome::Failed,
+                            sha256,
+                        },
                     });
                 }
             }
@@ -2911,7 +3269,16 @@ impl LiveCoordinator {
                 return;
             }
         };
-        let sha256 = Sha256Digest::of_bytes(&bytes);
+        let reference = if run.plan.identity_policy == CaptureIdentityPolicy::None {
+            CaptureSourceReference::OwnedLocalCut {
+                capture_id: run.plan.capture_id.clone(),
+                outcome,
+            }
+        } else {
+            CaptureSourceReference::Identified {
+                sha256: Sha256Digest::of_bytes(&bytes),
+            }
+        };
         // A resumed source has already passed readiness. Keep its verified
         // identity eligible while persisting continuation, until Running
         // publishes and reopens the gates.
@@ -2929,7 +3296,7 @@ impl LiveCoordinator {
         match committed {
             Ok(Ok(RecordCommit::Complete)) => {
                 if let Some(facts) = self.lock().journal.capture_mut(&run.operation) {
-                    facts.source_record = Some(sha256);
+                    facts.source_record = Some(reference);
                 }
             }
             Ok(Ok(RecordCommit::Uncertain(error))) => {
@@ -3427,6 +3794,7 @@ mod tests {
                 &file,
                 length,
                 CaptureDiskCopy::Copy,
+                vm_spec::capture::CaptureIdentityPolicy::Full,
                 &CancellationToken::new(),
             )
             .unwrap();
@@ -3460,6 +3828,7 @@ mod tests {
 
     fn disk_plan(length: u64, copy: CaptureDiskCopy) -> Vec<CaptureDiskPlan> {
         vec![CaptureDiskPlan {
+            identity: vm_spec::capture::DiskIdentityState::Unknown,
             name: CaptureDiskName::new("data").unwrap(),
             attachment_index: 0,
             block_id: vm_spec::BlockId::new("data").unwrap(),

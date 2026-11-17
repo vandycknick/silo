@@ -85,11 +85,16 @@ Every driver executes the same declaration-ordered scenario in
    child, whose RAM can be file-backed. Then stop and start the snapshot source,
    confirm exec readiness, repopulate busy RAM, and time `snapshot_after_restart`.
    The restart and workload are outside snapshot timing.
-9. Remove every retained VM and snapshot, including on failure.
+9. After every existing row, rewrite the identified snapshot source and fork it
+   twice outside timing. Time `snapshot_source_after_two_forks`, then
+   `snapshot_fork_child_first` and `snapshot_fork_child_second` on the first
+   child (rewrite its busy workload before the second snapshot, outside timing).
+10. Remove every retained VM and snapshot, including on failure.
 
 `create_first`, `image_convert_raw`, `snapshot_verify`, `fork_of_fork`,
-`snapshot_of_restored` and `snapshot_after_restart` are informational, with no
-timing targets. Operational and guest-visible correctness errors always fail.
+`snapshot_of_restored`, `snapshot_after_restart`, `snapshot_source_after_two_forks`,
+`snapshot_fork_child_first` and `snapshot_fork_child_second` are informational,
+with no timing targets. Operational and guest-visible correctness errors always fail.
 The first-create command has a 300-second timeout, not the one-second repeated
 create target. All workload and lifecycle commands have the same hard bound.
 
@@ -97,8 +102,17 @@ Metric names for both systems are `create_first`, `run_true`, `create`, `start`,
 `start_exec`, `fork_first`, `fork_first_exec`, `fork_second`, `fork_second_exec`,
 `fork_of_fork`, `snapshot_full`, `snapshot_incremental`, `restore_first`,
 `restore_first_exec`, `restore_second`, `restore_second_exec`,
-`snapshot_of_restored`, and `snapshot_after_restart`. The raw Silo cohort adds
+`snapshot_of_restored`, `snapshot_after_restart`, `snapshot_source_after_two_forks`,
+`snapshot_fork_child_first`, and `snapshot_fork_child_second`. The raw Silo cohort adds
 `image_convert_raw` and `snapshot_verify`.
+
+Live forks do no content hashing or map/pool publication. A child has owned
+complete bytes but unknown identity. Its first snapshot pays full RAM identity
+inside its pause and full disk identity after resume; the second is incremental.
+The source retains its identified anchor and hashes changes since its last
+snapshot, including writes across both forks. The additional rows expose this
+moved cost using full CLI wall time, without warming any existing row, changing
+its clock, or relaxing a target. No new performance result is claimed here.
 
 Each sample owns a fresh smoke Workspace. **No image cache is seeded or
 persisted by the live scenario**: receipt creation, prepared layers and

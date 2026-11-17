@@ -269,8 +269,16 @@ fn validate_start_request(
         {
             return Err(invalid_data("restore requires the krun backend"));
         }
-        if restore.evidence.machine_id.as_str() == request.machine_id
-            || restore.evidence.run_id.as_str() == request.machine_run_id
+        let (source_machine, source_run) = match &restore.authority {
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => {
+                (&evidence.machine_id, &evidence.run_id)
+            }
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
+                (&cut.machine_id, &cut.run_id)
+            }
+        };
+        if source_machine.as_str() == request.machine_id
+            || source_run.as_str() == request.machine_run_id
         {
             return Err(invalid_data(
                 "a restore launch needs a new machine and run identity",

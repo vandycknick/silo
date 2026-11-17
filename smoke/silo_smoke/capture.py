@@ -142,8 +142,17 @@ def pending_cut(directory: Path) -> dict:
 
 def completed_cut(cut: dict, seal: dict) -> None:
     for field in ("captureId", "machineId", "runId", "pauseToken", "pauseDisposition", "freezeEpoch",
-                  "freezeOperationId", "configurationDigest", "requestDigest", "memory"):
+                  "freezeOperationId", "configurationDigest", "requestDigest"):
         assert seal[field] == cut[field], field
+    before, after = cut["memory"], seal["memory"]
+    assert {key: value for key, value in before.items() if key != "stats"} == {
+        key: value for key, value in after.items() if key != "stats"}
+    # RAM identities are already sealed in the pending record. Host map
+    # publication later adds its node count without changing native work.
+    assert before["stats"]["mapNodesWritten"] == 0
+    assert after["stats"]["mapNodesWritten"] >= before["stats"]["mapNodesWritten"]
+    assert {key: value for key, value in before["stats"].items() if key != "mapNodesWritten"} == {
+        key: value for key, value in after["stats"].items() if key != "mapNodesWritten"}
     assert all(entry in seal["inventory"] for entry in cut["inventory"])
 
 

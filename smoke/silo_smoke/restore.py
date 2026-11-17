@@ -71,7 +71,8 @@ class Checkpoint:
 
 def checkpoint(silo: Silo, name: str, *, alias: str = "restore-checkpoint",
                borrowed: bool = False, policy: str | None = None,
-               dirty_crossover_percent: int = 60) -> Checkpoint:
+               dirty_crossover_percent: int = 60,
+               full_identity_reason: str | None = None) -> Checkpoint:
     """Capture a real guest, preserving acquired or borrowed pause authority.
 
     This deliberately does not start or assume an execution witness, so the
@@ -89,6 +90,8 @@ def checkpoint(silo: Silo, name: str, *, alias: str = "restore-checkpoint",
                       "--dirty-crossover-percent", str(dirty_crossover_percent), "--format", "json", timeout=240)
     value = json.loads(result.stdout)
     summary = value["capture"]
+    if full_identity_reason is not None:
+        assert summary["firstSnapshotFullIdentityReason"] == full_identity_reason, summary
     assert value["snapshot"]["captureKind"] == "live-execution"
     assert summary["sourceOutcome"] == "preserved" and summary["released"] is True
     assert summary["pause"] == ("borrowed" if borrowed else "acquired")

@@ -108,12 +108,14 @@ def test_source_snapshot_retains_dirty_union_after_three_unhashed_forks(
     disk_stats = saved.seal["diskStats"]
     if reflink_probe(saved.staging)["reflink"]:
         managed = disk_stats[:-1] if external else disk_stats
-        assert all(disk["baselineReused"] and disk["fullScanReason"] is None
+        assert all(disk["baselineReused"] and incremental.disk_full_scan_reason(disk) is None
                    for disk in managed), disk_stats
         if external:
-            assert not disk_stats[-1]["baselineReused"] and disk_stats[-1]["fullScanReason"] == "external", disk_stats
+            assert (not disk_stats[-1]["baselineReused"]
+                    and incremental.disk_full_scan_reason(disk_stats[-1]) == "external"), disk_stats
     else:
-        assert all(not disk["baselineReused"] and disk["fullScanReason"] in ("copy-lane", "external")
+        assert all(not disk["baselineReused"]
+                   and incremental.disk_full_scan_reason(disk) in ("copy-lane", "external")
                    for disk in disk_stats), disk_stats
     silo.ws.record("source-after-unhashed-forks", json.dumps(saved.seal, sort_keys=True) + "\n")
     silo.run("resume", SOURCE)
@@ -151,7 +153,7 @@ def test_fork_child_full_first_identity_then_incremental_and_orphan_grandchild_r
     first = restore.checkpoint(silo, child, alias="child-first-identity",
                                full_identity_reason="unknown-after-fork")
     incremental.full_file_oracle(silo, first, full_identity=True)
-    assert all(not disk["baselineReused"] and disk["fullScanReason"] is not None
+    assert all(not disk["baselineReused"] and incremental.disk_full_scan_reason(disk) is not None
                for disk in first.seal["diskStats"]), first.seal["diskStats"]
     assert silo.info(child)["ram_identity"]["kind"] == "identified"
     silo.run("resume", child)
