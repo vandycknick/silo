@@ -1635,7 +1635,8 @@ impl Formatter {
                 free_blocks_count_lo: free_blocks as u16,
                 free_inodes_count_lo: free_inodes as u16,
                 used_dirs_count_lo: dirs as u16,
-                flags: 0,
+                // The initialized table's unused tail was zero-padded above.
+                flags: bg_flags::INODE_ZEROED,
                 exclude_bitmap_lo: 0,
                 block_bitmap_csum_lo: 0,
                 inode_bitmap_csum_lo: 0,
@@ -1648,14 +1649,6 @@ impl Formatter {
         }
 
         // -- Step 5: Extra (empty) block groups beyond data --
-        let empty_inode_bitmap = {
-            let mut bm = vec![0xFFu8; self.blocks_per_group() as usize / 8];
-            for i in 0..inodes_per_group as u16 {
-                bm[(i / 8) as usize] &= !(1 << (i % 8));
-            }
-            bm
-        };
-
         for group in block_groups..total_groups_u32 {
             let blocks_in_group = if group == total_groups_u32 - 1 {
                 let rem = (self.size / self.block_size as u64) % self.blocks_per_group() as u64;
@@ -1679,12 +1672,10 @@ impl Formatter {
             let free_blocks_count = blocks_in_group.saturating_sub(used_empty_blocks);
             let free_inodes_count = inodes_per_group;
 
-            // BLOCK_UNINIT lets the bitmap be reconstructed on demand;
-            // INODE_UNINIT, paired with itable_unused_lo, lets the entire
-            // inode table be treated as uninitialized.  Together they let
-            // resize2fs extend the filesystem without fallocating the new
-            // inode tables -- a ~2 MiB-per-added-group cost on btrfs.
-            let mut flags = bg_flags::INODE_UNINIT;
+            // Fresh sparse storage guarantees zero inode tables, so no
+            // background table zeroing is needed. With GDT_CSUM, the kernel
+            // reconstructs UNINIT bitmaps from these metadata addresses.
+            let mut flags = bg_flags::INODE_UNINIT | bg_flags::INODE_ZEROED;
             if group != total_groups_u32 - 1 {
                 flags |= bg_flags::BLOCK_UNINIT;
             }
@@ -1706,21 +1697,19 @@ impl Formatter {
 
             total_used_blocks += used_empty_blocks.min(blocks_in_group);
 
-            // Write block bitmap + inode bitmap at the right offset.
-            self.seek_to_block(bb_offset)?;
-
-            let mut block_bitmap = vec![0u8; self.blocks_per_group() as usize / 8];
-            for i in 0..used_empty_blocks.min(blocks_in_group) {
-                block_bitmap[(i / 8) as usize] |= 1 << (i % 8);
-            }
-            if group == total_groups_u32 - 1 && blocks_in_group < self.blocks_per_group() {
-                // Last partial group: mark out-of-range blocks as used.
+            if flags & bg_flags::BLOCK_UNINIT == 0 {
+                // Keep the final bitmap initialized, including bits beyond
+                // the device end. All other empty-group bitmaps stay holes.
+                self.seek_to_block(bb_offset)?;
+                let mut block_bitmap = vec![0u8; self.block_size as usize];
+                for i in 0..used_empty_blocks.min(blocks_in_group) {
+                    block_bitmap[(i / 8) as usize] |= 1 << (i % 8);
+                }
                 for i in blocks_in_group..self.blocks_per_group() {
                     block_bitmap[(i / 8) as usize] |= 1 << (i % 8);
                 }
+                self.file.write_all(&block_bitmap)?;
             }
-            self.file.write_all(&block_bitmap)?;
-            self.file.write_all(&empty_inode_bitmap)?;
         }
 
         // Settle the UUID now so the group descriptor checksums and the

@@ -621,7 +621,8 @@ fn test_group_descriptor_counts_match_bitmaps() {
 
     for group in 0..group_count {
         let gd = reader.get_group_descriptor(group).unwrap();
-        let block_bitmap = read_block(&mut file, gd.block_bitmap_lo, block_size);
+        assert_ne!(gd.flags & bg_flags::INODE_ZEROED, 0);
+        let mut block_bitmap = read_block(&mut file, gd.block_bitmap_lo, block_size);
         let inode_bitmap = read_block(&mut file, gd.inode_bitmap_lo, block_size);
 
         let group_start = group * sb.blocks_per_group;
@@ -630,6 +631,34 @@ fn test_group_descriptor_counts_match_bitmaps() {
         } else {
             sb.blocks_per_group
         };
+
+        if gd.flags & bg_flags::BLOCK_UNINIT != 0 {
+            assert!(block_bitmap.iter().all(|byte| *byte == 0));
+            assert_ne!(gd.flags & bg_flags::INODE_UNINIT, 0);
+            assert_eq!(blocks_in_group, sb.blocks_per_group);
+            // Reconstruct the bitmap from metadata locations, independently
+            // of the descriptor's free count, as ext4 does for UNINIT groups.
+            if rootfs_spec::upper_geometry::has_sparse_super(group) {
+                let descriptor_blocks =
+                    (group_count as u64 * GroupDescriptor::SIZE as u64).div_ceil(block_size);
+                for index in 0..1 + descriptor_blocks + sb.reserved_gdt_blocks as u64 {
+                    block_bitmap[index as usize / 8] |= 1 << (index % 8);
+                }
+            }
+            let table_blocks =
+                (sb.inodes_per_group as u64 * sb.inode_size as u64).div_ceil(block_size) as u32;
+            for block in std::iter::once(gd.block_bitmap_lo)
+                .chain(std::iter::once(gd.inode_bitmap_lo))
+                .chain(gd.inode_table_lo..gd.inode_table_lo + table_blocks)
+            {
+                assert!(block >= group_start && block < group_start + blocks_in_group);
+                let index = (block - group_start) as usize;
+                block_bitmap[index / 8] |= 1 << (index % 8);
+            }
+        }
+        if gd.flags & bg_flags::INODE_UNINIT != 0 {
+            assert!(inode_bitmap.iter().all(|byte| *byte == 0));
+        }
 
         let free_blocks = count_free_bits(&block_bitmap, blocks_in_group);
         assert_eq!(

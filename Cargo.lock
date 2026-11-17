@@ -1147,6 +1147,7 @@ name = "disk-image"
 version = "0.1.2"
 dependencies = [
  "imago",
+ "nix 0.31.3",
  "rootfs-spec",
  "tempfile",
  "thiserror 2.0.19",

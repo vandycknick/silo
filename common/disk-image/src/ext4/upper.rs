@@ -69,7 +69,7 @@ mod tests {
 
     use crate::ext4::Reader;
     use crate::ext4::checksum;
-    use crate::ext4::constants::inode_flags;
+    use crate::ext4::constants::{bg_flags, inode_flags};
     use crate::ext4::types::GroupDescriptor;
     use crate::ext4::upper::{FormattedUpper, format_upper};
 
@@ -155,6 +155,7 @@ mod tests {
                 gd.checksum,
                 checksum::group_descriptor(&sb.uuid, group, &gd)
             );
+            assert_ne!(gd.flags & bg_flags::INODE_ZEROED, 0);
             let group_start = group as u64 * 32768;
             let blocks = (result.filesystem_bytes / 4096 - group_start).min(32768);
             for block in [
@@ -165,6 +166,27 @@ mod tests {
                 assert!((block as u64) < result.filesystem_bytes / 4096);
             }
             read_at(&mut file, gd.block_bitmap_lo as u64 * 4096, &mut bitmap);
+            if gd.flags & bg_flags::BLOCK_UNINIT != 0 {
+                assert_eq!(blocks, 32768);
+                assert!(bitmap.iter().all(|byte| *byte == 0));
+                // Reconstruct the kernel's metadata-only bitmap, then apply
+                // the same free-count and reserved-block checks below.
+                let system_blocks = if upper_geometry::has_sparse_super(group) {
+                    65
+                } else {
+                    0
+                };
+                for block in 0..system_blocks {
+                    bitmap[block / 8] |= 1 << (block % 8);
+                }
+                for block in std::iter::once(gd.block_bitmap_lo)
+                    .chain(std::iter::once(gd.inode_bitmap_lo))
+                    .chain(gd.inode_table_lo..gd.inode_table_lo + 512)
+                {
+                    let index = (block as u64 - group_start) as usize;
+                    bitmap[index / 8] |= 1 << (index % 8);
+                }
+            }
             let used: u64 = bitmap.iter().map(|byte| byte.count_ones() as u64).sum();
             assert_eq!(32768 - used, gd.free_blocks_count_lo as u64);
             for block in blocks..32768 {
@@ -176,6 +198,26 @@ mod tests {
                 }
             }
             read_at(&mut file, gd.inode_bitmap_lo as u64 * 4096, &mut bitmap);
+            if gd.flags & bg_flags::INODE_UNINIT != 0 {
+                assert!(bitmap.iter().all(|byte| *byte == 0));
+                assert_eq!(gd.free_inodes_count_lo, 8192);
+                assert_eq!(gd.itable_unused_lo, 8192);
+                assert_eq!(gd.used_dirs_count_lo, 0);
+                assert!(reader.metadata(group * 8192 + 1).is_err());
+                assert_eq!(
+                    gd.flags,
+                    bg_flags::INODE_UNINIT
+                        | bg_flags::INODE_ZEROED
+                        | if group == geometry.groups - 1 {
+                            0
+                        } else {
+                            bg_flags::BLOCK_UNINIT
+                        }
+                );
+                bitmap[1024..].fill(0xff);
+            } else {
+                assert_eq!(gd.flags, bg_flags::INODE_ZEROED);
+            }
             let used: u64 = bitmap.iter().map(|byte| byte.count_ones() as u64).sum();
             assert_eq!(32768 - used, gd.free_inodes_count_lo as u64);
             assert!(bitmap[1024..].iter().all(|byte| *byte == 0xff));
@@ -287,6 +329,180 @@ mod tests {
         {
             use std::os::unix::fs::MetadataExt;
             assert!(std::fs::metadata(&path).unwrap().blocks() * 512 < 256 << 20);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sparse_footprint(path: &std::path::Path) -> (usize, u64) {
+        use nix::errno::Errno;
+        use nix::unistd::{Whence, lseek};
+        use std::collections::BTreeSet;
+        use std::os::unix::fs::MetadataExt;
+
+        let mut file = File::open(path).unwrap();
+        let mut chunks = BTreeSet::new();
+        let mut buffer = [0u8; 64 << 10];
+        const CHUNK_BYTES: u64 = 8 << 20;
+        let size = file.metadata().unwrap().len();
+        let mut offset = 0;
+        while offset < size {
+            offset = match lseek(&file, offset as i64, Whence::SeekData) {
+                Ok(start) => start as u64,
+                Err(Errno::ENXIO) => break,
+                Err(error) => panic!("SEEK_DATA failed: {error}"),
+            };
+            let end = lseek(&file, offset as i64, Whence::SeekHole).unwrap() as u64;
+            assert!(offset < end && end <= size);
+            while offset < end {
+                let length = (end - offset)
+                    .min(buffer.len() as u64)
+                    .min(CHUNK_BYTES - offset % CHUNK_BYTES) as usize;
+                read_at(&mut file, offset, &mut buffer[..length]);
+                if buffer[..length].iter().any(|byte| *byte != 0) {
+                    chunks.insert(offset / CHUNK_BYTES);
+                }
+                offset += length as u64;
+            }
+        }
+        (chunks.len(), file.metadata().unwrap().blocks() * 512)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upper_sparse_chunk_footprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut measurements = Vec::new();
+        for (gib, expected_chunks) in [(30, 12usize), (100, 18), (500, 21)] {
+            let path = directory.path().join(format!("upper-{gib}.raw"));
+            let result = format_upper(&path, UpperCapacity::new(gib << 30).unwrap()).unwrap();
+            let (chunks, allocated) = sparse_footprint(&path);
+            eprintln!("{gib} GiB: {chunks} nonzero 8 MiB chunks, {allocated} allocated bytes");
+            measurements.push((gib, expected_chunks, chunks, allocated));
+            inspect(&path, result);
+            check_fresh_upper_with_e2fsprogs(&path, result);
+        }
+        for (gib, expected, chunks, allocated) in measurements {
+            // One chunk of tolerance covers boundary placement, not a
+            // per-block-group bitmap footprint that scales with capacity.
+            assert!(
+                chunks.abs_diff(expected) <= 1,
+                "{gib} GiB: expected {expected} +/- 1 nonzero chunks, got {chunks}"
+            );
+            assert!(allocated < 64 << 20, "{gib} GiB: allocated {allocated}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn e2fsprogs(tool: &str, args: &[&str]) -> Option<String> {
+        let output = match std::process::Command::new(format!("/usr/bin/{tool}"))
+            .args(args)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping {tool} validation: /usr/bin/{tool} is absent");
+                return None;
+            }
+            Err(error) => panic!("cannot execute {tool}: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "{tool} {args:?}: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(String::from_utf8(output.stdout).unwrap())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_fresh_upper_with_e2fsprogs(path: &std::path::Path, result: FormattedUpper) {
+        let name = path.to_str().unwrap();
+        if let Some(check) = e2fsprogs("e2fsck", &["-fn", name]) {
+            assert!(check.contains("Pass 5: Checking group summary information"));
+            eprintln!("{}: e2fsck -fn clean", path.display());
+        }
+        let Some(dump) = e2fsprogs("dumpe2fs", &[name]) else {
+            return;
+        };
+        for (field, expected) in [
+            ("Free blocks:", result.initial_free_bytes / 4096),
+            ("Free inodes:", result.initial_free_inodes),
+        ] {
+            let value = dump
+                .lines()
+                .find_map(|line| line.strip_prefix(field))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap();
+            assert_eq!(value, expected);
+        }
+        let features = dump
+            .lines()
+            .find_map(|line| line.strip_prefix("Filesystem features:"))
+            .unwrap();
+        assert!(features.split_whitespace().any(|flag| flag == "uninit_bg"));
+        assert!(
+            !features
+                .split_whitespace()
+                .any(|flag| flag == "metadata_csum")
+        );
+        let reader = Reader::new(path).unwrap();
+        let groups = (result.filesystem_bytes / 4096).div_ceil(32768) as u32;
+        let mut group_lines = dump.lines().filter(|line| line.starts_with("Group "));
+        for group in 0..groups {
+            let line = group_lines.next().unwrap();
+            assert!(line.starts_with(&format!("Group {group}:")), "{line}");
+            let gd = reader.get_group_descriptor(group).unwrap();
+            for (flag, label) in [
+                (bg_flags::INODE_UNINIT, "INODE_UNINIT"),
+                (bg_flags::BLOCK_UNINIT, "BLOCK_UNINIT"),
+                (bg_flags::INODE_ZEROED, "ITABLE_ZEROED"),
+            ] {
+                assert_eq!(line.contains(label), gd.flags & flag != 0, "{line}");
+            }
+        }
+        assert!(group_lines.next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upper_debugfs_initializes_lazy_bitmaps_on_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("upper.raw");
+        format_upper(&path, UpperCapacity::new(1 << 30).unwrap()).unwrap();
+        let before: Vec<_> = {
+            let reader = Reader::new(&path).unwrap();
+            (0..8)
+                .map(|group| reader.get_group_descriptor(group).unwrap())
+                .collect()
+        };
+        let name = path.to_str().unwrap();
+        if e2fsprogs("debugfs", &["-w", "-R", "write /dev/null /large", name]).is_none() {
+            return;
+        }
+        // Allocate 256 MiB without a large host payload. libext2fs must
+        // reconstruct at least one formerly BLOCK_UNINIT group's bitmap.
+        e2fsprogs("debugfs", &["-w", "-R", "fallocate /large 0 65535", name]).unwrap();
+        e2fsprogs(
+            "debugfs",
+            &["-w", "-R", "set_inode_field /large size 268435456", name],
+        )
+        .unwrap();
+        let reader = Reader::new(&path).unwrap();
+        assert!(
+            before.iter().enumerate().any(|(group, old)| {
+                let new = reader.get_group_descriptor(group as u32).unwrap();
+                old.flags & bg_flags::BLOCK_UNINIT != 0
+                    && new.flags & bg_flags::BLOCK_UNINIT == 0
+                    && new.free_blocks_count_lo < old.free_blocks_count_lo
+            }),
+            "debugfs must allocate in a formerly uninitialized block group"
+        );
+        if let Some(check) = e2fsprogs("e2fsck", &["-fn", name]) {
+            assert!(check.contains("Pass 5: Checking group summary information"));
+            eprintln!("debugfs 256 MiB allocation: e2fsck -fn clean");
         }
     }
 
