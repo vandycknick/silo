@@ -13,6 +13,21 @@
   descriptors, not bit-rot authentication; snapshot the child before verify,
   export or push. Perf separately reports the first and second child snapshots
   and the source snapshot after two forks without loosening existing targets.
+- Performance: a freshly formatted ext4 disk no longer writes block and inode
+  bitmaps into block groups already marked uninitialized, and marks its empty
+  inode tables as zeroed. A new 100 GiB disk has nonzero data in 18 of 12,800
+  8 MiB chunks, down from 800 (12 at 30 GiB, 21 at 500 GiB), so the first
+  snapshot of a new machine hashes about 144 MiB of disk, not 6.7 GB. The
+  footprint is nearly, not strictly, independent of disk size: a full snapshot
+  takes about 0.12 s longer with a 500 GiB disk than with a 30 GiB disk. The
+  first snapshot after a stop and restart still hashes all written disk data.
+- Performance: incremental RAM capture of a normally booted machine no longer
+  reads pages that are absent at the cut, such as memory the guest freed and
+  the host discarded; they are recorded as zero from pagemap. Machines restored
+  or forked from a RAM file still read every dirty page. Full identity for a
+  machine with a trusted RAM baseline reads the baseline's data extents plus
+  dirty pages, not the whole address space, and reports a typed fallback reason
+  when it cannot.
 - Fixed: restore inspection validates the pre-allocation intent separately from
   activation. Fork children bind their own complete, unidentified disk tracking
   seeds before activation admission. Host construction tests exercise raw and
