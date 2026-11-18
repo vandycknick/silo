@@ -30,16 +30,17 @@ def links_static(compiler: list[str]) -> bool:
 
 @cache
 def static_cc() -> tuple[str, ...]:
-    """`CC` when set, else the first candidate that links a static pthread program."""
+    """The first of `CC` and the candidates that links a static pthread program.
+
+    `CC` is only a preference: development shells export a dynamic-only `CC`
+    (Nix sets `CC=clang`) for host builds, which must not break guest probes.
+    """
     explicit = os.environ.get("CC")
-    if explicit:
-        compiler = shlex.split(explicit)
-        if not links_static(compiler):
-            raise SmokeEnvironmentError(f"CC={explicit!r} cannot link a static pthread program; unset CC to autodetect")
-        return tuple(compiler)
-    for candidate in _CANDIDATES:
-        if links_static([candidate]):
-            return (candidate,)
+    candidates = ([shlex.split(explicit)] if explicit else []) + [[candidate] for candidate in _CANDIDATES]
+    for compiler in candidates:
+        if links_static(compiler):
+            return tuple(compiler)
+    tried = ", ".join(" ".join(compiler) for compiler in candidates)
     raise SmokeEnvironmentError(
-        f"No C compiler links static guest probes (tried {', '.join(_CANDIDATES)}); "
-        "install static libc (glibc-static or musl) or set CC")
+        f"No C compiler links static guest probes (tried {tried}); "
+        "install static libc (glibc-static or musl) or set CC to one that does")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import platform
 from pathlib import Path
 import shutil
 import ssl
@@ -34,7 +33,7 @@ class Workspace:
     def __init__(self, config: SmokeConfig, registry_ca: Path, *, parent: Path | None = None, runtime_parent: Path | None = None) -> None:
         self.config = config
         if parent is None:
-            parent = workspace_parent() if platform.system() == "Linux" else Path(RUN_ROOT_PARENT)
+            parent = workspace_parent()
         self.root = Path(tempfile.mkdtemp(prefix="silo-smoke-", dir=parent))
         self.root.chmod(0o700)
         self.user_home = self.root / "user"

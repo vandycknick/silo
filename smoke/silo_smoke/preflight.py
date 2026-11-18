@@ -14,6 +14,7 @@ import warnings
 from . import procs
 from .config import RUN_ROOT_PARENT, SmokeConfig
 from .errors import SmokeEnvironmentError
+from .prereqs import workspace_parent
 
 
 def erofs_tool(name: str) -> str | None:
@@ -93,7 +94,7 @@ def _orphaned_processes() -> list[tuple[int, str]]:
     workspace is never touched: another smoke session may own it.
     """
     listing = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, check=False)
-    prefix = f"{RUN_ROOT_PARENT}/silo-smoke-"
+    prefix = f"{workspace_parent()}/silo-smoke-"
     orphans: list[tuple[int, str]] = []
     for line in listing.stdout.splitlines():
         pid_text, _, args = line.strip().partition(" ")

@@ -10,6 +10,7 @@ import pytest
 from .errors import SmokeEnvironmentError
 
 RUN_ROOT_PARENT = "/private/tmp" if platform.system() == "Darwin" else "/tmp"
+TMPFS_MAGIC = 0x01021994
 REPO = Path(__file__).resolve().parents[2]
 # Published multi-arch images every lane can rely on: the appliance comes from
 # .github/workflows/system-image.yml (the same dev default the daemon uses), the Arch

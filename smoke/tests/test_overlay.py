@@ -12,7 +12,7 @@ import pytest
 
 from silo_smoke import image_cache, images, overlay, procs, shutdown
 from silo_smoke.cli import Silo, timed
-from silo_smoke.config import REPO, SmokeConfig
+from silo_smoke.config import REPO, TMPFS_MAGIC, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
 
@@ -112,7 +112,7 @@ printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
 def test_overlay_sized_tmpfs_and_policy_removal(silo: Silo, overlay_image: str) -> None:
     name = "overlay-tmpfs"
     overlay.create(silo, name, overlay_image, "--tmpfs-size", "8mib")
-    assert overlay.filesystem_magic(silo, name, "/tmp") == overlay.TMPFS_MAGIC
+    assert overlay.filesystem_magic(silo, name, "/tmp") == TMPFS_MAGIC
     assert overlay.observation(silo, name)["root"]["temporaryDirectory"] == {"kind": "tmpfs", "capacityBytes": 8 * 1024**2}
     overlay.evidence(silo, name)
     assert silo.exec(name, "stat", "-c", "%a", "/tmp", user="root").stdout.strip() == "1777"
@@ -263,7 +263,7 @@ def test_overlay_replacement_growth_and_short_tails(silo: Silo, overlay_image: s
     name = "overlay-growth"
     if capacity >= 16 * 1024**3:
         host_fs = int(subprocess.run(["stat", "-f", "-c", "%t", str(silo.ws.root)], capture_output=True, text=True, check=True, timeout=15).stdout.strip(), 16)
-        assert host_fs != overlay.TMPFS_MAGIC, "large growth/copy gates require TMPDIR on a short durable /home path, not /tmp tmpfs"
+        assert host_fs != TMPFS_MAGIC, "large growth/copy gates require TMPDIR on a short durable /home path, not /tmp tmpfs"
     overlay.create(silo, name, overlay_image, capacity="64mib")
     silo.exec(name, overlay.PROBE, "durable", "/committed", user="root")
     before = overlay.observation(silo, name)

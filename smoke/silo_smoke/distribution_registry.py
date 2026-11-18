@@ -44,7 +44,6 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote, urlsplit
 
-from .config import RUN_ROOT_PARENT
 from .errors import SmokeAssertion, SmokeEnvironmentError
 from .registry import ensure_ca, issue_leaf_certificate
 from .prereqs import workspace_parent
@@ -512,11 +511,6 @@ def parse_gc_output(stdout: str, stderr: str, *, delete_untagged: bool, dry_run:
 _LISTENING = re.compile(r"listening on 127\.0\.0\.1:(\d+), tls")
 
 
-def default_parent() -> Path:
-    """Same durable scratch placement as `Workspace`, with short runtime sockets."""
-    return workspace_parent() if platform.system() == "Linux" else Path(RUN_ROOT_PARENT)
-
-
 class DistributionRegistry:
     """One disposable registry instance with persistent storage across restarts.
 
@@ -532,7 +526,7 @@ class DistributionRegistry:
                  startup_timeout: float = 30.0, stop_timeout: float = 20.0, gc_timeout: float = 300.0) -> None:
         self.installed = installed
         self.ca_path, _ = ensure_ca(cache_dir)
-        self.root = Path(tempfile.mkdtemp(prefix="silo-smoke-distribution-", dir=parent or default_parent()))
+        self.root = Path(tempfile.mkdtemp(prefix="silo-smoke-distribution-", dir=parent or workspace_parent()))
         self.root.chmod(0o700)
         self.storage = self.root / "storage"
         self.logs = self.root / "logs"
