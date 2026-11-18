@@ -13,7 +13,7 @@ import pytest
 
 from silo_smoke import areas, cloud_disk, config as smoke_config, image_cache, images, incremental, overlay, preflight, prereqs, restore, stopped
 from silo_smoke.cli import TIMINGS_PROPERTY, Silo, Vm, release, timed
-from silo_smoke.config import RUN_ROOT_PARENT, SmokeConfig
+from silo_smoke.config import SmokeConfig
 from silo_smoke.daemon import Daemon
 from silo_smoke.errors import SmokeEnvironmentError
 from silo_smoke.registry import LoopbackRegistry
@@ -47,7 +47,8 @@ def pytest_configure(config: pytest.Config) -> None:
             path = Path(config.option.xmlpath)
             config.option.xmlpath = str(path.with_name(f"{path.stem}-{lane}{path.suffix}"))
     if config.option.basetemp is None or hasattr(config, "workerinput"):
-        config.option.basetemp = tempfile.mkdtemp(prefix="ss-", dir=RUN_ROOT_PARENT)
+        # Fixture roots and probes are large: keep them off RAM-backed /tmp.
+        config.option.basetemp = tempfile.mkdtemp(prefix="ss-", dir=prereqs.workspace_parent())
 
 
 @pytest.hookimpl(hookwrapper=True)

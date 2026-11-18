@@ -35,7 +35,6 @@ PROBE = "/usr/local/bin/overlay-probe"
 PROFILE = "linux-erofs-overlay-v1"
 OVERLAYFS_SUPER_MAGIC = 0x794C7630
 EROFS_SUPER_MAGIC = 0xE0F5E1E2
-TMPFS_MAGIC = 0x01021994
 
 
 def native_capabilities(monitor: Path, *, diagnostic: Path | None = None) -> dict:

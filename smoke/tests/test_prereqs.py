@@ -165,11 +165,20 @@ def test_static_cc_autodetects_a_compiler_that_links_static(monkeypatch: pytest.
         toolchain.static_cc.cache_clear()
 
 
-def test_static_cc_refuses_an_explicit_compiler_that_cannot_link_static(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_static_cc_prefers_cc_but_falls_back_when_it_cannot_link_static(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CC", "false")
     toolchain.static_cc.cache_clear()
     try:
-        with pytest.raises(SmokeEnvironmentError, match="CC='false'"):
-            toolchain.static_cc()
+        compiler = toolchain.static_cc()
+        assert compiler != ("false",) and toolchain.links_static(list(compiler))
     finally:
         toolchain.static_cc.cache_clear()
+
+
+@pytest.mark.linux_only
+def test_scratch_refuses_tmpfs_and_defaults_to_durable_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TMPDIR", "/dev/shm")
+    with pytest.raises(SmokeEnvironmentError, match="tmpfs"):
+        prereqs.workspace_parent()
+    monkeypatch.delenv("TMPDIR")
+    assert prereqs.workspace_parent().is_relative_to(Path.home())

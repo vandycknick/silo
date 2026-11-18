@@ -279,6 +279,19 @@ With `CI=true`, nextest uses the `ci` profile and writes JUnit results under
 `target/nextest/ci/junit.xml` (under `CARGO_TARGET_DIR` when overridden).
 Real-VM qualification is separate; see the [smoke suite](smoke/README.md).
 
+For manual testing, give each build its own `SILO_HOME` on a disk-backed
+directory, never `/tmp`: on most Linux hosts `/tmp` is tmpfs, so image streams
+and multi-GiB guest disks would sit in RAM and reflink copies would not apply.
+
+```bash
+make build PROFILE=release
+mkdir -p ~/sm && export SILO_HOME=$(mktemp -d ~/sm/silo.XXXXXX)
+target/release/silo create alpine:3.21 --name dev
+```
+
+Sockets and locks still go to the short runtime directory (`/tmp/silo-$UID`),
+which holds no disk bytes. Stop every VM before deleting a scratch home.
+
 ## CLI
 
 Tracing diagnostics go to stderr, separately from command results on stdout.

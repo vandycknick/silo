@@ -14,7 +14,7 @@ import tempfile
 import tomllib
 
 from .areas import AREAS
-from .config import REPO
+from .config import REPO, RUN_ROOT_PARENT, TMPFS_MAGIC
 from .errors import SmokeEnvironmentError
 
 
@@ -122,12 +122,22 @@ def evidence_parent(variable: str = "SILO_SMOKE_EVIDENCE") -> Path:
 
 
 def workspace_parent() -> Path:
-    # Durable storage (reflinks, no RAM-backed multi-GiB files) at a short,
-    # canonical path: Unix socket paths under it must fit SUN_LEN, and the
-    # repo's target dir is too deep for that. TMPDIR stays an override.
+    """Durable scratch root for smoke Homes, registries and pytest temp files.
+
+    Linux defaults to `${XDG_CACHE_HOME:-~/.cache}/silo/smoke`: disk-backed
+    (reflinks, multi-GiB sparse disks) and short enough for Unix socket paths,
+    unlike the repo's target dir. `TMPDIR` overrides it but must not be tmpfs,
+    which would hold every guest disk in RAM. macOS `/private/tmp` is on disk.
+    """
+    if platform.system() != "Linux":
+        return Path(RUN_ROOT_PARENT)
     cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
     parent = Path(os.environ.get("TMPDIR", str(cache / "silo/smoke"))).expanduser().resolve()
     parent.mkdir(parents=True, exist_ok=True)
+    magic = subprocess.run(["stat", "-f", "-c", "%t", str(parent)], capture_output=True, text=True, check=True, timeout=15)
+    if int(magic.stdout.strip(), 16) == TMPFS_MAGIC:
+        raise SmokeEnvironmentError(f"smoke scratch {parent} is tmpfs and would hold guest disks in RAM; "
+                                    "unset TMPDIR or point it at a durable directory such as ~/sm")
     return parent
 
 

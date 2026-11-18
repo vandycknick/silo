@@ -55,9 +55,11 @@ No selected cases (pytest exit 5) is successful. `SMOKE_MARK=` removes the defau
 fixed-port cases never overlap workers.
 
 JUnit paths are suffixed `-parallel` and `-serial`. Each worker owns its fixtures,
-Homes and short pytest base. Linux durable workspaces default to
-`${XDG_CACHE_HOME:-~/.cache}/silo/smoke` (short enough for Unix socket paths;
-`TMPDIR` overrides it); long paths move only sockets/locks to `/tmp`.
+Homes and short pytest base. Linux Homes, registries and the pytest base all
+live under `${XDG_CACHE_HOME:-~/.cache}/silo/smoke`, which must be disk-backed:
+guest disks are multi-GiB sparse files and reflink copies, and `/tmp` is usually
+tmpfs (RAM). `TMPDIR` overrides the location (for example `TMPDIR=~/sm`) and is
+refused if it is tmpfs. Long paths move only sockets/locks to `/tmp`.
 Retained per-run evidence defaults to `$CARGO_TARGET_DIR/smoke/evidence/run-*`,
 with unique cohort/worker suffixes. Failed workspaces remain; `--keep` also keeps
 successes. Never share a live VM or mutable Home across workers.
@@ -99,10 +101,10 @@ automatically provisioned and never touch hosted credentials. Internet-dependent
 | IRQ diagnostic producer/witness | Separate `smoke-diagnostic` target directory and real xtask stage with `restore-irq-probe`; per-test private runtime and automatically assembled witness |
 | `SILO_SMOKE_FILESYSTEM_OBSERVER` / Go extractor | Existing `changeset-extractor` Make target, `CGO_ENABLED=0`, local Go >=1.26.6, only for eligible slow cases; precise Go skip otherwise |
 | `SILO_SMOKE_EVIDENCE`, `SILO_SMOKE_RESTORED_EVIDENCE` | Automatically created durable per-run evidence; env overrides optional |
-| `TMPDIR` | Optional scratch placement; default durable workspace root, short separate runtime sockets |
+| `TMPDIR` | Optional durable scratch root (default `${XDG_CACHE_HOME:-~/.cache}/silo/smoke`); refused on tmpfs; runtime sockets stay short and separate |
 | `SILO_SMOKE_STOPPED_DIR`, `SILO_SMOKE_STOPPED_FS` | Only actual host-ext4 gate is owner opt-in; exact enable command above |
 | `SILO_SMOKE_CAPTURE_FS` | Optional assertion on the observed host filesystem, not fixture setup |
-| Static C/Rust/assembly guest probes (`CC`, rustc, as/ld/objcopy/nm) | Built by session/test fixtures from repository or pinned native sources. `CC` is optional: unset, the first of `cc`, `gcc`, `/usr/bin/cc`, `/usr/bin/gcc`, `clang`, `musl-gcc` that links a static pthread program is used (`silo_smoke/toolchain.py`) |
+| Static C/Rust/assembly guest probes (`CC`, rustc, as/ld/objcopy/nm) | Built by session/test fixtures from repository or pinned native sources. The probe compiler is the first of `$CC`, `cc`, `gcc`, `/usr/bin/cc`, `/usr/bin/gcc`, `clang`, `musl-gcc` that links a static pthread program (`silo_smoke/toolchain.py`), so a dynamic-only `CC` such as Nix's clang falls through |
 | Alpine and OCI fixtures, ext4 images | Downloaded with pinned integrity or constructed by existing fixture builders, never prebuilt by hand |
 | Local loopback/Distribution registries and TLS CA | Existing automatic private registry fixtures and verified release cache |
 | `SILO_SMOKE_SYSTEM_IMAGE`, `SILO_SMOKE_DISTRO_IMAGES` | Public defaults; optional reference overrides or explicit empty opt-out |
