@@ -16,6 +16,13 @@
   are removed. Snapshot push is unavailable until it has mandatory encryption.
   The schema changes in place; a fresh `SILO_HOME` is required, with no
   migration.
+- Breaking: the VM artifact config drops `purpose`, `captureKind`,
+  `rootFamily`, `backendRequirement` and `minimumCapabilities`. It now has
+  `root` (`opaque-raw` or `linux-erofs-overlay`, which determines the
+  backend), a top-level `bootAbi`, and `memory`, which is `null` except for a
+  snapshot with memory and folds in the execution requirements and capture
+  provenance. Artifacts published before this change are refused. The format
+  is specified in `docs/architecture/vm-artifact.md`.
 - Breaking: live forks now retain owned local cuts without computing content
   hashes or publishing RAM/disk maps or pool objects. Capture/restore records
   and the initial catalog format change in place; recreate existing homes,

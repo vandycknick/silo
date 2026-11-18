@@ -98,11 +98,8 @@ macro_rules! wire_enum {
     };
 }
 wire_enum!(ContentKind { Image => "image", Snapshot => "snapshot" });
-wire_enum!(Purpose { Image => "image", Checkpoint => "checkpoint" });
-wire_enum!(CaptureKind { StoppedStorage => "stopped-storage", LiveExecution => "live-execution" });
-wire_enum!(RootFamily { OpaqueRaw => "opaque-raw", LinuxOverlay => "linux-overlay" });
-wire_enum!(BackendRequirement { RawBlock => "raw-block", KrunOverlay => "krun-overlay" });
-wire_enum!(StorageProfile { OpaqueRawV1 => "opaque-raw-v1", LinuxErofsOverlayV1 => "linux-erofs-overlay-v1" });
+wire_enum!(Root { OpaqueRaw => "opaque-raw", LinuxErofsOverlay => "linux-erofs-overlay" });
+wire_enum!(Execution { KrunV1 => "krun-v1" });
 wire_enum!(GuestOs { Linux => "linux" });
 wire_enum!(Architecture { Amd64 => "amd64", Arm64 => "arm64" });
 
@@ -121,13 +118,6 @@ pub struct GuestPlatform {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MinimumCapabilities {
-    pub storage_profile: StorageProfile,
-    pub boot_abi: String,
-    pub live_restore: bool,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompatibilityProfile {
     pub live_state_schema: String,
     pub architecture: String,
@@ -135,14 +125,17 @@ pub struct CompatibilityProfile {
     pub topology: ContentDigest,
     pub ram_layout: ContentDigest,
 }
+/// What restoring the memory of a snapshot requires, and the record that
+/// proves how it was captured.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExecutionRequirements {
-    pub kind: String,
+pub struct MemoryRequirements {
+    pub execution: Execution,
     pub execution_version: u32,
     pub execution_abi: u32,
     pub device_version: u32,
     pub compatibility_profile: CompatibilityProfile,
+    pub provenance: RecordRef,
 }
 
 fn required_nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
@@ -151,55 +144,42 @@ fn required_nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     Option::<T>::deserialize(d)
 }
 
+/// The config blob of the metadata manifest. The normative description is
+/// `docs/architecture/vm-artifact.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct VmArtifactConfigV2 {
+pub struct VmArtifactConfig {
     pub schema: u32,
     pub kind: String,
     pub encoding: String,
     pub content: ContentRef,
-    pub purpose: Purpose,
-    #[serde(deserialize_with = "required_nullable")]
-    pub capture_kind: Option<CaptureKind>,
-    pub root_family: RootFamily,
-    pub backend_requirement: BackendRequirement,
+    pub root: Root,
     pub guest_platform: GuestPlatform,
-    pub minimum_capabilities: MinimumCapabilities,
+    pub boot_abi: String,
+    /// Present exactly for a snapshot with memory.
     #[serde(deserialize_with = "required_nullable")]
-    pub execution_requirements: Option<ExecutionRequirements>,
+    pub memory: Option<MemoryRequirements>,
     pub streams: RecordRef,
     pub objects: RecordRef,
-    #[serde(deserialize_with = "required_nullable")]
-    pub capture_provenance: Option<RecordRef>,
 }
-impl VmArtifactConfigV2 {
+impl VmArtifactConfig {
     pub fn validate(&self) -> Result<()> {
         if self.schema != 2 || self.kind != "vm-artifact" || self.encoding != "silo-chunks-v2" {
             return Err(invalid(
                 "unsupported artifact format: fresh-state v2 required",
             ));
         }
-        let live = self.capture_kind == Some(CaptureKind::LiveExecution);
-        match (self.content.kind, self.purpose, self.capture_kind) {
-            (ContentKind::Image, Purpose::Image, None)
-            | (ContentKind::Snapshot, Purpose::Checkpoint, Some(_)) => {}
-            _ => return Err(invalid("inconsistent content kind/purpose/capture kind")),
+        if self.content.kind == ContentKind::Image && self.memory.is_some() {
+            return Err(invalid("an image artifact cannot carry memory"));
         }
-        if live != self.execution_requirements.is_some()
-            || live != self.capture_provenance.is_some()
-            || live != self.minimum_capabilities.live_restore
-        {
-            return Err(invalid("inconsistent execution requirements/provenance"));
-        }
-        if let Some(requirements) = &self.execution_requirements {
-            if requirements.kind != "krun-v1"
-                || requirements.execution_version != 1
-                || requirements.execution_abi != 1
-                || requirements.device_version != 1
+        if let Some(memory) = &self.memory {
+            if memory.execution_version != 1
+                || memory.execution_abi != 1
+                || memory.device_version != 1
             {
                 return Err(invalid("unsupported execution schema/ABI"));
             }
-            let profile = &requirements.compatibility_profile;
+            let profile = &memory.compatibility_profile;
             if profile.live_state_schema.is_empty()
                 || profile.live_state_schema.len() > 256
                 || profile.live_state_schema.contains('\0')
@@ -210,49 +190,38 @@ impl VmArtifactConfigV2 {
                 return Err(invalid("state schema or architecture byte bound"));
             }
         }
-        match (
-            self.root_family,
-            self.backend_requirement,
-            self.minimum_capabilities.storage_profile,
-        ) {
-            (RootFamily::OpaqueRaw, BackendRequirement::RawBlock, StorageProfile::OpaqueRawV1)
-            | (
-                RootFamily::LinuxOverlay,
-                BackendRequirement::KrunOverlay,
-                StorageProfile::LinuxErofsOverlayV1,
-            ) => {}
-            _ => return Err(invalid("inconsistent root/backend/storage profile")),
-        }
         for reference in [
             Some(self.content.record),
             Some(self.streams),
             Some(self.objects),
-            self.capture_provenance,
+            self.provenance(),
         ]
         .into_iter()
         .flatten()
         {
             reference.payload().validate()?;
         }
-        if self.minimum_capabilities.boot_abi.is_empty() {
+        if self.boot_abi.is_empty() {
             return Err(invalid("empty boot ABI"));
         }
         Ok(())
     }
+
+    /// The capture provenance record of a snapshot with memory.
+    pub fn provenance(&self) -> Option<RecordRef> {
+        self.memory.as_ref().map(|memory| memory.provenance)
+    }
 }
-pub fn decode_vm_config(bytes: &[u8]) -> Result<VmArtifactConfigV2> {
+pub fn decode_vm_config(bytes: &[u8]) -> Result<VmArtifactConfig> {
     let value: Value = decode_record(bytes)?;
-    if let Some(profile) = value
-        .pointer("/minimumCapabilities/storageProfile")
-        .and_then(Value::as_str)
-    {
-        if !matches!(profile, "opaque-raw-v1" | "linux-erofs-overlay-v1") {
-            return Err(crate::vm_artifact::Error::IncompatibleStorageProfile {
-                profile: profile.to_owned(),
+    if let Some(root) = value.get("root").and_then(Value::as_str) {
+        if serde_json::from_value::<Root>(Value::from(root)).is_err() {
+            return Err(crate::vm_artifact::Error::UnsupportedRoot {
+                root: root.to_owned(),
             });
         }
     }
-    let config: VmArtifactConfigV2 = serde_json::from_value(value)?;
+    let config: VmArtifactConfig = serde_json::from_value(value)?;
     config.validate()?;
     Ok(config)
 }
@@ -720,119 +689,267 @@ impl<'de> Deserialize<'de> for StrictValue {
 mod tests {
     use crate::changeset::model::{ContentDigest, StreamIdentity};
     use crate::vm_artifact::wire::{
-        self, ChunkEntry, RecordBlob, RecordRef, TransferPage, TransferRoot, CHUNK_SIZE,
-        MAX_METADATA_BYTES, MAX_PAGE_ENTRIES, MAX_STREAM_BYTES,
+        self, Architecture, ChunkEntry, CompatibilityProfile, ContentKind, ContentRef, Execution,
+        GuestOs, GuestPlatform, MemoryRequirements, RecordBlob, RecordRef, Root, TransferPage,
+        TransferRoot, VmArtifactConfig, CHUNK_SIZE, MAX_METADATA_BYTES, MAX_PAGE_ENTRIES,
+        MAX_STREAM_BYTES,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
 
-    fn config_value() -> serde_json::Value {
-        let reference = RecordRef::of_bytes(b"record");
-        json!({"schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
-            "content":{"kind":"image","id":reference.digest,"record":reference},
-            "purpose":"image","captureKind":null,"rootFamily":"opaque-raw","backendRequirement":"raw-block",
-            "guestPlatform":{"os":"linux","architecture":"arm64"},
-            "minimumCapabilities":{"storageProfile":"opaque-raw-v1","bootAbi":"linux-direct-v1","liveRestore":false},
-            "executionRequirements":null,"streams":reference,"objects":reference,"captureProvenance":null})
+    /// The normative specification. Its example configs must be the pretty
+    /// form of the golden bytes below, so the document cannot drift from the
+    /// encoder.
+    const SPEC: &str = include_str!("../../../../docs/architecture/vm-artifact.md");
+    const IMAGE_GOLDEN: &str = r#"{"bootAbi":"silo-direct-v2","content":{"id":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kind":"image","record":{"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":1874}},"encoding":"silo-chunks-v2","guestPlatform":{"architecture":"arm64","os":"linux"},"kind":"vm-artifact","memory":null,"objects":{"digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":655},"root":"linux-erofs-overlay","schema":2,"streams":{"digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333","size":412}}"#;
+    const SNAPSHOT_GOLDEN: &str = r#"{"bootAbi":"silo-direct-v2","content":{"id":"sha256:5555555555555555555555555555555555555555555555555555555555555555","kind":"snapshot","record":{"digest":"sha256:6666666666666666666666666666666666666666666666666666666666666666","size":2306}},"encoding":"silo-chunks-v2","guestPlatform":{"architecture":"amd64","os":"linux"},"kind":"vm-artifact","memory":{"compatibilityProfile":{"architecture":"x86_64","liveStateSchema":"silo.live-state/1","profile":"sha256:7777777777777777777777777777777777777777777777777777777777777777","ramLayout":"sha256:9999999999999999999999999999999999999999999999999999999999999999","topology":"sha256:8888888888888888888888888888888888888888888888888888888888888888"},"deviceVersion":1,"execution":"krun-v1","executionAbi":1,"executionVersion":1,"provenance":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":2210}},"objects":{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":1957},"root":"opaque-raw","schema":2,"streams":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1203}}"#;
+
+    fn reference(fill: u8, size: u64) -> RecordRef {
+        RecordRef {
+            digest: ContentDigest::from_sha256([fill; 32]),
+            size,
+        }
+    }
+
+    fn image_config() -> VmArtifactConfig {
+        VmArtifactConfig {
+            schema: 2,
+            kind: "vm-artifact".into(),
+            encoding: "silo-chunks-v2".into(),
+            content: ContentRef {
+                kind: ContentKind::Image,
+                id: ContentDigest::from_sha256([0x11; 32]),
+                record: reference(0x22, 1874),
+            },
+            root: Root::LinuxErofsOverlay,
+            guest_platform: GuestPlatform {
+                os: GuestOs::Linux,
+                architecture: Architecture::Arm64,
+            },
+            boot_abi: "silo-direct-v2".into(),
+            memory: None,
+            streams: reference(0x33, 412),
+            objects: reference(0x44, 655),
+        }
+    }
+
+    fn snapshot_config() -> VmArtifactConfig {
+        VmArtifactConfig {
+            content: ContentRef {
+                kind: ContentKind::Snapshot,
+                id: ContentDigest::from_sha256([0x55; 32]),
+                record: reference(0x66, 2306),
+            },
+            root: Root::OpaqueRaw,
+            guest_platform: GuestPlatform {
+                os: GuestOs::Linux,
+                architecture: Architecture::Amd64,
+            },
+            memory: Some(MemoryRequirements {
+                execution: Execution::KrunV1,
+                execution_version: 1,
+                execution_abi: 1,
+                device_version: 1,
+                compatibility_profile: CompatibilityProfile {
+                    live_state_schema: "silo.live-state/1".into(),
+                    architecture: "x86_64".into(),
+                    profile: ContentDigest::from_sha256([0x77; 32]),
+                    topology: ContentDigest::from_sha256([0x88; 32]),
+                    ram_layout: ContentDigest::from_sha256([0x99; 32]),
+                },
+                provenance: reference(0xaa, 2210),
+            }),
+            streams: reference(0xbb, 1203),
+            objects: reference(0xcc, 1957),
+            ..image_config()
+        }
+    }
+
+    fn value(config: &VmArtifactConfig) -> serde_json::Value {
+        serde_json::to_value(config).unwrap()
+    }
+
+    fn decode(value: &serde_json::Value) -> crate::vm_artifact::Result<VmArtifactConfig> {
+        wire::decode_vm_config(&serde_json::to_vec(value).unwrap())
+    }
+
+    /// The JSON block that follows `<!-- golden: NAME -->` in the spec.
+    fn documented(name: &str) -> &'static str {
+        let marker = format!("<!-- golden: {name} -->\n```json\n");
+        let start = SPEC.find(&marker).expect("documented example") + marker.len();
+        let end = start + SPEC[start..].find("```").expect("closed example");
+        &SPEC[start..end]
+    }
+
+    #[test]
+    fn golden_configs_are_canonical_and_documented_verbatim() {
+        for (name, config, golden) in [
+            ("image-config", image_config(), IMAGE_GOLDEN),
+            ("snapshot-config", snapshot_config(), SNAPSHOT_GOLDEN),
+        ] {
+            assert_eq!(
+                String::from_utf8(wire::canonical_bytes(&config).unwrap()).unwrap(),
+                golden,
+                "{name}"
+            );
+            assert_eq!(wire::decode_vm_config(golden.as_bytes()).unwrap(), config);
+            let pretty =
+                serde_json::to_string_pretty(&wire::strict_value(golden.as_bytes()).unwrap())
+                    .unwrap();
+            assert_eq!(documented(name), format!("{pretty}\n"), "{name}");
+        }
     }
 
     #[test]
     fn old_artifact_format_is_refused_clearly() {
-        let mut value = config_value();
+        let mut value = value(&image_config());
         value["schema"] = json!(1);
         value["encoding"] = json!("silo-chunks-v1");
-        let error = wire::decode_vm_config(&wire::canonical_bytes(&value).unwrap()).unwrap_err();
+        let error = decode(&value).unwrap_err();
         assert!(error.to_string().contains("fresh-state v2 required"));
     }
 
     #[test]
-    fn erofs_profile_is_explicit_and_retired_profiles_have_typed_refusals() {
-        let mut value = config_value();
-        value["rootFamily"] = json!("linux-overlay");
-        value["backendRequirement"] = json!("krun-overlay");
-        value["minimumCapabilities"]["storageProfile"] = json!("linux-erofs-overlay-v1");
-        assert!(wire::decode_vm_config(&wire::canonical_bytes(&value).unwrap()).is_ok());
-        for profile in [
-            "linux-overlay-v1",
-            "linux-flat-overlay-v1",
-            "future-overlay-v9",
+    fn known_roots_decode_and_unknown_roots_have_typed_refusals() {
+        let mut value = value(&image_config());
+        for (spelling, root) in [
+            ("opaque-raw", Root::OpaqueRaw),
+            ("linux-erofs-overlay", Root::LinuxErofsOverlay),
         ] {
-            value["minimumCapabilities"]["storageProfile"] = json!(profile);
+            value["root"] = json!(spelling);
+            assert_eq!(decode(&value).unwrap().root, root);
+        }
+        for retired in [
+            "linux-overlay",
+            "opaque-raw-v1",
+            "linux-erofs-overlay-v1",
+            "future-root",
+        ] {
+            value["root"] = json!(retired);
             assert!(matches!(
-                wire::decode_vm_config(&wire::canonical_bytes(&value).unwrap()),
-                Err(crate::vm_artifact::Error::IncompatibleStorageProfile { profile: refused })
-                    if refused == profile
+                decode(&value),
+                Err(crate::vm_artifact::Error::UnsupportedRoot { root }) if root == retired
             ));
         }
+        value["root"] = json!(7);
+        assert!(matches!(
+            decode(&value),
+            Err(crate::vm_artifact::Error::Json(_))
+        ));
     }
+
     #[test]
-    fn config_golden_and_required_nullable_closed_fields() {
-        let value = config_value();
-        let bytes = wire::canonical_bytes(&value).unwrap();
-        let config = wire::decode_vm_config(&bytes).unwrap();
-        assert_eq!(wire::canonical_bytes(&config).unwrap(), bytes);
-        for field in [
-            "schema",
-            "captureKind",
-            "executionRequirements",
-            "captureProvenance",
-        ] {
-            let mut missing = value.clone();
-            missing.as_object_mut().unwrap().remove(field);
-            assert!(
-                wire::decode_vm_config(&serde_json::to_vec(&missing).unwrap()).is_err(),
-                "{field}"
-            );
+    fn required_fields_and_unknown_fields_are_rejected_everywhere() {
+        for config in [image_config(), snapshot_config()] {
+            let value = value(&config);
+            assert_eq!(decode(&value).unwrap(), config);
+            for field in value.as_object().unwrap().keys() {
+                let mut missing = value.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(decode(&missing).is_err(), "{field}");
+            }
+            for retired in [
+                "purpose",
+                "captureKind",
+                "rootFamily",
+                "backendRequirement",
+                "minimumCapabilities",
+                "executionRequirements",
+                "captureProvenance",
+                "extra",
+            ] {
+                let mut bad = value.clone();
+                bad[retired] = json!(null);
+                assert!(decode(&bad).is_err(), "{retired}");
+            }
+            for nested in ["/content", "/content/record", "/guestPlatform", "/streams"] {
+                let mut bad = value.clone();
+                bad.pointer_mut(nested).unwrap()["unexpected"] = json!(0);
+                assert!(decode(&bad).is_err(), "{nested}");
+            }
         }
-        for (field, replacement) in [
-            ("schema", json!(1)),
-            ("rootFamily", json!("unknown")),
-            ("backendRequirement", json!("krun-overlay")),
-            ("captureKind", json!("live-execution")),
-            ("extra", json!(true)),
+        let mut bad = value(&snapshot_config());
+        for nested in [
+            "/memory",
+            "/memory/compatibilityProfile",
+            "/memory/provenance",
         ] {
+            let mut bad = bad.clone();
+            bad.pointer_mut(nested).unwrap()["unexpected"] = json!(0);
+            assert!(decode(&bad).is_err(), "{nested}");
+        }
+        bad["bootAbi"] = json!("");
+        assert!(decode(&bad).is_err());
+    }
+
+    #[test]
+    fn an_image_config_with_memory_is_rejected() {
+        let mut image = value(&image_config());
+        image["memory"] = value(&snapshot_config())["memory"].clone();
+        assert!(decode(&image)
+            .unwrap_err()
+            .to_string()
+            .contains("an image artifact cannot carry memory"));
+        let mut snapshot = value(&snapshot_config());
+        snapshot["memory"] = json!(null);
+        assert_eq!(decode(&snapshot).unwrap().provenance(), None);
+    }
+
+    #[test]
+    fn a_snapshot_with_memory_requires_provenance() {
+        let config = snapshot_config();
+        assert_eq!(config.provenance(), Some(reference(0xaa, 2210)));
+        let mut missing = value(&config);
+        missing["memory"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provenance");
+        assert!(decode(&missing).is_err());
+        let mut null = value(&config);
+        null["memory"]["provenance"] = json!(null);
+        assert!(decode(&null).is_err());
+    }
+
+    #[test]
+    fn memory_uses_a_closed_execution_set_versions_and_byte_bounds() {
+        let value = value(&snapshot_config());
+        for execution in [json!("krun-v2"), json!("vz-v1"), json!(""), json!(1)] {
             let mut bad = value.clone();
-            bad[field] = replacement;
-            assert!(
-                wire::decode_vm_config(&serde_json::to_vec(&bad).unwrap()).is_err(),
-                "{field}"
-            );
+            bad["memory"]["execution"] = execution;
+            assert!(decode(&bad).is_err());
         }
-        let mut bad = value;
-        bad["guestPlatform"]["unexpected"] = json!(0);
-        assert!(wire::decode_vm_config(&serde_json::to_vec(&bad).unwrap()).is_err());
-    }
-    #[test]
-    fn live_requirements_use_state_schema_architecture_and_closed_versions() {
-        let mut value = config_value();
-        let digest = ContentDigest::of_bytes(b"pin");
-        value["content"]["kind"] = json!("snapshot");
-        value["purpose"] = json!("checkpoint");
-        value["captureKind"] = json!("live-execution");
-        value["minimumCapabilities"]["liveRestore"] = json!(true);
-        value["captureProvenance"] = json!(RecordRef::of_bytes(b"provenance"));
-        value["executionRequirements"] = json!({"kind":"krun-v1","executionVersion":1,"executionAbi":1,"deviceVersion":1,
-            "compatibilityProfile":{"liveStateSchema":"silo.live-state/1","architecture":"x86_64","profile":digest,"topology":digest,"ramLayout":digest}});
-        assert!(wire::decode_vm_config(&serde_json::to_vec(&value).unwrap()).is_ok());
         for schema in [json!(""), json!("x".repeat(257)), json!(false)] {
             let mut bad = value.clone();
-            bad["executionRequirements"]["compatibilityProfile"]["liveStateSchema"] = schema;
-            assert!(wire::decode_vm_config(&serde_json::to_vec(&bad).unwrap()).is_err());
+            bad["memory"]["compatibilityProfile"]["liveStateSchema"] = schema;
+            assert!(decode(&bad).is_err());
         }
         for architecture in [json!(""), json!("x".repeat(33)), json!(false)] {
             let mut bad = value.clone();
-            bad["executionRequirements"]["compatibilityProfile"]["architecture"] = architecture;
-            assert!(wire::decode_vm_config(&serde_json::to_vec(&bad).unwrap()).is_err());
+            bad["memory"]["compatibilityProfile"]["architecture"] = architecture;
+            assert!(decode(&bad).is_err());
         }
         for field in ["executionVersion", "executionAbi", "deviceVersion"] {
             let mut bad = value.clone();
-            bad["executionRequirements"][field] = json!(2);
-            assert!(wire::decode_vm_config(&serde_json::to_vec(&bad).unwrap()).is_err());
+            bad["memory"][field] = json!(2);
+            assert!(decode(&bad).is_err());
         }
-        for field in ["executionRequirements", "captureProvenance"] {
-            let mut bad = value.clone();
-            bad[field] = serde_json::Value::Null;
-            assert!(wire::decode_vm_config(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+
+    #[test]
+    fn every_record_reference_is_within_the_record_bound() {
+        let value = value(&snapshot_config());
+        for pointer in [
+            "/content/record",
+            "/streams",
+            "/objects",
+            "/memory/provenance",
+        ] {
+            let mut at_bound = value.clone();
+            at_bound.pointer_mut(pointer).unwrap()["size"] = json!(MAX_METADATA_BYTES);
+            assert!(decode(&at_bound).is_ok(), "{pointer}");
+            let mut over = value.clone();
+            over.pointer_mut(pointer).unwrap()["size"] = json!(MAX_METADATA_BYTES + 1);
+            assert!(decode(&over).is_err(), "{pointer}");
         }
     }
     #[test]
