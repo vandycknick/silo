@@ -1,11 +1,13 @@
-//! Canonical immutable images in the shared image/snapshot alias namespace.
-//! Slow reads run in the actual lease-owning blocking worker. Root locks cover
-//! only catalog rechecks and publication commits, never whole-stream hashing.
-//! Appendable history is authenticated one bounded blob page at a time; aliases
-//! use 64-name pages. Inspection/list responses admit at most the existing
-//! MetadataPageBytes and MetadataPageEntries totals across managed images.
-//! They fail explicitly rather than truncating; consumers and GC need no
-//! diagnostic aggregate and can authenticate larger histories.
+//! Canonical immutable stored images (imported, converted or pulled raw
+//! images). Names live in the shared `image_name` table with cached OCI
+//! images; snapshots have their own names. Slow reads run in the actual
+//! lease-owning blocking worker. Root locks cover only catalog rechecks and
+//! publication commits, never whole-stream hashing. Appendable history is
+//! authenticated one bounded blob page at a time; names use 64-name pages.
+//! Inspection/list responses admit at most the existing MetadataPageBytes and
+//! MetadataPageEntries totals across stored images. They fail explicitly
+//! rather than truncating; consumers and GC need no diagnostic aggregate and
+//! can authenticate larger histories.
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::sync::Arc;
@@ -13,10 +15,7 @@ use std::sync::Arc;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::image::import_types::{
-    ImageProvenance, ManagedImageInfo, ManagedSourceId, ManagedSourceInfo, ManagedSourceRef,
-    RawConversionKey,
-};
+use crate::image::import_types::{ImageProvenance, RawConversionKey, StoredImageInfo};
 use crate::storage::identity::{ImageId, ObjectDigest, StreamId};
 use crate::storage::limits::Resource;
 use crate::storage::locks::StorageLock;
@@ -25,35 +24,35 @@ use crate::storage::stream::AuthenticatedStream;
 use crate::store::models::image::{image_id, ImageRecord};
 use crate::store::models::snapshot::{canonical_value, decode_identity_value};
 use crate::store::snapshot_store::{
-    bind_held, bind_reopened, recheck_closure, require_operation_closure, validate_alias,
-    verify_artifact_closure, AuthenticatedClosure, RecordInput, SnapshotRef, SnapshotStore,
+    bind_held, bind_reopened, recheck_closure, require_operation_closure, verify_artifact_closure,
+    AuthenticatedClosure, RecordInput,
 };
 use crate::store::Store;
 use crate::LibVmError;
 
 fn invalid(message: impl std::fmt::Display) -> LibVmError {
     LibVmError::InvalidStorageRecord {
-        record: "managed-image",
+        record: "stored-image",
         message: message.to_string(),
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct ManagedImageStore {
+pub(crate) struct StoredImageStore {
     store: Arc<Store>,
 }
 
 /// Not Clone: the actual copying worker must own this complete capability.
 /// Dropping a caller future cannot close the original operation OFD in that worker.
-pub(crate) struct ManagedImageConsumer {
-    pub info: ManagedImageRoot,
+pub(crate) struct StoredImageConsumer {
+    pub info: StoredImageRoot,
     pub operation_id: Uuid,
     _lease: StorageLock,
     closure: AuthenticatedClosure,
     _store: Arc<Store>,
 }
 
-impl ManagedImageConsumer {
+impl StoredImageConsumer {
     pub(crate) fn operation_id(&self) -> Uuid {
         self.operation_id
     }
@@ -89,49 +88,19 @@ impl ManagedImageConsumer {
     }
 }
 
-impl ManagedImageStore {
+impl StoredImageStore {
     pub(crate) fn from_store(store: Arc<Store>) -> Self {
         Self { store }
     }
 
-    pub(crate) async fn resolve(
-        &self,
-        reference: &ManagedSourceRef,
-    ) -> Result<ManagedSourceId, LibVmError> {
+    pub(crate) async fn inspect(&self, id: ImageId) -> Result<StoredImageInfo, LibVmError> {
         let mut tx = self.store.pool.begin().await?;
-        let id = resolve_target(&mut tx, reference).await?;
+        let observed = fetch_image(&mut tx, id, Some(&mut InspectionBudget::default())).await?;
         tx.commit().await?;
-        Ok(id)
+        Ok(observed.into_info())
     }
 
-    /// Resolve an untyped image:sha256: spelling without preferring either kind.
-    pub(crate) async fn resolve_digest(
-        &self,
-        digest: ObjectDigest,
-    ) -> Result<ManagedSourceId, LibVmError> {
-        let mut tx = self.store.pool.begin().await?;
-        let id = resolve_digest(&mut tx, &digest.to_string()).await?;
-        tx.commit().await?;
-        Ok(id)
-    }
-
-    pub(crate) async fn inspect(
-        &self,
-        reference: &ManagedSourceRef,
-    ) -> Result<ManagedSourceInfo, LibVmError> {
-        match self.resolve(reference).await? {
-            ManagedSourceId::Image(id) => Ok(ManagedSourceInfo::Image(Box::new(
-                self.load(&ManagedSourceRef::Image(id)).await?,
-            ))),
-            ManagedSourceId::Snapshot(id) => Ok(ManagedSourceInfo::Snapshot(
-                SnapshotStore::from_store(self.store.clone())
-                    .inspect(&SnapshotRef::Id(id))
-                    .await?,
-            )),
-        }
-    }
-
-    pub(crate) async fn list(&self) -> Result<Vec<ManagedSourceInfo>, LibVmError> {
+    pub(crate) async fn list(&self) -> Result<Vec<StoredImageInfo>, LibVmError> {
         let mut cursor = String::new();
         let mut images = Vec::new();
         let mut budget = InspectionBudget::default();
@@ -149,40 +118,18 @@ impl ManagedImageStore {
             }
             for id in ids {
                 cursor = id.clone();
-                let observed = fetch_image(
-                    &mut tx,
-                    &ManagedSourceRef::Image(id.parse().map_err(invalid)?),
-                    Some(&mut budget),
-                )
-                .await?;
-                images.push(ManagedSourceInfo::Image(Box::new(observed.into_info())));
+                let observed =
+                    fetch_image(&mut tx, id.parse().map_err(invalid)?, Some(&mut budget)).await?;
+                images.push(observed.into_info());
             }
             tx.commit().await?;
         }
-        images.extend(
-            SnapshotStore::from_store(self.store.clone())
-                .list()
-                .await?
-                .into_iter()
-                .map(ManagedSourceInfo::Snapshot),
-        );
         Ok(images)
     }
 
-    async fn load(&self, reference: &ManagedSourceRef) -> Result<ManagedImageInfo, LibVmError> {
+    async fn load_root(&self, id: ImageId) -> Result<StoredImageRoot, LibVmError> {
         let mut tx = self.store.pool.begin().await?;
-        let observed =
-            fetch_image(&mut tx, reference, Some(&mut InspectionBudget::default())).await?;
-        tx.commit().await?;
-        Ok(observed.into_info())
-    }
-
-    async fn load_root(
-        &self,
-        reference: &ManagedSourceRef,
-    ) -> Result<ManagedImageRoot, LibVmError> {
-        let mut tx = self.store.pool.begin().await?;
-        let observed = fetch_image(&mut tx, reference, None).await?;
+        let observed = fetch_image(&mut tx, id, None).await?;
         tx.commit().await?;
         Ok(observed.root)
     }
@@ -195,10 +142,10 @@ impl ManagedImageStore {
         record: ImageRecord,
         operation_id: Uuid,
         lease: StorageLock,
-        alias: Option<String>,
+        name: Option<String>,
         provenance: Vec<ImageProvenance>,
         conversion: Option<RawConversionKey>,
-    ) -> Result<ManagedImageInfo, LibVmError> {
+    ) -> Result<StoredImageInfo, LibVmError> {
         let collection = self.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
@@ -207,7 +154,7 @@ impl ManagedImageStore {
                 &record,
                 operation_id,
                 &_lease,
-                alias.as_deref(),
+                name.as_deref(),
                 provenance,
                 conversion,
             ))
@@ -221,12 +168,12 @@ impl ManagedImageStore {
         record: &ImageRecord,
         operation: Uuid,
         lease: &StorageLock,
-        alias: Option<&str>,
+        name: Option<&str>,
         provenance: Vec<ImageProvenance>,
         conversion: Option<RawConversionKey>,
-    ) -> Result<ManagedImageInfo, LibVmError> {
-        if let Some(alias) = alias {
-            validate_alias(alias)?;
+    ) -> Result<StoredImageInfo, LibVmError> {
+        if let Some(name) = name {
+            crate::store::names::validate_name(name)?;
         }
         let bytes = record.canonical_bytes()?;
         #[cfg(test)]
@@ -347,7 +294,6 @@ impl ManagedImageStore {
         recheck_closure(&fingerprints)?;
         require_operation_closure(&self.store, operation, &streams, &objects, None).await?;
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        refuse_cross_kind(&mut tx, &id.to_string()).await?;
         let existing =
             sqlx::query("SELECT record_digest,CASE WHEN length(CAST(record_bytes AS BLOB))<=?2 THEN record_bytes END AS bytes FROM storage_image WHERE id=?1")
                 .bind(id.to_string())
@@ -361,12 +307,8 @@ impl ManagedImageStore {
                 return Err(invalid("immutable image identity contradiction"));
             }
             exact_dependencies(&mut tx, id, &streams, &objects).await?;
-            sqlx::query("UPDATE storage_image SET retained=1 WHERE id=?1")
-                .bind(id.to_string())
-                .execute(&mut *tx)
-                .await?;
         } else {
-            sqlx::query("INSERT INTO storage_image(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,?3,1,?4)")
+            sqlx::query("INSERT INTO storage_image(id,record_digest,record_bytes,created_at) VALUES(?1,?2,?3,?4)")
                 .bind(id.to_string()).bind(digest.to_string()).bind(&bytes).bind(chrono::Utc::now().timestamp()).execute(&mut *tx).await?;
             for stream in &streams {
                 sqlx::query(
@@ -387,8 +329,13 @@ impl ManagedImageStore {
                 .await?;
             }
         }
-        if let Some(alias) = alias {
-            insert_alias(&mut tx, alias, ManagedSourceId::Image(id)).await?;
+        if let Some(name) = name {
+            crate::store::image_store::insert_image_name(
+                &mut tx,
+                name,
+                crate::store::image_store::LocalImage::Stored(id),
+            )
+            .await?;
         }
         for (digest, bytes) in provenance {
             let existing = sqlx::query(
@@ -433,27 +380,18 @@ impl ManagedImageStore {
         if changed.rows_affected() != 1 {
             return Err(invalid("image publication candidate changed before commit"));
         }
-        let observed = fetch_image(
-            &mut tx,
-            &ManagedSourceRef::Image(id),
-            Some(&mut InspectionBudget::default()),
-        )
-        .await?;
+        let observed = fetch_image(&mut tx, id, Some(&mut InspectionBudget::default())).await?;
         tx.commit().await?;
         drop(_roots);
         Ok(observed.into_info())
     }
 
-    pub(crate) async fn consume(
-        &self,
-        reference: &ManagedSourceRef,
-    ) -> Result<ManagedImageConsumer, LibVmError> {
-        let observed = self.load_root(reference).await?;
+    pub(crate) async fn consume(&self, id: ImageId) -> Result<StoredImageConsumer, LibVmError> {
+        let observed = self.load_root(id).await?;
         let collection = self.clone();
-        let reference = reference.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            let result: Result<ManagedImageConsumer, LibVmError> = runtime.block_on(async {
+            let result: Result<StoredImageConsumer, LibVmError> = runtime.block_on(async {
                 let bytes = observed.record.canonical_bytes()?;
                 let (streams, mut objects) = observed.record.content_dependencies()?;
                 objects.insert(observed.record_digest);
@@ -462,8 +400,7 @@ impl ManagedImageStore {
                 let lease = {
                     let _roots = pool.lock_roots()?;
                     let mut tx = collection.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                    recheck_image(&mut tx, &reference, &observed, &bytes, &streams, &objects)
-                        .await?;
+                    recheck_image(&mut tx, &observed, &bytes, &streams, &objects).await?;
                     let acquisition = crate::store::artifact_store::acquisition_objects(
                         &mut tx,
                         "image",
@@ -514,7 +451,7 @@ impl ManagedImageStore {
                 {
                     return Err(invalid("image bundle object contradicts its pinned tuple"));
                 }
-                Ok(ManagedImageConsumer {
+                Ok(StoredImageConsumer {
                     info: observed,
                     operation_id,
                     _lease: lease,
@@ -546,7 +483,7 @@ impl ManagedImageStore {
     pub(crate) async fn lookup_conversion(
         &self,
         key: &RawConversionKey,
-    ) -> Result<Option<ManagedImageConsumer>, LibVmError> {
+    ) -> Result<Option<StoredImageConsumer>, LibVmError> {
         let bytes = key.canonical_bytes()?;
         let digest = ObjectDigest::of_bytes(&bytes);
         let mut tx = self.store.pool.begin().await?;
@@ -565,7 +502,7 @@ impl ManagedImageStore {
             .try_get::<String, _>("image_id")?
             .parse()
             .map_err(invalid)?;
-        let consumer = self.consume(&ManagedSourceRef::Image(id)).await?;
+        let consumer = self.consume(id).await?;
         let crate::store::models::storage::BootProfile::LinuxDirect {
             userspace_platform, ..
         } = &consumer.info.record.boot
@@ -578,188 +515,48 @@ impl ManagedImageStore {
         Ok(Some(consumer))
     }
 
-    pub(crate) async fn add_alias(
+    /// Tag an existing stored image with a new local name. A name already
+    /// naming another image is refused; naming the same image again is a no-op.
+    pub(crate) async fn add_name(
         &self,
-        reference: &ManagedSourceRef,
-        alias: &str,
-    ) -> Result<ManagedSourceInfo, LibVmError> {
-        validate_alias(alias)?;
-        // Authenticate semantic identity and exact edges outside coordination.
-        let observed = self.inspect(reference).await?;
-        let target = match &observed {
-            ManagedSourceInfo::Image(info) => ManagedSourceId::Image(info.id),
-            ManagedSourceInfo::Snapshot(info) => ManagedSourceId::Snapshot(info.id),
-        };
-        let collection = self.clone();
-        let reference = reference.clone();
-        let alias = alias.to_owned();
-        let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            runtime.block_on(async move {
-                let pool = StoragePool::open(&collection.store.images_dir)?;
-                let _roots = pool.lock_roots()?;
-                let mut tx = collection.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                if resolve_target(&mut tx, &reference).await? != target {
-                    return Err(invalid("alias source changed before registration"));
-                }
-                insert_alias(&mut tx, &alias, target).await?;
-                let image = if let ManagedSourceId::Image(id) = target {
-                    Some(
-                        fetch_image(
-                            &mut tx,
-                            &ManagedSourceRef::Image(id),
-                            Some(&mut InspectionBudget::default()),
-                        )
-                        .await?
-                        .into_info(),
-                    )
-                } else {
-                    None
-                };
-                tx.commit().await?;
-                drop(_roots);
-                if let Some(info) = image {
-                    Ok(ManagedSourceInfo::Image(Box::new(info)))
-                } else {
-                    collection.inspect(&ManagedSourceRef::Alias(alias)).await
-                }
-            })
-        })
-        .await?
-    }
-
-    /// Removing a name does not release the independent explicit retention root.
-    pub(crate) async fn remove_alias(&self, alias: &str) -> Result<bool, LibVmError> {
-        validate_alias(alias)?;
-        let collection = self.clone();
-        let alias = alias.to_owned();
-        let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            runtime.block_on(async move {
-                let mut observation = collection.store.pool.begin().await?;
-                let row = sqlx::query("SELECT image_id,snapshot_id FROM image_alias WHERE name=?1")
-                    .bind(&alias)
-                    .fetch_optional(&mut *observation)
-                    .await?;
-                let Some(row) = row else {
-                    observation.commit().await?;
-                    return Ok(false);
-                };
-                let observed_target = alias_target(&row)?;
-                match observed_target {
-                    ManagedSourceId::Image(id) => {
-                        fetch_image(&mut observation, &ManagedSourceRef::Image(id), None).await?;
-                        observation.commit().await?;
-                    }
-                    ManagedSourceId::Snapshot(id) => {
-                        let facts = crate::store::snapshot_store::fetch_catalog(
-                            &mut observation,
-                            &SnapshotRef::Id(id),
-                        )
-                        .await?;
-                        observation.commit().await?;
-                        crate::store::snapshot_store::authenticate_catalog(facts)?;
-                    }
-                }
-                let pool = StoragePool::open(&collection.store.images_dir)?;
-                let _roots = pool.lock_roots()?;
-                let mut tx = collection.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                let row = sqlx::query("SELECT image_id,snapshot_id FROM image_alias WHERE name=?1")
-                    .bind(&alias)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                let Some(row) = row else { return Ok(false) };
-                let target = alias_target(&row)?;
-                if target != observed_target
-                    || resolve_digest(&mut tx, &target_string(target)).await? != target
-                {
-                    return Err(invalid("image alias changed before removal"));
-                }
-                sqlx::query("DELETE FROM image_alias WHERE name=?1")
-                    .bind(&alias)
-                    .execute(&mut *tx)
-                    .await?;
-                match target {
-                    ManagedSourceId::Image(id) => {
-                        remove_unrooted_image(&mut tx, &id.to_string()).await?
-                    }
-                    ManagedSourceId::Snapshot(id) => {
-                        crate::store::snapshot_store::remove_unrooted(&mut tx, &id.to_string())
-                            .await?
-                    }
-                }
-                tx.commit().await?;
-                Ok(true)
-            })
-        })
-        .await?
-    }
-
-    pub(crate) async fn release_retention(
-        &self,
-        reference: &ManagedSourceRef,
-    ) -> Result<bool, LibVmError> {
-        if let ManagedSourceId::Snapshot(id) = self.resolve(reference).await? {
-            let snapshot = match reference {
-                ManagedSourceRef::Alias(alias) => SnapshotRef::Image(alias.clone()),
-                _ => SnapshotRef::Id(id),
-            };
-            return SnapshotStore::from_store(self.store.clone())
-                .release_retention(&snapshot)
-                .await;
-        }
-        let observed = self.load_root(reference).await?;
-        let collection = self.clone();
-        let reference = reference.clone();
-        let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            runtime.block_on(async move {
-                let bytes = observed.record.canonical_bytes()?;
-                let (streams, mut objects) = observed.record.content_dependencies()?;
-                objects.insert(observed.record_digest);
-                let pool = StoragePool::open(&collection.store.images_dir)?;
-                let _roots = pool.lock_roots()?;
-                let mut tx = collection.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                recheck_image(&mut tx, &reference, &observed, &bytes, &streams, &objects).await?;
-                let retained =
-                    sqlx::query("UPDATE storage_image SET retained=0 WHERE id=?1 AND retained=1")
-                        .bind(observed.id.to_string())
-                        .execute(&mut *tx)
-                        .await?
-                        .rows_affected()
-                        == 1;
-                remove_unrooted_image(&mut tx, &observed.id.to_string()).await?;
-                tx.commit().await?;
-                Ok(retained)
-            })
-        })
-        .await?
+        id: ImageId,
+        name: &str,
+    ) -> Result<StoredImageInfo, LibVmError> {
+        crate::store::names::validate_name(name)?;
+        let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        crate::store::image_store::insert_image_name(
+            &mut tx,
+            name,
+            crate::store::image_store::LocalImage::Stored(id),
+        )
+        .await?;
+        let observed = fetch_image(&mut tx, id, Some(&mut InspectionBudget::default())).await?;
+        tx.commit().await?;
+        Ok(observed.into_info())
     }
 }
 
 /// Canonical consumer authority deliberately excludes appendable diagnostics.
 #[derive(Debug, Clone)]
-pub(crate) struct ManagedImageRoot {
+pub(crate) struct StoredImageRoot {
     pub id: ImageId,
     pub record_digest: ObjectDigest,
     pub record: ImageRecord,
-    retained: bool,
 }
 
 struct ImageObservation {
-    root: ManagedImageRoot,
-    aliases: Vec<String>,
+    root: StoredImageRoot,
+    names: Vec<String>,
     provenance: Vec<ImageProvenance>,
 }
 
 impl ImageObservation {
-    fn into_info(self) -> ManagedImageInfo {
-        ManagedImageInfo {
+    fn into_info(self) -> StoredImageInfo {
+        StoredImageInfo {
             id: self.root.id,
             record_digest: self.root.record_digest,
             record: self.root.record,
-            retained: self.root.retained,
-            aliases: self.aliases,
+            names: self.names,
             provenance: self.provenance,
         }
     }
@@ -785,154 +582,20 @@ impl InspectionBudget {
     }
 }
 
-fn target_string(target: ManagedSourceId) -> String {
-    match target {
-        ManagedSourceId::Image(id) => id.to_string(),
-        ManagedSourceId::Snapshot(id) => id.to_string(),
-    }
-}
-
-pub(crate) async fn refuse_cross_kind(
-    connection: &mut sqlx::SqliteConnection,
-    id: &str,
-) -> Result<(), LibVmError> {
-    let collision: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_image i JOIN storage_snapshot s ON s.id=i.id WHERE i.id=?1)")
-        .bind(id).fetch_one(connection).await?;
-    if collision {
-        return Err(invalid("managed identity has conflicting record kinds"));
-    }
-    Ok(())
-}
-
-async fn resolve_digest(
-    connection: &mut sqlx::SqliteConnection,
-    digest: &str,
-) -> Result<ManagedSourceId, LibVmError> {
-    refuse_cross_kind(connection, digest).await?;
-    let image: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_image WHERE id=?1)")
-        .bind(digest)
-        .fetch_one(&mut *connection)
-        .await?;
-    if image {
-        return Ok(ManagedSourceId::Image(digest.parse().map_err(invalid)?));
-    }
-    let snapshot: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_snapshot WHERE id=?1)")
-            .bind(digest)
-            .fetch_one(connection)
-            .await?;
-    if snapshot {
-        return Ok(ManagedSourceId::Snapshot(digest.parse().map_err(invalid)?));
-    }
-    Err(invalid("managed source does not exist"))
-}
-
-fn alias_target(row: &sqlx::sqlite::SqliteRow) -> Result<ManagedSourceId, LibVmError> {
-    match (
-        row.try_get::<Option<String>, _>("image_id")?,
-        row.try_get::<Option<String>, _>("snapshot_id")?,
-    ) {
-        (Some(id), None) => Ok(ManagedSourceId::Image(id.parse().map_err(invalid)?)),
-        (None, Some(id)) => Ok(ManagedSourceId::Snapshot(id.parse().map_err(invalid)?)),
-        _ => Err(invalid("image alias must name exactly one typed artifact")),
-    }
-}
-
-pub(crate) async fn resolve_target(
-    connection: &mut sqlx::SqliteConnection,
-    reference: &ManagedSourceRef,
-) -> Result<ManagedSourceId, LibVmError> {
-    let target = match reference {
-        ManagedSourceRef::Image(id) => ManagedSourceId::Image(*id),
-        ManagedSourceRef::Snapshot(id) => ManagedSourceId::Snapshot(*id),
-        ManagedSourceRef::Alias(alias) => {
-            validate_alias(alias)?;
-            let row = sqlx::query("SELECT image_id,snapshot_id FROM image_alias WHERE name=?1")
-                .bind(alias)
-                .fetch_optional(&mut *connection)
-                .await?
-                .ok_or_else(|| invalid("managed alias does not exist"))?;
-            alias_target(&row)?
-        }
-    };
-    let resolved = resolve_digest(connection, &target_string(target)).await?;
-    if resolved != target {
-        return Err(invalid("managed reference has the wrong record kind"));
-    }
-    Ok(target)
-}
-
-pub(crate) async fn insert_alias(
-    connection: &mut sqlx::SqliteConnection,
-    alias: &str,
-    target: ManagedSourceId,
-) -> Result<(), LibVmError> {
-    validate_alias(alias)?;
-    refuse_cross_kind(connection, &target_string(target)).await?;
-    if check_alias_available(connection, alias, Some(target)).await? {
-        return Ok(());
-    }
-    let (image, snapshot) = match target {
-        ManagedSourceId::Image(id) => (Some(id.to_string()), None),
-        ManagedSourceId::Snapshot(id) => (None, Some(id.to_string())),
-    };
-    sqlx::query("INSERT INTO image_alias(name,image_id,snapshot_id) VALUES(?1,?2,?3)")
-        .bind(alias)
-        .bind(image)
-        .bind(snapshot)
-        .execute(connection)
-        .await?;
-    Ok(())
-}
-
-async fn alias_binding(
-    connection: &mut sqlx::SqliteConnection,
-    alias: &str,
-) -> Result<Option<ManagedSourceId>, LibVmError> {
-    sqlx::query("SELECT image_id,snapshot_id FROM image_alias WHERE name=?1")
-        .bind(alias)
-        .fetch_optional(connection)
-        .await?
-        .as_ref()
-        .map(alias_target)
-        .transpose()
-}
-
-/// Admission has no content-derived target yet; an exact publication may
-/// reuse its own typed artifact binding. Returns whether that binding exists.
-pub(crate) async fn check_alias_available(
-    connection: &mut sqlx::SqliteConnection,
-    alias: &str,
-    target: Option<ManagedSourceId>,
-) -> Result<bool, LibVmError> {
-    validate_alias(alias)?;
-    let existing = alias_binding(connection, alias).await?;
-    if existing.is_some_and(|existing| Some(existing) != target) {
-        return Err(LibVmError::ImageAliasConflict {
-            alias: alias.to_owned(),
-        });
-    }
-    Ok(existing.is_some())
-}
-
 /// SQL guards keep oversized persisted values out of SQLx-owned allocations.
-/// Each blob page contains one record (at most MetadataPageBytes); alias pages
-/// contain at most 64 names of at most 128 bytes. No history-sized state survives
-/// a page unless the caller explicitly admits the bounded inspection response.
+/// Each blob page contains one record (at most MetadataPageBytes); name pages
+/// contain at most 64 names of at most 512 bytes. No history-sized state
+/// survives a page unless the caller explicitly admits the bounded response.
 async fn fetch_image(
     connection: &mut sqlx::SqliteConnection,
-    reference: &ManagedSourceRef,
+    id: ImageId,
     mut budget: Option<&mut InspectionBudget>,
 ) -> Result<ImageObservation, LibVmError> {
-    let ManagedSourceId::Image(id) = resolve_target(connection, reference).await? else {
-        return Err(invalid(
-            "snapshot requires stopped restore, not raw image consumption",
-        ));
-    };
-    let row = sqlx::query("SELECT record_digest,CASE WHEN length(CAST(record_bytes AS BLOB))<=?2 THEN record_bytes END AS bytes,retained FROM storage_image WHERE id=?1")
+    let row = sqlx::query("SELECT record_digest,CASE WHEN length(CAST(record_bytes AS BLOB))<=?2 THEN record_bytes END AS bytes FROM storage_image WHERE id=?1")
         .bind(id.to_string())
         .bind(Resource::MetadataPageBytes.maximum() as i64)
-        .fetch_one(&mut *connection).await?;
+        .fetch_optional(&mut *connection).await?
+        .ok_or_else(|| LibVmError::ImageNotFound { reference: id.to_string() })?;
     let bytes = bounded_blob(&row)?;
     if let Some(budget) = budget.as_deref_mut() {
         budget.charge(bytes.len() as u64)?;
@@ -949,51 +612,38 @@ async fn fetch_image(
     objects.insert(digest);
     exact_dependencies(connection, id, &streams, &objects).await?;
     crate::store::artifact_store::acquisition_objects(connection, "image", &id.to_string()).await?;
-    let retained: i64 = row.try_get("retained")?;
     let mut observation = ImageObservation {
-        root: ManagedImageRoot {
+        root: StoredImageRoot {
             id,
             record_digest: digest,
             record,
-            retained: retained == 1,
         },
-        aliases: Vec::new(),
+        names: Vec::new(),
         provenance: Vec::new(),
     };
     let mut cursor = String::new();
-    let mut has_alias = false;
     loop {
-        let aliases = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END FROM image_alias WHERE image_id=?1 AND name>?2 ORDER BY name LIMIT 64",
+        let names = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT CASE WHEN length(CAST(name AS BLOB))<=512 THEN name END FROM image_name WHERE stored_image_id=?1 AND name>?2 ORDER BY name LIMIT 64",
         ).bind(id.to_string()).bind(&cursor).fetch_all(&mut *connection).await?;
-        if aliases.is_empty() {
+        if names.is_empty() {
             break;
         }
-        for alias in aliases {
-            let alias = alias.ok_or_else(|| invalid("oversized image alias"))?;
-            validate_alias(&alias)?;
-            if resolve_target(connection, &ManagedSourceRef::Alias(alias.clone())).await?
-                != ManagedSourceId::Image(id)
-            {
-                return Err(invalid("image alias has contradictory typed target"));
-            }
-            cursor = alias.clone();
-            has_alias = true;
+        for name in names {
+            let name = name.ok_or_else(|| invalid("oversized image name"))?;
+            crate::store::names::validate_stored_name(&name)?;
+            cursor = name.clone();
             if let Some(budget) = budget.as_deref_mut() {
-                budget.charge(alias.len() as u64)?;
-                observation.aliases.push(alias);
+                budget.charge(name.len() as u64)?;
+                observation.names.push(name);
             }
         }
     }
     // Empty keys sort before the exclusive keyset cursors.
-    let empty_key: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM image_alias WHERE image_id=?1 AND name='' UNION ALL SELECT 1 FROM image_provenance WHERE image_id=?1 AND digest='' UNION ALL SELECT 1 FROM raw_conversion_result WHERE image_id=?1 AND key_digest='')")
+    let empty_key: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM image_name WHERE stored_image_id=?1 AND name='' UNION ALL SELECT 1 FROM image_provenance WHERE image_id=?1 AND digest='' UNION ALL SELECT 1 FROM raw_conversion_result WHERE image_id=?1 AND key_digest='')")
         .bind(id.to_string()).fetch_one(&mut *connection).await?;
-    let operation_owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='image' AND managed_id=?1)").bind(id.to_string()).fetch_one(&mut *connection).await?;
-    if empty_key || !matches!(retained, 0 | 1) || (retained == 0 && !has_alias && !operation_owned)
-    {
-        return Err(invalid(
-            "image has malformed metadata or an invalid public retention root",
-        ));
+    if empty_key {
+        return Err(invalid("image has malformed metadata"));
     }
     let mut cursor = String::new();
     loop {
@@ -1196,20 +846,17 @@ async fn exact_dependencies(
 
 async fn recheck_image(
     connection: &mut sqlx::SqliteConnection,
-    reference: &ManagedSourceRef,
-    observed: &ManagedImageRoot,
+    observed: &StoredImageRoot,
     bytes: &[u8],
     streams: &BTreeSet<StreamId>,
     objects: &BTreeSet<ObjectDigest>,
 ) -> Result<(), LibVmError> {
-    if resolve_target(connection, reference).await? != ManagedSourceId::Image(observed.id) {
-        return Err(invalid("image root changed before consumer registration"));
-    }
     let row = sqlx::query("SELECT record_digest,CASE WHEN length(CAST(record_bytes AS BLOB))<=?2 THEN record_bytes END AS bytes FROM storage_image WHERE id=?1")
         .bind(observed.id.to_string())
         .bind(Resource::MetadataPageBytes.maximum() as i64)
-        .fetch_one(&mut *connection)
-        .await?;
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| invalid("image root was removed before consumer registration"))?;
     if row.try_get::<String, _>("record_digest")? != observed.record_digest.to_string()
         || bounded_blob(&row)? != bytes
     {
@@ -1218,23 +865,12 @@ async fn recheck_image(
     exact_dependencies(connection, observed.id, streams, objects).await
 }
 
-pub(crate) async fn remove_unrooted_image(
-    connection: &mut sqlx::SqliteConnection,
-    id: &str,
-) -> Result<(), LibVmError> {
-    sqlx::query("DELETE FROM storage_image WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE image_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='image' AND managed_id=?1)")
-        .bind(id).execute(connection).await?;
-    Ok(())
-}
-
 /// Fail closed before collectors interpret any image edge as reachability.
 pub(crate) async fn check_image_catalog(store: &Store) -> Result<(), LibVmError> {
-    let malformed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM image_alias a WHERE (a.image_id IS NOT NULL) + (a.snapshot_id IS NOT NULL) != 1 OR (a.image_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM storage_image WHERE id=a.image_id)) OR (a.snapshot_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM storage_snapshot WHERE id=a.snapshot_id)) UNION ALL SELECT 1 FROM raw_conversion_result c WHERE NOT EXISTS(SELECT 1 FROM storage_image WHERE id=c.image_id))")
+    let malformed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM image_name n WHERE (n.oci_image_id IS NOT NULL) + (n.stored_image_id IS NOT NULL) != 1 OR (n.stored_image_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM storage_image WHERE id=n.stored_image_id)) OR (n.oci_image_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM image_composition_artifact WHERE image_id=n.oci_image_id)) UNION ALL SELECT 1 FROM snapshot_name n WHERE NOT EXISTS(SELECT 1 FROM storage_snapshot WHERE id=n.snapshot_id) UNION ALL SELECT 1 FROM raw_conversion_result c WHERE NOT EXISTS(SELECT 1 FROM storage_image WHERE id=c.image_id))")
         .fetch_one(&store.pool).await?;
     if malformed {
-        return Err(invalid(
-            "managed alias or conversion has a corrupt typed target",
-        ));
+        return Err(invalid("a name or conversion has a corrupt typed target"));
     }
     let mut cursor = String::new();
     loop {
@@ -1251,53 +887,23 @@ pub(crate) async fn check_image_catalog(store: &Store) -> Result<(), LibVmError>
         }
         for id in ids {
             cursor = id.clone();
-            fetch_image(
-                &mut tx,
-                &ManagedSourceRef::Image(id.parse().map_err(invalid)?),
-                None,
-            )
-            .await?;
+            fetch_image(&mut tx, id.parse().map_err(invalid)?, None).await?;
         }
         tx.commit().await?;
     }
     Ok(())
 }
 
-impl crate::store::ReadOnlyStore {
-    /// Logical observation only. No pool/catalog initialization, byte reads,
-    /// leases or retention changes are permitted through this handle.
-    pub(crate) async fn inspect_managed(
-        &self,
-        reference: &ManagedSourceRef,
-    ) -> Result<ManagedSourceInfo, LibVmError> {
-        let mut tx = self.pool.begin().await?;
-        match resolve_target(&mut tx, reference).await? {
-            ManagedSourceId::Image(_) => {
-                let observed =
-                    fetch_image(&mut tx, reference, Some(&mut InspectionBudget::default())).await?;
-                tx.commit().await?;
-                Ok(ManagedSourceInfo::Image(Box::new(observed.into_info())))
-            }
-            ManagedSourceId::Snapshot(id) => {
-                let facts =
-                    crate::store::snapshot_store::fetch_catalog(&mut tx, &SnapshotRef::Id(id))
-                        .await?;
-                tx.commit().await?;
-                let (_, info) = crate::store::snapshot_store::authenticate_catalog(facts)?;
-                Ok(ManagedSourceInfo::Snapshot(info))
-            }
-        }
-    }
-
-    pub(crate) async fn resolve_managed_digest(
-        &self,
-        digest: &ObjectDigest,
-    ) -> Result<ManagedSourceId, LibVmError> {
-        let mut tx = self.pool.begin().await?;
-        let id = resolve_digest(&mut tx, &digest.to_string()).await?;
-        tx.commit().await?;
-        Ok(id)
-    }
+/// Read-only inspection: no pool/catalog initialization, byte reads or leases.
+pub(crate) async fn stored_image_info(
+    connection: &mut sqlx::SqliteConnection,
+    id: ImageId,
+) -> Result<StoredImageInfo, LibVmError> {
+    Ok(
+        fetch_image(connection, id, Some(&mut InspectionBudget::default()))
+            .await?
+            .into_info(),
+    )
 }
 
 #[cfg(test)]
@@ -1306,22 +912,20 @@ pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
-    use crate::image::import_types::{
-        ImageContainerKind, ImageProvenance, ManagedSourceId, ManagedSourceInfo, ManagedSourceRef,
-        RawConversionKey,
-    };
+    use crate::image::import_types::{ImageContainerKind, ImageProvenance, RawConversionKey};
     use crate::paths::LocalPaths;
     use crate::storage::identity::ObjectDigest;
     use crate::storage::locks::StorageLock;
     use crate::storage::pool::StoragePool;
-    use crate::store::managed_image_store::ManagedImageStore;
+    use crate::store::image_store::LocalImage;
     use crate::store::models::image::{ImageRecord, ImageRecordKind};
     use crate::store::snapshot_store::{publish_map, SnapshotRef, SnapshotStore};
+    use crate::store::stored_image_store::StoredImageStore;
     use crate::store::Store;
 
     pub(crate) async fn fixture() -> (
         tempfile::TempDir,
-        ManagedImageStore,
+        StoredImageStore,
         ImageRecord,
         uuid::Uuid,
         StorageLock,
@@ -1368,7 +972,7 @@ pub(crate) mod tests {
         record.root.stream = map;
         (
             temp,
-            ManagedImageStore::from_store(Arc::new(store)),
+            StoredImageStore::from_store(Arc::new(store)),
             record,
             operation,
             lease,
@@ -1376,7 +980,7 @@ pub(crate) mod tests {
     }
 
     async fn operation(
-        images: &ManagedImageStore,
+        images: &StoredImageStore,
         record: &ImageRecord,
         kind: &str,
     ) -> (uuid::Uuid, StorageLock) {
@@ -1437,8 +1041,40 @@ pub(crate) mod tests {
         )
     }
 
+    async fn named_image(images: &StoredImageStore, name: &str) -> Option<LocalImage> {
+        let mut connection = images.store.pool.acquire().await.unwrap();
+        crate::store::image_store::named_image(&mut connection, name)
+            .await
+            .unwrap()
+    }
+
+    /// The fixture record with another root length, hence another id.
+    async fn other_record(
+        images: &StoredImageStore,
+        temporary: &std::path::Path,
+        record: &ImageRecord,
+        operation: uuid::Uuid,
+    ) -> ImageRecord {
+        let pool = StoragePool::open(&images.store.images_dir).unwrap();
+        let path = temporary.join("other.raw");
+        std::fs::write(&path, [0x5b; 1024]).unwrap();
+        let (stream, roots) = pool.publish_stream_for_catalog(&path).unwrap();
+        images
+            .store
+            .pin_published_storage_dependencies(operation, &[stream.id], &[])
+            .await
+            .unwrap();
+        drop(roots);
+        let mut other = record.clone();
+        other.root.stream = publish_map(&pool, &images.store, operation, &stream.map)
+            .await
+            .unwrap();
+        other.root.geometry.length = 1024;
+        other
+    }
+
     #[tokio::test]
-    async fn publication_identity_provenance_aliases_and_conversion_are_independent() {
+    async fn publication_identity_provenance_names_and_conversion_are_independent() {
         let (_temp, images, record, id, lease) = fixture().await;
         let first = images
             .publish_owned(
@@ -1464,7 +1100,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(first.id, second.id);
-        assert_eq!(second.aliases, ["cloud", "raw"]);
+        assert_eq!(second.names, ["cloud", "raw"]);
         assert_eq!(second.provenance.len(), 2);
         assert_eq!(
             second.record_digest,
@@ -1488,34 +1124,50 @@ pub(crate) mod tests {
         assert_eq!(hit.info.record.boot, record.boot);
         assert_eq!(hit.info.id, first.id);
         drop(hit);
-        assert!(images.resolve_digest(first.record_digest).await.is_err());
+        let mut connection = images.store.pool.acquire().await.unwrap();
         assert_eq!(
-            images
-                .resolve_digest(first.id.to_string().parse().unwrap())
+            crate::store::image_store::image_by_id(
+                &mut connection,
+                first.record_digest.to_string().parse().unwrap()
+            )
+            .await
+            .unwrap(),
+            None,
+            "a record digest is not an image id"
+        );
+        assert_eq!(
+            crate::store::image_store::image_by_id(&mut connection, first.id)
                 .await
                 .unwrap(),
-            ManagedSourceId::Image(first.id)
+            Some(LocalImage::Stored(first.id))
         );
+        drop(connection);
         assert_eq!(images.list().await.unwrap().len(), 1);
-        assert!(images.remove_alias("raw").await.unwrap());
-        let ManagedSourceInfo::Image(info) = images
-            .inspect(&ManagedSourceRef::Alias("cloud".into()))
+        let removal = images
+            .store
+            .remove_image(LocalImage::Stored(first.id), Some("raw"))
             .await
-            .unwrap()
-        else {
-            panic!("image")
-        };
-        assert!(info.retained);
+            .unwrap();
+        assert!(!removal.record_removed);
+        let info = images.inspect(first.id).await.unwrap();
+        assert_eq!(info.names, ["cloud"]);
         assert_eq!(info.provenance.len(), 3);
-        assert!(images
-            .release_retention(&ManagedSourceRef::Image(info.id))
+        let removal = images
+            .store
+            .remove_image(LocalImage::Stored(info.id), None)
             .await
-            .unwrap());
-        assert!(!images
-            .release_retention(&ManagedSourceRef::Image(info.id))
-            .await
-            .unwrap());
-        assert!(images.lookup_conversion(&key).await.unwrap().is_some());
+            .unwrap();
+        assert_eq!(removal.names, ["cloud"]);
+        assert!(removal.record_removed);
+        assert!(matches!(
+            images
+                .store
+                .remove_image(LocalImage::Stored(info.id), None)
+                .await,
+            Err(crate::LibVmError::ImageNotFound { .. })
+        ));
+        assert!(images.lookup_conversion(&key).await.unwrap().is_none());
+        assert!(images.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1533,10 +1185,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let consumer = images
-            .consume(&ManagedSourceRef::Alias("root".into()))
-            .await
-            .unwrap();
+        let consumer = images.consume(info.id).await.unwrap();
         let pool = StoragePool::open(&images.store.images_dir).unwrap();
         let mut file = consumer.open_stream(&pool).unwrap();
         let mut bytes = Vec::new();
@@ -1547,15 +1196,16 @@ pub(crate) mod tests {
         let inherited = consumer._lease.duplicate().unwrap();
         let consumer_id = consumer.operation_id;
         drop(consumer);
-        assert!(images
-            .release_retention(&ManagedSourceRef::Image(info.id))
+        let removal = images
+            .store
+            .remove_image(LocalImage::Stored(info.id), Some("root"))
             .await
-            .unwrap());
-        assert!(images.remove_alias("root").await.unwrap());
-        assert!(images
-            .inspect(&ManagedSourceRef::Image(info.id))
-            .await
-            .is_err());
+            .unwrap();
+        assert!(removal.record_removed);
+        assert!(matches!(
+            images.inspect(info.id).await,
+            Err(crate::LibVmError::ImageNotFound { .. })
+        ));
         assert!(images.lookup_conversion(&key).await.unwrap().is_none());
         images.store.recover_image_cache().await.unwrap();
         assert!(pool.try_exclusive_lease(consumer_id).unwrap().is_none());
@@ -1576,14 +1226,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn one_alias_namespace_refuses_image_snapshot_collisions_without_retargeting() {
+    async fn image_and_snapshot_names_coexist_and_each_resolves_only_to_its_kind() {
         let (_temp, images, record, id, lease) = fixture().await;
-        let info = images
+        let image = images
             .publish_owned(
                 record.clone(),
                 id,
                 lease,
-                Some("shared".into()),
+                Some("hello".into()),
                 Vec::new(),
                 None,
             )
@@ -1604,68 +1254,238 @@ pub(crate) mod tests {
         );
         snapshot.root = record.root.clone();
         let (id, lease) = operation(&images, &record, "snapshot").await;
-        assert!(snapshots
-            .publish(&snapshot, id, Some("shared"))
-            .await
-            .is_err());
-        drop(lease);
-        assert_eq!(
-            images
-                .resolve(&ManagedSourceRef::Alias("shared".into()))
-                .await
-                .unwrap(),
-            ManagedSourceId::Image(info.id)
-        );
-        let (id, lease) = operation(&images, &record, "snapshot").await;
         let captured = snapshots
-            .publish(&snapshot, id, Some("checkpoint"))
+            .publish(&snapshot, id, Some("hello"))
             .await
             .unwrap();
         images.store.finish_stopped_operation(id).await.unwrap();
         drop(lease);
-        assert!(matches!(
-            images
-                .inspect(&ManagedSourceRef::Alias("checkpoint".into()))
+        assert_eq!(captured.names, ["hello"]);
+        assert_eq!(images.inspect(image.id).await.unwrap().names, ["hello"]);
+        assert_eq!(
+            named_image(&images, "hello").await,
+            Some(LocalImage::Stored(image.id))
+        );
+        assert_eq!(
+            snapshots
+                .inspect(&SnapshotRef::Name("hello".into()))
                 .await
-                .unwrap(),
-            ManagedSourceInfo::Snapshot(_)
+                .unwrap()
+                .id,
+            captured.id
+        );
+        // Ids never cross kinds either.
+        let mut connection = images.store.pool.acquire().await.unwrap();
+        assert_eq!(
+            crate::store::image_store::image_by_id(
+                &mut connection,
+                captured.id.to_string().parse().unwrap()
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        drop(connection);
+        assert!(matches!(
+            snapshots
+                .inspect(&SnapshotRef::Id(image.id.to_string().parse().unwrap()))
+                .await,
+            Err(crate::LibVmError::SnapshotNotFound { .. })
         ));
-        assert!(images
-            .add_alias(&ManagedSourceRef::Snapshot(captured.id), "shared")
+        // Removing one kind's name leaves the other kind's name alone.
+        let removal = snapshots
+            .remove(&SnapshotRef::Name("hello".into()))
             .await
-            .is_err());
-        assert!(snapshots
-            .inspect(&SnapshotRef::Image("shared".into()))
+            .unwrap();
+        assert_eq!(removal.id, captured.id);
+        assert!(removal.record_removed);
+        assert_eq!(
+            named_image(&images, "hello").await,
+            Some(LocalImage::Stored(image.id))
+        );
+        let removal = images
+            .store
+            .remove_image(LocalImage::Stored(image.id), Some("hello"))
             .await
-            .is_err());
-        assert!(images
-            .consume(&ManagedSourceRef::Alias("checkpoint".into()))
-            .await
-            .is_err());
-        assert!(snapshots.remove_alias("shared").await.unwrap());
-        assert!(images
-            .inspect(&ManagedSourceRef::Image(info.id))
-            .await
-            .is_ok());
-        assert!(sqlx::query("INSERT INTO image_alias(name) VALUES('empty')")
-            .execute(&images.store.pool)
-            .await
-            .is_err());
-        assert!(sqlx::query(
-            "INSERT INTO image_alias(name,image_id,snapshot_id) VALUES('both',?1,?2)"
-        )
-        .bind(info.id.to_string())
-        .bind(captured.id.to_string())
-        .execute(&images.store.pool)
-        .await
-        .is_err());
+            .unwrap();
+        assert!(removal.record_removed);
+        assert!(images.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn failed_publication_rolls_back_alias_retention_and_conversion_together() {
+    async fn oci_and_stored_names_share_one_table_and_a_duplicate_is_refused() {
+        let (_temp, images, record, id, lease) = fixture().await;
+        let stored = images
+            .publish_owned(record, id, lease, Some("hello".into()), Vec::new(), None)
+            .await
+            .unwrap();
+        let held = crate::image::oci::tests::retained_lower(
+            &images.store,
+            &crate::image::oci::tests::LAYERS[..1],
+        )
+        .await;
+        let oci = crate::store::image_store::tests::oci_image_record(held.retained());
+        let oci_id = crate::store::image_store::tests::oci_id(&oci);
+        crate::store::ImageStore::save_oci_image(images.store.as_ref(), &oci)
+            .await
+            .unwrap();
+        let reference = crate::store::image_store::tests::REFERENCE;
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT name,oci_image_id,stored_image_id FROM image_name ORDER BY name",
+        )
+        .fetch_all(&images.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (reference.to_owned(), Some(oci_id.to_string()), None),
+                ("hello".to_owned(), None, Some(stored.id.to_string())),
+            ]
+        );
+        let mut tx = images
+            .store
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        assert!(matches!(
+            crate::store::image_store::insert_image_name(&mut tx, "hello", LocalImage::Oci(oci_id))
+                .await,
+            Err(crate::LibVmError::ImageNameConflict { name }) if name == "hello"
+        ));
+        assert!(matches!(
+            crate::store::image_store::insert_image_name(
+                &mut tx,
+                reference,
+                LocalImage::Stored(stored.id)
+            )
+            .await,
+            Err(crate::LibVmError::ImageNameConflict { name }) if name == reference
+        ));
+        // Naming the same image again is a no-op.
+        crate::store::image_store::insert_image_name(
+            &mut tx,
+            "hello",
+            LocalImage::Stored(stored.id),
+        )
+        .await
+        .unwrap();
+        for (oci, stored) in [(None, None), (Some(oci_id), Some(stored.id))] {
+            assert!(sqlx::query(
+                "INSERT INTO image_name(name,oci_image_id,stored_image_id,updated_at) VALUES('both',?1,?2,0)"
+            )
+            .bind(oci.map(|id| id.to_string()))
+            .bind(stored.map(|id| id.to_string()))
+            .execute(&mut *tx)
+            .await
+            .is_err());
+        }
+        tx.commit().await.unwrap();
+        assert!(matches!(
+            images.add_name(stored.id, reference).await,
+            Err(crate::LibVmError::InvalidName { .. })
+        ));
+        assert_eq!(
+            images.add_name(stored.id, "world").await.unwrap().names,
+            ["hello", "world"]
+        );
+        assert_eq!(
+            named_image(&images, reference).await,
+            Some(LocalImage::Oci(oci_id))
+        );
+        // A pulled stored artifact under the same reference moves the tag.
+        let mut tx = images.store.pool.begin().await.unwrap();
+        crate::store::image_store::move_image_name(
+            &mut tx,
+            reference,
+            LocalImage::Stored(stored.id),
+            3,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            named_image(&images, reference).await,
+            Some(LocalImage::Stored(stored.id))
+        );
+        let mut connection = images.store.pool.acquire().await.unwrap();
+        let cached = crate::store::image_store::list_oci_images(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(cached.len(), 1);
+        assert!(
+            cached[0].names.is_empty(),
+            "the cached image is left unnamed"
+        );
+    }
+
+    #[tokio::test]
+    async fn moved_tag_leaves_stored_image_listed_until_unused_and_pruned() {
+        use crate::store::ImageStore;
+        let (temp, images, record, id, lease) = fixture().await;
+        let reference = "example.test/raw:1";
+        let other = other_record(&images, temp.path(), &record, id).await;
+        let old = images
+            .publish_owned(record.clone(), id, lease, None, Vec::new(), None)
+            .await
+            .unwrap();
+        let (id, lease) = operation(&images, &other, "import").await;
+        let new = images
+            .publish_owned(other, id, lease, None, Vec::new(), None)
+            .await
+            .unwrap();
+        assert_ne!(old.id, new.id);
+        for image in [old.id, new.id] {
+            let mut tx = images.store.pool.begin().await.unwrap();
+            crate::store::image_store::move_image_name(
+                &mut tx,
+                reference,
+                LocalImage::Stored(image),
+                1,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let listed = images.list().await.unwrap();
+        let names = |id| {
+            listed
+                .iter()
+                .find(|image| image.id == id)
+                .map(|image| image.names.clone())
+        };
+        assert_eq!(names(old.id), Some(Vec::new()));
+        assert_eq!(names(new.id), Some(vec![reference.to_owned()]));
+        let paths = crate::paths::LocalPaths::new(images.store.home.clone());
+        let machine = crate::store::storage::tests::machine_using_image(
+            &images.store,
+            &paths,
+            crate::ImageSourceKind::Stored,
+            old.id,
+        )
+        .await;
+        assert_eq!(images.store.prune_images().await.unwrap().images_removed, 0);
+        assert!(images.inspect(old.id).await.is_ok());
+        crate::store::MachineStore::remove_machine(images.store.as_ref(), &machine)
+            .await
+            .unwrap();
+        assert_eq!(images.store.prune_images().await.unwrap().images_removed, 1);
+        assert!(matches!(
+            images.inspect(old.id).await,
+            Err(crate::LibVmError::ImageNotFound { .. })
+        ));
+        assert_eq!(images.inspect(new.id).await.unwrap().names, [reference]);
+        let pool = StoragePool::open(&images.store.images_dir).unwrap();
+        assert!(!pool.stream_path(&old.record.root.stream.stream).exists());
+        assert!(pool.verify_stream(&new.record.root.stream.stream).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_publication_rolls_back_name_record_and_conversion_together() {
         let (_temp, images, record, id, lease) = fixture().await;
         let (key, source) = conversion(&record);
-        sqlx::raw_sql("CREATE TRIGGER reject_managed_alias BEFORE INSERT ON image_alias BEGIN SELECT RAISE(ABORT,'publication fixture rejection'); END;").execute(&images.store.pool).await.unwrap();
+        sqlx::raw_sql("CREATE TRIGGER reject_image_name BEFORE INSERT ON image_name BEGIN SELECT RAISE(ABORT,'publication fixture rejection'); END;").execute(&images.store.pool).await.unwrap();
         let expected = record.id().unwrap();
         assert!(images
             .publish_owned(
@@ -1680,7 +1500,7 @@ pub(crate) mod tests {
             .is_err());
         for (table, query) in [
             ("storage_image", "SELECT COUNT(*) FROM storage_image"),
-            ("image_alias", "SELECT COUNT(*) FROM image_alias"),
+            ("image_name", "SELECT COUNT(*) FROM image_name"),
             (
                 "raw_conversion_result",
                 "SELECT COUNT(*) FROM raw_conversion_result",
@@ -1703,7 +1523,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn corruption_is_not_a_conversion_miss_and_cross_kind_lookup_never_prefers_one() {
+    async fn corruption_is_not_a_conversion_miss() {
         let (_temp, images, record, id, lease) = fixture().await;
         let (key, source) = conversion(&record);
         let info = images
@@ -1724,10 +1544,7 @@ pub(crate) mod tests {
             .execute(&images.store.pool)
             .await
             .unwrap();
-        assert!(images
-            .inspect(&ManagedSourceRef::Image(info.id))
-            .await
-            .is_err());
+        assert!(images.inspect(info.id).await.is_err());
         assert!(images.lookup_conversion(&key).await.is_err());
         sqlx::query("DELETE FROM image_object_dependency WHERE image_id=?1 AND object_digest=?2")
             .bind(info.id.to_string())
@@ -1741,20 +1558,6 @@ pub(crate) mod tests {
         std::fs::write(&path, b"corrupt bundle").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(images.lookup_conversion(&key).await.is_err());
-        sqlx::raw_sql("DROP TRIGGER snapshot_kind_collision;")
-            .execute(&images.store.pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO storage_snapshot(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,?3,1,0)")
-            .bind(info.id.to_string()).bind(info.record_digest.to_string()).bind(record.canonical_bytes().unwrap()).execute(&images.store.pool).await.unwrap();
-        assert!(images
-            .resolve_digest(info.id.to_string().parse().unwrap())
-            .await
-            .is_err());
-        assert!(images
-            .resolve(&ManagedSourceRef::Alias("checked".into()))
-            .await
-            .is_err());
     }
 
     #[tokio::test]
@@ -1785,11 +1588,7 @@ pub(crate) mod tests {
         release.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if images
-                    .inspect(&ManagedSourceRef::Image(expected))
-                    .await
-                    .is_ok()
-                {
+                if images.inspect(expected).await.is_ok() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1799,11 +1598,8 @@ pub(crate) mod tests {
         .unwrap();
         images.store.recover_image_cache().await.unwrap();
         assert_eq!(
-            images
-                .resolve(&ManagedSourceRef::Alias("detached".into()))
-                .await
-                .unwrap(),
-            ManagedSourceId::Image(expected)
+            named_image(&images, "detached").await,
+            Some(LocalImage::Stored(expected))
         );
     }
 
@@ -1826,18 +1622,23 @@ pub(crate) mod tests {
             .fetch_one(&readonly.pool)
             .await
             .unwrap();
-        let observed = readonly
-            .inspect_managed(&ManagedSourceRef::Alias("offline".into()))
+        let mut connection = readonly.pool.acquire().await.unwrap();
+        let image = crate::store::image_store::named_image(&mut connection, "offline")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(image, LocalImage::Stored(info.id));
+        let observed = crate::store::image_store::image_info(&mut connection, image, "offline")
             .await
             .unwrap();
-        assert_eq!(observed, ManagedSourceInfo::Image(Box::new(info.clone())));
+        assert_eq!(observed, crate::ImageInfo::Stored(Box::new(info.clone())));
         assert_eq!(
-            readonly
-                .resolve_managed_digest(&info.id.to_string().parse().unwrap())
+            crate::store::image_store::image_by_id(&mut connection, info.id)
                 .await
                 .unwrap(),
-            ManagedSourceId::Image(info.id)
+            Some(image)
         );
+        drop(connection);
         let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
             .fetch_one(&readonly.pool)
             .await
@@ -1869,7 +1670,7 @@ pub(crate) mod tests {
         let reader = images.clone();
         let task = tokio::spawn(async move {
             reader
-                .consume(&ManagedSourceRef::Alias("read".into()))
+                .consume(info.id)
                 .await
                 .map(|consumer| consumer.info.clone())
         });
@@ -1886,11 +1687,13 @@ pub(crate) mod tests {
         let operation: uuid::Uuid = operation.parse().unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        images
-            .release_retention(&ManagedSourceRef::Image(info.id))
+        let removal = images
+            .store
+            .remove_image(LocalImage::Stored(info.id), None)
             .await
             .unwrap();
-        images.remove_alias("read").await.unwrap();
+        assert_eq!(removal.names, ["read"]);
+        assert!(removal.record_removed);
         images.store.recover_image_cache().await.unwrap();
         let pool = StoragePool::open(&images.store.images_dir).unwrap();
         assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
@@ -1961,25 +1764,25 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
-        let ManagedSourceInfo::Image(info) = readonly
-            .inspect_managed(&ManagedSourceRef::Alias("owned-worker".into()))
-            .await
-            .unwrap()
-        else {
-            panic!("image")
-        };
-        assert_eq!(info.id, expected);
+        let mut connection = readonly.pool.acquire().await.unwrap();
+        assert_eq!(
+            crate::store::image_store::named_image(&mut connection, "owned-worker")
+                .await
+                .unwrap(),
+            Some(LocalImage::Stored(expected))
+        );
+        drop(connection);
         readonly.pool.close().await;
     }
 
     #[test]
     fn disk_and_oci_provenance_require_complete_noncontradictory_observations() {
         let mut raw = provenance(ImageContainerKind::Raw, "raw");
-        assert!(crate::store::managed_image_store::provenance_bytes(&raw).is_ok());
+        assert!(crate::store::stored_image_store::provenance_bytes(&raw).is_ok());
         raw.disk.as_mut().unwrap().source_length += 1;
-        assert!(crate::store::managed_image_store::provenance_bytes(&raw).is_err());
+        assert!(crate::store::stored_image_store::provenance_bytes(&raw).is_err());
         raw.disk = None;
-        assert!(crate::store::managed_image_store::provenance_bytes(&raw).is_err());
+        assert!(crate::store::stored_image_store::provenance_bytes(&raw).is_err());
         raw = provenance(ImageContainerKind::Qcow2, "qcow2");
         raw.disk.as_mut().unwrap().selected_root =
             Some(crate::image::import_types::RootCandidate {
@@ -1990,7 +1793,7 @@ pub(crate) mod tests {
                 mbr_type: Some(0x83),
                 attributes: 0,
             });
-        assert!(crate::store::managed_image_store::provenance_bytes(&raw).is_err());
+        assert!(crate::store::stored_image_store::provenance_bytes(&raw).is_err());
         let mut oci = ImageProvenance {
             container: ImageContainerKind::Oci,
             source_digest: ObjectDigest::of_bytes(b"manifest"),
@@ -1999,9 +1802,9 @@ pub(crate) mod tests {
             source_config: Some(ObjectDigest::of_bytes(b"config")),
             disk: None,
         };
-        assert!(crate::store::managed_image_store::provenance_bytes(&oci).is_ok());
+        assert!(crate::store::stored_image_store::provenance_bytes(&oci).is_ok());
         oci.source_manifest = None;
-        assert!(crate::store::managed_image_store::provenance_bytes(&oci).is_err());
+        assert!(crate::store::stored_image_store::provenance_bytes(&oci).is_err());
     }
 
     #[tokio::test]
@@ -2013,19 +1816,19 @@ pub(crate) mod tests {
             .unwrap();
         let mut tx = images.store.pool.begin().await.unwrap();
         for index in 0..129 {
-            let alias = format!("page-{index:03}");
-            sqlx::query("INSERT INTO image_alias(name,image_id) VALUES(?1,?2)")
-                .bind(&alias)
+            let name = format!("page-{index:03}");
+            sqlx::query("INSERT INTO image_name(name,stored_image_id,updated_at) VALUES(?1,?2,0)")
+                .bind(&name)
                 .bind(info.id.to_string())
                 .execute(&mut *tx)
                 .await
                 .unwrap();
             let (mut key, mut source) = conversion(&record);
-            key.source_manifest = ObjectDigest::of_bytes(alias.as_bytes());
+            key.source_manifest = ObjectDigest::of_bytes(name.as_bytes());
             source.source_manifest = Some(key.source_manifest);
             source.source_digest = key.source_manifest;
-            source.source_spelling = alias;
-            let bytes = crate::store::managed_image_store::provenance_bytes(&source).unwrap();
+            source.source_spelling = name;
+            let bytes = crate::store::stored_image_store::provenance_bytes(&source).unwrap();
             sqlx::query(
                 "INSERT INTO image_provenance(image_id,digest,record_bytes) VALUES(?1,?2,?3)",
             )
@@ -2046,24 +1849,24 @@ pub(crate) mod tests {
             .unwrap();
         }
         tx.commit().await.unwrap();
-        let reference = ManagedSourceRef::Image(info.id);
-        let inspected = images.load(&reference).await.unwrap();
-        assert_eq!(inspected.aliases.len(), 129);
+        let reference = info.id;
+        let inspected = images.inspect(reference).await.unwrap();
+        assert_eq!(inspected.names.len(), 129);
         assert_eq!(inspected.provenance.len(), 129);
-        let consumer = images.consume(&reference).await.unwrap();
+        let consumer = images.consume(reference).await.unwrap();
         assert_eq!(consumer.info.id, info.id);
         images.store.recover_image_cache().await.unwrap();
         images.store.recover_layer_objects().await.unwrap();
         drop(consumer);
-        sqlx::query("INSERT INTO image_alias(name,image_id) VALUES('zz invalid alias',?1)")
+        sqlx::query("INSERT INTO image_name(name,stored_image_id,updated_at) VALUES('zz invalid name',?1,0)")
             .bind(info.id.to_string())
             .execute(&images.store.pool)
             .await
             .unwrap();
-        assert!(images.consume(&reference).await.is_err());
+        assert!(images.consume(reference).await.is_err());
         assert!(images.store.recover_image_cache().await.is_err());
         assert!(images.store.recover_layer_objects().await.is_err());
-        sqlx::query("DELETE FROM image_alias WHERE name='zz invalid alias'")
+        sqlx::query("DELETE FROM image_name WHERE name='zz invalid name'")
             .execute(&images.store.pool)
             .await
             .unwrap();
@@ -2082,7 +1885,7 @@ pub(crate) mod tests {
             .execute(&images.store.pool)
             .await
             .unwrap();
-        assert!(images.consume(&reference).await.is_err());
+        assert!(images.consume(reference).await.is_err());
         assert!(images.store.recover_image_cache().await.is_err());
         assert!(images.store.recover_layer_objects().await.is_err());
     }
@@ -2095,9 +1898,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let mut tx = images.store.pool.begin().await.unwrap();
-        // Root plus this many aliases exceeds the existing inspection entry budget.
+        // Root plus this many names exceeds the existing inspection entry budget.
         for index in 0..crate::storage::limits::Resource::MetadataPageEntries.maximum() {
-            sqlx::query("INSERT INTO image_alias(name,image_id) VALUES(?1,?2)")
+            sqlx::query("INSERT INTO image_name(name,stored_image_id,updated_at) VALUES(?1,?2,0)")
                 .bind(format!("bounded-{index:06}"))
                 .bind(info.id.to_string())
                 .execute(&mut *tx)
@@ -2105,15 +1908,19 @@ pub(crate) mod tests {
                 .unwrap();
         }
         tx.commit().await.unwrap();
-        let reference = ManagedSourceRef::Image(info.id);
-        assert!(images.load(&reference).await.is_err());
+        let reference = info.id;
+        assert!(images.inspect(reference).await.is_err());
         assert!(images.list().await.is_err());
-        let consumer = images.consume(&reference).await.unwrap();
+        let consumer = images.consume(reference).await.unwrap();
         assert_eq!(consumer.info.id, info.id);
         images.store.recover_image_cache().await.unwrap();
         images.store.recover_layer_objects().await.unwrap();
-        assert!(images.release_retention(&reference).await.unwrap());
-        assert!(images.remove_alias("bounded-000000").await.unwrap());
+        let removal = images
+            .store
+            .remove_image(LocalImage::Stored(reference), None)
+            .await
+            .unwrap();
+        assert!(removal.record_removed);
         drop(consumer);
     }
 
@@ -2132,7 +1939,7 @@ pub(crate) mod tests {
                 )
             );
             let source = provenance(ImageContainerKind::Raw, &spelling);
-            let bytes = crate::store::managed_image_store::provenance_bytes(&source).unwrap();
+            let bytes = crate::store::stored_image_store::provenance_bytes(&source).unwrap();
             sqlx::query(
                 "INSERT INTO image_provenance(image_id,digest,record_bytes) VALUES(?1,?2,?3)",
             )
@@ -2143,9 +1950,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         }
-        let reference = ManagedSourceRef::Image(info.id);
-        assert!(images.load(&reference).await.is_err());
-        let consumer = images.consume(&reference).await.unwrap();
+        let reference = info.id;
+        assert!(images.inspect(reference).await.is_err());
+        let consumer = images.consume(reference).await.unwrap();
         assert_eq!(consumer.info.id, info.id);
         images.store.recover_image_cache().await.unwrap();
         images.store.recover_layer_objects().await.unwrap();
@@ -2171,7 +1978,7 @@ pub(crate) mod tests {
                     );
                     let bytes = serde_json::to_vec(&oversized_record).unwrap();
                     target = crate::store::models::image::image_id(&bytes);
-                    sqlx::query("INSERT INTO storage_image(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,?3,1,0)")
+                    sqlx::query("INSERT INTO storage_image(id,record_digest,record_bytes,created_at) VALUES(?1,?2,?3,0)")
                         .bind(target.to_string()).bind(ObjectDigest::of_bytes(&bytes).to_string())
                         .bind(bytes).execute(&images.store.pool).await.unwrap();
                 }
@@ -2193,13 +2000,13 @@ pub(crate) mod tests {
                 }
                 _ => unreachable!(),
             }
-            let reference = ManagedSourceRef::Image(target);
-            let error = images.load(&reference).await.unwrap_err();
+            let reference = target;
+            let error = images.inspect(reference).await.unwrap_err();
             assert!(
                 error.to_string().contains("exceeds MetadataPageBytes"),
                 "{table}: {error}"
             );
-            let error = images.consume(&reference).await.err().unwrap();
+            let error = images.consume(reference).await.err().unwrap();
             assert!(
                 error.to_string().contains("exceeds MetadataPageBytes"),
                 "{table}: {error}"
@@ -2218,63 +2025,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn alias_admission_refuses_managed_image_but_exact_typed_publication_replays() {
-        let (_temp, images, record, operation, lease) = fixture().await;
-        let image = images
-            .publish_owned(
-                record,
-                operation,
-                lease,
-                Some("occupied".into()),
-                Vec::new(),
-                None,
-            )
-            .await
-            .unwrap();
-        let mut tx = images
-            .store
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .unwrap();
-        let error =
-            crate::store::managed_image_store::check_alias_available(&mut tx, "occupied", None)
-                .await
-                .unwrap_err();
-        assert!(matches!(
-            error,
-            crate::LibVmError::ImageAliasConflict { alias } if alias == "occupied"
-        ));
-        assert!(crate::store::managed_image_store::check_alias_available(
-            &mut tx,
-            "occupied",
-            Some(ManagedSourceId::Image(image.id)),
-        )
-        .await
-        .unwrap());
-        crate::store::managed_image_store::insert_alias(
-            &mut tx,
-            "occupied",
-            ManagedSourceId::Image(image.id),
-        )
-        .await
-        .unwrap();
-        // Identical digest bytes with a different artifact kind are not replay.
-        let snapshot = image.id.to_string().parse().unwrap();
-        assert!(matches!(
-            crate::store::managed_image_store::check_alias_available(
-                &mut tx,
-                "occupied",
-                Some(ManagedSourceId::Snapshot(snapshot)),
-            )
-            .await,
-            Err(crate::LibVmError::ImageAliasConflict { .. })
-        ));
-        tx.commit().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn shared_map_subtrees_survive_until_the_last_image_is_released() {
+    async fn shared_map_subtrees_survive_until_the_last_image_is_removed() {
         use std::io::Write;
 
         let (temporary, images, mut record, initial_operation, initial_lease) = fixture().await;
@@ -2342,7 +2093,8 @@ pub(crate) mod tests {
                 .all(|node| !dependencies.contains(&node.to_string())));
         }
         images
-            .release_retention(&ManagedSourceRef::Image(published[0].id))
+            .store
+            .remove_image(LocalImage::Stored(published[0].id), None)
             .await
             .unwrap();
         images.store.recover_image_cache().await.unwrap();
@@ -2352,17 +2104,15 @@ pub(crate) mod tests {
         for node in &node_sets[0] {
             pool.verify_object(node).unwrap();
         }
-        let remaining = images
-            .consume(&ManagedSourceRef::Image(published[1].id))
-            .await
-            .unwrap();
+        let remaining = images.consume(published[1].id).await.unwrap();
         assert_eq!(
             remaining.info.record.root.stream,
             published[1].record.root.stream
         );
         drop(remaining);
         images
-            .release_retention(&ManagedSourceRef::Image(published[1].id))
+            .store
+            .remove_image(LocalImage::Stored(published[1].id), None)
             .await
             .unwrap();
         images.store.recover_image_cache().await.unwrap();

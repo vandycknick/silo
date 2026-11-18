@@ -23,8 +23,7 @@ pub(crate) const DIRECT_BOOT_ABI: &str = "silo-direct-v2";
 pub enum SourceFamily {
     Oci,
     LocalDisk,
-    ManagedImage,
-    Snapshot,
+    StoredImage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -114,7 +113,7 @@ pub(crate) fn effective_boot(
 ) -> Result<EffectiveBoot, LibVmError> {
     storage.validate()?;
     admit_create_source(
-        SourceFamily::ManagedImage,
+        SourceFamily::StoredImage,
         storage.profile,
         storage.backend,
         backend,
@@ -203,7 +202,7 @@ pub(crate) fn validate_direct_boot(
 ) -> Result<(), LibVmError> {
     storage.validate()?;
     admit_create_source(
-        SourceFamily::ManagedImage,
+        SourceFamily::StoredImage,
         storage.profile,
         storage.backend,
         backend,
@@ -864,7 +863,7 @@ pub(crate) async fn pin_boot_selection(
 ) -> Result<BootProfile, LibVmError> {
     storage.validate()?;
     admit_create_source(
-        SourceFamily::ManagedImage,
+        SourceFamily::StoredImage,
         storage.profile,
         storage.backend,
         context.backend,
@@ -2024,7 +2023,7 @@ mod tests {
             }
         ));
         assert!(admit_create_source(
-            SourceFamily::ManagedImage,
+            SourceFamily::StoredImage,
             crate::StorageProfile::OpaqueRawV1,
             crate::BackendRequirement::RawBlock,
             vm_spec::live::LiveBackend::Vz
@@ -2032,7 +2031,7 @@ mod tests {
         .is_ok());
         assert!(matches!(
             admit_create_source(
-                SourceFamily::ManagedImage,
+                SourceFamily::StoredImage,
                 crate::StorageProfile::LinuxOverlayV1,
                 crate::BackendRequirement::KrunOverlay,
                 vm_spec::live::LiveBackend::Vz

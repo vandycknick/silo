@@ -124,9 +124,8 @@ def test_restart_after_live_lineage_snapshot_removal_and_prune(
     for child in ("restart-restored", "restart-fork"):
         assert silo.exec(child, "cat", "/restart-marker").stdout.strip() == "after"
     silo.rm("restart-fork", force=True)
-    for alias, saved in (("restart-first", first), ("restart-second", second)):
-        silo.run("image", "remove", "image:" + alias)
-        silo.run("snapshot", "remove", saved.reference)
+    for alias in ("restart-first", "restart-second"):
+        silo.run("snapshot", "rm", alias)
     shutdown.storage_tool(silo, "prune")
     # The restored child's cold boot must not depend on its removed snapshot
     # or the force-removed sibling's capture ownership.
@@ -150,8 +149,7 @@ def test_restart_after_live_lineage_snapshot_removal_and_prune(
     call = fork.run(silo, source, ["restart-orphan-fork"], expect=0)
     assert fork.outcomes(call.result) == ["running"]
     silo.rm(source, force=True)
-    silo.run("image", "remove", "image:restart-after-stop")
-    silo.run("snapshot", "remove", third.reference)
+    silo.run("snapshot", "rm", third.snapshot)
     shutdown.storage_tool(silo, "prune")
     for child in ("restart-orphan-restored", "restart-orphan-fork"):
         silo.stop(child)

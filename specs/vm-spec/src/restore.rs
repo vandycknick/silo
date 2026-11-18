@@ -147,7 +147,7 @@ impl RestoreObjectRole {
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum RestoreAuthority {
     IdentifiedSnapshot {
-        checkpoint: Sha256Digest,
+        snapshot: Sha256Digest,
         evidence: Box<CaptureEvidence>,
     },
     OwnedLocalCut {
@@ -163,15 +163,15 @@ pub enum RestoreAuthority {
     deny_unknown_fields
 )]
 pub enum RestoreReference {
-    IdentifiedSnapshot { checkpoint: Sha256Digest },
+    IdentifiedSnapshot { snapshot: Sha256Digest },
     OwnedLocalCut { capture_id: LiveId },
 }
 
 impl RestoreAuthority {
     pub fn reference(&self) -> RestoreReference {
         match self {
-            Self::IdentifiedSnapshot { checkpoint, .. } => RestoreReference::IdentifiedSnapshot {
-                checkpoint: *checkpoint,
+            Self::IdentifiedSnapshot { snapshot, .. } => RestoreReference::IdentifiedSnapshot {
+                snapshot: *snapshot,
             },
             Self::OwnedLocalCut { cut } => RestoreReference::OwnedLocalCut {
                 capture_id: cut.capture_id.clone(),

@@ -37,7 +37,7 @@ const EXAMPLES: &[&str] = &[
     after_help = after_help()
 )]
 pub struct Cmd {
-    /// OCI registry reference or disk:PATH. Overrides the template image.
+    /// Image name, id, registry reference or disk:PATH. Overrides the template image.
     #[arg(value_name = "IMAGE")]
     image: Option<String>,
     /// Template providing VM defaults.

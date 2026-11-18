@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from silo_smoke import capture_multidisk as multidisk, fork, procs, reclaim, restore, stopped, stream_map
+from silo_smoke import capture_multidisk as multidisk, fork, overlay, procs, reclaim, restore, stopped, stream_map
 from silo_smoke.cli import RootProfile, Silo
 
 pytestmark = pytest.mark.linux_only
@@ -25,8 +25,8 @@ def create(silo: Silo, image: str, name: str, profile: RootProfile) -> None:
 
 
 def live_snapshot(silo: Silo, name: str, alias: str) -> tuple[str, dict[str, Any]]:
-    value = silo.json("snapshot", "create", name, "--live", "--name", alias, timeout=60)
-    assert value["snapshot"]["captureKind"] == "live-execution"
+    value = silo.json("snapshot", "create", name, "--memory", "--name", alias, timeout=60)
+    assert value["snapshot"]["memory"] == "included"
     summary = value["capture"]
     assert summary["sourceOutcome"] == "resumed" and summary["released"] is True
     relative = Path(summary["staging"])
@@ -45,7 +45,7 @@ def snapshot_record(silo: Silo, snapshot: str) -> dict[str, Any]:
 
 def verify(silo: Silo, snapshot: str) -> None:
     # The CLI's default expectation is exit zero; never accept an error object.
-    value = silo.json("snapshot", "verify", "image:" + snapshot, timeout=60)
+    value = silo.json("snapshot", "verify", snapshot, timeout=60)
     assert value["snapshot"] == snapshot
     assert value["streams"] > 0 and value["bytes"] > 0
 
@@ -70,12 +70,12 @@ def test_raw_root_live_snapshot_restore_fork_and_stopped(silo: Silo, basic_image
     assert second_seal["memory"]["baseline"] == first_seal["memory"]["ramStream"]
     for snapshot in (first, second):
         record = snapshot_record(silo, snapshot)
-        assert record["captureKind"] == "live-execution"
+        assert record["memory"] == "included"
         assert record["root"]["profile"] == {"kind": "opaque-raw"}
         verify(silo, snapshot)
 
     restored = "raw-live-restored"
-    restore.restore_child(silo, "image:" + first, restored)
+    restore.restore_child(silo, first, restored)
     assert stopped.record(silo, restored)["root"]["kind"] == "opaque-raw"
     assert silo.exec(restored, "cat", "/raw-live-marker").stdout == "first\n"
     silo.stop(restored)
@@ -90,8 +90,9 @@ def test_raw_root_live_snapshot_restore_fork_and_stopped(silo: Silo, basic_image
 
     silo.stop(source)
     captured = silo.json("snapshot", "create", source, "--name", "raw-stopped", timeout=60)
-    record = snapshot_record(silo, str(captured["id"]))
-    assert record["captureKind"] == "stopped-storage"
+    assert captured["capture"] is None and captured["snapshot"]["memory"] == "none"
+    record = snapshot_record(silo, str(captured["snapshot"]["id"]))
+    assert record["memory"] == "none"
     assert record["root"]["profile"] == {"kind": "opaque-raw"}
     stopped_child = "raw-stopped-fork"
     stopped.fork(silo, source, stopped_child)
@@ -129,7 +130,7 @@ done
 sync
 """, user="root")
     restored = "raw-data-restored"
-    restore.restore_child(silo, "image:" + snapshot, restored)
+    restore.restore_child(silo, snapshot, restored)
     assert silo.exec(restored, "cat", "/raw-live-marker", "/capture-a/raw-live-marker",
                      "/capture-b/raw-live-marker").stdout == "root-at-cut\ndata-a-at-cut\ndata-b-at-cut\n"
 
@@ -153,7 +154,7 @@ def test_verify_localizes_flipped_payload_despite_warm_receipts(
     assert stream_map.from_file(path, unit)[0] == root
     if member == "memory":
         child = "verify-root-restored"
-        restore.restore_child(silo, "image:" + snapshot, child)
+        restore.restore_child(silo, snapshot, child)
         # This is the actual file mapped into the restored guest, not a second
         # staging copy or a claimed stream ID from a CLI response.
         mapping = fork.ram_mapping(fork.worker(silo, child), path)
@@ -173,7 +174,7 @@ def test_verify_localizes_flipped_payload_despite_warm_receipts(
         assert os.pwrite(fd, bytes([original[0] ^ 0x80]), offset) == 1
         os.fsync(fd)
         os.fchmod(fd, mode)
-        failed = silo.run("snapshot", "verify", "image:" + snapshot, "--format", "json",
+        failed = silo.run("snapshot", "verify", snapshot, "--format", "json",
                           expect=1, timeout=120)
         error = json.loads(failed.stdout)["error"]
         assert (error["kind"], error["role"], error["stream"]) == ("chunkMismatch", role, binding["stream"])
@@ -210,7 +211,7 @@ def test_verify_refuses_corrupt_map_node_closure(silo: Silo, basic_image: str, h
         path.chmod(0o600)
         path.write_bytes(original[:-1] + bytes([original[-1] ^ 0x80]))
         path.chmod(mode)
-        failed = silo.run("snapshot", "verify", "image:" + snapshot, "--format", "json", expect=1, timeout=120)
+        failed = silo.run("snapshot", "verify", snapshot, "--format", "json", expect=1, timeout=120)
         error = json.loads(failed.stdout)["error"]
         assert (error["kind"], error["role"], error["node"], error["height"]) == (
             "mapNode", "RAM", node, height)
@@ -219,3 +220,57 @@ def test_verify_refuses_corrupt_map_node_closure(silo: Silo, basic_image: str, h
         path.chmod(0o600)
         path.write_bytes(original)
         path.chmod(mode)
+
+
+def memory_column(silo: Silo) -> dict[str, str]:
+    """MEMORY cell of each named row in the plain `snapshot list` table."""
+    lines = [line for line in silo.run("snapshot", "list").stdout.splitlines() if line.strip()]
+    assert lines and lines[0].split() == ["NAME", "ID", "MEMORY", "SOURCE", "CREATED"], lines
+    return {row.split()[0]: row.split()[2] for row in lines[1:]}
+
+
+def test_snapshot_memory_is_explicit_and_without_memory_restores_disks_only(silo: Silo, basic_image: str) -> None:
+    source = "memory-choice-source"
+    create(silo, basic_image, source, "layered")
+    silo.start(source)
+    running = silo.wait_ready(source)
+    boot_id = silo.exec(source, "cat", "/proc/sys/kernel/random/boot_id").stdout
+    silo.exec(source, "sh", "-eu", "-c",
+              "printf disk-cut >/memory-choice-marker; printf live-only >/dev/shm/memory-choice-live; sync",
+              user="root")
+
+    # Disks alone cannot be captured from a running VM this round: refused
+    # before any capture, naming both ways forward.
+    refused = silo.run("snapshot", "create", source, "--name", "never-captured", expect=None)
+    assert refused.returncode != 0
+    assert "stop it first" in refused.stderr and "memory" in refused.stderr, refused.stderr
+    assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM storage_snapshot") == [("0",)]
+    assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM storage_operation WHERE kind='capture'") == [("0",)]
+    current = silo.info(source)
+    assert current["state"] == "running" and current["run_id"] == running["run_id"]
+
+    with_memory, _ = live_snapshot(silo, source, "with-memory")
+    silo.stop(source)
+    without = silo.json("snapshot", "create", source, "--name", "without-memory", timeout=60)
+    assert without["capture"] is None and without["snapshot"]["memory"] == "none"
+    assert memory_column(silo) == {"with-memory": "yes", "without-memory": "no"}
+
+    # A snapshot with memory restored without it: a stopped VM from the
+    # captured disks; RAM is discarded and the next start is a new boot.
+    cold = "memory-choice-cold"
+    silo.ws.register_machine(cold)
+    silo.run("restore", "with-memory", "--without-memory", "--name", cold, timeout=240)
+    info = silo.info(cold)
+    assert info["state"] == "stopped" and info["run_id"] is None and info["ready"] is False
+    storage = stopped.record(silo, cold)
+    assert storage["root"]["kind"] == "linux-overlay", storage["root"]
+    assert storage["snapshot"] == with_memory and storage["stopOutcome"] == "unknown", storage
+    assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM restore_resource_reservation") == [("0",)]
+    assert not any(path.name in {"memory.ram", "execution.state", "devices.state"}
+                   for path in overlay.machine_dir(silo, cold).rglob("*")), "disk-only restore installed execution inputs"
+    silo.start(cold)
+    silo.wait_ready(cold)
+    assert silo.exec(cold, "cat", "/proc/sys/kernel/random/boot_id").stdout != boot_id
+    assert silo.exec(cold, "cat", "/memory-choice-marker").stdout == "disk-cut"
+    silo.exec(cold, "test", "!", "-e", "/dev/shm/memory-choice-live")
+    silo.stop(cold)

@@ -19,19 +19,14 @@ pub(crate) struct ImageManifestRecord {
     pub last_used_at: Option<i64>,
 }
 
+/// The `image_name` row naming one OCI selection. The digest-pinned
+/// selected reference is derived from the name and the manifest digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageRefRecord {
+    /// Canonical requested registry reference, the name of the selection.
     pub requested_reference: String,
     pub selected_reference: String,
-    pub manifest_digest: String,
-    pub image_id: String,
-    pub platform_os: String,
-    pub platform_architecture: String,
-    pub platform_variant: Option<String>,
-    pub size_bytes: Option<u64>,
-    pub created_at: i64,
     pub updated_at: i64,
-    pub last_used_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

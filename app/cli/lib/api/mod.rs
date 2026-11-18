@@ -14,8 +14,8 @@ pub(crate) mod types;
 use std::time::Duration;
 
 use libvm::{
-    ImageProgressSender, ImagePullPolicy, MachineData, MachineUpdate, NetworkDefinition,
-    NetworkDriver, NetworkTopology, RuntimeConfig,
+    ImageProgressSender, MachineData, MachineUpdate, NetworkDefinition, NetworkDriver,
+    NetworkTopology, RuntimeConfig,
 };
 
 use crate::machine_defaults::ResolvedMachineNetwork;
@@ -25,6 +25,7 @@ use crate::template::Template;
 use crate::api::machine::AppMachine;
 use crate::api::start_options::AppStartOptions;
 use crate::api::types::{ReadOnlyCreationResolution, SourceOptions, SourceResolution};
+use crate::commands::create::{parse_source, validate_source_options, SourceSpelling};
 
 #[derive(Debug)]
 pub(crate) enum AppApi {
@@ -107,15 +108,15 @@ impl AppApi {
         }
     }
 
-    pub(crate) async fn snapshot_live(
+    pub(crate) async fn snapshot(
         &mut self,
         reference: &str,
-        options: libvm::LiveSnapshotOptions,
+        options: libvm::SnapshotOptions,
         progress: Option<libvm::LiveOperationProgressSender>,
-    ) -> eyre::Result<libvm::LiveSnapshot> {
+    ) -> eyre::Result<libvm::CreatedSnapshot> {
         match self {
-            Self::Local(service) => service.snapshot_live(reference, options, progress).await,
-            Self::Daemon(service) => service.snapshot_live(reference, options).await,
+            Self::Local(service) => service.snapshot(reference, options, progress).await,
+            Self::Daemon(service) => service.snapshot(reference, options).await,
         }
     }
 
@@ -174,49 +175,25 @@ impl AppApi {
         }
     }
 
-    pub(crate) async fn snapshot_stopped(
-        &mut self,
-        reference: &str,
-        options: libvm::SnapshotOptions,
-    ) -> eyre::Result<libvm::SnapshotInfo> {
-        match self {
-            Self::Local(service) => service.snapshot_stopped(reference, options).await,
-            Self::Daemon(service) => service.snapshot_stopped(reference, options).await,
-        }
-    }
-
-    pub(crate) async fn restore_snapshot(
+    /// `--pull never` restores a local snapshot (name, `search_registries`
+    /// expansion, id or unique id prefix), which both backends admit before
+    /// any writable initialization. Otherwise `reference` runs the full
+    /// resolver: the same local steps, then a registry pull per `options.pull`.
+    pub(crate) async fn restore(
         &mut self,
         reference: &str,
         options: libvm::RestoreOptions,
         progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<MachineData> {
         silo_vm_control::images::reject_local_cut(reference)?;
-        let reference: libvm::SnapshotRef = if reference.starts_with("image:") {
-            reference.parse()?
+        let source = if options.pull == libvm::PullPolicy::Never {
+            libvm::RestoreSource::Local(reference.parse()?)
         } else {
-            format!("image:{reference}").parse()?
+            libvm::RestoreSource::Registry(reference.to_owned())
         };
         match self {
-            Self::Local(service) => service.restore_snapshot(reference, options, progress).await,
-            Self::Daemon(service) => service.restore_snapshot(reference, options).await,
-        }
-    }
-
-    pub(crate) async fn recover_checkpoint_disks(
-        &mut self,
-        reference: &str,
-        options: libvm::RecoverDisksOptions,
-    ) -> eyre::Result<MachineData> {
-        silo_vm_control::images::reject_local_cut(reference)?;
-        let reference: libvm::SnapshotRef = if reference.starts_with("image:") {
-            reference.parse()?
-        } else {
-            format!("image:{reference}").parse()?
-        };
-        match self {
-            Self::Local(service) => service.recover_checkpoint_disks(reference, options).await,
-            Self::Daemon(service) => service.recover_checkpoint_disks(reference, options).await,
+            Self::Local(service) => service.restore(source, options, progress).await,
+            Self::Daemon(service) => service.restore(source, options).await,
         }
     }
 
@@ -249,68 +226,67 @@ impl AppApi {
         }
     }
 
-    pub(crate) async fn release_snapshot(&mut self, reference: &str) -> eyre::Result<()> {
+    /// A name removes that name, and the snapshot with its last name; an id
+    /// removes the snapshot and all its names.
+    pub(crate) async fn remove_snapshot(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<libvm::SnapshotRemoval> {
         let reference: libvm::SnapshotRef = reference.parse()?;
         match self {
-            Self::Local(service) => service.release_snapshot(reference).await,
-            Self::Daemon(service) => service.release_snapshot(reference).await,
+            Self::Local(service) => service.remove_snapshot(reference).await,
+            Self::Daemon(service) => service.remove_snapshot(reference).await,
         }
     }
 
-    /// Removes only an `image:NAME` alias in the single image/snapshot namespace,
-    /// never an explicit retention.
-    pub(crate) async fn remove_image_alias(&mut self, reference: &str) -> eyre::Result<()> {
-        let alias = match silo_vm_control::images::parse_managed(reference)? {
-            silo_vm_control::images::ManagedSpelling::Reference(
-                libvm::ManagedSourceRef::Alias(alias),
-            ) => alias,
-            _ => {
-                eyre::bail!("image remove requires an image:NAME alias, not an immutable identity")
-            }
-        };
+    pub(crate) async fn list_images(&mut self) -> eyre::Result<Vec<libvm::ImageInfo>> {
         match self {
-            Self::Local(service) => service.remove_image_alias(alias).await,
-            Self::Daemon(service) => service.remove_image_alias(alias).await,
+            Self::Local(service) => service.list_images().await,
+            Self::Daemon(service) => service.list_images().await,
         }
     }
 
-    /// Resolves any `image:` spelling to a typed reference in either transport.
-    pub(crate) async fn managed_reference(
+    /// Local only: a name, `search_registries` expansion, id or unique id prefix.
+    pub(crate) async fn inspect_image(
         &mut self,
         reference: &str,
-    ) -> eyre::Result<libvm::ManagedSourceRef> {
-        let spelling = silo_vm_control::images::parse_managed(reference)?;
+    ) -> eyre::Result<libvm::ImageInfo> {
+        let reference: libvm::ImageRef = reference.parse()?;
         match self {
-            Self::Local(service) => service.managed_reference(spelling).await,
-            Self::Daemon(service) => service.managed_reference(spelling).await,
+            Self::Local(service) => service.inspect_image(&reference).await,
+            Self::Daemon(service) => service.inspect_image(&reference).await,
         }
     }
 
-    pub(crate) async fn inspect_managed(
+    /// A name removes that name, and the image with its last name; an id
+    /// removes the image and all its names.
+    pub(crate) async fn remove_image(
         &mut self,
         reference: &str,
-    ) -> eyre::Result<libvm::ManagedSourceInfo> {
-        let reference = self.managed_reference(reference).await?;
+    ) -> eyre::Result<libvm::ImageRemoval> {
+        let reference: libvm::ImageRef = reference.parse()?;
         match self {
-            Self::Local(service) => service.inspect_managed(&reference).await,
-            Self::Daemon(service) => service.inspect_managed(&reference).await,
+            Self::Local(service) => service.remove_image(&reference).await,
+            Self::Daemon(service) => service.remove_image(&reference).await,
         }
     }
 
-    pub(crate) async fn list_managed(&mut self) -> eyre::Result<Vec<libvm::ManagedSourceInfo>> {
+    pub(crate) async fn prune_images(&mut self) -> eyre::Result<libvm::ImagePruneReport> {
         match self {
-            Self::Local(service) => service.list_managed().await,
-            Self::Daemon(service) => service.list_managed().await,
+            Self::Local(service) => service.prune_images().await,
+            Self::Daemon(service) => service.prune_images().await,
         }
     }
 
-    /// Releases explicit retention of an image or snapshot; aliases and other
-    /// consumers still retain its bytes.
-    pub(crate) async fn release_image(&mut self, reference: &str) -> eyre::Result<()> {
-        let reference = self.managed_reference(reference).await?;
+    pub(crate) async fn pull_image(
+        &mut self,
+        reference: &str,
+        options: libvm::ImagePullOptions,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<libvm::ImageInfo> {
         match self {
-            Self::Local(service) => service.release_image(&reference).await,
-            Self::Daemon(service) => service.release_image(&reference).await,
+            Self::Local(service) => service.pull_image(reference, options, progress).await,
+            Self::Daemon(service) => service.pull_image(reference, options, progress).await,
         }
     }
 
@@ -321,16 +297,6 @@ impl AppApi {
         match self {
             Self::Local(service) => service.inspect_artifact(reference).await,
             Self::Daemon(service) => service.inspect_artifact(reference).await,
-        }
-    }
-
-    pub(crate) async fn acquire_artifact(
-        &mut self,
-        request: libvm::ArtifactAcquireRequest,
-    ) -> eyre::Result<libvm::ArtifactAcquireReport> {
-        match self {
-            Self::Local(service) => service.acquire_artifact(request).await,
-            Self::Daemon(service) => service.acquire_artifact(request).await,
         }
     }
 
@@ -348,7 +314,7 @@ impl AppApi {
         &mut self,
         request: libvm::DiskImportRequest,
         progress: ImageProgressSender,
-    ) -> eyre::Result<libvm::ManagedImageInfo> {
+    ) -> eyre::Result<libvm::StoredImageInfo> {
         match self {
             Self::Local(service) => service.import_image(request, progress).await,
             Self::Daemon(service) => service.import_image(request, progress).await,
@@ -358,11 +324,11 @@ impl AppApi {
     pub(crate) async fn convert_image(
         &mut self,
         reference: String,
-        pull: ImagePullPolicy,
+        pull: libvm::PullPolicy,
         platform: Option<libvm::LinuxPlatform>,
         options: libvm::RawConversionOptions,
         progress: ImageProgressSender,
-    ) -> eyre::Result<libvm::ManagedImageInfo> {
+    ) -> eyre::Result<libvm::StoredImageInfo> {
         match self {
             Self::Local(service) => {
                 service
@@ -533,25 +499,121 @@ impl AppApi {
         }
     }
 
+    /// `disk:PATH` is a disk; anything else is resolved like DESIGN §4: a
+    /// local stored image by name, expansion or id prefix is used directly
+    /// (re-pulled first under `--pull always` when spelled as a registry
+    /// reference); otherwise the reference selects an OCI image.
     pub(crate) async fn resolve_source(
         &mut self,
         positional: Option<&str>,
         template: &Template,
-        pull: Option<(ImagePullPolicy, PullPolicy)>,
+        pull: Option<(libvm::PullPolicy, PullPolicy)>,
         options: &SourceOptions,
         progress: ImageProgressSender,
     ) -> eyre::Result<SourceResolution> {
-        match self {
+        let requested = crate::commands::create::selected_image_reference(positional, template)?;
+        let spelling = parse_source(&requested)?;
+        validate_source_options(&spelling, options, pull.is_some())?;
+        let is_positional = positional.is_some();
+        let reference = match spelling {
+            SourceSpelling::Disk(path) => {
+                return local::disk_resolution(path, options, is_positional)
+            }
+            SourceSpelling::Reference(reference) => reference,
+        };
+        let pull = pull.unwrap_or((libvm::PullPolicy::IfMissing, PullPolicy::IfMissing));
+        let oci_reference = match self.creation_image(reference, pull.0, &progress).await? {
+            local::CreationImage::Stored(image) => {
+                return local::stored_resolution(requested, &image, options, is_positional)
+            }
+            local::CreationImage::Oci(reference) => reference,
+        };
+        let resolved = match self {
             Self::Local(service) => {
                 service
-                    .resolve_source(positional, template, pull, options, progress)
+                    .resolve_oci_source(
+                        oci_reference,
+                        pull,
+                        options,
+                        progress.clone(),
+                        is_positional,
+                    )
                     .await
             }
             Self::Daemon(service) => {
                 service
-                    .resolve_source(positional, template, pull, options, progress)
+                    .resolve_oci_source(
+                        oci_reference,
+                        pull,
+                        options,
+                        progress.clone(),
+                        is_positional,
+                    )
                     .await
             }
+        };
+        // A Silo image artifact is not an OCI container image: pulling it
+        // stores the image, which creation then uses by id.
+        let artifact = match resolved {
+            Err(error) if pull.0 != libvm::PullPolicy::Never => {
+                match error.downcast::<libvm::LibVmError>() {
+                    Ok(libvm::LibVmError::ImageIsVmArtifact { reference }) => reference,
+                    Ok(error) => return Err(error.into()),
+                    Err(error) => return Err(error),
+                }
+            }
+            resolved => return resolved,
+        };
+        let options_for_pull = libvm::ImagePullOptions {
+            policy: Some(pull.0),
+        };
+        match self.pull_image(&artifact, options_for_pull, progress).await? {
+            libvm::ImageInfo::Stored(image) => {
+                local::stored_resolution(requested, &image, options, is_positional)
+            }
+            libvm::ImageInfo::Oci(_) => eyre::bail!(
+                "{artifact} changed from a Silo image artifact to a container image while pulling; retry"
+            ),
+        }
+    }
+
+    async fn creation_image(
+        &mut self,
+        reference: String,
+        pull: libvm::PullPolicy,
+        progress: &ImageProgressSender,
+    ) -> eyre::Result<local::CreationImage> {
+        let image = match self.inspect_image(&reference).await {
+            Ok(image) => image,
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<libvm::LibVmError>(),
+                    Some(libvm::LibVmError::ImageNotFound { .. })
+                ) =>
+            {
+                return Ok(local::CreationImage::Oci(reference))
+            }
+            Err(error) => return Err(error),
+        };
+        match image {
+            libvm::ImageInfo::Stored(_)
+                if pull == libvm::PullPolicy::Always
+                    && local::is_registry_reference(&reference) =>
+            {
+                let options = libvm::ImagePullOptions {
+                    policy: Some(libvm::PullPolicy::Always),
+                };
+                Ok(
+                    match self
+                        .pull_image(&reference, options, progress.clone())
+                        .await?
+                    {
+                        libvm::ImageInfo::Stored(image) => local::CreationImage::Stored(image),
+                        libvm::ImageInfo::Oci(_) => local::CreationImage::Oci(reference),
+                    },
+                )
+            }
+            image => local::CreationImage::local(reference, image),
         }
     }
 
@@ -560,7 +622,7 @@ impl AppApi {
         requested_name: Option<String>,
         positional: Option<&str>,
         template: &Template,
-        pull: Option<(ImagePullPolicy, PullPolicy)>,
+        pull: Option<(libvm::PullPolicy, PullPolicy)>,
         options: &SourceOptions,
     ) -> eyre::Result<ReadOnlyCreationResolution> {
         local::LocalVmService::resolve_read_only_creation(
@@ -662,6 +724,196 @@ mod tests {
             message,
             "guest powered off during boot; check `silo logs archy --stream serial`"
         );
+    }
+
+    fn minimal_template() -> crate::template::Template {
+        serde_json::from_str(r#"{"version":"1"}"#).expect("parse minimal template")
+    }
+
+    #[tokio::test]
+    async fn snapshot_names_restore_machines_and_are_refused_as_creation_images() {
+        let temp = tempfile::tempdir().unwrap();
+        // Stopped capture admits only the krun direct-boot lane; nothing boots here.
+        let mut api = AppApi::local(
+            isolated_runtime_config(temp.path(), &temp.path().join("home"))
+                .with_virt_backend(libvm::VirtBackendOverride::Krun),
+        );
+        let source = create_idle_fixture(&mut api, temp.path(), "source").await;
+        let created = api
+            .snapshot(
+                "source",
+                libvm::SnapshotOptions {
+                    name: Some("web".into()),
+                    ..libvm::SnapshotOptions::default()
+                },
+                None,
+            )
+            .await
+            .expect("snapshot a stopped machine");
+        created.require_requested_name().unwrap();
+        assert_eq!(created.snapshot.names, ["web"]);
+        assert_eq!(created.snapshot.memory, libvm::SnapshotMemory::None);
+        assert!(created.capture.is_none());
+
+        let (progress, _events) = libvm::ImageProgressSender::default_channel();
+        let error = api
+            .resolve_source(
+                Some("web"),
+                &minimal_template(),
+                None,
+                &crate::api::types::SourceOptions::default(),
+                progress,
+            )
+            .await
+            .expect_err("create takes images only");
+        assert!(
+            matches!(
+                error.downcast_ref::<libvm::LibVmError>(),
+                Some(libvm::LibVmError::SnapshotIsNotAnImage { .. })
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("silo restore web"), "{error}");
+
+        let restored = api
+            .restore(
+                "web",
+                libvm::RestoreOptions {
+                    name: Some("restored".into()),
+                    ..libvm::RestoreOptions::default()
+                },
+                None,
+            )
+            .await
+            .expect("restore by local snapshot name");
+        assert_eq!(restored.name, "restored");
+        assert_eq!(restored.status, libvm::MachineStatus::Stopped);
+
+        let listed = api.list_snapshots().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, created.snapshot.id);
+        let removal = api.remove_snapshot("web").await.unwrap();
+        assert_eq!(removal.id, created.snapshot.id);
+        assert_eq!(removal.names, ["web"]);
+        assert!(removal.record_removed);
+        assert!(api.list_snapshots().await.unwrap().is_empty());
+        assert_eq!(
+            api.inspect_machine("restored").await.unwrap().status,
+            libvm::MachineStatus::Stopped,
+            "removing a snapshot leaves machines restored from it intact"
+        );
+        api.machine("restored")
+            .await
+            .unwrap()
+            .remove()
+            .await
+            .unwrap();
+        source.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stored_image_names_resolve_for_creation_and_follow_tag_removal() {
+        use crate::api::types::{ResolvedSource, SourceOptions};
+        use crate::planning::ResolvedImage;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut api = AppApi::local(isolated_runtime_config(
+            temp.path(),
+            &temp.path().join("home"),
+        ));
+        let disk = temp.path().join("base.img");
+        disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+            .and_then(|formatter| formatter.close())
+            .unwrap();
+        let platform = silo_vm_control::boot::host_platform().unwrap();
+        let (progress, _events) = libvm::ImageProgressSender::default_channel();
+        let image = api
+            .import_image(
+                libvm::DiskImportRequest {
+                    path: disk,
+                    boot: libvm::DiskImportBoot::LinuxDirect {
+                        platform: platform.clone(),
+                        root: libvm::ImportRootSelection::WholeDisk,
+                        assets: libvm::BootAssetSelection::Packaged,
+                    },
+                    name: Some("base".into()),
+                },
+                progress.clone(),
+            )
+            .await
+            .expect("import a named stored image");
+        assert_eq!(image.names, ["base"]);
+
+        let id = image.id.to_string();
+        let prefix = &id["sha256:".len().."sha256:".len() + 12];
+        for reference in ["base", prefix, id.as_str()] {
+            let source = api
+                .resolve_source(
+                    Some(reference),
+                    &minimal_template(),
+                    None,
+                    &SourceOptions::default(),
+                    progress.clone(),
+                )
+                .await
+                .expect("a stored image by name, id prefix or id");
+            assert!(
+                matches!(source.source, ResolvedSource::Stored(id) if id == image.id),
+                "{reference}"
+            );
+            assert!(matches!(
+                &source.plan_image,
+                ResolvedImage::Stored { requested_reference, id, .. }
+                    if requested_reference == reference && *id == image.id
+            ));
+        }
+        let error = api
+            .resolve_source(
+                Some("base"),
+                &minimal_template(),
+                None,
+                &SourceOptions {
+                    platform: Some(platform),
+                    root: None,
+                },
+                progress,
+            )
+            .await
+            .expect_err("--platform cannot rewrite stored boot metadata");
+        assert!(
+            error
+                .to_string()
+                .contains("--platform cannot change a stored image"),
+            "{error}"
+        );
+
+        let error = api
+            .restore("base", libvm::RestoreOptions::default(), None)
+            .await
+            .expect_err("restore takes snapshots only");
+        assert!(
+            matches!(
+                error.downcast_ref::<libvm::LibVmError>(),
+                Some(libvm::LibVmError::ImageIsNotASnapshot { .. })
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("silo create base"), "{error}");
+
+        assert!(api.list_images().await.unwrap().iter().any(|listed| {
+            matches!(listed, libvm::ImageInfo::Stored(stored) if stored.id == image.id && stored.names == ["base"])
+        }));
+        let removal = api.remove_image("base").await.unwrap();
+        assert_eq!(removal.id, image.id);
+        assert_eq!(removal.names, ["base"]);
+        assert!(removal.record_removed, "the last name removes the image");
+        assert!(matches!(
+            api.inspect_image("base")
+                .await
+                .unwrap_err()
+                .downcast_ref::<libvm::LibVmError>(),
+            Some(libvm::LibVmError::ImageNotFound { .. })
+        ));
     }
 
     #[tokio::test]

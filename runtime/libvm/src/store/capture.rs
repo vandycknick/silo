@@ -24,8 +24,8 @@ use crate::storage::limits::Resource;
 use crate::storage::pool::{PublicationLockPolicy, SealedStreamPublicationMode, StoragePool};
 use crate::storage::StorageError;
 use crate::store::models::snapshot::{
-    invalid, SnapshotCaptureKind, SnapshotCompatibilityProfile, SnapshotDisk, SnapshotExecution,
-    SnapshotKind, SnapshotPurpose, SnapshotRecord, SnapshotRoot, SnapshotRootProfile,
+    invalid, SnapshotCompatibilityProfile, SnapshotDisk, SnapshotExecution, SnapshotKind,
+    SnapshotMemoryState, SnapshotRecord, SnapshotRoot, SnapshotRootProfile,
 };
 use crate::store::models::MachineId;
 use crate::store::snapshot_store::{
@@ -128,8 +128,8 @@ impl SnapshotStore {
         Resource::ArtifactStreamBytes
             .check(logical)
             .map_err(StorageError::from)?;
-        if let Some(alias) = &request.alias {
-            crate::store::snapshot_store::validate_alias(alias)?;
+        if let Some(name) = &request.name {
+            crate::store::names::validate_name(name)?;
         }
         request.configuration.validate().map_err(invalid)?;
         let pool = StoragePool::open(&self.store.images_dir)?;
@@ -417,7 +417,7 @@ impl SnapshotStore {
             machine_id: request.machine_id,
             run_id: request.run_id,
             launch_operation_id: launch.operation_id,
-            alias: request.alias.clone(),
+            name: request.name.clone(),
             request,
             plan,
             state: CaptureState::Reserved,
@@ -792,9 +792,9 @@ impl SnapshotStore {
                 "local fork cut is not an identified snapshot; snapshot the child first",
             ));
         }
-        if record.alias != name {
+        if record.name != name {
             return Err(invalid(
-                "capture publication alias differs from durable intent",
+                "capture publication name differs from durable intent",
             ));
         }
         let expected = crate::paths::machine_data_dir_in(self.store.home_path(), record.machine_id)
@@ -1163,8 +1163,7 @@ impl SnapshotStore {
         let snapshot = SnapshotRecord {
             schema: 2,
             kind: SnapshotKind::Snapshot,
-            purpose: SnapshotPurpose::Checkpoint,
-            capture: SnapshotCaptureKind::LiveExecution {
+            memory: SnapshotMemoryState::Included {
                 execution: Box::new(SnapshotExecution {
                     memory,
                     layout: take(CaptureRole::Layout)?,
@@ -1448,7 +1447,7 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
             if !owned
                 || cut != record.capture_id
                 || record.candidate.is_some()
-                || record.alias.is_some()
+                || record.name.is_some()
                 || !record.publication_clones.is_empty() =>
         {
             return Err(invalid(
@@ -1462,10 +1461,10 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
         }
         _ => {}
     }
-    if let Some(crate::store::snapshot_store::CaptureNamingOutcome::AliasConflict { alias }) =
+    if let Some(crate::store::snapshot_store::CaptureNamingOutcome::NameConflict { name }) =
         &record.naming_outcome
     {
-        if record.alias.as_ref() != Some(alias)
+        if record.name.as_ref() != Some(name)
             || !matches!(
                 record.state,
                 CaptureState::Published { .. } | CaptureState::Released { snapshot: Some(_) }
@@ -1510,7 +1509,7 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
         || record.request.capture_id != record.capture_id
         || record.request.machine_id != record.machine_id
         || record.request.run_id != record.run_id
-        || record.request.alias != record.alias
+        || record.request.name != record.name
     {
         return Err(invalid("capture record identity contradiction"));
     }
@@ -1655,8 +1654,13 @@ pub(crate) async fn register_capture(
     lease_device: u64,
     lease_inode: u64,
 ) -> Result<(), LibVmError> {
-    if let Some(alias) = &record.alias {
-        crate::store::managed_image_store::check_alias_available(connection, alias, None).await?;
+    if let Some(name) = &record.name {
+        if crate::store::snapshot_store::named_snapshot(&mut *connection, name)
+            .await?
+            .is_some()
+        {
+            return Err(LibVmError::SnapshotNameConflict { name: name.clone() });
+        }
     }
     let current: Option<String> =
         sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
@@ -3265,14 +3269,14 @@ pub(crate) mod tests {
         AUTHENTICATION_BUFFER_BYTES,
     };
 
-    use crate::store::models::snapshot::SnapshotCaptureKind;
+    use crate::store::models::snapshot::SnapshotMemoryState;
     use crate::store::models::{
         MachineConfig, MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
     };
     use crate::store::operation_store::LaunchStorageLease;
     use crate::store::snapshot_store::{
         CaptureReservation, CaptureReservationRequest, CaptureSourceOutcome, CaptureState,
-        SnapshotCaptureKindName, SnapshotRef, SnapshotStore,
+        SnapshotMemory, SnapshotRef, SnapshotStore,
     };
     use crate::store::{MachineStore, Store};
 
@@ -3317,7 +3321,7 @@ pub(crate) mod tests {
                         .publish_capture(
                             fixture.reservation.record.capture_id,
                             directory.path(),
-                            Some("checkpoint".into()),
+                            Some("snapshot".into()),
                             crate::storage::pool::PublicationLockPolicy::Wait,
                         )
                         .await
@@ -3613,13 +3617,16 @@ pub(crate) mod tests {
             secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: LockId::from(0),
-            name: "checkpoint-source".into(),
+            name: "snapshot-source".into(),
             spec,
             retention: crate::MachineRetention::Persistent,
             process: crate::ProcessConfig::default(),
             template_name: None,
             agent_mode: None,
-            guest: crate::MachineGuestConfig::default(),
+            guest: crate::MachineGuestConfig {
+                agent: crate::MachineAgent::Disabled,
+                ..Default::default()
+            },
             machine_dir: directory.path().to_path_buf(),
             created_at: 1,
             modified_at: 1,
@@ -3695,11 +3702,7 @@ pub(crate) mod tests {
             run_id: run,
             capture_id: Uuid::new_v4(),
             configuration: CaptureConfiguration::from_spec(&config.spec).unwrap(),
-            alias: if fork {
-                None
-            } else {
-                Some("checkpoint".into())
-            },
+            name: if fork { None } else { Some("snapshot".into()) },
             policy,
             dirty_crossover_percent: 60,
             resume_policy: CaptureResumePolicy::ResumeIfAcquired,
@@ -4261,7 +4264,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             request.capture_id = Uuid::new_v4();
-            request.alias = None;
+            request.name = None;
             let base = crate::store::fork::tests::observation(request.machine_id, request.run_id);
             let mut report = base.report().clone();
             report.live.capture = vm_spec::live::LiveCapability {
@@ -4353,7 +4356,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_reservation_replay_pins_exact_launch_and_rejects_changed_intent() {
+    async fn memory_snapshot_reservation_replay_pins_exact_launch_and_rejects_changed_intent() {
         let fixture = fixture().await;
         let request = fixture.reservation.record.request.clone();
         let replay = fixture.snapshots.reserve_capture(&request).await.unwrap();
@@ -4405,7 +4408,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -4457,10 +4460,10 @@ pub(crate) mod tests {
             .restore_evidence(&consumer, &pool)
             .is_err());
         consumer.record.configuration.spec = saved;
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &mut consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &mut consumer.record.memory
         else {
-            panic!("execution checkpoint");
+            panic!("snapshot with memory required");
         };
         execution
             .compatibility_profile
@@ -4487,7 +4490,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -4497,10 +4500,10 @@ pub(crate) mod tests {
                 .snapshot_record(&SnapshotRef::Id(result.id))
                 .await
                 .unwrap();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            record.memory
         else {
-            panic!("execution checkpoint");
+            panic!("snapshot with memory required");
         };
         let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
         let path = pool.object_path(&execution.devices);
@@ -4534,7 +4537,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_seal_publication_survives_source_alias_loss_and_retains_provenance() {
+    async fn memory_snapshot_publication_survives_record_removal_and_keeps_provenance() {
         let fixture = fixture().await;
         let (directory, _) = seal(&fixture);
         let capture = fixture.reservation.record.capture_id;
@@ -4543,12 +4546,12 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap();
-        assert_eq!(result.capture_kind, SnapshotCaptureKindName::LiveExecution);
+        assert_eq!(result.memory, SnapshotMemory::Included);
         assert_eq!(result.provenance.len(), 1);
         let evidence_digest = result.provenance[0].evidence_digest;
         let consumer = fixture
@@ -4563,8 +4566,8 @@ pub(crate) mod tests {
         .unwrap()
         .objects;
         assert!(!boot_objects.is_empty());
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &consumer.record.memory
         else {
             panic!("not execution");
         };
@@ -4581,7 +4584,7 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -4623,11 +4626,8 @@ pub(crate) mod tests {
             .consume(&SnapshotRef::Id(result.id))
             .await
             .unwrap();
-        snapshots.remove_alias("checkpoint").await.unwrap();
-        snapshots
-            .release_retention(&SnapshotRef::Id(result.id))
-            .await
-            .unwrap();
+        let removal = snapshots.remove(&SnapshotRef::Id(result.id)).await.unwrap();
+        assert!(removal.record_removed);
         let launches = snapshots
             .store
             .launch_storage_operations(config.id)
@@ -4685,12 +4685,12 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_unreconciled_capture_survives_generic_recovery_after_owner_loss() {
+    async fn memory_snapshot_unreconciled_capture_survives_generic_recovery_after_owner_loss() {
         let fixture = fixture().await;
         let (directory, _) = seal(&fixture);
         let capture = fixture.reservation.record.capture_id;
         let snapshots = fixture.snapshots.clone();
-        let alias = fixture.reservation.record.alias.clone();
+        let alias = fixture.reservation.record.name.clone();
         drop(fixture.reservation);
         drop(fixture.launch);
         snapshots.store.recover_image_cache().await.unwrap();
@@ -4713,7 +4713,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_recovery_settles_owned_seal_temporary_before_publication() {
+    async fn memory_snapshot_recovery_settles_owned_seal_temporary_before_publication() {
         use vm_spec::capture::{CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE};
 
         let fixture = fixture().await;
@@ -4725,7 +4725,7 @@ pub(crate) mod tests {
         assert_eq!(before.nlink(), 2);
         let capture = fixture.reservation.record.capture_id;
         let snapshots = fixture.snapshots.clone();
-        let alias = fixture.reservation.record.alias.clone();
+        let alias = fixture.reservation.record.name.clone();
         drop(fixture.reservation);
         drop(fixture.launch);
         snapshots.store.recover_image_cache().await.unwrap();
@@ -4796,7 +4796,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_recovery_refuses_foreign_seal_links_without_removing_names() {
+    async fn memory_snapshot_recovery_refuses_foreign_seal_links_without_removing_names() {
         use vm_spec::capture::{CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE};
 
         for fault in [
@@ -4829,7 +4829,7 @@ pub(crate) mod tests {
             let before = std::fs::metadata(&final_path).unwrap();
             let capture = fixture.reservation.record.capture_id;
             let snapshots = fixture.snapshots.clone();
-            let alias = fixture.reservation.record.alias.clone();
+            let alias = fixture.reservation.record.name.clone();
             drop(fixture.reservation);
             drop(fixture.launch);
             snapshots.store.recover_image_cache().await.unwrap();
@@ -4884,7 +4884,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_recovery_keeps_request_control_record_singleton() {
+    async fn memory_snapshot_recovery_keeps_request_control_record_singleton() {
         use vm_spec::capture::CAPTURE_REQUEST_FILE;
 
         let fixture = fixture().await;
@@ -4897,7 +4897,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -4908,7 +4908,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_native_binding_changes_exact_objects_not_compatibility_or_disk_identity() {
+    async fn memory_snapshot_native_binding_changes_exact_objects_not_compatibility_or_disk_identity(
+    ) {
         let mut fixture = fixture().await;
         let (first_directory, _) = seal(&fixture);
         let first_capture = fixture.reservation.record.capture_id;
@@ -4917,7 +4918,7 @@ pub(crate) mod tests {
             .publish_capture(
                 first_capture,
                 first_directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -4929,7 +4930,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut request = fixture.reservation.record.request.clone();
         request.capture_id = Uuid::new_v4();
-        request.alias = Some("checkpoint-two".into());
+        request.name = Some("snapshot-two".into());
         let replacement = fixture.snapshots.reserve_capture(&request).await.unwrap();
         let boot = fixture
             .snapshots
@@ -4973,7 +4974,7 @@ pub(crate) mod tests {
             .publish_capture(
                 request.capture_id,
                 second_directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -4996,15 +4997,15 @@ pub(crate) mod tests {
             first_record.record.configuration,
             second_record.record.configuration
         );
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution {
+        let crate::store::models::snapshot::SnapshotMemoryState::Included {
             execution: first_execution,
-        } = &first_record.record.capture
+        } = &first_record.record.memory
         else {
             panic!("execution");
         };
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution {
+        let crate::store::models::snapshot::SnapshotMemoryState::Included {
             execution: second_execution,
-        } = &second_record.record.capture
+        } = &second_record.record.memory
         else {
             panic!("execution");
         };
@@ -5030,7 +5031,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_valid_seal_remains_publishable_when_source_continuation_fails() {
+    async fn memory_snapshot_valid_seal_remains_publishable_when_source_continuation_fails() {
         let fixture = fixture().await;
         let (directory, evidence) = seal(&fixture);
         let capture = fixture.reservation.record.capture_id;
@@ -5039,7 +5040,7 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -5091,7 +5092,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_verification_rejects_changed_bytes_unlisted_files_hardlinks_and_symlinks() {
+    async fn memory_snapshot_verification_rejects_changed_bytes_unlisted_files_hardlinks_and_symlinks(
+    ) {
         for fault in ["bytes", "extra", "hardlink", "symlink", "request"] {
             let fixture = fixture().await;
             let (directory, _) = seal(&fixture);
@@ -5125,7 +5127,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_native_headers_reject_corruption_foreign_bindings_and_geometry_even_with_valid_sha(
+    async fn memory_snapshot_native_headers_reject_corruption_foreign_bindings_and_geometry_even_with_valid_sha(
     ) {
         let schema_len = "silo.live-state/1".len();
         let architecture_len = "x86_64".len();
@@ -5206,7 +5208,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_rejects_consistent_foreign_native_layout_and_topology() {
+    async fn memory_snapshot_rejects_consistent_foreign_native_layout_and_topology() {
         for fault in ["topology", "layout-binding", "layout-bytes"] {
             let fixture = fixture().await;
             let (directory, mut evidence) = seal(&fixture);
@@ -5255,7 +5257,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_lanes_keep_inventory_order_and_held_inodes_and_reject_either_lane() {
+    async fn memory_snapshot_lanes_keep_inventory_order_and_held_inodes_and_reject_either_lane() {
         let sealed = fixture().await;
         let record = &sealed.reservation.record;
         let (directory, evidence) = seal(&sealed);
@@ -5330,7 +5332,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_rejects_the_writable_source_inode_as_a_staged_role_before_hashing() {
+    async fn memory_snapshot_rejects_the_writable_source_inode_as_a_staged_role_before_hashing() {
         let fixture = fixture().await;
         let (directory, evidence) = seal(&fixture);
         let disk = evidence
@@ -5437,7 +5439,7 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn checkpoint_lane_failure_stops_and_joins_the_ram_owner_before_returning() {
+    fn memory_snapshot_lane_failure_stops_and_joins_the_ram_owner_before_returning() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let temporary = tempfile::tempdir().unwrap();
@@ -5484,7 +5486,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn checkpoint_ram_lane_unwind_stops_the_sibling_and_is_a_typed_join_error() {
+    fn memory_snapshot_ram_lane_unwind_stops_the_sibling_and_is_a_typed_join_error() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let saw_stop = AtomicBool::new(false);
@@ -5501,7 +5503,7 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn checkpoint_caller_lane_unwind_stops_and_joins_the_ram_owner() {
+    fn memory_snapshot_caller_lane_unwind_stops_and_joins_the_ram_owner() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let temporary = tempfile::tempdir().unwrap();
@@ -5535,7 +5537,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_cleanup_stabilizes_authority_before_detaching_capture() {
+    async fn memory_snapshot_cleanup_stabilizes_authority_before_detaching_capture() {
         let fixture = fixture().await;
         let (directory, _) = seal(&fixture);
         let capture = fixture.reservation.record.capture_id;
@@ -5544,7 +5546,7 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -5596,7 +5598,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_native_baseline_lease_defers_terminal_capture_retirement() {
+    async fn memory_snapshot_native_baseline_lease_defers_terminal_capture_retirement() {
         let fixture = fixture().await;
         let capture = fixture.reservation.record.capture_id;
         let inherited = fixture.launch.lock().duplicate().unwrap();
@@ -5631,12 +5633,12 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_dropped_publication_waiter_retains_its_copy_owner() {
+    async fn memory_snapshot_dropped_publication_waiter_retains_its_copy_owner() {
         use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
         let fixture = fixture().await;
         let (directory, _) = seal(&fixture);
         let capture = fixture.reservation.record.capture_id;
-        let name = fixture.reservation.record.alias.clone();
+        let name = fixture.reservation.record.name.clone();
         let (hook, mut entered, release) = WorkerHook::new(WorkerPoint::Preparing, false);
         let mut worker = fixture.snapshots.store.as_ref().clone();
         worker.layer_hook = Some(hook);
@@ -5702,7 +5704,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_cleanup_recovers_each_namespace_interruption_without_losing_evidence() {
+    async fn memory_snapshot_cleanup_recovers_each_namespace_interruption_without_losing_evidence()
+    {
         use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
         for point in [
             WorkerPoint::CandidateAuthorized,
@@ -5717,7 +5720,7 @@ pub(crate) mod tests {
                 .publish_capture(
                     capture,
                     directory.path(),
-                    fixture.reservation.record.alias.clone(),
+                    fixture.reservation.record.name.clone(),
                     crate::storage::pool::PublicationLockPolicy::Wait,
                 )
                 .await
@@ -5781,11 +5784,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_concurrent_publication_joins_and_retry_converges_before_cleanup() {
+    async fn memory_snapshot_concurrent_publication_joins_and_retry_converges_before_cleanup() {
         let fixture = fixture().await;
         let (directory, _) = seal(&fixture);
         let capture = fixture.reservation.record.capture_id;
-        let name = fixture.reservation.record.alias.clone();
+        let name = fixture.reservation.record.name.clone();
         let (first, second) = tokio::join!(
             fixture.snapshots.publish_capture(
                 capture,
@@ -5908,7 +5911,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_layout_validation_rejects_overlap_gap_alignment_and_overflow() {
+    async fn memory_snapshot_layout_validation_rejects_overlap_gap_alignment_and_overflow() {
         let fixture = fixture().await;
         let (directory, evidence) = seal(&fixture);
         let memory = evidence.memory.unwrap();
@@ -5945,7 +5948,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_includes_external_writable_data_and_preserves_native_serials() {
+    async fn memory_snapshot_includes_external_writable_data_and_preserves_native_serials() {
         let fixture = fixture_with_external_data(true).await;
         let (directory, _) = seal(&fixture);
         let data = &fixture.config.spec.storage.as_ref().unwrap().disks[1];
@@ -5956,7 +5959,7 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -5988,7 +5991,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_rejects_oversized_ram_before_registering_a_reservation() {
+    async fn memory_snapshot_rejects_oversized_ram_before_registering_a_reservation() {
         let fixture = fixture().await;
         let mut request = fixture.reservation.record.request.clone();
         request.capture_id = Uuid::new_v4();
@@ -6231,7 +6234,7 @@ pub(crate) mod tests {
         const HOME: &str = "SILO_FORK_CUT_RETAINED_CRASH_HOME";
         const CAPTURE: &str = "SILO_FORK_CUT_RETAINED_CRASH_CAPTURE";
         if let Some(home) = std::env::var_os(HOME) {
-            let snapshots = SnapshotStore::open(Path::new(&home)).await.unwrap();
+            let snapshots = reopen(Path::new(&home)).await;
             let capture = Uuid::parse_str(&std::env::var(CAPTURE).unwrap()).unwrap();
             let operation = snapshots
                 .store
@@ -6289,9 +6292,7 @@ pub(crate) mod tests {
             status.signal(),
             Some(nix::sys::signal::Signal::SIGKILL as i32)
         );
-        let snapshots = SnapshotStore::open(fixture.snapshots.store.home_path())
-            .await
-            .unwrap();
+        let snapshots = reopen(fixture.snapshots.store.home_path()).await;
         let store = &snapshots.store;
         let phases: Vec<String> =
             sqlx::query_scalar("SELECT phase FROM fork_event WHERE operation_id=?1 ORDER BY rowid")
@@ -6512,7 +6513,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -6522,10 +6523,10 @@ pub(crate) mod tests {
             .consume(&SnapshotRef::Id(published.id))
             .await
             .unwrap();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &consumer.record.memory
         else {
-            panic!("live checkpoint required");
+            panic!("snapshot with memory required");
         };
         let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
         let ram = consumer
@@ -6566,7 +6567,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -6593,7 +6594,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -6605,10 +6606,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let record = consumer.record.clone();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &record.memory
         else {
-            panic!("live checkpoint required");
+            panic!("snapshot with memory required");
         };
         drop(consumer);
         std::fs::remove_file(pool.stream_path(&execution.memory.stream)).unwrap();
@@ -6654,7 +6655,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_refuses_contradictory_ram_receipt_before_publication() {
+    async fn memory_snapshot_refuses_contradictory_ram_receipt_before_publication() {
         let fixture = fixture().await;
         let (directory, evidence) = seal(&fixture);
         let mut document = serde_json::to_value(&evidence).unwrap();
@@ -6676,7 +6677,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -6921,7 +6922,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -6942,10 +6943,10 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    async fn reserve_next_fixture(fixture: &mut Fixture, alias: &str) {
+    async fn reserve_next_fixture(fixture: &mut Fixture, name: &str) {
         let mut request = fixture.reservation.record.request.clone();
         request.capture_id = Uuid::new_v4();
-        request.alias = Some(alias.into());
+        request.name = Some(name.into());
         fixture.reservation = fixture.snapshots.reserve_capture(&request).await.unwrap();
         fixture
             .snapshots
@@ -6957,9 +6958,9 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    async fn bind_fixture_alias(
+    async fn bind_fixture_name(
         snapshots: &SnapshotStore,
-        alias: &str,
+        name: &str,
         target: crate::storage::identity::SnapshotId,
     ) {
         let mut tx = snapshots
@@ -6968,14 +6969,18 @@ pub(crate) mod tests {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .unwrap();
-        crate::store::managed_image_store::insert_alias(
-            &mut tx,
-            alias,
-            crate::image::import_types::ManagedSourceId::Snapshot(target),
-        )
-        .await
-        .unwrap();
+        crate::store::snapshot_store::insert_name(&mut tx, name, target)
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
+    }
+
+    async fn reopen(home: &Path) -> SnapshotStore {
+        SnapshotStore::from_store(Arc::new(
+            crate::store::Store::open(&home.join("state.db"))
+                .await
+                .unwrap(),
+        ))
     }
 
     pub(crate) async fn capture_runtime(snapshots: &SnapshotStore) -> crate::Runtime {
@@ -6994,12 +6999,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn capture_admission_refuses_taken_alias_without_rows_pins_budget_or_staging() {
+    async fn capture_admission_refuses_taken_name_without_rows_pins_budget_or_staging() {
         let fixture = fixture().await;
         let original = publish_fixture(&fixture).await;
-        bind_fixture_alias(&fixture.snapshots, "checkpoint", original.id).await;
-        bind_fixture_alias(&fixture.snapshots, "checkpoint", original.id).await;
-        // Exact replay still joins its own reservation after its alias is bound.
+        bind_fixture_name(&fixture.snapshots, "snapshot", original.id).await;
+        // Exact replay still joins its own reservation after its name is bound.
         let replay = fixture
             .snapshots
             .reserve_capture(&fixture.reservation.record.request)
@@ -7012,7 +7016,7 @@ pub(crate) mod tests {
         drop(replay);
         release_fixture(&fixture).await;
 
-        // A second admitted machine shares the same alias namespace.
+        // A second admitted machine shares the same snapshot name table.
         let paths = LocalPaths::new(fixture.snapshots.store.home_path().to_path_buf());
         let mut other = fixture.config.clone();
         other.id = MachineId::new();
@@ -7066,12 +7070,12 @@ pub(crate) mod tests {
             request.machine_id = machine;
             request.run_id = run;
             let error = match fixture.snapshots.reserve_capture(&request).await {
-                Ok(_) => panic!("occupied capture alias admitted"),
+                Ok(_) => panic!("occupied capture name admitted"),
                 Err(error) => error,
             };
             assert!(matches!(
                 error,
-                crate::LibVmError::ImageAliasConflict { alias } if alias == "checkpoint"
+                crate::LibVmError::SnapshotNameConflict { name } if name == "snapshot"
             ));
             for query in [
                 "SELECT count(*) FROM storage_operation WHERE operation_id=?1",
@@ -7106,7 +7110,7 @@ pub(crate) mod tests {
         assert_eq!(
             fixture
                 .snapshots
-                .inspect(&SnapshotRef::Image("checkpoint".into()))
+                .inspect(&SnapshotRef::Name("snapshot".into()))
                 .await
                 .unwrap()
                 .id,
@@ -7115,17 +7119,16 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn capture_alias_race_retains_unaliased_checkpoint_and_publication_replays_skip_bytes() {
+    async fn capture_name_race_keeps_unnamed_snapshot_and_publication_replays_skip_bytes() {
         use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
         let mut fixture = fixture().await;
         let original = publish_fixture(&fixture).await;
         release_fixture(&fixture).await;
         reserve_next_fixture(&mut fixture, "racing").await;
-        bind_fixture_alias(&fixture.snapshots, "racing", original.id).await;
+        bind_fixture_name(&fixture.snapshots, "racing", original.id).await;
         let captured = publish_fixture(&fixture).await;
         assert_ne!(captured.id, original.id);
-        assert!(captured.retained);
-        assert!(captured.aliases.is_empty());
+        assert!(captured.names.is_empty());
         let capture = fixture.reservation.record.capture_id;
         let record = fixture
             .snapshots
@@ -7141,16 +7144,16 @@ pub(crate) mod tests {
         );
         assert_eq!(
             record.naming_outcome,
-            Some(crate::CaptureNamingOutcome::AliasConflict {
-                alias: "racing".into()
+            Some(crate::CaptureNamingOutcome::NameConflict {
+                name: "racing".into()
             })
         );
-        assert_eq!(record.alias.as_deref(), Some("racing"));
+        assert_eq!(record.name.as_deref(), Some("racing"));
         assert_eq!(captured.provenance[0].capture_id, capture);
         assert_eq!(
             fixture
                 .snapshots
-                .inspect(&SnapshotRef::Image("racing".into()))
+                .inspect(&SnapshotRef::Name("racing".into()))
                 .await
                 .unwrap()
                 .id,
@@ -7167,7 +7170,7 @@ pub(crate) mod tests {
                 .publish_capture(
                     capture,
                     &staging,
-                    record.alias.clone(),
+                    record.name.clone(),
                     crate::storage::pool::PublicationLockPolicy::Wait
                 )
                 .await
@@ -7198,8 +7201,8 @@ pub(crate) mod tests {
         assert_eq!(result.snapshot.id, captured.id);
         assert!(matches!(
             result.require_requested_name(),
-            Err(crate::LibVmError::CaptureAliasConflict { alias, checkpoint })
-                if alias == "racing" && checkpoint == captured.id
+            Err(crate::LibVmError::CaptureNameConflict { name, snapshot })
+                if name == "racing" && snapshot == captured.id
         ));
         assert!(snapshots.pending_captures(None).await.unwrap().is_empty());
         assert_eq!(
@@ -7207,7 +7210,7 @@ pub(crate) mod tests {
                 .publish_capture(
                     capture,
                     &staging,
-                    record.alias.clone(),
+                    record.name.clone(),
                     crate::storage::pool::PublicationLockPolicy::Wait
                 )
                 .await
@@ -7218,18 +7221,23 @@ pub(crate) mod tests {
             entered.try_recv().is_err(),
             "Released replay reached byte preparation"
         );
-        // Removing the competing binding cannot make replay acquire the name.
-        snapshots.remove_alias("racing").await.unwrap();
+        // Removing the competing name cannot make replay acquire the name.
+        let removal = snapshots
+            .remove(&SnapshotRef::Name("racing".into()))
+            .await
+            .unwrap();
+        assert_eq!(removal.id, original.id);
+        assert!(!removal.record_removed, "original keeps its fixture name");
         assert!(snapshots
             .publish_capture(
                 capture,
                 &staging,
-                record.alias,
+                record.name,
                 crate::storage::pool::PublicationLockPolicy::Wait
             )
             .await
             .unwrap()
-            .aliases
+            .names
             .is_empty());
         assert!(snapshots
             .capture_reservation(capture)
@@ -7243,7 +7251,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn capture_reconciliation_repairs_persisted_sealed_alias_conflict_once() {
+    async fn capture_reconciliation_repairs_persisted_sealed_name_conflict_once() {
         use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
         let mut fixture = fixture().await;
         let original = publish_fixture(&fixture).await;
@@ -7258,7 +7266,7 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         // Recreate the pre-fix commit boundary: authenticated/pinned outputs
-        // and candidate survive, but snapshot, alias and provenance rolled back.
+        // and candidate survive, but snapshot, name and provenance rolled back.
         let mut tx = fixture
             .snapshots
             .store
@@ -7266,7 +7274,7 @@ pub(crate) mod tests {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .unwrap();
-        sqlx::query("DELETE FROM image_alias WHERE name='stuck'")
+        sqlx::query("DELETE FROM snapshot_name WHERE name='stuck'")
             .execute(&mut *tx)
             .await
             .unwrap();
@@ -7283,7 +7291,7 @@ pub(crate) mod tests {
         sqlx::query("UPDATE storage_operation SET record_json=jsonb_remove(record_json,'$.namingOutcome') WHERE operation_id=?1")
             .bind(capture.to_string()).execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
-        bind_fixture_alias(&fixture.snapshots, "stuck", original.id).await;
+        bind_fixture_name(&fixture.snapshots, "stuck", original.id).await;
         let mut state = fixture
             .snapshots
             .store
@@ -7300,9 +7308,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let reopened = SnapshotStore::open(fixture.snapshots.store.home_path())
-            .await
-            .unwrap();
+        let reopened = reopen(fixture.snapshots.store.home_path()).await;
         let runtime = capture_runtime(&reopened).await;
         runtime.reconcile_captures().await.unwrap();
         let repaired = reopened
@@ -7318,14 +7324,14 @@ pub(crate) mod tests {
         );
         assert_eq!(
             repaired.naming_outcome,
-            Some(crate::CaptureNamingOutcome::AliasConflict {
-                alias: "stuck".into()
+            Some(crate::CaptureNamingOutcome::NameConflict {
+                name: "stuck".into()
             })
         );
         assert!(reopened.pending_captures(None).await.unwrap().is_empty());
         assert_eq!(
             reopened
-                .inspect(&SnapshotRef::Image("stuck".into()))
+                .inspect(&SnapshotRef::Name("stuck".into()))
                 .await
                 .unwrap()
                 .id,
@@ -7335,7 +7341,7 @@ pub(crate) mod tests {
             .inspect(&SnapshotRef::Id(prepared.id))
             .await
             .unwrap();
-        assert!(retained.retained && retained.aliases.is_empty());
+        assert!(retained.names.is_empty());
         assert_eq!(retained.provenance[0].capture_id, capture);
 
         let (hook, mut entered, _release) = WorkerHook::new(WorkerPoint::Preparing, true);
@@ -7355,10 +7361,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn capture_alias_sql_failure_is_not_a_naming_conflict() {
+    async fn capture_name_sql_failure_is_not_a_naming_conflict() {
         let fixture = fixture().await;
         let (directory, _) = seal(&fixture);
-        sqlx::raw_sql("CREATE TRIGGER reject_capture_alias BEFORE INSERT ON image_alias BEGIN SELECT RAISE(ABORT,'capture alias SQL failure'); END;")
+        sqlx::raw_sql("CREATE TRIGGER reject_capture_name BEFORE INSERT ON snapshot_name BEGIN SELECT RAISE(ABORT,'capture name SQL failure'); END;")
             .execute(&fixture.snapshots.store.pool).await.unwrap();
         let capture = fixture.reservation.record.capture_id;
         let error = fixture
@@ -7366,12 +7372,12 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("capture alias SQL failure"));
+        assert!(error.to_string().contains("capture name SQL failure"));
         let record = fixture
             .snapshots
             .capture_reservation(capture)
@@ -7388,8 +7394,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn capture_admission_refuses_alias_owned_by_managed_image() {
-        let fixture = fixture().await;
+    async fn capture_name_taken_by_an_image_coexists_and_each_resolves_to_its_kind() {
+        let mut fixture = fixture().await;
         let snapshot = publish_fixture(&fixture).await;
         release_fixture(&fixture).await;
         let consumer = fixture
@@ -7418,7 +7424,7 @@ pub(crate) mod tests {
         let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
         pool.create_operation_with_lease(operation, lease.duplicate().unwrap())
             .unwrap();
-        let images = crate::store::managed_image_store::ManagedImageStore::from_store(
+        let images = crate::store::stored_image_store::StoredImageStore::from_store(
             fixture.snapshots.store.clone(),
         );
         let image = images
@@ -7426,37 +7432,31 @@ pub(crate) mod tests {
                 record,
                 operation,
                 lease,
-                Some("managed".into()),
+                Some("hello".into()),
                 Vec::new(),
                 None,
             )
             .await
             .unwrap();
-        let mut request = fixture.reservation.record.request.clone();
-        request.capture_id = Uuid::new_v4();
-        request.alias = Some("managed".into());
-        let error = match fixture.snapshots.reserve_capture(&request).await {
-            Ok(_) => panic!("managed-image alias admitted for a new capture"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(error, crate::LibVmError::ImageAliasConflict { alias } if alias == "managed")
-        );
-        assert!(fixture
-            .snapshots
-            .capture_reservation(request.capture_id)
-            .await
-            .unwrap()
-            .is_none());
+        reserve_next_fixture(&mut fixture, "hello").await;
+        let captured = publish_fixture(&fixture).await;
+        assert_ne!(captured.id, snapshot.id);
+        assert_eq!(captured.names, ["hello"]);
+        assert_eq!(image.names, ["hello"]);
+        let mut connection = fixture.snapshots.store.pool.acquire().await.unwrap();
         assert_eq!(
-            images
-                .resolve(&crate::image::import_types::ManagedSourceRef::Alias(
-                    "managed".into()
-                ))
+            crate::store::image_store::named_image(&mut connection, "hello")
                 .await
                 .unwrap(),
-            crate::image::import_types::ManagedSourceId::Image(image.id),
+            Some(crate::store::image_store::LocalImage::Stored(image.id))
         );
+        assert_eq!(
+            crate::store::snapshot_store::named_snapshot(&mut connection, "hello")
+                .await
+                .unwrap(),
+            Some(captured.id)
+        );
+        drop(connection);
         fixture
             .snapshots
             .store
@@ -7495,7 +7495,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn sealed_stream_publication_carries_maps_without_payload_rereads() {
         use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
-        use crate::store::models::snapshot::SnapshotCaptureKind;
+        use crate::store::models::snapshot::SnapshotMemoryState;
         use crate::store::snapshot_store::tests::{observed_stream_read, watch_stream_reads};
 
         let fixture = fixture().await;
@@ -7534,7 +7534,7 @@ pub(crate) mod tests {
         let publisher = SnapshotStore::from_store(Arc::new(worker));
         let capture = fixture.reservation.record.capture_id;
         let staging = directory.path().to_path_buf();
-        let alias = fixture.reservation.record.alias.clone();
+        let alias = fixture.reservation.record.name.clone();
         let waiter = tokio::spawn(async move {
             publisher
                 .publish_capture(
@@ -7588,8 +7588,8 @@ pub(crate) mod tests {
             .consume_shape(&SnapshotRef::Id(published.id))
             .await
             .unwrap();
-        let SnapshotCaptureKind::LiveExecution { execution } = &consumer.record.capture else {
-            panic!("live checkpoint");
+        let SnapshotMemoryState::Included { execution } = &consumer.record.memory else {
+            panic!("snapshot with memory required");
         };
         assert_eq!(execution.memory.stream, id);
         assert_eq!(
@@ -7610,7 +7610,7 @@ pub(crate) mod tests {
         let publisher = SnapshotStore::from_store(Arc::new(worker));
         let capture = fixture.reservation.record.capture_id;
         let staging = directory.path().to_path_buf();
-        let alias = fixture.reservation.record.alias.clone();
+        let alias = fixture.reservation.record.name.clone();
         let waiter = tokio::spawn(async move {
             publisher
                 .publish_capture(
@@ -7652,7 +7652,7 @@ pub(crate) mod tests {
         let publisher = SnapshotStore::from_store(Arc::new(worker));
         let capture = fixture.reservation.record.capture_id;
         let staging = directory.path().to_path_buf();
-        let alias = fixture.reservation.record.alias.clone();
+        let alias = fixture.reservation.record.name.clone();
         let waiter = tokio::spawn(async move {
             publisher
                 .publish_capture(
@@ -7677,7 +7677,7 @@ pub(crate) mod tests {
                 .publish_capture(
                     capture,
                     directory.path(),
-                    fixture.reservation.record.alias.clone(),
+                    fixture.reservation.record.name.clone(),
                     crate::storage::pool::PublicationLockPolicy::Wait,
                 )
                 .await
@@ -7690,7 +7690,7 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -7813,7 +7813,7 @@ pub(crate) mod tests {
             .publish_capture(
                 record.capture_id,
                 directory.path(),
-                record.alias.clone(),
+                record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -7825,7 +7825,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut repeat = record.request.clone();
         repeat.capture_id = Uuid::new_v4();
-        repeat.alias = Some("checkpoint-repeat".into());
+        repeat.name = Some("snapshot-repeat".into());
         let next_capture = fixture.snapshots.reserve_capture(&repeat).await.unwrap();
         assert!(next_capture.record.plan.disks[0].tracking_eligible);
         assert_eq!(
@@ -7961,7 +7961,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -8122,7 +8122,7 @@ pub(crate) mod tests {
             .publish_capture(
                 record.capture_id,
                 directory.path(),
-                record.alias.clone(),
+                record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait
             )
             .await
@@ -8291,7 +8291,7 @@ pub(crate) mod tests {
             )
             .await;
             request.capture_id = Uuid::new_v4();
-            request.alias = None;
+            request.name = None;
             let error = match snapshots.reserve_capture(&request).await {
                 Ok(_) => panic!("capture was admitted without capacity"),
                 Err(error) => error,
@@ -8522,7 +8522,7 @@ pub(crate) mod tests {
         change_import_credit(&snapshots.store, owner, 1, 0).await;
         let mut request = record.request.clone();
         request.capture_id = Uuid::new_v4();
-        request.alias = None;
+        request.name = None;
         let uncertain = snapshots.reserve_capture(&request).await.unwrap();
         let mut uncertain_intent = intent;
         if let LiveCommand::Capture(command) = &mut uncertain_intent.command {
@@ -8594,7 +8594,7 @@ pub(crate) mod tests {
             .publish_capture(
                 record.capture_id,
                 directory.path(),
-                record.alias.clone(),
+                record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -8629,9 +8629,7 @@ pub(crate) mod tests {
             0,
         )
         .await;
-        let reopened = SnapshotStore::open(snapshots.store.home_path())
-            .await
-            .unwrap();
+        let reopened = reopen(snapshots.store.home_path()).await;
         let runtime = capture_runtime(&reopened).await;
         runtime.recover_maintenance().await.unwrap();
         assert_eq!(runtime.list_machines().await.unwrap().len(), 1);
@@ -9032,7 +9030,7 @@ pub(crate) mod tests {
             .publish_capture(
                 record.capture_id,
                 directory.path(),
-                record.alias,
+                record.name,
                 crate::storage::pool::PublicationLockPolicy::Defer,
             )
             .await
@@ -9095,9 +9093,7 @@ pub(crate) mod tests {
         drop(reservation);
         drop(launch);
         mark_fixture_stopped(&snapshots.store, config.id).await;
-        let reopened = SnapshotStore::open(snapshots.store.home_path())
-            .await
-            .unwrap();
+        let reopened = reopen(snapshots.store.home_path()).await;
         assert!(reopened
             .capture_reservation(record.capture_id)
             .await
@@ -9191,9 +9187,7 @@ pub(crate) mod tests {
         mark_fixture_stopped(&snapshots.store, config.id).await;
         sqlx::query("UPDATE storage_operation SET record_json=jsonb_set(record_json,'$.reservationBytes',0) WHERE operation_id=?1")
             .bind(capture.to_string()).execute(&snapshots.store.pool).await.unwrap();
-        let reopened = SnapshotStore::open(snapshots.store.home_path())
-            .await
-            .unwrap();
+        let reopened = reopen(snapshots.store.home_path()).await;
         let runtime = capture_runtime(&reopened).await;
         runtime.recover_maintenance().await.unwrap();
         assert_eq!(runtime.list_machines().await.unwrap().len(), 1);
@@ -9221,7 +9215,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -9248,9 +9242,8 @@ pub(crate) mod tests {
             .consume(&SnapshotRef::Id(first.id))
             .await
             .unwrap();
-        let SnapshotCaptureKind::LiveExecution { execution } = &first_consumer.record.capture
-        else {
-            panic!("live execution checkpoint required");
+        let SnapshotMemoryState::Included { execution } = &first_consumer.record.memory else {
+            panic!("snapshot with memory required");
         };
         let authority = pool
             .map_authority(Arc::new(
@@ -9280,7 +9273,7 @@ pub(crate) mod tests {
             let mut request = fixture.reservation.record.request.clone();
             request.capture_id = Uuid::new_v4();
             request.policy = CapturePolicy::Incremental;
-            request.alias = None;
+            request.name = None;
             fixture.reservation = fixture.snapshots.reserve_capture(&request).await.unwrap();
             fixture
                 .snapshots
@@ -9440,8 +9433,8 @@ pub(crate) mod tests {
                 .consume(&SnapshotRef::Id(published.id))
                 .await
                 .unwrap();
-            let SnapshotCaptureKind::LiveExecution { execution } = &consumer.record.capture else {
-                panic!("live execution checkpoint required");
+            let SnapshotMemoryState::Included { execution } = &consumer.record.memory else {
+                panic!("snapshot with memory required");
             };
             assert_eq!(execution.memory.chunk_size, ChunkSize::RAM.bytes());
             assert_eq!(
@@ -9484,7 +9477,7 @@ pub(crate) mod tests {
         const HOME: &str = "SILO_MAP_ADMISSION_CRASH_HOME";
         const CAPTURE: &str = "SILO_MAP_ADMISSION_CRASH_CAPTURE";
         if let Ok(home) = std::env::var(HOME) {
-            let snapshots = SnapshotStore::open(Path::new(&home)).await.unwrap();
+            let snapshots = reopen(Path::new(&home)).await;
             let capture = Uuid::parse_str(&std::env::var(CAPTURE).unwrap()).unwrap();
             let record = snapshots
                 .capture_reservation(capture)
@@ -9498,7 +9491,7 @@ pub(crate) mod tests {
                 .publish_capture(
                     capture,
                     directory.path(),
-                    record.alias,
+                    record.name,
                     crate::storage::pool::PublicationLockPolicy::Wait,
                 )
                 .await
@@ -9528,14 +9521,12 @@ pub(crate) mod tests {
             .execute(&fixture.snapshots.store.pool)
             .await
             .unwrap();
-        let reopened = SnapshotStore::open(fixture.snapshots.store.home_path())
-            .await
-            .unwrap();
+        let reopened = reopen(fixture.snapshots.store.home_path()).await;
         let published = reopened
             .publish_capture(
                 capture,
                 directory.path(),
-                record.alias,
+                record.name,
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -9552,8 +9543,8 @@ pub(crate) mod tests {
             .consume(&SnapshotRef::Id(published.id))
             .await
             .unwrap();
-        let SnapshotCaptureKind::LiveExecution { execution } = &consumer.record.capture else {
-            panic!("live execution checkpoint required");
+        let SnapshotMemoryState::Included { execution } = &consumer.record.memory else {
+            panic!("snapshot with memory required");
         };
         let pool = StoragePool::open(&reopened.store.images_dir).unwrap();
         assert_eq!(
@@ -9672,7 +9663,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn source_identity_anchors_survive_two_owned_forks_and_snapshot_alias_collection() {
+    async fn source_identity_anchors_survive_two_owned_forks_and_snapshot_removal() {
         let mut fixture = fixture().await;
         let (directory, _) = seal(&fixture);
         let first_capture = fixture.reservation.record.capture_id;
@@ -9681,7 +9672,7 @@ pub(crate) mod tests {
             .publish_capture(
                 first_capture,
                 directory.path(),
-                Some("checkpoint".into()),
+                Some("snapshot".into()),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -9726,7 +9717,7 @@ pub(crate) mod tests {
         for generation in 0..2 {
             let mut request = fixture.reservation.record.request.clone();
             request.capture_id = Uuid::new_v4();
-            request.alias = None;
+            request.name = None;
             let name = format!("anchor-child-{generation}");
             let options = crate::store::fork::tests::options(&[&name]);
             let observed =
@@ -9777,10 +9768,9 @@ pub(crate) mod tests {
             assert_eq!(current.ram_identity, original.ram_identity);
             assert_eq!(cut.evidence.stats.identity_bytes_hashed, 0);
         }
-        fixture.snapshots.remove_alias("checkpoint").await.unwrap();
         fixture
             .snapshots
-            .release_retention(&crate::SnapshotRef::Id(snapshot.id))
+            .remove(&crate::SnapshotRef::Id(snapshot.id))
             .await
             .unwrap();
         store.recover_image_cache().await.unwrap();
@@ -9817,7 +9807,7 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                Some("checkpoint".into()),
+                Some("snapshot".into()),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await

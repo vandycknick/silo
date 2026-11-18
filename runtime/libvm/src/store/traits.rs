@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::image::{ImageDetail, ImageHandle, ImagePruneReport, ImageRemoveOptions};
+use crate::image::ImagePruneReport;
 use crate::store::models::{
     DbConfig, MachineConfig, MachineId, MachineRootfsRecord, MachineState, NetworkAttachment,
     NetworkDefinition, NetworkInstance, OciImageRecord,
@@ -171,8 +171,8 @@ pub(crate) trait ImageStore: std::fmt::Debug + Send + Sync {
         operation_id: uuid::Uuid,
         digests: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(), LibVmError>;
-    /// Upserts OCI manifest metadata, its mutable reference, layers, and the
-    /// selection's immutable retained composition artifact.
+    /// Upserts OCI manifest metadata, layers, the selection's immutable
+    /// retained composition artifact and moves its requested name onto it.
     async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
 
     async fn cached_oci_image(
@@ -181,30 +181,8 @@ pub(crate) trait ImageStore: std::fmt::Debug + Send + Sync {
         platform: &oci::Platform,
     ) -> Result<Option<OciImageRecord>, LibVmError>;
 
-    /// Reads a lightweight image reference by exact reference.
-    async fn image_handle(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError>;
-
-    /// Lists known image references sorted by reference.
-    async fn list_image_handles(&self) -> Result<Vec<ImageHandle>, LibVmError>;
-
-    /// Reads image detail by exact reference.
-    async fn image_detail(&self, reference: &str) -> Result<Option<ImageDetail>, LibVmError>;
-
-    /// Verifies that an image reference can be removed without changing durable state.
-    async fn ensure_image_removable(
-        &self,
-        reference: &str,
-        options: ImageRemoveOptions,
-    ) -> Result<ImageHandle, LibVmError>;
-
-    /// Removes an image reference.
-    async fn remove_image(
-        &self,
-        reference: &str,
-        options: ImageRemoveOptions,
-    ) -> Result<(), LibVmError>;
-
-    /// Removes unreferenced image rows and reports best-effort reclaimed bytes.
+    /// Removes unnamed images no machine or operation uses, then collects
+    /// unreferenced bytes; reports best-effort reclaimed bytes.
     async fn prune_images(&self) -> Result<ImagePruneReport, LibVmError>;
 }
 

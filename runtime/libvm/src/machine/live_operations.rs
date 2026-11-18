@@ -319,8 +319,9 @@ impl Machine {
                 }
             }
             if let Err(error) = store.require_capture_dispatch(command).await {
-                let snapshots =
-                    crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
+                let snapshots = crate::store::snapshot_store::SnapshotStore::from_store(
+                    std::sync::Arc::new(store.clone()),
+                );
                 let capture = uuid(&command.plan.capture_id)?;
                 if snapshots
                     .capture_reservation(capture)
@@ -355,9 +356,11 @@ impl Machine {
                         None,
                     )
                     .await?;
-                crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()))
-                    .abandon_capture(uuid(&envelope.request_id)?)
-                    .await?;
+                crate::store::snapshot_store::SnapshotStore::from_store(std::sync::Arc::new(
+                    store.clone(),
+                ))
+                .abandon_capture(uuid(&envelope.request_id)?)
+                .await?;
                 return Ok(result);
             }
             Some(lock)

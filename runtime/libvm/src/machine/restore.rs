@@ -1,4 +1,4 @@
-//! Execution checkpoints have their own constructor. No ordinary start, root
+//! Snapshots with memory have their own constructor. No ordinary start, root
 //! repair, resize, bootstrap execution or fallback is part of this path.
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd};
@@ -24,12 +24,13 @@ use crate::machine::root_storage::invalid;
 use crate::machine::stopped::PrivateSource;
 use crate::storage::pool::StoragePool;
 use crate::storage::vmdk::{LowerBacking, LowerOccurrence};
-use crate::store::models::snapshot::{SnapshotCaptureKind, SnapshotRecord, SnapshotRootProfile};
+use crate::store::models::snapshot::{SnapshotMemoryState, SnapshotRecord, SnapshotRootProfile};
 use crate::store::restore::RestoreIntent;
+use crate::store::snapshot_store::SnapshotStore;
 use crate::supervisor::launch::{install_child_inheritance, RestoreLaunch};
 use crate::{
     DiskStorage, ExternalResourcePolicy, LibVmError, Machine, MachineRoot, MachineStorageRecord,
-    RestoreOptions, Runtime, SnapshotRef, SnapshotStore,
+    RestoreOptions, Runtime, SnapshotRef,
 };
 
 pub(crate) async fn preflight_execution(
@@ -47,8 +48,8 @@ fn validate_profile(
     policy: &ExternalResourcePolicy,
 ) -> Result<(), LibVmError> {
     record.validate()?;
-    if !matches!(record.capture, SnapshotCaptureKind::LiveExecution { .. }) {
-        return Err(invalid("execution restore requires a live checkpoint"));
+    if !matches!(record.memory, SnapshotMemoryState::Included { .. }) {
+        return Err(invalid("execution restore requires a snapshot with memory"));
     }
     if !record.external_requirements.is_empty() || !matches!(policy, ExternalResourcePolicy::Reject)
     {
@@ -93,7 +94,7 @@ pub(crate) async fn restore_owned(
         let shape = snapshots.prepare_restore_shape(&consumer).await?;
         if consumer.record != preview {
             return Err(invalid(
-                "checkpoint alias changed between preflight and verification",
+                "snapshot name changed between preflight and verification",
             ));
         }
         restore_consumer(
@@ -139,9 +140,9 @@ async fn restore_consumer(
     let shape = inspection_shape.shape();
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let evidence = snapshots.restore_evidence(consumer, &pool)?.evidence;
-    let execution = match &consumer.record.capture {
-        SnapshotCaptureKind::LiveExecution { execution } => execution,
-        _ => return Err(invalid("checkpoint capture kind changed")),
+    let execution = match &consumer.record.memory {
+        SnapshotMemoryState::Included { execution } => execution,
+        _ => return Err(invalid("snapshot memory changed")),
     };
     let transfer_roles = 5 + if matches!(
         consumer.record.root.profile,
@@ -246,7 +247,7 @@ async fn restore_consumer(
         crate::machine::builder::stopped_child_name(runtime, options.name.as_deref()).await?;
     let run = Uuid::new_v4();
     let intent = RestoreIntent {
-        checkpoint: crate::store::restore::RestoreIdentity::Snapshot {
+        source: crate::store::restore::RestoreIdentity::Snapshot {
             id: consumer.info.id,
         },
         consumer_operation: consumer.operation_id,
@@ -316,8 +317,8 @@ pub(crate) fn snapshot_restore_request(
     lower_inputs: Option<&LowerInputs>,
     hook: Option<crate::RestoreHook>,
 ) -> Result<RestoreRequest, LibVmError> {
-    let SnapshotCaptureKind::LiveExecution { execution } = &consumer.record.capture else {
-        return Err(invalid("checkpoint capture kind changed"));
+    let SnapshotMemoryState::Included { execution } = &consumer.record.memory else {
+        return Err(invalid("snapshot memory changed"));
     };
     let digests = [
         Sha256Digest::from_bytes(*execution.memory.stream.as_bytes()),
@@ -362,7 +363,7 @@ pub(crate) fn snapshot_restore_request(
         ),
         version: vm_spec::restore::RESTORE_REQUEST_VERSION,
         authority: vm_spec::restore::RestoreAuthority::IdentifiedSnapshot {
-            checkpoint: Sha256Digest::from_bytes(*consumer.info.id.as_bytes()),
+            snapshot: Sha256Digest::from_bytes(*consumer.info.id.as_bytes()),
             evidence: Box::new(evidence),
         },
         activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string())
@@ -891,7 +892,7 @@ fn prepare_lower_descriptor(
 
 pub(crate) fn storage_from_snapshot(
     record: &SnapshotRecord,
-    checkpoint: crate::storage::identity::SnapshotId,
+    snapshot: crate::storage::identity::SnapshotId,
 ) -> Result<MachineStorageRecord, LibVmError> {
     let (root, profile, backend) = match &record.root.profile {
         SnapshotRootProfile::OpaqueRaw => (
@@ -937,8 +938,8 @@ pub(crate) fn storage_from_snapshot(
         profile,
         backend,
         disk_baselines: Vec::new(),
-        ram_identity: match &record.capture {
-            SnapshotCaptureKind::LiveExecution { execution } => {
+        ram_identity: match &record.memory {
+            SnapshotMemoryState::Included { execution } => {
                 crate::store::models::storage::ContentIdentityState::Identified {
                     root: Sha256Digest::from_bytes(*execution.memory.stream.as_bytes()),
                 }
@@ -975,7 +976,7 @@ pub(crate) fn storage_from_snapshot(
         ownership: crate::MachineOwnership::Owned,
         operation: None,
         image: None,
-        snapshot: Some(checkpoint),
+        snapshot: Some(snapshot),
     };
     storage.bind_disk_identity_inventory(&record.configuration.spec);
     storage.validate()?;
@@ -1286,8 +1287,8 @@ async fn launch_restored(
 
 fn restore_authority_name(authority: &vm_spec::restore::RestoreAuthority) -> String {
     match authority {
-        vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { checkpoint, .. } => {
-            checkpoint.to_string()
+        vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { snapshot, .. } => {
+            snapshot.to_string()
         }
         vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
             format!("fork:{}", cut.capture_id)
@@ -1301,8 +1302,8 @@ fn inspection_refusal(
     expected: &str,
     actual: impl Into<String>,
 ) -> LibVmError {
-    LibVmError::CheckpointPortability {
-        checkpoint: restore_authority_name(&restore.authority),
+    LibVmError::SnapshotPortability {
+        snapshot: restore_authority_name(&restore.authority),
         refusal: Box::new(vm_spec::restore::RestorePortabilityRefusal::new(
             pin,
             expected,
@@ -1444,8 +1445,8 @@ async fn inspect(
                         error,
                     )
                 })?;
-                return Err(LibVmError::CheckpointPortability {
-                    checkpoint: restore_authority_name(&restore.authority),
+                return Err(LibVmError::SnapshotPortability {
+                    snapshot: restore_authority_name(&restore.authority),
                     refusal: Box::new(failure.refusal),
                 });
             }
@@ -1486,8 +1487,8 @@ async fn inspect(
                 error,
             )
         })?;
-        return Err(LibVmError::CheckpointPortability {
-            checkpoint: restore_authority_name(&restore.authority),
+        return Err(LibVmError::SnapshotPortability {
+            snapshot: restore_authority_name(&restore.authority),
             refusal: Box::new(refusal),
         });
     }
@@ -1775,7 +1776,7 @@ pub(crate) async fn restore_reserved_fork_child(
         return Err(invalid("fork restore native inspection identity changed"));
     }
     let intent = RestoreIntent {
-        checkpoint: crate::store::restore::RestoreIdentity::LocalCut {
+        source: crate::store::restore::RestoreIdentity::LocalCut {
             id: cut.record.cut_id,
         },
         consumer_operation: child.consumer_id,
@@ -1817,7 +1818,7 @@ pub(crate) mod tests {
 
     pub(crate) async fn assert_real_snapshot_child_requests(
         runtime: &crate::Runtime,
-        snapshots: &crate::SnapshotStore,
+        snapshots: &crate::store::snapshot_store::SnapshotStore,
         snapshot: crate::SnapshotId,
         count: usize,
     ) {
@@ -1840,8 +1841,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .complete(runtime.local_images_dir())
                 .unwrap();
-            let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-                &consumer.record.capture
+            let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+                &consumer.record.memory
             else {
                 panic!("execution snapshot required");
             };
@@ -1891,7 +1892,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let intent = crate::store::restore::RestoreIntent {
-                checkpoint: crate::store::restore::RestoreIdentity::Snapshot { id: snapshot },
+                source: crate::store::restore::RestoreIdentity::Snapshot { id: snapshot },
                 consumer_operation: consumer.operation_id,
                 request: request.clone(),
                 resources,
@@ -2007,7 +2008,7 @@ pub(crate) mod tests {
 
     pub(crate) async fn assert_real_fork_child_requests(
         runtime: &crate::Runtime,
-        snapshots: &crate::SnapshotStore,
+        snapshots: &crate::store::snapshot_store::SnapshotStore,
         operation: uuid::Uuid,
         child_count: usize,
     ) -> Vec<(
@@ -2047,7 +2048,7 @@ pub(crate) mod tests {
             let inspection =
                 crate::machine::restore::inspection_request(request.clone(), false).unwrap();
             let intent = crate::store::restore::RestoreIntent {
-                checkpoint: crate::store::restore::RestoreIdentity::LocalCut {
+                source: crate::store::restore::RestoreIdentity::LocalCut {
                     id: cut.record.cut_id,
                 },
                 consumer_operation: child.consumer_id,
@@ -2181,12 +2182,12 @@ pub(crate) mod tests {
     fn restore_full_byte_hash_preserves_descriptor_position_for_receiver() {
         use std::io::{Seek, Write};
         let mut file = tempfile::tempfile().unwrap();
-        file.write_all(b"checkpoint state").unwrap();
-        let expected = vm_spec::capture::Sha256Digest::of_bytes(b"checkpoint state");
+        file.write_all(b"snapshot state").unwrap();
+        let expected = vm_spec::capture::Sha256Digest::of_bytes(b"snapshot state");
         assert_eq!(whole_file_sha256(&file).unwrap(), expected);
         assert_eq!(
             file.stream_position().unwrap(),
-            b"checkpoint state".len() as u64
+            b"snapshot state".len() as u64
         );
     }
 
@@ -2256,7 +2257,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn portability_refusal_preserves_exact_pin_and_checkpoint() {
+    fn portability_refusal_preserves_exact_pin_and_snapshot() {
         let refusal = vm_spec::restore::RestorePortabilityRefusal {
             pin: "cpu.cpuid".into(),
             expected: "leaf 0x7 subleaf 0: ebx.avx2".into(),
@@ -2264,15 +2265,15 @@ pub(crate) mod tests {
             stage: "restore-preflight".into(),
         };
         refusal.validate().unwrap();
-        let error = crate::LibVmError::CheckpointPortability {
-            checkpoint: "sha256:captured-checkpoint".into(),
+        let error = crate::LibVmError::SnapshotPortability {
+            snapshot: "sha256:captured-snapshot".into(),
             refusal: Box::new(refusal),
         };
         let message = error.to_string();
         assert!(message.contains("cpu.cpuid"));
         assert!(message.contains("restore-preflight"));
         assert!(message.contains("leaf 0x7 subleaf 0"));
-        assert!(message.contains("sha256:captured-checkpoint"));
+        assert!(message.contains("sha256:captured-snapshot"));
         assert!(message.contains("no execution child was started"));
     }
 
@@ -2297,8 +2298,8 @@ pub(crate) mod tests {
                 geometry: record.root.geometry,
             })
             .collect();
-        let checkpoint = format!("sha256:{}", "02".repeat(32)).parse().unwrap();
-        let storage = storage_from_snapshot(&record, checkpoint).unwrap();
+        let snapshot = format!("sha256:{}", "02".repeat(32)).parse().unwrap();
+        let storage = storage_from_snapshot(&record, snapshot).unwrap();
         let mut spec = record.configuration.spec.clone();
         let pins = vm_spec::capture::CaptureConfiguration::from_spec(&spec).unwrap();
         project_restore_disks(
@@ -2363,8 +2364,8 @@ pub(crate) mod tests {
         record.configuration.spec.storage.as_mut().unwrap().disks[0].geometry = lower_geometry;
         record.configuration.spec.storage.as_mut().unwrap().disks[1].geometry =
             record.root.geometry;
-        let checkpoint = format!("sha256:{}", "03".repeat(32)).parse().unwrap();
-        let storage = storage_from_snapshot(&record, checkpoint).unwrap();
+        let snapshot = format!("sha256:{}", "03".repeat(32)).parse().unwrap();
+        let storage = storage_from_snapshot(&record, snapshot).unwrap();
         let crate::MachineRoot::LinuxOverlay {
             lower:
                 crate::OverlayLower::ErofsComposition {
@@ -2476,7 +2477,7 @@ pub(crate) mod tests {
         // This real file cannot execute. The request error must precede spawn.
         let executable = tempfile::tempfile().unwrap();
         let error = inspect(&executable, &request, false).await.unwrap_err();
-        let crate::LibVmError::CheckpointPortability { refusal, .. } = error else {
+        let crate::LibVmError::SnapshotPortability { refusal, .. } = error else {
             panic!("inspection request failure must be a restore-preflight refusal");
         };
         refusal.validate().unwrap();
@@ -2491,15 +2492,11 @@ pub(crate) mod tests {
         let error = crate::machine::restore::inspect(&executable, &request, false)
             .await
             .unwrap_err();
-        let crate::LibVmError::CheckpointPortability {
-            checkpoint,
-            refusal,
-        } = error
-        else {
+        let crate::LibVmError::SnapshotPortability { snapshot, refusal } = error else {
             panic!("inspection process failure must be a restore-preflight refusal");
         };
         refusal.validate().unwrap();
-        assert!(checkpoint.starts_with("fork:"));
+        assert!(snapshot.starts_with("fork:"));
         assert_eq!(refusal.stage, "restore-preflight");
         assert_eq!(refusal.pin, "inspection.process");
     }

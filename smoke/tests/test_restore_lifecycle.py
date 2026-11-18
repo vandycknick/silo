@@ -259,7 +259,7 @@ def test_restored_child_cold_start_keeps_its_own_disk_writes(
     listed = next(machine for machine in silo.ls() if machine["id"] == cold["id"])
     assert listed["image"] == "stopped-storage"
     if saved is not None:
-        assert silo.json("snapshot", "inspect", saved.reference)["retained"] is True
+        assert silo.json("snapshot", "inspect", saved.snapshot)["names"] == ["cold-start-checkpoint"]
         silo.run("resume", source)
     assert silo.exec(source, "cat", "/var/lib/cold-start-marker").stdout == "source-cut"
     # Subsequent starts use the ordinary stopped-machine path too.

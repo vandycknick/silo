@@ -618,7 +618,7 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
                     match operation {
                         LiveOperation::Pause => machine.pause(&observed).await.map(|_| ()),
                         LiveOperation::Capture => machine
-                            .snapshot_live(&observed, capture_options(), None)
+                            .submit_capture(&observed, uuid::Uuid::new_v4(), capture_options())
                             .await
                             .map(|_| ()),
                         LiveOperation::Fork => machine
@@ -1805,7 +1805,7 @@ async fn live_capabilities_wrong_machine_evidence_fails_before_unsupported_reaso
     for result in [
         other.pause(&observation).await.map(|_| ()),
         other
-            .snapshot_live(&observation, capture_options(), None)
+            .submit_capture(&observation, uuid::Uuid::new_v4(), capture_options())
             .await
             .map(|_| ()),
         other

@@ -230,11 +230,11 @@ def test_fork_budget_restore_to_running(
     source = budget_source(silo, restore_image)
     initial = source["initial"]
     fixture = fixture_proof(silo, SOURCE, source["upper"])
-    created = silo.run("snapshot", "create", SOURCE, "--live", "--name", "budget-checkpoint", "--format", "json", timeout=300)
+    created = silo.run("snapshot", "create", SOURCE, "--memory", "--name", "budget-checkpoint", "--format", "json", timeout=300)
     value = json.loads(created.stdout)
-    assert value["snapshot"]["captureKind"] == "live-execution", value
+    assert value["snapshot"]["memory"] == "included", value
     assert value["capture"]["sourceOutcome"] == "resumed", value
-    reference = "image:" + value["snapshot"]["id"]
+    reference = value["snapshot"]["id"]
     relative = Path(value["capture"]["staging"])
     assert not relative.is_absolute() and ".." not in relative.parts
     directory = silo.ws.silo_home / relative
@@ -310,7 +310,7 @@ def budget_dispatch(silo: Silo, *args: str,
 
 
 def checkpoint_value(silo: Silo, value: dict) -> tuple[Path, dict]:
-    assert value["snapshot"]["captureKind"] == "live-execution", value
+    assert value["snapshot"]["memory"] == "included", value
     assert value["capture"]["sourceOutcome"] == "resumed", value
     relative = Path(value["capture"]["staging"])
     assert not relative.is_absolute() and ".." not in relative.parts, relative
@@ -320,9 +320,8 @@ def checkpoint_value(silo: Silo, value: dict) -> tuple[Path, dict]:
     return directory, seal
 
 
-def remove_checkpoint(silo: Silo, alias: str, value: dict) -> None:
-    silo.run("image", "remove", "image:" + alias)
-    silo.run("snapshot", "remove", "image:" + value["snapshot"]["id"])
+def remove_snapshot(silo: Silo, value: dict) -> None:
+    silo.run("snapshot", "rm", value["snapshot"]["id"])
 
 
 def test_fork_budget_incremental_ten_percent_dirty(
@@ -351,7 +350,7 @@ def test_fork_budget_incremental_ten_percent_dirty(
     alias = "budget-incremental-baseline"
     reclaim.settled(silo, SOURCE)
     previous = json.loads(silo.run(
-        "snapshot", "create", SOURCE, "--live", "--capture-policy", "incremental",
+        "snapshot", "create", SOURCE, "--memory", "--capture-policy", "incremental",
         "--name", alias, "--format", "json", timeout=240).stdout)
     previous_directory, previous_seal = checkpoint_value(silo, previous)
     assert previous_seal["memory"]["mode"] == "full", previous_seal["memory"]
@@ -371,7 +370,7 @@ def test_fork_budget_incremental_ten_percent_dirty(
                 cache = fork_budget.cache_state(silo, cohort)
                 allocated = upper.stat().st_blocks * 512
                 stdout, dispatched, exited = budget_dispatch(
-                    silo, "snapshot", "create", SOURCE, "--live", "--capture-policy", "incremental",
+                    silo, "snapshot", "create", SOURCE, "--memory", "--capture-policy", "incremental",
                     "--name", current_alias, "--format", "json")
                 value = json.loads(stdout)
                 directory, seal = checkpoint_value(silo, value)
@@ -438,21 +437,21 @@ def test_fork_budget_incremental_ten_percent_dirty(
             # through restore outside the next sample's timed window.
             stopped.stop(silo, SOURCE, require_clean=False)
             silo.rm(SOURCE)
-            remove_checkpoint(silo, alias, previous)
+            remove_snapshot(silo, previous)
             shutdown.storage_tool(silo, "prune")
             assert not previous_directory.exists() and not directory.exists(), (
                 "ended source run retained incremental staging", previous_directory, directory)
-            previous, previous_seal, alias = value, seal, current_alias
+            previous, previous_seal = value, seal
             previous_directory = directory
             if position + 1 < len(fork_budget.SCHEDULE):
-                info = restore.restore_child(silo, "image:" + value["snapshot"]["id"], SOURCE)
+                info = restore.restore_child(silo, value["snapshot"]["id"], SOURCE)
                 upper = overlay.upper(silo, SOURCE)
     finally:
         trace = fork.source_trace(silo, info["id"])
         if trace.is_file():
             (evidence.directory / "source-vm.trace.log").write_text(trace.read_text(errors="replace"))
     # The last successful sample already stopped and removed its source.
-    remove_checkpoint(silo, alias, previous)
+    remove_snapshot(silo, previous)
     shutdown.storage_tool(silo, "prune")
     summary = evidence.finish()
     assert all(summary["pass"].values()), (str(evidence.directory), summary["pass"])

@@ -282,21 +282,17 @@ def test_disk_invariance_accepted_residual_applies_to_its_metric_only() -> None:
     assert not invariant(0.595, 0.760, cohort, "snapshot_full")
 
 
-def test_catalog_observer_decodes_real_alias(tmp_path: Path) -> None:
+def test_catalog_observer_decodes_real_snapshot_name(tmp_path: Path) -> None:
     # A real SQLite catalog exercises the observer's encoding contract, not a product double.
     path = tmp_path / "state.db"
     with sqlite3.connect(path) as connection:
-        connection.execute("CREATE TABLE image_alias(name TEXT PRIMARY KEY, snapshot_id TEXT, image_id TEXT)")
-        connection.execute("INSERT INTO image_alias VALUES ('chosen', 'sha256:abc', NULL)")
-    rows = observe(path)["image_alias"]
-    assert rows == [("text:63686F73656E", "text:7368613235363A616263", "null:")]
+        connection.execute("CREATE TABLE snapshot_name(name TEXT PRIMARY KEY NOT NULL, snapshot_id TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+        connection.execute("INSERT INTO snapshot_name VALUES ('chosen', 'sha256:abc', 1)")
+    rows = observe(path)["snapshot_name"]
+    assert rows == [("text:63686F73656E", "text:7368613235363A616263", "integer:31")]
     assert snapshot_id(path, "chosen") == "sha256:abc"
     assert snapshot_id(path, "absent") is None
     assert snapshot_id(tmp_path / "absent.db", "chosen") is None
-    with sqlite3.connect(path) as connection:
-        connection.execute("INSERT INTO image_alias VALUES ('not-snapshot', NULL, 'sha256:def')")
-    with pytest.raises(ValueError, match="not a snapshot"):
-        snapshot_id(path, "not-snapshot")
 
 
 def test_explicit_distribution_binary_never_acquires(tmp_path: Path) -> None:

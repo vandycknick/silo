@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, ValueEnum};
 use eyre::Context as _;
 use libvm::{
-    ImageProgressSender, ImagePullPolicy, MachineAgent, MachineRetention, MachineUserConfig,
-    PublishBind, RuntimeConfig,
+    ImageProgressSender, MachineAgent, MachineRetention, MachineUserConfig, PublishBind,
+    RuntimeConfig,
 };
 use nix::unistd::{Uid, User};
 
@@ -28,11 +28,11 @@ pub(crate) enum Pull {
 }
 
 impl Pull {
-    pub(crate) fn policy(self) -> ImagePullPolicy {
+    pub(crate) fn policy(self) -> libvm::PullPolicy {
         match self {
-            Self::Always => ImagePullPolicy::Always,
-            Self::Missing => ImagePullPolicy::IfMissing,
-            Self::Never => ImagePullPolicy::Never,
+            Self::Always => libvm::PullPolicy::Always,
+            Self::Missing => libvm::PullPolicy::IfMissing,
+            Self::Never => libvm::PullPolicy::Never,
         }
     }
 
@@ -44,7 +44,7 @@ impl Pull {
         }
     }
 
-    pub(crate) fn policies(self) -> (ImagePullPolicy, PullPolicy) {
+    pub(crate) fn policies(self) -> (libvm::PullPolicy, PullPolicy) {
         (self.policy(), self.plan_policy())
     }
 }
@@ -215,9 +215,12 @@ impl VmOverrideArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Create a persistent stopped VM from an image or template")]
+#[command(
+    about = "Create a persistent stopped VM from an image or template",
+    long_about = "Create a persistent stopped VM from an image or template.\n\nIMAGE is an image only: a local image name, an image id or unique id prefix, a registry reference, or disk:PATH. A local name wins; short registry names such as alpine:3.21 expand through search_registries (docker.io by default). Snapshots become machines through `silo restore`."
+)]
 pub struct Cmd {
-    /// OCI registry reference or disk:PATH. Overrides the template image.
+    /// Image name, id, registry reference or disk:PATH. Overrides the template image.
     #[arg(value_name = "IMAGE")]
     image: Option<String>,
     /// Template providing VM defaults.
@@ -312,24 +315,6 @@ impl Cmd {
                     image_progress.clone(),
                 )
                 .await?;
-            // A snapshot restores its complete captured configuration through the
-            // existing restore path; nothing implicit is synthesized over it.
-            if let crate::api::types::ResolvedSource::Managed(libvm::ManagedSourceRef::Snapshot(
-                id,
-            )) = &source.source
-            {
-                ensure_snapshot_has_no_overrides(&machine, &template)?;
-                let options = libvm::RestoreOptions {
-                    name: requested_name,
-                    external_resources: libvm::ExternalResourcePolicy::Reject,
-                    activation_hook: None,
-                };
-                return context
-                    .app_api()
-                    .await?
-                    .restore_snapshot(&format!("image:{id}"), options, None)
-                    .await;
-            }
             let settings = machine_settings(&machine);
             let plan = resolve_plan(PlanInputs {
                 kind: PlanKind::Create,
@@ -390,25 +375,19 @@ pub(crate) fn selected_image_reference(
         .ok_or_else(|| eyre::eyre!("an image is required when the template does not provide one"))
 }
 
-/// A source spelling, parsed in the same order by both transports: `image:`
-/// managed references first, then `disk:` paths, then OCI references.
+/// A source spelling, parsed the same way by both transports: `disk:` paths,
+/// otherwise an image reference for the shared name resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SourceSpelling {
-    Managed(silo_vm_control::images::ManagedSpelling),
     Disk(PathBuf),
-    Oci(String),
+    Reference(String),
 }
 
 pub(crate) fn parse_source(reference: &str) -> eyre::Result<SourceSpelling> {
-    if reference.starts_with("image:") {
-        return Ok(SourceSpelling::Managed(
-            silo_vm_control::images::parse_managed(reference)?,
-        ));
-    }
     if let Some(path) = reference.strip_prefix("disk:") {
         return Ok(SourceSpelling::Disk(disk_source_path(reference, path)?));
     }
-    Ok(SourceSpelling::Oci(reference.to_owned()))
+    Ok(SourceSpelling::Reference(reference.to_owned()))
 }
 
 /// Source options belong to the selected source family; they are never
@@ -419,59 +398,23 @@ pub(crate) fn validate_source_options(
     pull: bool,
 ) -> eyre::Result<()> {
     match spelling {
-        SourceSpelling::Oci(_) => {
+        SourceSpelling::Reference(_) => {
             if options.root.is_some() {
                 eyre::bail!("--root selects a partition of a disk: source only");
             }
         }
         SourceSpelling::Disk(_) => {
             if pull {
-                eyre::bail!("--pull is only supported for OCI image sources");
+                eyre::bail!("--pull is only supported for image references");
             }
         }
-        SourceSpelling::Managed(_) => {
-            if pull {
-                eyre::bail!("--pull is only supported for OCI image sources");
-            }
-            if options.platform.is_some() || options.root.is_some() {
-                eyre::bail!(
-                    "--platform and --root cannot change a managed image; its boot metadata is immutable"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Snapshot creation is a full stopped restore: only the new name applies.
-/// Explicit settings are refused rather than silently ignored; implicit
-/// defaults are never sent.
-pub(crate) fn ensure_snapshot_has_no_overrides(
-    options: &MachineCliOptions,
-    template: &crate::template::NamedTemplate,
-) -> eyre::Result<()> {
-    let explicit = options.overrides != MachineOverrides::default()
-        || options.kernel.is_some()
-        || options.initramfs.is_some()
-        || !options.kernel_args.is_empty()
-        || options.nested_virtualization
-        || options.rosetta.is_some()
-        || !options.disks.is_empty()
-        || options.agent.is_some()
-        || options.no_agent
-        || options.provision_user.is_some()
-        || !template.name.is_empty();
-    if explicit {
-        eyre::bail!(
-            "a snapshot restores its complete captured configuration; only --name applies (use `silo restore` options, or `silo set` after creation)"
-        );
     }
     Ok(())
 }
 
 /// `disk:` convenience: host-native userspace, whole-disk direct boot and
 /// packaged assets pinned at creation, unless explicitly selected. The
-/// assumption is complete and visible in the plan; creation publishes no alias.
+/// assumption is complete and visible in the plan; creation publishes no name.
 pub(crate) fn disk_create_request(
     path: PathBuf,
     options: &crate::api::types::SourceOptions,
@@ -490,7 +433,7 @@ pub(crate) fn disk_create_request(
                 .unwrap_or(libvm::ImportRootSelection::WholeDisk),
             assets: libvm::BootAssetSelection::Packaged,
         },
-        alias: None,
+        name: None,
     })
 }
 
@@ -663,7 +606,7 @@ pub(crate) fn preflight_create(
         .as_ref()
         .or(template.tmpfs_size.as_ref())
         .is_some()
-        && (reference.starts_with("image:") || reference.starts_with("disk:"))
+        && reference.starts_with("disk:")
     {
         eyre::bail!("--tmpfs-size requires a new OCI root");
     }
@@ -958,27 +901,20 @@ mod tests {
     }
 
     #[test]
-    fn managed_image_spelling_is_parsed_before_oci_and_options_follow_the_family() {
-        let digest = format!("sha256:{}", "ab".repeat(32));
-        assert_eq!(
-            parse_source("image:base").unwrap(),
-            SourceSpelling::Managed(silo_vm_control::images::ManagedSpelling::Reference(
-                libvm::ManagedSourceRef::Alias("base".into())
-            ))
-        );
-        assert_eq!(
-            parse_source(&format!("image:{digest}")).unwrap(),
-            SourceSpelling::Managed(silo_vm_control::images::ManagedSpelling::Digest(
-                digest.parse().unwrap()
-            ))
-        );
-        assert!(parse_source("image:sha256:ABC").is_err());
-        assert!(parse_source("image:").is_err());
-        assert!(parse_source("image:has space").is_err());
-        assert_eq!(
-            parse_source("ubuntu:24.04").unwrap(),
-            SourceSpelling::Oci("ubuntu:24.04".into())
-        );
+    fn disk_spelling_is_parsed_before_references_and_options_follow_the_family() {
+        for reference in [
+            "base",
+            "ubuntu:24.04",
+            "ghcr.io/acme/app:1",
+            "abc123",
+            &format!("sha256:{}", "ab".repeat(32)),
+        ] {
+            assert_eq!(
+                parse_source(reference).unwrap(),
+                SourceSpelling::Reference(reference.into())
+            );
+        }
+        assert!(parse_source("disk:").is_err());
         let root = SourceOptions {
             platform: None,
             root: Some(libvm::ImportRootSelection::AutoGpt),
@@ -987,14 +923,10 @@ mod tests {
             platform: Some(silo_vm_control::boot::parse_platform("arm64").unwrap()),
             root: None,
         };
-        let oci = SourceSpelling::Oci("ubuntu".into());
-        let managed = parse_source("image:base").unwrap();
+        let reference = SourceSpelling::Reference("ubuntu".into());
         let disk = SourceSpelling::Disk("/disk.raw".into());
-        assert!(validate_source_options(&oci, &root, false).is_err());
-        assert!(validate_source_options(&oci, &platform, true).is_ok());
-        assert!(validate_source_options(&managed, &platform, false).is_err());
-        assert!(validate_source_options(&managed, &root, false).is_err());
-        assert!(validate_source_options(&managed, &SourceOptions::default(), true).is_err());
+        assert!(validate_source_options(&reference, &root, false).is_err());
+        assert!(validate_source_options(&reference, &platform, true).is_ok());
         assert!(validate_source_options(&disk, &root, false).is_ok());
         assert!(validate_source_options(&disk, &platform, true).is_err());
     }
@@ -1011,7 +943,7 @@ mod tests {
                     root: libvm::ImportRootSelection::WholeDisk,
                     assets: libvm::BootAssetSelection::Packaged,
                 },
-                alias: None,
+                name: None,
             }
         );
         let explicit = SourceOptions {
@@ -1208,7 +1140,7 @@ mod tests {
             .expect_err("explicit disk pull policy must fail");
             assert!(error
                 .to_string()
-                .contains("--pull is only supported for OCI image sources"));
+                .contains("--pull is only supported for image references"));
         }
     }
 

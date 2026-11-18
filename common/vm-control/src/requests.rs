@@ -1,12 +1,12 @@
 use crate::{invalid, required, validate_uuid, ConversionError};
 use silod_spec::daemon::v1 as w;
-/// A selected immutable OCI identity, a typed local disk import, or a typed
-/// managed image/snapshot reference; never a mutable OCI tag ticket.
+/// A selected immutable OCI identity, a typed local disk import, or a stored
+/// image reference; never a mutable OCI tag ticket.
 #[derive(Debug, Clone)]
 pub enum CreateSource {
     Oci(crate::images::OciIdentity),
     Disk(libvm::DiskImportRequest),
-    Managed(libvm::ManagedSourceRef),
+    Stored(libvm::ImageRef),
 }
 pub fn create_request_to_wire(
     config: &crate::create::NormalizedMachineCreate,
@@ -23,8 +23,8 @@ pub fn create_request_to_wire(
             CreateSource::Disk(request) => {
                 Source::Disk(crate::boot::import_request_to_wire(request)?)
             }
-            CreateSource::Managed(reference) => {
-                Source::Managed(crate::images::managed_ref_to_wire(reference)?)
+            CreateSource::Stored(reference) => {
+                Source::Stored(crate::images::image_ref_to_wire(reference)?)
             }
         }),
     })
@@ -50,7 +50,7 @@ pub fn create_request_from_wire(
             CreateSource::Oci(identity)
         }
         Source::Disk(v) => CreateSource::Disk(crate::boot::import_request_from_wire(v)?),
-        Source::Managed(v) => CreateSource::Managed(crate::images::managed_ref_from_wire(v)?),
+        Source::Stored(v) => CreateSource::Stored(crate::images::image_ref_from_wire(v)?),
     };
     Ok((config, source, secret_scope))
 }

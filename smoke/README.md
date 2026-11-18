@@ -173,32 +173,20 @@ configuration and server/GC logs. A registry fixture never modifies the
 user's Docker configuration or hosted registry credentials.
 
 `test_artifact_stopped.py` drives the staged CLI in local and private-daemon
-mode against this registry. It covers raw and converted images plus stopped
-checkpoints, raw/zstd identity, trust refusal without catalog effects, source
-OCI deletion, offline registry GC, decoded-flat eviction, chunk-only
-reconstruction and real guest boot with retained boot assets. Its interrupted
-pull case removes a real registry chunk, corrupts one completed local cache
-entry, then proves the retry refetches only invalid/missing bytes.
-The Linux stopped-artifact gate passed all seven cases, including both local
-and daemon routes (`artifact-stopped-corrected.xml`, 338.87 s). This establishes
-the controlled Distribution lane only; GHCR remains deferred.
+mode against this registry. It covers raw and converted images, raw/zstd
+identity, source OCI deletion, offline registry GC, decoded-flat eviction,
+chunk-only reconstruction and real guest boot with retained boot assets. Its
+interrupted pull case removes a real registry chunk, corrupts one completed
+local cache entry, then proves the retry refetches only invalid/missing bytes.
+Snapshot push is not available, so the suite has no snapshot publication case.
+`image pull` and `create` refuse a snapshot artifact, and `restore` refuses an
+image artifact, with the right command and before any chunk or content-record
+blob appears in the registry access log. The snapshot artifact is a real image
+artifact whose config is relabelled as snapshot content.
+This establishes the controlled Distribution lane only; GHCR remains deferred.
 
 ```sh
 make smoke SMOKE_ARGS='tests/test_artifact_stopped.py'
-```
-
-`test_artifact_live.py` is a functional slow selection, not a performance
-budget. Use the staged runtime selected by `SILO_SMOKE_BIN_DIR` and
-`SILO_SMOKE_RUNTIME_DIR`. It publishes a real matched-cut checkpoint, pulls into
-a fresh home, removes source/registry dependencies, and exercises exact restore
-or incompatible-producer refusal. The destination has its own private runtime.
-The Linux gate passed all three cases
-(`artifact-live-exact-binding.xml`, 159.89 s). Restored machines preserve
-the complete captured boot binding and independently verified boot bytes,
-not a hardcoded ABI version.
-
-```sh
-uv run --project smoke pytest smoke/tests/test_artifact_live.py -m slow
 ```
 
 ### Stopped handoff between runtimes
@@ -310,7 +298,7 @@ reader is needed.
 
 The raw and default layered-root matrix checks `contained-init`, PID 1 and
 exec namespace membership, pause/resume with an existing counter session,
-live snapshot/restore and fork, retained boot identity, rotated child identity,
+memory snapshot/restore and fork, retained boot identity, rotated child identity,
 and surviving OpenRC services under the image cgroup. Systemd gates check
 delegated `MemoryMax=` OOM and `CPUQuota=` enforcement, agent resource
 protections, an exec's private cgroup mount, and a running ticker service in children.
@@ -340,7 +328,7 @@ has passed merely from collecting it.
 `tests/test_capture.py` runs directly against the staged runtime. Every live
 operation is supported when the backend and host provide its native primitive.
 The monitor's `buildIdentity` is informational `v1:silo:<target>:<version>` metadata.
-Checkpoint compatibility uses `liveStateSchema` and guest `architecture` only;
+Snapshot compatibility uses `liveStateSchema` and guest `architecture` only;
 restore refuses mismatches in those fields, not different source or build inputs.
 
 `test_native_capabilities.py` checks the selected staged monitor using ordinary,
@@ -355,7 +343,7 @@ make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_capture.py tests/test_capture_
 
 The root-family gates exercise raw and EROFS-overlay matched disk/RAM cuts,
 source continuation, acquired and borrowed pause authority, sealed-file
-immutability, independent retained RAM, and retention through source/alias
+immutability, independent retained RAM, and retention through source/name
 removal, home relocation and GC. Unsupported readonly virtiofs must be refused
 before staging or freezing. The child-only syscall tracer holds real capture
 write and record-settlement boundaries for manager/monitor/worker death, plus
@@ -400,7 +388,7 @@ Holding the worker's vsock muxer after cut publication, before continuation, exe
 genuine deadlines without injected errors or changed timeouts. The failure
 oracle checks the coherent published seal, Error fences and the source's durable
 workload counter, not survival of an exec session whose readiness was invalidated.
-The checkpoint durability gate records successful `fsync`/`fdatasync` calls
+The snapshot durability gate records successful `fsync`/`fdatasync` calls
 through real `/proc/<tid>/fd` device/inode observations. Every captured pool
 payload must have a file barrier and a later publication-directory barrier,
 followed by the catalog barrier. Capture staging must have none.
@@ -408,8 +396,8 @@ followed by the catalog barrier. Capture staging must have none.
 
 ### Execution restore and retained closure (Phase 15)
 
-`tests/test_restore.py` drives actual `silo snapshot create --live` followed by
-`silo restore image:<checkpoint> --name <child>`, with automatic execution-kind
+`tests/test_restore.py` drives actual `silo snapshot create VM --name <snapshot> --memory`
+followed by `silo restore <snapshot> --name <child>`, with automatic execution-kind
 dispatch and no cold-boot recovery fallback:
 
 ```sh
@@ -431,7 +419,7 @@ The timerfd/signal events are kernel-event witnesses, not hardware IRQ proof.
 Corruption cases alter real captured RAM, disks, state/layout/maps, boot assets
 and provenance. Compatibility cases use the public native execution codec to
 alter a real CPU/profile/schema/architecture/XSAVE envelope, then rebuild the
-object digests, canonical checkpoint identity, dependency edges and
+object digests, canonical snapshot identity, dependency edges and
 authenticated local seal. Only the precise native refusal subject satisfies
 those cases. Schema and architecture refusal is intentionally checked before
 device decoding; the original device binding is retained explicitly. All
@@ -440,7 +428,7 @@ Verification consumers may leave an unlocked stable lease inode by pool design;
 unsupported selected-backend refusal may not acquire even that consumer.
 The live suites use automatically built matching-profile helpers next to the CLI.
 `SILO_SMOKE_NATIVE_LIVE_API` optionally overrides the native entry.
-Foreign-lane compatibility still requires a real foreign-lane checkpoint, not a
+Foreign-lane compatibility still requires a real foreign-lane snapshot, not a
 synthetic mixed-architecture envelope.
 
 The hardware IRQ case uses an isolated diagnostic stage built automatically for
@@ -463,7 +451,7 @@ Each case boots a one-vCPU `--network private` source with the
 `restore-network` witness (`virt/vmm/tests/guest/restore_network.c`): a
 keepalive TCP stream and an unconnected UDP sender (sequence plus fresh
 getrandom UUID) to real host peers through netd's host-loopback NAT, a forward
-target listener and a durable progress record. A preserving live checkpoint is
+target listener and a durable progress record. A preserving memory snapshot is
 restored with the real `silo restore`. The workspace selects netd's own packet
 capture (`networking.drivers.netd.pcap`); the child's capture and trace log are
 followed from creation so destroyed children keep their evidence.
@@ -597,7 +585,7 @@ workers. It uses the same `linux_only` and `slow` markers as capture, restore,
 fork and incremental suites, and parametrizes both raw and layered guest roots.
 The ordinary workspace uses the Cargo target filesystem. To exercise ext4, point the
 stopped-lane variables at an actual mounted writable ext4 directory;
-all machine disks, checkpoint RAM and catalog bytes stay on that mount, while
+all machine disks, snapshot RAM and catalog bytes stay on that mount, while
 generated sockets use a short `/tmp` runtime directory. `findmnt` verifies the
 requested filesystem in the test process's namespace.
 
@@ -657,7 +645,7 @@ required; `released_bytes` must grow after every tested free.
 
 The first scenario checks boot reclaim before and after capture, lazy restore,
 shared reads, private rewrites, anonymous zero reuse, unchanged staging and
-published checkpoint RAM hashes, and a second restore of the original seeded
+published snapshot RAM hashes, and a second restore of the original seeded
 payload. After the restored child frees its payload, a genuine incremental
 capture is authenticated and compared byte-for-byte with the existing
 frozen-full oracle at the identical pause, then restored and scanned again.
@@ -670,11 +658,11 @@ source's seeded bytes must survive the other's reclaim.
 These are 4 GiB VM tests with real 2 GiB resident payloads and multiple retained
 4 GiB logical RAM artifacts. Provision host memory/disk space accordingly and
 run sequentially, not with pytest-xdist. All registered VMs stop on teardown.
-Successful ordinary runs remove their workspace/checkpoints; `--keep` or a
-failure retains stopped VM and checkpoint evidence, including
-`reclaim-samples.log`, checkpoint hashes and kernel-config provenance.
+Successful ordinary runs remove their workspace/snapshots; `--keep` or a
+failure retains stopped VM and snapshot evidence, including
+`reclaim-samples.log`, snapshot hashes and kernel-config provenance.
 
-### Incremental capture and named disk recovery (Phase 20)
+### Incremental capture (Phase 20)
 
 These are maintained **functional** gates, not timing budgets. Use the same
 staged KVM x86_64 runtime and VM-generation-aware workload kernel as the restore
@@ -682,7 +670,6 @@ gates. The CLI, monitor and helper examples must be staged together:
 
 ```sh
 make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_incremental.py --keep'
-make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_artifact_live.py --keep'
 make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_restore.py -k "corrupt_real_closure or real_native_incompatibility" --keep'
 ```
 
@@ -734,21 +721,12 @@ complete RAM bytes, identity and layout before the source can resume.
 boundary, short-tail, zero and randomized-edit evidence. `test_raw_live.py`
 flips actual RAM/disk bytes after warming verification, then requires
 `snapshot verify` to report the exact 64 KiB/8 MiB index and range. It also
-refuses corrupt map-node closures. `test_harness.py` checks old-format home
+refuses corrupt map-node closures, refuses a disk-only snapshot of a running VM
+before capture, lists MEMORY `yes`/`no`, and restores a memory snapshot with
+`--without-memory` as a stopped VM that cold-boots from the captured disks.
+`test_harness.py` checks old-format home
 refusal without conversion or deletion. Existing homes and artifacts must be
 recreated for this hard-breaking cutover.
-
-The incremental artifact case reuses the source-free live-checkpoint pipeline:
-two incremental generations after full capture, both parent records/aliases
-removed and locally collected, complete standalone OCI closure, real registry
-GC, pull into a fresh home and first-child incremental recapture. The original
-source OCI publication is unavailable during offline restore. The incompatible
-CPU artifact still imports, then names the exact `cpu.cpuid` compatibility pin
-at `restore-preflight` before allocation. Only the separately invoked
-`silo recover-disks IMAGE --name CHILD` creates new stopped private disks with
-`stopOutcome: unknown`; an explicit subsequent start proves a different boot ID,
-the captured disk marker and absence of a RAM-only marker. Registry bytes are
-already collected, source home quarantined and source OCI unavailable.
 
 The existing real-closure corruption and exact-native-refusal matrices also run
 against genuinely incremental-derived snapshots. They cover byte corruption of
@@ -799,20 +777,26 @@ parser is the oracle. The guest oracle is the probe: the mounted root's device
 number, partition number/start/size and its parent's virtio serial.
 
 Gates: raw and both qcow2 encodings import to one ImageId/stream with
-accumulated aliases/provenance, never-booted private roots equal the raw
+accumulated names/provenance, never-booted private roots equal the raw
 SHA-256, inputs stay unmodified; whole-disk, GPT (sparse slot 4) and MBR slot 4
 roots boot with the identical pinned kernel/initramfs/agent and stop clean
 (ESP never mounted); DPS auto refuses ambiguous/missing/wrong-ISA/no-auto/
 read-only and foreign platforms with candidates; unsupported containers,
 forbidden qcow2 features, special files, symlinks and incompatible layouts
-refuse before image/alias/machine publication; a cloned GPT on an attached
+refuse before image/name/machine publication; a cloned GPT on an attached
 disk never replaces the `silo-root` serial; fstab-mounted vfat reads with NLS
 options and a late ESP mount is never certified clean; opaque expansion keeps
 both GPT copies, the partition and the ext4 block count; pinned bundles survive
 source and packaged-asset removal and change only by `silo set
-boot-assets=packaged` while stopped; image/snapshot creation preserves
-semantic configuration and every snapshot disk; explicit conversion is cached
-per manifest/platform/flattener across packaged upgrades and boots.
+boot-assets=packaged` while stopped; snapshot creation preserves semantic
+configuration and every snapshot disk; `silo create` refuses a snapshot with a
+hint to use `silo restore`, which then restores it; an image and a snapshot
+both named `hello` coexist, `create` and `restore` each resolve only their own
+kind, and a name of the other kind is refused with the right command;
+`image rm NAME` removes one name and the record with its last name, `image rm
+ID` removes the record and all names, and `image prune` keeps unnamed images a
+machine uses; explicit conversion is
+cached per manifest/platform/flattener across packaged upgrades and boots.
 
 Shuffled attachment order cannot be produced by libvm (root is always first),
 so one test uses a disposable agentless candidate launch through the shipped
@@ -1624,7 +1608,7 @@ FD8 lease and publishes durable holders through the production publisher
 before releasing config. Those standalone fixtures do not substitute for
 the production CLI/SQL operation-retention gates above.
 
-## Stopped fork, checkpoint and restore gates
+## Stopped fork, snapshot and restore gates
 
 `tests/test_stopped.py` is the maintained production CLI controller for Phase 7.
 Its presence is not a qualification result. Main must run it against the staged
@@ -1674,18 +1658,18 @@ hashes verify exact pinned kernel/base-initramfs/agent objects. Both default-sel
 and source-private custom boot paths are covered. Only a private copy of the
 staged runtime is replaced, never the shared staged installation. Children
 must restore/boot after source deletion, unrelated OCI root removal/GC, old
-runtime boot-byte replacement and snapshot alias/retention release.
+runtime boot-byte replacement and snapshot name and record removal.
 
 Commands are explicit about intent:
 
 ```sh
 silo fork VM --name CHILD
-silo snapshot create VM --name CHECKPOINT
-silo snapshot inspect image:CHECKPOINT
+silo snapshot create VM --name SNAPSHOT
+silo snapshot inspect SNAPSHOT
 silo snapshot list
-silo restore image:CHECKPOINT --name CHILD
-silo image remove image:CHECKPOINT       # alias only
-silo snapshot remove image:sha256:HEX    # explicit retention only
+silo restore SNAPSHOT --name CHILD
+silo snapshot rm SNAPSHOT                # name; record goes with its last name
+silo snapshot rm sha256:HEX             # record and all its names
 ```
 
 Ordinary fork and snapshot capture require a stopped source and admit opaque raw
@@ -1694,7 +1678,7 @@ snapshot/restore artifacts retain the exact fsmeta, ordered pack and metadata
 graph, not a flattened lower or a requirement to regenerate from OCI. Obsolete
 flat profiles are rejected before effects. Live execution operations require
 their native backend/host primitives, not implicit stop/cold-boot fallbacks. An
-exact checkpoint preserves configured secrets, guest credentials, dirty journals
+exact snapshot preserves configured secrets, guest credentials, dirty journals
 and deleted-data remnants. It is neither sanitization nor application-consistency
 certification.
 External disks/shares require explicit `--external-requirements` at snapshot
@@ -1729,7 +1713,7 @@ Resuming the unchanged watchdog must produce actual exit125 before capture is
 admitted.
 `stopped_trace.py` is a child-only Linux x86_64 ptrace controller. Its retention
 and cancellation gates alter no syscall returns or bytes. One gate holds the
-real immutable source FD read while the normal CLI removes the snapshot alias and explicit retention and
+real immutable source FD read while the normal CLI removes the snapshot name and record and
 runs GC, then resumes the real restore and boots its child. Another stops actual
 source fsync, cancels only the async fork waiter via `storage_acceptance`, checks
 the surviving blocking owner's lifecycle/OFD/operation fences, resumes the
@@ -1840,7 +1824,7 @@ It does not deliver the monitor's public live commands or qualify other host
 lanes. Native diagnostic controller modules supply guest transport and
 independent validation, not the native operations under test.
 
-Checkpoint compatibility uses the native live-state schema and guest architecture,
+Snapshot compatibility uses the native live-state schema and guest architecture,
 not producer build identity. Keep source and input identities as reproduction
 evidence, and keep diagnostic native features separate from production captures.
 This standalone forensic CLI is separate from pytest and still takes explicit
@@ -1891,7 +1875,7 @@ exercises actual ENOSPC; do not substitute host disk exhaustion or `/dev/full`.
 Run `capabilities` last, with `--monitor "$STAGED_RUNTIME/bin/silo-vmm"`.
 On KVM x86_64, every live operation with a native primitive must report
 `supported`, independent of the workspace's libkrun pin. Standalone native
-proofs do not alter capability declarations. Checkpoint compatibility uses the
+proofs do not alter capability declarations. Snapshot compatibility uses the
 native state schema and guest architecture, never exact producer builds.
 
 `api-report.json`, per-process logs, captured manifests and input identities

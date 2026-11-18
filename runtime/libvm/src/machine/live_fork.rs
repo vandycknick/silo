@@ -777,7 +777,8 @@ async fn fail_capture(
     }
     let capture =
         Uuid::parse_str(current.capture_id.as_str()).map_err(|error| invalid(error.to_string()))?;
-    let snapshots = crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
+    let snapshots =
+        crate::store::snapshot_store::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
     let mut source_lock = None;
     let source_exists = runtime
         .machine_config(current.source_machine_id)
@@ -902,7 +903,8 @@ async fn settle_source(runtime: &Runtime, operation: Uuid) -> Result<(), LibVmEr
     if !matches!(result.source, ForkSourceOutcome::Pending) {
         return Ok(());
     }
-    let snapshots = crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
+    let snapshots =
+        crate::store::snapshot_store::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
     let capture =
         Uuid::parse_str(result.capture_id.as_str()).map_err(|error| invalid(error.to_string()))?;
     if let Some(record) = snapshots.capture_reservation(capture).await? {
@@ -1196,7 +1198,8 @@ async fn finish_if_settled(runtime: &Runtime, operation: Uuid) -> Result<(), Lib
                 | ForkChildOutcome::Activating
         )
     });
-    let snapshots = crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
+    let snapshots =
+        crate::store::snapshot_store::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
     let capture =
         Uuid::parse_str(result.capture_id.as_str()).map_err(|error| invalid(error.to_string()))?;
     let release_settled = snapshots
@@ -1262,7 +1265,8 @@ async fn reconcile_one(
         .ok_or_else(|| fork_error(operation, "fork disappeared"))?;
     let capture =
         Uuid::parse_str(result.capture_id.as_str()).map_err(|error| invalid(error.to_string()))?;
-    let snapshots = crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
+    let snapshots =
+        crate::store::snapshot_store::SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
     if snapshots.capture_reservation(capture).await?.is_some() {
         // Reconcile only the original capture and owned file journal. Even
         // after cut_retained, a dead manager does not authorize another capture
@@ -1324,7 +1328,7 @@ mod tests {
     use crate::machine::live_fork::{project_destination, ForkDestination};
 
     #[test]
-    fn fork_capture_request_has_no_checkpoint_alias() {
+    fn fork_capture_request_has_no_snapshot_name() {
         let options = crate::store::fork::tests::options(&["child"]);
         let capture = options.capture_options();
         assert_eq!(capture.name, None);

@@ -88,20 +88,25 @@ mod tests {
         assert!(Cli::try_parse_from(["silo", "status", "vm"]).is_err());
         assert!(Cli::try_parse_from(["silo", "daemon", "status"]).is_ok());
         assert!(Cli::try_parse_from(["silo", "pause", "vm"]).is_ok());
-        assert!(Cli::try_parse_from(["silo", "snapshot", "create", "vm", "--live"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "create", "vm", "--memory"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "create", "vm", "--live"]).is_err());
         assert!(Cli::try_parse_from(["silo", "snapshot", "create", "vm"]).is_ok());
-        assert!(Cli::try_parse_from(["silo", "snapshot", "vm", "--live"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "vm", "--memory"]).is_err());
         assert!(Cli::try_parse_from(["silo", "fork", "vm", "--name", "child"]).is_ok());
         assert!(Cli::try_parse_from(["silo", "fork", "vm", "--name", "child", "--live"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "restore", "web", "--name", "child"]).is_ok());
         assert!(
-            Cli::try_parse_from(["silo", "restore", "image:checkpoint", "--name", "child"]).is_ok()
+            Cli::try_parse_from(["silo", "restore", "ghcr.io/acme/web:1", "--name", "child"])
+                .is_ok()
         );
-        assert!(Cli::try_parse_from(["silo", "snapshot", "inspect", "image:checkpoint"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "inspect", "web"]).is_ok());
         assert!(Cli::try_parse_from(["silo", "snapshot", "list"]).is_ok());
-        assert!(Cli::try_parse_from(["silo", "snapshot", "remove", "image:checkpoint"]).is_ok());
-        assert!(Cli::try_parse_from(["silo", "image", "remove", "image:checkpoint"]).is_ok());
-        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint", "--execution"]).is_err());
-        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "rm", "web"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "image", "rm", "base"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "restore", "web", "--execution"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "restore", "web"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "restore", "web", "--without-memory"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "recover-disks", "web"]).is_err());
     }
 
     #[test]
@@ -109,7 +114,7 @@ mod tests {
         use silo_vm_control::transport::Admission;
         for args in [
             vec!["silo", "pause", "vm"],
-            vec!["silo", "snapshot", "create", "vm", "--live"],
+            vec!["silo", "snapshot", "create", "vm", "--memory"],
             vec!["silo", "fork", "vm", "--name", "child", "--live"],
             vec![
                 "silo",
@@ -118,7 +123,8 @@ mod tests {
                 "00000000-0000-4000-8000-0000000000aa",
                 "--cancel",
             ],
-            vec!["silo", "restore", "checkpoint"],
+            vec!["silo", "restore", "web"],
+            vec!["silo", "restore", "web", "--without-memory"],
             vec!["silo", "system", "info"],
         ] {
             assert_eq!(
@@ -136,8 +142,10 @@ mod tests {
             vec!["silo", "stop", "vm"],
             vec!["silo", "fork", "vm", "--name", "child"],
             vec!["silo", "snapshot", "create", "vm"],
-            vec!["silo", "snapshot", "remove", "image:checkpoint"],
-            vec!["silo", "image", "remove", "image:checkpoint"],
+            vec!["silo", "snapshot", "rm", "web"],
+            vec!["silo", "image", "rm", "base"],
+            vec!["silo", "image", "list"],
+            vec!["silo", "image", "pull", "alpine:3.21"],
         ] {
             assert_eq!(
                 Cli::try_parse_from(args)
@@ -221,11 +229,19 @@ mod tests {
             vec![
                 "silo",
                 "restore",
-                "image:checkpoint",
+                "web",
                 "--name",
                 "child",
                 "--map-disk",
                 "1=/tmp/data.raw",
+            ],
+            vec![
+                "silo",
+                "restore",
+                "web",
+                "--without-memory",
+                "--map-share",
+                "work=/tmp/work",
             ],
         ] {
             assert!(Cli::try_parse_from(args.clone()).is_ok(), "{args:?}");
@@ -245,7 +261,7 @@ mod tests {
                 "snapshot",
                 "create",
                 "vm",
-                "--live",
+                "--memory",
                 "--map-share",
                 "work=/tmp/work",
             ],
@@ -270,14 +286,22 @@ mod tests {
                 "snapshot",
                 "create",
                 "vm",
-                "--live",
+                "--memory",
                 "--external-requirements",
             ],
             vec![
                 "silo",
                 "restore",
-                "checkpoint",
+                "web",
                 "--execution",
+                "--map-disk",
+                "1=/tmp/data.raw",
+            ],
+            vec![
+                "silo",
+                "restore",
+                "web",
+                "--external-requirements",
                 "--map-disk",
                 "1=/tmp/data.raw",
             ],
@@ -337,22 +361,17 @@ mod tests {
         let valid =
             r#"{"argv":["/bin/false"],"environment":[],"workingDirectory":"/","timeoutMs":30000}"#;
         assert!(
-            Cli::try_parse_from(["silo", "restore", "checkpoint", "--activation-hook", valid])
-                .is_ok()
+            Cli::try_parse_from(["silo", "restore", "web", "--activation-hook", valid]).is_ok()
         );
         for invalid in [
             r#"{"argv":[],"environment":[],"workingDirectory":"/","timeoutMs":30000}"#,
             r#"{"argv":["/bin/false"],"environment":[],"workingDirectory":"/","timeoutMs":30001}"#,
             r#"{"argv":["/bin/false"],"environment":[],"workingDirectory":"/","timeoutMs":30000,"unknown":true}"#,
         ] {
-            assert!(Cli::try_parse_from([
-                "silo",
-                "restore",
-                "checkpoint",
-                "--activation-hook",
-                invalid
-            ])
-            .is_err());
+            assert!(
+                Cli::try_parse_from(["silo", "restore", "web", "--activation-hook", invalid])
+                    .is_err()
+            );
         }
     }
 }

@@ -1,7 +1,8 @@
 //! Strict storage-artifact management DTOs, separate from machine observations.
 use crate::{invalid, path_from_wire, path_to_wire, required, ConversionError};
 use libvm::{
-    ExternalResourceKey, ExternalResourceMapping, ExternalResourcePolicy, SnapshotInfo, SnapshotRef,
+    ExternalResourceKey, ExternalResourceMapping, ExternalResourcePolicy, SnapshotInfo,
+    SnapshotMemory, SnapshotRef, SnapshotRemoval,
 };
 use silod_spec::daemon::v1 as w;
 
@@ -118,31 +119,18 @@ pub fn name(value: Option<String>) -> Result<Option<String>, ConversionError> {
     Ok(value)
 }
 
-pub fn alias(value: &str) -> Result<String, ConversionError> {
-    crate::images::reject_local_cut(value)?;
-    match format!("image:{value}").parse::<SnapshotRef>() {
-        Ok(SnapshotRef::Image(alias)) if alias == value => Ok(alias),
-        _ => Err(invalid("alias", "invalid image alias")),
-    }
-}
-
-pub fn snapshot_policy(value: &ExternalResourcePolicy) -> Result<(), ConversionError> {
-    if matches!(value, ExternalResourcePolicy::Map { .. }) {
-        return Err(invalid("external_resources", "snapshot creation accepts only reject or required external declarations; destination mappings belong to fork or restore"));
-    }
-    Ok(())
-}
-
 pub fn reference_to_wire(value: &SnapshotRef) -> w::StorageSnapshotRef {
     use w::storage_snapshot_ref::Reference;
     w::StorageSnapshotRef {
         reference: Some(match value {
             SnapshotRef::Id(id) => Reference::Id(id.to_string()),
-            SnapshotRef::Image(name) => Reference::ImageAlias(name.clone()),
+            SnapshotRef::Name(name) => Reference::Name(name.clone()),
         }),
     }
 }
 
+/// A name is a local name, pulled registry reference or unique id prefix; a
+/// full id travels only as `id`.
 pub fn reference_from_wire(value: w::StorageSnapshotRef) -> Result<SnapshotRef, ConversionError> {
     use w::storage_snapshot_ref::Reference;
     match required(value.reference, "snapshot.reference")? {
@@ -151,8 +139,116 @@ pub fn reference_from_wire(value: w::StorageSnapshotRef) -> Result<SnapshotRef, 
                 invalid("snapshot.id", "invalid snapshot identity")
             })?))
         }
-        Reference::ImageAlias(value) => Ok(SnapshotRef::Image(alias(&value)?)),
+        Reference::Name(name) => {
+            registry_reference(&name)?;
+            match name.parse::<SnapshotRef>() {
+                Ok(reference @ SnapshotRef::Name(_)) => Ok(reference),
+                _ => Err(invalid("snapshot.name", "invalid snapshot name")),
+            }
+        }
     }
+}
+
+fn registry_reference(value: &str) -> Result<(), ConversionError> {
+    if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+        return Err(invalid("snapshot.reference", "empty, oversized or NUL"));
+    }
+    Ok(())
+}
+
+pub fn snapshot_request_to_wire(
+    machine: &libvm::MachineRef,
+    options: &libvm::SnapshotOptions,
+) -> Result<w::CreateSnapshotRequest, ConversionError> {
+    let wire = w::CreateSnapshotRequest {
+        machine: Some(crate::lifecycle::reference_to_wire(machine)?),
+        name: options.name.clone(),
+        memory: options.memory,
+        preserve: options.preserve,
+        capture_policy: options.capture_policy.map(crate::capture::policy_to_wire),
+        dirty_crossover_percent: options.dirty_crossover_percent.map(u32::from),
+        external_requirements: options.external_requirements,
+    };
+    snapshot_request_from_wire(wire.clone())?;
+    Ok(wire)
+}
+
+/// Option combinations (memory-only options, external requirements with
+/// memory) are libvm's to refuse; this checks each value's grammar.
+pub fn snapshot_request_from_wire(
+    value: w::CreateSnapshotRequest,
+) -> Result<(libvm::MachineRef, libvm::SnapshotOptions), ConversionError> {
+    Ok((
+        crate::lifecycle::reference_from_wire(required(value.machine, "snapshot.machine")?)?,
+        libvm::SnapshotOptions {
+            name: value.name.as_deref().map(crate::local_name).transpose()?,
+            memory: value.memory,
+            preserve: value.preserve,
+            capture_policy: value
+                .capture_policy
+                .map(crate::capture::policy_from_wire)
+                .transpose()?,
+            dirty_crossover_percent: value
+                .dirty_crossover_percent
+                .map(crate::capture::crossover_from_wire)
+                .transpose()?,
+            external_requirements: value.external_requirements,
+        },
+    ))
+}
+
+pub fn restore_request_to_wire(
+    source: &libvm::RestoreSource,
+    options: &libvm::RestoreOptions,
+) -> Result<w::RestoreSnapshotRequest, ConversionError> {
+    use w::restore_snapshot_request::Source;
+    let wire = w::RestoreSnapshotRequest {
+        source: Some(match source {
+            libvm::RestoreSource::Local(reference) => {
+                Source::Snapshot(reference_to_wire(reference))
+            }
+            libvm::RestoreSource::Registry(reference) => {
+                Source::RegistryReference(reference.clone())
+            }
+        }),
+        name: options.name.clone(),
+        external_resources: Some(policy_to_wire(&options.external_resources)),
+        activation_hook: options
+            .activation_hook
+            .as_ref()
+            .map(hook_to_wire)
+            .transpose()?,
+        pull_policy: crate::images::pull_policy_to_wire(options.pull),
+        without_memory: options.without_memory,
+    };
+    restore_request_from_wire(wire.clone())?;
+    Ok(wire)
+}
+
+pub fn restore_request_from_wire(
+    value: w::RestoreSnapshotRequest,
+) -> Result<(libvm::RestoreSource, libvm::RestoreOptions), ConversionError> {
+    use w::restore_snapshot_request::Source;
+    let source = match required(value.source, "restore.source")? {
+        Source::Snapshot(reference) => libvm::RestoreSource::Local(reference_from_wire(reference)?),
+        Source::RegistryReference(reference) => {
+            registry_reference(&reference)?;
+            libvm::RestoreSource::Registry(reference)
+        }
+    };
+    Ok((
+        source,
+        libvm::RestoreOptions {
+            name: name(value.name)?,
+            pull: crate::images::pull_policy_from_wire(value.pull_policy)?,
+            without_memory: value.without_memory,
+            activation_hook: value.activation_hook.map(hook_from_wire).transpose()?,
+            external_resources: policy_from_wire(required(
+                value.external_resources,
+                "restore.external_resources",
+            )?)?,
+        },
+    ))
 }
 
 fn key_to_wire(value: &ExternalResourceKey) -> w::ExternalResourceKey {
@@ -295,18 +391,14 @@ pub fn info_to_wire(value: &SnapshotInfo) -> Result<w::StorageSnapshotInfo, Conv
     let result = w::StorageSnapshotInfo {
         id: value.id.to_string(),
         record_digest: value.record_digest.to_string(),
-        retained: Some(value.retained),
-        aliases: value.aliases.clone(),
+        names: value.names.clone(),
         created_at: Some(value.created_at),
         streams: value
             .streams
             .iter()
             .map(crate::snapshots::stream_summary_to_wire)
             .collect(),
-        capture_kind: match value.capture_kind {
-            libvm::SnapshotCaptureKindName::StoppedStorage => w::StorageCaptureKind::StoppedStorage,
-            libvm::SnapshotCaptureKindName::LiveExecution => w::StorageCaptureKind::LiveExecution,
-        } as i32,
+        memory: memory_to_wire(value.memory),
         provenance: value
             .provenance
             .iter()
@@ -321,37 +413,30 @@ pub fn info_to_wire(value: &SnapshotInfo) -> Result<w::StorageSnapshotInfo, Conv
     info_from_wire(result.clone())?;
     Ok(result)
 }
+
+fn memory_to_wire(value: SnapshotMemory) -> i32 {
+    (match value {
+        SnapshotMemory::None => w::SnapshotMemory::None,
+        SnapshotMemory::Included => w::SnapshotMemory::Included,
+    }) as i32
+}
+
 pub fn info_from_wire(value: w::StorageSnapshotInfo) -> Result<SnapshotInfo, ConversionError> {
-    let capture_kind = match w::StorageCaptureKind::try_from(value.capture_kind) {
-        Ok(w::StorageCaptureKind::StoppedStorage) => libvm::SnapshotCaptureKindName::StoppedStorage,
-        Ok(w::StorageCaptureKind::LiveExecution) => libvm::SnapshotCaptureKindName::LiveExecution,
-        _ => {
-            return Err(invalid(
-                "snapshot.capture_kind",
-                "expected stopped-storage or live-execution",
-            ))
-        }
+    let memory = match w::SnapshotMemory::try_from(value.memory) {
+        Ok(w::SnapshotMemory::None) => SnapshotMemory::None,
+        Ok(w::SnapshotMemory::Included) => SnapshotMemory::Included,
+        _ => return Err(invalid("snapshot.memory", "expected none or included")),
     };
-    if value.aliases.len() > 4096 {
-        return Err(invalid("snapshot.aliases", "too many aliases"));
-    }
     if value.streams.len() > 4096 {
         return Err(invalid("snapshot.streams", "too many stream summaries"));
-    }
-    let mut aliases = std::collections::BTreeSet::new();
-    for value in &value.aliases {
-        if !aliases.insert(alias(value)?) {
-            return Err(invalid("snapshot.aliases", "duplicate alias"));
-        }
     }
     let created_at = required(value.created_at, "snapshot.created_at")?;
     if !(0..=9_007_199_254_740_991).contains(&created_at) {
         return Err(invalid("snapshot.created_at", "invalid timestamp"));
     }
-    // Provenance is evidence of live captures only; a stopped snapshot has none.
+    // Provenance is evidence of memory captures only.
     if value.provenance.len() > 4096
-        || (capture_kind == libvm::SnapshotCaptureKindName::StoppedStorage
-            && !value.provenance.is_empty())
+        || (memory == SnapshotMemory::None && !value.provenance.is_empty())
     {
         return Err(invalid(
             "snapshot.provenance",
@@ -388,16 +473,36 @@ pub fn info_from_wire(value: w::StorageSnapshotInfo) -> Result<SnapshotInfo, Con
             .record_digest
             .parse()
             .map_err(|_| invalid("snapshot.record_digest", "invalid object digest"))?,
-        capture_kind,
+        memory,
         provenance,
-        retained: required(value.retained, "snapshot.retained")?,
-        aliases: value.aliases,
+        names: crate::names_from_wire(value.names, "snapshot.names")?,
         created_at,
         streams: value
             .streams
             .into_iter()
             .map(crate::snapshots::stream_summary_from_wire)
             .collect::<Result<_, _>>()?,
+    })
+}
+
+pub fn removal_to_wire(value: &SnapshotRemoval) -> Result<w::SnapshotRemoval, ConversionError> {
+    let wire = w::SnapshotRemoval {
+        id: value.id.to_string(),
+        names: value.names.clone(),
+        record_removed: value.record_removed,
+    };
+    removal_from_wire(wire.clone())?;
+    Ok(wire)
+}
+
+pub fn removal_from_wire(value: w::SnapshotRemoval) -> Result<SnapshotRemoval, ConversionError> {
+    Ok(SnapshotRemoval {
+        id: value
+            .id
+            .parse()
+            .map_err(|_| invalid("snapshot.id", "invalid snapshot identity"))?,
+        names: crate::names_from_wire(value.names, "snapshot.names")?,
+        record_removed: value.record_removed,
     })
 }
 
@@ -412,23 +517,40 @@ mod tests {
     use silod_spec::daemon::v1 as w;
 
     #[test]
-    fn storage_references_are_explicit_and_strict() {
+    fn storage_references_round_trip_names_registry_references_and_ids() {
         assert!(reference_from_wire(w::StorageSnapshotRef::default()).is_err());
         for value in [
-            "image:checkpoint",
-            "image:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "hello",
+            "abc",
+            "ghcr.io/team/snap:v2",
+            &format!("sha256:{}", "a".repeat(64)),
         ] {
             let reference: SnapshotRef = value.parse().unwrap();
             assert_eq!(
-                reference_from_wire(reference_to_wire(&reference))
-                    .unwrap()
-                    .to_string(),
-                value
+                reference_from_wire(reference_to_wire(&reference)).unwrap(),
+                reference
             );
         }
-        for value in ["snapshot:checkpoint", "checkpoint", "image:"] {
-            assert!(value.parse::<SnapshotRef>().is_err());
+    }
+
+    #[test]
+    fn storage_references_reject_cuts_invalid_names_and_disguised_ids() {
+        use w::storage_snapshot_ref::Reference;
+        for name in [
+            "fork:00000000-0000-4000-8000-000000000001".to_owned(),
+            "Bad Name".into(),
+            String::new(),
+            format!("sha256:{}", "a".repeat(64)),
+        ] {
+            let wire = w::StorageSnapshotRef {
+                reference: Some(Reference::Name(name.clone())),
+            };
+            assert!(reference_from_wire(wire).is_err(), "{name:?}");
         }
+        let wire = w::StorageSnapshotRef {
+            reference: Some(Reference::Id("hello".into())),
+        };
+        assert!(reference_from_wire(wire).is_err());
     }
 
     #[test]
@@ -488,56 +610,191 @@ mod tests {
     }
 
     #[test]
-    fn storage_info_rejects_observation_shaped_success_and_foreign_provenance() {
+    fn storage_info_round_trips_memory_and_rejects_foreign_provenance() {
         let mut wire = w::StorageSnapshotInfo {
             id: format!("sha256:{}", "a".repeat(64)),
             record_digest: format!("sha256:{}", "b".repeat(64)),
-            retained: Some(false),
-            aliases: vec!["checkpoint".into()],
+            names: vec!["snap".into(), "ghcr.io/team/snap:v1".into()],
             created_at: Some(1),
-            capture_kind: w::StorageCaptureKind::StoppedStorage as i32,
+            memory: w::SnapshotMemory::None as i32,
             provenance: vec![],
             streams: Vec::new(),
         };
-        assert!(info_from_wire(wire.clone()).is_ok());
-        wire.capture_kind = 0;
-        assert!(info_from_wire(wire.clone()).is_err());
+        let stopped = info_from_wire(wire.clone()).unwrap();
+        assert_eq!(stopped.memory, libvm::SnapshotMemory::None);
+        assert_eq!(crate::stopped::info_to_wire(&stopped).unwrap(), wire);
+        let mut unspecified = wire.clone();
+        unspecified.memory = w::SnapshotMemory::Unspecified as i32;
+        assert!(info_from_wire(unspecified).is_err());
         let provenance = w::SnapshotCaptureProvenance {
             capture_id: "00000000-0000-4000-8000-000000000001".into(),
             machine_id: "00000000-0000-4000-8000-000000000002".into(),
             run_id: "00000000-0000-4000-8000-000000000003".into(),
             evidence_digest: format!("sha256:{}", "c".repeat(64)),
         };
-        wire.capture_kind = w::StorageCaptureKind::LiveExecution as i32;
-        wire.provenance = vec![provenance.clone()];
-        let live = info_from_wire(wire.clone()).unwrap();
+        wire.memory = w::SnapshotMemory::Included as i32;
+        wire.provenance = vec![provenance];
+        let included = info_from_wire(wire.clone()).unwrap();
+        assert_eq!(included.memory, libvm::SnapshotMemory::Included);
         assert_eq!(
-            live.capture_kind,
-            libvm::SnapshotCaptureKindName::LiveExecution
-        );
-        assert_eq!(
-            crate::stopped::info_to_wire(&live).unwrap(),
+            crate::stopped::info_to_wire(&included).unwrap(),
             wire,
-            "live execution info round-trips exactly"
+            "a snapshot with memory round-trips exactly"
         );
         let mut malformed = wire.clone();
         malformed.provenance[0].run_id = "not-a-uuid".into();
         assert!(info_from_wire(malformed).is_err());
-        wire.capture_kind = w::StorageCaptureKind::StoppedStorage as i32;
+        wire.memory = w::SnapshotMemory::None as i32;
         assert!(
             info_from_wire(wire.clone()).is_err(),
-            "stopped snapshots carry no capture provenance"
+            "a snapshot without memory carries no capture provenance"
         );
         wire.provenance.clear();
-        wire.retained = None;
-        assert!(info_from_wire(wire.clone()).is_err());
-        wire.retained = Some(true);
-        wire.aliases.push("checkpoint".into());
-        assert!(info_from_wire(wire).is_err());
+        wire.names.push("snap".into());
+        assert!(info_from_wire(wire.clone()).is_err(), "duplicate name");
+        wire.names = vec!["Not A Name".into()];
+        assert!(info_from_wire(wire).is_err(), "invalid name");
     }
 
     #[test]
-    fn creation_names_and_snapshot_external_policy_use_exact_native_grammar() {
+    fn removal_round_trips_and_rejects_invalid_identity() {
+        let removal = libvm::SnapshotRemoval {
+            id: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
+            names: vec!["snap".into()],
+            record_removed: false,
+        };
+        let wire = crate::stopped::removal_to_wire(&removal).unwrap();
+        assert_eq!(
+            crate::stopped::removal_from_wire(wire.clone()).unwrap(),
+            removal
+        );
+        let mut invalid = wire;
+        invalid.id = "snap".into();
+        assert!(crate::stopped::removal_from_wire(invalid).is_err());
+    }
+
+    #[test]
+    fn snapshot_request_round_trips_options_and_rejects_invalid_values() {
+        let machine = libvm::MachineRef::parse("vm-1").unwrap();
+        let options = libvm::SnapshotOptions {
+            name: Some("snap".into()),
+            memory: true,
+            preserve: true,
+            capture_policy: Some(vm_spec::lifecycle::CapturePolicy::Full),
+            dirty_crossover_percent: Some(30),
+            external_requirements: false,
+        };
+        let wire = crate::stopped::snapshot_request_to_wire(&machine, &options).unwrap();
+        let (decoded_machine, decoded) =
+            crate::stopped::snapshot_request_from_wire(wire.clone()).unwrap();
+        assert_eq!(decoded_machine, machine);
+        assert_eq!(decoded, options);
+        let defaults =
+            crate::stopped::snapshot_request_to_wire(&machine, &libvm::SnapshotOptions::default())
+                .unwrap();
+        assert_eq!(
+            crate::stopped::snapshot_request_from_wire(defaults)
+                .unwrap()
+                .1,
+            libvm::SnapshotOptions::default()
+        );
+        for case in 0..4 {
+            let mut invalid = wire.clone();
+            match case {
+                0 => invalid.name = Some("registry/name:tag".into()),
+                1 => invalid.capture_policy = Some(w::CapturePolicy::Unspecified as i32),
+                2 => invalid.dirty_crossover_percent = Some(61),
+                3 => invalid.machine = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                crate::stopped::snapshot_request_from_wire(invalid).is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_request_round_trips_local_and_registry_sources() {
+        let hook = libvm::RestoreHook {
+            argv: vec!["/bin/true".into()],
+            environment: Vec::new(),
+            working_directory: "/".into(),
+            timeout_ms: 1_000,
+        };
+        for (source, options) in [
+            (
+                libvm::RestoreSource::Local("snap".parse().unwrap()),
+                libvm::RestoreOptions {
+                    name: Some("child".into()),
+                    pull: libvm::PullPolicy::Never,
+                    without_memory: false,
+                    activation_hook: Some(hook),
+                    external_resources: ExternalResourcePolicy::Reject,
+                },
+            ),
+            (
+                libvm::RestoreSource::Registry("ghcr.io/team/snap:v1".into()),
+                libvm::RestoreOptions {
+                    name: None,
+                    pull: libvm::PullPolicy::Always,
+                    without_memory: true,
+                    activation_hook: None,
+                    external_resources: ExternalResourcePolicy::RequireMappings,
+                },
+            ),
+        ] {
+            let wire = crate::stopped::restore_request_to_wire(&source, &options).unwrap();
+            let (decoded_source, decoded) =
+                crate::stopped::restore_request_from_wire(wire).unwrap();
+            assert_eq!(decoded_source, source);
+            assert_eq!(decoded.name, options.name);
+            assert_eq!(decoded.pull, options.pull);
+            assert_eq!(decoded.without_memory, options.without_memory);
+            assert_eq!(decoded.activation_hook, options.activation_hook);
+            assert!(matches!(
+                (&decoded.external_resources, &options.external_resources),
+                (
+                    ExternalResourcePolicy::Reject,
+                    ExternalResourcePolicy::Reject
+                ) | (
+                    ExternalResourcePolicy::RequireMappings,
+                    ExternalResourcePolicy::RequireMappings
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn restore_request_requires_source_policy_and_valid_machine_name() {
+        let wire = crate::stopped::restore_request_to_wire(
+            &libvm::RestoreSource::Registry("snap".into()),
+            &libvm::RestoreOptions::default(),
+        )
+        .unwrap();
+        for case in 0..5 {
+            let mut invalid = wire.clone();
+            match case {
+                0 => invalid.source = None,
+                1 => invalid.pull_policy = w::PullPolicy::Unspecified as i32,
+                2 => invalid.external_resources = None,
+                3 => invalid.name = Some("../escape".into()),
+                4 => {
+                    invalid.source = Some(w::restore_snapshot_request::Source::RegistryReference(
+                        String::new(),
+                    ))
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                crate::stopped::restore_request_from_wire(invalid).is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn creation_names_use_exact_native_grammar() {
         for value in ["child", "child-1", "0"] {
             assert!(crate::stopped::name(Some(value.into())).is_ok());
         }
@@ -550,17 +807,6 @@ mod tests {
         ] {
             assert!(crate::stopped::name(Some(value.into())).is_err());
         }
-        assert!(crate::stopped::snapshot_policy(&ExternalResourcePolicy::Reject).is_ok());
-        assert!(crate::stopped::snapshot_policy(&ExternalResourcePolicy::RequireMappings).is_ok());
-        assert!(
-            crate::stopped::snapshot_policy(&ExternalResourcePolicy::Map {
-                mappings: vec![ExternalResourceMapping {
-                    resource: ExternalResourceKey::Disk { order: 1 },
-                    path: "/tmp/external.raw".into()
-                }],
-            })
-            .is_err()
-        );
     }
 
     #[test]

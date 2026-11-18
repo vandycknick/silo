@@ -11,7 +11,7 @@ The SQLite catalog uses WAL with `synchronous=NORMAL` (`fullfsync` and
 process crash loses no committed transactions, but power loss or an OS crash
 may lose transactions since the previous WAL checkpoint. Avoiding a commit
 fsync is deliberate: ext4 `data=ordered` drains all dirty private-copy data on
-each journal commit. Checkpoint publication and handoff receipt/ownership
+each journal commit. Snapshot publication and handoff receipt/ownership
 boundaries explicitly checkpoint before acknowledgment or replay; an incomplete
 checkpoint is an error, never a claim of power-loss durability. Destructive
 collection checkpoints retired roots and cleanup/eviction authority before unlink.
@@ -71,7 +71,7 @@ The explicit execution-state command grammar is:
 
 ```sh
 silo pause <VM>
-silo snapshot create <VM> --live [--name <NAME>]
+silo snapshot create <VM> --memory [--name <NAME>]
           [--capture-policy full|incremental] [--dirty-crossover-percent 1..60]
 silo fork <VM> --live --name <CHILD> [--name <CHILD>...] [--preserve]
           [--max-children <N>]
@@ -79,16 +79,18 @@ silo fork <VM> --live --name <CHILD> [--name <CHILD>...] [--preserve]
           [--capture-policy full|incremental] [--dirty-crossover-percent 1..60]
 silo fork <VM> --live --children-json '<JSON array>'
 silo fork --operation <UUID> [--cancel]
-silo restore <CHECKPOINT> [--name <CHILD>]
-silo recover-disks <CHECKPOINT> --name <CHILD>
+silo restore <SNAPSHOT> [--name <CHILD>] [--pull always|missing|never]
+silo restore <SNAPSHOT> --without-memory --name <CHILD>
 ```
 
 These endpoints refuse unsupported operations with typed capability errors.
 They never stop a machine, capture only its disks, or cold boot as a fallback.
-For VZ the ordinary alternative is to use `silo stop`, then the stopped-storage
-snapshot workflow, not an execution checkpoint.
+`snapshot create` on a running VM without `--memory` is refused ("VM is running:
+stop it first, or use --memory to include its memory"), and `--memory` on a
+stopped VM is refused. For VZ the ordinary alternative is to use `silo stop`,
+then the snapshot workflow without memory.
 
-Live snapshot and fork requests default to incremental capture and a 60 percent
+Snapshot-with-memory and live fork requests default to incremental capture and a 60 percent
 dirty crossover. `--capture-policy full` forces full capture; the existing
 `incremental` value expresses the default preference without a new policy mode.
 Before reservation, libvm resolves that preference to full when the exact
@@ -102,14 +104,16 @@ readback; replay, copy fallback and independent dedup still hash. Missing
 baselines, changed topology or epochs, uncertain coverage and the selected dirty
 threshold cause an explicitly reported full capture, never an incomplete delta
 chain. A booted VM's first default capture reports `no-baseline`; restored and
-forked children inherit their checkpoint as their first baseline.
+forked children inherit their source snapshot as their first baseline.
 
 Execution portability refusal names the exact pin, expected and destination
-values, and `restore-preflight` stage before child allocation. `recover-disks`
-is a separate explicit operation: it authenticates storage and captured boot
-assets, makes private disks and a fresh stopped machine, and records an unknown
-stop outcome. It installs no RAM or execution state. `silo start` cold-boots that
-recovered machine; restore never invokes recovery implicitly.
+values, and `restore-preflight` stage before child allocation.
+`restore --without-memory` is a separate explicit operation: it authenticates
+storage and captured boot assets, makes private disks and a fresh stopped
+machine, and records an unknown stop outcome. It installs no RAM or execution
+state, and the disks may need journal recovery on boot. `silo start` cold-boots
+that recovered machine; restore never invokes recovery implicitly. On a snapshot
+without memory the flag changes nothing.
 
 A live fork is one durable operation: one capture of the source, one restored
 running child per `--name` (or `--children-json` entry of `name`,
@@ -136,19 +140,23 @@ Stopped-storage operations are separate mutations, never a live fallback:
 ```sh
 silo fork <VM> --name <CHILD>
 silo snapshot create <VM> [--name <NAME>]
-silo snapshot inspect image:<NAME>
+silo snapshot inspect <NAME>
 silo snapshot list
-silo restore image:<NAME> --name <CHILD>
-silo snapshot remove image:<NAME>
-silo image remove image:<NAME>
+silo restore <NAME> --name <CHILD>
+silo snapshot rm <NAME|ID>
+silo image rm <NAME|ID>
+silo image prune
 ```
 
 Fork supports admitted stopped opaque raw and development flat-overlay roots.
-Snapshots and stopped restoration support opaque raw only. Both alias and
-immutable `image:sha256:HEX` references resolve through the library artifact
-collection. An unnamed snapshot is still explicitly retained. `snapshot remove`
-releases only that explicit retention; `image remove` removes only an alias.
-Other aliases, machines and in-flight operations continue rooting shared bytes.
+Snapshots and stopped restoration support opaque raw only. Images and snapshots
+share one storage pool but have separate name tables. A name or a unique
+`sha256:HEX` id prefix of at least 3 characters resolves within the expected
+kind; a name of the other kind gets a hint naming the right command. `rm NAME`
+removes that name, and the record goes with its last name; `rm ID` removes the
+record and all its names. `image prune` removes images with no names that no
+machine uses. Machines and in-flight operations continue rooting shared bytes
+after a record is removed.
 
 Exact copies preserve credentials, guest keys, dirty journals and deleted-data
 remnants. They do not sanitize, repair or replay source storage, nor implicitly
@@ -169,7 +177,7 @@ does not initialize writable runtime state. A running monitor's backend takes
 precedence over the current prospective backend override.
 Live-refusal commands and `system info` can use an authenticated normal daemon
 whose core is stopping; ordinary management still requires a ready core.
-Stopped fork, snapshot creation, restore and retention/alias removal require
+Stopped fork, snapshot creation, restore and image or snapshot removal require
 normal mutation readiness and drain admission, including when live refusal
 would be permitted. Read-only preflight rejects unsupported root, boot,
 resource or artifact kinds before writable initialization where possible;

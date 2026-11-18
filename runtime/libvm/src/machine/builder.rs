@@ -62,40 +62,10 @@ struct MachineCreateRequest {
     secret_scope: crate::SecretScopePolicy,
 }
 
-fn snapshot_creation_has_overrides(request: &MachineCreateRequest) -> bool {
-    request.platform.is_some()
-        || !request.labels.is_empty()
-        || !request.metadata.is_empty()
-        || request.cpus.is_some()
-        || request.memory.is_some()
-        || request.kernel.is_some()
-        || request.initramfs.is_some()
-        || !request.kernel_args.is_empty()
-        || request.disk_size_bytes.is_some()
-        || request.temporary_directory != crate::TemporaryDirectoryPolicy::DiskBacked
-        || request.nested_virtualization
-        || request.rosetta.is_some()
-        || request.userdata.is_some()
-        || !request.disks.is_empty()
-        || !request.mounts.is_empty()
-        || !request.forwards.is_empty()
-        || request.vsock.is_some()
-        || request.network.is_some()
-        || request.guest != MachineGuestConfig::default()
-        || request.retention != MachineRetention::Persistent
-        || request.process != ProcessConfig::default()
-        || request.secret_scope != crate::SecretScopePolicy::default()
-        || request.template_name.is_some()
-        || request
-            .agent_mode
-            .as_ref()
-            .is_some_and(|mode| *mode != MachineAgent::Default)
-}
-
 #[derive(Default)]
 struct SourceOwnership {
     _lease: Option<crate::storage::locks::StorageLock>,
-    _managed: Option<crate::store::managed_image_store::ManagedImageConsumer>,
+    _managed: Option<crate::store::stored_image_store::StoredImageConsumer>,
     /// Consumer lease over the layered lower until the machine row roots it.
     _lower: Option<crate::store::composition_store::HeldComposition>,
     /// Retain the construction operation after publication locks become root pins.
@@ -513,17 +483,53 @@ async fn create_machine_config_with_name(
             reason: "machine image source is required".to_string(),
         });
     };
+    if let Some(reason) = &request.network_error {
+        return Err(LibVmError::InvalidCreateRequest {
+            name,
+            reason: reason.clone(),
+        });
+    }
+    crate::machine::root_storage::validate_root_arguments(&request.kernel_args, false).map_err(
+        |error| LibVmError::InvalidCreateRequest {
+            name: name.clone(),
+            reason: error.to_string(),
+        },
+    )?;
+    // Resolve like `silo create` (DESIGN section 4): a local name or stored
+    // `search_registries` expansion, a unique id prefix, then a pull. A
+    // snapshot is refused with a restore hint; a Silo image artifact becomes
+    // a stored image. A stored source never pulls.
+    let unresolved = match &image_source {
+        ImageSource::Oci(reference) if request.resolved_oci_image.is_none() => {
+            Some((reference.clone(), runtime.image_pull_policy()))
+        }
+        ImageSource::Stored(reference) => Some((reference.to_string(), crate::PullPolicy::Never)),
+        ImageSource::Oci(_) | ImageSource::Disk(_) => None,
+    };
+    let mut stored_id = None;
+    if let Some((reference, pull)) = unresolved {
+        match runtime
+            .resolve_image_reference(&reference, request.platform.as_ref(), pull)
+            .await?
+        {
+            crate::image::ResolvedImageReference::Oci(resolved) => {
+                image_source = ImageSource::Oci(resolved.requested_reference.clone());
+                request.resolved_oci_image = Some(*resolved);
+            }
+            crate::image::ResolvedImageReference::Stored { reference, id } => {
+                image_source = ImageSource::Stored(reference);
+                stored_id = Some(id);
+            }
+        }
+    }
     // An OCI source always materializes a fresh layered EROFS root; local
-    // disks and managed images inherit the family of their retained root.
+    // disks and stored images inherit the family of their retained root.
     let mut overlay = matches!(&image_source, ImageSource::Oci(_));
     let mut layered_image = false;
     let source_family = match &image_source {
         ImageSource::Oci(_) => crate::runtime::boot_assets::SourceFamily::Oci,
         ImageSource::Disk(_) => crate::runtime::boot_assets::SourceFamily::LocalDisk,
-        ImageSource::Managed(crate::ManagedSourceRef::Snapshot(_)) => {
-            crate::runtime::boot_assets::SourceFamily::Snapshot
-        }
-        ImageSource::Managed(_) => crate::runtime::boot_assets::SourceFamily::ManagedImage,
+        ImageSource::Stored(_) => crate::runtime::boot_assets::SourceFamily::StoredImage,
     };
     crate::runtime::boot_assets::admit_create_source(
         source_family,
@@ -539,79 +545,33 @@ async fn create_machine_config_with_name(
         },
         runtime.effective_backend(),
     )?;
-    crate::machine::root_storage::validate_root_arguments(&request.kernel_args, false).map_err(
-        |error| LibVmError::InvalidCreateRequest {
-            name: name.clone(),
-            reason: error.to_string(),
-        },
-    )?;
-    if let Some(reason) = &request.network_error {
-        return Err(LibVmError::InvalidCreateRequest {
-            name,
-            reason: reason.clone(),
-        });
-    }
-    if let ImageSource::Managed(reference) = &image_source {
-        let collection = crate::store::managed_image_store::ManagedImageStore::from_store(
+    if let Some(id) = stored_id {
+        let info = crate::store::stored_image_store::StoredImageStore::from_store(
             std::sync::Arc::new(runtime.native_store()?),
-        );
-        match collection.resolve(reference).await? {
-            crate::ManagedSourceId::Image(id) => {
-                image_source = ImageSource::Managed(crate::ManagedSourceRef::Image(id));
-                let crate::ManagedSourceInfo::Image(info) = collection
-                    .inspect(&crate::ManagedSourceRef::Image(id))
-                    .await?
-                else {
-                    return Err(crate::machine::root_storage::invalid(
-                        "resolved managed image changed kind",
-                    ));
-                };
-                if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
-                    ..
-                } = &info.record.root.profile
-                {
-                    crate::runtime::boot_assets::admit_create_source(
-                        source_family,
-                        crate::StorageProfile::LinuxOverlayV1,
-                        crate::BackendRequirement::KrunOverlay,
-                        runtime.effective_backend(),
-                    )?;
-                    if request.temporary_directory != crate::TemporaryDirectoryPolicy::DiskBacked
-                        || request
-                            .disk_size_bytes
-                            .is_some_and(|size| size != info.record.root.geometry.length)
-                    {
-                        return Err(LibVmError::InvalidCreateRequest {
-                            name,
-                            reason: "a layered image keeps its retained upper capacity and temporary-directory policy".into(),
-                        });
-                    }
-                    overlay = true;
-                    layered_image = true;
-                }
+        )
+        .inspect(id)
+        .await?;
+        if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay { .. } =
+            &info.record.root.profile
+        {
+            crate::runtime::boot_assets::admit_create_source(
+                source_family,
+                crate::StorageProfile::LinuxOverlayV1,
+                crate::BackendRequirement::KrunOverlay,
+                runtime.effective_backend(),
+            )?;
+            if request.temporary_directory != crate::TemporaryDirectoryPolicy::DiskBacked
+                || request
+                    .disk_size_bytes
+                    .is_some_and(|size| size != info.record.root.geometry.length)
+            {
+                return Err(LibVmError::InvalidCreateRequest {
+                    name,
+                    reason: "a layered image keeps its retained upper capacity and temporary-directory policy".into(),
+                });
             }
-            crate::ManagedSourceId::Snapshot(id) => {
-                if snapshot_creation_has_overrides(&request) {
-                    return Err(LibVmError::InvalidCreateRequest {
-                        name,
-                        reason: "snapshot creation preserves the complete captured configuration; only name may be set, use stopped updates after restoration for other changes".into(),
-                    });
-                }
-                let machine = runtime
-                    .restore_snapshot(
-                        crate::SnapshotRef::Id(id),
-                        crate::RestoreOptions {
-                            name: Some(name.clone()),
-                            ..crate::RestoreOptions::default()
-                        },
-                        None,
-                    )
-                    .await?;
-                return runtime
-                    .machine_config(machine.machine_id())
-                    .await?
-                    .ok_or_else(|| LibVmError::MachineNotFound { reference: name });
-            }
+            overlay = true;
+            layered_image = true;
         }
     }
     if let Some(user) = &request.guest.user {
@@ -658,13 +618,14 @@ async fn create_machine_config_with_name(
                 agent: runtime.resolve_agent_path(&request.guest.agent)?,
             };
         }
-    } else if matches!(&image_source, ImageSource::Managed(_))
+    } else if matches!(&image_source, ImageSource::Stored(_))
         && (kernel.is_some() || initramfs.is_some())
     {
         return Err(LibVmError::InvalidCreateRequest {
             name,
-            reason: "managed boot assets are immutable; create first, then use update_boot_assets"
-                .into(),
+            reason:
+                "stored image boot assets are immutable; create first, then use update_boot_assets"
+                    .into(),
         });
     }
     if let Some(userdata) = request.userdata.as_deref() {
@@ -778,19 +739,6 @@ async fn create_machine_config_with_name(
     let network = request.network.unwrap_or_default().into();
     runtime.validate_machine_network_config(&network).await?;
     let tailscale = runtime.validate_tailscale_vsock(&network, &spec)?;
-    if request.resolved_oci_image.is_none() {
-        if let ImageSource::Oci(reference) = &image_source {
-            request.resolved_oci_image = Some(
-                runtime
-                    .resolve_oci_image(
-                        reference.clone(),
-                        runtime.image_pull_policy(),
-                        request.platform.as_ref(),
-                    )
-                    .await?,
-            );
-        }
-    }
     let userspace = match (&request.resolved_oci_image, &image_source) {
         (Some(image), _) => Some(crate::LinuxPlatform::from_oci(&image.platform)?),
         (_, ImageSource::Disk(disk)) => {
@@ -916,7 +864,7 @@ async fn create_machine_config_with_name(
         {
             if request.agent_mode.as_ref().is_some_and(|mode| {
                 mode != &MachineAgent::Default && mode.enabled() != agent.is_some()
-            }) || (matches!(&image_source, ImageSource::Managed(_))
+            }) || (matches!(&image_source, ImageSource::Stored(_))
                 && (matches!(&request.guest.agent, MachineAgent::Custom { .. })
                     || (request.guest.agent == MachineAgent::Disabled && agent.is_some())))
             {
@@ -1711,7 +1659,7 @@ pub(crate) async fn publish_stopped_child(
     sources: Vec<crate::machine::stopped::PrivateSource>,
     operation_id: uuid::Uuid,
 ) -> Result<MachineConfig, LibVmError> {
-    let (config, durability) = publish_checkpoint_child(
+    let (config, durability) = publish_snapshot_child(
         runtime,
         ChildConstruction {
             name,
@@ -1735,7 +1683,7 @@ pub(crate) async fn publish_restored_child(
     run_id: uuid::Uuid,
     authentication: Option<crate::machine::restore::RestoreAuthentication>,
 ) -> Result<(MachineConfig, ChildDurability), LibVmError> {
-    publish_checkpoint_child(runtime, construction, Some(run_id), authentication).await
+    publish_snapshot_child(runtime, construction, Some(run_id), authentication).await
 }
 
 pub(crate) struct ChildConstruction {
@@ -1748,7 +1696,7 @@ pub(crate) struct ChildConstruction {
         Option<std::sync::Arc<crate::machine::root_disk::SharedCopyQualification>>,
 }
 
-async fn publish_checkpoint_child(
+async fn publish_snapshot_child(
     runtime: &Runtime,
     construction: ChildConstruction,
     restore_run: Option<uuid::Uuid>,
@@ -1792,7 +1740,7 @@ async fn publish_checkpoint_child(
     .await?;
     storage.disk_baselines.clear();
     if restore_run.is_none() {
-        // A stopped copy transfers disks, never an execution/RAM checkpoint.
+        // A stopped copy transfers disks, never a memory snapshot.
         storage.ram_identity = crate::store::models::storage::ContentIdentityState::Unknown;
     }
     let baseline_pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
@@ -1832,7 +1780,7 @@ async fn publish_checkpoint_child(
             .transpose()?;
         // Admit each copied root before waiting for authentication, which may acquire exclusive roots.
         let copied = std::thread::Builder::new()
-            .name("checkpoint-private-copy".into())
+            .name("snapshot-private-copy".into())
             .stack_size(256 * 1024)
             .spawn_scoped(scope, || -> Result<Vec<std::fs::File>, LibVmError> {
                 let mut private_files = Vec::with_capacity(sources.len());
@@ -1961,7 +1909,7 @@ async fn publish_checkpoint_child(
                 Ok(private_files)
             })?
             .join()
-            .map_err(|_| std::io::Error::other("checkpoint private copy worker panicked"))?;
+            .map_err(|_| std::io::Error::other("snapshot private copy worker panicked"))?;
         if let Some(authentication) = authentication {
             let authenticated = authentication
                 .join()
@@ -2257,7 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn live_child_barrier_retains_launch_files_and_stopped_publication_syncs_inline() {
         use crate::machine::builder::{
-            publish_checkpoint_child, publish_stopped_child, sync_child_files, ChildConstruction,
+            publish_snapshot_child, publish_stopped_child, sync_child_files, ChildConstruction,
         };
         use crate::machine::stopped::{FencedSource, OperationStaging, PrivateSource};
         use crate::storage::pool::StoragePool;
@@ -2293,7 +2241,7 @@ mod tests {
                 file,
             })];
             if live {
-                let (child, mut durability) = publish_checkpoint_child(
+                let (child, mut durability) = publish_snapshot_child(
                     &runtime,
                     ChildConstruction {
                         name: "live-launch-child".into(),
@@ -2703,9 +2651,7 @@ mod tests {
         let machine = runtime
             .machine()
             .name("baseline-lock-transfer")
-            .image_source(ImageSource::Managed(crate::ManagedSourceRef::Image(
-                image.id,
-            )))
+            .image_source(ImageSource::Stored(crate::ImageRef::Id(image.id)))
             .create()
             .await
             .unwrap();
@@ -2765,9 +2711,7 @@ mod tests {
             let result = runtime
                 .machine()
                 .name("private-copy-retry")
-                .image_source(ImageSource::Managed(crate::ManagedSourceRef::Image(
-                    image.id,
-                )))
+                .image_source(ImageSource::Stored(crate::ImageRef::Id(image.id)))
                 .root_disk_size(if shrinking {
                     source_length / 2
                 } else {
@@ -3445,11 +3389,23 @@ mod tests {
             crate::TemporaryDirectoryPolicy::DiskBacked
         );
         let source = write_base_rootfs(temp.path());
+        // A cached OCI image resolves locally, so no registry is contacted.
+        const REFERENCE: &str = "unreachable.invalid/cached:latest";
+        crate::runtime::core::tests::write_cached_oci_rootfs(
+            &runtime,
+            REFERENCE,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await;
+        let operations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
+            .fetch_one(store.test_pool())
+            .await
+            .unwrap();
         let mut request = create_request(source.clone(), "old-kernel-overlay");
-        request.image_source = Some(ImageSource::oci(
-            "unreachable.invalid/should-not-resolve:latest",
-        ));
-        // The overlay kernel floor is checked before resolution or acquisition.
+        request.image_source = Some(ImageSource::oci(REFERENCE));
+        // The overlay kernel floor is checked before the layered root is
+        // materialized or any operation registers.
         let error = create_machine_config(&runtime, request).await.unwrap_err();
         assert!(
             matches!(
@@ -3473,6 +3429,11 @@ mod tests {
         if machines.exists() {
             assert!(std::fs::read_dir(machines).unwrap().next().is_none());
         }
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
+            .fetch_one(store.test_pool())
+            .await
+            .unwrap();
+        assert_eq!(after, operations);
         assert!(source.exists());
     }
 
@@ -3497,7 +3458,7 @@ mod tests {
         // A layered managed image inherits its family: VZ names krun instead.
         assert!(matches!(
             crate::runtime::boot_assets::admit_create_source(
-                crate::runtime::boot_assets::SourceFamily::ManagedImage,
+                crate::runtime::boot_assets::SourceFamily::StoredImage,
                 crate::StorageProfile::LinuxOverlayV1,
                 crate::BackendRequirement::KrunOverlay,
                 vm_spec::live::LiveBackend::Vz,
@@ -3508,7 +3469,7 @@ mod tests {
             })
         ));
         crate::runtime::boot_assets::admit_create_source(
-            crate::runtime::boot_assets::SourceFamily::ManagedImage,
+            crate::runtime::boot_assets::SourceFamily::StoredImage,
             crate::StorageProfile::OpaqueRawV1,
             crate::BackendRequirement::RawBlock,
             vm_spec::live::LiveBackend::Vz,
@@ -3711,7 +3672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vz_oci_rejection_happens_before_asset_or_registry_io() {
+    async fn vz_oci_rejection_happens_before_asset_io_or_materialization() {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("silo"));
         let store = Arc::new(Store::new(&paths).await.unwrap());
@@ -3726,125 +3687,105 @@ mod tests {
         )
         .await
         .unwrap();
-        let images_existed = paths.images_dir().exists();
+        // A cached OCI image resolves locally, so no registry is contacted.
+        const REFERENCE: &str = "invalid.invalid/cached:latest";
+        crate::runtime::core::tests::write_cached_oci_rootfs(
+            &runtime,
+            REFERENCE,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await;
+        let operations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
+            .fetch_one(store.test_pool())
+            .await
+            .unwrap();
+        // The missing kernel would fail asset resolution if it ran first.
         let error = runtime
             .machine()
             .name("vz-oci")
-            .image("invalid.invalid/not-contacted:latest")
+            .image(REFERENCE)
             .kernel(temp.path().join("missing-kernel"))
             .create()
             .await
             .unwrap_err();
-        assert!(matches!(
-            error,
-            LibVmError::BackendAdmissionRejected {
-                remedy: crate::AdmissionRemedy::ExplicitOciToRawConversion,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                error,
+                LibVmError::BackendAdmissionRejected {
+                    remedy: crate::AdmissionRemedy::ExplicitOciToRawConversion,
+                    ..
+                }
+            ),
+            "{error}"
+        );
         assert!(store.list_machine_configs().await.unwrap().is_empty());
-        assert_eq!(paths.images_dir().exists(), images_existed);
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
+            .fetch_one(store.test_pool())
+            .await
+            .unwrap();
+        assert_eq!(after, operations);
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn managed_snapshot_source_restores_complete_configuration_and_rejects_hidden_overrides()
-    {
+    async fn create_refuses_a_snapshot_by_name_or_id_with_a_restore_hint() {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("silo"));
         let (runtime, store) = runtime_with_sqlite_store(paths).await;
         let source = write_base_rootfs(temp.path());
-        let mut request = create_request(source, "snapshot-source");
-        request.cpus = Some(3);
-        request.process = ProcessConfig {
-            command: Some(vec!["/bin/true".into()]),
-            ..ProcessConfig::default()
-        };
-        let source = create_machine_config(&runtime, request).await.unwrap();
-        let source_storage = store.machine_storage(source.id).await.unwrap().unwrap();
-        let source_stream =
-            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
-                .hash_file(&source.machine_dir.join("root.raw"))
-                .unwrap()
-                .id();
-        let machine = crate::machine::Machine::new(runtime.clone(), source.id);
-        let snapshot = machine
-            .snapshot_stopped(crate::SnapshotOptions {
-                name: Some("complete-snapshot".into()),
-                ..crate::SnapshotOptions::default()
-            })
+        let source = create_machine_config(&runtime, create_request(source, "snapshot-source"))
             .await
             .unwrap();
-        let child = runtime
-            .machine()
-            .name("snapshot-child")
-            .image_source(ImageSource::Managed(crate::ManagedSourceRef::Alias(
-                "complete-snapshot".into(),
-            )))
-            .create()
-            .await
-            .unwrap();
-        let config = store
-            .machine_config(child.machine_id())
+        let snapshot = runtime
+            .snapshot(
+                &crate::MachineRef::id(source.id),
+                crate::SnapshotOptions {
+                    name: Some("saved".into()),
+                    ..crate::SnapshotOptions::default()
+                },
+                None,
+            )
             .await
             .unwrap()
-            .unwrap();
-        assert_eq!(config.process, source.process);
-        assert_eq!(config.spec.hardware, source.spec.hardware);
-        assert_eq!(config.guest, source.guest);
-        let child_storage = store.machine_storage(config.id).await.unwrap().unwrap();
-        assert_eq!(child_storage.boot, source_storage.boot);
-        assert_eq!(child_storage.disk_baselines.len(), 1);
-        assert!(matches!(
-            child_storage.disk_baselines[0].state,
-            crate::store::models::storage::DiskBaselineState::Ready
-        ));
-        assert_eq!(
-            child_storage.disk_baselines[0]
-                .seed
-                .baseline
-                .unwrap()
-                .as_bytes(),
-            source_stream.as_bytes()
-        );
-        assert_ne!(
-            child_storage.disk_baselines[0].seed.file_inode,
-            source_storage.disk_baselines[0].seed.file_inode
-        );
-        assert_ne!(
-            child_storage.disk_baselines[0].seed.epoch,
-            source_storage.disk_baselines[0].seed.epoch
-        );
-        assert!(matches!(
-            child_storage.root,
-            crate::MachineRoot::OpaqueRaw { initial_content: Some(stream), .. }
-                if stream == source_stream
-        ));
-        assert_eq!(
-            crate::storage::stream::StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
-                .hash_file(&config.machine_dir.join("root.raw"))
-                .unwrap()
-                .id(),
-            source_stream
-        );
-        assert_ne!(config.machine_dir, source.machine_dir);
-        let error = runtime
-            .machine()
-            .name("snapshot-override")
-            .image_source(ImageSource::Managed(crate::ManagedSourceRef::Snapshot(
-                snapshot.id,
-            )))
-            .cpus(7)
-            .create()
+            .snapshot;
+        let id = crate::ImageId::from_sha256(*snapshot.id.as_bytes());
+        for (source, reference) in [
+            (
+                ImageSource::Stored(crate::ImageRef::Name("saved".into())),
+                "saved".to_owned(),
+            ),
+            (ImageSource::Oci("saved".into()), "saved".to_owned()),
+            (
+                ImageSource::Stored(crate::ImageRef::Id(id)),
+                snapshot.id.to_string(),
+            ),
+        ] {
+            let error = runtime
+                .machine()
+                .name("snapshot-child")
+                .image_source(source)
+                .create()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, LibVmError::SnapshotIsNotAnImage { reference: refused }
+                    if *refused == reference),
+                "{error:?}"
+            );
+            assert!(error
+                .to_string()
+                .contains(&format!("use `silo restore {reference}`")));
+        }
+        assert!(store
+            .machine_config_by_name("snapshot-child")
             .await
-            .unwrap_err();
-        assert!(
-            matches!(error, LibVmError::InvalidCreateRequest { reason, .. } if reason.contains("complete captured configuration"))
-        );
+            .unwrap()
+            .is_none());
     }
     #[tokio::test]
-    async fn checkpoint_child_is_constructed_until_private_file_sync_completes() {
-        use crate::machine::builder::publish_checkpoint_child;
+    async fn snapshot_child_is_constructed_until_private_file_sync_completes() {
+        use crate::machine::builder::publish_snapshot_child;
         use crate::machine::stopped::{FencedSource, OperationStaging, PrivateSource};
         use crate::storage::pool::StoragePool;
 
@@ -3867,7 +3808,7 @@ mod tests {
                 crate::storage::stream::open_regular_source(&source.machine_dir.join("root.raw"))
                     .unwrap();
             let length = file.metadata().unwrap().len();
-            let (child, mut durability) = publish_checkpoint_child(
+            let (child, mut durability) = publish_snapshot_child(
                 &runtime,
                 crate::machine::builder::ChildConstruction {
                     name: format!("durability-{fail}"),
@@ -3935,7 +3876,7 @@ mod tests {
     }
     #[tokio::test]
     async fn restart_deletes_constructed_child_without_starting_it() {
-        use crate::machine::builder::{publish_checkpoint_child, ChildConstruction};
+        use crate::machine::builder::{publish_snapshot_child, ChildConstruction};
         use crate::machine::stopped::{FencedSource, OperationStaging, PrivateSource};
         use crate::storage::pool::StoragePool;
 
@@ -3959,7 +3900,7 @@ mod tests {
             crate::storage::stream::open_regular_source(&source.machine_dir.join("root.raw"))
                 .unwrap();
         let length = file.metadata().unwrap().len();
-        let (child, durability) = publish_checkpoint_child(
+        let (child, durability) = publish_snapshot_child(
             &runtime,
             ChildConstruction {
                 name: "crashed-constructed-child".into(),
@@ -4416,7 +4357,7 @@ mod tests {
                         run_id: run,
                         capture_id: capture,
                         configuration: CaptureConfiguration::from_spec(&config.spec).unwrap(),
-                        alias: None,
+                        name: None,
                         policy: CapturePolicy::Full,
                         dirty_crossover_percent: 60,
                         resume_policy: CaptureResumePolicy::ResumeIfAcquired,
@@ -4475,7 +4416,7 @@ mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 sealed.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await

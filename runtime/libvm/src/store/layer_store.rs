@@ -857,7 +857,7 @@ impl Store {
             {
                 let _roots=pool.lock_roots()?;
                 let mut tx=store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                sqlx::query("DELETE FROM layer_occurrence_set WHERE NOT EXISTS(SELECT 1 FROM image_manifest m JOIN image_ref r ON r.manifest_digest=m.digest WHERE m.digest=layer_occurrence_set.owner_digest OR m.config_digest=layer_occurrence_set.owner_digest) AND NOT EXISTS(SELECT 1 FROM storage_image WHERE record_digest=layer_occurrence_set.owner_digest) AND NOT EXISTS(SELECT 1 FROM storage_operation_object WHERE object_digest=layer_occurrence_set.owner_digest)")
+                sqlx::query("DELETE FROM layer_occurrence_set WHERE NOT EXISTS(SELECT 1 FROM image_manifest m JOIN image_composition_artifact a ON a.manifest_digest=m.digest WHERE m.digest=layer_occurrence_set.owner_digest OR m.config_digest=layer_occurrence_set.owner_digest) AND NOT EXISTS(SELECT 1 FROM storage_image WHERE record_digest=layer_occurrence_set.owner_digest) AND NOT EXISTS(SELECT 1 FROM storage_operation_object WHERE object_digest=layer_occurrence_set.owner_digest)")
                     .execute(&mut *tx).await?;
                 tx.commit().await?;
             }
@@ -904,9 +904,6 @@ impl Store {
             if recovery.checkpoint_deferred() {
                 return Ok(recovery);
             }
-            runtime.block_on(crate::store::artifact_store::retire_unrooted_managed(
-                &store, &pool,
-            ))?;
             if mode == ObjectRecovery::ValidateCatalog {
                 runtime.block_on(store.check_operation_recovery(&pool))?;
                 runtime.block_on(store.check_layer_catalog())?;
@@ -914,7 +911,7 @@ impl Store {
                     &store,
                 ))?;
                 runtime.block_on(crate::store::snapshot_store::check_snapshot_catalog(&store))?;
-                runtime.block_on(crate::store::managed_image_store::check_image_catalog(
+                runtime.block_on(crate::store::stored_image_store::check_image_catalog(
                     &store,
                 ))?;
                 runtime.block_on(crate::store::stream_representation::check_catalog(&store))?;

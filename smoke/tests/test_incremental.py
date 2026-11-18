@@ -204,7 +204,7 @@ def test_incremental_threshold_refuses_before_freeze(silo: Silo, incremental_ima
     create(silo, incremental_image)
     before = incremental.no_child(silo)
     info = silo.info(SOURCE)
-    result = silo.run("snapshot", "create", SOURCE, "--live", "--capture-policy", "incremental",
+    result = silo.run("snapshot", "create", SOURCE, "--memory", "--capture-policy", "incremental",
                       "--dirty-crossover-percent", str(threshold), expect=None)
     assert result.returncode != 0
     assert "dirty" in result.stderr.lower() and "60" in result.stderr
@@ -348,7 +348,7 @@ def test_capture_dirty_union_and_coverage_recovery(
                 result = json.loads((evidence / "capture-manager.stdout").read_bytes())
                 snapshot = result["snapshot"]["id"]
                 seal = json.loads((directory / "vm.capture.json").read_bytes())
-                retry = restore.Checkpoint("image:" + snapshot, snapshot, directory, seal,
+                retry = restore.Checkpoint(snapshot, snapshot, directory, seal,
                                            source_info, baseline.boot_id, generation)
                 facts = incremental.authenticated_map(silo, retry, mode="full", reason="coverage-lost")
             targets = incremental.pages_at_cut(silo, retry, {**written, "pages": written["pages"][:2]})

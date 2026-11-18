@@ -1,4 +1,4 @@
-# 21. Live snapshots and forks of running machines
+# 21. Snapshots with memory and forks of running machines
 
 Date: 2026-10-25
 
@@ -21,7 +21,7 @@ ADR and ADR 0014 a **hard breaking release**. Every user must reinstall and
 wipe all existing Silo state. No upgrade migrations, backfills, old-state
 readers or compatibility bridges are provided. Initial schemas and callers
 cut over directly; incompatible state is refused with a reinstall/wipe
-diagnostic rather than automatically deleted. Current-format checkpoint
+diagnostic rather than automatically deleted. Current-format snapshot
 validation, crash recovery and portability refusal remain mandatory.
 
 Phase 22 replaces the development flat lower with ADR 0014's default
@@ -49,9 +49,9 @@ in the [performance tracker](../architecture/live-operation-performance.md),
 backed by `.tmp/plan/evidence/phase-24/`.
 
 The owner decision of 2026-11-10 removes build-specific live admission and
-exact-build checkpoint compatibility. Any pinned libkrun reference supplies its
+exact-build snapshot compatibility. Any pinned libkrun reference supplies its
 native live operations subject to the existing host and machine checks.
-Checkpoints record the live state format schema and guest architecture; restore
+Snapshots with memory record the live state format schema and guest architecture; restore
 refuses those mismatches, not a different build.
 
 The owner decisions of 2026-11-15 (Phase 30) measure start and live-operation
@@ -64,7 +64,7 @@ the alternative and its costs are recorded under Alternatives Considered.
 Local snapshot publication now seeds the warm receipt, reversing the
 2026-11-14 rule that the first durable restore independently scans RAM.
 Silent local corruption between capture and restore is an accepted risk;
-`silo snapshot verify IMAGE` provides on-demand full authentication. Imported,
+`silo snapshot verify REF` provides on-demand full authentication. Imported,
 pulled and transported snapshots, export and handoff retain full byte
 authentication. The budgets below retain the 4 GiB gates and add the owner's
 30 GiB Arch cohort, both gated by `make perf`, not `make smoke`. These are
@@ -98,11 +98,39 @@ Every ended run invalidates its baseline; clean-stop sealing and deterministic
 upper templates remain planned stage 2. Stream-map v2 now replaces flat-map
 metadata; remaining runtime costs still require measured scaling qualification.
 
+### Snapshot memory terminology (2026-11-18)
+
+The image/snapshot split revises this ADR's vocabulary and commands. There is
+one noun, **snapshot**; memory is a property of a snapshot, `none` or
+`included`. "Checkpoint", "execution checkpoint", "live snapshot" and "stopped
+snapshot" are retired as names for the artifact; the decision text below uses
+"snapshot with memory" and "snapshot without memory". `silo fork --live` is
+unchanged: "live" describes the operation.
+
+- `silo snapshot create VM --memory` captures a running VM's RAM, CPU and
+  device state with its disks (formerly `--live`). `--memory` on a stopped VM
+  is refused. Without `--memory`, a stopped VM's disks are captured; a running
+  VM is refused with "VM is running: stop it first, or use --memory".
+- `silo snapshot list` reports MEMORY for each snapshot. Snapshots are
+  referenced by local name or `sha256:` id, separately from images.
+- `silo restore REF` is the only way to turn a snapshot into a VM;
+  `silo create` and `silo run` refuse snapshots and point to it.
+- `silo restore REF --without-memory` replaces `silo recover-disks`: a snapshot
+  with memory restores as a stopped VM from its disks only. RAM is discarded
+  and the disks may need journal recovery on boot.
+- Snapshot push is not available in the CLI or gRPC until mandatory
+  encryption and a design for secrets held in memory exist
+  ([ADR 0014](0014-layered-oci-image-storage.md)). Pulling a snapshot through
+  `silo restore REF` remains.
+- Follow-up, not decided here: a disk-only snapshot of a running VM (pause,
+  guest fsfreeze or crash-consistent capture, resume), which would remove the
+  "VM is running" refusal.
+
 ### Live fork identity authority (2026-11-17)
 
 Only **live forks** omit content identity. This decision supersedes any older
 fork requirement below to hash, publish maps, inherit a source content root,
-or wait for disk identity. Live and stopped snapshots keep their existing
+or wait for disk identity. Snapshots with and without memory keep their existing
 content-identified capture, verify, restore and transport behavior.
 
 A live child is launched from complete files Silo owns: immutable RAM and
@@ -118,7 +146,7 @@ This is not cryptographic authentication. Bit rot in internal owned fork files
 is not detected until the child is snapshotted, when identity is established
 for the resulting bytes, not retroactively verified against its fork cut.
 Adversarial same-UID/root mutation is outside this trust boundary. A local cut
-is never a snapshot: verify, export, push and snapshot-authority handoff refuse
+is never a snapshot: verify, export and snapshot-authority handoff refuse
 it with "local fork cut is not an identified snapshot; snapshot the child first".
 A missing identified snapshot receipt never selects owned-cut authority.
 Normal stopped-machine handoff still seals and authenticates its storage.
@@ -169,15 +197,15 @@ private storage is captured at the stopped boundary, identified by content, and
 restored by booting a new machine. That contract cannot express the operations
 users now need:
 
-1. Checkpoint a **running** machine, including its memory, CPU and device
+1. Snapshot a **running** machine, including its memory, CPU and device
    state, so that it can later resume where it was instead of booting again.
 2. Fork a running machine into N children that continue from the same instant,
    sharing unchanged memory, each with private writes.
 3. Pause and resume a machine without creating a snapshot.
-4. Publish and transfer such a checkpoint through the same artifact format and
+4. Store and pull such a snapshot through the same artifact format and
    retention model that [ADR 0014](0014-layered-oci-image-storage.md) defines for storage.
 
-A live checkpoint is a different artifact from a stopped snapshot. Its disk
+A snapshot with memory is a different artifact from one without. Its disk
 state is only meaningful together with the memory image captured at the same
 instant; its memory image contains the guest's entropy pool, open connections,
 cached identities and secrets; and it executes only on a host whose hypervisor,
@@ -208,8 +236,8 @@ deliberately onto Silo's fork, not adopted by changing a dependency revision.
 | Pause | Every vCPU parked at an instruction boundary, every device worker stopped at a terminal queue position, every host memory writer drained. Reversible; produces no artifact. |
 | Pause token | `(machineId, runId, pauseGeneration, owner)` identifying one established pause and who may resume it. A resume names the exact token. |
 | Capture | One operation that produces a coherent cut of execution state, RAM and every included writable disk at one pause token. |
-| Execution checkpoint | The immutable closure bound to producer-computed identities by a capture: RAM stream and layout, execution envelope, device state, sealed disks, boot and configuration provenance, compatibility profile. Local publication establishes restore trust; import, transport, export, handoff and explicit verification independently authenticate bytes. [ADR 0014](0014-layered-oci-image-storage.md) calls this a snapshot with `captureKind: live-execution`. |
-| Restore | Construction of a new machine generation whose first guest instruction continues from an execution checkpoint. |
+| Snapshot with memory | The immutable closure bound to producer-computed identities by a capture: RAM stream and layout, execution envelope, device state, sealed disks, boot and configuration provenance, compatibility profile. Local publication establishes restore trust; import, transport, export, handoff and explicit verification independently authenticate bytes. [ADR 0014](0014-layered-oci-image-storage.md) records it as a snapshot with memory `included`; a snapshot with memory `none` holds disks only. |
+| Restore | Construction of a new machine generation whose first guest instruction continues from a snapshot with memory. |
 | Fork | One durable capture-backed branch of a running source followed by N restores, with the source resumed under its recorded policy. |
 | Activation | The barrier between a restored guest's first instruction and the moment its workload runs and its endpoints are reachable: fresh VM generation identity acknowledged, agent rebound, network applied, workload thawed. |
 | Baseline | The retained RAM generation a VM's dirty tracking is measured against, enabling incremental capture. |
@@ -242,7 +270,7 @@ sequenceDiagram
     S->>G: re-handshake transport, then Thaw(captureId)
     S->>S: capture-disk-identity on immutable clones, then vm.capture.json
     S-->>L: capture coherent, source running
-    L->>L: verify, chunk, publish checkpoint, pin RAM inode
+    L->>L: verify, chunk, publish snapshot, pin RAM inode
     loop child 1 and child 2
         L->>L: private raw disk copies, new IDs, network, leases
         L->>C: start request with restore inputs, startPaused
@@ -256,16 +284,16 @@ sequenceDiagram
     end
 ```
 
-The same flow without the loop is a live snapshot. At admission, a capture of
+The same flow without the loop is `silo snapshot create --memory`. At admission, a capture of
 a user-paused source resolves the default `resume-if-acquired` policy to
 `preserve`, persists that policy in the plan and leaves the source paused.
-Neither a live snapshot nor a live fork needs `--preserve` to borrow a user
+Neither a snapshot with memory nor a live fork needs `--preserve` to borrow a user
 pause. A user pause alone is `FreezeWorkloads` and `Pause`; its resume is
 `Resume` followed by `Thaw`.
 
 ## Decision
 
-Silo adds **pause, live snapshot, restore and fork of running machines on the
+Silo adds **pause, snapshots with memory, restore and fork of running machines on the
 libkrun backend**, built from five commitments:
 
 - **One quiescent cut.** A capture is valid only when every vCPU, device
@@ -278,7 +306,7 @@ libkrun backend**, built from five commitments:
   files. [ADR 0014](0014-layered-oci-image-storage.md)'s one-encoding rule stands: no qcow2 chain, no block
   service, no Silo-owned CoW container. Children receive private raw copies.
 - **One immutable RAM file, privately mapped, for durable operation.** A
-  checkpoint's memory is one complete sparse RAM image with a separate layout
+  snapshot's memory is one complete sparse RAM image with a separate layout
   record. Every durable restore maps it `MAP_PRIVATE` from a read-only descriptor, so
   children share clean pages through the page cache and own only the pages
   they write. Incremental captures publish complete sparse Merkle roots,
@@ -296,10 +324,10 @@ libkrun backend**, built from five commitments:
 
 The capability is admitted per lane: Linux KVM x86_64, Linux KVM arm64 with
 GICv3, and macOS HVF arm64 on macOS 15 or later. VZ machines retain
-[ADR 0014](0014-layered-oci-image-storage.md)'s stopped snapshots only; every
+[ADR 0014](0014-layered-oci-image-storage.md)'s snapshots without memory only; every
 backend reports what it supports before any live operation starts, and an
 unsupported operation is refused up front, never partway (see Backend
-Capabilities And Early Rejection). Execution checkpoints restore on the same
+Capabilities And Early Rejection). Snapshots with memory restore on the same
 host class they were captured on; cross-host execution restore is a
 separately admitted profile with its own compatibility contract.
 
@@ -307,7 +335,7 @@ separately admitted profile with its own compatibility contract.
 
 1. A capture binds execution state, device state, RAM and every included
    writable disk to one pause token. An artifact that cannot prove the
-   binding is not a checkpoint.
+   binding is not a snapshot with memory.
 2. Writable disks have immutable private clones or copies before memory is
    captured and before any source write is admitted. Reflink disk identities
    may complete after source continuation, but every identity is complete before
@@ -326,14 +354,14 @@ separately admitted profile with its own compatibility contract.
    the child's Silo machine ID and `/run/silo/generation` records its run ID.
    The VM generation protocol reseeds the kernel entropy pool before thaw;
    userspace RNG state and other cached identities are not sanitized. A
-   checkpoint is privileged executable state and is treated as such.
+   snapshot with memory is privileged executable state and is treated as such.
 6. Source continuation and capture success are separate outcomes. A sealed
    capture survives a source that fails to resume; a source that resumes does
    not validate a capture that failed to seal.
 7. No fallback. A failed restore never becomes a cold boot, a failed child
    never becomes an unnamed omission from a fork result, and a storage-only
-   recovery from a checkpoint's disks is an explicit, differently named
-   operation.
+   recovery from a snapshot's disks is the explicit
+   `silo restore REF --without-memory` operation.
 8. A user-paused machine stays paused. Only the operation that acquired a
    pause resumes it.
 9. No step of restore or fork may scale with configured RAM or logical
@@ -350,7 +378,7 @@ separately admitted profile with its own compatibility contract.
 ### Scope and relationship to existing decisions
 
 [ADR 0014](0014-layered-oci-image-storage.md) owns the storage side: the stream identity of RAM and sealed disks,
-`captureKind` on snapshots, the artifact media types, GC roots and leases for
+the snapshot `memory` property (`none` or `included`), the artifact media types, GC roots and leases for
 RAM files and children, and the rule that live capture adds no disk encoding.
 This ADR owns execution: pause, capture, restore, activation, compatibility
 and the monitor contract. The two are written to be read together; where this
@@ -377,7 +405,7 @@ dropped.
 
 | Component | Owns | Never does |
 | --- | --- | --- |
-| libvm | Operation records, locks and leases; budgets and admission; the live capability vector and early rejection; staging roles; verification, chunking and publication of checkpoints; child allocation; database reconciliation; N-way fork orchestration; identity completion from a retained cut after positive monitor/worker termination. | Touches hypervisor state; reads staged payloads with live writers; completes identities while a live monitor still owns capture; converts an unsupported live operation into another operation. |
+| libvm | Operation records, locks and leases; budgets and admission; the live capability vector and early rejection; staging roles; verification, chunking and publication of snapshots; child allocation; database reconciliation; N-way fork orchestration; identity completion from a retained cut after positive monitor/worker termination. | Touches hypervisor state; reads staged payloads with live writers; completes identities while a live monitor still owns capture; converts an unsupported live operation into another operation. |
 | `silo-vmm` (monitor) | Host capability query without a machine; machine `live` vector in status; live commands on `vm.sock`; guest freeze and thaw; worker pause and capture commands; disk flush and clone/copy into named staging; `vm.capture-cut.json` and `vm.capture.json`; restore launch of a fresh worker; activation sequencing. | Opens the database; chooses output paths; declares success it did not observe. |
 | krun worker | Pause linearization; device quiescence; execution, device and RAM capture and restore through the libkrun capture ABI; dirty tracking and baselines; VM generation device. | Opens files outside its named inputs; resumes without the exact token. |
 | Guest init and agent | Workload freezer; `FreezeWorkloads`, `Activate` and `Thaw` RPCs; identity rotation after the VM generation acknowledgement; one-shot network reapplication. | Flushes or repairs filesystems as part of capture; runs the workload before `Thaw`. |
@@ -634,10 +662,10 @@ A capture runs in this order; each step completes before the next begins:
    On reflink filesystems this in-pause disk step is flush, clone and recording
    ownership facts only: no extent walk, map construction or hashing. Without
    reflinks the copy and inline hashing remain inside the pause. Staged files
-   close without synchronization; checkpoint publication or child durability
+   close without synchronization; snapshot publication or child durability
    barriers provide persistence. Read-only attachments (lower and boot assets)
    are recorded by identity, not copied. Any clone or copy failure fails the
-   whole capture; no partial multi-disk checkpoint is published.
+   whole capture; no partial multi-disk snapshot is published.
    Before execution/device capture, while still paused, the monitor freezes
    each writable disk's dirty generation and binds its receipt to this exact
    cut and held backing. Writes after continuation enter a separate generation.
@@ -706,7 +734,7 @@ A capture runs in this order; each step completes before the next begins:
    leaves the source fenced; it never authorizes another cut with lost dirties.
 
 The monitor synchronizes no staging files or records. Durability belongs to
-libvm at named-checkpoint publication and each fork child's barrier. A cut
+libvm at named-snapshot publication and each fork child's barrier. A cut
 survives a monitor or manager process crash when its retained bytes remain;
 power loss before publication or child durability is not acknowledged capture
 success, and recovery discards that interrupted capture. A capture is sealed
@@ -852,8 +880,8 @@ replay without producer authority, import, export, handoff or explicit verify.
 
 ### Incremental capture
 
-Live snapshots and live forks default to `--capture-policy incremental`: reuse
-the valid retained baseline, including the checkpoint inherited by a restored
+Snapshots with memory and live forks default to `--capture-policy incremental`: reuse
+the valid retained baseline, including the snapshot inherited by a restored
 child, without requiring an opt-in. `--capture-policy full` explicitly forces
 a full capture. The two existing values are sufficient: incremental is a
 preference, not a requirement to reject otherwise valid captures. If the
@@ -898,14 +926,14 @@ The serialized `CaptureMemoryStats` fields use camelCase.
 
 A restored machine seeds its own baseline from the immutable RAM file it was
 restored from and arms tracking before any restore-time write, so a
-checkpoint-restore-recapture cycle does not rescan unchanged memory. This
+snapshot-restore-recapture cycle does not rescan unchanged memory. This
 applies to durable restores as well as local forks.
 
 ## Memory Model
 
 ### Backing
 
-A durable checkpoint's memory is one complete sparse RAM file and one layout record.
+A durable snapshot's memory is one complete sparse RAM file and one layout record.
 The layout lists ordered, disjoint `(guestPhysicalAddress, length,
 streamOffset)` regions, the memory topology and the native page granule.
 Registered RAM is packed in guest-physical order; holes in the guest physical
@@ -965,7 +993,7 @@ stream and updates changed Merkle paths. Staging uses `memory.root`, disk
 nodes are not copied into each capture directory. Root ownership survives
 acceptance and staging release.
 
-Each checkpoint still has a complete immutable RAM file, reflink-seeded where
+Each snapshot with memory still has a complete immutable RAM file, reflink-seeded where
 supported, with no restore replay chain. A small dirty page rehashes its 64 KiB
 unit unless zero; the hypervisor's actual dirty granule is independent. Zero
 overlays punch or zero seeded output rather than exposing predecessor bytes.
@@ -1084,7 +1112,7 @@ and metadata/state/map allowances, not a second 30 GiB publication copy.
 These are bounded-admission policy allowances, not filesystem reservations.
 Unrelated writers, disk growth, quotas, delayed allocation and clone metadata
 can still exhaust storage. ENOSPC fails capture or defers publication without
-publishing an invalid checkpoint; source continuation follows its recorded
+publishing an invalid snapshot; source continuation follows its recorded
 policy. Neither filesystem-wide no-exhaustion nor guest ENOSPC immunity is promised.
 
 Initial disk/descriptor admission precedes committing the capture operation,
@@ -1192,9 +1220,9 @@ with `MADV_DONTNEED`. Restored file-private RAM retains lazy private COW sharing
 and reclaims by replacing only the reported range with fresh anonymous
 read/write memory at the same address (`MAP_FIXED | MAP_PRIVATE |
 MAP_ANONYMOUS | MAP_NORESERVE`). File-private RAM never receives
-`MADV_DONTNEED`, which could resurrect checkpoint bytes. Both discard paths
+`MADV_DONTNEED`, which could resurrect snapshot bytes. Both discard paths
 mark the range dirty through the host-writer memory domain before changing it;
-marking failure prevents discard. Freed ranges read zero, checkpoint RAM files
+marking failure prevents discard. Freed ranges read zero, snapshot RAM files
 remain unchanged, and other VMs' mappings are unaffected.
 
 Adjacent reports are coalesced. Anonymous replacement islands are bounded
@@ -1221,7 +1249,7 @@ authenticates the chunks and complete stream identity; a missing or corrupt
 chunk fails closed. Reconstructed flats remain re-evictable cache, protected
 from eviction while the consumer's operation roots are live.
 
-libvm verifies the checkpoint closure's shape, trust policy and compatibility
+libvm verifies the snapshot closure's shape, trust policy and compatibility
 profile before allocating anything for a child: every member is present with
 its recorded length, role and lineage. A snapshot produced on this host is
 trusted at publication: publication seeds the warm receipt, so neither its
@@ -1253,7 +1281,7 @@ A failed authentication rolls the owned child allocation back and reports the
 authentication error, never a construction error.
 
 Silent local corruption between capture and restore is not detected at restore
-under this trust boundary. The recovery tool is `silo snapshot verify IMAGE`,
+under this trust boundary. The recovery tool is `silo snapshot verify REF`,
 whose exact traversal and diagnostics are defined below. It rereads every RAM,
 state and disk byte without warm, map or composition receipts. Export and handoff
 also authenticate every byte without those receipts. Local forks use the
@@ -1261,7 +1289,7 @@ producer/owned-inode authority described below. libvm creates the child's machin
 directory, private raw copies of every sealed disk, fresh network reservations
 and sockets, the composite initramfs for provenance only, and the leases for
 the RAM file, lower and boot assets. It passes the resolved restore inputs to
-the monitor in the [ADR 0018](0018-silo-vmm-contract.md) start request: checkpoint ID; the RAM file,
+the monitor in the [ADR 0018](0018-silo-vmm-contract.md) start request: snapshot ID; the RAM file,
 layout, execution and device-state objects as inherited read-only
 descriptors; the private disk roles; the compatibility profile; the
 activation configuration; and `startPaused: true`.
@@ -1290,7 +1318,7 @@ not a cold boot.
 
 ### On-demand verification
 
-`silo snapshot verify IMAGE` uses `SnapshotStore::verify` to pin the selected
+`silo snapshot verify REF` uses `SnapshotStore::verify` to pin the selected
 local snapshot once and authenticate every byte against recorded identities.
 It ignores warm, map and composition receipts and producer capabilities, and
 reads and checks recorded-zero chunks, including filesystem holes.
@@ -1328,7 +1356,7 @@ used for restore. The worker then reports `restorePrepared` to the monitor and
 waits.
 
 A construction failure destroys the child's execution attempt and releases its
-attachments after the worker is reaped. The checkpoint remains available for a
+attachments after the worker is reaped. The snapshot remains available for a
 retry under a new run ID.
 
 ### Activation
@@ -1477,7 +1505,7 @@ the recorded RAM file and disk cut under a recoverable operation root, then
 restores each child subject to the admitted resource budgets. A local fork uses
 [ADR 0014](0014-layered-oci-image-storage.md)'s qualified clone and copy identity
 rules with producer-computed chunk identities; it does not first publish a
-durable checkpoint. An operation root is required. libvm validates the cut's
+durable snapshot. An operation root is required. libvm validates the cut's
 receipt structurally (run and configuration correlation, roles, lengths,
 chunk counts, token binding) and checks unchanged owned inode facts. Local fork
 RAM restore trusts that producer identity and inode ownership without rehashing
@@ -1485,7 +1513,7 @@ RAM, including on the first restore. Qualified disk reflinks carry the cut's
 identity without rereading; required copies authenticate written bytes inline.
 Local forks do not promise independent detection of RAM
 corruption that preserves those trusted facts. The cut is never published as a
-checkpoint; it exists only until every child is durable.
+snapshot; it exists only until every child is durable.
 
 Each child's qualified private disk clone carries the cut's identity. A
 non-reflink copy hashes written bytes inline and compares with that identity;
@@ -1563,7 +1591,7 @@ not the fragments.
 | `/run/silo/generation` | Atomically replaced before thaw on every restore/fork with the child run ID; absent at cold boot. Image file watchers react after thaw. |
 | Hostname, filesystem UUIDs, partition GUIDs, SSH host keys | Preserved. An explicitly selected activation hook may change what it supports; there is no universal live generalizer. |
 | Kernel entropy pool | Reseeded through the VM generation protocol before the workload runs. |
-| Userspace RNG state, tokens, nonces, cached credentials | Duplicated. Disclosed in the checkpoint description; not sanitized. |
+| Userspace RNG state, tokens, nonces, cached credentials | Duplicated. Disclosed in the snapshot description; not sanitized. |
 | TCP connections, vsock streams, exec sessions, forwards, publications | Dropped. Recreated from configuration where configured. |
 | Secrets in RAM or on disk | Captured. Destination access to new secrets requires explicit authorization. |
 
@@ -1572,7 +1600,7 @@ not the fragments.
 Live operations exist only on the libkrun backend, and only on admitted
 lanes. A machine whose selected backend is VZ never pauses, captures,
 restores or forks under this ADR, and a runtime whose selected backend is VZ
-never restores an execution checkpoint. Backend selection is the existing
+never restores a snapshot with memory. Backend selection is the existing
 rule: the runtime's explicit override (`SILO_VIRT_BACKEND`, the system
 configuration's recorded backend) or, absent one, the host default (`krun` on
 Linux and macOS). The exclusion is reported before operational admission or
@@ -1600,7 +1628,7 @@ only Silo's Cargo environment. It is useful alongside binary digests in system
 information and smoke evidence, but it does not participate in restore admission.
 Builds do not inspect source checkouts, Git metadata or source fingerprints.
 
-Capture receipts and checkpoint compatibility profiles carry `liveStateSchema`
+Capture receipts and snapshot compatibility profiles carry `liveStateSchema`
 and `architecture`. The native capabilities API exports `LIVE_STATE_SCHEMA`
 (`silo.live-state/1`); bump that summary whenever any component's state magic or
 schema changes. Each encoder owns its magic and schema constant, and its decoder
@@ -1654,8 +1682,8 @@ applicable. Discovery/protocol/observation failures are separate typed errors,
 not extra semantic unsupported reasons. Persisted machine/runtime state and
 logical database contents are unchanged during the operation interval.
 The CLI prints one line with the reason and the
-supported alternative; for a VZ machine that is `silo stop` followed by the
-stopped snapshot of [ADR 0014](0014-layered-oci-image-storage.md). `silod`
+supported alternative; for a VZ machine that is `silo stop` followed by
+`silo snapshot create` without `--memory` ([ADR 0014](0014-layered-oci-image-storage.md)). `silod`
 returns the same error as a precondition failure with the reason code, and
 its status API carries the host vector so a remote client can decide before
 it sends the request. `silo system info` and `silo info` print the vector.
@@ -1684,14 +1712,14 @@ weaken its no-mutation requirement.
 
 **No implicit fallback.** An unsupported live operation is never converted
 into a different operation: libvm never stops a machine to snapshot it, never
-downgrades a live snapshot request to a stopped snapshot, and never cold
-boots in place of a restore. The stopped snapshot and restore of
+downgrades a `--memory` snapshot request to one without memory, and never cold
+boots in place of a restore. Snapshots without memory and their restore in
 [ADR 0014](0014-layered-oci-image-storage.md) keep working unchanged on every
-backend, VZ included; restoring an execution checkpoint's sealed disks as a
-stopped snapshot is the explicit disk-only recovery operation, requested by
-name.
+backend, VZ included; restoring a snapshot with memory from its sealed disks
+only is the explicit `silo restore REF --without-memory` operation, requested
+by name.
 
-**Restore admission.** A checkpoint's compatibility profile names its lane.
+**Restore admission.** A snapshot's compatibility profile names its lane.
 libvm compares it with the host vector before allocation; a VZ-selected
 runtime, a lane mismatch or a `restore: unsupported` vector rejects with the
 same typed error and leaves the artifact untouched.
@@ -1770,7 +1798,7 @@ captures/<capture-id>/
 These are staging and evidence, not a second catalog. libvm registers the
 operation and hands its lease to the monitor before submit; the monitor writes
 only here and closes every writer before publishing the result; libvm computes
-stream identities, publishes content objects and commits the checkpoint or
+stream identities, publishes content objects and commits the snapshot or
 child retention in one database transaction. Staging is collectable only after
 reconciliation and after every mapping lease on `memory.ram` is released.
 
@@ -1803,7 +1831,7 @@ a file's existence or from an RPC that returned before the seal.
 [ADR 0018](0018-silo-vmm-contract.md) is amended to add: the
 `silo-vmm capabilities` subcommand and the `live` object in the status API;
 the six `VmMonitorService` operations above with their common envelope; a
-capability-gated `restore` object in the start request (checkpoint ID, RAM
+capability-gated `restore` object in the start request (snapshot ID, RAM
 file and layout as inherited descriptors, execution and device state as
 inherited descriptors, private disk roles under the data directory,
 compatibility profile, activation configuration, `startPaused`); the
@@ -1815,7 +1843,7 @@ user pause.
 
 ## Compatibility And Portability
 
-A checkpoint pins what its execution needs. Restore admits it only when the
+A snapshot with memory pins what its execution needs. Restore admits it only when the
 destination matches:
 
 | Pinned | Admission |
@@ -1841,18 +1869,18 @@ Publication retains the whole execution closure even when only the local host
 can run it. An artifact can be valid, inspectable and transferable while its
 execution is incompatible with the destination; the destination reports the
 incompatibility and preserves the artifact. Disk-only recovery from a
-checkpoint is an explicit `silo recover-disks <CHECKPOINT> --name <CHILD>`
-operation that boots a new machine from private copies of the sealed disks
-with stop outcome `unknown`; it is never offered as a fallback for a failed
-restore.
+snapshot with memory is an explicit `silo restore REF --without-memory --name <CHILD>`
+operation that discards RAM and boots a new machine from private copies of the
+sealed disks with stop outcome `unknown`; the disks may need journal recovery.
+It is never offered as a fallback for a failed restore.
 
 macOS hosts before macOS 15 cannot capture or restore execution state because
-the GIC state APIs are absent; they retain ordinary boot and stopped snapshots.
+the GIC state APIs are absent; they retain ordinary boot and snapshots without memory.
 A missing API resolves to a typed refusal, never fabricated support.
 
 ## Security And Trust
 
-A checkpoint is executable state with the authority of the machine that
+A snapshot with memory is executable state with the authority of the machine that
 produced it. Restoring one requires at least the authorization required to run
 its image. Its native-state parsers are host attack surface: the worker
 validates sizes, topology, schema and bounds before any hypervisor call.
@@ -1861,7 +1889,7 @@ verify every byte against chunk and state identities. Locally produced
 snapshots trust publication-seeded warm receipts from their first restore;
 local forks trust producer/owned-inode authority without RAM rereads. Silent
 local corruption between capture and restore is not detected at restore.
-`silo snapshot verify IMAGE` independently authenticates every RAM, state and
+`silo snapshot verify REF` independently authenticates every RAM, state and
 disk byte. Stream failures identify the chunk and byte range; state failures
 identify the whole object's role, digest and length. Structural failures are
 reported separately, as defined under On-demand verification. Hashing is integrity, not
@@ -1870,9 +1898,11 @@ authenticity; publisher trust and signatures apply to the OCI index under
 
 Staging, cache and published RAM objects are protected like process memory:
 0700 directories, 0600 files, included in retention accounting, never world
-readable. Publishing a checkpoint exports every secret and deleted-data
-remnant in RAM and on disk; the CLI says so when it publishes. Encryption of
-artifacts at rest is a separate feature.
+readable. A snapshot with memory holds every secret and deleted-data remnant
+in RAM and on disk. Snapshot push is therefore not available until mandatory
+encryption and a design for secrets held in memory exist
+([ADR 0014](0014-layered-oci-image-storage.md)). Encryption of artifacts at
+rest is a separate feature.
 
 A restored child gains no host access that its configuration does not grant.
 RAM may contain old paths and handles; they are not capabilities. Destination
@@ -1904,7 +1934,7 @@ cache assumption, as in [ADR 0014](0014-layered-oci-image-storage.md).
 | Monitor/worker dies in `IdentityPending` | After positive termination, libvm completes identities from retained clones without VM operations and writes the seal last; the pending cut is never reported sealed early. |
 | Monitor dies after seal | libvm completes publication from sealed files; source generation ends per [ADR 0018](0018-silo-vmm-contract.md). |
 | Sealed capture cannot admit remaining publication writes | Publication deferred with staging retained; no invalid snapshot is retained. Runtime maintenance open and unrelated commands continue. Retry only re-admits remaining writes, or explicit forced removal discards an unreferenced local cut after source termination. |
-| Restore construction fails | Child attempt destroyed; checkpoint untouched; retry with a new run. |
+| Restore construction fails | Child attempt destroyed; snapshot untouched; retry with a new run. |
 | Activation incomplete | Workload stays frozen and fences stay closed; child re-paused into `ActivationFailed`, or killed and reaped if pause fails; never `Running`; retry is a new restore. |
 | Fork: child k fails after seal | Children 1..k-1 keep running; result names k's failure; source outcome independent. |
 | Compatibility mismatch on restore | Typed diagnostic naming the mismatched pin; artifact preserved; no cold boot. |
@@ -2074,12 +2104,13 @@ above is split, not widened.
    reconciliation and database records, [ADR 0014](0014-layered-oci-image-storage.md) storage amendments
    delivered (sealed raw captures, RAM stream identity, GC roots, leases).
    User pause and resume are admitted at the end of this stage.
-5. **Live snapshot, restore and local fork.** Capture with activation,
+5. **Snapshot with memory, restore and local fork.** Capture with activation,
    restore, N-way fork with budgets, crash matrix. `Running` children are
    admitted only here.
 6. **Incremental capture, publication and transfer.** Baselines and
    deltas, chunk maps, OCI VM artifact media types for execution closures,
-   registry round trip, disk-only recovery operation.
+   registry pull through `silo restore REF` (snapshot push deferred, see
+   Security And Trust), `silo restore REF --without-memory`.
 7. **Later profiles.** Same-architecture other-host restore, execution
    relocation, virtiofs and Rosetta providers, nested state, VZ.
 
@@ -2088,7 +2119,7 @@ capture and fork before publication. The public capability vector flips one
 operation per stage: `pause` at the end of stage 4, `capture`, `restore` and
 `fork` at the end of stage 5, `incremental` at the end of stage 6, and each
 when its native primitive and host checks permit it; until delivery the bit
-reports `not-delivered`. A machine is `Paused`, a checkpoint is `coherent`,
+reports `not-delivered`. A machine is `Paused`, a capture is `coherent`,
 a child is `Running` and an artifact is published only when the corresponding
 runtime contract has been satisfied.
 
@@ -2119,7 +2150,7 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   balloon reports, changed-to-zero pages and repeated same-page writes all
   survive incremental capture. Faulting any harvest, re-arm or publication
   step loses no dirties; invalid coverage falls back to full.
-- **Baseline inheritance.** Restore a checkpoint, change a known page set,
+- **Baseline inheritance.** Restore a snapshot with memory, change a known page set,
   recapture: unchanged chunks are reused without scanning or copying live RAM
   in full. Stale or wrong-topology tokens reject.
 - **Physical sharing.** N fresh children map one immutable RAM inode: clean
@@ -2162,7 +2193,7 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   each sync, result and database boundary, and race stop, cancel and resume.
   The result is a recoverable coherent closure or no usable capture; source
   and child failures are explicit; a user pause never auto-resumes.
-- **Retention.** Delete the source and every checkpoint alias while children
+- **Retention.** Delete the source and every snapshot name while children
   run; move `SILO_HOME` while stopped; restore and recapture with original
   paths gone. The full RAM, disk and boot closure survives GC.
 - **Artifact and bounds.** Imported, pulled and transported snapshots with a
@@ -2170,7 +2201,7 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   Overlapping or out-of-range regions, oversized state and incompatible ABI
   reject on every restore. Local publication seeds first-restore trust without
   hashing RAM; warm-receipt invalidation and local-fork inode ownership have
-  separate trust-boundary checks. `silo snapshot verify IMAGE` detects corrupt
+  separate trust-boundary checks. `silo snapshot verify REF` detects corrupt
   RAM and disk chunks with stream identity, index and byte range, and corrupt
   state objects with role, whole-object digest and length. Missing, truncated,
   writable or replaced members are structural failures. Recorded-zero chunks
@@ -2184,12 +2215,12 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   distinct operation; no implicit reboot.
 - **Early rejection.** On a VZ-backed machine, a macOS 14 host, a lane
   without a gate record, and a libkrun machine with a rejected device: `silo
-  pause`, live `silo snapshot`, `silo fork` and execution restore fail with
+  pause`, `silo snapshot create --memory`, `silo fork` and execution restore fail with
   `LiveOperationUnsupported` and the typed reason before any lock, lease,
   budget reservation, child allocation or monitor command; the machine state,
   run ID and database are byte-identical before and after; `silo system
   info`, `silo info` and the `silod` status API already reported the
-  unsupported bit. The stopped snapshot of the same machine succeeds
+  unsupported bit. A snapshot without memory of the same machine, once stopped, succeeds
   unchanged. Exercised through the mock backend's declared vector and on a
   macOS host with VZ selected.
 - **Budgets.** Command start to agent ready, full and incremental pause,
@@ -2205,8 +2236,8 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
 
 ### Benefits
 
-- A running machine becomes a first-class checkpoint: resume where it was,
-  fork it N ways, publish it, all through the identity, retention and
+- A running machine becomes a first-class snapshot with memory: resume where it was,
+  fork it N ways, store it, all through the identity, retention and
   artifact model [ADR 0014](0014-layered-oci-image-storage.md) already defines.
 - Children share clean memory through the host page cache without a page
   server, a daemon or a privileged kernel feature, on both libkrun hosts.
@@ -2230,12 +2261,13 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   between children, not the still-running source.
 - Local publication trust removes the first-restore RAM scan but deliberately
   does not detect silent local corruption between capture and restore.
-  Operators use `silo snapshot verify IMAGE` for on-demand full authentication.
+  Operators use `silo snapshot verify REF` for on-demand full authentication.
 - Execution portability requires the same state schema and guest architecture.
   Native decoders still validate payloads and host execution prerequisites.
-  Unrunnable checkpoints stay inspectable and recoverable as disks.
+  Snapshots with memory that cannot run stay inspectable and restorable with
+  `silo restore REF --without-memory`.
 - macOS 14 hosts never gain the capability.
-- Checkpoints carry secrets and the guest's duplicated userspace state;
+- Snapshots with memory carry secrets and the guest's duplicated userspace state;
   users must treat them as credentials.
 
 ## Alternatives Considered
@@ -2315,12 +2347,12 @@ Linux `vmgenid` binds ACPI or device-tree transports. Silo's kernels run with
 ACPI disabled on both architectures, and neither transport carries an
 acknowledgement. The acknowledged virtio protocol is adopted instead.
 
-### Live snapshots on VZ
+### Snapshots with memory on VZ
 
 Apple's `saveMachineStateTo` exists on Apple silicon from macOS 14, produces a
 host-bound encrypted file, offers no memory sharing between restores and
 rejects configurations Silo attaches today (entropy and console devices were
-reported unsupported by other implementers). VZ keeps stopped snapshots; a VZ
+reported unsupported by other implementers). VZ keeps snapshots without memory; a VZ
 execution profile would be a separate ADR.
 
 ## Accepted Limitations
@@ -2338,15 +2370,17 @@ execution profile would be a separate ADR.
 ## What This Does Not Decide
 
 - Storage identity, publication, artifact format, GC and leases for
-  checkpoints: [ADR 0014](0014-layered-oci-image-storage.md).
+  snapshots: [ADR 0014](0014-layered-oci-image-storage.md).
 - Execution relocation to another host through the handoff protocol: a later
   profile under this ADR after same-host admission. Live migration with
   pre-copy or post-copy of a running machine is excluded, not deferred.
 - An application-level quiesce or pre-snapshot hook API beyond the single
   activation hook named here.
-- Checkpoint encryption at rest and key management.
+- Snapshot encryption at rest and key management.
+- Encrypted snapshot push and a policy for secrets held in memory (follow-up).
+- A disk-only snapshot of a running VM (follow-up).
 - A scheduler or fleet-level fork fan-out across hosts.
-- A VZ execution checkpoint profile.
+- A VZ profile for snapshots with memory.
 
 ## Implementation References
 

@@ -8,12 +8,11 @@ mod tests {
         let first = root.path().join("first-home");
         let second = root.path().join("second-home");
         let _layers = libvm::storage::LayerStore::open(&first).await.unwrap();
-        let _snapshots = libvm::SnapshotStore::open(&first).await.unwrap();
         let first_ledger = first.join("resource-budget");
         assert!(first_ledger.is_dir());
         // A poisoned fixture ledger cannot leak into independently opened homes.
         std::fs::write(first_ledger.join("unknown"), b"not a charge").unwrap();
-        let _other = libvm::SnapshotStore::open(&second).await.unwrap();
+        let _other = libvm::storage::LayerStore::open(&second).await.unwrap();
         let second_ledger = second.join("resource-budget");
         assert!(second_ledger.is_dir());
         assert_ne!(first_ledger, second_ledger);

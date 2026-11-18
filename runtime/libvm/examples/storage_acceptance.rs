@@ -34,8 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{report:?}");
         }
         ("remove-image", Some(reference), None) => {
-            runtime.images().remove(&reference).await?;
-            println!("removed image reference {reference}");
+            let removal = runtime.images().remove(&reference.parse()?).await?;
+            println!("removed image {reference}: {removal:?}");
         }
         ("fork-cancellable", Some(reference), Some(destination)) => {
             let machine = runtime.get_machine(&MachineRef::parse(&reference)?).await?;

@@ -259,7 +259,7 @@ def frozen_full_oracle(silo: Silo, name: str, saved: restore.Checkpoint) -> rest
     assert before["state"] == "paused" and authority is not None
     incremental_digest = overlay.digest(saved.staging / "memory.ram")
     incremental_layout = (saved.staging / "memory-layout.json").read_bytes()
-    result = json.loads(silo.run("snapshot", "create", name, "--live", "--preserve",
+    result = json.loads(silo.run("snapshot", "create", name, "--memory", "--preserve",
         "--capture-policy", "full", "--dirty-crossover-percent", "60",
         "--name", "incremental-full-oracle", "--format", "json", timeout=240).stdout)
     summary = result["capture"]
@@ -270,7 +270,7 @@ def frozen_full_oracle(silo: Silo, name: str, saved: restore.Checkpoint) -> rest
     seal = json.loads((directory / "vm.capture.json").read_bytes())
     assert seal["captureOutcome"] == "coherent" and seal["error"] is None
     assert seal["freezeOperationId"] == saved.seal["freezeOperationId"]
-    full = replace(saved, reference="image:" + result["snapshot"]["id"],
+    full = replace(saved, reference=result["snapshot"]["id"],
                    snapshot=result["snapshot"]["id"], staging=directory, seal=seal,
                    source_info=before)
     authenticated_map(silo, full, mode="full", reason="requested")

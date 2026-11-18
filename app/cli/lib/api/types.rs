@@ -13,10 +13,10 @@ pub(crate) struct SourceResolution {
 pub(crate) enum ResolvedSource {
     LocalResolvedOci(ResolvedOciImage),
     DaemonOciIdentity(OciIdentity),
-    /// Complete typed import metadata; creation never publishes an alias.
+    /// Complete typed import metadata; creation never publishes a name.
     Disk(libvm::DiskImportRequest),
-    /// A typed image or snapshot identity, never an alias that could move.
-    Managed(libvm::ManagedSourceRef),
+    /// A stored image by id, never a name that could move.
+    Stored(libvm::ImageId),
 }
 
 /// Source selection inputs that are not part of the source spelling itself.

@@ -2,10 +2,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use libvm::{
-    ImageProgressSender, ImagePullPolicy, LibVmError, MachineData, MachineExit,
-    MachineInventoryEntry, MachineKillOptions, MachineReadiness, MachineRunId, MachineStart,
-    MachineStopOptions, MachineUpdate, MachineWaitOptions, NetworkDefinition, NetworkDriver,
-    NetworkTopology,
+    ImageProgressSender, LibVmError, MachineData, MachineExit, MachineInventoryEntry,
+    MachineKillOptions, MachineReadiness, MachineRunId, MachineStart, MachineStopOptions,
+    MachineUpdate, MachineWaitOptions, NetworkDefinition, NetworkDriver, NetworkTopology,
 };
 use silo_vm_control::requests::{self, CreateSource};
 use silo_vm_control::{
@@ -17,10 +16,8 @@ use crate::api::daemon::{invalid_response, native_status, DaemonVmService};
 use crate::api::machine::AppMachine;
 use crate::api::start_options::AppStartOptions;
 use crate::api::types::{ResolvedSource, SourceOptions, SourceResolution};
-use crate::commands::create::{parse_source, validate_source_options, SourceSpelling};
 use crate::machine_defaults::ResolvedMachineNetwork;
 use crate::planning::{self, CreatePlan, PullPolicy, ResolvedImage};
-use crate::template::Template;
 
 fn reference(value: &str) -> Result<w::MachineRef, LibVmError> {
     lifecycle::reference_to_wire(&libvm::MachineRef::parse(value)?).map_err(invalid_response)
@@ -119,24 +116,19 @@ impl DaemonVmService {
         )?)
     }
 
-    pub(crate) async fn snapshot_live(
+    pub(crate) async fn snapshot(
         &self,
         value: &str,
-        options: libvm::LiveSnapshotOptions,
-    ) -> eyre::Result<libvm::LiveSnapshot> {
-        options.validate()?;
-        Ok(silo_vm_control::capture::live_snapshot_from_wire(
+        options: libvm::SnapshotOptions,
+    ) -> eyre::Result<libvm::CreatedSnapshot> {
+        let request = silo_vm_control::stopped::snapshot_request_to_wire(
+            &libvm::MachineRef::parse(value)?,
+            &options,
+        )?;
+        Ok(silo_vm_control::capture::created_snapshot_from_wire(
             self.machines
                 .clone()
-                .capture_execution(w::LiveCaptureRequest {
-                    machine: Some(reference(value)?),
-                    name: options.name,
-                    resume_policy: silo_vm_control::capture::resume_policy_to_wire(
-                        options.resume_policy,
-                    ),
-                    policy: silo_vm_control::capture::policy_to_wire(options.policy),
-                    dirty_crossover_percent: u32::from(options.dirty_crossover_percent),
-                })
+                .create_snapshot(request)
                 .await
                 .map_err(native_status)?
                 .into_inner(),
@@ -216,68 +208,17 @@ impl DaemonVmService {
         )?)
     }
 
-    pub(crate) async fn snapshot_stopped(
+    pub(crate) async fn restore(
         &self,
-        value: &str,
-        options: libvm::SnapshotOptions,
-    ) -> eyre::Result<libvm::SnapshotInfo> {
-        Ok(silo_vm_control::stopped::info_from_wire(
-            self.machines
-                .clone()
-                .snapshot_stopped(w::CreateStorageSnapshotRequest {
-                    machine: Some(reference(value)?),
-                    name: options.name,
-                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
-                        &options.external_resources,
-                    )),
-                })
-                .await
-                .map_err(native_status)?
-                .into_inner(),
-        )?)
-    }
-
-    pub(crate) async fn restore_snapshot(
-        &self,
-        reference: libvm::SnapshotRef,
+        source: libvm::RestoreSource,
         options: libvm::RestoreOptions,
     ) -> eyre::Result<MachineData> {
         Ok(snapshots::snapshot_from_wire(
             self.runtime
                 .clone()
-                .restore_snapshot(w::RestoreStorageSnapshotRequest {
-                    snapshot: Some(silo_vm_control::stopped::reference_to_wire(&reference)),
-                    name: options.name,
-                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
-                        &options.external_resources,
-                    )),
-                    activation_hook: options
-                        .activation_hook
-                        .as_ref()
-                        .map(silo_vm_control::stopped::hook_to_wire)
-                        .transpose()?,
-                })
-                .await
-                .map_err(native_status)?
-                .into_inner(),
-        )?)
-    }
-
-    pub(crate) async fn recover_checkpoint_disks(
-        &self,
-        reference: libvm::SnapshotRef,
-        options: libvm::RecoverDisksOptions,
-    ) -> eyre::Result<MachineData> {
-        Ok(snapshots::snapshot_from_wire(
-            self.runtime
-                .clone()
-                .recover_checkpoint_disks(w::RecoverCheckpointDisksRequest {
-                    snapshot: Some(silo_vm_control::stopped::reference_to_wire(&reference)),
-                    name: options.name,
-                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
-                        &options.external_resources,
-                    )),
-                })
+                .restore_snapshot(silo_vm_control::stopped::restore_request_to_wire(
+                    &source, &options,
+                )?)
                 .await
                 .map_err(native_status)?
                 .into_inner(),
@@ -325,23 +266,107 @@ impl DaemonVmService {
             .collect()
     }
 
-    pub(crate) async fn release_snapshot(&self, reference: libvm::SnapshotRef) -> eyre::Result<()> {
-        self.runtime
-            .clone()
-            .release_snapshot_retention(silo_vm_control::stopped::reference_to_wire(&reference))
-            .await
-            .map_err(native_status)?;
-        Ok(())
+    pub(crate) async fn remove_snapshot(
+        &self,
+        reference: libvm::SnapshotRef,
+    ) -> eyre::Result<libvm::SnapshotRemoval> {
+        Ok(silo_vm_control::stopped::removal_from_wire(
+            self.runtime
+                .clone()
+                .remove_snapshot(silo_vm_control::stopped::reference_to_wire(&reference))
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
     }
 
-    pub(crate) async fn remove_image_alias(&self, alias: String) -> eyre::Result<()> {
-        self.runtime
-            .clone()
-            .remove_image_alias(w::Name { name: alias })
-            .await
-            .map_err(native_status)?;
-        Ok(())
+    pub(crate) async fn list_images(&self) -> eyre::Result<Vec<libvm::ImageInfo>> {
+        Ok(images::image_list_from_wire(
+            self.runtime
+                .clone()
+                .list_images(())
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
     }
+
+    pub(crate) async fn inspect_image(
+        &self,
+        reference: &libvm::ImageRef,
+    ) -> eyre::Result<libvm::ImageInfo> {
+        Ok(images::image_info_from_wire(
+            self.runtime
+                .clone()
+                .inspect_image(images::image_ref_to_wire(reference)?)
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn remove_image(
+        &self,
+        reference: &libvm::ImageRef,
+    ) -> eyre::Result<libvm::ImageRemoval> {
+        Ok(images::image_removal_from_wire(
+            self.runtime
+                .clone()
+                .remove_image(images::image_ref_to_wire(reference)?)
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn prune_images(&self) -> eyre::Result<libvm::ImagePruneReport> {
+        Ok(images::prune_report_from_wire(
+            self.runtime
+                .clone()
+                .prune_images(())
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        ))
+    }
+
+    /// Exactly one terminal image ends the stream; progress precedes it.
+    pub(crate) async fn pull_image(
+        &self,
+        reference: &str,
+        options: libvm::ImagePullOptions,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<libvm::ImageInfo> {
+        let mut stream = self
+            .runtime
+            .clone()
+            .pull_image(images::pull_request_to_wire(reference, &options)?)
+            .await
+            .map_err(native_status)?
+            .into_inner();
+        let mut terminal = None;
+        while let Some(event) = stream.message().await.map_err(native_status)? {
+            eyre::ensure!(
+                terminal.is_none(),
+                "daemon pull stream continued after terminal image"
+            );
+            match event
+                .event
+                .ok_or_else(|| eyre::eyre!("daemon pull stream omitted event"))?
+            {
+                w::pull_image_event::Event::Progress(value) => {
+                    progress.send(images::progress_from_wire(value)?)
+                }
+                w::pull_image_event::Event::Image(value) => {
+                    terminal = Some(images::image_info_from_wire(value)?)
+                }
+            }
+        }
+        terminal.ok_or_else(|| {
+            eyre::eyre!("daemon pull stream ended without an image; inspect before retrying")
+        })
+    }
+
     pub(crate) async fn list_machines(&self) -> eyre::Result<Vec<MachineInventoryEntry>> {
         let mut stream = self
             .machines
@@ -673,35 +698,14 @@ impl DaemonVmService {
                 .into_inner(),
         )?)
     }
-    pub(crate) async fn resolve_source(
+    pub(crate) async fn resolve_oci_source(
         &self,
-        positional: Option<&str>,
-        template: &Template,
-        pull: Option<(ImagePullPolicy, PullPolicy)>,
+        reference: String,
+        (policy, plan_policy): (libvm::PullPolicy, PullPolicy),
         options: &SourceOptions,
         progress: ImageProgressSender,
+        is_positional: bool,
     ) -> eyre::Result<SourceResolution> {
-        let requested = crate::commands::create::selected_image_reference(positional, template)?;
-        let spelling = parse_source(&requested)?;
-        validate_source_options(&spelling, options, pull.is_some())?;
-        let is_positional = positional.is_some();
-        let reference = match spelling {
-            SourceSpelling::Managed(spelling) => {
-                let reference = self.managed_reference(spelling).await?;
-                let info = self.inspect_managed(&reference).await?;
-                return Ok(crate::api::local::managed_resolution(
-                    requested,
-                    &info,
-                    is_positional,
-                ));
-            }
-            SourceSpelling::Disk(path) => {
-                return crate::api::local::disk_resolution(path, options, is_positional)
-            }
-            SourceSpelling::Oci(reference) => reference,
-        };
-        let (policy, plan_policy) =
-            pull.unwrap_or((ImagePullPolicy::IfMissing, PullPolicy::IfMissing));
         let image = self
             .resolve_oci(reference, policy, options.platform.as_ref(), &progress)
             .await?;
@@ -731,7 +735,7 @@ impl DaemonVmService {
     async fn resolve_oci(
         &self,
         reference: String,
-        policy: ImagePullPolicy,
+        policy: libvm::PullPolicy,
         platform: Option<&libvm::LinuxPlatform>,
         progress: &ImageProgressSender,
     ) -> eyre::Result<images::ResolvedImage> {
@@ -783,7 +787,7 @@ impl DaemonVmService {
         let source = match source.source {
             ResolvedSource::DaemonOciIdentity(identity) => CreateSource::Oci(identity),
             ResolvedSource::Disk(request) => CreateSource::Disk(request),
-            ResolvedSource::Managed(reference) => CreateSource::Managed(reference),
+            ResolvedSource::Stored(id) => CreateSource::Stored(libvm::ImageRef::Id(id)),
             ResolvedSource::LocalResolvedOci(_) => {
                 eyre::bail!("local OCI source cannot be created through daemon management")
             }
@@ -820,84 +824,6 @@ impl DaemonVmService {
         })
     }
 
-    pub(crate) async fn managed_reference(
-        &self,
-        spelling: images::ManagedSpelling,
-    ) -> eyre::Result<libvm::ManagedSourceRef> {
-        Ok(match spelling {
-            images::ManagedSpelling::Reference(reference) => reference,
-            images::ManagedSpelling::Digest(digest) => {
-                images::managed_id_to_ref(images::managed_id_from_wire(
-                    self.runtime
-                        .clone()
-                        .resolve_managed_digest(images::managed_digest_to_wire(&digest))
-                        .await
-                        .map_err(native_status)?
-                        .into_inner(),
-                )?)
-            }
-        })
-    }
-
-    pub(crate) async fn inspect_managed(
-        &self,
-        reference: &libvm::ManagedSourceRef,
-    ) -> eyre::Result<libvm::ManagedSourceInfo> {
-        let info = images::managed_info_from_wire(
-            self.runtime
-                .clone()
-                .inspect_managed_image(images::managed_ref_to_wire(reference)?)
-                .await
-                .map_err(native_status)?
-                .into_inner(),
-        )?;
-        let answers = match (reference, &info) {
-            (libvm::ManagedSourceRef::Image(id), libvm::ManagedSourceInfo::Image(image)) => {
-                image.id == *id
-            }
-            (
-                libvm::ManagedSourceRef::Snapshot(id),
-                libvm::ManagedSourceInfo::Snapshot(snapshot),
-            ) => snapshot.id == *id,
-            (libvm::ManagedSourceRef::Alias(alias), libvm::ManagedSourceInfo::Image(image)) => {
-                image.aliases.contains(alias)
-            }
-            (
-                libvm::ManagedSourceRef::Alias(alias),
-                libvm::ManagedSourceInfo::Snapshot(snapshot),
-            ) => snapshot.aliases.contains(alias),
-            _ => false,
-        };
-        eyre::ensure!(
-            answers,
-            "daemon inspection does not answer the requested reference"
-        );
-        Ok(info)
-    }
-
-    pub(crate) async fn list_managed(&self) -> eyre::Result<Vec<libvm::ManagedSourceInfo>> {
-        Ok(images::managed_list_from_wire(
-            self.runtime
-                .clone()
-                .list_managed_images(())
-                .await
-                .map_err(native_status)?
-                .into_inner(),
-        )?)
-    }
-
-    pub(crate) async fn release_image(
-        &self,
-        reference: &libvm::ManagedSourceRef,
-    ) -> eyre::Result<()> {
-        self.runtime
-            .clone()
-            .release_image_retention(images::managed_ref_to_wire(reference)?)
-            .await
-            .map_err(native_status)?;
-        Ok(())
-    }
-
     pub(crate) async fn inspect_artifact(
         &self,
         reference: &str,
@@ -913,20 +839,6 @@ impl DaemonVmService {
             .map_err(native_status)?
             .into_inner();
         Ok(silo_vm_control::artifacts::inspection_from_wire(result)?)
-    }
-
-    pub(crate) async fn acquire_artifact(
-        &self,
-        request: libvm::ArtifactAcquireRequest,
-    ) -> eyre::Result<libvm::ArtifactAcquireReport> {
-        let result = self
-            .runtime
-            .clone()
-            .acquire_artifact(silo_vm_control::artifacts::acquire_to_wire(&request)?)
-            .await
-            .map_err(native_status)?
-            .into_inner();
-        Ok(silo_vm_control::artifacts::acquired_from_wire(result)?)
     }
 
     pub(crate) async fn publish_artifact(
@@ -948,7 +860,7 @@ impl DaemonVmService {
         &self,
         request: libvm::DiskImportRequest,
         progress: ImageProgressSender,
-    ) -> eyre::Result<libvm::ManagedImageInfo> {
+    ) -> eyre::Result<libvm::StoredImageInfo> {
         let stream = self
             .runtime
             .clone()
@@ -956,7 +868,7 @@ impl DaemonVmService {
             .await
             .map_err(native_status)?
             .into_inner();
-        managed_image_stream(stream, &progress).await
+        stored_image_stream(stream, &progress).await
     }
 
     /// Resolves the mutable spelling once, then converts exactly that selected
@@ -964,11 +876,11 @@ impl DaemonVmService {
     pub(crate) async fn convert_image(
         &self,
         reference: String,
-        pull: ImagePullPolicy,
+        pull: libvm::PullPolicy,
         platform: Option<libvm::LinuxPlatform>,
         options: libvm::RawConversionOptions,
         progress: ImageProgressSender,
-    ) -> eyre::Result<libvm::ManagedImageInfo> {
+    ) -> eyre::Result<libvm::StoredImageInfo> {
         let image = self
             .resolve_oci(reference, pull, platform.as_ref(), &progress)
             .await?;
@@ -979,7 +891,7 @@ impl DaemonVmService {
             .await
             .map_err(native_status)?
             .into_inner();
-        managed_image_stream(stream, &progress).await
+        stored_image_stream(stream, &progress).await
     }
 
     pub(crate) async fn update_boot_assets(
@@ -1001,11 +913,11 @@ impl DaemonVmService {
     }
 }
 
-/// Exactly one terminal managed image ends the stream; progress precedes it.
-async fn managed_image_stream(
-    mut stream: tonic::Streaming<w::ManagedImageEvent>,
+/// Exactly one terminal stored image ends the stream; progress precedes it.
+async fn stored_image_stream(
+    mut stream: tonic::Streaming<w::StoredImageEvent>,
     progress: &ImageProgressSender,
-) -> eyre::Result<libvm::ManagedImageInfo> {
+) -> eyre::Result<libvm::StoredImageInfo> {
     let mut terminal = None;
     while let Some(event) = stream.message().await.map_err(native_status)? {
         eyre::ensure!(
@@ -1016,15 +928,15 @@ async fn managed_image_stream(
             .event
             .ok_or_else(|| eyre::eyre!("daemon image stream omitted event"))?
         {
-            w::managed_image_event::Event::Progress(value) => {
+            w::stored_image_event::Event::Progress(value) => {
                 progress.send(images::progress_from_wire(value)?)
             }
-            w::managed_image_event::Event::Image(value) => {
-                terminal = Some(images::managed_image_from_wire(value)?)
+            w::stored_image_event::Event::Image(value) => {
+                terminal = Some(images::stored_image_from_wire(value)?)
             }
         }
     }
     terminal.ok_or_else(|| {
-        eyre::eyre!("daemon image stream ended without a managed image; inspect before retrying")
+        eyre::eyre!("daemon image stream ended without a stored image; inspect before retrying")
     })
 }

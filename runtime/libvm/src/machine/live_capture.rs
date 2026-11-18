@@ -63,10 +63,10 @@ const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Bound for reading the launched `config.json` back for the capture plan.
 const MAX_LAUNCH_SPEC_BYTES: usize = 4 << 20;
 
-/// Caller choices for a new live execution capture.
+/// Caller choices for one memory capture of a running machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSnapshotOptions {
-    /// Optional `image:` alias for the published checkpoint.
+    /// Optional local name for the published snapshot.
     pub name: Option<String>,
     /// Resume only a pause acquired by this capture. A user-paused source
     /// resolves to `preserve` and borrows the pause without ever resuming it.
@@ -144,7 +144,7 @@ pub enum SnapshotIdentityReason {
     UnknownAfterFork,
 }
 
-/// Capture identity and outcome of a published live checkpoint.
+/// Capture identity and outcome of a published snapshot with memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LiveCaptureSummary {
@@ -166,7 +166,7 @@ pub struct LiveCaptureSummary {
     pub staging: PathBuf,
 }
 
-/// A published live execution checkpoint and its capture.
+/// A published snapshot with memory and its capture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LiveSnapshot {
@@ -177,12 +177,12 @@ pub struct LiveSnapshot {
 
 impl LiveSnapshot {
     /// Naming failure is reported only after capture settlement, not as
-    /// publication uncertainty. The checkpoint remains independently retained.
+    /// publication uncertainty. The snapshot is kept without the name.
     pub fn require_requested_name(&self) -> Result<(), LibVmError> {
-        if let Some(crate::CaptureNamingOutcome::AliasConflict { alias }) = &self.naming_outcome {
-            return Err(LibVmError::CaptureAliasConflict {
-                alias: alias.clone(),
-                checkpoint: self.snapshot.id,
+        if let Some(crate::CaptureNamingOutcome::NameConflict { name }) = &self.naming_outcome {
+            return Err(LibVmError::CaptureNameConflict {
+                name: name.clone(),
+                snapshot: self.snapshot.id,
             });
         }
         Ok(())
@@ -197,7 +197,7 @@ pub enum MachineCaptureStage {
     /// Reserved and submitted; no coherent record has been verified yet.
     Reserved,
     Sealed,
-    /// The checkpoint is published; continuation or release is outstanding.
+    /// The snapshot is published; continuation or release is outstanding.
     Published,
 }
 
@@ -298,10 +298,10 @@ pub(crate) fn admission(
 }
 
 impl Machine {
-    /// Capture this exact running or user-paused run, publish the sealed
-    /// checkpoint through the snapshot store, settle the source continuation
-    /// and release the monitor's result ownership.
-    pub async fn snapshot_live(
+    /// Capture this exact running or user-paused run with its memory, publish
+    /// the sealed snapshot through the snapshot store, settle the source
+    /// continuation and release the monitor's result ownership.
+    pub(crate) async fn snapshot_memory(
         &self,
         observation: &MachineLiveObservation,
         options: LiveSnapshotOptions,
@@ -360,7 +360,7 @@ impl Machine {
             if command.plan.resume_policy != resume_policy
                 || command.plan.policy != options.policy
                 || command.plan.dirty_crossover_percent != options.dirty_crossover_percent
-                || reservation.is_none_or(|record| record.alias != options.name)
+                || reservation.is_none_or(|record| record.name != options.name)
             {
                 return conflict(observation);
             }
@@ -401,7 +401,7 @@ impl Machine {
                     run_id: run,
                     capture_id: request_id,
                     configuration,
-                    alias: options.name.clone(),
+                    name: options.name.clone(),
                     policy: options.policy,
                     dirty_crossover_percent: options.dirty_crossover_percent,
                     resume_policy: options.resume_policy,
@@ -1306,7 +1306,7 @@ pub(crate) async fn advance(
         CaptureState::ReleasedLocal { .. } => return Ok(CaptureProgress::Local),
         CaptureState::Released { snapshot: None } | CaptureState::Abandoned => {
             return Ok(CaptureProgress::Abandoned(
-                "capture produced no admissible checkpoint".into(),
+                "capture produced no admissible snapshot".into(),
             ))
         }
         CaptureState::Reserved
@@ -1579,7 +1579,7 @@ pub(crate) async fn advance(
             snapshot: Some(snapshot),
         } => finished(runtime, &snapshots, &record, snapshot).await,
         CaptureState::ReleasedLocal { .. } => Ok(CaptureProgress::Local),
-        _ => Err(protocol("released capture lost its published checkpoint")),
+        _ => Err(protocol("released capture lost its published snapshot")),
     }
 }
 
@@ -1804,10 +1804,10 @@ pub(crate) async fn reconcile_captures(
                 tracing::debug!(capture = %record.capture_id, stage, "capture remains owned by its run");
             }
             Ok(CaptureProgress::Finished(snapshot)) => {
-                if let Some(crate::CaptureNamingOutcome::AliasConflict { alias }) =
+                if let Some(crate::CaptureNamingOutcome::NameConflict { name }) =
                     &snapshot.naming_outcome
                 {
-                    tracing::info!(capture = %record.capture_id, snapshot = %snapshot.snapshot.id, alias, "reconciled live capture retained without conflicting alias");
+                    tracing::info!(capture = %record.capture_id, snapshot = %snapshot.snapshot.id, name, "reconciled live capture kept without its conflicting name");
                 } else {
                     tracing::info!(capture = %record.capture_id, snapshot = %snapshot.snapshot.id, "reconciled live capture");
                 }
@@ -1861,7 +1861,7 @@ async fn retain_or_publish(
         .publish_capture(
             record.capture_id,
             &staging_absolute(runtime, record),
-            record.alias.clone(),
+            record.name.clone(),
             lock_policy,
         )
         .await?;
@@ -2041,7 +2041,7 @@ mod tests {
     #[test]
     fn named_snapshot_uses_the_same_capture_contract() {
         let mut options = crate::LiveSnapshotOptions {
-            name: Some("checkpoint".into()),
+            name: Some("saved".into()),
             ..Default::default()
         };
         options.validate().unwrap();

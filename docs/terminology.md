@@ -84,10 +84,9 @@ The guest OS believes it is running on real hardware, even though a VMM and host
 
 In user-facing Silo documentation, use "VM" when referring to an instance created, started, stopped, or deleted by Silo.
 
-For `silo create` and `silo run`, the positional operand is an image source. A
-bare value is an OCI reference; `disk:PATH` selects an existing local disk.
-Templates are selected separately with `--template` and can supply the image
-when no positional source is given.
+For `silo create` and `silo run`, the positional operand is an image source.
+`disk:PATH` selects an existing local disk. Templates are selected separately
+with `--template` and can supply the image when no positional source is given.
 
 Examples:
 
@@ -95,6 +94,48 @@ Examples:
 - `silo create --template rust-dev --name dev`
 - `silo start dev`
 - `silo stop dev`
+
+## Images and Snapshots
+
+Images and snapshots are separate concepts with separate commands. They share
+one storage pool.
+
+| Term | Meaning |
+|---|---|
+| Image | A template for new machines: root disk, boot profile and default process. Hardware and config are chosen at `create`. Kinds: cached OCI image (layered EROFS lower) and stored raw image (import, convert, pulled image artifact). Managed with `silo image`. |
+| Snapshot | A saved machine: disks plus full machine configuration. `silo restore` gives back that machine. Managed with `silo snapshot`. |
+| Snapshot memory | `none`: restore gives a stopped VM that boots normally. `included`: also RAM, CPU and device state; restore resumes a running VM. Set with `silo snapshot create --memory`. |
+| Name | A tag pointing to exactly one image or one snapshot. A record has zero or more names. Images and snapshots have separate name tables, so an image `hello` and a snapshot `hello` can coexist. |
+| Id | Content identity `sha256:HEX`. Can be abbreviated to a unique hex prefix of at least 3 characters. |
+
+Use "snapshot" for the saved machine whether or not it includes memory. Do not
+use "checkpoint", "live snapshot" or "stopped snapshot" as names. In
+`silo fork --live`, "live" describes the operation.
+
+### Short and Full References
+
+A local name cannot contain `:` or `/`. A reference containing either is always
+a registry reference: `hello:v2`, `nixos/nix` and `ghcr.io/org/app:1` are
+remote. A full reference names the registry, for example
+`docker.io/library/alpine:3.21`. A short reference such as `alpine:3.21` is
+expanded through each entry of `search_registries` (default `docker.io`).
+
+`create` and `run` expect an image; `restore` expects a snapshot. Each resolves
+in this order:
+
+1. Exact local name of the expected kind.
+2. Each `search_registries` expansion, in order, already stored locally.
+3. Pull, following `--pull always|missing|never` (default `missing`).
+4. Unique id prefix of the expected kind.
+
+A local name shadows a registry short name. When a name exists only as the
+other kind, the error names the right command. There is no `image:` prefix.
+
+Pulling `REF` adds the name `REF`. When `--pull always` moves a tag, the name
+moves to the new record and the old record stays listed by id. `rm NAME`
+removes the name, and the record goes with its last name; `rm ID` removes the
+record and all its names; `silo image prune` removes images with no names that
+no machine uses. Removing a record never breaks a machine.
 
 ## Hypervisor
 

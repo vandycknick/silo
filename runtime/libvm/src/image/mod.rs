@@ -11,6 +11,7 @@ pub(crate) mod oci;
 pub(crate) mod progress;
 pub(crate) mod transport;
 
+use crate::image::import_types::{ImageInfo, ImageRef, ImageRemoval};
 use crate::runtime::Runtime;
 use crate::LibVmError;
 
@@ -19,15 +20,18 @@ pub use ::oci::Platform;
 pub use ::oci::{RegistryAction, RegistryPolicy, RegistryRule};
 pub use progress::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
 
-/// Source used to create a machine root disk.
+/// Source used to create a machine root disk. Images only: a snapshot is
+/// restored with `Runtime::restore`, never created from.
 ///
 /// `ImageSource` describes user intent, not the final disk that the virtual
 /// machine boots. `MachineBuilder::create` materializes this source immediately
 /// into a machine-local root disk. Later `Machine::start` calls only boot that
 /// already-created disk and never pull or re-resolve images.
 ///
-/// Strings passed to `MachineBuilder::image` are always OCI references. Local
-/// paths are intentionally explicit:
+/// Strings passed to `MachineBuilder::image` resolve like `silo create`: a
+/// local image name, a cached reference, a unique id prefix, then a pull
+/// (short references expand via `search_registries`; a Silo image artifact
+/// becomes a stored image). Local paths are intentionally explicit:
 ///
 /// ```rust,no_run
 /// use libvm::{ImageSource, Runtime};
@@ -45,16 +49,17 @@ pub use progress::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageSource {
-    /// Pull and materialize an OCI image reference.
+    /// Resolve a reference: local name, cached or pullable OCI reference,
+    /// Silo image artifact or unique id prefix.
     Oci(String),
     /// Import a quiesced caller-owned disk with explicit boot metadata.
     Disk(import_types::DiskImportRequest),
-    /// Acquire an immutable managed image or complete snapshot.
-    Managed(import_types::ManagedSourceRef),
+    /// Use an existing local image (stored or cached OCI) without pulling.
+    Stored(import_types::ImageRef),
 }
 
 impl ImageSource {
-    /// Creates an OCI image source.
+    /// Creates a reference image source.
     pub fn oci(reference: impl Into<String>) -> Self {
         Self::Oci(reference.into())
     }
@@ -75,7 +80,7 @@ impl ImageSource {
                 root: import_types::ImportRootSelection::WholeDisk,
                 assets: import_types::BootAssetSelection::Packaged,
             },
-            alias: None,
+            name: None,
         })
     }
 }
@@ -84,12 +89,12 @@ impl ImageSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageSourceKind {
-    /// The machine was created from an OCI image reference.
+    /// The machine was created from a cached OCI image.
     Oci,
     /// The machine was created from a caller-owned local disk image.
     Disk,
-    /// The machine was created from an immutable managed image.
-    Managed,
+    /// The machine was created from a stored raw image.
+    Stored,
 }
 
 impl ImageSourceKind {
@@ -97,7 +102,7 @@ impl ImageSourceKind {
         match self {
             Self::Oci => "oci",
             Self::Disk => "disk",
-            Self::Managed => "managed",
+            Self::Stored => "stored",
         }
     }
 }
@@ -130,15 +135,15 @@ impl ImageBuilder {
     }
 }
 
-/// Policy used when libvm materializes an OCI image.
+/// When `create`, `run`, `restore` and `image pull` contact a registry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ImagePullPolicy {
-    /// Use a locally cached image when present, otherwise pull it.
+pub enum PullPolicy {
+    /// Use a local record when present, otherwise pull it.
     #[default]
     IfMissing,
-    /// Resolve the reference and refresh the cache before use.
+    /// Resolve the reference again and pull; a moved tag moves its name.
     Always,
-    /// Require an already-cached image and fail without network access.
+    /// Use local records only and fail without network access.
     Never,
 }
 
@@ -146,14 +151,14 @@ pub enum ImagePullPolicy {
 #[derive(Debug, Clone, Default)]
 pub struct ImagePullOptions {
     /// Optional policy override for this operation.
-    pub policy: Option<ImagePullPolicy>,
+    pub policy: Option<PullPolicy>,
 }
 
 /// Options for read-only `Runtime::images().resolve_with` calls.
 #[derive(Debug, Clone, Default)]
 pub struct ImageResolveOptions {
     /// Optional policy override for this operation.
-    pub policy: Option<ImagePullPolicy>,
+    pub policy: Option<PullPolicy>,
     /// Requested Linux userspace platform; absence selects the host platform.
     pub platform: Option<crate::LinuxPlatform>,
 }
@@ -198,60 +203,18 @@ pub(crate) enum ResolvedOciImageMaterialization {
     Registry(Box<::oci::ResolvedImage>),
 }
 
-/// Options for removing image references.
-#[derive(Debug, Clone, Default)]
-pub struct ImageRemoveOptions {
-    /// Reserved override for records with actual shared storage dependencies.
-    pub force: bool,
-}
-
-/// Lightweight image row returned by list and get operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ImageHandle {
-    /// OCI reference requested by the caller, for example `ubuntu:24.04`.
-    pub requested_reference: String,
-    /// Digest-pinned OCI reference selected for the host platform.
-    pub selected_reference: String,
-    /// Immutable OCI manifest digest selected for this reference.
-    pub selected_manifest_digest: String,
-    /// Digest of the OCI image configuration document.
-    pub config_digest: String,
-    /// Immutable image ID for the resolved artifact.
-    pub image_id: String,
-    /// Platform operating system.
-    pub platform_os: String,
-    /// Platform CPU architecture.
-    pub platform_architecture: String,
-    /// Optional platform variant.
-    pub platform_variant: Option<String>,
-    /// Size of the materialized rootfs artifact in bytes when known.
-    pub size_bytes: Option<u64>,
-    /// Unix timestamp for when the reference was first recorded.
-    pub created_at: i64,
-    /// Unix timestamp for when the reference last changed.
-    pub updated_at: i64,
-    /// Unix timestamp for the last use, when known.
-    pub last_used_at: Option<i64>,
-}
-
-/// Full image details returned by inspect operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ImageDetail {
-    /// Basic image reference metadata.
-    pub handle: ImageHandle,
-    /// OCI image configuration metadata. Optional collection fields preserve the
-    /// distinction between an absent field and an explicitly empty value.
-    /// `StopSignal` is inspection-only; it does not alter `Machine::stop`.
-    pub config: OciImageConfigMetadata,
-    /// Ordered OCI layers.
-    pub layers: Vec<ImageLayerDetail>,
+/// A create/pull reference resolved to a source of known family.
+pub(crate) enum ResolvedImageReference {
+    Oci(Box<ResolvedOciImage>),
+    /// A stored image, by the name it matched (or its id) and its id.
+    Stored {
+        reference: import_types::ImageRef,
+        id: crate::ImageId,
+    },
 }
 
 /// One OCI layer belonging to an image manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ImageLayerDetail {
     /// Digest of the compressed registry blob.
     pub blob_digest: String,
@@ -267,14 +230,11 @@ pub struct ImageLayerDetail {
     pub position: i64,
 }
 
-/// Result of pruning unreferenced image records and artifacts.
+/// Result of pruning unnamed, unused images and unreferenced bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ImagePruneReport {
-    /// Number of image references removed.
-    pub references_removed: u64,
-    /// Number of retained image composition records removed.
-    pub artifacts_removed: u64,
+    /// Number of image records removed (cached OCI and stored).
+    pub images_removed: u64,
     /// Number of bytes removed from disk when known.
     pub bytes_removed: u64,
 }
@@ -294,84 +254,58 @@ impl Images {
         Self { runtime }
     }
 
-    fn managed_store(
-        &self,
-    ) -> Result<crate::store::managed_image_store::ManagedImageStore, LibVmError> {
-        Ok(
-            crate::store::managed_image_store::ManagedImageStore::from_store(std::sync::Arc::new(
-                self.runtime.native_store()?,
-            )),
-        )
+    fn store(&self) -> Result<std::sync::Arc<crate::store::Store>, LibVmError> {
+        Ok(std::sync::Arc::new(self.runtime.native_store()?))
     }
 
-    /// Resolves an untyped digest without preferring images over snapshots.
-    pub async fn resolve_managed_digest(
-        &self,
-        digest: &crate::ObjectDigest,
-    ) -> Result<crate::ManagedSourceId, LibVmError> {
-        self.managed_store()?.resolve_digest(*digest).await
-    }
-
-    /// Inspects canonical managed metadata without changing retention.
-    pub async fn inspect_managed(
-        &self,
-        source: &crate::ManagedSourceRef,
-    ) -> Result<crate::ManagedSourceInfo, LibVmError> {
-        self.managed_store()?.inspect(source).await
-    }
-
-    /// Lists retained managed image and snapshot metadata.
-    pub async fn list_managed(&self) -> Result<Vec<crate::ManagedSourceInfo>, LibVmError> {
-        self.managed_store()?.list().await
-    }
-
-    /// Names an existing managed source in the shared alias namespace.
-    pub async fn add_alias(
-        &self,
-        source: &crate::ManagedSourceRef,
-        alias: &str,
-    ) -> Result<crate::ManagedSourceInfo, LibVmError> {
-        self.managed_store()?.add_alias(source, alias).await
-    }
-
-    /// Removes an alias without releasing its target's independent retention.
-    pub async fn remove_alias(&self, alias: &str) -> Result<bool, LibVmError> {
-        self.managed_store()?.remove_alias(alias).await
-    }
-
-    /// Releases explicit retention; other aliases, machines and consumers remain roots.
-    pub async fn release_retention(
-        &self,
-        source: &crate::ManagedSourceRef,
-    ) -> Result<bool, LibVmError> {
-        self.managed_store()?.release_retention(source).await
-    }
-
-    /// Pulls or reuses an OCI image reference according to the runtime policy.
-    pub async fn pull(&self, reference: impl Into<String>) -> Result<ImageHandle, LibVmError> {
+    /// Pulls or reuses an image reference according to the runtime policy.
+    /// See [`Images::pull_with`].
+    pub async fn pull(&self, reference: impl Into<String>) -> Result<ImageInfo, LibVmError> {
         self.pull_with(reference, ImagePullOptions::default()).await
     }
 
-    /// Pulls or reuses an OCI image reference with an operation-specific policy.
+    /// Pulls or reuses an image reference. A local name or a locally stored
+    /// expansion is reused unless the policy is `Always`. A registry OCI
+    /// container image is cached as layers; a Silo image artifact becomes a
+    /// stored image; a Silo snapshot artifact is refused before any payload
+    /// is fetched (`ArtifactIsSnapshot`). The pulled record gets the canonical
+    /// reference as a name, moved from any previous record.
     pub async fn pull_with(
         &self,
         reference: impl Into<String>,
         options: ImagePullOptions,
-    ) -> Result<ImageHandle, LibVmError> {
+    ) -> Result<ImageInfo, LibVmError> {
         let reference = reference.into();
-        let runtime = match options.policy {
-            Some(policy) => self.runtime.clone().with_image_pull_policy(policy),
-            None => self.runtime.clone(),
-        };
-        let image = runtime
-            .materialize_image(&ImageSource::oci(reference.clone()))
-            .await?;
-        runtime
-            .image_handle(&image.requested_reference)
+        let pull = options.policy.unwrap_or(self.runtime.image_pull_policy());
+        let image = match self
+            .runtime
+            .resolve_image_reference(&reference, None, pull)
             .await?
-            .ok_or(LibVmError::ImageNotFound {
-                reference: image.requested_reference,
-            })
+        {
+            ResolvedImageReference::Stored { id, .. } => {
+                crate::store::image_store::LocalImage::Stored(id)
+            }
+            ResolvedImageReference::Oci(resolved) => {
+                let image = self
+                    .runtime
+                    .materialize_resolved_oci_image(&resolved)
+                    .await?;
+                let id = image
+                    .image_id
+                    .as_deref()
+                    .ok_or_else(|| {
+                        crate::machine::root_storage::invalid("pulled OCI image has no id")
+                    })?
+                    .parse()
+                    .map_err(|error: crate::storage::identity::IdentityError| {
+                        crate::machine::root_storage::invalid(error.to_string())
+                    })?;
+                crate::store::image_store::LocalImage::Oci(id)
+            }
+        };
+        let store = self.store()?;
+        let mut connection = store.pool.acquire().await?;
+        crate::store::image_store::image_info(&mut connection, image, &reference).await
     }
 
     /// Resolves an OCI reference according to the runtime pull policy without
@@ -397,39 +331,60 @@ impl Images {
             .await
     }
 
-    /// Returns a cached image reference without pulling.
-    pub async fn get(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError> {
-        self.runtime.image_handle(reference).await
+    /// Lists every local image: cached OCI images, then stored images.
+    pub async fn list(&self) -> Result<Vec<ImageInfo>, LibVmError> {
+        let store = self.store()?;
+        let mut images = {
+            let mut connection = store.pool.acquire().await?;
+            crate::store::image_store::list_oci_images(&mut connection)
+                .await?
+                .into_iter()
+                .map(|info| ImageInfo::Oci(Box::new(info)))
+                .collect::<Vec<_>>()
+        };
+        images.extend(
+            crate::store::stored_image_store::StoredImageStore::from_store(store)
+                .list()
+                .await?
+                .into_iter()
+                .map(|info| ImageInfo::Stored(Box::new(info))),
+        );
+        Ok(images)
     }
 
-    /// Lists known image references.
-    pub async fn list(&self) -> Result<Vec<ImageHandle>, LibVmError> {
-        self.runtime.list_image_handles().await
+    /// Inspects one local image by name, registry reference (expanded via
+    /// `search_registries`), id or unique id prefix. Never pulls.
+    pub async fn inspect(&self, reference: &ImageRef) -> Result<ImageInfo, LibVmError> {
+        let local = self.runtime.resolve_local_image(reference).await?;
+        let crate::resolve::LocalRecord::Image(image) = local.record else {
+            return Err(LibVmError::SnapshotIsNotAnImage {
+                reference: reference.to_string(),
+            });
+        };
+        let store = self.store()?;
+        let mut connection = store.pool.acquire().await?;
+        crate::store::image_store::image_info(&mut connection, image, &reference.to_string()).await
     }
 
-    /// Returns image details for a cached reference.
-    pub async fn inspect(&self, reference: &str) -> Result<Option<ImageDetail>, LibVmError> {
-        self.runtime.image_detail(reference).await
-    }
-
-    /// Removes an image reference; independent private machine roots are unaffected.
-    pub async fn remove(&self, reference: &str) -> Result<(), LibVmError> {
-        self.remove_with(reference, ImageRemoveOptions::default())
+    /// Docker tag semantics: a name removes that name, and the image once no
+    /// name remains; an id (or unique prefix) removes the image and all its
+    /// names. Machines created from it are unaffected.
+    pub async fn remove(&self, reference: &ImageRef) -> Result<ImageRemoval, LibVmError> {
+        let local = self.runtime.resolve_local_image(reference).await?;
+        let crate::resolve::LocalRecord::Image(image) = local.record else {
+            return Err(LibVmError::SnapshotIsNotAnImage {
+                reference: reference.to_string(),
+            });
+        };
+        self.store()?
+            .remove_image(image, local.name.as_deref())
             .await
     }
 
-    /// Removes an image reference with explicit options.
-    pub async fn remove_with(
-        &self,
-        reference: &str,
-        options: ImageRemoveOptions,
-    ) -> Result<(), LibVmError> {
-        self.runtime.remove_image(reference, options).await
-    }
-
-    /// Prunes unreferenced image metadata and bytes not retained by active operations.
+    /// Removes unnamed images no machine or operation uses, then collects
+    /// bytes no longer referenced.
     pub async fn prune(&self) -> Result<ImagePruneReport, LibVmError> {
-        self.runtime.prune_images().await
+        crate::store::ImageStore::prune_images(self.store()?.as_ref()).await
     }
 }
 
@@ -453,6 +408,6 @@ pub(crate) struct MaterializedImage {
     pub(crate) manifest_digest: Option<String>,
     pub(crate) config_digest: Option<String>,
     pub(crate) platform: Platform,
-    pub(crate) managed: Option<crate::store::managed_image_store::ManagedImageConsumer>,
+    pub(crate) managed: Option<crate::store::stored_image_store::StoredImageConsumer>,
     pub(crate) _lease: Option<crate::storage::locks::StorageLock>,
 }

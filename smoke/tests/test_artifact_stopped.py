@@ -1,8 +1,10 @@
-"""Real CLI/Distribution gates for portable raw images and stopped checkpoints.
+"""Real CLI/Distribution gates for portable raw image artifacts.
 
 All producer and consumer Homes are private. Registry oracles inspect actual OCI
 edges and bytes; local catalog observations are independent read-only queries.
 No hosted registry, fake server or guest-executing Cargo test is involved.
+Snapshot push is not reachable from the CLI, so the only snapshot artifact here
+is a real image artifact relabelled as snapshot content to prove refusal.
 """
 from __future__ import annotations
 
@@ -14,11 +16,11 @@ from pathlib import Path
 import pytest
 
 from silo_smoke import cloud_disk, images, overlay, procs, shutdown, stopped
-from silo_smoke.cli import ROOT_PROFILES, TIMINGS_PROPERTY, RootProfile, Silo, release
+from silo_smoke.cli import TIMINGS_PROPERTY, Silo, release
 from silo_smoke.config import SmokeConfig
 from silo_smoke.daemon import Daemon
 from silo_smoke.distribution_registry import (
-    OCI_INDEX, OCI_MANIFEST, DistributionRegistry, install_distribution,
+    OCI_INDEX, OCI_MANIFEST, DistributionRegistry, digest_of, install_distribution,
 )
 from silo_smoke.workspace import Workspace
 from silo_smoke.cloud_disk import Roots
@@ -30,6 +32,7 @@ pytestmark = pytest.mark.linux_only
 RAW_CHUNK = "application/vnd.silo.vm.chunk.v1"
 ZSTD_CHUNK = RAW_CHUNK + "+zstd"
 RECORD = "application/vnd.silo.vm.record.v2+json"
+REPOSITORY = "portable/vm"
 
 
 @pytest.fixture
@@ -139,25 +142,21 @@ def _graph(registry: DistributionRegistry, repository: str, index_digest: str) -
     return Graph(index_digest, config, payloads, frozenset(reachable))
 
 
-def _push_encodings(source: Silo, registry: DistributionRegistry, reference: str, *, checkpoint: bool) -> tuple[Graph, Graph]:
-    repository = "portable/vm"
-    graphs = []
+def _push(source: Silo, registry: DistributionRegistry, reference: str, encoding: str) -> Graph:
     source_id = cloud_disk.inspect(source, reference)["info"]["id"]
-    for encoding in ("zstd", "raw"):
-        destination = registry.reference(repository, encoding)
-        report = _json(source, "image", "push", reference, destination,
-                       *(["--raw"] if encoding == "raw" else []),
-                       *(["--acknowledge-checkpoint"] if checkpoint else []))
-        assert report["repository"] == f"{registry.address}/{repository}"
-        assert report["source"] == {"kind": "snapshot" if checkpoint else "image", "id": source_id}
-        assert report["purpose"] == ("checkpoint" if checkpoint else "image")
-        assert report["captureKind"] == ("stopped-storage" if checkpoint else None)
-        assert report["tag"] == encoding
-        graph = _graph(registry, repository, report["indexDigest"])
-        assert registry.client().manifest(repository, encoding).digest == graph.index
-        assert graph.config["purpose"] == report["purpose"]
-        graphs.append(graph)
-    compressed, raw = graphs
+    report = _json(source, "image", "push", reference, registry.reference(REPOSITORY, encoding),
+                   *(["--raw"] if encoding == "raw" else []))
+    assert report["repository"] == f"{registry.address}/{REPOSITORY}"
+    assert report["content"] == {"kind": "image", "id": source_id}
+    assert report["tag"] == encoding
+    graph = _graph(registry, REPOSITORY, report["indexDigest"])
+    assert registry.client().manifest(REPOSITORY, encoding).digest == graph.index
+    assert graph.config["content"]["kind"] == "image" and graph.config["content"]["id"] == source_id
+    return graph
+
+
+def _push_encodings(source: Silo, registry: DistributionRegistry, reference: str) -> tuple[Graph, Graph]:
+    compressed, raw = (_push(source, registry, reference, encoding) for encoding in ("zstd", "raw"))
     assert compressed.index != raw.index, "compressible ext4/boot bytes must exercise distinct encodings"
     assert compressed.config["content"] == raw.config["content"], "encoding must not salt canonical identity"
     assert any(item["mediaType"] == ZSTD_CHUNK for item in compressed.descriptors.values())
@@ -186,52 +185,34 @@ def _gc_source(registry: DistributionRegistry, source_digest: str, graphs: tuple
     assert client.manifest("source/container", "original") is None
     assert client.manifest("source/container", source_digest) is None
     for graph in graphs:
-        assert _graph(registry, "portable/vm", graph.index) == graph
+        assert _graph(registry, REPOSITORY, graph.index) == graph
 
 
-def _inspect_and_refuse(consumer: Silo, registry: DistributionRegistry, graph: Graph, *, checkpoint: bool,
-                        root_family: str = "opaque-raw") -> None:
-    reference = registry.reference("portable/vm", "zstd")
+def _inspect(consumer: Silo, registry: DistributionRegistry, graph: Graph) -> None:
+    reference = registry.reference(REPOSITORY, "zstd")
     before = (stopped.catalog(consumer), stopped.inventory(consumer.ws.silo_home), stopped.inventory(consumer.ws.run_root))
     inspected = _json(consumer, "image", "inspect-remote", reference)
-    assert inspected["indexDigest"] == graph.index and inspected["rootFamily"] == root_family
-    assert inspected["purpose"] == ("checkpoint" if checkpoint else "image")
-    assert inspected["captureKind"] == ("stopped-storage" if checkpoint else None)
-    assert inspected["liveRestore"] is False
+    assert inspected["indexDigest"] == graph.index and inspected["root"] == "opaque-raw"
+    assert inspected["content"] == {"kind": "image", "id": graph.config["content"]["id"]}
+    assert inspected["memory"] is False
     assert before == (stopped.catalog(consumer), stopped.inventory(consumer.ws.silo_home), stopped.inventory(consumer.ws.run_root))
     assert consumer.ls() == [], "inspection must never create or boot imported code"
-    wrong = "sha256:" + ("0" if graph.index[7] != "0" else "1") * 64
-    refusals = cloud_disk.EarlyRefusals(consumer)
-    for flags in (
-        ("--approve-digest", wrong),
-        ("--require-signature",),
-        (),
-    ):
-        refusals.refuse("image", "pull", reference, *flags, "--name", "untrusted")
-    refusals.refuse("create", reference, "--name", "not-a-container", "--network", "none")
-    assert consumer.ls() == []
 
 
-def _pull_both(consumer: Silo, registry: DistributionRegistry, graphs: tuple[Graph, Graph], expected: dict, *, checkpoint: bool) -> str:
+def _pull_both(consumer: Silo, registry: DistributionRegistry, graphs: tuple[Graph, Graph], expected: dict) -> str:
+    references = []
     for encoding, graph in zip(("zstd", "raw"), graphs):
-        report = _json(consumer, "image", "pull", registry.reference("portable/vm", encoding),
-                       "--approve-digest", graph.index, "--name", f"acquired-{encoding}")
-        assert report["indexDigest"] == graph.index
-        assert report["publisher"] == "unauthenticated", "digest consent is not publisher authentication"
-        assert report["source"]["kind"] == ("snapshot" if checkpoint else "image")
-        info = report["source"]["info"]
+        reference = registry.reference(REPOSITORY, encoding)
+        pulled = _json(consumer, "image", "pull", reference)
+        assert pulled["kind"] == "stored", pulled
+        info = pulled["info"]
         assert info["id"] == expected["id"] and info["recordDigest"] == expected["recordDigest"]
-        assert info["retained"] is True
-        if not checkpoint:
-            assert info["record"] == expected["record"]
-    immutable = "image:" + expected["id"]
-    info = cloud_disk.inspect(consumer, immutable)["info"]
-    assert set(info["aliases"]) == {"acquired-zstd", "acquired-raw"}
-    for encoding in ("zstd", "raw"):
-        consumer.run("image", "remove", f"image:acquired-{encoding}")
-    assert cloud_disk.inspect(consumer, immutable)["info"]["retained"] is True
-    assert cloud_disk.inspect(consumer, immutable)["info"]["aliases"] == []
-    return immutable
+        assert info["record"] == expected["record"]
+        assert reference in info["names"], info
+        references.append(reference)
+    # Each pulled reference names the one record both encodings carry.
+    assert set(cloud_disk.inspect(consumer, expected["id"])["info"]["names"]) == set(references)
+    return str(expected["id"])
 
 
 def _chunk_only(consumer: Silo, stream_ids: list[str]) -> None:
@@ -243,19 +224,57 @@ def _chunk_only(consumer: Silo, stream_ids: list[str]) -> None:
         assert procs.query(consumer.ws.state_db(), f"SELECT root_digest FROM stream_representation WHERE stream_id='{stream_id}'")
 
 
+def _payload_blobs(graph: Graph) -> frozenset[str]:
+    """Bulk payloads that verifying the metadata graph never needs: chunks and the content record."""
+    chunks = {digest for digest, item in graph.descriptors.items() if item["mediaType"] in {RAW_CHUNK, ZSTD_CHUNK}}
+    assert chunks
+    return frozenset({*chunks, graph.config["content"]["record"]["digest"]})
+
+
+def _fetched(log: str, digests: frozenset[str]) -> list[str]:
+    return sorted(digest for digest in digests if f"/blobs/{digest}" in log)
+
+
+def _as_snapshot_artifact(registry: DistributionRegistry, graph: Graph, tag: str) -> str:
+    """Relabel a real image artifact as snapshot content under a new tag.
+
+    Only the config and the metadata manifest change. Every payload manifest
+    and blob is the image's own, so the graph verifies and only the content
+    kind differs; the record and chunks are never consistent with that kind.
+    """
+    client = registry.client()
+    fetched_index = client.manifest(REPOSITORY, graph.index)
+    assert fetched_index is not None
+    index = json.loads(fetched_index.body)
+    fetched_metadata = client.manifest(REPOSITORY, index["manifests"][0]["digest"])
+    assert fetched_metadata is not None
+    metadata = json.loads(fetched_metadata.body)
+    config = {**graph.config, "content": {**graph.config["content"], "kind": "snapshot"},
+              "purpose": "checkpoint", "captureKind": "stopped-storage"}
+    config_bytes = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+    metadata["config"] = {**metadata["config"], "digest": client.push_blob(REPOSITORY, config_bytes),
+                          "size": len(config_bytes)}
+    metadata_bytes = json.dumps(metadata, separators=(",", ":")).encode()
+    metadata_digest = client.push_manifest(REPOSITORY, digest_of(metadata_bytes), metadata_bytes, OCI_MANIFEST)
+    index["manifests"][0] = {**index["manifests"][0], "digest": metadata_digest, "size": len(metadata_bytes)}
+    index_bytes = json.dumps(index, separators=(",", ":")).encode()
+    client.push_manifest(REPOSITORY, tag, index_bytes, OCI_INDEX)
+    return registry.reference(REPOSITORY, tag)
+
+
 @pytest.mark.parametrize("daemon_mode", [False, pytest.param(True, marks=pytest.mark.daemon)], ids=["local", "daemon"])
-def test_raw_artifact_same_identity_trust_and_offline_reconstruction(stopped_silo: Silo, artifact_destination: Silo,
-                                                                    artifact_registry: DistributionRegistry,
-                                                                    cloud_roots: Roots, daemon_mode: bool) -> None:
+def test_raw_artifact_same_identity_and_offline_reconstruction(stopped_silo: Silo, artifact_destination: Silo,
+                                                               artifact_registry: DistributionRegistry,
+                                                               cloud_roots: Roots, daemon_mode: bool) -> None:
     source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
     disk = cloud_disk.sparse_clone(cloud_roots.root, source.ws.root / "input.raw")
     expected_sha = overlay.digest(disk)
     _start_daemon(source, daemon_mode)
     imported = cloud_disk.import_disk(source, disk, root="whole-disk", name="raw-source")
-    graphs = _push_encodings(source, registry, "image:raw-source", checkpoint=False)
+    graphs = _push_encodings(source, registry, "raw-source")
     _start_daemon(consumer, daemon_mode)
-    _inspect_and_refuse(consumer, registry, graphs[0], checkpoint=False)
-    immutable = _pull_both(consumer, registry, graphs, imported, checkpoint=False)
+    _inspect(consumer, registry, graphs[0])
+    immutable = _pull_both(consumer, registry, graphs, imported)
     registry.stop()
     _chunk_only(consumer, [imported["record"]["root"]["stream"]["stream"]])
     consumer.create("raw-child", immutable, "--cpus", "1", "--memory", "512mib", "--network", "none", "--vsock")
@@ -263,7 +282,8 @@ def test_raw_artifact_same_identity_trust_and_offline_reconstruction(stopped_sil
     assert root.stat().st_size == disk.stat().st_size and overlay.digest(root) == expected_sha
     assert stopped.record(consumer, "raw-child")["boot"] == imported["record"]["boot"]
     cloud_disk.assert_pool_objects(consumer, imported["record"]["boot"]["binding"])
-    consumer.run("image", "release", immutable)
+    # rm ID removes the record and both pulled names; the machine keeps its bytes.
+    consumer.run("image", "rm", immutable)
     shutdown.storage_tool(consumer, "prune")
     assert procs.query(consumer.ws.state_db(), f"SELECT id FROM storage_image WHERE id='{imported['id']}'") == []
     cloud_disk.boot(consumer, "raw-child")
@@ -286,15 +306,14 @@ def test_converted_artifact_survives_source_oci_deletion_and_registry_gc(stopped
     stream = converted["record"]["root"]["stream"]["stream"]
     converted_root = source.ws.silo_home / "images/streams/sha256" / stream.removeprefix("sha256:")
     expected_sha, expected_length = overlay.digest(converted_root), converted_root.stat().st_size
-    graphs = _push_encodings(source, registry, "image:converted-source", checkpoint=False)
+    graphs = _push_encodings(source, registry, "converted-source")
     _gc_source(registry, image.manifest_digest, graphs, source)
-    source.run("image", "remove", "image:converted-source")
-    source.run("image", "release", "image:" + converted["id"])
+    source.run("image", "rm", converted["id"])
     shutdown.storage_tool(source, "remove-image", reference)
     shutdown.storage_tool(source, "prune")
     assert not converted_root.exists(), "the producer's decoded OCI cache must not rescue the consumer"
     _start_daemon(consumer, daemon_mode)
-    immutable = _pull_both(consumer, registry, graphs, converted, checkpoint=False)
+    immutable = _pull_both(consumer, registry, graphs, converted)
     registry.stop()
     _chunk_only(consumer, [stream])
     consumer.create("converted-child", immutable, "--cpus", "1", "--memory", "512mib", "--network", "none", "--vsock")
@@ -309,95 +328,52 @@ def test_converted_artifact_survives_source_oci_deletion_and_registry_gc(stopped
     stopped.stop(consumer, "converted-child")
 
 
-@pytest.mark.parametrize("profile", ROOT_PROFILES)
-@pytest.mark.parametrize("daemon_mode", [False, pytest.param(True, marks=pytest.mark.daemon)], ids=["local", "daemon"])
-def test_stopped_checkpoint_exact_closure_boot_and_config_after_registry_gc(stopped_silo: Silo, artifact_destination: Silo,
-                                                                         artifact_registry: DistributionRegistry,
-                                                                         overlay_image_bytes: images.OciImage, daemon_mode: bool,
-                                                                         profile: RootProfile) -> None:
+def test_image_pull_and_create_refuse_snapshot_artifact_before_payload_fetch(
+    stopped_silo: Silo, artifact_destination: Silo,
+    artifact_registry: DistributionRegistry, cloud_roots: Roots,
+) -> None:
     source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
-    reference = _publish_oci(registry, overlay_image_bytes)
-    source.create("checkpoint-source", source.root_image(reference, profile), "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock")
-    stopped.install_managed_fixture(source, "checkpoint-source", custom_boot=True)
-    _start_daemon(source, daemon_mode)
-    source.start("checkpoint-source")
-    source.wait_ready("checkpoint-source")
-    source.exec("checkpoint-source", overlay.PROBE, "durable", "/stopped-common", user="root")
-    stopped.stop(source, "checkpoint-source", require_clean=False)
-    before = stopped.backing(source, "checkpoint-source", "artifact-source")
-    expected_config = stopped.configured_semantics(stopped.configuration(source, "checkpoint-source"))
-    expected_boot = stopped.record(source, "checkpoint-source")["boot"]
-    snapshot = _json(source, "snapshot", "create", "checkpoint-source", "--name", "checkpoint-source")
-    rows = procs.query(source.ws.state_db(), f"SELECT CAST(record_bytes AS TEXT) FROM storage_snapshot WHERE id='{snapshot['id']}'")
-    assert len(rows) == 1
-    record_bytes = rows[0][0]
-    record = json.loads(record_bytes)
-    root_profile = record["root"]["profile"]
-    producer_lower: list[Path] = []
-    if profile == "layered":
-        assert root_profile["kind"] == "linux-overlay" and root_profile["lower"]["layers"], root_profile
-        producer_lower = [source.ws.silo_home / "images/objects/sha256" / root_profile["lower"]["fsmeta"].removeprefix("sha256:")]
-        producer_lower += [source.ws.silo_home / "images/streams/sha256" / layer["pack"]["stream"].removeprefix("sha256:")
-                           for layer in root_profile["lower"]["layers"]]
-        assert all(path.is_file() for path in producer_lower), producer_lower
-    else:
-        assert root_profile == {"kind": "opaque-raw"}, root_profile
-    destination = registry.reference("portable/refused", "checkpoint")
-    registry_before = registry.stored_blob_digests()
-    refusal = source.run("image", "push", "image:checkpoint-source", destination, expect=None)
-    assert refusal.returncode != 0
-    assert registry.stored_blob_digests() == registry_before
-    graphs = _push_encodings(source, registry, "image:checkpoint-source", checkpoint=True)
-    source.rm("checkpoint-source")
-    _gc_source(registry, overlay_image_bytes.manifest_digest, graphs, source)
-    source.run("image", "remove", "image:checkpoint-source")
-    source.run("snapshot", "remove", "image:" + snapshot["id"])
-    # Remove every producer OCI selection, including the seeded one with the
-    # same manifest, so no local composition can rescue the consumer.
-    for (selected,) in procs.query(source.ws.state_db(), "SELECT requested_reference FROM image_ref"):
-        shutdown.storage_tool(source, "remove-image", selected)
-    shutdown.storage_tool(source, "prune")
-    source_root = source.ws.silo_home / "images/streams/sha256" / record["root"]["stream"]["stream"].removeprefix("sha256:")
-    assert not source_root.exists(), "the producer's snapshot cache must be unavailable before acquisition"
-    assert not any(path.exists() for path in producer_lower), "the producer's composition must be unavailable before acquisition"
-    _start_daemon(consumer, daemon_mode)
-    _inspect_and_refuse(consumer, registry, graphs[0], checkpoint=True,
-                        root_family="opaque-raw" if profile == "raw" else "linux-overlay")
-    immutable = _pull_both(consumer, registry, graphs, snapshot, checkpoint=True)
-    actual_rows = procs.query(consumer.ws.state_db(), f"SELECT CAST(record_bytes AS TEXT) FROM storage_snapshot WHERE id='{snapshot['id']}'")
-    assert actual_rows == [(record_bytes,)], "canonical snapshot configuration/storage record changed in transport"
-    registry.stop()
-    streams = [record["root"]["stream"]["stream"], *(disk["content"]["stream"] for disk in record["disks"])]
-    _chunk_only(consumer, streams)
-    # Both public stopped-artifact acquisition routes must preserve the same
-    # snapshot semantics, not create an ordinary raw image with lost settings.
-    stopped.restore(consumer, immutable, "restored-child")
-    consumer.create("created-child", immutable)
-    copies = [stopped.backing(consumer, name, "artifact-child-before-boot") for name in ("restored-child", "created-child")]
-    for copy in copies:
-        stopped.same_content(before, copy)
-    stopped.independent(before, *copies)
-    for name in ("restored-child", "created-child"):
-        assert stopped.record(consumer, name)["boot"] == expected_boot
-        if profile == "layered":
-            assert stopped.record(consumer, name)["root"]["lower"]["record"] == root_profile["lower"]["result"]
-        assert stopped.configured_semantics(stopped.configuration(consumer, name)) == expected_config
-    consumer.run("snapshot", "remove", immutable)
-    shutdown.storage_tool(consumer, "prune")
-    assert procs.query(consumer.ws.state_db(), f"SELECT id FROM storage_snapshot WHERE id='{snapshot['id']}'") == []
-    for name in ("restored-child", "created-child"):
-        cloud_disk.assert_pool_objects(consumer, expected_boot["binding"])
-        consumer.start(name)
-        consumer.wait_ready(name)
-        assert consumer.exec(name, "cat", "/stopped-common", user="root").stdout == "committed\n"
-        assert consumer.exec(name, "sh", "-eu", "-c", 'printf "%s\\n" "$CAPTURE_UNICODE" "$CAPTURE_SECRET_WARNING"', user="root").stdout == "雪/é\nexact-not-sanitized\n"
-        assert cloud_disk.guest_agent_sha256(consumer, name) == expected_boot["binding"]["agent"]
-        data = consumer.exec(name, "sh", "-eu", "-c", 'for p in /sys/block/*; do if test "$(cat "$p/serial" 2>/dev/null)" = silo-data-0; then dd if=/dev/${p##*/} bs=1 skip=4096 count=23 2>/dev/null; fi; done', user="root").stdout
-        assert data == "managed-before-capture\n"
-        stopped.stop(consumer, name, require_clean=False)
-        other = "created-child" if name == "restored-child" else "restored-child"
-        if name == "restored-child":
-            stopped.same_content(copies[1], stopped.backing(consumer, other, "unbooted-sibling"))
+    disk = cloud_disk.sparse_clone(cloud_roots.root, source.ws.root / "relabel.raw")
+    cloud_disk.import_disk(source, disk, root="whole-disk", name="relabel-source")
+    graph = _push(source, registry, "relabel-source", "raw")
+    snapshot_reference = _as_snapshot_artifact(registry, graph, "as-snapshot")
+    payloads = _payload_blobs(graph)
+    inspected = _json(consumer, "image", "inspect-remote", snapshot_reference)
+    assert inspected["content"] == {"kind": "snapshot", "id": graph.config["content"]["id"]}, inspected
+
+    for args in (("image", "pull", snapshot_reference),
+                 ("create", snapshot_reference, "--name", "never-created", "--network", "none")):
+        before = registry.log_text()
+        refused = cloud_disk.refuse_before_publication(consumer, *args)
+        log = registry.log_text()[len(before):]
+        assert "silo restore" in refused.stderr, refused.stderr
+        assert "/manifests/as-snapshot" in log, "the refusal must come from the registry artifact"
+        assert _fetched(log, payloads) == [], "a snapshot artifact was refused only after payload fetch"
+    assert consumer.ls() == []
+
+    # Positive control: the same oracle observes payload fetches of the real image.
+    before = registry.log_text()
+    pulled = _json(consumer, "image", "pull", registry.reference(REPOSITORY, "raw"))
+    assert pulled["kind"] == "stored" and pulled["info"]["id"] == graph.config["content"]["id"]
+    assert _fetched(registry.log_text()[len(before):], payloads) == sorted(payloads)
+
+
+def test_restore_refuses_image_artifact_before_payload_fetch(
+    stopped_silo: Silo, artifact_destination: Silo,
+    artifact_registry: DistributionRegistry, cloud_roots: Roots,
+) -> None:
+    source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
+    disk = cloud_disk.sparse_clone(cloud_roots.root, source.ws.root / "restore-refused.raw")
+    cloud_disk.import_disk(source, disk, root="whole-disk", name="restore-refused")
+    graph = _push(source, registry, "restore-refused", "raw")
+    reference = registry.reference(REPOSITORY, "raw")
+    before = registry.log_text()
+    refused = cloud_disk.refuse_before_publication(consumer, "restore", reference, "--name", "never-restored")
+    log = registry.log_text()[len(before):]
+    assert f"silo create {reference}" in refused.stderr, refused.stderr
+    assert "/manifests/raw" in log, "the refusal must come from the registry artifact"
+    assert _fetched(log, _payload_blobs(graph)) == [], "an image artifact was refused only after payload fetch"
+    assert consumer.ls() == []
 
 
 def test_failed_pull_reuses_verified_chunks_and_refetches_corrupt_cache(
@@ -407,17 +383,16 @@ def test_failed_pull_reuses_verified_chunks_and_refetches_corrupt_cache(
     source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
     disk = cloud_disk.sparse_clone(cloud_roots.root, source.ws.root / "resume.raw")
     imported = cloud_disk.import_disk(source, disk, root="whole-disk", name="resume-source")
-    _, graph = _push_encodings(source, registry, "image:resume-source", checkpoint=False)
+    graph = _push(source, registry, "resume-source", "raw")
     chunks = sorted(digest for digest, item in graph.descriptors.items() if item["mediaType"] == RAW_CHUNK)
     assert len(chunks) >= 3, "fixture needs distinct failed, corrupted and reusable chunks"
     corrupt, reusable, missing = chunks[0], chunks[1], chunks[-1]
     client = registry.client()
-    missing_bytes = client.blob("portable/vm", missing)
+    missing_bytes = client.blob(REPOSITORY, missing)
     assert missing_bytes is not None
-    client.delete_blob("portable/vm", missing)
-    reference = registry.reference("portable/vm", "raw")
-    failed = consumer.run("image", "pull", reference, "--approve-digest", graph.index,
-                          "--name", "resumed", expect=None, timeout=300)
+    client.delete_blob(REPOSITORY, missing)
+    reference = registry.reference(REPOSITORY, "raw")
+    failed = consumer.run("image", "pull", reference, expect=None, timeout=300)
     assert failed.returncode != 0
     assert procs.query(consumer.ws.state_db(), "SELECT id FROM storage_image") == []
     cache = consumer.ws.silo_home / "images/transport/sha256"
@@ -426,18 +401,18 @@ def test_failed_pull_reuses_verified_chunks_and_refetches_corrupt_cache(
     damaged = cache / corrupt.removeprefix("sha256:")
     damaged.chmod(0o600)
     damaged.write_bytes(b"corrupt completed cache entry")
-    assert client.push_blob("portable/vm", missing_bytes) == missing
+    assert client.push_blob(REPOSITORY, missing_bytes) == missing
     before = registry.log_text()
-    acquired = _json(consumer, "image", "pull", reference, "--approve-digest", graph.index, "--name", "resumed")
+    acquired = _json(consumer, "image", "pull", reference)
     after = registry.log_text()
-    assert acquired["source"]["info"]["id"] == imported["id"]
+    assert acquired["info"]["id"] == imported["id"]
     # A valid completed chunk requires no network access on retry. A cache
     # pathname or prior completion bit cannot authorize the damaged chunk.
     assert after.count(f"/blobs/{reusable}") == before.count(f"/blobs/{reusable}")
     assert after.count(f"/blobs/{corrupt}") > before.count(f"/blobs/{corrupt}")
     assert overlay.digest(damaged) == corrupt.removeprefix("sha256:")
     registry.stop()
-    consumer.create("resumed-child", "image:resumed", "--network", "none")
+    consumer.create("resumed-child", reference, "--network", "none")
     root = cloud_disk.root_disk(consumer, "resumed-child")
     assert root.stat().st_size == disk.stat().st_size
     assert overlay.digest(root) == overlay.digest(disk)

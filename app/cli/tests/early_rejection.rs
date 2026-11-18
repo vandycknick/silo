@@ -204,7 +204,7 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
         for (args, operation) in [
             (vec!["pause", "absent"], LiveOperation::Pause),
             (
-                vec!["snapshot", "create", "absent", "--live"],
+                vec!["snapshot", "create", "absent", "--memory"],
                 LiveOperation::Capture,
             ),
             (
@@ -214,7 +214,9 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
             (
                 vec![
                     "restore",
-                    "image:checkpoint",
+                    "checkpoint",
+                    "--pull",
+                    "never",
                     "--name",
                     "unallocated-restore",
                 ],
@@ -259,7 +261,16 @@ fn early_rejection_explicit_live_execution_grammar_has_no_legacy_aliases_or_fall
     let before = snapshot(temp.path());
     for args in [
         vec!["snapshot", "source"],
-        vec!["restore", "checkpoint"],
+        vec!["restore", "checkpoint", "--execution"],
+        vec![
+            "restore",
+            "checkpoint",
+            "--without-memory",
+            "--activation-hook",
+            "{}",
+        ],
+        vec!["recover-disks", "checkpoint"],
+        vec!["image", "release", "base"],
         vec!["fork", "source"],
         vec!["show", "source"],
         vec!["status"],
@@ -366,7 +377,7 @@ async fn early_rejection_actual_mock_run_wins_over_prospective_krun_and_info_rep
                     root: libvm::ImportRootSelection::WholeDisk,
                     assets: libvm::BootAssetSelection::Packaged,
                 },
-                alias: None,
+                name: None,
             }))
             .network(|network| network.none())
             .create()
@@ -393,7 +404,7 @@ async fn early_rejection_actual_mock_run_wins_over_prospective_krun_and_info_rep
         );
         for args in [
             vec!["pause", "source"],
-            vec!["snapshot", "create", "source", "--live"],
+            vec!["snapshot", "create", "source", "--memory"],
             vec!["fork", "source", "--name", "unallocated", "--live"],
         ] {
             let before_home = snapshot(&root.join("home"));
@@ -518,14 +529,18 @@ fn stopped_preflight_rejects_missing_sources_and_wrong_reference_kinds_without_i
     for args in [
         vec!["fork", "absent", "--name", "child"],
         vec!["snapshot", "create", "absent", "--name", "checkpoint"],
-        vec!["restore", "image:absent", "--name", "child"],
-        vec!["restore", execution.to_str().unwrap(), "--name", "child"],
-        vec!["restore", "snapshot:checkpoint", "--name", "child"],
+        vec!["restore", "absent", "--pull", "never", "--name", "child"],
         vec![
-            "image",
-            "remove",
-            "image:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "restore",
+            execution.to_str().unwrap(),
+            "--pull",
+            "never",
+            "--name",
+            "child",
         ],
+        vec!["restore", "fork:checkpoint", "--name", "child"],
+        vec!["image", "rm", "NotAName"],
+        vec!["snapshot", "rm", "NotAName"],
     ] {
         let output = run(temp.path(), "krun", &args);
         assert!(

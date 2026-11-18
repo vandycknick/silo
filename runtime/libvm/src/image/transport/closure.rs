@@ -11,13 +11,13 @@ use oci::vm_artifact::wire::{
     PayloadMediaType, Purpose, RecordRef, VmArtifactConfigV2,
 };
 
-use crate::image::import_types::ManagedSourceId;
 use crate::image::transport::blobs::invalid;
+use crate::image::transport::ArtifactContent;
 use crate::storage::identity::{ObjectDigest, StreamId};
 use crate::storage::limits::Resource;
 use crate::store::models::image::{image_id, ImageRecord};
 use crate::store::models::snapshot::{
-    snapshot_id, SnapshotCaptureKind, SnapshotRecord, SnapshotRoot, SnapshotRootProfile,
+    snapshot_id, SnapshotMemoryState, SnapshotRecord, SnapshotRoot, SnapshotRootProfile,
     SnapshotStream,
 };
 use crate::store::models::storage::{BootBinding, BootProfile, GuestArchitecture};
@@ -144,14 +144,14 @@ pub(crate) struct Semantic {
     pub(crate) record: SemanticRecord,
     pub(crate) bytes: Vec<u8>,
     pub(crate) digest: ObjectDigest,
-    pub(crate) id: ManagedSourceId,
+    pub(crate) id: ArtifactContent,
 }
 
 impl Semantic {
     pub(crate) fn image(record: ImageRecord) -> Result<Self, LibVmError> {
         let bytes = record.canonical_bytes()?;
         Ok(Self {
-            id: ManagedSourceId::Image(image_id(&bytes)),
+            id: ArtifactContent::Image(image_id(&bytes)),
             digest: ObjectDigest::of_bytes(&bytes),
             record: SemanticRecord::Image(Box::new(record)),
             bytes,
@@ -161,7 +161,7 @@ impl Semantic {
     pub(crate) fn snapshot(record: SnapshotRecord) -> Result<Self, LibVmError> {
         let bytes = record.canonical_bytes()?;
         Ok(Self {
-            id: ManagedSourceId::Snapshot(snapshot_id(&bytes)),
+            id: ArtifactContent::Snapshot(snapshot_id(&bytes)),
             digest: ObjectDigest::of_bytes(&bytes),
             record: SemanticRecord::Snapshot(Box::new(record)),
             bytes,
@@ -191,8 +191,8 @@ impl Semantic {
 
     pub(crate) fn live(&self) -> bool {
         matches!(
-            self.snapshot_record().map(|record| &record.capture),
-            Some(SnapshotCaptureKind::LiveExecution { .. })
+            self.snapshot_record().map(|record| &record.memory),
+            Some(SnapshotMemoryState::Included { .. })
         )
     }
 
@@ -281,8 +281,8 @@ impl Semantic {
 
     pub(crate) fn content_ref(&self) -> ContentRef {
         let (kind, id) = match self.id {
-            ManagedSourceId::Image(id) => (ContentKind::Image, *id.as_bytes()),
-            ManagedSourceId::Snapshot(id) => (ContentKind::Snapshot, *id.as_bytes()),
+            ArtifactContent::Image(id) => (ContentKind::Image, *id.as_bytes()),
+            ArtifactContent::Snapshot(id) => (ContentKind::Snapshot, *id.as_bytes()),
         };
         ContentRef {
             kind,
@@ -313,13 +313,13 @@ impl Semantic {
         };
         let (purpose, capture_kind, execution_requirements) = match &self.record {
             SemanticRecord::Image(_) => (Purpose::Image, None, None),
-            SemanticRecord::Snapshot(record) => match &record.capture {
-                SnapshotCaptureKind::StoppedStorage { .. } => (
+            SemanticRecord::Snapshot(record) => match &record.memory {
+                SnapshotMemoryState::None { .. } => (
                     Purpose::Checkpoint,
                     Some(wire::CaptureKind::StoppedStorage),
                     None,
                 ),
-                SnapshotCaptureKind::LiveExecution { execution } => {
+                SnapshotMemoryState::Included { execution } => {
                     let profile = &execution.compatibility_profile;
                     (
                         Purpose::Checkpoint,
@@ -380,7 +380,7 @@ impl Semantic {
     ) -> Result<BTreeMap<ObjectDigest, ObjectRole>, LibVmError> {
         if self.live() != provenance.is_some() {
             return Err(failure(
-                "capture provenance is required exactly for live checkpoints",
+                "capture provenance is required exactly for snapshots with memory",
             ));
         }
         let metadata = ObjectRole::Record {
@@ -423,7 +423,7 @@ impl Semantic {
             add_role(&mut roles, *opaque, ObjectRole::Streamed)?;
         }
         if let Some(SnapshotRecord {
-            capture: SnapshotCaptureKind::LiveExecution { execution },
+            memory: SnapshotMemoryState::Included { execution },
             ..
         }) = self.snapshot_record()
         {
@@ -513,8 +513,8 @@ pub(crate) fn authenticate_composition_bytes(
 mod tests {
     use oci::vm_artifact::wire::{self, ContentKind, RecordRef};
 
-    use crate::image::import_types::ManagedSourceId;
     use crate::image::transport::closure::{ObjectRole, Semantic};
+    use crate::image::transport::ArtifactContent;
     use crate::storage::identity::{ObjectDigest, StreamId};
     use crate::store::models::snapshot::tests::record;
 
@@ -553,7 +553,7 @@ mod tests {
             ObjectDigest::of_bytes(b"kernel"),
         );
         let semantic = Semantic::snapshot(snapshot.clone()).unwrap();
-        let ManagedSourceId::Snapshot(id) = semantic.id else {
+        let ArtifactContent::Snapshot(id) = semantic.id else {
             panic!("snapshot identity expected");
         };
         assert_eq!(id, snapshot.id().unwrap());

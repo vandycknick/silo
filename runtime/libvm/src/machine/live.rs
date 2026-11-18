@@ -262,7 +262,7 @@ pub(crate) fn report_from_status(
 }
 
 /// Manager admission for source-run Pause, Capture, Fork and Incremental commands. Restore
-/// has a separate checkpoint-construction entrypoint. The monitor vector
+/// has a separate snapshot-construction entrypoint. The monitor vector
 /// remains the capability authority.
 pub fn require_live_operation(
     observation: &MachineLiveObservation,

@@ -59,7 +59,7 @@ impl CatalogCheckpointOutcome {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
-    pub(super) pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
     pub(super) home: PathBuf,
     /// `<home>/images`, the immutable pool; `state.db` is `<home>/state.db`.
     pub(super) images_dir: PathBuf,
@@ -453,6 +453,46 @@ pub(crate) mod tests {
         (dir, paths)
     }
 
+    /// A stopped machine whose root came from `image`, so the image is in use.
+    pub(crate) async fn machine_using_image(
+        db: &Store,
+        paths: &LocalPaths,
+        source_kind: crate::ImageSourceKind,
+        image: crate::ImageId,
+    ) -> MachineConfig {
+        let id = MachineId::new();
+        let machine = machine_from_path(id, format!("uses-{id}"), paths.machine(id).dir());
+        let rootfs = MachineRootfsRecord {
+            machine_id: id,
+            source_kind,
+            requested_reference: image.to_string(),
+            selected_reference: None,
+            manifest_digest: None,
+            config_digest: None,
+            image_id: Some(image.to_string()),
+            root_disk_path: paths.machine(id).dir().join("root.raw"),
+            root_disk_size_bytes: 64 * 1024 * 1024,
+            created_at: 7,
+        };
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            rootfs.root_disk_size_bytes,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        let _boot = db.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&machine.spec);
+        db.add_machine_with_rootfs(
+            &machine,
+            &machine_state(id, MachineRuntimeState::Stopped),
+            &rootfs,
+            &storage,
+        )
+        .await
+        .unwrap();
+        machine
+    }
+
     #[tokio::test]
     async fn lean_admission_retires_pending_work_without_scanning_pool() {
         let (_temporary, paths) = temp_paths();
@@ -575,8 +615,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn set_based_collection_preserves_shared_image_snapshot_and_composition_roots() {
         use crate::storage::pool::StoragePool;
-        use crate::store::managed_image_store::ManagedImageStore;
         use crate::store::snapshot_store::{SnapshotRef, SnapshotStore};
+        use crate::store::stored_image_store::StoredImageStore;
         use crate::store::ImageStore;
 
         let (_temporary, store, record, snapshot, snapshot_owner, representation) =
@@ -603,9 +643,16 @@ pub(crate) mod tests {
         let image_owner = pool
             .create_operation_with_lease(operation, lease.duplicate().unwrap())
             .unwrap();
-        let images = ManagedImageStore::from_store(store.clone());
+        let images = StoredImageStore::from_store(store.clone());
         let image = images
-            .publish_owned(image_record, operation, lease, None, Vec::new(), None)
+            .publish_owned(
+                image_record,
+                operation,
+                lease,
+                Some("shared-roots".into()),
+                Vec::new(),
+                None,
+            )
             .await
             .unwrap();
         let source = store.home_path().join("orphan");
@@ -638,7 +685,7 @@ pub(crate) mod tests {
         drop(image_owner);
         let snapshots = SnapshotStore::from_store(store.clone());
         snapshots
-            .release_retention(&SnapshotRef::Id(snapshot.id))
+            .remove(&SnapshotRef::Id(snapshot.id))
             .await
             .unwrap();
         store.recover_pending_image_cache().await.unwrap();
@@ -672,20 +719,22 @@ pub(crate) mod tests {
         .await
         .unwrap());
         assert!(pool.object_path(&representation).exists());
-        let consumer = images
-            .consume(&crate::ManagedSourceRef::Image(image.id))
-            .await
-            .unwrap();
+        let consumer = images.consume(image.id).await.unwrap();
         assert_eq!(
             std::fs::read(pool.stream_path(&record.root.stream.stream)).unwrap(),
             [3; 512]
         );
         drop(consumer);
 
-        images
-            .release_retention(&crate::ManagedSourceRef::Image(image.id))
+        let removal = store
+            .remove_image(
+                crate::store::image_store::LocalImage::Stored(image.id),
+                None,
+            )
             .await
             .unwrap();
+        assert_eq!(removal.names, ["shared-roots"]);
+        assert!(removal.record_removed);
         store.recover_pending_image_cache().await.unwrap();
         assert!(!pool.stream_path(&record.root.stream.stream).exists());
         assert!(!pool.object_path(&representation).exists());
@@ -3684,12 +3733,8 @@ pub(crate) mod tests {
         drop(roots);
         db.remove_machine(&child).await.unwrap();
         std::fs::remove_dir_all(&child.machine_dir).unwrap();
-        snapshots.remove_alias("restart-first").await.unwrap();
-        snapshots.remove_alias("restart-second").await.unwrap();
-        snapshots
-            .release_retention(&SnapshotRef::Id(saved.id))
-            .await
-            .unwrap();
+        let removal = snapshots.remove(&SnapshotRef::Id(saved.id)).await.unwrap();
+        assert_eq!(removal.names, ["restart-first", "restart-second"]);
         db.finish_stopped_operation(publication).await.unwrap();
         drop(publication_lease);
         drop(held);

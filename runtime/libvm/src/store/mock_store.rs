@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use mockall::mock;
 
-use crate::image::{ImageDetail, ImageHandle, ImagePruneReport, ImageRemoveOptions};
+use crate::image::ImagePruneReport;
 use crate::store::models::MachineId;
 use crate::store::models::{
     DbConfig, MachineConfig, MachineRootfsRecord, MachineState, NetworkAttachment,
@@ -100,25 +100,6 @@ mock! {
             reference: &str,
             platform: &oci::Platform,
         ) -> Result<Option<OciImageRecord>, LibVmError>;
-
-        async fn image_handle(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError>;
-
-        async fn list_image_handles(&self) -> Result<Vec<ImageHandle>, LibVmError>;
-
-        async fn image_detail(&self, reference: &str) -> Result<Option<ImageDetail>, LibVmError>;
-
-        async fn ensure_image_removable(
-            &self,
-            reference: &str,
-            options: ImageRemoveOptions,
-        ) -> Result<ImageHandle, LibVmError>;
-
-        async fn remove_image(
-            &self,
-            reference: &str,
-            options: ImageRemoveOptions,
-        ) -> Result<(), LibVmError>;
-
         async fn prune_images(&self) -> Result<ImagePruneReport, LibVmError>;
     }
 

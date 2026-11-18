@@ -22,16 +22,19 @@ use crate::LibVmError;
 pub enum SnapshotKind {
     Snapshot,
 }
+/// Whether a snapshot includes the machine's memory. `None` restores a
+/// stopped machine from its disks; `Included` also carries RAM, CPU and
+/// device state and restores a running machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
-    tag = "captureKind",
+    tag = "memory",
     rename_all = "kebab-case",
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum SnapshotCaptureKind {
-    StoppedStorage { stop_outcome: StorageStopOutcome },
-    LiveExecution { execution: Box<SnapshotExecution> },
+pub enum SnapshotMemoryState {
+    None { stop_outcome: StorageStopOutcome },
+    Included { execution: Box<SnapshotExecution> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,11 +57,6 @@ pub struct SnapshotCompatibilityProfile {
     pub profile: ObjectDigest,
     pub topology: ObjectDigest,
     pub ram_layout: ObjectDigest,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SnapshotPurpose {
-    Checkpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,8 +468,7 @@ pub struct SnapshotRecord {
     pub schema: u32,
     pub kind: SnapshotKind,
     #[serde(flatten)]
-    pub capture: SnapshotCaptureKind,
-    pub purpose: SnapshotPurpose,
+    pub memory: SnapshotMemoryState,
     pub root: SnapshotRoot,
     pub disks: Vec<SnapshotDisk>,
     pub platform_files: Vec<SnapshotPlatformFile>,
@@ -514,8 +511,8 @@ impl SnapshotRecord {
             logical = logical
                 .checked_add(stream.length)
                 .ok_or_else(|| invalid("snapshot closure length overflow"))?;
-            let role = match &self.capture {
-                SnapshotCaptureKind::LiveExecution { execution }
+            let role = match &self.memory {
+                SnapshotMemoryState::Included { execution }
                     if stream.stream == execution.memory.stream =>
                 {
                     vm_spec::stream_map::StreamRole::Ram
@@ -527,7 +524,7 @@ impl SnapshotRecord {
         Resource::ArtifactStreamBytes
             .check(logical)
             .map_err(crate::storage::StorageError::from)?;
-        if let SnapshotCaptureKind::LiveExecution { execution } = &self.capture {
+        if let SnapshotMemoryState::Included { execution } = &self.memory {
             Resource::CapturedRamBytes
                 .check(execution.memory.length)
                 .map_err(crate::storage::StorageError::from)?;
@@ -697,9 +694,9 @@ impl SnapshotRecord {
     }
 
     pub fn streams(&self) -> impl Iterator<Item = &SnapshotStream> {
-        let memory = match &self.capture {
-            SnapshotCaptureKind::LiveExecution { execution } => Some(&execution.memory),
-            SnapshotCaptureKind::StoppedStorage { .. } => None,
+        let memory = match &self.memory {
+            SnapshotMemoryState::Included { execution } => Some(&execution.memory),
+            SnapshotMemoryState::None { .. } => None,
         };
         self.storage_streams().chain(memory)
     }
@@ -750,7 +747,7 @@ impl SnapshotRecord {
         &self,
     ) -> Result<(BTreeSet<StreamId>, BTreeSet<ObjectDigest>), LibVmError> {
         let (mut streams, mut objects) = self.storage_content_dependencies()?;
-        if let SnapshotCaptureKind::LiveExecution { execution } = &self.capture {
+        if let SnapshotMemoryState::Included { execution } = &self.memory {
             streams.insert(execution.memory.stream);
             objects.insert(execution.memory.map);
             objects.extend([execution.layout, execution.execution, execution.devices]);
@@ -795,7 +792,7 @@ fn validate_numbers(value: &Value) -> Result<(), LibVmError> {
 fn validate_configured_closure(record: &SnapshotRecord) -> Result<(), LibVmError> {
     use crate::machine::stopped::ExternalResourceKey;
     use crate::store::models::storage::{PartitionTable, RootSelector};
-    let stopped = matches!(record.capture, SnapshotCaptureKind::StoppedStorage { .. });
+    let stopped = matches!(record.memory, SnapshotMemoryState::None { .. });
     let BootProfile::LinuxDirect { root_selector, .. } = &record.boot else {
         return Err(invalid("unadmitted snapshot boot profile"));
     };
@@ -1062,8 +1059,8 @@ pub(crate) mod tests {
     use crate::machine::stopped::SnapshotConfiguration;
     use crate::storage::identity::{ObjectDigest, StreamId};
     use crate::store::models::snapshot::{
-        canonical_value, SnapshotCaptureKind, SnapshotKind, SnapshotPurpose, SnapshotRecord,
-        SnapshotRoot, SnapshotStream, StrictValue,
+        canonical_value, SnapshotKind, SnapshotMemoryState, SnapshotRecord, SnapshotRoot,
+        SnapshotStream, StrictValue,
     };
     use crate::store::models::storage::{
         BootBinding, BootProfile, DirectCommandLinePolicy, GuestArchitecture, LinuxPlatform,
@@ -1080,10 +1077,9 @@ pub(crate) mod tests {
         SnapshotRecord {
             schema: 2,
             kind: SnapshotKind::Snapshot,
-            capture: SnapshotCaptureKind::StoppedStorage {
+            memory: SnapshotMemoryState::None {
                 stop_outcome: StorageStopOutcome::Unknown,
             },
-            purpose: SnapshotPurpose::Checkpoint,
             root: SnapshotRoot {
                 profile: crate::store::models::snapshot::SnapshotRootProfile::OpaqueRaw,
                 stream: SnapshotStream {
@@ -1199,7 +1195,7 @@ pub(crate) mod tests {
         record.configuration.process.entrypoint = Some(Vec::new());
         assert_ne!(record.id().unwrap(), id);
         record.configuration.process.entrypoint = None;
-        record.capture = SnapshotCaptureKind::StoppedStorage {
+        record.memory = SnapshotMemoryState::None {
             stop_outcome: StorageStopOutcome::Clean,
         };
         assert_ne!(record.id().unwrap(), id);
@@ -1297,7 +1293,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn checkpoint_live_identity_has_no_stop_or_capture_provenance_and_enforces_ram_limit() {
+    fn memory_snapshot_identity_has_no_stop_or_capture_provenance_and_enforces_ram_limit() {
         use crate::store::models::snapshot::{SnapshotCompatibilityProfile, SnapshotExecution};
         let digest = ObjectDigest::of_bytes(b"content");
         let stream = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -1309,7 +1305,7 @@ pub(crate) mod tests {
         memory.map = ObjectDigest::from_sha256([1; 32]);
         memory.length = 1 << 40;
         memory.chunk_size = vm_spec::stream_map::ChunkSize::RAM.bytes();
-        record.capture = SnapshotCaptureKind::LiveExecution {
+        record.memory = SnapshotMemoryState::Included {
             execution: Box::new(SnapshotExecution {
                 memory,
                 layout: digest,
@@ -1327,7 +1323,8 @@ pub(crate) mod tests {
         let bytes = record.canonical_bytes().unwrap();
         assert_eq!(SnapshotRecord::decode(&bytes).unwrap(), record);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["captureKind"], "live-execution");
+        assert_eq!(value["memory"], "included");
+        assert!(value.get("captureKind").is_none() && value.get("purpose").is_none());
         for key in [
             "stopOutcome",
             "captureId",
@@ -1338,7 +1335,7 @@ pub(crate) mod tests {
         ] {
             assert!(value.get(key).is_none(), "{key}");
         }
-        if let SnapshotCaptureKind::LiveExecution { execution } = &mut record.capture {
+        if let SnapshotMemoryState::Included { execution } = &mut record.memory {
             execution.memory.length += crate::storage::limits::CHUNK_SIZE as u64;
         }
         assert!(record.validate().is_err());

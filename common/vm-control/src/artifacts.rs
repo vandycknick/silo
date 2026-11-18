@@ -1,4 +1,5 @@
-//! Same-user management protocol for explicitly approved VM artifact acquisition.
+//! Same-user management protocol for VM artifact inspection, image
+//! acquisition and image publication. Snapshots are never published here.
 use crate::{invalid, required, ConversionError};
 use silod_spec::daemon::v1 as w;
 
@@ -12,46 +13,21 @@ pub fn validate_reference(value: &str) -> Result<(), ConversionError> {
 pub fn acquire_to_wire(
     value: &libvm::ArtifactAcquireRequest,
 ) -> Result<w::AcquireArtifactRequest, ConversionError> {
-    validate_reference(&value.reference)?;
-    if let Some(alias) = &value.alias {
-        crate::stopped::alias(alias)?;
-    }
-    Ok(w::AcquireArtifactRequest {
+    let wire = w::AcquireArtifactRequest {
         reference: value.reference.clone(),
-        alias: value.alias.clone(),
-        trust: Some(match &value.trust {
-            libvm::ArtifactTrust::ApproveDigest { digest } => {
-                w::acquire_artifact_request::Trust::ApprovedDigest(digest.to_string())
-            }
-            libvm::ArtifactTrust::RequireSignature => {
-                w::acquire_artifact_request::Trust::RequireSignature(())
-            }
-        }),
-    })
+        name: value.name.clone(),
+    };
+    acquire_from_wire(wire.clone())?;
+    Ok(wire)
 }
 
 pub fn acquire_from_wire(
     value: w::AcquireArtifactRequest,
 ) -> Result<libvm::ArtifactAcquireRequest, ConversionError> {
     validate_reference(&value.reference)?;
-    let alias = value
-        .alias
-        .map(|alias| crate::stopped::alias(&alias))
-        .transpose()?;
-    let trust = match required(value.trust, "artifact.trust")? {
-        w::acquire_artifact_request::Trust::ApprovedDigest(digest) => {
-            libvm::ArtifactTrust::ApproveDigest {
-                digest: crate::boot::digest_from_wire(&digest, "artifact.approved_digest")?,
-            }
-        }
-        w::acquire_artifact_request::Trust::RequireSignature(()) => {
-            libvm::ArtifactTrust::RequireSignature
-        }
-    };
     Ok(libvm::ArtifactAcquireRequest {
         reference: value.reference,
-        trust,
-        alias,
+        name: value.name.as_deref().map(crate::local_name).transpose()?,
     })
 }
 
@@ -59,25 +35,13 @@ pub fn publish_to_wire(
     value: &libvm::ArtifactPublishRequest,
 ) -> Result<w::PublishArtifactRequest, ConversionError> {
     validate_reference(&value.destination)?;
-    if let Some(ack) = &value.checkpoint_acknowledgement {
-        if ack.destination != value.destination {
-            return Err(invalid(
-                "artifact.checkpoint_acknowledgement",
-                "destination mismatch",
-            ));
-        }
-    }
     Ok(w::PublishArtifactRequest {
-        source: Some(crate::images::managed_ref_to_wire(&value.source)?),
+        image: Some(crate::images::image_ref_to_wire(&value.image)?),
         destination: value.destination.clone(),
         encoding: match value.encoding {
             libvm::ArtifactEncoding::Zstd => w::ArtifactEncoding::Zstd as i32,
             libvm::ArtifactEncoding::Raw => w::ArtifactEncoding::Raw as i32,
         },
-        checkpoint_acknowledgement: value
-            .checkpoint_acknowledgement
-            .as_ref()
-            .map(|ack| ack.destination.clone()),
     })
 }
 
@@ -90,98 +54,61 @@ pub fn publish_from_wire(
         Ok(w::ArtifactEncoding::Raw) => libvm::ArtifactEncoding::Raw,
         _ => return Err(invalid("artifact.encoding", "unknown encoding")),
     };
-    let acknowledgement = value
-        .checkpoint_acknowledgement
-        .map(|destination| {
-            if destination != value.destination {
-                return Err(invalid(
-                    "artifact.checkpoint_acknowledgement",
-                    "destination mismatch",
-                ));
-            }
-            Ok(libvm::CheckpointPublication { destination })
-        })
-        .transpose()?;
     Ok(libvm::ArtifactPublishRequest {
-        source: crate::images::managed_ref_from_wire(required(value.source, "artifact.source")?)?,
+        image: crate::images::image_ref_from_wire(required(value.image, "artifact.image")?)?,
         destination: value.destination,
         encoding,
-        checkpoint_acknowledgement: acknowledgement,
     })
 }
 
-fn purpose_to_wire(value: libvm::ArtifactPurpose) -> i32 {
-    match value {
-        libvm::ArtifactPurpose::Image => w::ArtifactPurpose::Image as i32,
-        libvm::ArtifactPurpose::Checkpoint => w::ArtifactPurpose::Checkpoint as i32,
+fn content_to_wire(value: &libvm::ArtifactContent) -> w::ArtifactContent {
+    use w::artifact_content::Id;
+    w::ArtifactContent {
+        id: Some(match value {
+            libvm::ArtifactContent::Image(id) => Id::ImageId(id.to_string()),
+            libvm::ArtifactContent::Snapshot(id) => Id::SnapshotId(id.to_string()),
+        }),
     }
 }
-fn purpose_from_wire(value: i32) -> Result<libvm::ArtifactPurpose, ConversionError> {
-    match w::ArtifactPurpose::try_from(value) {
-        Ok(w::ArtifactPurpose::Image) => Ok(libvm::ArtifactPurpose::Image),
-        Ok(w::ArtifactPurpose::Checkpoint) => Ok(libvm::ArtifactPurpose::Checkpoint),
-        _ => Err(invalid("artifact.purpose", "unknown purpose")),
-    }
+
+fn content_from_wire(value: w::ArtifactContent) -> Result<libvm::ArtifactContent, ConversionError> {
+    use w::artifact_content::Id;
+    Ok(match required(value.id, "artifact.content")? {
+        Id::ImageId(id) => libvm::ArtifactContent::Image(
+            id.parse()
+                .map_err(|_| invalid("artifact.content.image_id", "invalid image identity"))?,
+        ),
+        Id::SnapshotId(id) => {
+            libvm::ArtifactContent::Snapshot(id.parse().map_err(|_| {
+                invalid("artifact.content.snapshot_id", "invalid snapshot identity")
+            })?)
+        }
+    })
 }
-fn capture_to_wire(value: libvm::SnapshotCaptureKindName) -> i32 {
-    match value {
-        libvm::SnapshotCaptureKindName::StoppedStorage => {
-            w::ArtifactCaptureKind::StoppedStorage as i32
-        }
-        libvm::SnapshotCaptureKindName::LiveExecution => {
-            w::ArtifactCaptureKind::LiveExecution as i32
-        }
+
+/// Only a snapshot can include memory.
+fn validate_memory(content: &libvm::ArtifactContent, memory: bool) -> Result<(), ConversionError> {
+    if memory && matches!(content, libvm::ArtifactContent::Image(_)) {
+        return Err(invalid("artifact.memory", "an image carries no memory"));
     }
-}
-fn capture_from_wire(value: i32) -> Result<libvm::SnapshotCaptureKindName, ConversionError> {
-    match w::ArtifactCaptureKind::try_from(value) {
-        Ok(w::ArtifactCaptureKind::StoppedStorage) => {
-            Ok(libvm::SnapshotCaptureKindName::StoppedStorage)
-        }
-        Ok(w::ArtifactCaptureKind::LiveExecution) => {
-            Ok(libvm::SnapshotCaptureKindName::LiveExecution)
-        }
-        _ => Err(invalid("artifact.capture_kind", "unknown capture kind")),
-    }
-}
-fn validate_purpose(
-    purpose: libvm::ArtifactPurpose,
-    capture: Option<libvm::SnapshotCaptureKindName>,
-    source: &libvm::ManagedSourceId,
-) -> Result<(), ConversionError> {
-    match (purpose, capture, source) {
-        (libvm::ArtifactPurpose::Image, None, libvm::ManagedSourceId::Image(_)) => Ok(()),
-        (libvm::ArtifactPurpose::Checkpoint, Some(_), libvm::ManagedSourceId::Snapshot(_)) => {
-            Ok(())
-        }
-        _ => Err(invalid(
-            "artifact.purpose",
-            "purpose, capture kind and identity disagree",
-        )),
-    }
+    Ok(())
 }
 
 pub fn inspection_to_wire(
     value: &libvm::ArtifactInspection,
 ) -> Result<w::ArtifactInspection, ConversionError> {
     validate_reference(&value.repository)?;
-    validate_purpose(value.purpose, value.capture_kind, &value.content)?;
+    validate_memory(&value.content, value.memory)?;
     Ok(w::ArtifactInspection {
         repository: value.repository.clone(),
         index_digest: value.index_digest.to_string(),
-        purpose: purpose_to_wire(value.purpose),
-        capture_kind: value.capture_kind.map(capture_to_wire),
-        content: Some(crate::images::managed_id_to_wire(&value.content)),
-        root_family: match value.root_family {
+        content: Some(content_to_wire(&value.content)),
+        root: match value.root {
             libvm::ArtifactRootFamily::OpaqueRaw => w::ArtifactRootFamily::OpaqueRaw as i32,
             libvm::ArtifactRootFamily::LinuxOverlay => w::ArtifactRootFamily::LinuxOverlay as i32,
         },
-        backend: match value.backend {
-            libvm::BackendRequirement::RawBlock => w::BackendRequirement::RawBlock as i32,
-            libvm::BackendRequirement::KrunOverlay => w::BackendRequirement::KrunOverlay as i32,
-        },
         guest_architecture: crate::boot::architecture_to_wire(value.guest_architecture),
-        live_restore: value.live_restore,
+        memory: value.memory,
     })
 }
 
@@ -189,49 +116,23 @@ pub fn inspection_from_wire(
     value: w::ArtifactInspection,
 ) -> Result<libvm::ArtifactInspection, ConversionError> {
     validate_reference(&value.repository)?;
-    let content =
-        crate::images::managed_id_from_wire(required(value.content, "artifact.content")?)?;
-    let purpose = purpose_from_wire(value.purpose)?;
-    let capture_kind = value.capture_kind.map(capture_from_wire).transpose()?;
-    validate_purpose(purpose, capture_kind, &content)?;
-    if value.live_restore != (capture_kind == Some(libvm::SnapshotCaptureKindName::LiveExecution)) {
-        return Err(invalid(
-            "artifact.live_restore",
-            "disagrees with capture kind",
-        ));
-    }
-    let (root_family, backend) = match (
-        w::ArtifactRootFamily::try_from(value.root_family),
-        w::BackendRequirement::try_from(value.backend),
-    ) {
-        (Ok(w::ArtifactRootFamily::OpaqueRaw), Ok(w::BackendRequirement::RawBlock)) => (
-            libvm::ArtifactRootFamily::OpaqueRaw,
-            libvm::BackendRequirement::RawBlock,
-        ),
-        (Ok(w::ArtifactRootFamily::LinuxOverlay), Ok(w::BackendRequirement::KrunOverlay)) => (
-            libvm::ArtifactRootFamily::LinuxOverlay,
-            libvm::BackendRequirement::KrunOverlay,
-        ),
-        _ => {
-            return Err(invalid(
-                "artifact.root_family",
-                "unknown or inconsistent backend/root",
-            ))
-        }
+    let content = content_from_wire(required(value.content, "artifact.content")?)?;
+    validate_memory(&content, value.memory)?;
+    let root = match w::ArtifactRootFamily::try_from(value.root) {
+        Ok(w::ArtifactRootFamily::OpaqueRaw) => libvm::ArtifactRootFamily::OpaqueRaw,
+        Ok(w::ArtifactRootFamily::LinuxOverlay) => libvm::ArtifactRootFamily::LinuxOverlay,
+        _ => return Err(invalid("artifact.root", "unknown root family")),
     };
     Ok(libvm::ArtifactInspection {
         repository: value.repository,
         index_digest: crate::boot::digest_from_wire(&value.index_digest, "artifact.index_digest")?,
         content,
-        purpose,
-        capture_kind,
-        root_family,
-        backend,
+        root,
         guest_architecture: crate::boot::architecture_from_wire(
             value.guest_architecture,
             "artifact.guest_architecture",
         )?,
-        live_restore: value.live_restore,
+        memory: value.memory,
     })
 }
 
@@ -240,14 +141,9 @@ pub fn acquired_to_wire(
 ) -> Result<w::ArtifactAcquireReport, ConversionError> {
     validate_reference(&value.repository)?;
     Ok(w::ArtifactAcquireReport {
-        source: Some(crate::images::managed_info_to_wire(&value.source)?),
+        image: Some(crate::images::stored_image_to_wire(&value.image)?),
         repository: value.repository.clone(),
         index_digest: value.index_digest.to_string(),
-        publisher: match value.publisher {
-            libvm::PublisherAuthentication::Unauthenticated => {
-                w::ArtifactPublisher::Unauthenticated as i32
-            }
-        },
     })
 }
 
@@ -255,48 +151,35 @@ pub fn acquired_from_wire(
     value: w::ArtifactAcquireReport,
 ) -> Result<libvm::ArtifactAcquireReport, ConversionError> {
     validate_reference(&value.repository)?;
-    let publisher = match w::ArtifactPublisher::try_from(value.publisher) {
-        Ok(w::ArtifactPublisher::Unauthenticated) => {
-            libvm::PublisherAuthentication::Unauthenticated
-        }
-        _ => {
-            return Err(invalid(
-                "artifact.publisher",
-                "unknown publisher authentication",
-            ))
-        }
-    };
     Ok(libvm::ArtifactAcquireReport {
-        source: crate::images::managed_info_from_wire(required(value.source, "artifact.source")?)?,
+        image: crate::images::stored_image_from_wire(required(value.image, "artifact.image")?)?,
         repository: value.repository,
         index_digest: crate::boot::digest_from_wire(&value.index_digest, "artifact.index_digest")?,
-        publisher,
     })
 }
 
 pub fn published_to_wire(
     value: &libvm::ArtifactPublishReport,
 ) -> Result<w::ArtifactPublishReport, ConversionError> {
-    validate_reference(&value.repository)?;
-    validate_purpose(value.purpose, value.capture_kind, &value.source)?;
-    Ok(w::ArtifactPublishReport {
+    let wire = w::ArtifactPublishReport {
         repository: value.repository.clone(),
         index_digest: value.index_digest.to_string(),
         tag: value.tag.clone(),
-        source: Some(crate::images::managed_id_to_wire(&value.source)),
-        purpose: purpose_to_wire(value.purpose),
-        capture_kind: value.capture_kind.map(capture_to_wire),
-    })
+        content: Some(content_to_wire(&value.content)),
+    };
+    published_from_wire(wire.clone())?;
+    Ok(wire)
 }
 
+/// Publication over the management API carries images only.
 pub fn published_from_wire(
     value: w::ArtifactPublishReport,
 ) -> Result<libvm::ArtifactPublishReport, ConversionError> {
     validate_reference(&value.repository)?;
-    let source = crate::images::managed_id_from_wire(required(value.source, "artifact.source")?)?;
-    let purpose = purpose_from_wire(value.purpose)?;
-    let capture_kind = value.capture_kind.map(capture_from_wire).transpose()?;
-    validate_purpose(purpose, capture_kind, &source)?;
+    let content = content_from_wire(required(value.content, "artifact.content")?)?;
+    if !matches!(content, libvm::ArtifactContent::Image(_)) {
+        return Err(invalid("artifact.content", "only images are published"));
+    }
     if let Some(tag) = &value.tag {
         validate_reference(tag)?;
     }
@@ -304,77 +187,119 @@ pub fn published_from_wire(
         repository: value.repository,
         index_digest: crate::boot::digest_from_wire(&value.index_digest, "artifact.index_digest")?,
         tag: value.tag,
-        source,
-        purpose,
-        capture_kind,
+        content,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::artifacts::{acquire_from_wire, inspection_from_wire};
+    use crate::artifacts::{
+        acquire_from_wire, acquire_to_wire, inspection_from_wire, inspection_to_wire,
+        publish_from_wire, publish_to_wire, published_from_wire, published_to_wire,
+    };
     use silod_spec::daemon::v1 as w;
+
+    fn id(byte: &str) -> String {
+        format!("sha256:{}", byte.repeat(64))
+    }
 
     fn inspection() -> w::ArtifactInspection {
         w::ArtifactInspection {
             repository: "localhost:5000/vm".into(),
-            index_digest: format!("sha256:{}", "a".repeat(64)),
-            purpose: w::ArtifactPurpose::Image as i32,
-            capture_kind: None,
-            root_family: w::ArtifactRootFamily::OpaqueRaw as i32,
-            guest_architecture: w::GuestArchitecture::Amd64 as i32,
-            live_restore: false,
-            content: Some(w::ManagedSourceId {
-                id: Some(w::managed_source_id::Id::ImageId(format!(
-                    "sha256:{}",
-                    "b".repeat(64)
-                ))),
+            index_digest: id("a"),
+            content: Some(w::ArtifactContent {
+                id: Some(w::artifact_content::Id::ImageId(id("b"))),
             }),
-            backend: w::BackendRequirement::RawBlock as i32,
+            root: w::ArtifactRootFamily::OpaqueRaw as i32,
+            guest_architecture: w::GuestArchitecture::Amd64 as i32,
+            memory: false,
         }
     }
 
     #[test]
-    fn acquisition_requires_explicit_canonical_digest_or_signature_policy() {
-        let request = w::AcquireArtifactRequest {
+    fn acquisition_takes_a_reference_and_an_optional_local_name() {
+        let request = libvm::ArtifactAcquireRequest {
             reference: "localhost:5000/vm:latest".into(),
-            trust: None,
-            alias: None,
+            name: Some("vm".into()),
         };
-        assert!(acquire_from_wire(request.clone()).is_err());
-        let mut request = request;
-        request.trust = Some(w::acquire_artifact_request::Trust::ApprovedDigest(
-            "sha256:bad".into(),
-        ));
-        assert!(acquire_from_wire(request.clone()).is_err());
-        request.trust = Some(w::acquire_artifact_request::Trust::ApprovedDigest(format!(
-            "sha256:{}",
-            "a".repeat(64)
-        )));
-        let decoded = acquire_from_wire(request).unwrap();
-        assert!(
-            matches!(decoded.trust, libvm::ArtifactTrust::ApproveDigest { digest } if digest.to_string() == format!("sha256:{}", "a".repeat(64)))
+        assert_eq!(
+            acquire_from_wire(acquire_to_wire(&request).unwrap()).unwrap(),
+            request
         );
+        for (reference, name) in [
+            ("", None),
+            ("localhost:5000/vm", Some("registry/name")),
+            ("localhost:5000/vm", Some("Upper")),
+        ] {
+            let wire = w::AcquireArtifactRequest {
+                reference: reference.into(),
+                name: name.map(Into::into),
+            };
+            assert!(acquire_from_wire(wire).is_err(), "{reference:?} {name:?}");
+        }
     }
 
     #[test]
-    fn inspection_rejects_conflicting_identity_and_capture_semantics() {
+    fn inspection_round_trips_content_kind_root_and_memory() {
+        let image = inspection_from_wire(inspection()).unwrap();
+        assert!(matches!(image.content, libvm::ArtifactContent::Image(_)));
+        assert_eq!(inspection_to_wire(&image).unwrap(), inspection());
+
+        let mut snapshot = inspection();
+        snapshot.content = Some(w::ArtifactContent {
+            id: Some(w::artifact_content::Id::SnapshotId(id("c"))),
+        });
+        snapshot.root = w::ArtifactRootFamily::LinuxOverlay as i32;
+        snapshot.memory = true;
+        let decoded = inspection_from_wire(snapshot.clone()).unwrap();
+        assert!(decoded.memory);
+        assert_eq!(decoded.root, libvm::ArtifactRootFamily::LinuxOverlay);
+        assert_eq!(inspection_to_wire(&decoded).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn inspection_rejects_image_memory_and_unknown_fields() {
+        let mut value = inspection();
+        value.memory = true;
+        assert!(inspection_from_wire(value).is_err());
+        let mut value = inspection();
+        value.root = 999;
+        assert!(inspection_from_wire(value).is_err());
+        let mut value = inspection();
+        value.content = None;
+        assert!(inspection_from_wire(value).is_err());
+        let mut value = inspection();
+        value.index_digest = "sha256:short".into();
+        assert!(inspection_from_wire(value).is_err());
+    }
+
+    #[test]
+    fn publication_takes_an_image_reference_and_reports_images_only() {
+        let request = libvm::ArtifactPublishRequest {
+            image: "hello".parse().unwrap(),
+            destination: "localhost:5000/vm:v1".into(),
+            encoding: libvm::ArtifactEncoding::Zstd,
+        };
         assert_eq!(
-            inspection_from_wire(inspection()).unwrap().purpose,
-            libvm::ArtifactPurpose::Image
+            publish_from_wire(publish_to_wire(&request).unwrap()).unwrap(),
+            request
         );
-        let mut value = inspection();
-        value.capture_kind = Some(w::ArtifactCaptureKind::StoppedStorage as i32);
-        assert!(inspection_from_wire(value).is_err());
-        let mut value = inspection();
-        value.live_restore = true;
-        assert!(inspection_from_wire(value).is_err());
-        let mut value = inspection();
-        value.purpose = w::ArtifactPurpose::Checkpoint as i32;
-        value.capture_kind = Some(w::ArtifactCaptureKind::LiveExecution as i32);
-        assert!(inspection_from_wire(value).is_err());
-        let mut value = inspection();
-        value.root_family = 999;
-        assert!(inspection_from_wire(value).is_err());
+        let mut missing = publish_to_wire(&request).unwrap();
+        missing.image = None;
+        assert!(publish_from_wire(missing).is_err());
+
+        let report = libvm::ArtifactPublishReport {
+            repository: "localhost:5000/vm".into(),
+            index_digest: id("a").parse().unwrap(),
+            tag: Some("v1".into()),
+            content: libvm::ArtifactContent::Image(id("b").parse().unwrap()),
+        };
+        let wire = published_to_wire(&report).unwrap();
+        assert_eq!(published_from_wire(wire.clone()).unwrap(), report);
+        let mut snapshot = wire;
+        snapshot.content = Some(w::ArtifactContent {
+            id: Some(w::artifact_content::Id::SnapshotId(id("c"))),
+        });
+        assert!(published_from_wire(snapshot).is_err());
     }
 }

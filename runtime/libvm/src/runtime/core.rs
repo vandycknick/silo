@@ -22,9 +22,8 @@ use crate::image::{
         acquire_composition, cached_resolved_oci_image, image_error, materialized_image,
         resolve_oci_image_from_registry,
     },
-    ImageDetail, ImageHandle, ImageProgress, ImageProgressSender, ImagePruneReport,
-    ImagePullPolicy, ImageRemoveOptions, ImageSource, ImageSourceKind, Images, MaterializedImage,
-    MaterializedRoot, ResolvedOciImage,
+    ImageProgress, ImageProgressSender, ImageSource, ImageSourceKind, Images, MaterializedImage,
+    MaterializedRoot, PullPolicy, ResolvedImageReference, ResolvedOciImage,
 };
 use crate::machine::{
     EgressCredentials, Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind,
@@ -112,7 +111,7 @@ pub struct Runtime {
     supervisor: VmSupervisor,
     live_query: crate::runtime::capabilities::LiveCapabilityQuery,
     observation_store: Option<Arc<crate::store::observation::ObservationStore>>,
-    image_pull_policy: ImagePullPolicy,
+    image_pull_policy: PullPolicy,
     image_progress: Option<ImageProgressSender>,
     secret_store: Arc<dyn silo_secrets::SecretStore>,
     secret_provider: Option<crate::HostCommand>,
@@ -242,11 +241,9 @@ impl Runtime {
         Ok(())
     }
 
-    /// Access snapshots through this runtime's already admitted catalog.
-    pub fn snapshots(&self) -> Result<crate::SnapshotStore, LibVmError> {
-        Ok(crate::SnapshotStore::from_store(Arc::new(
-            self.native_store()?,
-        )))
+    /// Snapshot listing, inspection, verification and removal.
+    pub fn snapshots(&self) -> crate::Snapshots {
+        crate::Snapshots::new(self.clone())
     }
 
     async fn recover_constructed_children(&self) -> Result<(), LibVmError> {
@@ -311,20 +308,28 @@ impl Runtime {
         self.supervisor.client(machine_id)
     }
 
+    /// A real catalog runtime as `open_with_capability_query` builds it,
+    /// including live observation, over test components.
     #[cfg(test)]
     pub(crate) async fn open(
         paths: LocalPaths,
         networking: RuntimeNetworkingConfig,
     ) -> Result<Self, LibVmError> {
         let store = Store::new(&paths).await?;
+        let observation = crate::store::observation::ObservationStore::existing(&store);
         let components = crate::runtime::components::test_components(paths.home());
-        Self::from_store(
+        let query = crate::runtime::capabilities::LiveCapabilityQuery::resolved(
+            components.supervisor().to_path_buf(),
+            crate::runtime::capabilities::ResolvedBackendSelection::resolve(None)?,
+        )?;
+        Self::from_store_resolved(
             paths,
             Arc::new(store),
             networking,
             RegistryPolicy::default(),
             components,
-            None,
+            query,
+            Some(Arc::new(observation)),
         )
         .await
     }
@@ -384,7 +389,7 @@ impl Runtime {
             supervisor,
             live_query,
             observation_store,
-            image_pull_policy: ImagePullPolicy::default(),
+            image_pull_policy: PullPolicy::default(),
             image_progress: None,
             open_timing: crate::runtime::start_timeline::RuntimeOpenTiming::default(),
         };
@@ -715,12 +720,12 @@ impl Runtime {
     /// The policy applies to `Runtime::images().pull` and machine creation through
     /// `Runtime::machine().image(...).create()`. Starting an existing machine
     /// never pulls or re-resolves images.
-    pub fn with_image_pull_policy(mut self, policy: ImagePullPolicy) -> Self {
+    pub fn with_image_pull_policy(mut self, policy: PullPolicy) -> Self {
         self.image_pull_policy = policy;
         self
     }
 
-    pub(crate) fn image_pull_policy(&self) -> ImagePullPolicy {
+    pub(crate) fn image_pull_policy(&self) -> PullPolicy {
         self.image_pull_policy
     }
 
@@ -966,8 +971,8 @@ impl Runtime {
                 }
                 let info = self.images().import_disk(request.clone()).await?;
                 let image = self
-                    .materialize_managed_image(
-                        &crate::ManagedSourceRef::Image(info.id),
+                    .materialize_stored_image(
+                        info.id,
                         request.path.display().to_string(),
                         ImageSourceKind::Disk,
                     )
@@ -975,9 +980,23 @@ impl Runtime {
                 emit_image_progress_complete(self.image_progress.as_ref());
                 Ok(image)
             }
-            ImageSource::Managed(source) => {
-                self.materialize_managed_image(source, source.to_string(), ImageSourceKind::Managed)
-                    .await
+            ImageSource::Stored(reference) => {
+                let image = self.resolve_local_image(reference).await?;
+                match image.record {
+                    crate::resolve::LocalRecord::Image(
+                        crate::store::image_store::LocalImage::Stored(id),
+                    ) => {
+                        self.materialize_stored_image(
+                            id,
+                            reference.to_string(),
+                            ImageSourceKind::Stored,
+                        )
+                        .await
+                    }
+                    _ => Err(crate::machine::root_storage::invalid(
+                        "a stored image source resolved to another kind",
+                    )),
+                }
             }
         }
     }
@@ -992,16 +1011,16 @@ impl Runtime {
         self.materialize_resolved_oci_image(&resolved).await
     }
 
-    async fn materialize_managed_image(
+    async fn materialize_stored_image(
         &self,
-        source: &crate::ManagedSourceRef,
+        id: crate::ImageId,
         requested_reference: String,
         source_kind: ImageSourceKind,
     ) -> Result<MaterializedImage, LibVmError> {
-        let store = crate::store::managed_image_store::ManagedImageStore::from_store(Arc::new(
+        let store = crate::store::stored_image_store::StoredImageStore::from_store(Arc::new(
             self.native_store()?,
         ));
-        let consumer = store.consume(source).await?;
+        let consumer = store.consume(id).await?;
         let pool = crate::storage::pool::StoragePool::open(self.local_images_dir())?;
         let authenticated = consumer.open_copy_source(&pool)?;
         let crate::BootProfile::LinuxDirect {
@@ -1009,7 +1028,7 @@ impl Runtime {
         } = &consumer.info.record.boot
         else {
             return Err(crate::machine::root_storage::invalid(
-                "managed image does not have a Linux direct boot profile",
+                "stored image does not have a Linux direct boot profile",
             ));
         };
         let platform = oci::Platform {
@@ -1028,7 +1047,7 @@ impl Runtime {
                 authenticated,
             },
             requested_reference,
-            selected_reference: Some(source.to_string()),
+            selected_reference: Some(consumer.info.id.to_string()),
             source_kind,
             image_id: Some(consumer.info.id.to_string()),
             manifest_digest: None,
@@ -1039,10 +1058,112 @@ impl Runtime {
         })
     }
 
+    /// Local image resolution only (DESIGN §4 steps 1, 2 and the id prefix).
+    pub(crate) async fn resolve_local_image(
+        &self,
+        reference: &crate::ImageRef,
+    ) -> Result<crate::resolve::LocalMatch, LibVmError> {
+        let store = self.native_store()?;
+        let mut connection = store.pool.acquire().await?;
+        crate::resolve::resolve_local(
+            &mut connection,
+            &self.registry_policy,
+            &reference.to_string(),
+            crate::resolve::Kind::Image,
+        )
+        .await
+    }
+
+    /// Resolve a create/pull reference per DESIGN §4 into a source whose
+    /// family is known: a stored image, or an OCI selection resolved for
+    /// `platform`. A Silo image artifact is pulled into a stored image; a
+    /// snapshot (local name or artifact) is refused with a restore hint.
+    pub(crate) async fn resolve_image_reference(
+        &self,
+        reference: &str,
+        platform: Option<&crate::LinuxPlatform>,
+        pull: PullPolicy,
+    ) -> Result<ResolvedImageReference, LibVmError> {
+        let resolution = {
+            let store = self.native_store()?;
+            let mut connection = store.pool.acquire().await?;
+            crate::resolve::resolve(
+                &mut connection,
+                &self.registry_policy,
+                reference,
+                crate::resolve::Kind::Image,
+                pull,
+            )
+            .await?
+        };
+        let (name, policy) = match resolution {
+            crate::resolve::Resolution::Local(local) => match local.record {
+                crate::resolve::LocalRecord::Image(
+                    crate::store::image_store::LocalImage::Stored(id),
+                ) => {
+                    return Ok(ResolvedImageReference::Stored {
+                        reference: match local.name {
+                            Some(name) => crate::ImageRef::Name(name),
+                            None => crate::ImageRef::Id(id),
+                        },
+                        id,
+                    })
+                }
+                crate::resolve::LocalRecord::Image(crate::store::image_store::LocalImage::Oci(
+                    id,
+                )) => {
+                    let name = match local.name {
+                        Some(name) => name,
+                        None => self.oci_image_name(id).await?,
+                    };
+                    (name, PullPolicy::Never)
+                }
+                crate::resolve::LocalRecord::Snapshot(_) => {
+                    return Err(LibVmError::SnapshotIsNotAnImage {
+                        reference: reference.to_owned(),
+                    })
+                }
+            },
+            crate::resolve::Resolution::Remote(name) => (name, pull),
+        };
+        match self.resolve_oci_image(name, policy, platform).await {
+            Ok(resolved) => Ok(ResolvedImageReference::Oci(Box::new(resolved))),
+            Err(LibVmError::ImageIsVmArtifact { reference }) => {
+                let report = self
+                    .images()
+                    .acquire_artifact(crate::ArtifactAcquireRequest {
+                        reference,
+                        name: None,
+                    })
+                    .await?;
+                Ok(ResolvedImageReference::Stored {
+                    reference: crate::ImageRef::Id(report.image.id),
+                    id: report.image.id,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The first name of a cached OCI image; an unnamed selection can only be
+    /// used again after pulling it by reference.
+    async fn oci_image_name(&self, id: crate::ImageId) -> Result<String, LibVmError> {
+        let store = self.native_store()?;
+        let mut connection = store.pool.acquire().await?;
+        crate::store::image_store::oci_image_info(&mut connection, id)
+            .await?
+            .and_then(|info| info.names.into_iter().next())
+            .ok_or_else(|| LibVmError::InvalidRequest {
+                message: format!(
+                    "cached OCI image {id} has no name; pull it by its registry reference"
+                ),
+            })
+    }
+
     pub(crate) async fn resolve_oci_image(
         &self,
         reference: String,
-        policy: ImagePullPolicy,
+        policy: PullPolicy,
         platform: Option<&crate::LinuxPlatform>,
     ) -> Result<ResolvedOciImage, LibVmError> {
         let mut options =
@@ -1059,7 +1180,7 @@ impl Runtime {
                 variant: platform.variant.clone(),
             };
         }
-        if policy != ImagePullPolicy::Always {
+        if policy != PullPolicy::Always {
             if let Some(image) = self
                 .cached_oci_record(&reference, &options.platform)
                 .await?
@@ -1069,7 +1190,7 @@ impl Runtime {
                     image.reference.requested_reference.clone(),
                 ));
             }
-            if policy == ImagePullPolicy::Never {
+            if policy == PullPolicy::Never {
                 return Err(LibVmError::ImageNotFound { reference });
             }
         }
@@ -2578,36 +2699,6 @@ impl Runtime {
             .await
     }
 
-    pub(crate) async fn image_handle(
-        &self,
-        reference: &str,
-    ) -> Result<Option<ImageHandle>, LibVmError> {
-        self.store.image_handle(reference).await
-    }
-
-    pub(crate) async fn list_image_handles(&self) -> Result<Vec<ImageHandle>, LibVmError> {
-        self.store.list_image_handles().await
-    }
-
-    pub(crate) async fn image_detail(
-        &self,
-        reference: &str,
-    ) -> Result<Option<ImageDetail>, LibVmError> {
-        self.store.image_detail(reference).await
-    }
-
-    pub(crate) async fn remove_image(
-        &self,
-        reference: &str,
-        options: ImageRemoveOptions,
-    ) -> Result<(), LibVmError> {
-        self.store.remove_image(reference, options).await
-    }
-
-    pub(crate) async fn prune_images(&self) -> Result<ImagePruneReport, LibVmError> {
-        self.store.prune_images().await
-    }
-
     pub(crate) async fn machine_config_by_name(
         &self,
         name: &str,
@@ -3011,11 +3102,8 @@ fn validate_launch_storage(storage: &crate::MachineStorageRecord) -> Result<(), 
     Ok(())
 }
 
-fn validate_image_pull_policy(
-    source: &ImageSource,
-    policy: ImagePullPolicy,
-) -> Result<(), LibVmError> {
-    if matches!(source, ImageSource::Disk(_)) && policy != ImagePullPolicy::IfMissing {
+fn validate_image_pull_policy(source: &ImageSource, policy: PullPolicy) -> Result<(), LibVmError> {
+    if matches!(source, ImageSource::Disk(_)) && policy != PullPolicy::IfMissing {
         return Err(LibVmError::ImagePullPolicyUnsupported {
             policy,
             source_kind: ImageSourceKind::Disk,
@@ -3363,9 +3451,9 @@ pub(crate) mod tests {
     use crate::OciImageConfigMetadata;
     use crate::Platform;
     use crate::{
-        GuestPublish, ImageCacheState, ImagePullOptions, ImagePullPolicy, ImageResolveOptions,
-        ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions, MachineRef,
-        MachineRetention, MachineRunId, MachineStatus, MachineUpdate, Memory, PublishBind,
+        GuestPublish, ImageCacheState, ImagePullOptions, ImageResolveOptions, ImageSource,
+        LibVmError, MachineExitOutcome, MachineKillOptions, MachineRef, MachineRetention,
+        MachineRunId, MachineStatus, MachineUpdate, Memory, PublishBind, PullPolicy,
         RuntimeNetworkingConfig,
     };
     use oci::RootfsMetadata;
@@ -3706,7 +3794,7 @@ pub(crate) mod tests {
         let pool = crate::storage::pool::StoragePool::open_existing(paths.images_dir())
             .unwrap()
             .unwrap();
-        for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
+        for policy in [PullPolicy::IfMissing, PullPolicy::Never] {
             let resolved = runtime
                 .resolve_oci_image(reference.into(), policy, None)
                 .await
@@ -3729,10 +3817,7 @@ pub(crate) mod tests {
     fn disk_sources_reject_oci_pull_policies() {
         let disk = ImageSource::disk("rootfs.img");
 
-        for policy in [
-            crate::ImagePullPolicy::Always,
-            crate::ImagePullPolicy::Never,
-        ] {
+        for policy in [crate::PullPolicy::Always, crate::PullPolicy::Never] {
             let error = validate_image_pull_policy(&disk, policy)
                 .expect_err("disk source must reject OCI pull policy");
             assert!(matches!(
@@ -3743,7 +3828,7 @@ pub(crate) mod tests {
                 } if actual == policy
             ));
         }
-        validate_image_pull_policy(&disk, crate::ImagePullPolicy::IfMissing)
+        validate_image_pull_policy(&disk, crate::PullPolicy::IfMissing)
             .expect("default disk materialization remains supported");
     }
 
@@ -3763,7 +3848,7 @@ pub(crate) mod tests {
         let metadata = write_cached_oci_rootfs(&runtime, REFERENCE, MANIFEST, CONFIG).await;
         let before = runtime.images().list().await.unwrap();
 
-        for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
+        for policy in [PullPolicy::IfMissing, PullPolicy::Never] {
             let resolved = runtime
                 .images()
                 .resolve_with(
@@ -3790,7 +3875,7 @@ pub(crate) mod tests {
             .resolve_with(
                 "example.invalid/missing:mutable",
                 ImageResolveOptions {
-                    policy: Some(ImagePullPolicy::Never),
+                    policy: Some(PullPolicy::Never),
                     platform: None,
                 },
             )
@@ -3816,31 +3901,33 @@ pub(crate) mod tests {
         write_cached_oci_rootfs(&runtime, FIRST_REFERENCE, MANIFEST, CONFIG).await;
         write_cached_oci_rootfs(&runtime, SECOND_REFERENCE, MANIFEST, CONFIG).await;
 
-        let handle = runtime
+        let info = runtime
             .images()
             .pull_with(
                 SECOND_REFERENCE,
                 ImagePullOptions {
-                    policy: Some(ImagePullPolicy::Never),
+                    policy: Some(PullPolicy::Never),
                 },
             )
             .await
             .expect("pull second cached tag");
 
-        assert_eq!(handle.requested_reference, SECOND_REFERENCE);
-        assert_eq!(handle.selected_manifest_digest, MANIFEST);
-        assert!(runtime
-            .images()
-            .get(FIRST_REFERENCE)
-            .await
-            .expect("get first tag")
-            .is_some());
-        assert!(runtime
-            .images()
-            .get(SECOND_REFERENCE)
-            .await
-            .expect("get second tag")
-            .is_some());
+        let crate::ImageInfo::Oci(info) = info else {
+            panic!("a cached container image is an OCI image: {info:?}");
+        };
+        assert_eq!(info.id.to_string(), MANIFEST);
+        for reference in [FIRST_REFERENCE, SECOND_REFERENCE] {
+            let crate::ImageInfo::Oci(named) = runtime
+                .images()
+                .inspect(&crate::ImageRef::Name(reference.into()))
+                .await
+                .expect("inspect each tag")
+            else {
+                panic!("{reference} names the cached OCI image");
+            };
+            assert_eq!(named.id, info.id);
+            assert!(named.names.iter().any(|name| name == reference));
+        }
     }
 
     #[tokio::test]
@@ -3856,7 +3943,7 @@ pub(crate) mod tests {
         let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
             .expect("open runtime");
-        let metadata = write_cached_oci_rootfs(&runtime, REFERENCE, MANIFEST, CONFIG).await;
+        write_cached_oci_rootfs(&runtime, REFERENCE, MANIFEST, CONFIG).await;
         let lower = runtime
             .store
             .cached_oci_image(REFERENCE, &Platform::host().unwrap())
@@ -3881,29 +3968,32 @@ pub(crate) mod tests {
             .pull_with(
                 REFERENCE,
                 ImagePullOptions {
-                    policy: Some(ImagePullPolicy::Never),
+                    policy: Some(PullPolicy::Never),
                 },
             )
             .await
             .expect("persist cached image reference");
-        runtime
+        let removal = runtime
             .images()
-            .remove(REFERENCE)
+            .remove(&crate::ImageRef::Name(REFERENCE.into()))
             .await
             .expect("remove image reference");
+        assert_eq!(removal.names, vec![REFERENCE.to_owned()]);
+        assert!(removal.record_removed, "the last name takes the record");
 
-        assert!(runtime
-            .images()
-            .get(REFERENCE)
-            .await
-            .expect("look up removed image")
-            .is_none());
+        assert!(matches!(
+            runtime
+                .images()
+                .inspect(&crate::ImageRef::Name(REFERENCE.into()))
+                .await,
+            Err(LibVmError::ImageNotFound { .. })
+        ));
         let error = runtime
             .images()
             .pull_with(
                 REFERENCE,
                 ImagePullOptions {
-                    policy: Some(ImagePullPolicy::Never),
+                    policy: Some(PullPolicy::Never),
                 },
             )
             .await
@@ -3911,20 +4001,14 @@ pub(crate) mod tests {
         assert!(matches!(error, LibVmError::ImageNotFound { .. }));
         assert!(
             artifact_dir.exists(),
-            "removal must retain artifact until prune"
+            "removal must retain bytes until prune"
         );
-        let pinned = runtime
-            .resolve_oci_image(metadata.selected_reference, ImagePullPolicy::Never, None)
-            .await
-            .unwrap();
-        assert_eq!(pinned.manifest_digest, MANIFEST);
 
-        let report = runtime
+        runtime
             .images()
             .prune()
             .await
             .expect("prune image artifacts");
-        assert_eq!(report.artifacts_removed, 1);
         assert!(!artifact_dir.exists());
     }
 
@@ -3961,7 +4045,7 @@ pub(crate) mod tests {
             .resolve_with(
                 REFERENCE,
                 ImageResolveOptions {
-                    policy: Some(ImagePullPolicy::Never),
+                    policy: Some(PullPolicy::Never),
                     platform: None,
                 },
             )
@@ -7039,7 +7123,7 @@ pub(crate) mod tests {
             vec![],
         )
         .unwrap();
-        for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
+        for policy in [PullPolicy::IfMissing, PullPolicy::Never] {
             assert_eq!(
                 runtime
                     .resolve_oci_image(reference.into(), policy, None)
@@ -7051,7 +7135,7 @@ pub(crate) mod tests {
         }
         assert!(matches!(
             runtime
-                .resolve_oci_image(reference.into(), ImagePullPolicy::Always, None)
+                .resolve_oci_image(reference.into(), PullPolicy::Always, None)
                 .await,
             Err(LibVmError::ImageReferenceRejected { .. })
         ));

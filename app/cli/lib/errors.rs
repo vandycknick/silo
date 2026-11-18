@@ -74,7 +74,7 @@ pub fn print(error: &Report, verbose: u8) {
 
 fn live_refusal(value: &vm_spec::live::LiveOperationUnsupported) -> String {
     let alternative = if value.backend == vm_spec::live::LiveBackend::Vz {
-        "use silo stop, then an ordinary stopped-storage snapshot (not an execution checkpoint)"
+        "use silo stop, then a snapshot without memory"
     } else {
         "use ordinary boot or a stopped-storage workflow; no live fallback is performed"
     };
@@ -106,22 +106,23 @@ mod tests {
         assert_eq!(line.lines().count(), 1);
         assert!(line.contains("backend-excluded (backend=vz, lane=not-applicable)"));
         assert!(line.contains("silo stop"));
-        assert!(line.contains("stopped-storage snapshot"));
+        assert!(line.contains("snapshot without memory"));
         assert!(!line.contains("silo snapshot"));
+        assert!(!line.contains("checkpoint"));
     }
 
     #[test]
-    fn capture_alias_conflict_names_retained_checkpoint_and_uses_failure_exit() {
-        let checkpoint: libvm::SnapshotId = format!("sha256:{}", "c".repeat(64)).parse().unwrap();
-        let error: eyre::Report = libvm::LibVmError::CaptureAliasConflict {
-            alias: "web-cp".into(),
-            checkpoint,
+    fn capture_name_conflict_names_kept_snapshot_and_uses_failure_exit() {
+        let snapshot: libvm::SnapshotId = format!("sha256:{}", "c".repeat(64)).parse().unwrap();
+        let error: eyre::Report = libvm::LibVmError::CaptureNameConflict {
+            name: "web-cp".into(),
+            snapshot,
         }
         .into();
         let rendered = error.to_string();
         assert!(rendered.contains("web-cp"));
-        assert!(rendered.contains(&checkpoint.to_string()));
-        assert!(rendered.contains("retained without the requested alias"));
+        assert!(rendered.contains(&snapshot.to_string()));
+        assert!(rendered.contains("kept without the requested name"));
         assert_eq!(rendered.lines().count(), 1);
         // The CLI's normal error path defaults to failure, not a guest exit.
         assert_eq!(execution_exit_code(&error), None);

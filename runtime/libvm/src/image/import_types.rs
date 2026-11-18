@@ -1,12 +1,11 @@
-//! Typed managed-image requests and inspection data. Inspection is not a lease.
+//! Typed image requests and inspection data. Inspection is not a lease.
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::identity::{ImageId, ObjectDigest, SnapshotId};
+use crate::storage::identity::{ImageId, ObjectDigest};
 use crate::store::models::image::ImageRecord;
 use crate::store::models::storage::{LinuxPlatform, RootSelector};
-use crate::store::snapshot_store::SnapshotInfo;
 use crate::LibVmError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,9 +61,13 @@ pub enum DiskImportBoot {
 pub struct DiskImportRequest {
     pub path: PathBuf,
     pub boot: DiskImportBoot,
-    pub alias: Option<String>,
+    pub name: Option<String>,
 }
 
+/// An image by name or id. A name is a local name, a cached or pulled
+/// registry reference (short references expand via `search_registries`),
+/// or a unique id prefix of at least 3 hex digits. Ids cover both cached
+/// OCI images (the selected manifest digest) and stored images.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -72,32 +75,28 @@ pub struct DiskImportRequest {
     rename_all = "kebab-case",
     deny_unknown_fields
 )]
-pub enum ManagedSourceRef {
-    Alias(String),
-    Image(ImageId),
-    Snapshot(SnapshotId),
+pub enum ImageRef {
+    Name(String),
+    Id(ImageId),
 }
 
-impl std::fmt::Display for ManagedSourceRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Alias(name) => write!(f, "image:{name}"),
-            Self::Image(id) => write!(f, "image:{id}"),
-            Self::Snapshot(id) => write!(f, "image:{id}"),
-        }
+impl std::str::FromStr for ImageRef {
+    type Err = LibVmError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match crate::store::names::parse_reference(value)? {
+            crate::store::names::Spelling::Id(id) => Self::Id(ImageId::from_sha256(*id.as_bytes())),
+            crate::store::names::Spelling::Name(name) => Self::Name(name),
+        })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "id",
-    rename_all = "kebab-case",
-    deny_unknown_fields
-)]
-pub enum ManagedSourceId {
-    Image(ImageId),
-    Snapshot(SnapshotId),
+impl std::fmt::Display for ImageRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(name) => f.write_str(name),
+            Self::Id(id) => write!(f, "{id}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +108,7 @@ pub struct BootAssetsUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RawConversionOptions {
-    pub alias: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,32 +169,74 @@ pub struct DiskImportFacts {
     pub selected_root: Option<RootCandidate>,
 }
 
-/// Complete diagnostic response, never a truncated history. Managed-image
+/// Complete diagnostic response, never a truncated history. Stored-image
 /// inspection/list admission allows at most one `MetadataPageBytes` (4 MiB)
 /// and `MetadataPageEntries` (4096 entries) aggregate, including canonical
-/// records, aliases, provenance and conversion metadata. Larger appendable
+/// records, names, provenance and conversion metadata. Larger appendable
 /// catalogs remain consumable and collectable through bounded authentication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ManagedImageInfo {
+pub struct StoredImageInfo {
     pub id: ImageId,
     pub record_digest: ObjectDigest,
     pub record: ImageRecord,
-    pub aliases: Vec<String>,
-    pub retained: bool,
+    pub names: Vec<String>,
     pub provenance: Vec<ImageProvenance>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "info",
-    rename_all = "kebab-case",
-    deny_unknown_fields
-)]
-pub enum ManagedSourceInfo {
-    Image(Box<ManagedImageInfo>),
-    Snapshot(SnapshotInfo),
+/// A cached OCI image: one selected manifest and its layered EROFS lower.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OciImageInfo {
+    /// The selected manifest digest.
+    pub id: ImageId,
+    /// Canonical registry references naming this selection.
+    pub names: Vec<String>,
+    pub config_digest: String,
+    pub platform: crate::Platform,
+    /// Execution defaults declared by the OCI image configuration.
+    pub config: crate::OciImageConfigMetadata,
+    /// Ordered OCI layers.
+    pub layers: Vec<crate::ImageLayerDetail>,
+    /// Logical length of the retained layered lower, in bytes.
+    pub lower_length: u64,
+    /// Sum of the compressed registry layer sizes, in bytes.
+    pub compressed_size_bytes: u64,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+/// One local image: a cached OCI image or a stored raw image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageInfo {
+    Oci(Box<OciImageInfo>),
+    Stored(Box<StoredImageInfo>),
+}
+
+impl ImageInfo {
+    pub fn id(&self) -> ImageId {
+        match self {
+            Self::Oci(info) => info.id,
+            Self::Stored(info) => info.id,
+        }
+    }
+
+    pub fn names(&self) -> &[String] {
+        match self {
+            Self::Oci(info) => &info.names,
+            Self::Stored(info) => &info.names,
+        }
+    }
+}
+
+/// What one image `remove` call deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRemoval {
+    pub id: ImageId,
+    /// Names removed by this call.
+    pub names: Vec<String>,
+    /// Whether the record itself was deleted. Its bytes are collected once
+    /// no machine, operation or other record references them.
+    pub record_removed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

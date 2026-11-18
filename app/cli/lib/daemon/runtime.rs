@@ -1,10 +1,9 @@
 //! libvm operations for the managed appliance, independent of CLI policy and UI.
 use eyre::Context as _;
 use libvm::{
-    ExecutionOutput, Forward, ImagePullPolicy, ImageResolveOptions, MachineData, MachineReadiness,
-    MachineRef, MachineRetention, MachineRunId, MachineStart, MachineStartOptions,
-    MachineStopOptions, MachineUpdate, Memory, ProcessConfig, ResolvedOciImage, Runtime,
-    RuntimeConfig,
+    ExecutionOutput, Forward, ImageResolveOptions, MachineData, MachineReadiness, MachineRef,
+    MachineRetention, MachineRunId, MachineStart, MachineStartOptions, MachineStopOptions,
+    MachineUpdate, Memory, ProcessConfig, PullPolicy, ResolvedOciImage, Runtime, RuntimeConfig,
 };
 use silod_spec::labels::{INSTALLATION_LABEL, MANAGED_ROLE, MANAGED_ROLE_LABEL};
 use std::time::Duration;
@@ -95,7 +94,7 @@ impl SystemRuntime {
     pub(crate) async fn resolve_image(
         &mut self,
         reference: &str,
-        policy: ImagePullPolicy,
+        policy: PullPolicy,
     ) -> eyre::Result<ResolvedOciImage> {
         Ok(self
             .runtime
@@ -144,12 +143,12 @@ impl SystemRuntime {
                 let converted = self
                     .runtime
                     .images()
-                    .convert(&image, libvm::RawConversionOptions { alias: None })
+                    .convert(&image, libvm::RawConversionOptions { name: None })
                     .await
                     .context("convert appliance OCI root for VZ raw storage")?;
                 self.runtime
                     .machine()
-                    .image_source(libvm::ImageSource::Managed(libvm::ManagedSourceRef::Image(
+                    .image_source(libvm::ImageSource::Stored(libvm::ImageRef::Id(
                         converted.id,
                     )))
             }

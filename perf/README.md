@@ -81,7 +81,7 @@ Every driver executes the same declaration-ordered scenario in
    check that both restores contain the pre-snapshot marker, then take another
    untimed fork and check that it contains the post-change marker. This extra
    fork runs after both restores, so it cannot warm their measurements.
-8. Time `snapshot_of_restored`, a first live capture of the first restored
+8. Time `snapshot_of_restored`, a first memory snapshot of the first restored
    child, whose RAM can be file-backed. Then stop and start the snapshot source,
    confirm exec readiness, repopulate busy RAM, and time `snapshot_after_restart`.
    The restart and workload are outside snapshot timing.
@@ -133,13 +133,13 @@ snapshot cases use the same scenario. Both durable snapshots use
 `snap create --full` and restores are eager, as in bench2; CoW restore is not
 part of the shared comparison.
 
-Silo never parses default CLI JSON. It knows all requested VM/alias names.
-`snapshot_id` reads `image_alias.snapshot_id` through the existing read-only
-`catalog_observer`; cleanup removes `image:NAME` with `image remove`, then the
-resolved `image:ID` with `snapshot remove`. The lookup is isolated in one function
+Silo never parses default CLI JSON. It knows all requested VM/snapshot names.
+`snapshot_id` reads `snapshot_name.snapshot_id` through the existing read-only
+`catalog_observer`; cleanup removes each snapshot by its resolved id with
+`snapshot rm ID`, which drops the record and its names. The lookup is isolated in one function
 for a future explicit-format inspect API. Failed workspaces retain diagnostics,
 but cleanup still removes benchmark VMs and snapshots. `--keep` keeps successful
-workspace evidence, not running VMs or snapshot retention roots.
+workspace evidence, not running VMs or snapshots.
 
 ## Cohorts and targets
 
@@ -162,7 +162,7 @@ not evidence for dirty or fully populated guests. Busy cohorts exercise populate
 RAM, scattered dirty coverage and real disk writes. The raw cohort is a
 correctness regression lane, not a performance target: it times
 `silo image convert REF --disk-format raw --format json`, then creates and runs
-from the returned `image:ID`, and verifies the incremental snapshot.
+from the returned `sha256:HEX` image id, and verifies the incremental snapshot.
 Informational cohort rows are labelled explicitly and never fail on timing,
 even if a target is accidentally configured for them.
 

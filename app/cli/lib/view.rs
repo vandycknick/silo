@@ -451,7 +451,7 @@ fn image_source_kind_label(source: ImageSourceKind) -> &'static str {
     match source {
         ImageSourceKind::Oci => "oci",
         ImageSourceKind::Disk => "disk",
-        ImageSourceKind::Managed => "managed",
+        ImageSourceKind::Stored => "stored",
     }
 }
 

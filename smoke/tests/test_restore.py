@@ -201,8 +201,7 @@ def test_restore_execution_continues_exact_cut_and_isolates_siblings(
     for name in ("restore-source", "restore-first", "restore-second"):
         silo.rm(name)
     assert not (silo.ws.silo_home / "machines" / saved.source_info["id"]).exists()
-    silo.run("image", "remove", "image:restore-checkpoint")
-    # No original source, sibling, alias or runtime boot bytes remain authoritative.
+    # No original source, sibling or runtime boot bytes remain authoritative.
     closure_before = {str(path.relative_to(silo.ws.silo_home)): stopped.read_bytes(path).content()
                       for path in restore.closure_paths(silo, saved)}
     old_home = silo.ws.silo_home
@@ -219,7 +218,7 @@ def test_restore_execution_continues_exact_cut_and_isolates_siblings(
         asset.chmod(0o755 if filename == "agent" else 0o644)
     assert {relative: stopped.read_bytes(relocated / relative).content()
             for relative in closure_before} == closure_before
-    assert silo.json("snapshot", "inspect", saved.reference)["retained"] is True
+    assert silo.json("snapshot", "inspect", saved.snapshot)["names"] == ["restore-checkpoint"]
     relocated_saved = replace(saved, staging=relocated / saved.staging.relative_to(old_home))
     restore.restore_child(silo, relocated_saved, "restore-relocated")
     own(silo, "restore-relocated", restore_processes)
@@ -237,17 +236,19 @@ def test_restore_execution_continues_exact_cut_and_isolates_siblings(
     own(silo, "restore-recursion", restore_processes)
     restore.resumed(silo, "restore-recursion", next_identity, next_cut)
     restore.exact_boot(silo, "restore-recursion", expected_boot)
-    # Delete every checkpoint root while its immutable RAM is privately mapped.
-    # Registered leases, not aliases or source machine paths, must protect it.
+    # Delete every snapshot record while its immutable RAM is privately mapped.
+    # Registered leases, not names or source machine paths, must protect it.
     mapped = restore.closure_paths(silo, recaptured)
     expected = {str(path): stopped.read_bytes(path).content() for path in mapped}
     holders, lease = shutdown.holder(silo, "restore-recursion")
     processes = [shutdown.Process(entry["pid"]) for entry in holders["holders"]]
     try:
         assert shutdown.lease_busy(lease)
-        silo.run("image", "remove", "image:restore-recaptured")
-        silo.run("snapshot", "remove", saved.reference)
-        silo.run("snapshot", "remove", recaptured.reference)
+        # Removing the last name removes the record; removing an id removes it and its names.
+        silo.run("snapshot", "rm", "restore-recaptured")
+        silo.run("snapshot", "rm", saved.snapshot)
+        assert procs.query(silo.ws.state_db(), "SELECT id FROM storage_snapshot") == []
+        assert procs.query(silo.ws.state_db(), "SELECT name FROM snapshot_name") == []
         shutdown.storage_tool(silo, "prune")
         assert shutdown.lease_busy(lease)
         assert {str(path): stopped.read_bytes(path).content() for path in mapped} == expected
@@ -268,7 +269,7 @@ def test_restore_execution_continues_exact_cut_and_isolates_siblings(
     silo.ws.record("restore-retention", json.dumps({
         "checkpoint": saved.snapshot, "recaptured": recaptured.snapshot,
         "originalHomeGone": not old_home.exists(), "relocatedHome": str(relocated),
-        "sourceDeleted": True, "aliasesDeleted": True, "closureBefore": closure_before,
+        "sourceDeleted": True, "snapshotsDeleted": True, "closureBefore": closure_before,
         "mappedClosure": expected, "leaseReleasedAfterReap": True,
     }, sort_keys=True) + "\n")
 

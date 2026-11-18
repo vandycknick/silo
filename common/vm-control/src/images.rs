@@ -241,18 +241,18 @@ pub fn progress_from_wire(v: w::ImageProgress) -> Result<libvm::ImageProgress, C
         Event::Complete(()) => libvm::ImageProgress::Complete,
     })
 }
-pub fn pull_policy_to_wire(v: libvm::ImagePullPolicy) -> i32 {
-    match v {
-        libvm::ImagePullPolicy::IfMissing => 1,
-        libvm::ImagePullPolicy::Always => 2,
-        libvm::ImagePullPolicy::Never => 3,
-    }
+pub fn pull_policy_to_wire(v: libvm::PullPolicy) -> i32 {
+    (match v {
+        libvm::PullPolicy::IfMissing => w::PullPolicy::IfMissing,
+        libvm::PullPolicy::Always => w::PullPolicy::Always,
+        libvm::PullPolicy::Never => w::PullPolicy::Never,
+    }) as i32
 }
-pub fn pull_policy_from_wire(v: i32) -> Result<libvm::ImagePullPolicy, ConversionError> {
-    match v {
-        1 => Ok(libvm::ImagePullPolicy::IfMissing),
-        2 => Ok(libvm::ImagePullPolicy::Always),
-        3 => Ok(libvm::ImagePullPolicy::Never),
+pub fn pull_policy_from_wire(v: i32) -> Result<libvm::PullPolicy, ConversionError> {
+    match w::PullPolicy::try_from(v) {
+        Ok(w::PullPolicy::IfMissing) => Ok(libvm::PullPolicy::IfMissing),
+        Ok(w::PullPolicy::Always) => Ok(libvm::PullPolicy::Always),
+        Ok(w::PullPolicy::Never) => Ok(libvm::PullPolicy::Never),
         _ => Err(invalid("pull_policy", "invalid enum")),
     }
 }
@@ -263,7 +263,7 @@ pub struct OciIdentity {
     pub platform: libvm::Platform,
     pub manifest_digest: String,
     pub config_digest: String,
-    pub pull_policy: libvm::ImagePullPolicy,
+    pub pull_policy: libvm::PullPolicy,
 }
 impl OciIdentity {
     pub fn verify(&self, image: &libvm::ResolvedOciImage) -> Result<(), ConversionError> {
@@ -280,10 +280,7 @@ impl OciIdentity {
         Ok(())
     }
 }
-pub fn identity_to_wire(
-    v: &libvm::ResolvedOciImage,
-    policy: libvm::ImagePullPolicy,
-) -> w::OciIdentity {
+pub fn identity_to_wire(v: &libvm::ResolvedOciImage, policy: libvm::PullPolicy) -> w::OciIdentity {
     w::OciIdentity {
         requested_reference: v.requested_reference.clone(),
         selected_reference: v.selected_reference.clone(),
@@ -293,8 +290,8 @@ pub fn identity_to_wire(
         pull_policy: pull_policy_to_wire(policy),
     }
 }
-pub fn identity_from_wire(v: w::OciIdentity) -> Result<OciIdentity, ConversionError> {
-    let mut parts = v.platform.split('/');
+fn platform_from_wire(value: &str) -> Result<libvm::Platform, ConversionError> {
+    let mut parts = value.split('/');
     let os = parts
         .next()
         .filter(|v| !v.is_empty())
@@ -307,6 +304,14 @@ pub fn identity_from_wire(v: w::OciIdentity) -> Result<OciIdentity, ConversionEr
     if variant == Some("") || parts.next().is_some() {
         return Err(invalid("platform", "invalid variant"));
     }
+    Ok(libvm::Platform {
+        os: os.into(),
+        architecture: architecture.into(),
+        variant: variant.map(str::to_owned),
+    })
+}
+pub fn identity_from_wire(v: w::OciIdentity) -> Result<OciIdentity, ConversionError> {
+    let platform = platform_from_wire(&v.platform)?;
     if v.requested_reference.is_empty()
         || v.selected_reference.is_empty()
         || v.manifest_digest.is_empty()
@@ -324,11 +329,6 @@ pub fn identity_from_wire(v: w::OciIdentity) -> Result<OciIdentity, ConversionEr
             "not pinned to manifest digest",
         ));
     }
-    let platform = libvm::Platform {
-        os: os.into(),
-        architecture: architecture.into(),
-        variant: variant.map(str::to_owned),
-    };
     Ok(OciIdentity {
         requested_reference: v.requested_reference,
         selected_reference: v.selected_reference,
@@ -340,7 +340,7 @@ pub fn identity_from_wire(v: w::OciIdentity) -> Result<OciIdentity, ConversionEr
 }
 pub fn resolved_image_to_wire(
     v: &libvm::ResolvedOciImage,
-    policy: libvm::ImagePullPolicy,
+    policy: libvm::PullPolicy,
 ) -> Result<w::ResolvedImage, ConversionError> {
     Ok(w::ResolvedImage {
         identity: Some(identity_to_wire(v, policy)),
@@ -378,7 +378,7 @@ const MAX_SPELLING_BYTES: usize = 4096;
 /// platform remains part of the resolved identity.
 pub fn resolve_request_to_wire(
     reference: String,
-    policy: libvm::ImagePullPolicy,
+    policy: libvm::PullPolicy,
     platform: Option<&libvm::LinuxPlatform>,
 ) -> w::ResolveImageRequest {
     w::ResolveImageRequest {
@@ -411,14 +411,6 @@ impl OciIdentity {
     }
 }
 
-/// A user-facing `image:` spelling. A bare digest carries no kind and must be
-/// resolved to a typed reference before use; no kind is ever preferred.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ManagedSpelling {
-    Reference(libvm::ManagedSourceRef),
-    Digest(ObjectDigest),
-}
-
 pub fn reject_local_cut(value: &str) -> Result<(), ConversionError> {
     if value.starts_with("fork:") {
         return Err(invalid(
@@ -429,94 +421,43 @@ pub fn reject_local_cut(value: &str) -> Result<(), ConversionError> {
     Ok(())
 }
 
-pub fn parse_managed(value: &str) -> Result<ManagedSpelling, ConversionError> {
-    reject_local_cut(value)?;
-    let value = value
-        .strip_prefix("image:")
-        .ok_or_else(|| invalid("image", "expected image:NAME or image:sha256:HEX"))?;
-    if value.starts_with("sha256:") {
-        return Ok(ManagedSpelling::Digest(crate::boot::digest_from_wire(
-            value, "image",
-        )?));
+fn reference_spelling(value: &str) -> Result<(), ConversionError> {
+    if value.len() > MAX_SPELLING_BYTES || value.contains('\0') {
+        return Err(invalid("image.reference", "oversized or NUL"));
     }
-    Ok(ManagedSpelling::Reference(libvm::ManagedSourceRef::Alias(
-        crate::stopped::alias(value)?,
-    )))
+    Ok(())
 }
 
-pub fn managed_id_to_ref(value: libvm::ManagedSourceId) -> libvm::ManagedSourceRef {
-    match value {
-        libvm::ManagedSourceId::Image(id) => libvm::ManagedSourceRef::Image(id),
-        libvm::ManagedSourceId::Snapshot(id) => libvm::ManagedSourceRef::Snapshot(id),
-    }
-}
-
-pub fn managed_ref_to_wire(
-    value: &libvm::ManagedSourceRef,
-) -> Result<w::ManagedSourceRef, ConversionError> {
-    use w::managed_source_ref::Reference;
-    Ok(w::ManagedSourceRef {
+pub fn image_ref_to_wire(value: &libvm::ImageRef) -> Result<w::ImageRef, ConversionError> {
+    use w::image_ref::Reference;
+    let wire = w::ImageRef {
         reference: Some(match value {
-            libvm::ManagedSourceRef::Alias(alias) => {
-                Reference::Alias(crate::stopped::alias(alias)?)
+            libvm::ImageRef::Id(id) => Reference::Id(id.to_string()),
+            libvm::ImageRef::Name(name) => Reference::Name(name.clone()),
+        }),
+    };
+    image_ref_from_wire(wire.clone())?;
+    Ok(wire)
+}
+
+/// A name is a local name, registry reference or unique id prefix; a full
+/// id travels only as `id`.
+pub fn image_ref_from_wire(value: w::ImageRef) -> Result<libvm::ImageRef, ConversionError> {
+    use w::image_ref::Reference;
+    match required(value.reference, "image.reference")? {
+        Reference::Id(id) => {
+            Ok(libvm::ImageRef::Id(id.parse().map_err(|_| {
+                invalid("image.id", "invalid image identity")
+            })?))
+        }
+        Reference::Name(name) => {
+            reference_spelling(&name)?;
+            match name.parse::<libvm::ImageRef>() {
+                Ok(reference @ libvm::ImageRef::Name(_)) => Ok(reference),
+                _ => Err(invalid("image.name", "invalid image name")),
             }
-            libvm::ManagedSourceRef::Image(id) => Reference::ImageId(id.to_string()),
-            libvm::ManagedSourceRef::Snapshot(id) => Reference::SnapshotId(id.to_string()),
-        }),
-    })
-}
-
-pub fn managed_ref_from_wire(
-    value: w::ManagedSourceRef,
-) -> Result<libvm::ManagedSourceRef, ConversionError> {
-    use w::managed_source_ref::Reference;
-    Ok(match required(value.reference, "managed.reference")? {
-        Reference::Alias(alias) => libvm::ManagedSourceRef::Alias(crate::stopped::alias(&alias)?),
-        Reference::ImageId(id) => libvm::ManagedSourceRef::Image(
-            id.parse()
-                .map_err(|_| invalid("managed.image_id", "invalid image identity"))?,
-        ),
-        Reference::SnapshotId(id) => libvm::ManagedSourceRef::Snapshot(
-            id.parse()
-                .map_err(|_| invalid("managed.snapshot_id", "invalid snapshot identity"))?,
-        ),
-    })
-}
-
-pub fn managed_digest_to_wire(value: &ObjectDigest) -> w::ManagedDigest {
-    w::ManagedDigest {
-        digest: value.to_string(),
+        }
     }
-}
-
-pub fn managed_digest_from_wire(value: w::ManagedDigest) -> Result<ObjectDigest, ConversionError> {
-    crate::boot::digest_from_wire(&value.digest, "managed.digest")
-}
-
-pub fn managed_id_to_wire(value: &libvm::ManagedSourceId) -> w::ManagedSourceId {
-    use w::managed_source_id::Id;
-    w::ManagedSourceId {
-        id: Some(match value {
-            libvm::ManagedSourceId::Image(id) => Id::ImageId(id.to_string()),
-            libvm::ManagedSourceId::Snapshot(id) => Id::SnapshotId(id.to_string()),
-        }),
-    }
-}
-
-pub fn managed_id_from_wire(
-    value: w::ManagedSourceId,
-) -> Result<libvm::ManagedSourceId, ConversionError> {
-    use w::managed_source_id::Id;
-    Ok(match required(value.id, "managed.id")? {
-        Id::ImageId(id) => libvm::ManagedSourceId::Image(
-            id.parse()
-                .map_err(|_| invalid("managed.image_id", "invalid image identity"))?,
-        ),
-        Id::SnapshotId(id) => libvm::ManagedSourceId::Snapshot(
-            id.parse()
-                .map_err(|_| invalid("managed.snapshot_id", "invalid snapshot identity"))?,
-        ),
-    })
 }
 
 fn container_to_wire(value: libvm::ImageContainerKind) -> i32 {
@@ -628,48 +569,34 @@ fn provenance_from_wire(
     Ok(provenance)
 }
 
-fn aliases_from_wire(values: Vec<String>) -> Result<Vec<String>, ConversionError> {
-    if values.len() > MAX_LISTED {
-        return Err(invalid("image.aliases", "too many aliases"));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for value in &values {
-        if !seen.insert(crate::stopped::alias(value)?) {
-            return Err(invalid("image.aliases", "duplicate alias"));
-        }
-    }
-    Ok(values)
-}
-
 /// The record travels as its canonical bytes; both directions authenticate the
 /// record digest, the domain-separated image identity and the closed schema.
-pub fn managed_image_to_wire(
-    value: &libvm::ManagedImageInfo,
-) -> Result<w::ManagedImageInfo, ConversionError> {
+pub fn stored_image_to_wire(
+    value: &libvm::StoredImageInfo,
+) -> Result<w::StoredImageInfo, ConversionError> {
     let record = value
         .record
         .canonical_bytes()
         .map_err(|_| invalid("image.record", "record is not canonical"))?;
-    let wire = w::ManagedImageInfo {
+    let wire = w::StoredImageInfo {
         id: value.id.to_string(),
         record_digest: value.record_digest.to_string(),
         record,
-        aliases: value.aliases.clone(),
-        retained: value.retained,
+        names: value.names.clone(),
         provenance: value
             .provenance
             .iter()
             .map(provenance_to_wire)
             .collect::<Result<_, _>>()?,
     };
-    managed_image_from_wire(wire.clone())?;
+    stored_image_from_wire(wire.clone())?;
     Ok(wire)
 }
 
-pub fn managed_image_from_wire(
-    value: w::ManagedImageInfo,
-) -> Result<libvm::ManagedImageInfo, ConversionError> {
-    let id: libvm::storage::identity::ImageId = value
+pub fn stored_image_from_wire(
+    value: w::StoredImageInfo,
+) -> Result<libvm::StoredImageInfo, ConversionError> {
+    let id: libvm::ImageId = value
         .id
         .parse()
         .map_err(|_| invalid("image.id", "invalid image identity"))?;
@@ -692,12 +619,11 @@ pub fn managed_image_from_wire(
     if value.provenance.len() > MAX_LISTED {
         return Err(invalid("image.provenance", "too many provenance records"));
     }
-    Ok(libvm::ManagedImageInfo {
+    Ok(libvm::StoredImageInfo {
         id,
         record_digest,
         record,
-        aliases: aliases_from_wire(value.aliases)?,
-        retained: value.retained,
+        names: crate::names_from_wire(value.names, "image.names")?,
         provenance: value
             .provenance
             .into_iter()
@@ -706,59 +632,198 @@ pub fn managed_image_from_wire(
     })
 }
 
-pub fn managed_info_to_wire(
-    value: &libvm::ManagedSourceInfo,
-) -> Result<w::ManagedSourceInfo, ConversionError> {
-    use w::managed_source_info::Info;
-    Ok(w::ManagedSourceInfo {
-        info: Some(match value {
-            libvm::ManagedSourceInfo::Image(image) => Info::Image(managed_image_to_wire(image)?),
-            libvm::ManagedSourceInfo::Snapshot(snapshot) => {
-                Info::Snapshot(crate::stopped::info_to_wire(snapshot)?)
+pub fn oci_image_to_wire(value: &libvm::OciImageInfo) -> Result<w::OciImageInfo, ConversionError> {
+    let wire = w::OciImageInfo {
+        id: value.id.to_string(),
+        names: value.names.clone(),
+        config_digest: value.config_digest.clone(),
+        platform: value.platform.to_string(),
+        oci_config_json: serde_json::to_string(&value.config)
+            .map_err(|_| invalid("image.oci_config_json", "cannot encode OCI config"))?,
+        layers: value
+            .layers
+            .iter()
+            .map(|layer| w::OciImageLayer {
+                blob_digest: layer.blob_digest.clone(),
+                diff_id: layer.diff_id.clone(),
+                media_type: layer.media_type.clone(),
+                compressed_size_bytes: layer.compressed_size_bytes,
+                uncompressed_size_bytes: layer.uncompressed_size_bytes,
+                position: layer.position,
+            })
+            .collect(),
+        lower_length: value.lower_length,
+        compressed_size_bytes: value.compressed_size_bytes,
+        created_at: value.created_at,
+        last_used_at: value.last_used_at,
+    };
+    oci_image_from_wire(wire.clone())?;
+    Ok(wire)
+}
+
+pub fn oci_image_from_wire(value: w::OciImageInfo) -> Result<libvm::OciImageInfo, ConversionError> {
+    crate::boot::digest_from_wire(&value.config_digest, "image.config_digest")?;
+    if value.layers.len() > MAX_LISTED {
+        return Err(invalid("image.layers", "too many layers"));
+    }
+    let layers = value
+        .layers
+        .into_iter()
+        .map(|layer| {
+            crate::boot::digest_from_wire(&layer.blob_digest, "image.layer.blob_digest")?;
+            crate::boot::digest_from_wire(&layer.diff_id, "image.layer.diff_id")?;
+            if layer.media_type.is_empty() || layer.media_type.len() > MAX_SPELLING_BYTES {
+                return Err(invalid("image.layer.media_type", "empty or oversized"));
             }
+            Ok(libvm::ImageLayerDetail {
+                blob_digest: layer.blob_digest,
+                diff_id: layer.diff_id,
+                media_type: layer.media_type,
+                compressed_size_bytes: layer.compressed_size_bytes,
+                uncompressed_size_bytes: layer.uncompressed_size_bytes,
+                position: layer.position,
+            })
+        })
+        .collect::<Result<_, ConversionError>>()?;
+    Ok(libvm::OciImageInfo {
+        id: value
+            .id
+            .parse()
+            .map_err(|_| invalid("image.id", "invalid image identity"))?,
+        names: crate::names_from_wire(value.names, "image.names")?,
+        config_digest: value.config_digest,
+        platform: platform_from_wire(&value.platform)?,
+        config: serde_json::from_str(&value.oci_config_json)
+            .map_err(|_| invalid("image.oci_config_json", "invalid OCI config"))?,
+        layers,
+        lower_length: value.lower_length,
+        compressed_size_bytes: value.compressed_size_bytes,
+        created_at: value.created_at,
+        last_used_at: value.last_used_at,
+    })
+}
+
+pub fn image_info_to_wire(value: &libvm::ImageInfo) -> Result<w::ImageInfo, ConversionError> {
+    use w::image_info::Info;
+    Ok(w::ImageInfo {
+        info: Some(match value {
+            libvm::ImageInfo::Oci(image) => Info::Oci(oci_image_to_wire(image)?),
+            libvm::ImageInfo::Stored(image) => Info::Stored(stored_image_to_wire(image)?),
         }),
     })
 }
 
-pub fn managed_info_from_wire(
-    value: w::ManagedSourceInfo,
-) -> Result<libvm::ManagedSourceInfo, ConversionError> {
-    use w::managed_source_info::Info;
-    Ok(match required(value.info, "managed.info")? {
-        Info::Image(image) => {
-            libvm::ManagedSourceInfo::Image(Box::new(managed_image_from_wire(image)?))
-        }
-        Info::Snapshot(snapshot) => {
-            libvm::ManagedSourceInfo::Snapshot(crate::stopped::info_from_wire(snapshot)?)
-        }
+pub fn image_info_from_wire(value: w::ImageInfo) -> Result<libvm::ImageInfo, ConversionError> {
+    use w::image_info::Info;
+    Ok(match required(value.info, "image.info")? {
+        Info::Oci(image) => libvm::ImageInfo::Oci(Box::new(oci_image_from_wire(image)?)),
+        Info::Stored(image) => libvm::ImageInfo::Stored(Box::new(stored_image_from_wire(image)?)),
     })
 }
 
-pub fn managed_list_to_wire(
-    values: &[libvm::ManagedSourceInfo],
-) -> Result<w::ManagedSourceList, ConversionError> {
+pub fn image_list_to_wire(values: &[libvm::ImageInfo]) -> Result<w::ImageList, ConversionError> {
     if values.len() > MAX_LISTED {
-        return Err(invalid("managed.list", "too many managed sources"));
+        return Err(invalid("image.list", "too many images"));
     }
-    Ok(w::ManagedSourceList {
-        values: values
+    Ok(w::ImageList {
+        images: values
             .iter()
-            .map(managed_info_to_wire)
+            .map(image_info_to_wire)
             .collect::<Result<_, _>>()?,
     })
 }
 
-pub fn managed_list_from_wire(
-    value: w::ManagedSourceList,
-) -> Result<Vec<libvm::ManagedSourceInfo>, ConversionError> {
-    if value.values.len() > MAX_LISTED {
-        return Err(invalid("managed.list", "too many managed sources"));
+pub fn image_list_from_wire(value: w::ImageList) -> Result<Vec<libvm::ImageInfo>, ConversionError> {
+    if value.images.len() > MAX_LISTED {
+        return Err(invalid("image.list", "too many images"));
     }
-    value
-        .values
-        .into_iter()
-        .map(managed_info_from_wire)
-        .collect()
+    value.images.into_iter().map(image_info_from_wire).collect()
+}
+
+pub fn image_removal_to_wire(
+    value: &libvm::ImageRemoval,
+) -> Result<w::ImageRemoval, ConversionError> {
+    let wire = w::ImageRemoval {
+        id: value.id.to_string(),
+        names: value.names.clone(),
+        record_removed: value.record_removed,
+    };
+    image_removal_from_wire(wire.clone())?;
+    Ok(wire)
+}
+
+pub fn image_removal_from_wire(
+    value: w::ImageRemoval,
+) -> Result<libvm::ImageRemoval, ConversionError> {
+    Ok(libvm::ImageRemoval {
+        id: value
+            .id
+            .parse()
+            .map_err(|_| invalid("image.id", "invalid image identity"))?,
+        names: crate::names_from_wire(value.names, "image.names")?,
+        record_removed: value.record_removed,
+    })
+}
+
+pub fn prune_report_to_wire(value: &libvm::ImagePruneReport) -> w::ImagePruneReport {
+    w::ImagePruneReport {
+        images_removed: value.images_removed,
+        bytes_removed: value.bytes_removed,
+    }
+}
+
+pub fn prune_report_from_wire(value: w::ImagePruneReport) -> libvm::ImagePruneReport {
+    libvm::ImagePruneReport {
+        images_removed: value.images_removed,
+        bytes_removed: value.bytes_removed,
+    }
+}
+
+/// An absent policy defers to the daemon runtime's pull policy.
+pub fn pull_request_to_wire(
+    reference: &str,
+    options: &libvm::ImagePullOptions,
+) -> Result<w::PullImageRequest, ConversionError> {
+    let wire = w::PullImageRequest {
+        reference: reference.to_owned(),
+        pull_policy: options
+            .policy
+            .map(pull_policy_to_wire)
+            .unwrap_or(w::PullPolicy::Unspecified as i32),
+    };
+    pull_request_from_wire(wire.clone())?;
+    Ok(wire)
+}
+
+pub fn pull_request_from_wire(
+    value: w::PullImageRequest,
+) -> Result<(String, libvm::ImagePullOptions), ConversionError> {
+    if value.reference.is_empty() {
+        return Err(invalid("image.reference", "empty"));
+    }
+    reference_spelling(&value.reference)?;
+    let policy = (value.pull_policy != w::PullPolicy::Unspecified as i32)
+        .then(|| pull_policy_from_wire(value.pull_policy))
+        .transpose()?;
+    Ok((value.reference, libvm::ImagePullOptions { policy }))
+}
+
+pub fn pull_event_progress(
+    value: &libvm::ImageProgress,
+) -> Result<w::PullImageEvent, ConversionError> {
+    Ok(w::PullImageEvent {
+        event: Some(w::pull_image_event::Event::Progress(progress_to_wire(
+            value,
+        )?)),
+    })
+}
+
+pub fn pull_event_image(value: &libvm::ImageInfo) -> Result<w::PullImageEvent, ConversionError> {
+    Ok(w::PullImageEvent {
+        event: Some(w::pull_image_event::Event::Image(image_info_to_wire(
+            value,
+        )?)),
+    })
 }
 
 pub fn oci_identity_to_wire(source: &OciIdentity) -> w::OciIdentity {
@@ -778,11 +843,7 @@ pub fn convert_request_to_wire(
 ) -> Result<w::ConvertImageRequest, ConversionError> {
     Ok(w::ConvertImageRequest {
         source: Some(oci_identity_to_wire(source)),
-        alias: options
-            .alias
-            .as_deref()
-            .map(crate::stopped::alias)
-            .transpose()?,
+        name: options.name.as_deref().map(crate::local_name).transpose()?,
     })
 }
 
@@ -794,29 +855,26 @@ pub fn convert_request_from_wire(
     Ok((
         source,
         libvm::RawConversionOptions {
-            alias: value
-                .alias
-                .map(|alias| crate::stopped::alias(&alias))
-                .transpose()?,
+            name: value.name.as_deref().map(crate::local_name).transpose()?,
         },
     ))
 }
 
-pub fn managed_event_progress(
+pub fn stored_event_progress(
     value: &libvm::ImageProgress,
-) -> Result<w::ManagedImageEvent, ConversionError> {
-    Ok(w::ManagedImageEvent {
-        event: Some(w::managed_image_event::Event::Progress(progress_to_wire(
+) -> Result<w::StoredImageEvent, ConversionError> {
+    Ok(w::StoredImageEvent {
+        event: Some(w::stored_image_event::Event::Progress(progress_to_wire(
             value,
         )?)),
     })
 }
 
-pub fn managed_event_image(
-    value: &libvm::ManagedImageInfo,
-) -> Result<w::ManagedImageEvent, ConversionError> {
-    Ok(w::ManagedImageEvent {
-        event: Some(w::managed_image_event::Event::Image(managed_image_to_wire(
+pub fn stored_event_image(
+    value: &libvm::StoredImageInfo,
+) -> Result<w::StoredImageEvent, ConversionError> {
+    Ok(w::StoredImageEvent {
+        event: Some(w::stored_image_event::Event::Image(stored_image_to_wire(
             value,
         )?)),
     })
@@ -824,13 +882,202 @@ pub fn managed_event_image(
 
 #[cfg(test)]
 mod tests {
+    use silod_spec::daemon::v1 as w;
+
+    fn oci_image() -> libvm::OciImageInfo {
+        libvm::OciImageInfo {
+            id: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
+            names: vec![
+                "docker.io/library/alpine:3.21".into(),
+                "alpine-local".into(),
+            ],
+            config_digest: format!("sha256:{}", "b".repeat(64)),
+            platform: libvm::Platform {
+                os: "linux".into(),
+                architecture: "amd64".into(),
+                variant: None,
+            },
+            config: serde_json::from_str("{}").unwrap(),
+            layers: vec![libvm::ImageLayerDetail {
+                blob_digest: format!("sha256:{}", "c".repeat(64)),
+                diff_id: format!("sha256:{}", "d".repeat(64)),
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+                compressed_size_bytes: Some(10),
+                uncompressed_size_bytes: None,
+                position: 0,
+            }],
+            lower_length: 4096,
+            compressed_size_bytes: 10,
+            created_at: 1,
+            last_used_at: Some(2),
+        }
+    }
+
     #[test]
-    fn local_cut_spelling_never_grants_managed_authority() {
-        let error =
-            crate::images::parse_managed("fork:00000000-0000-4000-8000-000000000001").unwrap_err();
+    fn local_cut_spelling_is_refused_with_a_hint() {
+        let error = crate::images::reject_local_cut("fork:00000000-0000-4000-8000-000000000001")
+            .unwrap_err();
         assert!(error
             .to_string()
             .contains("local fork cut is not an identified snapshot; snapshot the child first"));
-        assert!(crate::images::parse_managed("image:ordinary-alias").is_ok());
+        assert!(crate::images::reject_local_cut("hello").is_ok());
+    }
+
+    #[test]
+    fn image_refs_round_trip_names_registry_references_and_ids() {
+        for value in [
+            "hello",
+            "abc123",
+            "docker.io/library/alpine:3.21",
+            "alpine:3.21",
+            &format!("sha256:{}", "e".repeat(64)),
+        ] {
+            let reference: libvm::ImageRef = value.parse().unwrap();
+            let wire = crate::images::image_ref_to_wire(&reference).unwrap();
+            assert_eq!(crate::images::image_ref_from_wire(wire).unwrap(), reference);
+        }
+        assert!(matches!(
+            crate::images::image_ref_to_wire(
+                &format!("sha256:{}", "e".repeat(64)).parse().unwrap()
+            )
+            .unwrap()
+            .reference,
+            Some(w::image_ref::Reference::Id(_))
+        ));
+    }
+
+    #[test]
+    fn image_refs_reject_absent_invalid_and_disguised_ids() {
+        use w::image_ref::Reference;
+        assert!(crate::images::image_ref_from_wire(w::ImageRef::default()).is_err());
+        for name in [
+            String::new(),
+            "Hello".into(),
+            "has space".into(),
+            "nul\0".into(),
+            format!("sha256:{}", "e".repeat(64)),
+            "a".repeat(4097),
+        ] {
+            let wire = w::ImageRef {
+                reference: Some(Reference::Name(name.clone())),
+            };
+            assert!(
+                crate::images::image_ref_from_wire(wire).is_err(),
+                "{name:?}"
+            );
+        }
+        let wire = w::ImageRef {
+            reference: Some(Reference::Id("sha256:short".into())),
+        };
+        assert!(crate::images::image_ref_from_wire(wire).is_err());
+    }
+
+    #[test]
+    fn oci_image_info_round_trips_through_image_list() {
+        let images = vec![libvm::ImageInfo::Oci(Box::new(oci_image()))];
+        let wire = crate::images::image_list_to_wire(&images).unwrap();
+        assert_eq!(crate::images::image_list_from_wire(wire).unwrap(), images);
+    }
+
+    #[test]
+    fn oci_image_info_rejects_invalid_names_digests_and_platform() {
+        let wire = crate::images::oci_image_to_wire(&oci_image()).unwrap();
+        let mut duplicate = wire.clone();
+        duplicate.names.push("alpine-local".into());
+        assert!(crate::images::oci_image_from_wire(duplicate).is_err());
+        let mut invalid_name = wire.clone();
+        invalid_name.names.push("Not A Name".into());
+        assert!(crate::images::oci_image_from_wire(invalid_name).is_err());
+        let mut digest = wire.clone();
+        digest.config_digest = "sha256:nope".into();
+        assert!(crate::images::oci_image_from_wire(digest).is_err());
+        let mut layer = wire.clone();
+        layer.layers[0].diff_id = "plain".into();
+        assert!(crate::images::oci_image_from_wire(layer).is_err());
+        let mut platform = wire.clone();
+        platform.platform = "linux".into();
+        assert!(crate::images::oci_image_from_wire(platform).is_err());
+        let mut config = wire;
+        config.oci_config_json = "not json".into();
+        assert!(crate::images::oci_image_from_wire(config).is_err());
+        assert!(crate::images::image_info_from_wire(w::ImageInfo::default()).is_err());
+    }
+
+    #[test]
+    fn removal_and_prune_reports_round_trip() {
+        let removal = libvm::ImageRemoval {
+            id: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
+            names: vec!["hello".into()],
+            record_removed: true,
+        };
+        let wire = crate::images::image_removal_to_wire(&removal).unwrap();
+        assert_eq!(
+            crate::images::image_removal_from_wire(wire).unwrap(),
+            removal
+        );
+        let report = libvm::ImagePruneReport {
+            images_removed: 2,
+            bytes_removed: 4096,
+        };
+        assert_eq!(
+            crate::images::prune_report_from_wire(crate::images::prune_report_to_wire(&report)),
+            report
+        );
+    }
+
+    #[test]
+    fn pull_request_keeps_an_absent_policy_absent_and_rejects_unknown_policies() {
+        for policy in [
+            None,
+            Some(libvm::PullPolicy::IfMissing),
+            Some(libvm::PullPolicy::Always),
+            Some(libvm::PullPolicy::Never),
+        ] {
+            let options = libvm::ImagePullOptions { policy };
+            let wire = crate::images::pull_request_to_wire("alpine:3.21", &options).unwrap();
+            let (reference, decoded) = crate::images::pull_request_from_wire(wire).unwrap();
+            assert_eq!(reference, "alpine:3.21");
+            assert_eq!(decoded.policy, policy);
+        }
+        assert!(crate::images::pull_request_from_wire(w::PullImageRequest {
+            reference: "alpine".into(),
+            pull_policy: 9,
+        })
+        .is_err());
+        assert!(crate::images::pull_request_from_wire(w::PullImageRequest::default()).is_err());
+    }
+
+    #[test]
+    fn conversion_names_are_local_names_only() {
+        let identity = crate::images::OciIdentity {
+            requested_reference: "docker.io/library/alpine:3.21".into(),
+            selected_reference: format!("docker.io/library/alpine@sha256:{}", "a".repeat(64)),
+            platform: libvm::Platform {
+                os: "linux".into(),
+                architecture: "amd64".into(),
+                variant: None,
+            },
+            manifest_digest: format!("sha256:{}", "a".repeat(64)),
+            config_digest: format!("sha256:{}", "b".repeat(64)),
+            pull_policy: libvm::PullPolicy::IfMissing,
+        };
+        let options = libvm::RawConversionOptions {
+            name: Some("raw-alpine".into()),
+        };
+        let wire = crate::images::convert_request_to_wire(&identity, &options).unwrap();
+        assert_eq!(
+            crate::images::convert_request_from_wire(wire.clone())
+                .unwrap()
+                .1,
+            options
+        );
+        for name in ["alpine:3.21", "team/alpine", "Upper"] {
+            let mut invalid = wire.clone();
+            invalid.name = Some(name.into());
+            assert!(
+                crate::images::convert_request_from_wire(invalid).is_err(),
+                "{name}"
+            );
+        }
     }
 }

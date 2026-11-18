@@ -352,7 +352,7 @@ Host and machine reports carry distinct mandatory scopes. A running report names
 the backend that actually constructed the run, regardless of the manager's
 current prospective backend override. Delivered live operations are supported
 when the backend supplies the native primitive and host and machine checks pass.
-Checkpoints record `liveStateSchema` and guest `architecture`; restore refuses
+Snapshots record `liveStateSchema` and guest `architecture`; restore refuses
 those format/architecture mismatches, not different native or monitor builds.
 Each component checks its own state magic and schema when decoding.
 
@@ -414,7 +414,7 @@ and all seven facts true; a `failed` record is diagnostic, not a seal. The
 file is immutable once written. It is versioned by addition only. It does not
 replace `vm.exit.json`, and `captureOutcome` is not a stop outcome.
 The monitor synchronizes neither capture payloads nor records. libvm provides
-checkpoint durability at content-pool publication and the catalog barrier;
+snapshot durability at content-pool publication and the catalog barrier;
 fork children provide their independent background durability barriers.
 
 

@@ -213,10 +213,10 @@ class Silo:
 
         New OCI machines default to the layered EROFS root; tests that need
         opaque whole-disk bytes request them through the real conversion CLI.
-        Returns the immutable managed `image:sha256:HEX` spelling.
+        Returns the immutable stored image id, `sha256:HEX`.
         """
         converted = self.json("image", "convert", reference, "--disk-format", "raw", timeout=600, label="image-convert-raw")
-        return "image:" + str(converted["id"])
+        return str(converted["id"])
 
     def root_image(self, reference: str, profile: RootProfile) -> str:
         """The create source for one lifecycle matrix root profile."""

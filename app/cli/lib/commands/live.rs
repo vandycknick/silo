@@ -12,6 +12,14 @@ enum CapturePolicyArgument {
     Incremental,
 }
 
+impl CapturePolicyArgument {
+    fn policy(self) -> vm_spec::lifecycle::CapturePolicy {
+        match self {
+            Self::Full => vm_spec::lifecycle::CapturePolicy::Full,
+            Self::Incremental => vm_spec::lifecycle::CapturePolicy::Incremental,
+        }
+    }
+}
 #[derive(Debug, Args)]
 struct CapturePolicyArgs {
     /// RAM capture policy (default incremental). Uses full capture without an admitted
@@ -25,12 +33,10 @@ struct CapturePolicyArgs {
 
 impl CapturePolicyArgs {
     fn policy(&self) -> vm_spec::lifecycle::CapturePolicy {
-        match self.capture_policy {
-            Some(CapturePolicyArgument::Incremental) | None => {
-                vm_spec::lifecycle::CapturePolicy::Incremental
-            }
-            Some(CapturePolicyArgument::Full) => vm_spec::lifecycle::CapturePolicy::Full,
-        }
+        self.capture_policy.map_or(
+            vm_spec::lifecycle::CapturePolicy::Incremental,
+            CapturePolicyArgument::policy,
+        )
     }
 
     fn crossover(&self) -> u8 {
@@ -73,7 +79,10 @@ impl Resume {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Create and manage immutable stopped-storage and live execution checkpoints", after_help = EXACT_BYTES_WARNING)]
+#[command(
+    about = "Create and manage snapshots: saved machines, with or without memory",
+    after_help = EXACT_BYTES_WARNING
+)]
 pub struct Snapshot {
     #[command(subcommand)]
     command: SnapshotCommand,
@@ -84,49 +93,56 @@ pub struct Snapshot {
 
 #[derive(Debug, Subcommand)]
 enum SnapshotCommand {
-    /// Capture a stopped machine's storage, or explicitly request a live execution capture.
+    /// Snapshot a stopped VM's disks and configuration, or a running VM's memory too with --memory.
     Create {
         #[arg(value_name = "VM")]
         machine: String,
-        /// Optional alias in the shared image: namespace. Unnamed snapshots remain retained.
+        /// Optional local snapshot name (no ':' or '/'). Unnamed snapshots are listed by id.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Request live execution capture, never fall back to stopped storage.
+        /// Include RAM, CPU and device state of a running VM. Without it the VM must be stopped.
         #[arg(long, conflicts_with = "external_requirements")]
-        live: bool,
+        memory: bool,
         /// Keep a running source paused after capture. An already user-paused source
         /// always stays paused, with or without this flag.
-        #[arg(long, requires = "live")]
+        #[arg(long, requires = "memory")]
         preserve: bool,
-        #[command(flatten)]
-        capture: CapturePolicyArgs,
+        /// RAM capture policy (default incremental). Uses full capture without an admitted
+        /// incremental backend or valid baseline; full always forces a complete capture.
+        #[arg(long, requires = "memory", value_enum)]
+        capture_policy: Option<CapturePolicyArgument>,
+        /// Fall back to full RAM capture at this dirty percentage (1..=60, default 60).
+        #[arg(long, requires = "memory", value_parser = clap::value_parser!(u8).range(1..=60))]
+        dirty_crossover_percent: Option<u8>,
         /// Omit external resources and record required mappings for a later restore.
         #[arg(long)]
         external_requirements: bool,
     },
-    /// Inspect an immutable snapshot by image: alias or image:sha256: identity.
+    /// Inspect a snapshot by name, id or unique id prefix.
     Inspect {
-        #[arg(value_name = "IMAGE")]
+        #[arg(value_name = "SNAPSHOT")]
         reference: String,
     },
     /// Reread and authenticate every RAM, state and disk byte of a local snapshot, ignoring trust receipts.
     ///
     /// This can take as long as reading the whole snapshot.
     Verify {
-        #[arg(value_name = "IMAGE")]
+        #[arg(value_name = "SNAPSHOT")]
         reference: String,
     },
-    /// List retained snapshots, including unnamed checkpoints.
+    /// List snapshots, one row per name; unnamed snapshots show <none>.
     List,
-    /// Release explicit snapshot retention. Aliases and other consumers still retain bytes.
-    Remove {
-        #[arg(value_name = "IMAGE")]
+    /// Remove a snapshot name; the snapshot goes with its last name. An id or unique id
+    /// prefix removes the snapshot and all its names. Restored machines are unaffected.
+    Rm {
+        #[arg(value_name = "SNAPSHOT")]
         reference: String,
     },
 }
 impl Snapshot {
-    pub(crate) fn is_live(&self) -> bool {
-        matches!(self.command, SnapshotCommand::Create { live: true, .. })
+    /// Capturing memory may reach an owned, stopping daemon for typed refusal.
+    pub(crate) fn includes_memory(&self) -> bool {
+        matches!(self.command, SnapshotCommand::Create { memory: true, .. })
     }
 
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
@@ -144,84 +160,59 @@ impl Snapshot {
             SnapshotCommand::Create {
                 machine,
                 name,
-                live: true,
+                memory,
                 preserve,
-                capture,
-                ..
+                capture_policy,
+                dirty_crossover_percent,
+                external_requirements,
             } => {
                 feedback.step(
                     "Capturing",
-                    format!("{machine} (memory, disks and publication)"),
+                    if memory {
+                        format!("{machine} (memory, disks and publication)")
+                    } else {
+                        format!("{machine} (disks and publication)")
+                    },
                 );
-                let resume_policy = if preserve {
-                    vm_spec::lifecycle::CaptureResumePolicy::Preserve
-                } else {
-                    vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired
+                let options = libvm::SnapshotOptions {
+                    name,
+                    memory,
+                    preserve,
+                    capture_policy: capture_policy.map(CapturePolicyArgument::policy),
+                    dirty_crossover_percent,
+                    external_requirements,
                 };
                 let (progress, stages) = libvm::LiveOperationProgressSender::default_channel();
-                let operation = api.snapshot_live(
-                    &machine,
-                    libvm::LiveSnapshotOptions {
-                        name,
-                        resume_policy,
-                        policy: capture.policy(),
-                        dirty_crossover_percent: capture.crossover(),
-                    },
-                    Some(progress),
-                );
-                let snapshot = feedback.during(operation, stages, &machine).await?;
+                let operation = api.snapshot(&machine, options, Some(progress));
+                let created = feedback.during(operation, stages, &machine).await?;
                 let elapsed = feedback.finish();
                 match self.format {
-                    OutputFormat::Json => ui::print_json(&snapshot)?,
+                    OutputFormat::Json => ui::print_json(&created)?,
                     OutputFormat::Plain => {
-                        ui::success(snapshot_result_line(&snapshot.snapshot, elapsed));
-                        if let Some(reason) = &snapshot.capture.first_snapshot_full_identity_reason
-                        {
-                            match reason {
-                                libvm::SnapshotIdentityReason::UnknownAfterFork => ui::secondary(
-                                    "Full content identity computed: this fork child's identity was not yet known",
-                                ),
+                        ui::success(snapshot_result_line(&created.snapshot, elapsed));
+                        if let Some(capture) = &created.capture {
+                            if let Some(reason) = &capture.first_snapshot_full_identity_reason {
+                                match reason {
+                                    libvm::SnapshotIdentityReason::UnknownAfterFork => ui::secondary(
+                                        "Full content identity computed: this fork child's identity was not yet known",
+                                    ),
+                                }
                             }
-                        }
-                        let source = match snapshot.capture.source_outcome {
-                            libvm::LiveCaptureSource::Resumed => "resumed",
-                            libvm::LiveCaptureSource::Preserved => "left paused",
-                            libvm::LiveCaptureSource::ResumeFailed => "RESUME FAILED",
-                            libvm::LiveCaptureSource::Unknown => "UNKNOWN",
-                        };
-                        let source_name = machine_display_name(api, &machine).await;
-                        ui::secondary(format!("Source {source_name} {source}"));
-                        if let Some(error) = &snapshot.capture.source_error {
-                            ui::warn(error.as_str());
+                            let source = match capture.source_outcome {
+                                libvm::LiveCaptureSource::Resumed => "resumed",
+                                libvm::LiveCaptureSource::Preserved => "left paused",
+                                libvm::LiveCaptureSource::ResumeFailed => "RESUME FAILED",
+                                libvm::LiveCaptureSource::Unknown => "UNKNOWN",
+                            };
+                            let source_name = machine_display_name(api, &machine).await;
+                            ui::secondary(format!("Source {source_name} {source}"));
+                            if let Some(error) = &capture.source_error {
+                                ui::warn(error.as_str());
+                            }
                         }
                     }
                 }
-                snapshot.require_requested_name()?;
-                Ok(())
-            }
-            SnapshotCommand::Create {
-                machine,
-                name,
-                live: false,
-                external_requirements,
-                ..
-            } => {
-                feedback.step("Capturing", format!("{machine} (disks and publication)"));
-                let external_resources = if external_requirements {
-                    libvm::ExternalResourcePolicy::RequireMappings
-                } else {
-                    libvm::ExternalResourcePolicy::Reject
-                };
-                let options = libvm::SnapshotOptions {
-                    name,
-                    external_resources,
-                };
-                let info = api.snapshot_stopped(&machine, options).await?;
-                let elapsed = feedback.finish();
-                match self.format {
-                    OutputFormat::Json => ui::print_json(&info)?,
-                    OutputFormat::Plain => ui::success(snapshot_result_line(&info, elapsed)),
-                }
+                created.require_requested_name()?;
                 Ok(())
             }
             SnapshotCommand::Inspect { reference } => {
@@ -233,15 +224,14 @@ impl Snapshot {
                 }
             }
             SnapshotCommand::Verify { reference } => {
-                let name = reference.strip_prefix("image:").unwrap_or(&reference);
-                feedback.step("Verifying", name);
+                feedback.step("Verifying", &reference);
                 let result = api.verify_snapshot(&reference).await;
                 let elapsed = feedback.finish();
                 match result {
                     Ok(report) => match self.format {
                         OutputFormat::Json => ui::print_json(&report),
                         OutputFormat::Plain => {
-                            ui::success(verification_result_line(&report, name, elapsed));
+                            ui::success(verification_result_line(&report, &reference, elapsed));
                             Ok(())
                         }
                     },
@@ -266,7 +256,22 @@ impl Snapshot {
                     OutputFormat::Plain => snapshot_table(&snapshots, ui::now_unix()).print(),
                 }
             }
-            SnapshotCommand::Remove { reference } => api.release_snapshot(&reference).await,
+            SnapshotCommand::Rm { reference } => {
+                feedback.finish();
+                let removal = api.remove_snapshot(&reference).await?;
+                match self.format {
+                    OutputFormat::Json => ui::print_json(&removal),
+                    OutputFormat::Plain => {
+                        ui::success(removal_line(
+                            "snapshot",
+                            &removal.id.to_string(),
+                            &removal.names,
+                            removal.record_removed,
+                        ));
+                        Ok(())
+                    }
+                }
+            }
         }
     }
 }
@@ -597,14 +602,33 @@ fn operation_id(value: &str) -> Result<uuid::Uuid, String> {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Restore a checkpoint into a new machine", long_about = "Restore a checkpoint into a new machine.\n\nLive checkpoints resume captured execution through fenced activation; stopped checkpoints create a stopped child. Neither path cold-boots a failed execution restore. Publication uses catalog-owned secret-scope recovery. Custom Runtime::with_secret_store overrides are refused; the ordinary CLI FileStore and secret-provider path remains supported.", after_help = EXACT_BYTES_WARNING)]
+#[command(
+    about = "Restore a snapshot into a new machine",
+    long_about = "Restore a snapshot into a new machine. This is the only way to turn a snapshot into a VM.\n\nREF is a local snapshot name, id or unique id prefix, or a registry reference. A local name wins; short registry names expand through search_registries, and a registry snapshot is pulled according to --pull.\n\nA snapshot with memory resumes its captured execution through fenced activation; a snapshot without memory creates a stopped machine that boots normally. A failed execution restore is never followed by a cold boot.\n\n--without-memory restores a snapshot with memory as a stopped machine from its disks only: RAM, CPU and device state are discarded, no activation runs, and the disks may need filesystem journal recovery on the next boot. It never runs implicitly, and it changes nothing for a snapshot without memory.\n\nPublication uses catalog-owned secret-scope recovery. Custom Runtime::with_secret_store overrides are refused; the ordinary CLI FileStore and secret-provider path remains supported.",
+    after_help = EXACT_BYTES_WARNING
+)]
 pub struct Restore {
-    #[arg(value_name = "IMAGE_OR_CHECKPOINT")]
-    checkpoint: String,
+    /// Snapshot name, id, unique id prefix or registry reference.
+    #[arg(value_name = "REF")]
+    reference: String,
+    /// Name of the restored machine.
     #[arg(long, value_name = "CHILD")]
     name: Option<String>,
-    /// Bounded RestoreHook JSON (argv, environment, workingDirectory, timeoutMs).
-    #[arg(long, value_name = "JSON", value_parser = activation_hook)]
+    /// When to pull a registry snapshot.
+    #[arg(long, value_enum, default_value = "missing")]
+    pull: crate::commands::create::Pull,
+    /// Restore only the disks of a snapshot with memory, as a stopped machine; RAM is
+    /// discarded and the disks may need journal recovery on boot.
+    #[arg(long)]
+    without_memory: bool,
+    /// Bounded RestoreHook JSON (argv, environment, workingDirectory, timeoutMs), run after
+    /// a snapshot with memory resumes.
+    #[arg(
+        long,
+        value_name = "JSON",
+        value_parser = activation_hook,
+        conflicts_with = "without_memory"
+    )]
     activation_hook: Option<libvm::RestoreHook>,
     #[command(flatten)]
     external: ExternalResources,
@@ -614,20 +638,26 @@ pub struct Restore {
 }
 impl Restore {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let mut feedback = OperationFeedback::new(self.format, "Admitting", &self.checkpoint);
+        let mut feedback = OperationFeedback::new(self.format, "Admitting", &self.reference);
         let api = context.app_api().await?;
         let options = libvm::RestoreOptions {
             name: self.name,
-            external_resources: self.external.policy()?,
+            pull: self.pull.policy(),
+            without_memory: self.without_memory,
             activation_hook: self.activation_hook,
+            external_resources: self.external.policy()?,
         };
         feedback.step(
             "Restoring",
-            format!("{} (disks and activation)", self.checkpoint),
+            if self.without_memory {
+                format!("{} (disks only)", self.reference)
+            } else {
+                format!("{} (disks and activation)", self.reference)
+            },
         );
         let (progress, stages) = libvm::LiveOperationProgressSender::default_channel();
-        let operation = api.restore_snapshot(&self.checkpoint, options, Some(progress));
-        let machine = feedback.during(operation, stages, &self.checkpoint).await?;
+        let operation = api.restore(&self.reference, options, Some(progress));
+        let machine = feedback.during(operation, stages, &self.reference).await?;
         let readiness = if machine.status.is_running() {
             feedback.step("Waiting for agent", &machine.name);
             wait_machine_ready(api, &machine.id).await
@@ -651,33 +681,6 @@ impl Restore {
     }
 }
 
-#[derive(Debug, Args)]
-#[command(about = "Recover only a live checkpoint's disks into a new stopped machine", long_about = "Explicitly recover a live checkpoint's captured disks and boot configuration into a new stopped private child. RAM and execution state are discarded, no activation is performed, and the disks may contain dirty journals. This never runs implicitly after a failed execution restore.", after_help = EXACT_BYTES_WARNING)]
-pub struct RecoverDisks {
-    #[arg(value_name = "IMAGE")]
-    checkpoint: String,
-    #[arg(long, value_name = "CHILD")]
-    name: Option<String>,
-    #[command(flatten)]
-    external: ExternalResources,
-}
-
-impl RecoverDisks {
-    pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let options = libvm::RecoverDisksOptions {
-            name: self.name,
-            external_resources: self.external.policy()?,
-        };
-        let machine = context
-            .app_api()
-            .await?
-            .recover_checkpoint_disks(&self.checkpoint, options)
-            .await?;
-        println!("{}", machine.id);
-        Ok(())
-    }
-}
-
 fn activation_hook(value: &str) -> Result<libvm::RestoreHook, String> {
     if value.len() > 1 << 20 {
         return Err("activation hook exceeds 1 MiB".into());
@@ -689,7 +692,7 @@ fn activation_hook(value: &str) -> Result<libvm::RestoreHook, String> {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Import, convert and manage immutable images in the shared image: namespace")]
+#[command(about = "Pull, import, convert and manage images: templates for new machines")]
 pub struct Image {
     #[command(subcommand)]
     command: ImageCommand,
@@ -699,25 +702,21 @@ pub struct Image {
 }
 #[derive(Debug, Subcommand)]
 enum ImageCommand {
-    /// Acquire a complete VM artifact without starting it. Digest approval is
-    /// integrity consent, not authenticated publisher identity.
-    Pull {
-        #[arg(value_name = "OCI_REFERENCE")]
+    /// List cached OCI images and stored images, one row per name.
+    List,
+    /// Inspect a local image by name, id or unique id prefix.
+    Inspect {
+        #[arg(value_name = "IMAGE")]
         reference: String,
-        #[arg(
-            long,
-            value_name = "SHA256",
-            required_unless_present = "require_signature",
-            conflicts_with = "require_signature"
-        )]
-        approve_digest: Option<libvm::ObjectDigest>,
-        /// Refuse unless a signature provider is configured and verifies the index.
-        #[arg(long)]
-        require_signature: bool,
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
     },
-    /// Publish complete immutable image or checkpoint content to an OCI repository.
+    /// Pull an image from a registry, even when a local copy exists. An OCI container
+    /// image is cached; a Silo image artifact becomes a stored image. A snapshot artifact
+    /// is refused: restore it with `silo restore`.
+    Pull {
+        #[arg(value_name = "REFERENCE")]
+        reference: String,
+    },
+    /// Publish a stored image as a Silo image artifact to an OCI repository.
     Push {
         #[arg(value_name = "IMAGE")]
         source: String,
@@ -726,15 +725,6 @@ enum ImageCommand {
         /// Use raw chunks instead of opportunistic zstd compression.
         #[arg(long)]
         raw: bool,
-        /// Acknowledge that publishing a checkpoint exposes its disks and RAM,
-        /// including secrets, to the named destination.
-        #[arg(long)]
-        acknowledge_checkpoint: bool,
-    },
-    /// Inspect a remote VM artifact's immutable index without retaining or booting it.
-    InspectRemote {
-        #[arg(value_name = "OCI_REFERENCE")]
-        reference: String,
     },
     /// Import a quiesced raw or qcow2 disk as a reusable direct-boot image.
     /// Platform and root selection are required; the boot bundle is pinned now.
@@ -750,7 +740,7 @@ enum ImageCommand {
         /// Boot profile. Only linux-direct is admitted.
         #[arg(long, value_enum)]
         boot: ImportBootProfile,
-        /// Optional alias in the shared image: namespace.
+        /// Optional local image name (no ':' or '/').
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
@@ -768,27 +758,22 @@ enum ImageCommand {
         /// Image pull policy for selecting the manifest.
         #[arg(long, value_enum)]
         pull: Option<crate::commands::create::Pull>,
-        /// Optional alias in the shared image: namespace.
+        /// Optional local image name (no ':' or '/').
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
-    /// Inspect an image or snapshot by image:NAME or image:sha256:HEX. Not a lease.
-    Inspect {
+    /// Remove an image name; the image goes with its last name. An id or unique id prefix
+    /// removes the image and all its names. Machines created from it are unaffected.
+    Rm {
         #[arg(value_name = "IMAGE")]
         reference: String,
     },
-    /// List managed images and snapshots in the shared namespace.
-    List,
-    /// Release explicit retention of an image or snapshot. Aliases and other
-    /// consumers still retain its bytes.
-    Release {
-        #[arg(value_name = "IMAGE")]
+    /// Remove images that have no name and that no machine uses.
+    Prune,
+    /// Inspect a remote Silo VM artifact's immutable index without pulling or booting it.
+    InspectRemote {
+        #[arg(value_name = "OCI_REFERENCE")]
         reference: String,
-    },
-    /// Remove only an image: alias, never release explicit retention.
-    Remove {
-        #[arg(value_name = "IMAGE_ALIAS")]
-        alias: String,
     },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -798,64 +783,55 @@ enum ImportBootProfile {
 impl Image {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         match self.command {
-            ImageCommand::Pull {
-                reference,
-                approve_digest,
-                require_signature,
-                name,
-            } => {
-                let trust = if require_signature {
-                    libvm::ArtifactTrust::RequireSignature
-                } else {
-                    libvm::ArtifactTrust::ApproveDigest {
-                        digest: approve_digest
-                            .ok_or_else(|| eyre::eyre!("--approve-digest is required"))?,
+            ImageCommand::List => {
+                let images = context.app_api().await?.list_images().await?;
+                match self.format {
+                    OutputFormat::Json => {
+                        ui::print_json(&images.iter().map(ImageView::new).collect::<Vec<_>>())
                     }
+                    OutputFormat::Plain => image_table(&images, ui::now_unix()).print(),
+                }
+            }
+            ImageCommand::Inspect { reference } => print_image(
+                &context.app_api().await?.inspect_image(&reference).await?,
+                self.format,
+            ),
+            ImageCommand::Pull { reference } => {
+                let (progress, events) = libvm::ImageProgressSender::default_channel();
+                let watcher = (self.format == OutputFormat::Plain)
+                    .then(|| crate::ui::watch_image_progress(&reference, events));
+                let options = libvm::ImagePullOptions {
+                    policy: Some(libvm::PullPolicy::Always),
                 };
-                let request = libvm::ArtifactAcquireRequest {
-                    reference,
-                    trust,
-                    alias: name
-                        .map(|name| silo_vm_control::stopped::alias(&name))
-                        .transpose()?,
-                };
-                print_details(
-                    &context.app_api().await?.acquire_artifact(request).await?,
-                    self.format,
-                )
+                let result = context
+                    .app_api()
+                    .await?
+                    .pull_image(&reference, options, progress)
+                    .await;
+                if let Some(watcher) = watcher {
+                    let _ = watcher.await;
+                }
+                print_image(&result?, self.format)
             }
             ImageCommand::Push {
                 source,
                 destination,
                 raw,
-                acknowledge_checkpoint,
             } => {
-                let api = context.app_api().await?;
-                let source = api.managed_reference(&source).await?;
-                let checkpoint_acknowledgement =
-                    acknowledge_checkpoint.then(|| libvm::CheckpointPublication {
-                        destination: destination.clone(),
-                    });
                 let request = libvm::ArtifactPublishRequest {
-                    source,
+                    image: source.parse()?,
                     destination,
                     encoding: if raw {
                         libvm::ArtifactEncoding::Raw
                     } else {
                         libvm::ArtifactEncoding::Zstd
                     },
-                    checkpoint_acknowledgement,
                 };
-                print_details(&api.publish_artifact(request).await?, self.format)
+                print_details(
+                    &context.app_api().await?.publish_artifact(request).await?,
+                    self.format,
+                )
             }
-            ImageCommand::InspectRemote { reference } => print_artifact_inspection(
-                &context
-                    .app_api()
-                    .await?
-                    .inspect_artifact(&reference)
-                    .await?,
-                self.format,
-            ),
             ImageCommand::Import {
                 path,
                 platform,
@@ -871,8 +847,9 @@ impl Image {
                         root,
                         assets: libvm::BootAssetSelection::Packaged,
                     },
-                    alias: name
-                        .map(|name| silo_vm_control::stopped::alias(&name))
+                    name: name
+                        .as_deref()
+                        .map(silo_vm_control::local_name)
                         .transpose()?,
                 };
                 let (progress, events) = libvm::ImageProgressSender::default_channel();
@@ -896,11 +873,12 @@ impl Image {
                 name,
             } => {
                 let options = libvm::RawConversionOptions {
-                    alias: name
-                        .map(|name| silo_vm_control::stopped::alias(&name))
+                    name: name
+                        .as_deref()
+                        .map(silo_vm_control::local_name)
                         .transpose()?,
                 };
-                let pull = pull.map_or(libvm::ImagePullPolicy::IfMissing, |pull| pull.policy());
+                let pull = pull.map_or(libvm::PullPolicy::IfMissing, |pull| pull.policy());
                 let (progress, events) = libvm::ImageProgressSender::default_channel();
                 let watcher = (self.format == OutputFormat::Plain)
                     .then(|| crate::ui::watch_image_progress(&reference, events));
@@ -914,23 +892,46 @@ impl Image {
                 }
                 print_details(&result?, self.format)
             }
-            ImageCommand::Inspect { reference } => print_managed_inspection(
-                &context.app_api().await?.inspect_managed(&reference).await?,
-                self.format,
-            ),
-            ImageCommand::List => {
-                let sources = context.app_api().await?.list_managed().await?;
+            ImageCommand::Rm { reference } => {
+                let removal = context.app_api().await?.remove_image(&reference).await?;
                 match self.format {
-                    OutputFormat::Json => ui::print_json(&sources),
-                    OutputFormat::Plain => image_table(&sources).print(),
+                    OutputFormat::Json => ui::print_json(&RemovalView {
+                        id: removal.id.to_string(),
+                        names: &removal.names,
+                        record_removed: removal.record_removed,
+                    }),
+                    OutputFormat::Plain => {
+                        ui::success(removal_line(
+                            "image",
+                            &removal.id.to_string(),
+                            &removal.names,
+                            removal.record_removed,
+                        ));
+                        Ok(())
+                    }
                 }
             }
-            ImageCommand::Release { reference } => {
-                context.app_api().await?.release_image(&reference).await
+            ImageCommand::Prune => {
+                let report = context.app_api().await?.prune_images().await?;
+                match self.format {
+                    OutputFormat::Json => ui::print_json(&PruneView {
+                        images_removed: report.images_removed,
+                        bytes_removed: report.bytes_removed,
+                    }),
+                    OutputFormat::Plain => {
+                        ui::success(prune_line(&report));
+                        Ok(())
+                    }
+                }
             }
-            ImageCommand::Remove { alias } => {
-                context.app_api().await?.remove_image_alias(&alias).await
-            }
+            ImageCommand::InspectRemote { reference } => print_artifact_inspection(
+                &context
+                    .app_api()
+                    .await?
+                    .inspect_artifact(&reference)
+                    .await?,
+                self.format,
+            ),
         }
     }
 }
@@ -945,11 +946,10 @@ fn print_details(value: &impl serde::Serialize, format: OutputFormat) -> eyre::R
 fn snapshot_detail_rows(info: &libvm::SnapshotInfo) -> Vec<(String, String)> {
     let mut rows = vec![
         ("ID".into(), info.id.to_string()),
-        ("Aliases".into(), aliases(&info.aliases)),
-        ("Kind".into(), format!("{} snapshot", snapshot_kind(info))),
+        ("Names".into(), names_label(&info.names)),
+        ("Memory".into(), memory_label(info.memory).into()),
         ("Created".into(), ui::format_unix(info.created_at)),
         ("Record digest".into(), info.record_digest.to_string()),
-        ("Retained".into(), ui::yes_no(info.retained).into()),
     ];
     for stream in &info.streams {
         let role = verification_role(&stream.role);
@@ -1102,165 +1102,298 @@ fn append_boot_details(
     Ok(())
 }
 
-fn managed_detail_rows(source: &libvm::ManagedSourceInfo) -> eyre::Result<Vec<(String, String)>> {
-    match source {
-        libvm::ManagedSourceInfo::Snapshot(info) => Ok(snapshot_detail_rows(info)),
-        libvm::ManagedSourceInfo::Image(info) => {
-            let mut rows = vec![
-                ("ID".into(), info.id.to_string()),
-                ("Aliases".into(), aliases(&info.aliases)),
-                ("Kind".into(), "image".into()),
-                (
-                    "Size".into(),
-                    ui::human_bytes(Some(info.record.root.stream.length)),
-                ),
-                ("Record digest".into(), info.record_digest.to_string()),
-                ("Retained".into(), ui::yes_no(info.retained).into()),
-                (
-                    "Root stream".into(),
-                    info.record.root.stream.stream.to_string(),
-                ),
-                ("Root map".into(), info.record.root.stream.map.to_string()),
-                (
-                    "Root identity chunk".into(),
-                    format!("{} bytes", info.record.root.stream.chunk_size),
-                ),
-                ("Map format".into(), "sparse Merkle v2".into()),
-                (
-                    "Sector size".into(),
-                    ui::human_bytes(Some(u64::from(
-                        info.record.root.geometry.logical_sector_size,
-                    ))),
-                ),
-                (
-                    "Root layout".into(),
-                    match info.record.root.layout {
-                        libvm::RawLayout::WholeDisk => "whole disk",
-                        libvm::RawLayout::Partitioned {
-                            table: libvm::PartitionTable::Gpt,
-                        } => "GPT",
-                        libvm::RawLayout::Partitioned {
-                            table: libvm::PartitionTable::Mbr,
-                        } => "MBR",
-                    }
-                    .into(),
-                ),
-                (
-                    "Boot".into(),
-                    match &info.record.boot {
-                        libvm::BootProfile::LinuxDirect { .. } => "Linux direct",
-                        libvm::BootProfile::LinuxEfi { .. } => "Linux EFI",
-                        libvm::BootProfile::MacOs { .. } => "macOS",
-                    }
-                    .into(),
-                ),
-            ];
-            let storage = serde_json::to_value(&info.record.root.profile)?;
-            let storage_kind = storage
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| eyre::eyre!("image storage profile is missing its kind"))?;
-            rows.push(("Storage".into(), storage_kind.replace('-', " ")));
-            if storage.as_object().is_some_and(|fields| fields.len() > 1) {
-                append_nested_details(&mut rows, "Storage details", &info.record.root.profile)?;
+fn stored_image_detail_rows(info: &libvm::StoredImageInfo) -> eyre::Result<Vec<(String, String)>> {
+    let mut rows = vec![
+        ("ID".into(), info.id.to_string()),
+        ("Names".into(), names_label(&info.names)),
+        ("Root".into(), "raw".into()),
+        (
+            "Size".into(),
+            ui::human_bytes(Some(info.record.root.stream.length)),
+        ),
+        ("Record digest".into(), info.record_digest.to_string()),
+        (
+            "Root stream".into(),
+            info.record.root.stream.stream.to_string(),
+        ),
+        ("Root map".into(), info.record.root.stream.map.to_string()),
+        (
+            "Root identity chunk".into(),
+            format!("{} bytes", info.record.root.stream.chunk_size),
+        ),
+        ("Map format".into(), "sparse Merkle v2".into()),
+        (
+            "Sector size".into(),
+            ui::human_bytes(Some(u64::from(
+                info.record.root.geometry.logical_sector_size,
+            ))),
+        ),
+        (
+            "Root layout".into(),
+            match info.record.root.layout {
+                libvm::RawLayout::WholeDisk => "whole disk",
+                libvm::RawLayout::Partitioned {
+                    table: libvm::PartitionTable::Gpt,
+                } => "GPT",
+                libvm::RawLayout::Partitioned {
+                    table: libvm::PartitionTable::Mbr,
+                } => "MBR",
             }
-            append_boot_details(&mut rows, &info.record.boot)?;
-            let process = &info.record.process;
+            .into(),
+        ),
+        (
+            "Boot".into(),
+            match &info.record.boot {
+                libvm::BootProfile::LinuxDirect { .. } => "Linux direct",
+                libvm::BootProfile::LinuxEfi { .. } => "Linux EFI",
+                libvm::BootProfile::MacOs { .. } => "macOS",
+            }
+            .into(),
+        ),
+    ];
+    let storage = serde_json::to_value(&info.record.root.profile)?;
+    let storage_kind = storage
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre::eyre!("image storage profile is missing its kind"))?;
+    rows.push(("Storage".into(), storage_kind.replace('-', " ")));
+    if storage.as_object().is_some_and(|fields| fields.len() > 1) {
+        append_nested_details(&mut rows, "Storage details", &info.record.root.profile)?;
+    }
+    append_boot_details(&mut rows, &info.record.boot)?;
+    let process = &info.record.process;
+    rows.extend([
+        (
+            "Entrypoint".into(),
+            argv_label(process.entrypoint.as_deref()),
+        ),
+        ("Command".into(), argv_label(process.command.as_deref())),
+        (
+            "Working directory".into(),
+            process.working_directory.clone(),
+        ),
+        (
+            "User".into(),
+            process.user.clone().unwrap_or_else(|| "-".into()),
+        ),
+    ]);
+    for (key, value) in &process.environment {
+        rows.push((format!("Environment {key}"), value.clone()));
+    }
+    for (index, provenance) in info.provenance.iter().enumerate() {
+        let group = format!("Source {}", index + 1);
+        rows.extend([
+            (group.clone(), provenance.source_spelling.clone()),
+            (
+                format!("{group} container"),
+                match provenance.container {
+                    libvm::ImageContainerKind::Raw => "raw",
+                    libvm::ImageContainerKind::Qcow2 => "qcow2",
+                    libvm::ImageContainerKind::Oci => "OCI",
+                }
+                .into(),
+            ),
+            (
+                format!("{group} digest"),
+                provenance.source_digest.to_string(),
+            ),
+        ]);
+        if let Some(manifest) = provenance.source_manifest {
+            rows.push((format!("{group} manifest"), manifest.to_string()));
+        }
+        if let Some(config) = provenance.source_config {
+            rows.push((format!("{group} config"), config.to_string()));
+        }
+        if let Some(disk) = &provenance.disk {
             rows.extend([
                 (
-                    "Entrypoint".into(),
-                    process
-                        .entrypoint
-                        .as_ref()
-                        .map(|argv| format!("{argv:?}"))
-                        .unwrap_or_else(|| "-".into()),
+                    format!("{group} size"),
+                    ui::human_bytes(Some(disk.source_length)),
                 ),
                 (
-                    "Command".into(),
-                    process
-                        .command
-                        .as_ref()
-                        .map(|argv| format!("{argv:?}"))
-                        .unwrap_or_else(|| "-".into()),
-                ),
-                (
-                    "Working directory".into(),
-                    process.working_directory.clone(),
-                ),
-                (
-                    "User".into(),
-                    process.user.clone().unwrap_or_else(|| "-".into()),
+                    format!("{group} decoded size"),
+                    ui::human_bytes(Some(disk.decoded_length)),
                 ),
             ]);
-            for (key, value) in &process.environment {
-                rows.push((format!("Environment {key}"), value.clone()));
+            if let Some(root) = &disk.selected_root {
+                append_nested_details(&mut rows, &format!("{group} root details"), root)?;
             }
-            for (index, provenance) in info.provenance.iter().enumerate() {
-                let group = format!("Source {}", index + 1);
-                rows.extend([
-                    (group.clone(), provenance.source_spelling.clone()),
-                    (
-                        format!("{group} container"),
-                        match provenance.container {
-                            libvm::ImageContainerKind::Raw => "raw",
-                            libvm::ImageContainerKind::Qcow2 => "qcow2",
-                            libvm::ImageContainerKind::Oci => "OCI",
-                        }
-                        .into(),
-                    ),
-                    (
-                        format!("{group} digest"),
-                        provenance.source_digest.to_string(),
-                    ),
-                ]);
-                if let Some(manifest) = provenance.source_manifest {
-                    rows.push((format!("{group} manifest"), manifest.to_string()));
-                }
-                if let Some(config) = provenance.source_config {
-                    rows.push((format!("{group} config"), config.to_string()));
-                }
-                if let Some(disk) = &provenance.disk {
-                    rows.extend([
-                        (
-                            format!("{group} size"),
-                            ui::human_bytes(Some(disk.source_length)),
-                        ),
-                        (
-                            format!("{group} decoded size"),
-                            ui::human_bytes(Some(disk.decoded_length)),
-                        ),
-                    ]);
-                    if let Some(root) = &disk.selected_root {
-                        append_nested_details(&mut rows, &format!("{group} root details"), root)?;
-                    }
-                }
-            }
-            Ok(rows)
+        }
+    }
+    Ok(rows)
+}
+
+fn oci_image_detail_rows(info: &libvm::OciImageInfo, now: i64) -> Vec<(String, String)> {
+    let platform = &info.platform;
+    let mut rows = vec![
+        ("ID".into(), info.id.to_string()),
+        ("Names".into(), names_label(&info.names)),
+        ("Root".into(), "layered".into()),
+        ("Size".into(), ui::human_bytes(Some(info.lower_length))),
+        (
+            "Compressed size".into(),
+            ui::human_bytes(Some(info.compressed_size_bytes)),
+        ),
+        (
+            "Platform".into(),
+            match &platform.variant {
+                Some(variant) => format!("{}/{}/{variant}", platform.os, platform.architecture),
+                None => format!("{}/{}", platform.os, platform.architecture),
+            },
+        ),
+        ("Config digest".into(), info.config_digest.clone()),
+        ("Layers".into(), info.layers.len().to_string()),
+        ("Created".into(), ui::format_unix(info.created_at)),
+        ("Last used".into(), last_used_label(info.last_used_at, now)),
+        (
+            "Entrypoint".into(),
+            argv_label(info.config.entrypoint.as_deref()),
+        ),
+        ("Command".into(), argv_label(info.config.cmd.as_deref())),
+        (
+            "Working directory".into(),
+            info.config
+                .working_dir
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "User".into(),
+            info.config.user.clone().unwrap_or_else(|| "-".into()),
+        ),
+    ];
+    for variable in info.config.env.iter().flatten() {
+        let (key, value) = variable.split_once('=').unwrap_or((variable, ""));
+        rows.push((format!("Environment {key}"), value.into()));
+    }
+    rows
+}
+
+fn argv_label(argv: Option<&[String]>) -> String {
+    argv.map(|argv| format!("{argv:?}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn last_used_label(last_used_at: Option<i64>, now: i64) -> String {
+    last_used_at.map_or_else(|| "-".into(), |time| ui::relative_time(time, now))
+}
+
+/// JSON shape of one local image: `{"kind": "oci"|"stored", "info": {...}}`.
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", content = "info", rename_all = "kebab-case")]
+enum ImageView<'a> {
+    Oci(OciImageView<'a>),
+    Stored(&'a libvm::StoredImageInfo),
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OciImageView<'a> {
+    id: libvm::ImageId,
+    names: &'a [String],
+    config_digest: &'a str,
+    platform: &'a libvm::Platform,
+    config: &'a libvm::OciImageConfigMetadata,
+    layers: Vec<OciLayerView<'a>>,
+    lower_length: u64,
+    compressed_size_bytes: u64,
+    created_at: i64,
+    last_used_at: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OciLayerView<'a> {
+    position: i64,
+    blob_digest: &'a str,
+    diff_id: &'a str,
+    media_type: &'a str,
+    compressed_size_bytes: Option<u64>,
+    uncompressed_size_bytes: Option<u64>,
+}
+
+impl<'a> ImageView<'a> {
+    fn new(image: &'a libvm::ImageInfo) -> Self {
+        match image {
+            libvm::ImageInfo::Stored(info) => Self::Stored(info),
+            libvm::ImageInfo::Oci(info) => Self::Oci(OciImageView {
+                id: info.id,
+                names: &info.names,
+                config_digest: &info.config_digest,
+                platform: &info.platform,
+                config: &info.config,
+                layers: info
+                    .layers
+                    .iter()
+                    .map(|layer| OciLayerView {
+                        position: layer.position,
+                        blob_digest: &layer.blob_digest,
+                        diff_id: &layer.diff_id,
+                        media_type: &layer.media_type,
+                        compressed_size_bytes: layer.compressed_size_bytes,
+                        uncompressed_size_bytes: layer.uncompressed_size_bytes,
+                    })
+                    .collect(),
+                lower_length: info.lower_length,
+                compressed_size_bytes: info.compressed_size_bytes,
+                created_at: info.created_at,
+                last_used_at: info.last_used_at,
+            }),
         }
     }
 }
 
-fn print_managed_inspection(
-    source: &libvm::ManagedSourceInfo,
-    format: OutputFormat,
-) -> eyre::Result<()> {
+/// JSON shape of an image removal; a snapshot removal serializes the same way.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemovalView<'a> {
+    id: String,
+    names: &'a [String],
+    record_removed: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PruneView {
+    images_removed: u64,
+    bytes_removed: u64,
+}
+
+fn removal_line(kind: &str, id: &str, names: &[String], record_removed: bool) -> String {
+    let id = table_id(id);
+    match (record_removed, names.is_empty()) {
+        (true, true) => format!("Removed {kind} [{id}]"),
+        (true, false) => format!("Removed {kind} {} [{id}]", names.join(", ")),
+        (false, _) => format!(
+            "Removed name {} [{id}]; the {kind} keeps its other names",
+            names.join(", ")
+        ),
+    }
+}
+
+fn prune_line(report: &libvm::ImagePruneReport) -> String {
+    format!(
+        "Pruned {} image{}, {} freed",
+        report.images_removed,
+        if report.images_removed == 1 { "" } else { "s" },
+        ui::human_bytes(Some(report.bytes_removed)),
+    )
+}
+
+fn print_image(image: &libvm::ImageInfo, format: OutputFormat) -> eyre::Result<()> {
     match format {
-        OutputFormat::Json => ui::print_json(source),
-        OutputFormat::Plain => ui::print_detail_rows(&managed_detail_rows(source)?),
+        OutputFormat::Json => ui::print_json(&ImageView::new(image)),
+        OutputFormat::Plain => ui::print_detail_rows(&match image {
+            libvm::ImageInfo::Stored(info) => stored_image_detail_rows(info)?,
+            libvm::ImageInfo::Oci(info) => oci_image_detail_rows(info, ui::now_unix()),
+        }),
     }
 }
 
 fn artifact_detail_rows(info: &libvm::ArtifactInspection) -> Vec<(String, String)> {
     let (id, kind) = match info.content {
-        libvm::ManagedSourceId::Image(id) => (id.to_string(), "image"),
-        libvm::ManagedSourceId::Snapshot(id) => (
-            id.to_string(),
-            match info.capture_kind {
-                Some(libvm::SnapshotCaptureKindName::LiveExecution) => "live snapshot",
-                Some(libvm::SnapshotCaptureKindName::StoppedStorage) => "stopped snapshot",
-                None => "snapshot",
-            },
-        ),
+        libvm::ArtifactContent::Image(id) => (id.to_string(), "image"),
+        libvm::ArtifactContent::Snapshot(id) => (id.to_string(), "snapshot"),
     };
     vec![
         ("ID".into(), id),
@@ -1268,38 +1401,18 @@ fn artifact_detail_rows(info: &libvm::ArtifactInspection) -> Vec<(String, String
         ("Repository".into(), info.repository.clone()),
         ("Index digest".into(), info.index_digest.to_string()),
         (
-            "Purpose".into(),
-            match info.purpose {
-                libvm::ArtifactPurpose::Image => "image",
-                libvm::ArtifactPurpose::Checkpoint => "checkpoint",
-            }
-            .into(),
-        ),
-        (
             "Root".into(),
-            match info.root_family {
-                libvm::ArtifactRootFamily::OpaqueRaw => "opaque raw",
-                libvm::ArtifactRootFamily::LinuxOverlay => "Linux overlay",
-            }
-            .into(),
-        ),
-        (
-            "Backend".into(),
-            match info.backend {
-                libvm::BackendRequirement::RawBlock => "raw block",
-                libvm::BackendRequirement::KrunOverlay => "krun overlay",
+            match info.root {
+                libvm::ArtifactRootFamily::OpaqueRaw => "raw",
+                libvm::ArtifactRootFamily::LinuxOverlay => "layered",
             }
             .into(),
         ),
         (
             "Guest architecture".into(),
-            match info.guest_architecture {
-                libvm::GuestArchitecture::Amd64 => "amd64",
-                libvm::GuestArchitecture::Arm64 => "arm64",
-            }
-            .into(),
+            architecture_label(info.guest_architecture).into(),
         ),
-        ("Live restore".into(), ui::yes_no(info.live_restore).into()),
+        ("Memory".into(), ui::yes_no(info.memory).into()),
     ]
 }
 
@@ -1367,26 +1480,32 @@ fn abbreviated_id(id: &str) -> &str {
     ui::short_id(id.strip_prefix("sha256:").unwrap_or(id))
 }
 
-fn aliases(aliases: &[String]) -> String {
-    if aliases.is_empty() {
+/// The first 12 hex digits of an image or snapshot id, as list tables show it.
+fn table_id(id: &str) -> &str {
+    let hex = id.strip_prefix("sha256:").unwrap_or(id);
+    hex.get(..12).unwrap_or(hex)
+}
+
+fn names_label(names: &[String]) -> String {
+    if names.is_empty() {
         "-".into()
     } else {
-        aliases.join(", ")
+        names.join(", ")
     }
 }
 
-fn snapshot_kind(info: &libvm::SnapshotInfo) -> &'static str {
-    match info.capture_kind {
-        libvm::SnapshotCaptureKindName::LiveExecution => "live",
-        libvm::SnapshotCaptureKindName::StoppedStorage => "stopped",
+fn memory_label(memory: libvm::SnapshotMemory) -> &'static str {
+    match memory {
+        libvm::SnapshotMemory::None => "no",
+        libvm::SnapshotMemory::Included => "yes",
     }
 }
 
 fn snapshot_result_line(info: &libvm::SnapshotInfo, elapsed: Duration) -> String {
-    let name = if info.aliases.is_empty() {
+    let name = if info.names.is_empty() {
         "(unnamed)".into()
     } else {
-        aliases(&info.aliases)
+        names_label(&info.names)
     };
     ui::result_message(
         "Created",
@@ -1568,82 +1687,49 @@ fn verification_error_json(error: &libvm::SnapshotVerificationError) -> serde_js
     json!({ "error": error, "guidance": VERIFICATION_GUIDANCE })
 }
 
+/// Rows for one record: one per name, or a single `<none>` row when unnamed.
+fn name_rows(names: &[String]) -> impl Iterator<Item = &str> {
+    let unnamed = names.is_empty().then_some("<none>");
+    names.iter().map(String::as_str).chain(unnamed)
+}
+
 fn snapshot_table(snapshots: &[libvm::SnapshotInfo], now: i64) -> Table {
-    let include_source = snapshots.iter().any(|info| !info.provenance.is_empty());
-    let include_aliases =
-        snapshots.is_empty() || snapshots.iter().any(|info| !info.aliases.is_empty());
-    let mut headers = vec!["ID"];
-    if include_aliases {
-        headers.push("ALIASES");
-    }
-    headers.push("KIND");
-    if include_source {
-        headers.push("SOURCE");
-    }
-    headers.push("CREATED");
-    let mut table = Table::new(headers);
+    let mut table = Table::new(["NAME", "ID", "MEMORY", "SOURCE", "CREATED"]);
     for info in snapshots {
+        let id = info.id.to_string();
         let sources = info
             .provenance
             .iter()
             .map(|entry| abbreviated_id(&entry.machine_id.to_string()).to_owned())
             .collect::<Vec<_>>();
-        let mut row = vec![abbreviated_id(&info.id.to_string()).to_owned()];
-        if include_aliases {
-            row.push(aliases(&info.aliases));
+        let sources = names_label(&sources);
+        let created = ui::relative_time(info.created_at, now);
+        for name in name_rows(&info.names) {
+            table.add_row([
+                name,
+                table_id(&id),
+                memory_label(info.memory),
+                &sources,
+                &created,
+            ]);
         }
-        row.push(snapshot_kind(info).into());
-        if include_source {
-            row.push(aliases(&sources));
-        }
-        row.push(ui::relative_time(info.created_at, now));
-        table.add_row(row);
     }
     table
 }
 
-fn image_table(sources: &[libvm::ManagedSourceInfo]) -> Table {
-    let include_size = sources
-        .iter()
-        .any(|source| matches!(source, libvm::ManagedSourceInfo::Image(_)));
-    let include_name = sources.is_empty()
-        || sources.iter().any(|source| match source {
-            libvm::ManagedSourceInfo::Image(info) => !info.aliases.is_empty(),
-            libvm::ManagedSourceInfo::Snapshot(info) => !info.aliases.is_empty(),
-        });
-    let mut headers = Vec::new();
-    if include_name {
-        headers.push("NAME");
-    }
-    headers.extend(["KIND", "ID"]);
-    if include_size {
-        headers.push("SIZE");
-    }
-    let mut table = Table::new(headers);
-    for source in sources {
-        let (names, kind, id, size) = match source {
-            libvm::ManagedSourceInfo::Image(info) => (
-                &info.aliases,
-                "image".into(),
-                info.id.to_string(),
-                Some(info.record.root.stream.length),
-            ),
-            libvm::ManagedSourceInfo::Snapshot(info) => (
-                &info.aliases,
-                format!("{} snapshot", snapshot_kind(info)),
-                info.id.to_string(),
-                None,
-            ),
+fn image_table(images: &[libvm::ImageInfo], now: i64) -> Table {
+    let mut table = Table::new(["NAME", "ID", "ROOT", "SIZE", "LAST USED"]);
+    for image in images {
+        let (root, size, last_used_at) = match image {
+            libvm::ImageInfo::Oci(info) => ("layered", info.lower_length, info.last_used_at),
+            libvm::ImageInfo::Stored(info) => ("raw", info.record.root.stream.length, None),
         };
-        let mut row = Vec::new();
-        if include_name {
-            row.push(aliases(names));
+        let id = image.id().to_string();
+        let size = ui::human_bytes(Some(size));
+        let last_used = last_used_label(last_used_at, now);
+        for name in name_rows(image.names()) {
+            table.add_row([name, table_id(&id), root, &size, &last_used]);
         }
-        row.extend([kind, abbreviated_id(&id).to_owned()]);
-        if include_size {
-            row.push(ui::human_bytes(size));
-        }
-        table.add_row(row);
     }
     table
 }
@@ -1947,7 +2033,7 @@ mod tests {
 
     #[test]
     fn snapshot_and_fork_default_to_incremental_with_explicit_full_override() {
-        use crate::commands::live::SnapshotCommand;
+        use crate::commands::live::{CapturePolicyArgument, SnapshotCommand};
         use vm_spec::lifecycle::CapturePolicy;
 
         for (flags, expected) in [
@@ -1958,16 +2044,27 @@ mod tests {
             ),
             (vec!["--capture-policy", "full"], CapturePolicy::Full),
         ] {
-            let prefix = ["silo", "snapshot", "create", "vm", "--live"];
+            let prefix = ["silo", "snapshot", "create", "vm", "--memory"];
             let cli = Cli::try_parse_from(prefix.iter().chain(flags.iter()).copied()).unwrap();
             let Command::Snapshot(snapshot) = cli.command else {
                 panic!("expected snapshot");
             };
-            let SnapshotCommand::Create { capture, .. } = snapshot.command else {
+            assert!(snapshot.includes_memory());
+            let SnapshotCommand::Create {
+                memory,
+                capture_policy,
+                dirty_crossover_percent,
+                ..
+            } = snapshot.command
+            else {
                 panic!("expected create");
             };
-            assert_eq!(capture.policy(), expected);
-            assert_eq!(capture.crossover(), 60);
+            assert!(memory);
+            assert_eq!(
+                capture_policy.map_or(CapturePolicy::Incremental, CapturePolicyArgument::policy),
+                expected
+            );
+            assert_eq!(dirty_crossover_percent, None);
 
             let mut args = vec!["vm", "--live", "--name", "child"];
             args.extend(flags);
@@ -1979,12 +2076,10 @@ mod tests {
 
     #[test]
     fn incremental_options_require_live_mode_and_bounded_crossover() {
-        for command in ["snapshot", "fork"] {
-            let prefix = if command == "snapshot" {
-                vec!["silo", "snapshot", "create", "vm"]
-            } else {
-                vec!["silo", "fork", "vm", "--name", "child"]
-            };
+        for (prefix, mode) in [
+            (vec!["silo", "snapshot", "create", "vm"], "--memory"),
+            (vec!["silo", "fork", "vm", "--name", "child"], "--live"),
+        ] {
             for flags in [
                 vec!["--capture-policy", "incremental"],
                 vec!["--dirty-crossover-percent", "60"],
@@ -1993,7 +2088,7 @@ mod tests {
             }
             for percent in ["0", "61", "256", "-1", "1.5"] {
                 let flags = [
-                    "--live",
+                    mode,
                     "--capture-policy",
                     "incremental",
                     "--dirty-crossover-percent",
@@ -2021,25 +2116,137 @@ mod tests {
     }
 
     #[test]
-    fn disk_recovery_never_accepts_execution_activation_options() {
-        for option in ["--activation-hook", "--memory-overcommit", "--live"] {
-            assert!(
-                Cli::try_parse_from(["silo", "recover-disks", "image:checkpoint", option]).is_err()
+    fn memory_only_snapshot_options_require_memory() {
+        for flags in [
+            vec!["--preserve"],
+            vec!["--capture-policy", "full"],
+            vec!["--dirty-crossover-percent", "10"],
+        ] {
+            let mut args = vec!["silo", "snapshot", "create", "vm"];
+            args.extend_from_slice(&flags);
+            let error = Cli::try_parse_from(&args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{flags:?}"
             );
+            args.push("--memory");
+            assert!(Cli::try_parse_from(&args).is_ok(), "{flags:?}");
         }
+        for args in [
+            vec!["silo", "snapshot", "create", "vm", "--live"],
+            vec![
+                "silo",
+                "snapshot",
+                "create",
+                "vm",
+                "--memory",
+                "--external-requirements",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn restore_folds_disk_recovery_into_without_memory() {
+        let hook =
+            r#"{"argv":["/bin/true"],"environment":[],"workingDirectory":"/","timeoutMs":1000}"#;
+        let error = Cli::try_parse_from([
+            "silo",
+            "restore",
+            "web",
+            "--without-memory",
+            "--activation-hook",
+            hook,
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(Cli::try_parse_from(["silo", "restore", "web", "--activation-hook", hook]).is_ok());
+
         let cli = Cli::try_parse_from([
             "silo",
-            "recover-disks",
-            "image:checkpoint",
+            "restore",
+            "ghcr.io/acme/web:1",
+            "--without-memory",
+            "--pull",
+            "never",
             "--name",
             "recovered",
         ])
         .unwrap();
-        let Command::RecoverDisks(command) = cli.command else {
-            panic!("disk recovery command");
+        let Command::Restore(command) = cli.command else {
+            panic!("restore command");
         };
-        assert_eq!(command.checkpoint, "image:checkpoint");
+        assert_eq!(command.reference, "ghcr.io/acme/web:1");
         assert_eq!(command.name.as_deref(), Some("recovered"));
+        assert!(command.without_memory);
+        assert_eq!(command.pull.policy(), libvm::PullPolicy::Never);
+
+        let Command::Restore(command) = Cli::try_parse_from(["silo", "restore", "web"])
+            .unwrap()
+            .command
+        else {
+            panic!("restore command");
+        };
+        assert!(!command.without_memory);
+        assert_eq!(command.pull.policy(), libvm::PullPolicy::IfMissing);
+        for pull in ["always", "missing", "never"] {
+            assert!(Cli::try_parse_from(["silo", "restore", "web", "--pull", pull]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["silo", "restore", "web", "--pull", "sometimes"]).is_err());
+    }
+
+    #[test]
+    fn removed_image_and_snapshot_commands_no_longer_parse() {
+        for args in [
+            vec!["silo", "recover-disks", "web"],
+            vec!["silo", "recover-disks", "web", "--name", "recovered"],
+            vec!["silo", "image", "release", "base"],
+            vec!["silo", "image", "remove", "base"],
+            vec!["silo", "snapshot", "remove", "web"],
+            vec![
+                "silo",
+                "image",
+                "pull",
+                "registry.example/a:1",
+                "--approve-digest",
+                "x",
+            ],
+            vec![
+                "silo",
+                "image",
+                "pull",
+                "registry.example/a:1",
+                "--require-signature",
+            ],
+            vec![
+                "silo",
+                "image",
+                "pull",
+                "registry.example/a:1",
+                "--name",
+                "a",
+            ],
+            vec![
+                "silo",
+                "image",
+                "push",
+                "base",
+                "registry.example/a:1",
+                "--acknowledge-checkpoint",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_err(), "{args:?}");
+        }
+        for args in [
+            vec!["silo", "image", "rm", "base"],
+            vec!["silo", "image", "prune"],
+            vec!["silo", "image", "pull", "registry.example/a:1"],
+            vec!["silo", "snapshot", "rm", "web"],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_ok(), "{args:?}");
+        }
     }
 
     fn fork_mode(args: &[&str]) -> eyre::Result<ForkMode> {
@@ -2466,12 +2673,12 @@ mod tests {
 
     #[test]
     fn restore_and_fork_reject_removed_ram_policy_flags() {
-        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "restore", "snap"]).is_ok());
         for flags in [
             vec!["--memory-overcommit"],
             vec!["--private-write-percent", "25"],
         ] {
-            let mut restore = vec!["silo", "restore", "checkpoint"];
+            let mut restore = vec!["silo", "restore", "snap"];
             restore.extend_from_slice(&flags);
             assert!(Cli::try_parse_from(restore).is_err());
             let mut fork = vec!["silo", "fork", "vm", "--live", "--name", "child"];
@@ -2480,19 +2687,18 @@ mod tests {
         }
     }
 
-    fn snapshot_info(alias: Option<&str>) -> libvm::SnapshotInfo {
+    fn snapshot_info(name: Option<&str>) -> libvm::SnapshotInfo {
         libvm::SnapshotInfo {
             id: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
             record_digest: format!("sha256:{}", "b".repeat(64)).parse().unwrap(),
-            capture_kind: libvm::SnapshotCaptureKindName::LiveExecution,
+            memory: libvm::SnapshotMemory::Included,
             provenance: vec![libvm::SnapshotCaptureProvenance {
                 capture_id: "00000000-0000-4000-8000-0000000000bb".parse().unwrap(),
                 machine_id: "12345678-0000-4000-8000-0000000000dd".parse().unwrap(),
                 run_id: "00000000-0000-4000-8000-0000000000cc".parse().unwrap(),
                 evidence_digest: format!("sha256:{}", "c".repeat(64)).parse().unwrap(),
             }],
-            retained: true,
-            aliases: alias.into_iter().map(str::to_owned).collect(),
+            names: name.into_iter().map(str::to_owned).collect(),
             created_at: 1_000,
             streams: vec![libvm::SnapshotStreamSummary {
                 role: libvm::SnapshotVerificationRole::Ram,
@@ -2510,36 +2716,127 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    fn stored_image(names: &[&str]) -> libvm::StoredImageInfo {
+        let digest = libvm::ObjectDigest::of_bytes(b"image renderer");
+        let record = libvm::ImageRecord {
+            schema: 2,
+            kind: libvm::ImageRecordKind::Image,
+            root: serde_json::from_value(serde_json::json!({
+                "profile": {"kind": "opaque-raw"},
+                "stream": {
+                    "stream": digest,
+                    "map": digest,
+                    "chunkSize": 8_388_608,
+                    "length": 512,
+                },
+                "geometry": {"length": 512, "logicalSectorSize": 512},
+                "layout": {"kind": "whole-disk"},
+            }))
+            .unwrap(),
+            boot: libvm::BootProfile::LinuxDirect {
+                userspace_platform: libvm::LinuxPlatform {
+                    architecture: libvm::GuestArchitecture::Amd64,
+                    variant: None,
+                },
+                kernel_architecture: libvm::GuestArchitecture::Amd64,
+                command_line_policy: libvm::DirectCommandLinePolicy::SiloDirectV1,
+                binding: libvm::BootBinding::Pinned {
+                    kernel: digest,
+                    base_initramfs: digest,
+                    agent: None,
+                    architecture: libvm::GuestArchitecture::Amd64,
+                    abi: "silo-direct-v2".into(),
+                },
+                root_selector: libvm::RootSelector::WholeDisk,
+                root_filesystem: libvm::RootFilesystem::Ext4,
+                translation: libvm::Translation::None,
+            },
+            process: libvm::ProcessConfig::default(),
+        };
+        record.validate().unwrap();
+        libvm::StoredImageInfo {
+            id: record.id().unwrap(),
+            record_digest: digest,
+            record,
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+            provenance: Vec::new(),
+        }
+    }
+
+    fn oci_image(names: &[&str], last_used_at: Option<i64>) -> libvm::OciImageInfo {
+        libvm::OciImageInfo {
+            id: format!("sha256:{}", "e".repeat(64)).parse().unwrap(),
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+            config_digest: format!("sha256:{}", "f".repeat(64)),
+            platform: libvm::Platform {
+                os: "linux".into(),
+                architecture: "amd64".into(),
+                variant: None,
+            },
+            config: libvm::OciImageConfigMetadata {
+                entrypoint: Some(vec!["/bin/app".into()]),
+                env: Some(vec!["A=1".into()]),
+                working_dir: Some("/srv".into()),
+                ..libvm::OciImageConfigMetadata::default()
+            },
+            layers: vec![libvm::ImageLayerDetail {
+                blob_digest: format!("sha256:{}", "1".repeat(64)),
+                diff_id: format!("sha256:{}", "2".repeat(64)),
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+                compressed_size_bytes: Some(100),
+                uncompressed_size_bytes: Some(200),
+                position: 0,
+            }],
+            lower_length: 4096,
+            compressed_size_bytes: 100,
+            created_at: 500,
+            last_used_at,
+        }
+    }
+
+    fn columns(line: &str) -> Vec<&str> {
+        line.split("  ")
+            .map(str::trim)
+            .filter(|column| !column.is_empty())
+            .collect()
+    }
+
     #[test]
-    fn plain_snapshot_results_and_lists_include_named_and_unnamed_checkpoints() {
+    fn plain_snapshot_results_and_lists_show_one_row_per_name_and_unnamed_records() {
         use crate::commands::live::{snapshot_result_line, snapshot_table};
         use std::time::Duration;
 
-        let named = snapshot_info(Some("checkpoint"));
-        let unnamed = snapshot_info(None);
+        let mut named = snapshot_info(Some("web"));
+        named.names.push("web-v2".into());
+        let mut unnamed = snapshot_info(None);
+        unnamed.memory = libvm::SnapshotMemory::None;
+        unnamed.provenance.clear();
         assert_eq!(
             snapshot_result_line(&named, Duration::from_millis(1250)),
-            "Created      checkpoint [aaaaaaaa] (1.2s)"
+            "Created      web, web-v2 [aaaaaaaa] (1.2s)"
         );
         assert_eq!(
             snapshot_result_line(&unnamed, Duration::from_millis(1250)),
             "Created      (unnamed) [aaaaaaaa] (1.2s)"
         );
         let text = table_text(snapshot_table(&[named, unnamed], 1_000));
-        for value in [
-            "ID",
-            "ALIASES",
-            "KIND",
-            "SOURCE",
-            "CREATED",
-            "checkpoint",
-            "aaaaaaaa",
-            "12345678",
-            "live",
-        ] {
-            assert!(text.contains(value), "{text}");
-        }
-        assert_eq!(text.lines().count(), 3);
+        let lines = text.lines().map(columns).collect::<Vec<_>>();
+        let created = crate::ui::relative_time(1_000, 1_000);
+        assert_eq!(
+            lines,
+            [
+                vec!["NAME", "ID", "MEMORY", "SOURCE", "CREATED"],
+                vec!["web", "aaaaaaaaaaaa", "yes", "12345678", created.as_str()],
+                vec![
+                    "web-v2",
+                    "aaaaaaaaaaaa",
+                    "yes",
+                    "12345678",
+                    created.as_str()
+                ],
+                vec!["<none>", "aaaaaaaaaaaa", "no", "-", created.as_str()],
+            ]
+        );
         assert!(!text.contains("sha256:"));
         assert!(!text.contains('\u{1b}'));
     }
@@ -2548,26 +2845,60 @@ mod tests {
     fn plain_empty_lists_render_only_their_headers() {
         use crate::commands::live::{image_table, snapshot_table};
         let snapshots = table_text(snapshot_table(&[], 1_000));
-        let images = table_text(image_table(&[]));
-        assert_eq!(snapshots.lines().count(), 1);
-        assert_eq!(images.lines().count(), 1);
-        assert!(snapshots.starts_with("ID"));
-        assert!(images.starts_with("NAME"));
-        assert!(!snapshots.contains("SIZE"));
-        assert!(!images.contains("CREATED"));
-        assert!(!images.contains("SIZE"));
-        assert!(!snapshots.contains("SOURCE"));
+        let images = table_text(image_table(&[], 1_000));
+        assert_eq!(
+            snapshots.lines().map(columns).collect::<Vec<_>>(),
+            [vec!["NAME", "ID", "MEMORY", "SOURCE", "CREATED"]]
+        );
+        assert_eq!(
+            images.lines().map(columns).collect::<Vec<_>>(),
+            [vec!["NAME", "ID", "ROOT", "SIZE", "LAST USED"]]
+        );
     }
 
     #[test]
-    fn plain_image_list_uses_available_snapshot_metadata() {
-        let sources = [libvm::ManagedSourceInfo::Snapshot(snapshot_info(None))];
-        let text = table_text(crate::commands::live::image_table(&sources));
-        assert!(text.contains("live snapshot"));
-        assert!(text.contains("aaaaaaaa"));
-        assert!(!text.contains("SIZE"));
-        assert!(!text.contains("NAME"));
-        assert_eq!(text.lines().count(), 2);
+    fn plain_image_list_shows_cached_and_stored_images_one_row_per_name() {
+        let images = [
+            libvm::ImageInfo::Oci(Box::new(oci_image(
+                &[
+                    "docker.io/library/python:3.12",
+                    "docker.io/library/python:3",
+                ],
+                Some(400),
+            ))),
+            libvm::ImageInfo::Oci(Box::new(oci_image(&[], None))),
+            libvm::ImageInfo::Stored(Box::new(stored_image(&["base"]))),
+        ];
+        let text = table_text(crate::commands::live::image_table(&images, 1_000));
+        let lines = text.lines().map(columns).collect::<Vec<_>>();
+        let oci_size = crate::ui::human_bytes(Some(4096));
+        let stored_size = crate::ui::human_bytes(Some(512));
+        let last_used = crate::ui::relative_time(400, 1_000);
+        let stored_id = images[2].id().to_string();
+        let stored_id = &stored_id["sha256:".len().."sha256:".len() + 12];
+        assert_eq!(
+            lines,
+            [
+                vec!["NAME", "ID", "ROOT", "SIZE", "LAST USED"],
+                vec![
+                    "docker.io/library/python:3.12",
+                    "eeeeeeeeeeee",
+                    "layered",
+                    oci_size.as_str(),
+                    last_used.as_str(),
+                ],
+                vec![
+                    "docker.io/library/python:3",
+                    "eeeeeeeeeeee",
+                    "layered",
+                    oci_size.as_str(),
+                    last_used.as_str(),
+                ],
+                vec!["<none>", "eeeeeeeeeeee", "layered", oci_size.as_str(), "-"],
+                vec!["base", stored_id, "raw", stored_size.as_str(), "-"],
+            ]
+        );
+        assert!(!text.contains("snapshot"));
     }
 
     #[test]
@@ -2636,12 +2967,11 @@ mod tests {
     #[test]
     fn snapshot_inspection_is_key_value_data_without_json_fragments() {
         use crate::commands::live::snapshot_detail_rows;
-        let mut info = snapshot_info(Some("checkpoint"));
-        info.aliases.push("another-alias".into());
+        let mut info = snapshot_info(Some("web"));
+        info.names.push("web-v2".into());
         let rows = snapshot_detail_rows(&info);
-        assert!(rows.contains(&("Aliases".into(), "checkpoint, another-alias".into())));
-        assert!(rows.contains(&("Retained".into(), "yes".into())));
-        assert!(rows.contains(&("Kind".into(), "live snapshot".into())));
+        assert!(rows.contains(&("Names".into(), "web, web-v2".into())));
+        assert!(rows.contains(&("Memory".into(), "yes".into())));
         assert!(rows.contains(&("Created".into(), crate::ui::format_unix(1_000))));
         assert!(rows.contains(&(
             "Source machine".into(),
@@ -2651,9 +2981,12 @@ mod tests {
         assert!(rows.iter().any(|(label, _)| label == "Capture"));
         assert!(!rows
             .iter()
+            .any(|(label, _)| label == "Kind" || label == "Retained" || label == "Aliases"));
+        assert!(!rows
+            .iter()
             .any(|(label, _)| label.contains('[') || label.contains('.')));
         let rows = snapshot_detail_rows(&snapshot_info(None));
-        assert!(rows.contains(&("Aliases".into(), "-".into())));
+        assert!(rows.contains(&("Names".into(), "-".into())));
     }
 
     #[test]
@@ -2661,25 +2994,15 @@ mod tests {
         use crate::ui::OutputFormat;
         let commands = [
             vec!["snapshot", "create", "vm"],
-            vec!["snapshot", "create", "vm", "--live"],
+            vec!["snapshot", "create", "vm", "--memory"],
             vec!["snapshot", "list"],
-            vec!["snapshot", "inspect", "image:checkpoint"],
+            vec!["snapshot", "inspect", "web"],
+            vec!["snapshot", "rm", "web"],
             vec!["image", "list"],
-            vec!["image", "inspect", "image:checkpoint"],
+            vec!["image", "inspect", "base"],
             vec!["image", "inspect-remote", "registry.example/image:tag"],
-            vec![
-                "image",
-                "pull",
-                "registry.example/image:tag",
-                "--approve-digest",
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ],
-            vec![
-                "image",
-                "push",
-                "image:checkpoint",
-                "registry.example/image:tag",
-            ],
+            vec!["image", "pull", "registry.example/image:tag"],
+            vec!["image", "push", "base", "registry.example/image:tag"],
             vec![
                 "image",
                 "import",
@@ -2692,7 +3015,9 @@ mod tests {
                 "linux-direct",
             ],
             vec!["image", "convert", "alpine", "--disk-format", "raw"],
-            vec!["restore", "image:checkpoint"],
+            vec!["image", "rm", "base"],
+            vec!["image", "prune"],
+            vec!["restore", "web"],
             vec!["fork", "vm", "--name", "child"],
             vec!["fork", "vm", "--live", "--name", "child"],
             vec!["fork", "--operation", OPERATION],
@@ -2724,77 +3049,95 @@ mod tests {
     }
 
     #[test]
-    fn plain_image_results_render_real_managed_image_fields() {
-        let digest = libvm::ObjectDigest::of_bytes(b"image renderer");
-        let record = libvm::ImageRecord {
-            schema: 2,
-            kind: libvm::ImageRecordKind::Image,
-            root: serde_json::from_value(serde_json::json!({
-                "profile": {"kind": "opaque-raw"},
-                "stream": {
-                    "stream": digest,
-                    "map": digest,
-                    "chunkSize": 8_388_608,
-                    "length": 512,
-                },
-                "geometry": {"length": 512, "logicalSectorSize": 512},
-                "layout": {"kind": "whole-disk"},
-            }))
-            .unwrap(),
-            boot: libvm::BootProfile::LinuxDirect {
-                userspace_platform: libvm::LinuxPlatform {
-                    architecture: libvm::GuestArchitecture::Amd64,
-                    variant: None,
-                },
-                kernel_architecture: libvm::GuestArchitecture::Amd64,
-                command_line_policy: libvm::DirectCommandLinePolicy::SiloDirectV1,
-                binding: libvm::BootBinding::Pinned {
-                    kernel: digest,
-                    base_initramfs: digest,
-                    agent: None,
-                    architecture: libvm::GuestArchitecture::Amd64,
-                    abi: "silo-direct-v2".into(),
-                },
-                root_selector: libvm::RootSelector::WholeDisk,
-                root_filesystem: libvm::RootFilesystem::Ext4,
-                translation: libvm::Translation::None,
-            },
-            process: libvm::ProcessConfig::default(),
-        };
-        record.validate().unwrap();
-        let info = libvm::ManagedImageInfo {
-            id: record.id().unwrap(),
-            record_digest: digest,
-            record,
-            aliases: vec!["base".into(), "second-alias".into()],
-            retained: true,
-            provenance: Vec::new(),
-        };
-        let source = libvm::ManagedSourceInfo::Image(Box::new(info));
-        let rows = crate::commands::live::managed_detail_rows(&source).unwrap();
-        assert!(rows.contains(&("Kind".into(), "image".into())));
-        assert!(rows.contains(&("Aliases".into(), "base, second-alias".into())));
+    fn image_inspection_renders_stored_and_cached_image_fields() {
+        use crate::commands::live::{oci_image_detail_rows, stored_image_detail_rows, ImageView};
+        let stored = stored_image(&["base", "second-name"]);
+        let rows = stored_image_detail_rows(&stored).unwrap();
+        assert!(rows.contains(&("Names".into(), "base, second-name".into())));
+        assert!(rows.contains(&("Root".into(), "raw".into())));
         assert!(rows.contains(&("Size".into(), crate::ui::human_bytes(Some(512)))));
         assert!(rows.contains(&("Root identity chunk".into(), "8388608 bytes".into())));
-        let json = serde_json::to_value(&source).unwrap();
-        let record = &json["info"]["record"];
-        assert_eq!(record["root"]["stream"]["chunkSize"], 8_388_608);
-        assert!(record["root"]["stream"].get("mapPages").is_none());
-        assert!(!rows.iter().any(|(label, _)| label.starts_with("info.")));
         assert!(rows.contains(&("Platform".into(), "linux/amd64".into())));
         assert!(rows.contains(&("Storage".into(), "opaque raw".into())));
         assert!(!rows
             .iter()
+            .any(|(label, _)| label == "Kind" || label == "Retained" || label == "Aliases"));
+        assert!(!rows
+            .iter()
             .any(|(label, _)| label.contains('.') || label.contains('[')));
-        let sources = [
-            source,
-            libvm::ManagedSourceInfo::Snapshot(snapshot_info(None)),
-        ];
-        let text = table_text(crate::commands::live::image_table(&sources));
-        assert!(text.contains("base, second-alias"));
-        assert!(text.contains(&crate::ui::human_bytes(Some(512))));
-        assert!(text.contains("SIZE"));
-        assert!(text.lines().last().unwrap().ends_with('-'));
+        let stored = libvm::ImageInfo::Stored(Box::new(stored));
+        let json = serde_json::to_value(ImageView::new(&stored)).unwrap();
+        assert_eq!(json["kind"], "stored");
+        assert_eq!(
+            json["info"]["names"],
+            serde_json::json!(["base", "second-name"])
+        );
+        assert_eq!(json["info"]["id"], stored.id().to_string());
+        assert_eq!(
+            json["info"]["record"]["root"]["stream"]["chunkSize"],
+            8_388_608
+        );
+        assert!(json["info"].get("retained").is_none());
+
+        let cached = oci_image(&["docker.io/library/python:3.12"], Some(400));
+        let rows = oci_image_detail_rows(&cached, 1_000);
+        for row in [
+            ("Names", "docker.io/library/python:3.12".to_owned()),
+            ("Root", "layered".to_owned()),
+            ("Size", crate::ui::human_bytes(Some(4096))),
+            ("Platform", "linux/amd64".to_owned()),
+            ("Layers", "1".to_owned()),
+            ("Last used", crate::ui::relative_time(400, 1_000)),
+            ("Entrypoint", r#"["/bin/app"]"#.to_owned()),
+            ("Command", "-".to_owned()),
+            ("Working directory", "/srv".to_owned()),
+            ("Environment A", "1".to_owned()),
+        ] {
+            assert!(rows.contains(&(row.0.into(), row.1.clone())), "{row:?}");
+        }
+        let rows = oci_image_detail_rows(&oci_image(&[], None), 1_000);
+        assert!(rows.contains(&("Names".into(), "-".into())));
+        assert!(rows.contains(&("Last used".into(), "-".into())));
+        let cached = libvm::ImageInfo::Oci(Box::new(cached));
+        let json = serde_json::to_value(ImageView::new(&cached)).unwrap();
+        assert_eq!(json["kind"], "oci");
+        assert_eq!(json["info"]["id"], format!("sha256:{}", "e".repeat(64)));
+        assert_eq!(
+            json["info"]["names"],
+            serde_json::json!(["docker.io/library/python:3.12"])
+        );
+        assert_eq!(json["info"]["lowerLength"], 4096);
+        assert_eq!(json["info"]["lastUsedAt"], 400);
+        assert_eq!(
+            json["info"]["layers"][0]["blobDigest"],
+            format!("sha256:{}", "1".repeat(64))
+        );
+    }
+
+    #[test]
+    fn removal_and_prune_lines_name_what_was_removed() {
+        use crate::commands::live::{prune_line, removal_line};
+        let id = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            removal_line("image", &id, &["base".into()], true),
+            "Removed image base [aaaaaaaaaaaa]"
+        );
+        assert_eq!(
+            removal_line("snapshot", &id, &[], true),
+            "Removed snapshot [aaaaaaaaaaaa]"
+        );
+        assert_eq!(
+            removal_line("image", &id, &["base".into()], false),
+            "Removed name base [aaaaaaaaaaaa]; the image keeps its other names"
+        );
+        assert_eq!(
+            prune_line(&libvm::ImagePruneReport {
+                images_removed: 1,
+                bytes_removed: 0,
+            }),
+            format!("Pruned 1 image, {} freed", crate::ui::human_bytes(Some(0)))
+        );
+        assert!(prune_line(&libvm::ImagePruneReport::default()).starts_with("Pruned 0 images"));
     }
 
     #[test]
@@ -2810,7 +3153,7 @@ mod tests {
         crate::ui::write_json(&mut bytes, &fork).unwrap();
         let previous = format!("{}\n", serde_json::to_string_pretty(&fork).unwrap());
         assert_eq!(bytes, previous.as_bytes());
-        let snapshot = snapshot_info(Some("checkpoint"));
+        let snapshot = snapshot_info(Some("snap"));
         bytes.clear();
         crate::ui::write_json(&mut bytes, &snapshot).unwrap();
         let previous = format!("{}\n", serde_json::to_string_pretty(&snapshot).unwrap());
@@ -2862,53 +3205,57 @@ mod tests {
     }
 
     #[test]
-    fn stopped_snapshot_inspection_omits_unavailable_source_details() {
+    fn snapshot_without_memory_inspection_omits_unavailable_source_details() {
         let mut snapshot = snapshot_info(None);
-        snapshot.capture_kind = libvm::SnapshotCaptureKindName::StoppedStorage;
+        snapshot.memory = libvm::SnapshotMemory::None;
         snapshot.provenance.clear();
         let rows = crate::commands::live::snapshot_detail_rows(&snapshot);
-        assert!(rows.contains(&("Kind".into(), "stopped snapshot".into())));
+        assert!(rows.contains(&("Memory".into(), "no".into())));
         assert!(!rows.iter().any(|(label, _)| label == "Source machine"));
-        let text = table_text(crate::commands::live::snapshot_table(&[snapshot], 1_000));
-        assert!(!text.contains("SOURCE"));
     }
 
     #[test]
     fn remote_inspection_uses_human_labels_for_all_available_metadata() {
         let snapshot = snapshot_info(None);
         let inspection = libvm::ArtifactInspection {
-            repository: "registry.example/team/checkpoint".into(),
+            repository: "registry.example/team/web".into(),
             index_digest: snapshot.record_digest,
-            content: libvm::ManagedSourceId::Snapshot(snapshot.id),
-            purpose: libvm::ArtifactPurpose::Checkpoint,
-            capture_kind: Some(libvm::SnapshotCaptureKindName::LiveExecution),
-            root_family: libvm::ArtifactRootFamily::OpaqueRaw,
-            backend: libvm::BackendRequirement::RawBlock,
+            content: libvm::ArtifactContent::Snapshot(snapshot.id),
+            root: libvm::ArtifactRootFamily::OpaqueRaw,
             guest_architecture: libvm::GuestArchitecture::Amd64,
-            live_restore: true,
+            memory: true,
         };
         let rows = crate::commands::live::artifact_detail_rows(&inspection);
         assert!(rows.contains(&("ID".into(), snapshot.id.to_string())));
-        assert!(rows.contains(&("Kind".into(), "live snapshot".into())));
-        assert!(rows.contains(&(
-            "Repository".into(),
-            "registry.example/team/checkpoint".into()
-        )));
+        assert!(rows.contains(&("Kind".into(), "snapshot".into())));
+        assert!(rows.contains(&("Repository".into(), "registry.example/team/web".into())));
         assert!(rows.contains(&("Guest architecture".into(), "amd64".into())));
-        assert!(rows.contains(&("Live restore".into(), "yes".into())));
-        assert!(rows.contains(&("Backend".into(), "raw block".into())));
-        assert!(!rows.iter().any(|(label, _)| label == "Created"));
+        assert!(rows.contains(&("Root".into(), "raw".into())));
+        assert!(rows.contains(&("Memory".into(), "yes".into())));
+        assert!(!rows.iter().any(|(label, _)| {
+            ["Created", "Purpose", "Backend", "Live restore"].contains(&label.as_str())
+        }));
         assert!(!rows
             .iter()
             .any(|(label, _)| label.contains('.') || label.contains('[')));
+        let image = libvm::ArtifactInspection {
+            content: libvm::ArtifactContent::Image(stored_image(&[]).id),
+            root: libvm::ArtifactRootFamily::LinuxOverlay,
+            memory: false,
+            ..inspection
+        };
+        let rows = crate::commands::live::artifact_detail_rows(&image);
+        assert!(rows.contains(&("Kind".into(), "image".into())));
+        assert!(rows.contains(&("Root".into(), "layered".into())));
+        assert!(rows.contains(&("Memory".into(), "no".into())));
     }
 
     #[test]
-    fn snapshot_verify_parses_alias_identity_and_json_format() {
+    fn snapshot_verify_parses_name_identity_and_json_format() {
         use crate::commands::live::SnapshotCommand;
         use crate::ui::OutputFormat;
-        let digest = format!("image:sha256:{}", "a".repeat(64));
-        for reference in ["image:checkpoint", digest.as_str()] {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for reference in ["web", "aaaaaa", digest.as_str()] {
             for args in [
                 vec!["silo", "snapshot", "verify", reference],
                 vec!["silo", "snapshot", "verify", reference, "--format", "json"],
@@ -2918,7 +3265,7 @@ mod tests {
                 let Command::Snapshot(snapshot) = cli.command else {
                     panic!("expected snapshot command");
                 };
-                assert!(!snapshot.is_live());
+                assert!(!snapshot.includes_memory());
                 let SnapshotCommand::Verify { reference: actual } = snapshot.command else {
                     panic!("expected snapshot verify");
                 };
@@ -2934,8 +3281,9 @@ mod tests {
         }
         for args in [
             vec!["silo", "snapshot", "verify"],
-            vec!["silo", "snapshot", "verify", "image:checkpoint", "extra"],
-            vec!["silo", "snapshot", "verify", "image:checkpoint", "--live"],
+            vec!["silo", "snapshot", "verify", "web", "extra"],
+            vec!["silo", "snapshot", "verify", "web", "--live"],
+            vec!["silo", "snapshot", "verify", "web", "--memory"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }

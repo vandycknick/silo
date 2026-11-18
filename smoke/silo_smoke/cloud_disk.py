@@ -765,9 +765,9 @@ def inspect(silo: Silo, reference: str) -> dict:
 
 
 PUBLISHED_TABLES = (
-    "machine_config", "machine_state", "machine_storage", "machine_rootfs", "storage_image", "image_alias",
+    "machine_config", "machine_state", "machine_storage", "machine_rootfs", "storage_image", "image_name",
     "image_provenance", "image_stream_dependency", "image_object_dependency", "raw_conversion_result",
-    "storage_snapshot",
+    "storage_snapshot", "snapshot_name",
 )
 
 

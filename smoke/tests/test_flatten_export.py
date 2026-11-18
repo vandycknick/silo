@@ -209,7 +209,7 @@ sync
     exported = cloud_disk.fingerprint(destination)
     imported = cloud_disk.import_disk(silo, destination, root="whole-disk", name="flattened-export")
     child = "flatten-consumer"
-    silo.create(child, "image:" + imported["id"], "--cpus", "1", "--memory", "512mib", "--network", "none", "--vsock")
+    silo.create(child, imported["id"], "--cpus", "1", "--memory", "512mib", "--network", "none", "--vsock")
     # Explicitly consume the sidecar's retained exact tuple, never silently pick
     # whichever boot assets happen to be packaged when the consumer starts.
     silo.run("set", child, "boot-assets=" + cloud_disk.bundle_digest(binding))

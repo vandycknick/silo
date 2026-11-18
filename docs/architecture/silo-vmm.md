@@ -230,7 +230,7 @@ than creating another pause. Historical success does not authorize a consumed
 token. A new `CancelOperation` is rejected while `Paused`; cancellation is
 the recovery exit from an unfinished or failed `Pausing`.
 Manager journal and authority updates acquire the SQLite writer reservation
-before reading current state, so concurrent checkpoint publication cannot
+before reading current state, so concurrent snapshot publication cannot
 invalidate a deferred read-to-write upgrade.
 Missing pause authority diagnostics include observed state, activity, last live
 error and pending resume identity. They never manufacture authority from an old
@@ -331,7 +331,7 @@ the existing inode. Publication establishes no warm verification receipt.
 Reconciliation can publish a coherent cut even when source continuation is
 unknown; uncertainty does not authorize releasing a live owner's storage.
 Terminal staging reclamation preserves the capture evidence separately.
-Checkpoint publication synchronizes every immutable pool payload and its
+Snapshot publication synchronizes every immutable pool payload and its
 publication directories before the catalog's stable-storage barrier. Local
 fork retention instead relocates without durability barriers; each fork child
 retains its independent background durability barrier.
@@ -366,7 +366,7 @@ with any cut member. The retained inspection binding excludes destination seeds,
 network and public SSH CA only; source authority and every state descriptor
 remain exact.
 
-Capture bindings and checkpoint compatibility profiles carry `liveStateSchema`
+Capture bindings and snapshot compatibility profiles carry `liveStateSchema`
 and guest `architecture`. The restoring monitor compares those with the native
 `LIVE_STATE_SCHEMA` and its guest architecture; mismatches produce typed
 expected/found refusals before child allocation. Every native state component
