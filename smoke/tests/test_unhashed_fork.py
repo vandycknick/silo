@@ -187,17 +187,19 @@ def test_owned_fork_cut_refuses_verification_export_push_and_handoff(
     cut = owned_fork(silo, SOURCE, "refusal-child", baseline)
     reference = "fork:" + cut.seal["captureId"]
     output = silo.ws.evidence / "refused-fork.tar"
-    for args in (
-        ("snapshot", "verify", reference),
-        ("storage", "export", reference, str(output), "--disk-format", "raw"),
-        ("image", "push", reference, "127.0.0.1:1/refused:latest"),
-        ("handoff", "plan", reference, "--mode", "fork",
-         "--operation", "00000000-0000-4000-8000-000000000001",
-         "--destination-home", str(silo.ws.evidence / "destination"),
-         "--destination-config", str(silo.ws.evidence / "destination.toml"),
-         "--destination-run-root", str(silo.ws.evidence / "destination-run")),
+    cut_refusal = "snapshot the child first"
+    for args, refusal in (
+        (("snapshot", "verify", reference), cut_refusal),
+        (("storage", "export", reference, str(output), "--disk-format", "raw"), cut_refusal),
+        # Images and snapshots are separate namespaces: a cut is never an image.
+        (("image", "push", reference, "127.0.0.1:1/refused:latest"), f"image {reference} not found"),
+        (("handoff", "plan", reference, "--mode", "fork",
+          "--operation", "00000000-0000-4000-8000-000000000001",
+          "--destination-home", str(silo.ws.evidence / "destination"),
+          "--destination-config", str(silo.ws.evidence / "destination.toml"),
+          "--destination-run-root", str(silo.ws.evidence / "destination-run")), cut_refusal),
     ):
         result = silo.run(*args, expect=None, timeout=30)
         assert result.returncode != 0
-        assert "local fork cut is not an identified snapshot; snapshot the child first" in result.stderr.lower(), result
+        assert refusal in result.stderr.lower(), result
     assert not output.exists(), "refused cut export created an artifact"

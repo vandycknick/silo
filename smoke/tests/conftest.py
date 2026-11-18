@@ -74,6 +74,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     if deselected:
         config.hook.pytest_deselected(items=deselected)
         items[:] = selected
+    skip_unavailable(config, items)
+
+
+def skip_unavailable(config: pytest.Config, items: list[pytest.Item]) -> None:
     system = platform.system()
     try:
         system_image = smoke_config.resolve(config).system_image

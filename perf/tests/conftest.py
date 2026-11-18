@@ -9,13 +9,13 @@ from smoke.tests.conftest import (
     basic_image,
     config,
     incremental_image,
-    pytest_collection_modifyitems,
     pytest_configure as configure_smoke,
     pytest_runtest_makereport,
     registry,
     restore_image,
     session_evidence,
     silo,
+    skip_unavailable,
     workspace,
 )
 from silo_smoke.config import add_options
@@ -32,3 +32,7 @@ def pytest_configure(config: pytest.Config) -> None:
     if os.environ.get("PROFILE") != "release":
         raise pytest.UsageError("perf measures only fresh release builds; run it through `make perf`")
     configure_smoke(config)
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    skip_unavailable(config, items)
