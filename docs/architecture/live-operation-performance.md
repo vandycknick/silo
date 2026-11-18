@@ -105,6 +105,36 @@ Known limits at this point:
   8.4 s and a full snapshot 13.5 s; these follow the dirtied memory and have
   not been broken down.
 
+### Minimum RAM hole length (2026-11-18)
+
+The RAM writer used to leave a file hole for every all-zero 4 KiB page. Guest
+memory that alternates data and zero pages (for example 3 GiB held by
+`(head -c 3G /dev/zero; sleep infinity) | tail -n1`, whose 8 KiB buffers are a
+page of bookkeeping and a page of zeros) then became a 4 GiB RAM file of about
+340,000 one-block extents on Btrfs. One reflink clone of such a file costs
+about 3 s of kernel time and one delete about 2 s, and every snapshot and fork
+makes several. The writer now only leaves a hole for a zero run of at least
+64 KiB; shorter zero runs between data are written. Content identity is
+unchanged.
+
+One run of that workload on an Ubuntu 26.04 guest (2 vCPU, 4 GiB RAM, 100 GiB
+disk, release build, hand-run script rather than `make perf`, seconds):
+
+| Operation | Before | After |
+|---|---:|---:|
+| Full snapshot | 15.49 | 4.37 |
+| Incremental snapshot | 8.04 | 0.83 |
+| Fork, first | 15.27 | 2.22 |
+| Fork, second | 8.22 | 1.15 |
+| Incremental snapshot after two forks | 10.50 | 0.85 |
+| Fork child's first snapshot | 18.45 | 3.88 |
+| Restore, first / second | 0.40 / 0.29 | 0.54 / 0.30 |
+| RAM file extents | 339,502 | 27,077 |
+
+A guest that keeps dirtying isolated single pages still fragments the RAM file
+across many incremental snapshots, because each snapshot overwrites pages inside
+a clone of the previous image. That case has not been measured.
+
 
 ## Phase 30 baseline (2026-11-15)
 
