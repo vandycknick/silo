@@ -6,7 +6,7 @@
 //!     plan        canonical approved plan (both roles)
 //!     manifest    canonical capture manifest (once bound or offered)
 //!     cleanup     destination replaced-generation cleanup authority
-//!     maps/<hex>  binary stream-map v2 root header
+//!     maps/<hex>  binary stream-map v1 root header
 //!     nodes/<hex> authenticated canonical map node objects
 //!     staging/    incomplete payload writes; never authoritative
 //! ```
@@ -309,7 +309,7 @@ pub(crate) fn decode_map(stream: &StreamId, bytes: &[u8]) -> Result<StreamRoot, 
     }
     let root = StreamRoot::decode(bytes).map_err(|error| {
         invalid(format!(
-            "unsupported or corrupt stream-map v2 root: {error}"
+            "unsupported or corrupt stream-map v1 root: {error}"
         ))
     })?;
     if root.id().as_bytes() != stream.as_bytes() {

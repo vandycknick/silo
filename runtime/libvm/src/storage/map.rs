@@ -467,9 +467,9 @@ impl MapNodeWriter {
                 .ok_or_else(|| StorageError::InvalidPath("staged node disappeared".into()))?;
             let mut header = [0; 27];
             file.read_exact_at(&mut header, 0)?;
-            let height = if header.starts_with(b"silo:stream-map:leaf:v2\n") {
+            let height = if header.starts_with(b"silo:stream-map:leaf:v1\n") {
                 0
-            } else if header.starts_with(b"silo:stream-map:branch:v2\n")
+            } else if header.starts_with(b"silo:stream-map:branch:v1\n")
                 && (1..=ROOT_HEIGHT).contains(&header[26])
             {
                 header[26]
@@ -522,7 +522,7 @@ impl NodeSink for MapNodeWriter {
         if bytes.len() > MAX_NODE_BYTES {
             return Err(MapError::NodeTooLarge(bytes.len()));
         }
-        let height = if bytes.starts_with(b"silo:stream-map:leaf:v2\n") {
+        let height = if bytes.starts_with(b"silo:stream-map:leaf:v1\n") {
             0
         } else {
             *bytes.get(26).ok_or(MapError::Truncated)?

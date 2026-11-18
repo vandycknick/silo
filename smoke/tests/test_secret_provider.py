@@ -83,7 +83,7 @@ def test_secret_provider_reloads_expired_payload(
         machine = UUID(ready["id"]).hex
         names = ["personal.oauth.access_token", "personal.oauth.expires_at"]
         grant = {
-            "version": 2, "store": f"file:{store}", "machine": machine,
+            "version": 1, "store": f"file:{store}", "machine": machine,
             "run": ready["run_id"], "issued_at": datetime.now(timezone.utc).isoformat(),
             "allowed": [
                 {"slot": slot, "key": KEY, "field": field, "backing_scope": "Home"}
@@ -91,7 +91,7 @@ def test_secret_provider_reloads_expired_payload(
             ],
         }
         request = json.dumps({
-            "version": 2, "operation": "get",
+            "version": 1, "operation": "get",
             "grant": base64.b64encode(json.dumps(grant).encode()).decode(),
             "scope": {"machine": machine, "run": ready["run_id"]},
             "names": names, "reason": "expired",
@@ -103,7 +103,7 @@ def test_secret_provider_reloads_expired_payload(
         header, body = stdout.split(b"\r\n\r\n", 1)
         assert header == f"Content-Length: {len(body)}".encode()
         response = json.loads(body)
-        assert response["version"] == 2
+        assert response["version"] == 1
         assert response["status"] == "ok"
         projected = {item["name"]: base64.b64decode(item["value"]).decode() for item in response["secrets"]}
         assert projected == {

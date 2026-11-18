@@ -361,7 +361,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
     # is emitted. This is the RFC 8785 spelling of this real captured record.
     canonical = json.dumps(record, sort_keys=True, ensure_ascii=False,
                            separators=(",", ":"), allow_nan=False).encode()
-    snapshot = "sha256:" + hashlib.sha256(b"silo:snapshot:v2\n" + canonical).hexdigest()
+    snapshot = "sha256:" + hashlib.sha256(b"silo:snapshot:v1\n" + canonical).hexdigest()
     record_digest, path = object_bytes(silo, canonical)
     created.append(path)
     seal_bytes = json.dumps(seal, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()

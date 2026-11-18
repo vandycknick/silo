@@ -373,7 +373,7 @@ fn layer_refs<'a>(unique: &'a [HeldLayer], occurrences: &[usize]) -> Vec<oci::er
         .collect()
 }
 
-const COMPOSITION_VALIDATION_SCHEMA: i64 = 2;
+const COMPOSITION_VALIDATION_SCHEMA: i64 = 1;
 
 async fn save_validation(
     store: &Store,
@@ -458,7 +458,7 @@ async fn save_graph_validation(
         }
     }
     let receipt = GraphValidation {
-        schema: 2,
+        schema: 1,
         graph: graph.clone(),
         metadata: held
             .into_iter()
@@ -496,7 +496,7 @@ async fn load_graph_validation(
     let (Ok(validation), Some(receipt)) = (validation, graph) else {
         return Ok(None);
     };
-    if receipt.schema != 2 {
+    if receipt.schema != 1 {
         return Ok(None);
     }
     if validation
@@ -1752,7 +1752,7 @@ mod tests {
 
     async fn receipt(store: &Store, held: &HeldComposition) -> Vec<u8> {
         sqlx::query_scalar(
-            "SELECT receipt FROM composition_validation WHERE lower_id=?1 AND schema=2",
+            "SELECT receipt FROM composition_validation WHERE lower_id=?1 AND schema=1",
         )
         .bind(held.retained.id.to_string())
         .fetch_one(&store.pool)
@@ -1992,7 +1992,7 @@ mod tests {
         let graph = held.snapshot_composition().unwrap();
         let lower = held.retained.overlay_lower();
         let receipt_query =
-            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=2";
+            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=1";
         let pack = pool.stream_path(&held.unique[0].0.pack.stream);
         let fsmeta = pool.object_path(&held.retained.fsmeta());
         for path in [&pack, &fsmeta] {
@@ -2301,14 +2301,14 @@ mod tests {
         );
         assert_eq!(root.length(), held.retained.result.lower_length);
         let receipt: Vec<u8> = sqlx::query_scalar(
-            "SELECT graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=2",
+            "SELECT graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=1",
         )
         .bind(held.retained.id.to_string())
         .fetch_one(&store.pool)
         .await
         .unwrap();
         let decoded: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
-        assert_eq!(decoded["schema"], 2);
+        assert_eq!(decoded["schema"], 1);
         assert!(decoded.get("maps").is_none());
         let roots = decoded["roots"].as_array().unwrap();
         assert_eq!(roots.len(), held.unique.len());
@@ -2332,7 +2332,7 @@ mod tests {
             .unwrap();
         held.authenticate_bytes(&pool).unwrap();
         let before: (Vec<u8>, Vec<u8>) = sqlx::query_as(
-            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=2",
+            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=1",
         ).bind(held.retained.id.to_string()).fetch_one(&store.pool).await.unwrap();
         let bytes = pool
             .read_object(
@@ -2350,7 +2350,7 @@ mod tests {
         std::fs::set_permissions(&path, Permissions::from_mode(0o400)).unwrap();
         assert!(held.authenticate_bytes(&pool).is_err());
         let after: (Vec<u8>, Vec<u8>) = sqlx::query_as(
-            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=2",
+            "SELECT receipt,graph_receipt FROM composition_validation WHERE lower_id=?1 AND schema=1",
         ).bind(held.retained.id.to_string()).fetch_one(&store.pool).await.unwrap();
         assert_eq!(before, after);
     }

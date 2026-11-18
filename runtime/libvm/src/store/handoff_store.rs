@@ -61,7 +61,7 @@ async fn write(
         HandoffPhase::Aborted => "aborted",
     };
     if insert {
-        sqlx::query("INSERT INTO handoff_operation(operation_id,schema,role,mode,source_machine,destination_machine,phase,terminal,record_json,source_runtime,destination_runtime,from_epoch,next_epoch) VALUES(?1,2,?2,?3,?4,?5,?6,?7,jsonb(?8),?9,?10,?11,?12)")
+        sqlx::query("INSERT INTO handoff_operation(operation_id,schema,role,mode,source_machine,destination_machine,phase,terminal,record_json,source_runtime,destination_runtime,from_epoch,next_epoch) VALUES(?1,1,?2,?3,?4,?5,?6,?7,jsonb(?8),?9,?10,?11,?12)")
             .bind(record.intent.operation.to_string()).bind(role).bind(mode).bind(record.intent.source_machine.to_string()).bind(record.intent.destination_machine.to_string()).bind(phase).bind(record.phase.is_terminal()).bind(json)
             .bind(record.intent.source_runtime.to_string()).bind(record.intent.destination_runtime.to_string())
             .bind(record.intent.from_epoch.get() as i64).bind(record.intent.destination_epoch()?.get() as i64)
@@ -113,7 +113,7 @@ fn check(
 }
 fn fresh(intent: &HandoffIntent, role: HandoffRole) -> HandoffRecord {
     HandoffRecord {
-        schema: 2,
+        schema: 1,
         role,
         intent: intent.clone(),
         binding: None,
@@ -1690,7 +1690,7 @@ mod tests {
         let root = root.unwrap();
         let capture = CaptureId::new(uuid::Uuid::new_v4()).unwrap();
         let manifest = CaptureManifest::new(ManifestBody {
-            schema: 2,
+            schema: 1,
             capture,
             operation: intent.operation,
             approved_plan_digest: intent.approved_plan_digest,

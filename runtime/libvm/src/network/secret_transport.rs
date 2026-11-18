@@ -100,7 +100,7 @@ pub(crate) fn frame(
                     message: "OAuth refresh hook command must be valid UTF-8".into(),
                 })?;
             Ok::<_, LibVmError>(Provider {
-                version: 2,
+                version: 1,
                 command,
                 args: &hook.args,
                 timeout_ms: hook.timeout_ms,

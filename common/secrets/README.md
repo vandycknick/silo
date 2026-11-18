@@ -1,9 +1,8 @@
 # Secret provider protocol
 
-The initial netd secrets payload stays **version 1** (16 KiB JSON). Its optional
-`provider` configuration is **version 2**, selecting the following request and
-response contract. Version 1 provider configuration and OAuth-refresh requests
-are unsupported.
+The netd secrets payload is **version 1** (16 KiB JSON). Its optional
+`provider` configuration is also **version 1** and selects the following request
+and response contract.
 
 Provider stdin and stdout each carry exactly one `Content-Length: N\r\n\r\n`
 frame followed by EOF. The header is capped at 128 bytes and JSON at 1 MiB.
@@ -12,22 +11,22 @@ and trailing data are rejected. netd runs the absolute executable with an empty
 environment, a configured timeout (default 10 seconds), and bounded output.
 
 ```json
-{"version":2,"operation":"get","grant":"<base64 JSON grant>","scope":{"machine":"<32 lowercase hex>","run":"<run id>"},"names":["codex.oauth.access_token","codex.oauth.expires_at"],"reason":"expired"}
+{"version":1,"operation":"get","grant":"<base64 JSON grant>","scope":{"machine":"<32 lowercase hex>","run":"<run id>"},"names":["codex.oauth.access_token","codex.oauth.expires_at"],"reason":"expired"}
 ```
 
 `reason` is `expired` or `expires_soon`. Success returns base64 bytes, including
 expiry as an RFC 3339 projection:
 
 ```json
-{"version":2,"status":"ok","secrets":[{"name":"codex.oauth.access_token","value":"<base64>"},{"name":"codex.oauth.expires_at","value":"<base64>"}]}
+{"version":1,"status":"ok","secrets":[{"name":"codex.oauth.access_token","value":"<base64>"},{"name":"codex.oauth.expires_at","value":"<base64>"}]}
 ```
 
-Errors return `{"version":2,"status":"error","error":{"code":...,"message":...,"retryable":false}}`.
+Errors return `{"version":1,"status":"error","error":{"code":...,"message":...,"retryable":false}}`.
 Codes are `not_found`, `read_only`, `unauthorized`, `invalid_request`,
 `provider_unavailable`, `provider_rejected`, `rate_limited`, `unsupported` and
 `internal_error`. netd does not expose provider messages or stderr.
 
-Grants contain `version:2`, `store:"file:<absolute selected Home record path>"`,
+Grants contain `version:1`, `store:"file:<absolute selected Home record path>"`,
 `machine`, `run`, `issued_at` and `allowed:[{slot,key,field,backing_scope}]`.
 `backing_scope` uses `"Home"` or `{"Machine":{"id":"..."}}`. Only selected
 OAuth projections are granted, never refresh tokens, plain overrides or `silo.*`.

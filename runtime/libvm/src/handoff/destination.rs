@@ -272,7 +272,7 @@ pub(crate) async fn preflight(
         &request.resources,
     )?;
     let plan = HandoffPlan::new(PlanBody {
-        schema: 2,
+        schema: 1,
         operation: request.operation,
         mode: request.mode,
         observation: source.clone(),

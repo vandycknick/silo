@@ -108,7 +108,7 @@ pub enum LibVmError {
     BootAssetsAcquisitionRequired {
         missing: crate::storage::identity::ObjectDigest,
     },
-    #[error("custom base initramfs bytes differ from the supported schema-2 bootstrap; select the packaged base initramfs")]
+    #[error("custom base initramfs bytes differ from the supported schema-1 bootstrap; select the packaged base initramfs")]
     BootBundleAbiUnsupported,
     #[error("root selection {:?} failed: {}", .0.requested, .0.reason)]
     RootSelectionFailed(Box<crate::image::import_types::RootSelectionFailed>),

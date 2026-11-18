@@ -27,7 +27,7 @@ use crate::lifecycle::{
 use crate::{BlockId, DiskFormat, DiskGeometry, DiskRole, GuestOs, Storage, VmSpec};
 
 /// Version of `request.json`, `vm.capture.json` and `vm.capture-source.json`.
-pub const CAPTURE_RECORD_VERSION: u32 = 3;
+pub const CAPTURE_RECORD_VERSION: u32 = 1;
 /// Staging root below the machine data directory.
 pub const CAPTURES_DIRECTORY: &str = "captures";
 /// Writable disk captures below one capture directory.
@@ -1138,7 +1138,7 @@ pub enum CapturePauseDisposition {
 }
 
 /// Host-local write coverage, independent of portable disk stream identity.
-pub const DISK_TRACKING_VERSION: u32 = 2;
+pub const DISK_TRACKING_VERSION: u32 = 1;
 pub const MAX_DISK_TRACKING_BYTES: usize = 16 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1175,7 +1175,7 @@ pub struct DiskTrackingSeed {
 impl DiskTrackingSeed {
     pub fn validate(&self) -> Result<(), String> {
         if self.version != DISK_TRACKING_VERSION
-            || self.map_format != 2
+            || self.map_format != 1
             || self.chunk_shift != 23
             || self.file_inode == 0
             || self.attachment_index >= 16
@@ -2491,7 +2491,7 @@ pub(crate) mod tests {
     fn tracking_receipt() -> DiskTrackingReceipt {
         let seed = DiskTrackingSeed {
             version: DISK_TRACKING_VERSION,
-            map_format: 2,
+            map_format: 1,
             chunk_shift: 23,
             role: DiskRole::RootUpper,
             attachment_index: 1,
@@ -2538,8 +2538,8 @@ pub(crate) mod tests {
         for malformed in [
             format!(" {json}"),
             format!("{json}\n"),
-            json.replacen("\"version\":2", "\"version\":2,\"version\":2", 1),
-            json.replacen("\"version\":2", "\"version\":2,\"future\":true", 1),
+            json.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
+            json.replacen("\"version\":1", "\"version\":1,\"future\":true", 1),
             json.replace(",\"invalidReason\":null", ""),
             json.replace(",\"baseline\":\"sha256:", ",\"baseline\":\"SHA256:"),
             json.replace("\"dirtyChunks\":2", "\"dirtyChunks\":2.0"),
@@ -4023,7 +4023,7 @@ pub(crate) mod tests {
         for bad in [
             format!("{text}\n"),
             text.replacen('{', "{\"future\":true,", 1),
-            text.replacen("\"version\":3", "\"version\":3,\"version\":3", 1),
+            text.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
             text.replace("\"complete\":true", "\"complete\":false"),
             text.replace(
                 "\"materializationGeneration\":2",

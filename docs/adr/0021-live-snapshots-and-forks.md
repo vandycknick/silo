@@ -95,7 +95,7 @@ the eligible reflink lane. Freshly formatted disks have no baseline at create;
 their first snapshot hashes written disk data once and seeds later captures in
 the same run.
 Every ended run invalidates its baseline; clean-stop sealing and deterministic
-upper templates remain planned stage 2. Stream-map v2 now replaces flat-map
+upper templates remain planned stage 2. Stream-map v1 now replaces flat-map
 metadata; remaining runtime costs still require measured scaling qualification.
 
 ### Snapshot memory terminology (2026-11-18)
@@ -186,7 +186,7 @@ changes since its last identified snapshot, not just since the last fork.
 Disk forks leave the source's identified map and dirty history untouched;
 frozen generations, if any, merge back rather than commit a new identity.
 Source/child removal cannot retire independently retained descendant inputs
-or the source's identified anchor. Capture/restore record v3 and the initial
+or the source's identified anchor. Capture/restore record v1 and the initial
 catalog format are a breaking fresh-home change, with no compatibility reader.
 
 
@@ -970,7 +970,7 @@ separately qualified; their inclusion or fallback is not a qualification claim.
 ### Identity and chains
 
 RAM uses [ADR 0014](0014-layered-oci-image-storage.md#stream-identity)'s binary
-stream-map v2 with **64 KiB** decoded identity units. Its root authenticates
+stream-map v1 with **64 KiB** decoded identity units. Its root authenticates
 exact packed length and unit size, not a flat digest list or whole-file SHA.
 All-zero units are absent; mixed units hash their exact bytes, including
 interior zeros, and tails are never padded. The separately hashed layout maps
@@ -1164,7 +1164,7 @@ private staging, file fsync, atomic rename, then directory fsync. SQL ownership
 commits before initial publication or construction-peak reduction. Interrupted
 updates therefore retain the complete conservative old charge or the complete
 new charge; interrupted initial staging is never an authoritative inventory
-entry. Under `admission.lock`, each home first atomically publishes a schema-2
+entry. Under `admission.lock`, each home first atomically publishes a schema-1
 `<state-db-device>-<state-db-inode>-home.json` anchor containing its canonical
 absolute home path, `state.db` device/inode identity and the exact operation
 lease device/inode identities and scopes for its charge documents. Opening a home
@@ -1199,7 +1199,7 @@ old-build Silo processes remain. No compatibility reader is provided.
 Charge documents in the new namespace reject unknown fields. Malformed charges
 with live or unknown lease owners refuse; orphan-prefix reclamation is unchanged.
 Refusals identify the owning home and ledger directory with removal guidance.
-Schema-2 anchors are a hard cutover; running older resource-ledger builds
+Schema-1 anchors are a hard cutover; running older resource-ledger builds
 concurrently against the same user's ledger is unsupported. Host tests enable
 the dev-only `test-isolated-resource-budget` feature and use a ledger inside
 each fixture home; cross-home tests explicitly share a temporary ledger. There

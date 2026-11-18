@@ -1,4 +1,4 @@
-//! Fresh-state stream-map v2 bounds. Limits are inclusive, not resource promises.
+//! Fresh-state stream-map v1 bounds. Limits are inclusive, not resource promises.
 
 /// Transport payload geometry, not the identity-unit size of RAM streams.
 pub const CHUNK_SIZE: usize = oci::vm_artifact::wire::CHUNK_SIZE as usize;

@@ -255,9 +255,9 @@
           "directory": "silo-artifacts/case-0004/layer-0000",
           "indexRoot": "sha256:dc971eba62cdbf068260295a266cb996068620981e7b45f672cff769e4d1c925",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:841ce6fafe580330cc6371ebceb320697696dcef1817cad9b26c592cc4b566ee",
-          "result": "sha256:d68da743dbc5014b643cd5504d0eea3fa6e39554610ee73cb420e3ff6c558203"
+          "result": "sha256:b18b35eb059316d48624f61df12701b218bea5993f8d6b148d38ec2bb6d8d4a2"
         }
       ],
       "expected": [
@@ -367,9 +367,9 @@
           "directory": "silo-artifacts/case-0005/layer-0000",
           "indexRoot": "sha256:0d7031376ad83b8c63e5ca73bee086d4584bf60fbe01d8a4f17342ce9e00bffa",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:0dd4f775baf5f90c4221088763db17790e615b563be2e92208306f9400830bca",
-          "result": "sha256:a6ace11bc85ff7c7bdea73e94e89776f0208a71dfaf3ec2db092884c946db3bc"
+          "result": "sha256:e36bfd451071158be243a7d790df5a64d7462f1eb8b3102b1c7047ff946e6f09"
         }
       ],
       "expected": [
@@ -479,9 +479,9 @@
           "directory": "silo-artifacts/case-0006/layer-0000",
           "indexRoot": "sha256:efdc95951f6ece1e0d14ef4e84a0efb54dba600a22b104808860c6c233cf1628",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:b0b216028990fc5dd04c3a1f9ab0f2af05aa1c7ab2eda6dabd9e7af418e0976e",
-          "result": "sha256:b2b14295ec0e76e315a27b997ba429f0d1573c9483d9f5917d75ace343fa988e"
+          "result": "sha256:b9a313ce1b4d5577b9c1aeb38630d767719c67bd10ce0ece9b68497bbbfd3c75"
         }
       ],
       "expected": [
@@ -591,9 +591,9 @@
           "directory": "silo-artifacts/case-0007/layer-0000",
           "indexRoot": "sha256:059b8fd38adee953957382b374e9701c9eaa0ab6910948e6626a10f845fa64cf",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:1d3d921c18c745a026eb9c63e76a5324d377dd8840f74c5dadbbf747b6f55f6c",
-          "result": "sha256:f6b8d5de3399bbe2cd194edcd9001036c805919a5be270d8058b3b077d747a65"
+          "result": "sha256:f96e1fa3ec77d0c745a3265e291bfee919b511209d6f754980a86f6af81fd401"
         }
       ],
       "expected": [
@@ -703,9 +703,9 @@
           "directory": "silo-artifacts/case-0008/layer-0000",
           "indexRoot": "sha256:5419b98b9b6851d939c0538985fc06ed22709864f7b4aeaab14cd100db2b5ca7",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:f300665fdd0d6f43a3e803325ef96c90fd99d6adc7cd045adeb2722555a3d91e",
-          "result": "sha256:2996e7037d112ef3305513593a34ddd42a07b94cbbd6909c27ff8ee3c80ea878"
+          "result": "sha256:8310f1a63676d3d2b51939eafeb54d1320a99ba29e3675ece197274621ac2d41"
         }
       ],
       "expected": [
@@ -1541,9 +1541,9 @@
           "directory": "silo-artifacts/case-0017/layer-0000",
           "indexRoot": "sha256:059b8fd38adee953957382b374e9701c9eaa0ab6910948e6626a10f845fa64cf",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:4c7de77d638e62e4e3793096b09a76c504bd2e4af74e0d4ac496b6d81a8bf7d0",
-          "result": "sha256:10cfb2826f01b26f7bc4602ff7ece99f9f561ed511b57db049f8a88f298bb34f"
+          "result": "sha256:e6236e5b22509f74de2ec78db068b6c20bc9cdbb0d76c8a6a624e35a31dc9ccb"
         }
       ],
       "expected": [
@@ -1653,9 +1653,9 @@
           "directory": "silo-artifacts/case-0018/layer-0000",
           "indexRoot": "sha256:5419b98b9b6851d939c0538985fc06ed22709864f7b4aeaab14cd100db2b5ca7",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:1572ce4a09587c02fcff7d0d492307ae7c8a95d89ece4c21ea40dc20e7920351",
-          "result": "sha256:2c0b1cc671f98c3eca27e35aadc5370d369d697fa35ae071e5064a6cb8bd73d2"
+          "result": "sha256:4da1fe40b70b8304994130c3ff55b8e5ac0130e9640d500825b4e0110642c2f3"
         }
       ],
       "expected": [
@@ -2057,9 +2057,9 @@
           "directory": "silo-artifacts/case-0020/layer-0000",
           "indexRoot": "sha256:2243e0d7209051122d92a6b07b50be8a23625ff27d2c1af170ecb8d28cf6924d",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:659dbeb371fe8287217a8aaec22e9a413d430b60607c3eab916464aa683dc1c4",
-          "result": "sha256:f15ef652426554f2550bcca0f25f54b5ca1557f6b3d0fd658fa948c24f852aaa"
+          "result": "sha256:01a8f31422cc045fe5ae41235e9765f74d0b2704dc7bd3a28b6586de4bf2a521"
         }
       ],
       "expected": [
@@ -2169,9 +2169,9 @@
           "directory": "silo-artifacts/case-0021/layer-0000",
           "indexRoot": "sha256:55c460db682f305d829ce8894f057b1883767326d36b36f7657780acca05c1b4",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:bad702291b20b22b8dcd383df132c0b5332ae9520b2287df109000160e1e01ea",
-          "result": "sha256:aa9df9608fb9f0d0d6ec8d3814dc118c042fd53655f2f97317cc77f1fd33c15f"
+          "result": "sha256:8da3780417afe6daa790e9fcbd4d2a929fd88a35e5d3965aea2c512667b3bc94"
         }
       ],
       "expected": [
@@ -2405,9 +2405,9 @@
           "directory": "silo-artifacts/case-0024/layer-0000",
           "indexRoot": "sha256:dc971eba62cdbf068260295a266cb996068620981e7b45f672cff769e4d1c925",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:d832073ba7ba07dcc357d72e92421db5951024527560ca14d88236f311071984",
-          "result": "sha256:3d0dbb430cf836f468502131de20c73ca96307deaaf56d3e122e28f52900e40d"
+          "result": "sha256:eaae176f67d39da14c01c99c746ba81f771cab31c9f75c98d986056c9aaf5446"
         }
       ],
       "expected": [
@@ -2517,9 +2517,9 @@
           "directory": "silo-artifacts/case-0025/layer-0000",
           "indexRoot": "sha256:0d7031376ad83b8c63e5ca73bee086d4584bf60fbe01d8a4f17342ce9e00bffa",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:6f8a8df3c44d0689ccfda914135ab355cb4c7d80b48f8552f9c62a36a9fca7f1",
-          "result": "sha256:c0b30bfaa5be539e7df887ad85940d0a90835e9649f8c69a39097ee5b9eefcfd"
+          "result": "sha256:68e70d34faf01e7d8c152e69ef12d32ba55bbf833076a39eb4db5a3ad4fe5736"
         }
       ],
       "expected": [
@@ -2629,9 +2629,9 @@
           "directory": "silo-artifacts/case-0026/layer-0000",
           "indexRoot": "sha256:efdc95951f6ece1e0d14ef4e84a0efb54dba600a22b104808860c6c233cf1628",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:444639188b6880444067caf7514802d7b4cd7147c7b45a9618cbfae8d606e454",
-          "result": "sha256:27be24cdf453bad2c85b657ac515949f7a18e5005f4b1bf666932bea2161e0c9"
+          "result": "sha256:c878aa14d4da63d189e83d97c8ada3705187bfbdff462cd4d3fc517b851de4fe"
         }
       ],
       "expected": [
@@ -2741,9 +2741,9 @@
           "directory": "silo-artifacts/case-0027/layer-0000",
           "indexRoot": "sha256:059b8fd38adee953957382b374e9701c9eaa0ab6910948e6626a10f845fa64cf",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:5bfe09ba350bd3b8032215b8d72690e82d01db9c34da17bc09f7a090f5f43cd8",
-          "result": "sha256:756eb6d2cde7f2d1b538882deda78d2be32624323371fe0dd42dfb01c9f77abf"
+          "result": "sha256:1722526ea9da044603c2fd8a5da5d12ef68f6050a98d50f6bb9b4803eb10ce66"
         }
       ],
       "expected": [
@@ -2853,9 +2853,9 @@
           "directory": "silo-artifacts/case-0028/layer-0000",
           "indexRoot": "sha256:5419b98b9b6851d939c0538985fc06ed22709864f7b4aeaab14cd100db2b5ca7",
           "packLength": 4096,
-          "packStream": "sha256:4ae0dababcd682a00feae6d46659a5177f6d4f0b0530a24c02d464afbbbbb4db",
+          "packStream": "sha256:c087254ca673ca00a9ec4a9cdc329bd8eb8a8aa19543683c40b4ecf7d9ceffac",
           "recipe": "sha256:e3ba84f2ee584a191a6c87f869b1fecddfba214261f35da4cbca4b1135cbde7a",
-          "result": "sha256:20598375cc1867e6b139e45fbe9daec5d961d0f53323ce69b4da6d67f523dbb7"
+          "result": "sha256:363701f562fa620cff0b60fb591c7ae2f25d2ec855d101b3db7aa64aa4b6f93d"
         }
       ],
       "expected": [

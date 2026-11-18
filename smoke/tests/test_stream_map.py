@@ -16,20 +16,20 @@ def test_empty_and_zero_root_exact_bytes() -> None:
     for shift in range(12, 24):
         for length in (0, 1, 30 << 30, 500 << 30, 1 << 40):
             root = oracle.from_leaves(length, 1 << shift, {})
-            encoded = b"silo:stream:v2\n" + struct.pack("<BQB", shift, length, 0)
+            encoded = b"silo:stream:v1\n" + struct.pack("<BQB", shift, length, 0)
             assert root.encode() == encoded and len(encoded) == 25
             assert oracle.decode_root(encoded) == root
     assert oracle.Root(0, oracle.RAM_CHUNK, None).identity != oracle.Root(1, oracle.RAM_CHUNK, None).identity
     assert oracle.Root(1, oracle.RAM_CHUNK, None).identity != oracle.Root(1, oracle.DISK_CHUNK, None).identity
     assert oracle.Root(0, oracle.RAM_CHUNK, None).identity == (
-        "sha256:8105ecb94483de323a5b839ea425e11e2270d9b5ae54fe5ab72ee75beed03f02")
+        "sha256:0fa0278a3087f83d9347b73df7478c3c57db0133648c175ecdb1bef827f912da")
     assert oracle.Root(1, oracle.RAM_CHUNK, None).identity == (
-        "sha256:0471c42fb5674f3d0950b535aebe6712afd9b09ca40891364a9042e0b2c9a23a")
+        "sha256:9fc10289d040aa404d1a11b5a7c1154e62c3ee572f21957fbab3b5b130d9d39e")
 
 
 @pytest.mark.parametrize(("size", "expected"), [
-    (oracle.RAM_CHUNK, "sha256:71e80b10f3466f6c8004110a61078629142623039973613bdaf5c687a7f9ee18"),
-    (oracle.DISK_CHUNK, "sha256:8baf9f891e9598b23cdd74e9cad57c07fadd8f7e382917be95a9a1aa67235996"),
+    (oracle.RAM_CHUNK, "sha256:8b25b9c841ffdeaa30600a8df3455b02972056dbb321bec7309fa2781d2d5622"),
+    (oracle.DISK_CHUNK, "sha256:1d8196cf588b72f714195dc71f2b8d96ba19fc4fe30243ea985059bd4e5beb4a"),
 ])
 def test_nonzero_short_tail_literal_root(tmp_path: Path, size: int, expected: str) -> None:
     path = tmp_path / "one-byte"
@@ -37,7 +37,7 @@ def test_nonzero_short_tail_literal_root(tmp_path: Path, size: int, expected: st
     root, leaves = oracle.from_file(path, size)
     assert root.identity == expected and root.length == 1
     assert leaves == {0: oracle.digest(b"A")}
-    assert root.tree == "sha256:b9498cd4ac4155f3cafb234fd53c1037c8f0daa85564dcc7b038bb2f1910dcb9"
+    assert root.tree == "sha256:f4c11de1ccbea066fd728db64b90ad0f40e28eae59076b61ea3873f0bbb1b5cd"
 
 
 def test_sparse_boundary_indices_and_closure_corruption(tmp_path: Path) -> None:
@@ -96,7 +96,7 @@ def test_random_writes_zeroes_and_short_tail_rebuild(tmp_path: Path) -> None:
     assert root == oracle.from_leaves(size, size, {i: v for i, v in leaves.items() if i == 0})
 
 
-@pytest.mark.parametrize("encoded", [b"{}", b"silo:stream:v1\n", oracle.ROOT + bytes(11)])
+@pytest.mark.parametrize("encoded", [b"{}", b"silo:stream:v2\n", oracle.ROOT + bytes(11)])
 def test_old_or_malformed_roots_refused(encoded: bytes) -> None:
     with pytest.raises(ValueError):
         oracle.decode_root(encoded)

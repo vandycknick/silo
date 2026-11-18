@@ -309,7 +309,7 @@ mod tests {
             reader.close().await.expect("close artifact reader");
             let artifact: Value = serde_json::from_slice(&artifact)
                 .expect("decode actual immutable bytes independently");
-            assert_eq!(artifact["schema"], 2);
+            assert_eq!(artifact["schema"], 1);
             assert_eq!(artifact["memory"], "none");
             assert!(artifact.get("purpose").is_none());
             assert!(artifact.get("captureKind").is_none());

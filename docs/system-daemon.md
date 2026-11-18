@@ -395,7 +395,7 @@ and guest/host memory-reclaim observations. A system retry does not change a
 working core API into a failed daemon.
 
 
-`--format json` returns the view with the schema-2 record under `daemon`.
+`--format json` returns the view with the schema-1 record under `daemon`.
 `daemon.core` is independent of optional `daemon.system` and `daemon.lobby`.
 One publisher merges component updates for the status file and gRPC API.
 

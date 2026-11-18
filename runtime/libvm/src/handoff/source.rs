@@ -144,7 +144,7 @@ pub(crate) async fn observation_body(
         .map(|(role, _, length)| WritableFile { role, length })
         .collect();
     Ok(ObservationBody {
-        schema: 2,
+        schema: 1,
         runtime: runtime_id,
         machine: config.id,
         name: config.name.clone(),
@@ -461,7 +461,7 @@ async fn seal_cut(
         });
     }
     let manifest = CaptureManifest::new(ManifestBody {
-        schema: 2,
+        schema: 1,
         capture: CaptureId::new(uuid::Uuid::new_v4())?,
         operation,
         approved_plan_digest: plan.digest(),

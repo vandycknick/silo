@@ -82,9 +82,9 @@ impl SealedDocument {
 
     fn open<T: Serialize + DeserializeOwned>(&self) -> Result<T, LibVmError> {
         let value = crate::store::models::snapshot::decode_identity_value(&self.bytes)?;
-        if value.get("schema").and_then(serde_json::Value::as_u64) != Some(2) {
+        if value.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
             return Err(invalid(
-                "unsupported handoff protocol version: expected version 2",
+                "unsupported handoff protocol version: expected version 1",
             ));
         }
         let decoded: T = serde_json::from_value(value.clone()).map_err(invalid)?;
@@ -214,9 +214,9 @@ impl SourceObservation {
 
 impl ObservationBody {
     fn validate(&self) -> Result<(), LibVmError> {
-        if self.schema != 2 {
+        if self.schema != 1 {
             return Err(invalid(
-                "unsupported handoff protocol version: expected version 2",
+                "unsupported handoff protocol version: expected version 1",
             ));
         }
         if uuid::Uuid::from(self.machine).is_nil() {
@@ -424,7 +424,7 @@ pub(crate) struct PlanBody {
 impl PlanBody {
     fn validate(&self) -> Result<(), LibVmError> {
         self.observation.validate()?;
-        if self.schema != 2
+        if self.schema != 1
             || SealedDocument::seal(&self.observation)?.digest() != self.observation_digest
         {
             return Err(invalid("handoff plan observation binding is invalid"));
@@ -740,7 +740,7 @@ impl CaptureManifest {
 impl ManifestBody {
     fn validate(&self) -> Result<(), LibVmError> {
         let mut roles = std::collections::BTreeSet::new();
-        if self.schema != 2
+        if self.schema != 1
             || self.files.first().map(|file| file.role) != Some(WritableRole::Root)
             || !self.files.iter().all(|file| roles.insert(file.role))
         {

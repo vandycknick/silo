@@ -963,7 +963,7 @@ pub(crate) mod tests {
         let snapshot =
             crate::store::models::snapshot::tests::record(stream.id, map.map, kernel.digest);
         let mut record = ImageRecord {
-            schema: 2,
+            schema: 1,
             kind: ImageRecordKind::Image,
             root: snapshot.root,
             boot: snapshot.boot,

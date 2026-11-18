@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 1,
   "root": {
     "kind": "linux-erofs-overlay-v1",
     "discovery": "virtio-block-serial",

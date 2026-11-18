@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Breaking: every Silo-owned format, hash-domain, record and protocol version
+  restarts at 1: VM artifact media types (`application/vnd.silo.vm.*.v1`),
+  `silo-chunks-v1`, the stream, stream-map, image, snapshot, layer-result and
+  composition-result hash domains, record `schema` fields, the
+  `silo-direct-v1` boot ABI, the `flat-ext4-v1` conversion identity, the root
+  bootstrap, capture, restore and disk-tracking records, the handoff protocol,
+  secret provider grants and requests, the daemon status file and the krun
+  worker protocol. Stream, image, snapshot and artifact ids change; a fresh
+  `SILO_HOME` is required, and artifacts pushed by earlier builds are refused.
 - Breaking: images and snapshots are separate concepts with separate commands
   and name tables, sharing one storage pool; an image and a snapshot can share
   a name. The `image:` prefix is gone: `create`, `run` and `restore` resolve a
@@ -140,7 +149,7 @@
 - Resource admission ignores disk and descriptor charges whose producing
   process is gone (lease-backed charges), so a crashed restore, fork or import
   in an abandoned home no longer shrinks every other home's budget. Ledger
-  anchors move to schema 2; running older builds concurrently is unsupported.
+  anchors use a new schema; running older builds concurrently is unsupported.
   Host tests use per-home ledgers instead of the user's real one.
 - A live fork child cancelled before its launch reports `cancelled`, not
   `failed`. A resume refused for missing pause authority names the observed

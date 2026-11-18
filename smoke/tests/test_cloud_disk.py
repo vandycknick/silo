@@ -66,7 +66,7 @@ def test_raw_and_qcow2_imports_share_decoded_identity_and_aliases(silo: Silo, cl
 
     raw = cloud_disk.import_disk(silo, disk.path, root="auto", name="cloud-raw")
     record = raw["record"]
-    assert record["schema"] == 2 and record["kind"] == "image"
+    assert record["schema"] == 1 and record["kind"] == "image"
     assert record["root"]["profile"] == {"kind": "opaque-raw"}
     assert record["root"]["geometry"] == {"length": size, "logicalSectorSize": 512}
     assert record["root"]["layout"] == {"kind": "partitioned", "table": "gpt"}
@@ -79,7 +79,7 @@ def test_raw_and_qcow2_imports_share_decoded_identity_and_aliases(silo: Silo, cl
     assert boot["rootFilesystem"] == "ext4" and boot["translation"] == "none"
     assert boot["userspacePlatform"] == {"architecture": cloud_disk.host_arch(), "variant": None}
     assert boot["kernelArchitecture"] == cloud_disk.host_arch()
-    assert boot["binding"]["kind"] == "pinned" and boot["binding"]["abi"] == "silo-direct-v2"
+    assert boot["binding"]["kind"] == "pinned" and boot["binding"]["abi"] == "silo-direct-v1"
     assert record["process"] == {"entrypoint": None, "command": None, "environment": {}, "workingDirectory": "/", "user": None}
     assert raw["names"] == ["cloud-raw"]
     assert raw["provenance"] == [{

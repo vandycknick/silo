@@ -251,7 +251,7 @@ fn retain_actual(stage: &StagedChangeset, directory: &Path) -> Value {
         pack_length: stage.pack_length(),
         index_root: encoded.root.digest,
     };
-    let result_record = serde_json::to_vec(&json!({"indexRoot":encoded.root.digest,"kind":"layer-result","packLength":stage.pack_length(),"packStream":stream,"recipe":independent_recipe,"schema":2})).unwrap();
+    let result_record = serde_json::to_vec(&json!({"indexRoot":encoded.root.digest,"kind":"layer-result","packLength":stage.pack_length(),"packStream":stream,"recipe":independent_recipe,"schema":1})).unwrap();
     assert_eq!(result.canonical_bytes().unwrap(), result_record);
     let independent_result = crate::support::abi::domain("layer-result", &result_record);
     assert_eq!(result.id().unwrap().to_string(), independent_result);

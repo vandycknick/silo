@@ -190,7 +190,7 @@ pub(crate) fn verify_imported_artifact(
         Some(reference) => {
             let bytes = blobs.read(&reference.payload())?;
             let wrapper =
-                crate::image::transport::provenance::PortableCaptureProvenanceV2::decode(&bytes)?;
+                crate::image::transport::provenance::PortableCaptureProvenance::decode(&bytes)?;
             let evidence = blobs.read(&wrapper.evidence.payload())?;
             Some((bytes, evidence))
         }
@@ -907,10 +907,10 @@ mod tests {
         objects.sort_by_key(ObjectBinding::object);
         let objects = wire::encode_object_table(&objects).unwrap();
         let config = wire::decode_vm_config(&wire::canonical_bytes(&serde_json::json!({
-            "schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
+            "schema":1,"kind":"vm-artifact","encoding":"silo-chunks-v1",
             "content":{"kind":"image","id":semantic.reference.digest,"record":semantic.reference},
             "root":"opaque-raw","guestPlatform":{"os":"linux","architecture":"amd64"},
-            "bootAbi":"silo-direct-v2","memory":null,
+            "bootAbi":"silo-direct-v1","memory":null,
             "streams":streams.root.reference,"objects":objects.root.reference
         })).unwrap()).unwrap();
         for table in [transfer, streams, objects] {

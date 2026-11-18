@@ -96,7 +96,7 @@ impl LayerRecipeId {
 impl LayerResultId {
     pub(crate) fn of_record(bytes: &[u8]) -> Self {
         let mut hash = Sha256::new();
-        hash.update(b"silo:layer-result:v2\n");
+        hash.update(b"silo:layer-result:v1\n");
         hash.update(bytes);
         Self(hash.finalize().into())
     }

@@ -9,10 +9,10 @@ use crate::capture::{
 };
 use crate::lifecycle::LiveId;
 
-pub const RESTORE_REQUEST_VERSION: u32 = 3;
+pub const RESTORE_REQUEST_VERSION: u32 = 1;
 pub const GENERATION_ACK_TIMEOUT_MS: u64 = 5_000;
 pub const ACTIVATE_TIMEOUT_MS: u64 = 30_000;
-pub const RESTORE_INSPECTION_VERSION: u32 = 2;
+pub const RESTORE_INSPECTION_VERSION: u32 = 1;
 pub const MAX_RESTORE_INSPECTION_BYTES: usize =
     crate::capture::MAX_CAPTURE_RECORD_BYTES + (1 << 20);
 pub const MAX_RESTORE_INSPECTION_REPORT_BYTES: usize = 2 * MAX_RESTORE_INSPECTION_BYTES + (1 << 20);
@@ -930,7 +930,7 @@ mod tests {
         use crate::{BlockId, DiskFormat, DiskGeometry, DiskRole};
         let seed = DiskTrackingSeed {
             version: DISK_TRACKING_VERSION,
-            map_format: 2,
+            map_format: 1,
             chunk_shift: 23,
             role: DiskRole::Root,
             attachment_index: 0,
@@ -988,8 +988,8 @@ mod tests {
         for invalid in [
             format!("{json}\n"),
             json.replacen('{', "{\"unexpected\":0,", 1),
-            json.replace(",\"mapFormat\":2", ""),
-            json.replace("\"mapFormat\":2", "\"mapFormat\":1"),
+            json.replace(",\"mapFormat\":1", ""),
+            json.replace("\"mapFormat\":1", "\"mapFormat\":2"),
             json.replace(",\"chunkShift\":23", ""),
             json.replace("\"chunkShift\":23", "\"chunkShift\":16"),
             serde_json::to_string(&duplicate_destination).unwrap(),
@@ -1118,7 +1118,7 @@ mod tests {
                 let metadata = disk.metadata().unwrap();
                 seeds.push(DiskTrackingSeed {
                     version: DISK_TRACKING_VERSION,
-                    map_format: 2,
+                    map_format: 1,
                     chunk_shift: 23,
                     role: attachment.role,
                     attachment_index: index as u32,

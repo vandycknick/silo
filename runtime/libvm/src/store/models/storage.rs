@@ -1231,7 +1231,7 @@ mod tests {
             ..
         } = &mut record.boot
         {
-            *abi = "silo-direct-v1".into();
+            *abi = "silo-direct-v2".into();
         }
         assert!(MachineStorageRecord::decode(&serde_json::to_string(&record).unwrap()).is_err());
     }
@@ -1554,7 +1554,7 @@ mod tests {
             )),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../specs/rootfs-spec/fixtures/invalid-old-schema.json"
+                "/../../specs/rootfs-spec/fixtures/invalid-unsupported-schema.json"
             )),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),

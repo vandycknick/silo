@@ -1,4 +1,4 @@
-//! Canonical stream-map v2: fixed-depth, 64-way sparse Merkle maps.
+//! Canonical stream-map v1: fixed-depth, 64-way sparse Merkle maps.
 //!
 //! All integers are unsigned little-endian; digests are raw SHA-256 bytes.
 //! Bit zero is the lowest slot. Digests follow set bits in ascending slot order.
@@ -6,15 +6,15 @@
 //! ```text
 //! root (25 or 57 bytes)
 //! +----------------------+-------------+------------+--------------+-------------+
-//! | "silo:stream:v2\n" 15 | shift: u8   | length:u64 | present: u8  | digest: 32? |
+//! | "silo:stream:v1\n" 15 | shift: u8   | length:u64 | present: u8  | digest: 32? |
 //! +----------------------+-------------+------------+--------------+-------------+
 //! branch (35 + 32 * popcount bytes, at most 2083)
 //! +---------------------------------+------------+-------------+---------------+
-//! | "silo:stream-map:branch:v2\n" 26 | height: u8 | bitmap: u64 | child digests |
+//! | "silo:stream-map:branch:v1\n" 26 | height: u8 | bitmap: u64 | child digests |
 //! +---------------------------------+------------+-------------+---------------+
 //! leaf (32 + 32 * popcount bytes, at most 2080)
 //! +-------------------------------+-------------+-------------------------------+
-//! | "silo:stream-map:leaf:v2\n" 24 | bitmap: u64 | raw decoded-byte SHA digests  |
+//! | "silo:stream-map:leaf:v1\n" 24 | bitmap: u64 | raw decoded-byte SHA digests  |
 //! +-------------------------------+-------------+-------------------------------+
 //! ```
 //!
@@ -58,9 +58,9 @@ pub const MAX_NODE_BYTES: usize = 2083;
 pub const EMPTY_ROOT_BYTES: usize = 25;
 pub const MAX_ROOT_BYTES: usize = 57;
 
-const ROOT_PREFIX: &[u8] = b"silo:stream:v2\n";
-const LEAF_PREFIX: &[u8] = b"silo:stream-map:leaf:v2\n";
-const BRANCH_PREFIX: &[u8] = b"silo:stream-map:branch:v2\n";
+const ROOT_PREFIX: &[u8] = b"silo:stream:v1\n";
+const LEAF_PREFIX: &[u8] = b"silo:stream-map:leaf:v1\n";
+const BRANCH_PREFIX: &[u8] = b"silo:stream-map:branch:v1\n";
 
 /// Closed errors, including storage I/O without erasing its cause.
 #[derive(Debug)]
@@ -781,29 +781,29 @@ pub fn worst_case_map_bytes(length: u64, chunk_size: ChunkSize) -> Result<u64, M
 pub fn default_digest(height: u8) -> Result<Sha256Digest, MapError> {
     let bytes = match height {
         0 => [
-            0x3b, 0xe8, 0x3e, 0xc3, 0xd9, 0xd6, 0x34, 0xa7, 0x51, 0xb6, 0x11, 0x3d, 0x59, 0x08,
-            0xa4, 0x16, 0xcb, 0x39, 0x82, 0x7b, 0x68, 0x68, 0x74, 0x44, 0xb9, 0xae, 0x30, 0x0c,
-            0x28, 0x55, 0x07, 0xca,
+            0xd3, 0xe6, 0x01, 0x95, 0xad, 0xe2, 0xed, 0x81, 0xa0, 0x3d, 0xaa, 0xc4, 0xa3, 0xcd,
+            0x9b, 0x7c, 0xd1, 0xf6, 0x7c, 0xd7, 0x7e, 0xac, 0x2b, 0x4f, 0xe1, 0xe6, 0x90, 0xda,
+            0x61, 0x88, 0xf8, 0x05,
         ],
         1 => [
-            0xca, 0xc0, 0x5d, 0x16, 0xcc, 0xaf, 0x3e, 0x4a, 0x21, 0x9c, 0x9e, 0x26, 0x63, 0xb2,
-            0x6e, 0xc5, 0xe2, 0xf6, 0xf3, 0xdd, 0x86, 0x61, 0xe6, 0xaf, 0x4d, 0x50, 0x52, 0x15,
-            0x7e, 0x53, 0x3c, 0x85,
+            0x1c, 0xd9, 0x06, 0x16, 0x27, 0x71, 0xdd, 0x1d, 0x42, 0x99, 0x0e, 0x22, 0x6c, 0xf0,
+            0x9e, 0x6b, 0x18, 0xb6, 0x66, 0xb2, 0xf2, 0x03, 0x76, 0x82, 0xfb, 0x9d, 0x51, 0x9f,
+            0xf7, 0x67, 0xdc, 0x61,
         ],
         2 => [
-            0x17, 0x02, 0xb3, 0xfd, 0x4f, 0x16, 0x7c, 0x8a, 0xd4, 0x90, 0x97, 0x06, 0xff, 0x9b,
-            0xed, 0xd3, 0xdd, 0x36, 0x65, 0x68, 0xfb, 0x61, 0xce, 0xda, 0xca, 0xa9, 0x21, 0x79,
-            0x0c, 0x4b, 0x84, 0x8f,
+            0x1a, 0x6f, 0xde, 0x5b, 0x66, 0x3e, 0xdd, 0xf0, 0x09, 0x64, 0x18, 0x5e, 0x92, 0x1d,
+            0x11, 0x58, 0x29, 0x83, 0x5e, 0xb6, 0x38, 0xbc, 0x70, 0x27, 0x89, 0x62, 0x97, 0x7d,
+            0x2c, 0x16, 0xe5, 0xdd,
         ],
         3 => [
-            0x43, 0xd4, 0xd2, 0xa9, 0x52, 0xe7, 0x19, 0xcc, 0x57, 0x4b, 0x80, 0xff, 0x59, 0x27,
-            0xe6, 0xae, 0xc5, 0xc5, 0xad, 0x3b, 0x0f, 0xb4, 0x72, 0xe4, 0x76, 0x14, 0xde, 0x6f,
-            0xa4, 0x11, 0xf1, 0xd9,
+            0xe1, 0x99, 0x9f, 0x3c, 0xb7, 0x64, 0xcb, 0xdf, 0x1d, 0x1a, 0x7d, 0x5c, 0xd9, 0x67,
+            0xa5, 0x34, 0x60, 0x3a, 0x5d, 0x61, 0x06, 0x53, 0xfe, 0x79, 0x6e, 0xd9, 0x06, 0xae,
+            0x87, 0xef, 0xfc, 0x8d,
         ],
         4 => [
-            0xba, 0xe1, 0xce, 0x1a, 0x9f, 0x92, 0x98, 0x88, 0xf1, 0x65, 0xaf, 0xdc, 0x1d, 0xd0,
-            0x25, 0xe6, 0xb0, 0x79, 0x22, 0x3b, 0xde, 0x18, 0x46, 0x3c, 0x02, 0x4b, 0x7d, 0x21,
-            0xb4, 0xfc, 0x56, 0xe9,
+            0xd5, 0xfc, 0x92, 0xaa, 0xda, 0xa2, 0x0e, 0xbc, 0x7c, 0x1d, 0x84, 0xf7, 0x11, 0xf4,
+            0xa0, 0x4d, 0x62, 0x07, 0x0e, 0x64, 0x3c, 0x4d, 0xbf, 0xcc, 0xd5, 0x0e, 0x93, 0x0d,
+            0x4f, 0x63, 0x90, 0x09,
         ],
         _ => return Err(MapError::InvalidHeight(height)),
     };
@@ -1417,32 +1417,32 @@ mod tests {
             (
                 0,
                 BTreeMap::new(),
-                "73696c6f3a73747265616d3a76320a10000000000000000000",
-                "8105ecb94483de323a5b839ea425e11e2270d9b5ae54fe5ab72ee75beed03f02",
+                "73696c6f3a73747265616d3a76310a10000000000000000000",
+                "0fa0278a3087f83d9347b73df7478c3c57db0133648c175ecdb1bef827f912da",
             ),
             (
                 65536,
                 BTreeMap::from([(0, x)]),
-                "73696c6f3a73747265616d3a76320a1000000100000000000126dd4dfd51286c68e6238ff529a4e138403b26e1aad67fbc20048ece2b56e725",
-                "4818ad50def4269ccd34fb9357556125719b71ce5b4913f003c3ad256c0ab446",
+                "73696c6f3a73747265616d3a76310a10000001000000000001255bd76a102270983730b49c35788d0e5937cd039758db7a2a1afe5e73184f13",
+                "54bc351022284ebb434799e32072399004ddade1813f1ac7dc703f0ce151d968",
             ),
             (
                 1,
                 BTreeMap::from([(0, x)]),
-                "73696c6f3a73747265616d3a76320a1001000000000000000126dd4dfd51286c68e6238ff529a4e138403b26e1aad67fbc20048ece2b56e725",
-                "f7a4122273a42a3ba069df9e80635c0caa6294d74ca8ef945f44cd6fe272383d",
+                "73696c6f3a73747265616d3a76310a10010000000000000001255bd76a102270983730b49c35788d0e5937cd039758db7a2a1afe5e73184f13",
+                "903d33bda7bbd949d7ba5d8ba664db0968fafe9cff98eff04e2b484f13777698",
             ),
             (
                 (64u64.pow(4) + 1) * 65536,
                 BTreeMap::from([(0, x), (64u64.pow(4), y)]),
-                "73696c6f3a73747265616d3a76320a100000010000010000018ed9e2d4b20c9eb7a261a4d95228080e6766b6dd23e57720925181fd7370511f",
-                "4f2ea9606cc10bf37b9f292a4ff5f581106f9a36aa84faa84d3d2336626f50f8",
+                "73696c6f3a73747265616d3a76310a1000000100000100000106f483fbd94786ab12ffdb7b1fdb960789bcc18099677357a2060ff044d06062",
+                "a5aa1fe9e360c8ebfa77f186fba0b2f5ee91171bb6833ea8d23e852137898e8e",
             ),
             (
                 64 * 65536,
                 (0..64).map(|index| (index, x)).collect(),
-                "73696c6f3a73747265616d3a76320a1000004000000000000196c308f544c9830e2091de3bc71d6fb4e959cbbecb33c3e0e01341d283fb1bab",
-                "6a6c20a86bf8872c857ff7e62c898e175a8e290e843608445768bbe55ba8552f",
+                "73696c6f3a73747265616d3a76310a10000040000000000001a336a9498be6ec97a24d4ff9310f315a859938221845f7c4a6a53fcf85d74c96",
+                "572ad07874d133bc3fbec94d79d8f4846b8e3d310375249ced805e97550e3b36",
             ),
         ];
         for (length, chunks, root_hex, id_hex) in fixtures {
@@ -1467,7 +1467,7 @@ mod tests {
                     .collect::<Vec<_>>()
             );
             for bytes in store.bytes.values() {
-                let height = if bytes.starts_with(b"silo:stream-map:leaf:v2\n") {
+                let height = if bytes.starts_with(b"silo:stream-map:leaf:v1\n") {
                     0
                 } else {
                     bytes[26]
@@ -1481,7 +1481,7 @@ mod tests {
     #[test]
     fn literal_leaf_goldens() {
         let single = hex(concat!(
-            "73696c6f3a73747265616d2d6d61703a6c6561663a76320a0100000000000000",
+            "73696c6f3a73747265616d2d6d61703a6c6561663a76310a0100000000000000",
             "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
         ));
         assert_eq!(
@@ -1501,7 +1501,7 @@ mod tests {
         // The dense vector is its literal all-bits-set header and exactly 64
         // copies of the literal digest, not bytes emitted by the codec.
         let dense = hex(concat!(
-            "73696c6f3a73747265616d2d6d61703a6c6561663a76320affffffffffffffff",
+            "73696c6f3a73747265616d2d6d61703a6c6561663a76310affffffffffffffff",
             "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
             "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
             "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
@@ -1588,9 +1588,9 @@ mod tests {
     fn defaults_match_exact_domain_bytes() {
         for height in 0..TREE_DEPTH {
             let mut bytes = if height == 0 {
-                b"silo:stream-map:leaf:v2\n".to_vec()
+                b"silo:stream-map:leaf:v1\n".to_vec()
             } else {
-                let mut bytes = b"silo:stream-map:branch:v2\n".to_vec();
+                let mut bytes = b"silo:stream-map:branch:v1\n".to_vec();
                 bytes.push(height);
                 bytes
             };
@@ -1609,7 +1609,7 @@ mod tests {
 
     #[test]
     fn roots_reject_noncanonical_records() {
-        let good = hex("73696c6f3a73747265616d3a76320a10000000000000000000");
+        let good = hex("73696c6f3a73747265616d3a76310a10000000000000000000");
         for end in 0..good.len() {
             assert!(StreamRoot::decode(&good[..end]).is_err());
         }
@@ -1619,10 +1619,10 @@ mod tests {
             StreamRoot::decode(&wrong),
             Err(MapError::InvalidMagic)
         ));
-        let mut old_version = good.clone();
-        old_version[13] = b'1';
+        let mut unsupported_version = good.clone();
+        unsupported_version[13] = b'2';
         assert!(matches!(
-            StreamRoot::decode(&old_version),
+            StreamRoot::decode(&unsupported_version),
             Err(MapError::InvalidMagic)
         ));
         assert!(StreamRoot::decode(b"{\"schema\":1,\"kind\":\"stream\"}").is_err());
@@ -1692,7 +1692,7 @@ mod tests {
             Err(MapError::InvalidMagic)
         ));
         wrong = good.clone();
-        wrong[22] = b'1';
+        wrong[22] = b'2';
         assert!(matches!(
             StreamNode::decode(&wrong, 0),
             Err(MapError::InvalidMagic)
@@ -1987,7 +1987,7 @@ mod tests {
                 .bytes
                 .iter()
                 .find_map(|(&digest, bytes)| {
-                    let actual = if bytes.starts_with(b"silo:stream-map:leaf:v2\n") {
+                    let actual = if bytes.starts_with(b"silo:stream-map:leaf:v1\n") {
                         0
                     } else {
                         bytes[26]

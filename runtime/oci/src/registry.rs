@@ -1015,8 +1015,8 @@ mod tests {
             "size": 5
         });
         for (artifact_type, count, admitted) in [
-            ("application/vnd.silo.vm.v2", 4097, true),
-            ("application/vnd.silo.vm.v2", 4098, false),
+            ("application/vnd.silo.vm.v1", 4097, true),
+            ("application/vnd.silo.vm.v1", 4098, false),
             ("application/vnd.example.other", 4097, false),
         ] {
             let bytes = serde_json::to_vec(&serde_json::json!({

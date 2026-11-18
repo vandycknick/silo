@@ -108,10 +108,10 @@ def ssh_material(directory: Path) -> str:
 
 
 def whole_disk_bootstrap(root: dict) -> dict:
-    """Schema-2 launch bootstrap selecting the `silo-root` attachment as an ext4 whole disk."""
+    """Schema-1 launch bootstrap selecting the `silo-root` attachment as an ext4 whole disk."""
     assert root["blockId"] == "silo-root", root
     geometry = root["geometry"]
-    return {"schemaVersion": 2, "rosetta": "disabled", "root": {
+    return {"schemaVersion": 1, "rosetta": "disabled", "root": {
         "kind": "opaque-raw-v1", "discovery": "virtio-block-serial",
         "device": {"serial": "silo-root", "lengthBytes": geometry["length"],
                    "logicalSectorSize": geometry["logicalSectorSize"], "readOnly": root["readOnly"]},

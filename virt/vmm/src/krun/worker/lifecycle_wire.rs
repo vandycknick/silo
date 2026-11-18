@@ -33,7 +33,7 @@ use crate::virt::lifecycle::{
     LifecycleCommand, LifecycleRejection, LifecycleRights,
 };
 
-pub(crate) const PROTOCOL_VERSION: u32 = 6;
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
 /// Bounded RAM summaries plus sparse disk runs for the aggregate 4 TiB stream limit.
 pub(crate) const MAX_FRAME: usize = vm_spec::capture::MAX_CAPTURE_RECORD_BYTES;
 /// The largest typed descriptor set of any command.
@@ -756,7 +756,7 @@ mod tests {
             .map(|index| {
                 let seed = DiskTrackingSeed {
                     version: DISK_TRACKING_VERSION,
-                    map_format: 2,
+                    map_format: 1,
                     chunk_shift: 23,
                     role: if index == 0 {
                         vm_spec::DiskRole::Root

@@ -976,11 +976,11 @@ async fn provide(command: &ProvideCmd) -> eyre::Result<()> {
     };
     let response = match result {
         Ok(secrets) => ProviderResponse::Ok {
-            version: 2,
+            version: 1,
             secrets,
         },
         Err(error) => ProviderResponse::Error {
-            version: 2,
+            version: 1,
             error: ProviderError {
                 code: error.code.into(),
                 message: error.message,
@@ -996,7 +996,7 @@ async fn provide_request(
     request: ProviderRequest,
     token_endpoint: &str,
 ) -> Result<Vec<ProjectedSecret>, OAuthRefreshFailure> {
-    if request.version != 2
+    if request.version != 1
         || request.operation != "get"
         || !matches!(request.reason.as_str(), "expired" | "expires_soon")
     {
@@ -1519,7 +1519,7 @@ mod tests {
         write_json_frame(
             output,
             &silo_secrets::grant::ProviderResponse::Ok {
-                version: 2,
+                version: 1,
                 secrets,
             },
         )
@@ -1717,7 +1717,7 @@ mod tests {
         let grant =
             SecretGrant::issue(store.path(), machine.clone(), "run".into(), allowed).unwrap();
         ProviderRequest {
-            version: 2,
+            version: 1,
             operation: "get".into(),
             grant: STANDARD.encode(serde_json::to_vec(&grant).unwrap()),
             scope: RequestScope {
@@ -1966,7 +1966,7 @@ mod tests {
                 .unwrap()
                 .contains("private-refresh"));
             let request = || ProviderRequest {
-                version: 2,
+                version: 1,
                 operation: "get".into(),
                 grant: encoded.clone(),
                 scope: RequestScope {
@@ -2073,7 +2073,7 @@ mod tests {
                 write_json_frame(
                     &mut wire,
                     &silo_secrets::grant::ProviderResponse::Ok {
-                        version: 2,
+                        version: 1,
                         secrets: response,
                     },
                 )

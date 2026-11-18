@@ -228,7 +228,7 @@ mod tests {
 
     /// A record row admitted by the catalog's checks; the resolver reads
     /// only ids and names.
-    const RECORD: &str = r#"{"schema":2,"root":{"stream":{"chunkSize":8388608}}}"#;
+    const RECORD: &str = r#"{"schema":1,"root":{"stream":{"chunkSize":8388608}}}"#;
 
     struct Catalog {
         _temp: tempfile::TempDir,

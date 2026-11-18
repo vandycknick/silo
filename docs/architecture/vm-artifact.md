@@ -19,12 +19,12 @@ Version identifiers in this document are the ones the current encoder writes.
 
 ```text
 OCI image index                       application/vnd.oci.image.index.v1+json
-  artifactType: application/vnd.silo.vm.v2
-├── [0] metadata manifest             artifactType application/vnd.silo.vm.metadata.v2
+  artifactType: application/vnd.silo.vm.v1
+├── [0] metadata manifest             artifactType application/vnd.silo.vm.metadata.v1
 │       platform: {os, architecture}  (guest platform)
-│       config:  application/vnd.silo.vm.config.v2+json   → VM artifact config
+│       config:  application/vnd.silo.vm.config.v1+json   → VM artifact config
 │       layers:  [ application/vnd.oci.empty.v1+json ]
-└── [1..n] payload manifests          artifactType application/vnd.silo.vm.payloads.v2
+└── [1..n] payload manifests          artifactType application/vnd.silo.vm.payloads.v1
         config:  application/vnd.oci.empty.v1+json
         layers:  every payload blob, at most 4096 per manifest and 4 MiB of JSON per manifest
 ```
@@ -49,8 +49,8 @@ OCI image index                       application/vnd.oci.image.index.v1+json
 
 | Media type | Content | Max size |
 |---|---|---|
-| `application/vnd.silo.vm.record.v2+json` | Canonical JSON records: content record, stream and object table roots and pages, transfer roots and pages, capture provenance | 4 MiB |
-| `application/vnd.silo.vm.stream-map.v2` | Stream identity map (Merkle root over the stream's identity chunks) | 2083 B |
+| `application/vnd.silo.vm.record.v1+json` | Canonical JSON records: content record, stream and object table roots and pages, transfer roots and pages, capture provenance | 4 MiB |
+| `application/vnd.silo.vm.stream-map.v1` | Stream identity map (Merkle root over the stream's identity chunks) | 2083 B |
 | `application/vnd.silo.vm.chunk.v1` | One raw 8 MiB stream chunk (shorter for the final chunk) | 8 MiB |
 | `application/vnd.silo.vm.chunk.v1+zstd` | One independent zstd frame for one chunk, used only when smaller than raw | < decoded length |
 | `application/vnd.silo.vm.execution.v1` | CPU and execution state (snapshot with memory only) | 16 MiB |
@@ -58,7 +58,7 @@ OCI image index                       application/vnd.oci.image.index.v1+json
 
 ## Config
 
-The metadata manifest's config blob (`application/vnd.silo.vm.config.v2+json`)
+The metadata manifest's config blob (`application/vnd.silo.vm.config.v1+json`)
 describes what the artifact carries and what a reader needs before it fetches
 any payload.
 
@@ -66,7 +66,7 @@ any payload.
 |---|---|
 | `schema` | Config schema; `2` |
 | `kind` | `vm-artifact` |
-| `encoding` | Transfer encoding; `silo-chunks-v2` |
+| `encoding` | Transfer encoding; `silo-chunks-v1` |
 | `content` | `kind` (`image` or `snapshot`), `id` (the content id) and `record` (`{digest, size}` of the canonical content record) |
 | `root` | `opaque-raw` or `linux-erofs-overlay` |
 | `guestPlatform` | `{os: "linux", architecture: "amd64" \| "arm64"}` |
@@ -80,7 +80,7 @@ An image:
 <!-- golden: image-config -->
 ```json
 {
-  "bootAbi": "silo-direct-v2",
+  "bootAbi": "silo-direct-v1",
   "content": {
     "id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
     "kind": "image",
@@ -89,7 +89,7 @@ An image:
       "size": 1874
     }
   },
-  "encoding": "silo-chunks-v2",
+  "encoding": "silo-chunks-v1",
   "guestPlatform": {
     "architecture": "arm64",
     "os": "linux"
@@ -101,7 +101,7 @@ An image:
     "size": 655
   },
   "root": "linux-erofs-overlay",
-  "schema": 2,
+  "schema": 1,
   "streams": {
     "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
     "size": 412
@@ -115,7 +115,7 @@ with memory:
 <!-- golden: snapshot-config -->
 ```json
 {
-  "bootAbi": "silo-direct-v2",
+  "bootAbi": "silo-direct-v1",
   "content": {
     "id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
     "kind": "snapshot",
@@ -124,7 +124,7 @@ with memory:
       "size": 2306
     }
   },
-  "encoding": "silo-chunks-v2",
+  "encoding": "silo-chunks-v1",
   "guestPlatform": {
     "architecture": "amd64",
     "os": "linux"
@@ -152,7 +152,7 @@ with memory:
     "size": 1957
   },
   "root": "opaque-raw",
-  "schema": 2,
+  "schema": 1,
   "streams": {
     "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "size": 1203
@@ -167,7 +167,7 @@ provenance record.
 
 ### Validation
 
-- `schema` is `2`, `kind` is `vm-artifact` and `encoding` is `silo-chunks-v2`.
+- `schema` is `1`, `kind` is `vm-artifact` and `encoding` is `silo-chunks-v1`.
   Anything else is refused as an unsupported format.
 - Every field is required; `memory` must be present even when it is `null`.
   Unknown fields are rejected in the config and in every nested object.
@@ -194,7 +194,7 @@ boot binding.
 ## Records
 
 All records are canonical JSON payloads with media type
-`application/vnd.silo.vm.record.v2+json`.
+`application/vnd.silo.vm.record.v1+json`.
 
 - **Content record.** The canonical image record (`root`, `boot`, `process`) or
   snapshot record (`root`, `disks`, `platformFiles`, `configuration`, `boot`,
@@ -209,7 +209,7 @@ All records are canonical JSON payloads with media type
   Each entry is `direct {object, size, payload}` (a whole-byte object such as
   fsmeta, a kernel or an initramfs, carried as one payload) or
   `stream {object, size, stream}` (an object carried as a stream).
-- **Transfer root.** `{schema, kind: "silo-chunks-v2", stream, length,
+- **Transfer root.** `{schema, kind: "silo-chunks-v1", stream, length,
   chunkSize: 8388608, pages[]}`.
 - **Transfer page.** `{schema, kind: "silo-chunk-map", firstChunk, entries[]}`.
   Each entry is `zero {length}` (not stored; the range is zeros) or

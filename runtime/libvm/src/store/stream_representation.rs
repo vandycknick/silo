@@ -1093,13 +1093,13 @@ pub(crate) mod tests {
         let mut pages = Vec::new();
         for (index, entries) in entries.chunks(entries_per_page).enumerate() {
             let page = oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
-                "schema":2,"kind":"silo-chunk-map",
+                "schema":1,"kind":"silo-chunk-map",
                 "firstChunk":index * entries_per_page,"entries":entries
             }))
             .unwrap();
             pages.push(publish_object(&store, &pool, operation, &page).await);
         }
-        let root_bytes=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":2,"kind":"silo-chunks-v2","stream":stream.id,"length":bytes.len(),"chunkSize":8388608,"pages":pages})).unwrap();
+        let root_bytes=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":1,"kind":"silo-chunks-v1","stream":stream.id,"length":bytes.len(),"chunkSize":8388608,"pages":pages})).unwrap();
         let root = publish_object(&store, &pool, operation, &root_bytes).await;
         let representation =
             VerifiedStreamRepresentation::verify(&pool, operation, content.clone(), root).unwrap();
@@ -1549,9 +1549,9 @@ pub(crate) mod tests {
         let content = crate::store::snapshot_store::publish_map(&pool, &store, owner.id, &map)
             .await
             .unwrap();
-        let page=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":2,"kind":"silo-chunk-map","firstChunk":0,"entries":[{"kind":"data","length":bytes.len(),"digest":object,"encoded":{"mediaType":"application/vnd.silo.vm.chunk.v1","digest":object,"size":bytes.len()}}]})).unwrap();
+        let page=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":1,"kind":"silo-chunk-map","firstChunk":0,"entries":[{"kind":"data","length":bytes.len(),"digest":object,"encoded":{"mediaType":"application/vnd.silo.vm.chunk.v1","digest":object,"size":bytes.len()}}]})).unwrap();
         let page = publish_object(&store, &pool, owner.id, &page).await;
-        let root_bytes=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":2,"kind":"silo-chunks-v2","stream":map.id(),"length":bytes.len(),"chunkSize":8388608,"pages":[page]})).unwrap();
+        let root_bytes=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({"schema":1,"kind":"silo-chunks-v1","stream":map.id(),"length":bytes.len(),"chunkSize":8388608,"pages":[page]})).unwrap();
         let root = publish_object(&store, &pool, owner.id, &root_bytes).await;
         let verified =
             VerifiedStreamRepresentation::verify(&pool, owner.id, content, root).unwrap();

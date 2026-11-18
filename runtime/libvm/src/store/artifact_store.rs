@@ -752,19 +752,19 @@ mod tests {
             "provenance":{"digest":digest,"size":42}
         }));
         let config = oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
-            "schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
+            "schema":1,"kind":"vm-artifact","encoding":"silo-chunks-v1",
             "content":{"kind":"snapshot","id":id,"record":record},
             "root":"opaque-raw","guestPlatform":{"os":"linux","architecture":"amd64"},
-            "bootAbi":"silo-direct-v2","memory":memory,
+            "bootAbi":"silo-direct-v1","memory":memory,
             "streams":record,"objects":record
         }))
         .unwrap();
         let child=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
-            "schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.silo.vm.metadata.v2",
-            "config":{"digest":ObjectDigest::of_bytes(&config),"size":config.len(),"mediaType":"application/vnd.silo.vm.config.v2+json"},"layers":[]
+            "schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.silo.vm.metadata.v1",
+            "config":{"digest":ObjectDigest::of_bytes(&config),"size":config.len(),"mediaType":"application/vnd.silo.vm.config.v1+json"},"layers":[]
         })).unwrap();
         let index=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
-            "schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","artifactType":"application/vnd.silo.vm.v2",
+            "schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","artifactType":"application/vnd.silo.vm.v1",
             "manifests":[{"digest":ObjectDigest::of_bytes(&child),"size":child.len(),"mediaType":"application/vnd.oci.image.manifest.v1+json"}]
         })).unwrap();
         (

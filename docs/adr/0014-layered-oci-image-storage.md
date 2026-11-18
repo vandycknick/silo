@@ -929,15 +929,15 @@ that wire boundary. Parsing an ID alone does not authenticate its stream map.
 
 ### Stream identity
 
-A stream uses the canonical binary **stream-map v2**, not JSON, a flat digest
+A stream uses the canonical binary **stream-map v1**, not JSON, a flat digest
 list, or its whole-file byte SHA. Integers are unsigned little-endian; digests
 are raw 32-byte SHA-256 values. These are the exact identity bytes:
 
 ```text
-root   = "silo:stream:v2\n" || u8(chunk_shift) || u64(length)
+root   = "silo:stream:v1\n" || u8(chunk_shift) || u64(length)
          || u8(tree_present) || [height-4 node digest iff present]
-leaf   = "silo:stream-map:leaf:v2\n" || u64(bitmap) || data digests
-branch = "silo:stream-map:branch:v2\n" || u8(height) || u64(bitmap)
+leaf   = "silo:stream-map:leaf:v1\n" || u64(bitmap) || data digests
+branch = "silo:stream-map:branch:v1\n" || u8(height) || u64(bitmap)
          || child node digests
 stream ID = SHA256(root)
 ```
@@ -1831,7 +1831,7 @@ disagreement fails closed.
 The shared current bootstrap/retained-observation codec lives in internal
 `specs/rootfs-spec`. It is `no_std`, core-only and allocation-free, with one
 bounded fixed-schema JSON implementation for host and init, no external JSON
-parser and no host-path fields. Bootstrap has `schemaVersion: 2` only, a
+parser and no host-path fields. Bootstrap has `schemaVersion: 1` only, a
 mandatory top-level `rosetta` of `disabled`, `optional` or `required`, and a
 closed `root`. An `opaque-raw-v1` root carries `discovery`
 (`virtio-block-serial`), `device` (`serial` `silo-root`, `lengthBytes` of the
@@ -2243,7 +2243,7 @@ their own name table; snapshots themselves are immutable.
 
 Silo uses OCI 1.1 image manifests and an OCI image index, not a custom registry
 API. The top-level index has
-`artifactType=application/vnd.silo.vm.v2` and identifies exactly one VM image
+`artifactType=application/vnd.silo.vm.v1` and identifies exactly one VM image
 encoding. It is not a multi-architecture container selection list. Silo inspects
 this type before applying ordinary OCI platform resolution.
 
@@ -2262,8 +2262,8 @@ OCI index (Silo VM artifact)
 ```
 
 The metadata manifest is first and has artifact type
-`application/vnd.silo.vm.metadata.v2`; remaining manifests have type
-`application/vnd.silo.vm.payloads.v2`. Empty descriptors use OCI's defined
+`application/vnd.silo.vm.metadata.v1`; remaining manifests have type
+`application/vnd.silo.vm.payloads.v1`. Empty descriptors use OCI's defined
 `application/vnd.oci.empty.v1+json` two-byte `{}` blob. The metadata descriptor
 carries the guest platform (`os` is `linux` or `darwin`, `architecture` per
 OCI); payload descriptors are platform-neutral. Stream
@@ -2290,9 +2290,9 @@ V1 media types are:
 | -------------------- | ------------------------------------------------------------------------- |
 | Top-level envelope   | `application/vnd.oci.image.index.v1+json` with Silo artifact type         |
 | Child manifest       | `application/vnd.oci.image.manifest.v1+json` with the child artifact type |
-| VM config            | `application/vnd.silo.vm.config.v2+json`                                  |
-| Record page          | `application/vnd.silo.vm.record.v2+json`                                  |
-| Binary map root/node | `application/vnd.silo.vm.stream-map.v2`                                   |
+| VM config            | `application/vnd.silo.vm.config.v1+json`                                  |
+| Record page          | `application/vnd.silo.vm.record.v1+json`                                  |
+| Binary map root/node | `application/vnd.silo.vm.stream-map.v1`                                   |
 | Raw transport chunk  | `application/vnd.silo.vm.chunk.v1`                                        |
 | Zstd transport chunk | `application/vnd.silo.vm.chunk.v1+zstd`                                   |
 | Execution envelope   | `application/vnd.silo.vm.execution.v1` (opaque native VM and vCPU state)  |
@@ -2308,7 +2308,7 @@ graph instead of a container-shaped manifest.
 
 ### Logical streams and chunks
 
-Portable transfer uses `silo-chunks-v2`: fixed **8 MiB payload** ranges from
+Portable transfer uses `silo-chunks-v1`: fixed **8 MiB payload** ranges from
 offset zero, with one shorter final range. Each binding also names its binary
 map root, exact logical length and **identity** chunk size. RAM identity is
 64 KiB, independent of payload geometry. Paged transport tables remain bounded
@@ -2405,7 +2405,7 @@ through `silo restore REF` remains available.
 
 ## Local-To-Cloud Handoff
 
-The handoff protocol is v2; schema-1 sessions are refused. It transfers small
+The handoff protocol is v1; other protocol versions are refused. It transfers small
 binary root headers and path-qualified
 `MapNode { digest, stream, height, first_index }` objects rather than whole flat
 maps. Height and first index are validated strong types. Source authorization

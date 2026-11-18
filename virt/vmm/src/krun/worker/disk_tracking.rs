@@ -147,7 +147,7 @@ mod tests {
         let metadata = file.metadata().unwrap();
         let seed = DiskTrackingSeed {
             version: DISK_TRACKING_VERSION,
-            map_format: 2,
+            map_format: 1,
             chunk_shift: 23,
             role: vm_spec::DiskRole::Data,
             attachment_index: 2,
@@ -238,9 +238,9 @@ mod tests {
         for defect in 0..3 {
             let mut invalid = binding.clone();
             match defect {
-                0 => invalid.map_format = 1,
+                0 => invalid.map_format = 2,
                 1 => invalid.chunk_shift = 16,
-                _ => invalid.version = 1,
+                _ => invalid.version = 2,
             }
             assert!(seed(&invalid).is_err());
             assert!(receipt(&native(&binding), &invalid).is_err());

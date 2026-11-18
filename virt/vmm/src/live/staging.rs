@@ -2906,7 +2906,7 @@ mod tests {
         let metadata = file.metadata().unwrap();
         let seed = DiskTrackingSeed {
             version: DISK_TRACKING_VERSION,
-            map_format: 2,
+            map_format: 1,
             chunk_shift: 23,
             role: vm_spec::DiskRole::Root,
             attachment_index: 0,

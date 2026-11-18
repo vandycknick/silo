@@ -16,7 +16,7 @@ use crate::machine::{MachineAgent, MachineGuestConfig};
 use crate::LibVmError;
 
 /// The bootstrap schema is part of the complete, immutable direct-boot tuple.
-pub(crate) const DIRECT_BOOT_ABI: &str = "silo-direct-v2";
+pub(crate) const DIRECT_BOOT_ABI: &str = "silo-direct-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -263,7 +263,7 @@ fn validate_direct_boot_profile(boot: &BootProfile) -> Result<(), LibVmError> {
     {
         if architecture != kernel_architecture || abi != DIRECT_BOOT_ABI {
             return Err(invalid_capture(
-                "boot bundle architecture or schema-2 bootstrap ABI is incompatible",
+                "boot bundle architecture or schema-1 bootstrap ABI is incompatible",
             ));
         }
     }

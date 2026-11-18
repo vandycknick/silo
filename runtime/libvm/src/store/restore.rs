@@ -803,7 +803,7 @@ pub(crate) async fn write_budget_anchor(
         });
     }
     let anchor = BudgetHomeAnchor {
-        schema: 2,
+        schema: 1,
         home,
         state_device: state.dev(),
         state_inode: state.ino(),
@@ -882,7 +882,7 @@ fn budget_home_is_live(directory: &crate::paths::OwnedDirectory, prefix: &str) -
         return false;
     };
     if bytes.len() > 16 << 20
-        || anchor.schema != 2
+        || anchor.schema != 1
         || !anchor.home.is_absolute()
         || prefix != format!("{}-{}-", anchor.state_device, anchor.state_inode)
     {
@@ -3608,7 +3608,7 @@ mod tests {
     async fn restore_budget_reclaims_malformed_or_unsupported_home_anchors() {
         for bytes in [
             b"{".as_slice(),
-            br#"{"schema":2,"home":"/","stateDevice":1,"stateInode":1}"#,
+            br#"{"schema":1,"home":"/","stateDevice":1,"stateInode":1}"#,
         ] {
             let fixture = CrossHomeBudgetFixture::new().await;
             let prefix = crate::store::restore::budget_prefix(&fixture.a).unwrap();
@@ -3718,7 +3718,7 @@ mod tests {
         )
         .unwrap();
         let state = std::fs::metadata(store.home.join("state.db")).unwrap();
-        assert_eq!(anchor.schema, 2);
+        assert_eq!(anchor.schema, 1);
         assert_eq!(anchor.home, std::fs::canonicalize(&store.home).unwrap());
         assert_eq!(
             (anchor.state_device, anchor.state_inode),
@@ -3741,7 +3741,7 @@ mod tests {
         let state = std::fs::metadata(fixture.b.home.join("state.db")).unwrap();
         let anchor_name = format!("{}home.json", budget_prefix(&fixture.b).unwrap());
         let inherited = BudgetHomeAnchor {
-            schema: 2,
+            schema: 1,
             home: fixture.root.path().join("deleted-home"),
             state_device: state.dev(),
             state_inode: state.ino(),
