@@ -1696,7 +1696,30 @@ pub(crate) struct ChildConstruction {
         Option<std::sync::Arc<crate::machine::root_disk::SharedCopyQualification>>,
 }
 
+/// Construction blocks its thread in `std::thread::scope` while the copy and
+/// authentication workers drive catalog futures through this runtime. It
+/// therefore owns a blocking thread, so the caller's runtime thread stays free
+/// to run the SQLx connection returns and drivers those workers wait on.
 async fn publish_snapshot_child(
+    runtime: &Runtime,
+    construction: ChildConstruction,
+    restore_run: Option<uuid::Uuid>,
+    authentication: Option<crate::machine::restore::RestoreAuthentication>,
+) -> Result<(MachineConfig, ChildDurability), LibVmError> {
+    let runtime = runtime.clone();
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(construct_snapshot_child(
+            &runtime,
+            construction,
+            restore_run,
+            authentication,
+        ))
+    })
+    .await?
+}
+
+async fn construct_snapshot_child(
     runtime: &Runtime,
     construction: ChildConstruction,
     restore_run: Option<uuid::Uuid>,
@@ -4237,6 +4260,13 @@ mod tests {
                 .await
                 .unwrap();
             let staging = OperationStaging::new(&pool, operation, &lease).unwrap();
+            // Three of the ten catalog slots stay checked out, so the four
+            // root admissions only fit if released connections return while
+            // the private copy is still running.
+            let mut held = Vec::new();
+            for _ in 0..3 {
+                held.push(store.pool.acquire().await.unwrap());
+            }
             let child = publish_stopped_child(
                 &runtime,
                 format!("managed-data-{data_count}"),
@@ -4247,6 +4277,7 @@ mod tests {
             )
             .await
             .unwrap();
+            drop(held);
             let stored = store.machine_storage(child.id).await.unwrap().unwrap();
             assert_eq!(stored.disks.len(), data_count);
             assert_eq!(stored.disk_baselines.len(), data_count + 1);
