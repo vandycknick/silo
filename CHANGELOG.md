@@ -58,6 +58,13 @@
   machine with a trusted RAM baseline reads the baseline's data extents plus
   dirty pages, not the whole address space, and reports a typed fallback reason
   when it cannot.
+- Performance: the RAM writer only leaves a file hole for a zero run of at
+  least 64 KiB; shorter zero runs between data are written. Memory that
+  alternates data and zero pages no longer becomes hundreds of thousands of
+  one-block extents, which made every reflink clone of the RAM file cost
+  seconds. With 3 GiB of such memory a full snapshot drops from 15.5 s to
+  4.4 s, an incremental snapshot from 8.0 s to 0.8 s and a first live fork
+  from 15.3 s to 2.2 s. Content identity is unchanged.
 - Fixed: restore inspection validates the pre-allocation intent separately from
   activation. Fork children bind their own complete, unidentified disk tracking
   seeds before activation admission. Host construction tests exercise raw and
