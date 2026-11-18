@@ -32,7 +32,7 @@ The catalog uses WAL with `synchronous=NORMAL`, retaining `fullfsync` and
 lose no committed transactions, while power loss or an OS crash can lose only
 transactions since the previous WAL checkpoint. This deliberately avoids
 per-commit fsyncs draining all dirty private-copy data on ext4 `data=ordered`.
-Checkpoint publication and handoff receipts/ownership decisions explicitly
+Snapshot publication and handoff receipts/ownership decisions explicitly
 checkpoint before acknowledgment, including replay, because those boundaries
 must survive power loss. Destructive collection likewise checkpoints retired
 roots, cleanup authority and eviction intent before removing their bytes.

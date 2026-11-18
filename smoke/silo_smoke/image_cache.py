@@ -23,8 +23,9 @@ POOL_DIRECTORIES = ("objects", "streams", "source-blobs", "transport")
 # persistent runtime identity on first open, never copy the preparer's.
 # An OCI selection is retained as its layered composition graph: rows root
 # every pack stream, fsmeta, record and index object, and embed no paths.
+# image_name also names stored images; only OCI selection names are kept.
 CATALOG_TABLES = {
-    "_sqlx_migrations", "image_manifest", "image_ref", "image_config",
+    "_sqlx_migrations", "image_manifest", "image_name", "image_config",
     "image_layer", "image_manifest_layer", "image_composition_artifact",
     "composition_recipe", "composition_result", "composition_layer",
     "layer_recipe", "layer_result", "layer_object_dependency",
@@ -68,8 +69,8 @@ def _catalog(home: Path) -> set[tuple[str, str, str]]:
     try:
         with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
             return set(connection.execute(
-                "SELECT r.requested_reference, r.manifest_digest, a.lower_id "
-                "FROM image_ref r JOIN image_composition_artifact a ON a.manifest_digest = r.manifest_digest"
+                "SELECT n.name, a.manifest_digest, a.lower_id "
+                "FROM image_name n JOIN image_composition_artifact a ON a.image_id = n.oci_image_id"
             ))
     except sqlite3.DatabaseError:
         # A cache from an incompatible schema is not reusable after a hard break.
@@ -98,6 +99,7 @@ def _snapshot(source: Path, destination: Path) -> None:
             for table in tables:
                 if table not in CATALOG_TABLES and not table.startswith("sqlite_"):
                     copy.execute('DELETE FROM "' + table.replace('"', '""') + '"')
+            copy.execute("DELETE FROM image_name WHERE oci_image_id IS NULL")
             copy.commit()
             copy.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             copy.execute("PRAGMA journal_mode = DELETE")

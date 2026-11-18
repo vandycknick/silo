@@ -512,7 +512,7 @@ fn immutable_image_verification_ignores_cache_warming_but_not_identity() {
         pull_policy: 3,
     };
     let selection = images::identity_from_wire(identity.clone()).unwrap();
-    assert_eq!(selection.pull_policy, libvm::ImagePullPolicy::Never);
+    assert_eq!(selection.pull_policy, libvm::PullPolicy::Never);
     assert_eq!(selection.platform.variant.as_deref(), Some("v8"));
     let metadata = libvm::OciImageConfigMetadata::default();
     for cache_state in [1, 2] {

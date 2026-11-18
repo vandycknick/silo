@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use eyre::{bail, Context as _};
-use libvm::{ImagePullPolicy, MachineData, Memory};
+use libvm::{MachineData, Memory, PullPolicy};
 use uuid::Uuid;
 
 use crate::daemon::record::DaemonRecord;
@@ -29,7 +29,7 @@ pub(crate) async fn ensure_system_machine(
         None => {
             runtime.ensure_name_available(SYSTEM_MACHINE_NAME).await?;
             let image = runtime
-                .resolve_image(&desired.image, ImagePullPolicy::IfMissing)
+                .resolve_image(&desired.image, PullPolicy::IfMissing)
                 .await
                 .context("could not fetch the system image")?;
             installation.configured_image = desired.image.clone();

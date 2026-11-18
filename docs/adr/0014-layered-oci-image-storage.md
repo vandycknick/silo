@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 
-Updated: 2026-11-16
+Updated: 2026-11-18
 
 ## Status
 
@@ -27,7 +27,7 @@ clones, and written-upper-byte-only copies without reflinks. Sealed stream
 identities accompany publication without another data pass. Local snapshot
 publication seeds restore trust, reversing the 2026-11-14 requirement that the
 first durable restore independently scans RAM. Silent local corruption between
-capture and restore is accepted; `silo snapshot verify IMAGE` supplies on-demand
+capture and restore is accepted; `silo snapshot verify REF` supplies on-demand
 authentication. Import, pull, transport, export and handoff still authenticate
 every byte. [ADR 0021](0021-live-snapshots-and-forks.md) records the agent-ready
 clock, scaling invariants, explicit zero ranges and retained plus new performance
@@ -52,6 +52,17 @@ The Phase 30 wave-three amendment (2026-11-15) adds fingerprint-bound graph and
 map caches, canonical RAM-map reuse and sealed-stream deduplication before
 clone creation. Capture batches pool-directory synchronization, preserving
 payload seal `fsync` and the checked catalog checkpoint before acknowledgement.
+
+The 2026-11-18 revision separates images and snapshots. They share one storage
+pool but have separate commands and separate name tables, so an image and a
+snapshot may both be named `hello`. The `image:` prefix, the shared alias
+namespace, the retained flag and the publication approval step (digest
+approval, signature requirement and checkpoint acknowledgement) are removed.
+`silo restore` is the only way to turn a snapshot into a machine; `create` and
+`run` take images only. "Snapshot" is the single noun; whether it includes
+memory is a property. Snapshot push is withdrawn until it has mandatory
+encryption and a design for secrets held in memory. This revision also
+requires a fresh `SILO_HOME`.
 
 ## Implementation status (2026-11-09)
 
@@ -105,11 +116,11 @@ resource budgets explicit, adds catalog-lock, lease-inheritance, discard-length,
 backing file, restates the payload-pack rationale, records the owner's
 acceptance budgets and ownership, and adds two alternatives.
 
-The same revision adds the storage side of [ADR 0021](0021-live-snapshots-and-forks.md)'s live execution
-checkpoints: sealed raw captures at a pause boundary, RAM as a logical stream
-with a layout record, `captureKind` on snapshots, a capture outcome distinct
+The same revision adds the storage side of [ADR 0021](0021-live-snapshots-and-forks.md)'s snapshots
+with memory: sealed raw captures at a pause boundary, RAM as a logical stream
+with a layout record, a memory property on snapshots, a capture outcome distinct
 from the stop outcome, execution media types, RAM mapping leases as GC roots
-and the explicit statement that live capture adds no disk encoding.
+and the explicit statement that memory capture adds no disk encoding.
 
 ## The Problem
 
@@ -160,7 +171,7 @@ one stored disk encoding**:
   ext4 upper per machine. libkrun presents the lower through a generated VMDK
   flat-extent descriptor on Linux and macOS alike. No other backend presents
   a layered root.
-- **Execution checkpoints ([ADR 0021](0021-live-snapshots-and-forks.md)):** a live capture of a running libkrun
+- **Snapshots with memory ([ADR 0021](0021-live-snapshots-and-forks.md)):** a memory capture of a running libkrun
   machine binds this storage model to captured RAM and device state. Its
   writable storage is represented by immutable raw captures sealed at the
   capture's pause boundary and by private raw restore copies; its memory is
@@ -226,7 +237,7 @@ additional opaque encoding on VZ without changing the raw contract here.
    persisted root.
 6. A storage-only snapshot captures stopped storage before journal replay or
    repair, crash-consistent unless stronger shutdown evidence is available.
-   An [ADR 0021](0021-live-snapshots-and-forks.md) execution checkpoint instead captures storage at one
+   An [ADR 0021](0021-live-snapshots-and-forks.md) snapshot with memory instead captures storage at one
    acknowledged vCPU, device and host-writer quiescent boundary and binds it
    to matching execution and RAM state. Neither implies application
    consistency or sanitization.
@@ -316,8 +327,9 @@ label an arbitrary filesystem image as bootable by every cloud provider.
 | Opaque raw root     | A private raw disk whose filesystem Silo does not interpret at runtime.                                                              |
 | Cloud disk          | A partitioned Linux disk image as distributed by a distribution, imported as an opaque raw root with a partition root selector.       |
 | Image               | An immutable creation source with storage, platform and boot requirements.                                                           |
-| Alias               | A mutable local name in the `image:` namespace, resolved to one immutable image or snapshot at creation.                             |
-| Snapshot            | An immutable capture of one machine's included storage and configuration: `stopped-storage` from a stopped machine, or `live-execution` with RAM and device state at a pause boundary ([ADR 0021](0021-live-snapshots-and-forks.md)). |
+| Name                | A mutable local tag pointing to exactly one image or one snapshot. Images and snapshots have separate name tables. Names cannot contain `:` or `/`. |
+| Id                  | Content identity `sha256:HEX`, abbreviable to a unique hex prefix of at least 3 characters.                                         |
+| Snapshot            | An immutable capture of one machine's included storage and configuration. Its memory is `none` (taken from a stopped machine) or `included` (RAM and device state at a pause boundary, [ADR 0021](0021-live-snapshots-and-forks.md)). Restored with `silo restore`, never a creation source. |
 | Fork                | A new machine with initially identical included disk bytes and new host lifecycle identity; a running-machine fork also continues the source's execution ([ADR 0021](0021-live-snapshots-and-forks.md)). |
 | Relocation          | Ownership transfer of the same stopped machine to another Silo runtime.                                                             |
 | Portable encoding   | Complete logical disk streams plus exact immutable filesystem objects; the only artifact encoding in this ADR.                       |
@@ -328,21 +340,30 @@ label an arbitrary filesystem image as bootable by every cloud provider.
 
 ### Sources and defaults
 
-Creation accepts these explicit source kinds:
+Creation (`create`, `run`) accepts images only, through these source kinds:
 
 | Input                                                | Interpretation                                                                   |
 | ---------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `ubuntu:24.04` or a digest-pinned registry reference | OCI container image or Silo VM artifact, selected by the resolved artifact type. |
-| `image:NAME`                                         | Managed local alias resolving to one image or snapshot.                          |
-| `image:sha256:HEX`                                   | Managed immutable image or snapshot identity.                                    |
+| `NAME`                                               | Local image name.                                                                |
+| `ubuntu:24.04`, `nixos/nix` or a digest-pinned registry reference | OCI container image or Silo image artifact, selected by the resolved artifact type. |
+| `sha256:HEX` or a unique hex prefix                  | Stored image identity.                                                           |
 | `disk:PATH`                                          | Quiesced local raw or qcow2 disk, decoded to raw and copied into Silo ownership. |
 | A typed macOS restore-image request                  | Installation through Apple's supported restore flow on VZ, not OCI ingestion.    |
 
-Snapshots are creation sources. Snapshot names and image names share the `image:`
-alias namespace, and an alias resolves to exactly one record. `image:sha256:HEX`
-names an image or snapshot record by its typed ID; the two record kinds are
-stored separately and one typed ID cannot denote both. V1 has no separate
-`snapshot:` source kind.
+Snapshots are not creation sources. `silo restore REF` turns a snapshot into a
+machine, from a local name, an id or a registry reference. `create`, `run` and
+`restore` resolve a reference the same way, for the kind they expect:
+
+1. Exact local name of the expected kind.
+2. Each `search_registries` expansion, in order, already stored locally.
+3. Pull, following `--pull always|missing|never` (default `missing`).
+4. Unique id prefix of the expected kind.
+
+A reference containing `:` or `/` is always a registry reference, and a local
+name shadows a registry short name. `disk:PATH` is accepted by `create` and
+`run` only. When the name exists only as the other kind, the error names the
+right command. `create` refuses a snapshot name or snapshot artifact with a
+hint to use `restore`; `restore` refuses an image.
 
 OCI container images create `linux-erofs-overlay-v1` roots by default, and
 only on a libkrun runtime. There is no `--root-profile` selector or template
@@ -428,19 +449,22 @@ silo fork dev --name experiment
 # Explicit reusable raw import. No writes reach ./rootfs.raw.
 silo image import disk:./rootfs.raw --name ubuntu-base \
   --arch arm64 --boot linux-direct
-silo create image:ubuntu-base --name raw-dev
+silo create ubuntu-base --name raw-dev
 
 # Cloud disk: qcow2 decoded to raw, root partition recorded at import.
 silo image import disk:./noble-server-cloudimg-arm64.img --name noble-cloud \
   --arch arm64 --boot linux-direct --root-partition auto
-silo create image:noble-cloud --name cloud-dev
+silo create noble-cloud --name cloud-dev
 
-# Immutable stopped checkpoint, then portable OCI publication.
-silo snapshot create dev --name checkpoint
-silo image push image:checkpoint ghcr.io/acme/dev-checkpoint:v1
+# Immutable snapshot of a stopped machine, restored as a new machine.
+silo snapshot create dev --name dev-snap
+silo restore dev-snap --name dev-restored
+
+# Portable OCI publication of an image.
+silo image push ubuntu-base ghcr.io/acme/ubuntu-base:v1
 
 # Run on the destination Silo host, without interpreting disk chunks as tar.
-silo create ghcr.io/acme/dev-checkpoint@sha256:HEX --name cloud-dev
+silo create ghcr.io/acme/ubuntu-base@sha256:HEX --name cloud-dev
 
 # amd64 userspace on an Apple-silicon Mac: arm64 Silo kernel, Rosetta translation.
 # The same machine boots natively after relocation to an x86_64 Linux host.
@@ -448,23 +472,28 @@ silo create --platform linux/amd64 ubuntu:24.04 --name amd-dev
 
 # VZ runtime: an OCI reference is rejected; convert first, then create.
 silo image convert ubuntu:24.04 --disk-format raw --name ubuntu-raw
-silo create image:ubuntu-raw --name vz-dev
+silo create ubuntu-raw --name vz-dev
 ```
 
-`image import` creates an immutable image and optional alias, not a running VM.
-`disk:PATH` in `create` performs the same ingest without a permanent alias.
-`image push` consumes an immutable image/snapshot, not a live machine path. A
-convenience publish action may stop and snapshot a machine first, but must
-display and obtain consent for that lifecycle transition. Snapshot and fork do
-not stop a running source implicitly.
+`image import` creates an immutable named image, not a running VM.
+`disk:PATH` in `create` performs the same ingest without a stored image.
+`image push` consumes an immutable image, not a live machine path, and refuses
+snapshots. Snapshot push is not available (see the VM artifact section).
+`snapshot create VM` captures disks of a stopped machine; on a running machine
+it is refused unless `--memory` is given, which also captures RAM and device
+state. `--memory` on a stopped machine is refused. Snapshot and fork do not
+stop a running source implicitly.
 
-An alias names exactly one record. Creating an alias that already exists fails
-unless the caller passes `--replace`; replacement changes future resolutions
-only. The remaining command families are `image ls`, `image inspect`,
-`image rm` (removes an alias or an unreferenced record), `image pull` (acquires
-a registry image or VM artifact without creating a machine), `image prune`,
-`snapshot ls`/`rm`, and `disk create`/`attach`/`detach` for managed data
-disks. Their names are non-normative; the operations are.
+A name points to exactly one record; a record has zero or more names. Pulling
+`REF` adds the name `REF`; when `--pull always` moves a tag, the name moves and
+the previous record stays listed by id. `rm NAME` removes that name, and the
+record goes with its last name. `rm ID` removes the record and all its names.
+Removing a record never breaks a machine. The remaining command families are
+`image list`, `image inspect`, `image rm`, `image pull` (acquires a registry
+image or image artifact without creating a machine; a snapshot artifact is
+refused with a hint to use `restore`), `image prune` (removes nameless images
+no machine uses), `snapshot list`/`inspect`/`verify`/`rm`, and
+`disk create`/`attach`/`detach` for managed data disks.
 
 For an overlay machine the requested root size is the upper's capacity, not
 the size of a whole root; the CLI help states this because today's size option
@@ -472,7 +501,7 @@ sizes a complete `rootfs.img`.
 
 `image push` has one encoding, portable. Ordinary registry creation allocates a
 new machine, never restores host identity merely because the artifact contains
-checkpoint provenance.
+snapshot provenance.
 
 Inspection displays source identity, root family, backend requirement, guest
 architecture, boot profile, logical capacity, host allocated bytes, shared lower
@@ -607,7 +636,7 @@ handoff(plan: AdmittedHandoffPlan, access: AcquisitionPolicy)
   -> Result<HandoffResult>
 ```
 
-- Acquisition resolves aliases/tags to typed immutable identities and verifies
+- Acquisition resolves names/tags to typed immutable identities and verifies
   the required local closure. A container source remains distinguishable from a
   VM artifact; only the former enters OCI namespace composition or explicit raw
   conversion. Import records the required architecture, boot profile and root
@@ -689,7 +718,7 @@ content digest, copies packaged assets into the object pool, and records their
 runtime/profile requirements; a runtime upgrade that removes a packaged kernel
 therefore cannot strand a machine. User-supplied boot files are copied into
 managed immutable ownership rather than left as portable references to
-arbitrary host paths. A checkpoint retains those exact assets.
+arbitrary host paths. A snapshot retains those exact assets.
 
 These assets form one boot bundle: kernel, base initramfs/trusted `/init`,
 optional injected agent, kernel architecture and bootstrap/profile ABI. The
@@ -707,7 +736,7 @@ available newer admitted bundle so security updates are visible.
 Creation from a VM artifact defaults to its exact bundle. If that bundle cannot
 run on the destination, creation fails with a proposed admitted replacement;
 the caller must explicitly select that replacement before publishing the stopped
-machine. The artifact and source checkpoint remain unchanged. Acquisition of
+machine. The artifact and source snapshot remain unchanged. Acquisition of
 replacement assets belongs to creation/preparation, never to normal `start`.
 
 Normal `start` performs no registry resolution or network acquisition. It resolves
@@ -972,7 +1001,7 @@ with pack boundaries, so lower identities cannot be obtained by concatenating
 pack roots. Whole-object/provenance SHA keeps its distinct raw-byte meaning.
 
 This is one hard-breaking fresh-state cutover across homes, packs, lower
-results, checkpoints and artifacts. Existing homes and artifacts must be
+results, snapshots and artifacts. Existing homes and artifacts must be
 recreated; there is no v1 reader, conversion, alias or compatibility shim.
 Stage-2 clean-stop disk sealing and cached upper templates remain separate
 work, not a consequence of changing the identity format.
@@ -987,7 +1016,7 @@ work, not a consequence of changing the identity format.
 | Lower result       | Composition recipe, fsmeta digest/UUID, ordered extents and mapped addresses, total length, stream ID of the logical lower. |
 | Raw image          | Stream ID, length and sector geometry, with separate boot metadata (including any partition selector).                      |
 | RAM image          | Stream ID and length of the packed sparse RAM image, plus the identity of its layout record (guest-physical regions, topology, page granule). |
-| VM snapshot        | `captureKind`; root, included disks, platform files, boot requirements, configuration and external-resource declarations; for `stopped-storage` the stop outcome; for `live-execution` the RAM image, layout, execution and device-state object identities and the compatibility profile. The capture evidence record (`vm.capture.json`) is provenance and is referenced by digest, not an identity input. |
+| VM snapshot        | Memory (`none` or `included`); root, included disks, platform files, boot requirements, configuration and external-resource declarations; without memory the stop outcome; with memory the RAM image, layout, execution and device-state object identities and the compatibility profile. The capture evidence record (`vm.capture.json`) is provenance and is referenced by digest, not an identity input. |
 
 Image and snapshot IDs include boot/configuration semantics; identical raw disk
 bytes may be used by distinct image records. Provenance records original tags,
@@ -1009,7 +1038,7 @@ through publication and child construction without a payload reread.
 ### Records and the database
 
 The database (`state.db`) is the only mutable record. It holds machines,
-images, snapshots, layer and composition results, aliases, provenance, the
+images, snapshots, layer and composition results, names, provenance, the
 conversion cache, operations, leases' logical owners and the reachability
 graph. Typed records exist on disk only as content-addressed objects in the
 pool, serialized with JCS, when they are published or transferred; such an
@@ -1042,13 +1071,13 @@ alone does not prove these facts. A monitor outcome of `forced` or `error` recor
 `forced`; missing or insufficient evidence records `unknown` once liveness is
 ruled out. Both are crash-consistent sources, not evidence for clean flattening.
 
-An execution checkpoint records a separate **capture outcome**, not a fourth
+A snapshot with memory records a separate **capture outcome**, not a fourth
 stop outcome. `captureOutcome: coherent` ([ADR 0021](0021-live-snapshots-and-forks.md)'s `vm.capture.json`)
 certifies that disk, RAM and device state were taken at one quiescent
 boundary; it does not certify clean unmounted filesystems or closed
 attachments, so it never qualifies as storage-clean. A live source's terminal
 stop outcome is unaffected by captures taken during its run. A machine
-created from a checkpoint's disks alone boots with recovery evidence
+restored from a snapshot's disks alone (`restore --without-memory`) boots with recovery evidence
 `unknown`.
 
 `ownershipEpoch` and an optional relocation operation/fence are persisted with
@@ -1063,7 +1092,7 @@ typed records, not filename suffixes:
 
 ```text
 ~/.silo/                                    (SILO_HOME)
-  state.db                                  # all records, aliases, reachability
+  state.db                                  # all records, names, reachability
   images/
     objects/sha256/<object-hex>             # fsmeta, pages, assets, encoded chunks
     streams/sha256/<stream-hex>             # verified immutable contiguous streams
@@ -1996,8 +2025,8 @@ no journal recovery. Dirty or unsupported recovery state returns a typed
 recovery-required error before export. A recorded `clean` stop is not a
 substitute for that check. The user can explicitly fork, boot the fork to recover,
 and shut it down cleanly before exporting it. Silo does not replay JBD2 on the
-host, boot a helper VM, or repair the source implicitly. Exact dirty checkpoints
-remain supported.
+host, boot a helper VM, or repair the source implicitly. Exact snapshots of
+dirty machines remain supported.
 
 libvm authenticates the exact retained fsmeta/pack graph and reconstructs the
 lower namespace from retained indexes and packs, then strictly audits and reads
@@ -2015,7 +2044,7 @@ reconstruction remain subject to the runtime flattening gate.
 The output is a fresh ext4 filesystem with a new image identity, not an exact
 snapshot of upper bytes or OverlayFS inode numbers. It remains a direct-kernel
 root filesystem; Silo does not add EFI partitions or a cloud-provider bootloader.
-Exact Silo checkpoints retain lower plus upper rather than flattening.
+Exact Silo snapshots retain lower plus upper rather than flattening.
 
 ## macOS Platform Storage
 
@@ -2082,7 +2111,7 @@ explicit application quiescence the user performed.
 
 ### Live capture boundary
 
-An execution checkpoint of a running machine follows [ADR 0021](0021-live-snapshots-and-forks.md) instead of the
+A snapshot with memory of a running machine follows [ADR 0021](0021-live-snapshots-and-forks.md) instead of the
 stopped procedure above. For storage, that means: the monitor proves every
 vCPU parked, every device and host-memory writer drained and every writable
 block backend flushed at one pause token; it then creates one immutable
@@ -2099,7 +2128,7 @@ If clone identities remain pending, `vm.capture-cut.json` records
 continuation. The source resumes or stays paused under its recorded policy,
 then the monitor hashes the immutable clones and writes the unchanged
 `vm.capture.json` final seal only when every identity is complete. The cut is
-never a seal, and no partial multi-disk checkpoint or fork child is admitted.
+never a seal, and no partial multi-disk snapshot or fork child is admitted.
 After a monitor/manager process crash, recovery completes identities from
 retained clones without VM operations. No power-loss durability is claimed
 before libvm publication or child durability barriers.
@@ -2163,7 +2192,7 @@ in one transaction. Failure removes only child-owned staging and cannot cause
 source data loss.
 
 A durable running-machine fork ([ADR 0021](0021-live-snapshots-and-forks.md))
-captures once and restores each child from that exact execution checkpoint.
+captures once and restores each child from that exact memory capture.
 Every child receives distinct private writable raw clones or copies of the
 sealed captures; unchanged RAM is shared between children through private
 mappings of one immutable RAM file.
@@ -2178,8 +2207,8 @@ identity-verification rules apply equally to sealed captures and child copies.
 A snapshot copies private state to immutable objects or chunked stream records,
 records configuration, exact dependencies and either the stop outcome or the
 capture evidence, and creates a persistent local retention root. Its
-`captureKind` is `stopped-storage` or `live-execution`. A `live-execution`
-snapshot includes all managed writable disks as sealed captures, the RAM image
+memory is `none` or `included`. A snapshot with memory includes all managed
+writable disks as sealed captures, the RAM image
 and layout, the execution and device-state objects, the exact boot, agent and
 configuration provenance, the compatibility profile and the external-resource
 declarations. Both kinds include all managed writable data disks by default.
@@ -2195,16 +2224,18 @@ with physical zero writes only when punching is unsupported. Their logical
 meaning is explicit zero, never inheritance; zero chunk objects are not hashed
 or stored.
 
-Snapshots have purpose `checkpoint` or `generalized-image`. A checkpoint contains
-exact selected storage bytes and includes a warning about credentials, journals
-and deleted-data remnants. A generalized image is created from a separate private
-fork where explicitly chosen guest preparation runs, followed by a new stopped
-snapshot. V1 supplies no universal automatic sanitizer. The resulting bytes and
-identity differ from the source checkpoint; preparation never mutates the source.
+A snapshot contains exact selected storage bytes and includes a warning about
+credentials, journals and deleted-data remnants. A generalized image is created
+from a separate private fork where explicitly chosen guest preparation runs,
+followed by a new snapshot. V1 supplies no universal automatic sanitizer. The
+resulting bytes and identity differ from the source snapshot; preparation never
+mutates the source. Turning a snapshot into an image (image commit) is a
+follow-up.
 
-Checkpoint images can create new machines. Preserving the original host machine
-identity is reserved for the relocation protocol, not a normal registry pull or
-`create`. Snapshot names are aliases; snapshots themselves are immutable.
+Snapshots do not create new machines through `create`; `silo restore` does.
+Preserving the original host machine identity is reserved for the relocation
+protocol, not a normal registry pull or restore. Snapshot names are tags in
+their own name table; snapshots themselves are immutable.
 
 ## OCI VM Artifact And Chunked Distribution
 
@@ -2320,7 +2351,7 @@ may need to scan the full stream to discover the few chunks it sends.
 A portable Linux overlay artifact carries exact fsmeta, layer packs, changeset
 indexes, lower result, full upper stream and boot/configuration closure. It does
 not carry the VMDK descriptor. A portable opaque artifact carries complete raw
-virtual streams and required platform files. A portable execution checkpoint
+virtual streams and required platform files. A portable snapshot with memory
 ([ADR 0021](0021-live-snapshots-and-forks.md)) additionally carries the complete RAM stream and its chunks, the
 RAM layout record, the execution and device-state objects and the exact boot,
 agent and configuration closure of the captured kernel, so that a storage-only
@@ -2338,13 +2369,14 @@ so source OCI registry deletion or a retired encoder cannot strand the image.
 
 ### Config and trust
 
-The VM config contains schema, image purpose, `captureKind`, root family,
-backend requirement, stream and object records, included disk roles, guest
-platform, exact boot asset references, minimum capabilities, compatible
-profile IDs, process settings, mutable platform file roles and
-external-resource declarations. For a `live-execution` checkpoint it also
-names the required execution schema and compatibility profile, so a reader
-that cannot restore execution reports that rather than silently booting.
+The VM config contains the content kind (image or snapshot), the snapshot's
+memory property, root family, stream and object records, included disk roles,
+guest platform, exact boot asset references, process settings, mutable
+platform file roles and external-resource declarations. For a snapshot with
+memory it also names the required execution version and compatibility
+profile, so a reader that cannot restore execution reports that rather than
+silently booting. An image config never carries memory. The normative format
+is [VM artifact format](../architecture/vm-artifact.md).
 Display names and source-machine IDs are provenance, not instructions to
 overwrite destination identity.
 
@@ -2356,11 +2388,20 @@ A receiving runtime applies its own network/security policy before start.
 
 TLS and OCI authorization protect transport. Digest verification establishes
 integrity, not publisher trust. Resolution reports the immutable index digest;
-imported code is not booted during inspection. A trust policy may require a
-verified signature on that index digest. V1 supports user-approved digest-pinned
-imports without signatures and never presents them as authenticated publishers.
-Signing provider integration and encryption/key management are separate security
-features, not properties implied by content addressing.
+imported code is not booted during inspection. There is no approval step:
+pull and restore do not ask for digest approval, signatures or snapshot
+acknowledgement, and never present an artifact as from an authenticated
+publisher. Signing provider integration and encryption/key management are
+separate security features, not properties implied by content addressing.
+
+### Snapshot push stopgap
+
+Snapshot push is not available: there is no `snapshot push` command or RPC,
+and `image push` refuses a snapshot. A snapshot can hold credentials and other
+secrets in its disks and, with memory, in RAM. Snapshot push returns only with
+mandatory encryption and a design for secrets held in memory. libvm keeps the
+snapshot export and import code crate-private. Pulling a snapshot artifact
+through `silo restore REF` remains available.
 
 ## Local-To-Cloud Handoff
 
@@ -2533,7 +2574,7 @@ fingerprints match. A changed fingerprint forces authentication or refusal.
 Silent local corruption between capture and restore is not detected at restore
 under the local receipt trust boundary.
 
-`silo snapshot verify IMAGE` rereads and authenticates every RAM, state and disk
+`silo snapshot verify REF` rereads and authenticates every RAM, state and disk
 byte of a local snapshot against recorded identities. RAM and disk mismatches
 name the stream, chunk index and byte range; state-object mismatches name the
 role, whole-object digest and length, not a chunk. Missing, truncated, writable
@@ -2633,7 +2674,7 @@ Receipts never permit substituting another graph, ignoring malformed records
 or reopening an unbound descriptor.
 
 Receipts are not retention roots and are not transported authority. Import,
-pull, transport, export, handoff and `silo snapshot verify IMAGE` never honour
+pull, transport, export, handoff and `silo snapshot verify REF` never honour
 them as byte-authentication proof. Exact imported composition admission validates
 bytes even if a matching local receipt exists.
 
@@ -2724,20 +2765,21 @@ supported; a second home is a second complete installation.
 
 ### Retention policy
 
-GC roots are explicitly retained images, managed aliases, machine dependencies,
-immutable local snapshots, operation records, and the children and sealed
-captures of an in-flight or completed live capture. User-requested
-`image import` and `image pull` retain their result even without an alias
-until `image rm` releases that retention. `create disk:PATH` uses ephemeral
+GC roots are named images, named snapshots, machine dependencies,
+operation records, and the children and sealed
+captures of an in-flight or completed memory capture. A record exists until
+it is removed: `rm NAME` removes the record with its last name, `rm ID`
+removes it with all names, and `image prune` removes nameless images no
+machine uses. `create disk:PATH` uses ephemeral
 ingest instead. An overlay machine depends on its lower closure and boot
 assets. An opaque raw machine holds a complete private copy and depends only
 on its boot assets; its source image is provenance, not a dependency. A
-machine restored from an execution checkpoint depends on the immutable RAM
+machine restored from a snapshot with memory depends on the immutable RAM
 file it maps for as long as any mapping or worker holds it, even after the
-source machine and every snapshot alias are gone; that dependency is a
+source machine and every snapshot name are gone; that dependency is a
 content lease held through the mapping's open descriptor, not a PID or TTL.
 A retained child never depends on its source's machine directory remaining
-present. Removing an image, aliases or explicit snapshot retention removes
+present. Removing an image or snapshot, or its names, removes
 references only; artifacts, compositions and layers remain until explicit prune,
 as before Phase 30. An unreferenced artifact is eligible for GC, not immediately
 unlinked by reference removal. Ordinary maintenance recovers orphan pool files
@@ -2965,11 +3007,11 @@ verification. Protection against arbitrary same-user tampering requires a strong
 host trust boundary, not a claim that `chmod` or OverlayFS origin checks are
 cryptographic enforcement.
 
-Exact checkpoints include journals, free-space bytes and potentially deleted
+Exact snapshots include journals, free-space bytes and potentially deleted
 secrets. EROFS lower packs can contain bodies hidden by later whiteouts, readable
 to guest root through the underlying block device. Whiteouts and file deletion
-are not sanitization. Publication requires explicit acknowledgement for checkpoint
-state, displays destination/ref/purpose, and must not log guest file contents,
+are not sanitization. Image publication displays destination and ref, and
+must not log guest file contents,
 credentials or auxiliary-storage bytes. Public visibility is never assumed to
 be private because a registry accepted credentials.
 
@@ -3265,7 +3307,7 @@ mocked mount or VMM behavior does not qualify a profile.
   Cross-architecture create/handoff uses a complete approved boot bundle and
   recomputes required translation without inheriting implicit Rosetta intent.
 - GC tests cover active launches, concurrent publication, snapshot deletion,
-  unaliased retained images and transport eviction against retained sole copies.
+  nameless unused images and transport eviction against retained sole copies.
   Large chunked streams use bounded lease descriptors; abandoned operation
   recovery never releases a closure still held by a worker. A long-lived
   parent with concurrent child writers on Linux and macOS retains every
@@ -3322,7 +3364,7 @@ mocked mount or VMM behavior does not qualify a profile.
   and is deliberately deferred to keep one encoding.
 - All required data is acquired before boot. Lazy fetching and a universal
   writable block CAS are not introduced by this ADR.
-- Checkpoints are not sanitized images, application-consistent live snapshots
+- Snapshots are not sanitized images, application-consistent snapshots
   or universal cloud-provider boot images. macOS has hardware, licensing and
   externally regenerated identity constraints.
 - A cloud disk runs Silo's kernel, not its own; its bootloader, kernel and
@@ -3333,7 +3375,7 @@ mocked mount or VMM behavior does not qualify a profile.
   dangling or looping symlink parents, rather than guessing at extraction.
 - Flatten export requires clean, supported ext4/index state and a representable
   output namespace. Dirty or larger guest-mutated roots remain exactly
-  checkpointable; they are not silently repaired or approximated for export.
+  snapshottable; they are not silently repaired or approximated for export.
 - Boot bundles are pinned per machine; updates reach an existing machine only
   through an explicit update or approved handoff plan. `start` and `inspect`
   report available updates without applying them.
@@ -3405,7 +3447,7 @@ helper also removes a second packaged kernel/initramfs and a private transport.
 ### A universal content-addressed block engine for every VM
 
 A block snapshot map and private writable overlay could unify Linux and APFS,
-reduce large-file copy-up and support cheap checkpoints without host CoW. It
+reduce large-file copy-up and support cheap snapshots without host CoW. It
 would require Silo to own write ordering, flush/FUA, discard/zero semantics,
 crash recovery, block-service lifetime and adapters on every backend. OverlayBD's
 standard device path is Linux-specific; QCOW2 is not directly consumable by Silo's
@@ -3465,7 +3507,7 @@ recipe dependence is rejected for durable machine portability.
 
 This ADR does not decide live execution capture, restore, activation or
 execution compatibility; [ADR 0021](0021-live-snapshots-and-forks.md) owns those, and this ADR owns the storage
-identity, publication and retention of their checkpoints. It does not
+identity, publication and retention of their snapshots. It does not
 introduce a cloud scheduler, provider billing/provisioning APIs, CPU emulation
 (Rosetta is a translation of user processes under Silo's own kernel, and no
 emulator is ever launched), public macOS redistribution rights, a universal

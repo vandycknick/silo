@@ -6,7 +6,7 @@ use oci::{MaterializeOptions, OciMaterializer};
 use crate::image::{
     local_disk::OpenDiskSource,
     oci::{cached_resolved_oci_image, image_error, resolve_oci_image_from_registry},
-    ImagePullPolicy, ResolvedOciImage,
+    PullPolicy, ResolvedOciImage,
 };
 use crate::runtime::RuntimeConfig;
 use crate::store::ReadOnlyStore;
@@ -55,39 +55,38 @@ impl ReadOnlyRuntime {
         crate::planning::propose_machine_name()
     }
 
-    /// Inspects an existing managed source without acquiring or publishing it.
-    pub async fn inspect_managed(
+    /// Inspects an existing local image (stored or cached OCI) by name, id or
+    /// unique id prefix without acquiring, pulling or publishing anything.
+    pub async fn inspect_image(
         &self,
-        source: &crate::ManagedSourceRef,
-    ) -> Result<crate::ManagedSourceInfo, LibVmError> {
+        reference: &crate::ImageRef,
+    ) -> Result<crate::ImageInfo, LibVmError> {
+        let reference = reference.to_string();
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| LibVmError::ImageNotFound {
-                reference: source.to_string(),
+                reference: reference.clone(),
             })?;
-        store.inspect_managed(source).await
-    }
-
-    /// Resolves a digest in the existing image/snapshot namespace.
-    pub async fn resolve_managed_digest(
-        &self,
-        digest: &crate::ObjectDigest,
-    ) -> Result<crate::ManagedSourceId, LibVmError> {
-        let store = self
-            .store
-            .as_ref()
-            .ok_or_else(|| LibVmError::ImageNotFound {
-                reference: digest.to_string(),
-            })?;
-        store.resolve_managed_digest(digest).await
+        let mut connection = store.pool.acquire().await?;
+        let local = crate::resolve::resolve_local(
+            &mut connection,
+            &self.registry_policy,
+            &reference,
+            crate::resolve::Kind::Image,
+        )
+        .await?;
+        let crate::resolve::LocalRecord::Image(image) = local.record else {
+            return Err(LibVmError::SnapshotIsNotAnImage { reference });
+        };
+        crate::store::image_store::image_info(&mut connection, image, &reference).await
     }
 
     /// Resolves OCI metadata without writing cache or durable state.
     pub async fn resolve_oci_image(
         &self,
         reference: String,
-        policy: ImagePullPolicy,
+        policy: PullPolicy,
         platform: Option<&crate::LinuxPlatform>,
     ) -> Result<ResolvedOciImage, LibVmError> {
         let producer =
@@ -110,11 +109,11 @@ impl ReadOnlyRuntime {
                 MaterializeOptions::for_host().map_err(|error| image_error(&reference, error))?
             }
         };
-        if policy != ImagePullPolicy::Always {
+        if policy != PullPolicy::Always {
             if let Some(image) = self.cached_oci_image(&reference, &options.platform).await? {
                 return Ok(image);
             }
-            if policy == ImagePullPolicy::Never {
+            if policy == PullPolicy::Never {
                 return Err(LibVmError::ImageNotFound { reference });
             }
         }
@@ -202,7 +201,7 @@ mod tests {
 
     use crate::store::models::DbConfig;
     use crate::store::{ConfigStore, Store};
-    use crate::{ImagePullPolicy, ReadOnlyRuntime, RuntimeConfig};
+    use crate::{PullPolicy, ReadOnlyRuntime, RuntimeConfig};
 
     mod logical_catalog {
         include!(concat!(
@@ -426,7 +425,7 @@ mod tests {
             .expect("open read-only runtime");
 
         let image = runtime
-            .resolve_oci_image(reference.clone(), ImagePullPolicy::Never, None)
+            .resolve_oci_image(reference.clone(), PullPolicy::Never, None)
             .await
             .expect("resolve cached image");
 
@@ -447,7 +446,7 @@ mod tests {
         assert!(runtime
             .resolve_oci_image(
                 "example.test/missing:latest".to_string(),
-                ImagePullPolicy::Never,
+                PullPolicy::Never,
                 None,
             )
             .await

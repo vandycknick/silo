@@ -166,7 +166,7 @@ def test_scenario_first_create_precedes_warm_run_and_new_capture_cases() -> None
     ("127.0.0.1:5000/smoke/alpine:latest", "local"),
     ("localhost:5000/smoke/alpine:latest", "local"),
     ("[::1]:5000/smoke/alpine:latest", "local"),
-    ("image:converted-id", "local"), ("disk:/tmp/root.raw", "local"),
+    ("sha256:" + "a" * 64, "local"), ("disk:/tmp/root.raw", "local"),
 ])
 def test_image_source_records_acquisition_origin(reference: str, source: str) -> None:
     assert image_source(reference) == source

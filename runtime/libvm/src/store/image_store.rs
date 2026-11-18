@@ -1,3 +1,12 @@
+//! Cached OCI images and the shared image name table.
+//!
+//! ```text
+//!   image_name ──┬── oci_image_id ───► image_composition_artifact ──► lower
+//!                └── stored_image_id ► storage_image ──► streams/objects
+//! ```
+//!
+//! A name tags exactly one image. Records exist until removed or pruned;
+//! bytes are collected once no record, machine or operation references them.
 use std::fs;
 use std::path::Path;
 
@@ -5,10 +14,8 @@ use async_trait::async_trait;
 use sqlx::Row;
 
 use crate::image::oci::storage_error;
-use crate::image::{
-    ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport, ImageRemoveOptions,
-    OciImageConfigMetadata,
-};
+use crate::image::{ImageLayerDetail, ImagePruneReport, OciImageConfigMetadata};
+use crate::storage::identity::ImageId;
 use crate::store::models::{
     CacheCleanupDeferral, CacheRecoveryReport, ImageCompositionArtifactRecord, ImageConfigRecord,
     ImageLayerRecord, ImageManifestLayerRecord, ImageManifestRecord, ImageRefRecord,
@@ -59,7 +66,7 @@ impl ImageStore for Store {
         reference: &str,
         platform: &oci::Platform,
     ) -> Result<Option<OciImageRecord>, LibVmError> {
-        cached_oci_image(&self.pool, reference, platform).await
+        cached_oci_image(&mut *self.pool.acquire().await?, reference, platform).await
     }
     async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError> {
         let coherent_layers = image.layers.len() <= 1024
@@ -76,16 +83,19 @@ impl ImageStore for Store {
                         && occurrence.layer_diff_id == layer.diff_id
                         && occurrence.layer_blob_digest == layer.blob_digest
                 });
-        if image.reference.manifest_digest != image.manifest.digest
-            || image.config.manifest_digest != image.manifest.digest
+        if image.config.manifest_digest != image.manifest.digest
             || image.artifact.manifest_digest != image.manifest.digest
             || image.manifest.config_digest.as_deref() != Some(image.config.digest.as_str())
             || image.artifact.config_digest != image.config.digest
             || image.artifact.image_id != image.manifest.image_id
-            || image.reference.image_id != image.manifest.image_id
             || image.artifact.platform_os != image.manifest.platform_os
             || image.artifact.platform_architecture != image.manifest.platform_architecture
             || image.artifact.platform_variant != image.manifest.platform_variant
+            || image.reference.selected_reference
+                != crate::store::names::pinned_reference(
+                    &image.reference.requested_reference,
+                    &image.manifest.digest,
+                )
             || !coherent_layers
         {
             return Err(LibVmError::InvalidCreateRequest {
@@ -117,25 +127,6 @@ impl ImageStore for Store {
         .bind(image.manifest.total_size_bytes)
         .bind(image.manifest.created_at)
         .bind(image.manifest.last_used_at)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO image_ref
-                (requested_reference, selected_reference, manifest_digest, created_at, updated_at, last_used_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(requested_reference) DO UPDATE SET
-                 selected_reference = excluded.selected_reference,
-                 manifest_digest = excluded.manifest_digest,
-                updated_at = excluded.updated_at,
-                last_used_at = excluded.last_used_at",
-        )
-        .bind(&image.reference.requested_reference)
-        .bind(&image.reference.selected_reference)
-        .bind(&image.reference.manifest_digest)
-        .bind(image.reference.created_at)
-        .bind(image.reference.updated_at)
-        .bind(image.reference.last_used_at)
         .execute(&mut *tx)
         .await?;
 
@@ -200,104 +191,291 @@ impl ImageStore for Store {
         }
 
         upsert_artifact(&mut tx, &image.artifact).await?;
+        move_image_name(
+            &mut tx,
+            &image.reference.requested_reference,
+            LocalImage::Oci(oci_image_id(&image.artifact.image_id)?),
+            image.reference.updated_at,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
 
-    async fn image_handle(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError> {
-        let row = sqlx::query(IMAGE_HANDLE_BY_REFERENCE_QUERY)
-            .bind(reference)
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(image_handle_from_row).transpose()
-    }
-
-    async fn list_image_handles(&self) -> Result<Vec<ImageHandle>, LibVmError> {
-        let rows = sqlx::query(IMAGE_HANDLE_LIST_QUERY)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter().map(image_handle_from_row).collect()
-    }
-
-    async fn image_detail(&self, reference: &str) -> Result<Option<ImageDetail>, LibVmError> {
-        let Some(handle) = self.image_handle(reference).await? else {
-            return Ok(None);
-        };
-        let config = image_config(&self.pool, &handle.selected_manifest_digest).await?;
-
-        let rows = sqlx::query(
-            "SELECT l.blob_digest, l.diff_id, ml.media_type,
-                    l.compressed_size_bytes, l.uncompressed_size_bytes, ml.position
-             FROM image_manifest_layer ml
-             JOIN image_layer l ON l.diff_id = ml.layer_diff_id AND l.blob_digest = ml.layer_blob_digest
-             WHERE ml.manifest_digest = ?1
-             ORDER BY ml.position",
-        )
-        .bind(&handle.selected_manifest_digest)
-        .fetch_all(&self.pool)
-        .await?;
-        let layers = rows
-            .into_iter()
-            .map(image_layer_from_row)
-            .collect::<Result<_, _>>()?;
-        Ok(Some(ImageDetail {
-            handle,
-            config,
-            layers,
-        }))
-    }
-
-    async fn ensure_image_removable(
-        &self,
-        reference: &str,
-        _options: ImageRemoveOptions,
-    ) -> Result<ImageHandle, LibVmError> {
-        let Some(handle) = self.image_handle(reference).await? else {
-            return Err(LibVmError::ImageNotFound {
-                reference: reference.to_string(),
-            });
-        };
-
-        Ok(handle)
-    }
-
-    async fn remove_image(
-        &self,
-        reference: &str,
-        options: ImageRemoveOptions,
-    ) -> Result<(), LibVmError> {
-        self.ensure_image_removable(reference, options).await?;
-
-        sqlx::query("DELETE FROM image_ref WHERE requested_reference = ?1")
-            .bind(reference)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     async fn prune_images(&self) -> Result<ImagePruneReport, LibVmError> {
-        // Retire unreferenced selections first so one prune collects the
-        // whole graph: artifact ─► composition ─► layers ─► objects ─► packs.
-        let artifacts = self.retire_image_artifacts().await?;
+        // Retire unnamed, unused images first so one prune collects the whole
+        // graph: artifact ─► composition ─► layers ─► objects ─► packs, and
+        // stored image ─► streams/objects.
+        let images = self.retire_unnamed_images().await?;
         self.retire_layer_cache().await?;
         if self.recover_layer_objects().await?.checkpoint_deferred() {
             return Ok(ImagePruneReport {
-                references_removed: 0,
-                artifacts_removed: artifacts,
+                images_removed: images,
                 bytes_removed: 0,
             });
         }
         let (mut report, _) = self.prune_image_cache(CacheMaintenance::Prune).await?;
-        report.artifacts_removed = report.artifacts_removed.saturating_add(artifacts);
+        report.images_removed = report.images_removed.saturating_add(images);
         Ok(report)
     }
 }
 
+/// One local image record of either kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalImage {
+    /// A cached OCI selection, by selected manifest digest.
+    Oci(ImageId),
+    /// A stored raw image.
+    Stored(ImageId),
+}
+
+impl LocalImage {
+    pub(crate) fn id(self) -> ImageId {
+        match self {
+            Self::Oci(id) | Self::Stored(id) => id,
+        }
+    }
+}
+
+fn oci_image_id(value: &str) -> Result<ImageId, LibVmError> {
+    value.parse().map_err(|_| LibVmError::StateDecode {
+        field: "image_composition_artifact.image_id",
+        message: format!("{value:?} is not a sha256 manifest digest"),
+    })
+}
+
+fn name_target(row: &sqlx::sqlite::SqliteRow) -> Result<LocalImage, LibVmError> {
+    match (
+        row.try_get::<Option<String>, _>("oci_image_id")?,
+        row.try_get::<Option<String>, _>("stored_image_id")?,
+    ) {
+        (Some(id), None) => Ok(LocalImage::Oci(oci_image_id(&id)?)),
+        (None, Some(id)) => Ok(LocalImage::Stored(oci_image_id(&id)?)),
+        _ => Err(LibVmError::StateDecode {
+            field: "image_name",
+            message: "a name must tag exactly one image".into(),
+        }),
+    }
+}
+
+/// The image an exact name tags, if any.
+pub(crate) async fn named_image(
+    connection: &mut sqlx::SqliteConnection,
+    name: &str,
+) -> Result<Option<LocalImage>, LibVmError> {
+    sqlx::query("SELECT oci_image_id,stored_image_id FROM image_name WHERE name=?1")
+        .bind(name)
+        .fetch_optional(connection)
+        .await?
+        .as_ref()
+        .map(name_target)
+        .transpose()
+}
+
+/// The image of either kind with exactly this id, if any.
+pub(crate) async fn image_by_id(
+    connection: &mut sqlx::SqliteConnection,
+    id: ImageId,
+) -> Result<Option<LocalImage>, LibVmError> {
+    let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM image_composition_artifact WHERE image_id=?1) AS oci,EXISTS(SELECT 1 FROM storage_image WHERE id=?1) AS stored")
+        .bind(id.to_string())
+        .fetch_one(connection)
+        .await?;
+    Ok(
+        match (
+            row.try_get::<bool, _>("oci")?,
+            row.try_get::<bool, _>("stored")?,
+        ) {
+            (true, _) => Some(LocalImage::Oci(id)),
+            (false, true) => Some(LocalImage::Stored(id)),
+            (false, false) => None,
+        },
+    )
+}
+
+/// Images of either kind whose id starts with `prefix` (hex, without
+/// `sha256:`), bounded to two: one is a match, two is ambiguous.
+pub(crate) async fn image_prefix(
+    connection: &mut sqlx::SqliteConnection,
+    prefix: &str,
+) -> Result<Vec<LocalImage>, LibVmError> {
+    let rows = sqlx::query("SELECT image_id AS id,1 AS oci FROM image_composition_artifact WHERE substr(image_id,8,length(?1))=?1 UNION ALL SELECT id,0 AS oci FROM storage_image WHERE substr(id,8,length(?1))=?1 ORDER BY id LIMIT 2")
+        .bind(prefix)
+        .fetch_all(connection)
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let id = oci_image_id(&row.try_get::<String, _>("id")?)?;
+            Ok(if row.try_get::<bool, _>("oci")? {
+                LocalImage::Oci(id)
+            } else {
+                LocalImage::Stored(id)
+            })
+        })
+        .collect()
+}
+
+fn name_columns(image: LocalImage) -> (Option<String>, Option<String>) {
+    match image {
+        LocalImage::Oci(id) => (Some(id.to_string()), None),
+        LocalImage::Stored(id) => (None, Some(id.to_string())),
+    }
+}
+
+/// Add a user-chosen `name` to `image`. A name already naming another image
+/// is refused; naming the same image again is a no-op.
+pub(crate) async fn insert_image_name(
+    connection: &mut sqlx::SqliteConnection,
+    name: &str,
+    image: LocalImage,
+) -> Result<(), LibVmError> {
+    match named_image(&mut *connection, name).await? {
+        Some(existing) if existing == image => Ok(()),
+        Some(_) => Err(LibVmError::ImageNameConflict {
+            name: name.to_owned(),
+        }),
+        None => {
+            let (oci, stored) = name_columns(image);
+            sqlx::query("INSERT INTO image_name(name,oci_image_id,stored_image_id,updated_at) VALUES(?1,?2,?3,?4)")
+                .bind(name)
+                .bind(oci)
+                .bind(stored)
+                .bind(chrono::Utc::now().timestamp())
+                .execute(connection)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Point a pulled registry reference at `image`, moving it from any previous
+/// image. The previous record stays, listed by id, until removed or pruned.
+pub(crate) async fn move_image_name(
+    connection: &mut sqlx::SqliteConnection,
+    name: &str,
+    image: LocalImage,
+    updated_at: i64,
+) -> Result<(), LibVmError> {
+    crate::store::names::validate_stored_name(name)?;
+    let (oci, stored) = name_columns(image);
+    sqlx::query("INSERT INTO image_name(name,oci_image_id,stored_image_id,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(name) DO UPDATE SET oci_image_id=excluded.oci_image_id,stored_image_id=excluded.stored_image_id,updated_at=excluded.updated_at")
+        .bind(name)
+        .bind(oci)
+        .bind(stored)
+        .bind(updated_at)
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
+async fn image_names(
+    connection: &mut sqlx::SqliteConnection,
+    image: LocalImage,
+) -> Result<Vec<String>, LibVmError> {
+    let query = match image {
+        LocalImage::Oci(_) => "SELECT name FROM image_name WHERE oci_image_id=?1 ORDER BY name",
+        LocalImage::Stored(_) => {
+            "SELECT name FROM image_name WHERE stored_image_id=?1 ORDER BY name"
+        }
+    };
+    Ok(sqlx::query_scalar::<_, String>(query)
+        .bind(image.id().to_string())
+        .fetch_all(connection)
+        .await?)
+}
+
+/// Delete one image record whose names are already gone. Stored dependencies,
+/// provenance and acquisitions cascade; an OCI lower stays rooted by any
+/// machine or operation that uses it until the layer collector runs.
+async fn delete_image(
+    connection: &mut sqlx::SqliteConnection,
+    image: LocalImage,
+    reference: &str,
+) -> Result<(), LibVmError> {
+    match image {
+        LocalImage::Oci(id) => {
+            sqlx::query("DELETE FROM image_composition_artifact WHERE image_id=?1")
+                .bind(id.to_string())
+                .execute(connection)
+                .await?;
+        }
+        LocalImage::Stored(id) => {
+            let importing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='image' AND managed_id=?1)")
+                .bind(id.to_string())
+                .fetch_one(&mut *connection)
+                .await?;
+            if importing {
+                return Err(LibVmError::RecordInUse {
+                    reference: reference.to_owned(),
+                });
+            }
+            sqlx::query("DELETE FROM storage_image WHERE id=?1")
+                .bind(id.to_string())
+                .execute(connection)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 impl Store {
-    /// Delete composition rows of OCI selections no reference names. A lower
-    /// still pinned by a live operation keeps its row until released; the
+    /// Docker tag semantics. With `name`, remove that name, and the record
+    /// once no name remains; without, remove the record and all its names.
+    pub(crate) async fn remove_image(
+        &self,
+        image: LocalImage,
+        name: Option<&str>,
+    ) -> Result<crate::ImageRemoval, LibVmError> {
+        let store = self.clone();
+        let name = name.map(str::to_owned);
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(async {
+                let pool = crate::storage::pool::StoragePool::open(&store.images_dir)?;
+                let _roots = pool.lock_roots()?;
+                let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+                let reference = name.clone().unwrap_or_else(|| image.id().to_string());
+                let names = match &name {
+                    Some(name) => {
+                        if named_image(&mut tx, name).await? != Some(image) {
+                            return Err(LibVmError::ImageNotFound {
+                                reference: name.clone(),
+                            });
+                        }
+                        vec![name.clone()]
+                    }
+                    None => {
+                        if image_by_id(&mut tx, image.id()).await? != Some(image) {
+                            return Err(LibVmError::ImageNotFound { reference });
+                        }
+                        image_names(&mut tx, image).await?
+                    }
+                };
+                for name in &names {
+                    sqlx::query("DELETE FROM image_name WHERE name=?1")
+                        .bind(name)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                let record_removed = image_names(&mut tx, image).await?.is_empty();
+                if record_removed {
+                    delete_image(&mut tx, image, &reference).await?;
+                }
+                tx.commit().await?;
+                Ok(crate::ImageRemoval {
+                    id: image.id(),
+                    names,
+                    record_removed,
+                })
+            })
+        })
+        .await?
+    }
+
+    /// Delete images no name, machine or operation references. A lower still
+    /// pinned by a live operation keeps its row until released; the
     /// composition graph itself is retired by the layer collector afterwards.
-    async fn retire_image_artifacts(&self) -> Result<u64, LibVmError> {
+    async fn retire_unnamed_images(&self) -> Result<u64, LibVmError> {
         let store = self.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
@@ -308,18 +486,21 @@ impl Store {
                 loop {
                     let _roots = pool.lock_roots()?;
                     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                    let ids = sqlx::query_scalar::<_, String>("SELECT image_id FROM image_composition_artifact a WHERE NOT EXISTS(SELECT 1 FROM image_ref r WHERE r.manifest_digest=a.manifest_digest) AND NOT EXISTS(SELECT 1 FROM storage_operation_lower p WHERE p.lower_id=a.lower_id) ORDER BY image_id LIMIT 256")
+                    let oci = sqlx::query_scalar::<_, String>("SELECT image_id FROM image_composition_artifact a WHERE NOT EXISTS(SELECT 1 FROM image_name n WHERE n.oci_image_id=a.image_id) AND NOT EXISTS(SELECT 1 FROM machine_rootfs m WHERE m.image_id=a.image_id) AND NOT EXISTS(SELECT 1 FROM storage_operation_lower p WHERE p.lower_id=a.lower_id) ORDER BY image_id LIMIT 256")
                         .fetch_all(&mut *tx)
                         .await?;
-                    for id in &ids {
-                        sqlx::query("DELETE FROM image_composition_artifact WHERE image_id=?1")
-                            .bind(id)
-                            .execute(&mut *tx)
-                            .await?;
+                    let stored = sqlx::query_scalar::<_, String>("SELECT id FROM storage_image i WHERE NOT EXISTS(SELECT 1 FROM image_name n WHERE n.stored_image_id=i.id) AND NOT EXISTS(SELECT 1 FROM machine_rootfs m WHERE m.image_id=i.id) AND NOT EXISTS(SELECT 1 FROM storage_operation_managed p WHERE p.managed_kind='image' AND p.managed_id=i.id) ORDER BY id LIMIT 256")
+                        .fetch_all(&mut *tx)
+                        .await?;
+                    for id in &oci {
+                        delete_image(&mut tx, LocalImage::Oci(oci_image_id(id)?), id).await?;
+                    }
+                    for id in &stored {
+                        delete_image(&mut tx, LocalImage::Stored(oci_image_id(id)?), id).await?;
                     }
                     tx.commit().await?;
-                    removed = removed.saturating_add(ids.len() as u64);
-                    if ids.len() < 256 {
+                    removed = removed.saturating_add((oci.len() + stored.len()) as u64);
+                    if oci.len() < 256 && stored.len() < 256 {
                         return Ok::<u64, LibVmError>(removed);
                     }
                 }
@@ -557,8 +738,7 @@ impl Store {
         let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
         let mut recovery = self.retire_abandoned_storage_operations(&pool).await?;
         let mut report = ImagePruneReport {
-            references_removed: 0,
-            artifacts_removed: 0,
+            images_removed: 0,
             bytes_removed: 0,
         };
         if recovery.checkpoint_deferred() {
@@ -571,7 +751,7 @@ impl Store {
         if maintenance != CacheMaintenance::Recovery {
             self.check_operation_recovery(&pool).await?;
             crate::store::snapshot_store::check_snapshot_catalog(self).await?;
-            crate::store::managed_image_store::check_image_catalog(self).await?;
+            crate::store::stored_image_store::check_image_catalog(self).await?;
             crate::store::stream_representation::check_catalog(self).await?;
             crate::store::cache_paths::check_machine_dependencies(self).await?;
         }
@@ -598,7 +778,7 @@ impl Store {
             sqlx::query("INSERT INTO image_stream_gc(stream_id,size_bytes) SELECT json_extract(c.value,'$[0]'),json_extract(c.value,'$[1]') FROM json_each(?1) c LEFT JOIN retained_stream r ON r.stream_id=json_extract(c.value,'$[0]') WHERE r.stream_id IS NULL ON CONFLICT(stream_id) DO NOTHING")
                 .bind(serde_json::to_string(&discovered).map_err(crate::store::models::snapshot::invalid)?)
                 .execute(&mut *tx).await?;
-            sqlx::query("DELETE FROM image_manifest WHERE NOT EXISTS(SELECT 1 FROM image_ref r WHERE r.manifest_digest=image_manifest.digest) AND NOT EXISTS(SELECT 1 FROM image_composition_artifact a WHERE a.manifest_digest=image_manifest.digest)").execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM image_manifest WHERE NOT EXISTS(SELECT 1 FROM image_composition_artifact a WHERE a.manifest_digest=image_manifest.digest)").execute(&mut *tx).await?;
             sqlx::query("DELETE FROM image_layer WHERE NOT EXISTS(SELECT 1 FROM image_manifest_layer ml WHERE ml.layer_diff_id=image_layer.diff_id AND ml.layer_blob_digest=image_layer.blob_digest)").execute(&mut *tx).await?;
             if !scan_finished {
                 pending_cursor.clear();
@@ -708,25 +888,99 @@ fn validate_collectable_stream(
     Ok(true)
 }
 
-const IMAGE_HANDLE_BY_REFERENCE_QUERY: &str =
-    "SELECT r.requested_reference, r.selected_reference, r.manifest_digest,
-            m.config_digest, m.image_id, m.platform_os,
-            m.platform_architecture, m.platform_variant, a.lower_length AS size_bytes,
-            r.created_at, r.updated_at, r.last_used_at
-     FROM image_ref r
-     JOIN image_manifest m ON m.digest = r.manifest_digest
-     LEFT JOIN image_composition_artifact a ON a.manifest_digest = r.manifest_digest
-      WHERE r.requested_reference = ?1";
+/// Inspect one cached OCI image; `None` when no such selection exists.
+pub(crate) async fn oci_image_info(
+    connection: &mut sqlx::SqliteConnection,
+    id: ImageId,
+) -> Result<Option<crate::OciImageInfo>, LibVmError> {
+    let Some(row) = sqlx::query(
+        "SELECT a.manifest_digest, a.config_digest, a.platform_os, a.platform_architecture,
+                a.platform_variant, a.lower_length, a.created_at, a.last_used_at,
+                m.total_size_bytes
+         FROM image_composition_artifact a
+         JOIN image_manifest m ON m.digest = a.manifest_digest
+         WHERE a.image_id = ?1",
+    )
+    .bind(id.to_string())
+    .fetch_optional(&mut *connection)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let manifest: String = row.try_get("manifest_digest")?;
+    let config = image_config(&mut *connection, &manifest).await?;
+    let layers = sqlx::query(
+        "SELECT l.blob_digest, l.diff_id, ml.media_type,
+                l.compressed_size_bytes, l.uncompressed_size_bytes, ml.position
+         FROM image_manifest_layer ml
+         JOIN image_layer l ON l.diff_id = ml.layer_diff_id AND l.blob_digest = ml.layer_blob_digest
+         WHERE ml.manifest_digest = ?1
+         ORDER BY ml.position LIMIT 1025",
+    )
+    .bind(&manifest)
+    .fetch_all(&mut *connection)
+    .await?
+    .into_iter()
+    .map(image_layer_from_row)
+    .collect::<Result<Vec<_>, _>>()?;
+    let names = image_names(&mut *connection, LocalImage::Oci(id)).await?;
+    for name in &names {
+        crate::store::names::validate_stored_name(name)?;
+    }
+    Ok(Some(crate::OciImageInfo {
+        id,
+        names,
+        config_digest: row.try_get("config_digest")?,
+        platform: oci::Platform {
+            os: row.try_get("platform_os")?,
+            architecture: row.try_get("platform_architecture")?,
+            variant: row.try_get("platform_variant")?,
+        },
+        config,
+        layers,
+        lower_length: u64_from_i64(row.try_get("lower_length")?)?,
+        compressed_size_bytes: u64_from_i64(row.try_get("total_size_bytes")?)?,
+        created_at: row.try_get("created_at")?,
+        last_used_at: row.try_get("last_used_at")?,
+    }))
+}
 
-const IMAGE_HANDLE_LIST_QUERY: &str =
-    "SELECT r.requested_reference, r.selected_reference, r.manifest_digest,
-            m.config_digest, m.image_id, m.platform_os,
-            m.platform_architecture, m.platform_variant, a.lower_length AS size_bytes,
-            r.created_at, r.updated_at, r.last_used_at
-     FROM image_ref r
-     JOIN image_manifest m ON m.digest = r.manifest_digest
-     LEFT JOIN image_composition_artifact a ON a.manifest_digest = r.manifest_digest
-      ORDER BY r.requested_reference";
+/// Inspect one local image of either kind. Read-only: no lease, no byte read.
+pub(crate) async fn image_info(
+    connection: &mut sqlx::SqliteConnection,
+    image: LocalImage,
+    reference: &str,
+) -> Result<crate::ImageInfo, LibVmError> {
+    match image {
+        LocalImage::Oci(id) => oci_image_info(connection, id)
+            .await?
+            .map(|info| crate::ImageInfo::Oci(Box::new(info)))
+            .ok_or_else(|| LibVmError::ImageNotFound {
+                reference: reference.to_owned(),
+            }),
+        LocalImage::Stored(id) => Ok(crate::ImageInfo::Stored(Box::new(
+            crate::store::stored_image_store::stored_image_info(connection, id).await?,
+        ))),
+    }
+}
+
+/// Every cached OCI image, ordered by id.
+pub(crate) async fn list_oci_images(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<Vec<crate::OciImageInfo>, LibVmError> {
+    let ids = sqlx::query_scalar::<_, String>(
+        "SELECT image_id FROM image_composition_artifact ORDER BY image_id",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut images = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(info) = oci_image_info(&mut *connection, oci_image_id(&id)?).await? {
+            images.push(info);
+        }
+    }
+    Ok(images)
+}
 
 /// Insert or verify the selection's immutable lower, refreshing only use time.
 async fn upsert_artifact(
@@ -775,28 +1029,8 @@ async fn upsert_artifact(
     Ok(())
 }
 
-fn image_handle_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ImageHandle, LibVmError> {
-    Ok(ImageHandle {
-        requested_reference: row.try_get("requested_reference")?,
-        selected_reference: row.try_get("selected_reference")?,
-        selected_manifest_digest: row.try_get("manifest_digest")?,
-        config_digest: row.try_get("config_digest")?,
-        image_id: row.try_get("image_id")?,
-        platform_os: row.try_get("platform_os")?,
-        platform_architecture: row.try_get("platform_architecture")?,
-        platform_variant: row.try_get("platform_variant")?,
-        size_bytes: row
-            .try_get::<Option<i64>, _>("size_bytes")?
-            .map(u64_from_i64)
-            .transpose()?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-        last_used_at: row.try_get("last_used_at")?,
-    })
-}
-
 async fn image_config(
-    pool: &sqlx::SqlitePool,
+    connection: &mut sqlx::SqliteConnection,
     manifest_digest: &str,
 ) -> Result<OciImageConfigMetadata, LibVmError> {
     let row = sqlx::query(
@@ -806,7 +1040,7 @@ async fn image_config(
          FROM image_config WHERE manifest_digest = ?1",
     )
     .bind(manifest_digest)
-    .fetch_optional(pool)
+    .fetch_optional(connection)
     .await?
     .ok_or_else(|| LibVmError::StateDecode {
         field: "image_config.manifest_digest",
@@ -971,12 +1205,14 @@ impl ReadOnlyStore {
         reference: &str,
         platform: &oci::Platform,
     ) -> Result<Option<OciImageRecord>, LibVmError> {
-        cached_oci_image(&self.pool, reference, platform).await
+        cached_oci_image(&mut *self.pool.acquire().await?, reference, platform).await
     }
 }
 
+/// The cached selection named exactly `reference`, or the selection whose
+/// manifest digest a digest-pinned `reference` names, for `platform`.
 async fn cached_oci_image(
-    pool: &sqlx::SqlitePool,
+    connection: &mut sqlx::SqliteConnection,
     reference: &str,
     platform: &oci::Platform,
 ) -> Result<Option<OciImageRecord>, LibVmError> {
@@ -987,20 +1223,24 @@ async fn cached_oci_image(
             .map_err(|error| storage_error(error.into()))?;
     }
     let row = sqlx::query(
-        "SELECT CASE WHEN ?5 IS NULL THEN r.requested_reference ELSE ?1 END AS requested_reference,
-                CASE WHEN ?5 IS NULL THEN r.selected_reference ELSE ?1 END AS selected_reference,
-                COALESCE(r.created_at, m.created_at) AS ref_created_at,
-                COALESCE(r.updated_at, m.created_at) AS updated_at, r.last_used_at AS ref_last_used_at,
+        "SELECT CASE WHEN ?5 IS NULL THEN n.name ELSE ?1 END AS requested_reference,
+                COALESCE(n.updated_at, m.created_at) AS updated_at,
                 m.*, a.lower_id, a.lower_length,
                 a.created_at AS artifact_created_at, a.last_used_at AS artifact_last_used_at
          FROM image_manifest m JOIN image_composition_artifact a ON a.manifest_digest = m.digest
-         LEFT JOIN image_ref r ON r.manifest_digest = m.digest
-         WHERE (r.requested_reference = ?1 OR r.selected_reference = ?1 OR m.digest = ?5)
+         LEFT JOIN image_name n ON n.oci_image_id = a.image_id AND n.name = ?1
+         WHERE (n.name IS NOT NULL OR m.digest = ?5)
            AND m.platform_os = ?2 AND m.platform_architecture = ?3
            AND m.platform_variant IS ?4
-         ORDER BY r.requested_reference LIMIT 1",
-    ).bind(reference).bind(&platform.os).bind(&platform.architecture).bind(&platform.variant)
-        .bind(selected_digest).fetch_optional(pool).await?;
+         LIMIT 1",
+    )
+    .bind(reference)
+    .bind(&platform.os)
+    .bind(&platform.architecture)
+    .bind(&platform.variant)
+    .bind(selected_digest)
+    .fetch_optional(&mut *connection)
+    .await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -1016,10 +1256,10 @@ async fn cached_oci_image(
             field: "image_composition_artifact.lower_id",
             message: error.to_string(),
         })?;
-    let config = image_config(pool, &digest).await?;
+    let config = image_config(&mut *connection, &digest).await?;
     let layer_rows = sqlx::query(
         "SELECT l.*, ml.position, ml.media_type FROM image_manifest_layer ml JOIN image_layer l ON l.diff_id = ml.layer_diff_id AND l.blob_digest = ml.layer_blob_digest WHERE ml.manifest_digest = ?1 ORDER BY ml.position LIMIT 1025",
-    ).bind(&digest).fetch_all(pool).await?;
+    ).bind(&digest).fetch_all(&mut *connection).await?;
     if layer_rows.len() > 1024 || row.try_get::<i64, _>("layer_count")? != layer_rows.len() as i64 {
         return Err(LibVmError::StateDecode {
             field: "image.layers",
@@ -1060,18 +1300,13 @@ async fn cached_oci_image(
             created_at,
             last_used_at: row.try_get("last_used_at")?,
         },
-        reference: ImageRefRecord {
-            requested_reference: row.try_get("requested_reference")?,
-            selected_reference: row.try_get("selected_reference")?,
-            manifest_digest: digest.clone(),
-            image_id: image_id.clone(),
-            platform_os: platform.os.clone(),
-            platform_architecture: platform.architecture.clone(),
-            platform_variant: platform.variant.clone(),
-            size_bytes: Some(lower_length),
-            created_at: row.try_get("ref_created_at")?,
-            updated_at: row.try_get("updated_at")?,
-            last_used_at: row.try_get("ref_last_used_at")?,
+        reference: {
+            let requested: String = row.try_get("requested_reference")?;
+            ImageRefRecord {
+                selected_reference: crate::store::names::pinned_reference(&requested, &digest),
+                requested_reference: requested,
+                updated_at: row.try_get("updated_at")?,
+            }
         },
         config: ImageConfigRecord {
             manifest_digest: digest.clone(),
@@ -1097,7 +1332,7 @@ async fn cached_oci_image(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
 
     use crate::image::oci::tests::LAYERS;
@@ -1105,11 +1340,18 @@ mod tests {
     use crate::paths::LocalPaths;
     use crate::storage::pool::StoragePool;
     use crate::store::composition_store::{HeldComposition, RetainedComposition};
+    use crate::store::image_store::LocalImage;
     use crate::store::models::{
         ImageCompositionArtifactRecord, ImageConfigRecord, ImageManifestRecord, ImageRefRecord,
         OciImageRecord,
     };
     use crate::store::{ImageStore, MachineStore, Store};
+
+    pub(crate) const REFERENCE: &str = "example.test/demo:latest";
+
+    fn digest(fill: char) -> String {
+        format!("sha256:{}", fill.to_string().repeat(64))
+    }
 
     /// A real retained composition with no image rows; its lease roots it.
     async fn lower(db: &Store, names: &[&str]) -> HeldComposition {
@@ -1120,37 +1362,32 @@ mod tests {
         sqlx::query_scalar(sql).fetch_one(&db.pool).await.unwrap()
     }
 
-    fn oci_image_record(lower: &RetainedComposition) -> OciImageRecord {
+    /// A cached selection of `lower` named [`REFERENCE`].
+    pub(crate) fn oci_image_record(lower: &RetainedComposition) -> OciImageRecord {
+        let manifest = digest('1');
+        let config = digest('2');
         OciImageRecord {
             manifest: ImageManifestRecord {
-                digest: "sha256:manifest".to_string(),
+                digest: manifest.clone(),
                 media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
-                image_id: "sha256:image-id".to_string(),
+                image_id: manifest.clone(),
                 platform_os: "linux".to_string(),
                 platform_architecture: "amd64".to_string(),
                 platform_variant: None,
-                config_digest: Some("sha256:config".to_string()),
+                config_digest: Some(config.clone()),
                 layer_count: 0,
                 total_size_bytes: 6,
                 created_at: 1,
                 last_used_at: Some(2),
             },
             reference: ImageRefRecord {
-                requested_reference: "example.test/demo:latest".to_string(),
-                selected_reference: "example.test/demo@sha256:manifest".to_string(),
-                manifest_digest: "sha256:manifest".to_string(),
-                image_id: "sha256:image-id".to_string(),
-                platform_os: "linux".to_string(),
-                platform_architecture: "amd64".to_string(),
-                platform_variant: None,
-                size_bytes: Some(lower.result.lower_length),
-                created_at: 1,
+                requested_reference: REFERENCE.to_string(),
+                selected_reference: format!("example.test/demo@{manifest}"),
                 updated_at: 2,
-                last_used_at: Some(2),
             },
             config: ImageConfigRecord {
-                manifest_digest: "sha256:manifest".to_string(),
-                digest: "sha256:config".to_string(),
+                manifest_digest: manifest.clone(),
+                digest: config.clone(),
                 metadata: OciImageConfigMetadata {
                     entrypoint: Some(Vec::new()),
                     cmd: None,
@@ -1165,9 +1402,9 @@ mod tests {
             layers: Vec::new(),
             manifest_layers: Vec::new(),
             artifact: ImageCompositionArtifactRecord {
-                image_id: "sha256:image-id".to_string(),
-                manifest_digest: "sha256:manifest".to_string(),
-                config_digest: "sha256:config".to_string(),
+                image_id: manifest.clone(),
+                manifest_digest: manifest,
+                config_digest: config,
                 platform_os: "linux".to_string(),
                 platform_architecture: "amd64".to_string(),
                 platform_variant: None,
@@ -1179,75 +1416,205 @@ mod tests {
         }
     }
 
+    /// Name `image` `reference`, keeping its derived pinned reference coherent.
+    pub(crate) fn named(mut image: OciImageRecord, reference: &str) -> OciImageRecord {
+        image.reference.selected_reference =
+            crate::store::names::pinned_reference(reference, &image.manifest.digest);
+        image.reference.requested_reference = reference.into();
+        image
+    }
+
+    /// Select another manifest digest, keeping every digest-bound row coherent.
+    fn redigest(mut image: OciImageRecord, manifest: String) -> OciImageRecord {
+        image.manifest.digest = manifest.clone();
+        image.manifest.image_id = manifest.clone();
+        image.config.manifest_digest = manifest.clone();
+        image.artifact.manifest_digest = manifest.clone();
+        image.artifact.image_id = manifest.clone();
+        for occurrence in &mut image.manifest_layers {
+            occurrence.manifest_digest = manifest.clone();
+        }
+        let reference = image.reference.requested_reference.clone();
+        named(image, &reference)
+    }
+
+    pub(crate) fn oci_id(image: &OciImageRecord) -> crate::ImageId {
+        image.manifest.digest.parse().unwrap()
+    }
+
+    async fn named_image(db: &Store, name: &str) -> Option<LocalImage> {
+        let mut connection = db.pool.acquire().await.unwrap();
+        crate::store::image_store::named_image(&mut connection, name)
+            .await
+            .unwrap()
+    }
+
+    async fn info(db: &Store, name: &str) -> Option<crate::OciImageInfo> {
+        let Some(LocalImage::Oci(id)) = named_image(db, name).await else {
+            return None;
+        };
+        let mut connection = db.pool.acquire().await.unwrap();
+        crate::store::image_store::oci_image_info(&mut connection, id)
+            .await
+            .unwrap()
+    }
+
+    async fn listed(db: &Store) -> Vec<(crate::ImageId, Vec<String>)> {
+        let mut connection = db.pool.acquire().await.unwrap();
+        crate::store::image_store::list_oci_images(&mut connection)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|image| (image.id, image.names))
+            .collect()
+    }
+
     #[tokio::test]
-    async fn image_detail_round_trips_oci_identity_and_config_nullability() {
+    async fn oci_image_info_round_trips_identity_names_and_config_nullability() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(temp.path().join("state"));
         let db = Store::new(&paths).await.expect("open db");
         let held = lower(&db, &LAYERS[..1]).await;
-        db.save_oci_image(&oci_image_record(held.retained()))
-            .await
-            .expect("save OCI image");
+        let image = oci_image_record(held.retained());
+        db.save_oci_image(&image).await.expect("save OCI image");
 
-        let detail = db
-            .image_detail("example.test/demo:latest")
-            .await
-            .expect("inspect image")
-            .expect("image exists");
+        let info = info(&db, REFERENCE).await.expect("image exists");
+        assert_eq!(info.id, oci_id(&image));
+        assert_eq!(info.names, [REFERENCE]);
+        assert_eq!(info.config_digest, digest('2'));
+        assert_eq!(info.platform, oci::Platform::linux_amd64());
+        assert_eq!(info.lower_length, held.retained().result.lower_length);
+        assert_eq!(info.compressed_size_bytes, 6);
+        assert_eq!((info.created_at, info.last_used_at), (1, Some(2)));
+        assert_eq!(info.config.entrypoint, Some(Vec::new()));
+        assert_eq!(info.config.cmd, None);
+        assert_eq!(info.config.env, Some(vec!["A=B".to_string()]));
+        assert_eq!(info.config.working_dir.as_deref(), Some(""));
+        assert_eq!(info.config.labels, Some(Default::default()));
+        assert_eq!(info.config.stop_signal.as_deref(), Some("SIGQUIT"));
 
-        assert_eq!(
-            detail.handle.requested_reference,
-            "example.test/demo:latest"
-        );
-        assert_eq!(
-            detail.handle.selected_reference,
-            "example.test/demo@sha256:manifest"
-        );
-        assert_eq!(detail.handle.selected_manifest_digest, "sha256:manifest");
-        assert_eq!(detail.handle.config_digest, "sha256:config");
-        assert_eq!(detail.handle.image_id, "sha256:image-id");
-        assert_eq!(
-            detail.handle.size_bytes,
-            Some(held.retained().result.lower_length)
-        );
-        assert_eq!(detail.config.entrypoint, Some(Vec::new()));
-        assert_eq!(detail.config.cmd, None);
-        assert_eq!(detail.config.env, Some(vec!["A=B".to_string()]));
-        assert_eq!(detail.config.working_dir.as_deref(), Some(""));
-        assert_eq!(detail.config.labels, Some(Default::default()));
-        assert_eq!(detail.config.stop_signal.as_deref(), Some("SIGQUIT"));
+        let cached = db
+            .cached_oci_image(REFERENCE, &oci::Platform::linux_amd64())
+            .await
+            .unwrap()
+            .unwrap();
+        let pinned = format!("example.test/demo@{}", digest('1'));
+        assert_eq!(cached.reference.selected_reference, pinned);
+        // A digest-pinned spelling finds the selection without being a name.
+        let by_digest = db
+            .cached_oci_image(&pinned, &oci::Platform::linux_amd64())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_digest.artifact, image.artifact);
+        assert_eq!(named_image(&db, &pinned).await, None);
     }
 
     #[tokio::test]
-    async fn unreferenced_selection_is_retired_only_after_its_lower_pin_closes() {
+    async fn oci_rm_name_removes_one_name_and_rm_id_removes_the_record_and_every_name() {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("home"));
         let db = Store::new(&paths).await.unwrap();
         let held = lower(&db, &LAYERS[..1]).await;
         let image = oci_image_record(held.retained());
+        let id = oci_id(&image);
         db.save_oci_image(&image).await.unwrap();
-        db.remove_image(
-            &image.reference.requested_reference,
-            crate::ImageRemoveOptions::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(db.prune_images().await.unwrap().artifacts_removed, 0);
+        db.save_oci_image(&named(image.clone(), "example.test/alias:1"))
+            .await
+            .unwrap();
         assert_eq!(
-            count(&db, "SELECT COUNT(*) FROM image_composition_artifact").await,
-            1
+            listed(&db).await,
+            [(
+                id,
+                vec!["example.test/alias:1".to_owned(), REFERENCE.to_owned()]
+            )]
         );
-        drop(held);
-        assert_eq!(db.prune_images().await.unwrap().artifacts_removed, 1);
-        for table in [
-            "SELECT COUNT(*) FROM image_composition_artifact",
-            "SELECT COUNT(*) FROM image_manifest",
-            "SELECT COUNT(*) FROM composition_result",
-            "SELECT COUNT(*) FROM layer_result",
-        ] {
-            assert_eq!(count(&db, table).await, 0, "{table}");
-        }
-        assert_eq!(db.prune_images().await.unwrap().artifacts_removed, 0);
+        let removal = db
+            .remove_image(LocalImage::Oci(id), Some(REFERENCE))
+            .await
+            .unwrap();
+        assert_eq!(
+            removal,
+            crate::ImageRemoval {
+                id,
+                names: vec![REFERENCE.into()],
+                record_removed: false,
+            }
+        );
+        assert!(matches!(
+            db.remove_image(LocalImage::Oci(id), Some(REFERENCE)).await,
+            Err(crate::LibVmError::ImageNotFound { reference }) if reference == REFERENCE
+        ));
+        assert_eq!(
+            listed(&db).await,
+            [(id, vec!["example.test/alias:1".to_owned()])]
+        );
+        let removal = db.remove_image(LocalImage::Oci(id), None).await.unwrap();
+        assert_eq!(removal.names, ["example.test/alias:1"]);
+        assert!(removal.record_removed);
+        assert!(listed(&db).await.is_empty());
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM image_name").await, 0);
+        assert!(matches!(
+            db.remove_image(LocalImage::Oci(id), None).await,
+            Err(crate::LibVmError::ImageNotFound { .. })
+        ));
+        // A stored-kind lookup never matches the cached image's id.
+        db.save_oci_image(&image).await.unwrap();
+        assert!(matches!(
+            db.remove_image(LocalImage::Stored(id), None).await,
+            Err(crate::LibVmError::ImageNotFound { .. })
+        ));
+        assert_eq!(listed(&db).await, [(id, vec![REFERENCE.to_owned()])]);
+    }
+
+    #[tokio::test]
+    async fn moved_tag_leaves_the_old_image_unnamed_but_listed_until_unused_and_pruned() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let db = Store::new(&paths).await.unwrap();
+        let old_lower = lower(&db, &LAYERS[..1]).await;
+        let old = oci_image_record(old_lower.retained());
+        db.save_oci_image(&old).await.unwrap();
+        let new_lower = lower(&db, &LAYERS[1..2]).await;
+        let new = redigest(oci_image_record(new_lower.retained()), digest('3'));
+        db.save_oci_image(&new).await.unwrap();
+        assert_eq!(
+            listed(&db).await,
+            [
+                (oci_id(&old), Vec::new()),
+                (oci_id(&new), vec![REFERENCE.to_owned()])
+            ]
+        );
+        assert_eq!(
+            named_image(&db, REFERENCE).await,
+            Some(LocalImage::Oci(oci_id(&new)))
+        );
+        // Its producer still pins the unnamed selection's lower.
+        assert_eq!(db.prune_images().await.unwrap().images_removed, 0);
+        drop(old_lower);
+        let machine = crate::store::storage::tests::machine_using_image(
+            &db,
+            &paths,
+            crate::ImageSourceKind::Oci,
+            oci_id(&old),
+        )
+        .await;
+        assert_eq!(db.prune_images().await.unwrap().images_removed, 0);
+        assert_eq!(listed(&db).await.len(), 2);
+        db.remove_machine(&machine).await.unwrap();
+        assert_eq!(db.prune_images().await.unwrap().images_removed, 1);
+        assert_eq!(
+            listed(&db).await,
+            [(oci_id(&new), vec![REFERENCE.to_owned()])]
+        );
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM image_manifest").await, 1);
+        drop(new_lower);
+        assert_eq!(
+            db.prune_images().await.unwrap().images_removed,
+            0,
+            "a named image is never pruned"
+        );
+        assert_eq!(listed(&db).await.len(), 1);
     }
 
     #[tokio::test]
@@ -1305,11 +1672,7 @@ mod tests {
             })
             .collect();
         db.save_oci_image(&image).await.unwrap();
-        let detail = db
-            .image_detail(&image.reference.requested_reference)
-            .await
-            .unwrap()
-            .unwrap();
+        let detail = info(&db, REFERENCE).await.unwrap();
         assert_eq!(detail.layers.len(), 2);
         assert_eq!(detail.layers[0].diff_id, detail.layers[1].diff_id);
         assert_eq!(
@@ -1317,61 +1680,37 @@ mod tests {
             (0, 1)
         );
         let original_blob = detail.layers[0].blob_digest.clone();
-        let mut second = image.clone();
-        second.manifest.digest = format!("sha256:{}", "c".repeat(64));
-        second.manifest.image_id = second.manifest.digest.clone();
-        second.reference.requested_reference = "example.test/other:latest".into();
-        second.reference.manifest_digest = second.manifest.digest.clone();
-        second.reference.image_id = second.manifest.image_id.clone();
-        second.config.manifest_digest = second.manifest.digest.clone();
-        second.artifact.manifest_digest = second.manifest.digest.clone();
-        second.artifact.image_id = second.manifest.image_id.clone();
+        let mut second = named(
+            redigest(image.clone(), digest('c')),
+            "example.test/other:latest",
+        );
         for layer in &mut second.layers {
-            layer.blob_digest = format!("sha256:{}", "d".repeat(64));
+            layer.blob_digest = digest('d');
         }
         for layer in &mut second.manifest_layers {
-            layer.manifest_digest = second.manifest.digest.clone();
             layer.layer_blob_digest = second.layers[0].blob_digest.clone();
         }
         db.save_oci_image(&second).await.unwrap();
-        let original = db
-            .image_detail(&image.reference.requested_reference)
+        let original = info(&db, REFERENCE).await.unwrap();
+        let changed = info(&db, &second.reference.requested_reference)
             .await
-            .unwrap()
-            .unwrap();
-        let changed = db
-            .image_detail(&second.reference.requested_reference)
-            .await
-            .unwrap()
             .unwrap();
         assert_eq!(original.layers[0].blob_digest, original_blob);
         assert_ne!(
             original.layers[0].blob_digest,
             changed.layers[0].blob_digest
         );
-        let mut equivalent = image.clone();
-        equivalent.manifest.digest = format!("sha256:{}", "f".repeat(64));
-        equivalent.manifest.image_id = equivalent.manifest.digest.clone();
-        equivalent.reference.requested_reference = "example.test/equivalent:latest".into();
-        equivalent.reference.manifest_digest = equivalent.manifest.digest.clone();
-        equivalent.reference.image_id = equivalent.manifest.image_id.clone();
-        equivalent.config.manifest_digest = equivalent.manifest.digest.clone();
-        equivalent.artifact.manifest_digest = equivalent.manifest.digest.clone();
-        equivalent.artifact.image_id = equivalent.manifest.image_id.clone();
+        let mut equivalent = named(
+            redigest(image.clone(), digest('f')),
+            "example.test/equivalent:latest",
+        );
         for occurrence in &mut equivalent.manifest_layers {
-            occurrence.manifest_digest = equivalent.manifest.digest.clone();
             occurrence.media_type = "application/vnd.docker.image.rootfs.diff.tar".into();
         }
         db.save_oci_image(&equivalent).await.unwrap();
-        let preserved = db
-            .image_detail(&image.reference.requested_reference)
+        let preserved = info(&db, REFERENCE).await.unwrap();
+        let alternate = info(&db, &equivalent.reference.requested_reference)
             .await
-            .unwrap()
-            .unwrap();
-        let alternate = db
-            .image_detail(&equivalent.reference.requested_reference)
-            .await
-            .unwrap()
             .unwrap();
         assert_eq!(
             preserved.layers[0].media_type,
@@ -1384,7 +1723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_catalog_publication_rolls_back_reference_and_manifest() {
+    async fn failed_catalog_publication_rolls_back_name_and_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("home"));
         let db = Store::new(&paths).await.unwrap();
@@ -1393,7 +1732,8 @@ mod tests {
             .execute(&db.pool).await.unwrap();
         let image = oci_image_record(held.retained());
         assert!(db.save_oci_image(&image).await.is_err());
-        assert!(db.list_image_handles().await.unwrap().is_empty());
+        assert!(listed(&db).await.is_empty());
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM image_name").await, 0);
         assert_eq!(count(&db, "SELECT COUNT(*) FROM image_manifest").await, 0);
     }
 
@@ -1428,17 +1768,18 @@ mod tests {
         // Re-saving one selection with another composition never re-points it.
         let other = lower(&db, &LAYERS[1..2]).await;
         assert_ne!(other.retained().id, held.retained().id);
-        let mut repointed = oci_image_record(other.retained());
-        repointed.reference.requested_reference = "example.test/repointed:latest".into();
+        let repointed = named(
+            oci_image_record(other.retained()),
+            "example.test/repointed:latest",
+        );
         assert!(matches!(
             db.save_oci_image(&repointed).await,
             Err(crate::LibVmError::StateDecode { .. })
         ));
-        assert!(db
-            .image_handle("example.test/repointed:latest")
-            .await
-            .unwrap()
-            .is_none());
+        assert_eq!(
+            named_image(&db, "example.test/repointed:latest").await,
+            None
+        );
         let unchanged = db
             .cached_oci_image(reference, &oci::Platform::linux_amd64())
             .await
@@ -1457,12 +1798,11 @@ mod tests {
         let image = oci_image_record(&retained);
         db.save_oci_image(&image).await.unwrap();
         drop(held);
-        db.remove_image(
-            &image.reference.requested_reference,
-            crate::ImageRemoveOptions::default(),
-        )
-        .await
-        .unwrap();
+        // An unnamed record, as a moved tag leaves it.
+        sqlx::query("DELETE FROM image_name")
+            .execute(&db.pool)
+            .await
+            .unwrap();
         let pool = StoragePool::open(paths.images_dir()).unwrap();
         let fsmeta = pool.object_path(&retained.fsmeta());
         sqlx::query("CREATE TRIGGER reject_prune BEFORE DELETE ON image_composition_artifact BEGIN SELECT RAISE(ABORT, 'reject prune'); END")
@@ -1481,7 +1821,7 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        assert_eq!(db.prune_images().await.unwrap().artifacts_removed, 1);
+        assert_eq!(db.prune_images().await.unwrap().images_removed, 1);
         assert!(!fsmeta.exists());
     }
 
@@ -1500,14 +1840,14 @@ mod tests {
             .await
             .unwrap();
         let recovered = db.prune_images().await.unwrap();
-        assert_eq!(recovered.artifacts_removed, 0);
+        assert_eq!(recovered.images_removed, 0);
         assert_eq!(recovered.bytes_removed, 6);
         assert_eq!(db.prune_images().await.unwrap().bytes_removed, 0);
         assert_eq!(count(&db, "SELECT COUNT(*) FROM image_stream_gc").await, 0);
     }
 
     #[tokio::test]
-    async fn digest_bound_facts_are_insert_or_verify_and_failed_aliases_roll_back() {
+    async fn digest_bound_facts_are_insert_or_verify_and_failed_names_roll_back() {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("home"));
         let db = Store::new(&paths).await.unwrap();
@@ -1534,11 +1874,7 @@ mod tests {
             .collect();
         db.save_oci_image(&image).await.unwrap();
         db.save_oci_image(&image).await.unwrap();
-        let original = db
-            .image_detail(&image.reference.requested_reference)
-            .await
-            .unwrap()
-            .unwrap();
+        let original = info(&db, REFERENCE).await.unwrap();
         let mut shorter = image.clone();
         shorter.layers.pop();
         shorter.manifest_layers.pop();
@@ -1552,24 +1888,14 @@ mod tests {
         let mut order = image.clone();
         order.layers[1].blob_digest = format!("sha256:{}", "c".repeat(64));
         order.manifest_layers[1].layer_blob_digest = order.layers[1].blob_digest.clone();
-        for mut conflicting in [shorter, config, descriptor, order] {
-            conflicting.reference.requested_reference = "example.test/failed:latest".into();
+        for conflicting in [shorter, config, descriptor, order] {
+            let conflicting = named(conflicting, "example.test/failed:latest");
             assert!(matches!(
                 db.save_oci_image(&conflicting).await,
                 Err(crate::LibVmError::StateDecode { .. })
             ));
-            assert!(db
-                .image_handle(&conflicting.reference.requested_reference)
-                .await
-                .unwrap()
-                .is_none());
-            assert_eq!(
-                db.image_detail(&image.reference.requested_reference)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                original
-            );
+            assert_eq!(named_image(&db, "example.test/failed:latest").await, None);
+            assert_eq!(info(&db, REFERENCE).await.unwrap(), original);
         }
     }
 
@@ -1597,7 +1923,7 @@ mod tests {
         fs::write(abandoned_path.join("interrupted"), b"abandoned").unwrap();
         drop(abandoned);
         let report = db.prune_images().await.unwrap();
-        assert_eq!(report.artifacts_removed, 0);
+        assert_eq!(report.images_removed, 0);
         assert_eq!(report.bytes_removed, 11);
         assert!(!stream.path.exists());
         assert!(!abandoned_path.exists());
@@ -1618,12 +1944,15 @@ mod tests {
         let image = oci_image_record(&retained);
         db.save_oci_image(&image).await.unwrap();
         drop(held);
-        db.remove_image(
-            &image.reference.requested_reference,
-            crate::ImageRemoveOptions::default(),
-        )
-        .await
-        .unwrap();
+        let removal = db
+            .remove_image(LocalImage::Oci(oci_id(&image)), Some(REFERENCE))
+            .await
+            .unwrap();
+        assert!(removal.record_removed);
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM image_composition_artifact").await,
+            0
+        );
         let pool = StoragePool::open(paths.images_dir()).unwrap();
         let source = paths.home().join("orphan.raw");
         fs::write(&source, b"interrupted-publication").unwrap();
@@ -1637,10 +1966,10 @@ mod tests {
         assert!(!orphan.path.exists());
         assert!(fsmeta.is_file() && pack.is_file());
         assert_eq!(
-            count(&reopened, "SELECT COUNT(*) FROM image_composition_artifact").await,
+            count(&reopened, "SELECT COUNT(*) FROM composition_result").await,
             1
         );
-        assert_eq!(reopened.prune_images().await.unwrap().artifacts_removed, 1);
+        assert_eq!(reopened.prune_images().await.unwrap().images_removed, 0);
         assert!(!fsmeta.exists() && !pack.exists());
     }
 

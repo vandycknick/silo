@@ -421,13 +421,10 @@ pub fn import_request_to_wire(
     if !value.path.is_absolute() {
         return Err(invalid("import.path", "must be absolute"));
     }
-    if let Some(alias) = &value.alias {
-        crate::stopped::alias(alias)?;
-    }
     Ok(w::DiskImportRequest {
         path: path_to_wire(&value.path),
         boot: Some(import_boot_to_wire(&value.boot)?),
-        alias: value.alias.clone(),
+        name: value.name.as_deref().map(crate::local_name).transpose()?,
     })
 }
 
@@ -441,10 +438,7 @@ pub fn import_request_from_wire(
     Ok(DiskImportRequest {
         path,
         boot: import_boot_from_wire(required(value.boot, "import.boot")?)?,
-        alias: value
-            .alias
-            .map(|alias| crate::stopped::alias(&alias))
-            .transpose()?,
+        name: value.name.as_deref().map(crate::local_name).transpose()?,
     })
 }
 
@@ -736,7 +730,7 @@ mod tests {
                     agent: None,
                 },
             },
-            alias: Some("cloud".into()),
+            name: Some("cloud".into()),
         };
         let wire = import_request_to_wire(&request).unwrap();
         assert_eq!(import_request_from_wire(wire.clone()).unwrap(), request);
@@ -758,9 +752,11 @@ mod tests {
         let mut relative = wire.clone();
         relative.path = b"cloud.qcow2".to_vec();
         assert!(import_request_from_wire(relative).is_err());
-        let mut bad_alias = wire.clone();
-        bad_alias.alias = Some("sha256:abc".into());
-        assert!(import_request_from_wire(bad_alias).is_err());
+        for name in ["sha256:abc", "registry/cloud", "Cloud"] {
+            let mut bad_name = wire.clone();
+            bad_name.name = Some(name.into());
+            assert!(import_request_from_wire(bad_name).is_err(), "{name}");
+        }
         let relative_asset = w::BootAssetSelection {
             selection: Some(w::boot_asset_selection::Selection::Files(
                 w::BootAssetFiles {

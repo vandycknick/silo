@@ -203,9 +203,9 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
             }
         },
         authority: match &restore.authority {
-            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { checkpoint, .. } => {
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { snapshot, .. } => {
                 vm_spec::restore::RestoreReference::IdentifiedSnapshot {
-                    checkpoint: *checkpoint,
+                    snapshot: *snapshot,
                 }
             }
             vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {

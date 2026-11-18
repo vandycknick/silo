@@ -15,9 +15,11 @@ pub mod node_state;
 mod owned_boot_assets;
 mod paths;
 pub mod planning;
+mod resolve;
 mod runtime;
 mod secrets;
 pub use crate::secrets::SecretScopePolicy;
+mod snapshots;
 mod ssh_ca;
 pub mod storage;
 mod store;
@@ -29,9 +31,9 @@ pub use crate::image::ext4_admission::Ext4Rejection;
 pub use crate::image::import::{AdmittedDiskImport, DiskImportError, ForeignContainer};
 pub use crate::image::import_types::{
     BootAssetSelection, BootAssetsUpdate, DiskImportBoot, DiskImportFacts, DiskImportRequest,
-    ImageContainerKind, ImageProvenance, ImportRootSelection, ManagedImageInfo, ManagedSourceId,
-    ManagedSourceInfo, ManagedSourceRef, RawConversionKey, RawConversionOptions, RootCandidate,
-    RootSelectionFailed,
+    ImageContainerKind, ImageInfo, ImageProvenance, ImageRef, ImageRemoval, ImportRootSelection,
+    OciImageInfo, RawConversionKey, RawConversionOptions, RootCandidate, RootSelectionFailed,
+    StoredImageInfo,
 };
 pub use crate::machine::live_capture::SnapshotIdentityReason;
 pub use crate::machine::live_fork::{
@@ -43,10 +45,10 @@ pub use crate::machine::live_operations::{
     LiveOperationProgress, LiveOperationProgressReceiver, LiveOperationProgressSender,
 };
 pub use crate::machine::{
-    preflight_recover_checkpoint_disks, preflight_restore_snapshot, preflight_stopped,
-    validate_new_machine_name, ExternalResourceKey, ExternalResourceMapping,
-    ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions, RecoverDisksOptions,
-    RestoreOptions, SnapshotConfiguration, SnapshotOptions,
+    preflight_restore_snapshot, preflight_stopped, validate_new_machine_name, CreatedSnapshot,
+    ExternalResourceKey, ExternalResourceMapping, ExternalResourcePolicy,
+    ExternalResourceRequirement, ForkOptions, RestoreOptions, RestoreSource, SnapshotConfiguration,
+    SnapshotOptions,
 };
 pub use crate::machine::{
     require_live_operation, LiveCaptureSource, LiveCaptureSummary, LiveObservationReader,
@@ -59,6 +61,7 @@ pub use crate::runtime::boot_assets::{AdmissionRemedy, SourceFamily};
 pub use crate::runtime::{
     require_host_live_operation, LiveCapabilityQuery, ResolvedBackendSelection,
 };
+pub use crate::snapshots::Snapshots;
 pub use crate::storage::identity::{ImageId, ObjectDigest, SnapshotId};
 pub use crate::store::live_store::MachineLifecycle;
 pub use crate::store::models::image::{ImageRecord, ImageRecordKind};
@@ -74,25 +77,23 @@ pub use crate::store::models::storage::{
 pub use crate::store::models::storage::{ContentIdentityState, DiskContentIdentity};
 pub use crate::store::models::{MachineId, MachineIdParseError};
 pub use crate::store::snapshot_store::{
-    CaptureNamingOutcome, SnapshotCaptureKindName, SnapshotCaptureProvenance, SnapshotInfo,
-    SnapshotMapNodeFailure, SnapshotRef, SnapshotStore, SnapshotStreamSummary,
-    SnapshotStructuralFailure, SnapshotVerificationError, SnapshotVerificationMember,
-    SnapshotVerificationReport, SnapshotVerificationRole,
+    CaptureNamingOutcome, SnapshotCaptureProvenance, SnapshotInfo, SnapshotMapNodeFailure,
+    SnapshotMemory, SnapshotRef, SnapshotRemoval, SnapshotStreamSummary, SnapshotStructuralFailure,
+    SnapshotVerificationError, SnapshotVerificationMember, SnapshotVerificationReport,
+    SnapshotVerificationRole,
 };
 pub use vm_spec::restore::{RestoreEnvironmentVariable, RestoreHook};
 pub use vm_spec::{live, BlockId, DiskFormat};
 pub mod policy_secrets;
 pub use crate::image::transport::{
-    ArtifactAcquireReport, ArtifactAcquireRequest, ArtifactEncoding, ArtifactInspection,
-    ArtifactPublishReport, ArtifactPublishRequest, ArtifactPurpose, ArtifactRootFamily,
-    ArtifactTrust, CheckpointPublication, PublisherAuthentication,
+    ArtifactAcquireReport, ArtifactAcquireRequest, ArtifactContent, ArtifactEncoding,
+    ArtifactInspection, ArtifactPublishReport, ArtifactPublishRequest, ArtifactRootFamily,
 };
 pub use crate::image::{
-    ImageBuilder, ImageCacheState, ImageDetail, ImageHandle, ImageLayerDetail, ImageProgress,
-    ImageProgressReceiver, ImageProgressSender, ImagePruneReport, ImagePullOptions,
-    ImagePullPolicy, ImageRemoveOptions, ImageResolveOptions, ImageSource, ImageSourceKind, Images,
-    OciImageConfigMetadata, Platform, RegistryAction, RegistryPolicy, RegistryRule,
-    ResolvedOciImage,
+    ImageBuilder, ImageCacheState, ImageLayerDetail, ImageProgress, ImageProgressReceiver,
+    ImageProgressSender, ImagePruneReport, ImagePullOptions, ImageResolveOptions, ImageSource,
+    ImageSourceKind, Images, OciImageConfigMetadata, Platform, PullPolicy, RegistryAction,
+    RegistryPolicy, RegistryRule, ResolvedOciImage,
 };
 pub use crate::machine::{
     resolve_mount_location, AttachmentSignal, EgressCredentials, EgressSecret, Entrypoint,

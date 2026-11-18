@@ -182,7 +182,7 @@ class Run:
                            " WHERE replace(capture_id,'-','')='" + UUID(self.plan["captureId"]).hex + "'")
 
     def summary(self, value: dict, policy: str, source: str) -> dict:
-        assert value["snapshot"]["captureKind"] == "live-execution", value
+        assert value["snapshot"]["memory"] == "included", value
         summary = value["capture"]
         assert summary["captureId"] == self.plan["captureId"], summary
         assert summary["runId"] == self.plan["runId"], summary
@@ -453,8 +453,8 @@ def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
                 rows = run.provenance()
                 assert len(rows) == 1, "stop lost the linked coherent checkpoint"
                 assert json.loads(rows[0][1]) == json.loads(seal_bytes)
-                snapshot = silo.json("snapshot", "inspect", "image:" + rows[0][0])
-                assert snapshot["id"] == rows[0][0] and snapshot["captureKind"] == "live-execution"
+                snapshot = silo.json("snapshot", "inspect", rows[0][0])
+                assert snapshot["id"] == rows[0][0] and snapshot["memory"] == "included"
                 record = run.capture_record()
                 if record is not None and record["state"]["state"] == "published":
                     value = json.loads(run.complete().stdout)
@@ -768,7 +768,7 @@ def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
         time.sleep(0.5)
         assert disk_counter() == frozen_counter, "failed continuation let the workload write"
         intents = procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command")
-        refused = silo.run("snapshot", "create", NAME, "--live", "--name", "fenced", expect=None)
+        refused = silo.run("snapshot", "create", NAME, "--memory", "--name", "fenced", expect=None)
         assert refused.returncode != 0, "a fenced source admitted a new capture"
         assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command") == intents
         assert silo.info(NAME)["state"] == "error"
@@ -852,7 +852,7 @@ def test_capture_budget_refusal_leaves_no_ownership_and_force_removal_works(
         with exhausted_capture_budget(silo):
             before = procs.query(silo.ws.state_db(),
                                  "SELECT count(*) FROM live_command WHERE json_extract(input_json,'$.command.command')='capture'")
-            refused = silo.run("snapshot", "create", NAME, "--live", "--name", "over-budget",
+            refused = silo.run("snapshot", "create", NAME, "--memory", "--name", "over-budget",
                                expect=None, timeout=120)
             assert refused.returncode != 0
             for component in ("pre-freeze admission", "requires", "available", "RAM staging",

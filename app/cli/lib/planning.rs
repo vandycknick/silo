@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use eyre::bail;
 use libvm::{
-    DiskImportBoot, Forward, MachineAgent, MachineRetention, MachineUserConfig, ManagedSourceId,
+    DiskImportBoot, Forward, ImageId, MachineAgent, MachineRetention, MachineUserConfig,
     OciImageConfigMetadata, Platform, ProcessConfig, PublishBind,
 };
 use serde::{Deserialize, Serialize};
@@ -47,11 +47,11 @@ pub(crate) enum ResolvedImage {
     /// Complete direct-boot metadata. `disk:` convenience assumptions
     /// (host-native platform, whole disk, packaged assets) are explicit here.
     Disk { path: PathBuf, boot: DiskImportBoot },
-    /// A managed image or snapshot, already resolved to its typed identity.
-    Managed {
+    /// A stored image, already resolved to its id.
+    Stored {
         requested_reference: String,
-        source: ManagedSourceId,
-        metadata: Option<Box<OciImageConfigMetadata>>,
+        id: ImageId,
+        metadata: Box<OciImageConfigMetadata>,
     },
 }
 
@@ -75,9 +75,9 @@ pub(crate) enum ImageIdentity {
         boot: DiskImportBoot,
     },
     #[serde(rename_all = "camelCase")]
-    Managed {
+    Stored {
         requested_reference: String,
-        source: ManagedSourceId,
+        id: ImageId,
     },
 }
 
@@ -302,19 +302,6 @@ pub(crate) fn resolve(request: ResolveRequest) -> eyre::Result<Plan> {
         )
     };
     let machine = resolve_machine(&request.template, request.machine_overrides)?;
-    if matches!(request.kind, PlanKind::Run(_))
-        && matches!(
-            image,
-            ImageIdentity::Managed {
-                source: ManagedSourceId::Snapshot(_),
-                ..
-            }
-        )
-    {
-        bail!(
-            "a snapshot keeps its captured configuration; use `silo restore` and then `silo start`"
-        );
-    }
     if machine.tmpfs_size.is_some() && !matches!(image, ImageIdentity::Oci(_)) {
         bail!("tmpfs_size requires a new OCI root");
     }
@@ -385,15 +372,13 @@ fn validate_image(image: &ResolvedImage) -> eyre::Result<&ResolvedImage> {
         ResolvedImage::Disk { path, .. } => {
             validate_no_nul(&path.to_string_lossy(), "disk image path")?;
         }
-        ResolvedImage::Managed {
+        ResolvedImage::Stored {
             requested_reference,
             metadata,
             ..
         } => {
             validate_no_nul(requested_reference, "image reference")?;
-            if let Some(metadata) = metadata {
-                validate_oci_metadata(metadata)?;
-            }
+            validate_oci_metadata(metadata)?;
         }
     }
     Ok(image)
@@ -560,7 +545,7 @@ impl ResolvedImage {
         match self {
             Self::Oci { identity, .. } => identity.requested_reference.clone(),
             Self::Disk { path, .. } => format!("disk:{}", path.display()),
-            Self::Managed {
+            Self::Stored {
                 requested_reference,
                 ..
             } => requested_reference.clone(),
@@ -571,7 +556,7 @@ impl ResolvedImage {
         match self {
             Self::Oci { metadata, .. } => Some(metadata),
             Self::Disk { .. } => None,
-            Self::Managed { metadata, .. } => metadata.as_deref(),
+            Self::Stored { metadata, .. } => Some(metadata),
         }
     }
 
@@ -582,21 +567,21 @@ impl ResolvedImage {
                 path: path.clone(),
                 boot: boot.clone(),
             },
-            Self::Managed {
+            Self::Stored {
                 requested_reference,
-                source,
+                id,
                 ..
-            } => ImageIdentity::Managed {
+            } => ImageIdentity::Stored {
                 requested_reference: requested_reference.clone(),
-                source: *source,
+                id: *id,
             },
         }
     }
 }
 
-/// Image execution defaults of a managed image, in the shape planning uses
-/// for OCI configuration. Snapshots carry their own captured configuration.
-pub(crate) fn managed_image_metadata(process: &ProcessConfig) -> OciImageConfigMetadata {
+/// Image execution defaults of a stored image, in the shape planning uses
+/// for OCI configuration.
+pub(crate) fn stored_image_metadata(process: &ProcessConfig) -> OciImageConfigMetadata {
     OciImageConfigMetadata {
         entrypoint: process.entrypoint.clone(),
         cmd: process.command.clone(),
@@ -871,7 +856,10 @@ mod tests {
         input.machine_overrides.tmpfs_size = Some("16mib".into());
         let plan = create_plan(resolve(input).unwrap());
         assert_eq!(plan.machine.tmpfs_size.as_deref(), Some("16mib"));
-        for source in [disk("/tmp/source.raw"), managed(None)] {
+        for source in [
+            disk("/tmp/source.raw"),
+            stored(OciImageConfigMetadata::default()),
+        ] {
             let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
             input.machine_overrides.tmpfs_size = Some("8mib".into());
             input.positional_image = Some(source);
@@ -905,28 +893,24 @@ mod tests {
         }
     }
 
-    fn managed(metadata: Option<OciImageConfigMetadata>) -> ResolvedImage {
-        ResolvedImage::Managed {
-            requested_reference: "image:base".into(),
-            source: libvm::ManagedSourceId::Image(
-                format!("sha256:{}", "ab".repeat(32)).parse().unwrap(),
-            ),
-            metadata: metadata.map(Box::new),
+    fn stored(metadata: OciImageConfigMetadata) -> ResolvedImage {
+        ResolvedImage::Stored {
+            requested_reference: "base".into(),
+            id: format!("sha256:{}", "ab".repeat(32)).parse().unwrap(),
+            metadata: Box::new(metadata),
         }
     }
 
     #[test]
-    fn managed_image_execution_defaults_seed_the_plan_and_keep_typed_identity() {
+    fn stored_image_execution_defaults_seed_the_plan_and_keep_its_id() {
         let mut process = libvm::ProcessConfig::new();
         process.entrypoint = Some(vec!["/bin/app".into()]);
         process.command = Some(Vec::new());
         process.working_directory = "/srv".into();
         process.environment = BTreeMap::from([("A".into(), "1".into())]);
         let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
-        input.positional_image = Some(managed(Some(crate::planning::managed_image_metadata(
-            &process,
-        ))));
-        let plan = create_plan(resolve(input).expect("resolve managed plan"));
+        input.positional_image = Some(stored(crate::planning::stored_image_metadata(&process)));
+        let plan = create_plan(resolve(input).expect("resolve stored plan"));
         assert_eq!(plan.process.entrypoint, process.entrypoint);
         assert_eq!(plan.process.command, Some(Vec::new()));
         assert_eq!(plan.process.working_directory, "/srv");
@@ -934,10 +918,10 @@ mod tests {
             plan.process.environment.get("A").map(String::as_str),
             Some("1")
         );
-        let ImageIdentity::Managed { source, .. } = plan.image else {
-            panic!("expected managed identity");
+        let ImageIdentity::Stored { id, .. } = plan.image else {
+            panic!("expected stored identity");
         };
-        assert!(matches!(source, libvm::ManagedSourceId::Image(_)));
+        assert_eq!(id.to_string(), format!("sha256:{}", "ab".repeat(32)));
     }
 
     #[test]

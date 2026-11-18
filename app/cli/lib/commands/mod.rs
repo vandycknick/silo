@@ -55,7 +55,6 @@ pub enum Command {
     Snapshot(live::Snapshot),
     Fork(live::Fork),
     Restore(live::Restore),
-    RecoverDisks(live::RecoverDisks),
     Image(live::Image),
     Storage(storage::Cmd),
     Handoff(handoff::Cmd),
@@ -70,7 +69,7 @@ impl Command {
         use silo_vm_control::transport::Admission;
         match self {
             Self::Pause(_) | Self::Resume(_) | Self::System(_) => Admission::Owned,
-            Self::Snapshot(command) if command.is_live() => Admission::Owned,
+            Self::Snapshot(command) if command.includes_memory() => Admission::Owned,
             Self::Fork(command) if command.is_live() => Admission::Owned,
             Self::Restore(_) => Admission::Owned,
             _ => Admission::Ready,
@@ -101,7 +100,6 @@ impl Command {
             Self::Snapshot(command) => command.run(context).await,
             Self::Fork(command) => command.run(context).await,
             Self::Restore(command) => command.run(context).await,
-            Self::RecoverDisks(command) => command.run(context).await,
             Self::Image(command) => command.run(context).await,
             Self::Storage(command) => command.run(context).await,
             Self::Handoff(command) => command.run(context).await,

@@ -457,13 +457,12 @@ def test_force_remove_fork_lineage_preserves_survivors_and_published_snapshot(
         for survivor, value in expected.items():
             assert marker(silo, survivor) == value
             restore.advances(silo, survivor, restore.witness(silo, survivor))
-    # A checkpoint's independent pool roots survive every originating machine.
+    # A snapshot's independent pool roots survive every originating machine.
     restore.restore_child(silo, saved, "force-after-lineage")
     assert marker(silo, "force-after-lineage") == "child-cut"
     restore.advances(silo, "force-after-lineage", initial)
     silo.run("rm", "--force", "force-after-lineage", timeout=180)
-    silo.run("image", "remove", "image:force-lineage-snapshot")
-    silo.run("snapshot", "remove", saved.reference)
+    silo.run("snapshot", "rm", "force-lineage-snapshot")
     gone_after_prune(silo, first.operation, second.operation)
     assert silo.ls() == []
     for table in ("storage_operation", "capture_resource_reservation", "restore_resource_reservation",

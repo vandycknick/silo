@@ -1292,10 +1292,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(operations, 1);
-        snapshots
-            .release_retention(&SnapshotRef::Id(info.id))
-            .await
-            .unwrap();
+        snapshots.remove(&SnapshotRef::Id(info.id)).await.unwrap();
         store.recover_layer_objects().await.unwrap();
         assert!(pool.object_path(&record.root.stream.map).exists());
         assert_eq!(
@@ -1575,7 +1572,7 @@ pub(crate) mod tests {
         assert!(pool.object_path(&root).exists());
         assert!(!pool.stream_path(&map.id()).exists());
         SnapshotStore::from_store(store.clone())
-            .release_retention(&SnapshotRef::Id(info.id))
+            .remove(&SnapshotRef::Id(info.id))
             .await
             .unwrap();
         store.recover_layer_objects().await.unwrap();

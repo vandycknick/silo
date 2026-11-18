@@ -97,7 +97,7 @@ def test_capture_multidisk_dirty_matched_cut_and_independent_sealed_bytes(
             trace.release()
             assert trace.wait("capture-manager-result.json")["code"] == 0
             result = json.loads((silo.ws.evidence / "capture-manager.stdout").read_text())
-            assert result["snapshot"]["captureKind"] == "live-execution"
+            assert result["snapshot"]["memory"] == "included"
             summary = result["capture"]
             assert summary["sourceOutcome"] == "resumed" and summary["released"] is True
             seal = json.loads((directory / "vm.capture.json").read_bytes())

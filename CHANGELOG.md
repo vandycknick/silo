@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Breaking: images and snapshots are separate concepts with separate commands
+  and name tables, sharing one storage pool; an image and a snapshot can share
+  a name. The `image:` prefix is gone: `create`, `run` and `restore` resolve a
+  local name, then stored `search_registries` expansions, then pull per
+  `--pull always|missing|never` (default `missing`), then a unique id prefix.
+  `create`/`run` refuse snapshots; `silo restore REF` is the only way to turn a
+  snapshot into a VM, and `restore --without-memory` replaces `recover-disks`.
+  `snapshot create --memory` replaces `--live`; a running VM without
+  `--memory` is refused. `image rm`/`snapshot rm` and `image prune` replace
+  `image release`, the alias-only `image remove` and the retained flag.
+  `--approve-digest`, `--require-signature` and `--acknowledge-checkpoint`
+  are removed. Snapshot push is unavailable until it has mandatory encryption.
+  The schema changes in place; a fresh `SILO_HOME` is required, with no
+  migration.
 - Breaking: live forks now retain owned local cuts without computing content
   hashes or publishing RAM/disk maps or pool objects. Capture/restore records
   and the initial catalog format change in place; recreate existing homes,

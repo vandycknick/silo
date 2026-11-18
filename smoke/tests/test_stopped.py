@@ -184,10 +184,10 @@ sync
 
 
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
-def test_stopped_explicit_live_and_execution_refuse_before_effects(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
+def test_stopped_live_fork_memory_snapshot_and_missing_restore_refuse_before_effects(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
     silo = stopped_silo
     create(silo, stopped_image, "refuse-source", profile)
-    for args in [("fork", "refuse-source", "--live", "--name", "never-live-child"), ("snapshot", "create", "refuse-source", "--live"), ("restore", str(silo.ws.root / "absent-execution-artifact"), "--execution", "--name", "never-execution-child")]:
+    for args in [("fork", "refuse-source", "--live", "--name", "never-live-child"), ("snapshot", "create", "refuse-source", "--memory"), ("restore", "absent-snapshot", "--pull", "never", "--name", "never-restored-child")]:
         stopped.refuse_without_effects(silo, *args)
     assert [item["name"] for item in silo.ls()] == ["refuse-source"]
 
@@ -282,14 +282,15 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     source_binding = stopped.record(silo, "snapshot-source")["boot"]["binding"]
     data_key = f"data:{2 if profile == 'layered' else 1}"
     assert set(source) == {"root", data_key}
-    captured = silo.json("snapshot", "create", "snapshot-source", "--name", "stopped-checkpoint", timeout=240)
-    assert captured["retained"] is True and "stopped-checkpoint" in captured["aliases"]
+    created = silo.json("snapshot", "create", "snapshot-source", "--name", "stopped-checkpoint", timeout=240)
+    assert created["capture"] is None and created["namingOutcome"] is None
+    captured = created["snapshot"]
+    assert captured["memory"] == "none" and captured["names"] == ["stopped-checkpoint"]
     captured_rows = procs.query(silo.ws.state_db(), f"SELECT CAST(record_bytes AS TEXT) FROM storage_snapshot WHERE id='{captured['id']}'")
     assert len(captured_rows) == 1
     captured_record = json.loads(captured_rows[0][0])
-    assert captured_record["captureKind"] == "stopped-storage"
+    assert captured_record["memory"] == "none"
     assert captured_record["stopOutcome"] == shutdown.outcome(silo, "snapshot-source")
-    assert captured_record["purpose"] == "checkpoint"
     source_root = stopped.record(silo, "snapshot-source")["root"]
     snapshot_root = captured_record["root"]["profile"]
     if profile == "layered":
@@ -303,12 +304,12 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
         assert "stream" not in snapshot_root["lower"] and snapshot_root["lower"]["layers"]
     else:
         assert source_root["kind"] == "opaque-raw" and snapshot_root == {"kind": "opaque-raw"}, (source_root, snapshot_root)
-    immutable = "image:" + captured["id"]
+    immutable = captured["id"]
     inspected = silo.json("snapshot", "inspect", immutable)
     assert inspected == captured
     stopped.same_content(source, stopped.backing(silo, "snapshot-source", "source-after-snapshot"))
     stopped.fork(silo, "snapshot-source", "boot-pinned-fork")
-    stopped.restore(silo, "image:stopped-checkpoint", "snapshot-first")
+    stopped.restore(silo, "stopped-checkpoint", "snapshot-first")
     a = stopped.backing(silo, "snapshot-first", "first-restored")
     stopped.same_content(source, a)
     stopped.independent(source, a)
@@ -339,10 +340,10 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     stopped.same_content(a, b)
     stopped.independent(a, b)
     assert stopped.configured_semantics(stopped.configuration(silo, "snapshot-second")) == expected_config
-    # Alias deletion and explicit retention release are different root changes.
-    silo.run("image", "remove", "image:stopped-checkpoint")
-    assert silo.json("snapshot", "inspect", immutable)["retained"] is True
-    silo.run("snapshot", "remove", immutable)
+    # Removing the last name removes the record; restored machines keep their closure.
+    removed = silo.json("snapshot", "rm", "stopped-checkpoint")
+    assert removed == {"id": immutable, "names": ["stopped-checkpoint"], "recordRemoved": True}, removed
+    assert procs.query(silo.ws.state_db(), f"SELECT id FROM storage_snapshot WHERE id='{immutable}'") == []
     shutdown.storage_tool(silo, "prune")
     first_after = None
     for child in ("snapshot-first", "snapshot-second", "boot-pinned-fork"):
@@ -375,8 +376,8 @@ def test_stopped_restore_retains_closure_during_concurrent_snapshot_removal(stop
     create(silo, stopped_image, "retention-source", profile)
     stopped.install_managed_fixture(silo, "retention-source", custom_boot=False)
     baseline = stopped.backing(silo, "retention-source", "retention-before")
-    info = silo.json("snapshot", "create", "retention-source", "--name", "retention-race", timeout=240)
-    reference = "image:" + info["id"]
+    info = silo.json("snapshot", "create", "retention-source", "--name", "retention-race", timeout=240)["snapshot"]
+    reference = info["id"]
     rows = procs.query(silo.ws.state_db(), f"SELECT CAST(record_bytes AS TEXT) FROM storage_snapshot WHERE id='{info['id']}'")
     assert len(rows) == 1
     artifact = json.loads(rows[0][0])
@@ -392,8 +393,7 @@ def test_stopped_restore_retains_closure_during_concurrent_snapshot_removal(stop
         assert len(operations) == 1, "restore opened artifact bytes before registering its consumer"
         lease = silo.ws.silo_home / "images/locks/leases" / (operations[0][0] + ".lease")
         assert shutdown.lease_busy(lease)
-        silo.run("image", "remove", "image:retention-race")
-        silo.run("snapshot", "remove", reference)
+        silo.run("snapshot", "rm", reference)
         shutdown.storage_tool(silo, "remove-image", stopped_image)
         shutdown.storage_tool(silo, "prune")
         assert procs.query(silo.ws.state_db(), f"SELECT id FROM storage_snapshot WHERE id='{info['id']}'") == []
@@ -542,8 +542,8 @@ def test_stopped_prepared_image_catalog_has_no_extra_retention_roots(stopped_sil
     assert not (home / "machines").exists()
     assert not (home / "images/locks").exists()
     assert not (home / "images/tmp").exists()
-    assert procs.query(home / "state.db", "SELECT requested_reference FROM image_ref") == [(stopped_image,)]
-    for table in ("machine_config", "storage_operation", "storage_snapshot", "storage_image", "storage_operation_stream", "storage_operation_object", "storage_operation_layer", "storage_operation_lower", "machine_lower_dependency"):
+    assert procs.query(home / "state.db", "SELECT name FROM image_name WHERE oci_image_id IS NOT NULL") == [(stopped_image,)]
+    for table in ("machine_config", "storage_operation", "storage_snapshot", "storage_image", "snapshot_name", "storage_operation_stream", "storage_operation_object", "storage_operation_layer", "storage_operation_lower", "machine_lower_dependency"):
         assert procs.query(home / "state.db", f"SELECT COUNT(*) FROM {table}") == [("0",)], table
     # The prepared OCI selection retains exactly one layered composition:
     # its fsmeta object and every ordered layer pack stream are seeded bytes.

@@ -385,10 +385,12 @@ def retained_inputs(silo: Silo, image: CorpusImage) -> list[Path]:
 def assert_unprepared(silo: Silo, image: CorpusImage, retired_inputs: list[Path] | None = None) -> None:
     """No selection, reusable layer result or former backing can satisfy this prepare."""
     with sqlite3.connect(f"file:{silo.ws.state_db()}?mode=ro", uri=True) as connection:
-        for table in ("image_ref", "image_composition_artifact"):
-            assert connection.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE manifest_digest=?", (image.manifest_digest,),
-            ).fetchone()[0] == 0, (table, image.manifest_digest)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_composition_artifact WHERE manifest_digest=?", (image.manifest_digest,),
+        ).fetchone()[0] == 0, ("image_composition_artifact", image.manifest_digest)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_name WHERE name=?", (image.reference,),
+        ).fetchone()[0] == 0, ("image_name", image.reference)
         for blob in image.blobs:
             assert connection.execute(
                 "SELECT COUNT(*) FROM layer_result r JOIN layer_recipe p ON p.id=r.recipe_id "
@@ -403,7 +405,7 @@ def remove_prepared_image(silo: Silo, image: CorpusImage) -> None:
     previous = retained_inputs(silo, image)
     with sqlite3.connect(f"file:{silo.ws.state_db()}?mode=ro", uri=True) as connection:
         referenced = connection.execute(
-            "SELECT COUNT(*) FROM image_ref WHERE requested_reference=?", (image.reference,),
+            "SELECT COUNT(*) FROM image_name WHERE name=?", (image.reference,),
         ).fetchone()[0] != 0
     if referenced:
         shutdown.storage_tool(silo, "remove-image", image.reference)

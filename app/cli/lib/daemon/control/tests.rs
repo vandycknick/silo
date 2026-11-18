@@ -217,12 +217,16 @@ async fn invalid_mutations_fail_before_runtime_or_admission() {
         }))
         .await;
     assert!(matches!(&result, Err(e) if e.code() == tonic::Code::InvalidArgument));
-    let result = service
-        .pull_image(Request::new(w::PullImageRequest {
-            reference: String::new(),
-        }))
-        .await;
-    assert!(matches!(&result, Err(e) if e.code() == tonic::Code::InvalidArgument));
+    for request in [
+        w::PullImageRequest::default(),
+        w::PullImageRequest {
+            reference: "alpine".into(),
+            pull_policy: 99,
+        },
+    ] {
+        let result = service.pull_image(Request::new(request)).await;
+        assert!(matches!(&result, Err(e) if e.code() == tonic::Code::InvalidArgument));
+    }
     assert!(owner.runtime.get().is_none());
     assert!(owner.components.get().is_none());
     assert_eq!(owner.capacity.available_permits(), 64);
@@ -421,12 +425,12 @@ async fn early_rejection_precedes_stopping_and_exhausted_daemon_admission() {
         (
             LiveOperation::Capture,
             machines
-                .capture_execution(w::LiveCaptureRequest {
+                .create_snapshot(w::CreateSnapshotRequest {
                     machine: request().machine,
-                    name: None,
-                    resume_policy: w::CaptureResumePolicy::ResumeIfAcquired as i32,
-                    policy: w::CapturePolicy::Full as i32,
-                    dirty_crossover_percent: 60,
+                    memory: true,
+                    capture_policy: Some(w::CapturePolicy::Full as i32),
+                    dirty_crossover_percent: Some(60),
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err(),
@@ -438,16 +442,16 @@ async fn early_rejection_precedes_stopping_and_exhausted_daemon_admission() {
         (
             LiveOperation::Restore,
             runtime
-                .restore_snapshot(w::RestoreStorageSnapshotRequest {
-                    snapshot: Some(silo_vm_control::stopped::reference_to_wire(
-                        &libvm::SnapshotRef::Image("checkpoint".into()),
-                    )),
-                    name: Some("child".into()),
-                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
-                        &libvm::ExternalResourcePolicy::Reject,
-                    )),
-                    activation_hook: None,
-                })
+                .restore_snapshot(
+                    silo_vm_control::stopped::restore_request_to_wire(
+                        &libvm::RestoreSource::Local("snap".parse().unwrap()),
+                        &libvm::RestoreOptions {
+                            name: Some("child".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                )
                 .await
                 .unwrap_err(),
         ),
@@ -489,12 +493,12 @@ async fn early_rejection_precedes_stopping_and_exhausted_daemon_admission() {
         (w::CapturePolicy::Full as i32, u32::MAX),
     ] {
         let status = machines
-            .capture_execution(w::LiveCaptureRequest {
+            .create_snapshot(w::CreateSnapshotRequest {
                 machine: request().machine,
-                name: None,
-                resume_policy: w::CaptureResumePolicy::ResumeIfAcquired as i32,
-                policy,
-                dirty_crossover_percent: crossover,
+                memory: true,
+                capture_policy: Some(policy),
+                dirty_crossover_percent: Some(crossover),
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -507,18 +511,18 @@ async fn early_rejection_precedes_stopping_and_exhausted_daemon_admission() {
             tonic::Code::InvalidArgument
         );
     }
-    let invalid_recovery = w::RecoverCheckpointDisksRequest {
-        snapshot: Some(silo_vm_control::stopped::reference_to_wire(
-            &"image:missing".parse().unwrap(),
-        )),
-        name: Some("../escape".into()),
-        external_resources: Some(silo_vm_control::stopped::policy_to_wire(
-            &libvm::ExternalResourcePolicy::Reject,
-        )),
-    };
+    let mut invalid_restore = silo_vm_control::stopped::restore_request_to_wire(
+        &libvm::RestoreSource::Local("missing".parse().unwrap()),
+        &libvm::RestoreOptions {
+            without_memory: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    invalid_restore.name = Some("../escape".into());
     assert_eq!(
         runtime
-            .recover_checkpoint_disks(invalid_recovery)
+            .restore_snapshot(invalid_restore)
             .await
             .unwrap_err()
             .code(),
@@ -554,17 +558,25 @@ async fn early_rejection_precedes_stopping_and_exhausted_daemon_admission() {
 }
 
 #[tokio::test]
-async fn stopped_retention_mutations_obey_stopping_without_runtime_initialization() {
+async fn removal_mutations_obey_stopping_without_runtime_initialization() {
     use w::runtime_service_server::RuntimeService;
     let root = tempfile::tempdir().unwrap();
     let owner = state(root.path());
     owner.begin_stopping().await.unwrap();
     let service = Service(owner.clone());
-    let reference =
-        silo_vm_control::stopped::reference_to_wire(&"image:checkpoint".parse().unwrap());
+    let snapshot = silo_vm_control::stopped::reference_to_wire(&"snap".parse().unwrap());
     assert_eq!(
         service
-            .release_snapshot_retention(Request::new(reference))
+            .remove_snapshot(Request::new(snapshot))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable,
+    );
+    let image = silo_vm_control::images::image_ref_to_wire(&"hello".parse().unwrap()).unwrap();
+    assert_eq!(
+        service
+            .remove_image(Request::new(image))
             .await
             .unwrap_err()
             .code(),
@@ -572,9 +584,7 @@ async fn stopped_retention_mutations_obey_stopping_without_runtime_initializatio
     );
     assert_eq!(
         service
-            .remove_image_alias(Request::new(w::Name {
-                name: "checkpoint".into()
-            }))
+            .prune_images(Request::new(()))
             .await
             .unwrap_err()
             .code(),
@@ -609,10 +619,9 @@ async fn malformed_stopped_contracts_fail_before_native_initialization() {
     );
     assert_eq!(
         service
-            .snapshot_stopped(Request::new(w::CreateStorageSnapshotRequest {
-                machine: machine.clone(),
-                name: None,
-                external_resources: Some(w::ExternalResourcePolicy::default()),
+            .create_snapshot(Request::new(w::CreateSnapshotRequest {
+                machine: None,
+                ..Default::default()
             }))
             .await
             .unwrap_err()
@@ -621,7 +630,7 @@ async fn malformed_stopped_contracts_fail_before_native_initialization() {
     );
     assert_eq!(
         service
-            .restore_snapshot(Request::new(w::RestoreStorageSnapshotRequest::default()))
+            .restore_snapshot(Request::new(w::RestoreSnapshotRequest::default()))
             .await
             .unwrap_err()
             .code(),
@@ -629,8 +638,11 @@ async fn malformed_stopped_contracts_fail_before_native_initialization() {
     );
     assert_eq!(
         service
-            .remove_image_alias(Request::new(w::Name {
-                name: "sha256:invalid".into()
+            .remove_image(Request::new(w::ImageRef {
+                reference: Some(w::image_ref::Reference::Name(format!(
+                    "sha256:{}",
+                    "a".repeat(64)
+                ))),
             }))
             .await
             .unwrap_err()
@@ -657,14 +669,17 @@ async fn malformed_stopped_contracts_fail_before_native_initialization() {
         );
         assert_eq!(
             service
-                .restore_snapshot(Request::new(w::RestoreStorageSnapshotRequest {
-                    snapshot: Some(silo_vm_control::stopped::reference_to_wire(
-                        &"image:checkpoint".parse().unwrap()
-                    )),
-                    name: Some(name.into()),
-                    external_resources: reject(),
-                    activation_hook: None,
-                }))
+                .restore_snapshot(Request::new(
+                    silo_vm_control::stopped::restore_request_to_wire(
+                        &libvm::RestoreSource::Local("snap".parse().unwrap()),
+                        &libvm::RestoreOptions::default(),
+                    )
+                    .map(|mut request| {
+                        request.name = Some(name.into());
+                        request
+                    })
+                    .unwrap(),
+                ))
                 .await
                 .unwrap_err()
                 .code(),
@@ -673,28 +688,22 @@ async fn malformed_stopped_contracts_fail_before_native_initialization() {
     }
     assert_eq!(
         service
-            .snapshot_stopped(Request::new(w::CreateStorageSnapshotRequest {
+            .create_snapshot(Request::new(w::CreateSnapshotRequest {
                 machine: machine.clone(),
-                name: Some("invalid alias".into()),
-                external_resources: reject(),
+                name: Some("invalid name".into()),
+                ..Default::default()
             }))
             .await
             .unwrap_err()
             .code(),
         tonic::Code::InvalidArgument,
     );
-    let mappings = libvm::ExternalResourcePolicy::Map {
-        mappings: vec![libvm::ExternalResourceMapping {
-            resource: libvm::ExternalResourceKey::Disk { order: 1 },
-            path: "/must/not/open.raw".into(),
-        }],
-    };
     assert_eq!(
         service
-            .snapshot_stopped(Request::new(w::CreateStorageSnapshotRequest {
+            .create_snapshot(Request::new(w::CreateSnapshotRequest {
                 machine,
-                name: None,
-                external_resources: Some(silo_vm_control::stopped::policy_to_wire(&mappings)),
+                name: Some("registry/name:tag".into()),
+                ..Default::default()
             }))
             .await
             .unwrap_err()

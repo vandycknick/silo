@@ -3285,7 +3285,7 @@ pub(crate) mod tests {
             map_node_store: None,
             version: crate::restore::RESTORE_REQUEST_VERSION,
             authority: RestoreAuthority::IdentifiedSnapshot {
-                checkpoint: Sha256Digest::of_bytes(b"checkpoint"),
+                snapshot: Sha256Digest::of_bytes(b"snapshot"),
                 evidence: Box::new(evidence),
             },
             activation_id: id("44444444-4444-4444-8444-444444444444"),

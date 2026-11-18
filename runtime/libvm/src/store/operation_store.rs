@@ -77,7 +77,7 @@ fn validate_record(record: &RetainedStorageOperation) -> Result<(), LibVmError> 
     }
     if let Some(restore) = &record.restore {
         restore.validate()?;
-        if record.storage.snapshot != restore.checkpoint.snapshot()
+        if record.storage.snapshot != restore.source.snapshot()
             || (record.admitted
                 && (restore.request.ssh_trusted_ca.is_none()
                     || restore.network_attachment != restore.request.network.is_some()))
@@ -901,10 +901,6 @@ impl Store {
             .bind(capture.to_string())
             .execute(&mut *tx)
             .await?;
-        if let Some(snapshot) = record.candidate {
-            sqlx::query("DELETE FROM storage_snapshot WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE snapshot_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=?1)")
-                .bind(snapshot.to_string()).execute(&mut *tx).await?;
-        }
         tx.commit().await?;
         Ok(())
     }
@@ -1062,14 +1058,14 @@ impl Store {
     pub(crate) async fn preserve_imported_operation(
         &self,
         id: Uuid,
-        target: crate::image::import_types::ManagedSourceId,
+        target: crate::image::transport::ArtifactContent,
         index: crate::storage::identity::ObjectDigest,
     ) -> Result<(), LibVmError> {
         let json = match target {
-            crate::image::import_types::ManagedSourceId::Image(id) => {
+            crate::image::transport::ArtifactContent::Image(id) => {
                 serde_json::json!({"candidateImageId":id,"candidateIndexDigest":index})
             }
-            crate::image::import_types::ManagedSourceId::Snapshot(id) => {
+            crate::image::transport::ArtifactContent::Snapshot(id) => {
                 serde_json::json!({"candidateSnapshotId":id,"candidateIndexDigest":index})
             }
         };
@@ -1659,10 +1655,6 @@ impl Store {
                             .bind(&cursor)
                             .execute(&mut *tx)
                             .await?;
-                        if let Some(snapshot) = capture.candidate {
-                            sqlx::query("DELETE FROM storage_snapshot WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE snapshot_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=?1)")
-                                .bind(snapshot.to_string()).execute(&mut *tx).await?;
-                        }
                         tx.commit().await?;
                         continue;
                     }
@@ -1929,7 +1921,7 @@ impl Store {
             sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT OR IGNORE INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT OR IGNORE INTO storage_operation_cut(operation_id,cut_id,role) SELECT ?1,cut_id,'ram-mapping' FROM storage_operation_cut WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
-            if let crate::store::restore::RestoreIdentity::LocalCut { id } = &restore.checkpoint {
+            if let crate::store::restore::RestoreIdentity::LocalCut { id } = &restore.source {
                 bind_fork_child_handoff(
                     &mut tx,
                     restore.consumer_operation,
@@ -2020,7 +2012,7 @@ impl Store {
             }
             if let Some(restore) = &record.restore {
                 if matches!(
-                    restore.checkpoint,
+                    restore.source,
                     crate::store::restore::RestoreIdentity::LocalCut { .. }
                 ) {
                     admit_fork_child_launch(

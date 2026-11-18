@@ -93,20 +93,17 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = reason.clone();
             tonic::Code::FailedPrecondition
         }
-        E::CheckpointPortability {
-            checkpoint,
-            refusal,
-        } => {
+        E::SnapshotPortability { snapshot, refusal } => {
             if refusal.validate().is_err() {
                 return native_error_to_status(&E::LiveProtocol {
-                    message: "invalid checkpoint portability refusal".into(),
+                    message: "invalid snapshot portability refusal".into(),
                 });
             }
             d.kind = 4;
             d.code = 15;
-            d.reference = Some(checkpoint.clone());
+            d.reference = Some(snapshot.clone());
             d.safe_message = v.to_string();
-            d.checkpoint_portability = Some(w::RestorePortabilityRefusal {
+            d.snapshot_portability = Some(w::RestorePortabilityRefusal {
                 pin: refusal.pin.clone(),
                 expected: refusal.expected.clone(),
                 actual: refusal.actual.clone(),
@@ -233,11 +230,55 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = "guest entrypoint could not launch".into();
             tonic::Code::FailedPrecondition
         }
-        E::MachineNotFound { reference } | E::ImageNotFound { reference } => {
+        E::MachineNotFound { reference }
+        | E::ImageNotFound { reference }
+        | E::SnapshotNotFound { reference } => {
             d.kind = 2;
             d.reference = Some(reference.clone());
-            d.safe_message = "requested resource not found".into();
+            d.safe_message = v.to_string();
             tonic::Code::NotFound
+        }
+        E::ImageNameConflict { name } | E::SnapshotNameConflict { name } => {
+            d.kind = 3;
+            d.reference = Some(name.clone());
+            d.safe_message = v.to_string();
+            tonic::Code::AlreadyExists
+        }
+        E::CaptureNameConflict { name, .. } => {
+            d.kind = 3;
+            d.reference = Some(name.clone());
+            d.safe_message = v.to_string();
+            tonic::Code::AlreadyExists
+        }
+        E::InvalidName { name, .. } => {
+            d.kind = 1;
+            d.reference = Some(name.clone());
+            d.safe_message = v.to_string();
+            tonic::Code::InvalidArgument
+        }
+        E::AmbiguousRecordPrefix { prefix, .. } => {
+            d.kind = 1;
+            d.reference = Some(prefix.clone());
+            d.safe_message = v.to_string();
+            tonic::Code::InvalidArgument
+        }
+        E::InvalidRequest { message } => {
+            d.kind = 1;
+            d.safe_message = message.clone();
+            tonic::Code::InvalidArgument
+        }
+        E::SnapshotIsNotAnImage { reference }
+        | E::ImageIsNotASnapshot { reference }
+        | E::ArtifactIsSnapshot { reference }
+        | E::ArtifactIsImage { reference }
+        | E::ImageIsVmArtifact { reference }
+        | E::SnapshotRequiresStoppedMachine { reference }
+        | E::MemorySnapshotRequiresRunningMachine { reference }
+        | E::RecordInUse { reference } => {
+            d.kind = 4;
+            d.reference = Some(reference.clone());
+            d.safe_message = v.to_string();
+            tonic::Code::FailedPrecondition
         }
         E::MachineAlreadyExists { name } => {
             d.kind = 3;
@@ -289,17 +330,6 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.kind = 1;
             d.safe_message = v.to_string();
             tonic::Code::InvalidArgument
-        }
-        E::ArtifactTrustMismatch { .. } => {
-            d.kind = 6;
-            d.safe_message = "resolved artifact index differs from the approved digest".into();
-            tonic::Code::PermissionDenied
-        }
-        E::ArtifactSignatureProviderUnavailable
-        | E::CheckpointPublicationNotAcknowledged { .. } => {
-            d.kind = 4;
-            d.safe_message = v.to_string();
-            tonic::Code::FailedPrecondition
         }
         E::BackendAdmissionRejected {
             source_family,
@@ -459,7 +489,7 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
         || (d.code != 10 && d.root_selection.is_some())
         || (d.code != 13 && d.disk_import.is_some())
         || (d.code != 14 && d.boot_bundle_abi.is_some())
-        || (d.code != 15 && d.checkpoint_portability.is_some())
+        || (d.code != 15 && d.snapshot_portability.is_some())
     {
         return Err(invalid(
             "error.detail",
@@ -549,9 +579,9 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
             category(
                 tonic::Code::FailedPrecondition,
                 4,
-                "error.checkpoint_portability",
+                "error.snapshot_portability",
             )?;
-            let value = required(d.checkpoint_portability, "error.checkpoint_portability")?;
+            let value = required(d.snapshot_portability, "error.snapshot_portability")?;
             let refusal = vm_spec::restore::RestorePortabilityRefusal {
                 pin: value.pin,
                 expected: value.expected,
@@ -559,13 +589,10 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
                 stage: value.stage,
             };
             refusal.validate().map_err(|_| {
-                invalid(
-                    "error.checkpoint_portability",
-                    "invalid portability refusal",
-                )
+                invalid("error.snapshot_portability", "invalid portability refusal")
             })?;
-            E::CheckpointPortability {
-                checkpoint: required(d.reference, "error.reference")?,
+            E::SnapshotPortability {
+                snapshot: required(d.reference, "error.reference")?,
                 refusal: Box::new(refusal),
             }
         }
@@ -685,6 +712,47 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
             "ImageNotFound" => E::ImageNotFound {
                 reference: required(d.reference, "error.reference")?,
             },
+            "SnapshotNotFound" if v.code() == tonic::Code::NotFound && d.kind == 2 => {
+                E::SnapshotNotFound {
+                    reference: required(d.reference, "error.reference")?,
+                }
+            }
+            "ImageNameConflict" if v.code() == tonic::Code::AlreadyExists && d.kind == 3 => {
+                E::ImageNameConflict {
+                    name: required(d.reference, "error.reference")?,
+                }
+            }
+            "SnapshotNameConflict" if v.code() == tonic::Code::AlreadyExists && d.kind == 3 => {
+                E::SnapshotNameConflict {
+                    name: required(d.reference, "error.reference")?,
+                }
+            }
+            "InvalidRequest" if v.code() == tonic::Code::InvalidArgument && d.kind == 1 => {
+                E::InvalidRequest {
+                    message: d.safe_message,
+                }
+            }
+            variant if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
+                let reference = required(d.reference, "error.reference")?;
+                match variant {
+                    "SnapshotIsNotAnImage" => E::SnapshotIsNotAnImage { reference },
+                    "ImageIsNotASnapshot" => E::ImageIsNotASnapshot { reference },
+                    "ArtifactIsSnapshot" => E::ArtifactIsSnapshot { reference },
+                    "ArtifactIsImage" => E::ArtifactIsImage { reference },
+                    "ImageIsVmArtifact" => E::ImageIsVmArtifact { reference },
+                    "SnapshotRequiresStoppedMachine" => {
+                        E::SnapshotRequiresStoppedMachine { reference }
+                    }
+                    "MemorySnapshotRequiresRunningMachine" => {
+                        E::MemorySnapshotRequiresRunningMachine { reference }
+                    }
+                    "RecordInUse" => E::RecordInUse { reference },
+                    _ => return Err(invalid(
+                        "error.native_variant",
+                        "retain original typed RPC status; native variant cannot be reconstructed",
+                    )),
+                }
+            }
             "ImageReferenceRejected" => E::ImageReferenceRejected {
                 reference: required(d.reference, "error.reference")?,
                 message: d.safe_message,
@@ -721,8 +789,7 @@ fn admission_to_wire(
         source_family: match source_family {
             libvm::SourceFamily::Oci => w::SourceFamily::Oci,
             libvm::SourceFamily::LocalDisk => w::SourceFamily::LocalDisk,
-            libvm::SourceFamily::ManagedImage => w::SourceFamily::ManagedImage,
-            libvm::SourceFamily::Snapshot => w::SourceFamily::Snapshot,
+            libvm::SourceFamily::StoredImage => w::SourceFamily::StoredImage,
         } as i32,
         root_profile: match root_profile {
             libvm::StorageProfile::OpaqueRawV1 => w::StorageProfile::OpaqueRawV1,
@@ -752,8 +819,7 @@ fn admission_from_wire(
         source_family: match w::SourceFamily::try_from(value.source_family) {
             Ok(w::SourceFamily::Oci) => libvm::SourceFamily::Oci,
             Ok(w::SourceFamily::LocalDisk) => libvm::SourceFamily::LocalDisk,
-            Ok(w::SourceFamily::ManagedImage) => libvm::SourceFamily::ManagedImage,
-            Ok(w::SourceFamily::Snapshot) => libvm::SourceFamily::Snapshot,
+            Ok(w::SourceFamily::StoredImage) => libvm::SourceFamily::StoredImage,
             _ => return Err(invalid("error.source_family", "unknown source family")),
         },
         root_profile: match w::StorageProfile::try_from(value.root_profile) {
@@ -1076,8 +1142,8 @@ mod tests {
         let detail = w::ErrorDetail {
             kind: 4,
             code: 15,
-            reference: Some(format!("image:sha256:{}", "a".repeat(64))),
-            checkpoint_portability: Some(w::RestorePortabilityRefusal {
+            reference: Some(format!("sha256:{}", "a".repeat(64))),
+            snapshot_portability: Some(w::RestorePortabilityRefusal {
                 pin: "cpu".into(),
                 expected: "captured-cpu".into(),
                 actual: "unavailable".into(),
@@ -1088,17 +1154,17 @@ mod tests {
         assert!(matches!(
             status_to_native_error(&status(detail.clone(), tonic::Code::FailedPrecondition))
                 .unwrap(),
-            libvm::LibVmError::CheckpointPortability { .. }
+            libvm::LibVmError::SnapshotPortability { .. }
         ));
         assert!(status_to_native_error(&status(detail.clone(), tonic::Code::Internal)).is_err());
         let mut wrong_stage = detail.clone();
-        wrong_stage.checkpoint_portability.as_mut().unwrap().stage = "activation".into();
+        wrong_stage.snapshot_portability.as_mut().unwrap().stage = "activation".into();
         assert!(
             status_to_native_error(&status(wrong_stage, tonic::Code::FailedPrecondition)).is_err()
         );
         let mut absent_pin = detail.clone();
         absent_pin
-            .checkpoint_portability
+            .snapshot_portability
             .as_mut()
             .unwrap()
             .pin
@@ -1107,11 +1173,95 @@ mod tests {
             status_to_native_error(&status(absent_pin, tonic::Code::FailedPrecondition)).is_err()
         );
         let mut absent_receipt = detail;
-        absent_receipt.checkpoint_portability = None;
+        absent_receipt.snapshot_portability = None;
         assert!(
             status_to_native_error(&status(absent_receipt, tonic::Code::FailedPrecondition))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn image_and_snapshot_kind_errors_keep_their_hint_and_type() {
+        use libvm::LibVmError as E;
+        let reference = || "hello".to_owned();
+        for error in [
+            E::SnapshotIsNotAnImage {
+                reference: reference(),
+            },
+            E::ImageIsNotASnapshot {
+                reference: reference(),
+            },
+            E::ArtifactIsSnapshot {
+                reference: reference(),
+            },
+            E::ArtifactIsImage {
+                reference: reference(),
+            },
+            E::ImageIsVmArtifact {
+                reference: reference(),
+            },
+            E::SnapshotRequiresStoppedMachine {
+                reference: reference(),
+            },
+            E::MemorySnapshotRequiresRunningMachine {
+                reference: reference(),
+            },
+            E::RecordInUse {
+                reference: reference(),
+            },
+            E::SnapshotNotFound {
+                reference: reference(),
+            },
+            E::ImageNameConflict { name: reference() },
+            E::SnapshotNameConflict { name: reference() },
+            E::InvalidRequest {
+                message: "preserve requires memory".into(),
+            },
+        ] {
+            let status = native_error_to_status(&error);
+            assert!(error.to_string().ends_with(status.message()), "{error:?}");
+            let decoded = status_to_native_error(&status).unwrap();
+            assert_eq!(decoded.variant(), error.variant());
+            assert_eq!(decoded.to_string(), error.to_string());
+        }
+        let status = native_error_to_status(&E::SnapshotIsNotAnImage {
+            reference: reference(),
+        });
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("silo restore hello"));
+    }
+
+    #[test]
+    fn unreconstructible_naming_errors_keep_their_message_and_category() {
+        use libvm::LibVmError as E;
+        let snapshot: libvm::SnapshotId = format!("sha256:{}", "a".repeat(64)).parse().unwrap();
+        for (error, code) in [
+            (
+                E::InvalidName {
+                    name: "Bad".into(),
+                    reason: "a name begins with a lowercase letter or digit",
+                },
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                E::AmbiguousRecordPrefix {
+                    prefix: "abc".into(),
+                    count: 2,
+                },
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                E::CaptureNameConflict {
+                    name: "taken".into(),
+                    snapshot,
+                },
+                tonic::Code::AlreadyExists,
+            ),
+        ] {
+            let status = native_error_to_status(&error);
+            assert_eq!(status.code(), code);
+            assert_eq!(status.message(), error.to_string());
+        }
     }
 
     #[test]

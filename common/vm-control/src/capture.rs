@@ -512,55 +512,62 @@ fn summary_from_wire(
     Ok(summary)
 }
 
-pub fn live_snapshot_to_wire(
-    value: &libvm::LiveSnapshot,
-) -> Result<w::LiveSnapshotInfo, ConversionError> {
-    let result = w::LiveSnapshotInfo {
+pub fn created_snapshot_to_wire(
+    value: &libvm::CreatedSnapshot,
+) -> Result<w::CreatedSnapshot, ConversionError> {
+    let result = w::CreatedSnapshot {
         snapshot: Some(crate::stopped::info_to_wire(&value.snapshot)?),
-        capture: Some(summary_to_wire(&value.capture)?),
-        alias_conflict: value.naming_outcome.as_ref().map(|outcome| match outcome {
-            libvm::CaptureNamingOutcome::AliasConflict { alias } => alias.clone(),
+        capture: value.capture.as_ref().map(summary_to_wire).transpose()?,
+        name_conflict: value.naming_outcome.as_ref().map(|outcome| match outcome {
+            libvm::CaptureNamingOutcome::NameConflict { name } => name.clone(),
         }),
     };
-    live_snapshot_from_wire(result.clone())?;
+    created_snapshot_from_wire(result.clone())?;
     Ok(result)
 }
 
-pub fn live_snapshot_from_wire(
-    value: w::LiveSnapshotInfo,
-) -> Result<libvm::LiveSnapshot, ConversionError> {
-    let snapshot = crate::stopped::info_from_wire(required(value.snapshot, "live.snapshot")?)?;
-    let capture = summary_from_wire(required(value.capture, "live.capture")?)?;
-    if snapshot.capture_kind != libvm::SnapshotCaptureKindName::LiveExecution {
-        return Err(invalid(
-            "live.snapshot",
-            "expected a live execution checkpoint",
-        ));
-    }
-    if !snapshot.provenance.iter().any(|provenance| {
-        provenance.capture_id.to_string() == capture.capture_id.as_str()
-            && provenance.machine_id.to_string() == capture.machine_id.as_str()
-            && provenance.run_id.to_string() == capture.run_id.as_str()
-    }) {
-        return Err(invalid(
-            "live.snapshot.provenance",
-            "checkpoint lacks this capture's provenance",
-        ));
-    }
-    let naming_outcome = value
-        .alias_conflict
-        .map(|alias| {
-            let alias = crate::stopped::alias(&alias)?;
-            if !snapshot.retained || snapshot.aliases.contains(&alias) {
+/// A capture is present exactly for a snapshot with memory, and the snapshot
+/// carries that capture's provenance.
+pub fn created_snapshot_from_wire(
+    value: w::CreatedSnapshot,
+) -> Result<libvm::CreatedSnapshot, ConversionError> {
+    let snapshot = crate::stopped::info_from_wire(required(value.snapshot, "created.snapshot")?)?;
+    let capture = value.capture.map(summary_from_wire).transpose()?;
+    match (&capture, snapshot.memory) {
+        (Some(capture), libvm::SnapshotMemory::Included) => {
+            if !snapshot.provenance.iter().any(|provenance| {
+                provenance.capture_id.to_string() == capture.capture_id.as_str()
+                    && provenance.machine_id.to_string() == capture.machine_id.as_str()
+                    && provenance.run_id.to_string() == capture.run_id.as_str()
+            }) {
                 return Err(invalid(
-                    "live.alias_conflict",
-                    "conflicting checkpoint must be retained without the requested alias",
+                    "created.snapshot.provenance",
+                    "snapshot lacks this capture's provenance",
                 ));
             }
-            Ok(libvm::CaptureNamingOutcome::AliasConflict { alias })
+        }
+        (None, libvm::SnapshotMemory::None) => {}
+        _ => {
+            return Err(invalid(
+                "created.capture",
+                "a capture is present exactly for a snapshot with memory",
+            ))
+        }
+    }
+    let naming_outcome = value
+        .name_conflict
+        .map(|name| {
+            let name = crate::local_name(&name)?;
+            if snapshot.names.contains(&name) {
+                return Err(invalid(
+                    "created.name_conflict",
+                    "the snapshot was kept without the conflicting name",
+                ));
+            }
+            Ok(libvm::CaptureNamingOutcome::NameConflict { name })
         })
         .transpose()?;
-    Ok(libvm::LiveSnapshot {
+    Ok(libvm::CreatedSnapshot {
         snapshot,
         capture,
         naming_outcome,
@@ -617,7 +624,7 @@ pub fn machine_capture_from_wire(
     if snapshot_id.is_some() != (stage == libvm::MachineCaptureStage::Published) {
         return Err(invalid(
             "capture.snapshot_id",
-            "a checkpoint identity is present exactly once published",
+            "a snapshot identity is present exactly once published",
         ));
     }
     Ok(libvm::MachineCapture {
@@ -639,7 +646,7 @@ mod tests {
     use vm_spec::lifecycle::{CaptureResumePolicy, Diagnostic, LiveId};
 
     use crate::capture::{
-        live_snapshot_from_wire, live_snapshot_to_wire, machine_capture_from_wire,
+        created_snapshot_from_wire, created_snapshot_to_wire, machine_capture_from_wire,
         machine_capture_to_wire, resume_policy_from_wire,
     };
 
@@ -651,15 +658,14 @@ mod tests {
         libvm::SnapshotInfo {
             id: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
             record_digest: format!("sha256:{}", "b".repeat(64)).parse().unwrap(),
-            capture_kind: libvm::SnapshotCaptureKindName::LiveExecution,
+            memory: libvm::SnapshotMemory::Included,
             provenance: vec![libvm::SnapshotCaptureProvenance {
                 capture_id: CAPTURE.parse().unwrap(),
                 machine_id: MACHINE.parse().unwrap(),
                 run_id: RUN.parse().unwrap(),
                 evidence_digest: format!("sha256:{}", "c".repeat(64)).parse().unwrap(),
             }],
-            retained: true,
-            aliases: vec!["checkpoint".into()],
+            names: vec!["snapshot".into()],
             created_at: 1,
             streams: Vec::new(),
         }
@@ -714,11 +720,11 @@ mod tests {
         }
     }
 
-    fn live() -> libvm::LiveSnapshot {
-        libvm::LiveSnapshot {
+    fn live() -> libvm::CreatedSnapshot {
+        libvm::CreatedSnapshot {
             snapshot: snapshot(),
             naming_outcome: None,
-            capture: libvm::LiveCaptureSummary {
+            capture: Some(libvm::LiveCaptureSummary {
                 capture_id: LiveId::parse(CAPTURE).unwrap(),
                 machine_id: LiveId::parse(MACHINE).unwrap(),
                 run_id: LiveId::parse(RUN).unwrap(),
@@ -730,26 +736,36 @@ mod tests {
                 staging: format!("machines/{MACHINE}/captures/{CAPTURE}").into(),
                 memory: memory(),
                 first_snapshot_full_identity_reason: None,
-            },
+            }),
         }
     }
 
     #[test]
     fn fork_child_full_identity_reason_round_trips_and_rejects_unknown_reason() {
         let mut snapshot = live();
-        snapshot.capture.first_snapshot_full_identity_reason =
+        snapshot
+            .capture
+            .as_mut()
+            .unwrap()
+            .first_snapshot_full_identity_reason =
             Some(libvm::SnapshotIdentityReason::UnknownAfterFork);
-        snapshot.capture.memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
-        snapshot.capture.memory.full_reason = None;
-        snapshot.capture.memory.identity_full_reason =
+        snapshot.capture.as_mut().unwrap().memory.mode =
+            vm_spec::lifecycle::CapturePolicy::Incremental;
+        snapshot.capture.as_mut().unwrap().memory.full_reason = None;
+        snapshot
+            .capture
+            .as_mut()
+            .unwrap()
+            .memory
+            .identity_full_reason =
             Some(vm_spec::capture::CaptureIdentityFullReason::UnknownAnchorAfterFork);
-        let mut wire = live_snapshot_to_wire(&snapshot).unwrap();
-        assert_eq!(live_snapshot_from_wire(wire.clone()).unwrap(), snapshot);
+        let mut wire = created_snapshot_to_wire(&snapshot).unwrap();
+        assert_eq!(created_snapshot_from_wire(wire.clone()).unwrap(), snapshot);
         wire.capture
             .as_mut()
             .unwrap()
             .first_snapshot_full_identity_reason = Some(0);
-        assert!(live_snapshot_from_wire(wire).is_err());
+        assert!(created_snapshot_from_wire(wire).is_err());
     }
 
     #[test]
@@ -781,11 +797,29 @@ mod tests {
             Reason::ExtentLimit,
         ] {
             let mut value = live();
-            value.capture.memory.stats.full_identity_read_fallback = reason;
-            value.capture.memory.stats.live_pages_classified = 7;
-            value.capture.memory.stats.identity_zero_bytes_filled = 4096;
-            let wire = live_snapshot_to_wire(&value).unwrap();
-            assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
+            value
+                .capture
+                .as_mut()
+                .unwrap()
+                .memory
+                .stats
+                .full_identity_read_fallback = reason;
+            value
+                .capture
+                .as_mut()
+                .unwrap()
+                .memory
+                .stats
+                .live_pages_classified = 7;
+            value
+                .capture
+                .as_mut()
+                .unwrap()
+                .memory
+                .stats
+                .identity_zero_bytes_filled = 4096;
+            let wire = created_snapshot_to_wire(&value).unwrap();
+            assert_eq!(created_snapshot_from_wire(wire).unwrap(), value);
         }
         for value in [0, -1, 6, i32::MAX] {
             assert!(crate::capture::identity_read_fallback_from_wire(value).is_err());
@@ -819,41 +853,58 @@ mod tests {
     }
 
     #[test]
-    fn capture_alias_conflict_round_trips_and_reports_retained_checkpoint() {
+    fn capture_name_conflict_round_trips_and_reports_kept_snapshot() {
         let mut value = live();
-        value.snapshot.retained = true;
-        value.naming_outcome = Some(libvm::CaptureNamingOutcome::AliasConflict {
-            alias: "taken".into(),
+        value.naming_outcome = Some(libvm::CaptureNamingOutcome::NameConflict {
+            name: "taken".into(),
         });
-        let wire = live_snapshot_to_wire(&value).unwrap();
-        assert_eq!(wire.alias_conflict.as_deref(), Some("taken"));
-        let decoded = live_snapshot_from_wire(wire.clone()).unwrap();
+        let wire = created_snapshot_to_wire(&value).unwrap();
+        assert_eq!(wire.name_conflict.as_deref(), Some("taken"));
+        let decoded = created_snapshot_from_wire(wire.clone()).unwrap();
         assert_eq!(decoded, value);
         assert!(matches!(
             decoded.require_requested_name(),
-            Err(libvm::LibVmError::CaptureAliasConflict { alias, checkpoint })
-                if alias == "taken" && checkpoint == value.snapshot.id
+            Err(libvm::LibVmError::CaptureNameConflict { name, snapshot })
+                if name == "taken" && snapshot == value.snapshot.id
         ));
         let mut invalid = wire.clone();
-        invalid.alias_conflict = Some("bad alias".into());
-        assert!(live_snapshot_from_wire(invalid).is_err());
-        let mut invalid = wire.clone();
-        invalid.snapshot.as_mut().unwrap().retained = Some(false);
-        assert!(live_snapshot_from_wire(invalid).is_err());
+        invalid.name_conflict = Some("bad name".into());
+        assert!(created_snapshot_from_wire(invalid).is_err());
         let mut invalid = wire;
         invalid
             .snapshot
             .as_mut()
             .unwrap()
-            .aliases
+            .names
             .push("taken".into());
-        assert!(live_snapshot_from_wire(invalid).is_err());
+        assert!(created_snapshot_from_wire(invalid).is_err());
         assert!(live().require_requested_name().is_ok());
     }
 
     #[test]
+    fn created_snapshot_carries_a_capture_exactly_with_memory() {
+        let wire = created_snapshot_to_wire(&live()).unwrap();
+        let mut without_capture = wire.clone();
+        without_capture.capture = None;
+        assert!(created_snapshot_from_wire(without_capture).is_err());
+
+        let mut stopped = live();
+        stopped.capture = None;
+        stopped.snapshot.memory = libvm::SnapshotMemory::None;
+        stopped.snapshot.provenance.clear();
+        let stopped_wire = created_snapshot_to_wire(&stopped).unwrap();
+        assert_eq!(
+            created_snapshot_from_wire(stopped_wire.clone()).unwrap(),
+            stopped
+        );
+        let mut with_capture = stopped_wire;
+        with_capture.capture = wire.capture;
+        assert!(created_snapshot_from_wire(with_capture).is_err());
+    }
+
+    #[test]
     fn capture_receipt_rejects_foreign_binding_and_incoherent_memory_evidence() {
-        let wire = live_snapshot_to_wire(&live()).unwrap();
+        let wire = created_snapshot_to_wire(&live()).unwrap();
         for case in 0..12 {
             let mut changed = wire.clone();
             let capture = changed.capture.as_mut().unwrap();
@@ -873,7 +924,7 @@ mod tests {
                 11 => capture.memory = None,
                 _ => unreachable!(),
             }
-            assert!(live_snapshot_from_wire(changed).is_err(), "case {case}");
+            assert!(created_snapshot_from_wire(changed).is_err(), "case {case}");
         }
         let mut incremental = wire;
         let memory = incremental
@@ -888,18 +939,18 @@ mod tests {
         memory.identity_policy = w::CaptureIdentityPolicy::SinceAnchor as i32;
         memory.identity_full_reason = None;
         memory.changes.as_mut().unwrap().coverage = w::CaptureRamCoverage::Incremental as i32;
-        assert!(live_snapshot_from_wire(incremental).is_err());
+        assert!(created_snapshot_from_wire(incremental).is_err());
     }
 
     #[test]
     fn memory_change_reference_round_trips_without_per_chunk_entries() {
         use prost::Message;
         let mut value = live();
-        let wire = live_snapshot_to_wire(&value).unwrap();
+        let wire = created_snapshot_to_wire(&value).unwrap();
         let encoded = wire.encode_to_vec();
         assert!(encoded.len() < 4096);
-        let decoded = w::LiveSnapshotInfo::decode(encoded.as_slice()).unwrap();
-        assert_eq!(live_snapshot_from_wire(decoded).unwrap(), value);
+        let decoded = w::CreatedSnapshot::decode(encoded.as_slice()).unwrap();
+        assert_eq!(created_snapshot_from_wire(decoded).unwrap(), value);
         for case in 0..5 {
             let mut invalid = wire.clone();
             let changes = invalid
@@ -920,9 +971,9 @@ mod tests {
                 4 => changes.baseline_stream = Some("invalid".into()),
                 _ => unreachable!(),
             }
-            assert!(live_snapshot_from_wire(invalid).is_err(), "case {case}");
+            assert!(created_snapshot_from_wire(invalid).is_err(), "case {case}");
         }
-        let memory = &mut value.capture.memory;
+        let memory = &mut value.capture.as_mut().unwrap().memory;
         memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
         memory.baseline = Some(vm_spec::capture::Sha256Digest::of_bytes(b"baseline"));
         memory.full_reason = None;
@@ -934,15 +985,15 @@ mod tests {
         memory.stats.live_bytes_read = 0;
         memory.stats.identity_bytes_hashed = 0;
         memory.stats.zero_bytes_omitted = 0;
-        let wire = live_snapshot_to_wire(&value).unwrap();
-        assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
+        let wire = created_snapshot_to_wire(&value).unwrap();
+        assert_eq!(created_snapshot_from_wire(wire).unwrap(), value);
     }
 
     #[test]
-    fn live_snapshot_round_trips_exact_capture_identity() {
+    fn created_snapshot_round_trips_exact_capture_identity() {
         let value = live();
-        let wire = live_snapshot_to_wire(&value).unwrap();
-        assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
+        let wire = created_snapshot_to_wire(&value).unwrap();
+        assert_eq!(created_snapshot_from_wire(wire).unwrap(), value);
     }
 
     #[test]
@@ -965,38 +1016,38 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_rejects_stopped_kind_foreign_provenance_and_path_authority() {
-        let wire = live_snapshot_to_wire(&live()).unwrap();
+    fn created_snapshot_rejects_memoryless_kind_foreign_provenance_and_path_authority() {
+        let wire = created_snapshot_to_wire(&live()).unwrap();
         let mut stopped = wire.clone();
         let info = stopped.snapshot.as_mut().unwrap();
-        info.capture_kind = w::StorageCaptureKind::StoppedStorage as i32;
+        info.memory = w::SnapshotMemory::None as i32;
         info.provenance.clear();
-        assert!(live_snapshot_from_wire(stopped).is_err());
+        assert!(created_snapshot_from_wire(stopped).is_err());
 
         let mut foreign = wire.clone();
         foreign.snapshot.as_mut().unwrap().provenance[0].capture_id =
             "00000000-0000-4000-8000-000000000009".into();
-        assert!(live_snapshot_from_wire(foreign).is_err());
+        assert!(created_snapshot_from_wire(foreign).is_err());
 
         for staging in ["/home/user/.silo/machines/x", "machines/../etc", ""] {
             let mut path = wire.clone();
             path.capture.as_mut().unwrap().staging = staging.into();
-            assert!(live_snapshot_from_wire(path).is_err(), "{staging}");
+            assert!(created_snapshot_from_wire(path).is_err(), "{staging}");
         }
 
         let mut unspecified = wire.clone();
         unspecified.capture.as_mut().unwrap().source_outcome =
             w::CaptureSourceOutcome::Unspecified as i32;
-        assert!(live_snapshot_from_wire(unspecified).is_err());
+        assert!(created_snapshot_from_wire(unspecified).is_err());
 
         let mut error_without_failure = wire;
         error_without_failure.capture.as_mut().unwrap().source_error = Some("boom".into());
-        assert!(live_snapshot_from_wire(error_without_failure).is_err());
+        assert!(created_snapshot_from_wire(error_without_failure).is_err());
     }
 
     #[test]
-    fn live_snapshot_rejects_foreign_source_and_impossible_continuation() {
-        let wire = live_snapshot_to_wire(&live()).unwrap();
+    fn created_snapshot_rejects_foreign_source_and_impossible_continuation() {
+        let wire = created_snapshot_to_wire(&live()).unwrap();
         for field in ["machine", "run"] {
             let mut changed = wire.clone();
             let summary = changed.capture.as_mut().unwrap();
@@ -1005,14 +1056,14 @@ mod tests {
             } else {
                 summary.run_id = CAPTURE.into();
             }
-            assert!(live_snapshot_from_wire(changed).is_err(), "{field}");
+            assert!(created_snapshot_from_wire(changed).is_err(), "{field}");
             let mut changed = live();
             if field == "machine" {
-                changed.capture.machine_id = LiveId::parse(CAPTURE).unwrap();
+                changed.capture.as_mut().unwrap().machine_id = LiveId::parse(CAPTURE).unwrap();
             } else {
-                changed.capture.run_id = LiveId::parse(CAPTURE).unwrap();
+                changed.capture.as_mut().unwrap().run_id = LiveId::parse(CAPTURE).unwrap();
             }
-            assert!(live_snapshot_to_wire(&changed).is_err(), "{field}");
+            assert!(created_snapshot_to_wire(&changed).is_err(), "{field}");
         }
         for (policy, pause, outcome) in [
             (
@@ -1037,34 +1088,34 @@ mod tests {
             ),
         ] {
             let mut changed = live();
-            changed.capture.resume_policy = policy;
-            changed.capture.pause = pause;
-            changed.capture.source_outcome = outcome;
-            assert!(live_snapshot_to_wire(&changed).is_err());
+            changed.capture.as_mut().unwrap().resume_policy = policy;
+            changed.capture.as_mut().unwrap().pause = pause;
+            changed.capture.as_mut().unwrap().source_outcome = outcome;
+            assert!(created_snapshot_to_wire(&changed).is_err());
             let mut changed = wire.clone();
             let summary = changed.capture.as_mut().unwrap();
             summary.resume_policy = crate::capture::resume_policy_to_wire(policy);
             summary.pause = crate::capture::pause_to_wire(pause);
             summary.source_outcome = crate::capture::source_to_wire(outcome);
-            assert!(live_snapshot_from_wire(changed).is_err());
+            assert!(created_snapshot_from_wire(changed).is_err());
         }
     }
 
     #[test]
     fn failed_continuation_keeps_its_diagnostic_and_unknown_is_distinct() {
         let mut value = live();
-        value.capture.source_outcome = libvm::LiveCaptureSource::ResumeFailed;
-        value.capture.source_error = Some(Diagnostic::new("thaw unacknowledged"));
-        let wire = live_snapshot_to_wire(&value).unwrap();
-        assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
-        value.capture.source_outcome = libvm::LiveCaptureSource::Unknown;
-        value.capture.source_error = None;
-        let wire = live_snapshot_to_wire(&value).unwrap();
+        value.capture.as_mut().unwrap().source_outcome = libvm::LiveCaptureSource::ResumeFailed;
+        value.capture.as_mut().unwrap().source_error = Some(Diagnostic::new("thaw unacknowledged"));
+        let wire = created_snapshot_to_wire(&value).unwrap();
+        assert_eq!(created_snapshot_from_wire(wire).unwrap(), value);
+        value.capture.as_mut().unwrap().source_outcome = libvm::LiveCaptureSource::Unknown;
+        value.capture.as_mut().unwrap().source_error = None;
+        let wire = created_snapshot_to_wire(&value).unwrap();
         assert_eq!(
             wire.capture.as_ref().unwrap().source_outcome,
             w::CaptureSourceOutcome::Unknown as i32
         );
-        assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
+        assert_eq!(created_snapshot_from_wire(wire).unwrap(), value);
     }
 
     #[test]
@@ -1077,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_capture_binds_checkpoint_identity_to_publication() {
+    fn machine_capture_binds_snapshot_identity_to_publication() {
         let mut value = libvm::MachineCapture {
             capture_id: LiveId::parse(CAPTURE).unwrap(),
             run_id: LiveId::parse(RUN).unwrap(),
@@ -1109,7 +1160,7 @@ mod tests {
             (CaptureSeedMethod::Rebuild, w::CaptureSeedMethod::Rebuild),
         ] {
             let mut value = live();
-            let memory = &mut value.capture.memory;
+            let memory = &mut value.capture.as_mut().unwrap().memory;
             memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
             memory.baseline = Some(vm_spec::capture::Sha256Digest::of_bytes(b"baseline"));
             memory.full_reason = None;
@@ -1122,7 +1173,7 @@ mod tests {
             memory.stats.overlay_bytes_written = 0;
             memory.stats.live_bytes_read = 0;
             memory.stats.zero_bytes_omitted = 0;
-            let wire = live_snapshot_to_wire(&value).unwrap();
+            let wire = created_snapshot_to_wire(&value).unwrap();
             assert_eq!(
                 wire.capture
                     .as_ref()
@@ -1136,13 +1187,13 @@ mod tests {
                     .seed_method,
                 expected as i32
             );
-            assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
+            assert_eq!(created_snapshot_from_wire(wire).unwrap(), value);
         }
     }
 
     #[test]
     fn memory_seed_method_rejects_unspecified_and_unknown_wire_values() {
-        let wire = live_snapshot_to_wire(&live()).unwrap();
+        let wire = created_snapshot_to_wire(&live()).unwrap();
         for method in [w::CaptureSeedMethod::Unspecified as i32, -1, 3, i32::MAX] {
             let mut changed = wire.clone();
             changed
@@ -1156,7 +1207,10 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .seed_method = method;
-            assert!(live_snapshot_from_wire(changed).is_err(), "method {method}");
+            assert!(
+                created_snapshot_from_wire(changed).is_err(),
+                "method {method}"
+            );
         }
     }
 }

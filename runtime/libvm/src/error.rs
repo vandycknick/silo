@@ -20,17 +20,49 @@ pub enum LibVmError {
     LiveProtocol { message: String },
     #[error("live observation for {reference} failed: {message}")]
     LiveObservation { reference: String, message: String },
-    /// A retained capture produced no admissible checkpoint or is still owned
+    /// A retained capture produced no admissible snapshot or is still owned
     /// by its run. The capture identity, reservation and staging are retained.
     #[error("live capture {capture_id}: {message}")]
     LiveCapture { capture_id: String, message: String },
-    #[error("image alias {alias} already names a different artifact")]
-    ImageAliasConflict { alias: String },
-    #[error("image alias {alias} already names a different artifact; checkpoint {checkpoint} retained without the requested alias")]
-    CaptureAliasConflict {
-        alias: String,
-        checkpoint: crate::storage::identity::SnapshotId,
+    #[error("invalid name {name:?}: {reason}")]
+    InvalidName { name: String, reason: &'static str },
+    #[error("image name {name} already names a different image")]
+    ImageNameConflict { name: String },
+    #[error("snapshot name {name} already names a different snapshot")]
+    SnapshotNameConflict { name: String },
+    #[error("snapshot name {name} already names a different snapshot; snapshot {snapshot} was kept without the requested name")]
+    CaptureNameConflict {
+        name: String,
+        snapshot: crate::storage::identity::SnapshotId,
     },
+    #[error("snapshot {reference} not found")]
+    SnapshotNotFound { reference: String },
+    #[error("id prefix {prefix:?} matches {count} records; use more characters")]
+    AmbiguousRecordPrefix { prefix: String, count: usize },
+    #[error("{reference} is a snapshot, not an image; use `silo restore {reference}`")]
+    SnapshotIsNotAnImage { reference: String },
+    #[error("{reference} is an image, not a snapshot; use `silo create {reference}`")]
+    ImageIsNotASnapshot { reference: String },
+    #[error("VM artifact {reference} is a snapshot, not an image; use `silo restore {reference}`")]
+    ArtifactIsSnapshot { reference: String },
+    #[error("VM artifact {reference} is an image, not a snapshot; use `silo create {reference}`")]
+    ArtifactIsImage { reference: String },
+    /// The registry reference names a Silo image artifact, which is pulled
+    /// into a stored image rather than resolved as an OCI container image.
+    #[error("{reference} is a Silo image artifact, not a container image; pull it with `silo image pull {reference}`")]
+    ImageIsVmArtifact { reference: String },
+    #[error(
+        "machine {reference} is running: stop it first, or include its memory in the snapshot"
+    )]
+    SnapshotRequiresStoppedMachine { reference: String },
+    #[error(
+        "machine {reference} is not running: a snapshot with memory requires a running machine"
+    )]
+    MemorySnapshotRequiresRunningMachine { reference: String },
+    #[error("{reference} is in use by an active storage operation; retry when it completes")]
+    RecordInUse { reference: String },
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
     #[error("live fork {operation_id}: {message}")]
     LiveFork {
         operation_id: String,
@@ -46,9 +78,9 @@ pub enum LibVmError {
     },
     #[error(transparent)]
     SnapshotVerification(#[from] crate::store::snapshot_store::SnapshotVerificationError),
-    #[error("checkpoint {checkpoint} refused at {}: pin {} expected {}, destination {}; no execution child was started", .refusal.stage, .refusal.pin, .refusal.expected, .refusal.actual)]
-    CheckpointPortability {
-        checkpoint: String,
+    #[error("snapshot {snapshot} refused at {}: pin {} expected {}, destination {}; no execution child was started", .refusal.stage, .refusal.pin, .refusal.expected, .refusal.actual)]
+    SnapshotPortability {
+        snapshot: String,
         /// Keep this uncommon diagnostic from enlarging every result and async state.
         refusal: Box<vm_spec::restore::RestorePortabilityRefusal>,
     },
@@ -108,12 +140,6 @@ pub enum LibVmError {
     },
     #[error(transparent)]
     ArtifactWire(oci::vm_artifact::Error),
-    #[error("approved VM artifact index {expected} differs from resolved index {actual}")]
-    ArtifactTrustMismatch { expected: String, actual: String },
-    #[error("signature-required VM artifact policy has no configured signature verifier; digest approval cannot substitute for publisher authentication")]
-    ArtifactSignatureProviderUnavailable,
-    #[error("checkpoint publication to {destination} requires an acknowledgement naming exactly that destination: disks and RAM export secrets and deleted-data remnants")]
-    CheckpointPublicationNotAcknowledged { destination: String },
     #[error("format private overlay upper: {0}")]
     UpperFormat(#[from] disk_image::ext4::FormatError),
     #[error(transparent)]
@@ -202,9 +228,9 @@ pub enum LibVmError {
         machine_count: u64,
     },
 
-    #[error("image pull policy {policy:?} does not apply to {source_kind:?} image sources")]
+    #[error("pull policy {policy:?} does not apply to {source_kind:?} image sources")]
     ImagePullPolicyUnsupported {
-        policy: crate::ImagePullPolicy,
+        policy: crate::PullPolicy,
         source_kind: crate::ImageSourceKind,
     },
 
@@ -391,15 +417,30 @@ impl LibVmError {
     /// cannot silently degrade a binding to message parsing or an unknown kind.
     pub fn variant(&self) -> &'static str {
         match self {
-            Self::ImageAliasConflict { .. } => "ImageAliasConflict",
-            Self::CaptureAliasConflict { .. } => "CaptureAliasConflict",
+            Self::InvalidName { .. } => "InvalidName",
+            Self::ImageNameConflict { .. } => "ImageNameConflict",
+            Self::SnapshotNameConflict { .. } => "SnapshotNameConflict",
+            Self::CaptureNameConflict { .. } => "CaptureNameConflict",
+            Self::SnapshotNotFound { .. } => "SnapshotNotFound",
+            Self::AmbiguousRecordPrefix { .. } => "AmbiguousRecordPrefix",
+            Self::SnapshotIsNotAnImage { .. } => "SnapshotIsNotAnImage",
+            Self::ImageIsNotASnapshot { .. } => "ImageIsNotASnapshot",
+            Self::ArtifactIsSnapshot { .. } => "ArtifactIsSnapshot",
+            Self::ArtifactIsImage { .. } => "ArtifactIsImage",
+            Self::ImageIsVmArtifact { .. } => "ImageIsVmArtifact",
+            Self::SnapshotRequiresStoppedMachine { .. } => "SnapshotRequiresStoppedMachine",
+            Self::MemorySnapshotRequiresRunningMachine { .. } => {
+                "MemorySnapshotRequiresRunningMachine"
+            }
+            Self::RecordInUse { .. } => "RecordInUse",
+            Self::InvalidRequest { .. } => "InvalidRequest",
             Self::Handoff(_) => "Handoff",
             Self::LiveOperationUnsupported { .. } => "LiveOperationUnsupported",
             Self::LiveDiscovery { .. } => "LiveDiscovery",
             Self::LiveProtocol { .. } => "LiveProtocol",
             Self::LiveObservation { .. } => "LiveObservation",
             Self::LiveCapture { .. } => "LiveCapture",
-            Self::CheckpointPortability { .. } => "CheckpointPortability",
+            Self::SnapshotPortability { .. } => "SnapshotPortability",
             Self::LiveFork { .. } => "LiveFork",
             Self::LiveForkNotFound { .. } => "LiveForkNotFound",
             Self::ForkChildCancelled { .. } => "ForkChildCancelled",
@@ -420,11 +461,6 @@ impl LibVmError {
             Self::RawExportUnsupported { .. } => "RawExportUnsupported",
             Self::ArtifactInvalid { .. } => "ArtifactInvalid",
             Self::ArtifactWire(_) => "ArtifactWire",
-            Self::ArtifactTrustMismatch { .. } => "ArtifactTrustMismatch",
-            Self::ArtifactSignatureProviderUnavailable => "ArtifactSignatureProviderUnavailable",
-            Self::CheckpointPublicationNotAcknowledged { .. } => {
-                "CheckpointPublicationNotAcknowledged"
-            }
             Self::UpperFormat(_) => "UpperFormat",
             Self::Changeset(_) => "Changeset",
             Self::Namespace(_) => "Namespace",

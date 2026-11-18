@@ -1,6 +1,6 @@
 //! Portable capture provenance: exact transported seal and historical plan.
 //! Verification proves the record-to-inventory and immutable-input
-//! relationships of one checkpoint. It never
+//! relationships of one snapshot. It never
 //! proves that a trusted monitor performed the cut, and it never creates local
 //! capture, launch, pause or reservation authority.
 use std::collections::BTreeMap;
@@ -18,7 +18,7 @@ use vm_spec::DiskFormat;
 use crate::image::transport::blobs::invalid;
 use crate::storage::identity::{ObjectDigest, SnapshotId, StreamId};
 use crate::store::models::snapshot::{
-    SnapshotCaptureKind, SnapshotExecution, SnapshotRecord, SnapshotRootProfile,
+    SnapshotExecution, SnapshotMemoryState, SnapshotRecord, SnapshotRootProfile,
 };
 use crate::LibVmError;
 
@@ -75,7 +75,7 @@ impl PortableCaptureProvenanceV2 {
     }
 }
 
-/// Structurally verified portable seal of one live checkpoint.
+/// Structurally verified portable seal of one snapshot with memory.
 #[derive(Debug, Clone)]
 pub(crate) struct PortableBinding {
     pub(crate) wrapper_digest: ObjectDigest,
@@ -110,7 +110,7 @@ pub(crate) fn provenance_objects(
     let memory = decoded
         .memory
         .as_ref()
-        .ok_or_else(|| failure("portable checkpoint lacks RAM change evidence"))?;
+        .ok_or_else(|| failure("portable snapshot lacks RAM change evidence"))?;
     Ok((
         ObjectDigest::of_bytes(wrapper),
         ObjectDigest::of_bytes(evidence),
@@ -119,10 +119,10 @@ pub(crate) fn provenance_objects(
 }
 
 fn execution(record: &SnapshotRecord) -> Result<&SnapshotExecution, LibVmError> {
-    match &record.capture {
-        SnapshotCaptureKind::LiveExecution { execution } => Ok(execution),
-        SnapshotCaptureKind::StoppedStorage { .. } => Err(failure(
-            "portable capture provenance requires a live-execution checkpoint",
+    match &record.memory {
+        SnapshotMemoryState::Included { execution } => Ok(execution),
+        SnapshotMemoryState::None { .. } => Err(failure(
+            "portable capture provenance requires a snapshot with memory",
         )),
     }
 }
@@ -172,7 +172,7 @@ fn writable_streams(
     Ok(sealed)
 }
 
-/// Reconstruct the portable wrapper for a local seal from the checkpoint's own
+/// Reconstruct the portable wrapper for a local seal from the snapshot's own
 /// configuration: fixed state roles followed by every writable attachment and
 /// its chunk map in order. Disks are paired by position, never by
 /// byte equality, which is ambiguous for identical disks.
@@ -215,7 +215,7 @@ pub(crate) fn build_local(
     Ok((binding, bytes))
 }
 
-/// Every structural relation between the canonical checkpoint, the wrapper and
+/// Every structural relation between the canonical snapshot, the wrapper and
 /// the exact evidence bytes. Byte measurements are [`verify_portable_capture`].
 pub(crate) fn verify_portable_binding(
     record: &SnapshotRecord,
@@ -247,7 +247,7 @@ pub(crate) fn verify_portable_binding(
         .map_err(failure)?;
     if wrapper.plan.configuration != configuration {
         return Err(failure(
-            "retained capture plan differs from checkpoint configuration",
+            "retained capture plan differs from snapshot configuration",
         ));
     }
     for input in &wrapper.plan.read_only_inputs {
@@ -258,7 +258,7 @@ pub(crate) fn verify_portable_binding(
                 .iter()
                 .find(|disk| disk.order == input.attachment_index && !disk.writable)
                 .ok_or_else(|| {
-                    failure("capture read-only input has no immutable checkpoint binding")
+                    failure("capture read-only input has no immutable snapshot binding")
                 })?
                 .content
                 .stream
@@ -266,21 +266,21 @@ pub(crate) fn verify_portable_binding(
         };
         if input.identity != identity {
             return Err(failure(
-                "captured immutable input differs from the checkpoint graph",
+                "captured immutable input differs from the snapshot graph",
             ));
         }
     }
     let digest = configuration.digest().map_err(failure)?;
     if evidence.configuration_digest != digest || memory.binding.topology != digest {
         return Err(failure(
-            "captured configuration differs from the checkpoint configuration",
+            "captured configuration differs from the snapshot configuration",
         ));
     }
     if memory.ram_stream.as_bytes() != execution.memory.stream.as_bytes()
         || memory.packed_length != execution.memory.length
     {
         return Err(failure(
-            "RAM stream or packed length differs from the checkpoint",
+            "RAM stream or packed length differs from the snapshot",
         ));
     }
     let profile = &execution.compatibility_profile;
@@ -347,7 +347,7 @@ pub(crate) fn verify_portable_binding(
             || entry.identity != Some(Sha256Digest::from_bytes(*stream.as_bytes()))
         {
             return Err(failure(
-                "sealed disk role, attachment order or length differs from the checkpoint",
+                "sealed disk role, attachment order or length differs from the snapshot",
             ));
         }
         disks.push((entry.clone(), *stream));
@@ -525,9 +525,7 @@ pub(crate) fn verify_portable_capture(
         }
     }
     if ObjectDigest::of_bytes(measured.layout) != execution.layout {
-        return Err(failure(
-            "RAM layout bytes differ from the checkpoint layout",
-        ));
+        return Err(failure("RAM layout bytes differ from the snapshot layout"));
     }
     let layout = crate::store::capture::validate_layout(
         measured.layout,
@@ -561,10 +559,10 @@ mod tests {
     use crate::storage::identity::{SnapshotId, StreamId};
     use crate::storage::map::AuthenticatedMap;
     use crate::storage::pool::StoragePool;
-    use crate::store::models::snapshot::{SnapshotCaptureKind, SnapshotRecord};
+    use crate::store::models::snapshot::{SnapshotMemoryState, SnapshotRecord};
     use crate::store::snapshot_store::SnapshotRef;
 
-    /// A real locally sealed and published live checkpoint.
+    /// A real locally sealed and published snapshot with memory.
     struct Published {
         _fixture: crate::store::capture::tests::Fixture,
         pool: StoragePool,
@@ -582,7 +580,7 @@ mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -783,7 +781,7 @@ mod tests {
         assert!(build_local(record, id, &extended, &published.plan).is_err());
         // A stopped snapshot has no portable capture.
         let mut stopped = record.clone();
-        stopped.capture = SnapshotCaptureKind::StoppedStorage {
+        stopped.memory = SnapshotMemoryState::None {
             stop_outcome: crate::store::models::storage::StorageStopOutcome::Unknown,
         };
         assert!(build_local(&stopped, id, &published.evidence, &published.plan).is_err());
@@ -795,8 +793,8 @@ mod tests {
         let record = &published.record;
         let (binding, _) =
             build_local(record, published.id, &published.evidence, &published.plan).unwrap();
-        let SnapshotCaptureKind::LiveExecution { execution } = &record.capture else {
-            panic!("live checkpoint expected");
+        let SnapshotMemoryState::Included { execution } = &record.memory else {
+            panic!("snapshot with memory expected");
         };
         let mut maps = BTreeMap::new();
         for stream in record.streams() {

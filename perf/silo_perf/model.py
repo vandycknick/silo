@@ -147,7 +147,7 @@ def target_for(targets: Mapping[TargetKey, Target], system: str, cohort: str,
 
 
 def image_source(reference: str) -> str:
-    if reference.startswith(("image:", "disk:")):
+    if reference.startswith(("sha256:", "disk:")):
         return "local"
     hostname = urlsplit("//" + reference).hostname
     return "local" if hostname in {"localhost", "127.0.0.1", "::1"} else "remote"

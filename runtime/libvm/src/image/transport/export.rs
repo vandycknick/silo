@@ -24,11 +24,11 @@ use oci::vm_artifact::wire::{
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
-use crate::image::import_types::ManagedSourceId;
 use crate::image::transport::blobs::{invalid, StagedBlobs};
 use crate::image::transport::closure::{content, identity, object, ObjectRole, Semantic};
 use crate::image::transport::identity::IdentityBuilder;
 use crate::image::transport::provenance::{build_local, verify_portable_binding};
+use crate::image::transport::ArtifactContent;
 use crate::paths::OwnedDirectory;
 use crate::storage::identity::{ObjectDigest, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
@@ -37,9 +37,9 @@ use crate::storage::locks::StorageLock;
 use crate::storage::map::AuthenticatedMap;
 use crate::storage::pool::{OperationPaths, StoragePool};
 use crate::storage::stream::{AuthenticatedStream, StreamHasher};
-use crate::store::managed_image_store::ManagedImageConsumer;
 use crate::store::models::snapshot::SnapshotStream;
 use crate::store::snapshot_store::{RecordInput, SnapshotConsumer};
+use crate::store::stored_image_store::StoredImageConsumer;
 use crate::store::stream_representation::VerifiedStreamRepresentation;
 use crate::store::Store;
 use crate::LibVmError;
@@ -48,7 +48,7 @@ use vm_spec::stream_map::{ChunkSize, StreamRole};
 /// The held managed source. Dropping it releases the closure lease, so the
 /// prepared artifact owns it until upload has finished.
 pub(crate) enum ExportSource {
-    Image(Box<ManagedImageConsumer>),
+    Image(Box<StoredImageConsumer>),
     Snapshot(Box<SnapshotConsumer>),
 }
 
@@ -110,9 +110,7 @@ impl ExportSource {
 /// payload of the graph is canonical pool content pinned by the source.
 pub(crate) struct PreparedVmArtifact {
     pub(crate) graph: EncodedVmGraph,
-    pub(crate) content: ManagedSourceId,
-    pub(crate) live: bool,
-    pub(crate) stopped_snapshot: bool,
+    pub(crate) content: ArtifactContent,
     images: PathBuf,
     _operation: OperationPaths,
     _source: ExportSource,
@@ -313,12 +311,9 @@ fn prepare_export_within(
         &records,
         &payloads.into_values().collect::<Vec<_>>(),
     )?;
-    let stopped_snapshot = matches!(source, ExportSource::Snapshot(_)) && !semantic.live();
     Ok(PreparedVmArtifact {
         graph,
         content: semantic.id,
-        live: semantic.live(),
-        stopped_snapshot,
         images,
         _operation: operation,
         _source: source,
@@ -432,7 +427,7 @@ fn select_provenance(
     let record = semantic
         .snapshot_record()
         .ok_or_else(|| invalid("capture provenance", "provenance requires a snapshot"))?;
-    let ManagedSourceId::Snapshot(id) = semantic.id else {
+    let ArtifactContent::Snapshot(id) = semantic.id else {
         return Err(invalid(
             "capture provenance",
             "provenance requires a snapshot",
@@ -476,7 +471,7 @@ fn select_provenance(
     candidates.into_values().next().ok_or_else(|| {
         invalid(
             "capture provenance",
-            "live checkpoint has no authenticated capture provenance to export",
+            "snapshot with memory has no authenticated capture provenance to export",
         )
     })
 }
@@ -1012,7 +1007,7 @@ mod tests {
             );
         }
         let prepared = export_within(&snapshots, info.id, complete).await.unwrap();
-        assert!(prepared.stopped_snapshot);
+        assert_eq!(prepared.content, crate::ArtifactContent::Snapshot(info.id));
         assert!(count(&catalog, bindings).await > before.1);
     }
 }

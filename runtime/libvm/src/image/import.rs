@@ -17,7 +17,7 @@
 //!      ▼
 //!  direct_boot_profile → pin_image_boot (same operation) → ImageRecord
 //!      ▼
-//!  ManagedImageStore::publish_owned (the original OFD moves into its worker)
+//!  StoredImageStore::publish_owned (the original OFD moves into its worker)
 //! ```
 //!
 //! Identity is computed over decoded raw bytes and canonical semantics only.
@@ -33,7 +33,7 @@ use disk_partition::{PartitionTable, ReadMode, SECTOR_SIZE};
 
 use crate::image::import_types::{
     DiskImportBoot, DiskImportFacts, DiskImportRequest, ImageProvenance, ImportRootSelection,
-    ManagedImageInfo, RootCandidate, RootSelectionFailed,
+    RootCandidate, RootSelectionFailed, StoredImageInfo,
 };
 use crate::image::local_disk::{AdmittedInput, OpenDiskSource};
 use crate::paths::OwnedDirectory;
@@ -41,10 +41,10 @@ use crate::storage::identity::ObjectDigest;
 use crate::storage::pool::{OperationPaths, StoragePool};
 use crate::storage::stream::write_sparse_at;
 use crate::storage::StorageError;
-use crate::store::managed_image_store::ManagedImageStore;
 use crate::store::models::image::{ImageRecord, ImageRecordKind};
 use crate::store::models::snapshot::{SnapshotRoot, SnapshotRootProfile};
 use crate::store::models::storage::{GuestArchitecture, RawLayout, RootSelector};
+use crate::store::stored_image_store::StoredImageStore;
 use crate::store::Store;
 use crate::LibVmError;
 
@@ -191,7 +191,7 @@ impl crate::image::Images {
     pub async fn import_disk(
         &self,
         request: DiskImportRequest,
-    ) -> Result<ManagedImageInfo, LibVmError> {
+    ) -> Result<StoredImageInfo, LibVmError> {
         self.import_admitted_disk(request.admit().await?).await
     }
 
@@ -199,7 +199,7 @@ impl crate::image::Images {
     pub async fn import_admitted_disk(
         &self,
         admitted: AdmittedDiskImport,
-    ) -> Result<ManagedImageInfo, LibVmError> {
+    ) -> Result<StoredImageInfo, LibVmError> {
         let runtime = self.runtime.clone();
         tokio::spawn(import_disk_owned(runtime, admitted)).await?
     }
@@ -209,9 +209,9 @@ impl crate::image::Images {
 async fn import_disk_owned(
     runtime: crate::runtime::Runtime,
     admitted: AdmittedDiskImport,
-) -> Result<ManagedImageInfo, LibVmError> {
+) -> Result<StoredImageInfo, LibVmError> {
     let AdmittedDiskImport { request, source } = admitted;
-    let DiskImportRequest { boot, alias, .. } = request;
+    let DiskImportRequest { boot, name, .. } = request;
     let DiskImportBoot::LinuxDirect {
         platform,
         root,
@@ -248,12 +248,12 @@ async fn import_disk_owned(
         boot,
         process: crate::ProcessConfig::default(),
     };
-    ManagedImageStore::from_store(Arc::new(store))
+    StoredImageStore::from_store(Arc::new(store))
         .publish_owned(
             record,
             operation_id,
             lease,
-            alias,
+            name,
             vec![prepared.provenance],
             None,
         )

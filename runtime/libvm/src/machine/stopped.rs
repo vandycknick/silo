@@ -18,16 +18,16 @@ use crate::runtime::boot_assets::{
 use crate::storage::locks::StorageLock;
 use crate::storage::pool::StoragePool;
 use crate::store::models::snapshot::{
-    SnapshotCaptureKind, SnapshotDisk, SnapshotKind, SnapshotPurpose, SnapshotRecord, SnapshotRoot,
+    SnapshotDisk, SnapshotKind, SnapshotMemoryState, SnapshotRecord, SnapshotRoot,
     SnapshotRootProfile, SnapshotStream,
 };
 use crate::store::models::{MachineConfig, MachineId};
-use crate::store::snapshot_store::publish_map;
+use crate::store::snapshot_store::{publish_map, SnapshotStore};
 use crate::store::{MachineStore, Store};
 use crate::{
     BootBinding, BootProfile, DiskStorage, LibVmError, Machine, MachineAgent, MachineGuestConfig,
-    MachineRef, MachineRetention, MachineRoot, MachineStorageRecord, ProcessConfig, Runtime,
-    RuntimeConfig, SnapshotInfo, SnapshotRef, SnapshotStore, StorageStopOutcome,
+    MachineRef, MachineRetention, MachineRoot, MachineStorageRecord, ProcessConfig, PullPolicy,
+    Runtime, RuntimeConfig, SnapshotInfo, SnapshotRef, StorageStopOutcome,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -81,24 +81,149 @@ pub struct ForkOptions {
     pub name: Option<String>,
     pub external_resources: ExternalResourcePolicy,
 }
-#[derive(Debug, Clone, Default)]
+
+/// Caller choices for `Runtime::snapshot`.
+///
+/// ```text
+///   machine   memory=false               memory=true
+///   stopped   disks                      MemorySnapshotRequiresRunningMachine
+///   running   SnapshotRequiresStopped…   RAM, CPU and device state + disks
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnapshotOptions {
+    /// Optional local name for the snapshot.
     pub name: Option<String>,
-    pub external_resources: ExternalResourcePolicy,
+    /// Include RAM, CPU and device state of a running (or user-paused)
+    /// machine. Without memory the machine must be stopped.
+    pub memory: bool,
+    /// With memory: never resume after the capture. A user-owned pause is
+    /// always preserved.
+    pub preserve: bool,
+    /// With memory: incremental or full capture (default incremental).
+    pub capture_policy: Option<vm_spec::lifecycle::CapturePolicy>,
+    /// With memory: dirty-page share (1..=60, default 60) above which an
+    /// incremental capture copies all RAM.
+    pub dirty_crossover_percent: Option<u8>,
+    /// Without memory: record external disks and shares as requirements that
+    /// restore must map, instead of refusing the snapshot.
+    pub external_requirements: bool,
+}
+
+impl SnapshotOptions {
+    fn validate(&self) -> Result<(), LibVmError> {
+        let refused = |message: &str| {
+            Err(LibVmError::InvalidRequest {
+                message: message.to_owned(),
+            })
+        };
+        if let Some(name) = &self.name {
+            crate::store::names::validate_name(name)?;
+        }
+        if self.memory {
+            if self.external_requirements {
+                return refused("external requirements apply to snapshots without memory");
+            }
+        } else if self.preserve
+            || self.capture_policy.is_some()
+            || self.dirty_crossover_percent.is_some()
+        {
+            return refused(
+                "preserve, capture policy and dirty crossover apply to snapshots with memory",
+            );
+        }
+        Ok(())
+    }
+
+    fn memory_options(&self) -> crate::LiveSnapshotOptions {
+        let defaults = crate::LiveSnapshotOptions::default();
+        crate::LiveSnapshotOptions {
+            name: self.name.clone(),
+            resume_policy: if self.preserve {
+                vm_spec::lifecycle::CaptureResumePolicy::Preserve
+            } else {
+                defaults.resume_policy
+            },
+            policy: self.capture_policy.unwrap_or(defaults.policy),
+            dirty_crossover_percent: self
+                .dirty_crossover_percent
+                .unwrap_or(defaults.dirty_crossover_percent),
+        }
+    }
+
+    fn external_resources(&self) -> ExternalResourcePolicy {
+        if self.external_requirements {
+            ExternalResourcePolicy::RequireMappings
+        } else {
+            ExternalResourcePolicy::Reject
+        }
+    }
+}
+
+/// The snapshot `Runtime::snapshot` published.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreatedSnapshot {
+    pub snapshot: SnapshotInfo,
+    /// The memory capture; absent for a snapshot without memory.
+    pub capture: Option<crate::LiveCaptureSummary>,
+    /// Another snapshot took the requested name first; this snapshot was
+    /// kept without it.
+    pub naming_outcome: Option<crate::CaptureNamingOutcome>,
+}
+
+impl CreatedSnapshot {
+    /// Report a lost name race as an error. The snapshot itself is kept.
+    pub fn require_requested_name(&self) -> Result<(), LibVmError> {
+        if let Some(crate::CaptureNamingOutcome::NameConflict { name }) = &self.naming_outcome {
+            return Err(LibVmError::CaptureNameConflict {
+                name: name.clone(),
+                snapshot: self.snapshot.id,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// What `Runtime::restore` turns into a machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreSource {
+    /// A local snapshot: name, pulled reference (short references expand via
+    /// `search_registries`), id or unique id prefix. Never pulls.
+    Local(SnapshotRef),
+    /// A reference resolved like `silo restore REF`: local name first, then
+    /// stored `search_registries` expansions, a unique id prefix, then a
+    /// registry pull according to `RestoreOptions::pull`.
+    Registry(String),
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {
+    /// Name of the restored machine.
     pub name: Option<String>,
-    pub external_resources: ExternalResourcePolicy,
+    /// When `RestoreSource::Registry` contacts a registry.
+    pub pull: PullPolicy,
+    /// Restore a snapshot with memory as a stopped machine from its disks
+    /// only: RAM is discarded and the guest boots, possibly replaying its
+    /// filesystem journal. No effect on a snapshot without memory.
+    pub without_memory: bool,
+    /// Runs in the guest after a snapshot with memory resumes.
     pub activation_hook: Option<vm_spec::restore::RestoreHook>,
+    pub external_resources: ExternalResourcePolicy,
 }
 
-/// Explicit cold-boot recovery, never execution restore or a restore fallback.
-#[derive(Debug, Clone, Default)]
-pub struct RecoverDisksOptions {
-    pub name: Option<String>,
-    pub external_resources: ExternalResourcePolicy,
+impl RestoreOptions {
+    fn validate(&self) -> Result<(), LibVmError> {
+        if self.without_memory && self.activation_hook.is_some() {
+            return Err(LibVmError::InvalidRequest {
+                message: "an activation hook requires restoring memory; drop --without-memory"
+                    .to_owned(),
+            });
+        }
+        if let Some(name) = &self.name {
+            crate::machine::reference::validate_new_machine_name(name)?;
+        }
+        Ok(())
+    }
 }
 
 /// Configured semantics only. Host identity, run state and secret scopes are absent.
@@ -207,20 +332,27 @@ pub async fn preflight_restore_snapshot(
     config: &RuntimeConfig,
     query: &crate::LiveCapabilityQuery,
     reference: &SnapshotRef,
-    policy: &ExternalResourcePolicy,
+    options: &RestoreOptions,
 ) -> Result<(), LibVmError> {
-    if !crate::LiveObservationReader::open(config)?.catalog_exists()? {
+    options.validate()?;
+    let policy = &options.external_resources;
+    if !options.without_memory && !crate::LiveObservationReader::open(config)?.catalog_exists()? {
         crate::require_host_live_operation(
             &query.host_report().await?,
             vm_spec::live::LiveOperation::Restore,
         )?;
     }
     let record = crate::store::snapshot_store::observe_snapshot_record(config, reference).await?;
-    if matches!(record.capture, SnapshotCaptureKind::LiveExecution { .. }) {
+    let memory = matches!(record.memory, SnapshotMemoryState::Included { .. });
+    if memory && !options.without_memory {
         return crate::machine::restore::preflight_execution(query, &record, policy).await;
     }
     check_policy(&record.external_requirements, policy)?;
-    let storage = storage_from_snapshot(&record)?;
+    let storage = if memory {
+        crate::machine::restore::storage_from_snapshot(&record, record.id()?)?
+    } else {
+        storage_from_snapshot(&record)?
+    };
     preflight_boot(
         config,
         &storage,
@@ -228,33 +360,6 @@ pub async fn preflight_restore_snapshot(
         &record.configuration.guest.agent,
     )
     .await
-}
-
-pub async fn preflight_recover_checkpoint_disks(
-    config: &RuntimeConfig,
-    reference: &SnapshotRef,
-    policy: &ExternalResourcePolicy,
-) -> Result<(), LibVmError> {
-    let record = crate::store::snapshot_store::observe_snapshot_record(config, reference).await?;
-    require_live_recovery(&record)?;
-    check_policy(&record.external_requirements, policy)?;
-    let storage = crate::machine::restore::storage_from_snapshot(&record, record.id()?)?;
-    preflight_boot(
-        config,
-        &storage,
-        &record.configuration.spec,
-        &record.configuration.guest.agent,
-    )
-    .await
-}
-
-fn require_live_recovery(record: &SnapshotRecord) -> Result<(), LibVmError> {
-    if !matches!(record.capture, SnapshotCaptureKind::LiveExecution { .. }) {
-        return Err(invalid(
-            "disk recovery requires an explicit live execution checkpoint",
-        ));
-    }
-    Ok(())
 }
 
 async fn preflight_boot(
@@ -307,37 +412,80 @@ impl Machine {
         })
         .await?
     }
-
-    pub async fn snapshot_stopped(
-        &self,
-        options: SnapshotOptions,
-    ) -> Result<SnapshotInfo, LibVmError> {
-        let runtime = self.runtime().clone();
-        let machine_id = self.machine_id();
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            handle.block_on(snapshot_owned(runtime, machine_id, options))
-        })
-        .await?
-    }
 }
 
 impl Runtime {
-    pub async fn restore_snapshot(
+    /// Snapshot `machine`. Without memory the machine must be stopped and
+    /// its disks are captured; with memory it must be running (or
+    /// user-paused) and RAM, CPU and device state are captured as well.
+    /// `progress` reports the memory capture.
+    pub async fn snapshot(
         &self,
-        reference: SnapshotRef,
+        machine: &MachineRef,
+        options: SnapshotOptions,
+        progress: Option<LiveOperationProgressSender>,
+    ) -> Result<CreatedSnapshot, LibVmError> {
+        options.validate()?;
+        let machine = self.get_machine(machine).await?;
+        if options.memory {
+            let observation = match machine.observe_live().await {
+                Ok(observation) => observation,
+                Err(LibVmError::MachineNotRunning { reference }) => {
+                    return Err(LibVmError::MemorySnapshotRequiresRunningMachine { reference })
+                }
+                Err(error) => return Err(error),
+            };
+            let captured = machine
+                .snapshot_memory(&observation, options.memory_options(), progress)
+                .await?;
+            return Ok(CreatedSnapshot {
+                snapshot: captured.snapshot,
+                capture: Some(captured.capture),
+                naming_outcome: captured.naming_outcome,
+            });
+        }
+        let runtime = self.clone();
+        let machine_id = machine.machine_id();
+        let handle = tokio::runtime::Handle::current();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            handle.block_on(snapshot_owned(runtime, machine_id, options))
+        })
+        .await?
+        .map_err(|error| match error {
+            LibVmError::MachineAlreadyRunning { reference } => {
+                LibVmError::SnapshotRequiresStoppedMachine { reference }
+            }
+            error => error,
+        })?;
+        Ok(CreatedSnapshot {
+            snapshot,
+            capture: None,
+            naming_outcome: None,
+        })
+    }
+
+    /// Turn a snapshot into a new machine: a snapshot with memory resumes
+    /// running (unless `without_memory`), one without memory restores a
+    /// stopped machine. A registry reference is pulled when missing; an
+    /// image is refused with a `silo create` hint.
+    pub async fn restore(
+        &self,
+        source: RestoreSource,
         options: RestoreOptions,
         progress: Option<LiveOperationProgressSender>,
     ) -> Result<Machine, LibVmError> {
+        options.validate()?;
+        // Refuse before resolution: a refused restore must not pull.
+        self.require_recoverable_child_scopes()?;
+        let snapshot = self.resolve_restore_source(source, options.pull).await?;
         report_progress(progress.as_ref(), LiveOperationProgress::Admitting);
         let runtime = self.clone();
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             let result = handle.block_on(restore_owned(
                 runtime,
-                reference,
+                SnapshotRef::Id(snapshot),
                 options,
-                false,
                 progress.as_ref(),
             ));
             if result.is_ok() {
@@ -348,27 +496,39 @@ impl Runtime {
         .await?
     }
 
-    pub async fn recover_checkpoint_disks(
+    async fn resolve_restore_source(
         &self,
-        reference: SnapshotRef,
-        options: RecoverDisksOptions,
-    ) -> Result<Machine, LibVmError> {
-        let runtime = self.clone();
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            handle.block_on(restore_owned(
-                runtime,
-                reference,
-                RestoreOptions {
-                    name: options.name,
-                    external_resources: options.external_resources,
-                    ..RestoreOptions::default()
-                },
-                true,
-                None,
-            ))
-        })
-        .await?
+        source: RestoreSource,
+        pull: PullPolicy,
+    ) -> Result<crate::SnapshotId, LibVmError> {
+        let (input, pull) = match source {
+            RestoreSource::Local(reference) => (reference.to_string(), PullPolicy::Never),
+            RestoreSource::Registry(reference) => (reference, pull),
+        };
+        let resolution = {
+            let store = self.native_store()?;
+            let mut connection = store.pool.acquire().await?;
+            crate::resolve::resolve(
+                &mut connection,
+                self.registry_policy(),
+                &input,
+                crate::resolve::Kind::Snapshot,
+                pull,
+            )
+            .await?
+        };
+        match resolution {
+            crate::resolve::Resolution::Local(crate::resolve::LocalMatch {
+                record: crate::resolve::LocalRecord::Snapshot(id),
+                ..
+            }) => Ok(id),
+            crate::resolve::Resolution::Local(_) => {
+                Err(LibVmError::ImageIsNotASnapshot { reference: input })
+            }
+            crate::resolve::Resolution::Remote(reference) => {
+                Ok(self.images().acquire_snapshot_artifact(reference).await?.id)
+            }
+        }
     }
 }
 
@@ -994,18 +1154,9 @@ async fn snapshot_owned(
     id: MachineId,
     options: SnapshotOptions,
 ) -> Result<SnapshotInfo, LibVmError> {
-    validate_snapshot_policy(&options.external_resources)?;
-    if let Some(name) = &options.name {
-        crate::store::snapshot_store::validate_alias(name)?;
-    }
+    let policy = options.external_resources();
     let _names = runtime.lock_machine_names().await?;
-    let mut source = admit_stopped(
-        &runtime,
-        id,
-        &options.external_resources,
-        StoppedAdmission::Ordinary,
-    )
-    .await?;
+    let mut source = admit_stopped(&runtime, id, &policy, StoppedAdmission::Ordinary).await?;
     let store = runtime.native_store()?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let closure = stopped_closure(&store, &source.storage).await?;
@@ -1116,10 +1267,9 @@ async fn snapshot_owned(
     let record = SnapshotRecord {
         schema: 2,
         kind: SnapshotKind::Snapshot,
-        capture: SnapshotCaptureKind::StoppedStorage {
+        memory: SnapshotMemoryState::None {
             stop_outcome: source.storage.stop_outcome,
         },
-        purpose: SnapshotPurpose::Checkpoint,
         root: SnapshotRoot {
             profile,
             stream: root_content,
@@ -1283,7 +1433,7 @@ fn reset_child_storage(storage: &mut MachineStorageRecord) {
 }
 
 fn storage_from_snapshot(record: &SnapshotRecord) -> Result<MachineStorageRecord, LibVmError> {
-    if matches!(record.capture, SnapshotCaptureKind::LiveExecution { .. }) {
+    if matches!(record.memory, SnapshotMemoryState::Included { .. }) {
         return Err(LibVmError::LiveOperationUnsupported {
             operation: vm_spec::live::LiveOperation::Restore,
             backend: vm_spec::live::LiveBackend::Krun,
@@ -1408,32 +1558,28 @@ async fn restore_owned(
     runtime: Runtime,
     reference: SnapshotRef,
     options: RestoreOptions,
-    recovery: bool,
     progress: Option<&LiveOperationProgressSender>,
 ) -> Result<Machine, LibVmError> {
     runtime.require_recoverable_child_scopes()?;
-    if let Some(name) = &options.name {
-        crate::machine::reference::validate_new_machine_name(name)?;
-    }
     let store = runtime.native_store()?;
     // Read catalog metadata only: no artifact object is opened before consume
     // registers its retained operation. Unsupported policy/lane fails first.
     let preview = crate::store::observation::ObservationStore::existing(&store)
         .snapshot_record(&reference)
         .await?;
-    if recovery {
-        require_live_recovery(&preview)?;
-    } else if matches!(preview.capture, SnapshotCaptureKind::LiveExecution { .. }) {
+    let memory = matches!(preview.memory, SnapshotMemoryState::Included { .. });
+    if memory && !options.without_memory {
         return crate::machine::restore::restore_owned(
             runtime, reference, options, preview, progress,
         )
         .await;
     }
     if options.activation_hook.is_some() {
-        return Err(invalid(
-            "activation hooks require a live execution checkpoint",
-        ));
+        return Err(LibVmError::InvalidRequest {
+            message: "an activation hook requires a snapshot with memory".to_owned(),
+        });
     }
+    let recovery = memory && options.without_memory;
     check_policy(&preview.external_requirements, &options.external_resources)?;
     let preview_storage = if recovery {
         crate::machine::restore::storage_from_snapshot(&preview, preview.id()?)?
@@ -1452,12 +1598,12 @@ async fn restore_owned(
         snapshots.consume(&reference).await?
     };
     if consumer.record != preview {
-        return Err(invalid("checkpoint alias changed after recovery preflight"));
+        return Err(invalid("snapshot changed after restore preflight"));
     }
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let mut staging = OperationStaging::new(&pool, consumer.operation_id, &consumer.lease)?;
     // A retained layered lower is re-registered from the authenticated,
-    // exact-loaded checkpoint graph and pinned under the consumer before the
+    // exact-loaded snapshot graph and pinned under the consumer before the
     // child (whose root names it) can be published.
     if let Some(lower) = consumer.record.lower() {
         let layers = crate::store::layer_store::LayerStore::from_store(store.clone());
@@ -1863,8 +2009,8 @@ mod tests {
             })
             .await;
         let restore = overridden
-            .restore_snapshot(
-                crate::SnapshotRef::Image("not-opened".into()),
+            .restore(
+                crate::RestoreSource::Local(crate::SnapshotRef::Name("not-opened".into())),
                 crate::RestoreOptions {
                     name: Some("refused-restore".into()),
                     ..Default::default()
@@ -2203,7 +2349,7 @@ mod tests {
         let content = crate::store::snapshot_store::publish_map(&pool, &store, operation, &map)
             .await
             .unwrap();
-        crate::SnapshotStore::from_store(std::sync::Arc::new(store.clone()))
+        crate::store::snapshot_store::SnapshotStore::from_store(std::sync::Arc::new(store.clone()))
             .seed_map_receipt(&content, &publication)
             .await
             .unwrap();
@@ -2355,5 +2501,243 @@ mod tests {
                 .unwrap(),
             storage
         );
+    }
+
+    /// A runtime over an acquisition destination, with `registry.example`
+    /// as its only search registry. The host never resolves, so any pull
+    /// fails: success proves the local copy was used.
+    async fn acquired_runtime(store: std::sync::Arc<crate::store::Store>) -> crate::Runtime {
+        let paths = crate::paths::LocalPaths::new(store.home_path().to_path_buf());
+        let components = crate::runtime::components::test_components(paths.home());
+        crate::Runtime::from_store(
+            paths,
+            store,
+            crate::RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::new(
+                crate::RegistryAction::Allow,
+                vec!["registry.example".into()],
+                Vec::new(),
+            )
+            .unwrap(),
+            components,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn registry_restore_reuses_the_acquired_snapshot_without_pulling() {
+        use crate::image::transport::tests::{
+            home, index_digest, stage, stopped_export, transfer, verify, REFERENCE,
+        };
+        let (_temp, _lease, prepared) = stopped_export().await;
+        let good = transfer(&prepared.graph, &prepared.payloads());
+        let (_destination_temp, destination) = home().await;
+        let verified = verify(&good, stage(&destination, &good).await, index_digest(&good))
+            .await
+            .unwrap();
+        let committed = crate::store::artifact_store::commit_imported_artifact(
+            verified,
+            REFERENCE.into(),
+            None,
+        )
+        .await
+        .unwrap();
+        let crate::image::transport::AcquiredContent::Snapshot(acquired) = &committed.content
+        else {
+            panic!("snapshot artifact committed another kind");
+        };
+        let id = acquired.id;
+        drop(committed);
+        let runtime = acquired_runtime(destination.clone()).await;
+        for (input, pull) in [
+            (REFERENCE, crate::PullPolicy::IfMissing),
+            ("team/vm:v1", crate::PullPolicy::IfMissing),
+            ("team/vm:v1", crate::PullPolicy::Never),
+        ] {
+            assert_eq!(
+                runtime
+                    .resolve_restore_source(crate::RestoreSource::Registry(input.into()), pull)
+                    .await
+                    .unwrap(),
+                id,
+                "{input} {pull:?}"
+            );
+        }
+        // A local source never pulls, even for a registry reference.
+        assert_eq!(
+            runtime
+                .resolve_restore_source(
+                    crate::RestoreSource::Local(crate::SnapshotRef::Name(REFERENCE.into())),
+                    crate::PullPolicy::Always,
+                )
+                .await
+                .unwrap(),
+            id
+        );
+        let acquisitions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM managed_artifact_acquisition")
+                .fetch_one(&destination.pool)
+                .await
+                .unwrap();
+        assert_eq!(acquisitions, 1);
+    }
+
+    #[tokio::test]
+    async fn registry_restore_of_an_acquired_image_names_the_create_command() {
+        use crate::image::transport::tests::{
+            export, home, index_digest, stage, transfer, verify, REFERENCE,
+        };
+        let (temp, images, record, operation, lease) =
+            crate::store::stored_image_store::tests::fixture().await;
+        let info = images
+            .publish_owned(record, operation, lease, None, Vec::new(), None)
+            .await
+            .unwrap();
+        let source = std::sync::Arc::new(
+            crate::store::Store::new(&crate::paths::LocalPaths::new(temp.path().join("home")))
+                .await
+                .unwrap(),
+        );
+        let prepared = export(
+            source,
+            crate::image::transport::export::ExportSource::Image(Box::new(
+                images.consume(info.id).await.unwrap(),
+            )),
+            oci::vm_artifact::codec::ChunkEncoding::Zstd,
+        )
+        .await;
+        let good = transfer(&prepared.graph, &prepared.payloads());
+        let (_destination_temp, destination) = home().await;
+        let verified = verify(&good, stage(&destination, &good).await, index_digest(&good))
+            .await
+            .unwrap();
+        drop(
+            crate::store::artifact_store::commit_imported_artifact(
+                verified,
+                REFERENCE.into(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = acquired_runtime(destination).await;
+        for input in [REFERENCE, "team/vm:v1"] {
+            let error = runtime
+                .restore(
+                    crate::RestoreSource::Registry(input.into()),
+                    crate::RestoreOptions::default(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, crate::LibVmError::ImageIsNotASnapshot { reference } if reference == input),
+                "{input}: {error:?}"
+            );
+            assert!(error
+                .to_string()
+                .contains(&format!("use `silo create {input}`")));
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_without_memory_turns_a_memory_snapshot_into_a_stopped_machine() {
+        use crate::store::MachineStore;
+        let fixture = crate::store::capture::tests::fixture().await;
+        let runtime = crate::store::capture::tests::capture_runtime(&fixture.snapshots).await;
+        let (sealed, _) = crate::store::capture::tests::seal(&fixture);
+        let info = fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                sealed.path(),
+                fixture.reservation.record.name.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.memory, crate::SnapshotMemory::Included);
+        let hook = vm_spec::restore::RestoreHook {
+            argv: vec!["/bin/true".into()],
+            environment: Vec::new(),
+            working_directory: "/".into(),
+            timeout_ms: 1000,
+        };
+        let refused = runtime
+            .restore(
+                crate::RestoreSource::Local(crate::SnapshotRef::Id(info.id)),
+                crate::RestoreOptions {
+                    name: Some("hooked".into()),
+                    without_memory: true,
+                    activation_hook: Some(hook),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(crate::LibVmError::InvalidRequest { .. })),
+            "{refused:?}"
+        );
+        let machine = runtime
+            .restore(
+                crate::RestoreSource::Local(crate::SnapshotRef::Id(info.id)),
+                crate::RestoreOptions {
+                    name: Some("recovered".into()),
+                    without_memory: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let store = runtime.native_store().unwrap();
+        let state = store
+            .machine_state(machine.machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.status,
+            crate::store::models::MachineRuntimeState::Stopped
+        );
+        assert_eq!(state.run_id, None);
+        let storage = store
+            .machine_storage(machine.machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage.snapshot, Some(info.id));
+        assert!(store
+            .machine_config_by_name("hooked")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn memory_snapshot_of_a_stopped_machine_names_the_running_requirement() {
+        let (_home, runtime, source) = raw_source("stopped-source").await;
+        let result = runtime
+            .snapshot(
+                &crate::MachineRef::id(source.machine_id()),
+                crate::SnapshotOptions {
+                    memory: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::LibVmError::MemorySnapshotRequiresRunningMachine { .. })
+            ),
+            "{result:?}"
+        );
+        assert!(runtime.snapshots().list().await.unwrap().is_empty());
     }
 }

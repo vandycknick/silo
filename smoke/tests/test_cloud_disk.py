@@ -17,7 +17,7 @@ from uuid import uuid4
 
 import pytest
 
-from silo_smoke import cloud_disk, images, overlay, shutdown, stopped, stream_map
+from silo_smoke import cloud_disk, images, overlay, procs, shutdown, stopped, stream_map
 from silo_smoke.cli import Silo
 from silo_smoke.cloud_disk import Disk, Guids, Part, Roots
 
@@ -81,7 +81,7 @@ def test_raw_and_qcow2_imports_share_decoded_identity_and_aliases(silo: Silo, cl
     assert boot["kernelArchitecture"] == cloud_disk.host_arch()
     assert boot["binding"]["kind"] == "pinned" and boot["binding"]["abi"] == "silo-direct-v2"
     assert record["process"] == {"entrypoint": None, "command": None, "environment": {}, "workingDirectory": "/", "user": None}
-    assert raw["retained"] is True and raw["aliases"] == ["cloud-raw"]
+    assert raw["names"] == ["cloud-raw"]
     assert raw["provenance"] == [{
         "container": "raw", "sourceDigest": "sha256:" + raw_sha, "sourceSpelling": str(disk.path.parent.resolve() / disk.path.name),
         "sourceManifest": None, "sourceConfig": None,
@@ -102,9 +102,9 @@ def test_raw_and_qcow2_imports_share_decoded_identity_and_aliases(silo: Silo, cl
         assert qcow2_facts[0]["disk"]["sourceLength"] == encoded.stat().st_size and qcow2_facts[0]["disk"]["decodedLength"] == size
     copy = cloud_disk.sparse_clone(disk.path, silo.ws.root / "elsewhere.raw")
     assert cloud_disk.import_disk(silo, copy, root="auto")["id"] == raw["id"], "a host path never salts image identity"
-    inspected = cloud_disk.inspect(silo, "image:cloud-q3")
-    assert inspected["kind"] == "image" and inspected["info"]["id"] == raw["id"]
-    assert set(inspected["info"]["aliases"]) == {"cloud-raw", "cloud-q2", "cloud-q3"}
+    inspected = cloud_disk.inspect(silo, "cloud-q3")
+    assert inspected["kind"] == "stored" and inspected["info"]["id"] == raw["id"]
+    assert set(inspected["info"]["names"]) == {"cloud-raw", "cloud-q2", "cloud-q3"}
     assert len(stopped.catalog(silo)["storage_image"]) == 1
 
     # One changed byte outside the root partition is a different stream and image.
@@ -129,7 +129,7 @@ def test_raw_and_qcow2_imports_share_decoded_identity_and_aliases(silo: Silo, cl
     # Independent decoded-byte oracle: the never-booted private root is the raw source.
     for alias in ("cloud-q2", "cloud-q3"):
         name = f"from-{alias}"
-        create_vm(silo, name, f"image:{alias}")
+        create_vm(silo, name, alias)
         root = cloud_disk.root_disk(silo, name)
         assert root.stat().st_size == size and overlay.digest(root) == raw_sha
         storage = stopped.record(silo, name)
@@ -137,9 +137,11 @@ def test_raw_and_qcow2_imports_share_decoded_identity_and_aliases(silo: Silo, cl
         assert storage["root"]["layout"] == record["root"]["layout"] and storage["boot"] == boot
     assert {path: cloud_disk.fingerprint(path) for path in sources} == sources, "imports modified a source"
 
-    silo.run("image", "remove", "image:cloud-raw")
-    after = cloud_disk.inspect(silo, f"image:{raw['id']}")["info"]
-    assert after["retained"] is True and "cloud-raw" not in after["aliases"]
+    # Removing one of several names keeps the record and its other names.
+    removed = silo.json("image", "rm", "cloud-raw")
+    assert removed == {"id": raw["id"], "names": ["cloud-raw"], "recordRemoved": False}, removed
+    after = cloud_disk.inspect(silo, raw["id"])["info"]
+    assert set(after["names"]) == {"cloud-q2", "cloud-q3"}
 
 
 @linux
@@ -152,8 +154,8 @@ def test_same_bundle_boots_whole_disk_gpt_and_mbr_roots_and_stops_clean(silo: Si
     cloud_disk.import_disk(silo, whole, root="whole-disk", name="phase17-whole")
     cloud_disk.import_disk(silo, disk.path, root="auto", name="phase17-gpt")
     mbr_source = cloud_disk.fingerprint(mbr.path)
-    create_vm(silo, "whole-vm", "image:phase17-whole")
-    create_vm(silo, "gpt-vm", "image:phase17-gpt")
+    create_vm(silo, "whole-vm", "phase17-whole")
+    create_vm(silo, "gpt-vm", "phase17-gpt")
     # One-shot disk: creation with explicit original MBR slot 4 (slots 2-3 empty).
     create_vm(silo, "mbr-vm", f"disk:{mbr.path}", "--root", "mbr:4")
     assert cloud_disk.fingerprint(mbr.path) == mbr_source
@@ -229,14 +231,14 @@ def test_dps_auto_selection_refuses_before_publication(silo: Silo, cloud_roots: 
 @linux
 def test_trusted_init_override_is_rejected_before_machine_publication(silo: Silo, cloud_roots: Roots) -> None:
     source = cloud_disk.import_disk(silo, cloud_roots.root, root="whole-disk", name="trusted-init")
-    before = cloud_disk.inspect(silo, "image:trusted-init")
+    before = cloud_disk.inspect(silo, "trusted-init")
     for argument in ("rdinit=/agent/silo-agent", 'rdinit="/agent/silo-agent"', '"rdinit=/agent/silo-agent"'):
         cloud_disk.refuse_before_publication(
-            silo, "create", "image:trusted-init", "--name", "never-bypass",
+            silo, "create", "trusted-init", "--name", "never-bypass",
             "--network", "none", f"--kernel-arg={argument}",
         )
-    assert cloud_disk.inspect(silo, "image:trusted-init") == before
-    create_vm(silo, "trusted-init", f"image:{source['id']}")
+    assert cloud_disk.inspect(silo, "trusted-init") == before
+    create_vm(silo, "trusted-init", source["id"])
     cloud_disk.boot(silo, "trusted-init")
     cloud_disk.assert_root(cloud_disk.guest_probe(silo, "trusted-init"), partition=None)
     stopped.stop(silo, "trusted-init")
@@ -349,7 +351,7 @@ def test_cloned_gpt_on_attached_disk_never_replaces_the_root_serial(silo: Silo, 
     tail = disk.path.stat().st_size - 33 * 512
     assert cloud_disk.read_at(disk.path, tail, 33 * 512) == cloud_disk.read_at(clone.path, tail, 33 * 512)
     cloud_disk.import_disk(silo, disk.path, root=f"gpt:{guids.root}", name="cloned-root")
-    create_vm(silo, "cloned", "image:cloned-root", "--disk", str(clone.path))
+    create_vm(silo, "cloned", "cloned-root", "--disk", str(clone.path))
     cloud_disk.boot(silo, "cloned")
     record = cloud_disk.guest_probe(silo, "cloned")
     cloud_disk.assert_root(record, partition=disk.root)
@@ -400,7 +402,7 @@ def test_vfat_esp_mounts_from_fstab_and_late_mount_is_not_clean(silo: Silo, clou
     disk, _ = gpt(silo, cloud_roots.root)
     cloud_disk.verify_esp(disk, 1, silo.ws.root)
     cloud_disk.import_disk(silo, disk.path, root="auto", name="esp-root")
-    create_vm(silo, "esp", "image:esp-root")
+    create_vm(silo, "esp", "esp-root")
     cloud_disk.boot(silo, "esp")
     # The guest's own fstab entry (LABEL=, explicit codepage/iocharset) drives mount.
     observed = silo.exec("esp", "sh", "-eu", "-c", """
@@ -426,7 +428,7 @@ sync
 def test_expanded_gpt_keeps_tables_partition_and_filesystem_size(silo: Silo, cloud_roots: Roots) -> None:
     disk, _ = gpt(silo, cloud_roots.root)
     cloud_disk.import_disk(silo, disk.path, root="auto", name="grow-root")
-    create_vm(silo, "grow", "image:grow-root")
+    create_vm(silo, "grow", "grow-root")
     root = cloud_disk.root_disk(silo, "grow")
     old = root.stat().st_size
     assert old % cloud_disk.MIB == 0
@@ -465,13 +467,13 @@ def test_pinned_bundle_survives_removal_and_changes_only_by_explicit_update(silo
     disk, _ = gpt(silo, cloud_roots.root)
     image = cloud_disk.import_disk(silo, disk.path, root="auto", name="pinned")
     assert image["record"]["boot"]["binding"] == original
-    create_vm(silo, "pinned-a", "image:pinned")
+    create_vm(silo, "pinned-a", "pinned")
     assert stopped.record(silo, "pinned-a")["boot"]["binding"] == original
 
     # Neither the caller's source nor the packaged assets are boot authority.
     disk.path.unlink()
     cloud_disk.break_assets(assets)
-    create_vm(silo, "pinned-b", "image:pinned")
+    create_vm(silo, "pinned-b", "pinned")
     assert stopped.record(silo, "pinned-b")["boot"]["binding"] == original
     cloud_disk.assert_pool_objects(silo, original)
     cloud_disk.boot(silo, "pinned-a")
@@ -487,7 +489,7 @@ def test_pinned_bundle_survives_removal_and_changes_only_by_explicit_update(silo
     view = silo.info("pinned-a")["boot"]
     assert view["bundle"] == cloud_disk.bundle_digest(original)
     assert view["packagedReplacement"] is None, "unimported installed bytes are not an admitted bundle"
-    create_vm(silo, "replacement-admission", "image:pinned")
+    create_vm(silo, "replacement-admission", "pinned")
     silo.run("set", "replacement-admission", "boot-assets=packaged")
     assert stopped.record(silo, "replacement-admission")["boot"]["binding"] == replacement
     view = silo.info("pinned-a")["boot"]
@@ -517,15 +519,15 @@ def test_pinned_bundle_survives_removal_and_changes_only_by_explicit_update(silo
     cloud_disk.assert_root(cloud_disk.guest_probe(silo, "pinned-a"), partition=disk.root)
     stopped.stop(silo, "pinned-a")
     # Source image and sibling machine keep their own immutable tuple.
-    assert cloud_disk.inspect(silo, "image:pinned")["info"]["record"] == image["record"]
+    assert cloud_disk.inspect(silo, "pinned")["info"]["record"] == image["record"]
     assert stopped.record(silo, "pinned-b")["boot"]["binding"] == original
 
 
 @linux
-def test_image_and_snapshot_creation_preserve_semantics_and_every_disk(silo: Silo, cloud_roots: Roots) -> None:
+def test_image_creation_and_snapshot_restore_preserve_semantics_and_every_disk(silo: Silo, cloud_roots: Roots) -> None:
     disk, _ = gpt(silo, cloud_roots.root)
     image = cloud_disk.import_disk(silo, disk.path, root="auto", name="snap-image")
-    create_vm(silo, "snap-source", "image:snap-image", "--label", "owner=phase17")
+    create_vm(silo, "snap-source", "snap-image", "--label", "owner=phase17")
     storage = stopped.record(silo, "snap-source")
     assert storage["boot"] == image["record"]["boot"] and storage["root"]["layout"] == image["record"]["root"]["layout"]
     assert storage["root"]["initialContent"] == image["record"]["root"]["stream"]["stream"]
@@ -538,10 +540,12 @@ def test_image_and_snapshot_creation_preserve_semantics_and_every_disk(silo: Sil
     source = stopped.backing(silo, "snap-source", "phase17-before-snapshot")
     assert set(source) == {"root", "data:1"}
     captured = silo.json("snapshot", "create", "snap-source", "--name", "cloud-snap", timeout=240)
-    assert captured["retained"] is True and "cloud-snap" in captured["aliases"]
+    assert captured["capture"] is None and captured["snapshot"]["names"] == ["cloud-snap"]
 
-    cloud_disk.refuse_before_publication(silo, "create", "image:cloud-snap", "--name", "never-overridden", "--cpus", "2")
-    silo.create("from-snap", "image:cloud-snap")
+    # A snapshot is not an image: create refuses it and names restore instead.
+    refused = cloud_disk.refuse_before_publication(silo, "create", "cloud-snap", "--name", "never-created")
+    assert "silo restore cloud-snap" in refused.stderr, refused.stderr
+    stopped.restore(silo, "cloud-snap", "from-snap")
     copy = stopped.backing(silo, "from-snap", "phase17-created-from-snapshot")
     stopped.same_content(source, copy)
     stopped.independent(source, copy)
@@ -555,6 +559,81 @@ def test_image_and_snapshot_creation_preserve_semantics_and_every_disk(silo: Sil
     assert data == "raw-data-before-stop"
     stopped.stop(silo, "from-snap", require_clean=False)
     stopped.same_content(source, stopped.backing(silo, "snap-source", "phase17-source-unchanged"))
+
+
+@linux
+def test_image_and_snapshot_named_hello_coexist_and_resolve_by_command(silo: Silo, cloud_roots: Roots) -> None:
+    image = cloud_disk.import_disk(silo, cloud_roots.root, root="whole-disk", name="hello")
+    create_vm(silo, "hello-source", "hello", "--label", "origin=snapshot")
+    snapshot = silo.json("snapshot", "create", "hello-source", "--name", "hello", timeout=240)["snapshot"]
+    assert snapshot["names"] == ["hello"]
+    # Each kind has its own name table: neither name shadows or refuses the other.
+    database = silo.ws.state_db()
+    assert procs.query(database, "SELECT name, stored_image_id FROM image_name WHERE stored_image_id IS NOT NULL") == [("hello", image["id"])]
+    assert procs.query(database, "SELECT name, snapshot_id FROM snapshot_name") == [("hello", snapshot["id"])]
+    assert cloud_disk.inspect(silo, "hello")["info"]["id"] == image["id"]
+    assert silo.json("snapshot", "inspect", "hello")["id"] == snapshot["id"]
+
+    # create resolves images only, restore snapshots only.
+    create_vm(silo, "from-image", "hello")
+    assert "origin" not in stopped.configuration(silo, "from-image")["labels"]
+    assert stopped.record(silo, "from-image")["root"]["initialContent"] == image["record"]["root"]["stream"]["stream"]
+    stopped.restore(silo, "hello", "from-snapshot")
+    assert stopped.configuration(silo, "from-snapshot")["labels"] == {"origin": "snapshot"}
+    assert stopped.configured_semantics(stopped.configuration(silo, "from-snapshot")) == \
+        stopped.configured_semantics(stopped.configuration(silo, "hello-source"))
+
+    # A name of only the other kind is refused with the right command, before any pull.
+    silo.json("snapshot", "create", "hello-source", "--name", "snapshot-only", timeout=240)
+    refused = cloud_disk.refuse_before_publication(silo, "create", "snapshot-only", "--name", "never-created")
+    assert "silo restore snapshot-only" in refused.stderr, refused.stderr
+    cloud_disk.import_disk(silo, cloud_roots.root, root="whole-disk", name="image-only")
+    refused = cloud_disk.refuse_before_publication(silo, "restore", "image-only", "--name", "never-restored")
+    assert "silo create image-only" in refused.stderr, refused.stderr
+
+
+@linux
+def test_image_rm_follows_names_and_prune_keeps_images_machines_use(silo: Silo, cloud_roots: Roots) -> None:
+    used = cloud_disk.import_disk(silo, cloud_roots.root, root="whole-disk")
+    disk, _ = gpt(silo, cloud_roots.root)
+    unused = cloud_disk.import_disk(silo, disk.path, root="auto")
+    assert used["names"] == [] and unused["names"] == [] and used["id"] != unused["id"]
+    create_vm(silo, "uses-image", used["id"])
+    database = silo.ws.state_db()
+
+    # Prune removes only unnamed images that no machine uses.
+    pruned = silo.json("image", "prune")
+    assert pruned["imagesRemoved"] == 1, pruned
+    assert procs.query(database, "SELECT id FROM storage_image") == [(used["id"],)]
+    stored = [entry["info"]["id"] for entry in silo.json("image", "list") if entry["kind"] == "stored"]
+    assert stored == [used["id"]], stored
+
+    # rm NAME removes that name; the record goes with its last name.
+    for name in ("tag-a", "tag-b", "tag-c"):
+        assert cloud_disk.import_disk(silo, cloud_roots.root, root="whole-disk", name=name)["id"] == used["id"]
+    removed = silo.json("image", "rm", "tag-a")
+    assert removed == {"id": used["id"], "names": ["tag-a"], "recordRemoved": False}, removed
+    assert set(cloud_disk.inspect(silo, used["id"])["info"]["names"]) == {"tag-b", "tag-c"}
+    removed = silo.json("image", "rm", "tag-b")
+    assert removed == {"id": used["id"], "names": ["tag-b"], "recordRemoved": False}, removed
+    removed = silo.json("image", "rm", "tag-c")
+    assert removed == {"id": used["id"], "names": ["tag-c"], "recordRemoved": True}, removed
+    assert procs.query(database, "SELECT id FROM storage_image") == []
+    assert procs.query(database, "SELECT name FROM image_name WHERE stored_image_id IS NOT NULL") == []
+
+    # rm ID removes the record and all its names.
+    again = cloud_disk.import_disk(silo, cloud_roots.root, root="whole-disk", name="tag-d")
+    assert again["id"] == used["id"]
+    cloud_disk.import_disk(silo, cloud_roots.root, root="whole-disk", name="tag-e")
+    removed = silo.json("image", "rm", used["id"])
+    assert removed["id"] == used["id"] and set(removed["names"]) == {"tag-d", "tag-e"} and removed["recordRemoved"] is True, removed
+    assert procs.query(database, "SELECT id FROM storage_image") == []
+
+    # A removed record never breaks a machine: its bytes stay until nothing references them.
+    silo.json("image", "prune")
+    cloud_disk.boot(silo, "uses-image")
+    cloud_disk.assert_root(cloud_disk.guest_probe(silo, "uses-image"), partition=None)
+    stopped.stop(silo, "uses-image")
 
 
 CONVERTED_PROCESS = {
@@ -581,7 +660,7 @@ def test_explicit_conversion_is_cached_preserves_defaults_and_boots(silo: Silo, 
     assert record["process"] == CONVERTED_PROCESS
     assert converted["provenance"] == [{"container": "oci", "sourceDigest": oci.manifest_digest, "sourceSpelling": reference,
                                         "sourceManifest": oci.manifest_digest, "sourceConfig": oci.config_digest, "disk": None}]
-    assert converted["retained"] is True and converted["aliases"] == ["conv-a"]
+    assert converted["names"] == ["conv-a"]
 
     repeated = silo.json("image", "convert", reference, "--disk-format", "raw", timeout=600)
     assert repeated["id"] == converted["id"] and repeated["record"] == record
@@ -589,11 +668,11 @@ def test_explicit_conversion_is_cached_preserves_defaults_and_boots(silo: Silo, 
     cloud_disk.valid_replacement_assets(assets, saved)
     aliased = silo.json("image", "convert", reference, "--disk-format", "raw", "--name", "conv-b", timeout=600)
     assert aliased["id"] == converted["id"] and aliased["record"]["boot"]["binding"] == packaged
-    assert set(aliased["aliases"]) == {"conv-a", "conv-b"}
+    assert set(aliased["names"]) == {"conv-a", "conv-b"}
     catalog = stopped.catalog(silo)
     assert len(catalog["storage_image"]) == 1 and len(catalog["raw_conversion_result"]) == 1
 
-    create_vm(silo, "converted", "image:conv-b")
+    create_vm(silo, "converted", "conv-b")
     assert stopped.configuration(silo, "converted")["process"] == CONVERTED_PROCESS
     assert stopped.record(silo, "converted")["boot"]["binding"] == packaged
     cloud_disk.boot(silo, "converted")
@@ -619,7 +698,7 @@ def test_vz_refuses_oci_and_layered_roots_and_boots_converted_raw(silo: Silo, ba
     assert silo.run("start", "krun-layered", expect=None).returncode != 0
     assert stopped.record(silo, "krun-layered") == before and silo.info("krun-layered")["state"] == "stopped"
     silo.run("image", "convert", basic_image, "--disk-format", "raw", "--name", "vz-raw", timeout=600)
-    create_vm(silo, "vz-raw-vm", "image:vz-raw")
+    create_vm(silo, "vz-raw-vm", "vz-raw")
     cloud_disk.boot(silo, "vz-raw-vm")
     silo.exec("vz-raw-vm", "test", "-f", "/etc/proof", user="root")
     silo.stop("vz-raw-vm")

@@ -75,33 +75,44 @@ execution, independently of guest-agent injection.
 
 The frozen effective backend governs both admission and the monitor request.
 Direct OCI creation on VZ refuses before materialization and names explicit
-OCI-to-raw conversion; VZ also refuses managed overlay roots. Stopped snapshots
+OCI-to-raw conversion; VZ also refuses stored overlay roots. Snapshots
 and forks admit raw whole-disk and GPT/MBR partition roots and retained layered
 roots, subject to their boot/backend admission. Live capture keeps its narrower
 whole-disk/layered-overlay root set. Neither lane is qualified merely by boot
 admission; public live lanes remain unqualified.
 
-Managed aliases resolve to typed immutable targets. Image roots are copied from
-their authenticated stream capability. A snapshot source uses full snapshot
-restoration, preserving captured configuration and included disks rather than
-copying only its root. Snapshot creation accepts a new name; other nondefault
-create settings are refused and require explicit stopped updates after restore.
+Creation takes images only. `MachineBuilder::image(REF)` resolves `REF` with the
+shared resolver (local name, stored `search_registries` expansions, unique id
+prefix of at least 3 hex digits, then a pull per `PullPolicy`). A snapshot name or
+a snapshot artifact is refused with `LibVmError::SnapshotIsNotAnImage` and a
+`silo restore` hint; a Silo image artifact becomes a stored image. Stored image
+roots are copied from their authenticated stream capability.
 
-`LiveSnapshotOptions` defaults to `CapturePolicy::Incremental`, a preference
+`Runtime::snapshot(&MachineRef, SnapshotOptions, progress)` is the one capture
+entry point. Without `memory` the machine must be stopped
+(`SnapshotRequiresStoppedMachine` otherwise) and its disks are captured; with
+`memory` it must be running or user-paused (`MemorySnapshotRequiresRunningMachine`
+otherwise) and RAM, CPU and device state are captured too. `preserve`,
+`capture_policy` and `dirty_crossover_percent` require `memory`;
+`external_requirements` requires its absence. Both refusals are
+`LibVmError::InvalidRequest`. The result is a `CreatedSnapshot` whose `capture`
+summary is present only for a memory capture.
+
+A memory capture defaults to `CapturePolicy::Incremental`, a preference
 shared by live-fork capture. An exact machine report without incremental
 capability resolves that preference to full before admission of the capture
 plan; normal Capture/Fork admission still applies. `CapturePolicy::Full` forces
 full capture. On incremental backends, missing or invalidated baselines,
 topology changes and dirty crossover retain their automatic full fallbacks;
 a booted VM's first default capture reports `no-baseline`. Restored children
-inherit their checkpoint baseline. `dirty_crossover_percent` accepts `1..=60`,
+inherit their snapshot's baseline. `dirty_crossover_percent` accepts `1..=60`,
 with 60 as the default.
 Successful capture summaries carry actual mode, baseline identity, fallback
 reason, affected identity chunks and separate native I/O/whole-file hashing
-facts. Each checkpoint owns a complete canonical RAM map and complete closure;
-its predecessor is not a replay dependency.
+facts. Each snapshot with memory owns a complete canonical RAM map and complete
+closure; its predecessor is not a replay dependency.
 
-`Machine::snapshot_live`, `Machine::fork_live` and `Runtime::restore_snapshot`
+`Runtime::snapshot`, `Machine::fork_live` and `Runtime::restore`
 take an optional `LiveOperationProgressSender`. Its `default_channel()` returns
 the sender and a `LiveOperationProgressReceiver` of user-facing stages. Like
 image progress, delivery is bounded, nonblocking and best effort: full or
@@ -121,14 +132,16 @@ show these stages only in an interactive spinner; JSON and noninteractive
 output have no stage lines. The daemon API has no progress stream for these
 operations and retains its coarse spinner labels.
 
-Execution restore reports `LibVmError::CheckpointPortability` with the exact
+Restoring memory reports `LibVmError::SnapshotPortability` with the exact
 failed pin and captured/destination values at `restore-preflight`, before a
 child is allocated. Compatibility is not required to import or retain an
-authenticated artifact. `Runtime::recover_checkpoint_disks` is a separate,
-explicit operation with `RecoverDisksOptions`: it authenticates storage and
-captured boot, creates new private disks and a stopped machine with unknown
-stop outcome and source-checkpoint provenance, and installs no RAM. An
-ordinary explicit start cold-boots it. Restore never falls back to recovery.
+authenticated artifact. `RestoreOptions::without_memory` restores a snapshot
+with memory from its disks only: it authenticates storage and captured boot,
+creates new private disks and a stopped machine with unknown stop outcome and
+source-snapshot provenance, and installs no RAM. An ordinary explicit start
+cold-boots it. On a snapshot without memory the flag changes nothing. Combining
+it with an activation hook is `InvalidRequest`. Restore never falls back to
+disks-only on its own.
 
 Use `Machine::update_boot_assets(BootAssetsUpdate { selection })` for an explicit
 stopped replacement. It requires exclusive stopped-generation ownership and
@@ -240,9 +253,9 @@ reconciliation. Force stop waits within its timeout for that complete
 holder/lease reconciliation after monitor termination, rather than treating the
 monitor's death as completion or reporting a live retained generation as absent.
 
-## Managed Raw Images
+## Stored Raw Images
 
-A managed image is an immutable creation source, not a captured machine or an
+A stored image is an immutable creation source, not a captured machine or an
 OCI filesystem-cache row. Its schema-1 `ImageRecord` includes the opaque raw
 root stream and map, 512-byte geometry, disk layout, concrete root selector,
 ext4 filesystem, Linux userspace platform, complete pinned direct-boot bundle
@@ -254,19 +267,25 @@ are appendable provenance, not image identity or retained source-container bytes
 Partition provenance encodes the full GPT attribute bitmask as sixteen lowercase
 hex digits in JSON, preserving DPS flags above the exact JSON integer range.
 
-Images and snapshots share one `image:NAME` alias namespace. Each name targets
-exactly one typed image or snapshot; collisions, corrupt dependencies and
-ambiguous cross-kind digest lookups fail closed. Explicit image retention is
-independent of aliases. Releasing retention leaves aliases rooted; removing an
-alias does not release explicit retention. Catalog removal never recursively
-unlinks shared content. Stream and object collectors account for image maps,
-canonical records, bundle records and every exact boot member.
+Images and snapshots have separate name tables (`image_name`, `snapshot_name`),
+so an image `hello` and a snapshot `hello` coexist. A name tags exactly one
+record; a record has zero or more names. Local names match
+`[a-z0-9][a-z0-9._-]*` (at most 128 bytes) and never contain `:` or `/`;
+pulled records are named by their canonical registry reference. `ImageRef` and
+`SnapshotRef` are `Name` or `Id`; ids abbreviate to a unique hex prefix of at
+least 3 characters. Removal follows tag semantics: removing a name removes that
+name and the record once no name remains; removing an id removes the record and
+all its names. A record exists until removed; `Images::prune` removes unnamed
+images no machine or operation uses. Removing a record never breaks a machine
+and never recursively unlinks shared content. Stream and object collectors
+account for image maps, canonical records, bundle records and every exact boot
+member.
 
 A retained stream can have a verified complete chunk representation in canonical
 `objects/` independently of its flat `streams/` materialization. Explicit pruning
 may evict that flat file only when no operation, machine, OCI cache artifact or
 layer result needs it. Eviction journals `present` → `evicting` → `absent`; missing
-flat bytes without that authority are corruption. A managed consumer reconstructs
+flat bytes without that authority are corruption. A stored-image consumer reconstructs
 from the exact canonical map and retained encoded chunks into fresh sparse
 staging, verifies both chunk identities and StreamId, then joins the shared
 immutable stream publication. Reconstruction never contacts a registry. Canonical
@@ -283,13 +302,13 @@ identities are registered before lookup/download; no lease descriptor is opened
 per chunk. Machine dependency indexes are committed with their exact storage
 generation, and collectors reject missing or surplus indexed edges.
 
-An imported live checkpoint retains its exact portable provenance and source seal
-separately from a local capture reservation. A local acquisition receipt binds
-the approved immutable index, repository, policy and selected provenance through
-the exact metadata child/config descriptor chain. Restore selects matching
-authenticated local or imported provenance, rather than trusting the first row.
-Digest approval establishes integrity and permission to import, not an
-authenticated publisher or proof that a local monitor performed the source cut.
+An imported snapshot with memory retains its exact portable provenance and
+source seal separately from a local capture reservation. A local acquisition
+receipt binds the resolved immutable index, repository and selected provenance
+through the exact metadata child/config descriptor chain. Restore selects
+matching authenticated local or imported provenance, rather than trusting the
+first row. The digest chain establishes integrity, not an authenticated
+publisher or proof that a local monitor performed the source cut.
 
 
 `Images::import_disk` imports a quiesced caller-owned regular file. The path is
@@ -348,7 +367,7 @@ platform, publishes that exact immutable stream as a whole-disk ext4
 preserves the OCI entrypoint, command, environment, working directory and user
 as process defaults. A retained hit authenticates the original complete
 closure, including its original bundle, rather than flattening again after a
-runtime upgrade; a new alias names that same image. Missing or corrupt hit
+runtime upgrade; a new name tags that same image. Missing or corrupt hit
 content is an error, not a cache miss. Collection of the image removes the
 conversion mapping.
 
@@ -358,27 +377,32 @@ remain rooted until publication completes. The actual blocking publisher owns
 the lease and writable catalog capability even if its caller is cancelled.
 It authenticates content outside roots coordination, records the exact image
 candidate before an uncertain commit, then atomically commits image identity,
-exact dependencies, retention, provenance, optional alias and conversion key.
+exact dependencies, provenance, optional name and conversion key.
 Consumers resolve and recheck the typed public target and register its entire
 closure in one roots-coordinated transaction before opening artifact bytes.
 Inspection is not a lease. Abandoned operation recovery and GC use the existing
-journal and lease machinery; there is no second cleanup or alias namespace.
+journal and lease machinery; there is no second cleanup or name namespace.
 
 ## OCI VM Artifact Transport
 
 `Images::inspect_artifact` resolves and checks bounded remote metadata without
-retaining content or booting it. `acquire_artifact(ArtifactAcquireRequest)`
-requires an exact immutable index digest via `ArtifactTrust::ApproveDigest`;
-the resulting publisher is explicitly unauthenticated. `RequireSignature`
-fails closed because no signing provider is integrated. A VM artifact is
-recognized before OCI container platform selection; ordinary container
-creation refuses it and requires explicit acquisition.
+retaining content or booting it; it reports the content kind and id, root,
+guest architecture and whether a snapshot includes memory.
+`acquire_artifact(ArtifactAcquireRequest { reference, name })` acquires a Silo
+image artifact into a stored image named by its canonical reference (plus the
+optional local `name`). A snapshot artifact is refused with
+`ArtifactIsSnapshot` after config inspection and before any payload fetch;
+`Runtime::restore(RestoreSource::Registry(..))` acquires snapshot artifacts and
+refuses image artifacts with `ArtifactIsImage`. Short references expand via
+`search_registries`. A VM artifact is recognized before OCI container platform
+selection; `Images::pull` and creation route it to acquisition.
 
-`publish_artifact(ArtifactPublishRequest)` exports the complete managed image
-or checkpoint, including pinned boot bytes and all included disks. Checkpoints
-require acknowledgement naming the exact destination. Live checkpoints also
-carry their execution state, device state, RAM and portable source seal.
-Acquisition does not grant live-restore compatibility or capability admission.
+`publish_artifact(ArtifactPublishRequest { image, destination, encoding })`
+exports one stored image, including pinned boot bytes. Snapshot publication is
+crate-private until snapshot push has an encryption design for disks and
+memory; the exporter carries all included disks and, for a snapshot with
+memory, its execution state, device state, RAM and portable source seal.
+Acquisition does not grant memory-restore compatibility or capability admission.
 
 The OCI index has a metadata child and bounded payload children. Every
 descriptor preserves exact bytes in the destination repository; source OCI
@@ -396,12 +420,12 @@ and immutable-publication peak through the shared cross-home import ledger
 before bulk effects. Detached operations retain their lease and capacity
 through blocking work even if the caller disappears. Complete semantic
 verification precedes atomic catalog publication; failed operations retain
-recovery authority, not partial public images or aliases.
+recovery authority, not partial public images or names.
 
-## Stopped Snapshot Retention And Identity
+## Snapshot Identity And Removal
 
-Stopped-storage snapshots are immutable opaque-raw or layered-root checkpoints,
-not execution checkpoints. Their current schema-1 record includes complete
+Snapshots without memory are immutable opaque-raw or layered-root captures of a
+stopped machine. Their current schema-1 record includes complete
 configured semantics, ordered included disk streams and maps, exact pinned
 next-boot assets, external resource requirements, and the actual `clean`,
 `forced`, or `unknown` stop outcome. Capture preserves guest bytes, including
@@ -422,11 +446,11 @@ records reject duplicate or unknown properties, floating point, unsafe integers,
 and malformed Unicode. Property ordering uses UTF-16 code units, including user
 configuration keys, without Unicode normalization.
 
-`SnapshotStore` resolves immutable `image:sha256:HEX` references and shared
-`image:NAME` aliases. An unnamed snapshot has its own persistent retention root.
-`remove_alias(NAME)` removes only a name; `release_retention(reference)` releases
-only explicit retention. Either an alias or explicit retention keeps the artifact
-rooted. Neither operation recursively deletes shared objects. A restore registers
+`Runtime::snapshots()` returns `Snapshots` with `list`, `inspect`, `verify` and
+`remove`. References resolve like `silo restore` without pulling: local name,
+stored `search_registries` expansion, id or unique id prefix; an image name is
+refused with `ImageIsNotASnapshot`. `remove` follows the tag semantics above.
+No removal recursively deletes shared objects. A restore registers
 its complete consumer closure before reading artifact bytes, so removing the last
 public root cannot race away an in-flight restore's disk maps, raw backing, or
 boot objects. After child publication, only its actual boot/read-only dependencies
@@ -636,20 +660,22 @@ kind, with the latter's new filesystem UUID. Both the sidecar and CLI JSON repor
 serialize `path` and `metadataPath` as raw Unix pathname byte arrays. No
 sanitization, EFI synthesis or cloud-provider bootloader is supplied.
 
-### Stopped forks and checkpoints
+### Stopped forks and snapshots
 
 `Machine::fork_stopped(ForkOptions)` creates a new **stopped** machine from an
 opaque raw root or an admitted `linux-erofs-overlay-v1` root.
-`Machine::snapshot_stopped(SnapshotOptions)` captures an immutable opaque-raw
-or exact layered-root checkpoint.
-`Runtime::restore_snapshot(SnapshotRef, RestoreOptions)` dispatches
-by the checkpoint's capture kind: stopped storage produces a new **stopped**
-machine, while a live checkpoint continues execution through paused construction
+`Runtime::snapshot` without memory captures an immutable opaque-raw or exact
+layered-root snapshot of a stopped machine.
+`Runtime::restore(RestoreSource, RestoreOptions, progress)` resolves
+`RestoreSource::Local(SnapshotRef)` locally, or `RestoreSource::Registry(REF)`
+like `silo restore REF` (pulling per `RestoreOptions::pull`), then dispatches by
+the snapshot's memory: without memory it produces a new **stopped** machine,
+while a snapshot with memory continues execution through paused construction
 and fenced activation. Neither path stops a source, replays a journal, repairs
 a filesystem or resizes captured bytes. A stopped source's reconciled
 Clean/Forced/Unknown outcome remains unchanged by synchronizing files now.
 
-All managed writable Data disks are included and become independent private
+All silo-managed writable Data disks are included and become independent private
 files with fresh host disk IDs. Read-only and pinned boot dependencies remain
 retained. Hardware, process (including unset versus empty commands), guest/user,
 userdata, environment, temporary-directory policy, labels and network intent
@@ -780,8 +806,8 @@ lane cannot be admitted.
 
 ### Execution restore
 
-`silo restore <checkpoint> [--name CHILD]` accepts an `image:` reference or a
-checkpoint alias and uses the same typed API locally and through the daemon.
+`silo restore REF [--name CHILD]` accepts a snapshot name, id or registry
+reference and uses the same typed API locally and through the daemon.
 Live restore first checks the selected host capability without initializing a
 writable runtime, then validates closure shape before child allocation. A leased
 consumer retains the exact stream and object descriptors under descriptor
@@ -884,10 +910,10 @@ machine-owned disks: a clean stop is clean, and a killed guest is
 crash-consistent, just like any other stopped VM. Its next `silo start` admits
 a fresh cold boot, atomically retiring the exact-run execution-restore binding
 and snapshot provenance with the new Starting state. Inspection then reports
-an ordinary `stopped-storage` machine. The checkpoint remains independently
+an ordinary `stopped-storage` machine. The snapshot remains independently
 retained and garbage-collected; its RAM is not loaded on this start.
 An unfinished activation cannot cold boot, even after its processes die:
-retry the retained checkpoint with a fresh restore run. Holder and lease
+retry the retained snapshot with a fresh restore run. Holder and lease
 reconciliation must finish before a completed child can cold boot.
 Inspection exposes `Restoring`, `Activating` and `ActivationFailed` without
 declaring readiness.

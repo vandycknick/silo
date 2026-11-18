@@ -1,4 +1,5 @@
-//! Immutable snapshot artifacts, shared image aliases, and independent retention.
+//! Immutable snapshot records and their names. A record exists until it is
+//! removed; `snapshot_name` tags are independent of the image name table.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
@@ -20,42 +21,53 @@ use crate::store::models::snapshot::{invalid, SnapshotRecord, SnapshotStream};
 use crate::store::Store;
 use crate::LibVmError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A snapshot by name or id. A name is a local name, a canonical registry
+/// reference it was pulled as, or a unique id prefix of at least 3 hex digits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "kebab-case",
+    deny_unknown_fields
+)]
 pub enum SnapshotRef {
+    Name(String),
     Id(SnapshotId),
-    Image(String),
 }
 impl FromStr for SnapshotRef {
     type Err = LibVmError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.starts_with("fork:") {
-            return Err(invalid(
-                "local fork cut is not an identified snapshot; snapshot the child first",
-            ));
+            return Err(LibVmError::InvalidName {
+                name: value.to_owned(),
+                reason: "a local fork cut is not a snapshot; snapshot the child first",
+            });
         }
-        let value = value
-            .strip_prefix("image:")
-            .ok_or_else(|| invalid("expected image:NAME or image:sha256:HEX"))?;
-        if value.starts_with("sha256:") {
-            return value.parse().map(Self::Id).map_err(invalid);
-        }
-        validate_alias(value)?;
-        Ok(Self::Image(value.to_owned()))
+        Ok(match crate::store::names::parse_reference(value)? {
+            crate::store::names::Spelling::Id(id) => {
+                Self::Id(SnapshotId::from_sha256(*id.as_bytes()))
+            }
+            crate::store::names::Spelling::Name(name) => Self::Name(name),
+        })
     }
 }
 impl fmt::Display for SnapshotRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Id(id) => write!(f, "image:{id}"),
-            Self::Image(name) => write!(f, "image:{name}"),
+            Self::Id(id) => write!(f, "{id}"),
+            Self::Name(name) => f.write_str(name),
         }
     }
 }
+
+/// Whether a snapshot includes the machine's memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum SnapshotCaptureKindName {
-    StoppedStorage,
-    LiveExecution,
+pub enum SnapshotMemory {
+    /// Disks only; restore gives a stopped machine that boots normally.
+    None,
+    /// RAM, CPU and device state too; restore resumes a running machine.
+    Included,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,12 +84,23 @@ pub struct SnapshotCaptureProvenance {
 pub struct SnapshotInfo {
     pub id: SnapshotId,
     pub record_digest: ObjectDigest,
-    pub capture_kind: SnapshotCaptureKindName,
+    pub memory: SnapshotMemory,
     pub provenance: Vec<SnapshotCaptureProvenance>,
-    pub retained: bool,
-    pub aliases: Vec<String>,
+    pub names: Vec<String>,
     pub created_at: i64,
     pub streams: Vec<SnapshotStreamSummary>,
+}
+
+/// What one `remove` call deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotRemoval {
+    pub id: SnapshotId,
+    /// Names removed by this call.
+    pub names: Vec<String>,
+    /// Whether the record itself was deleted. Its bytes are collected once
+    /// no machine, operation or other record references them.
+    pub record_removed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,8 +124,8 @@ fn stream_summaries(record: &SnapshotRecord) -> Vec<SnapshotStreamSummary> {
             chunk_size: content.chunk_size,
         })
     };
-    if let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-        &record.capture
+    if let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+        &record.memory
     {
         push(SnapshotVerificationRole::Ram, &execution.memory);
     }
@@ -208,11 +231,11 @@ pub struct SnapshotMapNodeFailure {
     pub failure: SnapshotStructuralFailure,
 }
 
-/// A checkpoint is retained even when its optional requested name loses a race.
+/// A captured snapshot is kept even when its optional requested name loses a race.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum CaptureNamingOutcome {
-    AliasConflict { alias: String },
+    NameConflict { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,7 +245,7 @@ pub(crate) struct CaptureReservationRequest {
     pub run_id: Uuid,
     pub capture_id: Uuid,
     pub configuration: vm_spec::capture::CaptureConfiguration,
-    pub alias: Option<String>,
+    pub name: Option<String>,
     pub policy: vm_spec::lifecycle::CapturePolicy,
     pub dirty_crossover_percent: u8,
     pub resume_policy: vm_spec::lifecycle::CaptureResumePolicy,
@@ -273,7 +296,7 @@ pub(crate) struct CaptureRecord {
     pub machine_id: crate::store::models::MachineId,
     pub run_id: Uuid,
     pub launch_operation_id: Uuid,
-    pub alias: Option<String>,
+    pub name: Option<String>,
     pub request: CaptureReservationRequest,
     pub plan: vm_spec::capture::CapturePlan,
     pub state: CaptureState,
@@ -322,7 +345,7 @@ pub(crate) struct CaptureReservation {
 }
 
 #[derive(Clone)]
-pub struct SnapshotStore {
+pub(crate) struct SnapshotStore {
     pub(crate) store: Arc<Store>,
 }
 
@@ -451,45 +474,30 @@ fn retained_members(
     for stream in record.streams() {
         objects.remove(&stream.map);
     }
-    if let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-        &record.capture
+    if let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+        &record.memory
     {
         objects.insert(execution.memory.map);
     }
     Ok((streams, objects))
 }
 
-pub(crate) fn validate_alias(name: &str) -> Result<(), LibVmError> {
-    if name.is_empty()
-        || name.len() > 128
-        || !name.as_bytes()[0].is_ascii_alphanumeric()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(invalid("image alias must be 1..128 ASCII letters/digits/dot/underscore/hyphen, beginning with a letter or digit"));
-    }
-    Ok(())
-}
-
 impl SnapshotStore {
-    pub async fn open(home: &Path) -> Result<Self, LibVmError> {
-        Ok(Self::from_store(Arc::new(
-            Store::open(&home.join("state.db")).await?,
-        )))
-    }
     pub(crate) fn from_store(store: Arc<Store>) -> Self {
         Self { store }
     }
 
-    pub async fn inspect(&self, reference: &SnapshotRef) -> Result<SnapshotInfo, LibVmError> {
+    pub(crate) async fn inspect(
+        &self,
+        reference: &SnapshotRef,
+    ) -> Result<SnapshotInfo, LibVmError> {
         let (_, info) = self.load_observed(reference).await?;
         Ok(info)
     }
 
     /// Pin a reference once and unconditionally reread its closure. Warm local
     /// receipts and producer capabilities are never verification authority.
-    pub async fn verify(
+    pub(crate) async fn verify(
         &self,
         reference: &SnapshotRef,
     ) -> Result<SnapshotVerificationReport, LibVmError> {
@@ -518,7 +526,7 @@ impl SnapshotStore {
         .await?
     }
 
-    pub async fn list(&self) -> Result<Vec<SnapshotInfo>, LibVmError> {
+    pub(crate) async fn list(&self) -> Result<Vec<SnapshotInfo>, LibVmError> {
         // Each discovery page is bounded. Immutable IDs provide a stable cursor;
         // concurrent removal can only omit an entry, never fabricate a record.
         let mut cursor = String::new();
@@ -536,9 +544,9 @@ impl SnapshotStore {
             for id in ids {
                 cursor = id.clone();
                 let mut tx = self.store.pool.begin().await?;
-                let reference = SnapshotRef::Id(id.parse().map_err(invalid)?);
-                let observed = if exists(&mut tx, &reference).await? {
-                    Some(fetch_catalog(&mut tx, &reference).await?)
+                let id: SnapshotId = id.parse().map_err(invalid)?;
+                let observed = if exists(&mut tx, id).await? {
+                    Some(fetch_catalog(&mut tx, &SnapshotRef::Id(id)).await?)
                 } else {
                     None
                 };
@@ -552,42 +560,72 @@ impl SnapshotStore {
         Ok(snapshots)
     }
 
-    /// Unbinding a name leaves its independently retained image/snapshot intact.
-    pub async fn remove_alias(&self, name: &str) -> Result<bool, LibVmError> {
-        crate::store::managed_image_store::ManagedImageStore::from_store(self.store.clone())
-            .remove_alias(name)
-            .await
-    }
-
-    /// Release only the unnamed explicit retention root. Aliases keep rooting
-    /// their artifact; no referenced bytes are recursively unlinked here.
-    pub async fn release_retention(&self, reference: &SnapshotRef) -> Result<bool, LibVmError> {
-        let collection = self.clone();
-        let reference = reference.clone();
-        let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            runtime.block_on(collection.release_retention_owned(&reference))
-        })
-        .await?
-    }
-
-    async fn release_retention_owned(&self, reference: &SnapshotRef) -> Result<bool, LibVmError> {
-        let (record, observed) = self.load_observed(reference).await?;
-        let bytes = record.canonical_bytes()?;
-        let (streams, mut objects) = record.content_dependencies()?;
-        objects.insert(observed.record_digest);
+    /// Docker tag semantics. A name removes that name, and the record once no
+    /// name remains; an id (or id prefix) removes the record and all its
+    /// names. Machines never depend on the record: bytes are collected only
+    /// once nothing else references them.
+    pub(crate) async fn remove(
+        &self,
+        reference: &SnapshotRef,
+    ) -> Result<SnapshotRemoval, LibVmError> {
         let pool = StoragePool::open(&self.store.images_dir)?;
         let _roots = pool.lock_roots()?;
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        recheck_catalog(&mut tx, reference, &observed, &bytes, &streams, &objects).await?;
-        let info = catalog_info(&mut tx, observed.id, observed.record_digest).await?;
-        sqlx::query("UPDATE storage_snapshot SET retained=0 WHERE id=?1")
-            .bind(info.id.to_string())
-            .execute(&mut *tx)
-            .await?;
-        remove_unrooted(&mut tx, &info.id.to_string()).await?;
+        let named = match reference {
+            SnapshotRef::Name(name) => named_snapshot(&mut tx, name).await?,
+            SnapshotRef::Id(_) => None,
+        };
+        let removal = match named {
+            Some(id) => {
+                let SnapshotRef::Name(name) = reference else {
+                    return Err(invalid("named removal lost its name"));
+                };
+                let remaining: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM snapshot_name WHERE snapshot_id=?1 AND name!=?2",
+                )
+                .bind(id.to_string())
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await?;
+                if remaining == 0 {
+                    refuse_in_use(&mut tx, id, reference).await?;
+                }
+                sqlx::query("DELETE FROM snapshot_name WHERE name=?1")
+                    .bind(name)
+                    .execute(&mut *tx)
+                    .await?;
+                if remaining == 0 {
+                    delete_record(&mut tx, id).await?;
+                }
+                SnapshotRemoval {
+                    id,
+                    names: vec![name.clone()],
+                    record_removed: remaining == 0,
+                }
+            }
+            None => {
+                let id = resolve_snapshot(&mut tx, reference).await?;
+                refuse_in_use(&mut tx, id, reference).await?;
+                let names = sqlx::query_scalar::<_, String>(
+                    "SELECT name FROM snapshot_name WHERE snapshot_id=?1 ORDER BY name",
+                )
+                .bind(id.to_string())
+                .fetch_all(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM snapshot_name WHERE snapshot_id=?1")
+                    .bind(id.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+                delete_record(&mut tx, id).await?;
+                SnapshotRemoval {
+                    id,
+                    names,
+                    record_removed: true,
+                }
+            }
+        };
         tx.commit().await?;
-        Ok(info.retained)
+        Ok(removal)
     }
 
     /// Called by the stopped blocking owner while it holds the original
@@ -596,12 +634,12 @@ impl SnapshotStore {
         &self,
         record: &SnapshotRecord,
         operation_id: Uuid,
-        alias: Option<&str>,
+        name: Option<&str>,
     ) -> Result<SnapshotInfo, LibVmError> {
         self.publish_authenticated(
             record,
             operation_id,
-            alias,
+            name,
             None,
             crate::storage::pool::PublicationLockPolicy::Wait,
         )
@@ -612,21 +650,21 @@ impl SnapshotStore {
         &self,
         record: &SnapshotRecord,
         operation_id: Uuid,
-        alias: Option<&str>,
+        name: Option<&str>,
         inputs: Option<&crate::store::capture::VerifiedCapture>,
         lock_policy: crate::storage::pool::PublicationLockPolicy,
     ) -> Result<SnapshotInfo, LibVmError> {
         if matches!(
-            record.capture,
-            crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { .. }
+            record.memory,
+            crate::store::models::snapshot::SnapshotMemoryState::Included { .. }
         ) != inputs.is_some()
         {
             return Err(invalid(
                 "execution publication requires its retained capture verification owner",
             ));
         }
-        if let Some(name) = alias {
-            validate_alias(name)?;
+        if let Some(name) = name {
+            crate::store::names::validate_name(name)?;
         }
         let bytes = record.canonical_bytes()?;
         let id = crate::store::models::snapshot::snapshot_id(&bytes);
@@ -641,8 +679,8 @@ impl SnapshotStore {
             pool
         };
         let capture = if matches!(
-            record.capture,
-            crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { .. }
+            record.memory,
+            crate::store::models::snapshot::SnapshotMemoryState::Included { .. }
         ) {
             let capture = self
                 .capture_reservation(operation_id)
@@ -786,12 +824,8 @@ impl SnapshotStore {
                 return Err(invalid("immutable snapshot identity contradiction"));
             }
             exact_catalog_dependencies(&mut tx, id, &streams, &objects).await?;
-            sqlx::query("UPDATE storage_snapshot SET retained=1 WHERE id=?1")
-                .bind(id.to_string())
-                .execute(&mut *tx)
-                .await?;
         } else {
-            sqlx::query("INSERT INTO storage_snapshot(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,?3,1,?4)")
+            sqlx::query("INSERT INTO storage_snapshot(id,record_digest,record_bytes,created_at) VALUES(?1,?2,?3,?4)")
                 .bind(id.to_string()).bind(digest.to_string()).bind(&bytes).bind(chrono::Utc::now().timestamp()).execute(&mut *tx).await?;
             for stream in &streams {
                 sqlx::query(
@@ -823,17 +857,11 @@ impl SnapshotStore {
             }
         }
         let mut naming_outcome = None;
-        if let Some(alias) = alias {
-            match crate::store::managed_image_store::insert_alias(
-                &mut tx,
-                alias,
-                crate::image::import_types::ManagedSourceId::Snapshot(id),
-            )
-            .await
-            {
+        if let Some(name) = name {
+            match insert_name(&mut tx, name, id).await {
                 Ok(()) => {}
-                Err(LibVmError::ImageAliasConflict { alias }) if capture.is_some() => {
-                    naming_outcome = Some(CaptureNamingOutcome::AliasConflict { alias });
+                Err(LibVmError::SnapshotNameConflict { name }) if capture.is_some() => {
+                    naming_outcome = Some(CaptureNamingOutcome::NameConflict { name });
                 }
                 Err(error) => return Err(error),
             }
@@ -907,7 +935,7 @@ impl SnapshotStore {
         }
         tx.commit().await?;
         // Pool publication has synchronized the files. Make the retained
-        // checkpoint and its closure power-loss durable before acknowledging it.
+        // snapshot and its closure power-loss durable before acknowledging it.
         self.store.checkpoint_catalog().await?;
         drop(_roots);
         self.inspect(&SnapshotRef::Id(id)).await
@@ -962,8 +990,8 @@ impl SnapshotStore {
                 .filter(|disk| disk.writable)
                 .map(|disk| disk.content.stream),
         );
-        if let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &consumer.record.capture
+        if let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &consumer.record.memory
         {
             deferred.remove(&execution.memory.stream);
         }
@@ -999,8 +1027,8 @@ impl SnapshotStore {
                 + 4,
         )
         .map_err(crate::storage::StorageError::from)?;
-        let ram = match &consumer.record.capture {
-            crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } => {
+        let ram = match &consumer.record.memory {
+            crate::store::models::snapshot::SnapshotMemoryState::Included { execution } => {
                 let capture = self.restore_evidence(consumer, &pool)?;
                 if execution.layout != execution.compatibility_profile.ram_layout {
                     return Err(invalid("snapshot layout contradicts compatibility profile"));
@@ -1381,20 +1409,150 @@ pub(crate) async fn observe_snapshot_record(
 
 async fn exists(
     connection: &mut sqlx::SqliteConnection,
-    reference: &SnapshotRef,
+    id: SnapshotId,
 ) -> Result<bool, LibVmError> {
-    let (id, alias) = reference_parts(reference)?;
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_snapshot WHERE id=?1 OR id=(SELECT snapshot_id FROM image_alias WHERE name=?2))")
-        .bind(id).bind(alias).fetch_one(connection).await?)
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_snapshot WHERE id=?1)")
+            .bind(id.to_string())
+            .fetch_one(connection)
+            .await?,
+    )
 }
-fn reference_parts(reference: &SnapshotRef) -> Result<(Option<String>, Option<&str>), LibVmError> {
+
+/// The snapshot an exact name tags, if any.
+pub(crate) async fn named_snapshot(
+    connection: &mut sqlx::SqliteConnection,
+    name: &str,
+) -> Result<Option<SnapshotId>, LibVmError> {
+    sqlx::query_scalar::<_, String>("SELECT snapshot_id FROM snapshot_name WHERE name=?1")
+        .bind(name)
+        .fetch_optional(connection)
+        .await?
+        .map(|id| id.parse().map_err(invalid))
+        .transpose()
+}
+
+/// Every snapshot whose id starts with `prefix` (hex, without `sha256:`),
+/// bounded to two: one is a match, two is ambiguous.
+pub(crate) async fn snapshot_prefix(
+    connection: &mut sqlx::SqliteConnection,
+    prefix: &str,
+) -> Result<Vec<SnapshotId>, LibVmError> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT id FROM storage_snapshot WHERE substr(id,8,length(?1))=?1 ORDER BY id LIMIT 2",
+    )
+    .bind(prefix)
+    .fetch_all(connection)
+    .await?
+    .into_iter()
+    .map(|id| id.parse().map_err(invalid))
+    .collect()
+}
+
+/// Local resolution only: an exact name, then a full id, then a unique id
+/// prefix. Registry expansion of short references belongs to the caller.
+pub(crate) async fn resolve_snapshot(
+    connection: &mut sqlx::SqliteConnection,
+    reference: &SnapshotRef,
+) -> Result<SnapshotId, LibVmError> {
+    let not_found = || LibVmError::SnapshotNotFound {
+        reference: reference.to_string(),
+    };
     match reference {
-        SnapshotRef::Id(id) => Ok((Some(id.to_string()), None)),
-        SnapshotRef::Image(name) => {
-            validate_alias(name)?;
-            Ok((None, Some(name)))
+        SnapshotRef::Id(id) => {
+            if exists(connection, *id).await? {
+                Ok(*id)
+            } else {
+                Err(not_found())
+            }
+        }
+        SnapshotRef::Name(name) => {
+            if let Some(id) = named_snapshot(connection, name).await? {
+                return Ok(id);
+            }
+            let Some(prefix) = crate::store::names::id_prefix(name) else {
+                return Err(not_found());
+            };
+            match snapshot_prefix(connection, prefix).await?.as_slice() {
+                [id] => Ok(*id),
+                [] => Err(not_found()),
+                matches => Err(LibVmError::AmbiguousRecordPrefix {
+                    prefix: prefix.to_owned(),
+                    count: matches.len(),
+                }),
+            }
         }
     }
+}
+
+/// Add `name` to `id`. A name already naming another snapshot is refused.
+pub(crate) async fn insert_name(
+    connection: &mut sqlx::SqliteConnection,
+    name: &str,
+    id: SnapshotId,
+) -> Result<(), LibVmError> {
+    match named_snapshot(&mut *connection, name).await? {
+        Some(existing) if existing == id => Ok(()),
+        Some(_) => Err(LibVmError::SnapshotNameConflict {
+            name: name.to_owned(),
+        }),
+        None => {
+            sqlx::query("INSERT INTO snapshot_name(name,snapshot_id,updated_at) VALUES(?1,?2,?3)")
+                .bind(name)
+                .bind(id.to_string())
+                .bind(chrono::Utc::now().timestamp())
+                .execute(connection)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Point a pulled registry reference at `id`, moving it from any previous
+/// snapshot. The previous record stays, listed by id, until removed.
+pub(crate) async fn move_name(
+    connection: &mut sqlx::SqliteConnection,
+    name: &str,
+    id: SnapshotId,
+) -> Result<(), LibVmError> {
+    sqlx::query("INSERT INTO snapshot_name(name,snapshot_id,updated_at) VALUES(?1,?2,?3) ON CONFLICT(name) DO UPDATE SET snapshot_id=excluded.snapshot_id,updated_at=excluded.updated_at")
+        .bind(name)
+        .bind(id.to_string())
+        .bind(chrono::Utc::now().timestamp())
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
+/// An import still committing the record, or a capture still settling the
+/// publication that names it as its candidate, owns the record for now.
+async fn refuse_in_use(
+    connection: &mut sqlx::SqliteConnection,
+    id: SnapshotId,
+    reference: &SnapshotRef,
+) -> Result<(), LibVmError> {
+    let in_use: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='snapshot' AND managed_id=?1) OR EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=?1 AND json_extract(record_json,'$.state.state') IN ('reserved','sealed','published'))")
+        .bind(id.to_string())
+        .fetch_one(connection)
+        .await?;
+    if in_use {
+        return Err(LibVmError::RecordInUse {
+            reference: reference.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Dependencies, provenance and acquisitions cascade; names must be gone.
+async fn delete_record(
+    connection: &mut sqlx::SqliteConnection,
+    id: SnapshotId,
+) -> Result<(), LibVmError> {
+    sqlx::query("DELETE FROM storage_snapshot WHERE id=?1")
+        .bind(id.to_string())
+        .execute(connection)
+        .await?;
+    Ok(())
 }
 
 struct CaptureProvenanceFact {
@@ -1410,44 +1568,26 @@ pub(crate) struct CatalogSnapshotFacts {
     id: String,
     digest: String,
     bytes: Vec<u8>,
-    retained: i64,
     created_at: i64,
-    aliases: Vec<String>,
+    names: Vec<String>,
     streams: Vec<String>,
     objects: Vec<String>,
     provenance: Vec<CaptureProvenanceFact>,
-    capture_owned: bool,
 }
 
 pub(crate) async fn fetch_catalog(
     connection: &mut sqlx::SqliteConnection,
     reference: &SnapshotRef,
 ) -> Result<CatalogSnapshotFacts, LibVmError> {
-    let (id, alias) = reference_parts(reference)?;
-    let target = crate::store::managed_image_store::resolve_target(
-        connection,
-        &match reference {
-            SnapshotRef::Id(id) => crate::image::import_types::ManagedSourceRef::Snapshot(*id),
-            SnapshotRef::Image(alias) => {
-                crate::image::import_types::ManagedSourceRef::Alias(alias.clone())
-            }
-        },
+    let id = resolve_snapshot(connection, reference).await?.to_string();
+    let row = sqlx::query(
+        "SELECT record_digest,record_bytes,created_at FROM storage_snapshot WHERE id=?1",
     )
+    .bind(&id)
+    .fetch_one(&mut *connection)
     .await?;
-    if !matches!(
-        target,
-        crate::image::import_types::ManagedSourceId::Snapshot(_)
-    ) {
-        return Err(invalid(
-            "image requires image creation, not snapshot restore",
-        ));
-    }
-    let row = sqlx::query("SELECT id,record_digest,record_bytes,retained,created_at,(EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) OR EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='snapshot' AND managed_id=storage_snapshot.id)) AS capture_owned FROM storage_snapshot WHERE id=?1 OR id=(SELECT snapshot_id FROM image_alias WHERE name=?2)")
-        .bind(id).bind(alias).fetch_optional(&mut *connection).await?
-        .ok_or_else(|| invalid(format!("snapshot {reference} does not exist")))?;
-    let id: String = row.try_get("id")?;
-    let aliases =
-        sqlx::query_scalar("SELECT name FROM image_alias WHERE snapshot_id=?1 ORDER BY name")
+    let names =
+        sqlx::query_scalar("SELECT name FROM snapshot_name WHERE snapshot_id=?1 ORDER BY name")
             .bind(&id)
             .fetch_all(&mut *connection)
             .await?;
@@ -1465,13 +1605,11 @@ pub(crate) async fn fetch_catalog(
         id,
         digest: row.try_get("record_digest")?,
         bytes: row.try_get("record_bytes")?,
-        retained: row.try_get("retained")?,
         created_at: row.try_get("created_at")?,
-        aliases,
+        names,
         streams,
         objects,
         provenance,
-        capture_owned: row.try_get("capture_owned")?,
     })
 }
 
@@ -1503,18 +1641,15 @@ pub(crate) fn authenticate_catalog(
     if streams != actual_streams || objects != actual_objects {
         return Err(invalid("snapshot dependency closure contradiction"));
     }
-    for alias in &facts.aliases {
-        validate_alias(alias)?;
+    for name in &facts.names {
+        crate::store::names::validate_stored_name(name)?;
     }
-    if !matches!(facts.retained, 0 | 1)
-        || (facts.retained == 0 && facts.aliases.is_empty() && !facts.capture_owned)
-    {
-        return Err(invalid("snapshot has no public retention root"));
-    }
-    let capture_kind = capture_kind(&record);
+    let memory = snapshot_memory(&record);
     let provenance = authenticate_provenance(facts.provenance)?;
-    if capture_kind == SnapshotCaptureKindName::StoppedStorage && !provenance.is_empty() {
-        return Err(invalid("stopped snapshot has live capture provenance"));
+    if memory == SnapshotMemory::None && !provenance.is_empty() {
+        return Err(invalid(
+            "snapshot without memory has live capture provenance",
+        ));
     }
     let summaries = stream_summaries(&record);
     Ok((
@@ -1522,10 +1657,9 @@ pub(crate) fn authenticate_catalog(
         SnapshotInfo {
             id,
             record_digest: digest,
-            capture_kind,
+            memory,
             provenance,
-            retained: facts.retained == 1,
-            aliases: facts.aliases,
+            names: facts.names,
             created_at: facts.created_at,
             streams: summaries,
         },
@@ -1537,40 +1671,28 @@ async fn catalog_info(
     id: SnapshotId,
     digest: ObjectDigest,
 ) -> Result<SnapshotInfo, LibVmError> {
-    let row = sqlx::query("SELECT record_bytes,retained,created_at,json_extract(CAST(record_bytes AS TEXT),'$.captureKind') AS capture_kind,(EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) OR EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='snapshot' AND managed_id=storage_snapshot.id)) AS capture_owned FROM storage_snapshot WHERE id=?1")
+    let row = sqlx::query("SELECT record_bytes,created_at FROM storage_snapshot WHERE id=?1")
         .bind(id.to_string())
         .fetch_one(&mut *connection)
         .await?;
-    let aliases = sqlx::query_scalar::<_, String>(
-        "SELECT name FROM image_alias WHERE snapshot_id=?1 ORDER BY name",
+    let names = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM snapshot_name WHERE snapshot_id=?1 ORDER BY name",
     )
     .bind(id.to_string())
     .fetch_all(&mut *connection)
     .await?;
-    for alias in &aliases {
-        validate_alias(alias)?;
+    for name in &names {
+        crate::store::names::validate_stored_name(name)?;
     }
-    let retained: i64 = row.try_get("retained")?;
-    if !matches!(retained, 0 | 1)
-        || (retained == 0 && aliases.is_empty() && !row.try_get::<bool, _>("capture_owned")?)
-    {
-        return Err(invalid("snapshot has no public retention root"));
-    }
+    let record = SnapshotRecord::decode(&row.try_get::<Vec<u8>, _>("record_bytes")?)?;
     Ok(SnapshotInfo {
         id,
         record_digest: digest,
         provenance: Vec::new(),
-        capture_kind: match row.try_get::<String, _>("capture_kind")?.as_str() {
-            "stopped-storage" => SnapshotCaptureKindName::StoppedStorage,
-            "live-execution" => SnapshotCaptureKindName::LiveExecution,
-            _ => return Err(invalid("invalid snapshot capture kind")),
-        },
-        retained: retained == 1,
-        aliases,
+        memory: snapshot_memory(&record),
+        names,
         created_at: row.try_get("created_at")?,
-        streams: stream_summaries(&SnapshotRecord::decode(
-            &row.try_get::<Vec<u8>, _>("record_bytes")?,
-        )?),
+        streams: stream_summaries(&record),
     })
 }
 async fn provenance_facts(
@@ -1675,13 +1797,11 @@ fn authenticate_provenance(
         .collect()
 }
 
-fn capture_kind(record: &SnapshotRecord) -> SnapshotCaptureKindName {
-    match &record.capture {
-        crate::store::models::snapshot::SnapshotCaptureKind::StoppedStorage { .. } => {
-            SnapshotCaptureKindName::StoppedStorage
-        }
-        crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { .. } => {
-            SnapshotCaptureKindName::LiveExecution
+pub(crate) fn snapshot_memory(record: &SnapshotRecord) -> SnapshotMemory {
+    match &record.memory {
+        crate::store::models::snapshot::SnapshotMemoryState::None { .. } => SnapshotMemory::None,
+        crate::store::models::snapshot::SnapshotMemoryState::Included { .. } => {
+            SnapshotMemory::Included
         }
     }
 }
@@ -1724,24 +1844,15 @@ async fn recheck_catalog(
     streams: &BTreeSet<StreamId>,
     objects: &BTreeSet<ObjectDigest>,
 ) -> Result<(), LibVmError> {
-    let target = crate::store::managed_image_store::resolve_target(
-        connection,
-        &match reference {
-            SnapshotRef::Id(id) => crate::image::import_types::ManagedSourceRef::Snapshot(*id),
-            SnapshotRef::Image(alias) => {
-                crate::image::import_types::ManagedSourceRef::Alias(alias.clone())
-            }
-        },
-    )
-    .await?;
-    if target != crate::image::import_types::ManagedSourceId::Snapshot(observed.id) {
+    if resolve_snapshot(connection, reference).await? != observed.id {
         return Err(invalid(
             "snapshot root changed before consumer registration",
         ));
     }
-    let (id, alias) = reference_parts(reference)?;
-    let row = sqlx::query("SELECT id,record_digest,record_bytes FROM storage_snapshot WHERE id=?1 OR id=(SELECT snapshot_id FROM image_alias WHERE name=?2)")
-        .bind(id).bind(alias).fetch_optional(&mut *connection).await?
+    let row = sqlx::query("SELECT id,record_digest,record_bytes FROM storage_snapshot WHERE id=?1")
+        .bind(observed.id.to_string())
+        .fetch_optional(&mut *connection)
+        .await?
         .ok_or_else(|| invalid("snapshot root was removed before consumer registration"))?;
     if row.try_get::<String, _>("id")? != observed.id.to_string()
         || row.try_get::<String, _>("record_digest")? != observed.record_digest.to_string()
@@ -1784,7 +1895,7 @@ pub(crate) async fn check_snapshot_catalog(store: &Store) -> Result<(), LibVmErr
             let (record, info) = authenticate_catalog(facts)?;
             if !imported.is_empty() {
                 let pool = StoragePool::open_existing(&store.images_dir)?
-                    .ok_or_else(|| invalid("imported checkpoint pool is missing"))?;
+                    .ok_or_else(|| invalid("imported snapshot pool is missing"))?;
                 crate::store::restore::authenticate_imported_captures(
                     &pool, &record, info.id, &imported,
                 )?;
@@ -1794,14 +1905,6 @@ pub(crate) async fn check_snapshot_catalog(store: &Store) -> Result<(), LibVmErr
     Ok(())
 }
 
-pub(crate) async fn remove_unrooted(
-    connection: &mut sqlx::SqliteConnection,
-    id: &str,
-) -> Result<(), LibVmError> {
-    sqlx::query("DELETE FROM storage_snapshot WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE snapshot_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='snapshot' AND managed_id=?1)")
-        .bind(id).execute(connection).await?;
-    Ok(())
-}
 pub(crate) async fn require_operation_closure(
     store: &Store,
     operation: Uuid,
@@ -2389,8 +2492,8 @@ fn verify_snapshot_bytes(
             bytes: 0,
         },
     };
-    if let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-        &record.capture
+    if let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+        &record.memory
     {
         verifier.stream(SnapshotVerificationRole::Ram, &execution.memory)?;
         let capture = snapshots.restore_evidence(consumer, &pool)?;
@@ -2484,10 +2587,8 @@ fn verify_closure(
     let bytes = record.canonical_bytes()?;
     let (_, objects) = record.content_dependencies()?;
     let (_, retained_objects) = retained_members(record)?;
-    let ram = match &record.capture {
-        crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution }
-            if retain =>
-        {
+    let ram = match &record.memory {
+        crate::store::models::snapshot::SnapshotMemoryState::Included { execution } if retain => {
             Some(execution.memory.stream)
         }
         _ => None,
@@ -3444,7 +3545,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -3453,8 +3554,8 @@ pub(crate) mod tests {
             .consume_shape(&SnapshotRef::Id(info.id))
             .await
             .unwrap();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &consumer.record.memory
         else {
             panic!("live fixture");
         };
@@ -3554,7 +3655,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -3563,8 +3664,8 @@ pub(crate) mod tests {
             .consume_shape(&SnapshotRef::Id(info.id))
             .await
             .unwrap();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &consumer.record.memory
         else {
             panic!("live fixture");
         };
@@ -3615,7 +3716,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_closure_shape_checks_state_length_without_reading_ram() {
-        use crate::store::models::snapshot::SnapshotCaptureKind;
+        use crate::store::models::snapshot::SnapshotMemoryState;
         use std::os::unix::fs::PermissionsExt;
 
         let fixture = crate::store::capture::tests::fixture().await;
@@ -3626,7 +3727,7 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -3636,7 +3737,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
-        let SnapshotCaptureKind::LiveExecution { execution } = &consumer.record.capture else {
+        let SnapshotMemoryState::Included { execution } = &consumer.record.memory else {
             panic!("live fixture");
         };
         let watcher = watch_stream_reads(&pool.stream_path(&execution.memory.stream));
@@ -3890,7 +3991,7 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -3998,29 +4099,164 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn snapshot_reference_has_only_shared_image_namespace() {
-        for invalid in [
-            "",
-            "snapshot:name",
-            "sha256:abcd",
-            "image:",
-            "image:../other",
-            "image:a:b",
-            "image:é",
-        ] {
-            assert!(invalid.parse::<SnapshotRef>().is_err(), "{invalid}");
+    fn snapshot_references_are_bare_names_ids_or_registry_spellings() {
+        let id = format!("sha256:{}", "ab".repeat(32));
+        assert_eq!(
+            id.parse::<SnapshotRef>().unwrap(),
+            SnapshotRef::Id(id.parse().unwrap())
+        );
+        for name in ["hello", "abc", "ghcr.io/team/app:1"] {
+            let reference = name.parse::<SnapshotRef>().unwrap();
+            assert_eq!(reference, SnapshotRef::Name(name.into()));
+            assert_eq!(reference.to_string(), name);
         }
-        for name in [
-            "image:checkpoint",
-            "image:Nightly_01.raw",
-            "image:sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        ] {
-            assert_eq!(name.parse::<SnapshotRef>().unwrap().to_string(), name);
+        assert_eq!(
+            SnapshotRef::Id(id.parse().unwrap()).to_string(),
+            id,
+            "an id prints as its full spelling"
+        );
+        for invalid in ["", "sha256:abcd", "Hello", "a b", "fork:child"] {
+            assert!(
+                matches!(
+                    invalid.parse::<SnapshotRef>(),
+                    Err(crate::LibVmError::InvalidName { .. })
+                ),
+                "{invalid:?}"
+            );
         }
     }
 
+    /// A catalog row whose id starts with `prefix`, for prefix resolution.
+    async fn forged_snapshot_row(snapshots: &SnapshotStore, id: &str) {
+        sqlx::query("INSERT INTO storage_snapshot(id,record_digest,record_bytes,created_at) VALUES(?1,?1,?2,1)")
+            .bind(id)
+            .bind(br#"{"schema":2,"root":{"stream":{"chunkSize":8388608}}}"#.as_slice())
+            .execute(&snapshots.store.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn resolve(
+        snapshots: &SnapshotStore,
+        reference: &str,
+    ) -> Result<crate::storage::identity::SnapshotId, crate::LibVmError> {
+        let mut connection = snapshots.store.pool.acquire().await.unwrap();
+        crate::store::snapshot_store::resolve_snapshot(
+            &mut connection,
+            &reference.parse::<SnapshotRef>().unwrap(),
+        )
+        .await
+    }
+
     #[tokio::test]
-    async fn checkpoint_publication_requires_completed_catalog_checkpoint() {
+    async fn snapshot_names_ids_and_unique_prefixes_resolve_and_ambiguous_prefixes_error() {
+        let (_temp, snapshots, record, operation, lease) = fixture("snapshot").await;
+        let info = snapshots
+            .publish(&record, operation, Some("hello"))
+            .await
+            .unwrap();
+        assert_eq!(info.names, ["hello"]);
+        let hex = info.id.to_string()["sha256:".len()..].to_owned();
+        for reference in [
+            "hello".to_owned(),
+            info.id.to_string(),
+            hex.clone(),
+            hex[..3].to_owned(),
+        ] {
+            assert_eq!(resolve(&snapshots, &reference).await.unwrap(), info.id);
+            assert_eq!(
+                snapshots
+                    .inspect(&reference.parse().unwrap())
+                    .await
+                    .unwrap()
+                    .id,
+                info.id,
+                "{reference}"
+            );
+        }
+        // Two characters never abbreviate an id; they are only a name.
+        assert!(matches!(
+            resolve(&snapshots, &hex[..2]).await,
+            Err(crate::LibVmError::SnapshotNotFound { .. })
+        ));
+        let flipped = if hex.as_bytes()[3] == b'0' { '1' } else { '0' };
+        let sibling = format!("sha256:{}{flipped}{}", &hex[..3], &hex[4..]);
+        forged_snapshot_row(&snapshots, &sibling).await;
+        assert!(matches!(
+            resolve(&snapshots, &hex[..3]).await,
+            Err(crate::LibVmError::AmbiguousRecordPrefix { prefix, count: 2 }) if prefix == hex[..3]
+        ));
+        assert_eq!(resolve(&snapshots, &hex[..4]).await.unwrap(), info.id);
+        // An exact name wins over an id prefix that spells the same.
+        let mut tx = snapshots.store.pool.begin().await.unwrap();
+        crate::store::snapshot_store::insert_name(&mut tx, &hex[..3], info.id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(resolve(&snapshots, &hex[..3]).await.unwrap(), info.id);
+        assert!(matches!(
+            resolve(&snapshots, "missing").await,
+            Err(crate::LibVmError::SnapshotNotFound { reference }) if reference == "missing"
+        ));
+        snapshots
+            .store
+            .finish_stopped_operation(operation)
+            .await
+            .unwrap();
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn snapshot_names_with_registry_syntax_or_taken_by_another_snapshot_are_refused() {
+        let (_temp, snapshots, record, operation, lease) = fixture("snapshot").await;
+        for name in ["hello:v2", "team/app", "Hello", ""] {
+            assert!(
+                matches!(
+                    snapshots.publish(&record, operation, Some(name)).await,
+                    Err(crate::LibVmError::InvalidName { .. })
+                ),
+                "{name:?}"
+            );
+        }
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM storage_snapshot")
+            .fetch_one(&snapshots.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "an invalid name refuses before publication");
+        let info = snapshots
+            .publish(&record, operation, Some("taken"))
+            .await
+            .unwrap();
+        let mut other = record.clone();
+        other.memory = crate::store::models::snapshot::SnapshotMemoryState::None {
+            stop_outcome: crate::StorageStopOutcome::Forced,
+        };
+        assert!(matches!(
+            snapshots.publish(&other, operation, Some("taken")).await,
+            Err(crate::LibVmError::SnapshotNameConflict { name }) if name == "taken"
+        ));
+        assert!(snapshots
+            .inspect(&SnapshotRef::Id(other.id().unwrap()))
+            .await
+            .is_err());
+        assert_eq!(
+            snapshots
+                .inspect(&SnapshotRef::Name("taken".into()))
+                .await
+                .unwrap()
+                .id,
+            info.id
+        );
+        snapshots
+            .store
+            .finish_stopped_operation(operation)
+            .await
+            .unwrap();
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn snapshot_publication_requires_completed_catalog_checkpoint() {
         let (_temp, snapshots, record, operation, _lease) = fixture("snapshot").await;
         let mut reader = snapshots.store.pool.begin().await.unwrap();
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM storage_snapshot")
@@ -4043,60 +4279,234 @@ pub(crate) mod tests {
             .publish(&record, operation, Some("power-loss-stable"))
             .await
             .unwrap();
-        assert!(info.retained);
-        assert_eq!(info.aliases, vec!["power-loss-stable".to_owned()]);
+        assert_eq!(info.names, vec!["power-loss-stable".to_owned()]);
     }
 
     #[tokio::test]
-    async fn snapshot_unnamed_retention_aliases_and_shared_bytes_are_independent() {
+    async fn snapshot_rm_name_removes_one_name_and_the_last_name_removes_the_record() {
         let (_temp, snapshots, record, operation, lease) = fixture("snapshot").await;
         let info = snapshots.publish(&record, operation, None).await.unwrap();
-        assert!(info.retained);
-        assert!(info.aliases.is_empty());
+        assert!(info.names.is_empty());
         let same = snapshots
             .publish(&record, operation, Some("one"))
             .await
             .unwrap();
         assert_eq!(same.id, info.id);
-        snapshots
+        let named = snapshots
             .publish(&record, operation, Some("two"))
             .await
             .unwrap();
+        assert_eq!(named.names, ["one", "two"]);
         snapshots
             .store
             .finish_stopped_operation(operation)
             .await
             .unwrap();
         drop(lease);
-        snapshots.store.recover_image_cache().await.unwrap();
-        assert!(snapshots.remove_alias("one").await.unwrap());
-        assert!(
-            snapshots
-                .inspect(&SnapshotRef::Id(info.id))
-                .await
-                .unwrap()
-                .retained
-        );
-        assert!(snapshots
-            .release_retention(&SnapshotRef::Id(info.id))
-            .await
-            .unwrap());
-        let remaining = snapshots
-            .inspect(&SnapshotRef::Image("two".into()))
+        let removal = snapshots
+            .remove(&SnapshotRef::Name("one".into()))
             .await
             .unwrap();
-        assert!(!remaining.retained);
-        assert_eq!(remaining.aliases, ["two"]);
+        assert_eq!(
+            removal,
+            crate::SnapshotRemoval {
+                id: info.id,
+                names: vec!["one".into()],
+                record_removed: false,
+            }
+        );
+        assert!(matches!(
+            snapshots.inspect(&SnapshotRef::Name("one".into())).await,
+            Err(crate::LibVmError::SnapshotNotFound { .. })
+        ));
+        let remaining = snapshots
+            .inspect(&SnapshotRef::Name("two".into()))
+            .await
+            .unwrap();
+        assert_eq!(remaining.id, info.id);
+        assert_eq!(remaining.names, ["two"]);
         snapshots.store.recover_image_cache().await.unwrap();
         assert!(snapshots.consume(&SnapshotRef::Id(info.id)).await.is_ok());
-        assert!(snapshots.remove_alias("two").await.unwrap());
-        assert!(snapshots.inspect(&SnapshotRef::Id(info.id)).await.is_err());
+        let removal = snapshots
+            .remove(&SnapshotRef::Name("two".into()))
+            .await
+            .unwrap();
+        assert_eq!(removal.names, ["two"]);
+        assert!(removal.record_removed);
+        assert!(matches!(
+            snapshots.inspect(&SnapshotRef::Id(info.id)).await,
+            Err(crate::LibVmError::SnapshotNotFound { .. })
+        ));
+        assert!(snapshots.list().await.unwrap().is_empty());
         snapshots.store.recover_image_cache().await.unwrap();
         let pool = StoragePool::open_existing(&snapshots.store.images_dir)
             .unwrap()
             .unwrap();
         assert!(!pool.stream_path(&record.root.stream.stream).exists());
         assert!(!pool.object_path(&info.record_digest).exists());
+    }
+
+    #[tokio::test]
+    async fn snapshot_rm_id_or_prefix_removes_the_record_and_every_name() {
+        let (_temp, snapshots, record, operation, lease) = fixture("snapshot").await;
+        let mut unnamed = record.clone();
+        unnamed.memory = crate::store::models::snapshot::SnapshotMemoryState::None {
+            stop_outcome: crate::StorageStopOutcome::Forced,
+        };
+        let kept = snapshots.publish(&unnamed, operation, None).await.unwrap();
+        snapshots
+            .publish(&record, operation, Some("b"))
+            .await
+            .unwrap();
+        let info = snapshots
+            .publish(&record, operation, Some("a"))
+            .await
+            .unwrap();
+        assert_eq!(info.names, ["a", "b"]);
+        snapshots
+            .store
+            .finish_stopped_operation(operation)
+            .await
+            .unwrap();
+        drop(lease);
+        let removal = snapshots.remove(&SnapshotRef::Id(info.id)).await.unwrap();
+        assert_eq!(
+            removal,
+            crate::SnapshotRemoval {
+                id: info.id,
+                names: vec!["a".into(), "b".into()],
+                record_removed: true,
+            }
+        );
+        let names: i64 = sqlx::query_scalar("SELECT count(*) FROM snapshot_name")
+            .fetch_one(&snapshots.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(names, 0);
+        assert!(matches!(
+            snapshots.remove(&SnapshotRef::Id(info.id)).await,
+            Err(crate::LibVmError::SnapshotNotFound { .. })
+        ));
+        assert!(matches!(
+            snapshots.remove(&SnapshotRef::Name("a".into())).await,
+            Err(crate::LibVmError::SnapshotNotFound { .. })
+        ));
+        // An unnamed record is removed by an id prefix.
+        let prefix = kept.id.to_string()["sha256:".len()..][..12].to_owned();
+        let removal = snapshots.remove(&SnapshotRef::Name(prefix)).await.unwrap();
+        assert_eq!(removal.id, kept.id);
+        assert!(removal.names.is_empty() && removal.record_removed);
+        assert!(snapshots.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_removed_record_leaves_a_machine_using_its_bytes_intact() {
+        use crate::store::MachineStore;
+        let fixture = crate::store::capture::tests::fixture().await;
+        let (directory, _) = crate::store::capture::tests::seal(&fixture);
+        let snapshots = fixture.snapshots.clone();
+        let capture = fixture.reservation.record.capture_id;
+        let info = snapshots
+            .publish_capture(
+                capture,
+                directory.path(),
+                fixture.reservation.record.name.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await
+            .unwrap();
+        snapshots
+            .record_capture_source(
+                capture,
+                crate::store::snapshot_store::CaptureSourceOutcome::Unknown,
+            )
+            .await
+            .unwrap();
+        snapshots
+            .finish_capture_release(capture, true)
+            .await
+            .unwrap();
+        let config = fixture.config.clone();
+        drop(fixture.reservation);
+        drop(fixture.launch);
+        // Retire the launch so only the machine itself roots its storage.
+        let launches = snapshots
+            .store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap();
+        let [launch] = launches.as_slice() else {
+            panic!("one launch: {launches:?}");
+        };
+        let mut stopped = snapshots
+            .store
+            .machine_state(config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        stopped.status = crate::store::models::MachineRuntimeState::Stopped;
+        stopped.run_id = None;
+        stopped.updated_at = 2;
+        assert!(snapshots
+            .store
+            .try_retire_launch_storage(
+                launch.operation_id,
+                launch.run_id,
+                launch.storage_generation,
+                &stopped,
+                crate::StorageStopOutcome::Unknown,
+            )
+            .await
+            .unwrap());
+        let storage = snapshots
+            .store
+            .machine_storage(config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let machine = crate::store::cache_paths::storage_pool_dependencies(&storage).unwrap();
+        let consumer = snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap();
+        let (streams, objects) = consumer.record.content_dependencies().unwrap();
+        snapshots
+            .store
+            .finish_stopped_operation(consumer.operation_id)
+            .await
+            .unwrap();
+        drop(consumer);
+        let shared = objects
+            .intersection(&machine.objects)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(!shared.is_empty(), "the machine shares the snapshot's boot");
+
+        let removal = snapshots.remove(&SnapshotRef::Id(info.id)).await.unwrap();
+        assert!(removal.record_removed);
+        snapshots.store.recover_image_cache().await.unwrap();
+        let pool = StoragePool::open_existing(&snapshots.store.images_dir)
+            .unwrap()
+            .unwrap();
+        assert!(snapshots.inspect(&SnapshotRef::Id(info.id)).await.is_err());
+        assert!(!pool.object_path(&info.record_digest).exists());
+        assert_eq!(
+            snapshots.store.machine_storage(config.id).await.unwrap(),
+            Some(storage)
+        );
+        for object in &machine.objects {
+            assert!(pool.verify_object(object).is_ok(), "{object}");
+        }
+        for stream in &machine.streams {
+            assert!(pool.verify_stream(stream).is_ok(), "{stream}");
+        }
+
+        snapshots.store.remove_machine(&config).await.unwrap();
+        std::fs::remove_dir_all(&config.machine_dir).unwrap();
+        snapshots.store.recover_image_cache().await.unwrap();
+        for object in &shared {
+            assert!(!pool.object_path(object).exists(), "{object}");
+        }
+        for stream in streams.intersection(&machine.streams) {
+            assert!(!pool.stream_path(stream).exists(), "{stream}");
+        }
     }
 
     #[tokio::test]
@@ -4141,13 +4551,11 @@ pub(crate) mod tests {
         drop(inherited);
         let consumer_id = consumer.operation_id;
         drop(consumer);
-        let snapshot_ref = SnapshotRef::Id(info.id);
-        let (removed, released) = tokio::join!(
-            snapshots.remove_alias("race"),
-            snapshots.release_retention(&snapshot_ref),
-        );
-        assert!(removed.unwrap());
-        assert!(released.unwrap());
+        let removal = snapshots
+            .remove(&SnapshotRef::Name("race".into()))
+            .await
+            .unwrap();
+        assert!(removal.record_removed);
         snapshots.store.recover_image_cache().await.unwrap();
         let pool = StoragePool::open_existing(&snapshots.store.images_dir)
             .unwrap()
@@ -4298,7 +4706,7 @@ pub(crate) mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         use crate::store::models::snapshot::{
-            SnapshotCaptureKind, SnapshotCompatibilityProfile, SnapshotExecution,
+            SnapshotCompatibilityProfile, SnapshotExecution, SnapshotMemoryState,
         };
         use crate::store::snapshot_store::verify_closure;
 
@@ -4336,7 +4744,7 @@ pub(crate) mod tests {
         else {
             panic!("fixture boot is pinned");
         };
-        consumer.record.capture = SnapshotCaptureKind::LiveExecution {
+        consumer.record.memory = SnapshotMemoryState::Included {
             execution: Box::new(SnapshotExecution {
                 memory: memory.clone(),
                 layout: *kernel,
@@ -4506,14 +4914,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_publication_requires_pins_and_alias_collision_is_atomic() {
+    async fn snapshot_publication_requires_pins_and_name_collision_is_atomic() {
         let (_temp, snapshots, record, operation, lease) = fixture("snapshot").await;
         let info = snapshots
             .publish(&record, operation, Some("stable"))
             .await
             .unwrap();
         let mut changed = record.clone();
-        changed.capture = crate::store::models::snapshot::SnapshotCaptureKind::StoppedStorage {
+        changed.memory = crate::store::models::snapshot::SnapshotMemoryState::None {
             stop_outcome: crate::StorageStopOutcome::Forced,
         };
         let changed_id = changed.id().unwrap();
@@ -4527,7 +4935,7 @@ pub(crate) mod tests {
             .is_err());
         assert_eq!(
             snapshots
-                .inspect(&SnapshotRef::Image("stable".into()))
+                .inspect(&SnapshotRef::Name("stable".into()))
                 .await
                 .unwrap()
                 .id,
@@ -4557,10 +4965,9 @@ pub(crate) mod tests {
         let (_temp, snapshots, record, operation, lease) = fixture("snapshot").await;
         let first = snapshots.publish(&record, operation, None).await.unwrap();
         let mut second_record = record.clone();
-        second_record.capture =
-            crate::store::models::snapshot::SnapshotCaptureKind::StoppedStorage {
-                stop_outcome: crate::StorageStopOutcome::Forced,
-            };
+        second_record.memory = crate::store::models::snapshot::SnapshotMemoryState::None {
+            stop_outcome: crate::StorageStopOutcome::Forced,
+        };
         let second = snapshots
             .publish(&second_record, operation, None)
             .await
@@ -4573,10 +4980,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         drop(lease);
-        snapshots
-            .release_retention(&SnapshotRef::Id(first.id))
-            .await
-            .unwrap();
+        snapshots.remove(&SnapshotRef::Id(first.id)).await.unwrap();
         snapshots.store.recover_image_cache().await.unwrap();
         let consumer = snapshots
             .consume(&SnapshotRef::Id(second.id))
@@ -4588,10 +4992,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(!pool.object_path(&first.record_digest).exists());
         assert!(pool.verify_stream(&record.root.stream.stream).is_ok());
-        snapshots
-            .release_retention(&SnapshotRef::Id(second.id))
-            .await
-            .unwrap();
+        snapshots.remove(&SnapshotRef::Id(second.id)).await.unwrap();
         snapshots.store.recover_image_cache().await.unwrap();
         assert!(pool.verify_stream(&record.root.stream.stream).is_ok());
         snapshots
@@ -4922,9 +5323,9 @@ pub(crate) mod tests {
             .parse()
             .unwrap();
         let mut value = serde_json::to_value(&record).unwrap();
-        value["purpose"] = serde_json::json!("unsupported-purpose");
+        value["unknownField"] = serde_json::json!(true);
         let malformed = crate::store::models::snapshot::canonical_value(&value).unwrap();
-        sqlx::query("INSERT INTO storage_snapshot(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,?3,1,1)")
+        sqlx::query("INSERT INTO storage_snapshot(id,record_digest,record_bytes,created_at) VALUES(?1,?2,?3,1)")
             .bind(format!("{id}")).bind(ObjectDigest::of_bytes(&malformed).to_string()).bind(malformed.as_slice())
             .execute(&snapshots.store.pool).await.unwrap();
         let mut tx = snapshots.store.pool.begin().await.unwrap();
@@ -5014,7 +5415,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        snapshots.release_retention(&reference).await.unwrap();
+        snapshots.remove(&reference).await.unwrap();
         let (record, observed) = crate::store::snapshot_store::authenticate_catalog(facts).unwrap();
         let bytes = record.canonical_bytes().unwrap();
         let (streams, mut objects) = record.content_dependencies().unwrap();
@@ -5516,7 +5917,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -5525,8 +5926,8 @@ pub(crate) mod tests {
             .consume_shape(&SnapshotRef::Id(info.id))
             .await
             .unwrap();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &consumer.record.memory
         else {
             panic!("live fixture")
         };
@@ -5794,7 +6195,7 @@ pub(crate) mod tests {
                 .publish_capture(
                     fixture.reservation.record.capture_id,
                     directory.path(),
-                    fixture.reservation.record.alias.clone(),
+                    fixture.reservation.record.name.clone(),
                     crate::storage::pool::PublicationLockPolicy::Wait,
                 )
                 .await
@@ -5803,8 +6204,8 @@ pub(crate) mod tests {
                 .consume_shape(&SnapshotRef::Id(info.id))
                 .await
                 .unwrap();
-            let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-                &consumer.record.capture
+            let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+                &consumer.record.memory
             else {
                 panic!("live capture fixture");
             };
@@ -5897,7 +6298,7 @@ pub(crate) mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -5908,8 +6309,8 @@ pub(crate) mod tests {
             .unwrap();
         let inspection = snapshots.prepare_restore_shape(&consumer).await.unwrap();
         let shape = inspection.shape();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &consumer.record.memory
         else {
             panic!("live capture fixture");
         };

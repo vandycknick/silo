@@ -29,10 +29,9 @@ service MachineService {
  rpc SetMachineSecret(SetMachineSecretRequest) returns (google.protobuf.Empty);
  rpc PauseMachine(LiveMachineRequest) returns (MachineSnapshot);
  rpc ResumeMachine(LiveMachineRequest) returns (MachineSnapshot);
- rpc CaptureExecution(LiveCaptureRequest) returns (LiveSnapshotInfo);
+ rpc CreateSnapshot(CreateSnapshotRequest) returns (CreatedSnapshot);
  rpc ForkExecution(LiveForkRequest) returns (LiveForkResult);
  rpc ForkStopped(StoppedForkRequest) returns (MachineSnapshot);
- rpc SnapshotStopped(CreateStorageSnapshotRequest) returns (StorageSnapshotInfo);
  // Explicit stopped boot-bundle replacement; the root and its platform never change.
  rpc UpdateBootAssets(UpdateBootAssetsRequest) returns (MachineSnapshot);
  // Root disk only; never stops, repairs, flattens, or overwrites implicitly.
@@ -47,28 +46,29 @@ service NetworkService {
 }
 service RuntimeService {
  rpc ResolveImage(ResolveImageRequest) returns (stream ResolveImageEvent);
- rpc PullImage(PullImageRequest) returns (stream ImageProgress);
+ rpc PullImage(PullImageRequest) returns (stream PullImageEvent);
+ rpc ListImages(google.protobuf.Empty) returns (ImageList);
+ rpc InspectImage(ImageRef) returns (ImageInfo);
+ // A name removes that name, then the image once no names remain; an id
+ // removes the image and all its names. Machines keep their own references.
+ rpc RemoveImage(ImageRef) returns (ImageRemoval);
+ // Removes images that have no names and are used by no machine.
+ rpc PruneImages(google.protobuf.Empty) returns (ImagePruneReport);
  rpc ProposeMachineName(google.protobuf.Empty) returns (Name);
  rpc ParseResource(ParseResourceRequest) returns (Size);
  rpc NormalizePolicy(NormalizePolicyRequest) returns (PolicyDocument);
  rpc CheckPolicySecrets(CheckPolicySecretsRequest) returns (PolicySecretsResult);
- rpc RestoreSnapshot(RestoreStorageSnapshotRequest) returns (MachineSnapshot);
- rpc RecoverCheckpointDisks(RecoverCheckpointDisksRequest) returns (MachineSnapshot);
+ rpc RestoreSnapshot(RestoreSnapshotRequest) returns (MachineSnapshot);
  rpc InspectStorageSnapshot(StorageSnapshotRef) returns (StorageSnapshotInfo);
  rpc VerifyStorageSnapshot(StorageSnapshotRef) returns (SnapshotVerificationResult);
  rpc ListStorageSnapshots(google.protobuf.Empty) returns (StorageSnapshotList);
- rpc ReleaseSnapshotRetention(StorageSnapshotRef) returns (google.protobuf.Empty);
- rpc RemoveImageAlias(Name) returns (google.protobuf.Empty);
- rpc ImportImage(DiskImportRequest) returns (stream ManagedImageEvent);
- rpc ConvertImage(ConvertImageRequest) returns (stream ManagedImageEvent);
+ // Same name/id semantics as RemoveImage.
+ rpc RemoveSnapshot(StorageSnapshotRef) returns (SnapshotRemoval);
+ rpc ImportImage(DiskImportRequest) returns (stream StoredImageEvent);
+ rpc ConvertImage(ConvertImageRequest) returns (stream StoredImageEvent);
  rpc InspectArtifact(InspectArtifactRequest) returns (ArtifactInspection);
  rpc AcquireArtifact(AcquireArtifactRequest) returns (ArtifactAcquireReport);
  rpc PublishArtifact(PublishArtifactRequest) returns (ArtifactPublishReport);
- rpc ResolveManagedDigest(ManagedDigest) returns (ManagedSourceId);
- rpc InspectManagedImage(ManagedSourceRef) returns (ManagedSourceInfo);
- rpc ListManagedImages(google.protobuf.Empty) returns (ManagedSourceList);
- // Releases explicit retention only; aliases and consumers still retain bytes.
- rpc ReleaseImageRetention(ManagedSourceRef) returns (google.protobuf.Empty);
  // Operation-scoped live fork observation and durable cancellation intent;
  // never resolved through a source machine, which may since have been removed.
  rpc GetFork(ForkOperationRef) returns (LiveForkResult);
@@ -239,50 +239,27 @@ message HandoffTerminalReceipt {
  optional HandoffCommitAuthorization authorization = 4;
 }
 message InspectArtifactRequest { string reference = 1; }
-message AcquireArtifactRequest {
- string reference = 1;
- oneof trust {
-  string approved_digest = 2;
-  google.protobuf.Empty require_signature = 3;
- }
- optional string alias = 4;
-}
+// Acquires a Silo image artifact; a snapshot artifact is refused before any
+// payload is fetched. The canonical reference names the image; name adds a
+// local name.
+message AcquireArtifactRequest { string reference = 1; optional string name = 2; }
 enum ArtifactEncoding { ARTIFACT_ENCODING_UNSPECIFIED = 0; ARTIFACT_ENCODING_ZSTD = 1; ARTIFACT_ENCODING_RAW = 2; }
-message PublishArtifactRequest {
- ManagedSourceRef source = 1;
- string destination = 2;
- ArtifactEncoding encoding = 3;
- optional string checkpoint_acknowledgement = 4;
-}
-enum ArtifactPurpose { ARTIFACT_PURPOSE_UNSPECIFIED = 0; ARTIFACT_PURPOSE_IMAGE = 1; ARTIFACT_PURPOSE_CHECKPOINT = 2; }
-enum ArtifactCaptureKind { ARTIFACT_CAPTURE_KIND_UNSPECIFIED = 0; ARTIFACT_CAPTURE_KIND_STOPPED_STORAGE = 1; ARTIFACT_CAPTURE_KIND_LIVE_EXECUTION = 2; }
-enum ArtifactPublisher { ARTIFACT_PUBLISHER_UNSPECIFIED = 0; ARTIFACT_PUBLISHER_UNAUTHENTICATED = 1; }
+// Publishes one stored image. Snapshots are never published over this API.
+message PublishArtifactRequest { ImageRef image = 1; string destination = 2; ArtifactEncoding encoding = 3; }
 enum ArtifactRootFamily { ARTIFACT_ROOT_FAMILY_UNSPECIFIED = 0; ARTIFACT_ROOT_FAMILY_OPAQUE_RAW = 1; ARTIFACT_ROOT_FAMILY_LINUX_OVERLAY = 2; }
+// The content kind and identity an artifact carries.
+message ArtifactContent { oneof id { string image_id = 1; string snapshot_id = 2; } }
+// memory is true exactly for a snapshot that includes memory.
 message ArtifactInspection {
  string repository = 1;
  string index_digest = 2;
- ArtifactPurpose purpose = 3;
- optional ArtifactCaptureKind capture_kind = 4;
- ArtifactRootFamily root_family = 5;
- GuestArchitecture guest_architecture = 6;
- bool live_restore = 7;
- ManagedSourceId content = 8;
- BackendRequirement backend = 9;
+ ArtifactContent content = 3;
+ ArtifactRootFamily root = 4;
+ GuestArchitecture guest_architecture = 5;
+ bool memory = 6;
 }
-message ArtifactAcquireReport {
- ManagedSourceInfo source = 1;
- string repository = 2;
- string index_digest = 3;
- ArtifactPublisher publisher = 4;
-}
-message ArtifactPublishReport {
- string repository = 1;
- string index_digest = 2;
- optional string tag = 3;
- ManagedSourceId source = 4;
- ArtifactPurpose purpose = 5;
- optional ArtifactCaptureKind capture_kind = 6;
-}
+message ArtifactAcquireReport { StoredImageInfo image = 1; string repository = 2; string index_digest = 3; }
+message ArtifactPublishReport { string repository = 1; string index_digest = 2; optional string tag = 3; ArtifactContent content = 4; }
 message Name { string name = 1; }
 message MachineRef { oneof reference { string id = 1; string name = 2; string id_prefix = 3; } }
 message MachineRunRef { string id = 1; string run_id = 2; }
@@ -340,7 +317,7 @@ message ResolvedImage { OciIdentity identity = 1; CacheState cache_state = 2; st
 // Absent rosetta is no explicit intent; false is an explicit disable.
 // Callers must explicitly select the credential lookup authority.
 enum SecretScopePolicy { SECRET_SCOPE_POLICY_UNSPECIFIED = 0; SECRET_SCOPE_POLICY_MACHINE_THEN_HOME = 1; SECRET_SCOPE_POLICY_MACHINE_ONLY = 2; }
-message CreateMachineRequest { NormalizedMachineCreate configuration = 1; oneof source { OciIdentity oci = 2; DiskImportRequest disk = 3; ManagedSourceRef managed = 4; } SecretScopePolicy secret_scope = 5; }
+message CreateMachineRequest { NormalizedMachineCreate configuration = 1; oneof source { OciIdentity oci = 2; DiskImportRequest disk = 3; ImageRef stored = 4; } SecretScopePolicy secret_scope = 5; }
 enum GuestArchitecture { GUEST_ARCHITECTURE_UNSPECIFIED = 0; GUEST_ARCHITECTURE_AMD64 = 1; GUEST_ARCHITECTURE_ARM64 = 2; }
 message LinuxPlatform { GuestArchitecture architecture = 1; optional string variant = 2; }
 // Request-only selection. auto_gpt is never persisted; GUIDs are canonical
@@ -354,12 +331,10 @@ enum Translation { TRANSLATION_UNSPECIFIED = 0; TRANSLATION_NONE = 1; TRANSLATIO
 message BootAssetFiles { bytes kernel = 1; bytes base_initramfs = 2; optional bytes agent = 3; }
 message BootAssetSelection { oneof selection { google.protobuf.Empty packaged = 1; BootAssetFiles files = 2; string exact_bundle = 3; } }
 message LinuxDirectImport { LinuxPlatform platform = 1; ImportRootSelection root = 2; BootAssetSelection assets = 3; }
-message DiskImportRequest { bytes path = 1; oneof boot { LinuxDirectImport linux_direct = 2; } optional string alias = 3; }
-// One typed image: namespace. A bare sha256 spelling is resolved first through
-// ResolveManagedDigest; it is never an untyped reference here.
-message ManagedSourceRef { oneof reference { string alias = 1; string image_id = 2; string snapshot_id = 3; } }
-message ManagedDigest { string digest = 1; }
-message ManagedSourceId { oneof id { string image_id = 1; string snapshot_id = 2; } }
+message DiskImportRequest { bytes path = 1; oneof boot { LinuxDirectImport linux_direct = 2; } optional string name = 3; }
+// An image by local name, registry reference or unique id prefix (name), or
+// by full sha256 id (id). Cached OCI images and stored images share one namespace.
+message ImageRef { oneof reference { string id = 1; string name = 2; } }
 enum ImageContainerKind { IMAGE_CONTAINER_KIND_UNSPECIFIED = 0; IMAGE_CONTAINER_KIND_RAW = 1; IMAGE_CONTAINER_KIND_QCOW2 = 2; IMAGE_CONTAINER_KIND_OCI = 3; }
 // Observed import facts of a disk container; the selected candidate extent is
 // an observation, not a persisted device address.
@@ -368,13 +343,18 @@ message DiskImportFacts { uint64 source_length = 1; uint64 decoded_length = 2; R
 // disk is present exactly for raw and qcow2 containers.
 message ImageProvenance { ImageContainerKind container = 1; string source_digest = 2; string source_spelling = 3; optional string source_manifest = 4; optional string source_config = 5; DiskImportFacts disk = 6; }
 // record is the canonical image record; receivers verify record_digest and id.
-message ManagedImageInfo { string id = 1; string record_digest = 2; bytes record = 3; repeated string aliases = 4; bool retained = 5; repeated ImageProvenance provenance = 6; }
+message StoredImageInfo { string id = 1; string record_digest = 2; bytes record = 3; repeated string names = 4; repeated ImageProvenance provenance = 5; }
+message OciImageLayer { string blob_digest = 1; string diff_id = 2; string media_type = 3; optional uint64 compressed_size_bytes = 4; optional uint64 uncompressed_size_bytes = 5; int64 position = 6; }
+// A cached OCI image; id is the selected manifest digest.
+message OciImageInfo { string id = 1; repeated string names = 2; string config_digest = 3; string platform = 4; string oci_config_json = 5; repeated OciImageLayer layers = 6; uint64 lower_length = 7; uint64 compressed_size_bytes = 8; int64 created_at = 9; optional int64 last_used_at = 10; }
 // Inspection is not a content lease.
-message ManagedSourceInfo { oneof info { ManagedImageInfo image = 1; StorageSnapshotInfo snapshot = 2; } }
-message ManagedSourceList { repeated ManagedSourceInfo values = 1; }
-message ManagedImageEvent { oneof event { ImageProgress progress = 1; ManagedImageInfo image = 2; } }
+message ImageInfo { oneof info { OciImageInfo oci = 1; StoredImageInfo stored = 2; } }
+message ImageList { repeated ImageInfo images = 1; }
+message ImageRemoval { string id = 1; repeated string names = 2; bool record_removed = 3; }
+message ImagePruneReport { uint64 images_removed = 1; uint64 bytes_removed = 2; }
+message StoredImageEvent { oneof event { ImageProgress progress = 1; StoredImageInfo image = 2; } }
 // Converts exactly this selected immutable identity, never a mutable tag.
-message ConvertImageRequest { OciIdentity source = 1; optional string alias = 2; }
+message ConvertImageRequest { OciIdentity source = 1; optional string name = 2; }
 message PinnedBootBundle { string digest = 1; string kernel = 2; string base_initramfs = 3; optional string agent = 4; GuestArchitecture architecture = 5; string abi = 6; }
 message LinuxDirectBoot { LinuxPlatform userspace_platform = 1; GuestArchitecture kernel_architecture = 2; PinnedBootBundle bundle = 3; RootSelector root_selector = 4; RootFilesystem root_filesystem = 5; Translation translation = 6; }
 // Current pinned boot meaning plus a newer locally admitted packaged bundle,
@@ -390,7 +370,9 @@ message CreateMachineEvent { oneof event { ImageProgress progress = 1; MachineSn
 // platform requests a Linux platform; the selected platform stays in the identity.
 message ResolveImageRequest { string reference = 1; PullPolicy pull_policy = 2; LinuxPlatform platform = 3; }
 message ResolveImageEvent { oneof event { ImageProgress progress = 1; ResolvedImage image = 2; } }
-message PullImageRequest { string reference = 1; }
+// A Silo image artifact becomes a stored image; an OCI container image is cached.
+message PullImageRequest { string reference = 1; PullPolicy pull_policy = 2; }
+message PullImageEvent { oneof event { ImageProgress progress = 1; ImageInfo image = 2; } }
 message EgressSecret { string slot = 1; bytes value = 2; }
 message Entrypoint { string program = 1; repeated string args = 2; optional string cwd = 3; repeated EnvironmentPair environment = 4; optional string user = 5; }
 message StartOptions { bool cleanup_on_exit = 1; repeated EgressSecret egress_secrets = 2; Entrypoint entrypoint = 3; }
@@ -413,7 +395,7 @@ message MachineIssue { IssueComponent component = 1; string message = 2; }
 message LifecycleDetail { optional string message = 1; }
 message RunningStatus { bool ready = 1; bool guest_ready = 2; optional string message = 3; }
 message MachineStatus { oneof status { google.protobuf.Empty stopped = 1; LifecycleDetail starting = 2; RunningStatus running = 3; LifecycleDetail stopping = 4; LifecycleDetail error = 5; LifecycleDetail pausing = 6; LifecycleDetail paused = 7; LifecycleDetail capturing = 8; LifecycleDetail restoring = 9; LifecycleDetail activating = 10; LifecycleDetail activation_failed = 11; } }
-enum ImageSourceKind { IMAGE_SOURCE_KIND_UNSPECIFIED = 0; IMAGE_SOURCE_KIND_OCI = 1; IMAGE_SOURCE_KIND_DISK = 2; IMAGE_SOURCE_KIND_MANAGED = 3; }
+enum ImageSourceKind { IMAGE_SOURCE_KIND_UNSPECIFIED = 0; IMAGE_SOURCE_KIND_OCI = 1; IMAGE_SOURCE_KIND_DISK = 2; IMAGE_SOURCE_KIND_STORED = 3; }
 message Rootfs { ImageSourceKind source_kind = 1; string requested_reference = 2; optional string selected_reference = 3; optional string manifest_digest = 4; optional string config_digest = 5; optional string image_id = 6; bytes root_disk_path = 7; uint64 root_disk_size_bytes = 8; google.protobuf.Timestamp created_at = 9; }
 message MachineTailscale { bytes state_dir = 1; string hostname = 2; bool ephemeral = 3; }
 enum BootMode { BOOT_MODE_UNSPECIFIED = 0; BOOT_MODE_STANDARD = 1; BOOT_MODE_AGENT_PID1 = 2; BOOT_MODE_INIT_CHILD = 3; BOOT_MODE_CONTAINED_INIT = 4; }
@@ -456,13 +438,13 @@ enum PolicySecretsState { POLICY_SECRETS_STATE_UNSPECIFIED = 0; POLICY_SECRETS_S
 message SecretDiagnostic { string slot = 1; optional string key = 2; string code = 3; }
 message PolicySecretsResult { PolicySecretsState state = 1; repeated SecretDiagnostic diagnostics = 2; repeated SecretRequirement requirements = 3; repeated SecretSlot slots = 4; }
 enum ErrorKind { ERROR_KIND_UNSPECIFIED = 0; ERROR_KIND_INVALID = 1; ERROR_KIND_MISSING = 2; ERROR_KIND_DUPLICATE = 3; ERROR_KIND_CONFLICT = 4; ERROR_KIND_LIMIT = 5; ERROR_KIND_DENIED = 6; ERROR_KIND_UNAVAILABLE = 7; ERROR_KIND_INTERNAL = 8; }
-enum ErrorCode { ERROR_CODE_UNSPECIFIED = 0; ERROR_CODE_ALREADY_RUNNING = 1; ERROR_CODE_NOT_RUNNING = 2; ERROR_CODE_STALE_GENERATION = 3; ERROR_CODE_MONITOR_CONNECTION = 4; ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED = 5; ERROR_CODE_COMMAND_NOT_FOUND = 6; ERROR_CODE_NATIVE = 7; ERROR_CODE_LIVE_OPERATION_UNSUPPORTED = 8; ERROR_CODE_BACKEND_ADMISSION_REJECTED = 9; ERROR_CODE_ROOT_SELECTION_FAILED = 10; ERROR_CODE_TRANSLATION_UNAVAILABLE = 11; ERROR_CODE_BOOT_ASSETS_ACQUISITION_REQUIRED = 12; ERROR_CODE_DISK_IMPORT_REJECTED = 13; ERROR_CODE_BOOT_BUNDLE_ABI_UNSUPPORTED = 14; ERROR_CODE_CHECKPOINT_PORTABILITY = 15; ERROR_CODE_INCOMPATIBLE_ROOT_PROFILE = 16; ERROR_CODE_COMPOSITION_ACQUISITION_REQUIRED = 17; ERROR_CODE_RAW_EXPORT_RECOVERY_REQUIRED = 18; ERROR_CODE_RAW_EXPORT_UNSUPPORTED = 19; }
-message ErrorDetail { ErrorKind kind = 1; ErrorCode code = 2; string safe_message = 3; optional string reference = 4; optional string expected_run = 5; optional string current_run = 6; optional string program = 7; optional string native_variant = 8; optional LaunchFailureReason launch_failure_reason = 9; LiveOperationUnsupported live_unsupported = 10; BackendAdmissionRejected backend_admission = 11; RootSelectionFailed root_selection = 12; DiskImportRejected disk_import = 13; BootBundleAbiUnsupported boot_bundle_abi = 14; RestorePortabilityRefusal checkpoint_portability = 15; }
+enum ErrorCode { ERROR_CODE_UNSPECIFIED = 0; ERROR_CODE_ALREADY_RUNNING = 1; ERROR_CODE_NOT_RUNNING = 2; ERROR_CODE_STALE_GENERATION = 3; ERROR_CODE_MONITOR_CONNECTION = 4; ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED = 5; ERROR_CODE_COMMAND_NOT_FOUND = 6; ERROR_CODE_NATIVE = 7; ERROR_CODE_LIVE_OPERATION_UNSUPPORTED = 8; ERROR_CODE_BACKEND_ADMISSION_REJECTED = 9; ERROR_CODE_ROOT_SELECTION_FAILED = 10; ERROR_CODE_TRANSLATION_UNAVAILABLE = 11; ERROR_CODE_BOOT_ASSETS_ACQUISITION_REQUIRED = 12; ERROR_CODE_DISK_IMPORT_REJECTED = 13; ERROR_CODE_BOOT_BUNDLE_ABI_UNSUPPORTED = 14; ERROR_CODE_SNAPSHOT_PORTABILITY = 15; ERROR_CODE_INCOMPATIBLE_ROOT_PROFILE = 16; ERROR_CODE_COMPOSITION_ACQUISITION_REQUIRED = 17; ERROR_CODE_RAW_EXPORT_RECOVERY_REQUIRED = 18; ERROR_CODE_RAW_EXPORT_UNSUPPORTED = 19; }
+message ErrorDetail { ErrorKind kind = 1; ErrorCode code = 2; string safe_message = 3; optional string reference = 4; optional string expected_run = 5; optional string current_run = 6; optional string program = 7; optional string native_variant = 8; optional LaunchFailureReason launch_failure_reason = 9; LiveOperationUnsupported live_unsupported = 10; BackendAdmissionRejected backend_admission = 11; RootSelectionFailed root_selection = 12; DiskImportRejected disk_import = 13; BootBundleAbiUnsupported boot_bundle_abi = 14; RestorePortabilityRefusal snapshot_portability = 15; }
 // Custom base initramfs bytes differ from the supported packaged bootstrap.
 // Select the packaged base initramfs. No host paths or asset hashes are exposed.
 message BootBundleAbiUnsupported { reserved 1, 2; reserved "expected", "actual"; }
 message RestorePortabilityRefusal { string pin = 1; string expected = 2; string actual = 3; string stage = 4; }
-enum SourceFamily { SOURCE_FAMILY_UNSPECIFIED = 0; SOURCE_FAMILY_OCI = 1; SOURCE_FAMILY_LOCAL_DISK = 2; SOURCE_FAMILY_MANAGED_IMAGE = 3; SOURCE_FAMILY_SNAPSHOT = 4; }
+enum SourceFamily { SOURCE_FAMILY_UNSPECIFIED = 0; SOURCE_FAMILY_OCI = 1; SOURCE_FAMILY_LOCAL_DISK = 2; SOURCE_FAMILY_STORED_IMAGE = 3; }
 enum StorageProfile { STORAGE_PROFILE_UNSPECIFIED = 0; STORAGE_PROFILE_OPAQUE_RAW_V1 = 1; STORAGE_PROFILE_LINUX_OVERLAY_V1 = 2; }
 enum BackendRequirement { BACKEND_REQUIREMENT_UNSPECIFIED = 0; BACKEND_REQUIREMENT_RAW_BLOCK = 1; BACKEND_REQUIREMENT_KRUN_OVERLAY = 2; }
 enum AdmissionRemedy { ADMISSION_REMEDY_UNSPECIFIED = 0; ADMISSION_REMEDY_EXPLICIT_OCI_TO_RAW_CONVERSION = 1; ADMISSION_REMEDY_USE_KRUN = 2; ADMISSION_REMEDY_UNSUPPORTED_BOOT_PROFILE = 3; }
@@ -539,7 +521,6 @@ message MachineLifecycle { LiveMachineReport report = 1; VmState state = 2; Live
 // a complete capture. UNSPECIFIED is invalid, including in observed memory modes.
 enum CapturePolicy { CAPTURE_POLICY_UNSPECIFIED = 0; CAPTURE_POLICY_FULL = 1; CAPTURE_POLICY_INCREMENTAL = 2; }
 enum CaptureResumePolicy { CAPTURE_RESUME_POLICY_UNSPECIFIED = 0; CAPTURE_RESUME_POLICY_RESUME_IF_ACQUIRED = 1; CAPTURE_RESUME_POLICY_PRESERVE = 2; }
-message LiveCaptureRequest { MachineRef machine = 1; optional string name = 2; CaptureResumePolicy resume_policy = 3; CapturePolicy policy = 4; uint32 dirty_crossover_percent = 5; }
 enum CapturePauseDisposition { CAPTURE_PAUSE_DISPOSITION_UNSPECIFIED = 0; CAPTURE_PAUSE_DISPOSITION_ACQUIRED = 1; CAPTURE_PAUSE_DISPOSITION_BORROWED = 2; }
 enum CaptureSourceOutcome { CAPTURE_SOURCE_OUTCOME_UNSPECIFIED = 0; CAPTURE_SOURCE_OUTCOME_RESUMED = 1; CAPTURE_SOURCE_OUTCOME_PRESERVED = 2; CAPTURE_SOURCE_OUTCOME_RESUME_FAILED = 3; CAPTURE_SOURCE_OUTCOME_UNKNOWN = 4; }
 // Capture ID equals the Capture request and monitor operation ID. Staging is
@@ -595,25 +576,32 @@ enum CaptureRamCoverage { CAPTURE_RAM_COVERAGE_UNSPECIFIED = 0; CAPTURE_RAM_COVE
 message CaptureRamChanges { uint64 byte_len = 1; string sha256 = 2; uint64 record_count = 3; CaptureRamCoverage coverage = 4; optional string baseline_stream = 5; }
 enum SnapshotIdentityReason { SNAPSHOT_IDENTITY_REASON_UNSPECIFIED = 0; SNAPSHOT_IDENTITY_REASON_UNKNOWN_AFTER_FORK = 1; }
 message LiveCaptureSummary { string capture_id = 1; string machine_id = 2; string run_id = 3; CaptureResumePolicy resume_policy = 4; CapturePauseDisposition pause = 5; CaptureSourceOutcome source_outcome = 6; optional string source_error = 7; bool released = 8; string staging = 9; CaptureMemoryEvidence memory = 10; optional SnapshotIdentityReason first_snapshot_full_identity_reason = 11; }
-message LiveSnapshotInfo { StorageSnapshotInfo snapshot = 1; LiveCaptureSummary capture = 2; optional string alias_conflict = 3; }
+// capture is present exactly for a snapshot with memory. name_conflict names
+// the requested name another snapshot took first; this one was kept without it.
+message CreatedSnapshot { StorageSnapshotInfo snapshot = 1; LiveCaptureSummary capture = 2; optional string name_conflict = 3; }
 enum MachineCaptureStage { MACHINE_CAPTURE_STAGE_UNSPECIFIED = 0; MACHINE_CAPTURE_STAGE_RESERVED = 1; MACHINE_CAPTURE_STAGE_SEALED = 2; MACHINE_CAPTURE_STAGE_PUBLISHED = 3; }
 // A retained, not yet released capture of this machine. source_outcome is
 // UNSPECIFIED until the continuation is recorded.
 message MachineCapture { string capture_id = 1; string run_id = 2; CaptureResumePolicy resume_policy = 3; CapturePauseDisposition pause = 4; MachineCaptureStage stage = 5; optional string snapshot_id = 6; CaptureSourceOutcome source_outcome = 7; string staging = 8; }
-// Stopped artifacts are distinct from MachineSnapshot, the observational read model.
-message StorageSnapshotRef { oneof reference { string id = 1; string image_alias = 2; } }
+// Snapshots are distinct from MachineSnapshot, the observational read model.
+// name is a local name, pulled registry reference or unique id prefix.
+message StorageSnapshotRef { oneof reference { string id = 1; string name = 2; } }
 message ExternalResourceKey { oneof resource { uint32 disk_order = 1; string share_tag = 2; } }
 message ExternalResourceMapping { ExternalResourceKey resource = 1; bytes path = 2; }
 message ExternalResourceMappings { repeated ExternalResourceMapping values = 1; }
 message ExternalResourcePolicy { oneof policy { google.protobuf.Empty reject = 1; google.protobuf.Empty require_mappings = 2; ExternalResourceMappings mappings = 3; } }
 message StoppedForkRequest { MachineRef machine = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; }
-// Creation records external requirements, never destination host mappings.
-// external_resources accepts only reject or require_mappings on this RPC.
-message CreateStorageSnapshotRequest { MachineRef machine = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; }
+// Without memory the machine must be stopped; with memory it must be running.
+// preserve, capture_policy and dirty_crossover_percent require memory;
+// external_requirements (record external disks and shares as requirements
+// restore must map) requires a snapshot without memory.
+message CreateSnapshotRequest { MachineRef machine = 1; optional string name = 2; bool memory = 3; bool preserve = 4; optional CapturePolicy capture_policy = 5; optional uint32 dirty_crossover_percent = 6; bool external_requirements = 7; }
 message RestoreActivationHook { repeated string argv = 1; repeated EnvironmentPair environment = 2; string working_directory = 3; optional uint32 timeout_ms = 4; }
-message RestoreStorageSnapshotRequest { StorageSnapshotRef snapshot = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; RestoreActivationHook activation_hook = 4; }
-// Explicit cold recovery, never an automatic fallback from execution restore.
-message RecoverCheckpointDisksRequest { StorageSnapshotRef snapshot = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; }
+// snapshot resolves locally and never pulls. registry_reference resolves like
+// `silo restore REF`: local name, search_registries expansions, id prefix,
+// then a pull per pull_policy. without_memory restores a snapshot with memory
+// as a stopped machine from its disks and conflicts with activation_hook.
+message RestoreSnapshotRequest { oneof source { StorageSnapshotRef snapshot = 1; string registry_reference = 2; } optional string name = 3; ExternalResourcePolicy external_resources = 4; RestoreActivationHook activation_hook = 5; PullPolicy pull_policy = 6; bool without_memory = 7; }
 // Live fork: one capture of a running source, N restored children. The
 // caller-selected, non-nil operation_id is the exact replay key; changed
 // options under an existing ID conflict. An empty destination grants no host
@@ -635,11 +623,12 @@ message ForkChildOutcome { oneof outcome { google.protobuf.Empty pending = 1; go
 enum MachineDurability { MACHINE_DURABILITY_UNSPECIFIED = 0; MACHINE_DURABILITY_CONSTRUCTED = 1; MACHINE_DURABILITY_DURABLE = 2; }
 message ForkChildResult { uint32 index = 1; string name = 2; string machine_id = 3; string run_id = 4; ForkChildOutcome outcome = 5; optional MachineDurability durability = 6; }
 message LiveForkResult { string operation_id = 1; string source_machine_id = 2; string source_run_id = 3; string capture_id = 4; ForkStage stage = 5; bool cancellation_requested = 6; ForkCaptureOutcome capture = 7; ForkSourceOutcome source = 8; repeated ForkChildResult children = 10; CaptureResumePolicy resume_policy = 11; }
-enum StorageCaptureKind { STORAGE_CAPTURE_KIND_UNSPECIFIED = 0; STORAGE_CAPTURE_KIND_STOPPED_STORAGE = 1; STORAGE_CAPTURE_KIND_LIVE_EXECUTION = 2; }
+enum SnapshotMemory { SNAPSHOT_MEMORY_UNSPECIFIED = 0; SNAPSHOT_MEMORY_NONE = 1; SNAPSHOT_MEMORY_INCLUDED = 2; }
 // Capture provenance is catalog metadata outside snapshot identity.
 message SnapshotCaptureProvenance { string capture_id = 1; string machine_id = 2; string run_id = 3; string evidence_digest = 4; }
-message StorageSnapshotInfo { string id = 1; string record_digest = 2; optional bool retained = 3; repeated string aliases = 4; optional int64 created_at = 5; StorageCaptureKind capture_kind = 6; repeated SnapshotCaptureProvenance provenance = 7; repeated SnapshotStreamSummary streams = 8; }
+message StorageSnapshotInfo { string id = 1; string record_digest = 2; repeated string names = 3; optional int64 created_at = 4; SnapshotMemory memory = 5; repeated SnapshotCaptureProvenance provenance = 6; repeated SnapshotStreamSummary streams = 7; }
 message StorageSnapshotList { repeated StorageSnapshotInfo snapshots = 1; }
+message SnapshotRemoval { string id = 1; repeated string names = 2; bool record_removed = 3; }
 message SnapshotVerificationReport { string snapshot = 1; uint64 streams = 2; uint64 bytes = 3; }
 enum SnapshotVerificationRole { SNAPSHOT_VERIFICATION_ROLE_UNSPECIFIED = 0; SNAPSHOT_VERIFICATION_ROLE_RAM = 1; SNAPSHOT_VERIFICATION_ROLE_LAYOUT = 2; SNAPSHOT_VERIFICATION_ROLE_EXECUTION = 3; SNAPSHOT_VERIFICATION_ROLE_DEVICES = 4; SNAPSHOT_VERIFICATION_ROLE_ROOT_DISK = 5; SNAPSHOT_VERIFICATION_ROLE_DATA_DISK = 6; SNAPSHOT_VERIFICATION_ROLE_DEPENDENCY = 7; }
 message SnapshotStreamSummary { SnapshotVerificationRole role = 1; optional uint32 disk_order = 2; string stream = 3; string map = 4; uint64 length = 5; uint64 chunk_size = 6; }

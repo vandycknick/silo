@@ -85,14 +85,14 @@ def checkpoint(silo: Silo, name: str, *, alias: str = "restore-checkpoint",
     if borrowed:
         silo.run("pause", name)
         original_pause = silo.info(name)["lifecycle"]["lifecycle"]["currentPause"]
-    result = silo.run("snapshot", "create", name, "--live", "--preserve", "--name", alias,
+    result = silo.run("snapshot", "create", name, "--memory", "--preserve", "--name", alias,
                       *(["--capture-policy", policy] if policy is not None else []),
                       "--dirty-crossover-percent", str(dirty_crossover_percent), "--format", "json", timeout=240)
     value = json.loads(result.stdout)
     summary = value["capture"]
     if full_identity_reason is not None:
         assert summary["firstSnapshotFullIdentityReason"] == full_identity_reason, summary
-    assert value["snapshot"]["captureKind"] == "live-execution"
+    assert value["snapshot"]["memory"] == "included"
     assert summary["sourceOutcome"] == "preserved" and summary["released"] is True
     assert summary["pause"] == ("borrowed" if borrowed else "acquired")
     relative = Path(summary["staging"])
@@ -108,7 +108,7 @@ def checkpoint(silo: Silo, name: str, *, alias: str = "restore-checkpoint",
         assert seal["freezeOperationId"] == original_pause["operationId"]
     assert seal["freezeOperationId"] and seal["freezeEpoch"] > 0
     snapshot = value["snapshot"]["id"]
-    return Checkpoint("image:" + snapshot, snapshot, directory, seal, source, boot_id, generation)
+    return Checkpoint(snapshot, snapshot, directory, seal, source, boot_id, generation)
 
 
 def restore_argv(reference: str, child: str, *extra: str) -> list[str]:
@@ -379,7 +379,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
         f"SELECT object_digest FROM snapshot_object_dependency WHERE snapshot_id='{saved.snapshot}'")}
     statements = [
         "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;",
-        f"INSERT INTO storage_snapshot(id,record_digest,record_bytes,retained,created_at) SELECT '{snapshot}','{record_digest}',X'{canonical.hex()}',1,created_at FROM storage_snapshot WHERE id='{saved.snapshot}';",
+        f"INSERT INTO storage_snapshot(id,record_digest,record_bytes,created_at) SELECT '{snapshot}','{record_digest}',X'{canonical.hex()}',created_at FROM storage_snapshot WHERE id='{saved.snapshot}';",
         f"INSERT INTO snapshot_stream_dependency SELECT '{snapshot}',stream_id FROM snapshot_stream_dependency WHERE snapshot_id='{saved.snapshot}';",
         f"INSERT INTO snapshot_capture_change SELECT '{snapshot}',changes_digest FROM snapshot_capture_change WHERE snapshot_id='{saved.snapshot}';",
         *[f"INSERT INTO snapshot_object_dependency VALUES('{snapshot}','{digest}');" for digest in sorted(objects)],
@@ -401,7 +401,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
             "negativeExpectedBinding": seal["memory"]["binding"],
             "schemaAdmissionPrecedesDeviceDecoding": mutation in {"schema", "architecture"},
         }, sort_keys=True) + "\n")
-        yield "image:" + snapshot, changed["subject"]
+        yield snapshot, changed["subject"]
     finally:
         if installed:
             sql(silo, "\n".join([

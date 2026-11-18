@@ -92,20 +92,17 @@ class Driver(Protocol):
     def cleanup(self) -> None: ...
 
 
-def snapshot_id(database: Path, alias: str) -> str | None:
-    """Decode the existing read-only observer's image_alias row, never CLI output."""
+def snapshot_id(database: Path, name: str) -> str | None:
+    """Decode the existing read-only observer's snapshot_name row, never CLI output."""
     if not database.exists():
         return None
-    rows = observe(database).get("image_alias", [])
-    def text(value: str) -> str | None:
+    def text(value: str) -> str:
         kind, _, encoded = value.partition(":")
-        return bytes.fromhex(encoded).decode() if kind == "text" else None
-    matches = [text(row[1]) for row in rows if text(row[0]) == alias]
-    if not matches:
-        return None
-    if len(matches) != 1 or matches[0] is None:
-        raise ValueError(f"snapshot alias is ambiguous or not a snapshot: {alias}")
-    return matches[0]
+        if kind != "text":
+            raise ValueError(f"snapshot_name column is not text: {value}")
+        return bytes.fromhex(encoded).decode()
+    matches = [text(row[1]) for row in observe(database).get("snapshot_name", []) if text(row[0]) == name]
+    return matches[0] if matches else None
 
 
 def raw_conversion_command(cohort: Cohort) -> tuple[str, ...]:
@@ -308,7 +305,7 @@ class SiloDriver(CommandDriver):
             identity = converted["id"]
             if not isinstance(identity, str) or not identity:
                 raise ValueError("raw image conversion returned no image id")
-            self.image = "image:" + identity
+            self.image = identity
             return {action.value: seconds}
         if action == Action.CREATE_FIRST:
             name = a + "-first"
@@ -334,7 +331,7 @@ class SiloDriver(CommandDriver):
         elif action == Action.SNAPSHOT_VERIFY:
             if not self.context.cohort.raw_root:
                 return {}
-            seconds = self.call("snapshot", "verify", "image:" + b + "-s2")
+            seconds = self.call("snapshot", "verify", b + "-s2")
         elif action in (Action.FORK_FIRST, Action.FORK_SECOND):
             name = a + ("-f1" if action == Action.FORK_FIRST else "-f2")
             seconds = self.fork(a, name)
@@ -361,17 +358,17 @@ class SiloDriver(CommandDriver):
                       Action.SNAPSHOT_FORK_CHILD_SECOND: "-fork-second"}[action]
             name = b + suffix
             self.snapshots.append(name)
-            seconds = self.call("snapshot", "create", source, "--live", "--name", name,
+            seconds = self.call("snapshot", "create", source, "--memory", "--name", name,
                                 *(["--capture-policy", "full"] if action == Action.SNAPSHOT_FULL else []))
             identity = snapshot_id(self.context.workspace.state_db(), name)
             if identity is None:
-                raise RuntimeError(f"published snapshot has no catalog alias: {name}")
+                raise RuntimeError(f"published snapshot has no catalog name: {name}")
             self.snapshot_ids[name] = identity
         elif action in (Action.RESTORE_FIRST, Action.RESTORE_SECOND):
             name = b + ("-r1" if action == Action.RESTORE_FIRST else "-r2")
             self.machines.append(name)
             self.context.workspace.register_machine(name)
-            seconds = self.call("restore", "image:" + b + "-s2", "--name", name)
+            seconds = self.call("restore", b + "-s2", "--name", name)
         else:
             raise ValueError(f"unsupported Silo action: {action}")
         return {action.value: seconds}
@@ -403,8 +400,7 @@ class SiloDriver(CommandDriver):
             try:
                 identity = self.snapshot_ids.get(name) or snapshot_id(self.context.workspace.state_db(), name)
                 if identity is not None:
-                    self.call("image", "remove", "image:" + name)
-                    self.call("snapshot", "remove", "image:" + identity)
+                    self.call("snapshot", "rm", identity)
             except Exception as error:
                 errors.append(error)
         if errors:

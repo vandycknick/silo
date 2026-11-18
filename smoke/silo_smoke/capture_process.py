@@ -31,7 +31,7 @@ def main() -> None:
     with (evidence / "capture-manager.stdout").open("wb") as output, \
             (evidence / "capture-manager.stderr").open("wb") as errors:
         process = subprocess.Popen(
-            [silo, "snapshot", "create", name, "--live", "--name", "crash-captured", "--format", "json",
+            [silo, "snapshot", "create", name, "--memory", "--name", "crash-captured", "--format", "json",
              *(["--preserve"] if request["preserve"] else []),
              *(["--capture-policy", request["capturePolicy"],
                 "--dirty-crossover-percent", str(request["dirtyCrossoverPercent"])]

@@ -44,12 +44,17 @@ use crate::LibVmError;
 
 pub(crate) fn image_error(reference: &str, source: OciError) -> LibVmError {
     match source {
-        OciError::InvalidReference { .. }
-        | OciError::RegistryPolicyDenied { .. }
-        | OciError::VmArtifactRequiresAcquisition { .. } => LibVmError::ImageReferenceRejected {
-            reference: reference.into(),
-            message: source.to_string(),
-        },
+        OciError::InvalidReference { .. } | OciError::RegistryPolicyDenied { .. } => {
+            LibVmError::ImageReferenceRejected {
+                reference: reference.into(),
+                message: source.to_string(),
+            }
+        }
+        // Image pull and create route a Silo VM artifact to artifact
+        // acquisition; callers that cannot pull report it typed.
+        OciError::VmArtifactRequiresAcquisition { reference, .. } => {
+            LibVmError::ImageIsVmArtifact { reference }
+        }
         source => LibVmError::Image {
             reference: reference.into(),
             source,
@@ -238,7 +243,11 @@ pub(crate) async fn acquire_composition(
         check_image_lower(&image, held.retained())?;
         let now = crate::utils::now_unix();
         image.reference.requested_reference = resolved.requested_reference.clone();
-        image.reference.last_used_at = Some(now);
+        image.reference.selected_reference = crate::store::names::pinned_reference(
+            &resolved.requested_reference,
+            &image.manifest.digest,
+        );
+        image.reference.updated_at = now;
         image.artifact.last_used_at = Some(now);
         store.save_oci_image(&image).await?;
         emit_image_progress_complete(progress);
@@ -486,15 +495,7 @@ pub(crate) fn oci_image_record(
         reference: ImageRefRecord {
             requested_reference: requested_reference.into(),
             selected_reference: metadata.selected_reference.clone(),
-            manifest_digest: metadata.manifest_digest.clone(),
-            image_id: metadata.manifest_digest.clone(),
-            platform_os: metadata.platform.os.clone(),
-            platform_architecture: metadata.platform.architecture.clone(),
-            platform_variant: metadata.platform.variant.clone(),
-            size_bytes: Some(lower.result.lower_length),
-            created_at,
             updated_at: now,
-            last_used_at: Some(now),
         },
         config: ImageConfigRecord {
             manifest_digest: metadata.manifest_digest.clone(),
@@ -1102,14 +1103,20 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         let fsmeta = pool.object_path(&lower.fsmeta());
 
-        // The image reference roots the graph.
+        // The image name roots the graph.
         store.prune_images().await.unwrap();
         assert!(fsmeta.is_file() && packs.iter().all(|pack| pack.is_file()));
 
-        store
-            .remove_image(reference, crate::ImageRemoveOptions::default())
-            .await
-            .unwrap();
+        let image = crate::store::image_store::named_image(
+            &mut store.pool.acquire().await.unwrap(),
+            reference,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let removal = store.remove_image(image, Some(reference)).await.unwrap();
+        assert!(removal.record_removed);
+        assert_eq!(removal.names, vec![reference.to_owned()]);
         // A live consumer lease still roots the lower, its layers and bytes.
         store.prune_images().await.unwrap();
         assert!(fsmeta.is_file() && packs.iter().all(|pack| pack.is_file()));
@@ -1119,8 +1126,7 @@ pub(crate) mod tests {
         );
 
         drop(acquired);
-        let report = store.prune_images().await.unwrap();
-        assert_eq!(report.artifacts_removed, 1);
+        store.prune_images().await.unwrap();
         assert!(!fsmeta.exists());
         assert!(packs.iter().all(|pack| !pack.exists()));
         for table in [

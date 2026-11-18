@@ -731,14 +731,14 @@ impl Store {
         .await?;
         if !safe {
             return Err(crate::machine::root_storage::invalid(
-                "an incomplete or unreconciled execution-restore child cannot cold boot; retry the retained checkpoint under a new restore run",
+                "an incomplete or unreconciled execution-restore child cannot cold boot; retry the retained snapshot under a new restore run",
             ));
         }
         Ok(())
     }
 
     /// Retire one-shot restore authority in the same transaction as cold-start
-    /// admission. The independently retained checkpoint is never deleted.
+    /// admission. The independently retained snapshot is never deleted.
     pub(crate) async fn start_restored_machine(
         &self,
         config: &MachineConfig,
@@ -1250,7 +1250,7 @@ fn machine_rootfs_from_row(
     let source_kind = match source_kind.as_str() {
         "oci" => crate::ImageSourceKind::Oci,
         "disk" => crate::ImageSourceKind::Disk,
-        "managed" => crate::ImageSourceKind::Managed,
+        "stored" => crate::ImageSourceKind::Stored,
         _ => {
             return Err(LibVmError::StateDecode {
                 field: "machine_rootfs.source_kind",

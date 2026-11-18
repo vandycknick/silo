@@ -70,12 +70,11 @@ Cold dispatches fsync and per-file evict all `owned_inputs(silo)` **and the
 registry blob store**, with mincore residency evidence and truthful
 `partial-cold` labels, never global cache dropping. Warm means a second
 **prepare after prune**, with page cache intact, not a retained-lower cache hit.
-`silo image remove` only removes managed image aliases, so this OCI lane instead
-removes the stopped machines, explicitly releases its OCI cache reference with
+This OCI lane removes the stopped machines, releases its OCI cache name with
 `shutdown.storage_tool(silo, "remove-image", REF)`, then calls
 `shutdown.storage_tool(silo, "prune")` between every size and sample. Removing
-machines alone is insufficient: the `image_ref` selection intentionally retains
-its composition until the reference is released. Before each prepare, the
+machines alone is insufficient: a named OCI selection (`image_name`) retains
+its composition until the name is removed. Before each prepare, the
 harness asserts no OCI reference/artifact for that manifest and no reusable
 layer results for any of its diff IDs. After cleanup it also proves that the
 previous composition/recipe/fsmeta, pack/index/map objects and source blobs have

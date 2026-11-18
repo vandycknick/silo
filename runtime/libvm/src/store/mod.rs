@@ -8,15 +8,15 @@ mod config_store;
 pub(crate) mod fork;
 pub(crate) mod handoff_payload_store;
 pub(crate) mod handoff_store;
-mod image_store;
+pub(crate) mod image_store;
 pub(crate) mod layer_store;
 pub(crate) mod live_store;
 pub(crate) mod machine_store;
-pub(crate) mod managed_image_store;
 pub(crate) mod map_store;
 #[cfg(test)]
 mod mock_store;
 pub(crate) mod models;
+pub(crate) mod names;
 mod network_store;
 pub(crate) mod observation;
 pub(crate) mod operation_store;
@@ -25,6 +25,7 @@ mod row;
 pub(crate) mod snapshot_store;
 #[path = "store.rs"]
 pub(crate) mod storage;
+pub(crate) mod stored_image_store;
 pub(crate) mod stream_representation;
 mod traits;
 

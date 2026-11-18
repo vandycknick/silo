@@ -30,7 +30,7 @@ impl RestoreIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RestoreIntent {
-    pub checkpoint: RestoreIdentity,
+    pub source: RestoreIdentity,
     pub consumer_operation: Uuid,
     pub request: vm_spec::restore::RestoreRequest,
     pub resources: RestoreResourceCharge,
@@ -277,11 +277,11 @@ impl RestoreIntent {
         self.inspection
             .validate_against(&bytes, &inspected)
             .map_err(invalid)?;
-        let authority_matches = match (&self.checkpoint, &self.request.authority) {
+        let authority_matches = match (&self.source, &self.request.authority) {
             (
                 RestoreIdentity::Snapshot { id },
-                vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { checkpoint, .. },
-            ) => id.as_bytes() == checkpoint.as_bytes(),
+                vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { snapshot, .. },
+            ) => id.as_bytes() == snapshot.as_bytes(),
             (
                 RestoreIdentity::LocalCut { id },
                 vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut },
@@ -289,7 +289,7 @@ impl RestoreIntent {
             _ => false,
         };
         if self.consumer_operation.is_nil() || !authority_matches {
-            return Err(invalid("restore intent contradicts checkpoint identity"));
+            return Err(invalid("restore intent contradicts snapshot identity"));
         }
         Ok(())
     }
@@ -319,7 +319,7 @@ pub(crate) fn authenticate_imported_captures(
             &capture.receipt_digest,
             crate::storage::limits::Resource::MetadataPageBytes.maximum(),
         )?;
-        let receipt = crate::image::transport::trust::AcquisitionReceipt::decode(&receipt_bytes)?;
+        let receipt = crate::image::transport::receipt::AcquisitionReceipt::decode(&receipt_bytes)?;
         if receipt.canonical_bytes()? != receipt_bytes
             || receipt.index_digest != capture.index_digest
         {
@@ -354,11 +354,11 @@ impl SnapshotStore {
         let configuration =
             vm_spec::capture::CaptureConfiguration::from_spec(&consumer.record.configuration.spec)
                 .map_err(invalid)?;
-        let execution = match &consumer.record.capture {
-            crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } => {
+        let execution = match &consumer.record.memory {
+            crate::store::models::snapshot::SnapshotMemoryState::Included { execution } => {
                 execution
             }
-            _ => return Err(invalid("execution restore requires a live checkpoint")),
+            _ => return Err(invalid("execution restore requires a snapshot with memory")),
         };
         let mut selected = None;
         for provenance in &consumer.info.provenance {
@@ -439,7 +439,7 @@ impl SnapshotStore {
             }
         }
         selected.ok_or_else(|| {
-            invalid("execution checkpoint lacks an authorized matching capture provenance")
+            invalid("snapshot with memory lacks an authorized matching capture provenance")
         })
     }
 
@@ -461,7 +461,7 @@ impl SnapshotStore {
         disk_peak: u64,
         descriptor_peak: u64,
     ) -> Result<RestoreResourceCharge, LibVmError> {
-        // Imported checkpoints can be restored before this home has ever owned a
+        // Imported snapshots can be restored before this home has ever owned a
         // machine. Create only the private container, not a child or disk, before
         // measuring and reserving space on its actual filesystem.
         let home = crate::paths::OwnedDirectory::open_existing_root(&self.store.home)?
@@ -1986,14 +1986,14 @@ mod tests {
         assert_ne!(path, old_path);
     }
 
-    struct CheckpointRequestFixture {
+    struct MemorySnapshotRequestFixture {
         capture: crate::store::capture::tests::Fixture,
         consumer: crate::store::snapshot_store::SnapshotConsumer,
         request: vm_spec::restore::RestoreRequest,
         _files: [std::fs::File; 5],
     }
 
-    async fn checkpoint_request_fixture() -> CheckpointRequestFixture {
+    async fn memory_snapshot_request_fixture() -> MemorySnapshotRequestFixture {
         use crate::storage::pool::StoragePool;
         use crate::store::capture::tests::{fixture, seal};
 
@@ -2004,7 +2004,7 @@ mod tests {
             .publish_capture(
                 fixture.reservation.record.capture_id,
                 sealed.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -2016,10 +2016,10 @@ mod tests {
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
         let inspection = snapshots.prepare_restore_shape(&consumer).await.unwrap();
         let shape = inspection.shape();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &consumer.record.memory
         else {
-            panic!("fixture must be an execution checkpoint");
+            panic!("fixture must be a snapshot with memory");
         };
         let files = [
             shape
@@ -2039,7 +2039,7 @@ mod tests {
             &runtime, &consumer, evidence, &files, None, None,
         )
         .unwrap();
-        CheckpointRequestFixture {
+        MemorySnapshotRequestFixture {
             capture: fixture,
             consumer,
             request,
@@ -2052,18 +2052,18 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         use vm_spec::stream_map::StreamRole;
 
-        let CheckpointRequestFixture {
+        let MemorySnapshotRequestFixture {
             capture: fixture,
             consumer,
             request,
             _files,
-        } = checkpoint_request_fixture().await;
+        } = memory_snapshot_request_fixture().await;
         let snapshots = &fixture.snapshots;
         let pool = crate::storage::pool::StoragePool::open(&snapshots.store.images_dir).unwrap();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &consumer.record.memory
         else {
-            panic!("execution checkpoint required");
+            panic!("snapshot with memory required");
         };
         let root_file = pool.open_object(&execution.memory.map).unwrap();
         let expected = root_file.metadata().unwrap();
@@ -2148,12 +2148,12 @@ mod tests {
         use crate::storage::pool::StoragePool;
         use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
-        let CheckpointRequestFixture {
+        let MemorySnapshotRequestFixture {
             capture: fixture,
             consumer,
             request: _request,
             _files,
-        } = checkpoint_request_fixture().await;
+        } = memory_snapshot_request_fixture().await;
         let snapshots = &fixture.snapshots;
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
         let disk_peak = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES + 512;
@@ -2732,7 +2732,7 @@ mod tests {
             .publish_capture(
                 record.capture_id,
                 sealed.path(),
-                record.alias,
+                record.name,
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -3799,19 +3799,19 @@ mod tests {
         use crate::store::snapshot_store::SnapshotConsumer;
         use std::os::unix::fs::{FileExt, PermissionsExt};
 
-        let CheckpointRequestFixture {
+        let MemorySnapshotRequestFixture {
             capture: fixture,
             consumer: initial_consumer,
             request: _request,
             _files,
-        } = checkpoint_request_fixture().await;
+        } = memory_snapshot_request_fixture().await;
         let snapshots = &fixture.snapshots;
         let reference = crate::SnapshotRef::Id(initial_consumer.info.id);
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &initial_consumer.record.capture
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &initial_consumer.record.memory
         else {
-            panic!("fixture must be an execution checkpoint");
+            panic!("fixture must be a snapshot with memory");
         };
         let ram_path = pool.stream_path(&execution.memory.stream);
         let ram_stream = execution.memory.stream;

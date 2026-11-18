@@ -243,7 +243,7 @@ pub(crate) async fn preflight(
     }
     let backend = runtime.effective_backend();
     crate::runtime::boot_assets::admit_create_source(
-        crate::runtime::boot_assets::SourceFamily::ManagedImage,
+        crate::runtime::boot_assets::SourceFamily::StoredImage,
         source.storage.profile,
         source.storage.backend,
         backend,

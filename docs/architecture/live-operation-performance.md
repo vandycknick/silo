@@ -444,7 +444,7 @@ The explicit read-only capability-observation path remains separate from this
 writable runtime admission and does not run recovery.
 
 Retention semantics are unchanged from before Phase 30. Removing an image or
-releasing a snapshot removes references only; artifacts, compositions and layers
+snapshot name removes references only; artifacts, compositions and layers
 remain until explicit prune. Explicit prune and layer recovery retain full
 validation and their checkpoint/recheck fences. The daemon's management runtime
 opens once in `Maintenance` and is reused, not reopened per RPC.
@@ -600,7 +600,7 @@ bytes at the device's sequential write rate (about 1 s per 1 GiB here).
 ## Batch 3: ext4 and simplification
 
 1. One capture mode: the monitor and worker never synchronize staged files;
-   durability is libvm's, at checkpoint publication (pool file and directory
+   durability is libvm's, at snapshot publication (pool file and directory
    syncs plus a checked WAL checkpoint after the catalog commit) and in each
    child's background barrier. `CutDurability` and the native `durable` flag
    were deleted.
@@ -612,7 +612,7 @@ bytes at the device's sequential write rate (about 1 s per 1 GiB here).
    barriers settle.
 3. Catalog `PRAGMA synchronous = NORMAL` in WAL mode: consistent after any
    crash, process-crash durable; the boundaries that need power-loss
-   durability (handoff receipts/fences/commits, checkpoint publication,
+   durability (handoff receipts/fences/commits, snapshot publication,
    commit-then-unlink garbage collection, machine deletion) run a checked
    `wal_checkpoint(PASSIVE)` after their commit and fail closed if it cannot
    complete.

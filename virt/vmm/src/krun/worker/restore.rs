@@ -636,7 +636,7 @@ pub(crate) mod tests {
             map_node_store: None,
             version: vm_spec::restore::RESTORE_REQUEST_VERSION,
             authority: vm_spec::restore::RestoreAuthority::IdentifiedSnapshot {
-                checkpoint: digest,
+                snapshot: digest,
                 evidence: Box::new(sealed_evidence),
             },
             activation_id: id(),

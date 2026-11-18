@@ -1,7 +1,7 @@
 //! Verified import of one OCI VM artifact. Order of authority:
 //!
 //! ```text
-//! approved index digest ──> verified graph (T1) ──> canonical record bytes
+//! resolved index digest ──> verified graph (T1) ──> canonical record bytes
 //!        │                                              │ derive
 //!        │                                              v
 //!        │                     config + stream/object table closure (exact sets)
@@ -35,7 +35,7 @@ use crate::image::transport::identity::IdentityBuilder;
 use crate::image::transport::provenance::{
     verify_portable_binding, verify_portable_capture, MeasuredCapture,
 };
-use crate::image::transport::trust::{AcquisitionReceipt, ApprovedArtifactDigest};
+use crate::image::transport::receipt::{AcquisitionReceipt, ResolvedIndex};
 use crate::paths::OwnedDirectory;
 use crate::storage::identity::{ImageId, ObjectDigest, SnapshotId, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
@@ -43,7 +43,7 @@ use crate::storage::map::AuthenticatedMap;
 use crate::storage::pool::OperationPaths;
 use crate::storage::stream::write_sparse_at;
 use crate::store::models::image::ImageRecord;
-use crate::store::models::snapshot::{SnapshotCaptureKind, SnapshotRecord};
+use crate::store::models::snapshot::{SnapshotMemoryState, SnapshotRecord};
 use crate::store::Store;
 use crate::LibVmError;
 use vm_spec::stream_map::{ChunkSize, StreamRole};
@@ -58,13 +58,13 @@ pub(crate) enum VerifiedContent {
         bytes: Vec<u8>,
         digest: ObjectDigest,
     },
-    StoppedSnapshot {
+    SnapshotWithoutMemory {
         id: SnapshotId,
         record: SnapshotRecord,
         bytes: Vec<u8>,
         digest: ObjectDigest,
     },
-    LiveCheckpoint {
+    SnapshotWithMemory {
         id: SnapshotId,
         record: SnapshotRecord,
         bytes: Vec<u8>,
@@ -154,20 +154,23 @@ pub(crate) struct ImportStaging {
     pub(crate) blobs: StagedBlobs,
 }
 
-/// Verify one complete artifact against an explicit digest approval. Blocking:
-/// run inside the worker that owns `staging` for the whole call.
+/// Verify one complete artifact resolved as `index`. Blocking: run inside the
+/// worker that owns `staging` for the whole call.
 pub(crate) fn verify_imported_artifact(
     graph: &VerifiedVmGraph,
-    trust: &ApprovedArtifactDigest,
-    approved_at_unix_ms: u64,
+    index: &ResolvedIndex,
+    acquired_at_unix_ms: u64,
     staging: ImportStaging,
 ) -> Result<VerifiedImportedArtifact, LibVmError> {
     let index_digest = object(graph.index_digest());
-    if trust.index_digest() != index_digest {
-        return Err(LibVmError::ArtifactTrustMismatch {
-            expected: trust.index_digest().to_string(),
-            actual: index_digest.to_string(),
-        });
+    if index.index_digest() != index_digest {
+        return Err(invalid(
+            "index",
+            format!(
+                "verified graph index {index_digest} differs from the resolved index {}",
+                index.index_digest()
+            ),
+        ));
     }
     let ImportStaging {
         operation,
@@ -323,7 +326,7 @@ pub(crate) fn verify_imported_artifact(
 
     let content = match semantic.record {
         SemanticRecord::Image(record) => {
-            let crate::image::import_types::ManagedSourceId::Image(id) = semantic.id else {
+            let crate::image::transport::ArtifactContent::Image(id) = semantic.id else {
                 return Err(invalid("record", "image identity kind mismatch"));
             };
             VerifiedContent::Image {
@@ -334,19 +337,19 @@ pub(crate) fn verify_imported_artifact(
             }
         }
         SemanticRecord::Snapshot(record) => {
-            let crate::image::import_types::ManagedSourceId::Snapshot(id) = semantic.id else {
+            let crate::image::transport::ArtifactContent::Snapshot(id) = semantic.id else {
                 return Err(invalid("record", "snapshot identity kind mismatch"));
             };
-            match (&record.capture, provenance) {
-                (SnapshotCaptureKind::StoppedStorage { .. }, None) => {
-                    VerifiedContent::StoppedSnapshot {
+            match (&record.memory, provenance) {
+                (SnapshotMemoryState::None { .. }, None) => {
+                    VerifiedContent::SnapshotWithoutMemory {
                         id,
                         record: *record,
                         bytes: semantic.bytes,
                         digest: semantic.digest,
                     }
                 }
-                (SnapshotCaptureKind::LiveExecution { execution }, Some((wrapper, evidence))) => {
+                (SnapshotMemoryState::Included { execution }, Some((wrapper, evidence))) => {
                     let binding = verify_portable_binding(&record, id, &wrapper, &evidence)?;
                     let layout = blobs.read(
                         &graph
@@ -386,7 +389,7 @@ pub(crate) fn verify_imported_artifact(
                             ))?,
                         },
                     )?;
-                    VerifiedContent::LiveCheckpoint {
+                    VerifiedContent::SnapshotWithMemory {
                         id,
                         record: *record,
                         bytes: semantic.bytes,
@@ -436,7 +439,7 @@ pub(crate) fn verify_imported_artifact(
             index_digest,
             metadata_manifest_bytes: graph.metadata_manifest_bytes().to_vec(),
             config_bytes: graph.config_bytes().to_vec(),
-            receipt: trust.receipt(approved_at_unix_ms),
+            receipt: index.receipt(acquired_at_unix_ms),
             content,
             streams,
             objects,

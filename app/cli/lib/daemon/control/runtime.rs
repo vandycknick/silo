@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use crate::daemon::control::{conversion, id, native, Service, Stream};
-use silo_vm_control::{images, policy, values};
+use silo_vm_control::{images, policy, values, ConversionError};
 use silod_spec::daemon::v1 as w;
 use tonic::{Request, Response, Status};
 
@@ -14,15 +14,19 @@ fn image_reference(value: &str) -> Result<(), Status> {
 }
 
 impl Service {
-    /// Runs one managed-image publication to completion independently of the
-    /// response consumer: progress first, then exactly one terminal image.
-    async fn managed_image_operation<F, Fut>(
+    /// Runs one image operation to completion independently of the response
+    /// consumer: progress first, then exactly one terminal event.
+    async fn image_operation<T, E, F, Fut>(
         &self,
+        progress_event: fn(&libvm::ImageProgress) -> Result<E, ConversionError>,
+        terminal_event: fn(&T) -> Result<E, ConversionError>,
         work: F,
-    ) -> Result<Response<Stream<w::ManagedImageEvent>>, Status>
+    ) -> Result<Response<Stream<E>>, Status>
     where
+        T: Send + 'static,
+        E: Send + 'static,
         F: FnOnce(Service, libvm::ImageProgressSender) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<libvm::ManagedImageInfo, Status>> + Send + 'static,
+        Fut: Future<Output = Result<T, Status>> + Send + 'static,
     {
         let permit = self.admit().await?;
         let state = self.clone();
@@ -31,7 +35,7 @@ impl Service {
         let events_tx = tx.clone();
         let forwarding = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                let event = images::managed_event_progress(&event).map_err(conversion);
+                let event = progress_event(&event).map_err(conversion);
                 if events_tx.send(event).await.is_err() {
                     break;
                 }
@@ -39,8 +43,8 @@ impl Service {
         });
         tokio::spawn(async move {
             let result = async {
-                let image = work(state, progress).await?;
-                images::managed_event_image(&image).map_err(conversion)
+                let value = work(state, progress).await?;
+                terminal_event(&value).map_err(conversion)
             }
             .await;
             // Drain counts native work, not a slow or canceled response consumer.
@@ -55,9 +59,9 @@ impl Service {
 #[tonic::async_trait]
 impl w::runtime_service_server::RuntimeService for Service {
     type ResolveImageStream = Stream<w::ResolveImageEvent>;
-    type PullImageStream = Stream<w::ImageProgress>;
-    type ImportImageStream = Stream<w::ManagedImageEvent>;
-    type ConvertImageStream = Stream<w::ManagedImageEvent>;
+    type PullImageStream = Stream<w::PullImageEvent>;
+    type ImportImageStream = Stream<w::StoredImageEvent>;
+    type ConvertImageStream = Stream<w::StoredImageEvent>;
 
     async fn inspect_artifact(
         &self,
@@ -136,15 +140,19 @@ impl w::runtime_service_server::RuntimeService for Service {
     ) -> Result<Response<Self::ImportImageStream>, Status> {
         let request =
             silo_vm_control::boot::import_request_from_wire(r.into_inner()).map_err(conversion)?;
-        self.managed_image_operation(move |state, progress| async move {
-            let admitted = request.admit().await.map_err(native)?;
-            let runtime = state.runtime().await?.with_image_progress(progress);
-            runtime
-                .images()
-                .import_admitted_disk(admitted)
-                .await
-                .map_err(native)
-        })
+        self.image_operation(
+            images::stored_event_progress,
+            images::stored_event_image,
+            move |state, progress| async move {
+                let admitted = request.admit().await.map_err(native)?;
+                let runtime = state.runtime().await?.with_image_progress(progress);
+                runtime
+                    .images()
+                    .import_admitted_disk(admitted)
+                    .await
+                    .map_err(native)
+            },
+        )
         .await
     }
 
@@ -158,176 +166,124 @@ impl w::runtime_service_server::RuntimeService for Service {
             images::convert_request_from_wire(r.into_inner()).map_err(conversion)?;
         image_reference(&identity.selected_reference)?;
         let resolve = identity.resolve_options().map_err(conversion)?;
-        self.managed_image_operation(move |state, progress| async move {
-            let runtime = state.runtime().await?.with_image_progress(progress);
-            let images = runtime
-                .with_image_pull_policy(identity.pull_policy)
-                .images();
-            let mut image = images
-                .resolve_with(identity.selected_reference.clone(), resolve)
-                .await
-                .map_err(native)?;
-            identity.verify(&image).map_err(conversion)?;
-            image.requested_reference = identity.requested_reference;
-            images.convert(&image, options).await.map_err(native)
-        })
+        self.image_operation(
+            images::stored_event_progress,
+            images::stored_event_image,
+            move |state, progress| async move {
+                let runtime = state.runtime().await?.with_image_progress(progress);
+                let images = runtime
+                    .with_image_pull_policy(identity.pull_policy)
+                    .images();
+                let mut image = images
+                    .resolve_with(identity.selected_reference.clone(), resolve)
+                    .await
+                    .map_err(native)?;
+                identity.verify(&image).map_err(conversion)?;
+                image.requested_reference = identity.requested_reference;
+                images.convert(&image, options).await.map_err(native)
+            },
+        )
         .await
     }
 
-    async fn resolve_managed_digest(
-        &self,
-        r: Request<w::ManagedDigest>,
-    ) -> Result<Response<w::ManagedSourceId>, Status> {
-        let digest = images::managed_digest_from_wire(r.into_inner()).map_err(conversion)?;
-        let id = self
+    async fn list_images(&self, _: Request<()>) -> Result<Response<w::ImageList>, Status> {
+        let images = self
             .runtime()
             .await?
             .images()
-            .resolve_managed_digest(&digest)
+            .list()
             .await
             .map_err(native)?;
-        Ok(Response::new(images::managed_id_to_wire(&id)))
+        Ok(Response::new(
+            images::image_list_to_wire(&images).map_err(conversion)?,
+        ))
     }
 
     /// Inspection is observation, not a content lease.
-    async fn inspect_managed_image(
+    async fn inspect_image(
         &self,
-        r: Request<w::ManagedSourceRef>,
-    ) -> Result<Response<w::ManagedSourceInfo>, Status> {
-        let reference = images::managed_ref_from_wire(r.into_inner()).map_err(conversion)?;
+        r: Request<w::ImageRef>,
+    ) -> Result<Response<w::ImageInfo>, Status> {
+        let reference = images::image_ref_from_wire(r.into_inner()).map_err(conversion)?;
         let info = self
             .runtime()
             .await?
             .images()
-            .inspect_managed(&reference)
+            .inspect(&reference)
             .await
             .map_err(native)?;
         Ok(Response::new(
-            images::managed_info_to_wire(&info).map_err(conversion)?,
+            images::image_info_to_wire(&info).map_err(conversion)?,
         ))
     }
 
-    async fn list_managed_images(
+    async fn remove_image(
         &self,
-        _: Request<()>,
-    ) -> Result<Response<w::ManagedSourceList>, Status> {
-        let infos = self
-            .runtime()
-            .await?
-            .images()
-            .list_managed()
-            .await
-            .map_err(native)?;
-        Ok(Response::new(
-            images::managed_list_to_wire(&infos).map_err(conversion)?,
-        ))
-    }
-
-    async fn release_image_retention(
-        &self,
-        r: Request<w::ManagedSourceRef>,
-    ) -> Result<Response<()>, Status> {
-        let reference = images::managed_ref_from_wire(r.into_inner()).map_err(conversion)?;
+        r: Request<w::ImageRef>,
+    ) -> Result<Response<w::ImageRemoval>, Status> {
+        let reference = images::image_ref_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
-        self.mutate(async move {
-            let runtime = state.runtime().await?;
-            runtime
-                .images()
-                .release_retention(&reference)
-                .await
-                .map_err(native)?;
-            Ok(())
-        })
-        .await?;
-        Ok(Response::new(()))
-    }
-    async fn restore_snapshot(
-        &self,
-        r: Request<w::RestoreStorageSnapshotRequest>,
-    ) -> Result<Response<w::MachineSnapshot>, Status> {
-        let value = r.into_inner();
-        let reference = silo_vm_control::stopped::reference_from_wire(
-            crate::daemon::control::required(value.snapshot)?,
-        )
-        .map_err(conversion)?;
-        let options = libvm::RestoreOptions {
-            name: silo_vm_control::stopped::name(value.name).map_err(conversion)?,
-            external_resources: silo_vm_control::stopped::policy_from_wire(
-                crate::daemon::control::required(value.external_resources)?,
-            )
-            .map_err(conversion)?,
-            activation_hook: value
-                .activation_hook
-                .map(silo_vm_control::stopped::hook_from_wire)
-                .transpose()
-                .map_err(conversion)?,
-        };
-        let query = match self.runtime.get() {
-            Some(runtime) => runtime.live_capability_query(),
-            None => {
-                self.live_query
-                    .get_or_try_init(|| async {
-                        libvm::LiveCapabilityQuery::open(&self.config).map_err(native)
-                    })
-                    .await?
-            }
-        };
-        libvm::preflight_restore_snapshot(
-            &self.config,
-            query,
-            &reference,
-            &options.external_resources,
-        )
-        .await
-        .map_err(native)?;
-        let state = self.clone();
-        let result = self
+        let removal = self
             .mutate(async move {
-                let machine = state
+                let removal = state
                     .runtime()
                     .await?
-                    .restore_snapshot(reference, options, None)
+                    .images()
+                    .remove(&reference)
                     .await
                     .map_err(native)?;
-                silo_vm_control::snapshots::snapshot_to_wire(
-                    &machine.inspect().await.map_err(native)?,
-                )
-                .map_err(conversion)
+                images::image_removal_to_wire(&removal).map_err(conversion)
             })
             .await?;
-        Ok(Response::new(result))
+        Ok(Response::new(removal))
     }
 
-    async fn recover_checkpoint_disks(
+    async fn prune_images(&self, _: Request<()>) -> Result<Response<w::ImagePruneReport>, Status> {
+        let state = self.clone();
+        let report = self
+            .mutate(async move {
+                let report = state
+                    .runtime()
+                    .await?
+                    .images()
+                    .prune()
+                    .await
+                    .map_err(native)?;
+                Ok(images::prune_report_to_wire(&report))
+            })
+            .await?;
+        Ok(Response::new(report))
+    }
+
+    async fn restore_snapshot(
         &self,
-        r: Request<w::RecoverCheckpointDisksRequest>,
+        r: Request<w::RestoreSnapshotRequest>,
     ) -> Result<Response<w::MachineSnapshot>, Status> {
-        let value = r.into_inner();
-        let reference = silo_vm_control::stopped::reference_from_wire(
-            crate::daemon::control::required(value.snapshot)?,
-        )
-        .map_err(conversion)?;
-        let options = libvm::RecoverDisksOptions {
-            name: silo_vm_control::stopped::name(value.name).map_err(conversion)?,
-            external_resources: silo_vm_control::stopped::policy_from_wire(
-                crate::daemon::control::required(value.external_resources)?,
-            )
-            .map_err(conversion)?,
-        };
-        libvm::preflight_recover_checkpoint_disks(
-            &self.config,
-            &reference,
-            &options.external_resources,
-        )
-        .await
-        .map_err(native)?;
+        let (source, options) = silo_vm_control::stopped::restore_request_from_wire(r.into_inner())
+            .map_err(conversion)?;
+        // A registry reference may need a pull first; libvm checks it in restore.
+        if let libvm::RestoreSource::Local(reference) = &source {
+            let query = match self.runtime.get() {
+                Some(runtime) => runtime.live_capability_query(),
+                None => {
+                    self.live_query
+                        .get_or_try_init(|| async {
+                            libvm::LiveCapabilityQuery::open(&self.config).map_err(native)
+                        })
+                        .await?
+                }
+            };
+            libvm::preflight_restore_snapshot(&self.config, query, reference, &options)
+                .await
+                .map_err(native)?;
+        }
         let state = self.clone();
         let result = self
             .mutate(async move {
                 let machine = state
                     .runtime()
                     .await?
-                    .recover_checkpoint_disks(reference, options)
+                    .restore(source, options, None)
                     .await
                     .map_err(native)?;
                 silo_vm_control::snapshots::snapshot_to_wire(
@@ -345,10 +301,10 @@ impl w::runtime_service_server::RuntimeService for Service {
     ) -> Result<Response<w::StorageSnapshotInfo>, Status> {
         let reference =
             silo_vm_control::stopped::reference_from_wire(r.into_inner()).map_err(conversion)?;
-        let runtime = self.runtime().await?;
-        let info = libvm::SnapshotStore::open(runtime.local_home())
-            .await
-            .map_err(native)?
+        let info = self
+            .runtime()
+            .await?
+            .snapshots()
             .inspect(&reference)
             .await
             .map_err(native)?;
@@ -363,12 +319,7 @@ impl w::runtime_service_server::RuntimeService for Service {
     ) -> Result<Response<w::SnapshotVerificationResult>, Status> {
         let reference =
             silo_vm_control::stopped::reference_from_wire(r.into_inner()).map_err(conversion)?;
-        let runtime = self.runtime().await?;
-        let result = runtime
-            .snapshots()
-            .map_err(native)?
-            .verify(&reference)
-            .await;
+        let result = self.runtime().await?.snapshots().verify(&reference).await;
         let result = match result {
             Ok(report) => silo_vm_control::snapshots::verification_to_wire(Ok(&report)),
             Err(libvm::LibVmError::SnapshotVerification(error)) => {
@@ -383,10 +334,10 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         _: Request<()>,
     ) -> Result<Response<w::StorageSnapshotList>, Status> {
-        let runtime = self.runtime().await?;
-        let infos = libvm::SnapshotStore::open(runtime.local_home())
-            .await
-            .map_err(native)?
+        let infos = self
+            .runtime()
+            .await?
+            .snapshots()
             .list()
             .await
             .map_err(native)?;
@@ -398,43 +349,26 @@ impl w::runtime_service_server::RuntimeService for Service {
         Ok(Response::new(w::StorageSnapshotList { snapshots }))
     }
 
-    async fn release_snapshot_retention(
+    async fn remove_snapshot(
         &self,
         r: Request<w::StorageSnapshotRef>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<w::SnapshotRemoval>, Status> {
         let reference =
             silo_vm_control::stopped::reference_from_wire(r.into_inner()).map_err(conversion)?;
         let state = self.clone();
-        self.mutate(async move {
-            let runtime = state.runtime().await?;
-            runtime
-                .snapshots()
-                .map_err(native)?
-                .release_retention(&reference)
-                .await
-                .map_err(native)?;
-            Ok(())
-        })
-        .await?;
-        Ok(Response::new(()))
-    }
-
-    /// Removes one name from the single image/snapshot namespace; explicit
-    /// retention of its target is unaffected.
-    async fn remove_image_alias(&self, r: Request<w::Name>) -> Result<Response<()>, Status> {
-        let alias = silo_vm_control::stopped::alias(&r.get_ref().name).map_err(conversion)?;
-        let state = self.clone();
-        self.mutate(async move {
-            let runtime = state.runtime().await?;
-            runtime
-                .images()
-                .remove_alias(&alias)
-                .await
-                .map_err(native)?;
-            Ok(())
-        })
-        .await?;
-        Ok(Response::new(()))
+        let removal = self
+            .mutate(async move {
+                let removal = state
+                    .runtime()
+                    .await?
+                    .snapshots()
+                    .remove(&reference)
+                    .await
+                    .map_err(native)?;
+                silo_vm_control::stopped::removal_to_wire(&removal).map_err(conversion)
+            })
+            .await?;
+        Ok(Response::new(removal))
     }
 
     /// Operation-scoped observation; never resolved through the source machine.
@@ -526,44 +460,23 @@ impl w::runtime_service_server::RuntimeService for Service {
         &self,
         r: Request<w::PullImageRequest>,
     ) -> Result<Response<Self::PullImageStream>, Status> {
-        let reference = r.get_ref().reference.clone();
-        image_reference(&reference)?;
-        let permit = self.admit().await?;
-        let state = self.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let (progress, mut events) = libvm::ImageProgressSender::channel(8);
-        let progress_tx = tx.clone();
-        let forwarding = tokio::spawn(async move {
-            while let Some(e) = events.recv().await {
-                if progress_tx
-                    .send(images::progress_to_wire(&e).map_err(conversion))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        tokio::spawn(async move {
-            let result = async {
+        let (reference, options) =
+            images::pull_request_from_wire(r.into_inner()).map_err(conversion)?;
+        self.image_operation(
+            images::pull_event_progress,
+            images::pull_event_image,
+            move |state, progress| async move {
                 state
                     .runtime()
                     .await?
                     .with_image_progress(progress)
                     .images()
-                    .pull(reference)
+                    .pull_with(reference, options)
                     .await
-                    .map_err(native)?;
-                Ok::<_, Status>(())
-            }
-            .await;
-            drop(permit);
-            let _ = forwarding.await;
-            if let Err(e) = result {
-                let _ = tx.send(Err(e)).await;
-            }
-        });
-        Ok(Response::new(self.response_stream(rx)))
+                    .map_err(native)
+            },
+        )
+        .await
     }
 
     async fn propose_machine_name(&self, _: Request<()>) -> Result<Response<w::Name>, Status> {

@@ -14,9 +14,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::{
-        ExternalResourcePolicy, ForkOptions, ImageSource, Machine, MachineRef, ProcessConfig,
-        ResolvedRuntimeComponents, RestoreOptions, Runtime, RuntimeConfig, SnapshotOptions,
-        SnapshotRef, SnapshotStore,
+        ExternalResourcePolicy, ForkOptions, ImageSource, LibVmError, Machine, MachineRef,
+        ProcessConfig, ResolvedRuntimeComponents, RestoreOptions, RestoreSource, Runtime,
+        RuntimeConfig, SnapshotMemory, SnapshotOptions, SnapshotRef,
     };
     use serde_json::Value;
     use sha2::{Digest, Sha256};
@@ -264,26 +264,34 @@ mod tests {
         }
     }
 
+    fn source_ref(fixture: &Fixture) -> MachineRef {
+        MachineRef::parse(fixture.source.id()).expect("source machine id")
+    }
+
     #[tokio::test]
     async fn stopped_snapshot_two_private_children_full_config_and_retention() {
         for empty_command in [false, true] {
             let fixture = Fixture::new(empty_command, false).await;
             let baseline = bytes(&root(&fixture.home, &fixture.source));
             let source_config = semantics(config(&fixture.home, &fixture.source).await);
-            let info = fixture
-                .source
-                .snapshot_stopped(SnapshotOptions {
-                    name: Some("checkpoint".into()),
-                    ..Default::default()
-                })
+            let created = fixture
+                .runtime
+                .snapshot(
+                    &source_ref(&fixture),
+                    SnapshotOptions {
+                        name: Some("saved".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
                 .await
                 .expect("real stopped snapshot");
-            let snapshots = SnapshotStore::open(&fixture.home)
-                .await
-                .expect("same real catalog");
+            assert_eq!((created.capture, created.naming_outcome), (None, None));
+            let info = created.snapshot;
+            let snapshots = fixture.runtime.snapshots();
             let reference = SnapshotRef::Id(info.id);
-            assert!(info.retained);
-            assert_eq!(info.aliases, vec!["checkpoint"]);
+            assert_eq!(info.names, vec!["saved"]);
+            assert_eq!(info.memory, SnapshotMemory::None);
             assert_ne!(info.id.to_string(), info.record_digest.to_string());
             let options = sqlx::sqlite::SqliteConnectOptions::new()
                 .filename(fixture.home.join("state.db"))
@@ -302,8 +310,9 @@ mod tests {
             let artifact: Value = serde_json::from_slice(&artifact)
                 .expect("decode actual immutable bytes independently");
             assert_eq!(artifact["schema"], 2);
-            assert_eq!(artifact["captureKind"], "stopped-storage");
-            assert_eq!(artifact["purpose"], "checkpoint");
+            assert_eq!(artifact["memory"], "none");
+            assert!(artifact.get("purpose").is_none());
+            assert!(artifact.get("captureKind").is_none());
             assert_eq!(
                 artifact["stopOutcome"], "unknown",
                 "a fresh fsync must not invent historical clean evidence"
@@ -311,8 +320,8 @@ mod tests {
             assert_eq!(artifact["externalRequirements"], serde_json::json!([]));
             let first = fixture
                 .runtime
-                .restore_snapshot(
-                    reference.clone(),
+                .restore(
+                    RestoreSource::Local(reference.clone()),
                     RestoreOptions {
                         name: Some("first".into()),
                         ..Default::default()
@@ -321,10 +330,12 @@ mod tests {
                 )
                 .await
                 .expect("first private restore");
+            // A local name wins over the registry: the default policy would
+            // otherwise expand `saved` to docker.io and pull.
             let second = fixture
                 .runtime
-                .restore_snapshot(
-                    "image:checkpoint".parse().expect("shared image namespace"),
+                .restore(
+                    RestoreSource::Registry("saved".into()),
                     RestoreOptions {
                         name: Some("second".into()),
                         ..Default::default()
@@ -332,7 +343,7 @@ mod tests {
                     None,
                 )
                 .await
-                .expect("second private restore");
+                .expect("second private restore by name");
             let first_root = root(&fixture.home, &first);
             let second_root = root(&fixture.home, &second);
             assert_eq!(bytes(&first_root), baseline);
@@ -366,17 +377,6 @@ mod tests {
             mutate.sync_all().expect("sync child");
             assert_eq!(bytes(&second_root), baseline);
             assert_eq!(bytes(&root(&fixture.home, &fixture.source)), baseline);
-            assert!(snapshots
-                .remove_alias("checkpoint")
-                .await
-                .expect("alias-only deletion"));
-            assert!(
-                snapshots
-                    .inspect(&reference)
-                    .await
-                    .expect("unaliased retained artifact")
-                    .retained
-            );
             fixture
                 .source
                 .clone()
@@ -395,12 +395,14 @@ mod tests {
             .expect("replace old init bytes");
             std::fs::write(fixture.components.agent(), b"replaced runtime agent")
                 .expect("replace old agent bytes");
+            // A snapshot without memory is unchanged by `without_memory`.
             let third = fixture
                 .runtime
-                .restore_snapshot(
-                    reference.clone(),
+                .restore(
+                    RestoreSource::Local(reference.clone()),
                     RestoreOptions {
                         name: Some("after-source-delete".into()),
+                        without_memory: true,
                         ..Default::default()
                     },
                     None,
@@ -408,10 +410,18 @@ mod tests {
                 .await
                 .expect("retained boot/storage restore");
             assert_eq!(bytes(&root(&fixture.home, &third)), baseline);
-            assert!(snapshots
-                .release_retention(&reference)
+            assert_stopped(&fixture.home, &third).await;
+            let removal = snapshots
+                .remove(&SnapshotRef::Name("saved".into()))
                 .await
-                .expect("release explicit retention"));
+                .expect("remove the last name");
+            assert_eq!(removal.id, info.id);
+            assert_eq!(removal.names, vec!["saved"]);
+            assert!(removal.record_removed, "the last name takes the record");
+            assert!(matches!(
+                snapshots.inspect(&reference).await,
+                Err(LibVmError::SnapshotNotFound { .. })
+            ));
             fixture
                 .runtime
                 .images()
@@ -443,11 +453,15 @@ mod tests {
             .await
             .is_err());
         assert!(fixture
-            .source
-            .snapshot_stopped(SnapshotOptions {
-                name: Some("refused-snapshot".into()),
-                ..Default::default()
-            })
+            .runtime
+            .snapshot(
+                &source_ref(&fixture),
+                SnapshotOptions {
+                    name: Some("refused-snapshot".into()),
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .is_err());
         assert_eq!(
@@ -463,21 +477,26 @@ mod tests {
             source_durability
         );
         let info = fixture
-            .source
-            .snapshot_stopped(SnapshotOptions {
-                external_resources: ExternalResourcePolicy::RequireMappings,
-                ..Default::default()
-            })
+            .runtime
+            .snapshot(
+                &source_ref(&fixture),
+                SnapshotOptions {
+                    external_requirements: true,
+                    ..Default::default()
+                },
+                None,
+            )
             .await
-            .expect("explicit omitted-as-requirement policy");
+            .expect("explicit omitted-as-requirement policy")
+            .snapshot;
         let child = fixture
             .runtime
-            .restore_snapshot(
-                SnapshotRef::Id(info.id),
+            .restore(
+                RestoreSource::Local(SnapshotRef::Id(info.id)),
                 RestoreOptions {
                     name: Some("unresolved".into()),
                     external_resources: ExternalResourcePolicy::RequireMappings,
-                    activation_hook: None,
+                    ..Default::default()
                 },
                 None,
             )
@@ -533,5 +552,186 @@ mod tests {
             .get_machine(&MachineRef::parse("no-symlink-child").expect("name"))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_refuses_the_wrong_memory_mode_without_effects() {
+        let fixture = Fixture::new(false, false).await;
+        let source = source_ref(&fixture);
+        let before = crate::machine::stopped_storage::live_catalog::snapshot(&fixture.home).await;
+        for options in [
+            SnapshotOptions {
+                preserve: true,
+                ..Default::default()
+            },
+            SnapshotOptions {
+                capture_policy: Some(vm_spec::lifecycle::CapturePolicy::Full),
+                ..Default::default()
+            },
+            SnapshotOptions {
+                dirty_crossover_percent: Some(10),
+                ..Default::default()
+            },
+            SnapshotOptions {
+                memory: true,
+                external_requirements: true,
+                ..Default::default()
+            },
+        ] {
+            let result = fixture.runtime.snapshot(&source, options, None).await;
+            assert!(
+                matches!(result, Err(LibVmError::InvalidRequest { .. })),
+                "{result:?}"
+            );
+        }
+        // A held launch lifetime is exactly what a running machine looks like.
+        let lifetime = fixture
+            .runtime
+            .machine_paths(fixture.source.machine_id())
+            .vmm_lock_path();
+        std::fs::create_dir_all(lifetime.parent().unwrap()).unwrap();
+        let held = crate::lock_manager::MachineLifetimeLock::try_acquire(&lifetime)
+            .unwrap()
+            .unwrap();
+        let result = fixture
+            .runtime
+            .snapshot(&source, SnapshotOptions::default(), None)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(LibVmError::SnapshotRequiresStoppedMachine { ref reference })
+                    if reference == "source"
+            ),
+            "{result:?}"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("stop it first, or include its memory"));
+        drop(held);
+        assert_eq!(
+            crate::machine::stopped_storage::live_catalog::snapshot(&fixture.home).await,
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_an_activation_hook_without_memory() {
+        let fixture = Fixture::new(false, false).await;
+        let info = fixture
+            .runtime
+            .snapshot(&source_ref(&fixture), SnapshotOptions::default(), None)
+            .await
+            .expect("real stopped snapshot")
+            .snapshot;
+        let before = crate::machine::stopped_storage::live_catalog::snapshot(&fixture.home).await;
+        let hook = vm_spec::restore::RestoreHook {
+            argv: vec!["/bin/true".into()],
+            environment: Vec::new(),
+            working_directory: "/".into(),
+            timeout_ms: 1000,
+        };
+        for without_memory in [true, false] {
+            let result = fixture
+                .runtime
+                .restore(
+                    RestoreSource::Local(SnapshotRef::Id(info.id)),
+                    RestoreOptions {
+                        name: Some("hooked".into()),
+                        without_memory,
+                        activation_hook: Some(hook.clone()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(LibVmError::InvalidRequest { .. })),
+                "without_memory={without_memory}: {result:?}"
+            );
+        }
+        assert_eq!(
+            crate::machine::stopped_storage::live_catalog::snapshot(&fixture.home).await,
+            before
+        );
+        assert!(fixture
+            .runtime
+            .get_machine(&MachineRef::parse("hooked").expect("name"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_publication_is_refused_publicly_and_settles_internally() {
+        let fixture = Fixture::new(false, false).await;
+        let info = fixture
+            .runtime
+            .snapshot(
+                &source_ref(&fixture),
+                SnapshotOptions {
+                    name: Some("saved".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("real stopped snapshot")
+            .snapshot;
+        // The public image push refuses a snapshot by type, by name or id.
+        for image in [
+            crate::ImageRef::Name("saved".into()),
+            crate::ImageRef::Id(crate::ImageId::from_sha256(*info.id.as_bytes())),
+        ] {
+            let result = fixture
+                .runtime
+                .images()
+                .publish_artifact(crate::ArtifactPublishRequest {
+                    image,
+                    destination: "registry.example/team/vm:v1".into(),
+                    encoding: crate::ArtifactEncoding::Zstd,
+                })
+                .await;
+            assert!(
+                matches!(result, Err(LibVmError::SnapshotIsNotAnImage { .. })),
+                "{result:?}"
+            );
+        }
+        // The crate-private exporter runs, then the registry policy refuses
+        // before any upload; the export operation is retired with it.
+        let store = fixture.runtime.native_store().unwrap();
+        let denied = Runtime::from_store(
+            fixture.runtime.local_paths().clone(),
+            std::sync::Arc::new(store.clone()),
+            crate::RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::new(crate::RegistryAction::Deny, Vec::new(), Vec::new())
+                .unwrap(),
+            fixture.components.clone(),
+            None,
+        )
+        .await
+        .expect("runtime with a deny-all registry policy");
+        let result = denied
+            .images()
+            .publish_snapshot_artifact(
+                SnapshotRef::Name("saved".into()),
+                "registry.example/team/vm:v1".into(),
+                crate::ArtifactEncoding::Zstd,
+            )
+            .await;
+        assert!(
+            matches!(
+                &result,
+                Err(LibVmError::ImageReferenceRejected { message, .. })
+                    if message.contains("denied by the registry policy")
+            ),
+            "{result:?}"
+        );
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation WHERE state<>'committed'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(pending, 0, "the failed export settled its operation");
     }
 }

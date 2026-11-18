@@ -218,18 +218,21 @@ impl Management {
             .0
             .pull_image(Request::new(w::PullImageRequest {
                 reference: reference.to_owned(),
+                pull_policy: w::PullPolicy::Unspecified as i32,
             }))
             .await?
             .into_inner();
-        let mut complete = false;
-        while let Some(progress) = stream.next().await {
-            let progress = progress?;
-            if complete || progress.event.is_none() {
-                return Err(invalid_response());
+        // Progress first, then exactly one terminal image.
+        let mut pulled = false;
+        while let Some(event) = stream.next().await {
+            match event?.event {
+                Some(w::pull_image_event::Event::Progress(progress))
+                    if !pulled && progress.event.is_some() => {}
+                Some(w::pull_image_event::Event::Image(_)) if !pulled => pulled = true,
+                _ => return Err(invalid_response()),
             }
-            complete = matches!(progress.event, Some(w::image_progress::Event::Complete(())));
         }
-        if complete {
+        if pulled {
             Ok(())
         } else {
             Err(invalid_response())

@@ -952,7 +952,7 @@ impl Machine {
                     )
                     .await?;
                 }
-                crate::SnapshotStore::from_store(std::sync::Arc::new(store))
+                crate::store::snapshot_store::SnapshotStore::from_store(std::sync::Arc::new(store))
                     .machine_capture_retained(config.id)
                     .await?
             }

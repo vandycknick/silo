@@ -236,15 +236,6 @@ CREATE TABLE image_manifest (
     last_used_at            INTEGER
 );
 
-CREATE TABLE image_ref (
-    requested_reference     TEXT PRIMARY KEY,
-    selected_reference      TEXT NOT NULL,
-    manifest_digest         TEXT NOT NULL REFERENCES image_manifest(digest) ON DELETE RESTRICT,
-    created_at              INTEGER NOT NULL,
-    updated_at              INTEGER NOT NULL,
-    last_used_at            INTEGER
-);
-
 CREATE TABLE image_config (
     manifest_digest         TEXT PRIMARY KEY REFERENCES image_manifest(digest) ON DELETE CASCADE,
     digest                  TEXT NOT NULL,
@@ -280,6 +271,8 @@ CREATE TABLE image_manifest_layer (
 );
 
 -- An OCI selection retains its layered composition; never a whole-lower copy.
+-- Its id is the selected manifest digest. Names live in image_name; the
+-- digest-pinned selection is derived from a name and the manifest digest.
 CREATE TABLE image_composition_artifact (
     image_id                TEXT PRIMARY KEY,
     manifest_digest         TEXT NOT NULL REFERENCES image_manifest(digest) ON DELETE RESTRICT,
@@ -295,7 +288,7 @@ CREATE TABLE image_composition_artifact (
 
 CREATE TABLE machine_rootfs (
     machine_id              TEXT PRIMARY KEY REFERENCES machine_config(id) ON DELETE CASCADE,
-    source_kind             TEXT NOT NULL CHECK (source_kind IN ('oci', 'disk', 'managed')),
+    source_kind             TEXT NOT NULL CHECK (source_kind IN ('oci', 'disk', 'stored')),
     requested_reference     TEXT NOT NULL,
     selected_reference      TEXT,
     manifest_digest         TEXT,
@@ -304,8 +297,8 @@ CREATE TABLE machine_rootfs (
     created_at              INTEGER NOT NULL
 );
 
-CREATE INDEX image_ref_manifest_digest_idx
-ON image_ref(manifest_digest);
+CREATE INDEX machine_rootfs_image_idx
+ON machine_rootfs(image_id);
 
 CREATE INDEX image_manifest_layer_layer_diff_id_idx
 ON image_manifest_layer(layer_diff_id);
@@ -322,12 +315,6 @@ CREATE TRIGGER image_manifest_created_at_immutable
 BEFORE UPDATE OF created_at ON image_manifest
 BEGIN
     SELECT RAISE(ABORT, 'image_manifest.created_at is immutable');
-END;
-
-CREATE TRIGGER image_ref_created_at_immutable
-BEFORE UPDATE OF created_at ON image_ref
-BEGIN
-    SELECT RAISE(ABORT, 'image_ref.created_at is immutable');
 END;
 
 CREATE TRIGGER image_config_created_at_immutable
@@ -745,8 +732,8 @@ BEGIN SELECT RAISE(ABORT, 'composition result is immutable'); END;
 CREATE TRIGGER composition_layer_immutable BEFORE UPDATE ON composition_layer
 BEGIN SELECT RAISE(ABORT, 'composition occurrence is immutable'); END;
 
--- Immutable storage and execution artifacts. Names are image: aliases;
--- explicit retention is independent of every alias.
+-- Immutable storage and execution artifacts. A record exists until it is
+-- removed; names are tags in the per-kind image_name and snapshot_name tables.
 CREATE TABLE storage_snapshot (
     id TEXT PRIMARY KEY NOT NULL,
     record_digest TEXT NOT NULL,
@@ -756,7 +743,6 @@ CREATE TABLE storage_snapshot (
         AND json_extract(CAST(record_bytes AS TEXT),'$.root.stream.chunkSize') IS 8388608
         AND json_type(CAST(record_bytes AS TEXT),'$.root.stream.mapPages') IS NULL
     ),
-    retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
     created_at INTEGER NOT NULL
 );
 CREATE TABLE storage_image (
@@ -768,7 +754,6 @@ CREATE TABLE storage_image (
         AND json_extract(CAST(record_bytes AS TEXT),'$.root.stream.chunkSize') IS 8388608
         AND json_type(CAST(record_bytes AS TEXT),'$.root.stream.mapPages') IS NULL
     ),
-    retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
     created_at INTEGER NOT NULL
 );
 CREATE TABLE image_stream_dependency (
@@ -806,20 +791,23 @@ CREATE TRIGGER image_provenance_immutable BEFORE UPDATE ON image_provenance
 BEGIN SELECT RAISE(ABORT, 'image provenance is immutable'); END;
 CREATE TRIGGER raw_conversion_result_immutable BEFORE UPDATE ON raw_conversion_result
 BEGIN SELECT RAISE(ABORT, 'raw conversion result is immutable'); END;
-CREATE TRIGGER image_kind_collision BEFORE INSERT ON storage_image
-WHEN EXISTS(SELECT 1 FROM storage_snapshot WHERE id=NEW.id)
-BEGIN SELECT RAISE(ABORT, 'managed identity has conflicting record kinds'); END;
-CREATE TRIGGER snapshot_kind_collision BEFORE INSERT ON storage_snapshot
-WHEN EXISTS(SELECT 1 FROM storage_image WHERE id=NEW.id)
-BEGIN SELECT RAISE(ABORT, 'managed identity has conflicting record kinds'); END;
-CREATE TABLE image_alias (
-    name TEXT PRIMARY KEY NOT NULL,
-    snapshot_id TEXT REFERENCES storage_snapshot(id) ON DELETE RESTRICT,
-    image_id TEXT REFERENCES storage_image(id) ON DELETE RESTRICT,
-    CHECK ((snapshot_id IS NOT NULL) + (image_id IS NOT NULL) = 1)
+-- One name table for both image kinds: a cached OCI selection or a stored
+-- image. Images and snapshots have separate name spaces.
+CREATE TABLE image_name (
+    name            TEXT PRIMARY KEY NOT NULL,
+    oci_image_id    TEXT REFERENCES image_composition_artifact(image_id) ON DELETE RESTRICT,
+    stored_image_id TEXT REFERENCES storage_image(id) ON DELETE RESTRICT,
+    updated_at      INTEGER NOT NULL,
+    CHECK ((oci_image_id IS NOT NULL) + (stored_image_id IS NOT NULL) = 1)
 );
-CREATE INDEX image_alias_snapshot_idx ON image_alias(snapshot_id);
-CREATE INDEX image_alias_image_idx ON image_alias(image_id, name);
+CREATE INDEX image_name_oci_idx ON image_name(oci_image_id, name);
+CREATE INDEX image_name_stored_idx ON image_name(stored_image_id, name);
+CREATE TABLE snapshot_name (
+    name        TEXT PRIMARY KEY NOT NULL,
+    snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE RESTRICT,
+    updated_at  INTEGER NOT NULL
+);
+CREATE INDEX snapshot_name_snapshot_idx ON snapshot_name(snapshot_id, name);
 CREATE TABLE snapshot_stream_dependency (
     snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE CASCADE,
     stream_id TEXT NOT NULL,

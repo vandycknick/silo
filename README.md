@@ -69,7 +69,7 @@ The profile requires Linux 6.6 or newer on libkrun; overlay compatibility is a k
 never silently substituted for raw. VZ rejects direct OCI and layered sources;
 use explicit `silo image convert REF --disk-format raw` and then create from the
 returned managed raw image. Imported disks remain opaque raw roots.
-Stopped snapshots and VM artifacts retain the exact fsmeta/pack graph, including
+Snapshots and VM artifacts retain the exact fsmeta/pack graph, including
 layer order and repetition, plus the upper and boot closure. Exact OCI
 regeneration is only a digest-gated fallback, not a portability requirement.
 
@@ -123,13 +123,13 @@ return a typed recovery-required error; unsupported or inconsistent state is
 rejected, not approximated. No host journal replay or implicit recovery occurs.
 Flattening preserves the visible namespace and hardlinks, removes OverlayFS
 controls and creates a new filesystem UUID/identity. It is not sanitization or
-an exact checkpoint. Export currently requires Linux direct boot; EFI and macOS
+an exact snapshot. Export currently requires Linux direct boot; EFI and macOS
 roots are rejected. No EFI layout or provider bootloader is synthesized.
 
 ## Live operations with stock images
 
 On supported libkrun hosts, stock systemd, busybox and OpenRC images support
-pause/resume, live snapshots, restore and live fork without an `init=` override.
+pause/resume, snapshots with memory, restore and live fork without an `init=` override.
 The image init remains PID 1 inside a contained cgroup namespace; Silo sessions
 use a separate workload cgroup. `silo info` reports boot mode `contained-init`.
 
@@ -138,8 +138,8 @@ silo create ghcr.io/vandycknick/archlinux:latest --name dev --memory 1gib
 silo start dev
 silo pause dev
 silo resume dev
-silo snapshot create dev --live --name dev-checkpoint
-silo restore image:dev-checkpoint --name restored
+silo snapshot create dev --memory --name dev-saved
+silo restore dev-saved --name restored
 silo fork dev --live --name child
 ```
 
@@ -155,16 +155,16 @@ use the machine name. Exact-byte copying caveats are documented in command help.
 Use `--format json` for scripts, including operation observation and cancellation:
 
 ```sh
-silo snapshot create dev --live --name saved --format json | jq .snapshot.id
+silo snapshot create dev --memory --name saved --format json | jq .snapshot.id
 silo fork dev --live --name scripted-child --format json | jq .children
 silo fork --operation UUID --format json
 silo fork --operation UUID --cancel --format json
-silo restore image:saved --name scripted-restore --format json | jq .id
+silo restore saved --name scripted-restore --format json | jq .id
 ```
 
-Snapshot JSON keeps its full capture result; stopped snapshot creation returns
-snapshot metadata directly. Restore and stopped fork JSON return an object with
-`id` and `name`, not a bare machine ID.
+Snapshot JSON keeps its full capture result; snapshot creation without memory
+returns snapshot metadata directly. Restore and stopped fork JSON return an
+object with `id` and `name`, not a bare machine ID.
 
 Before a restored or forked child runs image services, Silo reseeds the kernel
 RNG, reapplies networking, replaces an existing non-empty `/etc/machine-id` with
@@ -212,7 +212,7 @@ a bounded guest filesystem sync before the host force stop; a timeout is not
 proof of persistence or orderly image-service shutdown.
 See [ADR 0021](docs/adr/0021-live-snapshots-and-forks.md).
 
-Live snapshots and forks prefer incremental capture when a valid baseline exists;
+Snapshots with memory and live forks prefer incremental capture when a valid baseline exists;
 `--capture-policy full` remains an explicit override. Restore, fork and capture
 do not reserve host RAM; disk, descriptor and fork-count admission still apply.
 First owned reflink RAM publication trusts producer identities without readback.
@@ -305,7 +305,7 @@ make build
 The Linux development shell includes `pkg-config` and `virglrenderer` for
 compile-checking libkrun's optional GPU code. Compilation does not require a
 physical GPU; accelerated GPU runtime verification requires a suitable device
-and driver. This does not enable GPU live snapshots.
+and driver. This does not enable GPU snapshots with memory.
 
 On Apple Silicon macOS, this also downloads and verifies the prebuilt Rosetta
 probe, so no Linux builder is needed for normal development. Use
@@ -319,9 +319,15 @@ Run a temporary workload from an image:
 silo run ubuntu:24.04 -- uname -a
 ```
 
-Image operands are parsed in this order: `image:NAME` or `image:sha256:HEX`
-managed images and snapshots, then local disk images written as `disk:PATH`,
-then OCI registry references. Without `--name`, `run` creates a generated
+`create` and `run` take images only. An operand resolves in this order: an exact
+local image name, then each `search_registries` expansion already stored
+locally (`alpine:3.21` becomes `docker.io/library/alpine:3.21`), then a pull
+following `--pull always|missing|never` (default `missing`), then a unique image
+id prefix (`sha256:HEX`, at least 3 hex characters). Local names cannot contain
+`:` or `/`, so `hello:v2`, `nixos/nix` and `ghcr.io/...` are always registry
+references, and a local name shadows a registry short name. `disk:PATH` selects
+a local disk image. A snapshot name or snapshot artifact is refused with a hint
+to use `silo restore`. Without `--name`, `run` creates a generated
 ephemeral machine and removes it after the workload finishes.
 
 A `disk:PATH` source is a quiesced regular raw or qcow2 file (never a symlink),
@@ -349,26 +355,27 @@ raw image (required before an OCI root can run on VZ):
 ```bash
 silo image import ./cloud.qcow2 --platform linux/amd64 --root auto --boot linux-direct --name cloud
 silo image convert ubuntu:24.04 --disk-format raw --platform linux/arm64 --name ubuntu-raw
-silo create image:cloud --name web
-silo image inspect image:cloud
+silo create cloud --name web
+silo image inspect cloud
 silo image list
-silo image remove image:cloud     # removes the alias only
-silo image release image:sha256:HEX  # releases explicit retention only
+silo image rm cloud      # removes the name; the image goes with its last name
+silo image rm sha256:HEX # removes the image and all its names
+silo image prune         # removes unnamed images no machine uses
 ```
 
 `silo image list` and `silo snapshot list` print tables, omitting unavailable
 optional columns. Inspect commands group human-labelled key/value details, with
-readable creation times and comma-separated aliases. Image import, convert, pull
+readable creation times and comma-separated names. Image import, convert, pull
 and push also print key/value results by default. Add `--format json` to any of these commands (including
 `image inspect-remote` and `snapshot inspect`) to select the full JSON document:
 
 ```sh
 silo image list --format json | jq .
 silo snapshot list --format json | jq .
-silo image inspect image:cloud --format json | jq .
+silo image inspect cloud --format json | jq .
 ```
 
-`silo snapshot verify image:NAME` (or `image:sha256:HEX`) rereads and authenticates
+`silo snapshot verify NAME` (or an id) rereads and authenticates
 every RAM, state and disk byte of a local snapshot, ignoring trust receipts. It
 can take as long as reading the whole snapshot. Success reports the snapshot
 identity, stream count and verified bytes. `--format json` returns `snapshot`,
@@ -377,32 +384,42 @@ role, member or chunk, expected and actual identities, and recovery `guidance`,
 and still exit nonzero. Do not restore a failed snapshot; restore from another
 snapshot or re-create it.
 
-Aliases share one `image:` namespace with snapshots. A snapshot source preserves
-its complete captured configuration; only `--name` applies. Stopped checkpoints
-restore stopped; live execution checkpoints require compatible live-restore
-admission rather than falling back to a cold boot.
-For explicit storage-only recovery of a live checkpoint, use
-`silo recover-disks image:<CHECKPOINT> --name <CHILD>`. This creates a stopped
-machine with private disks and the captured boot assets, not resumed execution.
-Its stop outcome is unknown; an explicit `silo start <CHILD>` cold-boots it.
+Images and snapshots share one storage pool but have separate names, so an
+image `hello` and a snapshot `hello` can coexist. `silo snapshot create VM
+[--name N]` captures the disks of a stopped VM; add `--memory` on a running VM
+to capture RAM as well. A running VM without `--memory` is refused (stop it
+first), and `--memory` on a stopped VM is refused. `silo snapshot list` shows
+NAME(S), ID, MEMORY, SOURCE and CREATED. `silo snapshot rm` follows the same
+name and id semantics as `silo image rm`.
 
-Transfer a complete managed image through an OCI VM artifact:
+`silo restore REF [--name N] [--pull]` is the only way to turn a snapshot into a
+VM; it resolves like `create`, with the snapshot kind expected. A snapshot
+preserves its complete captured configuration; only `--name` applies. A
+snapshot without memory restores stopped; a snapshot with memory requires
+compatible live-restore admission rather than falling back to a cold boot.
+For explicit storage-only recovery, use
+`silo restore <SNAPSHOT> --without-memory --name <CHILD>`. This creates a stopped
+machine with private disks and the captured boot assets; RAM is discarded and
+the disks may need journal recovery on boot. Its stop outcome is unknown; an
+explicit `silo start <CHILD>` cold-boots it.
+
+Transfer a complete stored image through an OCI VM artifact:
 
 ```bash
-silo image push image:cloud registry.example/team/cloud:v1
+silo image push cloud registry.example/team/cloud:v1
 silo image inspect-remote registry.example/team/cloud:v1
-silo image pull registry.example/team/cloud:v1 --approve-digest sha256:HEX --name received
-silo create image:received --name web-copy
+silo image pull registry.example/team/cloud:v1
+silo create registry.example/team/cloud:v1 --name web-copy
 ```
 
-Use the immutable index digest reported by inspection for `--approve-digest`.
-Approval authorizes those exact bytes, not the publisher's identity.
-`--require-signature` fails closed until a signature verifier is integrated.
-Ordinary OCI creation does not implicitly acquire VM artifacts.
+Pulling adds the reference as the image name. Ordinary OCI creation does not
+implicitly acquire VM artifacts. `image pull` refuses a snapshot artifact (use
+`silo restore REF`), and `image push` refuses snapshots. Snapshot push is not
+available until it has mandatory encryption and a design for secrets held in
+memory; `silo restore REF` can still pull a snapshot artifact.
 Publication uses independent zstd chunks by default; `--raw` changes the transfer
-encoding, not the canonical image identity. Checkpoint publication additionally
-requires `--acknowledge-checkpoint`: disks and RAM can contain secrets and
-deleted-data remnants. Pull retains the complete closure without starting it.
+encoding, not the canonical image identity. Pull stores the complete closure
+without starting it.
 
 A machine never changes kernel or initramfs on its own. `silo info` shows the
 pinned bundle and a newer locally admitted packaged bundle when one exists;

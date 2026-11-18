@@ -1,7 +1,8 @@
 //! OCI VM artifact publication and acquisition (ADR 0014 "OCI VM Artifact
-//! And Chunked Distribution", "Config and trust"). The registry adapter moves
-//! exact bytes; this module owns semantic export, verified import and the
-//! public orchestration around them.
+//! And Chunked Distribution"). The registry adapter moves exact bytes; this
+//! module owns semantic export, verified import and the orchestration around
+//! them. Images publish publicly; snapshot publication is crate-private until
+//! snapshot push has an encryption design.
 //!
 //! RAM and disk identities authenticate sparse Merkle maps, exact lengths and
 //! identity-unit profiles independently of the 8 MiB transport payloads.
@@ -36,7 +37,7 @@ use oci::vm_artifact::codec::ChunkEncoding;
 use oci::vm_artifact::graph::{Descriptor, VerifiedVmGraph};
 use serde::{Deserialize, Serialize};
 
-use crate::image::import_types::{ManagedSourceId, ManagedSourceInfo, ManagedSourceRef};
+use crate::image::import_types::{ImageRef, StoredImageInfo};
 use crate::image::oci::image_error;
 use crate::image::transport::blobs::StagedBlobs;
 use crate::image::transport::closure::object;
@@ -44,10 +45,12 @@ use crate::image::transport::export::{prepare_artifact_export, ExportSource, Pre
 use crate::image::transport::import::{
     acquisition_space_charge, verify_imported_artifact, ImportStaging,
 };
+use crate::image::transport::receipt::ResolvedIndex;
+use crate::resolve::Kind;
 use crate::storage::identity::{ImageId, ObjectDigest, SnapshotId};
 use crate::storage::pool::{OperationPaths, StoragePool};
-use crate::store::models::storage::{BackendRequirement, GuestArchitecture};
-use crate::store::snapshot_store::{SnapshotCaptureKindName, SnapshotRef, SnapshotStore};
+use crate::store::models::storage::GuestArchitecture;
+use crate::store::snapshot_store::{SnapshotInfo, SnapshotRef, SnapshotStore};
 use crate::store::Store;
 use crate::LibVmError;
 
@@ -57,7 +60,7 @@ pub(crate) mod export;
 pub(crate) mod identity;
 pub(crate) mod import;
 pub(crate) mod provenance;
-pub(crate) mod trust;
+pub(crate) mod receipt;
 
 pub(crate) use crate::image::transport::import::{VerifiedContent, VerifiedImportedArtifact};
 
@@ -73,31 +76,33 @@ pub enum ArtifactEncoding {
     Raw,
 }
 
-/// Explicit acknowledgement that checkpoint disks (and RAM, for a live
-/// checkpoint) export secrets and deleted-data remnants to `destination`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CheckpointPublication {
-    pub destination: String,
+/// The content a VM artifact carries: one image or one snapshot, by id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "id",
+    rename_all = "kebab-case",
+    deny_unknown_fields
+)]
+pub enum ArtifactContent {
+    Image(ImageId),
+    Snapshot(SnapshotId),
 }
 
-/// Publish one managed image or snapshot as an OCI VM artifact.
+/// The local record an acquisition committed.
+pub(crate) enum AcquiredContent {
+    Image(Box<StoredImageInfo>),
+    Snapshot(Box<SnapshotInfo>),
+}
+
+/// Publish one stored image as an OCI VM artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArtifactPublishRequest {
-    pub source: ManagedSourceRef,
+    pub image: ImageRef,
     /// `registry/repository[:tag]`; a digest form is rejected.
     pub destination: String,
     pub encoding: ArtifactEncoding,
-    /// Required for every snapshot and must name exactly `destination`.
-    pub checkpoint_acknowledgement: Option<CheckpointPublication>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ArtifactPurpose {
-    Image,
-    Checkpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,44 +113,24 @@ pub struct ArtifactPublishReport {
     /// only the value observed at publication time.
     pub index_digest: ObjectDigest,
     pub tag: Option<String>,
-    pub source: ManagedSourceId,
-    pub purpose: ArtifactPurpose,
-    pub capture_kind: Option<SnapshotCaptureKindName>,
+    pub content: ArtifactContent,
 }
 
-/// Explicit local trust decision for one acquisition. Resolving a tag never
-/// approves anything by itself.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum ArtifactTrust {
-    /// Admit exactly this immutable index digest; publisher unauthenticated.
-    ApproveDigest { digest: ObjectDigest },
-    /// Require a verified publisher signature. No verifier is integrated, so
-    /// this fails closed rather than degrading to digest approval.
-    RequireSignature,
-}
-
+/// Acquire a Silo image artifact into a stored image. The canonical
+/// reference becomes a name of the image; `name` adds a local name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArtifactAcquireRequest {
     pub reference: String,
-    pub trust: ArtifactTrust,
-    pub alias: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PublisherAuthentication {
-    Unauthenticated,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArtifactAcquireReport {
-    pub source: ManagedSourceInfo,
+    pub image: StoredImageInfo,
     pub repository: String,
     pub index_digest: ObjectDigest,
-    pub publisher: PublisherAuthentication,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,73 +140,123 @@ pub enum ArtifactRootFamily {
     LinuxOverlay,
 }
 
-/// Bounded, structurally verified but untrusted metadata. Nothing is retained,
-/// approved or booted by inspection.
+/// Bounded, structurally verified but untrusted metadata. Nothing is
+/// retained or booted by inspection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArtifactInspection {
     pub repository: String,
     pub index_digest: ObjectDigest,
-    pub content: ManagedSourceId,
-    pub purpose: ArtifactPurpose,
-    pub capture_kind: Option<SnapshotCaptureKindName>,
-    pub root_family: ArtifactRootFamily,
-    pub backend: BackendRequirement,
+    pub content: ArtifactContent,
+    pub root: ArtifactRootFamily,
     pub guest_architecture: GuestArchitecture,
-    pub live_restore: bool,
+    /// Whether the snapshot includes memory; always false for images.
+    pub memory: bool,
+}
+
+/// One verified acquisition and where it came from.
+struct Acquisition {
+    content: AcquiredContent,
+    repository: String,
+    index_digest: ObjectDigest,
 }
 
 impl crate::image::Images {
-    /// Resolve and verify an artifact's metadata graph without approval,
-    /// payload acquisition or any local state change.
+    /// Resolve and verify an artifact's metadata graph without payload
+    /// acquisition or any local state change.
     pub async fn inspect_artifact(
         &self,
         reference: &str,
     ) -> Result<ArtifactInspection, LibVmError> {
         let registry = self.artifact_registry(reference)?;
-        let resolution = registry
-            .resolve(reference)
-            .await
-            .map_err(|error| image_error(reference, error))?;
+        let (canonical, resolution) = self.resolve_artifact(&registry, reference).await?;
         let graph = registry
             .inspect(&resolution)
             .await
-            .map_err(|error| image_error(reference, error))?;
+            .map_err(|error| image_error(&canonical, error))?;
         Ok(inspection(&resolution, graph.config()))
     }
 
-    /// Acquire an approved immutable artifact into explicit local retention.
+    /// Acquire a Silo image artifact into a stored image. A snapshot
+    /// artifact is refused before any payload is fetched.
     pub async fn acquire_artifact(
         &self,
         request: ArtifactAcquireRequest,
     ) -> Result<ArtifactAcquireReport, LibVmError> {
+        let acquisition = self
+            .acquire(request.reference, Kind::Image, request.name)
+            .await?;
+        let AcquiredContent::Image(image) = acquisition.content else {
+            return Err(blobs::invalid("config", "acquired content is not an image"));
+        };
+        Ok(ArtifactAcquireReport {
+            image: *image,
+            repository: acquisition.repository,
+            index_digest: acquisition.index_digest,
+        })
+    }
+
+    /// Acquire a Silo snapshot artifact for `Runtime::restore`. An image
+    /// artifact is refused before any payload is fetched.
+    pub(crate) async fn acquire_snapshot_artifact(
+        &self,
+        reference: String,
+    ) -> Result<SnapshotInfo, LibVmError> {
+        let acquisition = self.acquire(reference, Kind::Snapshot, None).await?;
+        let AcquiredContent::Snapshot(snapshot) = acquisition.content else {
+            return Err(blobs::invalid(
+                "config",
+                "acquired content is not a snapshot",
+            ));
+        };
+        Ok(*snapshot)
+    }
+
+    async fn acquire(
+        &self,
+        reference: String,
+        kind: Kind,
+        name: Option<String>,
+    ) -> Result<Acquisition, LibVmError> {
         // Cache and verification workers may outlive the caller's future.
         // Keep their operation owner through publication and cleanup.
         let images = self.clone();
-        tokio::spawn(async move { images.acquire_artifact_owned(request).await }).await?
+        tokio::spawn(async move { images.acquire_owned(&reference, kind, name).await }).await?
     }
 
-    async fn acquire_artifact_owned(
+    async fn acquire_owned(
         &self,
-        request: ArtifactAcquireRequest,
-    ) -> Result<ArtifactAcquireReport, LibVmError> {
-        let reference = request.reference.as_str();
-        if let Some(alias) = &request.alias {
-            crate::store::snapshot_store::validate_alias(alias)?;
+        reference: &str,
+        kind: Kind,
+        name: Option<String>,
+    ) -> Result<Acquisition, LibVmError> {
+        if let Some(name) = &name {
+            crate::store::names::validate_name(name)?;
         }
         let registry = self.artifact_registry(reference)?;
-        let resolution = registry
-            .resolve(reference)
-            .await
-            .map_err(|error| image_error(reference, error))?;
+        let (canonical, resolution) = self.resolve_artifact(&registry, reference).await?;
         let index_digest = object(resolution.digest());
         let repository = resolution.repository();
-        // Approval precedes every payload fetch and every publication.
-        let approved = trust::approve(&repository, index_digest, &request.trust)?;
+        let resolved = ResolvedIndex::new(&repository, index_digest)?;
         let graph = registry
             .inspect(&resolution)
             .await
-            .map_err(|error| image_error(reference, error))?;
+            .map_err(|error| image_error(&canonical, error))?;
+        // The content kind is checked before any payload is fetched.
+        match (kind, graph.config().content.kind) {
+            (Kind::Image, oci::vm_artifact::wire::ContentKind::Image)
+            | (Kind::Snapshot, oci::vm_artifact::wire::ContentKind::Snapshot) => {}
+            (Kind::Image, oci::vm_artifact::wire::ContentKind::Snapshot) => {
+                return Err(LibVmError::ArtifactIsSnapshot {
+                    reference: reference.to_owned(),
+                })
+            }
+            (Kind::Snapshot, oci::vm_artifact::wire::ContentKind::Image) => {
+                return Err(LibVmError::ArtifactIsImage {
+                    reference: reference.to_owned(),
+                })
+            }
+        }
         let store = Arc::new(self.runtime.native_store()?);
         let images = self.runtime.local_images_dir().to_path_buf();
         let pool = StoragePool::open(&images)?;
@@ -237,73 +272,132 @@ impl crate::image::Images {
                 let bytes = registry
                     .fetch_blob(&resolution, &Descriptor::from_payload(payload))
                     .await
-                    .map_err(|error| image_error(reference, error))?;
+                    .map_err(|error| image_error(&canonical, error))?;
                 let writer = cache.try_clone()?;
                 tokio::task::spawn_blocking(move || writer.insert(&payload, &bytes)).await??;
             }
-            let approved_at = unix_ms()?;
+            let acquired_at = unix_ms()?;
             let staging = ImportStaging {
                 operation,
                 store: store.clone(),
                 blobs: cache,
             };
             let verified = tokio::task::spawn_blocking(move || {
-                verify_imported_artifact(&graph, &approved, approved_at, staging)
+                verify_imported_artifact(&graph, &resolved, acquired_at, staging)
             })
             .await??;
-            commit_acquisition(&store, operation_id, verified, request.alias.clone()).await
+            commit_acquisition(&store, operation_id, verified, canonical.clone(), name).await
         }
         .await;
-        let source = settle(&store, &pool, result).await?;
-        Ok(ArtifactAcquireReport {
-            source,
+        let content = settle(&store, &pool, result).await?;
+        Ok(Acquisition {
+            content,
             repository,
             index_digest,
-            publisher: PublisherAuthentication::Unauthenticated,
         })
     }
 
-    /// Publish a managed image or snapshot as one fixed exact encoding.
+    /// The first `search_registries` expansion of `reference` that resolves
+    /// to a VM artifact index, with the canonical reference it resolved as.
+    async fn resolve_artifact(
+        &self,
+        registry: &ArtifactRegistry,
+        reference: &str,
+    ) -> Result<(String, ArtifactResolution), LibVmError> {
+        let candidates = self
+            .runtime
+            .registry_policy()
+            .candidates(reference)
+            .map_err(|error| image_error(reference, error))?;
+        let mut first_error = None;
+        for candidate in candidates {
+            let candidate = candidate.to_string();
+            match registry.resolve(&candidate).await {
+                Ok(resolution) => return Ok((candidate, resolution)),
+                Err(error) => {
+                    first_error.get_or_insert_with(|| image_error(&candidate, error));
+                }
+            }
+        }
+        Err(first_error.unwrap_or_else(|| LibVmError::ImageNotFound {
+            reference: reference.to_owned(),
+        }))
+    }
+
+    /// Publish a stored image as one fixed exact encoding.
     pub async fn publish_artifact(
         &self,
         request: ArtifactPublishRequest,
     ) -> Result<ArtifactPublishReport, LibVmError> {
+        let local = self.runtime.resolve_local_image(&request.image).await?;
+        let crate::resolve::LocalRecord::Image(crate::store::image_store::LocalImage::Stored(id)) =
+            local.record
+        else {
+            return Err(LibVmError::InvalidRequest {
+                message: format!(
+                    "{} is a cached OCI image; only stored images can be published as VM artifacts",
+                    request.image
+                ),
+            });
+        };
         let images = self.clone();
-        tokio::spawn(async move { images.publish_artifact_owned(request).await }).await?
+        tokio::spawn(async move {
+            images
+                .publish_owned(
+                    PublishSource::Image(id),
+                    &request.destination,
+                    request.encoding,
+                )
+                .await
+        })
+        .await?
     }
 
-    async fn publish_artifact_owned(
+    /// Publish a snapshot. Crate-private: snapshot push stays unreachable
+    /// for SDK and daemon callers until it has an encryption design for
+    /// disks and memory (DESIGN section 9); tests exercise the exporter.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "snapshot push is reachable from tests only")
+    )]
+    pub(crate) async fn publish_snapshot_artifact(
         &self,
-        request: ArtifactPublishRequest,
+        snapshot: SnapshotRef,
+        destination: String,
+        encoding: ArtifactEncoding,
     ) -> Result<ArtifactPublishReport, LibVmError> {
-        let (repository, tag) = parse_destination(&request.destination)?;
-        let registry = self.artifact_registry(&request.destination)?;
+        let images = self.clone();
+        tokio::spawn(async move {
+            images
+                .publish_owned(PublishSource::Snapshot(snapshot), &destination, encoding)
+                .await
+        })
+        .await?
+    }
+
+    async fn publish_owned(
+        &self,
+        source: PublishSource,
+        destination: &str,
+        encoding: ArtifactEncoding,
+    ) -> Result<ArtifactPublishReport, LibVmError> {
+        let (repository, tag) = parse_destination(destination)?;
+        let registry = self.artifact_registry(destination)?;
         let store = Arc::new(self.runtime.native_store()?);
-        let managed =
-            crate::store::managed_image_store::ManagedImageStore::from_store(store.clone());
-        let source = match managed.resolve(&request.source).await? {
-            ManagedSourceId::Image(id) => ExportSource::Image(Box::new(
-                managed.consume(&ManagedSourceRef::Image(id)).await?,
+        let source = match source {
+            PublishSource::Image(id) => ExportSource::Image(Box::new(
+                crate::store::stored_image_store::StoredImageStore::from_store(store.clone())
+                    .consume(id)
+                    .await?,
             )),
-            ManagedSourceId::Snapshot(id) => {
-                if request
-                    .checkpoint_acknowledgement
-                    .as_ref()
-                    .is_none_or(|acknowledged| acknowledged.destination != request.destination)
-                {
-                    return Err(LibVmError::CheckpointPublicationNotAcknowledged {
-                        destination: request.destination.clone(),
-                    });
-                }
-                ExportSource::Snapshot(Box::new(
-                    SnapshotStore::from_store(store.clone())
-                        .consume(&SnapshotRef::Id(id))
-                        .await?,
-                ))
-            }
+            PublishSource::Snapshot(reference) => ExportSource::Snapshot(Box::new(
+                SnapshotStore::from_store(store.clone())
+                    .consume(&reference)
+                    .await?,
+            )),
         };
         let pool = StoragePool::open(self.runtime.local_images_dir())?;
-        let encoding = match request.encoding {
+        let encoding = match encoding {
             ArtifactEncoding::Zstd => ChunkEncoding::Zstd,
             ArtifactEncoding::Raw => ChunkEncoding::Raw,
         };
@@ -316,38 +410,21 @@ impl crate::image::Images {
             .await??;
             let index_digest = push(
                 &registry,
-                &request.destination,
+                destination,
                 &repository,
                 tag.as_deref(),
                 &prepared,
             )
             .await?;
-            Ok::<_, LibVmError>((
-                index_digest,
-                prepared.content,
-                prepared.live,
-                prepared.stopped_snapshot,
-            ))
+            Ok::<_, LibVmError>((index_digest, prepared.content))
         }
         .await;
-        let (index_digest, content, live, stopped) = settle(&store, &pool, result).await?;
+        let (index_digest, content) = settle(&store, &pool, result).await?;
         Ok(ArtifactPublishReport {
             repository,
             index_digest,
             tag,
-            source: content,
-            purpose: if matches!(content, ManagedSourceId::Image(_)) {
-                ArtifactPurpose::Image
-            } else {
-                ArtifactPurpose::Checkpoint
-            },
-            capture_kind: if live {
-                Some(SnapshotCaptureKindName::LiveExecution)
-            } else if stopped {
-                Some(SnapshotCaptureKindName::StoppedStorage)
-            } else {
-                None
-            },
+            content,
         })
     }
 
@@ -355,6 +432,12 @@ impl crate::image::Images {
         ArtifactRegistry::new(self.runtime.registry_policy().clone())
             .map_err(|error| image_error(reference, error))
     }
+}
+
+/// What `publish_owned` exports.
+enum PublishSource {
+    Image(ImageId),
+    Snapshot(SnapshotRef),
 }
 
 /// Register an acquisition and admit its complete worst-case disk peak on the
@@ -393,11 +476,13 @@ async fn commit_acquisition(
     store: &Store,
     operation: uuid::Uuid,
     verified: VerifiedImportedArtifact,
-    alias: Option<String>,
-) -> Result<ManagedSourceInfo, LibVmError> {
-    let committed = crate::store::artifact_store::commit_imported_artifact(verified, alias).await?;
+    reference: String,
+    name: Option<String>,
+) -> Result<AcquiredContent, LibVmError> {
+    let committed =
+        crate::store::artifact_store::commit_imported_artifact(verified, reference, name).await?;
     store.release_import_space(operation).await?;
-    Ok(committed.info.clone())
+    Ok(committed.content)
 }
 
 /// Upload blobs, then child manifests by digest, then the index by digest and
@@ -503,34 +588,22 @@ fn inspection(
     use oci::vm_artifact::wire;
     let id = *config.content.id.as_bytes();
     let content = match config.content.kind {
-        wire::ContentKind::Image => ManagedSourceId::Image(ImageId::from_sha256(id)),
-        wire::ContentKind::Snapshot => ManagedSourceId::Snapshot(SnapshotId::from_sha256(id)),
+        wire::ContentKind::Image => ArtifactContent::Image(ImageId::from_sha256(id)),
+        wire::ContentKind::Snapshot => ArtifactContent::Snapshot(SnapshotId::from_sha256(id)),
     };
     ArtifactInspection {
         repository: resolution.repository(),
         index_digest: object(resolution.digest()),
         content,
-        purpose: match config.purpose {
-            wire::Purpose::Image => ArtifactPurpose::Image,
-            wire::Purpose::Checkpoint => ArtifactPurpose::Checkpoint,
-        },
-        capture_kind: config.capture_kind.map(|kind| match kind {
-            wire::CaptureKind::StoppedStorage => SnapshotCaptureKindName::StoppedStorage,
-            wire::CaptureKind::LiveExecution => SnapshotCaptureKindName::LiveExecution,
-        }),
-        root_family: match config.root_family {
+        root: match config.root_family {
             wire::RootFamily::OpaqueRaw => ArtifactRootFamily::OpaqueRaw,
             wire::RootFamily::LinuxOverlay => ArtifactRootFamily::LinuxOverlay,
-        },
-        backend: match config.backend_requirement {
-            wire::BackendRequirement::RawBlock => BackendRequirement::RawBlock,
-            wire::BackendRequirement::KrunOverlay => BackendRequirement::KrunOverlay,
         },
         guest_architecture: match config.guest_platform.architecture {
             wire::Architecture::Amd64 => GuestArchitecture::Amd64,
             wire::Architecture::Arm64 => GuestArchitecture::Arm64,
         },
-        live_restore: config.minimum_capabilities.live_restore,
+        memory: config.capture_kind == Some(wire::CaptureKind::LiveExecution),
     }
 }
 
@@ -602,7 +675,6 @@ pub(crate) mod tests {
         TransferRoot, VmArtifactConfigV2, CHUNK_SIZE, MAX_STREAM_BYTES,
     };
 
-    use crate::image::import_types::{ManagedSourceId, ManagedSourceInfo, ManagedSourceRef};
     use crate::image::transport::blobs::StagedBlobs;
     use crate::image::transport::closure::{
         canonical_map_bytes, content, identity, object, Semantic, SemanticRecord,
@@ -614,18 +686,19 @@ pub(crate) mod tests {
         acquisition_space_charge, verify_imported_artifact, ImportStaging, VerifiedContent,
         VerifiedImportedArtifact,
     };
+    use crate::image::transport::receipt::ResolvedIndex;
     use crate::image::transport::{
-        begin_acquisition, commit_acquisition, parse_destination, trust, ArtifactTrust,
+        begin_acquisition, commit_acquisition, parse_destination, AcquiredContent,
     };
     use crate::paths::{LocalPaths, OwnedDirectory};
     use crate::storage::identity::{ImageId, ObjectDigest};
     use crate::storage::map::{AuthenticatedMap, MapNodeWriter};
     use crate::storage::pool::StoragePool;
     use crate::store::artifact_store::commit_imported_artifact;
-    use crate::store::managed_image_store::ManagedImageStore;
     use crate::store::models::image::{ImageRecord, ImageRecordKind};
     use crate::store::models::snapshot::SnapshotStream;
     use crate::store::snapshot_store::SnapshotRef;
+    use crate::store::stored_image_store::StoredImageStore;
     use crate::store::Store;
     use crate::LibVmError;
     use vm_spec::capture::Sha256Digest;
@@ -634,6 +707,8 @@ pub(crate) mod tests {
     };
 
     pub(crate) const REPOSITORY: &str = "registry.example/team/vm";
+    /// The canonical reference an acquisition commits as the record's name.
+    pub(crate) const REFERENCE: &str = "registry.example/team/vm:v1";
 
     /// Exact bytes of one encoding, as a registry would serve them.
     pub(crate) struct Transfer {
@@ -721,19 +796,17 @@ pub(crate) mod tests {
         StagedBlobs::transport_cache(store.images_path()).unwrap()
     }
 
+    /// Verify `transfer` as acquired from [`REPOSITORY`] after resolving the
+    /// index `resolved`.
     pub(crate) async fn verify(
         transfer: &Transfer,
         staging: ImportStaging,
-        approved: ObjectDigest,
+        resolved: ObjectDigest,
     ) -> Result<VerifiedImportedArtifact, LibVmError> {
         let graph = verified_graph(transfer);
-        let trust = trust::approve(
-            REPOSITORY,
-            object(graph.index_digest()),
-            &ArtifactTrust::ApproveDigest { digest: approved },
-        )?;
+        let resolved = ResolvedIndex::new(REPOSITORY, resolved)?;
         tokio::task::spawn_blocking(move || {
-            verify_imported_artifact(&graph, &trust, 1_700_000_000_000, staging)
+            verify_imported_artifact(&graph, &resolved, 1_700_000_000_000, staging)
         })
         .await
         .unwrap()
@@ -1095,7 +1168,7 @@ pub(crate) mod tests {
     pub(crate) async fn layered_image() -> (
         tempfile::TempDir,
         Arc<Store>,
-        ManagedImageStore,
+        StoredImageStore,
         ImageId,
         ImageRecord,
     ) {
@@ -1106,7 +1179,7 @@ pub(crate) mod tests {
 
     pub(crate) async fn layered_image_in(
         store: Arc<Store>,
-    ) -> (ManagedImageStore, ImageId, ImageRecord) {
+    ) -> (StoredImageStore, ImageId, ImageRecord) {
         use crate::store::models::snapshot::{
             SnapshotComposition, SnapshotLayer, SnapshotRootProfile,
         };
@@ -1292,7 +1365,7 @@ pub(crate) mod tests {
             boot: snapshot.boot,
             process: crate::ProcessConfig::default(),
         };
-        let images = ManagedImageStore::from_store(store.clone());
+        let images = StoredImageStore::from_store(store.clone());
         let info = images
             .publish_owned(record.clone(), operation, lease, None, Vec::new(), None)
             .await
@@ -1378,9 +1451,12 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let commit = commit_imported_artifact(verified, None).await.unwrap();
+        let commit = commit_imported_artifact(verified, REFERENCE.into(), None)
+            .await
+            .unwrap();
         assert!(
-            matches!(&commit.info, crate::ManagedSourceInfo::Snapshot(imported) if imported.id == info.id)
+            matches!(&commit.content, AcquiredContent::Snapshot(imported)
+                if imported.id == info.id && imported.names == [REFERENCE])
         );
         let imported = crate::store::snapshot_store::SnapshotStore::from_store(destination.clone());
         let consumer = imported.consume(&SnapshotRef::Id(info.id)).await.unwrap();
@@ -1411,9 +1487,7 @@ pub(crate) mod tests {
         let (producer, source, images, id, record) = layered_image().await;
         let prepared = export(
             source.clone(),
-            ExportSource::Image(Box::new(
-                images.consume(&ManagedSourceRef::Image(id)).await.unwrap(),
-            )),
+            ExportSource::Image(Box::new(images.consume(id).await.unwrap())),
             ChunkEncoding::Raw,
         )
         .await;
@@ -1457,21 +1531,24 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let committed = commit_imported_artifact(verified, None).await.unwrap();
-        assert!(
-            matches!(&committed.info, crate::ManagedSourceInfo::Image(imported) if imported.id == id)
-        );
+        let committed = commit_imported_artifact(verified, REFERENCE.into(), Some("local".into()))
+            .await
+            .unwrap();
+        let AcquiredContent::Image(imported) = &committed.content else {
+            panic!("image import produced another kind");
+        };
+        assert_eq!(imported.id, id);
+        let mut names = imported.names.clone();
+        names.sort();
+        assert_eq!(names, ["local", REFERENCE]);
         let pool = StoragePool::open(destination.images_path()).unwrap();
         assert!(pool.object_path(&lower.fsmeta).is_file());
         assert!(!pool.stream_path(&fsmeta_stream).exists());
         assert!(!pool
             .stream_path(&crate::image::transport::closure::stream_id(lower_stream))
             .exists());
-        let imported = ManagedImageStore::from_store(destination.clone());
-        let retained = imported
-            .consume(&ManagedSourceRef::Image(id))
-            .await
-            .unwrap();
+        let imported = StoredImageStore::from_store(destination.clone());
+        let retained = imported.consume(id).await.unwrap();
         assert_eq!(retained.info.record, record);
         let republished = export(
             destination,
@@ -1523,9 +1600,7 @@ pub(crate) mod tests {
         let (_home, source, images, id, _) = layered_image().await;
         let prepared = export(
             source,
-            ExportSource::Image(Box::new(
-                images.consume(&ManagedSourceRef::Image(id)).await.unwrap(),
-            )),
+            ExportSource::Image(Box::new(images.consume(id).await.unwrap())),
             ChunkEncoding::Raw,
         )
         .await;
@@ -1583,7 +1658,7 @@ pub(crate) mod tests {
     async fn repeated_chunk_image() -> (
         tempfile::TempDir,
         Arc<Store>,
-        ManagedImageStore,
+        StoredImageStore,
         ImageId,
         ImageRecord,
         Vec<u8>,
@@ -1637,7 +1712,7 @@ pub(crate) mod tests {
         };
         record.root.geometry.length = map.length;
         record.root.stream = map;
-        let images = ManagedImageStore::from_store(store.clone());
+        let images = StoredImageStore::from_store(store.clone());
         let info = images
             .publish_owned(record.clone(), operation, lease, None, Vec::new(), None)
             .await
@@ -1706,7 +1781,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn image_round_trip_keeps_identity_across_encodings_with_one_receipt_each() {
         let (temp, images, record, operation, lease) =
-            crate::store::managed_image_store::tests::fixture().await;
+            crate::store::stored_image_store::tests::fixture().await;
         let info = images
             .publish_owned(record.clone(), operation, lease, None, Vec::new(), None)
             .await
@@ -1718,18 +1793,14 @@ pub(crate) mod tests {
         );
         let mut transfers = Vec::new();
         for encoding in [ChunkEncoding::Zstd, ChunkEncoding::Raw, ChunkEncoding::Zstd] {
-            let consumer = images
-                .consume(&ManagedSourceRef::Image(info.id))
-                .await
-                .unwrap();
+            let consumer = images.consume(info.id).await.unwrap();
             let prepared = export(
                 source.clone(),
                 ExportSource::Image(Box::new(consumer)),
                 encoding,
             )
             .await;
-            assert_eq!(prepared.content, ManagedSourceId::Image(info.id));
-            assert!(!prepared.live && !prepared.stopped_snapshot);
+            assert_eq!(prepared.content, crate::ArtifactContent::Image(info.id));
             transfers.push(transfer(&prepared.graph, &prepared.payloads()));
         }
         // Encoding changes the index digest, never the canonical identity.
@@ -1746,18 +1817,19 @@ pub(crate) mod tests {
             let verified = verify(transfer, staging, index_digest(transfer))
                 .await
                 .unwrap();
-            let committed = commit_acquisition(&destination, operation, verified, None)
-                .await
-                .unwrap();
+            let committed =
+                commit_acquisition(&destination, operation, verified, REFERENCE.into(), None)
+                    .await
+                    .unwrap();
             // Every copy exists: the committed pull no longer holds its peak.
             assert_eq!(reservation(&destination, operation).await, None);
             assert!(!ledger_holds(&destination, operation));
-            let ManagedSourceInfo::Image(imported) = &committed else {
+            let AcquiredContent::Image(imported) = &committed else {
                 panic!("image import produced another kind");
             };
             assert_eq!(imported.id, info.id);
             assert_eq!(imported.record, record);
-            assert!(imported.retained);
+            assert_eq!(imported.names, [REFERENCE]);
         }
         let catalog = database(&destination).await;
         let bytes: Vec<u8> =
@@ -1785,11 +1857,8 @@ pub(crate) mod tests {
         );
         // The imported image is consumable from the destination's own pool.
         let destination_images =
-            crate::store::managed_image_store::ManagedImageStore::from_store(destination.clone());
-        let consumer = destination_images
-            .consume(&ManagedSourceRef::Image(info.id))
-            .await
-            .unwrap();
+            crate::store::stored_image_store::StoredImageStore::from_store(destination.clone());
+        let consumer = destination_images.consume(info.id).await.unwrap();
         assert_eq!(consumer.info.record, record);
     }
 
@@ -1805,16 +1874,16 @@ pub(crate) mod tests {
             ChunkEncoding::Zstd,
         )
         .await;
-        assert!(prepared.stopped_snapshot && !prepared.live);
+        assert_eq!(prepared.content, crate::ArtifactContent::Snapshot(info.id));
         let staged = prepared.payloads();
         let good = transfer(&prepared.graph, &staged);
         let (_destination_temp, destination) = home().await;
 
-        // A different approved digest never admits this index.
+        // An index other than the one resolution observed is never admitted.
         let staging = stage(&destination, &good).await;
         assert!(matches!(
             verify(&good, staging, ObjectDigest::of_bytes(b"other index")).await,
-            Err(LibVmError::ArtifactTrustMismatch { .. })
+            Err(LibVmError::ArtifactInvalid { .. })
         ));
 
         // A well-formed config that contradicts the canonical record.
@@ -1897,8 +1966,8 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), good.blobs[&chunk.digest]);
         let verified = verify(&good, staging, index_digest(&good)).await.unwrap();
         let parts = verified.into_parts();
-        let VerifiedContent::StoppedSnapshot { id, bytes, .. } = &parts.content else {
-            panic!("stopped snapshot expected");
+        let VerifiedContent::SnapshotWithoutMemory { id, bytes, .. } = &parts.content else {
+            panic!("snapshot without memory expected");
         };
         assert_eq!(*id, info.id);
         assert_eq!(*bytes, record.canonical_bytes().unwrap());
@@ -1920,7 +1989,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn live_checkpoint_imports_portable_seal_without_local_capture_authority() {
+    async fn snapshot_with_memory_imports_portable_seal_without_local_capture_authority() {
         let fixture = crate::store::capture::tests::fixture().await;
         let (directory, _) = crate::store::capture::tests::seal(&fixture);
         let changes = std::fs::read(
@@ -1936,7 +2005,7 @@ pub(crate) mod tests {
             .publish_capture(
                 capture,
                 directory.path(),
-                fixture.reservation.record.alias.clone(),
+                fixture.reservation.record.name.clone(),
                 crate::storage::pool::PublicationLockPolicy::Wait,
             )
             .await
@@ -1953,7 +2022,7 @@ pub(crate) mod tests {
             ChunkEncoding::Zstd,
         )
         .await;
-        assert!(prepared.live);
+        assert_eq!(prepared.content, crate::ArtifactContent::Snapshot(info.id));
         let config = decode_vm_config(&prepared.graph.config.bytes).unwrap();
         assert!(config.minimum_capabilities.live_restore);
         assert!(config.capture_provenance.is_some());
@@ -1971,11 +2040,11 @@ pub(crate) mod tests {
             }
         }
         // Ingest refuses bytes that differ from their transported blob digest,
-        // even when the semantic stream identity and approved index match.
-        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
-            &source_record.capture
+        // even when the semantic stream identity and resolved index match.
+        let crate::store::models::snapshot::SnapshotMemoryState::Included { execution } =
+            &source_record.memory
         else {
-            panic!("live checkpoint expected");
+            panic!("snapshot with memory expected");
         };
         let ram = rows
             .iter()
@@ -2004,9 +2073,11 @@ pub(crate) mod tests {
         let (_destination_temp, destination) = home().await;
         let staging = stage(&destination, &good).await;
         let verified = verify(&good, staging, index_digest(&good)).await.unwrap();
-        let committed = commit_imported_artifact(verified, None).await.unwrap();
-        let ManagedSourceInfo::Snapshot(imported) = &committed.info else {
-            panic!("checkpoint import produced another kind");
+        let committed = commit_imported_artifact(verified, REFERENCE.into(), None)
+            .await
+            .unwrap();
+        let AcquiredContent::Snapshot(imported) = &committed.content else {
+            panic!("snapshot import produced another kind");
         };
         assert_eq!(imported.id, info.id);
         assert!(imported.provenance.is_empty());
@@ -2041,7 +2112,7 @@ pub(crate) mod tests {
         ] {
             assert_eq!(count(&catalog, query).await, expected, "{query}");
         }
-        // Re-export of the imported checkpoint uses its verified wrapper.
+        // Re-export of the imported snapshot uses its verified wrapper.
         let reconsumed =
             crate::store::snapshot_store::SnapshotStore::from_store(destination.clone())
                 .consume(&SnapshotRef::Id(info.id))
@@ -2086,31 +2157,8 @@ pub(crate) mod tests {
         assert!(parse_destination(&format!("r.example/vm:{}", "a".repeat(128))).is_ok());
     }
 
-    #[test]
-    fn trust_wire_shape_is_closed_and_explicit() {
-        let digest = ObjectDigest::of_bytes(b"index");
-        let approve = ArtifactTrust::ApproveDigest { digest };
-        let json = serde_json::to_value(&approve).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({"kind": "approve-digest", "digest": digest.to_string()})
-        );
-        assert_eq!(
-            serde_json::from_value::<ArtifactTrust>(json).unwrap(),
-            approve
-        );
-        assert_eq!(
-            serde_json::to_value(ArtifactTrust::RequireSignature).unwrap(),
-            serde_json::json!({"kind": "require-signature"})
-        );
-        assert!(serde_json::from_value::<ArtifactTrust>(serde_json::json!({
-            "kind": "approve-digest", "digest": digest.to_string(), "tag": "latest"
-        }))
-        .is_err());
-    }
-
     /// The stopped-snapshot fixture, published and exported once as zstd.
-    async fn stopped_export() -> (
+    pub(crate) async fn stopped_export() -> (
         tempfile::TempDir,
         crate::storage::locks::StorageLock,
         PreparedVmArtifact,
@@ -2279,7 +2327,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn repeated_chunks_dedupe_but_contradictory_decoded_claims_fail_in_verification() {
         let (_temp, source, images, id, record, disk) = repeated_chunk_image().await;
-        let consumer = images.consume(&ManagedSourceRef::Image(id)).await.unwrap();
+        let consumer = images.consume(id).await.unwrap();
         let prepared = export(
             source.clone(),
             ExportSource::Image(Box::new(consumer)),
@@ -2420,10 +2468,11 @@ pub(crate) mod tests {
         let staging = stage(&destination, &good).await;
         let operation = staging.operation.id;
         let verified = verify(&good, staging, index_digest(&good)).await.unwrap();
-        let imported = commit_acquisition(&destination, operation, verified, None)
-            .await
-            .unwrap();
-        let ManagedSourceInfo::Image(imported) = imported else {
+        let imported =
+            commit_acquisition(&destination, operation, verified, REFERENCE.into(), None)
+                .await
+                .unwrap();
+        let AcquiredContent::Image(imported) = imported else {
             panic!("image import produced another kind");
         };
         assert_eq!(imported.id, id);

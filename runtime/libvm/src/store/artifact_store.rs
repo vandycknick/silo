@@ -8,14 +8,15 @@ use std::sync::Arc;
 
 use sqlx::Row;
 
-use crate::image::import_types::{ManagedSourceId, ManagedSourceInfo, ManagedSourceRef};
+use crate::image::transport::{AcquiredContent, ArtifactContent};
 use crate::image::transport::{VerifiedContent, VerifiedImportedArtifact};
 use crate::storage::identity::ObjectDigest;
 use crate::storage::limits::Resource;
 use crate::storage::pool::{OperationPaths, StoragePool};
-use crate::store::managed_image_store::ManagedImageStore;
+use crate::store::image_store::LocalImage;
 use crate::store::models::snapshot::invalid;
 use crate::store::snapshot_store::{bind_held, recheck_closure, RecordInput};
+use crate::store::stored_image_store::StoredImageStore;
 use crate::store::stream_representation::{
     insert_representation, mark_flat_present, VerifiedStreamRepresentation,
 };
@@ -23,27 +24,33 @@ use crate::store::Store;
 use crate::LibVmError;
 
 /// The acquisition owner remains alive until the caller has received its
-/// durable explicit-retention result.
+/// durable named result.
 pub(crate) struct ImportedArtifactCommit {
-    pub(crate) info: ManagedSourceInfo,
+    pub(crate) content: AcquiredContent,
     _operation: OperationPaths,
     _store: Arc<Store>,
 }
 
+/// Commit a verified artifact. The canonical registry `reference` it was
+/// pulled as moves to the record; an optional local `name` is added.
 pub(crate) async fn commit_imported_artifact(
     artifact: VerifiedImportedArtifact,
-    alias: Option<String>,
+    reference: String,
+    name: Option<String>,
 ) -> Result<ImportedArtifactCommit, LibVmError> {
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || runtime.block_on(commit_owned(artifact, alias))).await?
+    tokio::task::spawn_blocking(move || runtime.block_on(commit_owned(artifact, reference, name)))
+        .await?
 }
 
 async fn commit_owned(
     artifact: VerifiedImportedArtifact,
-    alias: Option<String>,
+    reference: String,
+    name: Option<String>,
 ) -> Result<ImportedArtifactCommit, LibVmError> {
-    if let Some(alias) = &alias {
-        crate::store::snapshot_store::validate_alias(alias)?;
+    crate::store::names::validate_stored_name(&reference)?;
+    if let Some(name) = &name {
+        crate::store::names::validate_name(name)?;
     }
     let parts = artifact.into_parts();
     let store = &parts.store;
@@ -82,8 +89,8 @@ async fn commit_owned(
     }
     let semantic_streams = match &parts.content {
         VerifiedContent::Image { record, .. } => record.content_dependencies()?.0,
-        VerifiedContent::StoppedSnapshot { record, .. }
-        | VerifiedContent::LiveCheckpoint { record, .. } => record.content_dependencies()?.0,
+        VerifiedContent::SnapshotWithoutMemory { record, .. }
+        | VerifiedContent::SnapshotWithMemory { record, .. } => record.content_dependencies()?.0,
     };
     let mut representations = Vec::new();
     for stream in parts.streams.values() {
@@ -163,8 +170,8 @@ async fn commit_owned(
     }
     let root = match &parts.content {
         VerifiedContent::Image { record, .. } => &record.root,
-        VerifiedContent::StoppedSnapshot { record, .. }
-        | VerifiedContent::LiveCheckpoint { record, .. } => &record.root,
+        VerifiedContent::SnapshotWithoutMemory { record, .. }
+        | VerifiedContent::SnapshotWithMemory { record, .. } => &record.root,
     };
     if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay { lower, .. } =
         &root.profile
@@ -200,7 +207,7 @@ async fn commit_owned(
         } => {
             let (streams, objects) = record.content_dependencies()?;
             (
-                ManagedSourceId::Image(*id),
+                ArtifactContent::Image(*id),
                 bytes,
                 *digest,
                 streams,
@@ -208,7 +215,7 @@ async fn commit_owned(
                 None,
             )
         }
-        VerifiedContent::StoppedSnapshot {
+        VerifiedContent::SnapshotWithoutMemory {
             id,
             record,
             bytes,
@@ -216,7 +223,7 @@ async fn commit_owned(
         } => {
             let (streams, objects) = record.content_dependencies()?;
             (
-                ManagedSourceId::Snapshot(*id),
+                ArtifactContent::Snapshot(*id),
                 bytes,
                 *digest,
                 streams,
@@ -224,7 +231,7 @@ async fn commit_owned(
                 None,
             )
         }
-        VerifiedContent::LiveCheckpoint {
+        VerifiedContent::SnapshotWithMemory {
             id,
             record,
             bytes,
@@ -233,7 +240,7 @@ async fn commit_owned(
         } => {
             let (streams, objects) = record.content_dependencies()?;
             (
-                ManagedSourceId::Snapshot(*id),
+                ArtifactContent::Snapshot(*id),
                 bytes,
                 *digest,
                 streams,
@@ -247,8 +254,8 @@ async fn commit_owned(
         .preserve_imported_operation(operation, target, parts.index_digest)
         .await?;
     let (kind, id) = match target {
-        ManagedSourceId::Image(id) => ("image", id.to_string()),
-        ManagedSourceId::Snapshot(id) => ("snapshot", id.to_string()),
+        ArtifactContent::Image(id) => ("image", id.to_string()),
+        ArtifactContent::Snapshot(id) => ("snapshot", id.to_string()),
     };
     // Preserve the exact immutable encoding alongside the local receipt. These
     // bytes are metadata, never substituted for canonical semantic identity.
@@ -261,10 +268,10 @@ async fn commit_owned(
     recheck_closure(&fingerprints)?;
     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
     let existing = sqlx::query(match target {
-        ManagedSourceId::Image(_) => {
+        ArtifactContent::Image(_) => {
             "SELECT record_digest,record_bytes FROM storage_image WHERE id=?1"
         }
-        ManagedSourceId::Snapshot(_) => {
+        ArtifactContent::Snapshot(_) => {
             "SELECT record_digest,record_bytes FROM storage_snapshot WHERE id=?1"
         }
     })
@@ -278,10 +285,10 @@ async fn commit_owned(
             return Err(invalid("immutable imported managed identity contradiction"));
         }
         let actual_streams = sqlx::query_scalar::<_, String>(match target {
-            ManagedSourceId::Image(_) => {
+            ArtifactContent::Image(_) => {
                 "SELECT stream_id FROM image_stream_dependency WHERE image_id=?1"
             }
-            ManagedSourceId::Snapshot(_) => {
+            ArtifactContent::Snapshot(_) => {
                 "SELECT stream_id FROM snapshot_stream_dependency WHERE snapshot_id=?1"
             }
         })
@@ -292,10 +299,10 @@ async fn commit_owned(
         .map(|v| v.parse().map_err(invalid))
         .collect::<Result<BTreeSet<crate::storage::identity::StreamId>, _>>()?;
         let actual_objects = sqlx::query_scalar::<_, String>(match target {
-            ManagedSourceId::Image(_) => {
+            ArtifactContent::Image(_) => {
                 "SELECT object_digest FROM image_object_dependency WHERE image_id=?1"
             }
-            ManagedSourceId::Snapshot(_) => {
+            ArtifactContent::Snapshot(_) => {
                 "SELECT object_digest FROM snapshot_object_dependency WHERE snapshot_id=?1"
             }
         })
@@ -308,25 +315,18 @@ async fn commit_owned(
         if actual_streams != streams || actual_objects != objects {
             return Err(invalid("imported semantic dependency contradiction"));
         }
-        sqlx::query(match target {
-            ManagedSourceId::Image(_) => "UPDATE storage_image SET retained=1 WHERE id=?1",
-            ManagedSourceId::Snapshot(_) => "UPDATE storage_snapshot SET retained=1 WHERE id=?1",
-        })
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
     } else {
         sqlx::query(match target {
-            ManagedSourceId::Image(_) => "INSERT INTO storage_image(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,?3,?4,?5)",
-            ManagedSourceId::Snapshot(_) => "INSERT INTO storage_snapshot(id,record_digest,record_bytes,retained,created_at) VALUES(?1,?2,?3,?4,?5)",
+            ArtifactContent::Image(_) => "INSERT INTO storage_image(id,record_digest,record_bytes,created_at) VALUES(?1,?2,?3,?4)",
+            ArtifactContent::Snapshot(_) => "INSERT INTO storage_snapshot(id,record_digest,record_bytes,created_at) VALUES(?1,?2,?3,?4)",
         })
-            .bind(&id).bind(digest.to_string()).bind(bytes).bind(true).bind(chrono::Utc::now().timestamp()).execute(&mut *tx).await?;
+            .bind(&id).bind(digest.to_string()).bind(bytes).bind(chrono::Utc::now().timestamp()).execute(&mut *tx).await?;
         for stream in &streams {
             sqlx::query(match target {
-                ManagedSourceId::Image(_) => {
+                ArtifactContent::Image(_) => {
                     "INSERT INTO image_stream_dependency(image_id,stream_id) VALUES(?1,?2)"
                 }
-                ManagedSourceId::Snapshot(_) => {
+                ArtifactContent::Snapshot(_) => {
                     "INSERT INTO snapshot_stream_dependency(snapshot_id,stream_id) VALUES(?1,?2)"
                 }
             })
@@ -337,8 +337,8 @@ async fn commit_owned(
         }
         for object in &objects {
             sqlx::query(match target {
-                ManagedSourceId::Image(_) => "INSERT INTO image_object_dependency(image_id,object_digest) VALUES(?1,?2)",
-                ManagedSourceId::Snapshot(_) => "INSERT INTO snapshot_object_dependency(snapshot_id,object_digest) VALUES(?1,?2)",
+                ArtifactContent::Image(_) => "INSERT INTO image_object_dependency(image_id,object_digest) VALUES(?1,?2)",
+                ArtifactContent::Snapshot(_) => "INSERT INTO snapshot_object_dependency(snapshot_id,object_digest) VALUES(?1,?2)",
             })
             .bind(&id)
             .bind(object.to_string())
@@ -397,22 +397,45 @@ async fn commit_owned(
     {
         return Err(invalid("immutable acquisition receipt contradiction"));
     }
-    if let Some(alias) = alias {
-        crate::store::managed_image_store::insert_alias(&mut tx, &alias, target).await?;
+    match target {
+        ArtifactContent::Image(id) => {
+            let image = LocalImage::Stored(id);
+            crate::store::image_store::move_image_name(
+                &mut tx,
+                &reference,
+                image,
+                chrono::Utc::now().timestamp(),
+            )
+            .await?;
+            if let Some(name) = &name {
+                crate::store::image_store::insert_image_name(&mut tx, name, image).await?;
+            }
+        }
+        ArtifactContent::Snapshot(id) => {
+            crate::store::snapshot_store::move_name(&mut tx, &reference, id).await?;
+            if let Some(name) = &name {
+                crate::store::snapshot_store::insert_name(&mut tx, name, id).await?;
+            }
+        }
     }
     sqlx::query("UPDATE storage_operation SET state='staging',record_json=jsonb('{}') WHERE operation_id=?1 AND kind='import' AND state='committing'")
         .bind(operation.to_string()).execute(&mut *tx).await?;
     tx.commit().await?;
     drop(_roots);
-    let reference = match target {
-        ManagedSourceId::Image(id) => ManagedSourceRef::Image(id),
-        ManagedSourceId::Snapshot(id) => ManagedSourceRef::Snapshot(id),
+    let content = match target {
+        ArtifactContent::Image(id) => AcquiredContent::Image(Box::new(
+            StoredImageStore::from_store(parts.store.clone())
+                .inspect(id)
+                .await?,
+        )),
+        ArtifactContent::Snapshot(id) => AcquiredContent::Snapshot(Box::new(
+            crate::store::snapshot_store::SnapshotStore::from_store(parts.store.clone())
+                .inspect(&crate::SnapshotRef::Id(id))
+                .await?,
+        )),
     };
-    let info = ManagedImageStore::from_store(parts.store.clone())
-        .inspect(&reference)
-        .await?;
     Ok(ImportedArtifactCommit {
-        info,
+        content,
         _operation: parts.operation,
         _store: parts.store,
     })
@@ -437,7 +460,7 @@ pub(crate) async fn acquisition_objects(
             let bytes: Vec<u8> = row
                 .try_get::<Option<Vec<u8>>, _>("receipt_bytes")?
                 .ok_or_else(|| invalid("oversized acquisition receipt"))?;
-            let receipt = crate::image::transport::trust::AcquisitionReceipt::decode(&bytes)?;
+            let receipt = crate::image::transport::receipt::AcquisitionReceipt::decode(&bytes)?;
             let digest: ObjectDigest = cursor.1.parse().map_err(invalid)?;
             if receipt.canonical_bytes()? != bytes
                 || ObjectDigest::of_bytes(&bytes) != digest
@@ -555,45 +578,6 @@ pub(crate) async fn imported_capture_refs(
         }
     }
     Ok(refs)
-}
-
-pub(crate) async fn retire_unrooted_managed(
-    store: &Store,
-    pool: &StoragePool,
-) -> Result<(), LibVmError> {
-    for (kind, query) in [
-        (
-            "image",
-            "SELECT id FROM storage_image WHERE id>?1 AND retained=0 ORDER BY id LIMIT 256",
-        ),
-        (
-            "snapshot",
-            "SELECT id FROM storage_snapshot WHERE id>?1 AND retained=0 ORDER BY id LIMIT 256",
-        ),
-    ] {
-        let mut cursor = String::new();
-        loop {
-            let ids = sqlx::query_scalar::<_, String>(query)
-                .bind(&cursor)
-                .fetch_all(&store.pool)
-                .await?;
-            if ids.is_empty() {
-                break;
-            }
-            for id in ids {
-                cursor.clone_from(&id);
-                let _roots = pool.lock_roots()?;
-                let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                if kind == "image" {
-                    crate::store::managed_image_store::remove_unrooted_image(&mut tx, &id).await?;
-                } else {
-                    crate::store::snapshot_store::remove_unrooted(&mut tx, &id).await?;
-                }
-                tx.commit().await?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn encode_metadata(records: [&[u8]; 3]) -> Result<Vec<u8>, LibVmError> {
@@ -867,7 +851,7 @@ mod tests {
         store
             .preserve_imported_operation(
                 operation,
-                crate::image::import_types::ManagedSourceId::Snapshot(id),
+                crate::image::transport::ArtifactContent::Snapshot(id),
                 index,
             )
             .await
@@ -911,7 +895,10 @@ mod tests {
             let verified = verify(&transfer, staging, index_digest(&transfer))
                 .await
                 .unwrap();
-            let committed = commit_imported_artifact(verified, None).await.unwrap();
+            let committed =
+                commit_imported_artifact(verified, "example.test/snapshot:1".into(), None)
+                    .await
+                    .unwrap();
             assert!(pool.stream_path(&record.root.stream.stream).exists());
             let state: String =
                 sqlx::query_scalar("SELECT flat_state FROM storage_stream WHERE stream_id=?1")
@@ -1006,7 +993,10 @@ mod tests {
             let verified = verify(&transfer, staging, index_digest(&transfer))
                 .await
                 .unwrap();
-            let _committed = commit_imported_artifact(verified, None).await.unwrap();
+            let _committed =
+                commit_imported_artifact(verified, "example.test/snapshot:1".into(), None)
+                    .await
+                    .unwrap();
             let consumer = SnapshotStore::from_store(destination.clone())
                 .consume(&SnapshotRef::Id(id))
                 .await
@@ -1058,7 +1048,9 @@ mod tests {
         let verified = verify(&transfer, staging, index_digest(&transfer))
             .await
             .unwrap();
-        let _committed = commit_imported_artifact(verified, None).await.unwrap();
+        let _committed = commit_imported_artifact(verified, "example.test/snapshot:1".into(), None)
+            .await
+            .unwrap();
         let consumer = SnapshotStore::from_store(destination.clone())
             .consume(&SnapshotRef::Id(id))
             .await

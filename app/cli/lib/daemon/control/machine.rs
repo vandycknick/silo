@@ -85,41 +85,53 @@ impl w::machine_service_server::MachineService for Service {
         Ok(Response::new(result))
     }
 
-    async fn capture_execution(
+    async fn create_snapshot(
         &self,
-        r: Request<w::LiveCaptureRequest>,
-    ) -> Result<Response<w::LiveSnapshotInfo>, Status> {
-        let value = r.into_inner();
-        let reference = reference(value.machine)?;
-        let options = libvm::LiveSnapshotOptions {
-            name: value
-                .name
-                .map(|name| silo_vm_control::stopped::alias(&name))
-                .transpose()
-                .map_err(conversion)?,
-            resume_policy: silo_vm_control::capture::resume_policy_from_wire(value.resume_policy)
-                .map_err(conversion)?,
-            policy: silo_vm_control::capture::policy_from_wire(value.policy).map_err(conversion)?,
-            dirty_crossover_percent: silo_vm_control::capture::crossover_from_wire(
-                value.dirty_crossover_percent,
-            )
-            .map_err(conversion)?,
-        };
-        options.validate().map_err(native)?;
-        // Capability refusal precedes every lock, reservation and journal row.
-        self.require_machine_live(&reference, vm_spec::live::LiveOperation::Capture)
-            .await?;
-        let observation = self.observe_machine_live(&reference).await?;
+        r: Request<w::CreateSnapshotRequest>,
+    ) -> Result<Response<w::CreatedSnapshot>, Status> {
+        let (reference, options) =
+            silo_vm_control::stopped::snapshot_request_from_wire(r.into_inner())
+                .map_err(conversion)?;
+        // Refusals precede every lock, reservation and journal row.
+        if options.memory {
+            self.require_machine_live(&reference, vm_spec::live::LiveOperation::Capture)
+                .await
+                .map_err(|status| {
+                    match silo_vm_control::errors::status_to_native_error(&status) {
+                        Ok(libvm::LibVmError::MachineNotRunning { reference }) => {
+                            native(libvm::LibVmError::MemorySnapshotRequiresRunningMachine {
+                                reference,
+                            })
+                        }
+                        _ => status,
+                    }
+                })?;
+        } else {
+            let policy = if options.external_requirements {
+                libvm::ExternalResourcePolicy::RequireMappings
+            } else {
+                libvm::ExternalResourcePolicy::Reject
+            };
+            libvm::preflight_stopped(&self.config, &reference, true, &policy)
+                .await
+                .map_err(|error| match error {
+                    libvm::LibVmError::MachineAlreadyRunning { reference } => {
+                        libvm::LibVmError::SnapshotRequiresStoppedMachine { reference }
+                    }
+                    error => error,
+                })
+                .map_err(native)?;
+        }
         let state = self.clone();
         let result = self
             .mutate(async move {
-                let snapshot = state
-                    .machine(&reference)
+                let created = state
+                    .runtime()
                     .await?
-                    .snapshot_live(&observation, options, None)
+                    .snapshot(&reference, options, None)
                     .await
                     .map_err(native)?;
-                silo_vm_control::capture::live_snapshot_to_wire(&snapshot).map_err(conversion)
+                silo_vm_control::capture::created_snapshot_to_wire(&created).map_err(conversion)
             })
             .await?;
         Ok(Response::new(result))
@@ -183,42 +195,6 @@ impl w::machine_service_server::MachineService for Service {
         Ok(Response::new(result))
     }
 
-    async fn snapshot_stopped(
-        &self,
-        r: Request<w::CreateStorageSnapshotRequest>,
-    ) -> Result<Response<w::StorageSnapshotInfo>, Status> {
-        let value = r.into_inner();
-        let reference = reference(value.machine)?;
-        let options = libvm::SnapshotOptions {
-            name: value
-                .name
-                .map(|name| silo_vm_control::stopped::alias(&name))
-                .transpose()
-                .map_err(conversion)?,
-            external_resources: silo_vm_control::stopped::policy_from_wire(required(
-                value.external_resources,
-            )?)
-            .map_err(conversion)?,
-        };
-        silo_vm_control::stopped::snapshot_policy(&options.external_resources)
-            .map_err(conversion)?;
-        libvm::preflight_stopped(&self.config, &reference, true, &options.external_resources)
-            .await
-            .map_err(native)?;
-        let state = self.clone();
-        let result = self
-            .mutate(async move {
-                let info = state
-                    .machine(&reference)
-                    .await?
-                    .snapshot_stopped(options)
-                    .await
-                    .map_err(native)?;
-                silo_vm_control::stopped::info_to_wire(&info).map_err(conversion)
-            })
-            .await?;
-        Ok(Response::new(result))
-    }
     async fn list_machines(
         &self,
         _: Request<()>,
@@ -324,9 +300,9 @@ impl w::machine_service_server::MachineService for Service {
                 requests::CreateSource::Disk(request) => runtime
                     .machine()
                     .image_source(libvm::ImageSource::Disk(request)),
-                requests::CreateSource::Managed(reference) => runtime
+                requests::CreateSource::Stored(reference) => runtime
                     .machine()
-                    .image_source(libvm::ImageSource::Managed(reference)),
+                    .image_source(libvm::ImageSource::Stored(reference)),
                 requests::CreateSource::Oci(identity) => {
                     let mut image = runtime
                         .images()

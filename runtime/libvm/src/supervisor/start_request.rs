@@ -443,7 +443,7 @@ mod tests {
         let restore = RestoreRequest {
             version: vm_spec::restore::RESTORE_REQUEST_VERSION,
             authority: vm_spec::restore::RestoreAuthority::IdentifiedSnapshot {
-                checkpoint: vm_spec::capture::Sha256Digest::of_bytes(b"checkpoint"),
+                snapshot: vm_spec::capture::Sha256Digest::of_bytes(b"snapshot"),
                 evidence: Box::new(evidence.clone()),
             },
             activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),

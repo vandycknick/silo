@@ -137,7 +137,7 @@ fn rootfs_to_wire(v: &libvm::MachineRootfs) -> Result<w::Rootfs, ConversionError
         source_kind: match v.source_kind {
             libvm::ImageSourceKind::Oci => 1,
             libvm::ImageSourceKind::Disk => 2,
-            libvm::ImageSourceKind::Managed => 3,
+            libvm::ImageSourceKind::Stored => 3,
         },
         requested_reference: v.requested_reference.clone(),
         selected_reference: v.selected_reference.clone(),
@@ -154,7 +154,7 @@ fn rootfs_from_wire(v: w::Rootfs) -> Result<libvm::MachineRootfs, ConversionErro
         match v.source_kind {
             1 => libvm::ImageSourceKind::Oci,
             2 => libvm::ImageSourceKind::Disk,
-            3 => libvm::ImageSourceKind::Managed,
+            3 => libvm::ImageSourceKind::Stored,
             _ => return Err(invalid("rootfs.source_kind", "invalid enum")),
         },
         v.requested_reference,

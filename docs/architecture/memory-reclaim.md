@@ -79,14 +79,14 @@ unreported live pages or ranges crossing region boundaries.
   whether dirty tracking is enabled or disabled. Subsequent reads return zero.
 - **Restored file-private RAM:** replace the reported range at the same address
   with `MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE` read/write
-  memory. Reads return zero, private COW pages are released and checkpoint-file
-  pages leave this VM's mapping. The checkpoint RAM file is never modified and
+  memory. Reads return zero, private COW pages are released and snapshot-file
+  pages leave this VM's mapping. The snapshot RAM file is never modified and
   other VMs retain their independent mappings and shared page-cache pages.
   `MADV_DONTNEED` is never applied to file-private RAM because it would expose
-  old checkpoint bytes again.
+  old snapshot bytes again.
 
 A forced full capture of a restored VM reads all of its RAM, mapping clean
-checkpoint pages into the VMM as shared page cache (`RssFile`), not private
+snapshot pages into the VMM as shared page cache (`RssFile`), not private
 memory. The host can evict those pages under pressure. Incremental capture is
 now the default when a valid inherited baseline exists; on reflink-capable hosts
 it overlays dirty runs without scanning all unchanged live RAM. A full fallback

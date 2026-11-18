@@ -17,7 +17,7 @@ pub enum OciError {
     VmArtifact(#[from] crate::vm_artifact::Error),
     #[error("OCI reference {reference:?} is not a Silo VM artifact")]
     NotVmArtifact { reference: String },
-    #[error("Silo VM artifact {reference:?} requires explicit acquisition approving index {index_digest}")]
+    #[error("OCI reference {reference:?} is a Silo VM artifact (index {index_digest}), not a container image; acquire it as a VM artifact")]
     VmArtifactRequiresAcquisition {
         reference: String,
         index_digest: String,

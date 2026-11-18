@@ -10,7 +10,7 @@
 //!            └─ no mapping ───────► layered acquisition (exact composition)
 //!                                   ─► namespace ext4 flattener (held packs)
 //!                                   ─► stream + map ─► packaged pinned bundle
-//!                                   ─► image + alias + mapping in one commit
+//!                                   ─► image + name + mapping in one commit
 //! ```
 //!
 //! Nothing here runs implicitly at machine creation or start. A backend that
@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::image::import_types::{
-    BootAssetSelection, ImageContainerKind, ImageProvenance, ManagedImageInfo, ManagedSourceInfo,
-    ManagedSourceRef, RawConversionKey, RawConversionOptions,
+    BootAssetSelection, ImageContainerKind, ImageProvenance, RawConversionKey,
+    RawConversionOptions, StoredImageInfo,
 };
 use crate::image::oci::{acquire_composition, image_error};
 use crate::image::{
@@ -32,10 +32,10 @@ use crate::machine::stopped::OperationStaging;
 use crate::runtime::boot_assets::{direct_boot_profile, pin_image_boot, CapturedBootContext};
 use crate::storage::identity::ObjectDigest;
 use crate::storage::pool::StoragePool;
-use crate::store::managed_image_store::ManagedImageStore;
 use crate::store::models::image::{ImageRecord, ImageRecordKind};
 use crate::store::models::snapshot::{SnapshotRoot, SnapshotRootProfile};
 use crate::store::models::storage::{GuestArchitecture, LinuxPlatform, RawLayout, RootSelector};
+use crate::store::stored_image_store::StoredImageStore;
 use crate::store::{ImageStore, Store};
 use crate::{LibVmError, ProcessConfig};
 
@@ -54,7 +54,7 @@ impl Images {
         &self,
         resolved: &ResolvedOciImage,
         options: RawConversionOptions,
-    ) -> Result<ManagedImageInfo, LibVmError> {
+    ) -> Result<StoredImageInfo, LibVmError> {
         let runtime = &self.runtime;
         let producer = runtime
             .image_store()
@@ -124,7 +124,7 @@ pub(crate) async fn convert(
     context: ConversionContext,
     resolved: ResolvedOciImage,
     options: RawConversionOptions,
-) -> Result<ManagedImageInfo, LibVmError> {
+) -> Result<StoredImageInfo, LibVmError> {
     tokio::spawn(async move { convert_owned(&context, &resolved, options).await }).await?
 }
 
@@ -133,9 +133,9 @@ async fn convert_owned(
     context: &ConversionContext,
     resolved: &ResolvedOciImage,
     options: RawConversionOptions,
-) -> Result<ManagedImageInfo, LibVmError> {
-    if let Some(alias) = &options.alias {
-        crate::store::snapshot_store::validate_alias(alias)?;
+) -> Result<StoredImageInfo, LibVmError> {
+    if let Some(name) = &options.name {
+        crate::store::names::validate_name(name)?;
     }
     // Admission precedes any lock wait, registry traffic or flattening: the
     // platform needs a native direct boot here and the defaults must be valid.
@@ -153,31 +153,16 @@ async fn convert_owned(
     })
     .await??;
 
-    let images = ManagedImageStore::from_store(context.store.clone());
+    let images = StoredImageStore::from_store(context.store.clone());
     // Rechecked under the key lock: a concurrent identical conversion has
     // either committed its mapping or not started publishing.
     if let Some(consumer) = images.lookup_conversion(&key).await? {
-        let Some(alias) = options.alias else {
-            let ManagedSourceInfo::Image(info) = images
-                .inspect(&ManagedSourceRef::Image(consumer.info.id))
-                .await?
-            else {
-                return Err(invalid("conversion result resolved to a snapshot"));
-            };
-            return Ok(*info);
+        let Some(name) = options.name else {
+            return images.inspect(consumer.info.id).await;
         };
         // The consumer's lease keeps the authenticated closure rooted until
-        // the alias names it; the flattener is not rerun for a new name.
-        let ManagedSourceInfo::Image(info) = images
-            .add_alias(&ManagedSourceRef::Image(consumer.info.id), &alias)
-            .await?
-        else {
-            return Err(invalid("conversion alias resolved to a snapshot"));
-        };
-        if info.id != consumer.info.id {
-            return Err(invalid("conversion alias names a different image"));
-        }
-        return Ok(*info);
+        // the name tags it; the flattener is not rerun for a new name.
+        return images.add_name(consumer.info.id, &name).await;
     }
 
     let operation_id = uuid::Uuid::new_v4();
@@ -265,7 +250,7 @@ async fn convert_owned(
             record,
             operation_id,
             lease,
-            options.alias,
+            options.name,
             vec![provenance],
             Some(key),
         )
@@ -624,7 +609,7 @@ mod tests {
 
         use crate::image::convert::{convert, ConversionContext, PackagedBoot};
         use crate::image::import_types::{
-            ImageContainerKind, ImageProvenance, ManagedImageInfo, RawConversionOptions,
+            ImageContainerKind, ImageProvenance, RawConversionOptions, StoredImageInfo,
         };
         use crate::image::OciImageConfigMetadata;
         use crate::storage::pool::StoragePool;
@@ -726,13 +711,13 @@ mod tests {
 
             async fn convert(
                 &self,
-                alias: Option<&str>,
-            ) -> Result<ManagedImageInfo, crate::LibVmError> {
+                name: Option<&str>,
+            ) -> Result<StoredImageInfo, crate::LibVmError> {
                 convert(
                     self.context(),
                     self.resolved.clone(),
                     RawConversionOptions {
-                        alias: alias.map(Into::into),
+                        name: name.map(Into::into),
                     },
                 )
                 .await
@@ -759,7 +744,7 @@ mod tests {
             }
         }
 
-        fn packaged_binding(info: &ManagedImageInfo) -> BootBinding {
+        fn packaged_binding(info: &StoredImageInfo) -> BootBinding {
             info.record.boot_binding().unwrap().clone()
         }
 
@@ -774,8 +759,7 @@ mod tests {
             let info = fixture.convert(Some("app-raw")).await.unwrap();
 
             assert_eq!(info.id, info.record.id().unwrap());
-            assert!(info.retained);
-            assert_eq!(info.aliases, vec!["app-raw".to_string()]);
+            assert_eq!(info.names, vec!["app-raw".to_string()]);
             let root = &info.record.root;
             assert_eq!(root.profile, SnapshotRootProfile::OpaqueRaw);
             assert_eq!(root.layout, RawLayout::WholeDisk);
@@ -871,9 +855,9 @@ mod tests {
                 assert_eq!(repeated.record, first.record);
                 assert_eq!(packaged_binding(repeated), packaged_binding(&first));
             }
-            let mut aliases = second.aliases.clone();
-            aliases.sort();
-            assert_eq!(aliases, vec!["first".to_string(), "second".to_string()]);
+            let mut names = second.names.clone();
+            names.sort();
+            assert_eq!(names, vec!["first".to_string(), "second".to_string()]);
             assert_eq!(fixture.count("storage_image").await, 1);
             assert_eq!(fixture.count("raw_conversion_result").await, 1);
         }
@@ -928,12 +912,12 @@ mod tests {
                 assert_eq!(fixture.count("storage_image").await, 1);
                 assert_eq!(fixture.count("raw_conversion_result").await, 1);
                 assert_eq!(fixture.mapped_image().await, original.id.to_string());
-                let aliases: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM image_alias WHERE name='replacement'")
+                let named: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM image_name WHERE name='replacement'")
                         .fetch_one(fixture.store.test_pool())
                         .await
                         .unwrap();
-                assert_eq!(aliases, 0);
+                assert_eq!(named, 0);
             }
         }
 
@@ -950,11 +934,11 @@ mod tests {
             assert!(convert(
                 fixture.context(),
                 foreign,
-                RawConversionOptions { alias: None }
+                RawConversionOptions { name: None }
             )
             .await
             .is_err());
-            assert!(fixture.convert(Some("-bad alias")).await.is_err());
+            assert!(fixture.convert(Some("-bad name")).await.is_err());
             assert_eq!(fixture.count("storage_operation").await, operations);
             assert_eq!(fixture.count("storage_image").await, 0);
         }
@@ -1007,14 +991,14 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(staging, 0);
-            let aliased: String =
-                sqlx::query_scalar("SELECT image_id FROM image_alias WHERE name='detached'")
+            let named: String =
+                sqlx::query_scalar("SELECT stored_image_id FROM image_name WHERE name='detached'")
                     .fetch_one(fixture.store.test_pool())
                     .await
                     .unwrap();
-            assert_eq!(aliased, fixture.mapped_image().await);
+            assert_eq!(named, fixture.mapped_image().await);
             let repeated = fixture.convert(None).await.unwrap();
-            assert_eq!(repeated.id.to_string(), aliased);
+            assert_eq!(repeated.id.to_string(), named);
             assert_eq!(fixture.count("storage_image").await, 1);
         }
     }

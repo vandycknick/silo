@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eyre::{bail, Context as _};
-use libvm::{ExecutionResult, ImagePullPolicy, MachineData, MachineReadinessOutcome};
+use libvm::{ExecutionResult, MachineData, MachineReadinessOutcome, PullPolicy};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -101,9 +101,9 @@ pub(crate) async fn check(
     active: &MachineData,
 ) -> eyre::Result<Option<libvm::ResolvedOciImage>> {
     let policy = if reference.contains("@sha256:") {
-        ImagePullPolicy::IfMissing
+        PullPolicy::IfMissing
     } else {
-        ImagePullPolicy::Always
+        PullPolicy::Always
     };
     let image = runtime
         .resolve_image(reference, policy)
