@@ -419,7 +419,8 @@ available until it has mandatory encryption and a design for secrets held in
 memory; `silo restore REF` can still pull a snapshot artifact.
 Publication uses independent zstd chunks by default; `--raw` changes the transfer
 encoding, not the canonical image identity. Pull stores the complete closure
-without starting it.
+without starting it. The artifact format is specified in
+[VM artifact format](docs/architecture/vm-artifact.md).
 
 A machine never changes kernel or initramfs on its own. `silo info` shows the
 pinned bundle and a newer locally admitted packaged bundle when one exists;

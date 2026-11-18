@@ -655,11 +655,7 @@ fn authenticate_encoding(
     };
     if expected_kind != kind
         || config.content.id.to_string() != id
-        || config
-            .capture_provenance
-            .map(|p| p.digest.to_string())
-            .as_deref()
-            != provenance
+        || config.provenance().map(|p| p.digest.to_string()).as_deref() != provenance
     {
         return Err(invalid(
             "acquisition receipt does not bind its managed content and capture provenance",
@@ -750,19 +746,19 @@ mod tests {
     fn metadata(provenance: Option<ObjectDigest>) -> (Vec<u8>, ObjectDigest, String) {
         let id = ObjectDigest::of_bytes(b"canonical semantic record").to_string();
         let record = serde_json::json!({"digest":ObjectDigest::of_bytes(b"record"),"size":6});
-        let live = provenance.is_some();
-        let config=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
+        let memory = provenance.map(|digest| serde_json::json!({
+            "execution":"krun-v1","executionVersion":1,"executionAbi":1,"deviceVersion":1,
+            "compatibilityProfile":{"liveStateSchema":"silo.live-state/1","architecture":"x86_64","profile":ObjectDigest::of_bytes(b"profile"),"topology":ObjectDigest::of_bytes(b"topology"),"ramLayout":ObjectDigest::of_bytes(b"layout")},
+            "provenance":{"digest":digest,"size":42}
+        }));
+        let config = oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
             "schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
             "content":{"kind":"snapshot","id":id,"record":record},
-            "purpose":"checkpoint","captureKind":if live{"live-execution"}else{"stopped-storage"},
-            "rootFamily":"opaque-raw","backendRequirement":"raw-block",
-            "guestPlatform":{"os":"linux","architecture":"amd64"},
-            "minimumCapabilities":{"storageProfile":"opaque-raw-v1","bootAbi":"silo-direct-v1","liveRestore":live},
-            "executionRequirements":if live {Some(serde_json::json!({"kind":"krun-v1","executionVersion":1,"executionAbi":1,"deviceVersion":1,
-                "compatibilityProfile":{"liveStateSchema":"silo.live-state/1","architecture":"x86_64","profile":ObjectDigest::of_bytes(b"profile"),"topology":ObjectDigest::of_bytes(b"topology"),"ramLayout":ObjectDigest::of_bytes(b"layout")}}))}else{None},
-            "streams":record,"objects":record,
-            "captureProvenance":provenance.map(|digest|serde_json::json!({"digest":digest,"size":42}))
-        })).unwrap();
+            "root":"opaque-raw","guestPlatform":{"os":"linux","architecture":"amd64"},
+            "bootAbi":"silo-direct-v2","memory":memory,
+            "streams":record,"objects":record
+        }))
+        .unwrap();
         let child=oci::vm_artifact::wire::canonical_bytes(&serde_json::json!({
             "schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.silo.vm.metadata.v2",
             "config":{"digest":ObjectDigest::of_bytes(&config),"size":config.len(),"mediaType":"application/vnd.silo.vm.config.v2+json"},"layers":[]

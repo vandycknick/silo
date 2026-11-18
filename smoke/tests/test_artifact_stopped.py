@@ -137,6 +137,8 @@ def _graph(registry: DistributionRegistry, repository: str, index_digest: str) -
                 assert blob["digest"] not in payloads, "payload descriptors must be unique across children"
                 payloads[blob["digest"]] = blob
     assert config is not None and config["encoding"] == "silo-chunks-v2"
+    assert set(config) == {"schema", "kind", "encoding", "content", "root", "guestPlatform", "bootAbi", "memory",
+                           "streams", "objects"}, sorted(config)
     assert any(item["mediaType"] == RECORD for item in payloads.values())
     assert any(item["mediaType"] in {RAW_CHUNK, ZSTD_CHUNK} for item in payloads.values())
     return Graph(index_digest, config, payloads, frozenset(reachable))
@@ -249,8 +251,7 @@ def _as_snapshot_artifact(registry: DistributionRegistry, graph: Graph, tag: str
     fetched_metadata = client.manifest(REPOSITORY, index["manifests"][0]["digest"])
     assert fetched_metadata is not None
     metadata = json.loads(fetched_metadata.body)
-    config = {**graph.config, "content": {**graph.config["content"], "kind": "snapshot"},
-              "purpose": "checkpoint", "captureKind": "stopped-storage"}
+    config = {**graph.config, "content": {**graph.config["content"], "kind": "snapshot"}}
     config_bytes = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
     metadata["config"] = {**metadata["config"], "digest": client.push_blob(REPOSITORY, config_bytes),
                           "size": len(config_bytes)}

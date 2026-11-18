@@ -6,7 +6,7 @@ use crate::changeset::model::{ContentDigest, StreamIdentity};
 use crate::vm_artifact::wire::{
     self, ChunkEntry, GuestPlatform, ObjectBinding, ObjectTablePage, ObjectTableRoot,
     PayloadMediaType, PayloadRef, RecordBlob, RecordRef, StreamBinding, StreamTablePage,
-    StreamTableRoot, TransferPage, TransferRoot, VmArtifactConfigV2, CHUNK_SIZE, CONFIG_MEDIA_TYPE,
+    StreamTableRoot, TransferPage, TransferRoot, VmArtifactConfig, CHUNK_SIZE, CONFIG_MEDIA_TYPE,
     MAX_ARTIFACT_BYTES, MAX_METADATA_BYTES, MAX_PAGE_ENTRIES, MAX_STREAM_BYTES,
 };
 use crate::vm_artifact::{invalid, Error, Result};
@@ -119,7 +119,7 @@ struct Manifest {
 pub struct VerifiedVmGraph {
     index_bytes: Vec<u8>,
     index_digest: ContentDigest,
-    config: VmArtifactConfigV2,
+    config: VmArtifactConfig,
     config_bytes: Vec<u8>,
     metadata_manifest_bytes: Vec<u8>,
     inventory: BTreeMap<ContentDigest, PayloadRef>,
@@ -134,7 +134,7 @@ impl VerifiedVmGraph {
     pub fn index_digest(&self) -> ContentDigest {
         self.index_digest
     }
-    pub fn config(&self) -> &VmArtifactConfigV2 {
+    pub fn config(&self) -> &VmArtifactConfig {
         &self.config
     }
     pub fn config_bytes(&self) -> &[u8] {
@@ -184,7 +184,7 @@ pub struct GraphVerifier {
     index: Index,
     pending: VecDeque<Pending>,
     metadata_config: Option<Descriptor>,
-    config: Option<VmArtifactConfigV2>,
+    config: Option<VmArtifactConfig>,
     config_bytes: Vec<u8>,
     metadata_manifest_bytes: Vec<u8>,
     inventory: BTreeMap<ContentDigest, PayloadRef>,
@@ -312,7 +312,7 @@ impl GraphVerifier {
                     return Err(invalid("metadata platform/config mismatch"));
                 }
                 self.require_payload(config.content.record.payload())?;
-                if let Some(provenance) = config.capture_provenance {
+                if let Some(provenance) = config.provenance() {
                     self.require_payload(provenance.payload())?;
                 }
                 self.push_record(config.streams, Task::StreamsRoot)?;
@@ -652,7 +652,7 @@ impl GraphVerifier {
                 }
             }
         }
-        for reference in [Some(config.content.record), config.capture_provenance]
+        for reference in [Some(config.content.record), config.provenance()]
             .into_iter()
             .flatten()
         {
@@ -774,7 +774,7 @@ pub struct EncodedVmGraph {
 /// Build one fixed byte encoding. Caller-supplied payload descriptors must refer
 /// to verified held bytes; the graph builder does not acquire or own bulk data.
 pub fn encode_vm_graph(
-    config: &VmArtifactConfigV2,
+    config: &VmArtifactConfig,
     records: &[RecordBlob],
     payloads: &[PayloadRef],
 ) -> Result<EncodedVmGraph> {
@@ -953,12 +953,12 @@ mod tests {
     };
     use crate::vm_artifact::wire::{
         self, ChunkEntry, ObjectBinding, PayloadMediaType, PayloadRef, RecordBlob, StreamBinding,
-        TransferRoot, VmArtifactConfigV2, CHUNK_SIZE,
+        TransferRoot, VmArtifactConfig, CHUNK_SIZE,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
 
-    fn fixture(chunks: usize) -> (VmArtifactConfigV2, Vec<RecordBlob>, Vec<PayloadRef>) {
+    fn fixture(chunks: usize) -> (VmArtifactConfig, Vec<RecordBlob>, Vec<PayloadRef>) {
         let semantic = RecordBlob::new(br#"{"kind":"semantic-record"}"#.to_vec()).unwrap();
         let mut map_bytes = b"silo:stream:v2\n".to_vec();
         map_bytes.push(23);
@@ -1015,10 +1015,9 @@ mod tests {
         let config = wire::decode_vm_config(&serde_json::to_vec(&json!({
             "schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
             "content":{"kind":"image","id":ContentDigest::from_sha256([4;32]),"record":semantic.reference},
-            "purpose":"image","captureKind":null,"rootFamily":"opaque-raw","backendRequirement":"raw-block",
-            "guestPlatform":{"os":"linux","architecture":"amd64"},
-            "minimumCapabilities":{"storageProfile":"opaque-raw-v1","bootAbi":"linux-direct-v1","liveRestore":false},
-            "executionRequirements":null,"streams":streams.root.reference,"objects":objects.root.reference,"captureProvenance":null
+            "root":"opaque-raw","guestPlatform":{"os":"linux","architecture":"amd64"},
+            "bootAbi":"silo-direct-v2","memory":null,
+            "streams":streams.root.reference,"objects":objects.root.reference
         })).unwrap()).unwrap();
         payloads.push(PayloadRef {
             media_type: PayloadMediaType::StreamMap,

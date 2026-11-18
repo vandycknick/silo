@@ -583,7 +583,7 @@ async fn settle<T>(
 
 fn inspection(
     resolution: &ArtifactResolution,
-    config: &oci::vm_artifact::wire::VmArtifactConfigV2,
+    config: &oci::vm_artifact::wire::VmArtifactConfig,
 ) -> ArtifactInspection {
     use oci::vm_artifact::wire;
     let id = *config.content.id.as_bytes();
@@ -595,15 +595,15 @@ fn inspection(
         repository: resolution.repository(),
         index_digest: object(resolution.digest()),
         content,
-        root: match config.root_family {
-            wire::RootFamily::OpaqueRaw => ArtifactRootFamily::OpaqueRaw,
-            wire::RootFamily::LinuxOverlay => ArtifactRootFamily::LinuxOverlay,
+        root: match config.root {
+            wire::Root::OpaqueRaw => ArtifactRootFamily::OpaqueRaw,
+            wire::Root::LinuxErofsOverlay => ArtifactRootFamily::LinuxOverlay,
         },
         guest_architecture: match config.guest_platform.architecture {
             wire::Architecture::Amd64 => GuestArchitecture::Amd64,
             wire::Architecture::Arm64 => GuestArchitecture::Arm64,
         },
-        memory: config.capture_kind == Some(wire::CaptureKind::LiveExecution),
+        memory: config.memory.is_some(),
     }
 }
 
@@ -672,7 +672,7 @@ pub(crate) mod tests {
         decode_record, decode_vm_config, encode_object_table, encode_stream_table, encode_transfer,
         verify_transfer, ChunkEntry, ObjectBinding, ObjectTablePage, ObjectTableRoot,
         PayloadMediaType, RecordBlob, StreamBinding, StreamTablePage, StreamTableRoot,
-        TransferRoot, VmArtifactConfigV2, CHUNK_SIZE, MAX_STREAM_BYTES,
+        TransferRoot, VmArtifactConfig, CHUNK_SIZE, MAX_STREAM_BYTES,
     };
 
     use crate::image::transport::blobs::StagedBlobs;
@@ -939,7 +939,7 @@ pub(crate) mod tests {
     /// so only importer semantics, never graph structure, can reject it.
     fn finish(
         graph: &EncodedVmGraph,
-        mut config: VmArtifactConfigV2,
+        mut config: VmArtifactConfig,
         mut streams: Vec<StreamBinding>,
         mut objects: Vec<ObjectBinding>,
         mut records: Vec<RecordBlob>,
@@ -1725,7 +1725,7 @@ pub(crate) mod tests {
     /// checks, not the graph layer's, reject a well-formed contradiction.
     fn reencode(
         graph: &EncodedVmGraph,
-        mutate: impl FnOnce(&mut VmArtifactConfigV2),
+        mutate: impl FnOnce(&mut VmArtifactConfig),
         surplus: Vec<RecordBlob>,
     ) -> EncodedVmGraph {
         let mut config = decode_vm_config(&graph.config.bytes).unwrap();
@@ -2024,8 +2024,8 @@ pub(crate) mod tests {
         .await;
         assert_eq!(prepared.content, crate::ArtifactContent::Snapshot(info.id));
         let config = decode_vm_config(&prepared.graph.config.bytes).unwrap();
-        assert!(config.minimum_capabilities.live_restore);
-        assert!(config.capture_provenance.is_some());
+        assert!(config.memory.is_some());
+        assert!(config.provenance().is_some());
         let good = transfer(&prepared.graph, &prepared.payloads());
         // Blob digests measure the transported encoding at export, independently
         // of RAM and disk Merkle identities in the capture inventory.
@@ -2128,8 +2128,8 @@ pub(crate) mod tests {
         assert_eq!(
             decode_vm_config(&again.graph.config.bytes)
                 .unwrap()
-                .capture_provenance,
-            config.capture_provenance
+                .provenance(),
+            config.provenance()
         );
     }
 

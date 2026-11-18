@@ -535,14 +535,14 @@ impl From<crate::machine::root_disk::RootDiskError> for LibVmError {
     }
 }
 
-/// A retired or unknown artifact storage profile is the same typed root
-/// compatibility refusal as a retired local root; every other wire failure
-/// stays an artifact error.
+/// A retired or unknown artifact root is the same typed root compatibility
+/// refusal as a retired local root; every other wire failure stays an
+/// artifact error.
 impl From<oci::vm_artifact::Error> for LibVmError {
     fn from(source: oci::vm_artifact::Error) -> Self {
         match source {
-            oci::vm_artifact::Error::IncompatibleStorageProfile { profile } => {
-                Self::IncompatibleRootProfile { profile }
+            oci::vm_artifact::Error::UnsupportedRoot { root } => {
+                Self::IncompatibleRootProfile { profile: root }
             }
             source => Self::ArtifactWire(source),
         }

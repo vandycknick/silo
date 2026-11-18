@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use oci::changeset::model::{ContentDigest, StreamIdentity};
 use oci::vm_artifact::wire::{
-    self, ContentKind, ContentRef, ExecutionRequirements, GuestPlatform, MinimumCapabilities,
-    PayloadMediaType, Purpose, RecordRef, VmArtifactConfigV2,
+    self, ContentKind, ContentRef, GuestPlatform, MemoryRequirements, PayloadMediaType, RecordRef,
+    Root, VmArtifactConfig,
 };
 
 use crate::image::transport::blobs::invalid;
@@ -23,8 +23,6 @@ use crate::store::models::snapshot::{
 use crate::store::models::storage::{BootBinding, BootProfile, GuestArchitecture};
 use crate::LibVmError;
 
-/// Native execution envelope constants accepted by the current header reader.
-const EXECUTION_KIND: &str = "krun-v1";
 const MAX_LAYOUT_BYTES: u64 = 65536;
 
 pub(crate) fn content(digest: ObjectDigest) -> ContentDigest {
@@ -291,65 +289,54 @@ impl Semantic {
         }
     }
 
-    /// The complete VM config for the given table and provenance roots.
+    /// The complete VM config for the given table roots and the capture
+    /// provenance of a snapshot with memory.
     pub(crate) fn config(
         &self,
         streams: RecordRef,
         objects: RecordRef,
-        capture_provenance: Option<RecordRef>,
-    ) -> Result<VmArtifactConfigV2, LibVmError> {
+        provenance: Option<RecordRef>,
+    ) -> Result<VmArtifactConfig, LibVmError> {
         let (_, kernel_architecture, abi) = self.binding()?;
-        let (root_family, backend_requirement, storage_profile) = match &self.root().profile {
-            SnapshotRootProfile::OpaqueRaw => (
-                wire::RootFamily::OpaqueRaw,
-                wire::BackendRequirement::RawBlock,
-                wire::StorageProfile::OpaqueRawV1,
-            ),
-            SnapshotRootProfile::LinuxOverlay { .. } => (
-                wire::RootFamily::LinuxOverlay,
-                wire::BackendRequirement::KrunOverlay,
-                wire::StorageProfile::LinuxErofsOverlayV1,
-            ),
+        let root = match &self.root().profile {
+            SnapshotRootProfile::OpaqueRaw => Root::OpaqueRaw,
+            SnapshotRootProfile::LinuxOverlay { .. } => Root::LinuxErofsOverlay,
         };
-        let (purpose, capture_kind, execution_requirements) = match &self.record {
-            SemanticRecord::Image(_) => (Purpose::Image, None, None),
-            SemanticRecord::Snapshot(record) => match &record.memory {
-                SnapshotMemoryState::None { .. } => (
-                    Purpose::Checkpoint,
-                    Some(wire::CaptureKind::StoppedStorage),
-                    None,
-                ),
-                SnapshotMemoryState::Included { execution } => {
-                    let profile = &execution.compatibility_profile;
-                    (
-                        Purpose::Checkpoint,
-                        Some(wire::CaptureKind::LiveExecution),
-                        Some(ExecutionRequirements {
-                            kind: EXECUTION_KIND.into(),
-                            execution_version: 1,
-                            execution_abi: 1,
-                            device_version: 1,
-                            compatibility_profile: wire::CompatibilityProfile {
-                                live_state_schema: profile.live_state_schema.clone(),
-                                architecture: profile.architecture.clone(),
-                                profile: content(profile.profile),
-                                topology: content(profile.topology),
-                                ram_layout: content(profile.ram_layout),
-                            },
-                        }),
-                    )
-                }
-            },
+        let execution = match self.snapshot_record().map(|record| &record.memory) {
+            Some(SnapshotMemoryState::Included { execution }) => Some(execution),
+            Some(SnapshotMemoryState::None { .. }) | None => None,
         };
-        let config = VmArtifactConfigV2 {
+        let memory = match (execution, provenance) {
+            (Some(execution), Some(provenance)) => {
+                let profile = &execution.compatibility_profile;
+                Some(MemoryRequirements {
+                    execution: wire::Execution::KrunV1,
+                    execution_version: 1,
+                    execution_abi: 1,
+                    device_version: 1,
+                    compatibility_profile: wire::CompatibilityProfile {
+                        live_state_schema: profile.live_state_schema.clone(),
+                        architecture: profile.architecture.clone(),
+                        profile: content(profile.profile),
+                        topology: content(profile.topology),
+                        ram_layout: content(profile.ram_layout),
+                    },
+                    provenance,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(failure(
+                    "capture provenance accompanies exactly a snapshot with memory",
+                ))
+            }
+        };
+        let config = VmArtifactConfig {
             schema: 2,
             kind: "vm-artifact".into(),
             encoding: "silo-chunks-v2".into(),
             content: self.content_ref(),
-            purpose,
-            capture_kind,
-            root_family,
-            backend_requirement,
+            root,
             guest_platform: GuestPlatform {
                 os: wire::GuestOs::Linux,
                 architecture: match kernel_architecture {
@@ -357,15 +344,10 @@ impl Semantic {
                     GuestArchitecture::Arm64 => wire::Architecture::Arm64,
                 },
             },
-            minimum_capabilities: MinimumCapabilities {
-                storage_profile,
-                boot_abi: abi.to_owned(),
-                live_restore: self.live(),
-            },
-            execution_requirements,
+            boot_abi: abi.to_owned(),
+            memory,
             streams,
             objects,
-            capture_provenance,
         };
         config.validate()?;
         Ok(config)
@@ -572,21 +554,25 @@ mod tests {
             ObjectDigest::from_sha256(*stream().as_bytes()),
             ObjectDigest::of_bytes(b"kernel"),
         );
+        let crate::BootProfile::LinuxDirect {
+            binding: crate::BootBinding::Pinned { abi, .. },
+            ..
+        } = &snapshot.boot
+        else {
+            panic!("pinned direct boot expected");
+        };
+        let abi = abi.clone();
         let semantic = Semantic::snapshot(snapshot).unwrap();
         let table = RecordRef::of_bytes(b"{}");
         let config = semantic.config(table, table, None).unwrap();
-        assert_eq!(config.purpose, wire::Purpose::Checkpoint);
-        assert_eq!(config.capture_kind, Some(wire::CaptureKind::StoppedStorage));
-        assert_eq!(config.root_family, wire::RootFamily::OpaqueRaw);
-        assert_eq!(
-            config.backend_requirement,
-            wire::BackendRequirement::RawBlock
-        );
+        assert_eq!(config.content.kind, ContentKind::Snapshot);
+        assert_eq!(config.root, wire::Root::OpaqueRaw);
         assert_eq!(
             config.guest_platform.architecture,
             wire::Architecture::Amd64
         );
-        assert!(!config.minimum_capabilities.live_restore);
+        assert_eq!(config.boot_abi, abi);
+        assert_eq!(config.memory, None);
         assert_eq!(config.content.record, RecordRef::of_bytes(&semantic.bytes));
         // A stopped snapshot cannot carry capture provenance.
         assert!(semantic.config(table, table, Some(table)).is_err());

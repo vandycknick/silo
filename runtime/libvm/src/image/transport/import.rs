@@ -186,7 +186,7 @@ pub(crate) fn verify_imported_artifact(
             "content identity differs from the canonical record",
         ));
     }
-    let provenance = match config.capture_provenance {
+    let provenance = match config.provenance() {
         Some(reference) => {
             let bytes = blobs.read(&reference.payload())?;
             let wrapper =
@@ -196,7 +196,7 @@ pub(crate) fn verify_imported_artifact(
         }
         None => None,
     };
-    let expected = semantic.config(config.streams, config.objects, config.capture_provenance)?;
+    let expected = semantic.config(config.streams, config.objects, config.provenance())?;
     if &expected != config {
         return Err(invalid(
             "config",
@@ -909,10 +909,9 @@ mod tests {
         let config = wire::decode_vm_config(&wire::canonical_bytes(&serde_json::json!({
             "schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
             "content":{"kind":"image","id":semantic.reference.digest,"record":semantic.reference},
-            "purpose":"image","captureKind":null,"rootFamily":"opaque-raw","backendRequirement":"raw-block",
-            "guestPlatform":{"os":"linux","architecture":"amd64"},
-            "minimumCapabilities":{"storageProfile":"opaque-raw-v1","bootAbi":"linux-direct-v1","liveRestore":false},
-            "executionRequirements":null,"streams":streams.root.reference,"objects":objects.root.reference,"captureProvenance":null
+            "root":"opaque-raw","guestPlatform":{"os":"linux","architecture":"amd64"},
+            "bootAbi":"silo-direct-v2","memory":null,
+            "streams":streams.root.reference,"objects":objects.root.reference
         })).unwrap()).unwrap();
         for table in [transfer, streams, objects] {
             records.push(table.root);
