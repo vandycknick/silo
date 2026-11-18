@@ -10,7 +10,14 @@ make smoke                                  # default: not slow
 make smoke SMOKE_MARK=                       # all functional qualifications
 make smoke SMOKE_WORKERS=1                   # default: 2, size for guest RAM
 make smoke SMOKE_ARGS='-k lifecycle --keep'  # optional pytest selection
+make smoke SMOKE_AREAS=restore,fork          # only these areas
+make smoke SMOKE_AREAS=capture SMOKE_MARK=   # an area including its slow cases
+make smoke-areas                             # list areas and their modules
 ```
+
+Areas group test modules by feature (`silo_smoke/areas.py`). Each area is also a
+pytest marker, so `SMOKE_ARGS='-m "restore and not daemon"'` works too. Every
+module must belong to at least one area; collection fails otherwise.
 
 `make smoke` stages and tests a fresh release build on every run, so results
 never come from binaries older than the tree. `SMOKE_PROFILE=debug` selects a
@@ -25,7 +32,7 @@ Run it with `make smoke SMOKE_ARGS='tests/test_exec_stdin.py'`.
 
 Run as an ordinary user on a dev box with readable/writable `/dev/kvm` (or Apple
 Silicon HVF). Use the repository's normal Rust/Go toolchain, Python 3.12+, `uv`,
-ORAS, a static C compiler, `openssl`, `sqlite3`, OpenSSH, GNU coreutils, util-linux
+ORAS, a C compiler that can link static binaries, `openssl`, `sqlite3`, OpenSSH, GNU coreutils, util-linux
 (`findmnt`, `sfdisk`, `blkid`, `unshare`, `mount`, `umount`) and e2fsprogs
 (`mkfs.ext4`, `e2fsck`, `debugfs`). The Rust toolchain file supplies both guest
 musl targets. EROFS qualification additionally needs `fsck.erofs` and `dump.erofs`
@@ -95,7 +102,7 @@ automatically provisioned and never touch hosted credentials. Internet-dependent
 | `TMPDIR` | Optional scratch placement; default durable workspace root, short separate runtime sockets |
 | `SILO_SMOKE_STOPPED_DIR`, `SILO_SMOKE_STOPPED_FS` | Only actual host-ext4 gate is owner opt-in; exact enable command above |
 | `SILO_SMOKE_CAPTURE_FS` | Optional assertion on the observed host filesystem, not fixture setup |
-| Static C/Rust/assembly guest probes (`CC`, rustc, as/ld/objcopy/nm) | Built by session/test fixtures from repository or pinned native sources |
+| Static C/Rust/assembly guest probes (`CC`, rustc, as/ld/objcopy/nm) | Built by session/test fixtures from repository or pinned native sources. `CC` is optional: unset, the first of `cc`, `gcc`, `/usr/bin/cc`, `/usr/bin/gcc`, `clang`, `musl-gcc` that links a static pthread program is used (`silo_smoke/toolchain.py`) |
 | Alpine and OCI fixtures, ext4 images | Downloaded with pinned integrity or constructed by existing fixture builders, never prebuilt by hand |
 | Local loopback/Distribution registries and TLS CA | Existing automatic private registry fixtures and verified release cache |
 | `SILO_SMOKE_SYSTEM_IMAGE`, `SILO_SMOKE_DISTRO_IMAGES` | Public defaults; optional reference overrides or explicit empty opt-out |
@@ -598,7 +605,7 @@ SILO_SMOKE_STOPPED_DIR="$MOUNT" SILO_SMOKE_STOPPED_FS=ext4 \
 
 Use the same staged x86_64 live-capable workload kernel, agent and initramfs as
 the restore suites, with `/dev/kvm`, `sqlite3`, `findmnt`, a static C toolchain
-(`CC`, default `cc`) and the matching `native-live-api inspect-devices` example.
+(`CC`, autodetected) and the matching `native-live-api inspect-devices` example.
 The staged kernel's actual emitted config is resolved automatically;
 `SILO_SMOKE_KERNEL_CONFIG` is an optional override. Missing `CONFIG_PAGE_REPORTING=y` or
 `CONFIG_VIRTIO_BALLOON=y` fails with the missing options named. The test also
@@ -673,7 +680,7 @@ make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_incremental.py --keep'
 make smoke SMOKE_MARK=slow SMOKE_ARGS='tests/test_restore.py -k "corrupt_real_closure or real_native_incompatibility" --keep'
 ```
 
-Prerequisites are `/dev/kvm`, a static C toolchain (`CC`, default `cc`), `debugfs`,
+Prerequisites are `/dev/kvm`, a static C toolchain (`CC`, autodetected), `debugfs`,
 `sqlite3`, the restore fixture kernel/agent/initramfs and loopback TLS support.
 The host-writer gate additionally requires the workload kernel's
 `CONFIG_PAGE_REPORTING=y` and `CONFIG_VIRTIO_BALLOON=y`, a negotiated reporting

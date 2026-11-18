@@ -11,7 +11,7 @@ import tempfile
 from pluggy import Result
 import pytest
 
-from silo_smoke import cloud_disk, config as smoke_config, image_cache, images, incremental, overlay, preflight, prereqs, restore, stopped
+from silo_smoke import areas, cloud_disk, config as smoke_config, image_cache, images, incremental, overlay, preflight, prereqs, restore, stopped
 from silo_smoke.cli import TIMINGS_PROPERTY, Silo, Vm, release, timed
 from silo_smoke.config import RUN_ROOT_PARENT, SmokeConfig
 from silo_smoke.daemon import Daemon
@@ -27,12 +27,17 @@ _FAILED = pytest.StashKey[bool]()
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     smoke_config.add_options(parser)
-    parser.getgroup("silo smoke").addoption("--smoke-lane", choices=("parallel", "serial"), default=None)
+    group = parser.getgroup("silo smoke")
+    group.addoption("--smoke-lane", choices=("parallel", "serial"), default=None)
+    group.addoption("--area", action="append", default=[], choices=sorted(areas.AREAS),
+                    help="run only this smoke area (repeatable); see silo_smoke/areas.py")
 
 
 def pytest_configure(config: pytest.Config) -> None:
     if "SILO_SMOKE_EVIDENCE" not in os.environ:
         os.environ["SILO_SMOKE_EVIDENCE"] = tempfile.mkdtemp(prefix="run-", dir=prereqs.evidence_parent())
+    for name, area in areas.AREAS.items():
+        config.addinivalue_line("markers", f"{name}: {area.description}")
     lane = config.getoption("--smoke-lane")
     if lane is not None:
         selection = config.option.markexpr
@@ -53,7 +58,21 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) ->
         item.stash[_FAILED] = item.stash.get(_FAILED, False) or report.failed
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    selected_areas = set(config.getoption("--area"))
+    selected, deselected = [], []
+    for item in items:
+        module = item.path.stem
+        item_areas = areas.areas_of(module)
+        if not item_areas:
+            raise pytest.UsageError(f"{module} belongs to no smoke area; add it in smoke/silo_smoke/areas.py")
+        for name in item_areas:
+            item.add_marker(name)
+        (selected if not selected_areas or selected_areas.intersection(item_areas) else deselected).append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
     system = platform.system()
     try:
         system_image = smoke_config.resolve(config).system_image

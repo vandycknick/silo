@@ -7,13 +7,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import time
 
 import pytest
 
-from . import fork, images, overlay, prereqs, restore, stopped
+from . import fork, images, overlay, prereqs, restore, stopped, toolchain
 from .cli import TIMINGS_PROPERTY, Silo, release
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
@@ -49,7 +48,7 @@ def reclaim_image(config: SmokeConfig, registry: LoopbackRegistry,
         f"{path}: reclaim smoke requires built-in free page reporting and the "
         f"virtio-balloon driver; missing {sorted(required - lines)}")
     output = tmp_path_factory.mktemp("reclaim-probe") / "reclaim-memory"
-    command = [*shlex.split(os.environ.get("CC", "cc")), "-static", "-O2",
+    command = [*toolchain.static_cc(), "-static", "-O2",
                "-Wall", "-Wextra", "-Werror", "-std=c11",
                str(REPO / "smoke/fixtures/reclaim_memory.c"), "-o", str(output)]
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)

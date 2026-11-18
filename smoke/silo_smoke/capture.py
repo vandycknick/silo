@@ -6,18 +6,17 @@ import json
 import os
 from pathlib import Path
 import select
-import shlex
 import struct
 import subprocess
 import time
 
 from .cli import RootProfile, Silo
 from .config import REPO
-from . import stopped, stream_map
+from . import stopped, stream_map, toolchain
 
 
 def compile_probe(output: Path) -> Path:
-    command = [*shlex.split(os.environ.get("CC", "cc")), "-static", "-O2",
+    command = [*toolchain.static_cc(), "-static", "-O2",
                "-Wall", "-Wextra", "-Werror", "-std=c11",
                str(REPO / "virt/vmm/tests/guest/capture_counter.c"), "-o", str(output)]
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)

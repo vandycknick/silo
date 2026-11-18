@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import os
 import secrets
 import selectors
 import socket
-import shlex
 import struct
 import subprocess
 import threading
@@ -21,10 +19,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import toolchain
+
 
 def compile_probe(output: Path) -> Path:
     """Build the standalone static probe, only when called by the smoke owner."""
-    command = [*shlex.split(os.environ.get("CC", "cc")), "-static", "-O2",
+    command = [*toolchain.static_cc(), "-static", "-O2",
                "-Wall", "-Wextra", "-std=c11",
                str(Path(__file__).resolve().parents[2] / "virt/vmm/tests/guest/activation_network.c"),
                "-o", str(output)]

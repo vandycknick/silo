@@ -7,14 +7,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
-import os
 from pathlib import Path
-import shlex
 import subprocess
 
 import pytest
 
-from . import images, overlay, procs, restore, stopped, stream_map
+from . import images, overlay, procs, restore, stopped, stream_map, toolchain
 from .filesystem import reflink_probe
 from .cli import Silo
 from .config import REPO, SmokeConfig
@@ -38,7 +36,7 @@ def incremental_image(config: SmokeConfig, registry: LoopbackRegistry,
     for source, destination in ((REPO / "smoke/fixtures/incremental_memory.c", PROBE),
                                 (REPO / "virt/vmm/tests/guest/restore_execution.c", restore.PROBE)):
         executable = directory / Path(destination).name
-        command = [*shlex.split(os.environ.get("CC", "cc")), "-static", "-O2", "-pthread",
+        command = [*toolchain.static_cc(), "-static", "-O2", "-pthread",
                    "-Wall", "-Wextra", "-Werror", "-std=c11", str(source), "-o", str(executable)]
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
         files[destination.lstrip("/")] = images.GuestFile(executable.read_bytes(), mode=0o755)

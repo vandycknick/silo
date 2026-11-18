@@ -12,14 +12,13 @@ import json
 import os
 from pathlib import Path
 import select
-import shlex
 import struct
 import sqlite3
 import subprocess
 import sys
 from uuid import UUID, uuid4
 
-from . import capture, overlay, procs, shutdown, stopped
+from . import capture, overlay, procs, shutdown, stopped, toolchain
 from .cli import Silo
 from .config import REPO
 
@@ -28,7 +27,7 @@ MOUNTS = ("/capture-a", "/capture-b")
 
 
 def compile_probe(output: Path) -> Path:
-    command = [*shlex.split(os.environ.get("CC", "cc")), "-static", "-O2",
+    command = [*toolchain.static_cc(), "-static", "-O2",
                "-Wall", "-Wextra", "-Werror", "-std=c11",
                str(REPO / "virt/vmm/tests/guest/capture_multidisk.c"), "-o", str(output)]
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
