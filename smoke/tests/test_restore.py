@@ -81,7 +81,7 @@ def test_restore_inspection_rejects_writable_state_descriptors(
     silo: Silo, restore_image: str, restore_processes: list[shutdown.Process],
 ) -> None:
     """Inspection emits one typed refusal, not a success report, for writable FDs."""
-    inspection_version = 2
+    inspection_version = 1
     restore.create_source(silo, restore_image, profile="layered")
     own(silo, "restore-source", restore_processes)
     saved = restore.checkpoint(silo, "restore-source")
@@ -140,7 +140,7 @@ def test_restore_inspection_rejects_writable_state_descriptors(
     report = json.loads(accepted.stdout)
     assert report["version"] == inspection_version and "refusal" not in report, report
     assert report["authority"] == {
-        "kind": "identified-snapshot", "checkpoint": request["authority"]["checkpoint"],
+        "kind": "identified-snapshot", "snapshot": request["authority"]["snapshot"],
     }, report
     stop_owned(silo, "inspection-source", restore_processes)
     stop_owned(silo, "restore-source", restore_processes)
