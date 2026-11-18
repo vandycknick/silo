@@ -19,7 +19,7 @@ import subprocess
 import time
 from uuid import UUID, uuid4
 
-from . import overlay, prereqs
+from . import overlay, prereqs, toolchain
 from .cli import Silo
 from .config import REPO
 
@@ -207,7 +207,7 @@ class Candidate:
             self.spec["boot"]["kernel"]["cmdline"].append("silo.smoke_probes=" + ",".join(f"{offset}:{length}" for offset, length in self.mapping_probes))
         if historical:
             mapping_init = self.root / "mapping-init"
-            subprocess.run([os.environ.get("CC", "cc"), "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(mapping_init), str(REPO / "smoke/fixtures/vmdk_mapping.c")], check=True, capture_output=True, timeout=90)
+            subprocess.run([*toolchain.static_cc(), "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(mapping_init), str(REPO / "smoke/fixtures/vmdk_mapping.c")], check=True, capture_output=True, timeout=90)
             composite.write_bytes(cpio([("init", mapping_init.read_bytes(), 0o100755)]))
             self.spec["boot"]["kernel"]["cmdline"] = ["loglevel=6", "rdinit=/init", "silo.smoke_probes=" + ",".join(f"{offset}:{length}" for offset, length in self.mapping_probes)]
         self.config = self.root / "spec.json"

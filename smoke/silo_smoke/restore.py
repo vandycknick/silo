@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 import socket
 import struct
@@ -25,7 +24,7 @@ import uuid
 
 import pytest
 
-from . import images, irq_fixture, overlay, pause, prereqs, procs, stopped
+from . import images, irq_fixture, overlay, pause, prereqs, procs, stopped, toolchain
 from .cli import Result, RootProfile, Silo
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
@@ -39,7 +38,7 @@ STATE = struct.Struct("<15Q")
 def restore_image(config: SmokeConfig, registry: LoopbackRegistry,
                   tmp_path_factory: pytest.TempPathFactory) -> str:
     output = tmp_path_factory.mktemp("restore-probe") / "restore-execution"
-    command = [*shlex.split(os.environ.get("CC", "cc")), "-static", "-O2", "-pthread",
+    command = [*toolchain.static_cc(), "-static", "-O2", "-pthread",
                "-Wall", "-Wextra", "-Werror", "-std=c11",
                str(REPO / "virt/vmm/tests/guest/restore_execution.c"), "-o", str(output)]
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)

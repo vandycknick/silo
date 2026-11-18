@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from silo_smoke import overlay, preflight, prereqs
+from silo_smoke import overlay, preflight, prereqs, toolchain
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO
 from silo_smoke.overlay_candidate import Candidate, bounded_log, cpio
@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 def erofs_probe(tmp_path_factory: pytest.TempPathFactory) -> Path:
     output = tmp_path_factory.mktemp("erofs-probe") / "init"
     subprocess.run(
-        [os.environ.get("CC", "cc"), "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(output), str(REPO / "smoke/fixtures/erofs_mount.c")],
+        [*toolchain.static_cc(), "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(output), str(REPO / "smoke/fixtures/erofs_mount.c")],
         check=True, capture_output=True, timeout=90,
     )
     return output

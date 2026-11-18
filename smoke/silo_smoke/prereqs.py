@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import tomllib
 
+from .areas import AREAS
 from .config import REPO
 from .errors import SmokeEnvironmentError
 
@@ -156,6 +157,8 @@ def main() -> None:
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--local-kernel", type=Path)
     parser.add_argument("--marker", default="not slow")
+    # Validated here, before any VM work, so a typo fails fast instead of selecting nothing.
+    parser.add_argument("--area", action="append", default=[], choices=sorted(AREAS))
     args, pytest_args = parser.parse_known_args()
     native_root()
     print(f"Smoke kernel config: {kernel_config(args.runtime, args.local_kernel)}", flush=True)

@@ -24,6 +24,10 @@ SMOKE_ARGS ?=
 SMOKE_WORKERS ?= 2
 ##? SMOKE_MARK=expression: Smoke marker selection (default: not slow; SMOKE_ARGS=-m overrides it).
 SMOKE_MARK ?= not slow
+##? SMOKE_AREAS=a,b: Run only these smoke areas (default: all; make smoke-areas lists them).
+SMOKE_AREAS ?=
+comma := ,
+SMOKE_AREA_ARGS = $(foreach area,$(subst $(comma), ,$(SMOKE_AREAS)),--area $(area))
 ##? PERF_COHORTS=a,b: Performance cohorts (empty selects all).
 PERF_COHORTS ?=
 ##? PERF_SYSTEMS=silo,msb: Performance systems (default: silo).
@@ -204,7 +208,7 @@ coverage-baseline: ## Snapshot coverage as the reduction baseline.
 coverage-diff: ## Fail if coverage regressed versus BASELINE.
 	$(XTASK) coverage-diff --baseline "$(BASELINE)" --current "$(CARGO_TARGET_DIR)/coverage"
 
-.PHONY: smoke-kernel smoke-prereqs smoke-diagnostic
+.PHONY: smoke-kernel smoke-prereqs smoke-diagnostic smoke-areas
 SMOKE_RUNTIME_SOURCE ?= $(CARGO_TARGET_DIR)/silo-runtime/$(RUNTIME_TARGET)/$(SMOKE_PROFILE)
 # Smoke exercises this tree's kernel configuration, not the last published
 # kernel, so it builds the repo kernel (a cache hit after the first build)
@@ -222,7 +226,10 @@ smoke-prereqs: smoke-kernel ## Stage SMOKE_PROFILE with the smoke kernel and bui
 	cargo build --locked $(if $(filter release,$(SMOKE_PROFILE)),--release) -p libvm --example storage_acceptance --example live_acceptance --example root_metrics --example overlay_candidate_lower --example erofs_qualification
 	cargo build --locked $(if $(filter release,$(SMOKE_PROFILE)),--release) -p disk-image --example format_upper
 	cargo build --locked $(if $(filter release,$(SMOKE_PROFILE)),--release) -p silo-vmm --example native-live-api --example guest-lifecycle-controller
-	cd smoke && PROFILE="$(SMOKE_PROFILE)" SILO_SMOKE_BIN_DIR="$${SILO_SMOKE_BIN_DIR:-$(CARGO_TARGET_DIR)/$(SMOKE_PROFILE)}" uv run python -m silo_smoke.prereqs --runtime "$${SILO_SMOKE_RUNTIME_DIR:-$(CARGO_TARGET_DIR)/silo-runtime/$(RUNTIME_TARGET)/$(SMOKE_PROFILE)}" --local-kernel "$(SMOKE_KERNEL)" --marker "$(SMOKE_MARK)" -- $(SMOKE_ARGS)
+	cd smoke && PROFILE="$(SMOKE_PROFILE)" SILO_SMOKE_BIN_DIR="$${SILO_SMOKE_BIN_DIR:-$(CARGO_TARGET_DIR)/$(SMOKE_PROFILE)}" uv run python -m silo_smoke.prereqs --runtime "$${SILO_SMOKE_RUNTIME_DIR:-$(CARGO_TARGET_DIR)/silo-runtime/$(RUNTIME_TARGET)/$(SMOKE_PROFILE)}" --local-kernel "$(SMOKE_KERNEL)" --marker "$(SMOKE_MARK)" $(SMOKE_AREA_ARGS) -- $(SMOKE_ARGS)
+
+smoke-areas: ## List smoke areas for SMOKE_AREAS.
+	cd smoke && uv run python -m silo_smoke.areas
 
 smoke-diagnostic:
 	$(XTASK) --target-dir "$(CARGO_TARGET_DIR)/smoke-diagnostic" stage --profile "$(SMOKE_PROFILE)" --vmm-features restore-irq-probe --path "$(SMOKE_RUNTIME_SOURCE)/assets/kernel-default"
@@ -233,8 +240,8 @@ smoke: smoke-prereqs ## Build and run real-VM smoke (needs KVM/HVF; not CI).
 		export SILO_SMOKE_BIN_DIR="$${SILO_SMOKE_BIN_DIR:-$(CARGO_TARGET_DIR)/$(SMOKE_PROFILE)}"; \
 		export SILO_SMOKE_RUNTIME_DIR="$${SILO_SMOKE_RUNTIME_DIR:-$(CARGO_TARGET_DIR)/silo-runtime/$(RUNTIME_TARGET)/$(SMOKE_PROFILE)}"; \
 		status=0; \
-		uv run pytest -m "$(SMOKE_MARK)" $(SMOKE_ARGS) -n $(SMOKE_WORKERS) --dist loadfile --smoke-lane parallel || { code=$$?; test $$code -eq 5 || status=$$code; }; \
-		uv run pytest -m "$(SMOKE_MARK)" $(SMOKE_ARGS) -n 0 --smoke-lane serial || { code=$$?; test $$code -eq 5 || status=$$code; }; \
+		uv run pytest -m "$(SMOKE_MARK)" $(SMOKE_AREA_ARGS) $(SMOKE_ARGS) -n $(SMOKE_WORKERS) --dist loadfile --smoke-lane parallel || { code=$$?; test $$code -eq 5 || status=$$code; }; \
+		uv run pytest -m "$(SMOKE_MARK)" $(SMOKE_AREA_ARGS) $(SMOKE_ARGS) -n 0 --smoke-lane serial || { code=$$?; test $$code -eq 5 || status=$$code; }; \
 		exit $$status; \
 	}
 

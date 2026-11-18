@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from silo_smoke import prereqs
+from silo_smoke import areas, prereqs, toolchain
 from silo_smoke.config import REPO
 from silo_smoke.errors import SmokeEnvironmentError
 
@@ -147,3 +147,29 @@ def test_kernel_config_override_remains_an_explicit_input(tmp_path: Path) -> Non
     result = _run(code, tmp_path, supplied)
     assert result.returncode == 0, result.stderr
     assert Path(result.stdout.strip()) == supplied
+
+
+def test_every_smoke_module_has_an_area_and_every_area_names_real_modules() -> None:
+    modules = {path.stem for path in (REPO / "smoke/tests").glob("test_*.py")}
+    mapped = {module for area in areas.AREAS.values() for module in area.modules}
+    assert modules - mapped == set(), "unmapped smoke modules"
+    assert mapped - modules == set(), "areas name missing modules"
+
+
+def test_static_cc_autodetects_a_compiler_that_links_static(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CC", raising=False)
+    toolchain.static_cc.cache_clear()
+    try:
+        assert toolchain.links_static(list(toolchain.static_cc()))
+    finally:
+        toolchain.static_cc.cache_clear()
+
+
+def test_static_cc_refuses_an_explicit_compiler_that_cannot_link_static(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CC", "false")
+    toolchain.static_cc.cache_clear()
+    try:
+        with pytest.raises(SmokeEnvironmentError, match="CC='false'"):
+            toolchain.static_cc()
+    finally:
+        toolchain.static_cc.cache_clear()

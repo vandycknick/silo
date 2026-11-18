@@ -31,7 +31,6 @@ import os
 from pathlib import Path
 import re
 import select
-import shlex
 import socket
 import sqlite3
 import struct
@@ -45,7 +44,7 @@ from typing import Iterator
 
 import pytest
 
-from . import images, restore, shutdown, stopped
+from . import images, restore, shutdown, stopped, toolchain
 from .cli import Silo
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
@@ -85,7 +84,7 @@ SUCCESS_ORDER = (PREPARED, GENERATION_INSTALLED, GENERATION_ACKNOWLEDGED, ACTIVA
 
 
 def compile_probe(output: Path) -> Path:
-    command = [*shlex.split(os.environ.get("CC", "cc")), "-static", "-O2",
+    command = [*toolchain.static_cc(), "-static", "-O2",
                "-Wall", "-Wextra", "-Werror", "-std=c11",
                str(REPO / "virt/vmm/tests/guest/restore_network.c"), "-o", str(output)]
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
