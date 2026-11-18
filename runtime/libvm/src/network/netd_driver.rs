@@ -1150,7 +1150,7 @@ mod tests {
         assert_eq!(
             hook_json,
             &json!({
-                "version": 2,
+                "version": 1,
                 "command": "/usr/bin/silo",
                 "args": ["secret", "provide"],
                 "timeout_ms": 2500,

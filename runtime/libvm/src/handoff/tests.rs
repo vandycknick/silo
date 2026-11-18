@@ -1632,7 +1632,7 @@ async fn old_format_peer_is_refused_before_creating_an_operation() {
         .unwrap();
     let mut value: serde_json::Value =
         serde_json::from_slice(observation.document().bytes()).unwrap();
-    value["schema"] = serde_json::json!(1);
+    value["schema"] = serde_json::json!(2);
     let old = crate::handoff::plan::SealedDocument::seal(&value).unwrap();
     let error = crate::handoff::plan::SourceObservation::from_document(old).unwrap_err();
     assert!(error

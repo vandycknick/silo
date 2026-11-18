@@ -15,13 +15,13 @@ pub const MAX_PAGE_ENTRIES: usize = 4096;
 pub const MAX_STREAM_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 4 * MAX_STREAM_BYTES;
 pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
-pub const CONFIG_MEDIA_TYPE: &str = "application/vnd.silo.vm.config.v2+json";
+pub const CONFIG_MEDIA_TYPE: &str = "application/vnd.silo.vm.config.v1+json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PayloadMediaType {
-    #[serde(rename = "application/vnd.silo.vm.record.v2+json")]
+    #[serde(rename = "application/vnd.silo.vm.record.v1+json")]
     Record,
-    #[serde(rename = "application/vnd.silo.vm.stream-map.v2")]
+    #[serde(rename = "application/vnd.silo.vm.stream-map.v1")]
     StreamMap,
     #[serde(rename = "application/vnd.silo.vm.chunk.v1")]
     RawChunk,
@@ -35,8 +35,8 @@ pub enum PayloadMediaType {
 impl PayloadMediaType {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Record => "application/vnd.silo.vm.record.v2+json",
-            Self::StreamMap => "application/vnd.silo.vm.stream-map.v2",
+            Self::Record => "application/vnd.silo.vm.record.v1+json",
+            Self::StreamMap => "application/vnd.silo.vm.stream-map.v1",
             Self::RawChunk => "application/vnd.silo.vm.chunk.v1",
             Self::ZstdChunk => "application/vnd.silo.vm.chunk.v1+zstd",
             Self::Execution => "application/vnd.silo.vm.execution.v1",
@@ -164,9 +164,9 @@ pub struct VmArtifactConfig {
 }
 impl VmArtifactConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.schema != 2 || self.kind != "vm-artifact" || self.encoding != "silo-chunks-v2" {
+        if self.schema != 1 || self.kind != "vm-artifact" || self.encoding != "silo-chunks-v1" {
             return Err(invalid(
-                "unsupported artifact format: fresh-state v2 required",
+                "unsupported artifact format: fresh-state v1 required",
             ));
         }
         if self.content.kind == ContentKind::Image && self.memory.is_some() {
@@ -369,8 +369,8 @@ pub fn verify_transfer_to(
     mut fetch_record: impl FnMut(ContentDigest) -> Result<Vec<u8>>,
     mut visit: impl FnMut(u64, ChunkEntry) -> Result<()>,
 ) -> Result<()> {
-    if root.schema != 2
-        || root.kind != "silo-chunks-v2"
+    if root.schema != 1
+        || root.kind != "silo-chunks-v1"
         || root.chunk_size != CHUNK_SIZE
         || root.length > MAX_STREAM_BYTES
         || root.pages.len() > MAX_PAGE_ENTRIES
@@ -392,7 +392,7 @@ pub fn verify_transfer_to(
             return Err(invalid("transfer page digest mismatch"));
         }
         let page: TransferPage = decode_record(&bytes)?;
-        if page.schema != 2
+        if page.schema != 1
             || page.kind != "silo-chunk-map"
             || page.first_chunk != count
             || page.entries.is_empty()
@@ -467,7 +467,7 @@ pub fn encode_stream_table(entries: &[StreamBinding]) -> Result<EncodedTable> {
     }
     let pages = paginate(entries, "stream-table-page", "firstEntry")?;
     let root = RecordBlob::encode(&StreamTableRoot {
-        schema: 2,
+        schema: 1,
         kind: "stream-table".into(),
         entries: entries.len() as u64,
         pages: pages.iter().map(|page| page.reference).collect(),
@@ -502,7 +502,7 @@ pub fn encode_object_table(entries: &[ObjectBinding]) -> Result<EncodedTable> {
     }
     let pages = paginate(entries, "object-table-page", "firstEntry")?;
     let root = RecordBlob::encode(&ObjectTableRoot {
-        schema: 2,
+        schema: 1,
         kind: "object-table".into(),
         entries: entries.len() as u64,
         pages: pages.iter().map(|page| page.reference).collect(),
@@ -526,8 +526,8 @@ pub fn encode_transfer(
     }
     let pages = paginate(entries, "silo-chunk-map", "firstChunk")?;
     let root = RecordBlob::encode(&TransferRoot {
-        schema: 2,
-        kind: "silo-chunks-v2".into(),
+        schema: 1,
+        kind: "silo-chunks-v1".into(),
         stream,
         length,
         chunk_size: CHUNK_SIZE,
@@ -543,7 +543,7 @@ fn page_value<T: Serialize>(
     first: usize,
 ) -> Result<Value> {
     let mut object = serde_json::Map::new();
-    object.insert("schema".into(), Value::from(2));
+    object.insert("schema".into(), Value::from(1));
     object.insert("kind".into(), Value::String(kind.into()));
     object.insert(first_field.into(), Value::from(first as u64));
     object.insert("entries".into(), serde_json::to_value(entries)?);
@@ -701,8 +701,8 @@ mod tests {
     /// form of the golden bytes below, so the document cannot drift from the
     /// encoder.
     const SPEC: &str = include_str!("../../../../docs/architecture/vm-artifact.md");
-    const IMAGE_GOLDEN: &str = r#"{"bootAbi":"silo-direct-v2","content":{"id":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kind":"image","record":{"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":1874}},"encoding":"silo-chunks-v2","guestPlatform":{"architecture":"arm64","os":"linux"},"kind":"vm-artifact","memory":null,"objects":{"digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":655},"root":"linux-erofs-overlay","schema":2,"streams":{"digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333","size":412}}"#;
-    const SNAPSHOT_GOLDEN: &str = r#"{"bootAbi":"silo-direct-v2","content":{"id":"sha256:5555555555555555555555555555555555555555555555555555555555555555","kind":"snapshot","record":{"digest":"sha256:6666666666666666666666666666666666666666666666666666666666666666","size":2306}},"encoding":"silo-chunks-v2","guestPlatform":{"architecture":"amd64","os":"linux"},"kind":"vm-artifact","memory":{"compatibilityProfile":{"architecture":"x86_64","liveStateSchema":"silo.live-state/1","profile":"sha256:7777777777777777777777777777777777777777777777777777777777777777","ramLayout":"sha256:9999999999999999999999999999999999999999999999999999999999999999","topology":"sha256:8888888888888888888888888888888888888888888888888888888888888888"},"deviceVersion":1,"execution":"krun-v1","executionAbi":1,"executionVersion":1,"provenance":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":2210}},"objects":{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":1957},"root":"opaque-raw","schema":2,"streams":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1203}}"#;
+    const IMAGE_GOLDEN: &str = r#"{"bootAbi":"silo-direct-v1","content":{"id":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kind":"image","record":{"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":1874}},"encoding":"silo-chunks-v1","guestPlatform":{"architecture":"arm64","os":"linux"},"kind":"vm-artifact","memory":null,"objects":{"digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":655},"root":"linux-erofs-overlay","schema":1,"streams":{"digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333","size":412}}"#;
+    const SNAPSHOT_GOLDEN: &str = r#"{"bootAbi":"silo-direct-v1","content":{"id":"sha256:5555555555555555555555555555555555555555555555555555555555555555","kind":"snapshot","record":{"digest":"sha256:6666666666666666666666666666666666666666666666666666666666666666","size":2306}},"encoding":"silo-chunks-v1","guestPlatform":{"architecture":"amd64","os":"linux"},"kind":"vm-artifact","memory":{"compatibilityProfile":{"architecture":"x86_64","liveStateSchema":"silo.live-state/1","profile":"sha256:7777777777777777777777777777777777777777777777777777777777777777","ramLayout":"sha256:9999999999999999999999999999999999999999999999999999999999999999","topology":"sha256:8888888888888888888888888888888888888888888888888888888888888888"},"deviceVersion":1,"execution":"krun-v1","executionAbi":1,"executionVersion":1,"provenance":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":2210}},"objects":{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":1957},"root":"opaque-raw","schema":1,"streams":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1203}}"#;
 
     fn reference(fill: u8, size: u64) -> RecordRef {
         RecordRef {
@@ -713,9 +713,9 @@ mod tests {
 
     fn image_config() -> VmArtifactConfig {
         VmArtifactConfig {
-            schema: 2,
+            schema: 1,
             kind: "vm-artifact".into(),
-            encoding: "silo-chunks-v2".into(),
+            encoding: "silo-chunks-v1".into(),
             content: ContentRef {
                 kind: ContentKind::Image,
                 id: ContentDigest::from_sha256([0x11; 32]),
@@ -726,7 +726,7 @@ mod tests {
                 os: GuestOs::Linux,
                 architecture: Architecture::Arm64,
             },
-            boot_abi: "silo-direct-v2".into(),
+            boot_abi: "silo-direct-v1".into(),
             memory: None,
             streams: reference(0x33, 412),
             objects: reference(0x44, 655),
@@ -801,12 +801,12 @@ mod tests {
     }
 
     #[test]
-    fn old_artifact_format_is_refused_clearly() {
+    fn unsupported_artifact_format_is_refused_clearly() {
         let mut value = value(&image_config());
-        value["schema"] = json!(1);
-        value["encoding"] = json!("silo-chunks-v1");
+        value["schema"] = json!(2);
+        value["encoding"] = json!("silo-chunks-v2");
         let error = decode(&value).unwrap_err();
-        assert!(error.to_string().contains("fresh-state v2 required"));
+        assert!(error.to_string().contains("fresh-state v1 required"));
     }
 
     #[test]
@@ -1026,22 +1026,22 @@ mod tests {
         ];
         for split in [1, 2] {
             let first = RecordBlob::encode(&TransferPage {
-                schema: 2,
+                schema: 1,
                 kind: "silo-chunk-map".into(),
                 first_chunk: 0,
                 entries: entries[..split].to_vec(),
             })
             .unwrap();
             let last = RecordBlob::encode(&TransferPage {
-                schema: 2,
+                schema: 1,
                 kind: "silo-chunk-map".into(),
                 first_chunk: split as u64,
                 entries: entries[split..].to_vec(),
             })
             .unwrap();
             let mut root = TransferRoot {
-                schema: 2,
-                kind: "silo-chunks-v2".into(),
+                schema: 1,
+                kind: "silo-chunks-v1".into(),
                 stream,
                 length,
                 chunk_size: CHUNK_SIZE,
@@ -1073,15 +1073,15 @@ mod tests {
             (0, vec![ChunkEntry::Zero { length: CHUNK_SIZE }; 4]),
         ] {
             let page = RecordBlob::encode(&TransferPage {
-                schema: 2,
+                schema: 1,
                 kind: "silo-chunk-map".into(),
                 first_chunk,
                 entries,
             })
             .unwrap();
             let root = TransferRoot {
-                schema: 2,
-                kind: "silo-chunks-v2".into(),
+                schema: 1,
+                kind: "silo-chunks-v1".into(),
                 stream,
                 length,
                 chunk_size: CHUNK_SIZE,
@@ -1090,8 +1090,8 @@ mod tests {
             assert!(wire::verify_transfer(&root, |_| Ok(page.bytes.clone())).is_err());
         }
         let root = TransferRoot {
-            schema: 2,
-            kind: "silo-chunks-v2".into(),
+            schema: 1,
+            kind: "silo-chunks-v1".into(),
             stream,
             length,
             chunk_size: CHUNK_SIZE,

@@ -519,8 +519,8 @@ mod tests {
         let paths = LocalPaths::new(temporary.path());
         let store = Store::new(&paths).await.unwrap();
         for statement in [
-            "INSERT INTO storage_snapshot VALUES('old','old',CAST('{\"schema\":1}' AS BLOB),1,0)",
-            "INSERT INTO storage_image VALUES('old','old',CAST('{\"schema\":1}' AS BLOB),1,0)",
+            "INSERT INTO storage_snapshot VALUES('old','old',CAST('{\"schema\":2}' AS BLOB),1,0)",
+            "INSERT INTO storage_image VALUES('old','old',CAST('{\"schema\":2}' AS BLOB),1,0)",
             "INSERT INTO storage_stream VALUES('a',0,'b',23,'present')",
             "INSERT INTO verified_object VALUES('old',0,0,0,0,0,0,CAST('{\"chunks\":[]}' AS BLOB),'now')",
         ] {

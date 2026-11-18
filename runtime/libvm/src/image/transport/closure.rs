@@ -332,9 +332,9 @@ impl Semantic {
             }
         };
         let config = VmArtifactConfig {
-            schema: 2,
+            schema: 1,
             kind: "vm-artifact".into(),
-            encoding: "silo-chunks-v2".into(),
+            encoding: "silo-chunks-v1".into(),
             content: self.content_ref(),
             root,
             guest_platform: GuestPlatform {

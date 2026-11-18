@@ -2125,7 +2125,7 @@ fn map_validation(
         bind_held(&pool.open_object(digest)?, *expected)?;
     }
     serde_json::to_vec(&MapValidation {
-        schema: 2,
+        schema: 1,
         content: content.clone(),
         stream,
         root: root_fingerprint,
@@ -2155,7 +2155,7 @@ async fn load_map_validation(
     else {
         return Ok(None);
     };
-    if receipt.schema != 2 || receipt.content != *content || receipt.stream != fingerprint {
+    if receipt.schema != 1 || receipt.content != *content || receipt.stream != fingerprint {
         return Ok(None);
     }
     let root_file = pool.open_object(&content.map)?;
@@ -4130,7 +4130,7 @@ pub(crate) mod tests {
     async fn forged_snapshot_row(snapshots: &SnapshotStore, id: &str) {
         sqlx::query("INSERT INTO storage_snapshot(id,record_digest,record_bytes,created_at) VALUES(?1,?1,?2,1)")
             .bind(id)
-            .bind(br#"{"schema":2,"root":{"stream":{"chunkSize":8388608}}}"#.as_slice())
+            .bind(br#"{"schema":1,"root":{"stream":{"chunkSize":8388608}}}"#.as_slice())
             .execute(&snapshots.store.pool)
             .await
             .unwrap();
@@ -6161,7 +6161,7 @@ pub(crate) mod tests {
             .unwrap();
             assert!(receipt.len() < 4096);
             let value: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
-            assert_eq!(value["schema"], 2);
+            assert_eq!(value["schema"], 1);
             assert!(value.get("chunks").is_none());
             corrupt_member(&pool.object_path(&node.digest));
             // Local shape admission does not stat or decode every descendant.

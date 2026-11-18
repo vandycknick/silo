@@ -625,7 +625,7 @@ pub(crate) mod tests {
         let lower = retained_lower(&store, store.home_path(), b'G').await;
         let fsmeta = pool.object_path(&lower.retained().fsmeta());
         let image_record = crate::ImageRecord {
-            schema: 2,
+            schema: 1,
             kind: crate::ImageRecordKind::Image,
             root: record.root.clone(),
             boot: record.boot.clone(),

@@ -191,7 +191,7 @@ make smoke SMOKE_ARGS='tests/test_artifact_stopped.py'
 
 ### Stopped handoff between runtimes
 
-The v2 handoff sends binary roots and map nodes qualified by digest, stream,
+The v1 handoff sends binary roots and map nodes qualified by digest, stream,
 height and first index, separately from root/index-bound 8 MiB payloads.
 Source authorization follows only the named root-to-node path; artifact object
 tables remain digest-only. The independent disk oracle uses the sparse

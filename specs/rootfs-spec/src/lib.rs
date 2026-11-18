@@ -738,7 +738,7 @@ fn parse_rosetta(parser: &mut Parser<'_>) -> Result<RosettaMode, Error> {
 
 /// The only accepted bootstrap schema. Older launch bytes are rejected, never
 /// decoded through a compatibility path.
-pub const BOOTSTRAP_SCHEMA_VERSION: u64 = 2;
+pub const BOOTSTRAP_SCHEMA_VERSION: u64 = 1;
 
 pub fn decode_bootstrap(input: &[u8]) -> Result<Bootstrap, Error> {
     let mut parser = Parser::new(input)?;
@@ -1053,7 +1053,7 @@ mod tests {
         for fixture in [
             include_bytes!("../fixtures/invalid-duplicate.json").as_slice(),
             include_bytes!("../fixtures/invalid-unknown.json"),
-            include_bytes!("../fixtures/invalid-old-schema.json"),
+            include_bytes!("../fixtures/invalid-unsupported-schema.json"),
             include_bytes!("../fixtures/invalid-integer.json"),
             include_bytes!("../fixtures/invalid-uuid.json"),
         ] {
@@ -1068,11 +1068,11 @@ mod tests {
             "{}".into(),
             "[]".into(),
             "null".into(),
-            std::format!("{{\"schemaVersion\":02,\"root\":{RAW_ROOT},\"rosetta\":\"disabled\"}}"),
-            std::format!("{{\"schemaVersion\":2e0,\"root\":{RAW_ROOT},\"rosetta\":\"disabled\"}}"),
-            std::format!("{{\"schemaVersion\":2,\"root\":{RAW_ROOT},\"rosetta\":\"disabled\",}}"),
+            std::format!("{{\"schemaVersion\":01,\"root\":{RAW_ROOT},\"rosetta\":\"disabled\"}}"),
+            std::format!("{{\"schemaVersion\":1e0,\"root\":{RAW_ROOT},\"rosetta\":\"disabled\"}}"),
+            std::format!("{{\"schemaVersion\":1,\"root\":{RAW_ROOT},\"rosetta\":\"disabled\",}}"),
             std::format!(
-                "{{\"schemaVersion\":2,\"root\":{RAW_ROOT},\"rosetta\":\"disabled\"}}false"
+                "{{\"schemaVersion\":1,\"root\":{RAW_ROOT},\"rosetta\":\"disabled\"}}false"
             ),
         ] {
             assert!(decode_bootstrap(fixture.as_bytes()).is_err(), "{fixture}");
@@ -1080,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn only_schema_two_with_mandatory_translation_mode_is_accepted() {
+    fn only_schema_one_with_mandatory_translation_mode_is_accepted() {
         let bootstrap = |schema: &str, rosetta: &str| {
             decode_bootstrap(
                 std::format!("{{\"schemaVersion\":{schema},\"root\":{RAW_ROOT}{rosetta}}}")
@@ -1088,30 +1088,29 @@ mod tests {
             )
         };
         assert_eq!(
-            bootstrap("2", ",\"rosetta\":\"disabled\""),
+            bootstrap("1", ",\"rosetta\":\"disabled\""),
             Ok(whole_disk())
         );
-        for schema in ["0", "1", "3"] {
+        for schema in ["0", "2", "3"] {
             assert_eq!(
                 bootstrap(schema, ",\"rosetta\":\"disabled\""),
                 Err(Error::InvalidValue),
                 "{schema}"
             );
         }
-        assert_eq!(bootstrap("2", ""), Err(Error::MissingField));
+        assert_eq!(bootstrap("1", ""), Err(Error::MissingField));
         for mode in ["\"enabled\"", "\"Required\"", "true", "null", "\"\""] {
             assert!(
-                bootstrap("2", &std::format!(",\"rosetta\":{mode}")).is_err(),
+                bootstrap("1", &std::format!(",\"rosetta\":{mode}")).is_err(),
                 "{mode}"
             );
         }
         assert_eq!(
-            bootstrap("2", ",\"rosetta\":\"disabled\",\"rosetta\":\"disabled\""),
+            bootstrap("1", ",\"rosetta\":\"disabled\",\"rosetta\":\"disabled\""),
             Err(Error::DuplicateField)
         );
-        // The exact schema-1 raw producer output is not a compatible input.
         assert!(
-            decode_bootstrap(b"{\"schemaVersion\":1,\"root\":{\"kind\":\"opaque-raw-v1\"}}")
+            decode_bootstrap(b"{\"schemaVersion\":2,\"root\":{\"kind\":\"opaque-raw-v1\"}}")
                 .is_err()
         );
     }
@@ -1120,7 +1119,7 @@ mod tests {
     fn arbitrary_field_order_and_whitespace_are_valid() {
         assert_eq!(
             decode_bootstrap(
-                b" \n{ \"rosetta\" : \"disabled\", \"root\" : { \"filesystem\" : \"ext4\", \"selector\" : { \"kind\" : \"whole-disk\" }, \"device\" : { \"readOnly\" : false, \"logicalSectorSize\" : 512, \"lengthBytes\" : 8589934592, \"serial\" : \"silo-root\" }, \"discovery\" : \"virtio-block-serial\", \"kind\" : \"opaque-raw-v1\" }, \"schemaVersion\" : 2 }\t"
+                b" \n{ \"rosetta\" : \"disabled\", \"root\" : { \"filesystem\" : \"ext4\", \"selector\" : { \"kind\" : \"whole-disk\" }, \"device\" : { \"readOnly\" : false, \"logicalSectorSize\" : 512, \"lengthBytes\" : 8589934592, \"serial\" : \"silo-root\" }, \"discovery\" : \"virtio-block-serial\", \"kind\" : \"opaque-raw-v1\" }, \"schemaVersion\" : 1 }\t"
             )
             .unwrap(),
             whole_disk()

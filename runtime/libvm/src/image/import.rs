@@ -242,7 +242,7 @@ async fn import_disk_owned(
     )
     .await?;
     let record = ImageRecord {
-        schema: 2,
+        schema: 1,
         kind: ImageRecordKind::Image,
         root: prepared.root,
         boot,

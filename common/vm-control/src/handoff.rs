@@ -651,10 +651,10 @@ pub fn capabilities_to_wire(
 pub fn capabilities_from_wire(
     value: w::HandoffCapabilities,
 ) -> Result<libvm::handoff::plan::HandoffCapabilities, ConversionError> {
-    if value.protocol_version != 2 {
+    if value.protocol_version != 1 {
         return Err(invalid(
             "handoff.capabilities.protocol_version",
-            "unsupported handoff format; both peers must use protocol version 2 (no old-format conversion)",
+            "unsupported handoff format; both peers must use protocol version 1 (no old-format conversion)",
         ));
     }
     if value.max_frame_bytes == 0
@@ -838,7 +838,7 @@ mod tests {
         let mut intent = intent();
         intent.destination_machine = intent.source_machine;
         let record = h::HandoffRecord {
-            schema: 2,
+            schema: 1,
             role: h::HandoffRole::Source,
             intent,
             binding: None,
@@ -921,7 +921,7 @@ mod tests {
         use crate::handoff::{capabilities_from_wire, capabilities_to_wire};
         use prost::Message;
         let wire = w::HandoffCapabilities {
-            protocol_version: 2,
+            protocol_version: 1,
             runtime: uuid::Uuid::new_v4().to_string(),
             kernel_architecture: w::GuestArchitecture::Amd64 as i32,
             backend: w::LiveBackend::Krun as i32,
@@ -932,7 +932,7 @@ mod tests {
         let decoded = w::HandoffCapabilities::decode(wire.encode_to_vec().as_slice()).unwrap();
         let native = capabilities_from_wire(decoded).unwrap();
         assert_eq!(capabilities_to_wire(&native).unwrap(), wire);
-        for version in [0, 1, 3, u32::MAX] {
+        for version in [0, 2, 3, u32::MAX] {
             let mut old = wire.clone();
             old.protocol_version = version;
             let error = capabilities_from_wire(old).unwrap_err();

@@ -36,7 +36,7 @@ delivery and host admission. Capture receipts carry `liveStateSchema` and
 and schema. Restore inspection rejects mismatched schema or architecture before
 activation, while the complete device inventory remains required:
 
-The inspection envelope uses `RESTORE_INSPECTION_VERSION` (v2), independently of
+The inspection envelope uses `RESTORE_INSPECTION_VERSION` (v1), independently of
 the native `silo.live-state/1` metadata codec. Sender, report verifier and
 inspector must validate that shared envelope for both owned and identified
 authority. Invalid envelope/device-profile requests and native admission
@@ -162,7 +162,7 @@ Checkpoint pool publication owns durability; fork children retain their
 independent background barriers.
 
 The binary `memory.root` (wire role `ram-map`) and disk roots use ADR 0014's
-canonical stream-map v2 codec. Evidence contains bounded change-file summaries,
+canonical stream-map v1 codec. Evidence contains bounded change-file summaries,
 not per-unit digest lists. Root/node/change storage is charged separately from
 bounded control records and the state allowance. Retained and candidate roots
 have operation/run lifetimes, not a TTL; result release never discards the
@@ -238,7 +238,7 @@ qualification; Linux success does not establish it.
 
 The test formats a whole-disk ext4 root carrying the multicall Silo binary
 (`SILO_TEST_INIT`) as `/bin/sh`, attaches it as `silo-root`, and appends a
-schema-2 whole-disk launch bootstrap to the real base initramfs, as libvm
+schema-1 whole-disk launch bootstrap to the real base initramfs, as libvm
 composes it. The real Silo init resolves that root only through the bootstrap,
 then hands off to `init=/bin/sh`; there is no kernel `root=` argument and no
 rescue-shell path. Without a guest-agent stub, it runs these scenarios as

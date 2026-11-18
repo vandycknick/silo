@@ -40,13 +40,13 @@ func TestProviderActualCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	grant, err := json.Marshal(map[string]any{
-		"version": 2, "store": "file:" + store, "machine": "0123456789abcdef0123456789abcdef", "run": "run", "issued_at": "2026-09-30T00:00:00Z",
+		"version": 1, "store": "file:" + store, "machine": "0123456789abcdef0123456789abcdef", "run": "run", "issued_at": "2026-09-30T00:00:00Z",
 		"allowed": []map[string]string{{"slot": "personal.oauth.access_token", "key": "openai_codex_oauth.personal.oauth", "field": "OAuthAccessToken", "backing_scope": "Home"}, {"slot": "personal.oauth.expires_at", "key": "openai_codex_oauth.personal.oauth", "field": "OAuthExpiresAt", "backing_scope": "Home"}, {"slot": "personal.oauth.account_id", "key": "openai_codex_oauth.personal.oauth", "field": "OAuthAccountId", "backing_scope": "Home"}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := &Provider{Version: 2, Command: command, Args: []string{"secret", "provide", "--store-file", store}, Grant: grant}
+	provider := &Provider{Version: 1, Command: command, Args: []string{"secret", "provide", "--store-file", store}, Grant: grant}
 	credential := &hooks.Credential{Name: "personal", Kind: "openai_codex_oauth", Endpoint: "chatgpt"}
 	names := []string{"personal.oauth.access_token", "personal.oauth.expires_at", "personal.oauth.account_id"}
 	source := NewStatic(map[string][]byte{names[0]: []byte("old-synthetic-token"), names[1]: []byte("2099-01-01T00:00:00Z")}, provider)

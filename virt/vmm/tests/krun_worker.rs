@@ -575,7 +575,7 @@ fn native_root(path: &std::path::Path, init: &std::path::Path) -> u64 {
     length
 }
 
-/// Appends the launch-only schema-2 whole-disk bootstrap to the base
+/// Appends the launch-only schema-1 whole-disk bootstrap to the base
 /// initramfs, as libvm composes it: a 4-byte aligned uncompressed newc tail.
 fn compose_initramfs(base: &std::path::Path, root_length: u64, destination: &std::path::Path) {
     let bootstrap = rootfs_spec::Bootstrap {

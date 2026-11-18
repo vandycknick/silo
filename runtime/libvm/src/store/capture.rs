@@ -1161,7 +1161,7 @@ impl SnapshotStore {
                 .ok_or_else(|| invalid("capture state object is missing"))
         };
         let snapshot = SnapshotRecord {
-            schema: 2,
+            schema: 1,
             kind: SnapshotKind::Snapshot,
             memory: SnapshotMemoryState::Included {
                 execution: Box::new(SnapshotExecution {
@@ -1610,7 +1610,7 @@ fn staged_node_charge(directory: &OwnedDirectory, catalog: bool) -> Result<u64, 
                 .get_mut(..length)
                 .ok_or_else(|| invalid("staged map node exceeds its format bound"))?;
             std::os::unix::fs::FileExt::read_exact_at(&file, encoded, 0)?;
-            let height = if encoded.starts_with(b"silo:stream-map:leaf:v2\n") {
+            let height = if encoded.starts_with(b"silo:stream-map:leaf:v1\n") {
                 0
             } else {
                 *encoded
@@ -7404,7 +7404,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let record = crate::ImageRecord {
-            schema: 2,
+            schema: 1,
             kind: crate::ImageRecordKind::Image,
             root: consumer.record.root.clone(),
             boot: consumer.record.boot.clone(),

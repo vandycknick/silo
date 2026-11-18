@@ -386,7 +386,7 @@ fn verified_status(value: serde_json::Value, home: &Path) -> eyre::Result<Option
         .and_then(serde_json::Value::as_str);
     if let (Some(pid), Some(birth)) = (pid, birth) {
         if silod_spec::process::start_time(pid)?.as_deref() == Some(birth) {
-            if value.get("schema").and_then(serde_json::Value::as_u64) != Some(2) {
+            if value.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
                 bail!("a live daemon publishes an old status schema; restart required: run `silo daemon down` then `silo daemon up`");
             }
             let status: DaemonStatus =
@@ -523,7 +523,7 @@ async fn verify_core_api(status: &DaemonStatus, host: &libvm::HostPaths) -> eyre
             "daemon process identity changed during startup"
         );
         eyre::ensure!(
-            response.schema == 2,
+            response.schema == 1,
             "daemon status schema mismatch; restart required"
         );
         Ok::<_, eyre::Report>(response.core == silod_spec::daemon::v1::CorePhase::Ready as i32)
@@ -1241,7 +1241,7 @@ fn run(command: &mut Command, action: &str) -> eyre::Result<()> {
 mod tests {
     fn live_status_value(home: &std::path::Path) -> serde_json::Value {
         serde_json::json!({
-            "schema": 2,
+            "schema": 1,
             "generation": uuid::Uuid::new_v4(),
             "pid": std::process::id(),
             "process_start": silod_spec::process::start_time(std::process::id()).expect("birth").expect("live"),
@@ -1272,7 +1272,7 @@ mod tests {
             .expect("stale")
             .is_none());
         let mut old = value.clone();
-        old["schema"] = 1.into();
+        old["schema"] = 2.into();
         let error = crate::daemon::service::verified_status(old, home).expect_err("legacy live");
         assert!(error.to_string().contains("restart required"));
         assert!(crate::daemon::service::verified_status(
@@ -1603,7 +1603,7 @@ mod tests {
             std::fs::write(
                 paths.status(),
                 format!(
-                    r#"{{"schema":2,"generation":"d823458f-090b-48c3-87d4-33daf76c0000","pid":1,"process_start":"test","core":"{phase}","home":"/tmp","control_endpoint":"/tmp/control.sock","configuration_identity":"test","system":null,"manager_live":null,"appliance_live":null,"updated_at":"{updated_at}","last_error":"boom"}}"#
+                    r#"{{"schema":1,"generation":"d823458f-090b-48c3-87d4-33daf76c0000","pid":1,"process_start":"test","core":"{phase}","home":"/tmp","control_endpoint":"/tmp/control.sock","configuration_identity":"test","system":null,"manager_live":null,"appliance_live":null,"updated_at":"{updated_at}","last_error":"boom"}}"#
                 ),
             )
             .expect("status");

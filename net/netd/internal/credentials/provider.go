@@ -82,7 +82,7 @@ func (p *Provider) get(ctx context.Context, names []string, reason string) (map[
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	payload, err := json.Marshal(providerRequest{2, "get", base64.StdEncoding.EncodeToString(p.Grant), requestScope{grant.Machine, grant.Run}, names, reason})
+	payload, err := json.Marshal(providerRequest{1, "get", base64.StdEncoding.EncodeToString(p.Grant), requestScope{grant.Machine, grant.Run}, names, reason})
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +129,7 @@ func (p *Provider) get(ctx context.Context, names []string, reason string) (map[
 			return nil, errors.New("invalid provider error fields")
 		}
 	}
-	if response.Version != 2 {
+	if response.Version != 1 {
 		return nil, errors.New("unsupported provider response version")
 	}
 	if response.Status == "error" {

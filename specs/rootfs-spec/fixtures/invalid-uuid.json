@@ -1,5 +1,5 @@
 {
-  "schemaVersion":2,
+  "schemaVersion":1,
   "root":{
     "kind":"linux-erofs-overlay-v1","discovery":"virtio-block-serial",
     "lower":{"serial":"silo-root-lower","lengthBytes":268435456,"logicalSectorSize":512,"readOnly":true,"filesystem":"erofs","filesystemUuid":"12345678-1234-4234-8234-123456789abc"},

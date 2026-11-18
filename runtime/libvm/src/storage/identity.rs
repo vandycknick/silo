@@ -107,7 +107,7 @@ digest_type!(
 );
 digest_type!(
     StreamId,
-    "SHA-256 of the exact authenticated stream-map v2 binary root header."
+    "SHA-256 of the exact authenticated stream-map v1 binary root header."
 );
 digest_type!(
     ImageId,

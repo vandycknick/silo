@@ -44,7 +44,7 @@ const MINIMUM_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The one conversion flattener ABI and part of the raw-conversion key, so a
 /// changed renderer or floor never aliases an earlier conversion.
-pub(crate) const FLATTENER_ABI: &str = "flat-ext4-v3:erofs-composition:minimum-size=536870912";
+pub(crate) const FLATTENER_ABI: &str = "flat-ext4-v1:erofs-composition:minimum-size=536870912";
 
 impl Images {
     /// Explicitly converts an already selected OCI identity into a reusable,
@@ -231,7 +231,7 @@ async fn convert_owned(
     )
     .await?;
     let record = ImageRecord {
-        schema: 2,
+        schema: 1,
         kind: ImageRecordKind::Image,
         root: SnapshotRoot {
             profile: SnapshotRootProfile::OpaqueRaw,

@@ -149,7 +149,7 @@ atomically commits the complete tuple, dependent agent configuration and next
 storage generation. `Packaged`, a complete `Files` tuple and an owned `Exact`
 bundle are distinct selections; omitted members never inherit old assets.
 Fresh custom file tuples currently require the base initramfs to match the
-locally packaged schema-2 bootstrap bytes. Unknown custom base ABIs receive
+locally packaged schema-1 bootstrap bytes. Unknown custom base ABIs receive
 the payload-free `BootBundleAbiUnsupported` refusal, directing clients to select
 the packaged base without exposing host paths or computing diagnostic hashes. Previously admitted
 exact bundles remain usable after packages change. Ordinary configuration
@@ -169,7 +169,7 @@ guest. Overlay roots additionally require Linux 6.6 or newer, read from the held
 kernel. Overlay compatibility is a kernel-config property verified by the
 kernel track's gate at build time, not per boot.
 
-The mandatory schema-2 root bootstrap carries the named root attachment,
+The mandatory schema-1 root bootstrap carries the named root attachment,
 effective geometry, concrete disk-local selector, ext4 filesystem and effective
 Rosetta mode. Kernel `root=`, `rootfstype=` and `rootflags=` overrides are
 reserved for trusted bootstrap selection, and `rdinit=` is reserved because
@@ -872,7 +872,7 @@ cancellation fences exact unsubmitted handoffs and submissions; those children
 become cancelled after ownership cleanup, while genuinely lost identities remain
 failures. Already-submitted siblings keep their completion path.
 Resumed capture publication re-admits its disk and descriptor peaks before writing.
-The anchor schema is version 2; do not run older resource-ledger builds against
+The anchor schema is version 1; do not run older resource-ledger builds against
 the same user's ledger concurrently.
 The resource-only ledger uses a distinct namespace from older builds' RAM-aware
 `silo-restore-budget-<euid>` ledger. New builds never read that old directory,
@@ -1105,7 +1105,7 @@ accounts for unique live inode data, directory names, xattrs and the formatter's
 inode/extent/GDT/bitmap/journal overhead; a real dense image may therefore produce
 a lower larger than 2 GiB. Logical sparse-file length alone does not enlarge the
 artifact. The complete image remains bounded to 1 TiB. The current conversion
-identity is `flat-ext4-v3:erofs-composition:minimum-size=536870912`, so an earlier
+identity is `flat-ext4-v1:erofs-composition:minimum-size=536870912`, so an earlier
 development artifact is never reused under this conversion. There is no
 old-state migration, cache repair, compatibility reader or automatic wipe.
 

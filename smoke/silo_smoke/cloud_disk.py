@@ -856,7 +856,7 @@ def bundle_digest(binding: dict) -> str:
 def packaged_binding(assets: Path) -> dict:
     return {"kind": "pinned", "kernel": "sha256:" + overlay.digest(assets / "kernel-default"),
             "baseInitramfs": "sha256:" + overlay.digest(assets / "initramfs"),
-            "agent": "sha256:" + overlay.digest(assets / "agent"), "architecture": host_arch(), "abi": "silo-direct-v2"}
+            "agent": "sha256:" + overlay.digest(assets / "agent"), "architecture": host_arch(), "abi": "silo-direct-v1"}
 
 
 def assert_pool_objects(silo: Silo, binding: dict) -> None:
@@ -1073,7 +1073,7 @@ def candidate_disk(path: Path, *, role: str, block_id: str) -> dict:
 
 
 def raw_bootstrap(length: int, selector: dict) -> dict:
-    """Schema-2 bootstrap from rootfs-spec's own fixture, not a second codec."""
+    """Schema-1 bootstrap from rootfs-spec's own fixture, not a second codec."""
     value = json.loads((REPO / "specs/rootfs-spec/fixtures/raw-gpt.json").read_text())
     value["rosetta"] = "disabled"
     value["root"]["device"]["lengthBytes"] = length

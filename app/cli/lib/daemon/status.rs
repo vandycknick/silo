@@ -22,7 +22,7 @@ impl StatusPublisher {
             path: silod_spec::paths::DaemonPaths::new(host.home()).status(),
             config_dir: host.config_dir().into(),
             status: Mutex::new(DaemonStatus {
-                schema: 2,
+                schema: 1,
                 generation,
                 pid: std::process::id(),
                 process_start: process_start_identity()?,
@@ -348,7 +348,7 @@ mod tests {
         )
         .unwrap();
         let api = publisher.wire().unwrap();
-        assert_eq!(disk.schema, 2);
+        assert_eq!(disk.schema, 1);
         assert_eq!(disk.generation, generation);
         assert_eq!(api.generation, generation.to_string());
         assert_eq!(api.pid, disk.pid);

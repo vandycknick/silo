@@ -1121,7 +1121,7 @@ fn stored_image_detail_rows(info: &libvm::StoredImageInfo) -> eyre::Result<Vec<(
             "Root identity chunk".into(),
             format!("{} bytes", info.record.root.stream.chunk_size),
         ),
-        ("Map format".into(), "sparse Merkle v2".into()),
+        ("Map format".into(), "sparse Merkle v1".into()),
         (
             "Sector size".into(),
             ui::human_bytes(Some(u64::from(
@@ -2719,7 +2719,7 @@ mod tests {
     fn stored_image(names: &[&str]) -> libvm::StoredImageInfo {
         let digest = libvm::ObjectDigest::of_bytes(b"image renderer");
         let record = libvm::ImageRecord {
-            schema: 2,
+            schema: 1,
             kind: libvm::ImageRecordKind::Image,
             root: serde_json::from_value(serde_json::json!({
                 "profile": {"kind": "opaque-raw"},
@@ -2745,7 +2745,7 @@ mod tests {
                     base_initramfs: digest,
                     agent: None,
                     architecture: libvm::GuestArchitecture::Amd64,
-                    abi: "silo-direct-v2".into(),
+                    abi: "silo-direct-v1".into(),
                 },
                 root_selector: libvm::RootSelector::WholeDisk,
                 root_filesystem: libvm::RootFilesystem::Ext4,

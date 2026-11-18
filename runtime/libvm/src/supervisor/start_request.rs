@@ -366,7 +366,7 @@ mod tests {
                 .unwrap();
         let seed = vm_spec::capture::DiskTrackingSeed {
             version: vm_spec::capture::DISK_TRACKING_VERSION,
-            map_format: 2,
+            map_format: 1,
             chunk_shift: 23,
             role: vm_spec::DiskRole::Root,
             attachment_index: 0,

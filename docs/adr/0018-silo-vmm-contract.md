@@ -120,7 +120,7 @@ geometry/identity/access rather than reconstructing them from device positions.
 Every Silo direct launch, raw or managed overlay, carries an independently
 injected root bootstrap `silo/rootfs.json` in the initramfs, uid/gid 0, mode
 0600, at most 64 KiB, regardless of agent injection. A single core-only
-`rootfs-spec` codec serves host and init and accepts only `schemaVersion: 2`
+`rootfs-spec` codec serves host and init and accepts only `schemaVersion: 1`
 with a mandatory `rosetta` mode (`disabled`, `optional`, `required`). An
 `opaque-raw-v1` root names the `silo-root` attachment (effective length,
 512-byte sectors, access), a concrete `whole-disk`, unique `gpt-partition`

@@ -22,12 +22,7 @@ pub struct ExpectedLayer {
 
 pub fn domain(kind: &str, record: &[u8]) -> String {
     let mut digest = Sha256::new();
-    let version = if kind == "layer-result" || kind == "composition-result" {
-        2
-    } else {
-        1
-    };
-    digest.update(format!("silo:{kind}:v{version}\n"));
+    digest.update(format!("silo:{kind}:v1\n"));
     digest.update(record);
     crate::support::oracle::digest_text(&digest.finalize())
 }
@@ -49,9 +44,9 @@ fn stream_root(length: u64, mut leaves: BTreeMap<u64, [u8; 32]>) -> (Vec<u8>, St
         leaves = BTreeMap::new();
         for (index, entries) in groups {
             let mut node = if height == 0 {
-                b"silo:stream-map:leaf:v2\n".to_vec()
+                b"silo:stream-map:leaf:v1\n".to_vec()
             } else {
-                let mut prefix = b"silo:stream-map:branch:v2\n".to_vec();
+                let mut prefix = b"silo:stream-map:branch:v1\n".to_vec();
                 prefix.push(height);
                 prefix
             };
@@ -63,7 +58,7 @@ fn stream_root(length: u64, mut leaves: BTreeMap<u64, [u8; 32]>) -> (Vec<u8>, St
             leaves.insert(index, Sha256::digest(&node).into());
         }
     }
-    let mut root = b"silo:stream:v2\n".to_vec();
+    let mut root = b"silo:stream:v1\n".to_vec();
     root.push(23);
     root.extend_from_slice(&length.to_le_bytes());
     root.push(u8::from(!leaves.is_empty()));
@@ -213,7 +208,7 @@ pub fn expected(operations: &[Operation], tar: &[u8]) -> ExpectedLayer {
     );
     let recipe = domain("layer-recipe", &recipe_record);
     let result_record = encoded(
-        &json!({"indexRoot":hash(&root),"kind":"layer-result","packLength":pack.len(),"packStream":stream,"recipe":recipe,"schema":2}),
+        &json!({"indexRoot":hash(&root),"kind":"layer-result","packLength":pack.len(),"packStream":stream,"recipe":recipe,"schema":1}),
     );
     let result = domain("layer-result", &result_record);
     ExpectedLayer {

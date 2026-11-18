@@ -13,7 +13,7 @@ BEGIN SELECT RAISE(ABORT, 'runtime identity is immutable'); END;
 -- storage-operation rows. Terminal decisions survive both kinds of cleanup.
 CREATE TABLE handoff_operation (
     operation_id TEXT PRIMARY KEY NOT NULL,
-    schema INTEGER NOT NULL CHECK(schema=2),
+    schema INTEGER NOT NULL CHECK(schema=1),
     role TEXT NOT NULL CHECK(role IN ('source','destination')),
     mode TEXT NOT NULL CHECK(mode IN ('fork','relocate')),
     source_runtime TEXT NOT NULL,
@@ -108,7 +108,7 @@ CREATE TABLE verified_object (
     ctime_sec INTEGER NOT NULL,
     ctime_nsec INTEGER NOT NULL,
     map_receipt BLOB CHECK(map_receipt IS NULL OR (
-        json_valid(CAST(map_receipt AS TEXT),1) AND json_extract(CAST(map_receipt AS TEXT),'$.schema') IS 2
+        json_valid(CAST(map_receipt AS TEXT),1) AND json_extract(CAST(map_receipt AS TEXT),'$.schema') IS 1
         AND json_type(CAST(map_receipt AS TEXT),'$.chunks') IS NULL
         AND json_type(CAST(map_receipt AS TEXT),'$.content.mapPages') IS NULL
         AND json_type(CAST(map_receipt AS TEXT),'$.canonical') IS NULL
@@ -358,22 +358,22 @@ WHEN EXISTS (
     WHERE json_type(b.value,'$.map') IS NOT 'text'
        OR length(json_extract(b.value,'$.map')) != 71
        OR substr(json_extract(b.value,'$.map'),1,7) != 'sha256:'
-       OR json_extract(b.value,'$.seed.mapFormat') IS NOT 2
+       OR json_extract(b.value,'$.seed.mapFormat') IS NOT 1
        OR json_extract(b.value,'$.seed.chunkShift') IS NOT 23
        OR json_extract(b.value,'$.seed.baseline') IS NOT json_extract(b.value,'$.map')
 )
-BEGIN SELECT RAISE(ABORT,'machine baseline requires a stream-map v2 root'); END;
+BEGIN SELECT RAISE(ABORT,'machine baseline requires a stream-map v1 root'); END;
 CREATE TRIGGER machine_baseline_format_update BEFORE UPDATE OF record_json ON machine_storage
 WHEN EXISTS (
     SELECT 1 FROM json_each(NEW.record_json,'$.diskBaselines') b
     WHERE json_type(b.value,'$.map') IS NOT 'text'
        OR length(json_extract(b.value,'$.map')) != 71
        OR substr(json_extract(b.value,'$.map'),1,7) != 'sha256:'
-       OR json_extract(b.value,'$.seed.mapFormat') IS NOT 2
+       OR json_extract(b.value,'$.seed.mapFormat') IS NOT 1
        OR json_extract(b.value,'$.seed.chunkShift') IS NOT 23
        OR json_extract(b.value,'$.seed.baseline') IS NOT json_extract(b.value,'$.map')
 )
-BEGIN SELECT RAISE(ABORT,'machine baseline requires a stream-map v2 root'); END;
+BEGIN SELECT RAISE(ABORT,'machine baseline requires a stream-map v1 root'); END;
 
 CREATE TABLE machine_stream_dependency (
     machine_id TEXT NOT NULL REFERENCES machine_storage(machine_id) ON DELETE CASCADE,
@@ -702,10 +702,10 @@ CREATE INDEX composition_recipe_record_idx ON composition_recipe(record_digest);
 -- A local validation cache, never a retention root or transported authority.
 CREATE TABLE composition_validation (
     lower_id TEXT NOT NULL REFERENCES composition_result(id) ON DELETE CASCADE,
-    schema INTEGER NOT NULL CHECK(schema=2),
+    schema INTEGER NOT NULL CHECK(schema=1),
     receipt BLOB NOT NULL,
     graph_receipt BLOB CHECK(graph_receipt IS NULL OR (
-        json_valid(CAST(graph_receipt AS TEXT),1) AND json_extract(CAST(graph_receipt AS TEXT),'$.schema') IS 2
+        json_valid(CAST(graph_receipt AS TEXT),1) AND json_extract(CAST(graph_receipt AS TEXT),'$.schema') IS 1
         AND json_type(CAST(graph_receipt AS TEXT),'$.chunks') IS NULL
         AND json_type(CAST(graph_receipt AS TEXT),'$.maps') IS NULL
     )),
@@ -739,7 +739,7 @@ CREATE TABLE storage_snapshot (
     record_digest TEXT NOT NULL,
     record_bytes BLOB NOT NULL CHECK(
         json_valid(CAST(record_bytes AS TEXT),1)
-        AND json_extract(CAST(record_bytes AS TEXT),'$.schema') IS 2
+        AND json_extract(CAST(record_bytes AS TEXT),'$.schema') IS 1
         AND json_extract(CAST(record_bytes AS TEXT),'$.root.stream.chunkSize') IS 8388608
         AND json_type(CAST(record_bytes AS TEXT),'$.root.stream.mapPages') IS NULL
     ),
@@ -750,7 +750,7 @@ CREATE TABLE storage_image (
     record_digest TEXT NOT NULL,
     record_bytes BLOB NOT NULL CHECK(
         json_valid(CAST(record_bytes AS TEXT),1)
-        AND json_extract(CAST(record_bytes AS TEXT),'$.schema') IS 2
+        AND json_extract(CAST(record_bytes AS TEXT),'$.schema') IS 1
         AND json_extract(CAST(record_bytes AS TEXT),'$.root.stream.chunkSize') IS 8388608
         AND json_type(CAST(record_bytes AS TEXT),'$.root.stream.mapPages') IS NULL
     ),

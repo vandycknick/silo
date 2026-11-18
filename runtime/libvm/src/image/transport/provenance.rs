@@ -39,7 +39,7 @@ fn failure(message: impl std::fmt::Display) -> LibVmError {
 /// `portable-capture-provenance`, direct record JSON in canonical form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PortableCaptureProvenanceV2 {
+pub(crate) struct PortableCaptureProvenance {
     pub(crate) schema: u32,
     pub(crate) kind: String,
     pub(crate) snapshot: SnapshotId,
@@ -57,7 +57,7 @@ pub(crate) struct PortableCaptureDisk {
     pub(crate) attachment_index: u32,
 }
 
-impl PortableCaptureProvenanceV2 {
+impl PortableCaptureProvenance {
     pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, LibVmError> {
         Ok(canonical_bytes(self)?)
     }
@@ -65,7 +65,7 @@ impl PortableCaptureProvenanceV2 {
     /// Strict closed decoding of exactly canonical bytes.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, LibVmError> {
         let wrapper: Self = decode_record(bytes)?;
-        if wrapper.schema != 2 || wrapper.kind != "portable-capture-provenance" {
+        if wrapper.schema != 1 || wrapper.kind != "portable-capture-provenance" {
             return Err(failure("unsupported provenance schema or kind"));
         }
         if wrapper.canonical_bytes()? != bytes {
@@ -195,8 +195,8 @@ pub(crate) fn build_local(
             "capture inventory disk count differs from writable attachments",
         ));
     }
-    let wrapper = PortableCaptureProvenanceV2 {
-        schema: 2,
+    let wrapper = PortableCaptureProvenance {
+        schema: 1,
         kind: "portable-capture-provenance".into(),
         snapshot,
         evidence: RecordRef::of_bytes(evidence_bytes),
@@ -224,7 +224,7 @@ pub(crate) fn verify_portable_binding(
     evidence_bytes: &[u8],
 ) -> Result<PortableBinding, LibVmError> {
     let execution = execution(record)?;
-    let wrapper = PortableCaptureProvenanceV2::decode(wrapper_bytes)?;
+    let wrapper = PortableCaptureProvenance::decode(wrapper_bytes)?;
     if wrapper.snapshot != snapshot {
         return Err(failure("provenance names a different snapshot"));
     }
@@ -554,7 +554,7 @@ mod tests {
 
     use crate::image::transport::provenance::{
         build_local, verify_portable_binding, verify_portable_capture, MeasuredCapture,
-        PortableCaptureProvenanceV2,
+        PortableCaptureProvenance,
     };
     use crate::storage::identity::{SnapshotId, StreamId};
     use crate::storage::map::AuthenticatedMap;
@@ -610,8 +610,8 @@ mod tests {
         decoded.canonical_bytes().unwrap()
     }
 
-    fn rewrap(wrapper: &[u8], change: impl FnOnce(&mut PortableCaptureProvenanceV2)) -> Vec<u8> {
-        let mut decoded = PortableCaptureProvenanceV2::decode(wrapper).unwrap();
+    fn rewrap(wrapper: &[u8], change: impl FnOnce(&mut PortableCaptureProvenance)) -> Vec<u8> {
+        let mut decoded = PortableCaptureProvenance::decode(wrapper).unwrap();
         change(&mut decoded);
         decoded.canonical_bytes().unwrap()
     }
@@ -630,7 +630,7 @@ mod tests {
             binding.wrapper_digest,
             crate::storage::identity::ObjectDigest::of_bytes(&wrapper)
         );
-        let decoded = PortableCaptureProvenanceV2::decode(&wrapper).unwrap();
+        let decoded = PortableCaptureProvenance::decode(&wrapper).unwrap();
         assert_eq!(decoded.snapshot, published.id);
         assert_eq!(decoded.plan, published.plan);
         assert_eq!(

@@ -1759,7 +1759,7 @@ mod tests {
                 .unwrap()
                 .id()
                 .to_string(),
-            "sha256:8105ecb94483de323a5b839ea425e11e2270d9b5ae54fe5ab72ee75beed03f02"
+            "sha256:0fa0278a3087f83d9347b73df7478c3c57db0133648c175ecdb1bef827f912da"
         );
         assert_eq!(
             StreamHasher::new(ChunkSize::RAM)
@@ -1767,7 +1767,7 @@ mod tests {
                 .unwrap()
                 .id()
                 .to_string(),
-            "sha256:0471c42fb5674f3d0950b535aebe6712afd9b09ca40891364a9042e0b2c9a23a"
+            "sha256:9fc10289d040aa404d1a11b5a7c1154e62c3ee572f21957fbab3b5b130d9d39e"
         );
         source
             .write_all_at(&[1], ChunkSize::RAM.bytes() + 37)

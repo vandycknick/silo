@@ -573,7 +573,7 @@ pub(crate) fn seed_disk(
     let (_, roots) = retain_disk_map(pool, machine_dir, map)?;
     let seed = vm_spec::capture::DiskTrackingSeed {
         version: vm_spec::capture::DISK_TRACKING_VERSION,
-        map_format: 2,
+        map_format: 1,
         chunk_shift: vm_spec::stream_map::ChunkSize::DISK.shift(),
         role: disk.role,
         attachment_index: u32::try_from(index).map_err(|error| invalid(error.to_string()))?,
@@ -770,7 +770,7 @@ pub(crate) fn launch_disk_seeds(
         let metadata = source.file.metadata()?;
         let seed = vm_spec::capture::DiskTrackingSeed {
             version: vm_spec::capture::DISK_TRACKING_VERSION,
-            map_format: 2,
+            map_format: 1,
             chunk_shift: vm_spec::stream_map::ChunkSize::DISK.shift(),
             role,
             attachment_index: identity.attachment_index,
@@ -1549,7 +1549,7 @@ mod tests {
                 "generation" => record.storage_generation += 1,
                 "seed-binding" => record.disk_baselines[0].seed.file_inode += 1,
                 "seed-profile" => record.disk_baselines[0].seed.chunk_shift = 16,
-                "seed-format" => record.disk_baselines[0].seed.map_format = 1,
+                "seed-format" => record.disk_baselines[0].seed.map_format = 2,
                 "map-missing" => std::fs::remove_file(&map_path).unwrap(),
                 "map-truncated" | "map-identity" | "map-profile" => {
                     std::fs::set_permissions(&map_path, std::fs::Permissions::from_mode(0o600))

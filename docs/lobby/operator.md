@@ -144,7 +144,7 @@ silo daemon status --format json
 silo daemon logs --follow
 ```
 
-Core readiness is independent of lobby readiness. The schema-2 status record's
+Core readiness is independent of lobby readiness. The schema-1 status record's
 `lobby` object contains `phase`, `dns_name`, `approval_url`, `diagnostic`,
 `restart_count` and `updated_at`. Phases are `starting`, `needs_login`,
 `needs_tag`, `ready`, `degraded` and `failed`; current gateway supervision emits

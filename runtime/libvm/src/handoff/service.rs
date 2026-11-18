@@ -128,7 +128,7 @@ impl HandoffService {
 
     pub async fn capabilities(&self) -> Result<HandoffCapabilities, LibVmError> {
         Ok(HandoffCapabilities {
-            protocol_version: 2,
+            protocol_version: 1,
             runtime: self.runtime.native_store()?.runtime_id().await?,
             kernel_architecture: crate::handoff::destination::host_architecture()?,
             backend: self.runtime.effective_backend(),

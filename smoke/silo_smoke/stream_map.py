@@ -1,4 +1,4 @@
-"""Independent stream-map v2 and native RAM-change decoders (stdlib only).
+"""Independent stream-map v1 and native RAM-change decoders (stdlib only).
 
 This deliberately shares no implementation with the Rust codec. Full-byte scans
 are evidence, never part of a timed local capture/restore operation.
@@ -15,9 +15,9 @@ import struct
 
 RAM_CHUNK = 1 << 16
 DISK_CHUNK = 1 << 23
-ROOT = b"silo:stream:v2\n"
-LEAF = b"silo:stream-map:leaf:v2\n"
-BRANCH = b"silo:stream-map:branch:v2\n"
+ROOT = b"silo:stream:v1\n"
+LEAF = b"silo:stream-map:leaf:v1\n"
+BRANCH = b"silo:stream-map:branch:v1\n"
 
 
 def digest(data: bytes) -> str:
@@ -68,7 +68,7 @@ class Root:
 
 def decode_root(encoded: bytes) -> Root:
     if not encoded.startswith(ROOT) or len(encoded) not in (len(ROOT) + 10, len(ROOT) + 42):
-        raise ValueError("invalid stream-map v2 root")
+        raise ValueError("invalid stream-map v1 root")
     shift, length, present = struct.unpack_from("<BQB", encoded, len(ROOT))
     if present not in (0, 1) or len(encoded) != len(ROOT) + 10 + 32 * present:
         raise ValueError("invalid tree flag or root length")

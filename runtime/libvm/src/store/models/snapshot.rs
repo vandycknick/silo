@@ -491,7 +491,7 @@ impl SnapshotRecord {
     }
 
     fn validate_semantics(&self) -> Result<(), LibVmError> {
-        if self.schema != 2 {
+        if self.schema != 1 {
             return Err(invalid("unsupported snapshot schema"));
         }
         Resource::IncludedDisks
@@ -758,7 +758,7 @@ impl SnapshotRecord {
 
 pub(crate) fn snapshot_id(canonical: &[u8]) -> SnapshotId {
     let mut hash = Sha256::new();
-    hash.update(b"silo:snapshot:v2\n");
+    hash.update(b"silo:snapshot:v1\n");
     hash.update(canonical);
     SnapshotId::from_sha256(hash.finalize().into())
 }
@@ -1075,7 +1075,7 @@ pub(crate) mod tests {
         kernel: ObjectDigest,
     ) -> SnapshotRecord {
         SnapshotRecord {
-            schema: 2,
+            schema: 1,
             kind: SnapshotKind::Snapshot,
             memory: SnapshotMemoryState::None {
                 stop_outcome: StorageStopOutcome::Unknown,
@@ -1214,7 +1214,7 @@ pub(crate) mod tests {
         );
         let value = serde_json::to_value(&record).unwrap();
         for (field, replacement) in [
-            ("schema", serde_json::json!(1)),
+            ("schema", serde_json::json!(2)),
             ("captureKind", serde_json::json!("stopped")),
             ("captureKind", serde_json::json!("live-execution")),
             ("purpose", serde_json::json!("generalized-image")),

@@ -86,7 +86,7 @@ macro_rules! identity {
     };
 }
 identity!(CompositionRecipeId, b"silo:composition-recipe:v1\n");
-identity!(CompositionResultId, b"silo:composition-result:v2\n");
+identity!(CompositionResultId, b"silo:composition-result:v1\n");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -303,7 +303,7 @@ impl CompositionResult {
                 })
                 .collect(),
             recipe: self.recipe,
-            schema: 2,
+            schema: 1,
         })
     }
     pub fn id(&self) -> CompositionResultValue<CompositionResultId> {
@@ -311,7 +311,7 @@ impl CompositionResult {
     }
     pub fn decode(bytes: &[u8]) -> CompositionResultValue<Self> {
         let record: ResultRecord = decode_record(bytes)?;
-        if record.schema != 2 || record.kind != "composition-result" {
+        if record.schema != 1 || record.kind != "composition-result" {
             return Err(CompositionError::Invalid(
                 "unsupported composition result schema",
             ));
@@ -686,7 +686,7 @@ pub fn authenticate_layer(
         return Err(CompositionError::Invalid("index root exceeds format bound"));
     }
     let record: LayerResultRecord = decode_record(result_bytes)?;
-    if record.schema != 2 || record.kind != "layer-result" {
+    if record.schema != 1 || record.kind != "layer-result" {
         return Err(CompositionError::Invalid("unsupported layer result schema"));
     }
     let result = LayerResult {
@@ -940,7 +940,7 @@ mod tests {
         assert_ne!(recipe_hash, raw_hash);
         let result_bytes = result.canonical_bytes().unwrap();
         let mut independent_result = Sha256::new();
-        independent_result.update(b"silo:composition-result:v2\n");
+        independent_result.update(b"silo:composition-result:v1\n");
         independent_result.update(&result_bytes);
         let result_hash: [u8; 32] = independent_result.finalize().into();
         assert_eq!(result.id().unwrap().as_bytes(), &result_hash);
@@ -1132,7 +1132,7 @@ mod tests {
         let encoded = result.canonical_bytes().unwrap();
         for mutation in [
             mutate_record(&encoded, |v| v["schema"] = json!(0)),
-            mutate_record(&encoded, |v| v["schema"] = json!(1)),
+            mutate_record(&encoded, |v| v["schema"] = json!(2)),
             mutate_record(&encoded, |v| v["kind"] = json!("layer-result")),
             mutate_record(&encoded, |v| v["extra"] = json!(0)),
             mutate_record(&encoded, |v| v["fsmeta"]["extra"] = json!(0)),
@@ -1228,7 +1228,7 @@ mod tests {
         assert!(authenticate(&result, &fixture.root, false, fixture.changeset.diff_id).is_err());
         let result = mutate_record(&result_bytes, |v| v["extra"] = json!(0));
         assert!(authenticate(&result, &fixture.root, false, fixture.changeset.diff_id).is_err());
-        let result = mutate_record(&result_bytes, |v| v["schema"] = json!(1));
+        let result = mutate_record(&result_bytes, |v| v["schema"] = json!(2));
         assert!(authenticate(&result, &fixture.root, false, fixture.changeset.diff_id).is_err());
         let result = format!("{} ", String::from_utf8(result_bytes).unwrap());
         assert!(authenticate(

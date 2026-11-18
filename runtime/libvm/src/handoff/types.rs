@@ -230,7 +230,7 @@ impl HandoffRecord {
     pub fn validate(&self) -> Result<(), HandoffError> {
         self.intent.validate()?;
         let source = self.role == HandoffRole::Source;
-        if self.schema != 2
+        if self.schema != 1
             || !matches!(
                 (self.role, self.phase),
                 (

@@ -1533,10 +1533,10 @@ mod tests {
         }
         let artifact = libvm::LibVmError::ArtifactInvalid {
             boundary: "format",
-            message: "unsupported artifact format 1; fresh-state format 2 is required".into(),
+            message: "unsupported artifact format 2; fresh-state format 1 is required".into(),
         };
         let status = native_error_to_status(&artifact);
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert!(status.message().contains("unsupported artifact format 1"));
+        assert!(status.message().contains("unsupported artifact format 2"));
     }
 }

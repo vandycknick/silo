@@ -256,13 +256,13 @@ func TestOAuthRefreshHookHelperProcess(t *testing.T) {
 		expectedReason = "expired"
 	}
 	customGrant := strings.HasPrefix(mode, "pair-regression:") || mode == "account-override"
-	if !customGrant && (request.Version != 2 || request.Grant != base64.StdEncoding.EncodeToString(helperGrant()) || request.Operation != "get" || request.Scope.Machine != "0123456789abcdef0123456789abcdef" || request.Scope.Run != "run" || len(request.Names) != 3 || request.Names[0] != "personal.oauth.access_token" || request.Reason != expectedReason) {
+	if !customGrant && (request.Version != 1 || request.Grant != base64.StdEncoding.EncodeToString(helperGrant()) || request.Operation != "get" || request.Scope.Machine != "0123456789abcdef0123456789abcdef" || request.Scope.Run != "run" || len(request.Names) != 3 || request.Names[0] != "personal.oauth.access_token" || request.Reason != expectedReason) {
 		t.Fatal("unexpected hook request")
 	}
 	secrets := []providerSecret{{"personal.oauth.access_token", base64.StdEncoding.EncodeToString([]byte("new-access-token"))}, {"personal.oauth.expires_at", base64.StdEncoding.EncodeToString([]byte("2099-01-01T00:00:00Z"))}, {"personal.oauth.account_id", base64.StdEncoding.EncodeToString([]byte("acct_new"))}}
 	if customGrant {
-		if request.Version != 2 || request.Operation != "get" {
-			t.Fatal("not a v2 get")
+		if request.Version != 1 || request.Operation != "get" {
+			t.Fatal("not a v1 get")
 		}
 		selected := make([]providerSecret, 0, len(request.Names))
 		for _, name := range request.Names {
@@ -277,7 +277,7 @@ func TestOAuthRefreshHookHelperProcess(t *testing.T) {
 			t.Fatal("raw account should not be requested")
 		}
 	}
-	response := providerResponse{Version: 2, Status: "ok", Secrets: &secrets}
+	response := providerResponse{Version: 1, Status: "ok", Secrets: &secrets}
 	if mode == "invalid-expiry" {
 		secrets[1].Value = base64.StdEncoding.EncodeToString([]byte("bad-expiry"))
 	}
@@ -299,7 +299,7 @@ func TestOAuthRefreshHookHelperProcess(t *testing.T) {
 	case "bad-base64":
 		secrets[2].Value = "%%%"
 	case "bad-version":
-		response.Version = 1
+		response.Version = 2
 	}
 	payload, err := json.Marshal(response)
 	if err != nil {
@@ -403,7 +403,7 @@ func configureOAuthRefreshHookHelper(t *testing.T, mode string) *Provider {
 		t.Fatalf("os.Executable returned error: %v", err)
 	}
 	return &Provider{
-		Version:            2,
+		Version:            1,
 		Command:            executable,
 		Args:               []string{"-test.run=^TestOAuthRefreshHookHelperProcess$", "--", "--provider-helper", mode},
 		TimeoutMS:          5000,
@@ -413,7 +413,7 @@ func configureOAuthRefreshHookHelper(t *testing.T, mode string) *Provider {
 }
 
 func helperGrant() []byte {
-	return []byte(`{"version":2,"machine":"0123456789abcdef0123456789abcdef","run":"run","allowed":[{"slot":"personal.oauth.access_token","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccessToken","backing_scope":"Home"},{"slot":"personal.oauth.expires_at","key":"openai_codex_oauth.personal.oauth","field":"OAuthExpiresAt","backing_scope":"Home"},{"slot":"personal.oauth.account_id","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccountId","backing_scope":"Home"}]}`)
+	return []byte(`{"version":1,"machine":"0123456789abcdef0123456789abcdef","run":"run","allowed":[{"slot":"personal.oauth.access_token","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccessToken","backing_scope":"Home"},{"slot":"personal.oauth.expires_at","key":"openai_codex_oauth.personal.oauth","field":"OAuthExpiresAt","backing_scope":"Home"},{"slot":"personal.oauth.account_id","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccountId","backing_scope":"Home"}]}`)
 }
 
 func TestOAuthRefreshRequiresSameBackingTokenExpiryPair(t *testing.T) {

@@ -148,7 +148,7 @@ impl ImageRecord {
     pub fn validate(&self) -> Result<(), crate::LibVmError> {
         use crate::store::models::snapshot::{invalid, validate_geometry, SnapshotRootProfile};
         use crate::store::models::storage::{validate_root_selection, BootBinding, BootProfile};
-        if self.schema != 2 {
+        if self.schema != 1 {
             return Err(invalid("image requires current schema"));
         }
         validate_geometry(&self.root.stream, &self.root.geometry)?;
@@ -275,7 +275,7 @@ impl ImageRecord {
 pub(crate) fn image_id(canonical: &[u8]) -> crate::storage::identity::ImageId {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
-    hash.update(b"silo:image:v2\n");
+    hash.update(b"silo:image:v1\n");
     hash.update(canonical);
     crate::storage::identity::ImageId::from_sha256(hash.finalize().into())
 }
@@ -295,7 +295,7 @@ mod tests {
             ObjectDigest::of_bytes(b"kernel"),
         );
         ImageRecord {
-            schema: 2,
+            schema: 1,
             kind: ImageRecordKind::Image,
             root: snapshot.root,
             boot: snapshot.boot,

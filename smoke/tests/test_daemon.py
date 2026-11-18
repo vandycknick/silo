@@ -23,7 +23,7 @@ def test_daemon_ready_status_and_cli_routing(
 ) -> None:
     daemon.start()
     status = daemon.wait_core("ready")
-    assert status["schema"] == 2
+    assert status["schema"] == 1
     assert status["pid"] == daemon.pid
     assert status["control_endpoint"] == str(daemon.control_sock)
     assert status["home"] == str(workspace.silo_home)

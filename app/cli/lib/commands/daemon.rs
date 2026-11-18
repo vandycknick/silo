@@ -507,7 +507,7 @@ mod tests {
 
     fn status_view(lobby: Option<LobbyStatus>) -> DaemonStatusView {
         let daemon = serde_json::from_value(serde_json::json!({
-            "schema": 2, "generation": "00000000-0000-4000-8000-000000000004",
+            "schema": 1, "generation": "00000000-0000-4000-8000-000000000004",
             "pid": 1, "process_start": "1", "core": "ready", "home": "/tmp/home",
             "control_endpoint": "/tmp/control", "updated_at": "2026-11-11T00:00:00Z",
             "last_error": null, "system": null, "lobby": lobby,

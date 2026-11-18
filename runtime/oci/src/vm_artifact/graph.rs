@@ -13,9 +13,9 @@ use crate::vm_artifact::{invalid, Error, Result};
 
 pub const INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
-pub const ARTIFACT_TYPE: &str = "application/vnd.silo.vm.v2";
-pub const METADATA_ARTIFACT_TYPE: &str = "application/vnd.silo.vm.metadata.v2";
-pub const PAYLOAD_ARTIFACT_TYPE: &str = "application/vnd.silo.vm.payloads.v2";
+pub const ARTIFACT_TYPE: &str = "application/vnd.silo.vm.v1";
+pub const METADATA_ARTIFACT_TYPE: &str = "application/vnd.silo.vm.metadata.v1";
+pub const PAYLOAD_ARTIFACT_TYPE: &str = "application/vnd.silo.vm.payloads.v1";
 pub const EMPTY_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 
 /// OCI descriptors, unlike closed Silo records, can carry standard optional
@@ -209,7 +209,7 @@ impl GraphVerifier {
             || index.manifests.len() > MAX_PAGE_ENTRIES + 1
         {
             return Err(invalid(
-                "unsupported VM artifact: fresh-state v2 index required",
+                "unsupported VM artifact: fresh-state v1 index required",
             ));
         }
         let mut pending = VecDeque::new();
@@ -426,8 +426,8 @@ impl GraphVerifier {
             }
             Task::TransferRoot(stream, length) => {
                 let root: TransferRoot = wire::decode_record(bytes)?;
-                if root.schema != 2
-                    || root.kind != "silo-chunks-v2"
+                if root.schema != 1
+                    || root.kind != "silo-chunks-v1"
                     || root.stream != stream
                     || root.length != length
                     || root.chunk_size != CHUNK_SIZE
@@ -476,7 +476,7 @@ impl GraphVerifier {
                     .ok_or_else(|| invalid("missing transfer coverage state"))?;
                 let length = root.length;
                 let expected = length.div_ceil(CHUNK_SIZE);
-                if page.schema != 2
+                if page.schema != 1
                     || page.kind != "silo-chunk-map"
                     || page.first_chunk != count
                     || page.entries.is_empty()
@@ -697,7 +697,7 @@ fn validate_table_root(
     entries: u64,
     pages: &[RecordRef],
 ) -> Result<()> {
-    if schema != 2
+    if schema != 1
         || kind != expected
         || pages.len() > MAX_PAGE_ENTRIES
         || entries > (MAX_PAGE_ENTRIES * MAX_PAGE_ENTRIES) as u64
@@ -725,7 +725,7 @@ fn validate_table_page(
     total: Option<u64>,
 ) -> Result<()> {
     let total = total.ok_or_else(|| invalid("table page before root"))?;
-    if schema != 2
+    if schema != 1
         || kind != expected
         || first != consumed as u64
         || entries == 0
@@ -960,7 +960,7 @@ mod tests {
 
     fn fixture(chunks: usize) -> (VmArtifactConfig, Vec<RecordBlob>, Vec<PayloadRef>) {
         let semantic = RecordBlob::new(br#"{"kind":"semantic-record"}"#.to_vec()).unwrap();
-        let mut map_bytes = b"silo:stream:v2\n".to_vec();
+        let mut map_bytes = b"silo:stream:v1\n".to_vec();
         map_bytes.push(23);
         map_bytes.extend_from_slice(&(chunks as u64 * CHUNK_SIZE).to_le_bytes());
         map_bytes.push(0);
@@ -1013,10 +1013,10 @@ mod tests {
         bindings.sort_by_key(ObjectBinding::object);
         let objects = wire::encode_object_table(&bindings).unwrap();
         let config = wire::decode_vm_config(&serde_json::to_vec(&json!({
-            "schema":2,"kind":"vm-artifact","encoding":"silo-chunks-v2",
+            "schema":1,"kind":"vm-artifact","encoding":"silo-chunks-v1",
             "content":{"kind":"image","id":ContentDigest::from_sha256([4;32]),"record":semantic.reference},
             "root":"opaque-raw","guestPlatform":{"os":"linux","architecture":"amd64"},
-            "bootAbi":"silo-direct-v2","memory":null,
+            "bootAbi":"silo-direct-v1","memory":null,
             "streams":streams.root.reference,"objects":objects.root.reference
         })).unwrap()).unwrap();
         payloads.push(PayloadRef {
@@ -1188,24 +1188,24 @@ mod tests {
     #[test]
     fn table_roots_and_pages_enforce_every_count_boundary() {
         let reference = wire::RecordRef::of_bytes(b"page");
-        assert!(graph::validate_table_root(2, "stream-table", "stream-table", 0, &[]).is_ok());
+        assert!(graph::validate_table_root(1, "stream-table", "stream-table", 0, &[]).is_ok());
         assert!(
-            graph::validate_table_root(2, "stream-table", "stream-table", 1, &[reference]).is_ok()
+            graph::validate_table_root(1, "stream-table", "stream-table", 1, &[reference]).is_ok()
         );
         for (schema, kind, count, pages) in [
-            (1, "stream-table", 1, vec![reference]),
-            (2, "wrong", 1, vec![reference]),
-            (2, "stream-table", 0, vec![reference]),
-            (2, "stream-table", 1, vec![]),
-            (2, "stream-table", 2, vec![reference, reference]),
-            (2, "stream-table", 1, vec![reference; MAX_PAGE_ENTRIES + 1]),
+            (2, "stream-table", 1, vec![reference]),
+            (1, "wrong", 1, vec![reference]),
+            (1, "stream-table", 0, vec![reference]),
+            (1, "stream-table", 1, vec![]),
+            (1, "stream-table", 2, vec![reference, reference]),
+            (1, "stream-table", 1, vec![reference; MAX_PAGE_ENTRIES + 1]),
         ] {
             assert!(
                 graph::validate_table_root(schema, kind, "stream-table", count, &pages).is_err()
             );
         }
         assert!(graph::validate_table_page(
-            2,
+            1,
             "object-table-page",
             "object-table-page",
             0,
@@ -1215,7 +1215,7 @@ mod tests {
         )
         .is_ok());
         assert!(graph::validate_table_page(
-            2,
+            1,
             "object-table-page",
             "object-table-page",
             0,
@@ -1232,7 +1232,7 @@ mod tests {
             (0, 1, 0, None),
         ] {
             assert!(graph::validate_table_page(
-                2,
+                1,
                 "object-table-page",
                 "object-table-page",
                 first,

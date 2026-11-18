@@ -1265,7 +1265,7 @@ async fn snapshot_owned(
         });
     }
     let record = SnapshotRecord {
-        schema: 2,
+        schema: 1,
         kind: SnapshotKind::Snapshot,
         memory: SnapshotMemoryState::None {
             stop_outcome: source.storage.stop_outcome,

@@ -258,10 +258,10 @@ class VmArtifact:
 
 def _push_vm_artifact(client: DistributionClient, repository: str, label: str, shared_chunk: bytes) -> VmArtifact:
     """Push a Silo-shaped ADR 0014 graph: blobs, child manifests by digest, then the index by digest."""
-    config = _json({"schema": 2, "kind": "vm-artifact", "encoding": "silo-chunks-v2", "label": label})
+    config = _json({"schema": 1, "kind": "vm-artifact", "encoding": "silo-chunks-v1", "label": label})
     layers = [
-        ("application/vnd.silo.vm.stream-map.v2", stream_map.Root(0, stream_map.RAM_CHUNK, None).encode()),
-        ("application/vnd.silo.vm.record.v2+json", _json({"schema": 2, "kind": "stream-table", "label": label})),
+        ("application/vnd.silo.vm.stream-map.v1", stream_map.Root(0, stream_map.RAM_CHUNK, None).encode()),
+        ("application/vnd.silo.vm.record.v1+json", _json({"schema": 1, "kind": "stream-table", "label": label})),
         ("application/vnd.silo.vm.chunk.v1", _bytes(f"{label}-raw", 8192)),
         ("application/vnd.silo.vm.chunk.v1+zstd", b"\x28\xb5\x2f\xfd" + _bytes(f"{label}-zstd", 512)),
         ("application/vnd.silo.vm.chunk.v1", shared_chunk),
@@ -272,19 +272,19 @@ def _push_vm_artifact(client: DistributionClient, repository: str, label: str, s
     for digest, data in contents.items():
         assert client.push_blob(repository, data) == digest
     payloads = sorted((_descriptor(media_type, data) for media_type, data in layers), key=lambda item: str(item["digest"]))
-    metadata = _json({"schemaVersion": 2, "mediaType": OCI_MANIFEST, "artifactType": "application/vnd.silo.vm.metadata.v2",
-                      "config": _descriptor("application/vnd.silo.vm.config.v2+json", config),
+    metadata = _json({"schemaVersion": 2, "mediaType": OCI_MANIFEST, "artifactType": "application/vnd.silo.vm.metadata.v1",
+                      "config": _descriptor("application/vnd.silo.vm.config.v1+json", config),
                       "layers": [_descriptor(OCI_EMPTY, EMPTY_JSON)]})
-    children = [_json({"schemaVersion": 2, "mediaType": OCI_MANIFEST, "artifactType": "application/vnd.silo.vm.payloads.v2",
+    children = [_json({"schemaVersion": 2, "mediaType": OCI_MANIFEST, "artifactType": "application/vnd.silo.vm.payloads.v1",
                        "config": _descriptor(OCI_EMPTY, EMPTY_JSON), "layers": group})
                 for group in (payloads[:4], payloads[4:])]
     manifests = {digest_of(body): body for body in (metadata, *children)}
     for digest, body in manifests.items():
         assert client.push_manifest(repository, digest, body, OCI_MANIFEST) == digest
-    index = _json({"schemaVersion": 2, "mediaType": OCI_INDEX, "artifactType": "application/vnd.silo.vm.v2", "manifests": [
-        _descriptor(OCI_MANIFEST, metadata, artifactType="application/vnd.silo.vm.metadata.v2",
+    index = _json({"schemaVersion": 2, "mediaType": OCI_INDEX, "artifactType": "application/vnd.silo.vm.v1", "manifests": [
+        _descriptor(OCI_MANIFEST, metadata, artifactType="application/vnd.silo.vm.metadata.v1",
                     platform={"os": "linux", "architecture": images.oci_arch()}),
-        *(_descriptor(OCI_MANIFEST, child, artifactType="application/vnd.silo.vm.payloads.v2") for child in children)]})
+        *(_descriptor(OCI_MANIFEST, child, artifactType="application/vnd.silo.vm.payloads.v1") for child in children)]})
     index_digest = client.push_manifest(repository, digest_of(index), index, OCI_INDEX)
     return VmArtifact(index_digest, index, manifests, contents)
 
