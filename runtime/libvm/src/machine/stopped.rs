@@ -2670,7 +2670,14 @@ mod tests {
     #[tokio::test]
     async fn restore_without_memory_turns_a_memory_snapshot_into_a_stopped_machine() {
         use crate::store::MachineStore;
-        let fixture = crate::store::capture::tests::fixture().await;
+        let fixture = crate::store::capture::tests::fixture_with_retention(
+            crate::MachineRetention::Ephemeral,
+        )
+        .await;
+        assert_eq!(
+            fixture.reservation.record.configuration.retention,
+            crate::MachineRetention::Ephemeral
+        );
         let runtime = crate::store::capture::tests::capture_runtime(&fixture.snapshots).await;
         let (sealed, _) = crate::store::capture::tests::seal(&fixture);
         let info = fixture
@@ -2719,6 +2726,15 @@ mod tests {
             .await
             .unwrap();
         let store = runtime.native_store().unwrap();
+        assert_eq!(
+            store
+                .machine_config(machine.machine_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .retention,
+            crate::MachineRetention::Persistent
+        );
         let state = store
             .machine_state(machine.machine_id())
             .await

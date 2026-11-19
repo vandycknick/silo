@@ -44,7 +44,9 @@ impl Cmd {
 
 fn ensure_defaultable(retention: MachineRetention, name: &str) -> eyre::Result<()> {
     if retention == MachineRetention::Ephemeral {
-        eyre::bail!("machine `{name}` is ephemeral and cannot be the default; use a persistent VM");
+        eyre::bail!(
+            "machine `{name}` is an ephemeral `silo run` machine and cannot be the default; remove it with `silo rm {name}` and choose a persistent VM"
+        );
     }
     Ok(())
 }
@@ -57,7 +59,11 @@ mod tests {
 
     #[test]
     fn rejects_ephemeral_default_machine() {
-        assert!(ensure_defaultable(MachineRetention::Ephemeral, "temporary").is_err());
+        let error = ensure_defaultable(MachineRetention::Ephemeral, "temporary").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ephemeral `silo run` machine"));
+        assert!(message.contains("cannot be the default"));
+        assert!(message.contains("silo rm temporary"));
         assert!(ensure_defaultable(MachineRetention::Persistent, "development").is_ok());
     }
 }

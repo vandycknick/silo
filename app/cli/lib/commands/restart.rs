@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use clap::Args;
-use libvm::{MachineStatus, DEFAULT_GUEST_READINESS_TIMEOUT};
+use libvm::{MachineData, MachineRetention, MachineStatus, DEFAULT_GUEST_READINESS_TIMEOUT};
 
 use crate::commands::stop::parse_timeout;
 use crate::context::Context;
@@ -28,18 +28,7 @@ impl Cmd {
         let mut spinner = Spinner::start("Finding", self.name.as_deref().unwrap_or("default VM"));
         let name = context.resolve_machine_name(self.name.as_deref())?;
         let data = context.app_api().await?.inspect_machine(&name).await?;
-        if data.retention == libvm::MachineRetention::Ephemeral {
-            eyre::bail!(
-                "machine `{}` is ephemeral and cannot be restarted; use `silo run` instead",
-                data.name
-            );
-        }
-        if matches!(data.status, MachineStatus::Starting { .. }) {
-            eyre::bail!(
-                "machine `{}` is starting; wait for it to become ready",
-                data.name
-            );
-        }
+        ensure_restartable(&data)?;
         let deadline = Instant::now()
             .checked_add(self.timeout)
             .ok_or_else(|| eyre::eyre!("restart timeout is too large"))?;
@@ -71,6 +60,22 @@ impl Cmd {
     }
 }
 
+fn ensure_restartable(data: &MachineData) -> eyre::Result<()> {
+    if data.retention == MachineRetention::Ephemeral {
+        eyre::bail!(
+            "machine `{}` is an ephemeral `silo run` machine and cannot be restarted; remove it with `silo rm {}`",
+            data.name, data.name
+        );
+    }
+    if matches!(data.status, MachineStatus::Starting { .. }) {
+        eyre::bail!(
+            "machine `{}` is starting; wait for it to become ready",
+            data.name
+        );
+    }
+    Ok(())
+}
+
 fn remaining(deadline: Instant) -> eyre::Result<Duration> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     if timeout.is_zero() {
@@ -84,10 +89,28 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use libvm::DEFAULT_MACHINE_WAIT_TIMEOUT;
+    use libvm::{MachineData, MachineRetention, DEFAULT_MACHINE_WAIT_TIMEOUT};
 
     use crate::app::Cli;
     use crate::commands::Command;
+
+    #[test]
+    fn rejects_ephemeral_restart_with_removal_hint() {
+        let mut data = MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "temporary".into(),
+            vm_spec::VmSpec::current(),
+        );
+        data.retention = MachineRetention::Ephemeral;
+        let error = crate::commands::restart::ensure_restartable(&data).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ephemeral `silo run` machine"));
+        assert!(message.contains("cannot be restarted"));
+        assert!(message.contains("silo rm temporary"));
+        assert!(!message.contains("use `silo run` instead"));
+        data.retention = MachineRetention::Persistent;
+        assert!(crate::commands::restart::ensure_restartable(&data).is_ok());
+    }
 
     #[test]
     fn restart_parses_force_and_total_timeout() {

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed: restored and forked machines are kept even when their source was a
+  temporary `silo run` machine, so they can be started, restarted and chosen
+  as the default VM. Leftover temporary machines now explain how to remove them.
 - Fixed: `silo restore` recognizes local images by name, stored registry
   expansion, id or unique prefix before initializing writable state, and
   suggests `silo create` instead of reporting a missing snapshot. A shared

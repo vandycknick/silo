@@ -1928,6 +1928,16 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+            assert_eq!(config.retention, crate::MachineRetention::Persistent);
+            assert_eq!(
+                store
+                    .machine_config(config.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .retention,
+                crate::MachineRetention::Persistent
+            );
             durability.spawn().await.unwrap().unwrap();
             let storage = store.machine_storage(config.id).await.unwrap().unwrap();
             let lease = snapshots
@@ -2085,6 +2095,16 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+            assert_eq!(config.retention, crate::MachineRetention::Persistent);
+            assert_eq!(
+                store
+                    .machine_config(config.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .retention,
+                crate::MachineRetention::Persistent
+            );
             durability.spawn().await.unwrap().unwrap();
             assert_eq!(config.id, child.result.machine_id);
             let storage = store.machine_storage(config.id).await.unwrap().unwrap();

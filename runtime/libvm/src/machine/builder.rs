@@ -1751,7 +1751,7 @@ async fn construct_snapshot_child(
             metadata: configuration.metadata,
             network: configuration.network,
             guest: configuration.guest,
-            retention: configuration.retention,
+            retention: MachineRetention::Persistent,
             process: configuration.process,
             template_name: configuration.template_name,
             agent_mode: configuration.agent_mode,
@@ -2237,17 +2237,15 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temporary.path().join("home"));
         let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
-        let source = create_machine_config(
-            &runtime,
-            create_request(write_base_rootfs(temporary.path()), "launch-source"),
-        )
-        .await
-        .unwrap();
+        let mut request = create_request(write_base_rootfs(temporary.path()), "launch-source");
+        request.retention = MachineRetention::Ephemeral;
+        let source = create_machine_config(&runtime, request).await.unwrap();
         let mut storage = store.machine_storage(source.id).await.unwrap().unwrap();
         storage.ram_identity = crate::store::models::storage::ContentIdentityState::Identified {
             root: vm_spec::capture::Sha256Digest::of_bytes(b"source execution anchor"),
         };
         let configuration = crate::SnapshotConfiguration::capture(&source).unwrap();
+        assert_eq!(configuration.retention, MachineRetention::Ephemeral);
         let pool = StoragePool::open(runtime.local_images_dir()).unwrap();
         for live in [false, true] {
             let (operation, lease) = store
@@ -2279,6 +2277,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                assert_eq!(child.retention, MachineRetention::Persistent);
+                assert_eq!(
+                    store
+                        .machine_config(child.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .retention,
+                    MachineRetention::Persistent
+                );
                 assert_eq!(
                     store.machine_durability(child.id).await.unwrap(),
                     Some(crate::MachineDurability::Constructed)
@@ -2405,6 +2413,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                assert_eq!(child.retention, MachineRetention::Persistent);
+                assert_eq!(
+                    store
+                        .machine_config(child.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .retention,
+                    MachineRetention::Persistent
+                );
                 assert_eq!(
                     store
                         .machine_storage(child.id)

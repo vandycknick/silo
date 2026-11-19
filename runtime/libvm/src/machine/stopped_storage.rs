@@ -15,8 +15,8 @@ mod tests {
 
     use crate::{
         ExternalResourcePolicy, ForkOptions, ImageSource, LibVmError, Machine, MachineRef,
-        ProcessConfig, ResolvedRuntimeComponents, RestoreOptions, RestoreSource, Runtime,
-        RuntimeConfig, SnapshotMemory, SnapshotOptions, SnapshotRef,
+        MachineRetention, ProcessConfig, ResolvedRuntimeComponents, RestoreOptions, RestoreSource,
+        Runtime, RuntimeConfig, SnapshotMemory, SnapshotOptions, SnapshotRef,
     };
     use serde_json::Value;
     use sha2::{Digest, Sha256};
@@ -143,6 +143,14 @@ mod tests {
 
     impl Fixture {
         async fn new(empty_command: bool, external: bool) -> Self {
+            Self::with_retention(empty_command, external, MachineRetention::Persistent).await
+        }
+
+        async fn with_retention(
+            empty_command: bool,
+            external: bool,
+            retention: MachineRetention,
+        ) -> Self {
             let files = match std::env::var_os("SILO_TEST_COPY_DIR") {
                 Some(parent) => tempfile::Builder::new()
                     .prefix("stopped-")
@@ -240,6 +248,7 @@ mod tests {
                 .machine()
                 .name("source")
                 .image_source(ImageSource::disk(disk))
+                .retention(retention)
                 .network(|network| network.none())
                 .cpus(2)
                 .process(process)
@@ -271,9 +280,16 @@ mod tests {
     #[tokio::test]
     async fn stopped_snapshot_two_private_children_full_config_and_retention() {
         for empty_command in [false, true] {
-            let fixture = Fixture::new(empty_command, false).await;
+            let fixture =
+                Fixture::with_retention(empty_command, false, MachineRetention::Ephemeral).await;
             let baseline = bytes(&root(&fixture.home, &fixture.source));
-            let source_config = semantics(config(&fixture.home, &fixture.source).await);
+            let mut expected_child_config = semantics(config(&fixture.home, &fixture.source).await);
+            assert_eq!(
+                expected_child_config["retention"],
+                serde_json::to_value(MachineRetention::Ephemeral).unwrap()
+            );
+            expected_child_config["retention"] =
+                serde_json::to_value(MachineRetention::Persistent).unwrap();
             let created = fixture
                 .runtime
                 .snapshot(
@@ -311,6 +327,14 @@ mod tests {
                 .expect("decode actual immutable bytes independently");
             assert_eq!(artifact["schema"], 1);
             assert_eq!(artifact["memory"], "none");
+            assert_eq!(
+                serde_json::from_value::<MachineRetention>(
+                    artifact["configuration"]["retention"].clone()
+                )
+                .unwrap(),
+                MachineRetention::Ephemeral,
+                "snapshots retain the source policy, not the child policy"
+            );
             assert!(artifact.get("purpose").is_none());
             assert!(artifact.get("captureKind").is_none());
             assert_eq!(
@@ -349,11 +373,11 @@ mod tests {
             assert_eq!(bytes(&first_root), baseline);
             assert_eq!(bytes(&second_root), baseline);
             assert_eq!(
-                source_config,
+                expected_child_config,
                 semantics(config(&fixture.home, &first).await)
             );
             assert_eq!(
-                source_config,
+                expected_child_config,
                 semantics(config(&fixture.home, &second).await)
             );
             let source_meta =
@@ -368,6 +392,16 @@ mod tests {
             );
             for child in [&first, &second] {
                 assert_stopped(&fixture.home, child).await;
+                assert_eq!(
+                    fixture
+                        .runtime
+                        .machine_config(child.machine_id())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .retention,
+                    MachineRetention::Persistent
+                );
             }
             let mut mutate = OpenOptions::new()
                 .write(true)
@@ -411,6 +445,16 @@ mod tests {
                 .expect("retained boot/storage restore");
             assert_eq!(bytes(&root(&fixture.home, &third)), baseline);
             assert_stopped(&fixture.home, &third).await;
+            assert_eq!(
+                fixture
+                    .runtime
+                    .machine_config(third.machine_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .retention,
+                MachineRetention::Persistent
+            );
             let removal = snapshots
                 .remove(&SnapshotRef::Name("saved".into()))
                 .await
@@ -431,6 +475,52 @@ mod tests {
             assert_eq!(bytes(&root(&fixture.home, &second)), baseline);
             assert_eq!(bytes(&root(&fixture.home, &third)), baseline);
         }
+    }
+
+    #[tokio::test]
+    async fn stopped_fork_of_ephemeral_source_and_its_child_are_persistent() {
+        let fixture = Fixture::with_retention(false, false, MachineRetention::Ephemeral).await;
+        let baseline = bytes(&root(&fixture.home, &fixture.source));
+        let child = fixture
+            .source
+            .fork_stopped(ForkOptions {
+                name: Some("child".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("fork an ephemeral stopped source");
+        let grandchild = child
+            .fork_stopped(ForkOptions {
+                name: Some("grandchild".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("fork a stopped fork child");
+        for machine in [&child, &grandchild] {
+            assert_stopped(&fixture.home, machine).await;
+            assert_eq!(bytes(&root(&fixture.home, machine)), baseline);
+            assert_eq!(
+                fixture
+                    .runtime
+                    .machine_config(machine.machine_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .retention,
+                MachineRetention::Persistent
+            );
+        }
+        assert_eq!(
+            fixture
+                .runtime
+                .machine_config(fixture.source.machine_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .retention,
+            MachineRetention::Ephemeral,
+            "forking does not change the source retention"
+        );
     }
 
     #[tokio::test]

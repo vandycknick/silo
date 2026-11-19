@@ -3343,6 +3343,10 @@ pub(crate) mod tests {
         fixture_with_external_data(false).await
     }
 
+    pub(crate) async fn fixture_with_retention(retention: crate::MachineRetention) -> Fixture {
+        fixture_source_profile(false, false, CapturePolicy::Full, 512, false, 2, retention).await
+    }
+
     async fn fixture_with_external_data(include_data: bool) -> Fixture {
         fixture_source(include_data, false, CapturePolicy::Full).await
     }
@@ -3363,8 +3367,13 @@ pub(crate) mod tests {
                         512,
                         layered,
                         count,
+                        crate::MachineRetention::Ephemeral,
                     )
                     .await;
+                    assert_eq!(
+                        fixture.reservation.record.configuration.retention,
+                        crate::MachineRetention::Ephemeral
+                    );
                     let runtime = capture_runtime(&fixture.snapshots).await;
                     let (directory, _) = seal(&fixture);
                     let snapshot = fixture
@@ -3401,8 +3410,13 @@ pub(crate) mod tests {
                         512,
                         layered,
                         count,
+                        crate::MachineRetention::Ephemeral,
                     )
                     .await;
+                    assert_eq!(
+                        fixture.reservation.record.configuration.retention,
+                        crate::MachineRetention::Ephemeral
+                    );
                     let runtime = capture_runtime(&fixture.snapshots).await;
                     let store = fixture.snapshots.store.clone();
                     let capture = fixture.reservation.record.capture_id;
@@ -3605,7 +3619,16 @@ pub(crate) mod tests {
         policy: CapturePolicy,
         disk_length: u64,
     ) -> Fixture {
-        fixture_source_profile(include_data, fork, policy, disk_length, false, 2).await
+        fixture_source_profile(
+            include_data,
+            fork,
+            policy,
+            disk_length,
+            false,
+            2,
+            crate::MachineRetention::Persistent,
+        )
+        .await
     }
 
     async fn fixture_source_profile(
@@ -3615,6 +3638,7 @@ pub(crate) mod tests {
         disk_length: u64,
         layered: bool,
         child_count: usize,
+        retention: crate::MachineRetention,
     ) -> Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temporary.path().join("home"));
@@ -3670,7 +3694,7 @@ pub(crate) mod tests {
             lock_id: LockId::from(0),
             name: "snapshot-source".into(),
             spec,
-            retention: crate::MachineRetention::Persistent,
+            retention,
             process: crate::ProcessConfig::default(),
             template_name: None,
             agent_mode: None,

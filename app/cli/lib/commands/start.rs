@@ -39,8 +39,8 @@ impl Cmd {
 pub(crate) fn ensure_startable(data: &MachineData) -> eyre::Result<()> {
     if data.retention == MachineRetention::Ephemeral {
         eyre::bail!(
-            "machine `{}` is ephemeral and cannot be started; use `silo run` instead",
-            data.name
+            "machine `{}` is an ephemeral `silo run` machine and cannot be started; remove it with `silo rm {}`",
+            data.name, data.name
         );
     }
     if matches!(
@@ -64,6 +64,25 @@ pub(crate) fn requires_guest_readiness(data: &MachineData) -> bool {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use libvm::{MachineData, MachineRetention};
+
+    #[test]
+    fn rejects_ephemeral_start_with_removal_hint() {
+        let mut data = MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "temporary".into(),
+            vm_spec::VmSpec::current(),
+        );
+        data.retention = MachineRetention::Ephemeral;
+        let error = crate::commands::start::ensure_startable(&data).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ephemeral `silo run` machine"));
+        assert!(message.contains("cannot be started"));
+        assert!(message.contains("silo rm temporary"));
+        assert!(!message.contains("use `silo run` instead"));
+        data.retention = MachineRetention::Persistent;
+        assert!(crate::commands::start::ensure_startable(&data).is_ok());
+    }
 
     #[test]
     fn parses_no_wait_for_named_and_default_vms() {
