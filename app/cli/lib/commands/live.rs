@@ -184,7 +184,14 @@ impl Snapshot {
                 };
                 let (progress, stages) = libvm::LiveOperationProgressSender::default_channel();
                 let operation = api.snapshot(&machine, options, Some(progress));
-                let created = feedback.during(operation, stages, &machine).await?;
+                let created = match feedback.during(operation, stages, &machine).await {
+                    Ok(created) => created,
+                    Err(error) => {
+                        return Err(
+                            capture_failure(api, &machine, CaptureAction::Snapshot, error).await,
+                        );
+                    }
+                };
                 let elapsed = feedback.finish();
                 match self.format {
                     OutputFormat::Json => ui::print_json(&created)?,
@@ -250,7 +257,8 @@ impl Snapshot {
             }
             SnapshotCommand::List => {
                 feedback.finish();
-                let snapshots = api.list_snapshots().await?;
+                let mut snapshots = api.list_snapshots().await?;
+                sort_snapshots(&mut snapshots);
                 match self.format {
                     OutputFormat::Json => ui::print_json(&snapshots),
                     OutputFormat::Plain => snapshot_table(&snapshots, ui::now_unix()).print(),
@@ -454,6 +462,11 @@ impl Fork {
                 let result = match feedback.during(operation, stages, &machine).await {
                     Ok(result) => result,
                     Err(error) => {
+                        let error =
+                            capture_failure(api, &machine, CaptureAction::Fork, error).await;
+                        if error.downcast_ref::<CaptureContactFailure>().is_some() {
+                            return Err(error);
+                        }
                         if !fork_rejected_before_acceptance(&error)
                             && !matches!(
                                 error.downcast_ref::<libvm::LibVmError>(),
@@ -470,6 +483,28 @@ impl Fork {
                         return Err(error);
                     }
                 };
+                if matches!(
+                    result.capture,
+                    libvm::ForkCaptureOutcome::Failed { .. }
+                        | libvm::ForkCaptureOutcome::Abandoned { .. }
+                ) && result
+                    .children
+                    .iter()
+                    .all(|child| child.durability.is_none())
+                {
+                    if let Ok(source) = api.inspect_machine(&machine).await {
+                        if source.observation == libvm::MachineObservation::Observed
+                            && !source.status.is_active()
+                        {
+                            return Err(CaptureContactFailure {
+                                name: source.name,
+                                action: CaptureAction::Fork,
+                                stopped: true,
+                            }
+                            .into());
+                        }
+                    }
+                }
                 let readiness = wait_fork_children(api, &result, &mut feedback).await;
                 let elapsed = feedback.finish();
                 print_fork_result(api, &result, elapsed, &readiness, format, false).await?;
@@ -521,6 +556,15 @@ fn fork_confirmation_note(
 }
 
 fn fork_rejected_before_acceptance(error: &eyre::Report) -> bool {
+    if matches!(
+        error.downcast_ref::<libvm::LibVmError>(),
+        Some(
+            libvm::LibVmError::MachineCaptureBusy { .. }
+                | libvm::LibVmError::MachineAlreadyExists { .. }
+        )
+    ) {
+        return true;
+    }
     error.downcast_ref::<tonic::Status>().is_some_and(|status| {
         status
             .metadata()
@@ -638,6 +682,9 @@ pub struct Restore {
 }
 impl Restore {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
+        if let Some(name) = &self.name {
+            libvm::validate_new_machine_name(name)?;
+        }
         let mut feedback = OperationFeedback::new(self.format, "Admitting", &self.reference);
         let api = context.app_api().await?;
         let options = libvm::RestoreOptions {
@@ -1373,7 +1420,7 @@ fn removal_line(kind: &str, id: &str, names: &[String], record_removed: bool) ->
 
 fn prune_line(report: &libvm::ImagePruneReport) -> String {
     format!(
-        "Pruned {} image{}, {} freed",
+        "Removed {} image{}; reclaimed {} of unreferenced data",
         report.images_removed,
         if report.images_removed == 1 { "" } else { "s" },
         ui::human_bytes(Some(report.bytes_removed)),
@@ -1691,6 +1738,110 @@ fn verification_error_json(error: &libvm::SnapshotVerificationError) -> serde_js
 fn name_rows(names: &[String]) -> impl Iterator<Item = &str> {
     let unnamed = names.is_empty().then_some("<none>");
     names.iter().map(String::as_str).chain(unnamed)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CaptureAction {
+    Snapshot,
+    Fork,
+}
+
+impl std::fmt::Display for CaptureAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Snapshot => "snapshot",
+            Self::Fork => "fork",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CaptureContactFailure {
+    name: String,
+    action: CaptureAction,
+    stopped: bool,
+}
+
+impl std::error::Error for CaptureContactFailure {}
+
+impl std::fmt::Display for CaptureContactFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.stopped {
+            write!(formatter, "machine {} stopped unexpectedly during the {}; start it again with `silo start {}`", self.name, self.action, self.name)
+        } else {
+            write!(
+                formatter,
+                "lost contact with machine {} during the {}; check `silo list` before trying again",
+                self.name, self.action
+            )
+        }
+    }
+}
+
+async fn capture_failure(
+    api: &mut crate::api::AppApi,
+    reference: &str,
+    action: CaptureAction,
+    error: eyre::Report,
+) -> eyre::Report {
+    let transport = matches!(
+        error.downcast_ref::<libvm::LibVmError>(),
+        Some(
+            libvm::LibVmError::MonitorConnection { .. } | libvm::LibVmError::LiveObservation { .. }
+        )
+    );
+    let capture = matches!(
+        error.downcast_ref::<libvm::LibVmError>(),
+        Some(libvm::LibVmError::LiveCapture { .. } | libvm::LibVmError::LiveFork { .. })
+    );
+    if !transport && !capture {
+        return error;
+    }
+    let observed = api.inspect_capture_source(reference).await;
+    capture_failure_observed(
+        reference,
+        action,
+        error,
+        observed
+            .filter(|machine| machine.observation == libvm::MachineObservation::Observed)
+            .map(|machine| (machine.name, machine.status)),
+    )
+}
+
+fn capture_failure_observed(
+    reference: &str,
+    action: CaptureAction,
+    error: eyre::Report,
+    observed: Option<(String, libvm::MachineStatus)>,
+) -> eyre::Report {
+    let transport = matches!(
+        error.downcast_ref::<libvm::LibVmError>(),
+        Some(
+            libvm::LibVmError::MonitorConnection { .. } | libvm::LibVmError::LiveObservation { .. }
+        )
+    );
+    let stopped = observed
+        .as_ref()
+        .is_some_and(|(_, status)| !status.is_active());
+    if !transport && !stopped {
+        return error;
+    }
+    CaptureContactFailure {
+        name: observed.map_or_else(|| reference.to_owned(), |(name, _)| name),
+        action,
+        stopped,
+    }
+    .into()
+}
+
+fn sort_snapshots(snapshots: &mut [libvm::SnapshotInfo]) {
+    snapshots.sort_unstable_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.names.cmp(&right.names))
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 fn snapshot_table(snapshots: &[libvm::SnapshotInfo], now: i64) -> Table {
@@ -3135,9 +3286,21 @@ mod tests {
                 images_removed: 1,
                 bytes_removed: 0,
             }),
-            format!("Pruned 1 image, {} freed", crate::ui::human_bytes(Some(0)))
+            format!(
+                "Removed 1 image; reclaimed {} of unreferenced data",
+                crate::ui::human_bytes(Some(0))
+            )
         );
-        assert!(prune_line(&libvm::ImagePruneReport::default()).starts_with("Pruned 0 images"));
+        assert_eq!(
+            prune_line(&libvm::ImagePruneReport {
+                images_removed: 0,
+                bytes_removed: 1024
+            }),
+            format!(
+                "Removed 0 images; reclaimed {} of unreferenced data",
+                crate::ui::human_bytes(Some(1024))
+            )
+        );
     }
 
     #[test]
@@ -3588,5 +3751,140 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn busy_fork_and_existing_name_are_definitive_rejections() {
+        use crate::commands::live::fork_rejected_before_acceptance;
+        assert!(fork_rejected_before_acceptance(
+            &libvm::LibVmError::MachineCaptureBusy {
+                reference: "base".into()
+            }
+            .into()
+        ));
+        assert!(fork_rejected_before_acceptance(
+            &libvm::LibVmError::MachineAlreadyExists {
+                name: "base".into()
+            }
+            .into()
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_invalid_name_before_opening_context() {
+        let cli = Cli::try_parse_from(["silo", "restore", "nonexistent", "--name", "wr-anon1.8g"])
+            .unwrap();
+        let Command::Restore(command) = cli.command else {
+            panic!("restore command")
+        };
+        let mut context =
+            crate::context::Context::new(0, silo_vm_control::transport::Admission::Ready);
+        let error = command.run(&mut context).await.unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<libvm::LibVmError>(), Some(libvm::LibVmError::InvalidMachineName { name, .. }) if name == "wr-anon1.8g")
+        );
+    }
+
+    #[test]
+    fn snapshot_lists_sort_by_newest_then_name() {
+        use crate::commands::live::sort_snapshots;
+        let mut old = snapshot_info(Some("old"));
+        old.created_at = 10;
+        let mut newest_z = snapshot_info(Some("z"));
+        newest_z.created_at = 20;
+        let mut newest_a = snapshot_info(Some("a"));
+        newest_a.created_at = 20;
+        let mut snapshots = vec![old, newest_z, newest_a];
+        sort_snapshots(&mut snapshots);
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|info| info.names[0].as_str())
+                .collect::<Vec<_>>(),
+            ["a", "z", "old"]
+        );
+    }
+
+    #[test]
+    fn capture_contact_diagnostics_distinguish_stopped_from_lost_contact() {
+        use crate::commands::live::{
+            capture_failure_observed, CaptureAction, CaptureContactFailure,
+        };
+        for status in [
+            libvm::MachineStatus::Running {
+                ready: true,
+                guest_ready: true,
+                message: None,
+            },
+            libvm::MachineStatus::Paused { message: None },
+            libvm::MachineStatus::Capturing { message: None },
+            libvm::MachineStatus::Stopped,
+            libvm::MachineStatus::Error {
+                message: Some("worker exited".into()),
+            },
+        ] {
+            let error = capture_failure_observed(
+                "id",
+                CaptureAction::Snapshot,
+                libvm::LibVmError::MonitorConnection {
+                    reference: "id".into(),
+                    message: "internal transport path".into(),
+                }
+                .into(),
+                Some(("base".into(), status.clone())),
+            );
+            let failure = error.downcast_ref::<CaptureContactFailure>().unwrap();
+            assert_eq!(failure.name, "base");
+            assert_eq!(failure.stopped, !status.is_active());
+            assert!(!error.to_string().contains("internal transport path"));
+        }
+        let error = capture_failure_observed(
+            "id",
+            CaptureAction::Fork,
+            libvm::LibVmError::LiveObservation {
+                reference: "id".into(),
+                message: "connection refused".into(),
+            }
+            .into(),
+            Some(("base".into(), libvm::MachineStatus::Stopped)),
+        );
+        assert!(error
+            .downcast_ref::<CaptureContactFailure>()
+            .is_some_and(|failure| failure.stopped));
+        let error = capture_failure_observed(
+            "base",
+            CaptureAction::Snapshot,
+            libvm::LibVmError::LiveCapture {
+                capture_id: OPERATION.into(),
+                message: "bad disk".into(),
+            }
+            .into(),
+            Some((
+                "base".into(),
+                libvm::MachineStatus::Running {
+                    ready: true,
+                    guest_ready: true,
+                    message: None,
+                },
+            )),
+        );
+        assert!(matches!(
+            error.downcast_ref::<libvm::LibVmError>(),
+            Some(libvm::LibVmError::LiveCapture { .. })
+        ));
+        let stopped = CaptureContactFailure {
+            name: "base".into(),
+            action: CaptureAction::Snapshot,
+            stopped: true,
+        };
+        assert_eq!(stopped.to_string(), "machine base stopped unexpectedly during the snapshot; start it again with `silo start base`");
+        let running = CaptureContactFailure {
+            name: "base".into(),
+            action: CaptureAction::Fork,
+            stopped: false,
+        };
+        assert_eq!(
+            running.to_string(),
+            "lost contact with machine base during the fork; check `silo list` before trying again"
+        );
     }
 }

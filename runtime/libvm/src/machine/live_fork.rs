@@ -288,7 +288,6 @@ impl Machine {
             &self.runtime().live_capabilities().await?,
             vm_spec::live::LiveOperation::Restore,
         )?;
-        crate::machine::live_capture::admission(observation, options.resume_policy)?;
         let runtime = self.runtime().clone();
         let machine = self.machine_id();
         let observation = observation.clone();
@@ -306,7 +305,6 @@ impl Machine {
         })
         .await
         .map_err(|error| fork_error(operation, error))?
-        .map_err(|error| fork_error(operation, error))
     }
 }
 
@@ -344,6 +342,14 @@ async fn create_fork(
             }
             return Ok(existing);
         }
+        crate::store::capture::ensure_capture_available(
+            &mut *store.pool.acquire().await?,
+            machine,
+            Uuid::parse_str(&observation.report().run_id)
+                .map_err(|error| invalid(error.to_string()))?,
+            Uuid::nil(),
+        )
+        .await?;
         let fresh = runtime
             .observe_live(&crate::MachineRef::id(machine))
             .await?;
@@ -370,8 +376,7 @@ async fn create_fork(
         }
         store
             .admit_fork(machine, &fresh, &options, Uuid::new_v4())
-            .await
-            .map_err(|error| fork_error(operation, error))?
+            .await?
     };
     store
         .record_fork_api_entered(operation, entered)
@@ -1258,7 +1263,29 @@ async fn reconcile_one(
     let Some(_owner) = pool.try_exclusive_lease(operation)? else {
         return Ok(());
     };
-    store.validate_fork_lease(operation, &_owner).await?;
+    if !store
+        .validate_retained_fork_lease(operation, &_owner)
+        .await?
+    {
+        let result = store
+            .fork_result(operation)
+            .await?
+            .ok_or_else(|| fork_error(operation, "fork journal is missing"))?;
+        if result.stage == ForkStage::Finished
+            && result.children.iter().all(|child| {
+                !matches!(
+                    child.outcome,
+                    ForkChildOutcome::Pending
+                        | ForkChildOutcome::Constructing
+                        | ForkChildOutcome::Activating
+                        | ForkChildOutcome::RecoveryPending { .. }
+                )
+            })
+        {
+            return Ok(());
+        }
+        return Err(fork_error(operation, "live-fork operation root is missing"));
+    }
     let result = store
         .fork_result(operation)
         .await?
@@ -1326,6 +1353,72 @@ pub(crate) async fn reconcile_forks(runtime: &Runtime) -> Result<(), LibVmError>
 #[cfg(test)]
 mod tests {
     use crate::machine::live_fork::{project_destination, ForkDestination};
+
+    #[tokio::test]
+    async fn fork_reconciliation_tolerates_retirement_after_enumeration_but_requires_active_root() {
+        use crate::machine::live_fork::reconcile_one;
+        use crate::storage::pool::{PublicationLockPolicy, StoragePool};
+        use crate::store::fork::tests::{finish_fork, observation, options};
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = crate::Runtime::open(
+            crate::paths::LocalPaths::new(temporary.path().join("home")),
+            crate::RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut store = runtime.native_store().unwrap();
+        let source = crate::MachineId::new();
+        let request = options(&["retired-during-reconciliation"]);
+        let (_, owner) = store
+            .admit_fork(
+                source,
+                &observation(source, uuid::Uuid::new_v4()),
+                &request,
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        drop(owner);
+        let (hook, mut entered, release) =
+            WorkerHook::new(WorkerPoint::ForkReconciliationEnumerated, false);
+        store.layer_hook = Some(hook);
+        let worker = store.clone();
+        let handle = tokio::runtime::Handle::current();
+        let enumeration = tokio::task::spawn_blocking(move || {
+            handle.block_on(worker.forks_requiring_reconciliation())
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        finish_fork(&store, request.operation_id).await;
+        let pool = StoragePool::open(runtime.local_images_dir()).unwrap();
+        store.retire_finished_fork_roots(&pool).await.unwrap();
+        release.send(()).unwrap();
+        let operations = enumeration.await.unwrap().unwrap();
+        assert_eq!(operations, vec![request.operation_id.to_string()]);
+        reconcile_one(&runtime, request.operation_id, PublicationLockPolicy::Defer)
+            .await
+            .unwrap();
+
+        // A missing root without a settled receipt is corruption, not retirement.
+        store
+            .update_fork(request.operation_id, |result| {
+                result.stage = crate::ForkStage::Settling;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = reconcile_one(&runtime, request.operation_id, PublicationLockPolicy::Defer)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("operation root is missing"));
+        assert!(error
+            .to_string()
+            .contains(&request.operation_id.to_string()));
+    }
 
     #[test]
     fn fork_capture_request_has_no_snapshot_name() {

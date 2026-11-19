@@ -278,8 +278,9 @@ impl Store {
         let json: String =
             sqlx::query_scalar("SELECT json(request_json) FROM live_fork WHERE operation_id=?1")
                 .bind(operation.to_string())
-                .fetch_one(&self.pool)
-                .await?;
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| invalid(format!("live-fork request {operation} is missing")))?;
         let options: LiveForkOptions =
             serde_json::from_str(&json).map_err(|error| invalid(error.to_string()))?;
         options.validate()?;
@@ -344,6 +345,13 @@ impl Store {
                 lease,
             ));
         }
+        crate::store::capture::ensure_capture_available(
+            &mut tx,
+            source,
+            Uuid::parse_str(run.as_str()).map_err(|error| invalid(error.to_string()))?,
+            capture,
+        )
+        .await?;
         let lease = pool.lease(options.operation_id)?;
         let (device, inode) = lease.file_identity()?;
         let mut children = Vec::with_capacity(options.children.len());
@@ -402,8 +410,13 @@ impl Store {
         let json: String =
             sqlx::query_scalar("SELECT json(result_json) FROM live_fork WHERE operation_id=?1")
                 .bind(operation.to_string())
-                .fetch_one(&mut *tx)
-                .await?;
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "live-fork journal {operation} is missing during update"
+                    ))
+                })?;
         let mut result: LiveForkResult =
             serde_json::from_str(&json).map_err(|error| invalid(error.to_string()))?;
         update(&mut result)?;
@@ -486,7 +499,9 @@ impl Store {
         outcome: ForkChildOutcome,
     ) -> Result<(), LibVmError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let json: String = sqlx::query_scalar("SELECT json(result_json) FROM live_fork_child WHERE operation_id=?1 AND child_index=?2").bind(operation.to_string()).bind(i64::from(index)).fetch_one(&mut *tx).await?;
+        let json: String = sqlx::query_scalar("SELECT json(result_json) FROM live_fork_child WHERE operation_id=?1 AND child_index=?2")
+            .bind(operation.to_string()).bind(i64::from(index)).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| invalid(format!("live-fork child {operation}/{index} is missing during update")))?;
         let mut child: ForkChildResult =
             serde_json::from_str(&json).map_err(|error| invalid(error.to_string()))?;
         // Running is a historical completion receipt, not current liveness.
@@ -834,7 +849,30 @@ impl Store {
         operation: Uuid,
         lease: &crate::storage::locks::StorageLock,
     ) -> Result<(), LibVmError> {
-        let (device,inode):(String,String)=sqlx::query_as("SELECT file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='live-fork'").bind(operation.to_string()).fetch_one(&self.pool).await?;
+        if !self.validate_retained_fork_lease(operation, lease).await? {
+            return Err(invalid(format!(
+                "live-fork operation {operation} is missing"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Recovery may acquire an exclusive lease after another reaper retired
+    /// its root. Active callers must use the strict validator above.
+    pub(crate) async fn validate_retained_fork_lease(
+        &self,
+        operation: Uuid,
+        lease: &crate::storage::locks::StorageLock,
+    ) -> Result<bool, LibVmError> {
+        let identity: Option<(String, String)> = sqlx::query_as(
+            "SELECT file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='live-fork'",
+        )
+        .bind(operation.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((device, inode)) = identity else {
+            return Ok(false);
+        };
         if lease.file_identity()?
             != (
                 device
@@ -847,7 +885,7 @@ impl Store {
         {
             return Err(invalid("fork operation lease inode was replaced"));
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -862,6 +900,10 @@ impl Store {
             if operations.is_empty() {
                 break;
             }
+            #[cfg(test)]
+            if let Some(hook) = &self.layer_hook {
+                hook.hit(crate::store::layer_store::tests::WorkerPoint::ForkRootsEnumerated)?;
+            }
             for operation in operations {
                 cursor = operation;
                 let operation =
@@ -870,9 +912,15 @@ impl Store {
                 let Some(lease) = pool.try_exclusive_lease(operation)? else {
                     continue;
                 };
-                self.validate_fork_lease(operation, &lease).await?;
+                // Roots and the exclusive lease prevent retirement after this
+                // read, but not between enumeration and claiming those guards.
+                if !self.validate_retained_fork_lease(operation, &lease).await? {
+                    continue;
+                }
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-                let finished:bool=sqlx::query_scalar("SELECT json_extract(result_json,'$.stage')='finished' FROM live_fork WHERE operation_id=?1").bind(&cursor).fetch_one(&mut *tx).await?;
+                let finished: bool = sqlx::query_scalar("SELECT json_extract(result_json,'$.stage')='finished' FROM live_fork WHERE operation_id=?1")
+                    .bind(&cursor).fetch_optional(&mut *tx).await?
+                    .ok_or_else(|| invalid(format!("live-fork journal {operation} is missing during root retirement")))?;
                 let dependent:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation o JOIN live_fork f ON o.operation_id=f.capture_id WHERE f.operation_id=?1 UNION ALL SELECT 1 FROM live_fork_child c JOIN storage_operation o ON o.operation_id=c.consumer_id OR o.operation_id=c.launch_id OR (o.machine_id=c.machine_id AND o.run_id=c.run_id) WHERE c.operation_id=?1 UNION ALL SELECT 1 FROM live_fork_child WHERE operation_id=?1 AND name_reserved=1 UNION ALL SELECT 1 FROM storage_operation_cut d JOIN local_cut l ON l.cut_id=d.cut_id WHERE l.operation_id=?1 AND d.operation_id!=?1)").bind(&cursor).fetch_one(&mut *tx).await?;
                 let constructed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM live_fork_child c JOIN machine_config m ON m.id=c.machine_id WHERE c.operation_id=?1 AND m.durability='constructed')")
                     .bind(&cursor).fetch_one(&mut *tx).await?;
@@ -951,8 +999,13 @@ impl Store {
         let id: String =
             sqlx::query_scalar("SELECT cancellation_id FROM live_fork WHERE operation_id=?1")
                 .bind(operation.to_string())
-                .fetch_one(&self.pool)
-                .await?;
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "live-fork cancellation journal {operation} is missing"
+                    ))
+                })?;
         let id = Uuid::parse_str(&id).map_err(|error| invalid(error.to_string()))?;
         if id.is_nil() {
             return Err(invalid("fork cancellation identity is nil"));
@@ -1006,9 +1059,14 @@ impl Store {
     }
 
     pub(crate) async fn forks_requiring_reconciliation(&self) -> Result<Vec<String>, LibVmError> {
-        Ok(sqlx::query_scalar("SELECT f.operation_id FROM live_fork f WHERE json_extract(f.result_json,'$.stage')!='finished' OR EXISTS(SELECT 1 FROM live_fork_child c WHERE c.operation_id=f.operation_id AND json_extract(c.result_json,'$.outcome.kind')='recovery-pending') ORDER BY f.operation_id")
+        let operations = sqlx::query_scalar("SELECT f.operation_id FROM live_fork f WHERE json_extract(f.result_json,'$.stage')!='finished' OR EXISTS(SELECT 1 FROM live_fork_child c WHERE c.operation_id=f.operation_id AND json_extract(c.result_json,'$.outcome.kind')='recovery-pending') ORDER BY f.operation_id")
             .fetch_all(&self.pool)
-            .await?)
+            .await?;
+        #[cfg(test)]
+        if let Some(hook) = &self.layer_hook {
+            hook.hit(crate::store::layer_store::tests::WorkerPoint::ForkReconciliationEnumerated)?;
+        }
+        Ok(operations)
     }
 }
 
@@ -1023,6 +1081,150 @@ pub(crate) mod tests {
         LiveForkChild, LiveForkOptions,
     };
     use uuid::Uuid;
+
+    pub(crate) async fn finish_fork(store: &Store, operation: Uuid) {
+        for child in store.fork_children(operation).await.unwrap() {
+            store
+                .set_fork_child(operation, child.result.index, ForkChildOutcome::Cancelled)
+                .await
+                .unwrap();
+        }
+        store
+            .update_fork(operation, |result| {
+                result.stage = ForkStage::Finished;
+                result.capture = ForkCaptureOutcome::Abandoned {
+                    diagnostic: crate::machine::live_fork::diagnostic("never submitted"),
+                };
+                result.source = ForkSourceOutcome::Unchanged;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn store_recovery_tolerates_fork_retirement_after_root_enumeration() {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temporary.path().join("home"));
+        let store = Store::new(&paths).await.unwrap();
+        let source = MachineId::new();
+        let request = options(&["retired-child"]);
+        let (_, owner) = store
+            .admit_fork(
+                source,
+                &observation(source, Uuid::new_v4()),
+                &request,
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        finish_fork(&store, request.operation_id).await;
+        drop(owner);
+
+        let (hook, mut entered, release) = WorkerHook::new(WorkerPoint::ForkRootsEnumerated, false);
+        let mut recovering = Store::admit(&paths.state_db_path()).await.unwrap();
+        recovering.layer_hook = Some(hook);
+        let runtime = tokio::runtime::Handle::current();
+        let recovery = tokio::task::spawn_blocking(move || {
+            runtime.block_on(async {
+                let result = recovering.recover().await;
+                recovering.close().await;
+                result
+            })
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // A second real opener retires exactly the root the first enumerated.
+        let retired = Store::open(&paths.state_db_path()).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(&store.images_dir).unwrap();
+        let lease = pool
+            .try_exclusive_lease(request.operation_id)
+            .unwrap()
+            .unwrap();
+        assert!(!retired
+            .validate_retained_fork_lease(request.operation_id, &lease)
+            .await
+            .unwrap());
+        let error = retired
+            .validate_fork_lease(request.operation_id, &lease)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(&request.operation_id.to_string()));
+        assert!(error.to_string().contains("is missing"));
+        drop(lease);
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), recovery)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(retired
+            .fork_result(request.operation_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn fork_recovery_names_missing_required_journal_and_checks_lease_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temporary.path().join("home")))
+            .await
+            .unwrap();
+        let source = MachineId::new();
+        let request = options(&["corrupt-child"]);
+        let (_, owner) = store
+            .admit_fork(
+                source,
+                &observation(source, Uuid::new_v4()),
+                &request,
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        let pool = crate::storage::pool::StoragePool::open(&store.images_dir).unwrap();
+        store.retire_finished_fork_roots(&pool).await.unwrap();
+        store
+            .validate_fork_lease(request.operation_id, &owner)
+            .await
+            .unwrap();
+        let foreign = pool.lease(Uuid::new_v4()).unwrap();
+        assert!(store
+            .validate_retained_fork_lease(request.operation_id, &foreign)
+            .await
+            .is_err());
+        drop((foreign, owner));
+        sqlx::query("DELETE FROM live_fork_child WHERE operation_id=?1")
+            .bind(request.operation_id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM fork_event WHERE operation_id=?1")
+            .bind(request.operation_id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM live_fork WHERE operation_id=?1")
+            .bind(request.operation_id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let error = store.retire_finished_fork_roots(&pool).await.unwrap_err();
+        assert!(error.to_string().contains("live-fork journal"));
+        assert!(error
+            .to_string()
+            .contains(&request.operation_id.to_string()));
+        assert!(!matches!(
+            error,
+            crate::LibVmError::Database(sqlx::Error::RowNotFound)
+        ));
+    }
 
     #[tokio::test]
     async fn fork_recovery_retires_unsubmitted_import_only_after_worker_lease_ends() {
@@ -1206,10 +1408,18 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let conflicting = options(&["free-name", "second"]);
-        assert!(store
-            .admit_fork(source, &observed, &conflicting, Uuid::new_v4())
+        // Name fencing is independent of the source capture fence.
+        let other = MachineId::new();
+        let other_observed = observation(other, Uuid::new_v4());
+        let error = store
+            .admit_fork(other, &other_observed, &conflicting, Uuid::new_v4())
             .await
-            .is_err());
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            crate::LibVmError::MachineAlreadyExists { name } if name == "second"
+        ));
         assert!(store
             .fork_result(conflicting.operation_id)
             .await
@@ -1242,8 +1452,17 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let replacement = options(&["first"]);
-        let _replacement = store
+        let error = store
             .admit_fork(source, &observed, &replacement, Uuid::new_v4())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            crate::LibVmError::MachineCaptureBusy { .. }
+        ));
+        let _replacement = store
+            .admit_fork(other, &other_observed, &replacement, Uuid::new_v4())
             .await
             .unwrap();
         drop(owner);
@@ -1654,5 +1873,148 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+    #[tokio::test]
+    async fn competing_fork_is_busy_before_reserving_any_children() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temporary.path().join("home")))
+            .await
+            .unwrap();
+        let source = MachineId::new();
+        let observed = observation(source, Uuid::new_v4());
+        let first = options(&["first", "second"]);
+        let (_, owner) = store
+            .admit_fork(source, &observed, &first, Uuid::new_v4())
+            .await
+            .unwrap();
+        let competing = options(&["third"]);
+        let error = store
+            .admit_fork(source, &observed, &competing, Uuid::new_v4())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            crate::LibVmError::MachineCaptureBusy { .. }
+        ));
+        let reader = crate::LiveObservationReader::open(&crate::RuntimeConfig::local(
+            temporary.path().join("home"),
+        ))
+        .unwrap();
+        assert!(matches!(
+            reader.require_capture_available(&observed, None).await,
+            Err(crate::LibVmError::MachineCaptureBusy { .. })
+        ));
+        reader
+            .require_capture_available(&observed, Some(first.operation_id))
+            .await
+            .unwrap();
+        assert!(store
+            .fork_result(competing.operation_id)
+            .await
+            .unwrap()
+            .is_none());
+        for query in [
+            "SELECT count(*) FROM live_fork_child WHERE operation_id=?1",
+            "SELECT count(*) FROM storage_operation WHERE operation_id=?1",
+            "SELECT count(*) FROM capture_resource_reservation WHERE operation_id=?1",
+        ] {
+            let count: i64 = sqlx::query_scalar(query)
+                .bind(competing.operation_id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+        let mut connection = store.pool.acquire().await.unwrap();
+        let error = crate::store::capture::ensure_capture_available(
+            &mut connection,
+            source,
+            Uuid::parse_str(&observed.report().run_id).unwrap(),
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::LibVmError::MachineCaptureBusy { .. }
+        ));
+        assert_eq!(
+            store
+                .fork_result(first.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .children
+                .len(),
+            2
+        );
+        drop(connection);
+        let other = MachineId::new();
+        let duplicate = options(&["first"]);
+        let error = store
+            .admit_fork(
+                other,
+                &observation(other, Uuid::new_v4()),
+                &duplicate,
+                Uuid::new_v4(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, crate::LibVmError::MachineAlreadyExists { name } if name == "first")
+        );
+        assert!(store
+            .fork_result(duplicate.operation_id)
+            .await
+            .unwrap()
+            .is_none());
+        drop(owner);
+    }
+    #[tokio::test]
+    async fn simultaneous_fork_admissions_have_one_source_capture_owner() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temporary.path().join("home")))
+            .await
+            .unwrap();
+        let source = MachineId::new();
+        let observed = observation(source, Uuid::new_v4());
+        let mut jobs = Vec::new();
+        for names in [&["first", "second"][..], &["third"][..]] {
+            let store = store.clone();
+            let observed = observed.clone();
+            let options = options(names);
+            let runtime = tokio::runtime::Handle::current();
+            jobs.push(tokio::task::spawn_blocking(move || {
+                runtime.block_on(store.admit_fork(source, &observed, &options, Uuid::new_v4()))
+            }));
+        }
+        let mut owners = Vec::new();
+        let mut busy = 0;
+        for job in jobs {
+            match job.await.unwrap() {
+                Ok((result, owner)) => owners.push((result, owner)),
+                Err(crate::LibVmError::MachineCaptureBusy { .. }) => busy += 1,
+                Err(error) => panic!("unexpected competing fork error: {error}"),
+            }
+        }
+        assert_eq!(owners.len(), 1);
+        assert_eq!(busy, 1);
+        let operations: i64 = sqlx::query_scalar("SELECT count(*) FROM live_fork")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(operations, 1);
+        let children: i64 = sqlx::query_scalar("SELECT count(*) FROM live_fork_child")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(children as usize, owners[0].0.children.len());
+        let machines: i64 = sqlx::query_scalar("SELECT count(*) FROM machine_config")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(machines, 0);
     }
 }

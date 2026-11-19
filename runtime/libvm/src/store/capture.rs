@@ -1648,6 +1648,44 @@ pub(crate) fn stage_map_nodes(
     Ok(())
 }
 
+/// The capture row owns an admitted cut. Before it exists, the fork journal
+/// reserves that same source while capture storage admission is in progress.
+/// Callers that admit new work hold an IMMEDIATE transaction.
+pub(crate) async fn ensure_capture_available(
+    connection: &mut sqlx::SqliteConnection,
+    machine: MachineId,
+    run: Uuid,
+    capture: Uuid,
+) -> Result<(), LibVmError> {
+    let busy: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM storage_operation
+            WHERE kind='capture' AND machine_id=?1 AND run_id=?2 AND state='staging' AND operation_id!=?3
+            UNION ALL
+            SELECT 1 FROM live_fork
+            WHERE json_extract(result_json,'$.sourceMachineId')=?1
+              AND json_extract(result_json,'$.sourceRunId')=?2
+              AND json_extract(result_json,'$.capture.kind')='pending' AND capture_id!=?3
+        )",
+    )
+    .bind(machine.to_string())
+    .bind(run.to_string())
+    .bind(capture.to_string())
+    .fetch_one(&mut *connection)
+    .await?;
+    if busy {
+        let name: Option<String> =
+            sqlx::query_scalar("SELECT name FROM machine_config WHERE id=?1")
+                .bind(machine.to_string())
+                .fetch_optional(&mut *connection)
+                .await?;
+        return Err(LibVmError::MachineCaptureBusy {
+            reference: name.unwrap_or_else(|| machine.to_string()),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn register_capture(
     connection: &mut sqlx::SqliteConnection,
     record: &CaptureRecord,
@@ -1685,11 +1723,13 @@ pub(crate) async fn register_capture(
             "capture launch owner retired before reservation commit",
         ));
     }
-    let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND machine_id=?1 AND run_id=?2 AND state='staging')")
-        .bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *connection).await?;
-    if busy {
-        return Err(invalid("the source run already has an unresolved capture"));
-    }
+    ensure_capture_available(
+        connection,
+        record.machine_id,
+        record.run_id,
+        record.capture_id,
+    )
+    .await?;
     sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,machine_id,run_id,storage_generation,file_device,file_inode,record_json) VALUES(?1,1,'capture','staging',?2,?3,?4,?5,?6,jsonb(?7))")
         .bind(record.capture_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).bind(i64::try_from(record.storage.storage_generation).map_err(invalid)?).bind(lease_device.to_string()).bind(lease_inode.to_string()).bind(encode_record(record)?).execute(&mut *connection).await?;
     for statement in [
@@ -1737,8 +1777,13 @@ async fn update_capture_in_transaction(
         "SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'",
     )
     .bind(capture.to_string())
-    .fetch_one(&mut *connection)
-    .await?;
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| {
+        invalid(format!(
+            "capture operation {capture} is missing during update"
+        ))
+    })?;
     let mut record = decode_record(&json)?;
     update(&mut record)?;
     write_record(connection, &record).await?;
@@ -1784,7 +1829,9 @@ async fn check_lease(
     operation: Uuid,
     lease: &crate::storage::locks::StorageLock,
 ) -> Result<(), LibVmError> {
-    let row = sqlx::query("SELECT file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='capture'").bind(operation.to_string()).fetch_one(&store.pool).await?;
+    let row = sqlx::query("SELECT file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
+        .bind(operation.to_string()).fetch_optional(&store.pool).await?
+        .ok_or_else(|| invalid(format!("owned capture operation {operation} is missing during lease validation")))?;
     let expected = (
         row.try_get::<String, _>("file_device")?,
         row.try_get::<String, _>("file_inode")?,
@@ -3164,7 +3211,9 @@ impl SnapshotStore {
                 };
                 Ok(())
             }).await?;
-            let json: String = sqlx::query_scalar("SELECT json(result_json) FROM live_fork WHERE operation_id=?1").bind(operation.to_string()).fetch_one(&mut *tx).await?;
+            let json: String = sqlx::query_scalar("SELECT json(result_json) FROM live_fork WHERE operation_id=?1")
+                .bind(operation.to_string()).fetch_optional(&mut *tx).await?
+                .ok_or_else(|| invalid(format!("live-fork journal {operation} is missing during cut retention")))?;
             let mut result: crate::LiveForkResult = serde_json::from_str(&json).map_err(invalid)?;
             result.capture = crate::ForkCaptureOutcome::Sealed { cut_id };
             if result.stage != crate::ForkStage::Finished { result.stage = crate::ForkStage::Restoring; }
@@ -3204,7 +3253,9 @@ impl Store {
                 return Err(invalid("fork no longer authorizes capture dispatch"));
             }
         }
-        let json:String=sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'").bind(capture.to_string()).fetch_one(&self.pool).await?;
+        let json: String = sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
+            .bind(capture.to_string()).fetch_optional(&self.pool).await?
+            .ok_or_else(|| invalid(format!("capture operation {capture} is missing before dispatch")))?;
         let record = decode_record(&json)?;
         if record.plan != command.plan
             || record.state != CaptureState::Reserved
@@ -9849,5 +9900,57 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(owned, 0);
+    }
+    #[tokio::test]
+    async fn competing_snapshot_and_fork_are_busy_without_admitting_state() {
+        let fixture = fixture().await;
+        let original = &fixture.reservation.record;
+        let mut request = original.request.clone();
+        request.capture_id = Uuid::new_v4();
+        request.name = Some("competing".into());
+        let error = fixture
+            .snapshots
+            .reserve_capture(&request)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, crate::LibVmError::MachineCaptureBusy { reference } if reference == fixture.config.name)
+        );
+        assert!(fixture
+            .snapshots
+            .capture_reservation(request.capture_id)
+            .await
+            .unwrap()
+            .is_none());
+        let fork = crate::store::fork::tests::options(&["not-created"]);
+        let error = fixture
+            .snapshots
+            .store
+            .admit_fork(
+                original.machine_id,
+                &crate::store::fork::tests::observation(original.machine_id, original.run_id),
+                &fork,
+                Uuid::new_v4(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            crate::LibVmError::MachineCaptureBusy { .. }
+        ));
+        assert!(fixture
+            .snapshots
+            .store
+            .fork_result(fork.operation_id)
+            .await
+            .unwrap()
+            .is_none());
+        let reservations: i64 = sqlx::query_scalar("SELECT count(*) FROM live_fork_child")
+            .fetch_one(&fixture.snapshots.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(reservations, 0);
     }
 }

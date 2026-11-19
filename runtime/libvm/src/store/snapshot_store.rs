@@ -868,7 +868,8 @@ impl SnapshotStore {
         }
         if let Some((evidence_digest, evidence)) = capture {
             let json: String = sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
-                .bind(operation_id.to_string()).fetch_one(&mut *tx).await?;
+                .bind(operation_id.to_string()).fetch_optional(&mut *tx).await?
+                .ok_or_else(|| invalid(format!("capture operation {operation_id} is missing during snapshot publication")))?;
             let mut capture = crate::store::capture::decode_record(&json)?;
             let plan_bytes = capture.plan.canonical_bytes().map_err(invalid)?;
             authenticate_capture_plan(&plan_bytes, &evidence, operation_id)?;
@@ -1400,9 +1401,16 @@ pub(crate) async fn observe_snapshot_record(
     config: &crate::RuntimeConfig,
     reference: &SnapshotRef,
 ) -> Result<SnapshotRecord, LibVmError> {
+    if !crate::LiveObservationReader::open(config)?.catalog_exists()? {
+        return Err(LibVmError::SnapshotNotFound {
+            reference: reference.to_string(),
+        });
+    }
     let home = config.resolve_home()?;
     let store = crate::store::observation::ObservationStore::open(&home.join("state.db")).await?;
-    let record = store.snapshot_record(reference).await;
+    let record = store
+        .restore_snapshot_record(reference, &config.registry_policy)
+        .await;
     store.close().await?;
     record
 }
@@ -1584,8 +1592,9 @@ pub(crate) async fn fetch_catalog(
         "SELECT record_digest,record_bytes,created_at FROM storage_snapshot WHERE id=?1",
     )
     .bind(&id)
-    .fetch_one(&mut *connection)
-    .await?;
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| invalid(format!("snapshot catalog record {id} is missing")))?;
     let names =
         sqlx::query_scalar("SELECT name FROM snapshot_name WHERE snapshot_id=?1 ORDER BY name")
             .bind(&id)
@@ -1673,8 +1682,13 @@ async fn catalog_info(
 ) -> Result<SnapshotInfo, LibVmError> {
     let row = sqlx::query("SELECT record_bytes,created_at FROM storage_snapshot WHERE id=?1")
         .bind(id.to_string())
-        .fetch_one(&mut *connection)
-        .await?;
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| {
+            invalid(format!(
+                "snapshot catalog record {id} is missing during publication"
+            ))
+        })?;
     let names = sqlx::query_scalar::<_, String>(
         "SELECT name FROM snapshot_name WHERE snapshot_id=?1 ORDER BY name",
     )

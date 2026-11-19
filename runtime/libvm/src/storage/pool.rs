@@ -1149,8 +1149,36 @@ impl StoragePool {
         .ok_or_else(|| StorageError::InvalidPath("registered operation is being retired".into()))
     }
 
-    /// Never wait for a lease while holding root coordination.
+    /// Never wait for a lease while holding root coordination. The shared
+    /// inventory fence attributes exclusive recovery holds even after their
+    /// catalog roots have been retired.
     pub fn try_exclusive_lease(
+        &self,
+        operation: Uuid,
+    ) -> Result<Option<StorageLock>, StorageError> {
+        let inventory = locks::blocking(
+            &self.lock_directory,
+            "lease-inventory.lock",
+            FlockArg::LockShared,
+        )?;
+        Ok(self
+            .probe_exclusive_lease(operation)?
+            .map(|lease| lease.with_coordination(inventory)))
+    }
+
+    /// Inventory takes roots first and only tries this fence nonblockingly.
+    pub(crate) fn try_lock_lease_inventory(&self) -> Result<Option<StorageLock>, StorageError> {
+        locks::acquire(
+            &self.lock_directory,
+            "lease-inventory.lock",
+            FlockArg::LockExclusiveNonblock,
+        )
+    }
+
+    /// Uncoordinated inventory probe. Inventory holds roots and must additionally
+    /// exclude recovery holds before classifying an unknown busy lease.
+    /// Ordinary recovery must use `try_exclusive_lease` instead.
+    pub(crate) fn probe_exclusive_lease(
         &self,
         operation: Uuid,
     ) -> Result<Option<StorageLock>, StorageError> {

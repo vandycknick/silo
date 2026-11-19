@@ -298,6 +298,31 @@ pub(crate) fn admission(
 }
 
 impl Machine {
+    /// Read-only fast refusal before maintenance. This is not admission:
+    /// capture and fork transactions repeat the check before reserving state.
+    pub async fn require_capture_available(
+        &self,
+        observation: &MachineLiveObservation,
+        fork_operation: Option<Uuid>,
+    ) -> Result<(), LibVmError> {
+        self.require_observation(observation)?;
+        let store = self.runtime().native_store()?;
+        if let Some(operation) = fork_operation {
+            if store.fork_result(operation).await?.is_some() {
+                return Ok(());
+            }
+        }
+        let run = Uuid::parse_str(&observation.report().run_id)
+            .map_err(|error| protocol(error.to_string()))?;
+        crate::store::capture::ensure_capture_available(
+            &mut *store.pool.acquire().await?,
+            self.machine_id(),
+            run,
+            Uuid::nil(),
+        )
+        .await
+    }
+
     /// Capture this exact running or user-paused run with its memory, publish
     /// the sealed snapshot through the snapshot store, settle the source
     /// continuation and release the monitor's result ownership.
@@ -336,6 +361,7 @@ impl Machine {
             return Err(protocol("nil capture identity"));
         }
         self.require_observation(observation)?;
+        require_live_operation(observation, LiveOperation::Capture)?;
         options.policy = resolve_policy(options.policy, observation);
         let runtime = self.runtime();
         let store = runtime.native_store()?;
@@ -368,10 +394,17 @@ impl Machine {
                 .live_command(observation, existing.intent.command)
                 .await;
         }
-        let (pause, resume_policy) = admission(observation, options.resume_policy)?;
-        options.resume_policy = resume_policy;
         let (reservation, intent) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            crate::store::capture::ensure_capture_available(
+                &mut *store.pool.acquire().await?,
+                self.machine_id(),
+                run,
+                request_id,
+            )
+            .await?;
+            let (pause, resume_policy) = admission(observation, options.resume_policy)?;
+            options.resume_policy = resume_policy;
             let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
             require_same_observation(observation, &fresh)?;
             options.policy = resolve_policy(options.policy, &fresh);

@@ -443,6 +443,9 @@ fn inspect_error(context: &str, timed_out: &str, status: Status) -> VmmClientErr
 }
 
 fn rpc_error(context: &str, status: Status) -> VmmClientError {
+    if status.code() == tonic::Code::Unavailable {
+        return VmmClientError::Connection(format!("{context}: {}", status.message()));
+    }
     let detail = protocol::decode_error_detail(status.details())
         .ok()
         .and_then(|detail| detail.code)
@@ -469,8 +472,11 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
     while let Some(error) = source {
-        message.push_str(": ");
-        message.push_str(&error.to_string());
+        let cause = error.to_string();
+        if !message.ends_with(&cause) {
+            message.push_str(": ");
+            message.push_str(&cause);
+        }
         source = error.source();
     }
     message
@@ -557,5 +563,20 @@ mod tests {
             );
             assert!(matches!(error, VmmClientError::Protocol(_)), "{error:?}");
         }
+    }
+    #[test]
+    fn error_chain_does_not_repeat_a_wrapped_cause() {
+        let error = std::io::Error::other(std::io::Error::other("connection refused"));
+        assert_eq!(
+            crate::supervisor::client::error_chain(&error),
+            "connection refused"
+        );
+        assert!(matches!(
+            crate::supervisor::client::rpc_error(
+                "capture",
+                tonic::Status::unavailable("lost contact")
+            ),
+            VmmClientError::Connection(_)
+        ));
     }
 }

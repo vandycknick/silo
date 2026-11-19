@@ -557,3 +557,113 @@ fn stopped_preflight_rejects_missing_sources_and_wrong_reference_kinds_without_i
         assert!(!temp.path().join("run").exists());
     }
 }
+
+#[tokio::test]
+async fn early_rejection_missing_machine_commands_preserve_absent_empty_and_existing_homes() {
+    for home_kind in ["absent", "empty", "catalog"] {
+        let temp = tempfile::tempdir().expect("private root");
+        let root = temp.path();
+        install_runtime(&root.join("runtime"));
+        if home_kind == "empty" {
+            std::fs::create_dir(root.join("home")).expect("empty home");
+        } else if home_kind == "catalog" {
+            let scenario = root.join("scenario.json");
+            Scenario::default().write_to(&scenario).expect("scenario");
+            let runtime = Runtime::new(
+                RuntimeConfig::local(root.join("home"))
+                    .with_run_root(root.join("run"))
+                    .with_runtime_root(root.join("runtime"))
+                    .with_mock_vmm(&scenario),
+            )
+            .await
+            .expect("existing catalog");
+            drop(runtime);
+        }
+        std::fs::write(root.join("sentinel"), b"unchanged").expect("sentinel");
+        symlink("sentinel", root.join("sentinel-link")).expect("sentinel link");
+        for args in [
+            vec!["snapshot", "create", "absent", "--memory"],
+            vec!["snapshot", "create", "absent", "--name", "checkpoint"],
+            vec!["fork", "absent", "--name", "child", "--live"],
+            vec!["fork", "absent", "--name", "child"],
+            vec!["restore", "absent", "--name", "child"],
+            vec!["restore", "absent", "--pull", "always", "--name", "child"],
+            vec!["restore", "absent", "--pull", "never", "--name", "child"],
+            vec!["restore", "absent", "--name", "invalid.name"],
+            vec!["rm", "absent"],
+            vec!["rm", "absent", "--force"],
+        ] {
+            let before = snapshot(root);
+            let catalog = if home_kind == "catalog" {
+                Some(live_catalog::snapshot(&root.join("home")).await)
+            } else {
+                None
+            };
+            let output = run(root, "krun", &args);
+            assert!(!output.status.success(), "{home_kind}: {args:?}");
+            assert!(output.stdout.is_empty(), "{home_kind}: {args:?}");
+            assert_eq!(snapshot(root), before, "{home_kind}: {args:?}");
+            if let Some(catalog) = catalog {
+                assert_eq!(
+                    live_catalog::snapshot(&root.join("home")).await,
+                    catalog,
+                    "{args:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn early_rejection_restore_image_preserves_existing_home() {
+    let temp = tempfile::tempdir().expect("private root");
+    let root = temp.path();
+    install_runtime(&root.join("runtime"));
+    let scenario = root.join("scenario.json");
+    Scenario::default().write_to(&scenario).expect("scenario");
+    let runtime = Runtime::new(
+        RuntimeConfig::local(root.join("home"))
+            .with_run_root(root.join("run"))
+            .with_runtime_root(root.join("runtime"))
+            .with_mock_vmm(&scenario),
+    )
+    .await
+    .expect("fixture runtime");
+    let disk = root.join("disk.raw");
+    disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+        .and_then(|formatter| formatter.close())
+        .expect("whole-disk ext4 fixture");
+    let ImageSource::Disk(mut request) = ImageSource::disk(&disk) else {
+        panic!("disk source must provide an import request");
+    };
+    request.name = Some("image-only".into());
+    runtime
+        .images()
+        .import_disk(request)
+        .await
+        .expect("local image");
+    drop(runtime);
+    for pull in [None, Some("never"), Some("always")] {
+        let mut args = vec!["restore", "image-only", "--name", "never-restored"];
+        if let Some(pull) = pull {
+            args.extend(["--pull", pull]);
+        }
+        let before = snapshot(root);
+        let catalog = live_catalog::snapshot(&root.join("home")).await;
+        let output = run(root, "krun", &args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("image-only is an image, not a snapshot"),
+            "{error}"
+        );
+        assert!(error.contains("silo create image-only"), "{error}");
+        assert_eq!(snapshot(root), before, "{args:?}");
+        assert_eq!(
+            live_catalog::snapshot(&root.join("home")).await,
+            catalog,
+            "{args:?}"
+        );
+    }
+}

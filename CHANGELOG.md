@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Fixed: `silo restore` recognizes local images by name, stored registry
+  expansion, id or unique prefix before initializing writable state, and
+  suggests `silo create` instead of reporting a missing snapshot. A shared
+  image and snapshot name still selects the snapshot.
+- Fixed: commands that open the store no longer fail with `busy lease ... has
+  no understood operation root` or a missing-row database error while another
+  process retires a finished operation. Recovery rechecks discovered operations
+  under their ownership guards. Stopping many machines at once now works.
+- Fixed: a snapshot or live fork of a machine that is already being
+  snapshotted or forked is refused up front with `machine NAME is busy with
+  another snapshot or fork; try again when it finishes`. Two concurrent live
+  forks no longer end in a database error, and the refused command leaves no
+  operation, child or name reservation behind.
+- Fixed: when a machine's VM process dies during a snapshot or fork, the
+  command says the machine stopped unexpectedly and how to start it again,
+  instead of printing a socket error twice.
+- Fixed: a fork child that is stopped and started again no longer reports that
+  its identity was unknown after the fork on its next snapshot.
+- Changed: `silo rm` of a running machine says to stop it first or use
+  `--force`; `silo restore` validates the new machine name like `silo fork`;
+  fork errors no longer repeat their prefix; `silo image prune` reports removed
+  images and reclaimed unreferenced data separately; `silo snapshot list` and
+  `silo image list` show the newest first.
+- Changed: relative times (`CREATED`, `LAST USED`) follow Docker's wording:
+  "Less than a second ago" only under one second, then seconds, "About a
+  minute", minutes, "About an hour", hours up to 48, then days, weeks, months
+  and years.
 - Breaking: every Silo-owned format, hash-domain, record and protocol version
   restarts at 1: VM artifact media types (`application/vnd.silo.vm.*.v1`),
   `silo-chunks-v1`, the stream, stream-map, image, snapshot, layer-result and
@@ -16,6 +43,9 @@
   a name. The `image:` prefix is gone: `create`, `run` and `restore` resolve a
   local name, then stored `search_registries` expansions, then pull per
   `--pull always|missing|never` (default `missing`), then a unique id prefix.
+  The exception is a bare snapshot name that `restore` cannot find locally: it
+  is reported as not found and no registry is contacted; a qualified registry
+  path still pulls.
   `create`/`run` refuse snapshots; `silo restore REF` is the only way to turn a
   snapshot into a VM, and `restore --without-memory` replaces `recover-disks`.
   `snapshot create --memory` replaces `--live`; a running VM without

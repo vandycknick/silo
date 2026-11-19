@@ -1216,13 +1216,23 @@ impl crate::store::Store {
             directory.write_file_atomic(&name, json.as_bytes())?;
             authoritative.insert(name);
         }
-        let captures: Vec<String> =
-            sqlx::query_scalar("SELECT operation_id FROM capture_resource_reservation")
-                .fetch_all(&self.pool)
-                .await?;
-        for id in captures {
+        // Read identities and inventories together. Retirement does not take
+        // admission and may cascade-delete a reservation immediately after this
+        // read. Its snapshot can conservatively remain until the next sweep.
+        let captures: Vec<(String, String)> = sqlx::query_as(
+            "SELECT operation_id,json(charge_json) FROM capture_resource_reservation",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        #[cfg(test)]
+        if let Some(hook) = &self.layer_hook {
+            hook.hit(crate::store::layer_store::tests::WorkerPoint::BudgetInventoryRead)?;
+        }
+        for (id, inventory) in captures {
             let operation = Uuid::parse_str(&id).map_err(invalid)?;
-            let json = self.capture_budget_document(operation).await?;
+            let json = self
+                .render_capture_budget_document(operation, &inventory)
+                .await?;
             let name = budget_name(self, operation)?;
             directory.write_file_atomic(&name, json.as_bytes())?;
             authoritative.insert(name);
@@ -1246,7 +1256,8 @@ impl crate::store::Store {
         let _roots = pool.lock_roots()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let json: String = sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='launch'")
-            .bind(operation.to_string()).fetch_one(&mut *tx).await?;
+            .bind(operation.to_string()).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| invalid(format!("restore launch operation {operation} is missing during activation")))?;
         let mut record: crate::store::operation_store::RetainedStorageOperation =
             serde_json::from_str(&json).map_err(invalid)?;
         if record.admitted {
@@ -1621,9 +1632,18 @@ impl crate::store::Store {
             "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
         )
         .bind(owner.to_string())
-        .fetch_one(&self.pool)
-        .await?;
-        let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| invalid(format!("capture resource reservation {owner} is missing")))?;
+        self.render_capture_budget_document(owner, &json).await
+    }
+
+    async fn render_capture_budget_document(
+        &self,
+        owner: Uuid,
+        json: &str,
+    ) -> Result<String, LibVmError> {
+        let mut inventory: CaptureBudgetInventory = serde_json::from_str(json).map_err(invalid)?;
         let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('capture','import'))").bind(inventory.capture_id.to_string()).fetch_one(&self.pool).await?;
         if !retained {
             inventory.capture_disks.clear();
@@ -1671,8 +1691,13 @@ impl crate::store::Store {
             "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
         )
         .bind(operation.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            invalid(format!(
+                "fork resource reservation {operation} is missing during binding"
+            ))
+        })?;
         let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
         for pending in &inventory.pending {
             let lease = pool.lease_deferred(pending.consumer_id)?;
@@ -1717,8 +1742,13 @@ impl crate::store::Store {
             "SELECT json(charge_json) FROM restore_resource_reservation WHERE operation_id=?1",
         )
         .bind(consumer.to_string())
-        .fetch_one(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            invalid(format!(
+                "restore resource reservation {consumer} is missing"
+            ))
+        })?;
         let charge: RestoreResourceCharge = serde_json::from_str(&json).map_err(invalid)?;
         charge.validate()?;
         Ok(charge)
@@ -1789,7 +1819,9 @@ impl crate::store::Store {
             "admission.lock",
             nix::fcntl::FlockArg::LockExclusive,
         )?;
-        let json:String=sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'").bind(capture.to_string()).fetch_one(&self.pool).await?;
+        let json: String = sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
+            .bind(capture.to_string()).fetch_optional(&self.pool).await?
+            .ok_or_else(|| invalid(format!("capture operation {capture} is missing during boot inventory refinement")))?;
         let record = crate::store::capture::decode_record(&json)?;
         let boot = record
             .captured_boot
@@ -1801,8 +1833,13 @@ impl crate::store::Store {
             "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
         )
         .bind(owner.to_string())
-        .fetch_one(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            invalid(format!(
+                "fork resource reservation {owner} is missing during boot inventory refinement"
+            ))
+        })?;
         let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
         let mut budget = RestoreBudget::read(self, &directory)?;
         let mut changed = false;
@@ -3998,5 +4035,103 @@ mod tests {
             held.metadata().unwrap().ino()
         );
         assert_ne!(std::fs::read(ledger.path().join(&name)).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn budget_reconciliation_tolerates_retirement_after_inventory_discovery() {
+        use crate::paths::LocalPaths;
+        use crate::storage::pool::StoragePool;
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+        use crate::store::restore::{budget_directory, budget_name};
+        use crate::store::Store;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temporary.path().join("home")))
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let (retired, retired_lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        store.reserve_import_space(retired, 4096).await.unwrap();
+        let (active, active_lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        store.reserve_import_space(active, 8192).await.unwrap();
+        let (hook, mut entered, release) = WorkerHook::new(WorkerPoint::BudgetInventoryRead, false);
+        let mut reconciling = store.clone();
+        reconciling.layer_hook = Some(hook);
+        let runtime = tokio::runtime::Handle::current();
+        let worker_runtime = runtime.clone();
+        let reconciliation = tokio::task::spawn_blocking(move || {
+            worker_runtime.block_on(reconciling.reconcile_restore_budget())
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(retired_lease);
+        let retiring = store.clone();
+        let retirement = tokio::task::spawn_blocking(move || {
+            runtime.block_on(retiring.retire_pending_storage_operations(&pool))
+        });
+        // The real retirement transaction cascades away the reservation, then
+        // waits for reconciliation's admission lock before updating the ledger.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let retained: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM capture_resource_reservation WHERE operation_id=?1)",
+                )
+                .bind(retired.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+                if !retained {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), reconciliation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), retirement)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // Active callers still require an authoritative reservation.
+        let error = store.capture_budget_document(retired).await.unwrap_err();
+        assert!(matches!(
+            &error,
+            crate::LibVmError::InvalidStorageRecord { .. }
+        ));
+        assert!(error.to_string().contains("capture resource reservation"));
+        assert!(error.to_string().contains(&retired.to_string()));
+        let ledger = budget_directory(&store).unwrap();
+        assert!(!ledger
+            .path()
+            .join(budget_name(&store, retired).unwrap())
+            .exists());
+        assert!(ledger
+            .path()
+            .join(budget_name(&store, active).unwrap())
+            .exists());
+        assert_eq!(
+            RestoreBudget::read(&store, &ledger)
+                .unwrap()
+                .disks
+                .values()
+                .sum::<u64>(),
+            8192
+        );
+        drop(active_lease);
     }
 }

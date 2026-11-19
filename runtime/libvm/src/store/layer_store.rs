@@ -1004,6 +1004,10 @@ pub(crate) mod tests {
         CandidateDetached,
         CandidateDirectoryVerified,
         CandidateRemoved,
+        LeaseInventoryWait,
+        BudgetInventoryRead,
+        ForkRootsEnumerated,
+        ForkReconciliationEnumerated,
         Compose,
     }
     #[derive(Debug)]

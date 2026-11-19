@@ -1280,8 +1280,13 @@ impl Store {
                 "SELECT json(record_json) FROM machine_storage WHERE machine_id=?1",
             )
             .bind(machine.to_string())
-            .fetch_one(&mut **tx)
-            .await?;
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "machine storage {machine} is missing during candidate recovery"
+                ))
+            })?;
             MachineStorageRecord::decode(&json)?.validate_for_machine(machine.into())?;
             let construction: Option<String> = sqlx::query_scalar("SELECT json(construction_json) FROM restore_resource_reservation WHERE operation_id=?1 AND construction_json IS NOT NULL")
                 .bind(operation.to_string()).fetch_optional(&mut **tx).await?;
@@ -1590,7 +1595,8 @@ impl Store {
                         let _roots = pool.lock_roots()?;
                         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                         let current = sqlx::query("SELECT state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
-                            .bind(&cursor).fetch_one(&mut *tx).await?;
+                            .bind(&cursor).fetch_optional(&mut *tx).await?
+                            .ok_or_else(|| invalid(format!("owned capture operation {id} is missing before cleanup")))?;
                         validate_lease_identity(&current, &_lease)?;
                         if crate::store::capture::decode_record(
                             &current.try_get::<String, _>("record_json")?,
@@ -1635,7 +1641,8 @@ impl Store {
                         let _roots = pool.lock_roots()?;
                         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                         let current = sqlx::query("SELECT state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
-                            .bind(&cursor).fetch_one(&mut *tx).await?;
+                            .bind(&cursor).fetch_optional(&mut *tx).await?
+                            .ok_or_else(|| invalid(format!("owned capture operation {id} is missing during cleanup")))?;
                         validate_lease_identity(&current, &_lease)?;
                         if current.try_get::<String, _>("state")? != "cleaning"
                             || crate::store::capture::decode_record(
@@ -1718,7 +1725,8 @@ impl Store {
                         let _roots = pool.lock_roots()?;
                         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                         let current = sqlx::query("SELECT state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1")
-                            .bind(id.to_string()).fetch_one(&mut *tx).await?;
+                            .bind(id.to_string()).fetch_optional(&mut *tx).await?
+                            .ok_or_else(|| invalid(format!("owned candidate operation {id} is missing during cleanup")))?;
                         validate_lease_identity(&current, &_lease)?;
                         if current.try_get::<String, _>("state")? != "cleaning"
                             || current.try_get::<String, _>("record_json")? != candidate_json
@@ -2109,20 +2117,21 @@ impl Store {
         let json: String =
             sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
                 .bind(next_state.machine_id.to_string())
-                .fetch_one(&mut *tx)
-                .await?;
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "machine storage {} is missing during launch reconciliation",
+                        next_state.machine_id
+                    ))
+                })?;
         let mut storage = MachineStorageRecord::decode(&json)?;
         if storage.storage_generation != generation {
             return Err(invalid("machine generation changed before reconciliation"));
         }
         storage.stop_outcome = outcome;
         storage.invalidate_disk_baselines();
-        if matches!(
-            storage.ram_identity,
-            crate::store::models::storage::ContentIdentityState::Identified { .. }
-        ) {
-            storage.ram_identity = crate::store::models::storage::ContentIdentityState::Unknown;
-        }
+        storage.ram_identity = crate::store::models::storage::ContentIdentityState::Unknown;
         tracing::info!(machine_id = %next_state.machine_id, "disk tracking baseline invalidated at stop; stage 1 restart requires one full capture hash");
         Self::write_machine_storage(&mut tx, next_state.machine_id, &storage).await?;
         sqlx::query("INSERT INTO machine_state(machine_id,status,state_json) VALUES(?1,?2,jsonb(?3)) ON CONFLICT(machine_id) DO UPDATE SET status=excluded.status,state_json=excluded.state_json")
@@ -2149,19 +2158,44 @@ impl Store {
             if batch.is_empty() {
                 break;
             }
-            let _roots = pool.lock_roots()?;
-            for id in batch {
-                let known: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)",
-                )
-                .bind(id.to_string())
-                .fetch_one(&self.pool)
-                .await?;
-                if !known && pool.try_exclusive_lease(id)?.is_none() {
-                    return Err(invalid(format!(
-                        "busy lease {id} has no understood operation root"
-                    )));
+            'check: loop {
+                let roots = pool.lock_roots()?;
+                for id in &batch {
+                    let known: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)",
+                    )
+                    .bind(id.to_string())
+                    .fetch_one(&self.pool)
+                    .await?;
+                    if known || pool.probe_exclusive_lease(*id)?.is_some() {
+                        continue;
+                    }
+                    let Some(_inventory) = pool.try_lock_lease_inventory()? else {
+                        // Reapers can hold EX after removing a root, or before
+                        // acquiring roots for temporary cleanup. Let them finish
+                        // outside roots; waiting here would deadlock that cleanup.
+                        drop(roots);
+                        #[cfg(test)]
+                        if let Some(hook) = &self.layer_hook {
+                            hook.hit(
+                                crate::store::layer_store::tests::WorkerPoint::LeaseInventoryWait,
+                            )?;
+                        }
+                        // Never queue an exclusive fence waiter ahead of a
+                        // roots owner acquiring its shared recovery fence.
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        continue 'check;
+                    };
+                    // Roots fence producer registration; inventory excludes EX
+                    // recovery holds. An unknown busy lease is now genuinely an
+                    // unrooted SH producer, not another process's cleanup.
+                    if pool.probe_exclusive_lease(*id)?.is_none() {
+                        return Err(invalid(format!(
+                            "busy lease {id} has no understood operation root"
+                        )));
+                    }
                 }
+                break;
             }
         }
         self.check_pending_operation_recovery(pool).await

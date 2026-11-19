@@ -16,15 +16,27 @@ use crate::storage::StorageError;
 #[must_use = "storage lock is released when its final descriptor closes"]
 pub struct StorageLock {
     file: File,
+    // Close the protected descriptor before releasing its inventory fence.
+    coordination: Option<File>,
 }
 
 impl StorageLock {
     pub fn duplicate(&self) -> io::Result<Self> {
         Ok(Self {
             file: self.file.try_clone()?,
+            coordination: self
+                .coordination
+                .as_ref()
+                .map(File::try_clone)
+                .transpose()?,
         })
     }
+    pub(crate) fn with_coordination(mut self, coordination: Self) -> Self {
+        self.coordination = Some(coordination.file);
+        self
+    }
     pub(crate) fn durability_file(&self) -> io::Result<File> {
+        self.require_single_descriptor()?;
         self.file.try_clone()
     }
     pub(crate) fn sync(&self) -> io::Result<()> {
@@ -33,10 +45,21 @@ impl StorageLock {
 
     /// Remains CLOEXEC in the parent; only an intended child may clear CLOEXEC.
     pub fn duplicate_inheritable(&self) -> io::Result<OwnedFd> {
+        self.require_single_descriptor()?;
         let fd = nix::fcntl::fcntl(&self.file, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(3))
             .map_err(io::Error::other)?;
         // F_DUPFD_CLOEXEC returned a new descriptor owned by this call.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn require_single_descriptor(&self) -> io::Result<()> {
+        if self.coordination.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a recovery lease must retain its inventory fence; duplicate the complete lock",
+            ));
+        }
+        Ok(())
     }
 
     // Native stat field types differ between Linux and Darwin.
@@ -129,7 +152,12 @@ fn acquire_mode(
     loop {
         #[allow(deprecated)]
         match nix::fcntl::flock(file.as_raw_fd(), argument) {
-            Ok(()) => return Ok(Some(StorageLock { file })),
+            Ok(()) => {
+                return Ok(Some(StorageLock {
+                    file,
+                    coordination: None,
+                }));
+            }
             Err(Errno::EINTR) => continue,
             Err(Errno::EAGAIN) => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -303,5 +331,39 @@ mod tests {
         )
         .is_err());
         assert!(directory.path().join("generation.lease").exists());
+    }
+
+    #[test]
+    fn coordinated_duplicates_keep_both_locks_and_cannot_export_one_descriptor() {
+        if isolated("storage::locks::tests::coordinated_duplicates_keep_both_locks_and_cannot_export_one_descriptor") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let directory = OwnedDirectory::open_root(&temp.path().join("locks")).unwrap();
+        let inventory = blocking(&directory, "inventory.lock", FlockArg::LockShared).unwrap();
+        let lease = blocking(&directory, "operation.lease", FlockArg::LockExclusive)
+            .unwrap()
+            .with_coordination(inventory);
+        assert_eq!(
+            lease.durability_file().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            lease.duplicate_inheritable().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let duplicate = lease.duplicate().unwrap();
+        drop(lease);
+        for name in ["inventory.lock", "operation.lease"] {
+            assert!(acquire(&directory, name, FlockArg::LockExclusiveNonblock)
+                .unwrap()
+                .is_none());
+        }
+        drop(duplicate);
+        for name in ["inventory.lock", "operation.lease"] {
+            assert!(acquire(&directory, name, FlockArg::LockExclusiveNonblock)
+                .unwrap()
+                .is_some());
+        }
     }
 }

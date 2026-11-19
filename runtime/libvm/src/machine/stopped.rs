@@ -300,6 +300,9 @@ pub async fn preflight_stopped(
     if snapshot {
         validate_snapshot_policy(policy)?;
     }
+    crate::LiveObservationReader::open(config)?
+        .require_machine_exists(reference)
+        .await?;
     let roots = config.observation_roots()?;
     let observer =
         crate::store::observation::ObservationStore::open(&roots.state_db_path()).await?;
@@ -505,6 +508,13 @@ impl Runtime {
             RestoreSource::Local(reference) => (reference.to_string(), PullPolicy::Never),
             RestoreSource::Registry(reference) => (reference, pull),
         };
+        // A missing local name is not permission to pull a Docker library image.
+        // Qualified registry paths retain the caller's explicit pull policy.
+        let pull = if input.contains('/') {
+            pull
+        } else {
+            PullPolicy::Never
+        };
         let resolution = {
             let store = self.native_store()?;
             let mut connection = store.pool.acquire().await?;
@@ -526,7 +536,22 @@ impl Runtime {
                 Err(LibVmError::ImageIsNotASnapshot { reference: input })
             }
             crate::resolve::Resolution::Remote(reference) => {
-                Ok(self.images().acquire_snapshot_artifact(reference).await?.id)
+                match self.images().acquire_snapshot_artifact(reference).await {
+                    Ok(snapshot) => Ok(snapshot.id),
+                    Err(LibVmError::Image { reference, source }) => {
+                        Err(LibVmError::SnapshotPullFailed {
+                            reference: input,
+                            message: format!("pulling {reference} failed: {source}"),
+                        })
+                    }
+                    Err(LibVmError::ImageReferenceRejected { reference, message }) => {
+                        Err(LibVmError::SnapshotPullFailed {
+                            reference: input,
+                            message: format!("pulling {reference} failed: {message}"),
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
             }
         }
     }
@@ -2739,5 +2764,201 @@ mod tests {
             "{result:?}"
         );
         assert!(runtime.snapshots().list().await.unwrap().is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restore_preflight_resolves_local_kinds_without_registry_contacts() {
+        let (home, runtime, _source) = raw_source("preflight-source").await;
+        let registry = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        registry.set_nonblocking(true).unwrap();
+        let policy = crate::RegistryPolicy::new(
+            crate::RegistryAction::Allow,
+            vec![registry.local_addr().unwrap().to_string()],
+            Vec::new(),
+        )
+        .unwrap();
+        let store = runtime.native_store().unwrap();
+        let image = runtime.images().list().await.unwrap().remove(0).id();
+        let expanded = policy.candidates("image-expanded").unwrap()[0].to_string();
+        for name in ["image-only", "hello", &expanded] {
+            sqlx::query("INSERT INTO image_name(name,stored_image_id,updated_at) VALUES(?1,?2,0)")
+                .bind(name)
+                .bind(image.to_string())
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let snapshot = runtime
+            .snapshot(
+                &crate::MachineRef::parse("preflight-source").unwrap(),
+                crate::SnapshotOptions {
+                    name: Some("hello".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        crate::store::snapshot_store::insert_name(
+            &mut store.pool.acquire().await.unwrap(),
+            "snapshot-only",
+            snapshot.snapshot.id,
+        )
+        .await
+        .unwrap();
+        let config = crate::RuntimeConfig::local(home.path().join("silo"))
+            .with_runtime_components(crate::runtime::components::test_components(home.path()))
+            .with_registry_policy(policy);
+        let query = crate::LiveCapabilityQuery::open(&config).unwrap();
+        let options = crate::RestoreOptions::default();
+        let image_id = image.to_string();
+        for reference in ["image-only", "image-expanded", &image_id, &image_id[7..15]] {
+            let error = crate::preflight_restore_snapshot(
+                &config,
+                &query,
+                &reference.parse().unwrap(),
+                &options,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, crate::LibVmError::ImageIsNotASnapshot { reference: actual }
+                    if actual == reference),
+                "{reference}: {error:?}"
+            );
+        }
+        let error = crate::preflight_restore_snapshot(
+            &config,
+            &query,
+            &"unknown-local-name".parse().unwrap(),
+            &options,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::LibVmError::SnapshotNotFound { reference } if reference == "unknown-local-name"
+        ));
+        for reference in ["snapshot-only", "hello"] {
+            crate::preflight_restore_snapshot(
+                &config,
+                &query,
+                &reference.parse().unwrap(),
+                &options,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            registry.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_preflight_absent_home_is_not_found_without_initialization() {
+        let home = tempfile::tempdir().unwrap();
+        let absent = home.path().join("absent");
+        let config = crate::RuntimeConfig::local(&absent)
+            .with_runtime_components(crate::runtime::components::test_components(home.path()));
+        let query = crate::LiveCapabilityQuery::open(&config).unwrap();
+        let error = crate::preflight_restore_snapshot(
+            &config,
+            &query,
+            &"missing".parse().unwrap(),
+            &crate::RestoreOptions {
+                without_memory: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::LibVmError::SnapshotNotFound { reference } if reference == "missing"
+        ));
+        assert!(!absent.exists());
+    }
+
+    #[tokio::test]
+    async fn restore_missing_bare_name_never_pulls_even_with_always() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = crate::paths::LocalPaths::new(temporary.path().join("home"));
+        let store = std::sync::Arc::new(crate::store::Store::new(&paths).await.unwrap());
+        let runtime = acquired_runtime(store.clone()).await;
+        for policy in [
+            crate::PullPolicy::IfMissing,
+            crate::PullPolicy::Always,
+            crate::PullPolicy::Never,
+        ] {
+            let error = runtime
+                .resolve_restore_source(
+                    crate::RestoreSource::Registry("nonexistent".into()),
+                    policy,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, crate::LibVmError::SnapshotNotFound { reference } if reference == "nonexistent")
+            );
+        }
+        let acquisitions: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM managed_artifact_acquisition")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(acquisitions, 0);
+    }
+
+    #[test]
+    fn restore_name_validation_preserves_machine_name_rule() {
+        let error = crate::RestoreOptions {
+            name: Some("wr-anon1.8g".into()),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(
+            matches!(error, crate::LibVmError::InvalidMachineName { name, .. } if name == "wr-anon1.8g")
+        );
+    }
+    #[tokio::test]
+    async fn qualified_restore_pull_failure_reports_snapshot_reference_and_cause() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = crate::paths::LocalPaths::new(temporary.path().join("home"));
+        let store = std::sync::Arc::new(crate::store::Store::new(&paths).await.unwrap());
+        let components = crate::runtime::components::test_components(paths.home());
+        let runtime = crate::Runtime::from_store(
+            paths,
+            store,
+            crate::RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::new(
+                crate::RegistryAction::Deny,
+                vec!["registry.example".into()],
+                Vec::new(),
+            )
+            .unwrap(),
+            components,
+            None,
+        )
+        .await
+        .unwrap();
+        let expanded = runtime
+            .registry_policy()
+            .candidates("team/nonexistent")
+            .unwrap()[0]
+            .to_string();
+        let error = runtime
+            .resolve_restore_source(
+                crate::RestoreSource::Registry("team/nonexistent".into()),
+                crate::PullPolicy::Always,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, crate::LibVmError::SnapshotPullFailed { reference, message }
+            if reference == "team/nonexistent" && message.contains(&expanded) && message.contains("denied")),
+            "{error:?}"
+        );
     }
 }
