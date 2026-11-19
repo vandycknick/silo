@@ -213,7 +213,6 @@ fn joined(parts: &[Vec<u8>]) -> Vec<u8> {
 
 fn normalized(path: &[u8]) -> Result<Vec<u8>, String> {
     if path.is_empty()
-        || path.first() == Some(&b'/')
         || path.contains(&0)
         || path.split(|byte| *byte == b'/').any(|part| part == b"..")
     {
@@ -342,16 +341,10 @@ impl Tree {
         let mut unique = BTreeMap::new();
         let mut normalized_ops = Vec::new();
         for operation in operations {
-            // The approved exception is an entry spelling, not a general path
-            // normalization rule. In particular hardlink targets still pass
-            // through strict normalized() below and cannot use absolute `/`.
-            let path = if operation.path == b"/"
-                && matches!(operation.action, Action::Put(Object::Directory))
-            {
-                Vec::new()
-            } else {
-                normalized(&operation.path)?
-            };
+            let path = normalized(&operation.path)?;
+            if path.is_empty() && !matches!(operation.action, Action::Put(Object::Directory)) {
+                return Err("non-directory root".into());
+            }
             if unique.insert(path.clone(), ()).is_some() {
                 return Err("duplicate source name".into());
             }
@@ -402,6 +395,9 @@ impl Tree {
             match &operation.action {
                 Action::Link(target) => {
                     let target = normalized(target)?;
+                    if target.is_empty() {
+                        return Err("root hardlink target".into());
+                    }
                     let target = self
                         .destination(&target, false)?
                         .ok_or("missing link parent")?;

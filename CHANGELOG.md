@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed: OCI images with absolute archive paths, including Nix dockerTools
+  images, now load those paths relative to the image root.
+- Changed: `-v` shows debug output without SQL statements, `-vv` adds the SQL
+  statements and `-vvv` is trace. Registry authentication responses, which
+  contain bearer tokens, are no longer printed at any of these levels.
 - Fixed: restored and forked machines are kept even when their source was a
   temporary `silo run` machine, so they can be started, restarted and chosen
   as the default VM. Leftover temporary machines now explain how to remove them.

@@ -71,9 +71,11 @@ pub(crate) fn normalize_path(
     if raw.is_empty() && root_allowed {
         return Ok(Vec::new());
     }
-    if raw.is_empty() || raw.first() == Some(&b'/') || raw.contains(&0) {
-        return Err(invalid("empty, absolute or NUL-containing tar path"));
+    if raw.is_empty() || raw.contains(&0) {
+        return Err(invalid("empty or NUL-containing tar path"));
     }
+    // Leading slashes name the layer root, never the host root. The result is
+    // relative, NUL-free and has no `..` components, so it cannot escape it.
     let mut result = Vec::with_capacity(raw.len());
     let mut depth = 0_u64;
     for part in raw.split(|byte| *byte == b'/') {
@@ -1100,13 +1102,7 @@ pub(crate) fn parse(
         if name.is_empty() {
             return Err(invalid("empty raw tar member name"));
         }
-        // Only the exact effective source-directory spelling "/" aliases ".".
-        // Canonical index paths and hardlink targets keep their strict parser.
-        let path = if directory && name == b"/" {
-            normalize_path(b".", true, limits)?
-        } else {
-            normalize_path(&name, directory, limits)?
-        };
+        let path = normalize_path(&name, directory, limits)?;
         if !names.insert(path.clone()) {
             return Err(invalid("duplicate normalized tar path"));
         }
@@ -1321,6 +1317,30 @@ mod tests {
     use crate::changeset::tar::Pax;
     use crate::changeset::ChangesetLimits;
     use std::io::{BufReader, Seek, SeekFrom, Write};
+
+    #[test]
+    fn layer_relative_normalization_preserves_all_path_limits() {
+        use crate::changeset::tar::normalize_path;
+        use crate::changeset::ChangesetError;
+
+        let limits = ChangesetLimits {
+            max_path_bytes: 8,
+            max_component_bytes: 3,
+            max_depth: 2,
+            ..ChangesetLimits::default()
+        };
+        assert_eq!(normalize_path(b"//./a/b", false, &limits).unwrap(), b"a/b");
+        for (path, resource) in [
+            (b"////////a".as_slice(), "path bytes"),
+            (b"/abcd", "path component bytes"),
+            (b"/a/b/c", "path depth"),
+        ] {
+            assert!(matches!(
+                normalize_path(path, false, &limits),
+                Err(ChangesetError::Limit { resource: actual, .. }) if actual == resource
+            ));
+        }
+    }
 
     #[test]
     fn source_type_mode_bits_are_validated_not_blindly_masked() {

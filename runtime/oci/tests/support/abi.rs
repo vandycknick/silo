@@ -160,7 +160,12 @@ pub fn expected(operations: &[Operation], tar: &[u8]) -> ExpectedLayer {
                 "symlink"
             }
             Action::Link(target) => {
-                entry["target"] = json!(bytes(target));
+                let target = target
+                    .split(|byte| *byte == b'/')
+                    .filter(|part| !part.is_empty() && *part != b".")
+                    .collect::<Vec<_>>()
+                    .join(&b'/');
+                entry["target"] = json!(bytes(&target));
                 "hardlink"
             }
             Action::Put(Object::Character(major, minor)) => {

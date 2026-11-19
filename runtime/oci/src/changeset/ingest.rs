@@ -531,9 +531,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_slash_directory_preserves_root_metadata_after_effective_path_resolution() {
+    fn root_spellings_preserve_metadata_after_effective_path_resolution() {
         for (header_name, path_override) in [
             (b"/".as_slice(), None),
+            (b"//".as_slice(), None),
+            (b"/.".as_slice(), None),
+            (b"/./".as_slice(), None),
             (b"ignored".as_slice(), Some(b"/".as_slice())),
             (b"/ignored".as_slice(), Some(b"/".as_slice())),
             (b"/".as_slice(), Some(b".".as_slice())),
@@ -595,24 +598,86 @@ mod tests {
     }
 
     #[test]
-    fn slash_root_exception_does_not_admit_other_absolutes_or_link_targets() {
-        fn rejects(bytes: Vec<u8>) {
+    fn absolute_paths_and_hardlinks_are_layer_relative_after_pax_selection() {
+        for (path, normalized) in [
+            (b"/nix/store/x".as_slice(), b"nix/store/x".as_slice()),
+            (b"//a", b"a"),
+            (b"/./a", b"a"),
+            (b"///a//./b", b"a/b"),
+        ] {
+            for overridden in [false, true] {
+                let mut bytes = if overridden {
+                    pax(&[(b"path", path)], false)
+                } else {
+                    Vec::new()
+                };
+                // Only the effective PAX path is validated.
+                bytes.extend(member(
+                    if overridden { b"/../ignored" } else { path },
+                    b'0',
+                    b"X",
+                ));
+                let (_dir, staged) = raw(&finish(bytes));
+                assert_eq!(staged.changeset().entries[0].path, normalized);
+            }
+        }
+        for overridden in [false, true] {
+            let mut bytes = member(b"/base", b'0', b"X");
+            if overridden {
+                bytes.extend(pax(&[(b"linkpath", b"//./base")], false));
+            }
+            let mut link = member(b"/alias", b'1', b"");
+            let target = if overridden {
+                b"/../ignored".as_slice()
+            } else {
+                b"//./base"
+            };
+            link[157..157 + target.len()].copy_from_slice(target);
+            checksum(&mut link);
+            bytes.extend(link);
+            bytes.extend(member(b"/dir/.wh.name", b'0', b""));
+            bytes.extend(member(b"/dir/.wh..wh..opq", b'0', b""));
+            let (_dir, staged) = raw(&finish(bytes));
+            let entries = &staged.changeset().entries;
+            assert_eq!(entries[1].path, b"alias");
+            assert!(
+                matches!(&entries[1].kind, EntryKind::Hardlink { target } if target == b"base")
+            );
+            assert_eq!(entries[2].path, b"dir/.wh.name");
+            assert_eq!(entries[2].kind, EntryKind::Whiteout);
+            assert_eq!(entries[3].path, b"dir/.wh..wh..opq");
+            assert_eq!(entries[3].kind, EntryKind::Opaque);
+        }
+    }
+
+    #[test]
+    fn absolute_paths_still_reject_traversal_nul_and_non_directory_roots() {
+        fn rejects(bytes: Vec<u8>, expected: &str) {
             let bytes = finish(bytes);
             assert!(matches!(
                 attempt(&bytes, &bytes, RAW, &ChangesetLimits::default()).1,
                 Err(crate::changeset::ChangesetError::Invalid(message))
-                    if message == "empty, absolute or NUL-containing tar path"
+                    if message == expected
             ));
         }
-        for path in [b"//".as_slice(), b"/./", b"/.", b"/nix/", b"/file", b"/../"] {
-            rejects(member(path, b'5', b""));
+        for path in [b"/../x".as_slice(), b"/a/../b"] {
+            rejects(member(path, b'5', b""), "parent traversal in tar path");
             let mut bytes = pax(&[(b"path", path)], false);
             bytes.extend(member(b"/", b'5', b""));
-            rejects(bytes);
+            rejects(bytes, "parent traversal in tar path");
+            let mut bytes = pax(&[(b"linkpath", path)], false);
+            bytes.extend(member(b"link", b'1', b""));
+            rejects(bytes, "parent traversal in tar path");
         }
         let mut nul = pax(&[(b"path", b"/\0")], false);
         nul.extend(member(b"/", b'5', b""));
-        rejects(nul);
+        rejects(nul, "empty or NUL-containing tar path");
+        for path in [b"//".as_slice(), b"/.", b"/./"] {
+            rejects(
+                member(path, b'0', b""),
+                "root path is only admitted for explicit directory",
+            );
+        }
         for flag in [0, b'0', b'1', b'2', b'3', b'4', b'6'] {
             let mut entry = member(b"/", flag, b"");
             if matches!(flag, b'1' | b'2') {
@@ -623,14 +688,17 @@ mod tests {
                 entry[337..345].copy_from_slice(b"0000003\0");
             }
             checksum(&mut entry);
-            rejects(entry);
+            rejects(entry, "root path is only admitted for explicit directory");
         }
         let mut socket = pax(&[(b"SCHILY.filetype", b"socket")], false);
         socket.extend(member(b"/", b'0', b""));
-        rejects(socket);
+        rejects(socket, "root path is only admitted for explicit directory");
         let mut regular_override = pax(&[(b"path", b"/")], false);
         regular_override.extend(member(b"ordinary", b'0', b""));
-        rejects(regular_override);
+        rejects(
+            regular_override,
+            "root path is only admitted for explicit directory",
+        );
         for pax_target in [false, true] {
             let mut bytes = if pax_target {
                 pax(&[(b"linkpath", b"/")], false)
@@ -645,7 +713,7 @@ mod tests {
             }
             checksum(&mut link);
             bytes.extend(link);
-            rejects(bytes);
+            rejects(bytes, "root path is only admitted for explicit directory");
         }
         // Absolute symlink targets remain guest data, not entry paths.
         let mut symlink = member(b"symlink", b'2', b"");
@@ -667,6 +735,8 @@ mod tests {
             (b".".as_slice(), b"/".as_slice()),
             (b"/".as_slice(), b".".as_slice()),
             (b"/".as_slice(), b"/".as_slice()),
+            (b"//".as_slice(), b"/./".as_slice()),
+            (b"/.".as_slice(), b".".as_slice()),
         ] {
             let mut bytes = member(first, b'5', b"");
             bytes.extend(member(second, b'5', b""));
@@ -697,6 +767,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn absolute_and_relative_children_share_duplicate_detection() {
+        for (first, second) in [(b"/a".as_slice(), b"a".as_slice()), (b"a", b"//./a")] {
+            let mut bytes = member(first, b'0', b"");
+            bytes.extend(member(second, b'0', b""));
+            let bytes = finish(bytes);
+            assert!(matches!(
+                attempt(&bytes, &bytes, RAW, &ChangesetLimits::default()).1,
+                Err(crate::changeset::ChangesetError::Invalid(message))
+                    if message == "duplicate normalized tar path"
+            ));
+        }
+    }
+
     fn checksum(member: &mut [u8]) {
         member[148..156].fill(b' ');
         let sum: u64 = member[..512].iter().map(|byte| u64::from(*byte)).sum();
@@ -708,7 +792,7 @@ mod tests {
     fn invalid_names_whiteouts_ids_times_flags_and_types_fail_before_publish() {
         for name in [
             b"".as_slice(),
-            b"/a",
+            b"/../a",
             b"x/../y",
             b".",
             b"a\0b",
@@ -2918,8 +3002,16 @@ mod tests {
 
     #[test]
     fn all_path_envelopes_share_byte_normalization_without_host_traversal() {
-        for path in [b"a/../b".as_slice(), b"/a", b"a\0b", b"raw-\xff"] {
-            let accepted = path == b"raw-\xff";
+        for path in [
+            b"a/../b".as_slice(),
+            b"/../a",
+            b"/a/../b",
+            b"/a",
+            b"//./a",
+            b"a\0b",
+            b"raw-\xff",
+        ] {
+            let accepted = matches!(path, b"/a" | b"//./a" | b"raw-\xff");
             let mut variants = vec![member(path, b'0', b"")];
             let mut pax_path = pax(&[(b"path", path)], false);
             pax_path.extend(member(b"header", b'0', b""));
@@ -2940,7 +3032,7 @@ mod tests {
         }
         for (prefix, accepted) in [
             (b"a/..".as_slice(), false),
-            (b"/", false),
+            (b"/", true),
             (b"raw-\xff", true),
         ] {
             let mut item = member(b"b", b'0', b"");
@@ -2950,7 +3042,12 @@ mod tests {
             let (_dir, result) = attempt(&bytes, &bytes, RAW, &ChangesetLimits::default());
             assert_eq!(result.is_ok(), accepted);
             if accepted {
-                assert_eq!(result.unwrap().changeset().entries[0].path, b"raw-\xff/b");
+                let expected = if prefix == b"/" {
+                    b"b".as_slice()
+                } else {
+                    b"raw-\xff/b"
+                };
+                assert_eq!(result.unwrap().changeset().entries[0].path, expected);
             }
         }
         let target = b"/../guest/\xff";

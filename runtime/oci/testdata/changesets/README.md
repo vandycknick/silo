@@ -214,23 +214,50 @@ but each retained **three root-metadata differences**: helper scratch-root mode
 `policy-difference`, **not passes or equality**. Apko was admitted with the actual
 device-creation limitation recorded. The historical original Kaniko run rejected
 layers 1 and 5 for raw directory name `/`; retain that report. The owner then
-approved a narrow current-profile correction: effective entry name **exactly `/`
-only for a directory** becomes the explicit canonical root, preserving metadata
-and operation order. `root-slash-metadata` independently exercises that real tar
-spelling against the dot-root expectation; their pack/index match, but source
-recipe/result identities remain distinct. Empty names, `//`, `/./`, absolute
-children, non-directory `/`, absolute hardlink targets and duplicate normalized
-root aliases remain rejected. The retained-byte Kaniko rerun admitted every
-layer and retained only three root-metadata policy differences. The original
-rejection report remains historical evidence, not the current admission verdict.
+approved a narrow correction admitting that directory as the explicit canonical
+root, preserving metadata and operation order. `root-slash-metadata` independently
+exercises that real tar spelling against the dot-root expectation; their
+pack/index match, but source recipe/result identities remain distinct. The
+retained-byte Kaniko rerun admitted every layer and retained only three
+root-metadata policy differences. The original rejection report remains
+historical evidence, not the current admission verdict.
 
-Original Nix layer 0 starts with `/nix/` and `/nix/store/`, which remain rejected.
-The independently pinned additional Nix-built Cardano tracer specimen was
-actually admitted by the supervisor, but its original containerd report retains
-five differences: root mode/mtime and `nix/store` mtime. Its metadata/source
-provenance and measured result are recorded in
-`.tmp/plan/research/phase-02-c4-candidates/README.md`. That report remains intact,
-as does the original absolute-path Nix rejection; neither is relabelled a pass.
+The 2026-11-20 owner decision admits all absolute entry paths and hardlink
+targets relative to the layer root, matching containerd and GNU tar and real
+Nix dockerTools output. Repeated leading slashes and `.` components normalize
+away. `/`, `//`, `/.` and `/./` denote the root only for explicit directories.
+Empty names, NUL, every `..` component, non-directory roots, root hardlink targets,
+duplicate normalized paths and existing resource-limit violations still fail.
+Absolute whiteouts/opaque markers normalize just like other entry paths;
+symlink targets remain untouched guest data. The conformance test
+`absolute_and_relative_layers_have_identical_canonical_content_and_digests`
+compares independent expectations, real normalized entries, complete pack/index
+bytes, content digests and composed namespaces for both source spellings.
+Source-byte diff IDs and recipe/result identities remain distinct.
+
+Original Nix layer 0 starts with `/nix/` and `/nix/store/`, which now normalize
+to `nix` and `nix/store`. The unmodified pinned `nixos/nix:2.28.3` specimen is
+a required positive control, not a negative. The independently pinned additional
+Nix-built Cardano tracer specimen was actually admitted by the supervisor, but
+its original containerd report retains five differences: root mode/mtime and
+`nix/store` mtime. Its metadata/source provenance and measured result are recorded
+in `.tmp/plan/research/phase-02-c4-candidates/README.md`. That report and the
+historical absolute-path Nix rejection remain intact; neither is relabelled a pass.
+
+No published-image differential result has been regenerated for the new rule.
+Retain the old `target/changeset-qualification/nix/differences.json`,
+`differences.md` and `extractor.log` as historical evidence. Generate fresh
+Silo artifacts, reference observations and comparison reports in a new directory:
+
+```sh
+make changeset-acquire CHANGESET_ARGS='--image nix'
+make qualify-changesets CHANGESET_ARGS='--acquired target/changeset-acquired/nix --out target/changeset-qualification/nix-absolute-admitted --user-namespace'
+```
+
+The privileged umoci positive-control comparison and readonly EROFS traversal
+must also be rerun with this original specimen before adding it to the historical
+Phase 22 aggregate reports below. Do not infer its row counts or equality from
+the Cardano tracer results.
 
 The exact pinned [containerd default applier](https://github.com/containerd/containerd/blob/v2.4.2/pkg/archive/tar.go#L264-L277)
 unconditionally ignores an entry resolving to the extraction root. Thus changing
@@ -242,10 +269,11 @@ The owner explicitly approved a different independent published-builder
 positive-control gate: **privileged umoci v0.6.0 unpack**, rather than the pinned
 containerd v2.4.2 `archive.Apply` application. The exact umoci binary SHA-256 is
 `b51c267ec394499e42c6fde47f240b7b7dba57ea49df0b5acd304378b82a3b71`.
-The additional, provenance-reviewed Nix-built Cardano tracer is the Nix positive;
-the original `/nix/` archive remains a required negative, not a silently
-rewritten input. This is an explicit owner exception to the former
-containerd-only positive gate, not a waiver of differences in that evidence.
+The additional, provenance-reviewed Nix-built Cardano tracer supplied the
+historical Nix positive; the original `/nix/` archive is now also a required
+positive with unchanged source bytes. The umoci choice is an explicit owner
+exception to the former containerd-only positive gate, not a waiver of
+differences in that evidence.
 
 The actual independent results are retained in
 `.tmp/plan/evidence/phase-22/umoci-corpus-comparisons.json`:

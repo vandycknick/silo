@@ -35,9 +35,10 @@ also matched actual readonly EROFS traversals without excluded fields.
 Production-root boot/lifecycle and kernel-mutated flatten gates passed on
 Linux x86_64 with stable 7.2.2 and longterm 6.18.48. Phase 24 separately records
 Linux KVM x86_64 runtime evidence, including the mandatory btrfs and ext4
-budget sweep. Original
-containerd differential evidence and the absolute-path Nix negative remain
-intact; see [ADR 0014's gate exception](0014-layered-oci-image-storage.md#filesystem-and-linux-gates).
+budget sweep. Original containerd differential evidence, including the historical
+absolute-path Nix rejection, remains intact. The original Nix specimen is now a
+positive control under the 2026-11-20 layer-root normalization decision, requiring
+fresh evidence; see [ADR 0014's gate exception](0014-layered-oci-image-storage.md#filesystem-and-linux-gates).
 
 The 2026-11-09 Phase 24 revision accepts the chunk-list stream identity,
 the explicit record step after the cut, structural trust of local monitor

@@ -1132,7 +1132,10 @@ reference = registry.publish(image, spec.name)
 
 Paths are relative to the guest root. Overlay entries replace matching base
 members; `append` adds bytes to existing text files and `remove` drops base
-members. Absolute paths, traversal and duplicate normalized paths are rejected.
+members. This fixture-authoring API requires relative paths and rejects traversal
+and duplicate normalized paths; this is not the OCI reader's admission policy.
+The OCI reader also accepts absolute tar entry and hardlink paths relative to
+the layer root.
 Keep scenario-specific additions in separate specs rather than changing BASIC.
 BASIC also removes Alpine's busybox `/sbin/init` so the agent stays PID 1
 (the agent hands off to any executable init it finds).

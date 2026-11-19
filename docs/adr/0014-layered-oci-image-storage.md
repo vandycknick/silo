@@ -1326,19 +1326,22 @@ are described in the [changeset conformance guide](../../runtime/oci/testdata/ch
 
 ### Namespace semantics
 
-Stored changeset paths are relative byte sequences. Source admission first
-rejects NUL and any `..` component. The effective source entry path **exactly
-`/`** is admitted only for a directory and canonicalized to the explicit root,
-preserving its metadata and operation ordinal. All other absolute entry paths
-are rejected before removing `.` and empty separator components; `//`, `/./`
-and absolute child paths are not alternate root spellings. Empty non-root names
-and duplicate normalized entry paths fail. Root `.` is also an explicit
-directory entry, so `.` and `/` in one layer collide as duplicate root entries.
-The exception applies after effective PAX path/type selection, not to the shared
-canonical path normalizer or hardlink targets. Non-directory `/` and all absolute
-hardlink targets still fail. Non-UTF-8 Linux names are preserved through
-byte-safe encoding. Symlink targets are preserved as guest data and never
-traversed by the host filesystem.
+Stored changeset paths are relative byte sequences. After effective PAX path/type
+selection, source entry paths and hardlink targets are interpreted relative to
+the layer root: one or more leading `/` bytes are ignored, as are `.` and empty
+separator components. Thus `/nix/store/x`, `//nix/store/x` and `nix/store/x`
+have the same canonical path. This admits real Nix dockerTools images and matches
+containerd and GNU tar's leading-slash handling, without a producer-specific waiver.
+NUL and every `..` component still fail, including `/../x` and `/a/../b`;
+all existing byte, component and depth limits still apply. Empty source names
+and duplicate normalized entry paths fail. `.`, `/`, `//`, `/.` and `/./`
+denote the explicit root only for directory entries, preserving metadata and
+operation ordinal; `.` and `/` in one layer collide. Root hardlink targets and
+non-directory root entries fail. Absolute whiteout and opaque-marker names have
+the same semantics as their relative spellings. Non-UTF-8 Linux names are
+preserved through byte-safe encoding. Symlink targets remain untouched guest
+data and are never traversed by the host filesystem. Normalized paths contain
+neither a leading slash nor `..`, so no source path can escape the layer root.
 
 An entry whose parent path crosses a symlink is placed where the guest kernel
 would place it: the composer resolves each parent component inside the merged
@@ -1431,12 +1434,14 @@ socket type bits. Mode bits alone or an invented typeflag do not enable sockets.
 Numeric ownership and timestamps never use host name lookup or floating point.
 Numeric SCHILY source device/inode/link-count facts are validated provenance,
 not inode identities or preserved topology. Textual owner names and atime/ctime
-are likewise outside preserved content. Apart from the exact-directory `/`
-source spelling above, absolute **entry** paths remain rejected, even for a
-published producer archive. This is distinct from admitted absolute symlink
-targets, which are guest data resolved at the merged root. No producer-specific
-path-stripping waiver or absolute hardlink-target exception is implied by
-qualification; `/nix/` and other absolute child paths remain invalid.
+are likewise outside preserved content. Absolute entry paths and hardlink targets
+use the same layer-root normalization for every producer, including `/nix/` from
+Nix dockerTools. This does not change symlink targets, which remain guest data
+resolved at the merged root, or relax traversal, duplicate or resource checks.
+Equivalent relative and absolute spellings produce identical canonical index
+and pack bytes and content digests. Transport digests and decoded `diff_id`,
+and recipe/result identities containing them, still bind the original source
+bytes and therefore differ when the tar spelling differs.
 
 Exactly five additional SCHILY keywords are admitted as **global PAX
 archive-only provenance**, outside preserved inode/index metadata:
@@ -3170,9 +3175,12 @@ mocked mount or VMM behavior does not qualify a profile.
   The owner explicitly approved privileged **umoci v0.6.0** as the independent
   published-builder positive-control oracle in place of containerd v2.4.2
   `archive.Apply`. The original containerd differential reports remain unchanged,
-  including root-metadata differences, and the original absolute-path Nix
-  specimen remains a negative control. The additional provenance-reviewed
-  Nix-built Cardano tracer supplies the Nix positive. The retained
+  including root-metadata differences and the historical absolute-path Nix
+  rejection. The original Nix specimen is now a required positive control under
+  the 2026-11-20 layer-root path rule; its prior rejection is not relabelled a
+  successful run, and fresh differential evidence must be generated. The
+  additional provenance-reviewed Nix-built Cardano tracer remains a positive.
+  The retained
   `.tmp/plan/evidence/phase-22/umoci-corpus-comparisons.json` records Docker
   5,793, Buildah 15,584, Bazel 1,745, apko 1,375, Kaniko 502 and Nix tracer
   10,905 rows: **35,904 rows, zero differences and zero observer problems**.

@@ -329,7 +329,84 @@ mod tests {
     }
 
     #[test]
-    fn slash_root_exception_does_not_admit_other_absolutes_or_duplicate_root_aliases() {
+    fn absolute_and_relative_layers_have_identical_canonical_content_and_digests() {
+        use crate::support::oracle::Action;
+
+        let relative = crate::support::fixtures::fixture(
+            "relative-layer-paths",
+            &["N01", "N03", "N07"],
+            vec![
+                vec![
+                    Operation::put(b".", Object::Directory),
+                    Operation::put(b"nix/store", Object::Directory),
+                    Operation::file(b"nix/store/base", b"body"),
+                    Operation::link(b"alias", b"nix/store/base"),
+                    Operation::put(b"symlink", Object::Symlink(b"/nix/store/base".to_vec())),
+                    Operation::file(b"dir/old", b"old"),
+                    Operation::file(b"opaque/old", b"old"),
+                ],
+                vec![
+                    Operation::remove(b"dir/.wh.old"),
+                    Operation::opaque(b"opaque/.wh..wh..opq"),
+                    Operation::file(b"opaque/new", b"new"),
+                ],
+            ],
+        );
+        let mut absolute = relative.clone();
+        absolute.name = "absolute-layer-paths".into();
+        for layer in &mut absolute.layers {
+            for operation in layer {
+                operation.path.splice(..0, b"//./".iter().copied());
+                if let Action::Link(target) = &mut operation.action {
+                    target.splice(..0, b"//./".iter().copied());
+                }
+            }
+        }
+        let relative_report = check_fixture(&relative, None);
+        let absolute_report = check_fixture(&absolute, None);
+        assert_eq!(absolute_report["expected"], relative_report["expected"]);
+        let staging = tempfile::tempdir().unwrap();
+        for (index, (relative_ops, absolute_ops)) in
+            relative.layers.iter().zip(&absolute.layers).enumerate()
+        {
+            let relative_tar = archive(relative_ops);
+            let absolute_tar = archive(absolute_ops);
+            let relative_stage = crate::ingest(&relative_tar, staging.path(), index * 2);
+            let absolute_stage = crate::ingest(&absolute_tar, staging.path(), index * 2 + 1);
+            assert_eq!(
+                relative_stage.changeset().entries,
+                absolute_stage.changeset().entries
+            );
+            let relative_pack = std::fs::read(relative_stage.pack_path()).unwrap();
+            let absolute_pack = std::fs::read(absolute_stage.pack_path()).unwrap();
+            assert_eq!(relative_pack, absolute_pack);
+            assert_eq!(
+                crate::support::abi::stream_identity(&relative_pack),
+                crate::support::abi::stream_identity(&absolute_pack)
+            );
+            assert_eq!(
+                oci::changeset::index::encode_index(
+                    relative_stage.changeset(),
+                    &oci::changeset::ChangesetLimits::default()
+                )
+                .unwrap(),
+                oci::changeset::index::encode_index(
+                    absolute_stage.changeset(),
+                    &oci::changeset::ChangesetLimits::default()
+                )
+                .unwrap()
+            );
+            // Source authentication still binds the complete original tar:
+            // diff IDs and the recipes/results containing them are not content aliases.
+            assert_ne!(
+                relative_stage.changeset().diff_id,
+                absolute_stage.changeset().diff_id
+            );
+        }
+    }
+
+    #[test]
+    fn layer_relative_paths_still_reject_invalid_roots_traversal_and_duplicates() {
         let dot = Operation::put(b".", Object::Directory);
         let slash = Operation::put(b"/", Object::Directory);
         let mut controls = vec![
@@ -338,20 +415,12 @@ mod tests {
                 vec![Operation::put(b"", Object::Directory)],
             ),
             (
-                "double-slash-directory",
-                vec![Operation::put(b"//", Object::Directory)],
+                "absolute-parent-traversal",
+                vec![Operation::file(b"/../x", b"body")],
             ),
             (
-                "slash-dot-directory",
-                vec![Operation::put(b"/./", Object::Directory)],
-            ),
-            (
-                "absolute-child-directory",
-                vec![Operation::put(b"/nix/", Object::Directory)],
-            ),
-            (
-                "absolute-child-file",
-                vec![Operation::file(b"/nix/store/file", b"body")],
+                "absolute-interior-parent-traversal",
+                vec![Operation::file(b"/a/../b", b"body")],
             ),
             ("slash-regular-file", vec![Operation::file(b"/", b"body")]),
             (
@@ -381,6 +450,13 @@ mod tests {
         ];
         controls.push(("dot-slash-duplicate", vec![dot.clone(), slash.clone()]));
         controls.push(("slash-dot-duplicate", vec![slash, dot]));
+        controls.push((
+            "absolute-relative-child-duplicate",
+            vec![
+                Operation::file(b"/a", b"body"),
+                Operation::file(b"a", b"body"),
+            ],
+        ));
         for (name, operations) in controls {
             let mut tree = Tree::default();
             assert!(
