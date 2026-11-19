@@ -877,15 +877,22 @@ pub fn now_unix() -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
+/// Formats whole-second timestamps using Docker's go-units HumanDuration rules.
+///
+/// Hour thresholds round to the nearest hour; the final year count truncates.
+/// A zero timestamp is missing, and future timestamps have zero elapsed time.
 pub fn relative_time(timestamp: i64, now: i64) -> String {
     if timestamp == 0 {
         return "N/A".to_string();
     }
 
-    let seconds = (now - timestamp).max(0);
+    let seconds = now.saturating_sub(timestamp).max(0);
 
-    if seconds < 5 {
+    if seconds < 1 {
         return "Less than a second ago".to_string();
+    }
+    if seconds == 1 {
+        return "1 second ago".to_string();
     }
     if seconds < 60 {
         return format!("{seconds} seconds ago");
@@ -899,7 +906,7 @@ pub fn relative_time(timestamp: i64, now: i64) -> String {
         return format!("{minutes} minutes ago");
     }
 
-    let hours = minutes / 60;
+    let hours = seconds / 3600 + i64::from(seconds % 3600 >= 1800);
     if hours == 1 {
         return "About an hour ago".to_string();
     }
@@ -907,23 +914,17 @@ pub fn relative_time(timestamp: i64, now: i64) -> String {
         return format!("{hours} hours ago");
     }
 
-    let days = hours / 24;
-    if days < 14 {
-        return format!("{days} days ago");
+    if hours < 24 * 7 * 2 {
+        return format!("{} days ago", hours / 24);
+    }
+    if hours < 24 * 30 * 2 {
+        return format!("{} weeks ago", hours / 24 / 7);
+    }
+    if hours < 24 * 365 * 2 {
+        return format!("{} months ago", hours / 24 / 30);
     }
 
-    let weeks = days / 7;
-    if weeks < 8 {
-        return format!("{weeks} weeks ago");
-    }
-
-    let months = days / 30;
-    if months < 12 {
-        return format!("{months} months ago");
-    }
-
-    let years = days / 365;
-    format!("{years} years ago")
+    format!("{} years ago", seconds / 3600 / 24 / 365)
 }
 
 pub fn format_unix(timestamp: i64) -> String {
@@ -1102,22 +1103,61 @@ mod tests {
     }
 
     #[test]
-    fn relative_time_formatting() {
-        let now = 1000000;
-
+    fn relative_time_matches_docker_boundaries() {
+        let now = 2_000_000_000;
+        for (seconds, expected) in [
+            (-60, "Less than a second ago"),
+            (0, "Less than a second ago"),
+            (1, "1 second ago"),
+            (2, "2 seconds ago"),
+            (4, "4 seconds ago"),
+            (5, "5 seconds ago"),
+            (59, "59 seconds ago"),
+            (60, "About a minute ago"),
+            (119, "About a minute ago"),
+            (120, "2 minutes ago"),
+            (59 * 60, "59 minutes ago"),
+            (60 * 60 - 1, "59 minutes ago"),
+            (60 * 60, "About an hour ago"),
+            (90 * 60 - 1, "About an hour ago"),
+            (90 * 60, "2 hours ago"),
+            (2 * 3600 - 1, "2 hours ago"),
+            (2 * 3600, "2 hours ago"),
+            (24 * 3600, "24 hours ago"),
+            (47 * 3600, "47 hours ago"),
+            (48 * 3600 - 1801, "47 hours ago"),
+            (48 * 3600 - 1800, "2 days ago"),
+            (48 * 3600 - 1, "2 days ago"),
+            (48 * 3600, "2 days ago"),
+            (3 * 86400 - 1801, "2 days ago"),
+            (3 * 86400 - 1800, "3 days ago"),
+            (7 * 86400, "7 days ago"),
+            (14 * 86400 - 1801, "13 days ago"),
+            (14 * 86400 - 1800, "2 weeks ago"),
+            (14 * 86400 - 1, "2 weeks ago"),
+            (14 * 86400, "2 weeks ago"),
+            (21 * 86400 - 1801, "2 weeks ago"),
+            (21 * 86400 - 1800, "3 weeks ago"),
+            (56 * 86400, "8 weeks ago"),
+            (60 * 86400 - 1801, "8 weeks ago"),
+            (60 * 86400 - 1800, "2 months ago"),
+            (60 * 86400 - 1, "2 months ago"),
+            (60 * 86400, "2 months ago"),
+            (90 * 86400 - 1801, "2 months ago"),
+            (90 * 86400 - 1800, "3 months ago"),
+            (360 * 86400, "12 months ago"),
+            (365 * 86400, "12 months ago"),
+            (730 * 86400 - 1801, "24 months ago"),
+            (730 * 86400 - 1800, "1 years ago"),
+            (730 * 86400 - 1, "1 years ago"),
+            (730 * 86400, "2 years ago"),
+            (3 * 365 * 86400 - 1, "2 years ago"),
+            (3 * 365 * 86400, "3 years ago"),
+        ] {
+            assert_eq!(relative_time(now - seconds, now), expected, "{seconds}s");
+        }
         assert_eq!(relative_time(0, now), "N/A");
-        assert_eq!(relative_time(now, now), "Less than a second ago");
-        assert_eq!(relative_time(now - 3, now), "Less than a second ago");
-        assert_eq!(relative_time(now - 30, now), "30 seconds ago");
-        assert_eq!(relative_time(now - 60, now), "About a minute ago");
-        assert_eq!(relative_time(now - 90, now), "About a minute ago");
-        assert_eq!(relative_time(now - 300, now), "5 minutes ago");
-        assert_eq!(relative_time(now - 3600, now), "About an hour ago");
-        assert_eq!(relative_time(now - 7200, now), "2 hours ago");
-        assert_eq!(relative_time(now - 86400, now), "24 hours ago");
-        assert_eq!(relative_time(now - 172800, now), "2 days ago");
-        assert_eq!(relative_time(now - 604800, now), "7 days ago");
-        assert_eq!(relative_time(now - 604800 * 2, now), "2 weeks ago");
+        assert_eq!(relative_time(i64::MAX, i64::MIN), "Less than a second ago");
     }
 
     #[test]

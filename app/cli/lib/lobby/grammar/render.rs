@@ -72,46 +72,6 @@ pub(crate) fn absolute_time(time: &DateTime<Utc>) -> String {
     }
 }
 
-pub(crate) fn relative_time(created: &DateTime<Utc>, now: &DateTime<Utc>) -> String {
-    if is_zero_time(created) || created.timestamp() == 0 {
-        return "N/A".into();
-    }
-    let seconds = now.timestamp() - created.timestamp();
-    if seconds < 5 {
-        return "Less than a second ago".into();
-    }
-    if seconds < 60 {
-        return format!("{seconds} seconds ago");
-    }
-    let minutes = seconds / 60;
-    if minutes == 1 {
-        return "About a minute ago".into();
-    }
-    if minutes < 60 {
-        return format!("{minutes} minutes ago");
-    }
-    let hours = minutes / 60;
-    if hours == 1 {
-        return "About an hour ago".into();
-    }
-    if hours < 48 {
-        return format!("{hours} hours ago");
-    }
-    let days = hours / 24;
-    if days < 14 {
-        return format!("{days} days ago");
-    }
-    let weeks = days / 7;
-    if weeks < 8 {
-        return format!("{weeks} weeks ago");
-    }
-    let months = days / 30;
-    if months < 12 {
-        return format!("{months} months ago");
-    }
-    format!("{} years ago", days / 365)
-}
-
 pub(crate) fn render_list(vms: &[VmView]) -> String {
     render_list_at(vms, &Utc::now())
 }
@@ -134,7 +94,14 @@ pub(crate) fn render_list_at(vms: &[VmView], now: &DateTime<Utc>) -> String {
             },
             vm.cpus.to_string(),
             human_memory(vm.memory),
-            relative_time(&vm.created, now),
+            crate::ui::relative_time(
+                if is_zero_time(&vm.created) {
+                    0
+                } else {
+                    vm.created.timestamp()
+                },
+                now.timestamp(),
+            ),
         ]);
     }
     let mut text = table(&rows);
@@ -550,8 +517,8 @@ mod tests {
 
     use crate::lobby::grammar::render::{
         absolute_time, completion_text, connection_hints, expiry_text, human_disk, human_memory,
-        phase, relative_time, render_documents, render_list_at, render_ops, render_show,
-        render_version, render_who_am_i, safe_text, ProgressDisplay, SPINNER_FRAMES,
+        phase, render_documents, render_list_at, render_ops, render_show, render_version,
+        render_who_am_i, safe_text, ProgressDisplay, SPINNER_FRAMES,
     };
     use crate::lobby::identity::{Peer, Principal};
     use crate::lobby::jobs::{Completion, Operation, OperationState};
@@ -595,41 +562,26 @@ mod tests {
     }
 
     #[test]
-    fn relative_time_cli_boundaries() {
+    fn relative_time_list_uses_shared_formatter() {
         let now = time("2026-10-02T12:00:00Z");
-        for (seconds, want) in [
-            (-60, "Less than a second ago"),
-            (0, "Less than a second ago"),
-            (4, "Less than a second ago"),
-            (5, "5 seconds ago"),
-            (59, "59 seconds ago"),
-            (60, "About a minute ago"),
-            (119, "About a minute ago"),
-            (120, "2 minutes ago"),
-            (3599, "59 minutes ago"),
-            (3600, "About an hour ago"),
-            (7199, "About an hour ago"),
-            (7200, "2 hours ago"),
-            (48 * 3600 - 1, "47 hours ago"),
-            (48 * 3600, "2 days ago"),
-            (14 * 86400 - 1, "13 days ago"),
-            (14 * 86400, "2 weeks ago"),
-            (56 * 86400 - 1, "7 weeks ago"),
-            (56 * 86400, "1 months ago"),
-            (360 * 86400 - 1, "11 months ago"),
-            (360 * 86400, "0 years ago"),
-            (365 * 86400, "1 years ago"),
-            (730 * 86400, "2 years ago"),
-        ] {
-            assert_eq!(
-                relative_time(&(now - TimeDelta::seconds(seconds)), &now),
-                want,
-                "{seconds}"
-            );
+        let mut vm = snapshot_vm();
+        for created in [now - TimeDelta::seconds(4), now + TimeDelta::seconds(60)] {
+            vm.created = created;
+            let text = render_list_at(std::slice::from_ref(&vm), &now);
+            assert!(text.ends_with(&format!(
+                "{}\n",
+                crate::ui::relative_time(created.timestamp(), now.timestamp())
+            )));
         }
         for created in [time("0001-01-01T00:00:00Z"), DateTime::UNIX_EPOCH] {
-            assert_eq!(relative_time(&created, &now), "N/A");
+            vm.created = created;
+            let text = render_list_at(std::slice::from_ref(&vm), &now);
+            assert!(text.ends_with("N/A\n"));
         }
+    }
+
+    #[test]
+    fn absolute_time_formatting() {
         assert_eq!(
             absolute_time(&time("2026-10-02T14:00:00+02:00")),
             "2026-10-02 12:00:00 UTC"
