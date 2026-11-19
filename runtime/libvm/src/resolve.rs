@@ -108,7 +108,20 @@ pub(crate) async fn resolve(
                 .collect(),
         };
         match matches.as_slice() {
-            [] => {}
+            [] => {
+                if kind == Kind::Snapshot {
+                    match image_prefix(connection, prefix).await?.len() {
+                        0 => {}
+                        1 => return Err(wrong_kind(input, kind)),
+                        count => {
+                            return Err(LibVmError::AmbiguousRecordPrefix {
+                                prefix: prefix.to_owned(),
+                                count,
+                            })
+                        }
+                    }
+                }
+            }
             [record] => {
                 return Ok(Resolution::Local(LocalMatch {
                     record: *record,
@@ -456,7 +469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_other_kind_gets_a_wrong_kind_hint_by_name_expansion_or_id() {
+    async fn the_other_kind_gets_a_wrong_kind_hint_by_name_expansion_id_or_image_prefix() {
         let catalog = catalog().await;
         let snapshot_id = catalog
             .snapshot("a1", &["saved", "docker.io/library/saved:v1"])
@@ -476,7 +489,7 @@ mod tests {
                 .to_string()
                 .contains(&format!("use `silo restore {input}`")));
         }
-        for input in ["web", &image_id.to_string()] {
+        for input in ["web", &image_id.to_string(), "b10"] {
             let error = catalog
                 .resolve(&policy, input, Kind::Snapshot, PullPolicy::IfMissing)
                 .await

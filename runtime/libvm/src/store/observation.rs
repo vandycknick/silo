@@ -74,8 +74,13 @@ impl ObservationStore {
             validate_existing_sidecars(path)?;
             crate::store::storage::validate_embedded_migration_history(&pool).await?;
             let os: String = sqlx::query_scalar("SELECT os FROM db_config WHERE id = 1")
-                .fetch_one(&pool)
-                .await?;
+                .fetch_optional(&pool)
+                .await?
+                .ok_or_else(|| LibVmError::StateDatabaseConfigMismatch {
+                    field: "db_config.row_count",
+                    expected: "1".into(),
+                    actual: "0".into(),
+                })?;
             crate::runtime::validate_db_config(&crate::store::models::DbConfig { os })?;
             Ok::<(), LibVmError>(())
         }
@@ -131,7 +136,11 @@ impl ObservationStore {
             }
         };
         let row = sqlx::query("SELECT machine_id, status, CASE WHEN json_valid(state_json, 8) THEN json(state_json) ELSE '{}' END AS state_json FROM machine_state WHERE machine_id = ?1")
-            .bind(config.id.to_string()).fetch_one(&mut *transaction).await?;
+            .bind(config.id.to_string()).fetch_optional(&mut *transaction).await?
+            .ok_or_else(|| LibVmError::CorruptState {
+                id: config.id.to_string(),
+                field: "machine_state",
+            })?;
         let state = DbMachineState::from_row(&row)?.0;
         transaction.commit().await?;
         Ok((config, state))
@@ -154,6 +163,36 @@ impl ObservationStore {
         .transpose()
     }
 
+    pub(crate) async fn require_capture_available(
+        &self,
+        observation: &crate::MachineLiveObservation,
+        fork_operation: Option<uuid::Uuid>,
+    ) -> Result<(), LibVmError> {
+        let mut connection = self.pool.acquire().await?;
+        if let Some(operation) = fork_operation {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM live_fork WHERE operation_id=?1)")
+                    .bind(operation.to_string())
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if exists {
+                return Ok(());
+            }
+        }
+        let run = uuid::Uuid::parse_str(&observation.report().run_id).map_err(|error| {
+            LibVmError::LiveProtocol {
+                message: error.to_string(),
+            }
+        })?;
+        crate::store::capture::ensure_capture_available(
+            &mut connection,
+            observation.machine_id(),
+            run,
+            uuid::Uuid::nil(),
+        )
+        .await
+    }
+
     pub(crate) async fn machine_storage(
         &self,
         id: crate::store::models::MachineId,
@@ -173,6 +212,32 @@ impl ObservationStore {
         let mut transaction = self.pool.begin().await?;
         let facts =
             crate::store::snapshot_store::fetch_catalog(&mut transaction, reference).await?;
+        transaction.commit().await?;
+        crate::store::snapshot_store::authenticate_catalog(facts).map(|(record, _)| record)
+    }
+
+    pub(crate) async fn restore_snapshot_record(
+        &self,
+        reference: &crate::SnapshotRef,
+        policy: &crate::RegistryPolicy,
+    ) -> Result<crate::store::models::snapshot::SnapshotRecord, LibVmError> {
+        let mut transaction = self.pool.begin().await?;
+        let input = reference.to_string();
+        let local = crate::resolve::resolve_local(
+            &mut transaction,
+            policy,
+            &input,
+            crate::resolve::Kind::Snapshot,
+        )
+        .await?;
+        let crate::resolve::LocalRecord::Snapshot(id) = local.record else {
+            return Err(LibVmError::ImageIsNotASnapshot { reference: input });
+        };
+        let facts = crate::store::snapshot_store::fetch_catalog(
+            &mut transaction,
+            &crate::SnapshotRef::Id(id),
+        )
+        .await?;
         transaction.commit().await?;
         crate::store::snapshot_store::authenticate_catalog(facts).map(|(record, _)| record)
     }

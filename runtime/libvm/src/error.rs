@@ -222,6 +222,9 @@ pub enum LibVmError {
     #[error("image {reference} not found")]
     ImageNotFound { reference: String },
 
+    #[error("snapshot {reference} was not found locally; {message}")]
+    SnapshotPullFailed { reference: String, message: String },
+
     #[error("image {reference} is still pinned by {machine_count} machine(s)")]
     ImageInUse {
         reference: String,
@@ -249,6 +252,11 @@ pub enum LibVmError {
 
     #[error("machine {reference} is already running")]
     MachineAlreadyRunning { reference: String },
+
+    #[error(
+        "machine {reference} is busy with another snapshot or fork; try again when it finishes"
+    )]
+    MachineCaptureBusy { reference: String },
 
     #[error("machine {reference} is not running")]
     MachineNotRunning { reference: String },
@@ -484,12 +492,14 @@ impl LibVmError {
             Self::MachineNameGenerationFailed { .. } => "MachineNameGenerationFailed",
             Self::MachineNotFound { .. } => "MachineNotFound",
             Self::ImageNotFound { .. } => "ImageNotFound",
+            Self::SnapshotPullFailed { .. } => "SnapshotPullFailed",
             Self::ImageInUse { .. } => "ImageInUse",
             Self::ImagePullPolicyUnsupported { .. } => "ImagePullPolicyUnsupported",
             Self::Image { .. } => "Image",
             Self::ImageReferenceRejected { .. } => "ImageReferenceRejected",
             Self::MachineIdAlreadyExists { .. } => "MachineIdAlreadyExists",
             Self::MachineAlreadyRunning { .. } => "MachineAlreadyRunning",
+            Self::MachineCaptureBusy { .. } => "MachineCaptureBusy",
             Self::MachineNotRunning { .. } => "MachineNotRunning",
             Self::MachineStaleGeneration { .. } => "MachineStaleGeneration",
             Self::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",

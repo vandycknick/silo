@@ -148,6 +148,12 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = "live machine observation unavailable".into();
             tonic::Code::Unavailable
         }
+        E::SnapshotPullFailed { reference, message } => {
+            d.kind = 7;
+            d.reference = Some(reference.clone());
+            d.safe_message = message.clone();
+            tonic::Code::Unavailable
+        }
         E::LiveProtocol { .. } => {
             d.safe_message = "invalid live capability protocol evidence".into();
             tonic::Code::DataLoss
@@ -212,11 +218,11 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = "machine run is no longer current".into();
             tonic::Code::FailedPrecondition
         }
-        E::MonitorConnection { reference, .. } => {
+        E::MonitorConnection { reference, message } => {
             d.kind = 7;
             d.code = 4;
             d.reference = Some(reference.clone());
-            d.safe_message = "monitor connection unavailable".into();
+            d.safe_message = message.clone();
             tonic::Code::Unavailable
         }
         E::EntrypointLaunchFailed { failure } => {
@@ -274,6 +280,7 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
         | E::ImageIsVmArtifact { reference }
         | E::SnapshotRequiresStoppedMachine { reference }
         | E::MemorySnapshotRequiresRunningMachine { reference }
+        | E::MachineCaptureBusy { reference }
         | E::RecordInUse { reference } => {
             d.kind = 4;
             d.reference = Some(reference.clone());
@@ -676,6 +683,12 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
                     message: d.safe_message,
                 }
             }
+            "SnapshotPullFailed" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
+                E::SnapshotPullFailed {
+                    reference: required(d.reference, "error.reference")?,
+                    message: d.safe_message,
+                }
+            }
             "LiveProtocol" if v.code() == tonic::Code::DataLoss && d.kind == 8 => E::LiveProtocol {
                 message: d.safe_message,
             },
@@ -747,6 +760,7 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
                         E::MemorySnapshotRequiresRunningMachine { reference }
                     }
                     "RecordInUse" => E::RecordInUse { reference },
+                    "MachineCaptureBusy" => E::MachineCaptureBusy { reference },
                     _ => return Err(invalid(
                         "error.native_variant",
                         "retain original typed RPC status; native variant cannot be reconstructed",
@@ -1538,5 +1552,26 @@ mod tests {
         let status = native_error_to_status(&artifact);
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(status.message().contains("unsupported artifact format 2"));
+    }
+    #[test]
+    fn capture_busy_and_snapshot_pull_errors_roundtrip() {
+        use crate::errors::{native_error_to_status, status_to_native_error};
+        for error in [
+            libvm::LibVmError::MachineCaptureBusy {
+                reference: "base".into(),
+            },
+            libvm::LibVmError::SnapshotPullFailed {
+                reference: "team/saved".into(),
+                message: "pulling registry.example/team/saved:latest failed: refused".into(),
+            },
+            libvm::LibVmError::MonitorConnection {
+                reference: "base".into(),
+                message: "connection refused".into(),
+            },
+        ] {
+            let restored = status_to_native_error(&native_error_to_status(&error)).unwrap();
+            assert_eq!(restored.variant(), error.variant());
+            assert_eq!(restored.to_string(), error.to_string());
+        }
     }
 }

@@ -343,12 +343,13 @@ impl Images {
                 .collect::<Vec<_>>()
         };
         images.extend(
-            crate::store::stored_image_store::StoredImageStore::from_store(store)
+            crate::store::stored_image_store::StoredImageStore::from_store(store.clone())
                 .list()
                 .await?
                 .into_iter()
                 .map(|info| ImageInfo::Stored(Box::new(info))),
         );
+        order_images(&store.pool, &mut images).await?;
         Ok(images)
     }
 
@@ -410,4 +411,86 @@ pub(crate) struct MaterializedImage {
     pub(crate) platform: Platform,
     pub(crate) managed: Option<crate::store::stored_image_store::StoredImageConsumer>,
     pub(crate) _lease: Option<crate::storage::locks::StorageLock>,
+}
+
+async fn order_images(pool: &sqlx::SqlitePool, images: &mut [ImageInfo]) -> Result<(), LibVmError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT id,created_at FROM storage_image UNION ALL SELECT image_id,created_at FROM image_composition_artifact",
+    ).fetch_all(pool).await?;
+    let created = rows
+        .into_iter()
+        .map(|(id, time)| id.parse::<crate::ImageId>().map(|id| (id, time)))
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+        .map_err(crate::storage::StorageError::from)?;
+    images.sort_unstable_by(|left, right| {
+        created
+            .get(&right.id())
+            .cmp(&created.get(&left.id()))
+            .then_with(|| left.names().cmp(right.names()))
+            .then_with(|| left.id().cmp(&right.id()))
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn image_list_orders_real_store_creation_times_then_names() {
+        let (temporary, images, mut record, operation, lease) =
+            crate::store::stored_image_store::tests::fixture().await;
+        let store = crate::store::Store::open(&temporary.path().join("home/state.db"))
+            .await
+            .unwrap();
+        let first = images
+            .publish_owned(
+                record.clone(),
+                operation,
+                lease,
+                Some("old".into()),
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut listed = vec![crate::ImageInfo::Stored(Box::new(first))];
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        for name in ["z", "a"] {
+            record.process.command = Some(vec![name.into()]);
+            let (streams, objects) = record.content_dependencies().unwrap();
+            let (operation, lease) = store
+                .begin_stopped_operation(
+                    "import",
+                    &streams.into_iter().collect::<Vec<_>>(),
+                    &objects.into_iter().collect::<Vec<_>>(),
+                )
+                .await
+                .unwrap();
+            crate::storage::pool::StoragePool::open(&temporary.path().join("home/images"))
+                .unwrap()
+                .create_operation_with_lease(operation, lease.duplicate().unwrap())
+                .unwrap();
+            let info = images
+                .publish_owned(
+                    record.clone(),
+                    operation,
+                    lease,
+                    Some(name.into()),
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+            listed.push(crate::ImageInfo::Stored(Box::new(info)));
+        }
+        crate::image::order_images(store.test_pool(), &mut listed)
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|image| image.names()[0].as_str())
+                .collect::<Vec<_>>(),
+            ["a", "z", "old"]
+        );
+    }
 }

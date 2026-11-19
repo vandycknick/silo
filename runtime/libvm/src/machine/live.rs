@@ -126,10 +126,42 @@ impl LiveObservationReader {
         }
     }
 
+    /// Resolve an existing machine without initializing runtime state.
+    pub async fn require_machine_exists(&self, reference: &MachineRef) -> Result<(), LibVmError> {
+        if !self.catalog_exists()? {
+            return Err(LibVmError::MachineNotFound {
+                reference: crate::store::machine_store::discovery_query(reference).1,
+            });
+        }
+        let store = ObservationStore::open(&self.catalog).await?;
+        let result = store.lookup(reference).await.map(|_| ());
+        let closed = store.close().await;
+        result.and(closed)
+    }
+
+    /// Read-only fast refusal. Writable admission repeats this check atomically.
+    pub async fn require_capture_available(
+        &self,
+        observation: &MachineLiveObservation,
+        fork_operation: Option<uuid::Uuid>,
+    ) -> Result<(), LibVmError> {
+        let store = ObservationStore::open(&self.catalog).await?;
+        let result = store
+            .require_capture_available(observation, fork_operation)
+            .await;
+        let closed = store.close().await;
+        result.and(closed)
+    }
+
     pub async fn observe(
         &self,
         reference: &MachineRef,
     ) -> Result<MachineLiveObservation, LibVmError> {
+        if !self.catalog_exists()? {
+            return Err(LibVmError::MachineNotFound {
+                reference: crate::store::machine_store::discovery_query(reference).1,
+            });
+        }
         let store = ObservationStore::open(&self.catalog).await?;
         let result = async {
             let (config, state) = store.lookup(reference).await?;

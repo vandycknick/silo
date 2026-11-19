@@ -32,7 +32,8 @@ impl Cmd {
             .app_api()
             .await?
             .remove_machine(&self.name, self.force)
-            .await?;
+            .await
+            .map_err(removal_error)?;
         if removed_default {
             GlobalConfig::write_default_machine(None)?;
         }
@@ -43,5 +44,59 @@ impl Cmd {
             ui::warn("removed default machine. Set a new one with `silo default <vm>`.");
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct RunningMachineRemoval(String);
+
+impl std::error::Error for RunningMachineRemoval {}
+
+impl std::fmt::Display for RunningMachineRemoval {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "machine {} is running; stop it first or use --force",
+            self.0
+        )
+    }
+}
+
+fn removal_error(error: eyre::Report) -> eyre::Report {
+    match error.downcast_ref::<libvm::LibVmError>() {
+        Some(libvm::LibVmError::MachineAlreadyRunning { reference }) => {
+            RunningMachineRemoval(reference.clone()).into()
+        }
+        _ => error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn removal_explains_running_refusal_without_changing_other_errors() {
+        let error = crate::commands::rm::removal_error(
+            libvm::LibVmError::MachineAlreadyRunning {
+                reference: "base".into(),
+            }
+            .into(),
+        );
+        assert!(error
+            .downcast_ref::<crate::commands::rm::RunningMachineRemoval>()
+            .is_some());
+        assert_eq!(
+            error.to_string(),
+            "machine base is running; stop it first or use --force"
+        );
+        let error = crate::commands::rm::removal_error(
+            libvm::LibVmError::MachineNotFound {
+                reference: "base".into(),
+            }
+            .into(),
+        );
+        assert!(matches!(
+            error.downcast_ref::<libvm::LibVmError>(),
+            Some(libvm::LibVmError::MachineNotFound { .. })
+        ));
     }
 }

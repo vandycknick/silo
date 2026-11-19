@@ -135,6 +135,35 @@ impl LocalVmService {
         })
     }
 
+    async fn require_capture_available(
+        &mut self,
+        reference: &MachineRef,
+        observation: &libvm::MachineLiveObservation,
+        fork_operation: Option<uuid::Uuid>,
+    ) -> eyre::Result<()> {
+        match self {
+            Self::Uninitialized {
+                config: Some(config),
+                ..
+            } => {
+                libvm::LiveObservationReader::open(config)?
+                    .require_capture_available(observation, fork_operation)
+                    .await?;
+            }
+            Self::Ready { runtime, .. } => {
+                runtime
+                    .get_machine(reference)
+                    .await?
+                    .require_capture_available(observation, fork_operation)
+                    .await?;
+            }
+            Self::Uninitialized { config: None, .. } => {
+                eyre::bail!("local runtime configuration unavailable");
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn export_raw_disk(
         &mut self,
         reference: &str,
@@ -207,6 +236,9 @@ impl LocalVmService {
                     Ok(error) => error.into(),
                     Err(error) => error,
                 })?;
+            let observation = self.observe_machine_live(&machine).await?;
+            self.require_capture_available(&machine, &observation, None)
+                .await?;
         } else {
             let policy = if options.external_requirements {
                 libvm::ExternalResourcePolicy::RequireMappings
@@ -245,6 +277,8 @@ impl LocalVmService {
         self.require_machine_live(reference, vm_spec::live::LiveOperation::Fork)
             .await?;
         let observation = self.observe_machine_live(&machine_ref).await?;
+        self.require_capture_available(&machine_ref, &observation, Some(options.operation_id))
+            .await?;
         let machine = self.runtime().await?.get_machine(&machine_ref).await?;
         Ok(machine.fork_live(&observation, options, progress).await?)
     }
@@ -355,10 +389,12 @@ impl LocalVmService {
     pub(crate) async fn restore(
         &mut self,
         source: libvm::RestoreSource,
-        mut options: libvm::RestoreOptions,
+        options: libvm::RestoreOptions,
         progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<MachineData> {
-        options.name = silo_vm_control::stopped::name(options.name)?;
+        if let Some(name) = &options.name {
+            libvm::validate_new_machine_name(name)?;
+        }
         silo_vm_control::stopped::restore_request_to_wire(&source, &options)?;
         if let libvm::RestoreSource::Local(reference) = &source {
             if let Self::Uninitialized {
@@ -434,6 +470,15 @@ impl LocalVmService {
     }
 
     pub(crate) async fn inspect_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
+        if let Self::Uninitialized {
+            config: Some(config),
+            ..
+        } = self
+        {
+            libvm::LiveObservationReader::open(config)?
+                .require_machine_exists(&MachineRef::parse(reference)?)
+                .await?;
+        }
         let machine = self
             .observation_runtime()
             .await?
@@ -1549,8 +1594,11 @@ mod tests {
                 .unwrap_err();
             assert!(
                 error
-                    .downcast_ref::<silo_vm_control::ConversionError>()
-                    .is_some(),
+                    .downcast_ref::<libvm::LibVmError>()
+                    .is_some_and(|error| matches!(
+                        error,
+                        libvm::LibVmError::InvalidMachineName { .. }
+                    )),
                 "{error}"
             );
             assert!(!home.exists());

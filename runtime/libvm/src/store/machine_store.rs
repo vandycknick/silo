@@ -488,8 +488,14 @@ impl Store {
         let json: String =
             sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
                 .bind(record.machine_id.to_string())
-                .fetch_one(&mut *tx)
-                .await?;
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    crate::machine::root_storage::invalid(format!(
+                        "machine storage {} is missing during capture baseline reconciliation",
+                        record.machine_id
+                    ))
+                })?;
         let mut storage = crate::MachineStorageRecord::decode(&json)?;
         if storage.storage_generation != record.storage.storage_generation {
             return Ok(());
@@ -660,8 +666,13 @@ impl Store {
         let json: String =
             sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
                 .bind(machine.to_string())
-                .fetch_one(&mut *tx)
-                .await?;
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    crate::machine::root_storage::invalid(format!(
+                        "machine storage {machine} is missing during baseline invalidation"
+                    ))
+                })?;
         let mut storage = crate::MachineStorageRecord::decode(&json)?;
         storage.invalidate_disk_baselines();
         Self::write_machine_storage(&mut tx, machine, &storage).await?;

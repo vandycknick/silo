@@ -60,16 +60,16 @@ impl CatalogCheckpointOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
     pub(crate) pool: SqlitePool,
-    pub(super) home: PathBuf,
+    pub(in crate::store) home: PathBuf,
     /// `<home>/images`, the immutable pool; `state.db` is `<home>/state.db`.
-    pub(super) images_dir: PathBuf,
+    pub(in crate::store) images_dir: PathBuf,
     /// Explicit capability for detached filesystem workers, independent of
     /// SqlitePool::close; native connections retain their own clone as well.
-    pub(super) catalog: std::sync::Arc<CatalogGuard>,
+    pub(in crate::store) catalog: std::sync::Arc<CatalogGuard>,
     #[cfg(test)]
-    pub(super) layer_hook: Option<std::sync::Arc<crate::store::layer_store::tests::WorkerHook>>,
+    pub(crate) layer_hook: Option<std::sync::Arc<crate::store::layer_store::tests::WorkerHook>>,
     #[cfg(any(test, feature = "test-isolated-resource-budget"))]
-    pub(super) resource_budget_directory: Option<PathBuf>,
+    pub(in crate::store) resource_budget_directory: Option<PathBuf>,
 }
 
 impl Store {
@@ -4834,5 +4834,287 @@ pub(crate) mod tests {
         assert_eq!(db.machine_config(id).await.unwrap(), Some(config));
         assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
         drop(lease);
+    }
+
+    type WaitingLeaseInventory = (
+        tokio::task::JoinHandle<Result<(), crate::LibVmError>>,
+        std::sync::mpsc::Sender<()>,
+    );
+
+    async fn waiting_lease_inventories(db: &Store) -> Vec<WaitingLeaseInventory> {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+
+        let mut pending = Vec::new();
+        let mut entered = Vec::new();
+        for _ in 0..8 {
+            let (hook, receiver, release) = WorkerHook::new(WorkerPoint::LeaseInventoryWait, false);
+            let mut worker = db.clone();
+            worker.layer_hook = Some(hook);
+            let runtime = tokio::runtime::Handle::current();
+            let task = tokio::task::spawn_blocking(move || {
+                runtime.block_on(async {
+                    let pool = crate::storage::pool::StoragePool::open(&worker.images_dir)?;
+                    worker.check_operation_recovery(&pool).await
+                })
+            });
+            pending.push((task, release));
+            entered.push(receiver);
+        }
+        for mut receiver in entered {
+            tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        pending
+    }
+
+    async fn finish_lease_inventories(pending: Vec<WaitingLeaseInventory>) {
+        for (_, release) in &pending {
+            release.send(()).unwrap();
+        }
+        for (task, _) in pending {
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_inventory_waits_for_retired_launch_without_holding_roots() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "concurrent-stop".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let run = uuid::Uuid::new_v4();
+        let owner = db
+            .register_launch_storage(id, run, &storage, &config.spec)
+            .await
+            .unwrap();
+        let operation = owner.operation_id();
+        drop(owner);
+
+        // Hold the real budget lock so retirement pauses after deleting its
+        // catalog row and releasing roots, but before closing its EX lease.
+        let budget = crate::store::restore::budget_directory(&db).unwrap();
+        let admission = crate::storage::locks::blocking(
+            &budget,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .unwrap();
+        let worker = db.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let retiring = tokio::task::spawn_blocking(move || {
+            runtime.block_on(worker.try_retire_launch_storage(
+                operation,
+                run,
+                storage.storage_generation,
+                &machine_state(id, MachineRuntimeState::Stopped),
+                crate::StorageStopOutcome::Forced,
+            ))
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !db.launch_storage_operations(id).await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        let pending = waiting_lease_inventories(&db).await;
+        assert!(pool.try_roots_shared().unwrap().is_some());
+        drop(admission);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), retiring)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        );
+        finish_lease_inventories(pending).await;
+        assert!(db.launch_storage_operations(id).await.unwrap().is_empty());
+        assert_eq!(
+            db.machine_storage(id).await.unwrap().unwrap().stop_outcome,
+            crate::StorageStopOutcome::Forced
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_inventory_waits_for_temporary_scan_before_roots() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let (operation, lease) = db.begin_stopped_operation("fork", &[], &[]).await.unwrap();
+        let workspace = pool
+            .create_operation_with_lease(operation, lease.duplicate().unwrap())
+            .unwrap();
+        std::fs::write(workspace.temporary.join("private"), b"abandoned bytes").unwrap();
+        let path = workspace.temporary.clone();
+        db.finish_stopped_operation(operation).await.unwrap();
+        drop((workspace, lease));
+        db.retire_pending_storage_operations(&pool).await.unwrap();
+
+        // TemporaryScan claims the retired operation's EX lease before the
+        // cleanup caller acquires roots. Inventory must not call it corruption,
+        // and must leave roots available to that caller.
+        let candidate = pool.abandoned_temporary().unwrap().next().unwrap().unwrap();
+        assert_eq!(candidate.path(), path);
+        let pending = waiting_lease_inventories(&db).await;
+        {
+            let _roots = pool.lock_roots().unwrap();
+            candidate.remove().unwrap();
+        }
+        finish_lease_inventories(pending).await;
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn lease_inventory_preserves_unknown_producer_and_malformed_record_detection() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let unknown = pool.lease(uuid::Uuid::new_v4()).unwrap();
+        assert!(matches!(
+            db.check_operation_recovery(&pool).await.unwrap_err(),
+            crate::LibVmError::InvalidStorageRecord { .. }
+        ));
+        drop(unknown);
+        db.check_operation_recovery(&pool).await.unwrap();
+
+        let (operation, producer) = db.begin_stopped_operation("fork", &[], &[]).await.unwrap();
+        db.check_operation_recovery(&pool).await.unwrap();
+        sqlx::query("UPDATE storage_operation SET record_json=jsonb('{\"unexpected\":true}') WHERE operation_id=?1")
+            .bind(operation.to_string()).execute(&db.pool).await.unwrap();
+        assert!(matches!(
+            db.check_operation_recovery(&pool).await.unwrap_err(),
+            crate::LibVmError::InvalidStorageRecord { .. }
+        ));
+        drop(producer);
+        assert!(matches!(
+            db.check_operation_recovery(&pool).await.unwrap_err(),
+            crate::LibVmError::InvalidStorageRecord { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_discards_ram_identity_including_unidentified_fork_memory() {
+        use crate::store::models::storage::ContentIdentityState;
+
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        for identity in [
+            ContentIdentityState::Unknown,
+            ContentIdentityState::UnknownAfterFork,
+            ContentIdentityState::Identified {
+                root: vm_spec::capture::Sha256Digest::from_bytes([1; 32]),
+            },
+        ] {
+            let id = MachineId::new();
+            let config = machine_from_path(id, id.to_string(), paths.machine(id).dir());
+            seed_machine(&db, &config).await;
+            let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+            storage.ram_identity = identity;
+            db.save_machine_config_with_storage(&config, &storage)
+                .await
+                .unwrap();
+            let run = uuid::Uuid::new_v4();
+            let owner = db
+                .register_launch_storage(id, run, &storage, &config.spec)
+                .await
+                .unwrap();
+            let operation = owner.operation_id();
+            drop(owner);
+            assert!(db
+                .try_retire_launch_storage(
+                    operation,
+                    run,
+                    storage.storage_generation,
+                    &machine_state(id, MachineRuntimeState::Stopped),
+                    crate::StorageStopOutcome::Forced,
+                )
+                .await
+                .unwrap());
+            assert_eq!(
+                db.machine_storage(id).await.unwrap().unwrap().ram_identity,
+                ContentIdentityState::Unknown
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_store_opens_and_forced_stop_retirements_are_independent() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let mut launches = Vec::new();
+        for index in 0..8 {
+            let id = MachineId::new();
+            let config = machine_from_path(
+                id,
+                format!("parallel-stop-{index}"),
+                paths.machine(id).dir(),
+            );
+            seed_machine(&db, &config).await;
+            let storage = db.machine_storage(id).await.unwrap().unwrap();
+            let run = uuid::Uuid::new_v4();
+            let owner = db
+                .register_launch_storage(id, run, &storage, &config.spec)
+                .await
+                .unwrap();
+            let mut state = machine_state(id, MachineRuntimeState::Running);
+            state.run_id = Some(run.to_string());
+            db.save_machine_state(&state).await.unwrap();
+            launches.push((id, run, storage.storage_generation, owner.operation_id()));
+            drop(owner);
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let runtime = tokio::runtime::Handle::current();
+        let mut workers = Vec::new();
+        for &(id, run, generation, operation) in &launches {
+            let path = paths.state_db_path();
+            let start = start.clone();
+            let runtime = runtime.clone();
+            workers.push(tokio::task::spawn_blocking(move || {
+                start.wait();
+                runtime.block_on(async {
+                    let store = Store::open(&path).await?;
+                    store
+                        .try_retire_launch_storage(
+                            operation,
+                            run,
+                            generation,
+                            &machine_state(id, MachineRuntimeState::Stopped),
+                            crate::StorageStopOutcome::Forced,
+                        )
+                        .await
+                })
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+            );
+        }
+        for (id, _, _, _) in launches {
+            assert!(db.launch_storage_operations(id).await.unwrap().is_empty());
+            assert_eq!(
+                db.machine_state(id).await.unwrap().unwrap().status,
+                MachineRuntimeState::Stopped
+            );
+            assert_eq!(
+                db.machine_storage(id).await.unwrap().unwrap().stop_outcome,
+                crate::StorageStopOutcome::Forced
+            );
+        }
     }
 }

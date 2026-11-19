@@ -175,10 +175,8 @@ impl AppApi {
         }
     }
 
-    /// `--pull never` restores a local snapshot (name, `search_registries`
-    /// expansion, id or unique id prefix), which both backends admit before
-    /// any writable initialization. Otherwise `reference` runs the full
-    /// resolver: the same local steps, then a registry pull per `options.pull`.
+    /// Local references (including bare names) are admitted without writable
+    /// initialization. Only qualified registry paths may pull.
     pub(crate) async fn restore(
         &mut self,
         reference: &str,
@@ -186,7 +184,7 @@ impl AppApi {
         progress: Option<libvm::LiveOperationProgressSender>,
     ) -> eyre::Result<MachineData> {
         silo_vm_control::images::reject_local_cut(reference)?;
-        let source = if options.pull == libvm::PullPolicy::Never {
+        let source = if options.pull == libvm::PullPolicy::Never || !reference.contains('/') {
             libvm::RestoreSource::Local(reference.parse()?)
         } else {
             libvm::RestoreSource::Registry(reference.to_owned())
@@ -390,6 +388,15 @@ impl AppApi {
         match self {
             Self::Local(service) => service.inspect_machine(reference).await,
             Self::Daemon(service) => service.inspect_machine(reference).await,
+        }
+    }
+
+    /// Preflight failures have not entered a capture and must not initialize
+    /// a runtime merely to enrich their diagnostics.
+    pub(crate) async fn inspect_capture_source(&mut self, reference: &str) -> Option<MachineData> {
+        match self {
+            Self::Local(local::LocalVmService::Uninitialized { .. }) => None,
+            _ => self.inspect_machine(reference).await.ok(),
         }
     }
 
