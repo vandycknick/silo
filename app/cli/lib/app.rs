@@ -13,7 +13,7 @@ const HELP_TEMPLATE: &str = "{about}\n\n{usage-heading} {usage}\n\n{all-args}{af
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Increase diagnostics (-v: debug, -vv: trace and full error chains). RUST_LOG overrides logging.
+    /// Increase diagnostics (-v: debug without SQL, -vv: debug with SQL, -vvv: trace). RUST_LOG overrides verbosity; registry auth logs stay capped.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
@@ -188,6 +188,20 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
 
         assert!(!help.contains("cleanup"));
+    }
+
+    #[test]
+    fn verbosity_help_describes_each_diagnostic_level() {
+        let help = Cli::command().render_long_help().to_string();
+        for level in [
+            "-v: debug without SQL",
+            "-vv: debug with SQL",
+            "-vvv: trace",
+            "RUST_LOG overrides verbosity",
+            "registry auth logs stay capped",
+        ] {
+            assert!(help.contains(level), "missing verbosity help: {level}");
+        }
     }
 
     #[test]

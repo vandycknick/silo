@@ -296,11 +296,16 @@ which holds no disk bytes. Stop every VM before deleting a scratch home.
 
 Tracing diagnostics go to stderr, separately from command results on stdout.
 The CLI defaults to warnings and errors, including calls into libvm. Use `-v`
-for debug diagnostics (including the machine start timeline), or `-vv` for
-trace diagnostics and full error chains. A valid, nonempty `RUST_LOG` filter
-overrides verbosity, for example
+for debug diagnostics (including the machine start timeline) without SQL
+statements, `-vv` to additionally log SQL statements, or `-vvv` (and higher) for
+trace diagnostics. All verbose levels show full error chains. A valid, nonempty
+`RUST_LOG` filter overrides verbosity, for example
 `RUST_LOG=warn,libvm::runtime::start_timeline=debug silo start archy`.
 Missing, empty or invalid filters fall back to the verbosity/default policy.
+Registry client diagnostics on `oci_client::client` are capped at info even with
+`RUST_LOG=trace`, because debug logs can contain bearer tokens. Only an explicit
+`RUST_LOG` directive naming `oci_client::client` bypasses this cap. Do not enable
+that target's debug or trace logs when capturing or sharing diagnostics.
 Tracing temporarily clears and redraws active spinners and pull progress so
 diagnostics cannot split their lines. `silo daemon run` uses the same policy;
 native service managers retain their existing stderr capture. Monitor and
