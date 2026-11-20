@@ -67,7 +67,7 @@ struct SourceOwnership {
     _lease: Option<crate::storage::locks::StorageLock>,
     _managed: Option<crate::store::stored_image_store::StoredImageConsumer>,
     /// Consumer lease over the layered lower until the machine row roots it.
-    _lower: Option<crate::store::composition_store::HeldComposition>,
+    _lower: Option<crate::store::composition_store::CompositionHold>,
     /// Retain the construction operation after publication locks become root pins.
     _baseline_lease: Option<crate::storage::locks::StorageLock>,
 }
@@ -821,7 +821,7 @@ async fn create_machine_config_with_name(
                 .publish_local_composition(consumer.operation_id(), lower)
                 .await?;
             CreateRoot::Image {
-                held: layers.hold_composition(id).await?,
+                held: layers.hold_composition_records(id).await?,
                 upper: authenticated,
                 upper_uuid: *upper_uuid,
                 ext4_profile: *ext4_profile,
@@ -1202,10 +1202,10 @@ enum CreateRoot {
         authenticated: crate::storage::stream::AuthenticatedStream,
     },
     /// A freshly formatted upper over a new OCI image's retained composition.
-    Fresh(crate::store::composition_store::HeldComposition),
+    Fresh(crate::store::composition_store::CompositionHold),
     /// A private copy of a layered managed image's upper over its exact lower.
     Image {
-        held: crate::store::composition_store::HeldComposition,
+        held: crate::store::composition_store::CompositionHold,
         upper: crate::storage::stream::AuthenticatedStream,
         upper_uuid: uuid::Uuid,
         ext4_profile: crate::Ext4Profile,
@@ -1226,7 +1226,7 @@ struct LayeredUpper {
 /// derived claims of the authenticated composition result.
 fn layered_storage(
     mut storage: crate::MachineStorageRecord,
-    held: &crate::store::composition_store::HeldComposition,
+    held: &crate::store::composition_store::CompositionHold,
     upper: LayeredUpper,
 ) -> Result<crate::MachineStorageRecord, LibVmError> {
     storage.root = crate::MachineRoot::LinuxOverlay {

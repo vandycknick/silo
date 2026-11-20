@@ -33,7 +33,7 @@ use crate::image::{
 };
 use crate::storage::identity::{LowerResultId, ObjectDigest};
 use crate::storage::pool::StoragePool;
-use crate::store::composition_store::{HeldComposition, RetainedComposition};
+use crate::store::composition_store::{CompositionHold, HeldComposition, RetainedComposition};
 use crate::store::layer_store::LayerStore;
 use crate::store::models::snapshot::SnapshotComposition;
 use crate::store::models::storage::{GuestArchitecture, LinuxPlatform};
@@ -160,7 +160,7 @@ fn ensure_resolved_oci_identity(
 /// while holding it.
 pub(crate) struct AcquiredComposition {
     pub(crate) record: OciImageRecord,
-    pub(crate) held: HeldComposition,
+    pub(crate) held: CompositionHold,
 }
 
 pub(crate) fn materialized_image(
@@ -241,7 +241,9 @@ pub(crate) async fn acquire_composition(
         ensure_resolved_oci_identity(resolved, &image)?;
         emit_cached_image_progress(progress, &resolved.requested_reference);
         // Exact retained bytes are authoritative; no source or encoder is used.
-        let held = layers.hold_composition(image.artifact.lower).await?;
+        let held = layers
+            .hold_composition_records(image.artifact.lower)
+            .await?;
         check_image_lower(&image, held.retained())?;
         let now = crate::utils::now_unix();
         image.reference.requested_reference = resolved.requested_reference.clone();
@@ -332,7 +334,10 @@ pub(crate) async fn acquire_composition(
     ensure_resolved_oci_identity(resolved, &record)?;
     store.save_oci_image(&record).await?;
     emit_image_progress_complete(progress);
-    Ok(AcquiredComposition { record, held })
+    Ok(AcquiredComposition {
+        record,
+        held: held.into_hold(),
+    })
 }
 
 fn staging_operation(reference: &str) -> Result<::oci::StagingOperation, LibVmError> {
@@ -1000,7 +1005,13 @@ pub(crate) mod tests {
         let record =
             oci_image_record(metadata, held.retained(), &metadata.requested_reference).unwrap();
         store.save_oci_image(&record).await.unwrap();
-        (record.clone(), AcquiredComposition { record, held })
+        (
+            record.clone(),
+            AcquiredComposition {
+                record,
+                held: held.into_hold(),
+            },
+        )
     }
 
     async fn home() -> (tempfile::TempDir, Store) {
@@ -1162,6 +1173,47 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(acquired.held.retained(), &lower);
         assert_eq!(acquired.record.artifact.lower, lower.id);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cached_acquisition_reads_no_index_pages_or_packs() {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+
+        let (_temp, store) = home().await;
+        let reference = "example.test/app:1";
+        let (record, first) = cache_layered_image(&store, reference, MANIFEST).await;
+        let lower = first.held.retained().clone();
+        let graph = LayerStore::from_store(store.clone())
+            .snapshot_composition(lower.id)
+            .await
+            .unwrap();
+        let pool = StoragePool::open(store.images_path()).unwrap();
+        let events = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).unwrap();
+        assert!(graph
+            .layers
+            .iter()
+            .any(|layer| !layer.index_pages.is_empty()));
+        for layer in &graph.layers {
+            for digest in &layer.index_pages {
+                events
+                    .add_watch(&pool.object_path(digest), AddWatchFlags::IN_ACCESS)
+                    .unwrap();
+            }
+            events
+                .add_watch(
+                    &pool.stream_path(&layer.pack.stream),
+                    AddWatchFlags::IN_ACCESS,
+                )
+                .unwrap();
+        }
+        drop(first);
+        let resolved = cached_resolved_oci_image(&record, reference.into());
+        let acquired = acquire_composition(&store, &producer(&store), None, &resolved)
+            .await
+            .unwrap();
+        assert_eq!(acquired.held.retained(), &lower);
+        assert_eq!(events.read_events().unwrap_err(), nix::errno::Errno::EAGAIN);
     }
 
     #[tokio::test]

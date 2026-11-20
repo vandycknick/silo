@@ -8,6 +8,9 @@
   with its own state (waiting, downloading, verifying, extracting, complete).
   When an image has more layers than the terminal has rows, the list scrolls
   as layers complete instead of running off the screen.
+- Changed: `silo create` and `silo run` no longer re-read every layer's file
+  list for an image that is already stored and unchanged, which makes them
+  faster for images with many files.
 - Changed: start-up clean-up does less work per command on homes with many
   stored objects.
 - Fixed: OCI images with absolute archive paths, including Nix dockerTools

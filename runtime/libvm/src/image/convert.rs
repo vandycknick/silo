@@ -179,7 +179,12 @@ async fn convert_owned(
         progress.send(ImageProgress::MaterializingRootfs);
     }
     let output = staging.directory()?.path().join("root.raw");
-    let held = acquired.held;
+    let held = acquired
+        .held
+        .into_decoded(&crate::store::layer_store::LayerStore::from_store(
+            context.store.as_ref().clone(),
+        ))
+        .await?;
     let (pool, published, roots) = tokio::task::spawn_blocking(move || {
         let layers = held.layers();
         let retained = held.retained();

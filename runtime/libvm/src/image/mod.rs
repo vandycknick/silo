@@ -399,7 +399,7 @@ pub(crate) enum MaterializedRoot {
         authenticated: crate::storage::stream::AuthenticatedStream,
     },
     /// An OCI selection's leased exact layered composition; never copied.
-    Layered(Box<crate::store::composition_store::HeldComposition>),
+    Layered(Box<crate::store::composition_store::CompositionHold>),
 }
 
 pub(crate) struct MaterializedImage {
