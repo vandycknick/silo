@@ -38,40 +38,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     fs::create_dir(&index_directory)?;
     let mut inputs = Vec::with_capacity(layer_count);
-    for occurrence in 0..layer_count {
-        let operation = oci::StagingOperation::try_from(uuid::Uuid::new_v4().to_string())?;
-        let staged = producer
-            .ingest_changeset(&resolved, occurrence, &operation, &limits, None)
-            .await?;
-        let root = encode_index_to(staged.changeset(), &limits, |object| {
+    let downloads = producer.layer_downloads(&resolved, &limits, None)?;
+    let indices = (0..layer_count).collect::<Vec<_>>();
+    let acquire = async {
+        for occurrence in 0..layer_count {
+            let operation = oci::StagingOperation::try_from(uuid::Uuid::new_v4().to_string())?;
+            let staged = downloads.ingest_changeset(occurrence, &operation).await?;
+            let root = encode_index_to(staged.changeset(), &limits, |object| {
+                fs::write(
+                    index_directory.join(object.digest.to_string()),
+                    object.bytes,
+                )?;
+                Ok(())
+            })?;
+            fs::write(index_directory.join(root.digest.to_string()), &root.bytes)?;
+            let recipe = LayerRecipe {
+                diff_id: staged.changeset().diff_id,
+            };
+            let (pack, guard) = pool.publish_stream_for_catalog(staged.pack_path())?;
+            let result = LayerResult {
+                recipe: recipe.id()?,
+                pack_stream: StreamIdentity::from_sha256(*pack.id.as_bytes()),
+                pack_length: pack.length,
+                index_root: root.digest,
+            };
             fs::write(
-                index_directory.join(object.digest.to_string()),
-                object.bytes,
+                directory.join(format!("layer-{occurrence}-recipe.json")),
+                recipe.canonical_bytes()?,
             )?;
-            Ok(())
-        })?;
-        fs::write(index_directory.join(root.digest.to_string()), &root.bytes)?;
-        let recipe = LayerRecipe {
-            diff_id: staged.changeset().diff_id,
-        };
-        let (pack, guard) = pool.publish_stream_for_catalog(staged.pack_path())?;
-        let result = LayerResult {
-            recipe: recipe.id()?,
-            pack_stream: StreamIdentity::from_sha256(*pack.id.as_bytes()),
-            pack_length: pack.length,
-            index_root: root.digest,
-        };
-        fs::write(
-            directory.join(format!("layer-{occurrence}-recipe.json")),
-            recipe.canonical_bytes()?,
-        )?;
-        fs::write(
-            directory.join(format!("layer-{occurrence}-result.json")),
-            result.canonical_bytes()?,
-        )?;
-        let file = File::open(&pack.path)?;
-        inputs.push((staged, result, file, guard, pack.id));
-    }
+            fs::write(
+                directory.join(format!("layer-{occurrence}-result.json")),
+                result.canonical_bytes()?,
+            )?;
+            let file = File::open(&pack.path)?;
+            inputs.push((staged, result, file, guard, pack.id));
+        }
+        Ok::<_, Box<dyn Error>>(())
+    };
+    tokio::try_join!(
+        async {
+            downloads
+                .prefetch(&indices)
+                .await
+                .map_err(Box::<dyn Error>::from)
+        },
+        acquire,
+    )?;
     let layers: Vec<_> = inputs
         .iter()
         .map(|(staged, result, pack, _, _)| Layer {

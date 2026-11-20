@@ -1,8 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use futures_util::TryStreamExt;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use oci_client::client::{BlobResponse, SizedStream};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -17,6 +18,8 @@ use crate::{OciError, OciResult, Platform, RegistryPolicy};
 const BLOBS_DIR_NAME: &str = "source-blobs";
 const PROGRESS_STEP_BYTES: u64 = 256 * 1024;
 const TMP_DIR_NAME: &str = "tmp";
+// Matches Docker's default max-concurrent-downloads.
+const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct MaterializeOptions {
@@ -95,6 +98,117 @@ pub struct OciMaterializer {
     policy: RegistryPolicy,
 }
 
+/// One pull's verified compressed blobs. Drive `prefetch` alongside ordered
+/// `ingest_changeset` calls; dropping those futures cancels every download.
+pub struct LayerDownloads<'a> {
+    producer: &'a OciMaterializer,
+    resolved: &'a ResolvedImage,
+    limits: crate::changeset::ChangesetLimits,
+    progress: Option<ProgressReporter>,
+    paths: BTreeMap<String, tokio::sync::watch::Sender<Option<PathBuf>>>,
+}
+
+impl LayerDownloads<'_> {
+    /// Fetch selected occurrences in ascending order, at most three at once.
+    /// A repeated compressed digest shares one verified file and event sequence.
+    pub async fn prefetch(&self, indices: &[usize]) -> OciResult<()> {
+        self.prefetch_with_registry(indices, &RegistryClient::new()?)
+            .await
+    }
+
+    async fn prefetch_with_registry(
+        &self,
+        indices: &[usize],
+        registry: &RegistryClient,
+    ) -> OciResult<()> {
+        let mut indices = indices.to_vec();
+        indices.sort_unstable();
+        indices.dedup();
+        let mut digests = BTreeSet::new();
+        let mut selected = Vec::new();
+        for index in indices {
+            let layer = self.layer(index)?;
+            if digests.insert(&layer.digest) {
+                selected.push(index);
+            }
+        }
+        if selected.is_empty() {
+            return Ok(());
+        }
+        registry
+            .authenticate_pull(&self.resolved.reference, &self.resolved.requested_reference)
+            .await?;
+        let mut downloads = stream::iter(selected)
+            .map(|index| async move {
+                let layer = self.layer(index)?;
+                let path = self
+                    .producer
+                    .get_or_download_layer(LayerDownloadRequest {
+                        registry,
+                        reference: &self.resolved.reference,
+                        image_ref: &self.resolved.requested_reference,
+                        layer,
+                        index: index + 1,
+                        total: self.resolved.layers.len(),
+                        progress: self.progress.as_ref(),
+                    })
+                    .await?;
+                if let Some(sender) = self.paths.get(&layer.digest) {
+                    sender.send_replace(Some(path));
+                }
+                Ok::<_, OciError>(())
+            })
+            .buffer_unordered(MAX_CONCURRENT_DOWNLOADS);
+        while downloads.try_next().await?.is_some() {}
+        Ok(())
+    }
+
+    /// Wait for a verified blob without fetching or emitting more events.
+    pub async fn ready(&self, index: usize) -> OciResult<PathBuf> {
+        let layer = self.layer(index)?;
+        let sender = self.paths.get(&layer.digest).ok_or_else(|| {
+            crate::changeset::ChangesetError::Invalid("layer download slot is absent".into())
+        })?;
+        let mut receiver = sender.subscribe();
+        let value = receiver
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        value.clone().ok_or_else(|| {
+            crate::changeset::ChangesetError::Invalid("layer download path is absent".into()).into()
+        })
+    }
+
+    /// Structurally verify an already fetched layer. Retention and composition
+    /// remain the caller's responsibility; retries reuse the same source file.
+    pub async fn ingest_changeset(
+        &self,
+        index: usize,
+        operation: &StagingOperation,
+    ) -> OciResult<crate::changeset::StagedChangeset> {
+        let path = self.ready(index).await?;
+        let input = layer_input(self.layer(index)?)?;
+        let root = self.producer.root.clone();
+        let operation = operation.clone();
+        let limits = self.limits;
+        tokio::task::spawn_blocking(move || {
+            crate::changeset::ingest_layer(&path, &input, &root, &operation, &limits)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .map_err(OciError::from)
+    }
+
+    fn layer(&self, index: usize) -> OciResult<&ResolvedLayer> {
+        self.resolved.layers.get(index).ok_or_else(|| {
+            crate::changeset::ChangesetError::Invalid(
+                "layer occurrence index outside manifest".into(),
+            )
+            .into()
+        })
+    }
+}
+
 struct LayerDownloadRequest<'a> {
     registry: &'a RegistryClient,
     reference: &'a oci_client::Reference,
@@ -135,16 +249,14 @@ impl OciMaterializer {
             .await
     }
 
-    /// Acquire and structurally verify one ordered layer occurrence. Publication
-    /// and parent-dependent composition remain the caller's responsibility.
-    pub async fn ingest_changeset(
-        &self,
-        resolved: &ResolvedImage,
-        layer_index: usize,
-        operation: &StagingOperation,
+    /// Prepare a pull after its source blobs have been pinned by the caller.
+    /// Only indices passed to `prefetch` are downloaded.
+    pub fn layer_downloads<'a>(
+        &'a self,
+        resolved: &'a ResolvedImage,
         limits: &crate::changeset::ChangesetLimits,
         progress: Option<ProgressReporter>,
-    ) -> OciResult<crate::changeset::StagedChangeset> {
+    ) -> OciResult<LayerDownloads<'a>> {
         limits.validate()?;
         if resolved.layers.len() as u64 > limits.max_layers {
             return Err(crate::changeset::ChangesetError::Limit {
@@ -154,37 +266,20 @@ impl OciMaterializer {
             }
             .into());
         }
-        let layer = resolved.layers.get(layer_index).ok_or_else(|| {
-            crate::changeset::ChangesetError::Invalid(
-                "layer occurrence index outside manifest".into(),
-            )
-        })?;
         self.policy.check(&resolved.reference)?;
-        let registry = RegistryClient::new()?;
-        registry
-            .authenticate_pull(&resolved.reference, &resolved.requested_reference)
-            .await?;
-        let path = self
-            .get_or_download_layer(LayerDownloadRequest {
-                registry: &registry,
-                reference: &resolved.reference,
-                image_ref: &resolved.requested_reference,
-                layer,
-                index: layer_index + 1,
-                total: resolved.layers.len(),
-                progress: progress.as_ref(),
-            })
-            .await?;
-        let input = layer_input(layer)?;
-        let root = self.root.clone();
-        let operation = operation.clone();
-        let limits = *limits;
-        tokio::task::spawn_blocking(move || {
-            crate::changeset::ingest_layer(&path, &input, &root, &operation, &limits)
+        let mut paths = BTreeMap::new();
+        for layer in &resolved.layers {
+            paths
+                .entry(layer.digest.clone())
+                .or_insert_with(|| tokio::sync::watch::channel(None).0);
+        }
+        Ok(LayerDownloads {
+            producer: self,
+            resolved,
+            limits: *limits,
+            progress,
+            paths,
         })
-        .await
-        .map_err(|error| std::io::Error::other(error.to_string()))?
-        .map_err(OciError::from)
     }
 
     async fn resolve_remote_oci(
@@ -697,7 +792,14 @@ impl Drop for StagingDir {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    use crate::progress::{ProgressEvent, ProgressReporter};
     use crate::registry::ResolvedLayer;
+    use crate::registry::{ImageConfig, RegistryClient, ResolvedImage};
     use crate::store::{
         digest_path_components, sha256_bytes, verified_blob_exists, verify_layer_file,
         OciMaterializer, StagingDir,
@@ -950,5 +1052,406 @@ mod tests {
                 .unwrap();
             let _exclusive = Flock::lock(contender, FlockArg::LockExclusiveNonblock).unwrap();
         });
+    }
+
+    struct RegistryFixture {
+        address: std::net::SocketAddr,
+        state: Arc<RegistryState>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    struct RegistryState {
+        blobs: Vec<Vec<u8>>,
+        requested: Mutex<Vec<usize>>,
+        gates: Vec<(Mutex<bool>, Condvar)>,
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+        authentications: AtomicUsize,
+        stop: AtomicBool,
+        failing: Option<usize>,
+    }
+
+    impl RegistryFixture {
+        fn new(count: usize, failing: Option<usize>) -> Self {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let blobs = (0..count)
+                .map(|index| {
+                    let data = vec![index as u8; 300 * 1024];
+                    let mut archive = tar::Builder::new(Vec::new());
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(data.len() as u64);
+                    header.set_mode(0o644);
+                    header.set_uid(0);
+                    header.set_gid(0);
+                    header.set_mtime(0);
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, format!("layer-{index}"), data.as_slice())
+                        .unwrap();
+                    archive.into_inner().unwrap()
+                })
+                .collect();
+            let state = Arc::new(RegistryState {
+                blobs,
+                requested: Mutex::new(Vec::new()),
+                gates: (0..count)
+                    .map(|_| (Mutex::new(false), Condvar::new()))
+                    .collect(),
+                active: AtomicUsize::new(0),
+                maximum: AtomicUsize::new(0),
+                authentications: AtomicUsize::new(0),
+                stop: AtomicBool::new(false),
+                failing,
+            });
+            let serving = Arc::clone(&state);
+            let server = std::thread::spawn(move || {
+                let mut workers = Vec::new();
+                while !serving.stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((socket, _)) => {
+                            let state = Arc::clone(&serving);
+                            workers.push(std::thread::spawn(move || {
+                                Self::respond(socket, address, &state);
+                            }));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("registry accept: {error}"),
+                    }
+                }
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            });
+            Self {
+                address,
+                state,
+                server: Some(server),
+            }
+        }
+
+        fn respond(
+            mut socket: std::net::TcpStream,
+            address: std::net::SocketAddr,
+            state: &RegistryState,
+        ) {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = match socket.read(&mut buffer) {
+                    Ok(read) => read,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        return
+                    }
+                    Err(error) => panic!("registry request: {error}"),
+                };
+                if read == 0 {
+                    // Cancellation can close an accepted connection before a
+                    // complete request has reached the registry.
+                    return;
+                }
+                assert!(request.len() + read <= 16384);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let target = request.split_whitespace().nth(1).unwrap();
+            if target == "/v2/" {
+                state.authentications.fetch_add(1, Ordering::SeqCst);
+                write!(socket, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\nWWW-Authenticate: Bearer realm=\"http://{address}/token\",service=\"fixture\"\r\n\r\n").unwrap();
+                return;
+            }
+            if target.starts_with("/token?") {
+                let token = br#"{"token":"fixture-token"}"#;
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    token.len()
+                )
+                .unwrap();
+                socket.write_all(token).unwrap();
+                return;
+            }
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer "));
+            let digest = target.rsplit('/').next().unwrap();
+            let index = state
+                .blobs
+                .iter()
+                .position(|blob| format!("sha256:{}", sha256_bytes(blob)) == digest)
+                .expect("requested blob belongs to fixture");
+            let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+            state.maximum.fetch_max(active, Ordering::SeqCst);
+            state.requested.lock().unwrap().push(index);
+            let blob = &state.blobs[index];
+            if state.failing != Some(index)
+                && (write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    blob.len()
+                )
+                .is_err()
+                    || socket.write_all(&blob[..256 * 1024]).is_err())
+            {
+                state.active.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            let (gate, changed) = &state.gates[index];
+            let (released, timeout) = changed
+                .wait_timeout_while(gate.lock().unwrap(), Duration::from_secs(5), |released| {
+                    !*released
+                })
+                .unwrap();
+            assert!(!timeout.timed_out(), "registry response was never released");
+            assert!(*released);
+            if state.failing == Some(index) {
+                let _ = socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 12\r\n\r\nlayer failed");
+            } else {
+                let _ = socket.write_all(&blob[256 * 1024..]);
+            }
+            state.active.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        fn release(&self, index: usize) {
+            let (gate, changed) = &self.state.gates[index];
+            *gate.lock().unwrap() = true;
+            changed.notify_all();
+        }
+
+        fn client(&self) -> RegistryClient {
+            RegistryClient {
+                client: oci_client::Client::new(oci_client::client::ClientConfig {
+                    protocol: oci_client::client::ClientProtocol::Http,
+                    ..Default::default()
+                }),
+            }
+        }
+
+        fn resolved(&self) -> ResolvedImage {
+            let reference =
+                RegistryClient::parse_reference(&format!("{}/fixture:latest", self.address))
+                    .unwrap();
+            ResolvedImage {
+                requested_reference: reference.to_string(),
+                selected_reference: reference.to_string(),
+                manifest_digest: format!("sha256:{}", "1".repeat(64)),
+                config_digest: format!("sha256:{}", "2".repeat(64)),
+                config: ImageConfig::default(),
+                platform: Platform::linux_amd64(),
+                reference,
+                layers: self
+                    .state
+                    .blobs
+                    .iter()
+                    .map(|blob| {
+                        let digest = format!("sha256:{}", sha256_bytes(blob));
+                        ResolvedLayer {
+                            digest: digest.clone(),
+                            media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+                            size_bytes: blob.len() as u64,
+                            diff_id: digest,
+                        }
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for RegistryFixture {
+        fn drop(&mut self) {
+            self.state.stop.store(true, Ordering::SeqCst);
+            for index in 0..self.state.blobs.len() {
+                self.release(index);
+            }
+            if let Some(server) = self.server.take() {
+                server.join().unwrap();
+            }
+        }
+    }
+
+    async fn until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition did not become true");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[test]
+    fn pull_downloads_three_at_once_authenticates_once_and_overlaps_ordered_unpack() {
+        let registry = RegistryFixture::new(6, None);
+        let temp = tempfile::tempdir().unwrap();
+        let producer = OciMaterializer::open(temp.path(), RegistryPolicy::default()).unwrap();
+        let mut resolved = registry.resolved();
+        resolved.layers.push(resolved.layers[0].clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let reported = Arc::clone(&events);
+        let progress = ProgressReporter::new(move |event| reported.lock().unwrap().push(event));
+        let downloads = producer
+            .layer_downloads(
+                &resolved,
+                &crate::changeset::ChangesetLimits::default(),
+                Some(progress),
+            )
+            .unwrap();
+        let client = registry.client();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let ordered = async {
+                    until(|| registry.state.requested.lock().unwrap().len() == 3).await;
+                    let mut initial = registry.state.requested.lock().unwrap().clone();
+                    initial.sort_unstable();
+                    assert_eq!(initial, vec![0, 1, 2]);
+                    assert_eq!(registry.state.maximum.load(Ordering::SeqCst), 3);
+                    registry.release(0);
+                    let first = downloads.ingest_changeset(0, &operation(1)).await.unwrap();
+                    assert_eq!(
+                        first.changeset().diff_id.to_string(),
+                        resolved.layers[0].diff_id
+                    );
+                    assert!(
+                        registry.state.active.load(Ordering::SeqCst) >= 2,
+                        "later downloads remain in flight during the first unpack"
+                    );
+                    for index in 1..5 {
+                        registry.release(index);
+                    }
+                    let mut unpacked = vec![0];
+                    for index in 1..5 {
+                        let staged = downloads
+                            .ingest_changeset(index, &operation(index as u64 + 1))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            staged.changeset().diff_id.to_string(),
+                            resolved.layers[index].diff_id
+                        );
+                        unpacked.push(index);
+                    }
+                    assert_eq!(unpacked, vec![0, 1, 2, 3, 4]);
+                    assert_eq!(
+                        downloads.ready(6).await.unwrap(),
+                        downloads.ready(0).await.unwrap()
+                    );
+                };
+                let (result, ()) = tokio::join!(
+                    downloads.prefetch_with_registry(&[6, 4, 3, 2, 1, 0], &client),
+                    ordered
+                );
+                result.unwrap();
+            });
+        assert_eq!(registry.state.authentications.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.state.maximum.load(Ordering::SeqCst), 3);
+        let mut requested = registry.state.requested.lock().unwrap().clone();
+        requested.sort_unstable();
+        assert_eq!(
+            requested,
+            vec![0, 1, 2, 3, 4],
+            "omitted retained blob and repeat are not fetched"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProgressEvent::LayerDownloadFinished { .. }))
+                .count(),
+            5
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::LayerDownloadSkipped { .. })));
+    }
+
+    #[test]
+    fn failed_prefetch_cancels_other_downloads_and_preserves_resumable_files() {
+        let registry = RegistryFixture::new(4, Some(1));
+        let temp = tempfile::tempdir().unwrap();
+        let producer = OciMaterializer::open(temp.path(), RegistryPolicy::default()).unwrap();
+        let resolved = registry.resolved();
+        let downloads = producer
+            .layer_downloads(
+                &resolved,
+                &crate::changeset::ChangesetLimits::default(),
+                None,
+            )
+            .unwrap();
+        let client = registry.client();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let control = async {
+                    until(|| registry.state.requested.lock().unwrap().len() == 3).await;
+                    registry.release(0);
+                    downloads.ready(0).await.unwrap();
+                    until(|| {
+                        producer
+                            .blob_part_path(&resolved.layers[2].digest)
+                            .unwrap()
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.len() >= 256 * 1024)
+                    })
+                    .await;
+                    registry.release(1);
+                    std::future::pending::<crate::OciResult<()>>().await
+                };
+                let error = tokio::try_join!(
+                    downloads.prefetch_with_registry(&[0, 1, 2, 3], &client),
+                    control
+                )
+                .unwrap_err();
+                let OciError::Registry {
+                    source: oci_client::errors::OciDistributionError::RequestError(source),
+                    ..
+                } = error
+                else {
+                    panic!("expected the failed layer's HTTP error, got {error:?}");
+                };
+                assert_eq!(source.status().map(|status| status.as_u16()), Some(500));
+                assert!(source
+                    .url()
+                    .unwrap()
+                    .path()
+                    .ends_with(&resolved.layers[1].digest));
+                assert!(producer
+                    .blob_path(&resolved.layers[0].digest)
+                    .unwrap()
+                    .is_file());
+                let part = producer.blob_part_path(&resolved.layers[2].digest).unwrap();
+                assert_eq!(
+                    std::fs::read(&part).unwrap(),
+                    registry.state.blobs[2][..256 * 1024]
+                );
+                let length = std::fs::metadata(&part).unwrap().len();
+                registry.release(2);
+                until(|| registry.state.active.load(Ordering::SeqCst) <= 1).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    std::fs::metadata(&part).unwrap().len(),
+                    length,
+                    "cancelled downloads no longer consume response bytes"
+                );
+            });
     }
 }

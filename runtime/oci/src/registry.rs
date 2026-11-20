@@ -293,6 +293,8 @@ impl RegistryClient {
             .map_err(|source| OciError::registry(requested_ref.to_string(), source))
     }
 
+    /// Authenticate once before a pull's blob downloads. Blob requests use the
+    /// client's token cache and refresh expired tokens from its stored auth.
     pub(crate) async fn authenticate_pull(
         &self,
         reference: &Reference,

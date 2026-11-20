@@ -1,6 +1,16 @@
 use std::fmt;
 use std::sync::Arc;
 
+/// After manifest resolution, up to three layer downloads may interleave.
+/// For each 1-based index, downloads emit either `LayerDownloadSkipped` or
+/// `LayerDownloadStarted`, zero or more progress events, verifying, finished.
+/// A complete resumed partial file may emit only verifying and finished.
+/// Retained unpacked layers emit no download events; repeated occurrences
+/// may emit no events at all. `total` is the manifest's layer count.
+///
+/// `ApplyingLayer` remains sequential in ascending index order and may
+/// overlap later downloads. Its unpack ends at the next different applying
+/// index or `MaterializingRootfs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressEvent {
     ResolvingManifest {

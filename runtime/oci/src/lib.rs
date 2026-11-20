@@ -20,5 +20,6 @@ pub use crate::policy::{RegistryAction, RegistryPolicy, RegistryRule};
 pub use crate::progress::{ProgressEvent, ProgressReporter};
 pub use crate::registry::{ImageConfig, ResolvedImage};
 pub use crate::store::{
-    MaterializeOptions, OciMaterializer, RootfsLayerMetadata, RootfsMetadata, StagingOperation,
+    LayerDownloads, MaterializeOptions, OciMaterializer, RootfsLayerMetadata, RootfsMetadata,
+    StagingOperation,
 };

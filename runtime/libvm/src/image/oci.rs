@@ -5,9 +5,11 @@
 //!   lock(selection)
 //!   ├─ catalog row ─► hold exact retained composition ─► record
 //!   │                 (no OCI source, no encoder; missing bytes refuse)
-//!   └─ miss ─► every ordered occurrence:
+//!   └─ miss ─► pin reusable recipes; prefetch missing unique source blobs
+//!              (three downloads at once, concurrent with ordered unpack)
+//!            ─► every ordered occurrence:
 //!                retained recipe ─► reuse (no download)
-//!                otherwise ──────► ingest_changeset ─► LayerStore::publish
+//!                otherwise ──────► verified blob ─► ingest ─► publish
 //!              pin each result to the acquisition operation
 //!            ─► compose_retained ─► image rows + image_composition_artifact
 //! ```
@@ -293,6 +295,9 @@ pub(crate) async fn acquire_composition(
     store.pin_source_blobs(operation, &source_blobs).await?;
     let limits = ChangesetLimits::default();
     let reference = resolved.requested_reference.as_str();
+    let downloads = producer
+        .layer_downloads(image, &limits, oci_progress_reporter(progress.cloned()))
+        .map_err(|error| image_error(reference, error))?;
     let held = compose_layers(
         &layers,
         operation,
@@ -300,16 +305,27 @@ pub(crate) async fn acquire_composition(
         &metadata.layers,
         &limits,
         progress,
-        |index| {
-            let reporter = oci_progress_reporter(progress.cloned());
-            async move {
-                let staging = staging_operation(reference)?;
-                producer
-                    .ingest_changeset(image, index, &staging, &limits, reporter)
-                    .await
-                    .map_err(|error| image_error(reference, error))
-            }
-        },
+        (
+            |indices| {
+                let downloads = &downloads;
+                async move {
+                    downloads
+                        .prefetch(&indices)
+                        .await
+                        .map_err(|error| image_error(reference, error))
+                }
+            },
+            |index| {
+                let downloads = &downloads;
+                async move {
+                    let staging = staging_operation(reference)?;
+                    downloads
+                        .ingest_changeset(index, &staging)
+                        .await
+                        .map_err(|error| image_error(reference, error))
+                }
+            },
+        ),
     )
     .await?;
     let record = oci_image_record(&metadata, held.retained(), reference)?;
@@ -327,47 +343,97 @@ fn staging_operation(reference: &str) -> Result<::oci::StagingOperation, LibVmEr
 /// Retain every ordered occurrence as a layer result pinned to `operation`,
 /// then compose (or reuse) their exact composition. Repeated diff IDs share
 /// one retained result and remain separate occurrences.
-async fn compose_layers<F, Fut>(
+async fn compose_layers<D, DFut, F, Fut>(
     layers: &LayerStore,
     operation: uuid::Uuid,
     platform: ::oci::Platform,
     descriptors: &[RootfsLayerMetadata],
     limits: &ChangesetLimits,
     progress: Option<&ImageProgressSender>,
-    mut ingest: F,
+    (download, mut ingest): (D, F),
 ) -> Result<HeldComposition, LibVmError>
 where
+    D: FnOnce(Vec<usize>) -> DFut,
+    DFut: Future<Output = Result<(), LibVmError>>,
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = Result<StagedChangeset, LibVmError>>,
 {
     crate::storage::limits::Resource::LayerOccurrences
         .check(descriptors.len() as u64)
         .map_err(crate::storage::StorageError::from)?;
-    let mut retained: Vec<(ContentDigest, LayerResultId)> = Vec::new();
-    let mut occurrences = Vec::with_capacity(descriptors.len());
-    for (index, descriptor) in descriptors.iter().enumerate() {
-        let diff_id: ContentDigest = descriptor.diff_id.parse()?;
-        if let Some((_, id)) = retained.iter().find(|(other, _)| *other == diff_id) {
-            occurrences.push(*id);
-            continue;
+    let diff_ids = descriptors
+        .iter()
+        .map(|layer| layer.diff_id.parse())
+        .collect::<Result<Vec<ContentDigest>, _>>()?;
+    let missing = missing_layers(layers, operation, &diff_ids, limits).await?;
+    let compose = async move {
+        let mut retained: Vec<(ContentDigest, LayerResultId)> = Vec::new();
+        let mut occurrences = Vec::with_capacity(descriptors.len());
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            let diff_id: ContentDigest = descriptor.diff_id.parse()?;
+            if let Some((_, id)) = retained.iter().find(|(other, _)| *other == diff_id) {
+                occurrences.push(*id);
+                continue;
+            }
+            if let Some(progress) = progress {
+                progress.send(ImageProgress::ApplyingLayer {
+                    index: index + 1,
+                    total: descriptors.len(),
+                    digest: Some(descriptor.blob_digest.clone()),
+                });
+            }
+            let id = retain_layer(layers, operation, diff_id, limits, || ingest(index)).await?;
+            retained.push((diff_id, id));
+            occurrences.push(id);
         }
         if let Some(progress) = progress {
-            progress.send(ImageProgress::ApplyingLayer {
-                index: index + 1,
-                total: descriptors.len(),
-                digest: Some(descriptor.blob_digest.clone()),
-            });
+            progress.send(ImageProgress::MaterializingRootfs);
         }
-        let id = retain_layer(layers, operation, diff_id, limits, || ingest(index)).await?;
-        retained.push((diff_id, id));
-        occurrences.push(id);
+        layers
+            .compose_retained(platform, &occurrences, limits)
+            .await
+    };
+    let ((), held) = tokio::try_join!(download(missing), compose)?;
+    Ok(held)
+}
+
+/// Authenticate and pin reusable recipes before scheduling any source I/O.
+/// The ordered retention pass still rechecks and keeps its two-attempt retry.
+async fn missing_layers(
+    layers: &LayerStore,
+    operation: uuid::Uuid,
+    diff_ids: &[ContentDigest],
+    limits: &ChangesetLimits,
+) -> Result<Vec<usize>, LibVmError> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut missing = Vec::new();
+    for (index, diff_id) in diff_ids.iter().copied().enumerate() {
+        if !seen.insert(diff_id) {
+            continue;
+        }
+        let recipe = LayerRecipe { diff_id }.id()?;
+        let mut pinned = false;
+        for _ in 0..2 {
+            let Some(layer) = layers.find_recipe(recipe, limits).await? else {
+                break;
+            };
+            if layer.recipe != recipe {
+                return Err(invalid("retained layer contradicts its recipe"));
+            }
+            if layers
+                .store
+                .pin_operation_layers(operation, &[layer.id])
+                .await?
+            {
+                pinned = true;
+                break;
+            }
+        }
+        if !pinned {
+            missing.push(index);
+        }
     }
-    if let Some(progress) = progress {
-        progress.send(ImageProgress::MaterializingRootfs);
-    }
-    layers
-        .compose_retained(platform, &occurrences, limits)
-        .await
+    Ok(missing)
 }
 
 /// Reuse the retained result of `diff_id` (its pack and index are
@@ -592,23 +658,51 @@ pub(crate) async fn prepare_exact_composition(
         handle.block_on(async {
             let platform = oci_platform(&source.platform);
             let resolved = tokio::sync::OnceCell::new();
+            let downloads = tokio::sync::OnceCell::new();
             let sources = SourceBlobPins::begin(&store).await?;
             let reference = source.selected_reference.as_str();
-            prepare_exact(&store, operation, &expected, &platform, |index| {
-                let (resolved, producer, source, platform, sources, store) =
-                    (&resolved, &producer, &source, &platform, &sources, &store);
-                async move {
-                    let image = resolved
-                        .get_or_try_init(|| resolve_source(producer, source, platform))
-                        .await?;
-                    sources.pin(store, image).await?;
-                    let staging = staging_operation(reference)?;
-                    producer
-                        .ingest_changeset(image, index, &staging, &ChangesetLimits::default(), None)
-                        .await
-                        .map_err(|error| image_error(reference, error))
-                }
-            })
+            let initialize = || async {
+                let image = resolved
+                    .get_or_try_init(|| resolve_source(&producer, &source, &platform))
+                    .await?;
+                sources.pin(&store, image).await?;
+                producer
+                    .layer_downloads(image, &ChangesetLimits::default(), None)
+                    .map_err(|error| image_error(reference, error))
+            };
+            prepare_exact(
+                &store,
+                operation,
+                &expected,
+                &platform,
+                (
+                    |indices: Vec<usize>| {
+                        let downloads = &downloads;
+                        async move {
+                            if indices.is_empty() {
+                                return Ok(());
+                            }
+                            downloads
+                                .get_or_try_init(initialize)
+                                .await?
+                                .prefetch(&indices)
+                                .await
+                                .map_err(|error| image_error(reference, error))
+                        }
+                    },
+                    |index| {
+                        let downloads = &downloads;
+                        async move {
+                            let downloads = downloads.get_or_try_init(initialize).await?;
+                            let staging = staging_operation(reference)?;
+                            downloads
+                                .ingest_changeset(index, &staging)
+                                .await
+                                .map_err(|error| image_error(reference, error))
+                        }
+                    },
+                ),
+            )
             .await
         })
     })
@@ -660,14 +754,16 @@ async fn resolve_source(
     Ok(image)
 }
 
-async fn prepare_exact<F, Fut>(
+async fn prepare_exact<D, DFut, F, Fut>(
     store: &Store,
     operation: uuid::Uuid,
     expected: &SnapshotComposition,
     platform: &::oci::Platform,
-    mut ingest: F,
+    (download, mut ingest): (D, F),
 ) -> Result<LowerResultId, LibVmError>
 where
+    D: FnOnce(Vec<usize>) -> DFut,
+    DFut: Future<Output = Result<(), LibVmError>>,
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = Result<StagedChangeset, LibVmError>>,
 {
@@ -682,73 +778,84 @@ where
     }
     let layers = LayerStore::from_store(store.clone());
     let limits = ChangesetLimits::default();
-    let mut unique: Vec<(
-        LayerResultId,
-        crate::store::layer_store::PinnedLayer,
-        std::fs::File,
-    )> = Vec::new();
-    let mut slots = Vec::with_capacity(expected.layers.len());
-    for (index, (layer, facts)) in expected
+    let diff_ids = authenticated
         .layers
         .iter()
-        .zip(&authenticated.layers)
-        .enumerate()
-    {
-        let id = facts.result.id()?;
-        if let Some(slot) = unique.iter().position(|(other, ..)| *other == id) {
-            slots.push(slot);
-            continue;
-        }
-        let retained = retain_layer(&layers, operation, facts.changeset.diff_id, &limits, || {
-            ingest(index)
-        })
-        .await?;
-        if retained != id {
-            return Err(invalid(
-                "local or OCI layer does not reproduce the expected layer result",
-            ));
-        }
-        // Pinned by `operation`; pack bytes were authenticated by reuse or
-        // publication and are hashed again by exact regeneration.
-        let pinned = layers.load_pinned_layer(id, &limits, false).await?;
-        if pinned.result != facts.result
-            || pinned.recipe_digest != layer.recipe
-            || pinned.result_digest != layer.result
-            || pinned.index_root != layer.index_root
-            || pinned.index_pages != layer.index_pages
-            || pinned.pack != layer.pack
-        {
-            return Err(invalid(
-                "reproduced layer closure differs from the expected graph",
-            ));
-        }
-        let pack = pool.open_stream(&layer.pack.stream)?;
-        slots.push(unique.len());
-        unique.push((id, pinned, pack));
-    }
-    let refs = slots
-        .iter()
-        .filter_map(|slot| unique.get(*slot))
-        .map(|(_, layer, pack)| ::oci::erofs::Layer {
-            result: &layer.result,
-            changeset: &layer.changeset,
-            pack,
-        })
+        .map(|layer| layer.changeset.diff_id)
         .collect::<Vec<_>>();
-    if refs.len() != expected.layers.len() {
-        return Err(invalid("expected occurrence lost its reproduced layer"));
-    }
-    let id = crate::store::composition_store::publish_regenerated(
-        store,
-        operation,
-        expected,
-        authenticated,
-        &refs,
-    )
-    .await?;
-    if id != expected.result {
-        return Err(invalid("regenerated composition has a different identity"));
-    }
+    let missing = missing_layers(&layers, operation, &diff_ids, &limits).await?;
+    let prepare = async {
+        let mut unique: Vec<(
+            LayerResultId,
+            crate::store::layer_store::PinnedLayer,
+            std::fs::File,
+        )> = Vec::new();
+        let mut slots = Vec::with_capacity(expected.layers.len());
+        for (index, (layer, facts)) in expected
+            .layers
+            .iter()
+            .zip(&authenticated.layers)
+            .enumerate()
+        {
+            let id = facts.result.id()?;
+            if let Some(slot) = unique.iter().position(|(other, ..)| *other == id) {
+                slots.push(slot);
+                continue;
+            }
+            let retained =
+                retain_layer(&layers, operation, facts.changeset.diff_id, &limits, || {
+                    ingest(index)
+                })
+                .await?;
+            if retained != id {
+                return Err(invalid(
+                    "local or OCI layer does not reproduce the expected layer result",
+                ));
+            }
+            // Pinned by `operation`; pack bytes were authenticated by reuse or
+            // publication and are hashed again by exact regeneration.
+            let pinned = layers.load_pinned_layer(id, &limits, false).await?;
+            if pinned.result != facts.result
+                || pinned.recipe_digest != layer.recipe
+                || pinned.result_digest != layer.result
+                || pinned.index_root != layer.index_root
+                || pinned.index_pages != layer.index_pages
+                || pinned.pack != layer.pack
+            {
+                return Err(invalid(
+                    "reproduced layer closure differs from the expected graph",
+                ));
+            }
+            let pack = pool.open_stream(&layer.pack.stream)?;
+            slots.push(unique.len());
+            unique.push((id, pinned, pack));
+        }
+        let refs = slots
+            .iter()
+            .filter_map(|slot| unique.get(*slot))
+            .map(|(_, layer, pack)| ::oci::erofs::Layer {
+                result: &layer.result,
+                changeset: &layer.changeset,
+                pack,
+            })
+            .collect::<Vec<_>>();
+        if refs.len() != expected.layers.len() {
+            return Err(invalid("expected occurrence lost its reproduced layer"));
+        }
+        let id = crate::store::composition_store::publish_regenerated(
+            store,
+            operation,
+            expected,
+            authenticated,
+            &refs,
+        )
+        .await?;
+        if id != expected.result {
+            return Err(invalid("regenerated composition has a different identity"));
+        }
+        Ok(id)
+    };
+    let ((), id) = tokio::try_join!(download(missing), prepare)?;
     Ok(id)
 }
 
@@ -862,7 +969,10 @@ pub(crate) mod tests {
             &descriptors,
             &ChangesetLimits::default(),
             None,
-            |index| std::future::ready(ingest(store, names[index])),
+            (
+                |_| std::future::ready(Ok(())),
+                |index| std::future::ready(ingest(store, names[index])),
+            ),
         )
         .await
         .unwrap()
@@ -1011,11 +1121,17 @@ pub(crate) mod tests {
             &metadata.layers,
             &ChangesetLimits::default(),
             None,
-            |_| {
-                std::future::ready(Err(LibVmError::ImageNotFound {
-                    reference: "retained layers must not be fetched".into(),
-                }))
-            },
+            (
+                |indices| {
+                    assert!(indices.is_empty(), "retained layers must not be downloaded");
+                    std::future::ready(Ok(()))
+                },
+                |_| {
+                    std::future::ready(Err(LibVmError::ImageNotFound {
+                        reference: "retained layers must not be fetched".into(),
+                    }))
+                },
+            ),
         )
         .await
         .unwrap();
@@ -1219,7 +1335,13 @@ pub(crate) mod tests {
             operation,
             &graph,
             &oci::Platform::linux_amd64(),
-            unavailable,
+            (
+                |indices| {
+                    assert!(indices.is_empty());
+                    std::future::ready(Ok(()))
+                },
+                unavailable,
+            ),
         )
         .await
         .unwrap();
@@ -1243,10 +1365,16 @@ pub(crate) mod tests {
             operation,
             &graph,
             &oci::Platform::linux_amd64(),
-            |index| {
-                fetched.push(index);
-                std::future::ready(ingest(&destination, LAYERS[index]))
-            },
+            (
+                |indices| {
+                    assert_eq!(indices, vec![0, 1]);
+                    std::future::ready(Ok(()))
+                },
+                |index| {
+                    fetched.push(index);
+                    std::future::ready(ingest(&destination, LAYERS[index]))
+                },
+            ),
         )
         .await
         .unwrap();
@@ -1261,13 +1389,16 @@ pub(crate) mod tests {
             operation,
             &graph,
             &oci::Platform::linux_amd64(),
-            |_| {
-                std::future::ready(Ok(ingest(
-                    &destination,
-                    "metadata-producers/gnu-tar-file-05.tar",
-                )
-                .unwrap()))
-            },
+            (
+                |_| std::future::ready(Ok(())),
+                |_| {
+                    std::future::ready(Ok(ingest(
+                        &destination,
+                        "metadata-producers/gnu-tar-file-05.tar",
+                    )
+                    .unwrap()))
+                },
+            ),
         )
         .await;
         assert!(wrong.is_err());
@@ -1282,7 +1413,10 @@ pub(crate) mod tests {
             operation,
             &graph,
             &oci::Platform::linux_arm64(),
-            |index| std::future::ready(ingest(&destination, LAYERS[index])),
+            (
+                |_| std::future::ready(Ok(())),
+                |index| std::future::ready(ingest(&destination, LAYERS[index])),
+            ),
         )
         .await;
         assert!(refused.is_err());
@@ -1309,5 +1443,157 @@ pub(crate) mod tests {
         );
         value["unknown"] = serde_json::json!(true);
         assert!(serde_json::from_value::<OciCompositionSource>(value).is_err());
+    }
+
+    #[tokio::test]
+    async fn download_driver_overlaps_ordered_ingest_and_propagates_later_failure() {
+        for failing in [false, true] {
+            let (temp, store) = home().await;
+            let operation = uuid::Uuid::new_v4();
+            let _lease = store.begin_storage_operation(operation).await.unwrap();
+            let descriptors = LAYERS
+                .iter()
+                .map(|name| descriptor(name))
+                .collect::<Vec<_>>();
+            let paths = [
+                temp.path().join("first.tar"),
+                temp.path().join("second.tar"),
+            ];
+            let (ready, received) = tokio::sync::watch::channel([false; 2]);
+            let first_unpacked = tokio::sync::Notify::new();
+            let mut ingested = Vec::new();
+            let (progress, mut events) = crate::image::ImageProgressSender::default_channel();
+            let result = compose_layers(
+                &LayerStore::from_store(store.clone()),
+                operation,
+                oci::Platform::linux_amd64(),
+                &descriptors,
+                &ChangesetLimits::default(),
+                Some(&progress),
+                (
+                    |indices| {
+                        let paths = &paths;
+                        let first_unpacked = &first_unpacked;
+                        async move {
+                            assert_eq!(indices, vec![0, 1], "repeat is not scheduled");
+                            tokio::fs::copy(fixture(LAYERS[0]), &paths[0]).await?;
+                            ready.send_replace([true, false]);
+                            // The second blob cannot finish until the first
+                            // real layer has been unpacked, proving pipelining.
+                            first_unpacked.notified().await;
+                            if failing {
+                                return Err(LibVmError::ImageNotFound {
+                                    reference: "failed layer 2".into(),
+                                });
+                            }
+                            tokio::fs::copy(fixture(LAYERS[1]), &paths[1]).await?;
+                            ready.send_replace([true, true]);
+                            Ok(())
+                        }
+                    },
+                    |index| {
+                        ingested.push(index);
+                        let paths = &paths;
+                        let store = &store;
+                        let descriptors = &descriptors;
+                        let first_unpacked = &first_unpacked;
+                        let mut received = received.clone();
+                        async move {
+                            received
+                                .wait_for(|ready| ready[index])
+                                .await
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                            let descriptor = &descriptors[index];
+                            let staged = oci::changeset::ingest_layer(
+                                &paths[index],
+                                &LayerInput {
+                                    blob_digest: descriptor.blob_digest.parse()?,
+                                    media_type: descriptor.media_type.clone(),
+                                    size_bytes: descriptor.size_bytes,
+                                    diff_id: descriptor.diff_id.parse()?,
+                                },
+                                store.images_path(),
+                                &oci::StagingOperation::try_from(uuid::Uuid::new_v4().to_string())
+                                    .unwrap(),
+                                &ChangesetLimits::default(),
+                            )?;
+                            if index == 0 {
+                                first_unpacked.notify_one();
+                            }
+                            Ok(staged)
+                        }
+                    },
+                ),
+            )
+            .await;
+            if failing {
+                let error = result.err().expect("second download fails the pull");
+                assert!(error.to_string().contains("failed layer 2"), "{error}");
+                assert!(paths[0].is_file(), "earlier source bytes are preserved");
+                assert_eq!(
+                    count(&store, "SELECT COUNT(*) FROM composition_result").await,
+                    0
+                );
+            } else {
+                let held = result.unwrap();
+                assert_eq!(held.retained().layers[0], held.retained().layers[2]);
+                assert_eq!(ingested, vec![0, 1]);
+            }
+            assert!(
+                ingested == [0] || ingested == [0, 1],
+                "unpack attempts follow manifest order"
+            );
+            let mut applying = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let crate::image::ImageProgress::ApplyingLayer { index, .. } = event {
+                    applying.push(index);
+                }
+            }
+            assert!(
+                applying == [1] || applying == [1, 2],
+                "applying events are ordered and unique"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_retained_and_repeated_layers_schedule_only_missing_sources() {
+        let (_temp, store) = home().await;
+        let layers = LayerStore::from_store(store.clone());
+        let limits = ChangesetLimits::default();
+        let retained = layers
+            .publish(ingest(&store, LAYERS[0]).unwrap(), &limits)
+            .await
+            .unwrap();
+        let operation = uuid::Uuid::new_v4();
+        let _lease = store.begin_storage_operation(operation).await.unwrap();
+        let descriptors = LAYERS
+            .iter()
+            .map(|name| descriptor(name))
+            .collect::<Vec<_>>();
+        let mut ingested = Vec::new();
+        let held = compose_layers(
+            &layers,
+            operation,
+            oci::Platform::linux_amd64(),
+            &descriptors,
+            &limits,
+            None,
+            (
+                |indices| {
+                    assert_eq!(indices, vec![1]);
+                    std::future::ready(Ok(()))
+                },
+                |index| {
+                    ingested.push(index);
+                    std::future::ready(ingest(&store, LAYERS[index]))
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ingested, vec![1]);
+        assert_eq!(held.retained().layers[0], retained.id);
+        assert_eq!(held.retained().layers[0], held.retained().layers[2]);
     }
 }

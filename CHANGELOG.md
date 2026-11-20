@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Changed: `silo image pull`, `silo create` and `silo run` download up to
+  three image layers at once and unpack them while later layers are still
+  downloading. Pull progress now shows one summary line plus only the layers
+  being worked on, so images with many layers no longer scroll off the screen.
+- Changed: start-up clean-up does less work per command on homes with many
+  stored objects.
 - Fixed: OCI images with absolute archive paths, including Nix dockerTools
   images, now load those paths relative to the image root.
 - Changed: `-v` shows debug output without SQL statements, `-vv` adds the SQL
