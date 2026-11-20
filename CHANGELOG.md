@@ -4,8 +4,10 @@
 
 - Changed: `silo image pull`, `silo create` and `silo run` download up to
   three image layers at once and unpack them while later layers are still
-  downloading. Pull progress now shows one summary line plus only the layers
-  being worked on, so images with many layers no longer scroll off the screen.
+  downloading. Pull progress shows one line per layer in image order, each
+  with its own state (waiting, downloading, verifying, extracting, complete).
+  When an image has more layers than the terminal has rows, the list scrolls
+  as layers complete instead of running off the screen.
 - Changed: start-up clean-up does less work per command on homes with many
   stored objects.
 - Fixed: OCI images with absolute archive paths, including Nix dockerTools

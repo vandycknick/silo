@@ -2,6 +2,13 @@ use tokio::sync::mpsc;
 
 const DEFAULT_PROGRESS_BUFFER: usize = 256;
 
+/// One manifest-ordered occurrence, including repeated compressed blobs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageProgressLayer {
+    pub digest: crate::storage::identity::ObjectDigest,
+    pub size_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageProgress {
     ResolvingManifest {
@@ -10,8 +17,7 @@ pub enum ImageProgress {
     ResolvedManifest {
         image_ref: String,
         manifest_digest: String,
-        layer_count: usize,
-        total_download_bytes: Option<u64>,
+        layers: Vec<ImageProgressLayer>,
     },
     CheckingCache {
         image_ref: String,
@@ -100,13 +106,19 @@ impl From<oci::ProgressEvent> for ImageProgress {
             oci::ProgressEvent::ResolvedManifest {
                 image_ref,
                 manifest_digest,
-                layer_count,
-                total_download_bytes,
+                layers,
             } => Self::ResolvedManifest {
                 image_ref,
                 manifest_digest,
-                layer_count,
-                total_download_bytes,
+                layers: layers
+                    .into_iter()
+                    .map(|layer| ImageProgressLayer {
+                        digest: crate::storage::identity::ObjectDigest::from_sha256(
+                            *layer.digest.as_bytes(),
+                        ),
+                        size_bytes: layer.size_bytes,
+                    })
+                    .collect(),
             },
             oci::ProgressEvent::LayerDownloadStarted {
                 index,
@@ -189,5 +201,37 @@ mod tests {
             ImageProgress::MaterializingRootfs
         );
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn resolved_manifest_keeps_ordered_digests_sizes_and_repeats() {
+        let layers = [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"first".as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| oci::ManifestLayer {
+            digest: oci::changeset::ContentDigest::of_bytes(bytes),
+            size_bytes: index as u64,
+        })
+        .collect::<Vec<_>>();
+        let converted = ImageProgress::from(oci::ProgressEvent::ResolvedManifest {
+            image_ref: "image".into(),
+            manifest_digest: "manifest".into(),
+            layers: layers.clone(),
+        });
+        let ImageProgress::ResolvedManifest {
+            layers: received, ..
+        } = converted
+        else {
+            panic!("expected resolved manifest");
+        };
+        assert_eq!(received.len(), layers.len());
+        for (received, original) in received.iter().zip(layers) {
+            assert_eq!(received.digest.as_bytes(), original.digest.as_bytes());
+            assert_eq!(received.size_bytes, original.size_bytes);
+        }
     }
 }

@@ -846,7 +846,7 @@ impl Image {
             ImageCommand::Pull { reference } => {
                 let (progress, events) = libvm::ImageProgressSender::default_channel();
                 let watcher = (self.format == OutputFormat::Plain)
-                    .then(|| crate::ui::watch_image_progress(&reference, events));
+                    .then(|| crate::pull_progress::watch_image_progress(&reference, events));
                 let options = libvm::ImagePullOptions {
                     policy: Some(libvm::PullPolicy::Always),
                 };
@@ -901,7 +901,7 @@ impl Image {
                 };
                 let (progress, events) = libvm::ImageProgressSender::default_channel();
                 let watcher = (self.format == OutputFormat::Plain)
-                    .then(|| crate::ui::watch_image_progress("image import", events));
+                    .then(|| crate::pull_progress::watch_image_progress("image import", events));
                 let result = context
                     .app_api()
                     .await?
@@ -928,7 +928,7 @@ impl Image {
                 let pull = pull.map_or(libvm::PullPolicy::IfMissing, |pull| pull.policy());
                 let (progress, events) = libvm::ImageProgressSender::default_channel();
                 let watcher = (self.format == OutputFormat::Plain)
-                    .then(|| crate::ui::watch_image_progress(&reference, events));
+                    .then(|| crate::pull_progress::watch_image_progress(&reference, events));
                 let result = context
                     .app_api()
                     .await?

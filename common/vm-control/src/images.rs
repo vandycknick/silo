@@ -33,15 +33,17 @@ pub fn progress_to_wire(v: &libvm::ImageProgress) -> Result<w::ImageProgress, Co
             libvm::ImageProgress::ResolvedManifest {
                 image_ref,
                 manifest_digest,
-                layer_count,
-                total_download_bytes,
+                layers,
             } => Event::ResolvedManifest(w::ManifestProgress {
                 image_ref: image_ref.clone(),
                 manifest_digest: manifest_digest.clone(),
-                layer_count: (*layer_count)
-                    .try_into()
-                    .map_err(|_| invalid("layer_count", "overflow"))?,
-                total_download_bytes: *total_download_bytes,
+                layers: layers
+                    .iter()
+                    .map(|layer| w::ManifestLayerProgress {
+                        digest: layer.digest.to_string(),
+                        size_bytes: layer.size_bytes,
+                    })
+                    .collect(),
             }),
             libvm::ImageProgress::LayerDownloadStarted {
                 index,
@@ -161,11 +163,18 @@ pub fn progress_from_wire(v: w::ImageProgress) -> Result<libvm::ImageProgress, C
         Event::ResolvedManifest(v) => libvm::ImageProgress::ResolvedManifest {
             image_ref: v.image_ref,
             manifest_digest: v.manifest_digest,
-            layer_count: v
-                .layer_count
-                .try_into()
-                .map_err(|_| invalid("layer_count", "overflow"))?,
-            total_download_bytes: v.total_download_bytes,
+            layers: v
+                .layers
+                .into_iter()
+                .map(|layer| {
+                    Ok(libvm::ImageProgressLayer {
+                        digest: layer.digest.parse().map_err(|_| {
+                            invalid("manifest.layers.digest", "invalid SHA-256 digest")
+                        })?,
+                        size_bytes: layer.size_bytes,
+                    })
+                })
+                .collect::<Result<_, ConversionError>>()?,
         },
         Event::LayerDownloadStarted(v) => libvm::ImageProgress::LayerDownloadStarted {
             index: v

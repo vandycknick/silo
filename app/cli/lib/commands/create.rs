@@ -17,8 +17,9 @@ use crate::planning::{
     self, MachineCreationSettings, MachineOverrides, Plan, PlanKind, ProcessOverrides, PullPolicy,
     ResolveRequest, ResolvedImage,
 };
+use crate::pull_progress::watch_image_progress;
 use crate::template::{Template, TemplateStore};
-use crate::ui::{success, watch_image_progress, OutputFormat, Spinner};
+use crate::ui::{success, OutputFormat, Spinner};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum Pull {

@@ -90,10 +90,10 @@ pub use crate::image::transport::{
     ArtifactInspection, ArtifactPublishReport, ArtifactPublishRequest, ArtifactRootFamily,
 };
 pub use crate::image::{
-    ImageBuilder, ImageCacheState, ImageLayerDetail, ImageProgress, ImageProgressReceiver,
-    ImageProgressSender, ImagePruneReport, ImagePullOptions, ImageResolveOptions, ImageSource,
-    ImageSourceKind, Images, OciImageConfigMetadata, Platform, PullPolicy, RegistryAction,
-    RegistryPolicy, RegistryRule, ResolvedOciImage,
+    ImageBuilder, ImageCacheState, ImageLayerDetail, ImageProgress, ImageProgressLayer,
+    ImageProgressReceiver, ImageProgressSender, ImagePruneReport, ImagePullOptions,
+    ImageResolveOptions, ImageSource, ImageSourceKind, Images, OciImageConfigMetadata, Platform,
+    PullPolicy, RegistryAction, RegistryPolicy, RegistryRule, ResolvedOciImage,
 };
 pub use crate::machine::{
     resolve_mount_location, AttachmentSignal, EgressCredentials, EgressSecret, Entrypoint,

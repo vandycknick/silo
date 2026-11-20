@@ -366,6 +366,17 @@ where
         .map(|layer| layer.diff_id.parse())
         .collect::<Result<Vec<ContentDigest>, _>>()?;
     let missing = missing_layers(layers, operation, &diff_ids, limits).await?;
+    if let Some(progress) = progress {
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            if missing.binary_search(&index).is_err() {
+                progress.send(ImageProgress::LayerDownloadSkipped {
+                    index: index + 1,
+                    total: descriptors.len(),
+                    digest: descriptor.blob_digest.clone(),
+                });
+            }
+        }
+    }
     let compose = async move {
         let mut retained: Vec<(ContentDigest, LayerResultId)> = Vec::new();
         let mut occurrences = Vec::with_capacity(descriptors.len());
@@ -374,13 +385,6 @@ where
             if let Some((_, id)) = retained.iter().find(|(other, _)| *other == diff_id) {
                 occurrences.push(*id);
                 continue;
-            }
-            if let Some(progress) = progress {
-                progress.send(ImageProgress::ApplyingLayer {
-                    index: index + 1,
-                    total: descriptors.len(),
-                    digest: Some(descriptor.blob_digest.clone()),
-                });
             }
             let id = retain_layer(layers, operation, diff_id, limits, || ingest(index)).await?;
             retained.push((diff_id, id));
@@ -1543,15 +1547,16 @@ pub(crate) mod tests {
                 ingested == [0] || ingested == [0, 1],
                 "unpack attempts follow manifest order"
             );
-            let mut applying = Vec::new();
+            let mut skipped = Vec::new();
             while let Ok(event) = events.try_recv() {
-                if let crate::image::ImageProgress::ApplyingLayer { index, .. } = event {
-                    applying.push(index);
+                if let crate::image::ImageProgress::LayerDownloadSkipped { index, .. } = event {
+                    skipped.push(index);
                 }
             }
-            assert!(
-                applying == [1] || applying == [1, 2],
-                "applying events are ordered and unique"
+            assert_eq!(
+                skipped,
+                [3],
+                "repeated occurrences are announced before I/O"
             );
         }
     }
@@ -1572,15 +1577,32 @@ pub(crate) mod tests {
             .map(|name| descriptor(name))
             .collect::<Vec<_>>();
         let mut ingested = Vec::new();
+        let (progress, mut events) = crate::image::ImageProgressSender::default_channel();
         let held = compose_layers(
             &layers,
             operation,
             oci::Platform::linux_amd64(),
             &descriptors,
             &limits,
-            None,
+            Some(&progress),
             (
                 |indices| {
+                    assert_eq!(
+                        events.try_recv().unwrap(),
+                        crate::image::ImageProgress::LayerDownloadSkipped {
+                            index: 1,
+                            total: 3,
+                            digest: descriptors[0].blob_digest.clone(),
+                        }
+                    );
+                    assert_eq!(
+                        events.try_recv().unwrap(),
+                        crate::image::ImageProgress::LayerDownloadSkipped {
+                            index: 3,
+                            total: 3,
+                            digest: descriptors[2].blob_digest.clone(),
+                        }
+                    );
                     assert_eq!(indices, vec![1]);
                     std::future::ready(Ok(()))
                 },
@@ -1595,5 +1617,11 @@ pub(crate) mod tests {
         assert_eq!(ingested, vec![1]);
         assert_eq!(held.retained().layers[0], retained.id);
         assert_eq!(held.retained().layers[0], held.retained().layers[2]);
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event,
+                crate::image::ImageProgress::ApplyingLayer { .. }
+            ));
+        }
     }
 }

@@ -431,7 +431,7 @@ fn image_progress_line(progress: w::ImageProgress) -> Option<String> {
     use w::image_progress::Event;
     match progress.event? {
         Event::ResolvedManifest(manifest) => {
-            Some(format!("resolved image: {} layers", manifest.layer_count))
+            Some(format!("resolved image: {} layers", manifest.layers.len()))
         }
         Event::CacheHit(_) => Some("using cached image".into()),
         Event::ApplyingLayer(layer) => {

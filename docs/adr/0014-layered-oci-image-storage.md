@@ -1164,6 +1164,31 @@ verifies their descriptors, and checks layer/`diff_id` counts. Supported Linux
 layer inputs are uncompressed tar, gzip tar and zstd tar. Unknown filesystem
 layer types and non-Linux container platforms fail with typed errors.
 
+TTY image progress uses manifest-ordered digest-labelled rows, with separate
+download, verification, extraction and final states. The CLI's reusable
+`progress_list` module owns width fitting and fixed line slots; `pull_progress`
+maps image events into those rows. A terminal reserves one header and one spare
+row. If the full list fits, every row stays visible. Otherwise the viewport
+only moves forward, placing the first non-final row after at most one completed
+context row. When active download/verification rows lie beyond that window, it
+splits into a short extraction-front segment and a download-front segment,
+separated by a summary of the hidden rows. Both segment starts only advance;
+they merge when all active rows fit contiguously again. Hidden-range summaries
+and blank tail slots preserve the height. Terminals under five rows show only
+the header. Bars require more than 110 usable columns and are dropped before
+byte counts. Counts appear only after manifest resolution, byte counts only
+for nonzero totals, and registry acquisition remains labelled `Pulling`.
+Non-TTY output stays silent, shared progress rendering keeps logs above the
+display, and drop clears all slots.
+
+Resolved-manifest progress carries every ordered compressed digest and size.
+Preflight announces retained and repeated occurrences as skipped before source
+I/O. A cached compressed blob can also be skipped, then extracted; only actual
+ingest emits `ApplyingLayer`, after its blob is ready. Ascending applying events
+finalize earlier rows, while materialization or completion finalizes all rows.
+Skipped occurrences with no ingest become `Already exists`; extracted ones
+become `Pull complete`.
+
 Each input blob is verified against its descriptor length and digest. The entire
 decoded stream is hashed, including tar padding/trailing bytes, before accepting
 its `diff_id`. Early tar end markers do not stop digest verification. Decoder

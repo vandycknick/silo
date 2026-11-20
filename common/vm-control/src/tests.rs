@@ -1,6 +1,7 @@
 use crate::errors::{native_error_to_status, status_to_native_error};
 use crate::snapshots::{snapshot_from_wire, snapshot_to_wire};
 use crate::*;
+use libvm::ObjectDigest;
 use silod_spec::daemon::v1 as w;
 use std::collections::BTreeMap;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -273,8 +274,20 @@ fn image_progress_preserves_layer_accounting_and_absence() {
         libvm::ImageProgress::ResolvedManifest {
             image_ref: "image".into(),
             manifest_digest: "sha256:abc".into(),
-            layer_count: 3,
-            total_download_bytes: None,
+            layers: vec![
+                libvm::ImageProgressLayer {
+                    digest: ObjectDigest::of_bytes(b"first"),
+                    size_bytes: 123,
+                },
+                libvm::ImageProgressLayer {
+                    digest: ObjectDigest::of_bytes(b"second"),
+                    size_bytes: 456,
+                },
+                libvm::ImageProgressLayer {
+                    digest: ObjectDigest::of_bytes(b"first"),
+                    size_bytes: 123,
+                },
+            ],
         },
         libvm::ImageProgress::LayerDownloadProgress {
             index: 2,
@@ -297,6 +310,21 @@ fn image_progress_preserves_layer_accounting_and_absence() {
         );
     }
     assert!(images::progress_from_wire(w::ImageProgress::default()).is_err());
+    for digest in ["", "sha256:abc", "sha256:🌳", "other:abc"] {
+        let event = w::ImageProgress {
+            event: Some(w::image_progress::Event::ResolvedManifest(
+                w::ManifestProgress {
+                    image_ref: "image".into(),
+                    manifest_digest: "manifest".into(),
+                    layers: vec![w::ManifestLayerProgress {
+                        digest: digest.into(),
+                        size_bytes: 0,
+                    }],
+                },
+            )),
+        };
+        assert!(images::progress_from_wire(event).is_err());
+    }
 }
 #[test]
 fn canonical_policy_retains_explicit_deny_and_secret_metadata() {

@@ -18,7 +18,8 @@ use crate::commands::create::{
 };
 use crate::environment::EnvironmentOverride;
 use crate::planning::{Plan, PlanKind, ProcessOverrides, RunOptions, TtyCapabilities, TtyMode};
-use crate::ui::{self, watch_image_progress, OutputFormat, Spinner};
+use crate::pull_progress::watch_image_progress;
+use crate::ui::{self, OutputFormat, Spinner};
 
 const FAILED_READINESS_EXIT_WAIT: Duration = Duration::from_secs(2);
 const SHUTDOWN_PROGRESS_DELAY: Duration = Duration::from_secs(5);

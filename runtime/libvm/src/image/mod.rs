@@ -15,10 +15,12 @@ use crate::image::import_types::{ImageInfo, ImageRef, ImageRemoval};
 use crate::runtime::Runtime;
 use crate::LibVmError;
 
+pub use crate::image::progress::{
+    ImageProgress, ImageProgressLayer, ImageProgressReceiver, ImageProgressSender,
+};
 pub use ::oci::ImageConfig as OciImageConfigMetadata;
 pub use ::oci::Platform;
 pub use ::oci::{RegistryAction, RegistryPolicy, RegistryRule};
-pub use progress::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
 
 /// Source used to create a machine root disk. Images only: a snapshot is
 /// restored with `Runtime::restore`, never created from.

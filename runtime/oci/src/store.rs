@@ -191,6 +191,14 @@ impl LayerDownloads<'_> {
         let root = self.producer.root.clone();
         let operation = operation.clone();
         let limits = self.limits;
+        emit_progress(
+            self.progress.as_ref(),
+            ProgressEvent::ApplyingLayer {
+                index: index + 1,
+                total: self.resolved.layers.len(),
+                digest: Some(input.blob_digest.to_string()),
+            },
+        );
         tokio::task::spawn_blocking(move || {
             crate::changeset::ingest_layer(&path, &input, &root, &operation, &limits)
         })
@@ -318,8 +326,16 @@ impl OciMaterializer {
                 ProgressEvent::ResolvedManifest {
                     image_ref: canonical_ref,
                     manifest_digest: resolved.manifest_digest.clone(),
-                    layer_count: resolved.layers.len(),
-                    total_download_bytes: total_download_bytes(&resolved.layers),
+                    layers: resolved
+                        .layers
+                        .iter()
+                        .map(|layer| {
+                            Ok(crate::ManifestLayer {
+                                digest: layer.digest.parse()?,
+                                size_bytes: layer.size_bytes,
+                            })
+                        })
+                        .collect::<Result<_, crate::changeset::ChangesetError>>()?,
                 },
             );
             return Ok(resolved);
@@ -533,12 +549,6 @@ fn emit_progress(progress: Option<&ProgressReporter>, event: ProgressEvent) {
     if let Some(progress) = progress {
         progress.report(event);
     }
-}
-
-fn total_download_bytes(layers: &[ResolvedLayer]) -> Option<u64> {
-    layers
-        .iter()
-        .try_fold(0_u64, |total, layer| total.checked_add(layer.size_bytes))
 }
 
 async fn write_layer_stream(request: LayerStreamWrite<'_>) -> OciResult<()> {
@@ -1368,6 +1378,22 @@ mod tests {
             "omitted retained blob and repeat are not fetched"
         );
         let events = events.lock().unwrap();
+        let applying: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProgressEvent::ApplyingLayer { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applying, [1, 2, 3, 4, 5]);
+        for index in applying {
+            let finished = events.iter().position(|event| matches!(event, ProgressEvent::LayerDownloadFinished { index: other, .. } if *other == index)).unwrap();
+            let applying = events.iter().position(|event| matches!(event, ProgressEvent::ApplyingLayer { index: other, .. } if *other == index)).unwrap();
+            assert!(
+                finished < applying,
+                "ingest starts only after its blob is ready"
+            );
+        }
         assert_eq!(
             events
                 .iter()

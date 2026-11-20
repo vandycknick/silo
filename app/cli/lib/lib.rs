@@ -11,6 +11,8 @@ mod lobby;
 pub mod machine_defaults;
 mod network_policy;
 pub mod planning;
+mod progress_list;
+mod pull_progress;
 pub mod template;
 pub mod terminal;
 pub mod ui;

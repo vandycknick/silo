@@ -362,7 +362,8 @@ message LinuxDirectBoot { LinuxPlatform userspace_platform = 1; GuestArchitectur
 message MachineBoot { LinuxDirectBoot linux_direct = 1; optional string packaged_replacement = 2; }
 message UpdateBootAssetsRequest { MachineRef machine = 1; BootAssetSelection selection = 2; }
 message ImageReferenceProgress { string image_ref = 1; }
-message ManifestProgress { string image_ref = 1; string manifest_digest = 2; uint64 layer_count = 3; optional uint64 total_download_bytes = 4; }
+message ManifestLayerProgress { string digest = 1; uint64 size_bytes = 2; }
+message ManifestProgress { string image_ref = 1; string manifest_digest = 2; reserved 3, 4; repeated ManifestLayerProgress layers = 5; }
 message LayerProgress { uint64 index = 1; uint64 total = 2; string digest = 3; optional uint64 size_bytes = 4; uint64 downloaded_bytes = 5; }
 message ApplyingLayerProgress { uint64 index = 1; uint64 total = 2; optional string digest = 3; }
 message ImageProgress { oneof event { ImageReferenceProgress resolving_manifest = 1; ManifestProgress resolved_manifest = 2; ImageReferenceProgress checking_cache = 3; ImageReferenceProgress cache_hit = 4; ImageReferenceProgress cache_miss = 5; ImageReferenceProgress using_local_disk = 6; LayerProgress layer_download_started = 7; LayerProgress layer_download_progress = 8; LayerProgress layer_download_verifying = 9; LayerProgress layer_download_finished = 10; LayerProgress layer_download_skipped = 11; ApplyingLayerProgress applying_layer = 12; google.protobuf.Empty materializing_rootfs = 13; google.protobuf.Empty publishing_rootfs = 14; google.protobuf.Empty complete = 15; } }
