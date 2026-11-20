@@ -306,7 +306,7 @@ fn recheck(file: &File, expected: SourceFingerprint) -> Result<(), StorageError>
 }
 
 fn invalid(error: impl std::fmt::Display) -> StorageError {
-    StorageError::InvalidPath(format!("EROFS composition: {error}"))
+    StorageError::CompositionIntegrity(error.to_string())
 }
 
 /// Positioned reads preserve every caller's file offset, including repeated
@@ -463,7 +463,10 @@ mod tests {
         let composed = compose(&recipe, &layers, &mut fsmeta).unwrap();
         let mut wrong_lower = composed.result.clone();
         wrong_lower.lower_stream = StreamIdentity::from_sha256([7; 32]);
-        assert!(load_exact(&recipe, &layers, &wrong_lower, &fsmeta).is_err());
+        assert!(matches!(
+            load_exact(&recipe, &layers, &wrong_lower, &fsmeta),
+            Err(crate::storage::StorageError::CompositionIntegrity(_))
+        ));
         let mut wrong_pack = result;
         wrong_pack.pack_stream = StreamIdentity::from_sha256([9; 32]);
         let layers = [Layer {
@@ -473,7 +476,10 @@ mod tests {
         }];
         let recipe = CompositionRecipe::from_layers(oci::Platform::linux_amd64(), &layers).unwrap();
         fsmeta.write_all_at(b"preserve", 0).unwrap();
-        assert!(compose(&recipe, &layers, &mut fsmeta).is_err());
+        assert!(matches!(
+            compose(&recipe, &layers, &mut fsmeta),
+            Err(crate::storage::StorageError::CompositionIntegrity(_))
+        ));
         let mut unchanged = [0; 8];
         fsmeta.read_exact_at(&mut unchanged, 0).unwrap();
         assert_eq!(&unchanged, b"preserve");

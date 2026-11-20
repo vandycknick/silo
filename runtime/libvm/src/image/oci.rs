@@ -68,6 +68,19 @@ pub(crate) fn storage_error(error: crate::storage::StorageError) -> LibVmError {
     LibVmError::Storage(error)
 }
 
+pub(crate) fn stored_image_error(reference: &str, error: LibVmError) -> LibVmError {
+    match error {
+        LibVmError::Storage(
+            source @ (crate::storage::StorageError::CompositionIntegrity(_)
+            | crate::storage::StorageError::ContentMismatch(_)),
+        ) => LibVmError::StoredImageDamaged {
+            reference: reference.into(),
+            detail: source.to_string(),
+        },
+        error => error,
+    }
+}
+
 fn invalid(message: impl std::fmt::Display) -> LibVmError {
     LibVmError::StateDecode {
         field: "image.composition",
@@ -243,7 +256,8 @@ pub(crate) async fn acquire_composition(
         // Exact retained bytes are authoritative; no source or encoder is used.
         let held = layers
             .hold_composition_records(image.artifact.lower)
-            .await?;
+            .await
+            .map_err(|error| stored_image_error(&resolved.requested_reference, error))?;
         check_image_lower(&image, held.retained())?;
         let now = crate::utils::now_unix();
         image.reference.requested_reference = resolved.requested_reference.clone();
@@ -329,7 +343,8 @@ pub(crate) async fn acquire_composition(
             },
         ),
     )
-    .await?;
+    .await
+    .map_err(|error| stored_image_error(reference, error))?;
     let record = oci_image_record(&metadata, held.retained(), reference)?;
     ensure_resolved_oci_identity(resolved, &record)?;
     store.save_oci_image(&record).await?;
@@ -1032,6 +1047,102 @@ pub(crate) mod tests {
         oci::OciMaterializer::open(store.images_path(), oci::RegistryPolicy::default()).unwrap()
     }
 
+    fn tamper(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[0] ^= 0xff;
+        let replacement = path.with_extension("damaged");
+        std::fs::write(&replacement, bytes).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::rename(replacement, path).unwrap();
+    }
+
+    fn assert_stored_image_damaged(error: &LibVmError, reference: &str) {
+        let LibVmError::StoredImageDamaged {
+            reference: actual,
+            detail,
+        } = error
+        else {
+            panic!("expected image damage, got {error:?}");
+        };
+        assert_eq!(actual, reference);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "stored data for image {reference} is damaged or was changed on disk; remove the image if it is still listed (`silo image rm {reference}`), run `silo image prune`, then pull it again ({detail})"
+            )
+        );
+        assert!(!error.to_string().contains("owned storage path"));
+    }
+
+    #[tokio::test]
+    async fn cached_acquisition_names_the_requested_image_when_its_pack_was_changed() {
+        let (_temp, store) = home().await;
+        let (record, acquired) = cache_layered_image(&store, "example.test/app:1", MANIFEST).await;
+        let lower = acquired.held.retained().clone();
+        drop(acquired);
+        let pool = StoragePool::open(store.images_path()).unwrap();
+        let pack = crate::storage::identity::StreamId::from_sha256(
+            *lower.result.packs[0].stream.as_bytes(),
+        );
+        tamper(&pool.stream_path(&pack));
+        let requested = "example.test/app:latest";
+        let resolved = cached_resolved_oci_image(&record, requested.into());
+        let error = acquire_composition(&store, &producer(&store), None, &resolved)
+            .await
+            .err()
+            .expect("a damaged pack must refuse acquisition");
+        assert_stored_image_damaged(&error, requested);
+    }
+
+    #[tokio::test]
+    async fn pull_composition_reports_a_damaged_layer_retained_after_image_removal() {
+        let (_temp, store) = home().await;
+        let reference = "example.test/app:1";
+        let (_, acquired) = cache_layered_image(&store, reference, MANIFEST).await;
+        let lower = acquired.held.retained().clone();
+        drop(acquired);
+        let image = crate::store::image_store::named_image(
+            &mut store.pool.acquire().await.unwrap(),
+            reference,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        store.remove_image(image, Some(reference)).await.unwrap();
+        let pool = StoragePool::open(store.images_path()).unwrap();
+        let pack = crate::storage::identity::StreamId::from_sha256(
+            *lower.result.packs[0].stream.as_bytes(),
+        );
+        tamper(&pool.stream_path(&pack));
+        let metadata = metadata(reference, MANIFEST);
+        let operation = uuid::Uuid::new_v4();
+        let _lease = store.begin_storage_operation(operation).await.unwrap();
+        let error = compose_layers(
+            &LayerStore::from_store(store.clone()),
+            operation,
+            metadata.platform,
+            &metadata.layers,
+            &ChangesetLimits::default(),
+            None,
+            (
+                |_| std::future::ready(Ok(())),
+                |index| std::future::ready(ingest(&store, LAYERS[index])),
+            ),
+        )
+        .await
+        .map_err(|error| crate::image::oci::stored_image_error(reference, error))
+        .err()
+        .expect("a retained damaged layer must refuse pull composition");
+        assert_stored_image_damaged(&error, reference);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM layer_result").await, 2);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM image_composition_artifact").await,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn shared_layers_retain_metadata_and_distinct_nonempty_packs() {
         let (_temp, store) = home().await;
@@ -1234,6 +1345,11 @@ pub(crate) mod tests {
             } else {
                 bytes[0] ^= 0xff;
                 std::fs::write(&path, &bytes).unwrap();
+                std::fs::set_permissions(
+                    &path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o400),
+                )
+                .unwrap();
             }
             let resolved = cached_resolved_oci_image(&record, reference.into());
             let error = acquire_composition(&store, &producer(&store), None, &resolved)
@@ -1248,6 +1364,8 @@ pub(crate) mod tests {
                     ),
                     "{error:?}"
                 );
+            } else {
+                assert_stored_image_damaged(&error, reference);
             }
             assert_eq!(
                 count(&store, "SELECT COUNT(*) FROM composition_result").await,

@@ -81,6 +81,14 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = missing.clone();
             tonic::Code::FailedPrecondition
         }
+        E::StoredImageDamaged { reference, detail } => {
+            d.kind = 4;
+            d.code = 20;
+            d.reference = Some(reference.clone());
+            d.safe_message = v.to_string();
+            d.stored_image_damage_detail = Some(detail.clone());
+            tonic::Code::FailedPrecondition
+        }
         E::RawExportRecoveryRequired { reason } => {
             d.kind = 4;
             d.code = 18;
@@ -497,6 +505,7 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
         || (d.code != 13 && d.disk_import.is_some())
         || (d.code != 14 && d.boot_bundle_abi.is_some())
         || (d.code != 15 && d.snapshot_portability.is_some())
+        || (d.code != 20 && d.stored_image_damage_detail.is_some())
     {
         return Err(invalid(
             "error.detail",
@@ -545,6 +554,20 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
             )?;
             E::RawExportUnsupported {
                 reason: d.safe_message,
+            }
+        }
+        20 => {
+            category(
+                tonic::Code::FailedPrecondition,
+                4,
+                "error.stored_image_damaged",
+            )?;
+            E::StoredImageDamaged {
+                reference: required(d.reference, "error.reference")?,
+                detail: required(
+                    d.stored_image_damage_detail,
+                    "error.stored_image_damage_detail",
+                )?,
             }
         }
         9 => {
@@ -1027,6 +1050,52 @@ mod tests {
     use prost::Message;
     use silod_spec::daemon::v1 as w;
     use vm_spec::live::*;
+
+    #[test]
+    fn stored_image_damage_preserves_reference_remedy_and_detail() {
+        let error = libvm::LibVmError::StoredImageDamaged {
+            reference: "python:3.12".into(),
+            detail: "composition pack stream identity mismatch".into(),
+        };
+        let status_value = native_error_to_status(&error);
+        assert_eq!(status_value.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status_value.message(), error.to_string());
+        let decoded = status_to_native_error(&status_value).unwrap();
+        assert_eq!(decoded.variant(), "StoredImageDamaged");
+        assert_eq!(decoded.to_string(), error.to_string());
+        assert!(matches!(
+            decoded,
+            libvm::LibVmError::StoredImageDamaged { reference, detail }
+                if reference == "python:3.12"
+                    && detail == "composition pack stream identity mismatch"
+        ));
+        let envelope = RpcStatus::decode(status_value.details()).unwrap();
+        let detail = w::ErrorDetail::decode(envelope.details[0].value.as_slice()).unwrap();
+        assert!(status_to_native_error(&status(detail.clone(), tonic::Code::Internal)).is_err());
+        let mut wrong_kind = detail.clone();
+        wrong_kind.kind = 8;
+        assert!(
+            status_to_native_error(&status(wrong_kind, tonic::Code::FailedPrecondition)).is_err()
+        );
+        let mut missing_detail = detail.clone();
+        missing_detail.stored_image_damage_detail = None;
+        assert!(
+            status_to_native_error(&status(missing_detail, tonic::Code::FailedPrecondition))
+                .is_err()
+        );
+        let mut missing_reference = detail.clone();
+        missing_reference.reference = None;
+        assert!(status_to_native_error(&status(
+            missing_reference,
+            tonic::Code::FailedPrecondition
+        ))
+        .is_err());
+        let mut wrong_code = detail;
+        wrong_code.code = 19;
+        assert!(
+            status_to_native_error(&status(wrong_code, tonic::Code::FailedPrecondition)).is_err()
+        );
+    }
 
     #[test]
     fn kernel_argument_rejections_preserve_the_typed_safe_reason() {

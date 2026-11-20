@@ -426,6 +426,13 @@ the same authenticated changesets, exact EROFS composition and held payload
 packs as layered creation. The old tar applier and flat OCI cache are retired;
 one namespace semantics remains.
 
+When stored image composition or immutable-content checks detect changed bytes,
+the image operation names the requested image and reports the technical detail
+after the recovery guidance. Recovery is explicit: remove the image with
+`silo image rm REF` if it is still listed, run `silo image prune`, then pull it
+again. Removal followed by pull alone can reuse a damaged layer retained until
+pruning; Silo never repairs or replaces it automatically.
+
 The Silo daemon (`silo daemon run`) uses this conversion for its system
 appliance on a VZ backend, because the appliance image is an OCI reference. On
 libkrun the appliance uses the layered root. User-invoked conversion

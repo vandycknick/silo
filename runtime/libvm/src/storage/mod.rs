@@ -47,6 +47,8 @@ pub enum StorageError {
     PublicationBusy { resource: String },
     #[error("invalid owned storage path: {0}")]
     InvalidPath(String),
+    #[error("EROFS composition integrity failure: {0}")]
+    CompositionIntegrity(String),
     #[error("immutable content at {0} does not match its identity")]
     ContentMismatch(std::path::PathBuf),
     #[error("source is not a regular file: {0}")]

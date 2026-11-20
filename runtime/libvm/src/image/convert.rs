@@ -184,7 +184,10 @@ async fn convert_owned(
         .into_decoded(&crate::store::layer_store::LayerStore::from_store(
             context.store.as_ref().clone(),
         ))
-        .await?;
+        .await
+        .map_err(|error| {
+            crate::image::oci::stored_image_error(&resolved.requested_reference, error)
+        })?;
     let (pool, published, roots) = tokio::task::spawn_blocking(move || {
         let layers = held.layers();
         let retained = held.retained();

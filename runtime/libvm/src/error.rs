@@ -125,6 +125,8 @@ pub enum LibVmError {
         lower: crate::storage::identity::LowerResultId,
         missing: String,
     },
+    #[error("stored data for image {reference} is damaged or was changed on disk; remove the image if it is still listed (`silo image rm {reference}`), run `silo image prune`, then pull it again ({detail})")]
+    StoredImageDamaged { reference: String, detail: String },
     /// Raw export refuses a source whose on-disk filesystem state needs
     /// recovery; Silo never replays a journal or repairs the source.
     #[error("raw disk export requires a cleanly stopped source: {reason}")]
@@ -409,6 +411,7 @@ impl LibVmError {
                 | Self::CorruptState { .. }
                 | Self::StateDecode { .. }
                 | Self::InvalidStorageRecord { .. }
+                | Self::StoredImageDamaged { .. }
                 | Self::Storage(crate::storage::StorageError::Bound(_))
                 | Self::NetworkRuntime { .. }
                 | Self::MonitorConnection { .. }
@@ -465,6 +468,7 @@ impl LibVmError {
             Self::DiskImport(_) => "DiskImport",
             Self::IncompatibleRootProfile { .. } => "IncompatibleRootProfile",
             Self::CompositionAcquisitionRequired { .. } => "CompositionAcquisitionRequired",
+            Self::StoredImageDamaged { .. } => "StoredImageDamaged",
             Self::RawExportRecoveryRequired { .. } => "RawExportRecoveryRequired",
             Self::RawExportUnsupported { .. } => "RawExportUnsupported",
             Self::ArtifactInvalid { .. } => "ArtifactInvalid",

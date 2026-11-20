@@ -11,6 +11,9 @@
 - Changed: `silo create` and `silo run` no longer re-read every layer's file
   list for an image that is already stored and unchanged, which makes them
   faster for images with many files.
+- Fixed: when an image's stored data is damaged or was changed on disk, Silo
+  now names the image and says how to recover (`silo image rm`, `silo image
+  prune`, pull again) instead of reporting an invalid storage path.
 - Changed: start-up clean-up does less work per command on homes with many
   stored objects.
 - Fixed: OCI images with absolute archive paths, including Nix dockerTools

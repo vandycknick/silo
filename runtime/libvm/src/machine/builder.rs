@@ -819,9 +819,14 @@ async fn create_machine_config_with_name(
             let layers = crate::store::layer_store::LayerStore::from_store(runtime.native_store()?);
             let id = layers
                 .publish_local_composition(consumer.operation_id(), lower)
-                .await?;
+                .await
+                .map_err(|error| {
+                    crate::image::oci::stored_image_error(&requested_reference, error)
+                })?;
             CreateRoot::Image {
-                held: layers.hold_composition_records(id).await?,
+                held: layers.hold_composition_records(id).await.map_err(|error| {
+                    crate::image::oci::stored_image_error(&requested_reference, error)
+                })?,
                 upper: authenticated,
                 upper_uuid: *upper_uuid,
                 ext4_profile: *ext4_profile,
