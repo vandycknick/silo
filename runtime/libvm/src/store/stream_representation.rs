@@ -1,11 +1,12 @@
 //! Retained encoded transport payloads and shared flat materializations.
 //! Payload geometry is independent of the authenticated stream identity profile.
 //! Operation stream pins protect representations, map roots and flat inodes.
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use oci::vm_artifact::wire::{ChunkEntry, TransferRoot};
 use sqlx::Row;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::storage::identity::{ObjectDigest, StreamId};
@@ -823,6 +824,16 @@ fn authenticate_object_binding(
         ));
     }
     Ok(authenticated.fingerprint())
+}
+
+pub(crate) async fn retained_objects(store: &Store) -> Result<HashSet<ObjectDigest>, LibVmError> {
+    let mut retained = HashSet::new();
+    let mut rows = sqlx::query_scalar::<_, String>("SELECT object_digest FROM retained_object")
+        .fetch(&store.pool);
+    while let Some(value) = rows.next().await {
+        retained.insert(value?.parse().map_err(invalid)?);
+    }
+    Ok(retained)
 }
 
 pub(crate) async fn unreachable_objects(

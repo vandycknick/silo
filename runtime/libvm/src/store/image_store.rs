@@ -647,7 +647,9 @@ impl Store {
             if recovery.checkpoint_deferred() {
                 return Ok::<_, LibVmError>(recovery);
             }
-            let (_, recovery) = self.prune_image_cache(maintenance).await?;
+            let (_, recovery) = self
+                .prune_image_cache_with_recovery(maintenance, Some(recovery))
+                .await?;
             Ok(recovery)
         }
         .await;
@@ -664,13 +666,22 @@ impl Store {
         &self,
         maintenance: CacheMaintenance,
     ) -> Result<(ImagePruneReport, CacheRecoveryReport), LibVmError> {
+        self.prune_image_cache_with_recovery(maintenance, None)
+            .await
+    }
+
+    async fn prune_image_cache_with_recovery(
+        &self,
+        maintenance: CacheMaintenance,
+        recovery: Option<CacheRecoveryReport>,
+    ) -> Result<(ImagePruneReport, CacheRecoveryReport), LibVmError> {
         let store = self.clone();
         let runtime = tokio::runtime::Handle::current();
         // The worker owns both catalog access and every deletion/root guard.
         // Cancellation of an awaiting caller cannot strand filesystem cleanup
         // on an executor or outlive its writable catalog capability.
         tokio::task::spawn_blocking(move || {
-            runtime.block_on(store.prune_image_cache_inner(maintenance))
+            runtime.block_on(store.prune_image_cache_inner(maintenance, recovery))
         })
         .await?
     }
@@ -734,9 +745,15 @@ impl Store {
     async fn prune_image_cache_inner(
         &self,
         maintenance: CacheMaintenance,
+        recovery: Option<CacheRecoveryReport>,
     ) -> Result<(ImagePruneReport, CacheRecoveryReport), LibVmError> {
         let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
-        let mut recovery = self.retire_abandoned_storage_operations(&pool).await?;
+        // Startup already retired abandoned operations during object recovery.
+        // Standalone prune callers still need their own operations pass.
+        let mut recovery = match recovery {
+            Some(recovery) => recovery,
+            None => self.retire_abandoned_storage_operations(&pool).await?,
+        };
         let mut report = ImagePruneReport {
             images_removed: 0,
             bytes_removed: 0,
@@ -2143,6 +2160,47 @@ pub(crate) mod tests {
             let _reopened = Store::open(&db.home.join("state.db")).await.unwrap();
             assert!(!path.exists(), "{kind} collection did not resume");
         }
+    }
+
+    #[tokio::test]
+    async fn startup_prune_reuses_operations_pass_and_preserves_deferrals() {
+        use crate::store::image_store::CacheMaintenance;
+        use crate::store::models::CacheCleanupDeferral;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Store::new(&LocalPaths::new(temp.path().join("home")))
+            .await
+            .unwrap();
+        let (operation, lease) = db
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let recovery = db.recover_orphan_objects().await.unwrap();
+        assert_eq!(
+            recovery.deferred,
+            [CacheCleanupDeferral::ActiveLease {
+                operation_id: operation
+            }]
+        );
+        drop(lease);
+        let (_, reused) = db
+            .prune_image_cache_with_recovery(CacheMaintenance::Recovery, Some(recovery.clone()))
+            .await
+            .unwrap();
+        assert_eq!(reused, recovery);
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM storage_operation").await,
+            1
+        );
+        let (_, recovery) = db
+            .prune_image_cache(CacheMaintenance::Recovery)
+            .await
+            .unwrap();
+        assert!(recovery.deferred.is_empty());
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM storage_operation").await,
+            0
+        );
     }
 
     #[tokio::test]

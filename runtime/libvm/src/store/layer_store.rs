@@ -919,59 +919,24 @@ impl Store {
             runtime.block_on(crate::store::stream_representation::retire_unrooted(
                 &store, &pool,
             ))?;
+            let retained = runtime.block_on(
+                crate::store::stream_representation::retained_objects(&store),
+            )?;
             let mut scan = pool.scan_objects()?;
             loop {
-                let batch = scan.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
+                let mut batch = scan.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
                 if batch.is_empty() {
                     break;
                 }
-                let _roots = pool.lock_roots()?;
-                let deferred = runtime.block_on(async {
-                    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                    let orphaned =
-                        crate::store::stream_representation::unreachable_objects(&mut tx, &batch)
-                            .await?;
-                    // A fully retained batch has no unlink to authorize. In
-                    // particular it needs neither a WAL checkpoint nor a
-                    // second writer transaction on every runtime open.
-                    if orphaned.is_empty() {
-                        tx.commit().await?;
-                        return Ok::<_, LibVmError>(None);
-                    }
-                    let candidates = orphaned
-                        .iter()
-                        .map(|digest| pool.object_path(digest))
-                        .collect::<Vec<_>>();
-                    crate::store::ensure_cache_paths_unreferenced(
-                        &mut tx,
-                        &candidates,
-                        &store.home,
-                    )
-                    .await?;
-                    tx.commit().await?;
-                    // Stabilize the observed root removals before unlink, then
-                    // recheck after reacquiring the SQLite writer fence.
-                    if let Some(deferred) = store.try_checkpoint_catalog().await?.deferral() {
-                        return Ok(Some(deferred));
-                    }
-                    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                    crate::store::ensure_cache_paths_unreferenced(
-                        &mut tx,
-                        &candidates,
-                        &store.home,
-                    )
-                    .await?;
-                    #[cfg(test)]
-                    _context.hit(WorkerPoint::RecoveryDelete)?;
-                    for digest in
-                        crate::store::stream_representation::unreachable_objects(&mut tx, &orphaned)
-                            .await?
-                    {
-                        pool.remove_object(&digest)?;
-                    }
-                    tx.commit().await?;
-                    Ok::<_, LibVmError>(None)
-                })?;
+                // A stale set can miss newly unreferenced objects until the next
+                // scan, or shortlist newly referenced objects. Live rechecks under
+                // roots and the writer fence, not this set, authorize every unlink.
+                batch.retain(|digest| !retained.contains(digest));
+                if batch.is_empty() {
+                    continue;
+                }
+                let deferred =
+                    runtime.block_on(store.remove_orphan_objects(&pool, &batch, &_context))?;
                 if let Some(deferred) = deferred {
                     recovery.deferred.push(deferred);
                     return Ok(recovery);
@@ -980,6 +945,45 @@ impl Store {
             Ok::<_, LibVmError>(recovery)
         })
         .await?
+    }
+
+    async fn remove_orphan_objects(
+        &self,
+        pool: &StoragePool,
+        shortlist: &[ObjectDigest],
+        _context: &WorkerContext,
+    ) -> Result<Option<crate::store::models::CacheCleanupDeferral>, LibVmError> {
+        let _roots = pool.lock_roots()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let orphaned =
+            crate::store::stream_representation::unreachable_objects(&mut tx, shortlist).await?;
+        if orphaned.is_empty() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let candidates = orphaned
+            .iter()
+            .map(|digest| pool.object_path(digest))
+            .collect::<Vec<_>>();
+        // This checks external paths, not retained object reachability.
+        crate::store::ensure_cache_paths_unreferenced(&mut tx, &candidates, &self.home).await?;
+        tx.commit().await?;
+        // Stabilize the observed root removals before unlink, then recheck
+        // after reacquiring the SQLite writer fence while still holding roots.
+        if let Some(deferred) = self.try_checkpoint_catalog().await?.deferral() {
+            return Ok(Some(deferred));
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        crate::store::ensure_cache_paths_unreferenced(&mut tx, &candidates, &self.home).await?;
+        #[cfg(test)]
+        _context.hit(WorkerPoint::RecoveryDelete)?;
+        for digest in
+            crate::store::stream_representation::unreachable_objects(&mut tx, &orphaned).await?
+        {
+            pool.remove_object(&digest)?;
+        }
+        tx.commit().await?;
+        Ok(None)
     }
 }
 
@@ -1203,6 +1207,83 @@ pub(crate) mod tests {
                 .unwrap()
                 .pack_length,
             4096
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_scan_preserves_base_representation_and_map_objects_across_batches() {
+        use crate::storage::identity::ObjectDigest;
+        use crate::store::stream_representation::tests::retained_paginated;
+
+        let (temp, store, _record, _info, owner, _root) = retained_paginated(&[3; 512], 1).await;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        drop(owner);
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        let mut retained = Vec::new();
+        for sql in [
+            "SELECT object_digest FROM retained_base_object EXCEPT SELECT object_digest FROM stream_representation_object EXCEPT SELECT object_digest FROM retained_map_object LIMIT 1",
+            "SELECT object_digest FROM stream_representation_object EXCEPT SELECT object_digest FROM retained_base_object EXCEPT SELECT object_digest FROM retained_map_object LIMIT 1",
+            "SELECT object_digest FROM retained_map_object EXCEPT SELECT object_digest FROM retained_base_object EXCEPT SELECT object_digest FROM stream_representation_object LIMIT 1",
+        ] {
+            let digest = sqlx::query_scalar::<_, String>(sql)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+                .parse::<ObjectDigest>()
+                .unwrap();
+            retained.push(pool.object_path(&digest));
+        }
+        let before = pool.scan_objects().unwrap().count();
+        let source = temp.path().join("orphan");
+        let mut orphaned = Vec::new();
+        for value in 0_u64..257 {
+            fs::write(&source, value.to_le_bytes()).unwrap();
+            orphaned.push(pool.publish_object(&source).unwrap().path);
+        }
+        let recovery = store.recover_orphan_objects().await.unwrap();
+        assert!(!recovery.checkpoint_deferred());
+        assert!(orphaned.iter().all(|path| !path.exists()));
+        assert!(retained.iter().all(|path| path.exists()));
+        assert_eq!(pool.scan_objects().unwrap().count(), before);
+    }
+
+    #[tokio::test]
+    async fn orphan_shortlist_rechecks_references_added_after_retained_snapshot() {
+        use crate::store::stream_representation::retained_objects;
+
+        let temp = tempfile::tempdir().unwrap();
+        let layers = LayerStore::open(temp.path()).await.unwrap();
+        let store = &layers.store;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let (operation, _lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let source = temp.path().join("object");
+        fs::write(&source, b"referenced after shortlisting").unwrap();
+        let published = pool.publish_object(&source).unwrap();
+        let retained = retained_objects(store).await.unwrap();
+        let mut shortlist = vec![published.digest];
+        shortlist.retain(|digest| !retained.contains(digest));
+        assert_eq!(shortlist, [published.digest]);
+        let roots = pool.lock_roots_shared().unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[], &[published.digest])
+            .await
+            .unwrap();
+        drop(roots);
+        let context = store.layer_worker_context();
+        assert!(store
+            .remove_orphan_objects(&pool, &shortlist, &context)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            fs::read(&published.path).unwrap(),
+            b"referenced after shortlisting"
         );
     }
     #[tokio::test]
