@@ -181,12 +181,9 @@ struct EchoGuard;
 pub struct PullProgressDisplay {
     mp: MultiProgress,
     header: ProgressBar,
-    layer_bars: Vec<ProgressBar>,
-    reference: String,
-    download_style: ProgressStyle,
-    materialize_style: ProgressStyle,
-    done_style: ProgressStyle,
-    current_applying_layer: Option<usize>,
+    active_lines: Vec<ProgressBar>,
+    state: PullProgressState,
+    interactive: bool,
     _echo_guard: Option<EchoGuard>,
 }
 
@@ -375,6 +372,326 @@ impl Drop for EchoGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PullLayerActivity {
+    #[default]
+    Waiting,
+    Downloading,
+    Verifying,
+    Unpacking,
+    Done,
+}
+
+#[derive(Debug, Default)]
+struct PullLayerState {
+    digest: Option<String>,
+    activity: PullLayerActivity,
+    downloaded: u64,
+    size: Option<u64>,
+}
+
+impl PullLayerState {
+    fn label(&self, index: usize, total: usize) -> String {
+        if let Some(hex) = self
+            .digest
+            .as_deref()
+            .and_then(|digest| digest.strip_prefix("sha256:"))
+        {
+            if hex.len() >= 12 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return hex[..12].to_string();
+            }
+        }
+        format!("layer {index}/{total}")
+    }
+
+    fn line(&self, index: usize, total: usize, width: usize) -> String {
+        let label = self.label(index, total);
+        let status = match self.activity {
+            PullLayerActivity::Downloading => "downloading",
+            PullLayerActivity::Verifying => "verifying",
+            PullLayerActivity::Unpacking => "unpacking",
+            PullLayerActivity::Waiting | PullLayerActivity::Done => return String::new(),
+        };
+        let message = if self.activity == PullLayerActivity::Unpacking {
+            format!("{}", style(status).blue())
+        } else {
+            let bytes = match self.size {
+                Some(size) => format!(
+                    "{}/{}",
+                    indicatif::HumanBytes(self.downloaded),
+                    indicatif::HumanBytes(size)
+                ),
+                None => format!("{} downloaded", indicatif::HumanBytes(self.downloaded)),
+            };
+            format!("{bytes}  {}", style(status).magenta())
+        };
+        let base = format!("     {label}  {message}");
+        let bar_width = width.saturating_sub(measure_text_width(&base) + 2).min(36);
+        let line = if self.activity != PullLayerActivity::Unpacking && bar_width >= 4 {
+            let filled = self.size.filter(|size| *size > 0).map_or(0, |size| {
+                ((u128::from(self.downloaded.min(size)) * bar_width as u128) / u128::from(size))
+                    as usize
+            });
+            format!(
+                "     {label}  {}{}  {message}",
+                style("━".repeat(filled)).magenta(),
+                style("╌".repeat(bar_width - filled)).color256(238),
+            )
+        } else {
+            base
+        };
+        console::truncate_str(&line, width, "").into_owned()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PullPhase {
+    Resolving,
+    Pulling,
+    Checking,
+    Cached,
+    Building,
+    Using,
+    Writing,
+    Saving,
+    Pulled,
+}
+
+impl PullPhase {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Resolving => "Resolving",
+            Self::Pulling => "Pulling",
+            Self::Checking => "Checking",
+            Self::Cached => "Cached",
+            Self::Building => "Building",
+            Self::Using => "Using",
+            Self::Writing => "Writing",
+            Self::Saving => "Saving",
+            Self::Pulled => "Pulled",
+        }
+    }
+}
+
+struct PullProgressState {
+    reference: String,
+    phase: PullPhase,
+    layers: Vec<PullLayerState>,
+    total_download_bytes: Option<u64>,
+    done: usize,
+}
+
+impl PullProgressState {
+    fn new(reference: &str) -> Self {
+        Self {
+            reference: reference.to_string(),
+            phase: PullPhase::Pulling,
+            layers: Vec::new(),
+            total_download_bytes: None,
+            done: 0,
+        }
+    }
+
+    fn layer_mut(&mut self, index: usize, total: usize) -> Option<&mut PullLayerState> {
+        if total != self.layers.len() {
+            return None;
+        }
+        index
+            .checked_sub(1)
+            .and_then(|index| self.layers.get_mut(index))
+    }
+
+    // A layer is done only once its unpack has ended. Ascending ApplyingLayer
+    // events prove all lower indexes are done, including silent cached or repeated
+    // layers. MaterializingRootfs (or Complete) proves every layer is done.
+    // DownloadFinished and Skipped alone still leave unpacking work to do.
+    fn finish_before(&mut self, end: usize) {
+        self.done = self.done.max(end.min(self.layers.len()));
+        for layer in self.layers.iter_mut().take(self.done) {
+            layer.activity = PullLayerActivity::Done;
+        }
+    }
+
+    fn handle_event(&mut self, event: ImageProgress) {
+        match event {
+            ImageProgress::ResolvingManifest { image_ref } => {
+                self.reference = image_ref;
+                self.phase = PullPhase::Resolving;
+            }
+            ImageProgress::ResolvedManifest {
+                image_ref,
+                layer_count,
+                total_download_bytes,
+                ..
+            } => {
+                self.reference = image_ref;
+                self.phase = PullPhase::Pulling;
+                self.layers = (0..layer_count)
+                    .map(|_| PullLayerState::default())
+                    .collect();
+                self.total_download_bytes = total_download_bytes;
+                self.done = 0;
+            }
+            ImageProgress::CheckingCache { image_ref } => {
+                self.reference = image_ref;
+                self.phase = PullPhase::Checking;
+            }
+            ImageProgress::CacheHit { image_ref } => {
+                self.reference = image_ref;
+                self.phase = PullPhase::Cached;
+            }
+            ImageProgress::CacheMiss { image_ref } => {
+                self.reference = image_ref;
+                self.phase = PullPhase::Building;
+            }
+            ImageProgress::UsingLocalDisk { image_ref } => {
+                self.reference = image_ref;
+                self.phase = PullPhase::Using;
+            }
+            ImageProgress::LayerDownloadStarted {
+                index,
+                total,
+                digest,
+                size_bytes,
+            } => {
+                if let Some(layer) = self.layer_mut(index, total) {
+                    if layer.activity != PullLayerActivity::Done {
+                        layer.digest = Some(digest);
+                        layer.activity = PullLayerActivity::Downloading;
+                        layer.size = size_bytes.or(layer.size);
+                        layer.downloaded = layer.downloaded.min(layer.size.unwrap_or(u64::MAX));
+                    }
+                }
+            }
+            ImageProgress::LayerDownloadProgress {
+                index,
+                total,
+                digest,
+                downloaded_bytes,
+                size_bytes,
+            } => {
+                if let Some(layer) = self.layer_mut(index, total) {
+                    if layer.activity != PullLayerActivity::Done {
+                        layer.digest = Some(digest);
+                        layer.activity = PullLayerActivity::Downloading;
+                        layer.size = size_bytes.or(layer.size);
+                        layer.downloaded = layer
+                            .downloaded
+                            .max(downloaded_bytes)
+                            .min(layer.size.unwrap_or(u64::MAX));
+                    }
+                }
+            }
+            ImageProgress::LayerDownloadVerifying {
+                index,
+                total,
+                digest,
+            } => {
+                if let Some(layer) = self.layer_mut(index, total) {
+                    if layer.activity != PullLayerActivity::Done {
+                        layer.digest = Some(digest);
+                        layer.activity = PullLayerActivity::Verifying;
+                        layer.downloaded = layer.size.unwrap_or(layer.downloaded);
+                    }
+                }
+            }
+            ImageProgress::LayerDownloadFinished {
+                index,
+                total,
+                digest,
+            }
+            | ImageProgress::LayerDownloadSkipped {
+                index,
+                total,
+                digest,
+            } => {
+                if let Some(layer) = self.layer_mut(index, total) {
+                    if layer.activity != PullLayerActivity::Done {
+                        layer.digest = Some(digest);
+                        layer.activity = PullLayerActivity::Waiting;
+                        layer.downloaded = layer.size.unwrap_or(layer.downloaded);
+                    }
+                }
+            }
+            ImageProgress::ApplyingLayer {
+                index,
+                total,
+                digest,
+            } => {
+                if total != self.layers.len() || index == 0 || index > total || index <= self.done {
+                    return;
+                }
+                self.finish_before(index - 1);
+                if let Some(layer) = self.layer_mut(index, total) {
+                    layer.digest = digest.or_else(|| layer.digest.take());
+                    layer.activity = PullLayerActivity::Unpacking;
+                }
+            }
+            ImageProgress::MaterializingRootfs => {
+                self.finish_before(self.layers.len());
+                self.phase = PullPhase::Writing;
+            }
+            ImageProgress::PublishingRootfs => self.phase = PullPhase::Saving,
+            ImageProgress::Complete => {
+                self.finish_before(self.layers.len());
+                self.phase = PullPhase::Pulled;
+            }
+        }
+    }
+
+    fn visible_layers(&self, cap: usize) -> impl Iterator<Item = (usize, &PullLayerState)> {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| {
+                matches!(
+                    layer.activity,
+                    PullLayerActivity::Downloading
+                        | PullLayerActivity::Verifying
+                        | PullLayerActivity::Unpacking
+                )
+                .then_some((index + 1, layer))
+            })
+            .take(cap)
+    }
+
+    fn byte_totals(&self) -> (u64, u64) {
+        let downloaded = self
+            .layers
+            .iter()
+            .fold(0_u64, |sum, layer| sum.saturating_add(layer.downloaded));
+        let total = self.total_download_bytes.unwrap_or_else(|| {
+            self.layers.iter().fold(0_u64, |sum, layer| {
+                sum.saturating_add(layer.size.unwrap_or(layer.downloaded))
+            })
+        });
+        (downloaded.min(total), total)
+    }
+
+    fn header(&self, width: usize) -> String {
+        let mut suffix = format!("  {}/{} layers", self.done, self.layers.len());
+        let (downloaded, total) = self.byte_totals();
+        if self.total_download_bytes.is_some() || total > 0 {
+            suffix.push_str(&format!(
+                "  {} / {}",
+                indicatif::HumanBytes(downloaded),
+                indicatif::HumanBytes(total)
+            ));
+        }
+        let phase = format!("{:<12} ", self.phase.word());
+        let reference_width =
+            width.saturating_sub(measure_text_width(&phase) + measure_text_width(&suffix));
+        let reference = console::truncate_str(&self.reference, reference_width, "");
+        let message = format!("{phase}{reference}{suffix}");
+        console::truncate_str(&message, width, "").into_owned()
+    }
+}
+
+fn pull_layer_row_cap(rows: u16) -> usize {
+    // Reserve one header row and one spare row to avoid scrolling on redraw.
+    usize::from(rows.saturating_sub(2)).min(4)
+}
+
 impl PullProgressDisplay {
     pub fn new(reference: &str) -> Self {
         Self::new_inner(reference, false)
@@ -385,209 +702,92 @@ impl PullProgressDisplay {
     }
 
     fn new_inner(reference: &str, quiet: bool) -> Self {
-        let is_tty = !quiet && stderr_is_interactive();
-        let mp = if is_tty {
+        let interactive = !quiet && stderr_is_interactive();
+        let mp = if interactive {
             progress_renderer()
         } else {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         };
-
         let header = mp.add(ProgressBar::new_spinner());
-        header.set_style(
-            ProgressStyle::default_spinner()
-                .tick_strings(BRAILLE_TICKS)
-                .template("   {spinner} {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        header.set_message(format!("{:<12} {}", "Pulling", reference));
         header.enable_steady_tick(Duration::from_millis(80));
-
-        Self {
+        let mut display = Self {
             mp,
             header,
-            layer_bars: Vec::new(),
-            reference: reference.to_string(),
-            download_style: ProgressStyle::default_bar()
-                .template(
-                    "     {prefix}  {bar:36.magenta/238}  {bytes}/{total_bytes}  {msg:.magenta}",
-                )
-                .unwrap_or_else(|_| ProgressStyle::default_bar())
-                .progress_chars("━━╌"),
-            materialize_style: ProgressStyle::default_bar()
-                .template("     {prefix}  {bar:36.blue/238}  {msg:.blue}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar())
-                .progress_chars("━━╌"),
-            done_style: ProgressStyle::default_bar()
-                .template("     {prefix}  {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar()),
-            current_applying_layer: None,
-            _echo_guard: if is_tty { EchoGuard::acquire() } else { None },
-        }
+            active_lines: Vec::new(),
+            state: PullProgressState::new(reference),
+            interactive,
+            _echo_guard: if interactive {
+                EchoGuard::acquire()
+            } else {
+                None
+            },
+        };
+        display.draw();
+        display
     }
 
     pub fn handle_event(&mut self, event: ImageProgress) {
-        match event {
-            ImageProgress::ResolvingManifest { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}...", "Resolving", self.reference));
-            }
-            ImageProgress::ResolvedManifest {
-                image_ref,
-                layer_count,
-                ..
-            } => {
-                self.reference = image_ref;
-                self.header.set_message(format!(
-                    "{:<12} {} ({} layer{})",
-                    "Pulling",
-                    self.reference,
-                    layer_count,
-                    if layer_count == 1 { "" } else { "s" }
-                ));
-                self.ensure_layer_bars(layer_count);
-            }
-            ImageProgress::CheckingCache { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Checking", self.reference));
-            }
-            ImageProgress::CacheHit { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Cached", self.reference));
-            }
-            ImageProgress::CacheMiss { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Building", self.reference));
-            }
-            ImageProgress::UsingLocalDisk { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Using", self.reference));
-            }
-            ImageProgress::LayerDownloadStarted {
-                index,
-                total,
-                size_bytes,
-                ..
-            } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_style(self.download_style.clone());
-                    pb.set_position(0);
-                    if let Some(size_bytes) = size_bytes {
-                        pb.set_length(size_bytes);
-                    }
-                    pb.set_message("downloading");
-                }
-            }
-            ImageProgress::LayerDownloadProgress {
-                index,
-                total,
-                downloaded_bytes,
-                size_bytes,
-                ..
-            } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    if let Some(size_bytes) = size_bytes {
-                        pb.set_length(size_bytes);
-                    }
-                    pb.set_position(downloaded_bytes);
-                }
-            }
-            ImageProgress::LayerDownloadVerifying { index, total, .. } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_message("verifying");
-                }
-            }
-            ImageProgress::LayerDownloadFinished { index, total, .. } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_position(pb.length().unwrap_or(0));
-                    pb.set_message("downloaded");
-                }
-            }
-            ImageProgress::LayerDownloadSkipped { index, total, .. } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_position(pb.length().unwrap_or(1));
-                    pb.set_message("cached");
-                }
-            }
-            ImageProgress::ApplyingLayer { index, total, .. } => {
-                self.finish_current_applying_layer();
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_style(self.materialize_style.clone());
-                    pb.set_length(1);
-                    pb.set_position(0);
-                    pb.set_message("unpacking");
-                }
-                self.current_applying_layer = Some(index);
-            }
-            ImageProgress::MaterializingRootfs => {
-                self.finish_current_applying_layer();
-                self.header
-                    .set_message(format!("{:<12} {}", "Writing", self.reference));
-            }
-            ImageProgress::PublishingRootfs => {
-                self.header
-                    .set_message(format!("{:<12} {}", "Saving", self.reference));
-            }
-            ImageProgress::Complete => {
-                self.finish_current_applying_layer();
-                self.header
-                    .set_message(format!("{:<12} {}", "Pulled", self.reference));
-            }
-        }
+        self.state.handle_event(event);
+        self.draw();
     }
 
-    pub fn finish(mut self) {
-        self.finish_current_applying_layer();
-    }
-
-    fn ensure_layer_bars(&mut self, layer_count: usize) {
-        if self.layer_bars.len() >= layer_count {
+    fn draw(&mut self) {
+        if !self.interactive {
             return;
         }
-        let width = layer_count.to_string().len();
-        for index in self.layer_bars.len()..layer_count {
-            let pb = self.mp.add(ProgressBar::new(1));
-            pb.set_style(self.download_style.clone());
-            pb.set_prefix(format!("layer {:>width$}/{layer_count}", index + 1));
-            pb.set_message("waiting");
-            self.layer_bars.push(pb);
-        }
-    }
-
-    fn layer_bar(&self, one_based_index: usize) -> Option<&ProgressBar> {
-        one_based_index
-            .checked_sub(1)
-            .and_then(|index| self.layer_bars.get(index))
-    }
-
-    fn finish_current_applying_layer(&mut self) {
-        let Some(index) = self.current_applying_layer.take() else {
-            return;
+        let (rows, columns) = Term::stderr().size();
+        // Leave the final column free so an exactly full line cannot wrap.
+        let width = usize::from(columns).saturating_sub(1).max(1);
+        let (template, header_prefix) = if width >= 5 {
+            ("   {spinner} {msg}", 5)
+        } else {
+            ("{spinner}{msg}", 1)
         };
-        if let Some(pb) = self.layer_bar(index) {
-            pb.set_position(pb.length().unwrap_or(1));
-            pb.set_style(self.done_style.clone());
-            pb.set_message(format!("{}", style("✓").green()));
-            pb.tick();
+        self.header.set_style(
+            ProgressStyle::default_spinner()
+                .tick_strings(BRAILLE_TICKS)
+                .template(template)
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        self.header
+            .set_message(self.state.header(width.saturating_sub(header_prefix)));
+        let cap = pull_layer_row_cap(rows);
+        let visible = self.state.visible_layers(cap);
+        let mut count = 0;
+        for (index, layer) in visible {
+            if self.active_lines.len() == count {
+                let line = self.mp.add(
+                    ProgressBar::new_spinner().with_style(
+                        ProgressStyle::default_spinner()
+                            .template("{msg}")
+                            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                    ),
+                );
+                self.active_lines.push(line);
+            }
+            if let Some(line) = self.active_lines.get(count) {
+                line.set_message(layer.line(index, self.state.layers.len(), width));
+            }
+            count += 1;
         }
+        while self.active_lines.len() > count {
+            if let Some(line) = self.active_lines.pop() {
+                line.finish_and_clear();
+                self.mp.remove(&line);
+            }
+        }
+    }
+
+    pub fn finish(self) {
+        drop(self);
     }
 }
 
 impl Drop for PullProgressDisplay {
     fn drop(&mut self) {
-        for pb in &self.layer_bars {
-            pb.finish_and_clear();
-            self.mp.remove(pb);
+        for line in &self.active_lines {
+            line.finish_and_clear();
+            self.mp.remove(line);
         }
         self.header.finish_and_clear();
         self.mp.remove(&self.header);
@@ -955,7 +1155,10 @@ fn write_columns(out: &mut impl Write, values: &[String], widths: &[usize]) -> e
 mod tests {
     use libvm::ImageProgress;
 
-    use crate::ui::{relative_time, short_id, with_delayed_spinner, PullProgressDisplay};
+    use crate::ui::{
+        pull_layer_row_cap, relative_time, short_id, with_delayed_spinner, PullLayerActivity,
+        PullLayerState, PullProgressDisplay, PullProgressState,
+    };
     #[test]
     fn live_progress_words_describe_each_stage_without_changing_names() {
         use crate::ui::live_operation_progress_words;
@@ -1166,81 +1369,356 @@ mod tests {
         assert_eq!(short_id("1234"), "1234");
     }
 
+    fn pull_state(total: usize, bytes: Option<u64>) -> PullProgressState {
+        let mut state = PullProgressState::new("docker.io/nixos/nix:latest");
+        state.handle_event(ImageProgress::ResolvedManifest {
+            image_ref: state.reference.clone(),
+            manifest_digest: "sha256:abcd".to_string(),
+            layer_count: total,
+            total_download_bytes: bytes,
+        });
+        state
+    }
+
+    fn download_started(index: usize, total: usize) -> ImageProgress {
+        ImageProgress::LayerDownloadStarted {
+            index,
+            total,
+            digest: format!("sha256:{index:064x}"),
+            size_bytes: Some(100),
+        }
+    }
+
+    #[test]
+    fn pull_progress_bounds_concurrent_layers_and_finishes_silent_layers() {
+        for cap in [0, 1, 2, 3, 4, 20] {
+            let mut state = pull_state(69, Some(6900));
+            let mut last_done = 0;
+            for index in 2..=4 {
+                state.handle_event(download_started(index, 69));
+            }
+            for index in 1..=69 {
+                if index > 1 {
+                    state.handle_event(ImageProgress::LayerDownloadVerifying {
+                        index,
+                        total: 69,
+                        digest: format!("sha256:{index:064x}"),
+                    });
+                    state.handle_event(ImageProgress::LayerDownloadFinished {
+                        index,
+                        total: 69,
+                        digest: format!("sha256:{index:064x}"),
+                    });
+                    if index + 3 <= 69 {
+                        state.handle_event(download_started(index + 3, 69));
+                    }
+                }
+                state.handle_event(ImageProgress::ApplyingLayer {
+                    index,
+                    total: 69,
+                    digest: None,
+                });
+                let visible: Vec<_> = state.visible_layers(cap).map(|(index, _)| index).collect();
+                assert_eq!(
+                    visible,
+                    (index..=(index + 3).min(69)).take(cap).collect::<Vec<_>>()
+                );
+                assert!(visible.len() <= cap);
+                assert!(state.done >= last_done);
+                assert_eq!(state.done, index - 1);
+                last_done = state.done;
+            }
+            state.handle_event(ImageProgress::MaterializingRootfs);
+            assert_eq!(state.done, 69);
+            assert_eq!(state.visible_layers(cap).count(), 0);
+            state.handle_event(ImageProgress::Complete);
+            assert_eq!(state.done, 69);
+        }
+        let mut silent = pull_state(69, None);
+        silent.handle_event(ImageProgress::Complete);
+        assert_eq!(silent.done, 69);
+        let mut empty = pull_state(0, None);
+        empty.handle_event(ImageProgress::MaterializingRootfs);
+        assert_eq!(empty.done, 0);
+        assert_eq!(empty.byte_totals(), (0, 0));
+    }
+
+    #[test]
+    fn pull_progress_interleaves_download_verification_and_unpacking() {
+        let mut state = pull_state(4, Some(400));
+        state.handle_event(download_started(1, 4));
+        state.handle_event(download_started(2, 4));
+        state.handle_event(ImageProgress::LayerDownloadProgress {
+            index: 2,
+            total: 4,
+            digest: "sha256:bbbbbbbbbbbbbbbb".into(),
+            downloaded_bytes: 75,
+            size_bytes: Some(100),
+        });
+        state.handle_event(ImageProgress::LayerDownloadVerifying {
+            index: 1,
+            total: 4,
+            digest: "sha256:aaaaaaaaaaaaaaaa".into(),
+        });
+        assert_eq!(state.layers[0].activity, PullLayerActivity::Verifying);
+        assert_eq!(state.layers[0].downloaded, 100);
+        assert_eq!(state.layers[1].activity, PullLayerActivity::Downloading);
+        assert_eq!(state.layers[1].downloaded, 75);
+        state.handle_event(ImageProgress::LayerDownloadFinished {
+            index: 1,
+            total: 4,
+            digest: "sha256:aaaaaaaaaaaaaaaa".into(),
+        });
+        assert_eq!(
+            state
+                .visible_layers(4)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(state.done, 0);
+        state.handle_event(ImageProgress::ApplyingLayer {
+            index: 1,
+            total: 4,
+            digest: None,
+        });
+        assert_eq!(state.layers[0].activity, PullLayerActivity::Unpacking);
+        assert_eq!(state.layers[0].label(1, 4), "aaaaaaaaaaaa");
+        assert_eq!(state.layers[1].downloaded, 75);
+        // A complete partial download can go straight to verification.
+        state.handle_event(ImageProgress::LayerDownloadVerifying {
+            index: 3,
+            total: 4,
+            digest: "sha256:cccccccccccccccc".into(),
+        });
+        assert_eq!(state.layers[2].activity, PullLayerActivity::Verifying);
+        state.handle_event(ImageProgress::LayerDownloadFinished {
+            index: 3,
+            total: 4,
+            digest: "sha256:cccccccccccccccc".into(),
+        });
+        assert_eq!(state.layers[2].activity, PullLayerActivity::Waiting);
+        assert_eq!(state.visible_layers(4).count(), 2);
+    }
+
+    #[test]
+    fn pull_progress_counts_resumed_offsets_and_bounds_byte_totals() {
+        let mut state = pull_state(2, Some(150));
+        for (index, downloaded, size) in [(1, 60, Some(100)), (2, 80, None), (1, 500, Some(100))] {
+            state.handle_event(ImageProgress::LayerDownloadProgress {
+                index,
+                total: 2,
+                digest: format!("sha256:{index:064x}"),
+                downloaded_bytes: downloaded,
+                size_bytes: size,
+            });
+        }
+        assert_eq!(state.layers[0].downloaded, 100);
+        assert_eq!(state.layers[1].downloaded, 80);
+        assert_eq!(state.byte_totals(), (150, 150));
+        let mut resumed = pull_state(1, None);
+        resumed.handle_event(ImageProgress::LayerDownloadProgress {
+            index: 1,
+            total: 1,
+            digest: "sha256:aaaaaaaaaaaa".into(),
+            downloaded_bytes: 60,
+            size_bytes: Some(100),
+        });
+        assert_eq!(resumed.byte_totals(), (60, 100));
+        resumed.handle_event(ImageProgress::LayerDownloadVerifying {
+            index: 1,
+            total: 1,
+            digest: "sha256:aaaaaaaaaaaa".into(),
+        });
+        assert_eq!(resumed.byte_totals(), (100, 100));
+        let mut unknown = pull_state(1, None);
+        unknown.handle_event(ImageProgress::LayerDownloadProgress {
+            index: 1,
+            total: 1,
+            digest: "sha256:aaaaaaaaaaaa".into(),
+            downloaded_bytes: u64::MAX,
+            size_bytes: None,
+        });
+        assert_eq!(unknown.byte_totals(), (u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn pull_progress_skipped_downloads_still_wait_for_unpacking() {
+        let mut state = pull_state(3, Some(300));
+        state.handle_event(ImageProgress::LayerDownloadSkipped {
+            index: 1,
+            total: 3,
+            digest: "sha256:aaaaaaaaaaaa".into(),
+        });
+        assert_eq!(state.visible_layers(4).count(), 0);
+        assert_eq!(state.done, 0);
+        assert_eq!(state.byte_totals(), (0, 300));
+        state.handle_event(ImageProgress::ApplyingLayer {
+            index: 1,
+            total: 3,
+            digest: None,
+        });
+        assert_eq!(state.done, 0);
+        state.handle_event(ImageProgress::ApplyingLayer {
+            index: 3,
+            total: 3,
+            digest: None,
+        });
+        assert_eq!(state.done, 2);
+        assert_eq!(state.layers[0].activity, PullLayerActivity::Done);
+        assert_eq!(state.layers[1].activity, PullLayerActivity::Done);
+        state.handle_event(ImageProgress::MaterializingRootfs);
+        assert_eq!(state.done, 3);
+    }
+
+    #[test]
+    fn pull_progress_ignores_unknown_indexes_without_changing_other_layers() {
+        let mut state = PullProgressState::new("image");
+        state.handle_event(download_started(1, 1));
+        assert!(state.layers.is_empty());
+        let mut state = pull_state(2, None);
+        state.handle_event(download_started(1, 2));
+        for (index, total) in [(0, 2), (3, 2), (usize::MAX, 2), (1, 3)] {
+            let digest = "sha256:bbbbbbbbbbbb".to_string();
+            for event in [
+                download_started(index, total),
+                ImageProgress::LayerDownloadProgress {
+                    index,
+                    total,
+                    digest: digest.clone(),
+                    downloaded_bytes: 50,
+                    size_bytes: Some(100),
+                },
+                ImageProgress::LayerDownloadVerifying {
+                    index,
+                    total,
+                    digest: digest.clone(),
+                },
+                ImageProgress::LayerDownloadFinished {
+                    index,
+                    total,
+                    digest: digest.clone(),
+                },
+                ImageProgress::LayerDownloadSkipped {
+                    index,
+                    total,
+                    digest: digest.clone(),
+                },
+                ImageProgress::ApplyingLayer {
+                    index,
+                    total,
+                    digest: Some(digest),
+                },
+            ] {
+                state.handle_event(event);
+                assert_eq!(state.done, 0);
+                assert_eq!(state.layers[0].activity, PullLayerActivity::Downloading);
+                assert_eq!(state.layers[0].downloaded, 0);
+                assert_eq!(state.layers[1].activity, PullLayerActivity::Waiting);
+            }
+        }
+    }
+
+    #[test]
+    fn pull_progress_shortens_digests_and_falls_back_for_missing_or_invalid_digests() {
+        for (digest, expected) in [
+            (Some("sha256:3f2a9c1b7d04abcdef"), "3f2a9c1b7d04"),
+            (None, "layer 7/69"),
+            (Some("sha256:abcd"), "layer 7/69"),
+            (Some("sha256:🌳🌳🌳🌳"), "layer 7/69"),
+            (Some("other:3f2a9c1b7d04abcdef"), "layer 7/69"),
+        ] {
+            let layer = PullLayerState {
+                digest: digest.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(layer.label(7, 69), expected);
+        }
+    }
+
+    #[test]
+    fn pull_progress_fits_terminal_rows_and_columns() {
+        for (rows, expected) in [(0, 0), (1, 0), (2, 0), (3, 1), (5, 3), (6, 4), (50, 4)] {
+            assert_eq!(pull_layer_row_cap(rows), expected);
+        }
+        let mut state = pull_state(69, Some(162_400_000));
+        state.handle_event(download_started(1, 69));
+        state.handle_event(ImageProgress::ApplyingLayer {
+            index: 2,
+            total: 69,
+            digest: None,
+        });
+        state.handle_event(download_started(3, 69));
+        state.handle_event(ImageProgress::LayerDownloadVerifying {
+            index: 3,
+            total: 69,
+            digest: "sha256:aaaaaaaaaaaa".into(),
+        });
+        for width in [0, 1, 5, 12, 20, 40, 79, 120] {
+            assert!(console::measure_text_width(&state.header(width)) <= width);
+            for (index, layer) in state.visible_layers(4) {
+                assert!(console::measure_text_width(&layer.line(index, 69, width)) <= width);
+            }
+        }
+        let header = state.header(74);
+        assert!(header.contains("1/69 layers"));
+        assert!(header.ends_with(&indicatif::HumanBytes(162_400_000).to_string()));
+        assert!(state.layers[2].line(3, 69, 120).contains('━'));
+        assert!(!state.layers[2].line(3, 69, 40).contains('━'));
+    }
+
     #[test]
     fn pull_progress_display_handles_the_complete_image_event_sequence() {
-        let mut display = PullProgressDisplay::quiet("ubuntu:24.04");
-        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-        for event in [
-            ImageProgress::ResolvingManifest {
-                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
-            },
-            ImageProgress::ResolvedManifest {
-                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
-                manifest_digest: digest.to_string(),
-                layer_count: 1,
-                total_download_bytes: Some(1024),
-            },
-            ImageProgress::CheckingCache {
-                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
-            },
-            ImageProgress::CacheMiss {
-                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
-            },
-            ImageProgress::LayerDownloadStarted {
-                index: 1,
-                total: 1,
-                digest: digest.to_string(),
-                size_bytes: Some(1024),
-            },
-            ImageProgress::LayerDownloadProgress {
-                index: 1,
-                total: 1,
-                digest: digest.to_string(),
-                downloaded_bytes: 512,
-                size_bytes: Some(1024),
-            },
-            ImageProgress::LayerDownloadVerifying {
-                index: 1,
-                total: 1,
-                digest: digest.to_string(),
-            },
-            ImageProgress::LayerDownloadFinished {
-                index: 1,
-                total: 1,
-                digest: digest.to_string(),
-            },
-            ImageProgress::ApplyingLayer {
-                index: 1,
-                total: 1,
-                digest: Some(digest.to_string()),
-            },
+        let mut display = PullProgressDisplay::quiet("image");
+        for (event, phase) in [
+            (
+                ImageProgress::ResolvingManifest {
+                    image_ref: "image".into(),
+                },
+                "Resolving",
+            ),
+            (
+                ImageProgress::ResolvedManifest {
+                    image_ref: "image".into(),
+                    manifest_digest: "sha256:abcd".into(),
+                    layer_count: 1,
+                    total_download_bytes: Some(100),
+                },
+                "Pulling",
+            ),
+            (
+                ImageProgress::CheckingCache {
+                    image_ref: "image".into(),
+                },
+                "Checking",
+            ),
+            (
+                ImageProgress::CacheHit {
+                    image_ref: "image".into(),
+                },
+                "Cached",
+            ),
+            (
+                ImageProgress::CacheMiss {
+                    image_ref: "image".into(),
+                },
+                "Building",
+            ),
+            (
+                ImageProgress::UsingLocalDisk {
+                    image_ref: "image".into(),
+                },
+                "Using",
+            ),
+            (ImageProgress::MaterializingRootfs, "Writing"),
+            (ImageProgress::PublishingRootfs, "Saving"),
+            (ImageProgress::Complete, "Pulled"),
         ] {
             display.handle_event(event);
+            assert_eq!(display.state.phase.word(), phase);
+            assert!(display.active_lines.is_empty());
         }
-
-        display.handle_event(ImageProgress::MaterializingRootfs);
-        assert_eq!(
-            display.header.message(),
-            "Writing      docker.io/library/ubuntu:24.04"
-        );
-
-        display.handle_event(ImageProgress::PublishingRootfs);
-        assert_eq!(
-            display.header.message(),
-            "Saving       docker.io/library/ubuntu:24.04"
-        );
-
-        display.handle_event(ImageProgress::Complete);
-        assert_eq!(
-            display.header.message(),
-            "Pulled       docker.io/library/ubuntu:24.04"
-        );
-
-        assert_eq!(display.reference, "docker.io/library/ubuntu:24.04");
-        assert_eq!(display.layer_bars.len(), 1);
-        assert_eq!(display.layer_bars[0].position(), 1);
-        assert_eq!(display.current_applying_layer, None);
+        assert_eq!(display.state.done, 1);
         display.finish();
     }
 }
