@@ -13,6 +13,18 @@ fn publish_at(
     destination_machine_id: &str,
     destination_run_id: &str,
 ) -> io::Result<()> {
+    publish_generation_at(root, destination_run_id)?;
+
+    // A child must never thaw with its parent's identity (owner decision O2).
+    rotate_machine_id(
+        &root.join("etc/machine-id"),
+        &root.join("run/machine-id"),
+        destination_machine_id,
+    )
+}
+
+/// Wake publishes only the run generation, preserving image-selected machine identity.
+pub(crate) fn publish_generation_at(root: &Path, destination_run_id: &str) -> io::Result<()> {
     // /run/silo is Silo's root-only state directory (root storage refuses any
     // other mode). Create it 0700 when absent and never change an existing one.
     let directory = root.join("run/silo");
@@ -36,14 +48,7 @@ fn publish_at(
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result?;
-
-    // A child must never thaw with its parent's identity (owner decision O2).
-    rotate_machine_id(
-        &root.join("etc/machine-id"),
-        &root.join("run/machine-id"),
-        destination_machine_id,
-    )
+    result
 }
 
 fn rotate_machine_id(

@@ -1,4 +1,7 @@
 //! Run-bound guest lifecycle. Kernel completion, not transport lifetime, owns progress.
+//!
+//! Clone rotates guest identity and may run a restore hook. Wake only publishes
+//! the fresh run generation; both retire sessions, correct time and reapply networking.
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -753,14 +756,7 @@ impl Lifecycle {
         }
         let deadline = deadline(request.deadline_ms, 30000)?;
         // Validate pure input before admitting any side effects.
-        let (network, shutdown) = validate_activation(&request)?;
-        crate::provision::ssh::parse_ca(
-            request
-                .ssh_trusted_ca
-                .as_deref()
-                .ok_or_else(|| Status::invalid_argument("destination SSH CA trust is required"))?,
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let activation = validate_activation(&request, &self.runtime)?;
         crate::forward::listen::validate_activation_listeners(&request.listeners)?;
         let receiver = {
             let mut owner = lock(&self.coordinator);
@@ -798,10 +794,17 @@ impl Lifecycle {
                     .network
                     .try_lock()
                     .map_err(|_| Status::failed_precondition("network configuration is busy"))?;
-                match (retained.as_ref(), network.as_ref()) {
-                    (Some(applied), Some(network)) => applied
-                        .validate_activation(network)
-                        .map_err(|error| Status::failed_precondition(error.to_string()))?,
+                match (retained.as_ref(), activation.network.as_ref()) {
+                    (Some(applied), Some(network)) => {
+                        applied
+                            .validate_activation(network)
+                            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                        if activation.purpose == v1::ActivationPurpose::SameMachine {
+                            applied
+                                .validate_same_machine(network)
+                                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                        }
+                    }
                     (None, None) => {}
                     _ => {
                         return Err(Status::failed_precondition(
@@ -821,7 +824,7 @@ impl Lifecycle {
             let lifecycle = self.clone();
             tokio::spawn(async move {
                 let result = lifecycle
-                    .perform_activation(&request, network, shutdown, deadline)
+                    .perform_activation(&request, activation, deadline)
                     .await;
                 if let Err(error) = &result {
                     let reference = lifecycle.runtime.lifecycle.borrow().freeze_ref.clone();
@@ -845,16 +848,15 @@ impl Lifecycle {
     async fn perform_activation(
         &self,
         request: &v1::ActivateRequest,
-        network: Option<agent_spec::NetworkConfig>,
-        shutdown: StorageShutdownContext,
+        activation: ValidatedActivation,
         deadline: tokio::time::Instant,
     ) -> Result<v1::ActivateResponse, Status> {
         let result = tokio::time::timeout_at(deadline, async {
             self.controller.check_containment()?;
             self.runtime.drain(deadline).await?;
-            let mut retained = self.network.lock().await;
+            let retained = self.network.lock().await;
             self.forwards.reset_for_activation().await?;
-            let identity = self.runtime.rotate(shutdown);
+            let identity = self.runtime.rotate(activation.shutdown);
             let mut reference = request
                 .freeze_ref
                 .clone()
@@ -863,33 +865,53 @@ impl Lifecycle {
             reference.run_id = identity.run_id.clone();
             self.publish(State::Activating, &reference, true, None, None);
             self.runtime.drain_sessions(deadline).await?;
-            let ca = crate::provision::ssh::replace_trust(
-                request.ssh_trusted_ca.as_deref().ok_or_else(|| {
-                    Status::invalid_argument("destination SSH CA trust is required")
-                })?,
-            )
-            .map_err(internal)?;
-            *self.runtime.ssh_trusted_ca() = Some(ca);
-            crate::clock::activate_realtime(request.host_time.as_ref()).map_err(internal)?;
-            if let (Some(applied), Some(network)) = (retained.as_ref(), network.as_ref()) {
-                let replacement = crate::provision::network::activate_network(applied, network)
-                    .await
+            // This is the identity-policy decision point. Everything outside it,
+            // including retirement and thaw admission, is shared with clone activation.
+            let listeners = match activation.purpose {
+                v1::ActivationPurpose::Clone => {
+                    let ca = crate::provision::ssh::replace_trust(
+                        request.ssh_trusted_ca.as_deref().ok_or_else(|| {
+                            Status::invalid_argument("destination SSH CA trust is required")
+                        })?,
+                    )
                     .map_err(internal)?;
-                *retained = Some(replacement);
-            }
-            drop(retained);
-            crate::activation_identity::publish(
-                &request.destination_machine_id,
-                &request.destination_run_id,
-            )
-            .map_err(internal)?;
-            let listeners = self
-                .forwards
-                .register_activation(&request.listeners)
-                .await?;
-            if let Some(hook) = &request.hook {
-                self.run_hook(hook, deadline).await?;
-            }
+                    *self.runtime.ssh_trusted_ca() = Some(ca);
+                    activate_environment(
+                        retained,
+                        activation.network.as_ref(),
+                        request.host_time.as_ref(),
+                    )
+                    .await?;
+                    crate::activation_identity::publish(
+                        &request.destination_machine_id,
+                        &request.destination_run_id,
+                    )
+                    .map_err(internal)?;
+                    let listeners = self
+                        .forwards
+                        .register_activation(&request.listeners)
+                        .await?;
+                    if let Some(hook) = &request.hook {
+                        self.run_hook(hook, deadline).await?;
+                    }
+                    listeners
+                }
+                v1::ActivationPurpose::SameMachine => {
+                    activate_same_machine(
+                        request,
+                        retained,
+                        activation.network.as_ref(),
+                        std::path::Path::new("/"),
+                    )
+                    .await?;
+                    self.forwards
+                        .register_activation(&request.listeners)
+                        .await?
+                }
+                v1::ActivationPurpose::Unspecified => {
+                    return Err(Status::invalid_argument("activation purpose is required"));
+                }
+            };
             if !self.controller.is_frozen().map_err(internal)? {
                 return Err(Status::failed_precondition(
                     "workload freeze lost during activation",
@@ -986,6 +1008,33 @@ impl Lifecycle {
     }
 }
 
+async fn activate_environment(
+    mut retained: tokio::sync::MutexGuard<'_, Option<crate::provision::network::AppliedNetwork>>,
+    network: Option<&agent_spec::NetworkConfig>,
+    host_time: Option<&prost_types::Timestamp>,
+) -> Result<crate::clock::ClockSyncOutcome, Status> {
+    let clock = crate::clock::activate_realtime(host_time).map_err(internal)?;
+    if let (Some(applied), Some(network)) = (retained.as_ref(), network) {
+        let replacement = crate::provision::network::activate_network(applied, network)
+            .await
+            .map_err(internal)?;
+        *retained = Some(replacement);
+    }
+    Ok(clock)
+}
+
+async fn activate_same_machine(
+    request: &v1::ActivateRequest,
+    retained: tokio::sync::MutexGuard<'_, Option<crate::provision::network::AppliedNetwork>>,
+    network: Option<&agent_spec::NetworkConfig>,
+    root: &std::path::Path,
+) -> Result<crate::clock::ClockSyncOutcome, Status> {
+    let clock = activate_environment(retained, network, request.host_time.as_ref()).await?;
+    crate::activation_identity::publish_generation_at(root, &request.destination_run_id)
+        .map_err(internal)?;
+    Ok(clock)
+}
+
 fn internal(error: impl std::fmt::Display) -> Status {
     Status::internal(error.to_string())
 }
@@ -1042,15 +1091,42 @@ async fn wait<T: Clone>(mut completion: CompletionReceiver<T>) -> Result<T, Stat
 fn completed<T>(value: T) -> CompletionReceiver<T> {
     watch::channel(Some(Ok(value))).1
 }
+struct ValidatedActivation {
+    purpose: v1::ActivationPurpose,
+    network: Option<agent_spec::NetworkConfig>,
+    shutdown: StorageShutdownContext,
+}
+
 fn validate_activation(
     request: &v1::ActivateRequest,
-) -> Result<(Option<agent_spec::NetworkConfig>, StorageShutdownContext), Status> {
-    let purpose =
-        protocol::restore::validate_activate_request(request).map_err(Status::invalid_argument)?;
-    if v1::ActivationPurpose::from(purpose) != v1::ActivationPurpose::Clone {
-        return Err(Status::failed_precondition(
-            "Same-machine activation is not available; do not wake this saved machine yet",
-        ));
+    runtime: &RuntimeContext,
+) -> Result<ValidatedActivation, Status> {
+    let purpose = v1::ActivationPurpose::from(
+        protocol::restore::validate_activate_request(request).map_err(Status::invalid_argument)?,
+    );
+    // SameMachine has no identity-rewrite inputs: the destination machine must
+    // be the current one, the run must be fresh (checked by the wire contract),
+    // and hooks are forbidden. An omitted CA preserves trust; a supplied CA is
+    // only an assertion of the retained authority, never replacement trust.
+    // There is no hostname or startup command in ActivateRequest.
+    if purpose == v1::ActivationPurpose::SameMachine {
+        let current = lock(&runtime.identity);
+        if request.expected.as_ref() != Some(&current.expected)
+            || request.destination_machine_id != current.expected.machine_id
+        {
+            return Err(Status::failed_precondition(
+                "Cannot wake a different machine; use the saved machine's identity",
+            ));
+        }
+        if let Some(value) = request.ssh_trusted_ca.as_deref() {
+            let ca = crate::provision::ssh::parse_ca(value)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if runtime.ssh_trusted_ca().as_ref().map(|key| key.key_data()) != Some(ca.key_data()) {
+                return Err(Status::failed_precondition(
+                    "Cannot wake with different SSH trust; restore the machine's original SSH authority",
+                ));
+            }
+        }
     }
     validate_uuid(&request.activation_id)?;
     validate_uuid(&request.destination_machine_id)?;
@@ -1074,7 +1150,20 @@ fn validate_activation(
     if let Some(hook) = &request.hook {
         validate_hook(hook)?;
     }
-    Ok((target, shutdown))
+    if purpose == v1::ActivationPurpose::Clone {
+        crate::provision::ssh::parse_ca(
+            request
+                .ssh_trusted_ca
+                .as_deref()
+                .ok_or_else(|| Status::invalid_argument("destination SSH CA trust is required"))?,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    }
+    Ok(ValidatedActivation {
+        purpose,
+        network: target,
+        shutdown,
+    })
 }
 fn validate_network(network: &v1::ActivationNetwork) -> Result<agent_spec::NetworkConfig, Status> {
     let parse_ip = |value: &str| {
@@ -1301,5 +1390,307 @@ mod tests {
             .drain_sessions(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
             .await
             .unwrap();
+    }
+
+    fn same_machine_request(runtime: &RuntimeContext) -> v1::ActivateRequest {
+        let expected = runtime.expected();
+        v1::ActivateRequest {
+            purpose: Some(v1::ActivationPurpose::SameMachine as i32),
+            activation_id: uuid::Uuid::new_v4().to_string(),
+            freeze_ref: Some(v1::FreezeRef {
+                machine_id: expected.machine_id.clone(),
+                run_id: expected.run_id.clone(),
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                freeze_epoch: Some(1),
+            }),
+            destination_machine_id: expected.machine_id.clone(),
+            destination_run_id: uuid::Uuid::new_v4().to_string(),
+            expected: Some(expected),
+            host_time: Some(prost_types::Timestamp {
+                seconds: 1_704_067_200,
+                nanos: 0,
+            }),
+            shutdown: Some(v1::ActivationShutdownContext {
+                manifest_json: br#"{"kind":"unsupported","reason":"unit-test inventory"}"#.to_vec(),
+            }),
+            deadline_ms: Some(30000),
+            ..Default::default()
+        }
+    }
+
+    fn ca(seed: u8) -> russh::keys::PublicKey {
+        use russh::keys::ssh_key::{private::Ed25519Keypair, PrivateKey};
+        PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]))
+            .public_key()
+            .clone()
+    }
+
+    #[test]
+    fn same_machine_accepts_fresh_run_and_only_retained_ssh_authority() {
+        let runtime = RuntimeContext::for_tests();
+        let retained = ca(1);
+        *runtime.ssh_trusted_ca() = Some(retained.clone());
+        let mut request = same_machine_request(&runtime);
+        let activation = crate::lifecycle::validate_activation(&request, &runtime).unwrap();
+        assert_eq!(activation.purpose, v1::ActivationPurpose::SameMachine);
+        assert_eq!(
+            activation.shutdown.machine_id,
+            runtime.expected().machine_id
+        );
+        assert_ne!(activation.shutdown.run_id, runtime.expected().run_id);
+        request.ssh_trusted_ca = Some(retained.to_openssh().unwrap());
+        assert!(crate::lifecycle::validate_activation(&request, &runtime).is_ok());
+        request.ssh_trusted_ca = Some(ca(2).to_openssh().unwrap());
+        assert!(crate::lifecycle::validate_activation(&request, &runtime).is_err());
+        request.ssh_trusted_ca = Some(String::new());
+        assert!(crate::lifecycle::validate_activation(&request, &runtime).is_err());
+        request.ssh_trusted_ca = Some(retained.to_openssh().unwrap());
+        *runtime.ssh_trusted_ca() = None;
+        assert!(crate::lifecycle::validate_activation(&request, &runtime).is_err());
+    }
+
+    #[test]
+    fn same_machine_rejects_changed_identity_old_run_and_malformed_inputs() {
+        let runtime = RuntimeContext::for_tests();
+        let request = same_machine_request(&runtime);
+        for change in 0..10 {
+            let mut changed = request.clone();
+            match change {
+                0 => changed.destination_machine_id = uuid::Uuid::new_v4().to_string(),
+                1 => changed.destination_run_id = runtime.expected().run_id,
+                2 => {
+                    let expected = changed.expected.as_mut().unwrap();
+                    expected.machine_id = uuid::Uuid::new_v4().to_string();
+                    changed.destination_machine_id = expected.machine_id.clone();
+                }
+                3 => {
+                    changed.expected.as_mut().unwrap().agent_instance_id =
+                        uuid::Uuid::new_v4().to_string()
+                }
+                4 => changed.expected.as_mut().unwrap().boot_id = uuid::Uuid::new_v4().to_string(),
+                5 => changed.host_time = None,
+                6 => changed.host_time.as_mut().unwrap().nanos = -1,
+                7 => changed.shutdown.as_mut().unwrap().manifest_json = b"invalid".to_vec(),
+                8 => changed.purpose = None,
+                _ => changed.purpose = Some(v1::ActivationPurpose::Unspecified as i32),
+            }
+            assert!(
+                crate::lifecycle::validate_activation(&changed, &runtime).is_err(),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_machine_rejects_restore_hook_without_executing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("hook-ran");
+        let script = root.path().join("restore.sh");
+        std::fs::write(&script, format!("touch '{}'\n", marker.display())).unwrap();
+        let runtime = RuntimeContext::for_tests();
+        let mut request = same_machine_request(&runtime);
+        request.hook = Some(v1::ActivationHook {
+            argv: vec!["/bin/sh".into(), script.display().to_string()],
+            working_directory: root.path().display().to_string(),
+            timeout_ms: Some(1000),
+            ..Default::default()
+        });
+        let error = crate::lifecycle::validate_activation(&request, &runtime)
+            .err()
+            .unwrap();
+        assert!(error.message().contains("restore hook"));
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn same_machine_preserves_identity_files_and_does_not_rerun_startup() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let runtime = RuntimeContext::for_tests();
+        let retained_ca = ca(1);
+        *runtime.ssh_trusted_ca() = Some(retained_ca.clone());
+        let mut request = same_machine_request(&runtime);
+        let ca_line = retained_ca.to_openssh().unwrap();
+        request.ssh_trusted_ca = Some(ca_line.clone());
+        crate::lifecycle::validate_activation(&request, &runtime).unwrap();
+        let host_key = crate::ssh::agent::persistent_host_key(
+            &root
+                .path()
+                .join("var/lib/silo-agent/ssh/ssh_host_ed25519_key"),
+        )
+        .unwrap();
+        assert!(!host_key.public_key().to_openssh().unwrap().is_empty());
+        let files = [
+            (
+                "etc/machine-id",
+                b"image-selected-id-not-the-silo-uuid\n".as_slice(),
+            ),
+            ("run/machine-id", b"transient-image-selected-id\n"),
+            ("etc/hostname", b"unchanged-hostname\n"),
+            ("etc/ssh/silo_ca.pub", ca_line.as_bytes()),
+            ("etc/ssh/ssh_host_ed25519_key", b"image-host-key\n"),
+            (
+                "home/silo/.ssh/authorized_keys",
+                b"original-authorized-trust\n",
+            ),
+        ];
+        for (path, contents) in files {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let mut paths = files
+            .iter()
+            .map(|(path, _)| root.path().join(path))
+            .collect::<Vec<_>>();
+        paths.push(
+            root.path()
+                .join("var/lib/silo-agent/ssh/ssh_host_ed25519_key"),
+        );
+        let before = paths
+            .iter()
+            .map(|path| {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
+                (
+                    std::fs::read(path).unwrap(),
+                    std::fs::metadata(path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let startup_log = root.path().join("startup-runs");
+        let startup = root.path().join("startup.sh");
+        std::fs::write(
+            &startup,
+            format!("echo started >> '{}'\n", startup_log.display()),
+        )
+        .unwrap();
+        assert!(std::process::Command::new("/bin/sh")
+            .arg(&startup)
+            .status()
+            .unwrap()
+            .success());
+        let network = tokio::sync::Mutex::new(None);
+        let clock = crate::lifecycle::activate_same_machine(
+            &request,
+            network.lock().await,
+            None,
+            root.path(),
+        )
+        .await
+        .unwrap();
+        // Exercise the actual clock path without setting the host's system clock:
+        // activation never rewinds a clock that is already ahead of host_time.
+        assert!(clock.offset_nanos < 0);
+        assert!(!clock.stepped);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("run/silo/generation")).unwrap(),
+            format!("{}\n", request.destination_run_id),
+        );
+        assert_eq!(std::fs::read_to_string(startup_log).unwrap(), "started\n");
+        assert_eq!(runtime.ssh_trusted_ca().as_ref().unwrap(), &retained_ca);
+        for (path, (contents, metadata)) in paths.iter().zip(before) {
+            let after = std::fs::metadata(path).unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), contents);
+            assert_eq!(
+                (
+                    after.ino(),
+                    after.mode(),
+                    after.mtime(),
+                    after.mtime_nsec(),
+                    after.ctime(),
+                    after.ctime_nsec()
+                ),
+                (
+                    metadata.ino(),
+                    metadata.mode(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec()
+                ),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn same_machine_clock_failure_does_not_publish_a_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = RuntimeContext::for_tests();
+        let mut request = same_machine_request(&runtime);
+        request.host_time = None;
+        let network = tokio::sync::Mutex::new(None);
+        assert!(crate::lifecycle::activate_same_machine(
+            &request,
+            network.lock().await,
+            None,
+            root.path(),
+        )
+        .await
+        .is_err());
+        assert!(!root.path().join("run/silo/generation").exists());
+    }
+
+    #[tokio::test]
+    async fn same_machine_retires_real_inherited_session_process_and_stream() {
+        use std::io::Read;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let runtime = RuntimeContext::for_tests();
+        let request = same_machine_request(&runtime);
+        let activation = crate::lifecycle::validate_activation(&request, &runtime).unwrap();
+        let session = runtime.admit_session().unwrap();
+        let retirement = runtime.retirement();
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let worker = tokio::task::spawn_blocking(move || {
+            let outcome = crate::pid1::wait_retiring_child(&mut child, Some(retirement)).unwrap();
+            drop(stream);
+            drop(session);
+            outcome
+        });
+        runtime.close().unwrap();
+        let old = runtime.expected();
+        let fresh = runtime.rotate(activation.shutdown);
+        runtime
+            .drain_sessions(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            worker.await.unwrap().signal(),
+            Some(nix::sys::signal::Signal::SIGKILL as i32)
+        );
+        assert_eq!(peer.read(&mut [0_u8; 1]).unwrap(), 0);
+        assert_eq!(fresh.machine_id, old.machine_id);
+        assert_eq!(fresh.boot_id, old.boot_id);
+        assert_eq!(fresh.run_id, request.destination_run_id);
+        assert_ne!(fresh.agent_instance_id, old.agent_instance_id);
+        runtime.open();
+        assert!(runtime.admit_session().is_ok());
+    }
+
+    #[test]
+    fn clone_still_accepts_replacement_identity_trust_and_restore_hook() {
+        let runtime = RuntimeContext::for_tests();
+        *runtime.ssh_trusted_ca() = Some(ca(1));
+        let mut request = same_machine_request(&runtime);
+        request.purpose = Some(v1::ActivationPurpose::Clone as i32);
+        request.destination_machine_id = uuid::Uuid::new_v4().to_string();
+        request.ssh_trusted_ca = Some(ca(2).to_openssh().unwrap());
+        request.hook = Some(v1::ActivationHook {
+            argv: vec!["/bin/true".into()],
+            working_directory: "/".into(),
+            timeout_ms: Some(1000),
+            ..Default::default()
+        });
+        let activation = crate::lifecycle::validate_activation(&request, &runtime).unwrap();
+        assert_eq!(activation.purpose, v1::ActivationPurpose::Clone);
+        assert_eq!(
+            activation.shutdown.machine_id,
+            request.destination_machine_id
+        );
+        assert_eq!(activation.shutdown.run_id, request.destination_run_id);
     }
 }

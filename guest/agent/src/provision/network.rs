@@ -62,6 +62,16 @@ impl AppliedNetwork {
             .context("managed network namespace changed")?;
         Ok(())
     }
+
+    /// Wake may repair the managed attachment, but may not assign a clone identity.
+    pub(crate) fn validate_same_machine(&self, target: &NetworkConfig) -> eyre::Result<()> {
+        if target.interfaces.as_slice() != std::slice::from_ref(&self.interface) {
+            eyre::bail!(
+                "Cannot wake with changed network settings; use the machine's saved configuration"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Own the connection even when the surrounding lifecycle operation is cancelled.
@@ -1139,5 +1149,38 @@ mod tests {
             .build();
         assert!(!route_uses_interface(&route, 7));
         assert!(route.attributes.contains(&RouteAttribute::Oif(8)));
+    }
+
+    #[test]
+    fn same_machine_network_requires_the_saved_mac_addresses_routes_and_dns() {
+        let root = tempfile::tempdir().unwrap();
+        let device = File::create(root.path().join("retained-interface")).unwrap();
+        let applied = AppliedNetwork {
+            index: 7,
+            interface: interface(),
+            identity: Arc::new(LinkIdentity {
+                device,
+                namespace: File::open("/proc/self/ns/net").unwrap(),
+            }),
+        };
+        let saved = NetworkConfig {
+            interfaces: vec![interface()],
+        };
+        applied.validate_activation(&saved).unwrap();
+        applied.validate_same_machine(&saved).unwrap();
+        for change in 0..8 {
+            let mut changed = saved.clone();
+            match change {
+                0 => changed.interfaces[0].mac_address = "02:00:00:00:00:08".into(),
+                1 => changed.interfaces[0].ipv4.address = Ipv4Addr::new(192, 168, 105, 8),
+                2 => changed.interfaces[0].ipv4.prefix_length = 25,
+                3 => changed.interfaces[0].ipv4.gateway = Ipv4Addr::new(192, 168, 105, 2),
+                4 => changed.interfaces[0].dns.servers.clear(),
+                5 => changed.interfaces[0].dns.search.clear(),
+                6 => changed.interfaces.clear(),
+                _ => changed.interfaces.push(interface()),
+            }
+            assert!(applied.validate_same_machine(&changed).is_err(), "{change}");
+        }
     }
 }
