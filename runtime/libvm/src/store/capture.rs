@@ -3181,8 +3181,13 @@ impl SnapshotStore {
                                 }
                                 file.sync_all()?;
                                 crate::storage::pool::rename_component_no_replace(&from, name, &to, name)?;
+                                // One rename is one filesystem transaction, so
+                                // syncing the destination makes both halves of
+                                // the move durable. Syncing the source directory
+                                // as well buys nothing, and on Btrfs it commits
+                                // the whole filesystem whenever a commit landed
+                                // between the capture's write and this move.
                                 to.sync()?;
-                                from.sync()?;
                             } else {
                                 this.store.reserve_capture_publication(&record, record.reservation_bytes - record.plan.reservation.staging_bytes).await?;
                                 let copy = crate::machine::root_disk::copy_private(
