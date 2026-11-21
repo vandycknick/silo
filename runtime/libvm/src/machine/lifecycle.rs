@@ -105,6 +105,7 @@ impl Machine {
                 }
                 return Err(LibVmError::WakeConsumed {
                     reference: config.name.clone(),
+                    source: None,
                 });
             }
             crate::machine::hibernate::fence(

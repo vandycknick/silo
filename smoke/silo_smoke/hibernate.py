@@ -1,7 +1,7 @@
 """Real hibernate CLI, saved-file and identity observers for ADR 0023.
 
-Only info's new reporting fields are provisional. Keep their spelling in
-report(), so qualification can follow the final CLI schema in one place.
+Keep public info reporting fields in report(), so smoke and performance
+qualification share one adapter for the CLI schema.
 """
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import select
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -25,7 +26,6 @@ from silo_smoke.cli import Result, RootProfile, Silo
 from silo_smoke.config import REPO
 
 IMAGE_MACHINE_ID = "aabbccddeeff00112233445566778899"
-STARTS = "/hibernate-starts"
 
 
 class MemoryMode(StrEnum):
@@ -52,7 +52,7 @@ def report(silo: Silo, name: str) -> Report:
     info = silo.info(name)
     assert info["state"] == "hibernated" and info["ready"] is False, info
     value = info["hibernation"]
-    timestamp = datetime.fromtimestamp(value["hibernated_at"], tz=timezone.utc)
+    timestamp = datetime.fromtimestamp(value["hibernated_at"], tz=UTC)
     size = value["saved_state_bytes"]
     assert timestamp.tzinfo is not None and type(size) is int and size > 0, value
     memory = value["memory_capture"]
@@ -67,8 +67,9 @@ def report(silo: Silo, name: str) -> Report:
 
 
 def create(silo: Silo, image: str, name: str, *flags: str,
-           profile: RootProfile = "layered", network: str = "none", start: bool = True) -> None:
-    silo.create(name, silo.root_image(image, profile), "--cpus", "1", "--memory", "512mib",
+           profile: RootProfile = "layered", network: str = "none", start: bool = True,
+           cpus: int = 1) -> None:
+    silo.create(name, silo.root_image(image, profile), "--cpus", str(cpus), "--memory", "512mib",
                 "--disk-size", "512mib", "--vsock", "--network", network, *flags)
     if start:
         silo.start(name)
@@ -77,6 +78,23 @@ def create(silo: Silo, image: str, name: str, *flags: str,
 
 def boot_id(silo: Silo, name: str) -> str:
     return silo.exec(name, "cat", "/proc/sys/kernel/random/boot_id").stdout.strip()
+
+
+@dataclass(frozen=True)
+class BootProcess:
+    pid: int
+    start_ticks: int
+    command: str
+
+
+def boot_process(silo: Silo, name: str) -> BootProcess:
+    """Observe the boot-started PID 1, not an OCI CMD ignored by idle start."""
+    raw = silo.exec(name, "cat", "/proc/1/stat").stdout
+    pid = int(raw.split(" ", 1)[0])
+    start_ticks = int(raw.rsplit(") ", 1)[1].split()[19])
+    command = silo.exec(name, "cat", "/proc/1/cmdline").stdout.rstrip("\0")
+    assert pid == 1 and start_ticks >= 0 and command, (raw, command)
+    return BootProcess(pid, start_ticks, command)
 
 
 def holders(silo: Silo, name: str) -> list[shutdown.Process]:
@@ -88,7 +106,8 @@ def save(silo: Silo, name: str) -> None:
     processes = holders(silo, name)
     try:
         result = silo.run("hibernate", name, timeout=240)
-        assert f"Hibernated {name}" in result.stdout + result.stderr, result
+        assert result.stdout == "", result
+        assert re.search(rf"✓ Hibernated\s+{re.escape(name)}\b", result.stderr), result
         for process in processes:
             process.wait()
         saved_files(silo, name)
@@ -152,8 +171,8 @@ def identity(silo: Silo, name: str) -> Identity:
     info = silo.info(name)
     host, guest_id = silo.exec(name, "sh", "-ec", "hostname; cat /etc/machine-id").stdout.splitlines()
     trust = silo.ws.known_host(procs.machine_id(silo.ws, name)).read_text().split()
-    assert len(trust) == 3, trust
-    digest = hashlib.sha256(base64.b64decode(trust[2], validate=True)).digest()
+    assert len(trust) == 2 and trust[0] == "ssh-ed25519", trust
+    digest = hashlib.sha256(base64.b64decode(trust[1], validate=True)).digest()
     fingerprint = "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
     return Identity(str(info["id"]), str(info["name"]), restore_lifecycle.guest_identity(silo, name),
                     host, guest_id, fingerprint)

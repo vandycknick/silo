@@ -941,6 +941,7 @@ mod tests {
             },
             E::WakeConsumed {
                 reference: "dev".into(),
+                source: None,
             },
             E::HibernateOutOfSpace {
                 reference: "dev".into(),

@@ -164,7 +164,7 @@ mod tests {
             (E::HibernateBusy { reference: reference() }, "machine `dev` is busy with another lifecycle operation; try again when it finishes"),
             (E::HibernateFailed { reference: reference(), message: "disk write failed".into() }, "could not hibernate `dev`: disk write failed"),
             (E::WakeFailedBeforeConsume { reference: reference(), source: Box::new(E::InvalidRequest { message: "construction failed".into() }) }, "could not wake `dev`; its saved state was kept; retry `silo start dev`"),
-            (E::WakeConsumed { reference: reference() }, "could not wake `dev`; its saved state is gone and the machine is stopped; run `silo start dev` to boot it"),
+            (E::WakeConsumed { reference: reference(), source: None }, "could not wake `dev`; its saved state is gone and the machine is stopped; run `silo start dev` to boot it"),
             (E::MachineNotRunning { reference: reference() }, "machine `dev` is not running; start it with `silo start dev`"),
         ] {
             assert_eq!(crate::errors::native_message(&error), expected);

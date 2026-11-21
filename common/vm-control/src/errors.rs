@@ -66,7 +66,7 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
         | E::HibernateFailed { reference, .. }
         | E::HibernateUnusable { reference, .. }
         | E::WakeFailedBeforeConsume { reference, .. }
-        | E::WakeConsumed { reference } => {
+        | E::WakeConsumed { reference, .. } => {
             d.kind = 4;
             d.reference = Some(reference.clone());
             d.safe_message = v.to_string();
@@ -830,7 +830,10 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
                         reference,
                         source: Box::new(E::InvalidRequest { message: "wake construction failed".into() }),
                     },
-                    "WakeConsumed" => E::WakeConsumed { reference },
+                    "WakeConsumed" => E::WakeConsumed {
+                        reference,
+                        source: None,
+                    },
                     "SnapshotIsNotAnImage" => E::SnapshotIsNotAnImage { reference },
                     "ImageIsNotASnapshot" => E::ImageIsNotASnapshot { reference },
                     "ArtifactIsSnapshot" => E::ArtifactIsSnapshot { reference },

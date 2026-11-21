@@ -37,7 +37,13 @@ pub enum LibVmError {
         source: Box<LibVmError>,
     },
     #[error("could not wake `{reference}`; its saved state is gone and the machine is stopped; run `silo start {reference}` to boot it")]
-    WakeConsumed { reference: String },
+    WakeConsumed {
+        reference: String,
+        /// Why the wake failed, when this process observed it. Absent for a
+        /// caller that only joined a wake another process ran.
+        #[source]
+        source: Option<Box<LibVmError>>,
+    },
     #[error(transparent)]
     Handoff(#[from] crate::handoff::types::HandoffError),
     #[error("{operation} unsupported: {reason} (backend={backend}, lane={lane})")]

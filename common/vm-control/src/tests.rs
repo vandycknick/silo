@@ -968,6 +968,7 @@ fn hibernation_errors_keep_their_typed_variant_and_message_over_daemon_transport
         },
         E::WakeConsumed {
             reference: reference(),
+            source: None,
         },
     ];
     use libvm::storage::hibernate_file::HibernateUnusableReason as R;

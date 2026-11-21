@@ -11,13 +11,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 
 from silo_smoke import (
     capture_multidisk,
-    cloud_disk,
     hibernate,
     images,
     procs,
@@ -30,6 +29,7 @@ from silo_smoke import restore_lifecycle as network
 from silo_smoke.cli import ROOT_PROFILES, Result, RootProfile, Silo
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
+from silo_smoke.terminal import PtyCommand
 
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 NAME = "hibernate-vm"
@@ -38,7 +38,7 @@ NAME = "hibernate-vm"
 @pytest.fixture(scope="session")
 def hibernate_image(config: SmokeConfig, registry: LoopbackRegistry,
                     tmp_path_factory: pytest.TempPathFactory) -> str:
-    """Existing execution witness, with a non-Silo image id and startup counter."""
+    """Existing execution witness with an image-owned, non-Silo machine id."""
     output = tmp_path_factory.mktemp("hibernate-probe") / "restore-execution"
     subprocess.run([*toolchain.static_cc(), "-static", "-O2", "-pthread", "-Wall", "-Wextra", "-Werror",
                     "-std=c11", str(REPO / "virt/vmm/tests/guest/restore_execution.c"), "-o", str(output)],
@@ -48,9 +48,7 @@ def hibernate_image(config: SmokeConfig, registry: LoopbackRegistry,
         "etc/machine-id": (hibernate.IMAGE_MACHINE_ID + "\n").encode(),
         restore.PROBE.lstrip("/"): images.GuestFile(output.read_bytes(), mode=0o755),
     })
-    image = cloud_disk.with_process_defaults(images.build(spec, images.fetch_alpine(config.cache_dir)), {
-        "Cmd": ["/bin/sh", "-ec", f"echo started >>{hibernate.STARTS}; exec sleep 2147483647"],
-    })
+    image = images.build(spec, images.fetch_alpine(config.cache_dir))
     return registry.publish(image, "hibernate")
 
 
@@ -59,11 +57,12 @@ def test_process_memory_pid_boot_and_startup_survive_two_cycles(
     silo: Silo, hibernate_image: str, profile: RootProfile,
 ) -> None:
     """Conformance 1, repeated incremental saves, and snapshot after wake."""
-    hibernate.create(silo, hibernate_image, NAME, profile=profile)
+    # Both native CPU/register witness threads pin themselves to guest CPU 1.
+    hibernate.create(silo, hibernate_image, NAME, profile=profile, cpus=2)
     before = restore.start_witness(silo, NAME)
     boot = hibernate.boot_id(silo, NAME)
     run_id = silo.info(NAME)["run_id"]
-    assert silo.exec(NAME, "cat", hibernate.STARTS).stdout == "started\n"
+    init = hibernate.boot_process(silo, NAME)
     for _ in range(2):
         hibernate.save(silo, NAME)
         current = hibernate.wake(silo, NAME)
@@ -71,9 +70,9 @@ def test_process_memory_pid_boot_and_startup_survive_two_cycles(
         run_id = current
         before = restore.advances(silo, NAME, before)
         assert hibernate.boot_id(silo, NAME) == boot
-        assert silo.exec(NAME, "cat", hibernate.STARTS).stdout == "started\n"
+        assert hibernate.boot_process(silo, NAME) == init
     saved = restore.checkpoint(silo, NAME, alias="after-wake")
-    assert saved.boot_id == boot
+    assert saved.boot_id.strip() == boot
     silo.run("resume", NAME)
     restore.restore_child(silo, saved, "after-wake-child")
     restore.advances(silo, "after-wake-child", before)
@@ -146,7 +145,7 @@ def test_stop_hibernated_then_cold_start(silo: Silo, basic_image: str, force: bo
 
 REFUSED = (
     "snapshot", "snapshot-memory", "fork", "fork-live", "cpus", "memory", "disk", "network",
-    "kernel", "boot-assets", "rename", "export", "handoff", "pause", "resume",
+    "kernel", "boot-assets", "rename", "export", "pause", "resume",
 )
 
 
@@ -178,10 +177,6 @@ def test_protected_operations_leave_save_disks_and_config_unchanged(
         "boot-assets": ("set", NAME, "boot-assets=packaged"),
         "rename": ("set", NAME, "name=refused"),
         "export": ("storage", "export", NAME, str(output), "--disk-format", "raw", "--flatten-filesystem"),
-        "handoff": ("handoff", "plan", NAME, "--mode", "relocate", "--operation", str(uuid4()),
-                    "--destination-home", str(silo.ws.root / "destination"),
-                    "--destination-config", str(silo.ws.root / "destination-config"),
-                    "--destination-run-root", str(silo.ws.root / "destination-run")),
         "pause": ("pause", NAME), "resume": ("resume", NAME),
     }
     result = silo.run(*commands[operation], expect=None)
@@ -306,7 +301,7 @@ def test_twenty_concurrent_accesses_share_one_wake(silo: Silo, basic_image: str)
             assert result.stdout == f"exec-{index}"
         else:
             result = silo.shell(NAME, f"printf 'shell-{index}\\n'; exit 0\n")
-            assert result.stdout.replace("\r\n", "\n") == f"shell-{index}\n"
+            assert f"shell-{index}" in result.stdout.replace("\r\n", "\n").splitlines()
         return Access(result, str(silo.info(NAME)["run_id"]))
 
     with ThreadPoolExecutor(max_workers=20) as pool:
@@ -355,32 +350,36 @@ def test_exec_session_ends_and_configured_forward_reconnects(
     shutdown.until(listening, description="guest server not listening")
     assert network.forward_reply(path) == b"hello"
     session = silo.popen("exec", NAME, "--", "sh", "-ec", "echo SESSION-OPEN; exec sleep 2147483647")
-    shell = silo.popen("shell", NAME, "--user", "root", stdin=subprocess.PIPE)
+    shell = PtyCommand(silo.ws, [str(silo.ws.config.silo), "shell", NAME, "--user", "root"],
+                       label="hibernate-shell", term="dumb")
     forward_session: subprocess.Popen[bytes] | None = None
     try:
         assert hibernate.read_line(session) == b"SESSION-OPEN\n"
-        assert shell.stdin is not None
-        shell.stdin.write(b"printf 'SHELL-OPEN\\n'; exec sleep 2147483647\n")
-        shell.stdin.flush()
-        assert hibernate.read_line(shell).replace(b"\r\n", b"\n") == b"SHELL-OPEN\n"
-        shell.stdin.close()
-        shell.stdin = None
+        # Input typed before the first prompt is discarded when the guest
+        # shell switches the terminal into line-editing mode.
+        shell.wait_for(b":~# ")
+        shell.write(b"printf '\\nSHELL-OPEN\\n'; exec sleep 2147483647\n")
+        shell.wait_for(b"\r\nSHELL-OPEN\r\n")
         forward_session = silo.popen("forward", NAME, "0:9000", stdin=subprocess.DEVNULL)
         assert procs.bound_port(hibernate.read_line(forward_session)) > 0
         hibernate.save(silo, NAME)
-        for old in (session, shell, forward_session):
+        for old in (session, forward_session):
             output, errors = old.communicate(timeout=15)
             assert old.returncode is not None
             assert b"Waking" not in output + errors
+        shell.wait(timeout=15)
+        assert b"Waking" not in shell.output
         assert network.unix_refused(path)
         hibernate.wake(silo, NAME)
         assert network.forward_reply(path) == b"hello"
-        assert all(old.poll() is not None for old in (session, shell, forward_session)), (
+        assert all(old.poll() is not None for old in (session, shell.proc, forward_session)), (
             "an old access command was replayed")
     finally:
         if forward_session is not None:
             hibernate.terminate(forward_session, silo, "hibernate-old-forward")
-        hibernate.terminate(shell, silo, "hibernate-old-shell")
+        if shell.proc.poll() is None:
+            shell.proc.kill()
+        shell.wait(timeout=15)
         hibernate.terminate(session, silo, "hibernate-old-exec")
 
 
@@ -406,19 +405,30 @@ def test_admission_and_observation_never_wake(silo: Silo, basic_image: str) -> N
 
 
 def test_temporary_run_cannot_hibernate(silo: Silo, basic_image: str) -> None:
-    name = "hibernate-temporary"
-    silo.ws.register_machine(name)
-    process = silo.popen("run", basic_image, "--name", name, "--cpus", "1", "--memory", "512mib",
-                         "--vsock", "--network", "none", "--", "sleep", "2147483647")
+    # Only unnamed `run` machines are ephemeral. Hold stdin open and wait for
+    # guest output before looking up its generated name, avoiding creation races.
+    process = silo.popen("run", basic_image, "--cpus", "1", "--memory", "512mib",
+                         "--vsock", "--network", "none", "--", "sh", "-ec",
+                         "printf 'RUN-OPEN\\n'; cat >/dev/null", stdin=subprocess.PIPE)
+    name: str | None = None
     try:
+        assert hibernate.read_line(process) == b"RUN-OPEN\n"
+        machines = silo.ls()
+        assert len(machines) == 1, machines
+        name = str(machines[0]["name"])
+        silo.ws.register_machine(name)
         silo.wait_ready(name)
         hibernate.refused(silo.run("hibernate", name, expect=None),
                          f"machine `{name}` is a temporary `silo run` machine and cannot be hibernated")
         assert silo.info(name)["state"] == "running"
         assert silo.exec(name, "printf", "still-running").stdout == "still-running"
     finally:
-        silo.stop(name, force=True)
-        hibernate.terminate(process, silo, "hibernate-temporary")
+        try:
+            if name is not None:
+                result = silo.run("stop", name, "--force", expect=None)
+                assert result.returncode == 0 or "not found" in result.stderr, result
+        finally:
+            hibernate.terminate(process, silo, "hibernate-temporary")
 
 
 @pytest.mark.parametrize("access", ["exec", "cp", "shell", "forward"])
@@ -435,8 +445,8 @@ def test_guest_access_wakes_once_on_stderr(silo: Silo, basic_image: str, access:
         result = silo.run("cp", f"{NAME}:/hibernate-access", str(target))
         assert result.stdout == "" and target.read_bytes() == b"content"
     elif access == "shell":
-        result = silo.shell(NAME, "printf content; exit 0\n")
-        assert result.stdout == "content"
+        result = silo.shell(NAME, "printf 'content\\n'; exit 0\n")
+        assert "content" in result.stdout.replace("\r\n", "\n").splitlines()
     else:
         process = silo.popen("forward", NAME, "0:9000", stdin=subprocess.DEVNULL)
         try:

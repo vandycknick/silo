@@ -453,12 +453,14 @@ impl Machine {
         }
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         recover_locked(runtime, &config).await?;
+        // A wake only proves the VM runs again. Access needs the agent of the
+        // new run, so the waker waits for readiness exactly as a joiner does.
         if let Some(record) = runtime
             .native_store()?
             .machine_hibernation(config.id)
             .await?
         {
-            return Ok(self.wake_locked(&config, record).await?.run_id);
+            self.wake_locked(&config, record).await?;
         }
         let state = runtime.machine_state(config.id).await?;
         if state.status != MachineRuntimeState::Running {
@@ -669,6 +671,7 @@ impl Machine {
                 runtime.mark_machine_stopped(config.id, None).await?;
                 return Err(LibVmError::WakeConsumed {
                     reference: config.name.clone(),
+                    source: Some(Box::new(primary)),
                 });
             }
             store

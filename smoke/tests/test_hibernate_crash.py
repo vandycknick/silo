@@ -43,12 +43,14 @@ def test_manager_killed_before_memory_save_completes(silo: Silo, basic_image: st
             trace.release()
             manager.wait()
             assert trace.wait("result.json")["code"] != 0
-            state = silo.info(NAME)["state"]
-            assert state in {"running", "hibernated"}, state
-            if state == "hibernated":
-                hibernate.wake(silo, NAME)
-            else:
-                silo.wait_ready(NAME)
+            # Observation is deliberately read-only. Drive reconciliation with
+            # a real guest-access command while the orphaned capture rolls back;
+            # a durable save instead takes the ordinary access-triggered wake.
+            shutdown.until(
+                lambda: silo.exec(NAME, "true", expect=None, timeout=10).returncode == 0,
+                timeout=90, description="manager death left the machine unusable",
+            )
+            assert silo.info(NAME)["state"] == "running"
             assert hibernate.boot_id(silo, NAME) == boot
             assert silo.exec(NAME, "cat", "/hibernate-crash-marker").stdout == "before-crash"
             # A fresh save/wake proves recovery did not leave a wedged capture.

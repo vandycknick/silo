@@ -1960,30 +1960,32 @@ saved state is fabricated. Collection never starts guests.
 
 | ADR conformance item | Scenario in `tests/test_hibernate.py` (unless noted) |
 | --- | --- |
-| 1 | `process_memory_pid_boot_and_startup_survive_two_cycles`: existing native execution witness preserves PID, memory address, CPU/register/timer progress and boot id; an OCI startup counter stays at one. Runs on raw and layered roots, twice, then snapshots and restores the woken guest. |
+| 1 | `process_memory_pid_boot_and_startup_survive_two_cycles`: existing native execution witness preserves PID, memory address, CPU/register/timer progress and boot id; the boot-started PID 1 keeps its PID, `/proc/1/stat` start time and command line. Idle `create`/`start` does not execute OCI CMD, so no image-command counter is assumed. Uses two vCPUs because its CPU/register threads pin themselves to CPU 1. Runs on raw and layered roots, twice, then snapshots and restores the woken guest. |
 | 2 | `identity_is_preserved_including_image_machine_id`: id/name, actual guest MAC/IP, hostname, image-owned machine-id distinct from Silo id, and SHA-256 fingerprint of guest SSH host trust are unchanged. |
 | 3 | `wall_clock_is_corrected_after_configurable_sleep`: default three-second sleep and 1.5-second tolerance; set `SILO_SMOKE_HIBERNATE_SLEEP=180` for the several-minute qualification and optionally `SILO_SMOKE_HIBERNATE_CLOCK_TOLERANCE`. |
 | 4 | `paused_hibernate_wakes_running`: no inherited user pause after wake. |
 | 5 | `stop_hibernated_then_cold_start`: clean stop retains a deliberately unsynced file; force discards without wake; both next starts have a new boot id. Raw/layered matrix. |
-| 6 | `protected_operations_leave_save_disks_and_config_unchanged`: disk/live snapshot and fork, CPU/memory/disk/network/kernel/boot/name settings, raw flatten/export, handoff plan, pause and resume each refuse with the ADR diagnostic; actual disk/save bytes and catalog config bytes stay identical; each machine subsequently wakes. |
+| 6 | `protected_operations_leave_save_disks_and_config_unchanged`: disk/live snapshot and fork, CPU/memory/disk/network/kernel/boot/name settings, raw flatten/export, pause and resume each refuse with the ADR diagnostic; actual disk/save bytes and catalog config bytes stay identical; each machine subsequently wakes. Handoff refusal is covered by the libvm host test only: its CLI requires a running source daemon before machine admission, unlike these daemon-free scenarios. |
 | 7 | `every_saved_file_tamper_refuses_without_boot_then_plain_stop_discards`: delete, truncate and same-byte replacement of every discovered saved file. `each_writable_disk_tamper_refuses_without_boot`: writes to the root and every managed/external writable data disk. Exact refusal reasons, no monitor, plain-stop discard and successful cold boot are required. |
-| 8 | `tests/test_hibernate_crash.py`: CLI/manager killed while native saved-RAM write is held, then reconcile and use the guest; monitor/worker killed while native saved-RAM mmap is held before consume, then retry the untouched save. |
+| 8 | `tests/test_hibernate_crash.py`: CLI/manager killed while native saved-RAM write is held, then bounded guest-access retries drive recovery (read-only info deliberately does not); monitor/worker killed while native saved-RAM mmap is held before consume, then retry the untouched save. |
 | 9 | Explicitly skipped: no existing rootless bounded-filesystem Home fixture. Filling the shared host filesystem is unsafe; injected ENOSPC would not prove this scenario. |
-| 10 | `twenty_concurrent_accesses_share_one_wake`: twenty exec/cp/shell callers, identical new run id, preserved boot id, clean stdout/copied contents, at least one wake notice and at most one exact notice per caller. |
+| 10 | `twenty_concurrent_accesses_share_one_wake`: twenty exec/cp/shell callers, identical new run id, preserved boot id, clean exec stdout/copied contents and complete shell output lines despite PTY echo/prompts, at least one wake notice and at most one exact notice per caller. |
 | 11 | `hibernated_fresh_cli_without_silo_processes` simulates process disappearance in the private workspace and uses a fresh CLI. This is not a host reboot, filesystem remount, Btrfs device-number reassignment or ext4/Btrfs reboot matrix. |
-| 12 | `exec_session_ends_and_configured_forward_reconnects`: old exec, shell and session-forward clients end, configured forward disappears, then accepts a fresh connection after wake. |
+| 12 | `exec_session_ends_and_configured_forward_reconnects`: old exec, shell and session-forward clients end, configured forward disappears, then accepts a fresh connection after wake. The long-lived shell uses the existing PTY helper with `TERM=dumb`, like the workspace's normal shell environment, so it does not wait for an unanswered cursor-position query. |
 
-Additional cases cover stopped/already-hibernated/temporary-machine admission,
+Additional cases cover stopped/already-hibernated/temporary-machine admission
+(an unnamed `silo run`, with stdin held open and guest readiness witnessed),
 observational list/info/logs/forward-list commands, and each access command
 individually waking with exactly one `Waking NAME` line on stderr.
 All happy-path saves require every discovered saved file to be read-only.
 
-`silo_smoke.hibernate.report()` is the only adapter for provisional public info
-fields: `hibernation.hibernated_at` (timezone-bearing ISO-8601),
+`silo_smoke.hibernate.report()` is the only adapter for public info fields:
+`hibernation.hibernated_at` (Unix seconds),
 `hibernation.saved_state_bytes` (positive allocated bytes), and
-`hibernation.memory_capture.{mode,bytes_written,full_reason}`. Mode is `full` or
-`incremental`; incremental capture has no full reason. Reconcile these names
-with the CLI implementation before real-VM qualification.
+`hibernation.memory_capture.{mode,full_reason,stats}`. Native camelCase counters
+`fullBytesWritten`, `baselineBytesWritten` and `overlayBytesWritten` are summed
+for perf's bytes-written evidence. Mode is `full` or `incremental`; incremental
+capture has no full reason.
 
 Remaining manual crash coverage: post-durable/pre-release, post-consume, discard
 checkpoint and true host-power-loss boundaries, plus deliberate PID reuse.
