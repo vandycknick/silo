@@ -460,6 +460,7 @@ mod tests {
                 backend: LiveBackend::Mock,
                 lane: LiveLane::NotApplicable,
                 topology_revision: 1,
+                same_machine_activation: false,
                 live: LiveCapabilityVector::all_unsupported(LiveReasonCode::NotDelivered),
             },
             command: LiveCommand::Pause(PauseCommand {

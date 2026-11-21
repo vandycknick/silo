@@ -70,6 +70,7 @@ struct MonitorService {
     finite_capacity: Arc<Semaphore>,
     waiter_capacity: Arc<Semaphore>,
     live: Arc<LiveCoordinator>,
+    consume: Option<crate::restore::activation::ConsumeGate>,
 }
 
 impl MonitorService {
@@ -142,6 +143,47 @@ impl MonitorService {
 
 #[tonic::async_trait]
 impl VmMonitorService for MonitorService {
+    async fn get_restore_prepared(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<protocol::v1::GetRestorePreparedResponse>, Status> {
+        let _permit = admission(&self.finite_capacity, "restore control")?;
+        Ok(Response::new(protocol::v1::GetRestorePreparedResponse {
+            prepared: self
+                .consume
+                .as_ref()
+                .and_then(|gate| gate.prepared())
+                .map(Into::into),
+        }))
+    }
+
+    async fn authorize_consume(
+        &self,
+        request: Request<protocol::v1::ConsumeAuthorization>,
+    ) -> Result<Response<()>, Status> {
+        let _permit = admission(&self.finite_capacity, "restore control")?;
+        let authorization = request
+            .into_inner()
+            .try_into()
+            .map_err(Status::invalid_argument)?;
+        self.consume
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this run is not a parked wake"))?
+            .authorize(&authorization)
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(()))
+    }
+
+    async fn abandon_restore(&self, _: Request<()>) -> Result<Response<()>, Status> {
+        let _permit = admission(&self.finite_capacity, "restore control")?;
+        self.consume
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this run is not a parked wake"))?
+            .abandon()
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(()))
+    }
+
     async fn get_status(
         &self,
         _: Request<GetStatusRequest>,
@@ -472,6 +514,44 @@ pub async fn start_services(
     sync_reporter: &mut SyncReporter,
     startup: StartupGate,
 ) -> eyre::Result<ServiceHandles> {
+    let consume = startup
+        .activation
+        .as_ref()
+        .and_then(|activation| activation.consume_gate());
+    let result = start_services_inner(
+        runtime,
+        ctx,
+        startup_command,
+        exec_log,
+        vsock_surface,
+        sync_reporter,
+        startup,
+    )
+    .await;
+    if let (Err(error), Some(consume)) = (&result, consume) {
+        // Never request guest shutdown on either side of the consume cut.
+        let boundary = consume.finish_failure();
+        let detail = match ctx.machine.force_stop().await {
+            Ok(()) => format!("{error:#}"),
+            Err(cleanup) => format!("{error:#}; worker cleanup failed: {cleanup}"),
+        };
+        return Err(eyre::Report::new(vm_spec::hibernate::WakeFailure {
+            boundary,
+            detail,
+        }));
+    }
+    result
+}
+
+async fn start_services_inner(
+    runtime: &RuntimeContext,
+    ctx: &DaemonContext,
+    startup_command: Option<crate::start_request::StartupCommand>,
+    exec_log: Option<crate::exec_log::ExecLogWriter>,
+    vsock_surface: Option<crate::vsock::VsockSurface>,
+    sync_reporter: &mut SyncReporter,
+    startup: StartupGate,
+) -> eyre::Result<ServiceHandles> {
     let StartupGate {
         require_guest_ready,
         deadline: startup_deadline,
@@ -542,6 +622,9 @@ pub async fn start_services(
         finite_capacity: Arc::new(Semaphore::new(64)),
         waiter_capacity: Arc::new(Semaphore::new(64)),
         live: ctx.live.clone(),
+        consume: activation
+            .as_ref()
+            .and_then(|activation| activation.consume_gate()),
     };
     let access = AccessService {
         machine: ctx.machine.clone(),
@@ -660,13 +743,14 @@ pub async fn start_services(
     };
     if let Some(activation) = activation {
         let activation_id = activation.activation_id();
-        let activated = tokio::select! {
-            biased;
-            () = tokio::time::sleep_until(startup_deadline) => Err(eyre::eyre!(
-                "restore activation exceeded the original startup deadline"
-            )),
-            result = activation.run(ctx, runtime.runtime_dir(), &startup_cancel, startup_deadline) => result,
-        };
+        let activated = activation
+            .run(
+                ctx,
+                runtime.runtime_dir(),
+                &startup_cancel,
+                startup_deadline,
+            )
+            .await;
         match activated {
             Ok(crate::restore::activation::Activated::Running(surface)) => {
                 // Native exposure is irreversible. Cold-start admission checks
@@ -1130,6 +1214,7 @@ mod tests {
         );
         let monitor = crate::services::MonitorService {
             live: idle_live(&store, &machine, &run),
+            consume: None,
             store,
             machine_run_id: run.clone(),
             finite_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1343,6 +1428,7 @@ mod tests {
         let machine = store.status().unwrap().machine_id.unwrap();
         let service = crate::services::MonitorService {
             live: idle_live(&store, &machine, &run),
+            consume: None,
             store,
             machine_run_id: run,
             finite_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1461,6 +1547,7 @@ mod tests {
             .unwrap();
         let service = crate::services::MonitorService {
             live: idle_live(&store, &machine, &run),
+            consume: None,
             store,
             machine_run_id: run.clone(),
             finite_capacity: Arc::new(tokio::sync::Semaphore::new(8)),

@@ -615,6 +615,7 @@ impl Journal {
                         phase: vm_spec::capture::HibernateCapturePhase::Saving,
                         populated_memory_estimate_bytes: None,
                         cut: None,
+                        memory: None,
                         failure: None,
                     },
                 ),

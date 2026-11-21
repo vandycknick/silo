@@ -69,17 +69,50 @@ impl Machine {
         &self,
         options: MachineStartOptions,
     ) -> Result<MachineStart, LibVmError> {
-        // Keep the public future small when callers compose several lifecycle operations.
-        Box::pin(self.start_inner(options)).await
+        let machine = self.clone();
+        tokio::spawn(async move { machine.start_inner(options).await }).await?
     }
 
     async fn start_inner(&self, options: MachineStartOptions) -> Result<MachineStart, LibVmError> {
         let runtime = self.runtime();
         let supervisor = runtime.supervisor();
         let mut timeline = crate::runtime::start_timeline::StartTimeline::new(runtime.open_timing);
+        let joining_wake = runtime
+            .native_store()?
+            .has_hibernation(self.machine_id())
+            .await?;
         let (config, run_id) = {
             let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
+            crate::machine::hibernate::recover_locked(runtime, &config).await?;
+            if let Some(record) = runtime
+                .native_store()?
+                .machine_hibernation(config.id)
+                .await?
+            {
+                return self.wake_locked(&config, record).await;
+            }
+            if joining_wake {
+                let state = runtime.machine_state(config.id).await?;
+                if state.status == MachineRuntimeState::Running {
+                    let run_id = state.run_id.ok_or_else(|| LibVmError::MachineNotRunning {
+                        reference: config.name.clone(),
+                    })?;
+                    return Ok(MachineStart {
+                        machine: runtime.machine_inspect_data(config).await?,
+                        run_id: MachineRunId::from_raw(run_id),
+                    });
+                }
+                return Err(LibVmError::WakeConsumed {
+                    reference: config.name.clone(),
+                });
+            }
+            crate::machine::hibernate::fence(
+                runtime,
+                &config,
+                crate::machine::hibernate::HibernateRemedy::Stop,
+            )
+            .await?;
             let _node_state = crate::node_state::acquire(&config).await?;
             let machine_paths = runtime.machine_paths(config.id);
             let pid_path = machine_paths.vmm_pid_path();
@@ -474,18 +507,24 @@ impl Machine {
     }
 
     /// Stops the machine and returns its updated inspect data.
-    pub async fn stop(&self) -> Result<MachineData, LibVmError> {
+    pub async fn stop(&self) -> Result<crate::MachineStopOutcome, LibVmError> {
         self.stop_impl(None, MachineStopOptions::default(), false)
             .await
     }
 
     /// Stops the machine with explicit stop options.
-    pub async fn stop_with(&self, options: MachineStopOptions) -> Result<MachineData, LibVmError> {
+    pub async fn stop_with(
+        &self,
+        options: MachineStopOptions,
+    ) -> Result<crate::MachineStopOutcome, LibVmError> {
         self.stop_impl(None, options, false).await
     }
 
     /// Stops this exact machine run without affecting a replacement run.
-    pub async fn stop_run(&self, run_id: MachineRunId) -> Result<MachineData, LibVmError> {
+    pub async fn stop_run(
+        &self,
+        run_id: MachineRunId,
+    ) -> Result<crate::MachineStopOutcome, LibVmError> {
         self.stop_impl(Some(&run_id), MachineStopOptions::default(), false)
             .await
     }
@@ -495,7 +534,7 @@ impl Machine {
         &self,
         run_id: MachineRunId,
         options: MachineStopOptions,
-    ) -> Result<MachineData, LibVmError> {
+    ) -> Result<crate::MachineStopOutcome, LibVmError> {
         self.stop_impl(Some(&run_id), options, false).await
     }
 
@@ -504,8 +543,21 @@ impl Machine {
         expected_run_id: Option<&MachineRunId>,
         options: MachineStopOptions,
         for_removal: bool,
-    ) -> Result<MachineData, LibVmError> {
-        Box::pin(self.stop_inner(expected_run_id, options, for_removal)).await
+    ) -> Result<crate::MachineStopOutcome, LibVmError> {
+        let handle = self.clone();
+        let expected_run_id = expected_run_id.cloned();
+        tokio::spawn(async move {
+            let mut warning = None;
+            let machine = Box::pin(handle.stop_inner(
+                expected_run_id.as_ref(),
+                options,
+                for_removal,
+                &mut warning,
+            ))
+            .await?;
+            Ok(crate::MachineStopOutcome { machine, warning })
+        })
+        .await?
     }
 
     async fn stop_inner(
@@ -513,10 +565,42 @@ impl Machine {
         expected_run_id: Option<&MachineRunId>,
         options: MachineStopOptions,
         for_removal: bool,
+        warning: &mut Option<crate::MachineStopWarning>,
     ) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
         let wait_target = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            if expected_run_id.is_none() {
+                crate::machine::hibernate::recover_locked(runtime, &config).await?;
+                if let Some(record) = runtime
+                    .native_store()?
+                    .machine_hibernation(config.id)
+                    .await?
+                {
+                    if for_removal {
+                        crate::machine::hibernate::discard_locked(runtime, &config).await?;
+                    } else if let Err(error) = self.wake_locked(&config, record).await {
+                        *warning = Some(match error {
+                            LibVmError::HibernateUnusable { reason, .. } => {
+                                crate::MachineStopWarning::SavedStateUnusable { reason }
+                            }
+                            LibVmError::WakeConsumed { .. } => {
+                                crate::MachineStopWarning::WakeFailed
+                            }
+                            other => {
+                                if runtime.machine_state(config.id).await?.status
+                                    != MachineRuntimeState::Hibernated
+                                {
+                                    return Err(other);
+                                }
+                                crate::MachineStopWarning::WakeFailed
+                            }
+                        });
+                        crate::machine::hibernate::discard_locked(runtime, &config).await?;
+                        return runtime.machine_inspect_data(config).await;
+                    }
+                }
+            }
             // Removal must preflight orphan ownership before reconciliation,
             // which can otherwise write a storage-busy lifecycle projection.
             let status = if for_removal {
@@ -751,6 +835,13 @@ impl Machine {
         let runtime = self.runtime();
         let exit = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            if expected_run_id.is_none()
+                && crate::machine::hibernate::discard_locked(runtime, &config).await?
+            {
+                return Ok(MachineExit::already_stopped(
+                    runtime.machine_inspect_data(config).await?,
+                ));
+            }
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             require_current_run(&config, &status, expected_run_id)?;
             if !status.is_active() {
@@ -903,6 +994,7 @@ impl Machine {
         }
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
+        crate::machine::hibernate::discard_locked(runtime, &config).await?;
         let storage = runtime.machine_storage_record(config.id).await?;
         storage.ownership.ensure_owned(config.id)?;
         runtime

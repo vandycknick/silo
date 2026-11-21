@@ -135,15 +135,17 @@ Command behaviour by state:
 | `restart` | As today | As today | Wake, clean shutdown, cold boot | Cold boot |
 | `rm` | As today | As today | Discard and remove | Remove |
 | `snapshot`, `fork` | As today | As today | Refused: start it first | As today |
-| `update` and any change to disks, memory, CPUs, kernel, boot assets, network or forwards | As today | As today | Refused: stop it first | As today |
+| `set` and any change to disks, memory, CPUs, kernel, boot assets, network or forwards | As today | As today | Refused: stop it first | As today |
 | raw export, handoff | As today | As today | Refused: stop it first | As today |
 | `pause`, `resume` | As today | As today | Refused: start it first | As today |
-| `list`, `inspect`, `logs`, listing forwards | Observe | Observe | Observe; never wake | Observe |
+| `list`, `info`, `logs`, listing forwards | Observe | Observe | Observe; never wake | Observe |
 
 Temporary `silo run` machines cannot be hibernated.
 
-`silo list` shows the state `hibernated`. `silo inspect` additionally reports
-when the machine was hibernated and the allocated size of the saved state.
+`silo list` shows the state `hibernated`. `silo info` additionally reports
+when the machine was hibernated, the allocated size of the saved state, and
+how the memory file was written: incrementally or in full, with the bytes
+written. The last item is the evidence the performance suite uses.
 
 ## Hibernate
 
@@ -313,7 +315,7 @@ hibernation row and refuses while it exists. The check lives in the shared
 stopped-storage admission in `libvm` and in the cold-start path, so a new
 stopped-machine operation is covered by default.
 
-Operations refused: cold start, `update` and all configuration changes,
+Operations refused: cold start, `set` and all configuration changes,
 stopped snapshot, stopped fork, live snapshot and live fork, raw export, and
 handoff (before its automatic stop). `stop`, `restart` and `rm` are the only
 operations that end the hibernated state other than wake.
@@ -358,6 +360,11 @@ hibernated and the user discards.
 The guest agent embedded in a machine's boot assets must support same-machine
 activation. Hibernate refuses a machine whose agent does not, because the
 agent cannot be replaced while the machine sleeps.
+
+The hibernation row records the host SSH signing key the guest trusts. Wake
+refuses, before consume, when that key is missing or has been replaced on the
+host, because the woken guest would keep trusting a key the host no longer
+uses. The reason reported is "not compatible with this system".
 
 The daemon gains a `HibernateMachine` call. `StartMachine` wakes. New state
 values are appended to the existing wire enums.

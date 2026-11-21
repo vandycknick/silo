@@ -201,6 +201,7 @@ impl InstanceStore {
             lane: profile.lane,
             topology_revision: 1,
             live: profile.live,
+            same_machine_activation: false,
         };
         live.validate().map_err(StoreError::Validation)?;
         let mut state = State {
@@ -1647,7 +1648,16 @@ fn project_status(
     observed_at: SystemTime,
 ) -> Result<HostStatus, StoreError> {
     let mut live = state.live.clone();
-    live.live = crate::capabilities::narrow_for_guest(live.live, guest_rejection(state, now));
+    let guest_rejection = guest_rejection(state, now);
+    live.live = crate::capabilities::narrow_for_guest(live.live, guest_rejection);
+    // Clone/capture support predates wake. Only the current, live guest can
+    // positively advertise identity-preserving activation; old agents cannot.
+    live.same_machine_activation = guest_rejection.is_none()
+        && state
+            .status
+            .as_ref()
+            .and_then(|status| status.value.lifecycle.as_ref())
+            .is_some_and(|lifecycle| lifecycle.same_machine_activation == Some(true));
     let live = live.try_into().map_err(StoreError::Validation)?;
     let (ready, reason) = readiness_detail(state, now);
     let agent = if state.agent_enabled {
@@ -3266,6 +3276,86 @@ mod tests {
             assert_eq!(readiness.ready, Some(false));
             assert_eq!(readiness.reason, Some(reason as i32));
             assert_eq!(store.readiness().unwrap(), outcome);
+        }
+    }
+
+    #[test]
+    fn same_machine_activation_relay_requires_explicit_current_guest_support() {
+        let instance = "00000000-0000-4000-8000-000000000002";
+        for supported in [None, Some(false), Some(true)] {
+            let store = live_store();
+            let initial =
+                LiveMachineReport::try_from(store.status().unwrap().live.unwrap()).unwrap();
+            assert!(!initial.supports_same_machine_activation());
+            let mut status = live_status(instance, Some(true));
+            status
+                .report
+                .as_mut()
+                .unwrap()
+                .lifecycle
+                .as_mut()
+                .unwrap()
+                .same_machine_activation = supported;
+            store
+                .observe_status(status, Duration::from_secs(15))
+                .unwrap();
+            let status = store.status().unwrap();
+            let report = LiveMachineReport::try_from(status.live.unwrap()).unwrap();
+            assert_eq!(
+                report.live.pause.availability,
+                vm_spec::live::LiveAvailability::Supported,
+            );
+            assert_eq!(
+                report.supports_same_machine_activation(),
+                supported == Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn same_machine_activation_relay_rejects_stale_or_mismatched_guest_evidence() {
+        let instance = "00000000-0000-4000-8000-000000000002";
+        for rejection in 0..3 {
+            let store = live_store();
+            let mut status = live_status(instance, Some(true));
+            status
+                .report
+                .as_mut()
+                .unwrap()
+                .lifecycle
+                .as_mut()
+                .unwrap()
+                .same_machine_activation = Some(true);
+            store
+                .observe_status(status, Duration::from_secs(15))
+                .unwrap();
+            let supported =
+                LiveMachineReport::try_from(store.status().unwrap().live.unwrap()).unwrap();
+            assert!(supported.supports_same_machine_activation());
+            {
+                let mut state = store.state.lock().unwrap();
+                match rejection {
+                    0 => {
+                        state.status.as_mut().unwrap().deadline =
+                            Instant::now() - Duration::from_secs(1)
+                    }
+                    1 => {
+                        state
+                            .status
+                            .as_mut()
+                            .unwrap()
+                            .value
+                            .lifecycle
+                            .as_mut()
+                            .unwrap()
+                            .machine_id = uuid::Uuid::new_v4().to_string()
+                    }
+                    _ => state.agent_enabled = false,
+                }
+            }
+            let rejected =
+                LiveMachineReport::try_from(store.status().unwrap().live.unwrap()).unwrap();
+            assert!(!rejected.supports_same_machine_activation(), "{rejection}");
         }
     }
 }

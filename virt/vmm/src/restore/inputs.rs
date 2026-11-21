@@ -173,6 +173,15 @@ pub(crate) fn adopt(raw: Vec<RawFd>, request: &RestoreRequest) -> io::Result<Res
     let mut order = Vec::with_capacity(raw.len());
     for object in &request.objects {
         let fd = next()?;
+        if matches!(
+            object.authority,
+            vm_spec::restore::RestoreObjectAuthority::Hibernation { .. }
+        ) {
+            // SAFETY: startup validated every inherited descriptor as open;
+            // ownership is adopted below only after the entire set matches.
+            let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+            validate_object(&file, object)?;
+        }
         check(
             fd,
             object.fd,
@@ -260,6 +269,13 @@ pub(crate) fn validate_object(
     file: &File,
     object: &vm_spec::restore::RestoreObject,
 ) -> io::Result<()> {
+    if let vm_spec::restore::RestoreObjectAuthority::Hibernation { file: expected } =
+        &object.authority
+    {
+        validate_hibernation_file(file, &expected.path, expected)?;
+        #[cfg(target_os = "linux")]
+        reject_surviving_writer(file)?;
+    }
     use std::os::fd::AsFd;
     let facts = readonly_regular(file.as_fd())?;
     if facts != (object.file_device, object.file_inode, object.length) {
@@ -275,6 +291,43 @@ pub(crate) fn validate_object(
         if fingerprint(file)? != *expected {
             return Err(invalid("owned restore object fingerprint changed"));
         }
+    }
+    Ok(())
+}
+
+/// Compare both the held descriptor and the current no-follow path with the save.
+/// Device numbers are intentionally not part of the durable comparison.
+pub(crate) fn validate_hibernation_file(
+    file: &File,
+    path: &std::path::Path,
+    expected: &vm_spec::hibernate::HibernateFileBinding,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let mismatch = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            vm_spec::hibernate::HibernateFileMismatch {
+                path: expected.path.clone(),
+            },
+        )
+    };
+    if path != expected.path {
+        return Err(mismatch());
+    }
+    let matches = |metadata: &std::fs::Metadata| {
+        metadata.is_file()
+            && metadata.ino() == expected.inode
+            && metadata.len() == expected.size
+            && metadata.mode() == expected.mode
+            && metadata.mtime() == expected.modified_seconds
+            && metadata.mtime_nsec() == expected.modified_nanoseconds
+            && metadata.ctime() == expected.changed_seconds
+            && metadata.ctime_nsec() == expected.changed_nanoseconds
+    };
+    if !matches(&file.metadata().map_err(|_| mismatch())?)
+        || !matches(&std::fs::symlink_metadata(path).map_err(|_| mismatch())?)
+    {
+        return Err(mismatch());
     }
     Ok(())
 }
@@ -492,6 +545,61 @@ mod tests {
             "replacement inode is not admitted"
         );
         drop((replacement, launch));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn wake_file_checks_reject_every_changed_fact_with_a_typed_reason() {
+        use crate::restore::inputs::{validate_hibernation_file, validate_object};
+        use vm_spec::restore::RestoreObjectAuthority;
+        let directory = std::env::temp_dir().join(format!("wake-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let launch = crate::krun::worker::restore::tests::hibernation_launch(&directory);
+        let file = &launch.files.objects[0];
+        let RestoreObjectAuthority::Hibernation { file: expected } =
+            &launch.request.objects[0].authority
+        else {
+            panic!("hibernation authority");
+        };
+        validate_object(file, &launch.request.objects[0]).unwrap();
+        for change in 0..8 {
+            let mut changed = expected.clone();
+            match change {
+                0 => changed.path = directory.join("elsewhere"),
+                1 => changed.inode += 1,
+                2 => changed.size += 1,
+                3 => changed.mode ^= 0o100,
+                4 => changed.modified_seconds += 1,
+                5 => changed.modified_nanoseconds += 1,
+                6 => changed.changed_seconds += 1,
+                _ => changed.changed_nanoseconds += 1,
+            }
+            let error = validate_hibernation_file(file, &expected.path, &changed).unwrap_err();
+            assert!(
+                error
+                    .get_ref()
+                    .unwrap()
+                    .is::<vm_spec::hibernate::HibernateFileMismatch>(),
+                "mutation {change}"
+            );
+        }
+        // Current-device rebinding is permitted: the durable file facts carry
+        // no device, while the inherited descriptor remains exactly bound.
+        let json = serde_json::to_value(expected).unwrap();
+        assert!(json.get("device").is_none());
+        std::fs::rename(&expected.path, directory.join("original")).unwrap();
+        std::fs::write(&expected.path, b"replacement").unwrap();
+        assert!(validate_object(file, &launch.request.objects[0])
+            .unwrap_err()
+            .get_ref()
+            .unwrap()
+            .is::<vm_spec::hibernate::HibernateFileMismatch>());
+        std::fs::remove_file(&expected.path).unwrap();
+        std::os::unix::fs::symlink(directory.join("original"), &expected.path).unwrap();
+        assert!(validate_hibernation_file(file, &expected.path, expected).is_err());
+        std::fs::remove_file(&expected.path).unwrap();
+        assert!(validate_hibernation_file(file, &expected.path, expected).is_err());
+        drop(launch);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

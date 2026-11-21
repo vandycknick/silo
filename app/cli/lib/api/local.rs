@@ -500,7 +500,8 @@ impl LocalVmService {
             // terminal owners, storage outcome and durable operation pins.
             return Ok(machine
                 .stop_with(MachineStopOptions::new().timeout(timeout))
-                .await?);
+                .await?
+                .machine);
         }
         if force {
             machine

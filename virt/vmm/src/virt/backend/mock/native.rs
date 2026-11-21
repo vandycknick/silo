@@ -1167,7 +1167,18 @@ impl NativeLifecycle for ScenarioNative {
             }),
             predecessor_generation,
             baseline: None,
-            full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
+            // This scenario writes the full file and does not model native
+            // dirty coverage. Incremental requests must report the actual
+            // fallback, not pretend that the caller requested a full write.
+            full_reason: Some(
+                if preparation.policy == vm_spec::lifecycle::CapturePolicy::Full {
+                    vm_spec::capture::CaptureFullReason::Requested
+                } else if predecessor_generation == 0 {
+                    vm_spec::capture::CaptureFullReason::NoBaseline
+                } else {
+                    vm_spec::capture::CaptureFullReason::CoverageLost
+                },
+            ),
             identity_chunk_bytes: WRITE_CHUNK as u32,
             changes: changes_summary,
             changes_output,

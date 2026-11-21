@@ -298,6 +298,7 @@ mod tests {
             lane: LiveLane::NotApplicable,
             topology_revision: 1,
             live: LiveCapabilityVector::all_unsupported(LiveReasonCode::NotDelivered),
+            same_machine_activation: false,
         };
         serde_json::json!({
             "phase": "ready", "machine_id": live.machine_id, "run_id": live.run_id,

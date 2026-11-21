@@ -486,6 +486,7 @@ mod tests {
                 live: vm_spec::live::LiveCapabilityVector::all_unsupported(
                     vm_spec::live::LiveReasonCode::NotDelivered,
                 ),
+                same_machine_activation: false,
             },
             state: d::VmLifecycleState::Paused,
             lifecycle: d::LiveLifecycle {

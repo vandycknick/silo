@@ -118,6 +118,7 @@ impl GuestLifecycle {
             generation_driver_ready: Some(scenario.generation_driver_ready),
             clock_profile: None,
             clock_profile_unavailable_reason: None,
+            same_machine_activation: scenario.same_machine_activation.then_some(true),
         };
         Self {
             machine_id,

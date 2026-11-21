@@ -18,8 +18,9 @@
 //!  hibernate: prepare → pause/drain → flush → report Rss+Swap estimate
 //!       → await write authorization → unhashed state + sparse RAM → fsync cut
 //!       → await durable manager commit → journal committed → kill/reap, no thaw.
-//!  request.json/record.json without committed.json is precommit and reversible;
-//!  committed.json binds the exact old worker PID and start time for recovery.
+//!  Old-run request/record/commit journals live in captures/<id>, not the save.
+//!  A committed marker binds the exact old worker PID/start time until reap;
+//!  clean release or precommit rollback deletes that operation journal.
 //!
 //!  unsealed failure/cancel ─► abort any frozen disk generations ─► resolve RAM candidate
 //!       ─► snapshot-only failed evidence ─► continue once under policy
@@ -839,12 +840,53 @@ impl LiveCoordinator {
         }
         self.stage_execution_and_memory(run).await?;
         let cut = self.verify_hibernate_cut(run).await?;
+        let Some(CommandOutcome::MemoryCaptured {
+            mode,
+            full_reason,
+            stats,
+            ..
+        }) = run.native_memory.as_ref()
+        else {
+            return Err(Abort::Failed(failure(
+                LiveFailureCode::CaptureVerificationFailed,
+                LiveStage::CaptureVerify,
+                "The saved machine lacks its memory receipt; retry hibernation",
+            )));
+        };
+        let memory = vm_spec::capture::HibernateMemoryReceipt {
+            mode: *mode,
+            full_reason: *full_reason,
+            stats: stats.as_ref().clone(),
+        };
+        tracing::info!(
+            save_id = %run.operation,
+            memory_mode = ?memory.mode,
+            memory_full_reason = ?memory.full_reason,
+            memory_seed_method = ?memory.stats.seed_method,
+            memory_full_bytes_written = memory.stats.full_bytes_written,
+            memory_baseline_bytes_written = memory.stats.baseline_bytes_written,
+            memory_overlay_bytes_written = memory.stats.overlay_bytes_written,
+            memory_layout_bytes_written = memory.stats.layout_bytes_written,
+            memory_live_bytes_read = memory.stats.live_bytes_read,
+            memory_baseline_bytes_read = memory.stats.baseline_bytes_read,
+            memory_materialization_dirty_pages = memory.stats.materialization_dirty_pages,
+            memory_live_pages_classified = memory.stats.live_pages_classified,
+            "hibernation memory materialized"
+        );
         let status = HibernateCaptureStatus {
             phase: HibernateCapturePhase::Prepared,
             populated_memory_estimate_bytes: Some(estimated),
             cut: Some(Box::new(cut)),
+            memory: Some(memory),
             failure: None,
         };
+        status.validate().map_err(|error| {
+            Abort::Failed(failure(
+                LiveFailureCode::CaptureVerificationFailed,
+                LiveStage::CaptureVerify,
+                error,
+            ))
+        })?;
         self.write_hibernate_journal(run, &status, false).await?;
         self.checkpoint(run, LiveStage::CaptureSeal)?;
         {
@@ -1152,7 +1194,7 @@ impl LiveCoordinator {
             return;
         }
         self.gate.seal();
-        let result = self.machine.hibernate_stop().await.map_err(|error| {
+        let mut result = self.machine.hibernate_stop().await.map_err(|error| {
             failure(
                 LiveFailureCode::ReleaseFailed,
                 LiveStage::CaptureRelease,
@@ -1171,6 +1213,15 @@ impl LiveCoordinator {
                 .set_vm_state(protocol::v1::VmState::Hibernated, "machine hibernated")
             {
                 tracing::error!(%error, "publish hibernation terminal state");
+            }
+            if let Some(staging) = run.staging.clone() {
+                result = match tokio::task::spawn_blocking(move || staging.remove_hibernate_journal()).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(io_capture_failure(&error, LiveStage::CaptureRelease,
+                        LiveFailureCode::ReleaseFailed)),
+                    Err(error) => Err(failure(LiveFailureCode::ReleaseFailed, LiveStage::CaptureRelease,
+                        format!("Could not remove the completed hibernation journal: {error}; retry old-run cleanup"))),
+                };
             }
         }
         self.complete_hibernate_release(&run.operation, result);
@@ -3652,6 +3703,7 @@ impl LiveCoordinator {
             status.phase = HibernateCapturePhase::Failed;
             status.failure = Some(cause.clone());
             status.cut = None;
+            status.memory = None;
         }
         if let Err(cause) = disk_settlement {
             self.write_failed_record(&run, &cause).await;

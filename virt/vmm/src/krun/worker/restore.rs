@@ -204,6 +204,45 @@ struct Roles<'a> {
     mux: Option<OwnedFd>,
 }
 
+/// The original writable descriptors and their configured paths must still
+/// match the cut both before construction and before announcing prepared.
+fn validate_hibernation_disks(
+    config: &KrunConfig,
+    request: &RestoreRequest,
+    raw_handles: &[OwnedFd],
+) -> std::io::Result<()> {
+    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let vm_spec::restore::RestoreAuthority::Hibernation { cut } = &request.authority else {
+        return Ok(());
+    };
+    for saved in &cut.writable_disks {
+        let index = saved.attachment_index as usize;
+        let disk = config
+            .disks
+            .get(index)
+            .ok_or_else(|| invalid("wake disk attachment is missing"))?;
+        if disk.format != vm_spec::DiskFormat::Raw || disk.read_only {
+            return Err(invalid("wake requires the original writable raw disk"));
+        }
+        let slot = config
+            .storage_context
+            .raw_handles
+            .iter()
+            .position(|binding| binding.disk_index as usize == index)
+            .ok_or_else(|| invalid("wake disk descriptor binding is missing"))?;
+        let descriptor = raw_handles
+            .get(slot)
+            .ok_or_else(|| invalid("wake disk descriptor is missing"))?;
+        // SAFETY: borrow the owned raw role without taking ownership or
+        // duplicating its descriptor. The wrapper cannot close it.
+        let file =
+            std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(descriptor.as_raw_fd()) });
+        crate::restore::inputs::validate_hibernation_file(&file, &disk.path, &saved.file)?;
+    }
+    Ok(())
+}
+
 fn resources(
     roles: Roles<'_>,
     shape: &libkrun::live::inspection::AdmittedShape,
@@ -349,6 +388,12 @@ pub(crate) fn run(launch: Launch<'_>) -> eyre::Result<()> {
         stage,
     } = launch;
     let network = validate(config, &request)?;
+    request
+        .validate_activation(
+            &vm_spec::lifecycle::LiveId::parse(&binding.machine_id.to_string()).map_err(invalid)?,
+            &vm_spec::lifecycle::LiveId::parse(&binding.run_id.to_string()).map_err(invalid)?,
+        )
+        .map_err(invalid)?;
     let fds::RestoreStateFiles {
         ram,
         layout,
@@ -390,6 +435,12 @@ pub(crate) fn run(launch: Launch<'_>) -> eyre::Result<()> {
                 materialization_generation: cut.materialization_generation.get(),
             }
         }
+        (
+            vm_spec::restore::RestoreAuthority::Hibernation { cut },
+            fds::RestoreRamMap::OwnedLocalCut,
+        ) => crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut {
+            materialization_generation: cut.materialization_generation.get(),
+        },
         _ => return Err(invalid("restore map descriptor authority is mismatched")),
     };
     if held.len() != request.objects.len() {
@@ -411,6 +462,7 @@ pub(crate) fn run(launch: Launch<'_>) -> eyre::Result<()> {
         deadline,
     )?;
     let (expected, _) = crate::krun::restore::identity(&request)?;
+    validate_hibernation_disks(config, &request, raw_handles)?;
     let resources = resources(
         Roles {
             config,
@@ -438,6 +490,7 @@ pub(crate) fn run(launch: Launch<'_>) -> eyre::Result<()> {
             for (file, object) in held.iter().zip(&request.objects) {
                 crate::restore::inputs::validate_object(file, object)?;
             }
+            validate_hibernation_disks(config, &request, raw_handles)?;
             // Serving starts a thread and returns: native dispatch runs only
             // after this callback, so no blocking native call happens here.
             let served = lifecycle::serve(
@@ -658,7 +711,8 @@ pub(crate) mod tests {
     pub(crate) fn evidence(authority: &vm_spec::restore::RestoreAuthority) -> &CaptureEvidence {
         match authority {
             vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => evidence,
-            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. } => {
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. }
+            | vm_spec::restore::RestoreAuthority::Hibernation { .. } => {
                 panic!("identified fixture authority")
             }
         }
@@ -669,7 +723,8 @@ pub(crate) mod tests {
     ) -> &mut CaptureEvidence {
         match authority {
             vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => evidence,
-            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. } => {
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. }
+            | vm_spec::restore::RestoreAuthority::Hibernation { .. } => {
                 panic!("identified fixture authority")
             }
         }
@@ -1247,5 +1302,197 @@ pub(crate) mod tests {
         malformed.lowers[0].descriptor.file_inode += 1;
         assert!(lower_blocks(&malformed, duplicate_files()).is_err());
         assert!(lower_blocks(&request, vec![files[0].try_clone().unwrap()]).is_err());
+    }
+
+    pub(crate) fn hibernation_launch(directory: &std::path::Path) -> crate::virt::RestoreLaunch {
+        use vm_spec::hibernate::{
+            HibernateCut, HibernateFileBinding, HibernateSavedFile, HibernateSavedFileRole,
+        };
+        let mut launch = owned_launch(directory);
+        let vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } = &launch.request.authority
+        else {
+            panic!("owned fixture");
+        };
+        let saved_files = std::array::from_fn(|index| {
+            let file = &launch.files.objects[index];
+            let metadata = file.metadata().unwrap();
+            HibernateSavedFile {
+                role: [
+                    HibernateSavedFileRole::Memory,
+                    HibernateSavedFileRole::MemoryLayout,
+                    HibernateSavedFileRole::ExecutionState,
+                    HibernateSavedFileRole::DeviceState,
+                ][index],
+                file: HibernateFileBinding {
+                    path: directory.join(format!("restore-object-{index}")),
+                    inode: metadata.ino(),
+                    size: metadata.len(),
+                    mode: metadata.mode(),
+                    modified_seconds: metadata.mtime(),
+                    modified_nanoseconds: metadata.mtime_nsec(),
+                    changed_seconds: metadata.ctime(),
+                    changed_nanoseconds: metadata.ctime_nsec(),
+                },
+            }
+        });
+        let cut = HibernateCut {
+            version: vm_spec::hibernate::HIBERNATE_CUT_VERSION,
+            save_id: cut.capture_id.clone(),
+            machine_id: cut.machine_id.clone(),
+            ended_run_id: cut.run_id.clone(),
+            freeze_operation_id: cut.freeze_operation_id.clone(),
+            freeze_epoch: cut.freeze_epoch,
+            configuration: cut.configuration.clone(),
+            binding: cut.binding.clone(),
+            materialization_generation: cut.materialization_generation,
+            predecessor_generation: cut.predecessor_generation,
+            packed_length: cut.packed_length,
+            page_granule: cut.page_granule,
+            regions: cut.regions,
+            saved_files,
+            writable_disks: vec![],
+        };
+        cut.validate().unwrap();
+        for (object, saved) in launch.request.objects.iter_mut().zip(&cut.saved_files) {
+            object.authority = vm_spec::restore::RestoreObjectAuthority::Hibernation {
+                file: saved.file.clone(),
+            };
+        }
+        launch.request.purpose = vm_spec::restore::ActivationPurpose::SameMachine;
+        launch.request.authority =
+            vm_spec::restore::RestoreAuthority::Hibernation { cut: Box::new(cut) };
+        launch.request.validate().unwrap();
+        launch
+    }
+
+    #[test]
+    fn wake_uses_owned_native_authority_and_rejects_clone_or_mixed_inputs() {
+        let directory = std::env::temp_dir().join(format!("wake-native-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let launch = hibernation_launch(&directory);
+        validate(&config(launch.request.clone()), &launch.request).unwrap();
+        let wire = protocol::v1::RestoreRequest::try_from(launch.request.clone()).unwrap();
+        assert_eq!(RestoreRequest::try_from(wire).unwrap(), launch.request);
+        let (native, layout) = crate::krun::restore::identity(&launch.request).unwrap();
+        assert!(matches!(
+            native.ram_image,
+            libkrun::live::RamInputAuthority::OwnedLocalCut { .. }
+        ));
+        assert!(matches!(
+            layout,
+            libkrun::live::restore::StateObjectAuthority::OwnedLocalFile { .. }
+        ));
+        for change in 0..4 {
+            let mut request = launch.request.clone();
+            match change {
+                0 => request.purpose = vm_spec::restore::ActivationPurpose::Clone,
+                1 => {
+                    request.objects[0].authority =
+                        vm_spec::restore::RestoreObjectAuthority::Identified {
+                            identity: vm_spec::capture::Sha256Digest::of_bytes(b"foreign"),
+                        }
+                }
+                2 => request.map_node_store = Some("/foreign".into()),
+                _ => {
+                    request.freeze_operation_id =
+                        vm_spec::lifecycle::LiveId::parse(&uuid::Uuid::new_v4().to_string())
+                            .unwrap()
+                }
+            }
+            assert!(request.validate().is_err(), "mutation {change}");
+        }
+        drop(launch);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn wake_binds_the_original_writable_descriptor_and_path_without_copying() {
+        use crate::krun::worker::restore::validate_hibernation_disks;
+        use vm_spec::hibernate::{HibernateDiskBinding, HibernateFileBinding};
+        let directory = std::env::temp_dir().join(format!("wake-disk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let mut launch = hibernation_launch(&directory);
+        let path = directory.join("original.raw");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(4096).unwrap();
+        let metadata = file.metadata().unwrap();
+        let disk = vm_spec::Disk {
+            path: path.clone(),
+            block_id: vm_spec::BlockId::new("root").unwrap(),
+            role: vm_spec::DiskRole::Root,
+            format: vm_spec::DiskFormat::Raw,
+            geometry: vm_spec::DiskGeometry {
+                length: 4096,
+                logical_sector_size: 512,
+            },
+            read_only: false,
+        };
+        let vm_spec::restore::RestoreAuthority::Hibernation { cut } = &mut launch.request.authority
+        else {
+            panic!("wake cut")
+        };
+        cut.configuration
+            .attachments
+            .push(vm_spec::capture::CaptureAttachment {
+                block_id: disk.block_id.clone(),
+                role: disk.role,
+                format: disk.format,
+                geometry: disk.geometry,
+                read_only: false,
+            });
+        cut.writable_disks.push(HibernateDiskBinding {
+            attachment_index: 0,
+            block_id: disk.block_id.clone(),
+            role: disk.role,
+            file: HibernateFileBinding {
+                path: path.clone(),
+                inode: metadata.ino(),
+                size: metadata.len(),
+                mode: metadata.mode(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            },
+        });
+        launch.request.configuration = cut.configuration.clone();
+        launch.request.validate().unwrap();
+        let mut config = config(launch.request.clone());
+        config.disks.push(disk);
+        config
+            .storage_context
+            .raw_handles
+            .push(protocol::shutdown::RawHandleBinding {
+                disk_index: 0,
+                child_fd: 9,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length_bytes: 4096,
+                read_only: false,
+            });
+        let handles = vec![std::os::fd::OwnedFd::from(file)];
+        validate_hibernation_disks(&config, &launch.request, &handles).unwrap();
+        config.disks[0].path = directory.join("copy.raw");
+        std::fs::copy(&path, &config.disks[0].path).unwrap();
+        let error = validate_hibernation_disks(&config, &launch.request, &handles).unwrap_err();
+        assert!(error
+            .get_ref()
+            .unwrap()
+            .is::<vm_spec::hibernate::HibernateFileMismatch>());
+        config.disks[0].path = path.clone();
+        std::os::unix::fs::FileExt::write_all_at(&launch.files.objects[0], b"forbidden", 0)
+            .unwrap_err();
+        let replacement = std::fs::File::open(directory.join("copy.raw")).unwrap();
+        assert!(
+            validate_hibernation_disks(&config, &launch.request, &[replacement.into()]).is_err()
+        );
+        validate_hibernation_disks(&config, &launch.request, &handles).unwrap();
+        drop((handles, launch));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

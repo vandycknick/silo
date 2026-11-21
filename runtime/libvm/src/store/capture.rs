@@ -1662,6 +1662,21 @@ pub(crate) async fn ensure_capture_available(
     run: Uuid,
     capture: Uuid,
 ) -> Result<(), LibVmError> {
+    let sleeping: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM machine_hibernation WHERE machine_id=?1)")
+            .bind(machine.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+    if sleeping {
+        let name: Option<String> =
+            sqlx::query_scalar("SELECT name FROM machine_config WHERE id=?1")
+                .bind(machine.to_string())
+                .fetch_optional(&mut *connection)
+                .await?;
+        return Err(LibVmError::HibernatedStartFirst {
+            reference: name.unwrap_or_else(|| machine.to_string()),
+        });
+    }
     let busy: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM storage_operation
@@ -1907,7 +1922,7 @@ pub(crate) fn writable_path(
 /// The canonical identity a capture plan binds for one read-only attachment:
 /// the retained composition `LowerResultId` of a layered lower, or the
 /// managed stream of a read-only Data disk.
-fn read_only_identity(
+pub(crate) fn read_only_identity(
     storage: &crate::MachineStorageRecord,
     order: u32,
     role: vm_spec::DiskRole,
@@ -3125,6 +3140,7 @@ impl SnapshotStore {
                     }
                     sqlx::query("INSERT OR REPLACE INTO storage_operation_cut(operation_id,cut_id,role) VALUES(?1,?2,'ram-baseline')")
                         .bind(record.launch_operation_id.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
+                    crate::store::map_store::release_hibernation_baseline(&mut tx, record.launch_operation_id).await?;
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
@@ -8454,6 +8470,7 @@ pub(crate) mod tests {
                 backend: LiveBackend::Krun,
                 lane: LiveLane::KvmX86_64,
                 topology_revision: 1,
+                same_machine_activation: false,
                 live: LiveCapabilityVector::all_unsupported(LiveReasonCode::NotDelivered),
             },
             command: LiveCommand::Capture(Box::new(CaptureCommand {

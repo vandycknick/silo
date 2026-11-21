@@ -711,6 +711,34 @@ pub enum HibernateCapturePhase {
     Failed,
 }
 
+/// Native byte-materialization evidence, separate from the hibernation cut.
+/// These counters are copied from the completed worker receipt, never inferred
+/// from generation numbers or from the allocated size of the saved RAM file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HibernateMemoryReceipt {
+    pub mode: CapturePolicy,
+    pub full_reason: Option<CaptureFullReason>,
+    pub stats: CaptureMemoryStats,
+}
+
+impl HibernateMemoryReceipt {
+    pub fn validate(&self) -> Result<(), String> {
+        if (self.mode == CapturePolicy::Full) != self.full_reason.is_some()
+            || self.stats.logical_bytes == 0
+            || self.stats.logical_bytes > MAX_CAPTURE_RAM_BYTES
+            || self.stats.identity_bytes_hashed != 0
+            || self.stats.whole_file_bytes_hashed != 0
+            || self.stats.map_nodes_written != 0
+        {
+            return Err(invalid(
+                "hibernation memory receipt has invalid materialization evidence",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HibernateCaptureStatus {
@@ -719,6 +747,9 @@ pub struct HibernateCaptureStatus {
     /// Advisory only: write-time ENOSPC rollback remains the safety barrier.
     pub populated_memory_estimate_bytes: Option<u64>,
     pub cut: Option<Box<crate::hibernate::HibernateCut>>,
+    /// Present once Prepared and retained through committed teardown.
+    #[serde(default)]
+    pub memory: Option<HibernateMemoryReceipt>,
     pub failure: Option<LiveFailure>,
 }
 
@@ -731,6 +762,7 @@ impl HibernateCaptureStatus {
                 | HibernateCapturePhase::Released
         );
         if self.cut.is_some() != has_cut
+            || self.memory.is_some() != has_cut
             || self.failure.is_some() != (self.phase == HibernateCapturePhase::Failed)
             || (!matches!(
                 self.phase,
@@ -743,6 +775,16 @@ impl HibernateCaptureStatus {
         }
         if let Some(cut) = &self.cut {
             cut.validate()?;
+            let memory = self
+                .memory
+                .as_ref()
+                .ok_or_else(|| invalid("hibernation cut lacks its memory receipt"))?;
+            memory.validate()?;
+            if memory.stats.logical_bytes != cut.packed_length {
+                return Err(invalid(
+                    "hibernation memory receipt differs from the saved RAM length",
+                ));
+            }
         }
         if let Some(failure) = &self.failure {
             failure.validate()?;
@@ -4334,6 +4376,51 @@ pub(crate) mod tests {
             plan.validate().is_err(),
             "in-place capture still requires flush coverage"
         );
+    }
+
+    #[test]
+    fn hibernate_memory_receipt_preserves_actual_materialization_mode_and_costs() {
+        let mut receipt = HibernateMemoryReceipt {
+            mode: CapturePolicy::Incremental,
+            full_reason: None,
+            stats: CaptureMemoryStats {
+                logical_bytes: 1 << 20,
+                seed_method: CaptureSeedMethod::Clone,
+                live_bytes_read: 4096,
+                overlay_bytes_written: 4096,
+                materialization_dirty_pages: 1,
+                ..CaptureMemoryStats::default()
+            },
+        };
+        receipt.validate().unwrap();
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HibernateMemoryReceipt>(&bytes).unwrap(),
+            receipt
+        );
+        receipt.full_reason = Some(CaptureFullReason::CoverageLost);
+        assert!(receipt.validate().is_err());
+        receipt.mode = CapturePolicy::Full;
+        receipt.stats.seed_method = CaptureSeedMethod::Rebuild;
+        receipt.stats.full_bytes_written = 1 << 20;
+        receipt.validate().unwrap();
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HibernateMemoryReceipt>(&bytes).unwrap(),
+            receipt
+        );
+        receipt.full_reason = None;
+        assert!(receipt.validate().is_err());
+        receipt.full_reason = Some(CaptureFullReason::NoBaseline);
+        for identity in 0..3 {
+            let mut bad = receipt.clone();
+            match identity {
+                0 => bad.stats.identity_bytes_hashed = 1,
+                1 => bad.stats.whole_file_bytes_hashed = 1,
+                _ => bad.stats.map_nodes_written = 1,
+            }
+            assert!(bad.validate().is_err());
+        }
     }
 
     #[test]

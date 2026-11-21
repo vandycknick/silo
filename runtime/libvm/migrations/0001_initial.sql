@@ -82,6 +82,30 @@ CREATE TABLE machine_state (
     state_json          BLOB NOT NULL
 );
 
+-- The only authority to resume this machine's private, single-use saved state.
+CREATE TABLE machine_hibernation (
+    machine_id TEXT PRIMARY KEY NOT NULL REFERENCES machine_config(id) ON DELETE CASCADE,
+    save_id TEXT UNIQUE NOT NULL,
+    ended_run_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('saving','available','waking','discarding')),
+    new_run_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    allocated_size INTEGER NOT NULL CHECK(allocated_size>=0),
+    record_json BLOB NOT NULL CHECK(json_valid(record_json,8)),
+    CHECK(json_extract(record_json,'$.begin.machineId') IS machine_id),
+    CHECK(json_extract(record_json,'$.begin.saveId') IS save_id),
+    CHECK(json_extract(record_json,'$.begin.endedRunId') IS ended_run_id),
+    CHECK(json_extract(record_json,'$.phase') IS phase),
+    CHECK(json_extract(record_json,'$.newRunId') IS new_run_id),
+    CHECK(json_extract(record_json,'$.createdAt') IS created_at),
+    CHECK(json_extract(record_json,'$.updatedAt') IS updated_at),
+    CHECK(json_extract(record_json,'$.allocatedSize') IS allocated_size),
+    CHECK((phase='waking') = (new_run_id IS NOT NULL)),
+    CHECK(phase NOT IN ('available','waking') OR json_type(record_json,'$.cut') IS 'object')
+);
+CREATE INDEX machine_hibernation_recovery ON machine_hibernation(phase,machine_id);
+
 -- One-shot execution restore authority. Completion survives terminal runtime
 -- reconciliation; only an admitted cold start retires the binding.
 CREATE TABLE machine_restore_binding (
@@ -440,6 +464,16 @@ CREATE TABLE storage_operation_memory_baseline (
     operation_id TEXT PRIMARY KEY NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
     root_digest TEXT NOT NULL REFERENCES stream_map_root(root_digest) ON DELETE RESTRICT
 );
+-- These launch roots outlive consumed resume authority. Deleting the launch
+-- releases both roles; replacing a baseline never releases its lazy mapping.
+CREATE TABLE storage_operation_hibernation (
+    operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    machine_id TEXT NOT NULL,
+    save_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('ram-mapping','ram-baseline')),
+    PRIMARY KEY(operation_id,role)
+);
+CREATE INDEX storage_operation_hibernation_save ON storage_operation_hibernation(machine_id,save_id);
 CREATE TABLE storage_operation_managed (
     operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
     managed_kind TEXT NOT NULL CHECK(managed_kind IN ('image','snapshot')),

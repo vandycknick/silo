@@ -22,6 +22,57 @@ use crate::{BlockId, DiskRole};
 
 pub const HIBERNATE_CUT_VERSION: u32 = 1;
 
+/// A save member or original writable disk no longer matches the durable cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HibernateFileMismatch {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for HibernateFileMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Saved file or disk {} changed; restore it unchanged or stop the machine with --force",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for HibernateFileMismatch {}
+
+/// Whether the durable single-use authorization was accepted before failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WakeFailureBoundary {
+    PreConsume,
+    PostConsume,
+}
+
+#[derive(Debug)]
+pub struct WakeFailure {
+    pub boundary: WakeFailureBoundary,
+    pub detail: String,
+}
+
+impl std::fmt::Display for WakeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.boundary {
+            WakeFailureBoundary::PreConsume => write!(
+                formatter,
+                "wake failed before consume; the machine remains hibernated: {}",
+                self.detail
+            ),
+            WakeFailureBoundary::PostConsume => write!(
+                formatter,
+                "wake failed after consume; the machine is stopped: {}",
+                self.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WakeFailure {}
+
 /// Reboot-stable file facts. Device numbers are deliberately excluded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

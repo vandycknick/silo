@@ -411,7 +411,7 @@ impl w::machine_service_server::MachineService for Service {
                         None => m.stop_with(options).await,
                     }
                     .map_err(native)?;
-                    snapshot(&data)
+                    snapshot(&data.machine)
                 }
             })
             .await?,
@@ -570,7 +570,8 @@ impl w::machine_service_server::MachineService for Service {
                         .await?
                         .stop_run_with(run, options)
                         .await
-                        .map_err(native)?,
+                        .map_err(native)?
+                        .machine,
                 )
             })
             .await?,

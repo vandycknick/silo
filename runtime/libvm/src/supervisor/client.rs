@@ -169,6 +169,77 @@ impl VmmClient {
         Ok(result)
     }
 
+    pub(crate) async fn control_hibernate(
+        &self,
+        envelope: vm_spec::lifecycle::LiveCommandEnvelope,
+        operation_id: vm_spec::lifecycle::LiveId,
+        authorize: bool,
+    ) -> Result<vm_spec::capture::HibernateCaptureStatus, VmmClientError> {
+        let mut client = monitor_client(self.channel().await?);
+        let response = client
+            .control_hibernate_capture(timed_request(
+                protocol::v1::ControlHibernateCaptureRequest {
+                    envelope: Some(envelope.into()),
+                    operation_id: Some(operation_id.to_string()),
+                    action: Some(if authorize {
+                        protocol::v1::HibernateCaptureAction::AuthorizeWrite
+                    } else {
+                        protocol::v1::HibernateCaptureAction::Observe
+                    } as i32),
+                },
+                RPC_TIMEOUT,
+            ))
+            .await
+            .map_err(|error| rpc_error("hibernate control failed", error))?
+            .into_inner();
+        vm_spec::capture::HibernateCaptureStatus::decode(
+            response
+                .status
+                .as_deref()
+                .ok_or_else(|| VmmClientError::Protocol("hibernate status missing".into()))?,
+        )
+        .map_err(VmmClientError::Protocol)
+    }
+
+    pub(crate) async fn restore_prepared(
+        &self,
+    ) -> Result<Option<vm_spec::hibernate::RestorePrepared>, VmmClientError> {
+        let mut client = monitor_client(self.channel().await?);
+        client
+            .get_restore_prepared(timed_request((), RPC_TIMEOUT))
+            .await
+            .map_err(|error| rpc_error("wake preparation failed", error))?
+            .into_inner()
+            .prepared
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(VmmClientError::Protocol)
+    }
+
+    pub(crate) async fn authorize_consume(
+        &self,
+        authorization: vm_spec::hibernate::ConsumeAuthorization,
+    ) -> Result<(), VmmClientError> {
+        let mut client = monitor_client(self.channel().await?);
+        client
+            .authorize_consume(timed_request(
+                protocol::v1::ConsumeAuthorization::from(authorization),
+                RPC_TIMEOUT,
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|error| rpc_error("wake execution authorization failed", error))
+    }
+
+    pub(crate) async fn abandon_restore(&self) -> Result<(), VmmClientError> {
+        let mut client = monitor_client(self.channel().await?);
+        client
+            .abandon_restore(timed_request((), RPC_TIMEOUT))
+            .await
+            .map(|_| ())
+            .map_err(|error| rpc_error("wake cancellation failed", error))
+    }
+
     pub(crate) async fn wait_ready(
         &self,
         timeout: Duration,

@@ -1065,7 +1065,10 @@ mod tests {
                 &[C::Resume, C::Capture, C::GetOperation, C::ReleaseCapture],
             ),
             (S::Capturing, &[C::GetOperation, C::CancelOperation]),
-            (S::Hibernating, &[C::GetOperation, C::CancelOperation]),
+            (
+                S::Hibernating,
+                &[C::GetOperation, C::CancelOperation, C::ReleaseCapture],
+            ),
             (S::Hibernated, &[]),
             (S::Restoring, &[C::GetOperation]),
             (S::Activating, &[C::GetOperation]),

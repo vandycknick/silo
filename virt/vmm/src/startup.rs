@@ -641,6 +641,8 @@ pub async fn init(
                 run_uuid,
                 &start_request.storage_shutdown,
                 vsock_filename.map(Path::to_path_buf),
+                startup_deadline,
+                startup_cancel.clone(),
             )?;
             let files = crate::restore::inputs::adopt(restore_fds, &request)
                 .map_err(|error| eyre::eyre!("adopt inherited restore descriptors: {error}"))?;

@@ -2078,10 +2078,14 @@ impl Store {
             next_state.status,
             crate::store::models::MachineRuntimeState::Stopped
                 | crate::store::models::MachineRuntimeState::Error
+                | crate::store::models::MachineRuntimeState::Hibernated
         ) {
             return Err(invalid(
                 "operation retirement requires a terminal lifecycle state",
             ));
+        }
+        if next_state.status == crate::store::models::MachineRuntimeState::Hibernated {
+            self.checkpoint_catalog().await?;
         }
         let pool = StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
@@ -2103,6 +2107,31 @@ impl Store {
             return Err(invalid(
                 "reconciliation does not match exact launch generation",
             ));
+        }
+        let hibernation: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT phase,ended_run_id,json_extract(record_json,'$.begin.launchOperationId') FROM machine_hibernation WHERE machine_id=?1",
+        )
+        .bind(record.machine_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        match (next_state.status, hibernation) {
+            (
+                crate::store::models::MachineRuntimeState::Hibernated,
+                Some((phase, ended, launch)),
+            ) if phase == "available"
+                && ended == run_id.to_string()
+                && launch == operation_id.to_string() => {}
+            (crate::store::models::MachineRuntimeState::Hibernated, _) => {
+                return Err(invalid(
+                    "hibernation retirement requires the matching durable saved state",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(invalid(
+                    "saved state still owns this machine; wake or discard it before stopping",
+                ));
+            }
+            (_, None) => {}
         }
         let current_state = sqlx::query_as::<_,crate::store::row::DbMachineState>("SELECT machine_id,status,json(state_json) AS state_json FROM machine_state WHERE machine_id=?1")
             .bind(next_state.machine_id.to_string()).fetch_optional(&mut *tx).await?;
@@ -2143,6 +2172,12 @@ impl Store {
         tx.commit().await?;
         drop(_roots);
         self.reconcile_restore_budget().await?;
+        if let Some(deferred) = self
+            .recover_machine_hibernation_files(next_state.machine_id, &pool)
+            .await?
+        {
+            tracing::warn!(machine = %next_state.machine_id, ?deferred, "saved memory cleanup deferred after launch retirement");
+        }
         Ok(true)
     }
 

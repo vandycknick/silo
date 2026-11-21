@@ -1,4 +1,5 @@
-//! Strict monitor capability conversions. Missing/unknown data is a protocol error.
+//! Strict monitor capability conversions. Missing required data is a protocol error;
+//! absent additive guest capabilities conservatively mean unsupported.
 use crate::v1 as wire;
 use vm_spec::live as domain;
 
@@ -217,6 +218,7 @@ impl TryFrom<domain::LiveMachineReport> for wire::LiveMachineReport {
             lane: Some(value.lane.wire_number()),
             topology_revision: Some(value.topology_revision),
             live: Some(encode_vector(value.live)),
+            same_machine_activation: Some(value.same_machine_activation),
         })
     }
 }
@@ -233,6 +235,7 @@ impl TryFrom<wire::LiveMachineReport> for domain::LiveMachineReport {
             lane: read_enum!(value.lane, LiveLane, "lane"),
             topology_revision: required(value.topology_revision, "topologyRevision")?,
             live: required(value.live, "live")?.try_into()?,
+            same_machine_activation: value.same_machine_activation.unwrap_or(false),
         };
         report.validate()?;
         Ok(report)
@@ -381,6 +384,7 @@ mod tests {
             lane: domain::LiveLane::NotApplicable,
             topology_revision: 1,
             live: host().live,
+            same_machine_activation: false,
         };
         assert!(wire::LiveMachineReport::try_from(machine.clone()).is_ok());
         machine.topology_revision = 0;
@@ -416,5 +420,53 @@ mod tests {
             incremental: positive,
         };
         assert!(wire::LiveHostReport::try_from(report).is_ok());
+    }
+
+    #[test]
+    fn same_machine_activation_wire_roundtrip_defaults_old_reports_to_unsupported() {
+        use prost::Message;
+        let mut report = domain::LiveMachineReport {
+            schema_version: 1,
+            scope: domain::LiveScope::Machine,
+            machine_id: "00000000-0000-4000-8000-000000000001".into(),
+            run_id: "00000000-0000-4000-8000-000000000002".into(),
+            monitor_id: "00000000-0000-4000-8000-000000000003".into(),
+            backend: domain::LiveBackend::Mock,
+            lane: domain::LiveLane::NotApplicable,
+            topology_revision: 1,
+            live: host().live,
+            same_machine_activation: false,
+        };
+        for supported in [false, true] {
+            report.same_machine_activation = supported;
+            let wire = wire::LiveMachineReport::try_from(report.clone()).unwrap();
+            let decoded = wire::LiveMachineReport::decode(wire.encode_to_vec().as_slice()).unwrap();
+            let decoded = domain::LiveMachineReport::try_from(decoded).unwrap();
+            assert_eq!(decoded, report);
+            assert_eq!(decoded.supports_same_machine_activation(), supported);
+        }
+        let mut old = wire::LiveMachineReport::try_from(report).unwrap();
+        old.same_machine_activation = None;
+        let decoded = wire::LiveMachineReport::decode(old.encode_to_vec().as_slice()).unwrap();
+        let decoded = domain::LiveMachineReport::try_from(decoded).unwrap();
+        assert!(!decoded.supports_same_machine_activation());
+    }
+
+    #[test]
+    fn same_machine_activation_guest_wire_requires_explicit_support() {
+        use prost::Message;
+        for supported in [None, Some(false), Some(true)] {
+            let status = wire::GuestLifecycleStatus {
+                same_machine_activation: supported,
+                ..Default::default()
+            };
+            let decoded =
+                wire::GuestLifecycleStatus::decode(status.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded.same_machine_activation, supported);
+            assert_eq!(
+                decoded.same_machine_activation == Some(true),
+                supported == Some(true)
+            );
+        }
     }
 }

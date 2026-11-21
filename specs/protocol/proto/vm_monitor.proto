@@ -23,6 +23,11 @@ service VmMonitorService {
   // Observe the paused-memory estimate or authorize writing after the caller's
   // free-space check. ReleaseCapture(PUBLISHED) remains the durable commit.
   rpc ControlHibernateCapture(ControlHibernateCaptureRequest) returns (ControlHibernateCaptureResponse);
+  // Empty prepared means this is not a parked wake. Authorization is accepted
+  // only for the exact machine/save/new run; duplicates join the same attempt.
+  rpc GetRestorePrepared(google.protobuf.Empty) returns (GetRestorePreparedResponse);
+  rpc AuthorizeConsume(ConsumeAuthorization) returns (google.protobuf.Empty);
+  rpc AbandonRestore(google.protobuf.Empty) returns (google.protobuf.Empty);
 }
 
 service VmAccessService {
@@ -319,6 +324,8 @@ message LiveMachineReport {
   optional LiveLane lane = 7;
   optional uint64 topology_revision = 8;
   LiveCapabilityVector live = 9;
+  // Positive evidence from the current guest; absence means unsupported.
+  optional bool same_machine_activation = 10;
 }
 message LiveOperationUnsupported {
   optional LiveOperation operation = 1;
@@ -771,6 +778,10 @@ message ConsumeAuthorization {
   optional string machine_id = 1;
   optional string save_id = 2;
   optional string new_run_id = 3;
+}
+
+message GetRestorePreparedResponse {
+  RestorePrepared prepared = 1;
 }
 
 message ReleaseCaptureResponse {

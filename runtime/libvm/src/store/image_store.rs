@@ -638,7 +638,7 @@ impl Store {
             Err(error) => return Err(error.into()),
         }
         let recovered = async {
-            let recovery = match maintenance {
+            let mut recovery = match maintenance {
                 CacheMaintenance::Recovery => self.recover_orphan_objects().await?,
                 CacheMaintenance::Sweep | CacheMaintenance::Prune => {
                     self.recover_layer_objects().await?
@@ -646,6 +646,10 @@ impl Store {
             };
             if recovery.checkpoint_deferred() {
                 return Ok::<_, LibVmError>(recovery);
+            }
+            if let Some(deferred) = self.recover_hibernation_files().await? {
+                recovery.deferred.push(deferred);
+                return Ok(recovery);
             }
             let (_, recovery) = self
                 .prune_image_cache_with_recovery(maintenance, Some(recovery))

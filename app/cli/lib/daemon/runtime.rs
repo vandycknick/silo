@@ -201,13 +201,19 @@ impl SystemMachine {
         &self,
         run_id: MachineRunId,
     ) -> Result<MachineData, libvm::LibVmError> {
-        self.inner.stop_run_with(run_id, stop_options()).await
+        self.inner
+            .stop_run_with(run_id, stop_options())
+            .await
+            .map(|outcome| outcome.machine)
     }
 
     /// Stops whichever run is current. The supervisor owns the system VM outright,
     /// so shutdown must not depend on having observed the run that is live now.
     pub(crate) async fn stop(&self) -> Result<MachineData, libvm::LibVmError> {
-        self.inner.stop_with(stop_options()).await
+        self.inner
+            .stop_with(stop_options())
+            .await
+            .map(|outcome| outcome.machine)
     }
 
     pub(crate) async fn exec_with_input(

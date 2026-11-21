@@ -51,6 +51,9 @@ pub struct Scenario {
 pub struct LifecycleScenario {
     /// Boot-observed bound generation driver, reported by the guest status.
     pub generation_driver_ready: bool,
+    /// Advertise identity-preserving activation support for hibernate admission.
+    /// Defaults to no advertisement; this does not model restore or Activate.
+    pub same_machine_activation: bool,
     /// Guest freezer refusal (unsupported containment). `None` models the
     /// admitted AgentPid1 workload layout.
     pub freezer_unsupported: Option<String>,
@@ -73,6 +76,7 @@ impl Default for LifecycleScenario {
     fn default() -> Self {
         Self {
             generation_driver_ready: true,
+            same_machine_activation: false,
             freezer_unsupported: None,
             workload_roots: vec!["/sys/fs/cgroup/silo-workloads".to_string()],
             providers: ProviderScenario::standard(),
@@ -635,6 +639,7 @@ mod tests {
         let lifecycle = modeled.lifecycle.expect("modeled lifecycle");
         assert_eq!(lifecycle, LifecycleScenario::default());
         assert!(lifecycle.generation_driver_ready);
+        assert!(!lifecycle.same_machine_activation);
         assert!(lifecycle
             .providers
             .iter()
@@ -643,6 +648,7 @@ mod tests {
         let scripted = Scenario::from_json(
             r#"{"lifecycle": {
                 "generationDriverReady": false,
+                "sameMachineActivation": true,
                 "memoryTracking": "disabled",
                 "nativePause": [{"result": "loseReply"}, {"delayMs": 5, "result": "fail"}],
                 "nativeCancel": [{"result": "fail"}],
@@ -656,6 +662,7 @@ mod tests {
         .lifecycle
         .expect("lifecycle");
         assert!(!scripted.generation_driver_ready);
+        assert!(scripted.same_machine_activation);
         assert_eq!(scripted.memory_tracking, MemoryTrackingScenario::Disabled);
         assert_eq!(
             scripted

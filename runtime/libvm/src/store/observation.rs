@@ -99,6 +99,18 @@ impl ObservationStore {
         })
     }
 
+    pub(crate) async fn has_hibernation(
+        &self,
+        machine: crate::MachineId,
+    ) -> Result<bool, LibVmError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM machine_hibernation WHERE machine_id=?1)",
+        )
+        .bind(machine.to_string())
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// One deferred SQLite snapshot. No connection/transaction survives the
     /// return into the monitor network await.
     pub(crate) async fn lookup(

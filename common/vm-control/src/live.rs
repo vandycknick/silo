@@ -212,6 +212,7 @@ pub fn machine_to_wire(v: &LiveMachineReport) -> Result<w::LiveMachineReport, Co
         lane: Some(lane_to_wire(v.lane)),
         topology_revision: Some(v.topology_revision),
         live: Some(vector_to_wire(&v.live)),
+        same_machine_activation: Some(v.same_machine_activation),
     })
 }
 pub fn machine_from_wire(v: w::LiveMachineReport) -> Result<LiveMachineReport, ConversionError> {
@@ -225,6 +226,7 @@ pub fn machine_from_wire(v: w::LiveMachineReport) -> Result<LiveMachineReport, C
         lane: lane_from_wire(required(v.lane, "live.lane")?)?,
         topology_revision: required(v.topology_revision, "live.topology_revision")?,
         live: vector_from_wire(required(v.live, "live.vector")?)?,
+        same_machine_activation: v.same_machine_activation.unwrap_or(false),
     };
     value
         .validate()
@@ -308,8 +310,8 @@ pub fn validate_daemon_status(value: &w::DaemonStatus) -> Result<(), ConversionE
 #[cfg(test)]
 mod tests {
     use crate::live::{
-        capability_from_wire, host_from_wire, host_to_wire, unsupported_from_wire,
-        unsupported_to_wire, validate_daemon_status,
+        capability_from_wire, host_from_wire, host_to_wire, machine_from_wire, machine_to_wire,
+        unsupported_from_wire, unsupported_to_wire, validate_daemon_status,
     };
     use silod_spec::daemon::v1 as w;
     use vm_spec::live::*;
@@ -437,6 +439,7 @@ mod tests {
             lane: LiveLane::NotApplicable,
             topology_revision: 1,
             live: LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded),
+            same_machine_activation: false,
         };
         let mut status = w::DaemonStatus {
             live_schema_version: Some(1),
@@ -464,5 +467,36 @@ mod tests {
             .unwrap()
             .machine_id = Some("12345678123442348234123456789abc".into());
         assert!(validate_daemon_status(&status).is_err());
+    }
+
+    #[test]
+    fn same_machine_activation_daemon_wire_preserves_support_and_defaults_absence_to_false() {
+        use prost::Message;
+        let mut report = LiveMachineReport {
+            schema_version: 1,
+            scope: LiveScope::Machine,
+            machine_id: "12345678-1234-4234-8234-123456789abc".into(),
+            run_id: "22345678-1234-4234-8234-123456789abc".into(),
+            monitor_id: "32345678-1234-4234-8234-123456789abc".into(),
+            backend: LiveBackend::Mock,
+            lane: LiveLane::NotApplicable,
+            topology_revision: 1,
+            live: LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded),
+            same_machine_activation: false,
+        };
+        for supported in [false, true] {
+            report.same_machine_activation = supported;
+            let encoded = machine_to_wire(&report).unwrap().encode_to_vec();
+            let decoded = w::LiveMachineReport::decode(encoded.as_slice()).unwrap();
+            let decoded = machine_from_wire(decoded).unwrap();
+            assert_eq!(decoded, report);
+            assert_eq!(decoded.supports_same_machine_activation(), supported);
+        }
+        let mut old = machine_to_wire(&report).unwrap();
+        old.same_machine_activation = None;
+        let decoded = w::LiveMachineReport::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(!machine_from_wire(decoded)
+            .unwrap()
+            .supports_same_machine_activation());
     }
 }

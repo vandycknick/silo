@@ -2206,6 +2206,7 @@ mod tests {
                     backend: vm_spec::live::LiveBackend::Mock,
                     lane: vm_spec::live::LiveLane::NotApplicable,
                     topology_revision: 1,
+                    same_machine_activation: false,
                     live: vm_spec::live::LiveCapabilityVector::all_unsupported(
                         vm_spec::live::LiveReasonCode::BackendExcluded,
                     ),

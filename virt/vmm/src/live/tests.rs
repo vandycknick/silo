@@ -95,6 +95,25 @@ impl Harness {
         memory_mib: Option<u32>,
         root_disk_bytes: u64,
     ) -> Self {
+        Self::start_shaped_with_capabilities(
+            lifecycle,
+            timeouts,
+            wait_ready,
+            memory_mib,
+            root_disk_bytes,
+            baseline(),
+        )
+        .await
+    }
+
+    async fn start_shaped_with_capabilities(
+        lifecycle: Option<serde_json::Value>,
+        timeouts: LiveTimeouts,
+        wait_ready: bool,
+        memory_mib: Option<u32>,
+        root_disk_bytes: u64,
+        capabilities: LiveCapabilityVector,
+    ) -> Self {
         let root = Path::new("/tmp").join(format!(
             "lv-{:x}-{:x}",
             std::process::id(),
@@ -169,7 +188,7 @@ impl Harness {
                     run_id: run_uuid.hyphenated().to_string(),
                     backend: LiveBackend::Mock,
                     lane: LiveLane::NotApplicable,
-                    live: baseline(),
+                    live: capabilities,
                 },
             )
             .unwrap(),
@@ -2322,6 +2341,7 @@ async fn live_hibernate_saves_in_place_and_only_commit_kills_without_shutdown() 
         .hibernate_phase(&request, HibernateCapturePhase::AwaitingWrite)
         .await;
     assert!(ready.populated_memory_estimate_bytes.unwrap() > 0);
+    assert!(ready.memory.is_none());
     let directory = harness.root.join("hibernation").join(request.as_str());
     assert_eq!(
         std::fs::metadata(directory.join("memory.ram"))
@@ -2337,6 +2357,24 @@ async fn live_hibernate_saves_in_place_and_only_commit_kills_without_shutdown() 
     let prepared = harness
         .hibernate_phase(&request, HibernateCapturePhase::Prepared)
         .await;
+    let memory = prepared.memory.as_ref().unwrap();
+    assert_eq!(memory.mode, CapturePolicy::Full);
+    assert_eq!(
+        memory.full_reason,
+        Some(vm_spec::capture::CaptureFullReason::Requested)
+    );
+    assert_eq!(memory.stats.logical_bytes, 1 << 20);
+    assert_eq!(memory.stats.live_bytes_read, 1 << 20);
+    assert_eq!(memory.stats.full_bytes_written, 1 << 20);
+    assert_eq!(memory.stats.identity_bytes_hashed, 0);
+    assert_eq!(memory.stats.whole_file_bytes_hashed, 0);
+    assert_eq!(memory.stats.map_nodes_written, 0);
+    let response =
+        protocol::v1::ControlHibernateCaptureResponse::try_from(prepared.clone()).unwrap();
+    assert_eq!(
+        vm_spec::capture::HibernateCaptureStatus::try_from(response).unwrap(),
+        prepared
+    );
     let cut = prepared.cut.unwrap();
     cut.validate().unwrap();
     assert_eq!(cut.saved_files.len(), 4);
@@ -2363,11 +2401,22 @@ async fn live_hibernate_saves_in_place_and_only_commit_kills_without_shutdown() 
         assert_eq!(metadata.ctime(), saved.file.changed_seconds);
         assert_eq!(metadata.ctime_nsec(), saved.file.changed_nanoseconds);
     }
+    let saved_paths: std::collections::BTreeSet<_> = cut
+        .saved_files
+        .iter()
+        .map(|saved| saved.file.path.clone())
+        .collect();
+    let listed_paths: std::collections::BTreeSet<_> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(listed_paths, saved_paths);
+    let journal = harness.root.join("captures").join(request.as_str());
     assert!(!directory.join("disks").exists());
     assert!(!directory.join("map-nodes").exists());
     assert!(!directory.join("memory.root").exists());
     assert_eq!(
-        std::fs::metadata(directory.join("memory.changes"))
+        std::fs::metadata(journal.join("memory.changes"))
             .unwrap()
             .len(),
         0
@@ -2378,10 +2427,14 @@ async fn live_hibernate_saves_in_place_and_only_commit_kills_without_shutdown() 
         crate::virt::lifecycle::NativeControl::Paused { .. }
     ));
     let record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.join("record.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(journal.join("record.json")).unwrap()).unwrap();
     assert_eq!(record["status"]["phase"], "prepared");
     assert_eq!(record["runId"], harness.run_id.as_str());
-    assert!(!directory.join("committed.json").exists());
+    assert_eq!(
+        record["status"]["memory"],
+        serde_json::to_value(&prepared.memory).unwrap()
+    );
+    assert!(!journal.join("committed.json").exists());
     let outcome = harness
         .release_hibernate(&request, CaptureReleaseDisposition::Published)
         .await;
@@ -2398,9 +2451,15 @@ async fn live_hibernate_saves_in_place_and_only_commit_kills_without_shutdown() 
         harness.hibernate_status(&request).terminal_outcome(),
         Some(vm_spec::capture::CaptureTerminalOutcome::WorkerKilledWithoutShutdown)
     );
-    let record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.join("committed.json")).unwrap()).unwrap();
-    assert_eq!(record["status"]["phase"], "committed");
+    assert!(
+        !journal.exists(),
+        "clean hibernate release removes its old-run journal"
+    );
+    let listed_paths: std::collections::BTreeSet<_> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(listed_paths, saved_paths);
     assert_eq!(
         harness.store.live_snapshot().unwrap().state,
         VmLifecycleState::Hibernated
@@ -2464,6 +2523,11 @@ async fn live_hibernate_write_failure_and_enospc_roll_back_running_and_user_paus
             assert!(!harness
                 .root
                 .join("hibernation")
+                .join(request.as_str())
+                .exists());
+            assert!(!harness
+                .root
+                .join("captures")
                 .join(request.as_str())
                 .exists());
             assert!(harness.machine.try_wait().await.unwrap().is_none());
@@ -2531,6 +2595,11 @@ async fn live_hibernate_abort_before_commit_removes_files_and_restores_original_
                 .join("hibernation")
                 .join(request.as_str())
                 .exists());
+            assert!(!harness
+                .root
+                .join("captures")
+                .join(request.as_str())
+                .exists());
             harness.stop().await;
         }
     }
@@ -2572,6 +2641,11 @@ async fn live_hibernate_manager_disappearance_before_commit_rolls_back() {
         assert!(!harness
             .root
             .join("hibernation")
+            .join(request.as_str())
+            .exists());
+        assert!(!harness
+            .root
+            .join("captures")
             .join(request.as_str())
             .exists());
         harness.stop().await;
@@ -2620,4 +2694,101 @@ async fn live_hibernate_commit_from_user_pause_keeps_the_original_guest_freeze()
     );
     assert!(harness.machine.wait().await.unwrap().hibernated());
     harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_scenario_same_machine_activation_is_not_advertised_by_default() {
+    let harness = Harness::start(Some(serde_json::json!({}))).await;
+    let report =
+        vm_spec::live::LiveMachineReport::try_from(harness.store.status().unwrap().live.unwrap())
+            .unwrap();
+    harness.stop().await;
+    assert!(!report.supports_same_machine_activation());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_scenario_same_machine_activation_is_advertised_when_enabled() {
+    let lifecycle = test_utils::LifecycleScenario {
+        same_machine_activation: true,
+        ..Default::default()
+    };
+    let harness = Harness::start(Some(serde_json::to_value(lifecycle).unwrap())).await;
+    let report =
+        vm_spec::live::LiveMachineReport::try_from(harness.store.status().unwrap().live.unwrap())
+            .unwrap();
+    harness.stop().await;
+    assert!(report.supports_same_machine_activation());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_hibernate_incremental_request_reports_actual_full_fallback() {
+    use vm_spec::capture::{
+        CaptureFullReason, CaptureIdentityPolicy, CaptureMode, CapturePauseAuthority,
+        CaptureReleaseDisposition, HibernateCapturePhase,
+    };
+    for with_baseline in [false, true] {
+        let mut capabilities = baseline();
+        capabilities.incremental = LiveCapability {
+            native: true,
+            availability: LiveAvailability::Supported,
+        };
+        let harness = Harness::start_shaped_with_capabilities(
+            Some(serde_json::json!({"capture":{"ramBytes":1 << 20}})),
+            timeouts(),
+            true,
+            Some(1),
+            ROOT_DISK_BYTES,
+            capabilities,
+        )
+        .await;
+        if with_baseline {
+            let request = live_id(Uuid::new_v4());
+            let mut plan = harness.capture_plan(
+                &request,
+                CapturePauseAuthority::Acquire,
+                CaptureResumePolicy::ResumeIfAcquired,
+            );
+            plan.mode = CaptureMode::Fork;
+            plan.identity_policy = CaptureIdentityPolicy::None;
+            harness.capture(plan).await;
+            let previous = harness.capture_settled(&request).await;
+            assert!(matches!(
+                previous.operation.outcome,
+                OperationOutcome::CaptureSealed { .. }
+            ));
+        }
+        let request = live_id(Uuid::new_v4());
+        let mut plan = harness.hibernate_plan(&request, None);
+        plan.policy = CapturePolicy::Incremental;
+        assert!(matches!(
+            harness.capture(plan).await,
+            LiveCommandResult::Capture(vm_spec::lifecycle::CaptureOutcome::Accepted { .. })
+        ));
+        harness
+            .hibernate_phase(&request, HibernateCapturePhase::AwaitingWrite)
+            .await;
+        harness.authorize_hibernate_write(&request);
+        let prepared = harness
+            .hibernate_phase(&request, HibernateCapturePhase::Prepared)
+            .await;
+        let memory = prepared.memory.unwrap();
+        assert_eq!(memory.mode, CapturePolicy::Full);
+        assert_eq!(
+            memory.full_reason,
+            Some(if with_baseline {
+                CaptureFullReason::CoverageLost
+            } else {
+                CaptureFullReason::NoBaseline
+            })
+        );
+        assert_eq!(memory.stats.full_bytes_written, 1 << 20);
+        assert_eq!(memory.stats.identity_bytes_hashed, 0);
+        assert!(matches!(
+            harness
+                .release_hibernate(&request, CaptureReleaseDisposition::Published)
+                .await,
+            vm_spec::lifecycle::ReleaseCaptureOutcome::Released { .. }
+        ));
+        harness.stop().await;
+    }
 }

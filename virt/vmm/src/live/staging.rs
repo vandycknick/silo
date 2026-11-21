@@ -23,6 +23,9 @@
 //!                                   ├─ vm.capture.json        (once)
 //!                                   └─ vm.capture-source.json (once)
 //! ```
+//! Hibernate keeps only the four execution-state roles in hibernation/<id>/.
+//! Its request, native scratch and old-run markers use captures/<id>/ and are
+//! removed after a clean reap or precommit rollback, never read for wake.
 use std::fs::File;
 use std::io::{self, Write};
 use std::ops::Range;
@@ -151,6 +154,13 @@ pub(crate) struct CaptureStaging {
     node_allocation: std::sync::Arc<AtomicU64>,
     node_count: std::sync::Arc<AtomicU64>,
     hibernate_parent: Option<OwnedFd>,
+    hibernate_journal: Option<HibernateJournalDirectory>,
+}
+
+#[derive(Debug)]
+struct HibernateJournalDirectory {
+    directory: OwnedFd,
+    parent: OwnedFd,
 }
 
 /// Outcome of a write-once record.
@@ -388,6 +398,7 @@ impl CaptureStaging {
             node_allocation: std::sync::Arc::new(AtomicU64::new(0)),
             node_count: std::sync::Arc::new(AtomicU64::new(0)),
             hibernate_parent: None,
+            hibernate_journal: None,
         })
     }
 
@@ -406,7 +417,18 @@ impl CaptureStaging {
         }
         let data = open(data_dir, directory_flags(), Mode::empty())?;
         let parent = private_child(&data, "hibernation", false)?;
+        let journal_parent = private_child(&data, CAPTURES_DIRECTORY, false)?;
         let directory = private_child(&parent, capture.as_str(), true)?;
+        let journal_directory = match private_child(&journal_parent, capture.as_str(), true) {
+            Ok(directory) => directory,
+            Err(error) => {
+                if let Err(cleanup) = unlinkat(&parent, capture.as_str(), UnlinkatFlags::RemoveDir)
+                {
+                    tracing::error!(%cleanup, "remove empty hibernation directory");
+                }
+                return Err(error);
+            }
+        };
         let staging = Self {
             disks: directory.try_clone()?,
             nodes: std::sync::Arc::new(File::from(directory.try_clone()?)),
@@ -417,6 +439,10 @@ impl CaptureStaging {
             node_allocation: std::sync::Arc::new(AtomicU64::new(0)),
             node_count: std::sync::Arc::new(AtomicU64::new(0)),
             hibernate_parent: Some(parent),
+            hibernate_journal: Some(HibernateJournalDirectory {
+                directory: journal_directory,
+                parent: journal_parent,
+            }),
         };
         if let Err(error) = nix::unistd::fsync(&data)
             .map_err(io::Error::from)
@@ -445,14 +471,10 @@ impl CaptureStaging {
             .as_ref()
             .ok_or_else(|| invalid("only a hibernation directory can be removed here"))?;
         for name in [
-            "request.json",
             "execution.state",
             "devices.state",
             "memory.ram",
             "memory-layout.json",
-            "memory.changes",
-            "record.json",
-            "record.tmp",
         ] {
             match unlinkat(&self.directory, name, UnlinkatFlags::NoRemoveDir) {
                 Ok(()) | Err(Errno::ENOENT) => {}
@@ -465,13 +487,54 @@ impl CaptureStaging {
             .ok_or_else(|| invalid("save directory has no name"))?;
         unlinkat(parent, name, UnlinkatFlags::RemoveDir)?;
         nix::unistd::fsync(parent)?;
+        self.remove_hibernate_journal()?;
         Ok(())
     }
 
     pub(crate) fn sync_hibernate_record(&self, name: &str) -> io::Result<()> {
         self.open_entry(name)?.sync_all()?;
+        nix::unistd::fsync(self.record_directory())?;
+        if let Some(journal) = &self.hibernate_journal {
+            nix::unistd::fsync(&journal.parent)?;
+        }
         self.sync_hibernate_directory()
     }
+
+    /// Only old-run control evidence lives here. The catalog remains authority,
+    /// and a clean release removes the journal after the worker is reaped.
+    pub(crate) fn remove_hibernate_journal(&self) -> io::Result<()> {
+        let journal = self
+            .hibernate_journal
+            .as_ref()
+            .ok_or_else(|| invalid("capture has no hibernation journal"))?;
+        for name in [
+            "request.json",
+            "memory.changes",
+            "record.json",
+            "record.tmp",
+            "committed.json",
+            "committed.tmp",
+        ] {
+            match unlinkat(&journal.directory, name, UnlinkatFlags::NoRemoveDir) {
+                Ok(()) | Err(Errno::ENOENT) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let name = self
+            .path
+            .file_name()
+            .ok_or_else(|| invalid("save directory has no name"))?;
+        unlinkat(&journal.parent, name, UnlinkatFlags::RemoveDir)?;
+        nix::unistd::fsync(&journal.parent)?;
+        Ok(())
+    }
+
+    fn record_directory(&self) -> &OwnedFd {
+        self.hibernate_journal
+            .as_ref()
+            .map_or(&self.directory, |journal| &journal.directory)
+    }
+
     pub(crate) fn set_node_store(&self, path: Option<&str>) -> io::Result<()> {
         let pool = path
             .map(|path| {
@@ -533,7 +596,7 @@ impl CaptureStaging {
 
     pub(crate) fn write_owned_request(&self, bytes: &[u8]) -> io::Result<()> {
         let file = File::from(openat(
-            &self.directory,
+            self.record_directory(),
             CAPTURE_REQUEST_FILE,
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             private_mode(),
@@ -618,6 +681,9 @@ impl CaptureStaging {
 
     fn locate(&self, role: &CaptureRole) -> (&OwnedFd, String) {
         match role {
+            CaptureRole::RamChanges if self.hibernate_journal.is_some() => {
+                (self.record_directory(), role.relative_path())
+            }
             CaptureRole::Disk(name) => (&self.disks, name.file_name()),
             CaptureRole::DiskMap(name) => (&self.disks, format!("{}.root", name.as_str())),
             other => (&self.directory, other.relative_path()),
@@ -948,7 +1014,11 @@ impl CaptureStaging {
         let identity = self.write_temporary(temporary, bytes)?;
         // linkat is the no-replace rename: EEXIST never overwrites a record.
         if let Err(error) = self.link_record(temporary, name) {
-            if let Err(cleanup) = unlinkat(&self.directory, temporary, UnlinkatFlags::NoRemoveDir) {
+            if let Err(cleanup) = unlinkat(
+                self.record_directory(),
+                temporary,
+                UnlinkatFlags::NoRemoveDir,
+            ) {
                 tracing::warn!(%cleanup, temporary, "could not remove a capture record temporary");
             }
             return Err(error);
@@ -969,7 +1039,7 @@ impl CaptureStaging {
     /// Create and fill the exclusive temporary.
     fn write_temporary(&self, temporary: &str, bytes: &[u8]) -> io::Result<FileFacts> {
         let file = File::from(openat(
-            &self.directory,
+            self.record_directory(),
             temporary,
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             private_mode(),
@@ -981,9 +1051,9 @@ impl CaptureStaging {
 
     fn link_record(&self, temporary: &str, name: &str) -> io::Result<()> {
         linkat(
-            &self.directory,
+            self.record_directory(),
             temporary,
-            &self.directory,
+            self.record_directory(),
             name,
             AtFlags::empty(),
         )
@@ -1019,7 +1089,11 @@ impl CaptureStaging {
                         "the temporary record name holds a file this commit does not own",
                     ));
                 }
-                unlinkat(&self.directory, temporary, UnlinkatFlags::NoRemoveDir)?;
+                unlinkat(
+                    self.record_directory(),
+                    temporary,
+                    UnlinkatFlags::NoRemoveDir,
+                )?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -1032,7 +1106,7 @@ impl CaptureStaging {
     /// links or blocking on special files.
     fn open_entry(&self, name: &str) -> io::Result<File> {
         Ok(File::from(openat(
-            &self.directory,
+            self.record_directory(),
             name,
             OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
             Mode::empty(),
@@ -1043,7 +1117,7 @@ impl CaptureStaging {
     #[cfg(test)]
     pub(crate) fn read_record(&self, name: &str) -> io::Result<Vec<u8>> {
         let file = File::from(openat(
-            &self.directory,
+            self.record_directory(),
             name,
             OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),

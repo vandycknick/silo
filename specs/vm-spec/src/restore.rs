@@ -184,6 +184,10 @@ pub enum RestoreAuthority {
     OwnedLocalCut {
         cut: Box<OwnedLocalCut>,
     },
+    /// Private same-machine save, with original writable disks, never disk copies.
+    Hibernation {
+        cut: Box<crate::hibernate::HibernateCut>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +200,7 @@ pub enum RestoreAuthority {
 pub enum RestoreReference {
     IdentifiedSnapshot { snapshot: Sha256Digest },
     OwnedLocalCut { capture_id: LiveId },
+    Hibernation { save_id: LiveId },
 }
 
 impl RestoreAuthority {
@@ -206,6 +211,9 @@ impl RestoreAuthority {
             },
             Self::OwnedLocalCut { cut } => RestoreReference::OwnedLocalCut {
                 capture_id: cut.capture_id.clone(),
+            },
+            Self::Hibernation { cut } => RestoreReference::Hibernation {
+                save_id: cut.save_id.clone(),
             },
         }
     }
@@ -218,6 +226,7 @@ impl RestoreAuthority {
                 .map(|memory| &memory.binding)
                 .ok_or_else(|| "identified restore lacks a memory binding".into()),
             Self::OwnedLocalCut { cut } => Ok(&cut.binding),
+            Self::Hibernation { cut } => Ok(&cut.binding),
         }
     }
 }
@@ -225,8 +234,17 @@ impl RestoreAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum RestoreObjectAuthority {
-    Identified { identity: Sha256Digest },
-    Owned { fingerprint: SourceFingerprint },
+    Identified {
+        identity: Sha256Digest,
+    },
+    Owned {
+        fingerprint: SourceFingerprint,
+    },
+    /// Reboot-stable durable facts; the object's device number binds this open
+    /// descriptor only and is not compared with the save.
+    Hibernation {
+        file: crate::hibernate::HibernateFileBinding,
+    },
 }
 
 /// The sender duplicates an admitted, leased immutable object under explicit
@@ -308,7 +326,7 @@ pub struct RestoreRequest {
     pub objects: Vec<RestoreObject>,
     pub lowers: Vec<RestoreLower>,
     pub network: Option<RestoreNetwork>,
-    /// Destination public SSH CA. Absent only during pre-allocation inspection.
+    /// Clone destination CA, or retained SameMachine trust. Wake may omit it.
     pub ssh_trusted_ca: Option<String>,
     pub hook: Option<RestoreHook>,
 }
@@ -319,6 +337,7 @@ impl RestoreRequest {
         let source_machine = match &self.authority {
             RestoreAuthority::IdentifiedSnapshot { evidence, .. } => &evidence.machine_id,
             RestoreAuthority::OwnedLocalCut { cut } => &cut.machine_id,
+            RestoreAuthority::Hibernation { cut } => &cut.machine_id,
         };
         self.purpose.validate(
             source_machine,
@@ -348,6 +367,11 @@ impl RestoreRequest {
     ) -> Result<(), String> {
         if self.version != RESTORE_REQUEST_VERSION || !self.start_paused {
             return Err("restore requires the current schema and startPaused=true".into());
+        }
+        if (self.purpose == ActivationPurpose::SameMachine)
+            != matches!(self.authority, RestoreAuthority::Hibernation { .. })
+        {
+            return Err("wake requires hibernation authority and same-machine activation".into());
         }
         if self
             .map_node_store
@@ -418,6 +442,22 @@ impl RestoreRequest {
                 }
                 4
             }
+            RestoreAuthority::Hibernation { cut } => {
+                cut.validate()?;
+                if self.purpose != ActivationPurpose::SameMachine
+                    || self.hook.is_some()
+                    || cut.configuration != self.configuration
+                    || cut.freeze_operation_id != self.freeze_operation_id
+                    || self.map_node_store.is_some()
+                    || self
+                        .disk_tracking_seeds
+                        .iter()
+                        .any(|seed| seed.baseline.is_some())
+                {
+                    return Err("wake inputs differ from the saved execution configuration".into());
+                }
+                4
+            }
         };
         if self.objects.len() != expected_count {
             return Err("restore object count does not match input authority".into());
@@ -471,6 +511,29 @@ impl RestoreRequest {
                         || object.file_inode != fingerprint.inode
                     {
                         return Err("restore exact-file facts differ from owned evidence".into());
+                    }
+                }
+                (
+                    RestoreAuthority::Hibernation { cut },
+                    RestoreObjectAuthority::Hibernation { file },
+                ) => {
+                    let saved = cut
+                        .saved_files
+                        .get(match object.role {
+                            RestoreObjectRole::Ram => 0,
+                            RestoreObjectRole::Layout => 1,
+                            RestoreObjectRole::Execution => 2,
+                            RestoreObjectRole::Devices => 3,
+                            RestoreObjectRole::RamMap => {
+                                return Err("wake has no identified RAM map".into())
+                            }
+                        })
+                        .ok_or("wake saved file is missing")?;
+                    if file != &saved.file
+                        || object.length != file.size
+                        || object.file_inode != file.inode
+                    {
+                        return Err("wake object facts differ from the saved file".into());
                     }
                 }
                 _ => return Err("restore input authority cannot be downgraded or mixed".into()),
@@ -913,7 +976,7 @@ impl RestoreInspectionReport {
             ) => *sha256 == Sha256Digest::of_bytes(request_bytes),
             (
                 RestoreInspectionRequestBinding::OwnedLocalCut { request: exact },
-                RestoreAuthority::OwnedLocalCut { .. },
+                RestoreAuthority::OwnedLocalCut { .. } | RestoreAuthority::Hibernation { .. },
             ) => exact.as_bytes() == request_bytes,
             _ => false,
         };

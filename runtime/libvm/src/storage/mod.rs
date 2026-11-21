@@ -4,6 +4,7 @@
 //! and directories. These primitives do not assign image or snapshot semantics.
 pub(crate) mod clone;
 pub mod composition;
+pub mod hibernate_file;
 pub mod identity;
 pub mod identity_file;
 pub mod limits;

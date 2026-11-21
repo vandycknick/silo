@@ -215,6 +215,15 @@ impl Machine {
         }
 
         let machine_id = self.machine_id();
+        let initial = runtime
+            .resolve_machine_config(&crate::MachineRef::id(machine_id))
+            .await?;
+        crate::machine::hibernate::fence(
+            runtime,
+            &initial,
+            crate::machine::hibernate::HibernateRemedy::Stop,
+        )
+        .await?;
         let _name_lock = if update.name.is_some() {
             Some(runtime.lock_machine_names().await?)
         } else {

@@ -225,6 +225,18 @@ impl Runtime {
     }
 
     async fn recover_machine_operations(&self) -> Result<(), LibVmError> {
+        let store = self.native_store()?;
+        for record in store.hibernations_needing_recovery().await? {
+            let Some(config) = self.machine_config(record.begin.machine_id).await? else {
+                continue;
+            };
+            let Some(_lock) = self.try_acquire_machine_lock(config.lock_id)? else {
+                continue;
+            };
+            if let Err(error) = crate::machine::hibernate::recover_locked(self, &config).await {
+                tracing::warn!(machine = %config.id, %error, "hibernate recovery retained uncertainty");
+            }
+        }
         self.recover_constructed_children().await?;
         if let Err(error) = crate::machine::live_capture::reconcile_captures(
             self,
@@ -1420,6 +1432,11 @@ impl Runtime {
         &self,
         metadata: &MachineConfig,
     ) -> Result<RuntimeStatus, LibVmError> {
+        if crate::machine::hibernate::recover_locked(self, metadata).await? {
+            return Ok(RuntimeStatus::from_machine_state(
+                &self.machine_state(metadata.id).await?,
+            ));
+        }
         let persisted = self.store.machine_state(metadata.id).await?;
         let observed = self
             .observe_machine_state(metadata, persisted.as_ref())
@@ -1442,6 +1459,12 @@ impl Runtime {
         config: &MachineConfig,
         storage: &crate::MachineStorageRecord,
     ) -> Result<(), LibVmError> {
+        crate::machine::hibernate::fence(
+            self,
+            config,
+            crate::machine::hibernate::HibernateRemedy::Stop,
+        )
+        .await?;
         let state = self.store.machine_state(config.id).await?.ok_or_else(|| {
             crate::machine::root_storage::invalid(
                 "source has no durable lifecycle admission record",
@@ -1576,7 +1599,7 @@ impl Runtime {
         Ok(true)
     }
 
-    fn launch_holders_terminal(
+    pub(crate) fn launch_holders_terminal(
         &self,
         config: &MachineConfig,
         operation: &crate::store::operation_store::RetainedStorageOperation,
@@ -1637,6 +1660,16 @@ impl Runtime {
         metadata: &MachineConfig,
         runtime: Option<&MachineState>,
     ) -> Result<ObservedMachineRuntime, LibVmError> {
+        if let Some(store) = self.optional_native_store() {
+            if store.has_hibernation(metadata.id).await? {
+                return Ok(ObservedMachineRuntime {
+                    state: runtime
+                        .cloned()
+                        .unwrap_or_else(|| stopped_machine_state(metadata.id, None)),
+                    storage_stop_outcome: None,
+                });
+            }
+        }
         let pid_path = self.paths.machine(metadata.id).vmm_pid_path();
         let exit_status_path = self.paths.machine(metadata.id).vmm_exit_status_path();
         let pid_from_file = match read_monitor_pid(&pid_path) {
@@ -1680,52 +1713,75 @@ impl Runtime {
                 }
             }
         }
-        let observed_state = match matching_exit {
-            Some(status) => {
-                let (clean, error) = exit_observed_event(status);
-                transitions::reduce(
-                    stored_state,
-                    transitions::Event::ExitObserved { clean, error },
-                    now_unix(),
-                )
-                .map_err(transition_error)?
+        let consumed_wake_ended = if live_pid.is_none() {
+            match (
+                self.optional_native_store(),
+                stored_state
+                    .run_id
+                    .as_deref()
+                    .and_then(|run| uuid::Uuid::parse_str(run).ok()),
+            ) {
+                (Some(store), Some(run)) => {
+                    store.run_has_hibernation_memory(metadata.id, run).await?
+                }
+                _ => false,
             }
-            None => match live_pid {
-                Some(pid) => {
-                    let started_at = live_identity.as_ref().and_then(ProcessIdentity::started_at);
-                    let run_id = runtime.and_then(|runtime| runtime.run_id.clone());
+        } else {
+            false
+        };
+        let observed_state = if consumed_wake_ended {
+            stopped_machine_state(metadata.id, None)
+        } else {
+            match matching_exit {
+                Some(status) => {
+                    let (clean, error) = exit_observed_event(status);
                     transitions::reduce(
                         stored_state,
-                        transitions::Event::MonitorObserved {
-                            pid,
-                            started_at,
-                            run_id,
-                        },
+                        transitions::Event::ExitObserved { clean, error },
                         now_unix(),
                     )
                     .map_err(transition_error)?
                 }
-                None if abandoned_start => {
-                    transitions::reduce(stored_state, transitions::Event::StartTimedOut, now_unix())
+                None => match live_pid {
+                    Some(pid) => {
+                        let started_at =
+                            live_identity.as_ref().and_then(ProcessIdentity::started_at);
+                        let run_id = runtime.and_then(|runtime| runtime.run_id.clone());
+                        transitions::reduce(
+                            stored_state,
+                            transitions::Event::MonitorObserved {
+                                pid,
+                                started_at,
+                                run_id,
+                            },
+                            now_unix(),
+                        )
                         .map_err(transition_error)?
-                }
-                None if current_state == MachineRuntimeState::Starting => MachineState {
-                    vmm_pid: None,
-                    started_at: None,
-                    last_error: None,
-                    updated_at: now_unix(),
-                    ..stored_state
-                },
-                None => {
-                    let last_error = runtime.and_then(|runtime| runtime.last_error.clone());
-                    transitions::reduce(
+                    }
+                    None if abandoned_start => transitions::reduce(
                         stored_state,
-                        transitions::Event::MonitorGone { last_error },
+                        transitions::Event::StartTimedOut,
                         now_unix(),
                     )
-                    .map_err(transition_error)?
-                }
-            },
+                    .map_err(transition_error)?,
+                    None if current_state == MachineRuntimeState::Starting => MachineState {
+                        vmm_pid: None,
+                        started_at: None,
+                        last_error: None,
+                        updated_at: now_unix(),
+                        ..stored_state
+                    },
+                    None => {
+                        let last_error = runtime.and_then(|runtime| runtime.last_error.clone());
+                        transitions::reduce(
+                            stored_state,
+                            transitions::Event::MonitorGone { last_error },
+                            now_unix(),
+                        )
+                        .map_err(transition_error)?
+                    }
+                },
+            }
         };
         let storage_stop_outcome = if live_pid.is_none() && terminal_storage_observed {
             Some(
@@ -1820,6 +1876,12 @@ impl Runtime {
         config: &mut MachineConfig,
         storage: &mut crate::MachineStorageRecord,
     ) -> Result<(), LibVmError> {
+        crate::machine::hibernate::fence(
+            self,
+            config,
+            crate::machine::hibernate::HibernateRemedy::Stop,
+        )
+        .await?;
         let invalid = |message: &str| crate::machine::root_storage::invalid(message);
         storage.validate_disk_identity_inventory(&config.spec)?;
         let root_index = usize::from(matches!(
@@ -2432,6 +2494,44 @@ impl Runtime {
         .await
     }
 
+    pub(crate) async fn prepare_wake_network(
+        &self,
+        config: &MachineConfig,
+        run_id: &str,
+        secrets: &crate::secrets::ResolvedSecrets,
+        saved: Option<&vm_spec::restore::RestoreNetwork>,
+    ) -> Result<VmmNetworkAttachment, LibVmError> {
+        let mut networking = self.networking.clone();
+        if let Some(saved) = saved {
+            saved
+                .validate()
+                .map_err(crate::machine::root_storage::invalid)?;
+            networking.netd.subnet = format!("{}/{}", saved.gateway, saved.prefix_length);
+        }
+        let mut network = prepare_network_runtime(
+            &self.paths,
+            self.store.as_ref(),
+            config,
+            run_id,
+            &networking,
+            self.components.netd(),
+            secrets,
+            crate::MachineDurability::Durable,
+        )
+        .await?;
+        match (&mut network, saved) {
+            (VmmNetworkAttachment::None, None) => {}
+            (VmmNetworkAttachment::UnixDatagram { mac, ipv4, dns, .. }, Some(saved))
+                if *mac == saved.mac && ipv4.address == saved.ipv4
+                    && ipv4.prefix_length == saved.prefix_length && ipv4.gateway == saved.gateway => {
+                dns.servers.clone_from(&saved.dns_servers);
+                dns.search.clone_from(&saved.dns_search);
+            }
+            _ => return Err(crate::machine::root_storage::invalid("saved network configuration cannot be recreated; stop the machine to discard its saved state")),
+        }
+        Ok(network)
+    }
+
     pub(crate) async fn reconcile_machine_network(
         &self,
         config: &MachineConfig,
@@ -2813,7 +2913,10 @@ impl Runtime {
         let mut lifecycle = None;
         let (status, boot_report, provision_report) = if runtime_status.is_active()
             && observation == MachineObservation::Observed
-        {
+            && !matches!(
+                state.status,
+                MachineRuntimeState::Hibernating | MachineRuntimeState::Hibernated
+            ) {
             let response =
                 self.supervisor
                     .client(config.id)
@@ -2970,8 +3073,8 @@ impl Runtime {
         if let (Some(storage), Some(outcome)) = (&mut storage, storage_stop_outcome) {
             storage.stop_outcome = outcome;
         }
-        let run_id = runtime_status
-            .is_active()
+        let run_id = (runtime_status.is_active()
+            && state.status != MachineRuntimeState::Hibernated)
             .then(|| {
                 runtime_status
                     .run_id
@@ -2995,6 +3098,17 @@ impl Runtime {
                     reference: machine_id.to_string(),
                 }
             })?;
+            if let Some(record) = store.machine_hibernation(machine_id).await? {
+                if record.phase == crate::store::hibernate::HibernatePhase::Available {
+                    data.hibernation = record.available_at.zip(record.memory.as_ref()).map(
+                        |(hibernated_at, memory)| crate::MachineHibernationInfo {
+                            hibernated_at,
+                            saved_state_bytes: record.allocated_size,
+                            memory_capture: memory.clone(),
+                        },
+                    );
+                }
+            }
         }
         data.storage = storage;
         if let Some(storage) = &data.storage {
@@ -5285,7 +5399,10 @@ pub(crate) mod tests {
             .await
             .expect("bounded stop");
             if force {
-                assert_eq!(result.expect("forced stop").status, MachineStatus::Stopped);
+                assert_eq!(
+                    result.expect("forced stop").machine.status,
+                    MachineStatus::Stopped
+                );
                 assert!(!reaper.await.expect("reap").success());
                 assert!(!runtime.machine_paths(machine.id).vmm_pid_path().exists());
             } else {
@@ -5377,7 +5494,7 @@ pub(crate) mod tests {
             .await
             .expect("read machine state");
 
-        assert_eq!(inspect_data.status, MachineStatus::Stopped);
+        assert_eq!(inspect_data.machine.status, MachineStatus::Stopped);
         assert_eq!(state.status, MachineRuntimeState::Stopped);
     }
 
@@ -5548,7 +5665,7 @@ pub(crate) mod tests {
             .await
             .expect("join stop task")
             .expect("captured terminal completion should be idempotent");
-        assert_eq!(machine.status, MachineStatus::Stopped);
+        assert_eq!(machine.machine.status, MachineStatus::Stopped);
         assert_eq!(
             runtime
                 .machine_state(machine_id)
@@ -5731,6 +5848,7 @@ pub(crate) mod tests {
             .stop()
             .await
             .expect("stop machine");
+        let inspect_data = inspect_data.machine;
         let state = runtime
             .machine_state(machine.id)
             .await
@@ -5780,6 +5898,7 @@ pub(crate) mod tests {
             .stop()
             .await
             .expect("stop machine");
+        let inspect_data = inspect_data.machine;
         let state = runtime
             .machine_state(machine.id)
             .await
@@ -5891,6 +6010,7 @@ pub(crate) mod tests {
             .stop()
             .await
             .expect("stop machine");
+        let inspect_data = inspect_data.machine;
         let state = runtime
             .machine_state(machine.id)
             .await
@@ -5938,6 +6058,7 @@ pub(crate) mod tests {
             .stop()
             .await
             .expect("stop machine");
+        let inspect_data = inspect_data.machine;
         let state = runtime
             .machine_state(machine.id)
             .await
@@ -5987,6 +6108,7 @@ pub(crate) mod tests {
             .stop()
             .await
             .expect("stop machine");
+        let inspect_data = inspect_data.machine;
         let state = runtime
             .machine_state(machine.id)
             .await
@@ -6035,6 +6157,7 @@ pub(crate) mod tests {
             .stop()
             .await
             .expect("stop machine");
+        let inspect_data = inspect_data.machine;
         let state = runtime
             .machine_state(machine.id)
             .await

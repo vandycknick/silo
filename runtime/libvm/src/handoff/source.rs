@@ -197,6 +197,12 @@ pub(crate) async fn observe(
     let store = runtime.native_store()?;
     let config = runtime.resolve_machine_config(reference).await?;
     let (_lifecycle, config) = runtime.lock_machine_config(config.id).await?;
+    crate::machine::hibernate::fence(
+        runtime,
+        &config,
+        crate::machine::hibernate::HibernateRemedy::Stop,
+    )
+    .await?;
     let storage = runtime.machine_storage_record(config.id).await?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
     SourceObservation::new(
@@ -261,6 +267,12 @@ pub(crate) async fn begin(
             .resolve_machine_config(&MachineRef::id(intent.source_machine))
             .await?;
         let (_lifecycle, config) = runtime.lock_machine_config(config.id).await?;
+        crate::machine::hibernate::fence(
+            runtime,
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Stop,
+        )
+        .await?;
         let storage = runtime.machine_storage_record(config.id).await?;
         let pool = StoragePool::open(runtime.local_images_dir())?;
         if observation_body(
@@ -355,6 +367,12 @@ pub(crate) async fn capture(
     let id = intent.source_machine;
     let running = {
         let (_lifecycle, config) = runtime.lock_machine_config(id).await?;
+        crate::machine::hibernate::fence(
+            runtime,
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Stop,
+        )
+        .await?;
         let storage = runtime.machine_storage_record(id).await?;
         let pool = StoragePool::open(runtime.local_images_dir())?;
         let current = observation_body(

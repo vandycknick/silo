@@ -1288,6 +1288,7 @@ mod tests {
                 populated_memory_estimate_bytes: (phase != HibernateCapturePhase::Saving)
                     .then_some(4096),
                 cut: None,
+                memory: None,
                 failure: None,
             };
             let response = wire::ControlHibernateCaptureResponse::try_from(status.clone()).unwrap();
@@ -1303,6 +1304,7 @@ mod tests {
             phase: HibernateCapturePhase::Prepared,
             populated_memory_estimate_bytes: Some(4096),
             cut: None,
+            memory: None,
             failure: None,
         };
         assert!(wire::ControlHibernateCaptureResponse::try_from(status).is_err());

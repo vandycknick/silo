@@ -3,6 +3,7 @@ mod config;
 mod forward;
 mod guest;
 mod handle;
+pub(crate) mod hibernate;
 mod inspect;
 mod lifecycle;
 mod lifecycle_options;

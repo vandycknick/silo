@@ -90,6 +90,7 @@ impl RuntimeContext {
             state: State::Running as i32,
             machine_id: context.machine_id.clone(),
             run_id: context.run_id.clone(),
+            same_machine_activation: Some(true),
             ..Default::default()
         };
         let (lifecycle, _) = watch::channel(status);
@@ -1692,5 +1693,23 @@ mod tests {
             request.destination_machine_id
         );
         assert_eq!(activation.shutdown.run_id, request.destination_run_id);
+    }
+
+    #[test]
+    fn current_agent_reports_same_machine_activation_support() {
+        let runtime = RuntimeContext::for_tests();
+        let status = runtime.project(v1::AgentStatus {
+            report: Some(v1::AgentStatusReport::default()),
+            ..Default::default()
+        });
+        assert_eq!(
+            status
+                .report
+                .unwrap()
+                .lifecycle
+                .unwrap()
+                .same_machine_activation,
+            Some(true),
+        );
     }
 }

@@ -250,6 +250,16 @@ impl Machine {
         mut options: LiveForkOptions,
         progress: Option<LiveOperationProgressSender>,
     ) -> Result<LiveForkResult, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&crate::MachineRef::id(self.machine_id()))
+            .await?;
+        crate::machine::hibernate::fence(
+            self.runtime(),
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Start,
+        )
+        .await?;
         let entered = monotonic_ns()?;
         report_progress(progress.as_ref(), LiveOperationProgress::Admitting);
         if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {

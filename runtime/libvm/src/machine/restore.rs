@@ -1,6 +1,7 @@
 //! Snapshots with memory have their own constructor. No ordinary start, root
 //! repair, resize, bootstrap execution or fallback is part of this path.
 use std::fs::File;
+use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -1059,6 +1060,78 @@ fn bind_restore_disk_tracking(
     request.validate().map_err(invalid)
 }
 
+/// Reuse the existing machine's immutable lower descriptor and held pool
+/// backings. No disk cloning or child publication belongs to same-machine wake.
+pub(crate) async fn hibernation_lower(
+    runtime: &Runtime,
+    config: &crate::store::models::MachineConfig,
+    lease: &crate::store::operation_store::LaunchStorageLease,
+) -> Result<(Vec<vm_spec::restore::RestoreLower>, Vec<File>), LibVmError> {
+    let storage = lease.storage_record();
+    if !matches!(storage.root, MachineRoot::LinuxOverlay { .. }) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let pool = StoragePool::open(runtime.local_images_dir())?;
+    let held = crate::store::layer_store::LayerStore::from_store(runtime.native_store()?)
+        .launch_lower(lease, storage)
+        .await?;
+    let configuration = crate::SnapshotConfiguration::capture(config)?;
+    let verified = verify_local_lower(&pool, storage, &configuration, Some(&held))?
+        .ok_or_else(|| invalid("saved machine lower is missing"))?;
+    let disk = config
+        .spec
+        .storage
+        .iter()
+        .flat_map(|storage| &storage.disks)
+        .find(|disk| disk.role == vm_spec::DiskRole::RootLower)
+        .ok_or_else(|| invalid("saved machine lower attachment is missing"))?;
+    let path = if disk.path.is_absolute() {
+        disk.path.clone()
+    } else {
+        config.machine_dir.join(&disk.path)
+    };
+    let descriptor = crate::storage::stream::open_regular_source(&path)?;
+    let mut text = String::new();
+    (&descriptor)
+        .take((verified.descriptor.len() + 1) as u64)
+        .read_to_string(&mut text)?;
+    if text != verified.descriptor {
+        return Err(invalid("saved machine lower descriptor was changed"));
+    }
+    let metadata = descriptor.metadata()?;
+    let mut files = vec![descriptor];
+    let mut extents = Vec::with_capacity(verified.backings.len());
+    for backing in &verified.backings {
+        let file = backing.file.try_clone()?;
+        let stat = file.metadata()?;
+        extents.push(vm_spec::restore::RestoreExtent {
+            path: backing
+                .path
+                .to_str()
+                .ok_or_else(|| invalid("lower path is not UTF-8"))?
+                .into(),
+            fd: file.as_raw_fd(),
+            file_device: stat.dev(),
+            file_inode: stat.ino(),
+            length: backing.length,
+        });
+        files.push(file);
+    }
+    Ok((
+        vec![vm_spec::restore::RestoreLower {
+            block_id: verified.block_id,
+            descriptor: vm_spec::restore::RestoreDescriptor {
+                fd: files[0].as_raw_fd(),
+                file_device: metadata.dev(),
+                file_inode: metadata.ino(),
+                length: metadata.len(),
+            },
+            extents,
+        }],
+        files,
+    ))
+}
+
 async fn launch_restored(
     runtime: &Runtime,
     config: &crate::store::models::MachineConfig,
@@ -1294,6 +1367,9 @@ fn restore_authority_name(authority: &vm_spec::restore::RestoreAuthority) -> Str
         vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
             format!("fork:{}", cut.capture_id)
         }
+        vm_spec::restore::RestoreAuthority::Hibernation { cut } => {
+            format!("hibernation:{}", cut.save_id)
+        }
     }
 }
 
@@ -1333,7 +1409,7 @@ pub(crate) fn inspection_request(
     Ok(request)
 }
 
-async fn inspect(
+pub(crate) async fn inspect(
     executable: &File,
     restore: &RestoreRequest,
     network: bool,
@@ -2175,7 +2251,7 @@ pub(crate) mod tests {
                         sha256: vm_spec::capture::Sha256Digest::of_bytes(&bytes),
                     }
                 }
-                RestoreAuthority::OwnedLocalCut { .. } => {
+                RestoreAuthority::OwnedLocalCut { .. } | RestoreAuthority::Hibernation { .. } => {
                     RestoreInspectionRequestBinding::OwnedLocalCut {
                         request: String::from_utf8(bytes).unwrap(),
                     }

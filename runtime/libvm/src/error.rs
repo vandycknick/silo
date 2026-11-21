@@ -5,6 +5,39 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LibVmError {
+    #[error("machine `{reference}` is hibernated; start it with `silo start {reference}` first")]
+    HibernatedStartFirst { reference: String },
+    #[error("machine `{reference}` is hibernated; run `silo stop {reference}` first")]
+    HibernatedStopFirst { reference: String },
+    #[error("machine `{reference}` is already hibernated; wake it with `silo start {reference}`")]
+    AlreadyHibernated { reference: String },
+    #[error("machine `{reference}` is a temporary `silo run` machine and cannot be hibernated")]
+    HibernateTemporary { reference: String },
+    #[error("machine `{reference}` is busy with another lifecycle operation; try again when it finishes")]
+    HibernateBusy { reference: String },
+    #[error("not enough disk space to hibernate `{reference}`: {needed_bytes} bytes needed, {free_bytes} bytes free")]
+    HibernateOutOfSpace {
+        reference: String,
+        needed_bytes: u64,
+        free_bytes: u64,
+    },
+    #[error("could not hibernate `{reference}`: {message}")]
+    HibernateFailed { reference: String, message: String },
+    #[error("cannot wake `{reference}`: its saved state cannot be used ({reason}); run `silo stop {reference}` to discard it, then `silo start {reference}`")]
+    HibernateUnusable {
+        reference: String,
+        reason: crate::storage::hibernate_file::HibernateUnusableReason,
+    },
+    #[error(
+        "could not wake `{reference}`; its saved state was kept; retry `silo start {reference}`"
+    )]
+    WakeFailedBeforeConsume {
+        reference: String,
+        #[source]
+        source: Box<LibVmError>,
+    },
+    #[error("could not wake `{reference}`; its saved state is gone and the machine is stopped; run `silo start {reference}` to boot it")]
+    WakeConsumed { reference: String },
     #[error(transparent)]
     Handoff(#[from] crate::handoff::types::HandoffError),
     #[error("{operation} unsupported: {reason} (backend={backend}, lane={lane})")]
@@ -428,6 +461,16 @@ impl LibVmError {
     /// cannot silently degrade a binding to message parsing or an unknown kind.
     pub fn variant(&self) -> &'static str {
         match self {
+            Self::HibernatedStartFirst { .. } => "HibernatedStartFirst",
+            Self::HibernatedStopFirst { .. } => "HibernatedStopFirst",
+            Self::AlreadyHibernated { .. } => "AlreadyHibernated",
+            Self::HibernateTemporary { .. } => "HibernateTemporary",
+            Self::HibernateOutOfSpace { .. } => "HibernateOutOfSpace",
+            Self::HibernateFailed { .. } => "HibernateFailed",
+            Self::HibernateUnusable { .. } => "HibernateUnusable",
+            Self::HibernateBusy { .. } => "HibernateBusy",
+            Self::WakeFailedBeforeConsume { .. } => "WakeFailedBeforeConsume",
+            Self::WakeConsumed { .. } => "WakeConsumed",
             Self::InvalidName { .. } => "InvalidName",
             Self::ImageNameConflict { .. } => "ImageNameConflict",
             Self::SnapshotNameConflict { .. } => "SnapshotNameConflict",

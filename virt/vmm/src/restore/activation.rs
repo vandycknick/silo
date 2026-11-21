@@ -52,10 +52,11 @@ pub(crate) struct Activation {
     machine: Uuid,
     run: Uuid,
     /// The destination's public SSH CA; never a source secret.
-    ssh_trusted_ca: String,
+    ssh_trusted_ca: Option<String>,
     shutdown_manifest: Vec<u8>,
     /// The public vsock surface: bound after Activate, served after commit.
     vsock_filename: Option<PathBuf>,
+    consume: Option<ConsumeGate>,
 }
 
 pub(crate) enum Activated {
@@ -63,6 +64,150 @@ pub(crate) enum Activated {
     Running(Option<crate::vsock::VsockSurface>),
     /// Positively parked and fenced; stop is the only transition.
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumeState {
+    Parked,
+    Authorized,
+    Abandoned,
+    Closed,
+    ClosedAfterConsume,
+}
+
+/// Shared only with this monitor's startup RPC service. No guest execution is
+/// released by the RPC itself; the activation owner crosses the barrier.
+#[derive(Clone)]
+pub(crate) struct ConsumeGate {
+    prepared: vm_spec::hibernate::RestorePrepared,
+    state: tokio::sync::watch::Sender<ConsumeState>,
+    deadline: tokio::time::Instant,
+    cancelled: CancellationToken,
+}
+
+impl ConsumeGate {
+    fn new(
+        prepared: vm_spec::hibernate::RestorePrepared,
+        deadline: tokio::time::Instant,
+        cancelled: CancellationToken,
+    ) -> Self {
+        let (state, _) = tokio::sync::watch::channel(ConsumeState::Parked);
+        Self {
+            prepared,
+            state,
+            deadline,
+            cancelled,
+        }
+    }
+
+    pub(crate) fn prepared(&self) -> Option<vm_spec::hibernate::RestorePrepared> {
+        (*self.state.borrow() == ConsumeState::Parked).then(|| self.prepared.clone())
+    }
+
+    pub(crate) fn finish_failure(&self) -> vm_spec::hibernate::WakeFailureBoundary {
+        self.state.send_if_modified(|state| {
+            if matches!(state, ConsumeState::Parked | ConsumeState::Authorized) {
+                *state = if *state == ConsumeState::Authorized {
+                    ConsumeState::ClosedAfterConsume
+                } else {
+                    ConsumeState::Closed
+                };
+                true
+            } else {
+                false
+            }
+        });
+        if matches!(
+            *self.state.borrow(),
+            ConsumeState::Authorized | ConsumeState::ClosedAfterConsume
+        ) {
+            vm_spec::hibernate::WakeFailureBoundary::PostConsume
+        } else {
+            vm_spec::hibernate::WakeFailureBoundary::PreConsume
+        }
+    }
+
+    pub(crate) fn authorize(
+        &self,
+        authorization: &vm_spec::hibernate::ConsumeAuthorization,
+    ) -> Result<(), String> {
+        self.prepared.validate_authorization(authorization)?;
+        let mut accepted = false;
+        self.state.send_if_modified(|state| {
+            if *state == ConsumeState::Parked
+                && (self.cancelled.is_cancelled() || tokio::time::Instant::now() >= self.deadline)
+            {
+                *state = ConsumeState::Closed;
+                return true;
+            }
+            accepted = matches!(state, ConsumeState::Parked | ConsumeState::Authorized);
+            if *state == ConsumeState::Parked {
+                *state = ConsumeState::Authorized;
+                true
+            } else {
+                false
+            }
+        });
+        if accepted {
+            Ok(())
+        } else {
+            Err("wake is no longer awaiting authorization".into())
+        }
+    }
+
+    pub(crate) fn abandon(&self) -> Result<(), String> {
+        let mut accepted = false;
+        self.state.send_if_modified(|state| {
+            accepted = matches!(state, ConsumeState::Parked | ConsumeState::Abandoned);
+            if *state == ConsumeState::Parked {
+                *state = ConsumeState::Abandoned;
+                true
+            } else {
+                false
+            }
+        });
+        if accepted {
+            Ok(())
+        } else {
+            Err("wake was already consumed or ended".into())
+        }
+    }
+
+    async fn wait(&self) -> Result<(), String> {
+        let mut changes = self.state.subscribe();
+        loop {
+            match *changes.borrow_and_update() {
+                ConsumeState::Authorized => return Ok(()),
+                ConsumeState::Abandoned
+                | ConsumeState::Closed
+                | ConsumeState::ClosedAfterConsume => {
+                    return Err("wake abandoned before authorization".into())
+                }
+                ConsumeState::Parked => {}
+            }
+            tokio::select! {
+                biased;
+                () = self.cancelled.cancelled() => {},
+                () = tokio::time::sleep_until(self.deadline) => {},
+                result = changes.changed() => {
+                    if result.is_ok() { continue; }
+                }
+            }
+            self.state.send_if_modified(|state| {
+                if *state == ConsumeState::Parked {
+                    *state = ConsumeState::Closed;
+                    true
+                } else {
+                    false
+                }
+            });
+            // Authorization and deadline/cancellation race under the same lock.
+            if *self.state.borrow() == ConsumeState::Authorized {
+                return Ok(());
+            }
+            return Err("wake cancelled or timed out before authorization".into());
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -264,6 +409,8 @@ impl Activation {
         run: Uuid,
         shutdown: &protocol::shutdown::StorageShutdownContext,
         vsock_filename: Option<PathBuf>,
+        startup_deadline: tokio::time::Instant,
+        startup_cancel: CancellationToken,
     ) -> eyre::Result<Self> {
         request
             .validate_activation(
@@ -272,16 +419,29 @@ impl Activation {
                 &vm_spec::lifecycle::LiveId::parse(&run.to_string()).map_err(eyre::Report::msg)?,
             )
             .map_err(eyre::Report::msg)?;
-        if request.purpose != vm_spec::restore::ActivationPurpose::Clone {
-            eyre::bail!(
-                "Wake is not available; keep the machine hibernated until wake is supported"
-            );
-        }
+        request.validate().map_err(eyre::Report::msg)?;
         let activation = Uuid::parse_str(request.activation_id.as_str())
             .map_err(|error| eyre::eyre!("restore activation ID: {error}"))?;
-        let ssh_trusted_ca =
-            crate::start_request::destination_ssh_ca(request.ssh_trusted_ca.as_deref())?
-                .to_string();
+        let ssh_trusted_ca = match request.purpose {
+            vm_spec::restore::ActivationPurpose::Clone => Some(
+                crate::start_request::destination_ssh_ca(request.ssh_trusted_ca.as_deref())?
+                    .to_string(),
+            ),
+            vm_spec::restore::ActivationPurpose::SameMachine => request.ssh_trusted_ca.clone(),
+        };
+        let consume = match &request.authority {
+            vm_spec::restore::RestoreAuthority::Hibernation { cut } => Some(ConsumeGate::new(
+                vm_spec::hibernate::RestorePrepared {
+                    machine_id: cut.machine_id.clone(),
+                    save_id: cut.save_id.clone(),
+                    new_run_id: vm_spec::lifecycle::LiveId::parse(&run.to_string())
+                        .map_err(eyre::Report::msg)?,
+                },
+                startup_deadline,
+                startup_cancel,
+            )),
+            _ => None,
+        };
         let shutdown_manifest = serde_json::to_vec(&shutdown.manifest)
             .map_err(|error| eyre::eyre!("encode restore shutdown manifest: {error}"))?;
         protocol::shutdown::manifest_from_json(&shutdown_manifest)
@@ -294,11 +454,16 @@ impl Activation {
             ssh_trusted_ca,
             shutdown_manifest,
             vsock_filename,
+            consume,
         })
     }
 
     pub(crate) fn activation_id(&self) -> Uuid {
         self.activation
+    }
+
+    pub(crate) fn consume_gate(&self) -> Option<ConsumeGate> {
+        self.consume.clone()
     }
 
     fn publish(&self, ctx: &DaemonContext, state: VmLifecycleState, message: String, parked: bool) {
@@ -369,6 +534,9 @@ impl Activation {
             vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
                 (&cut.machine_id, &cut.run_id, cut.freeze_epoch)
             }
+            vm_spec::restore::RestoreAuthority::Hibernation { cut } => {
+                (&cut.machine_id, &cut.ended_run_id, cut.freeze_epoch)
+            }
         };
         Ok((
             FreezeRef {
@@ -429,7 +597,7 @@ impl Activation {
 
     fn activate_request(
         &self,
-        ctx: &DaemonContext,
+        listeners: Vec<protocol::v1::ActivationListener>,
         expected: ExpectedGuestIdentity,
         reference: FreezeRef,
     ) -> ActivateRequest {
@@ -470,7 +638,7 @@ impl Activation {
             destination_machine_id: self.machine.hyphenated().to_string(),
             destination_run_id: self.run.hyphenated().to_string(),
             network,
-            listeners: ctx.forwards.activation_listeners(),
+            listeners,
             hook,
             // Sampled once: an identical replay stays identical.
             host_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
@@ -480,7 +648,7 @@ impl Activation {
             deadline_ms: Some(
                 u32::try_from(vm_spec::restore::ACTIVATE_TIMEOUT_MS).unwrap_or(u32::MAX),
             ),
-            ssh_trusted_ca: Some(self.ssh_trusted_ca.clone()),
+            ssh_trusted_ca: self.ssh_trusted_ca.clone(),
         }
     }
 
@@ -700,6 +868,25 @@ impl Activation {
         startup_deadline: tokio::time::Instant,
     ) -> eyre::Result<Activated> {
         let activation = self.activation;
+        if let Some(consume) = &self.consume {
+            self.publish(
+                ctx,
+                VmLifecycleState::Restoring,
+                "wake prepared; awaiting durable consume".into(),
+                true,
+            );
+            let prepared = tokio::select! {
+                biased;
+                result = consume.wait() => result,
+                exit = ctx.machine.wait() => Err(format!("parked wake worker exited: {exit:?}")),
+            };
+            if let Err(detail) = prepared {
+                return Err(eyre::Report::new(vm_spec::hibernate::WakeFailure {
+                    boundary: vm_spec::hibernate::WakeFailureBoundary::PreConsume,
+                    detail,
+                }));
+            }
+        }
         self.publish(
             ctx,
             VmLifecycleState::Activating,
@@ -708,6 +895,7 @@ impl Activation {
         );
         let result = tokio::select! {
             biased;
+            () = tokio::time::sleep_until(startup_deadline) => Err(Abort::Uncertain("restore activation exceeded the startup deadline".into())),
             result = self.sequence(ctx, runtime_dir, cancel, startup_deadline) => result,
             exit = ctx.machine.wait() => Err(Abort::Uncertain(format!(
                 "restore worker terminated during activation: {exit:?}"
@@ -715,6 +903,15 @@ impl Activation {
         };
         match result {
             Ok(vsock) => Ok(Activated::Running(vsock)),
+            Err(failure) if self.consume.is_some() => {
+                Err(eyre::Report::new(vm_spec::hibernate::WakeFailure {
+                    boundary: vm_spec::hibernate::WakeFailureBoundary::PostConsume,
+                    detail: match failure {
+                        Abort::Fenced(failure) => failure.message(),
+                        Abort::Uncertain(detail) => detail,
+                    },
+                }))
+            }
             Err(Abort::Uncertain(detail)) => {
                 tracing::info!(%activation, "restore activation reaping child");
                 Err(eyre::eyre!("restore exposure uncertain: {detail}"))
@@ -788,7 +985,8 @@ impl Activation {
             agent_instance_id: source.instance_id.hyphenated().to_string(),
             boot_id: source.boot_id.hyphenated().to_string(),
         };
-        let request = self.activate_request(ctx, expected, source_ref);
+        let request =
+            self.activate_request(ctx.forwards.activation_listeners(), expected, source_ref);
         tracing::info!(%activation, "restore activate sending");
         let guest = self.activate(ctx, cancel, &request, &source).await?;
         tracing::info!(%activation, "restore activate acknowledged");
@@ -1139,5 +1337,202 @@ mod tests {
             .message(),
             "restore activation failed: stage=acknowledgement code=clock-generation-failed: late"
         );
+    }
+
+    fn consume_gate() -> crate::restore::activation::ConsumeGate {
+        crate::restore::activation::ConsumeGate::new(
+            vm_spec::hibernate::RestorePrepared {
+                machine_id: vm_spec::lifecycle::LiveId::parse(SOURCE_MACHINE).unwrap(),
+                save_id: vm_spec::lifecycle::LiveId::parse(OPERATION).unwrap(),
+                new_run_id: vm_spec::lifecycle::LiveId::parse(DESTINATION_RUN).unwrap(),
+            },
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            tokio_util::sync::CancellationToken::new(),
+        )
+    }
+
+    fn authorization(
+        gate: &crate::restore::activation::ConsumeGate,
+    ) -> vm_spec::hibernate::ConsumeAuthorization {
+        vm_spec::hibernate::ConsumeAuthorization {
+            machine_id: gate.prepared.machine_id.clone(),
+            save_id: gate.prepared.save_id.clone(),
+            new_run_id: gate.prepared.new_run_id.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_consume_gate_parks_until_exact_authorization_and_rejects_each_stale_identity() {
+        use std::time::Duration;
+        let gate = consume_gate();
+        let mut waiting = Box::pin(gate.wait());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        for field in 0..3 {
+            let mut wrong = authorization(&gate);
+            let foreign = vm_spec::lifecycle::LiveId::parse(DESTINATION_MACHINE).unwrap();
+            match field {
+                0 => wrong.machine_id = foreign,
+                1 => wrong.save_id = foreign,
+                _ => wrong.new_run_id = foreign,
+            }
+            assert!(gate.authorize(&wrong).is_err());
+            assert!(gate.prepared().is_some());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                    .await
+                    .is_err()
+            );
+        }
+        gate.authorize(&authorization(&gate)).unwrap();
+        waiting.await.unwrap();
+        assert!(gate.prepared().is_none());
+        gate.authorize(&authorization(&gate)).unwrap();
+        assert!(gate.abandon().is_err());
+        assert_eq!(
+            gate.finish_failure(),
+            vm_spec::hibernate::WakeFailureBoundary::PostConsume
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_consume_gate_abandon_cancel_timeout_and_setup_loss_are_preconsume() {
+        use std::time::Duration;
+        for cause in 0..4 {
+            let mut gate = consume_gate();
+            if cause == 2 {
+                gate.deadline = tokio::time::Instant::now() + Duration::ZERO;
+            }
+            match cause {
+                0 => gate.abandon().unwrap(),
+                1 => gate.cancelled.cancel(),
+                2 => {}
+                _ => {
+                    gate.finish_failure();
+                }
+            }
+            assert!(gate.wait().await.is_err());
+            assert_eq!(
+                gate.finish_failure(),
+                vm_spec::hibernate::WakeFailureBoundary::PreConsume
+            );
+            assert!(gate.authorize(&authorization(&gate)).is_err());
+            assert!(gate.prepared().is_none());
+        }
+    }
+
+    #[test]
+    fn wake_authorization_refuses_expired_or_cancelled_attempts_without_polling_the_waiter() {
+        for cancelled in [false, true] {
+            let mut gate = consume_gate();
+            if cancelled {
+                gate.cancelled.cancel();
+            } else {
+                gate.deadline = tokio::time::Instant::now();
+            }
+            assert!(gate.authorize(&authorization(&gate)).is_err());
+            assert_eq!(
+                gate.finish_failure(),
+                vm_spec::hibernate::WakeFailureBoundary::PreConsume
+            );
+            assert!(gate.prepared().is_none());
+        }
+    }
+
+    #[test]
+    fn wake_activation_preserves_identity_and_trust_and_never_supplies_a_hook() {
+        use crate::restore::activation::Activation;
+        use vm_spec::restore::{ActivationPurpose, RestoreAuthority};
+        let directory = std::env::temp_dir().join(format!("wake-activate-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let launch = crate::krun::worker::restore::tests::hibernation_launch(&directory);
+        let RestoreAuthority::Hibernation { cut } = &launch.request.authority else {
+            panic!("wake cut")
+        };
+        let machine = Uuid::parse_str(cut.machine_id.as_str()).unwrap();
+        let run = Uuid::new_v4();
+        let shutdown = protocol::shutdown::StorageShutdownContext {
+            version: protocol::shutdown::VERSION,
+            machine_id: machine.to_string(),
+            run_id: run.to_string(),
+            manifest: protocol::shutdown::StorageManifest::Unsupported {
+                reason: "fixture has no writable disks".into(),
+            },
+        };
+        let construct = |request, machine, run| {
+            Activation::new(
+                request,
+                machine,
+                run,
+                &shutdown,
+                None,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                tokio_util::sync::CancellationToken::new(),
+            )
+        };
+        let activation = construct(launch.request.clone(), machine, run).unwrap();
+        assert!(activation.consume_gate().is_some());
+        let (source, _) = activation.source_freeze_ref().unwrap();
+        assert_eq!(source.machine_id, machine.to_string());
+        assert_eq!(source.run_id, cut.ended_run_id.to_string());
+        let request = activation.activate_request(
+            vec![],
+            ExpectedGuestIdentity {
+                machine_id: machine.to_string(),
+                run_id: source.run_id.clone(),
+                agent_instance_id: Uuid::new_v4().to_string(),
+                boot_id: Uuid::new_v4().to_string(),
+            },
+            source,
+        );
+        assert_eq!(
+            request.purpose,
+            Some(protocol::v1::ActivationPurpose::SameMachine as i32)
+        );
+        assert_eq!(request.destination_machine_id, machine.to_string());
+        assert_eq!(request.destination_run_id, run.to_string());
+        assert!(request.hook.is_none());
+        assert_eq!(request.ssh_trusted_ca, launch.request.ssh_trusted_ca);
+        assert!(request.host_time.is_some());
+        let mut foreign = launch.request.clone();
+        assert!(construct(foreign.clone(), Uuid::new_v4(), run).is_err());
+        assert!(construct(
+            foreign.clone(),
+            machine,
+            Uuid::parse_str(cut.ended_run_id.as_str()).unwrap()
+        )
+        .is_err());
+        foreign.hook = Some(vm_spec::restore::RestoreHook {
+            argv: vec!["true".into()],
+            environment: vec![],
+            working_directory: "/".into(),
+            timeout_ms: 1,
+        });
+        assert!(construct(foreign, machine, run).is_err());
+        let mut clone = launch.request.clone();
+        clone.purpose = ActivationPurpose::Clone;
+        assert!(clone
+            .validate_activation(
+                &cut.machine_id,
+                &vm_spec::lifecycle::LiveId::parse(&run.to_string()).unwrap()
+            )
+            .is_err());
+        let clone_directory = directory.join("clone");
+        std::fs::create_dir(&clone_directory).unwrap();
+        let mut owned = crate::krun::worker::restore::tests::owned_launch(&clone_directory);
+        let key = russh::keys::PrivateKey::from(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]),
+        );
+        owned.request.ssh_trusted_ca = Some(key.public_key().to_openssh().unwrap());
+        let cloned = construct(owned.request, Uuid::new_v4(), run).unwrap();
+        assert!(
+            cloned.consume_gate().is_none(),
+            "clone never waits for consume"
+        );
+        drop((activation, launch));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

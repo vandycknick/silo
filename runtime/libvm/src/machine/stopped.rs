@@ -308,6 +308,11 @@ pub async fn preflight_stopped(
         crate::store::observation::ObservationStore::open(&roots.state_db_path()).await?;
     let result = async {
         let (machine, state) = observer.lookup(reference).await?;
+        if observer.has_hibernation(machine.id).await? {
+            return Err(LibVmError::HibernatedStartFirst {
+                reference: machine.name,
+            });
+        }
         let storage = observer.machine_storage(machine.id).await?;
         validate_managed_attachments(&machine.spec, &storage)?;
         validate_capture_shape(&storage, StoppedAdmission::Ordinary)?;
@@ -430,6 +435,15 @@ impl Runtime {
     ) -> Result<CreatedSnapshot, LibVmError> {
         options.validate()?;
         let machine = self.get_machine(machine).await?;
+        let config = self
+            .resolve_machine_config(&MachineRef::id(machine.machine_id()))
+            .await?;
+        crate::machine::hibernate::fence(
+            self,
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Start,
+        )
+        .await?;
         if options.memory {
             let observation = match machine.observe_live().await {
                 Ok(observation) => observation,
@@ -711,6 +725,17 @@ pub(crate) async fn admit_stopped(
     admission: StoppedAdmission,
 ) -> Result<StoppedStorageGuard, LibVmError> {
     let (lifecycle, config) = runtime.lock_machine_config(id).await?;
+    crate::machine::hibernate::fence(
+        runtime,
+        &config,
+        match admission {
+            StoppedAdmission::Ordinary => crate::machine::hibernate::HibernateRemedy::Start,
+            StoppedAdmission::RawExport | StoppedAdmission::Handoff(_) => {
+                crate::machine::hibernate::HibernateRemedy::Stop
+            }
+        },
+    )
+    .await?;
     runtime.validate_machine_data_dir(&config)?;
     let initial_storage = runtime.machine_storage_record(id).await?;
     validate_capture_shape(&initial_storage, admission)?;

@@ -8,6 +8,7 @@ mod config_store;
 pub(crate) mod fork;
 pub(crate) mod handoff_payload_store;
 pub(crate) mod handoff_store;
+pub(crate) mod hibernate;
 pub(crate) mod image_store;
 pub(crate) mod layer_store;
 pub(crate) mod live_store;

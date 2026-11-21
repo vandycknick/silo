@@ -126,6 +126,7 @@ pub(crate) fn live_operation_progress_words(
 
     match stage {
         LiveOperationProgress::Admitting => ("Admitting", source.into()),
+        LiveOperationProgress::Waking => ("Waking", source.into()),
         LiveOperationProgress::PausingSource => ("Pausing", source.into()),
         LiveOperationProgress::CapturingMemory => ("Capturing memory", String::new()),
         LiveOperationProgress::CapturingDisks => ("Capturing disks", String::new()),

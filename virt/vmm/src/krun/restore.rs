@@ -64,6 +64,20 @@ fn object(request: &RestoreRequest, role: RestoreObjectRole) -> io::Result<State
                 },
             }
         }
+        vm_spec::restore::RestoreObjectAuthority::Hibernation { file } => {
+            StateObjectAuthority::OwnedLocalFile {
+                fingerprint: NativeFileFingerprint {
+                    device: object.file_device,
+                    inode: file.inode,
+                    length: file.size,
+                    mode: file.mode,
+                    modified_seconds: file.modified_seconds,
+                    modified_nanoseconds: file.modified_nanoseconds,
+                    changed_seconds: file.changed_seconds,
+                    changed_nanoseconds: file.changed_nanoseconds,
+                },
+            }
+        }
     })
 }
 
@@ -77,6 +91,7 @@ pub(crate) fn binding(
             .map(|memory| &memory.binding)
             .ok_or_else(|| invalid("restore seal has no memory binding")),
         vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => Ok(&cut.binding),
+        vm_spec::restore::RestoreAuthority::Hibernation { cut } => Ok(&cut.binding),
     }
 }
 
@@ -110,6 +125,12 @@ pub(crate) fn identity(
                     })
                 }
                 vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
+                    RamInputAuthority::OwnedLocalCut {
+                        state: binding.clone(),
+                        materialization_generation: cut.materialization_generation.get(),
+                    }
+                }
+                vm_spec::restore::RestoreAuthority::Hibernation { cut } => {
                     RamInputAuthority::OwnedLocalCut {
                         state: binding.clone(),
                         materialization_generation: cut.materialization_generation.get(),

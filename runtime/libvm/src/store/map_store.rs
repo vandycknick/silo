@@ -50,6 +50,7 @@ impl Store {
         .bind(operation.to_string())
         .execute(&mut *tx)
         .await?;
+        release_hibernation_baseline(&mut tx, operation).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -135,6 +136,20 @@ impl Store {
             })
             .collect()
     }
+}
+
+/// Replacing byte authority must never release the original lazy RAM mapping.
+pub(crate) async fn release_hibernation_baseline(
+    connection: &mut SqliteConnection,
+    operation: Uuid,
+) -> Result<(), LibVmError> {
+    sqlx::query(
+        "DELETE FROM storage_operation_hibernation WHERE operation_id=?1 AND role='ram-baseline'",
+    )
+    .bind(operation.to_string())
+    .execute(connection)
+    .await?;
+    Ok(())
 }
 
 /// Admit only previously unknown nodes, child first. Existing admitted subtree

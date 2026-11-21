@@ -395,6 +395,8 @@ pub struct LiveMachineReport {
     pub lane: LiveLane,
     pub topology_revision: u64,
     pub live: LiveCapabilityVector,
+    /// Positive evidence from this run's guest agent, never inferred from clone support.
+    pub same_machine_activation: bool,
 }
 
 #[derive(Deserialize)]
@@ -409,6 +411,8 @@ struct RawMachineReport {
     lane: LiveLane,
     topology_revision: u64,
     live: LiveCapabilityVector,
+    #[serde(default)]
+    same_machine_activation: bool,
 }
 
 impl TryFrom<RawMachineReport> for LiveMachineReport {
@@ -424,6 +428,7 @@ impl TryFrom<RawMachineReport> for LiveMachineReport {
             lane: raw.lane,
             topology_revision: raw.topology_revision,
             live: raw.live,
+            same_machine_activation: raw.same_machine_activation,
         };
         value.validate()?;
         Ok(value)
@@ -431,6 +436,11 @@ impl TryFrom<RawMachineReport> for LiveMachineReport {
 }
 
 impl LiveMachineReport {
+    /// Old agents and reports without this capability do not support safe wake.
+    pub fn supports_same_machine_activation(&self) -> bool {
+        self.same_machine_activation
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != LIVE_SCHEMA_VERSION || self.scope != LiveScope::Machine {
             return Err("invalid machine report schema/scope".into());
@@ -621,7 +631,7 @@ impl Serialize for LiveHostReport {
 impl Serialize for LiveMachineReport {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(S::Error::custom)?;
-        let mut value = serializer.serialize_struct("LiveMachineReport", 9)?;
+        let mut value = serializer.serialize_struct("LiveMachineReport", 10)?;
         value.serialize_field("schemaVersion", &self.schema_version)?;
         value.serialize_field("scope", &self.scope)?;
         value.serialize_field("machineId", &self.machine_id)?;
@@ -631,6 +641,7 @@ impl Serialize for LiveMachineReport {
         value.serialize_field("lane", &self.lane)?;
         value.serialize_field("topologyRevision", &self.topology_revision)?;
         value.serialize_field("live", &self.live)?;
+        value.serialize_field("sameMachineActivation", &self.same_machine_activation)?;
         value.end()
     }
 }
@@ -753,6 +764,7 @@ mod tests {
             lane: LiveLane::NotApplicable,
             topology_revision: 1,
             live: host().live,
+            same_machine_activation: false,
         };
         let value = serde_json::to_value(&report).unwrap();
         for field in ["machineId", "runId", "monitorId", "topologyRevision"] {
@@ -790,6 +802,7 @@ mod tests {
             lane: LiveLane::NotApplicable,
             topology_revision: 1,
             live: host().live,
+            same_machine_activation: false,
         };
         assert!(serde_json::to_vec(&machine).is_ok());
         machine.topology_revision = 0;
@@ -849,6 +862,7 @@ mod tests {
             lane: LiveLane::NotApplicable,
             topology_revision: 1,
             live: host().live,
+            same_machine_activation: false,
         };
         let machine_payload = serde_json::to_value(machine).unwrap();
         for kind in ["virtiofs", "rosetta", "tap", "gpu", "nested", "tee"] {
@@ -873,5 +887,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn same_machine_activation_json_roundtrip_defaults_old_reports_to_unsupported() {
+        let mut report = LiveMachineReport {
+            schema_version: LIVE_SCHEMA_VERSION,
+            scope: LiveScope::Machine,
+            machine_id: "00000000-0000-4000-8000-000000000001".into(),
+            run_id: "00000000-0000-4000-8000-000000000002".into(),
+            monitor_id: "00000000-0000-4000-8000-000000000003".into(),
+            backend: LiveBackend::Mock,
+            lane: LiveLane::NotApplicable,
+            topology_revision: 1,
+            live: host().live,
+            same_machine_activation: false,
+        };
+        for supported in [false, true] {
+            report.same_machine_activation = supported;
+            let encoded = serde_json::to_value(&report).unwrap();
+            let decoded: LiveMachineReport = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, report);
+            assert_eq!(decoded.supports_same_machine_activation(), supported);
+        }
+        let mut old = serde_json::to_value(report).unwrap();
+        old.as_object_mut().unwrap().remove("sameMachineActivation");
+        let decoded: LiveMachineReport = serde_json::from_value(old).unwrap();
+        assert!(!decoded.supports_same_machine_activation());
     }
 }

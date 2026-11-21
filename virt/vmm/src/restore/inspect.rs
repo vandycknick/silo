@@ -160,7 +160,8 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
             (layout, execution, devices)
         }
         (
-            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. },
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. }
+            | vm_spec::restore::RestoreAuthority::Hibernation { .. },
             [_, layout, execution, devices],
         ) => (layout, execution, devices),
         _ => {
@@ -196,24 +197,14 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
                     sha256: Sha256Digest::of_bytes(record),
                 }
             }
-            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. } => {
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. }
+            | vm_spec::restore::RestoreAuthority::Hibernation { .. } => {
                 vm_spec::restore::RestoreInspectionRequestBinding::OwnedLocalCut {
                     request: std::str::from_utf8(record)?.to_owned(),
                 }
             }
         },
-        authority: match &restore.authority {
-            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { snapshot, .. } => {
-                vm_spec::restore::RestoreReference::IdentifiedSnapshot {
-                    snapshot: *snapshot,
-                }
-            }
-            vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
-                vm_spec::restore::RestoreReference::OwnedLocalCut {
-                    capture_id: cut.capture_id.clone(),
-                }
-            }
-        },
+        authority: restore.authority.reference(),
         live_state_schema: libkrun::capabilities::LIVE_STATE_SCHEMA.to_string(),
         architecture: std::env::consts::ARCH.to_string(),
         lane: host.lane,

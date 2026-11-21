@@ -134,7 +134,10 @@ impl AppMachine {
             .timeout(Duration::from_secs(60))
             .force_after_timeout(Duration::from_secs(5));
         match self {
-            Self::Local { native, .. } => native.stop_run_with(run_id, options).await,
+            Self::Local { native, .. } => native
+                .stop_run_with(run_id, options)
+                .await
+                .map(|outcome| outcome.machine),
             Self::Daemon { id, service, .. } => service.stop_run(id, run_id, options).await,
         }
     }

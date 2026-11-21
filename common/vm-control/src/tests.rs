@@ -513,6 +513,7 @@ fn readiness_preserves_each_outcome_and_reason() {
                         live: vm_spec::live::LiveCapabilityVector::all_unsupported(
                             vm_spec::live::LiveReasonCode::BackendExcluded,
                         ),
+                        same_machine_activation: false,
                     },
                 },
             };
@@ -739,6 +740,7 @@ fn snapshot_matches_compact_durable_machine_id_to_canonical_live_uuid() {
         lane: LiveLane::NotApplicable,
         topology_revision: 1,
         live: LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded),
+        same_machine_activation: false,
     });
     let wire = snapshot_to_wire(&data).unwrap();
     let decoded = snapshot_from_wire(wire.clone()).unwrap();

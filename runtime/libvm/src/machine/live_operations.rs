@@ -19,6 +19,7 @@ use crate::{LibVmError, Runtime};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveOperationProgress {
     Admitting,
+    Waking,
     PausingSource,
     CapturingMemory,
     CapturingDisks,
@@ -219,6 +220,18 @@ impl Machine {
         observation: &MachineLiveObservation,
         command: LiveCommand,
     ) -> Result<LiveCommandResult, LibVmError> {
+        if matches!(command, LiveCommand::Pause(_) | LiveCommand::Resume(_)) {
+            let config = self
+                .runtime()
+                .resolve_machine_config(&MachineRef::id(self.machine_id()))
+                .await?;
+            crate::machine::hibernate::fence(
+                self.runtime(),
+                &config,
+                crate::machine::hibernate::HibernateRemedy::Start,
+            )
+            .await?;
+        }
         if let LiveCommand::Capture(capture) = &command {
             capture.validate_plan().map_err(protocol)?;
         }
@@ -405,6 +418,16 @@ impl Machine {
         observation: &MachineLiveObservation,
         request_id: Uuid,
     ) -> Result<LiveCommandResult, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        crate::machine::hibernate::fence(
+            self.runtime(),
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Start,
+        )
+        .await?;
         let lifecycle = observation.lifecycle()?;
         let current = match lifecycle.current_pause {
             Some(current) => current,
@@ -514,6 +537,16 @@ impl Machine {
         &self,
         observation: &MachineLiveObservation,
     ) -> Result<MachineLifecycle, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        crate::machine::hibernate::fence(
+            self.runtime(),
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Start,
+        )
+        .await?;
         let pending = self
             .pending_command(observation, vm_spec::lifecycle::LiveCommandKind::Resume)
             .await?;
@@ -544,6 +577,16 @@ impl Machine {
         &self,
         observation: &MachineLiveObservation,
     ) -> Result<MachineLifecycle, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        crate::machine::hibernate::fence(
+            self.runtime(),
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Start,
+        )
+        .await?;
         if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
             return Err(LibVmError::LiveObservation {
                 reference: self.id(),
@@ -939,6 +982,7 @@ mod tests {
                 backend: LiveBackend::Mock,
                 lane: LiveLane::NotApplicable,
                 topology_revision: 1,
+                same_machine_activation: false,
                 live: LiveCapabilityVector::all_unsupported(LiveReasonCode::NotDelivered),
             },
             state,

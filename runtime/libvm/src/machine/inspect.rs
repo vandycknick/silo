@@ -151,6 +151,8 @@ pub struct MachineData {
     pub name: String,
     /// VM specification used to start the machine.
     pub spec: VmSpec,
+    /// Unused execution save, observed without waking the machine.
+    pub hibernation: Option<crate::MachineHibernationInfo>,
     /// Retention policy recorded for this machine.
     pub retention: MachineRetention,
     /// Private-copy persistence, independent of lifecycle status.
@@ -240,6 +242,7 @@ impl MachineData {
             id,
             name,
             spec,
+            hibernation: None,
             retention: MachineRetention::Persistent,
             durability: MachineDurability::Durable,
             process: ProcessConfig::default(),
@@ -308,6 +311,7 @@ impl MachineData {
             id: config.id.to_string(),
             name: config.name,
             spec: config.spec,
+            hibernation: None,
             retention: config.retention,
             durability: MachineDurability::Durable,
             process: config.process,

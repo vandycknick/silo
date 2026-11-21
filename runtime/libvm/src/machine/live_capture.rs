@@ -306,6 +306,16 @@ impl Machine {
         fork_operation: Option<Uuid>,
     ) -> Result<(), LibVmError> {
         self.require_observation(observation)?;
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        crate::machine::hibernate::fence(
+            self.runtime(),
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Start,
+        )
+        .await?;
         let store = self.runtime().native_store()?;
         if let Some(operation) = fork_operation {
             if store.fork_result(operation).await?.is_some() {
@@ -396,6 +406,12 @@ impl Machine {
         }
         let (reservation, intent) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            crate::machine::hibernate::fence(
+                runtime,
+                &config,
+                crate::machine::hibernate::HibernateRemedy::Start,
+            )
+            .await?;
             crate::store::capture::ensure_capture_available(
                 &mut *store.pool.acquire().await?,
                 self.machine_id(),
@@ -1950,6 +1966,7 @@ mod tests {
             backend: LiveBackend::Mock,
             lane: LiveLane::NotApplicable,
             topology_revision: 1,
+            same_machine_activation: false,
             live,
         }
     }

@@ -1084,6 +1084,7 @@ mod tests {
             lane: LiveLane::NotApplicable,
             topology_revision: 1,
             live: LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded),
+            same_machine_activation: false,
         };
         assert!(crate::daemon::supervisor::live_report_for_run(
             None,

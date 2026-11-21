@@ -356,6 +356,8 @@ message GuestLifecycleStatus {
   // Bounded actual observations from this boot, never diagnostic defaults.
   GuestClockProfile clock_profile = 12;
   optional string clock_profile_unavailable_reason = 13;
+  // Explicit guest implementation support. Absent on older agents means unsupported.
+  optional bool same_machine_activation = 14;
 }
 
 enum GuestClocksource {

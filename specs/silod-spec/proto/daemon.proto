@@ -666,6 +666,6 @@ message LiveCapability {
 }
 message LiveCapabilityVector { LiveCapability pause = 1; LiveCapability capture = 2; LiveCapability restore = 3; LiveCapability fork = 4; LiveCapability incremental = 5; }
 message LiveHostReport { reserved 7; optional uint32 schema_version = 1; optional LiveScope scope = 2; optional LiveBackend backend = 3; optional LiveLane lane = 4; LiveCapabilityVector live = 5; optional string build_identity = 6; optional string scenario_digest = 8; }
-message LiveMachineReport { optional uint32 schema_version = 1; optional LiveScope scope = 2; optional string machine_id = 3; optional string run_id = 4; optional string monitor_id = 5; optional LiveBackend backend = 6; optional LiveLane lane = 7; optional uint64 topology_revision = 8; LiveCapabilityVector live = 9; }
+message LiveMachineReport { optional uint32 schema_version = 1; optional LiveScope scope = 2; optional string machine_id = 3; optional string run_id = 4; optional string monitor_id = 5; optional LiveBackend backend = 6; optional LiveLane lane = 7; optional uint64 topology_revision = 8; LiveCapabilityVector live = 9; optional bool same_machine_activation = 10; }
 message LiveOperationUnsupported { optional LiveOperation operation = 1; optional LiveBackend backend = 2; optional LiveLane lane = 3; LiveUnsupportedReason reason = 4; }
 enum LiveEvidenceState { LIVE_EVIDENCE_STATE_UNSPECIFIED = 0; LIVE_EVIDENCE_STATE_RUN = 1; LIVE_EVIDENCE_STATE_PROSPECTIVE = 2; LIVE_EVIDENCE_STATE_UNAVAILABLE = 3; }

@@ -35,6 +35,9 @@ pub use crate::image::import_types::{
     OciImageInfo, RawConversionKey, RawConversionOptions, RootCandidate, RootSelectionFailed,
     StoredImageInfo,
 };
+pub use crate::machine::hibernate::{
+    MachineHibernationInfo, MachineStopOutcome, MachineStopWarning,
+};
 pub use crate::machine::live_capture::SnapshotIdentityReason;
 pub use crate::machine::live_fork::{
     ForkCaptureOutcome, ForkChildOutcome, ForkChildResult, ForkDestination, ForkFailurePhase,
