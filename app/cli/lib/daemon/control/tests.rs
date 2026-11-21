@@ -945,6 +945,21 @@ async fn hibernation_and_pause_local_daemon_routes_share_durable_authority() {
     let stop = silo_vm_control::lifecycle::stop_from_wire(stop).unwrap();
     assert_eq!(stop.machine.status.label(), "stopped");
     assert!(stop.warning.is_none());
+    let repeated = daemon
+        .stop_machine(w::StopMachineRequest {
+            machine: request().machine,
+            force: true,
+            timeout: Some(prost_types::Duration {
+                seconds: 30,
+                nanos: 0,
+            }),
+            expected_run: None,
+        })
+        .await
+        .expect("force stop of a stopped machine succeeds")
+        .into_inner();
+    let repeated = silo_vm_control::snapshots::snapshot_from_wire(repeated).unwrap();
+    assert_eq!(repeated.status.label(), "stopped");
     machine.stop().await.unwrap();
     cleanup.0 = None;
     shutdown.cancel();

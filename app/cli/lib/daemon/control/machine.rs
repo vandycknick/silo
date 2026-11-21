@@ -418,7 +418,19 @@ impl w::machine_service_server::MachineService for Service {
                             m.kill_run_with(run, options).await.map_err(native)?;
                         }
                         None => {
-                            m.kill_with(options).await.map_err(native)?;
+                            // Force has something to end only on a running
+                            // machine or a saved one; otherwise the stop path
+                            // reconciles and succeeds on a stopped machine.
+                            let data = m.inspect().await.map_err(native)?;
+                            if data.is_running() || data.hibernation.is_some() {
+                                m.kill_with(options).await.map_err(native)?;
+                            } else {
+                                let mut stop = libvm::MachineStopOptions::new();
+                                if let Some(timeout) = timeout {
+                                    stop = stop.timeout(timeout);
+                                }
+                                m.stop_with(stop).await.map_err(native)?;
+                            }
                         }
                     }
                     snapshot(&m.inspect().await.map_err(native)?)
