@@ -462,14 +462,19 @@ impl Machine {
         {
             self.wake_locked(&config, record).await?;
         }
-        let state = runtime.machine_state(config.id).await?;
-        if state.status != MachineRuntimeState::Running {
+        // Judge "running" from the reconciled observation, as access did
+        // before wake existed. The stored state alone can lag the monitor,
+        // for example right after a refused pause.
+        let observed = runtime.machine_inspect_data(config.clone()).await?;
+        if !observed.is_running() {
             return Err(LibVmError::MachineNotRunning {
                 reference: config.name.clone(),
             });
         }
-        let run = state
+        let run = observed
             .run_id
+            .as_ref()
+            .map(|run| run.as_str().to_owned())
             .ok_or_else(|| failure(&config, "running generation is missing"))?;
         let ready = self.wait_ready(Duration::from_secs(60)).await?;
         if !ready.status.readiness.ready {

@@ -580,25 +580,45 @@ impl Machine {
                 {
                     if for_removal {
                         crate::machine::hibernate::discard_locked(runtime, &config).await?;
-                    } else if let Err(error) = self.wake_locked(&config, record).await {
-                        *warning = Some(match error {
-                            LibVmError::HibernateUnusable { reason, .. } => {
-                                crate::MachineStopWarning::SavedStateUnusable { reason }
-                            }
-                            LibVmError::WakeConsumed { .. } => {
-                                crate::MachineStopWarning::WakeFailed
-                            }
-                            other => {
-                                if runtime.machine_state(config.id).await?.status
-                                    != MachineRuntimeState::Hibernated
+                    } else {
+                        match self.wake_locked(&config, record).await {
+                            Ok(_) => {
+                                // A clean shutdown is asked of the agent of the
+                                // new run. Stopping the instant the VM runs
+                                // again finds no agent yet and falls back to a
+                                // forced stop, losing what the guest held in
+                                // memory. If the agent never arrives, the stop
+                                // below still ends the machine.
+                                if let Err(error) =
+                                    self.wait_ready(std::time::Duration::from_secs(60)).await
                                 {
-                                    return Err(other);
+                                    tracing::debug!(
+                                        %error,
+                                        "agent not ready after wake; stopping without it"
+                                    );
                                 }
-                                crate::MachineStopWarning::WakeFailed
                             }
-                        });
-                        crate::machine::hibernate::discard_locked(runtime, &config).await?;
-                        return runtime.machine_inspect_data(config).await;
+                            Err(error) => {
+                                *warning = Some(match error {
+                                    LibVmError::HibernateUnusable { reason, .. } => {
+                                        crate::MachineStopWarning::SavedStateUnusable { reason }
+                                    }
+                                    LibVmError::WakeConsumed { .. } => {
+                                        crate::MachineStopWarning::WakeFailed
+                                    }
+                                    other => {
+                                        if runtime.machine_state(config.id).await?.status
+                                            != MachineRuntimeState::Hibernated
+                                        {
+                                            return Err(other);
+                                        }
+                                        crate::MachineStopWarning::WakeFailed
+                                    }
+                                });
+                                crate::machine::hibernate::discard_locked(runtime, &config).await?;
+                                return runtime.machine_inspect_data(config).await;
+                            }
+                        }
                     }
                 }
             }
