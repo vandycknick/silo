@@ -14,6 +14,15 @@ use tokio_stream::Stream;
 use crate::api::daemon::DaemonVmService;
 use crate::api::start_options::AppStartOptions;
 
+/// Whether an access command says that it woke a hibernated machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeNotice {
+    /// Print `Waking NAME` on standard error.
+    Announce,
+    /// Say nothing: the command hands the user a terminal.
+    Silent,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum AppMachine {
     Local {
@@ -66,8 +75,12 @@ impl AppMachine {
         }
     }
 
-    pub(crate) async fn for_access(&self) -> eyre::Result<Self> {
+    pub(crate) async fn for_access(&self, notice: WakeNotice) -> eyre::Result<Self> {
         let native = self.session_machine().await?;
+        if notice == WakeNotice::Silent {
+            let admitted = native.for_access(None).await?;
+            return Ok(Self::new(admitted, self.home().to_path_buf()));
+        }
         let name = native.inspect().await?.name;
         let (progress, mut stages) = libvm::LiveOperationProgressSender::default_channel();
         let operation = native.for_access(Some(&progress));

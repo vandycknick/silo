@@ -40,7 +40,9 @@ impl Cmd {
         if self.attach == Some(AttachMode::Serial) {
             reject_serial_forward_agent(self.forward_agent)?;
         }
-        let machine = machine.for_access().await?;
+        let machine = machine
+            .for_access(crate::api::machine::WakeNotice::Silent)
+            .await?;
 
         if self.attach == Some(AttachMode::Serial) {
             if self.user.is_some() {

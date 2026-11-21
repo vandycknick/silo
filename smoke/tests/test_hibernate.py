@@ -458,5 +458,9 @@ def test_guest_access_wakes_once_on_stderr(silo: Silo, basic_image: str, access:
             assert result.returncode == 0
         finally:
             hibernate.terminate(process, silo, "hibernate-access-forward")
-    hibernate.waking(result, NAME)
+    if access == "shell":
+        # A shell hands over a terminal; a wake line above the prompt is noise.
+        assert "Waking" not in result.stdout + result.stderr, result
+    else:
+        hibernate.waking(result, NAME)
     assert hibernate.boot_id(silo, NAME) == boot

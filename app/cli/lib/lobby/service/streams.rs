@@ -242,7 +242,12 @@ impl Service {
                     biased;
                     _ = io.cancel.cancelled() => return Err(cancelled()),
                     Some(stage) = stages.recv() => {
-                        if stage == libvm::LiveOperationProgress::Waking && !reported {
+                        // A shell is a terminal the user is about to type
+                        // into; a wake line above the prompt is only noise.
+                        if stage == libvm::LiveOperationProgress::Waking
+                            && !reported
+                            && !matches!(action, Action::Shell)
+                        {
                             io.stderr.write_all(format!("Waking {}\n", snapshot.name).as_bytes()).await
                                 .map_err(|_| lost("progress output transport failed"))?;
                             reported = true;

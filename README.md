@@ -151,7 +151,8 @@ silo fork dev --live --name child
 releases its host processes. `silo start`, `exec`, `shell` (including serial
 attach), `cp`, guest file operations and opening a forward wake the same VM.
 Listing machines or forwards, `info` and `logs` never wake it. Wake reports
-`Waking NAME` on stderr, leaving command output, JSON and copied bytes alone.
+`Waking NAME` on stderr, leaving command output, JSON and copied bytes alone;
+`shell` wakes silently and goes straight to the prompt.
 
 Existing shell, exec, forward and network connections end at hibernate. Reconnect
 after wake. `silo stop NAME` wakes and shuts down cleanly; if wake is impossible,
