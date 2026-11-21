@@ -1,23 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import hashlib
 import json
 import math
-from pathlib import Path
 import sqlite3
+import subprocess
 import sys
+import time
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
+from silo_perf.drivers import snapshot_id
+from silo_perf.history import Host, Record, append, delta, load, parse, previous
+from silo_perf.model import (
+    Cohort,
+    Target,
+    Verdict,
+    invariant,
+    load_cohorts,
+    load_targets,
+    target_for,
+)
+from silo_perf.report import render, trend
 
 from silo_smoke.catalog_observer import observe
 from silo_smoke.distribution_registry import DistributionRelease, install_distribution
 from silo_smoke.errors import SmokeEnvironmentError
-from silo_perf.drivers import snapshot_id
-from silo_perf.history import Host, Record, append, delta, load, parse, previous
-from silo_perf.model import Cohort, Target, Verdict, invariant, load_cohorts, load_targets, target_for
-from silo_perf.report import render, trend
-
 
 HOST = Host("unit CPU", 64 * 1024**3, "btrfs", "unit kernel", "x86_64")
 
@@ -346,12 +355,70 @@ def test_create_and_run_clock_labels() -> None:
 
 
 def test_fork_identity_cost_rows_are_informational_and_follow_existing_clocks() -> None:
-    from silo_perf.drivers import Action, INFORMATIONAL_METRICS
+    from silo_perf.drivers import INFORMATIONAL_METRICS, Action
     from silo_perf.scenario import SCENARIO
 
     added = (Action.SNAPSHOT_SOURCE_AFTER_FORKS, Action.SNAPSHOT_FORK_CHILD_FIRST,
              Action.SNAPSHOT_FORK_CHILD_SECOND)
-    assert SCENARIO[-3:] == added
+    start = SCENARIO.index(added[0])
+    assert SCENARIO[start:start + 3] == added
     assert SCENARIO.index(Action.SNAPSHOT_AFTER_RESTART) < SCENARIO.index(added[0])
     assert {action.value for action in added} <= INFORMATIONAL_METRICS
     assert not {action.value for action in added} & {key[-1] for key in load_targets()}
+
+
+def test_hibernation_targets_are_provisional_and_reporting_only_rows_have_no_target() -> None:
+    from silo_perf.drivers import HIBERNATION_ACTIONS, INFORMATIONAL_METRICS, Action
+    from silo_perf.scenario import SCENARIO
+
+    cohort = load_cohorts()["arch-30g"]
+    assert cohort.hibernate and cohort.workload is None
+    assert not load_cohorts()["arch-30g-busy"].hibernate
+    assert frozenset(SCENARIO[-6:]) == HIBERNATION_ACTIONS
+    targets = load_targets()
+    for metric, seconds in (("hibernate", 2.0), ("wake", 0.75), ("exec_on_hibernated", 0.85),
+                            ("hibernate_after_wake", 1.5)):
+        target = target_for(targets, "silo", "arch-30g", "image", metric)
+        assert target is not None and target.seconds == seconds
+        assert target.expected_fail and target.slice == "adr-0023"
+        assert target.evaluate(seconds * 2) == Verdict.NOT_YET
+    for action in (Action.STOP_HIBERNATED, Action.WAKE_COLD_CACHE):
+        assert action.value in INFORMATIONAL_METRICS
+        assert target_for(targets, "silo", "arch-30g", "image", action.value) is None
+    assert "wake_partial_cold_cache" in INFORMATIONAL_METRICS
+
+
+def test_first_guest_output_boundary_precedes_process_completion() -> None:
+    from silo_perf.drivers import first_output
+
+    command = [sys.executable, "-c",
+               "import sys; print('GUEST-OUTPUT', flush=True); sys.stdin.read(1); print('FINISHED')"]
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as process:
+        try:
+            started = time.perf_counter_ns()
+            prefix, observed = first_output(process, 5)
+            assert prefix == "GUEST-OUTPUT\n"
+            assert observed >= started and process.poll() is None
+            output, errors = process.communicate(input="x", timeout=5)
+            assert process.returncode == 0 and output == "FINISHED\n" and errors == ""
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("output", [False, True], ids=["timeout", "eof"])
+def test_first_output_does_not_substitute_cli_completion(output: bool) -> None:
+    from silo_perf.drivers import first_output
+
+    command = [sys.executable, "-c", "pass" if output else "import sys; sys.stdin.read(1)"]
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as process:
+        try:
+            with pytest.raises(RuntimeError if output else subprocess.TimeoutExpired):
+                first_output(process, 5 if output else 0.05)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)

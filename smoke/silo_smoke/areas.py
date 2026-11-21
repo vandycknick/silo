@@ -40,6 +40,8 @@ AREAS: dict[str, Area] = {
     "restore": Area("restoring snapshots with memory and activation", (
         "test_restore", "test_restore_lifecycle", "test_guest_activation")),
     "fork": Area("live and stopped forks", ("test_fork", "test_unhashed_fork")),
+    "hibernate": Area("same-machine hibernate, wake, disk guards and crash recovery", (
+        "test_hibernate", "test_hibernate_crash")),
     "native": Area("native VMM capabilities and live API", ("test_native_capabilities", "test_native_live_api")),
     "memory": Area("host memory reclaim", ("test_reclaim",)),
 }

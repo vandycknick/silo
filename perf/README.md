@@ -368,3 +368,33 @@ into a real command as msb does for create/start, never synthesized from guesses
 The scenario, cohort selection, history and table do not need a second procedure.
 Add the competitor's pinned Nix derivation and one entry to `competitors` in
 `nix/perfShell.nix`; do not add an installer to Python or Make.
+
+## Hibernate and wake (ADR 0023)
+
+The idle `arch-30g` cohort enables Silo-only actions after every existing
+snapshot/fork row. A separate idle VM prevents busy conditioning from changing
+these boundaries; image and agent modes retain their usual reporting.
+
+| Metric | Timed boundary | Provisional image-mode target |
+| --- | --- | --- |
+| `hibernate` | CLI start to return, requiring old monitor/worker already terminal | 2.0 s |
+| `wake` | `start` to agent-ready return; an untimed exec confirms usability | 0.75 s |
+| `exec_on_hibernated` | CLI start to first actual guest stdout byte, not command completion | 0.85 s |
+| `hibernate_after_wake` | CLI start to old processes gone after replacing one 4 KiB tmpfs page outside timing | 1.5 s |
+| `stop_hibernated` | CLI start to stopped | Reported only |
+| `wake_cold_cache` | `start` to agent ready after per-file saved-RAM eviction | Reported only |
+
+The four targets use the existing `expected_fail` / `NOT YET` mechanism with
+slice `adr-0023`. They are targets to confirm or revise, not measured results.
+The incremental row retains public `silo info` memory-capture mode, bytes
+written, full reason, initial save bytes and controlled change size in evidence,
+and fails if the observed capture fell back to full. Public JSON spellings are
+isolated in `silo_smoke.hibernate.report()`, shared with smoke.
+
+Cold conditioning reuses `silo_perf.page_cache.evict`: only the owned saved
+memory file is fsynced and advised `POSIX_FADV_DONTNEED`, before timing.
+`mincore` residency evidence is retained. If pages remain resident, the row is
+honestly named `wake_partial_cold_cache`, not `wake_cold_cache`. Neither row has
+a target. There is no global cache drop, sudo or private hibernation-record
+parsing. Every retained VM is removed by the existing driver cleanup path.
+

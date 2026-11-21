@@ -38,3 +38,25 @@ seconds = 1.0
 
 [silo.arch-30g.image.run_true]
 seconds = 2.0
+
+# ADR 0023 provisional targets, not measured results. Keep NOT YET until the
+# first Arch 30 GiB qualification confirms or revises them.
+[silo.arch-30g.image.hibernate]
+seconds = 2.0
+expected_fail = true
+slice = "adr-0023"
+
+[silo.arch-30g.image.wake]
+seconds = 0.75
+expected_fail = true
+slice = "adr-0023"
+
+[silo.arch-30g.image.exec_on_hibernated]
+seconds = 0.85
+expected_fail = true
+slice = "adr-0023"
+
+[silo.arch-30g.image.hibernate_after_wake]
+seconds = 1.5
+expected_fail = true
+slice = "adr-0023"

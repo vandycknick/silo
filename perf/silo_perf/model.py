@@ -64,6 +64,7 @@ class Cohort:
     informational: bool = False
     raw_root: bool = False
     workload: Workload | None = None
+    hibernate: bool = False
 
     def __post_init__(self) -> None:
         if self.workload is not None and self.workload.tmpfs_mib >= self.memory_gib * 1024:

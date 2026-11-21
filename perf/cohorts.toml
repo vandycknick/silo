@@ -21,6 +21,8 @@ image = "ghcr.io/vandycknick/archlinux:20260831.150324"
 cpus = 10
 memory_gib = 30
 disks = ["100gb"]
+# ADR 0023 idle same-machine qualification, after the existing snapshot rows.
+hibernate = true
 
 [disk-invariance]
 image = "docker.io/library/alpine:latest"

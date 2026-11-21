@@ -217,6 +217,9 @@ def main() -> None:
         "restore-vcpu-run": {16},
         "restore-guest-transport": set(),
         "restore-transport-reply": {1, 20, 44, 46},
+        # Same-machine wake maps its private RAM baseline during construction,
+        # before RestorePrepared and the manager's durable consume permission.
+        "wake-memory-map": {9},
     }[boundary]
     if observe_copies:
         candidates = candidates | {1, 16, 18, 20}
@@ -585,7 +588,7 @@ def main() -> None:
                 if syscall not in candidates:
                     resume(24, tid)
                     return
-                fd = int(info.data[1])
+                fd = int(info.data[5] if boundary == "wake-memory-map" else info.data[1])
                 try:
                     fd_path = Path(f"/proc/{tid}/fd/{fd}")
                     metadata = fd_path.stat()
@@ -616,12 +619,12 @@ def main() -> None:
                     publication_seen = publication_seen or publication
                 capture_directory = (
                     actual_path is not None
-                    and actual_path.parent.name == "captures"
+                    and actual_path.parent.name == request.get("captureDirectoryName", "captures")
                     and actual_path.parent.parent.parent == machines
                 )
                 capture_file = (
                     actual_path is not None
-                    and actual_path.parent.parent.name == "captures"
+                    and actual_path.parent.parent.name == request.get("captureDirectoryName", "captures")
                     and actual_path.parent.parent.parent.parent == machines
                 )
                 capture_disk = (
@@ -673,6 +676,8 @@ def main() -> None:
                                 (capture_id,)).fetchone()
                         catalog_commit = row is not None and row[0] is not None and published is not None
                 selected = ((boundary == "source-sync" and syscall in (74, 75) and source)
+                            or (boundary == "wake-memory-map" and syscall == 9 and source
+                                and thread_name(group) == "krun")
                             or (boundary == "source-read" and syscall in (0, 5, 8, 17) and source)
                             or (boundary == "boot-kernel-copy" and syscall in (1, 18, 20)
                                 and actual_path is not None and actual_path.parent.parent == machines

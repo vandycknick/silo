@@ -1,20 +1,25 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import StrEnum
 import json
 import os
-from pathlib import Path
+import select
 import shutil
 import subprocess
 import tempfile
 import time
-from typing import Callable, Protocol
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
+from typing import ClassVar, Protocol
 
-from silo_smoke.catalog_observer import observe
-from silo_smoke.workspace import Workspace
+from silo_perf import page_cache
 from silo_perf.model import Cohort, Mode
 from silo_perf.workload import INPUT, Write, marker_check, marker_write, writes
+from silo_smoke import hibernate
+from silo_smoke.catalog_observer import observe
+from silo_smoke.cli import Silo
+from silo_smoke.workspace import Workspace
 
 
 class Action(StrEnum):
@@ -41,13 +46,25 @@ class Action(StrEnum):
     SNAPSHOT_SOURCE_AFTER_FORKS = "snapshot_source_after_two_forks"
     SNAPSHOT_FORK_CHILD_FIRST = "snapshot_fork_child_first"
     SNAPSHOT_FORK_CHILD_SECOND = "snapshot_fork_child_second"
+    HIBERNATE = "hibernate"
+    WAKE = "wake"
+    EXEC_ON_HIBERNATED = "exec_on_hibernated"
+    HIBERNATE_AFTER_WAKE = "hibernate_after_wake"
+    STOP_HIBERNATED = "stop_hibernated"
+    WAKE_COLD_CACHE = "wake_cold_cache"
 
+
+HIBERNATION_ACTIONS = frozenset({
+    Action.HIBERNATE, Action.WAKE, Action.EXEC_ON_HIBERNATED, Action.HIBERNATE_AFTER_WAKE,
+    Action.STOP_HIBERNATED, Action.WAKE_COLD_CACHE,
+})
 
 INFORMATIONAL_METRICS = frozenset({
     Action.IMAGE_CONVERT_RAW.value, Action.CREATE_FIRST.value, Action.FORK_OF_FORK.value,
     Action.SNAPSHOT_OF_RESTORED.value, Action.SNAPSHOT_AFTER_RESTART.value, Action.SNAPSHOT_VERIFY.value,
     Action.SNAPSHOT_SOURCE_AFTER_FORKS.value, Action.SNAPSHOT_FORK_CHILD_FIRST.value,
     Action.SNAPSHOT_FORK_CHILD_SECOND.value,
+    Action.STOP_HIBERNATED.value, Action.WAKE_COLD_CACHE.value, "wake_partial_cold_cache",
 })
 
 
@@ -69,8 +86,8 @@ class Context:
 
 
 class Driver(Protocol):
-    system: str
-    modes: tuple[Mode, ...]
+    system: ClassVar[str]
+    modes: ClassVar[tuple[Mode, ...]]
     def __init__(self, context: Context) -> None: ...
 
     @classmethod
@@ -121,8 +138,21 @@ def copy_command(system: str, source: Path, machine: str, destination: str) -> t
     raise ValueError(f"unsupported workload copy system: {system}")
 
 
+def first_output(process: subprocess.Popen[str], timeout: float) -> tuple[str, int]:
+    """Observe actual stdout bytes, not CLI completion or a readiness probe."""
+    assert process.stdout is not None
+    if not select.select([process.stdout], [], [], timeout)[0]:
+        raise subprocess.TimeoutExpired(process.args, timeout)
+    prefix = os.read(process.stdout.fileno(), 4096)
+    observed = time.perf_counter_ns()
+    if not prefix:
+        raise RuntimeError("guest exec ended before producing its first output")
+    return prefix.decode(errors="replace"), observed
+
+
 @dataclass
 class CommandDriver:
+    system: ClassVar[str]
     context: Context
     binary: Path
     environment: dict[str, str]
@@ -130,15 +160,20 @@ class CommandDriver:
     snapshots: list[str] = field(default_factory=list)
     workload_generations: dict[str, int] = field(default_factory=dict)
 
-    def call(self, *args: str) -> float:
+    def call(self, *args: str, until_first_output: bool = False) -> float:
         command = [str(self.binary), *args]
         started = time.perf_counter_ns()
         timed_out = False
+        prefix = ""
+        observed: int | None = None
         with subprocess.Popen(command, env=self.environment, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, errors="replace") as process:
             try:
-                stdout, stderr = process.communicate(timeout=300)
+                if until_first_output:
+                    prefix, observed = first_output(process, 300)
+                remaining = max(0.001, 300 - (time.perf_counter_ns() - started) / 1e9)
+                stdout, stderr = process.communicate(timeout=remaining)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 process.kill()
@@ -147,8 +182,8 @@ class CommandDriver:
                 process.kill()
                 process.communicate()
                 raise
-            result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-        seconds = (time.perf_counter_ns() - started) / 1e9
+            result = subprocess.CompletedProcess(command, process.returncode, prefix + stdout, stderr)
+        seconds = ((observed if observed is not None else time.perf_counter_ns()) - started) / 1e9
         self.context.workspace.record("perf-commands", f"{self.binary} {args}\nexit={result.returncode}\n"
                                       f"seconds={seconds:.9f}\n{result.stdout}\n{result.stderr}\n")
         if result.returncode or timed_out:
@@ -248,13 +283,14 @@ class CommandDriver:
 
 
 class SiloDriver(CommandDriver):
-    system = "silo"
-    modes = (Mode.IMAGE, Mode.AGENT)
+    system: ClassVar[str] = "silo"
+    modes: ClassVar[tuple[Mode, ...]] = (Mode.IMAGE, Mode.AGENT)
 
     def __init__(self, context: Context) -> None:
         super().__init__(context, context.workspace.config.silo, context.workspace.env())
         self.snapshot_ids: dict[str, str] = {}
         self.image = context.cohort.image
+        self.first_hibernate_bytes: int | None = None
 
     @classmethod
     def available(cls) -> str | None:
@@ -296,6 +332,8 @@ class SiloDriver(CommandDriver):
 
     def measure(self, action: Action) -> dict[str, float]:
         a, b = self.context.names.source, self.context.names.snapshot_source
+        if action in HIBERNATION_ACTIONS:
+            return self.measure_hibernation(action)
         if action == Action.IMAGE_CONVERT_RAW:
             command = raw_conversion_command(self.context.cohort)
             if not command:
@@ -373,6 +411,73 @@ class SiloDriver(CommandDriver):
             raise ValueError(f"unsupported Silo action: {action}")
         return {action.value: seconds}
 
+    def time_hibernate(self, name: str) -> float:
+        processes = hibernate.holders(Silo(self.context.workspace), name)
+        try:
+            seconds = self.call("hibernate", name)
+            if not all(process.terminal() for process in processes):
+                raise RuntimeError("hibernate returned before its old VM processes ended")
+            return seconds
+        finally:
+            for process in processes:
+                process.close()
+
+    def measure_hibernation(self, action: Action) -> dict[str, float]:
+        if not self.context.cohort.hibernate:
+            return {}
+        name = self.context.names.source + "-hibernate"
+        silo = Silo(self.context.workspace)
+        if action == Action.HIBERNATE:
+            # A separate idle machine: busy snapshot/fork conditioning must not
+            # contaminate the ADR's idle-guest boundary.
+            self.create(name)
+            self.call("start", name)
+            self.guest(name, "mkdir -p /hibernate-perf; mount -t tmpfs -o size=8m tmpfs /hibernate-perf; "
+                            "dd if=/dev/urandom of=/hibernate-perf/change bs=4096 count=1 2>/dev/null")
+            seconds = self.time_hibernate(name)
+            capture = hibernate.report(silo, name).memory_capture
+            self.first_hibernate_bytes = capture.bytes_written
+        elif action == Action.WAKE:
+            seconds = self.call("start", name)
+            self.call("exec", name, "--", "/bin/true")
+        elif action == Action.EXEC_ON_HIBERNATED:
+            self.time_hibernate(name)
+            seconds = self.call("exec", name, "--", "/bin/sh", "-c", "printf HIBERNATE-PERF",
+                                until_first_output=True)
+            if self.last_stdout != "HIBERNATE-PERF":
+                raise RuntimeError(f"wake exec stdout was contaminated: {self.last_stdout!r}")
+        elif action == Action.HIBERNATE_AFTER_WAKE:
+            # Exactly one 4 KiB tmpfs page is changed outside the timed window.
+            self.guest(name, "dd if=/dev/urandom of=/hibernate-perf/change bs=4096 count=1 "
+                            "conv=notrunc 2>/dev/null")
+            seconds = self.time_hibernate(name)
+            capture = hibernate.report(silo, name).memory_capture
+            self.context.workspace.record("hibernate-memory-reuse", json.dumps({
+                "mode": capture.mode.value, "bytesWritten": capture.bytes_written,
+                "fullReason": capture.full_reason, "firstBytesWritten": self.first_hibernate_bytes,
+                "controlledChangeBytes": 4096,
+            }) + "\n")
+            if capture.mode != hibernate.MemoryMode.INCREMENTAL or capture.full_reason is not None:
+                raise RuntimeError(f"hibernate after wake did not reuse its memory baseline: {capture}")
+        elif action == Action.STOP_HIBERNATED:
+            seconds = self.call("stop", name)
+            if silo.info(name)["state"] != "stopped":
+                raise RuntimeError("stop on a hibernated machine did not end stopped")
+        elif action == Action.WAKE_COLD_CACHE:
+            self.call("start", name)
+            self.call("exec", name, "--", "/bin/true")
+            self.time_hibernate(name)
+            memory = hibernate.saved_directory(silo, name) / "memory.ram"
+            receipt = page_cache.evict([memory])
+            self.context.workspace.record("hibernate-page-cache", json.dumps(receipt) + "\n")
+            seconds = self.call("start", name)
+            self.call("exec", name, "--", "/bin/true")
+            metric = action.value if receipt["label"] == "cold" else "wake_partial_cold_cache"
+            return {metric: seconds}
+        else:
+            raise ValueError(f"unsupported hibernation action: {action}")
+        return {action.value: seconds}
+
     def remove_fork_sources(self) -> None:
         a = self.context.names.source
         for name in (a + "-f1-f1", a + "-f2", a + "-f1", a):
@@ -417,8 +522,8 @@ EXEC_NAMES: dict[Action, Callable[[str, str], str]] = {
 
 
 class MsbDriver(CommandDriver):
-    system = "msb"
-    modes = (Mode.DEFAULT,)
+    system: ClassVar[str] = "msb"
+    modes: ClassVar[tuple[Mode, ...]] = (Mode.DEFAULT,)
 
     def __init__(self, context: Context) -> None:
         binary = self.find_binary()
@@ -477,7 +582,7 @@ class MsbDriver(CommandDriver):
 
     def measure(self, action: Action) -> dict[str, float]:
         a, b = self.context.names.source, self.context.names.snapshot_source
-        if action in (Action.IMAGE_CONVERT_RAW, Action.SNAPSHOT_VERIFY):
+        if action in HIBERNATION_ACTIONS or action in (Action.IMAGE_CONVERT_RAW, Action.SNAPSHOT_VERIFY):
             return {}
         if action == Action.CREATE_FIRST:
             name = a + "-first"
