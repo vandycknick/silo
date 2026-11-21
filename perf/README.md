@@ -197,10 +197,9 @@ Change the top-level `tolerance = 0.10` in `targets.toml` to adjust the default,
 or add `tolerance` to an individual target table to override it; values must be
 finite and in `[0, 1)`, and the accepted verdict displays the configured percent.
 
-First/second fork and incremental snapshot remain marked `expected_fail = true`
-with slice `30a` until disk tracking and format work qualify them. A target met
-within tolerance passes even while marked, so its marker can be removed.
-Each qualified fix removes its expected-failure marker; never increase a target
+No target is currently marked `expected_fail = true`. Mark one only while a
+named slice is still working toward it, and remove the marker once it passes;
+never increase a target
 to hide a regression. Add another keyed target entry to extend the gate matrix.
 msb comparisons are informational, not gates.
 
@@ -384,8 +383,7 @@ these boundaries; image and agent modes retain their usual reporting.
 | `stop_hibernated` | CLI start to stopped | Reported only |
 | `wake_cold_cache` | `start` to agent ready after per-file saved-RAM eviction | Reported only |
 
-The four targets use the existing `expected_fail` / `NOT YET` mechanism with
-slice `adr-0023`. They are targets to confirm or revise, not measured results.
+The four targets were confirmed on the first Arch 30 GiB qualification.
 The incremental row retains public `silo info` memory-capture mode, bytes
 written, full reason, initial save bytes and controlled change size in evidence,
 and fails if the observed capture fell back to full. Public JSON spellings are

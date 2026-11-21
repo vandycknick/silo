@@ -1,6 +1,6 @@
 tolerance = 0.10
 
-# Each Phase 30 fix removes its expected_fail marker after measured qualification.
+# Mark a target expected_fail (with its slice) only while work toward it is open.
 [silo.arch-30g.image.start]
 seconds = 1.0
 
@@ -14,18 +14,12 @@ seconds = 0.5
 
 [silo.arch-30g.image.fork_second]
 seconds = 1.25
-expected_fail = true
-slice = "30a"
 
 [silo.arch-30g.image.fork_first]
 seconds = 2.0
-expected_fail = true
-slice = "30a"
 
 [silo.arch-30g.image.snapshot_incremental]
 seconds = 1.5
-expected_fail = true
-slice = "30a"
 
 [silo.arch-30g.image.exec]
 seconds = 0.1
@@ -39,24 +33,15 @@ seconds = 1.0
 [silo.arch-30g.image.run_true]
 seconds = 2.0
 
-# ADR 0023 provisional targets, not measured results. Keep NOT YET until the
-# first Arch 30 GiB qualification confirms or revises them.
+# ADR 0023 targets, confirmed on the first Arch 30 GiB qualification.
 [silo.arch-30g.image.hibernate]
 seconds = 2.0
-expected_fail = true
-slice = "adr-0023"
 
 [silo.arch-30g.image.wake]
 seconds = 0.75
-expected_fail = true
-slice = "adr-0023"
 
 [silo.arch-30g.image.exec_on_hibernated]
 seconds = 0.85
-expected_fail = true
-slice = "adr-0023"
 
 [silo.arch-30g.image.hibernate_after_wake]
 seconds = 1.5
-expected_fail = true
-slice = "adr-0023"

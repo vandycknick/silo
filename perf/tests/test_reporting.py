@@ -380,8 +380,8 @@ def test_hibernation_targets_are_provisional_and_reporting_only_rows_have_no_tar
                             ("hibernate_after_wake", 1.5)):
         target = target_for(targets, "silo", "arch-30g", "image", metric)
         assert target is not None and target.seconds == seconds
-        assert target.expected_fail and target.slice == "adr-0023"
-        assert target.evaluate(seconds * 2) == Verdict.NOT_YET
+        assert not target.expected_fail
+        assert target.evaluate(seconds * 2) == Verdict.FAIL
     for action in (Action.STOP_HIBERNATED, Action.WAKE_COLD_CACHE):
         assert action.value in INFORMATIONAL_METRICS
         assert target_for(targets, "silo", "arch-30g", "image", action.value) is None
