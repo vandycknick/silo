@@ -205,13 +205,19 @@ def observe(silo: Silo, operation: str, *, cancel: bool = False) -> dict:
 
 
 def settle(silo: Silo, operation: str, *, timeout: float = 240) -> dict:
-    """Observe (and thereby recover) until the operation is finished."""
+    """Observe (and thereby recover) until the operation and its children settle.
+
+    A finished operation can still report a child as recovery-pending while
+    that child's cleanup retires its ownership. Each observation reconciles
+    such a child, so its outcome is not final until it leaves that state.
+    """
     deadline = time.monotonic() + timeout
     while True:
         value = observe(silo, operation)
-        if value["stage"] == "finished":
+        recovering = any(child["outcome"]["kind"] == "recovery-pending" for child in value["children"])
+        if value["stage"] == "finished" and not recovering:
             return value
-        assert time.monotonic() < deadline, f"fork {operation} never finished: {json.dumps(value)}"
+        assert time.monotonic() < deadline, f"fork {operation} never settled: {json.dumps(value)}"
         time.sleep(0.5)
 
 
