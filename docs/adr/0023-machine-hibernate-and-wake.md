@@ -6,7 +6,9 @@ Date: 2026-11-21
 
 Proposed
 
-This ADR specifies a target architecture. Nothing in it is implemented yet. It
+This ADR is implemented on the `feat/adr-14` branch and awaits owner
+acceptance. The conformance section lists what has and has not been
+qualified. It
 builds on [ADR 0021](0021-live-snapshots-and-forks.md) for capture, restore
 construction and activation, on
 [ADR 0014](0014-layered-oci-image-storage.md) for storage ownership, and on
@@ -388,17 +390,18 @@ never run twice.
 
 ## Conformance Requirements
 
-Measured with `make perf` on the Arch 30 GiB cohort, idle guest. These are
-targets to confirm or revise with the first measurements, not results:
+Measured with `make perf` on the Arch 30 GiB cohort, idle guest. The measured
+column is the median of three samples in image mode, from three runs on
+2026-11-21 at commit `83fe25a8` on a Btrfs host:
 
-| Action | Boundary | Target |
-|---|---|---|
-| `hibernate` | Command start to old processes gone | 2.0 s |
-| `wake` | `silo start` to agent ready | 0.75 s |
-| `exec` on a hibernated machine | Command start to first guest output | 0.85 s |
-| `hibernate` after a wake | As above, with a small controlled change | 1.5 s, and evidence of incremental memory reuse |
-| `stop` on a hibernated machine | Command start to stopped | Reported, no target yet |
-| `wake` with a cold host page cache | `silo start` to agent ready | Reported, no target yet |
+| Action | Boundary | Target | Measured |
+|---|---|---|---|
+| `hibernate` | Command start to old processes gone | 2.0 s | 0.85 to 0.90 s |
+| `wake` | `silo start` to agent ready | 0.75 s | 0.30 s |
+| `exec` on a hibernated machine | Command start to first guest output | 0.85 s | 0.36 to 0.37 s |
+| `hibernate` after a wake | As above, with a small controlled change | 1.5 s, and evidence of incremental memory reuse | 0.57 to 0.58 s, incremental |
+| `stop` on a hibernated machine | Command start to stopped | Reported, no target yet | 0.73 s |
+| `wake` with a cold host page cache | `silo start` to agent ready | Reported, no target yet | 0.45 to 0.48 s |
 
 Hibernate must not read or copy disk contents in proportion to disk size, and
 neither hibernate nor wake may hash or eagerly read memory in proportion to
@@ -429,6 +432,18 @@ Real-VM scenarios that must pass before the status becomes Implemented:
     and on ext4.
 12. Old exec, shell and forward sessions end at hibernate; configured forwards
     accept new connections after wake.
+
+Qualification state on 2026-11-21, `make smoke` hibernate area on a Btrfs
+host (40 passed, 1 skipped):
+
+| Scenario | State |
+|---|---|
+| 1, 2, 4, 5, 7, 10, 12 | Pass on real VMs. |
+| 3 | Passes with a short sleep; a sleep of several minutes has not been run. |
+| 6 | Passes on real VMs for every operation except handoff, whose refusal is covered by a host test only. |
+| 8 | Manager killed during the memory write and monitor or worker killed before consume pass on real VMs. The windows after the durable commit, after consume and during discard, and PID reuse, are covered by host tests only. |
+| 9 | Not run on real VMs: the suite has no small filesystem without root. The rollback is covered by host tests. |
+| 11 | Not run. The check ignores the device number by construction; a real reboot on Btrfs and on ext4 remains a manual check. |
 
 ## Consequences
 
