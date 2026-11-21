@@ -42,6 +42,27 @@ impl w::machine_service_server::MachineService for Service {
         Ok(Response::new(result))
     }
 
+    async fn hibernate_machine(
+        &self,
+        r: Request<w::LiveMachineRequest>,
+    ) -> Result<Response<w::MachineSnapshot>, Status> {
+        let reference = reference(r.into_inner().machine)?;
+        let state = self.clone();
+        let result = self
+            .mutate(async move {
+                snapshot(
+                    &state
+                        .machine(&reference)
+                        .await?
+                        .hibernate()
+                        .await
+                        .map_err(native)?,
+                )
+            })
+            .await?;
+        Ok(Response::new(result))
+    }
+
     async fn pause_machine(
         &self,
         r: Request<w::LiveMachineRequest>,
@@ -411,7 +432,7 @@ impl w::machine_service_server::MachineService for Service {
                         None => m.stop_with(options).await,
                     }
                     .map_err(native)?;
-                    snapshot(&data.machine)
+                    lifecycle::stop_to_wire(&data).map_err(conversion)
                 }
             })
             .await?,
@@ -564,15 +585,15 @@ impl w::machine_service_server::MachineService for Service {
         let state = self.clone();
         Ok(Response::new(
             self.mutate(async move {
-                snapshot(
+                lifecycle::stop_to_wire(
                     &state
                         .machine(&reference)
                         .await?
                         .stop_run_with(run, options)
                         .await
-                        .map_err(native)?
-                        .machine,
+                        .map_err(native)?,
                 )
+                .map_err(conversion)
             })
             .await?,
         ))

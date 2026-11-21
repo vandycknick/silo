@@ -1884,4 +1884,128 @@ mod tests {
         pause.await.unwrap().unwrap();
         f.machine.kill().await.unwrap();
     }
+    #[tokio::test]
+    async fn hibernation_access_binding_never_replays_between_file_steps() {
+        let f = CaptureFixture::new(lifecycle(), MachineRetention::Persistent).await;
+        let admitted = f.machine.for_access(None).await.unwrap();
+        admitted.running_config().await.unwrap();
+        f.machine.hibernate().await.unwrap();
+        for machine in [&admitted, &f.machine] {
+            assert!(matches!(
+                machine.get_file_entry("/").await,
+                Err(LibVmError::MachineNotRunning { .. })
+            ));
+            assert_eq!(
+                f.machine.inspect().await.unwrap().status.label(),
+                "hibernated"
+            );
+        }
+        assert!(matches!(
+            admitted.for_access(None).await,
+            Err(LibVmError::MachineNotRunning { .. })
+        ));
+        assert!(matches!(
+            admitted.download_file("/file").await,
+            Err(LibVmError::MachineNotRunning { .. })
+        ));
+        f.machine.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hibernation_access_refuses_paused_and_stopped_without_resuming_or_booting() {
+        let f = CaptureFixture::new(lifecycle(), MachineRetention::Persistent).await;
+        f.machine
+            .pause(&f.machine.observe_live().await.unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            f.machine.for_access(None).await,
+            Err(LibVmError::MachineNotRunning { .. })
+        ));
+        assert_eq!(f.machine.inspect().await.unwrap().status.label(), "paused");
+        f.machine.kill().await.unwrap();
+        assert!(matches!(
+            f.machine.for_access(None).await,
+            Err(LibVmError::MachineNotRunning { .. })
+        ));
+        assert_eq!(f.machine.inspect().await.unwrap().status.label(), "stopped");
+    }
+
+    #[tokio::test]
+    async fn hibernation_pause_refusal_precedes_stale_observation() {
+        let f = CaptureFixture::new(lifecycle(), MachineRetention::Persistent).await;
+        let observation = f.machine.observe_live().await.unwrap();
+        f.machine.hibernate().await.unwrap();
+        assert!(matches!(
+            f.machine.pause(&observation).await,
+            Err(LibVmError::HibernatedStartFirst { .. })
+        ));
+        assert!(matches!(
+            f.runtime
+                .observe_live_for_mutation(&crate::MachineRef::id(f.machine.machine_id()))
+                .await,
+            Err(LibVmError::HibernatedStartFirst { .. })
+        ));
+        assert_eq!(
+            f.machine.inspect().await.unwrap().status.label(),
+            "hibernated"
+        );
+        f.machine.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hibernation_resume_refusal_precedes_stale_observation() {
+        let f = CaptureFixture::new(lifecycle(), MachineRetention::Persistent).await;
+        let observation = f.machine.observe_live().await.unwrap();
+        f.machine.hibernate().await.unwrap();
+        assert!(matches!(
+            f.machine.resume(&observation).await,
+            Err(LibVmError::HibernatedStartFirst { .. })
+        ));
+        f.machine.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hibernation_snapshot_refusal_precedes_live_observation() {
+        let f = CaptureFixture::new(lifecycle(), MachineRetention::Persistent).await;
+        f.machine.hibernate().await.unwrap();
+        assert!(matches!(
+            f.runtime
+                .snapshot(
+                    &crate::MachineRef::id(f.machine.machine_id()),
+                    crate::SnapshotOptions {
+                        memory: true,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await,
+            Err(LibVmError::HibernatedStartFirst { .. })
+        ));
+        f.machine.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hibernation_fork_refusal_precedes_stale_observation() {
+        let f = CaptureFixture::new(lifecycle(), MachineRetention::Persistent).await;
+        let observation = f.machine.observe_live().await.unwrap();
+        f.machine.hibernate().await.unwrap();
+        let options = crate::LiveForkOptions {
+            operation_id: uuid::Uuid::new_v4(),
+            children: vec![crate::LiveForkChild {
+                name: "child".into(),
+                activation_hook: None,
+                destination: Default::default(),
+            }],
+            max_children: std::num::NonZeroU32::MIN,
+            resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
+            policy: vm_spec::lifecycle::CapturePolicy::Incremental,
+            dirty_crossover_percent: 60,
+        };
+        assert!(matches!(
+            f.machine.fork_live(&observation, options, None).await,
+            Err(LibVmError::HibernatedStartFirst { .. })
+        ));
+        f.machine.kill().await.unwrap();
+    }
 }

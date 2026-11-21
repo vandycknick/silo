@@ -162,10 +162,13 @@ impl ControlState {
         reference: &libvm::MachineRef,
     ) -> Result<libvm::MachineLiveObservation, Status> {
         match self.runtime.get() {
-            Some(runtime) => runtime.observe_live(reference).await.map_err(native),
+            Some(runtime) => runtime
+                .observe_live_for_mutation(reference)
+                .await
+                .map_err(native),
             None => libvm::LiveObservationReader::open(&self.config)
                 .map_err(native)?
-                .observe(reference)
+                .observe_for_mutation(reference)
                 .await
                 .map_err(native),
         }
@@ -177,14 +180,20 @@ impl ControlState {
         operation: vm_spec::live::LiveOperation,
     ) -> Result<(), Status> {
         let observation = match self.runtime.get() {
-            Some(runtime) => runtime.observe_live(reference).await.map_err(native)?,
+            Some(runtime) => runtime
+                .observe_live_for_mutation(reference)
+                .await
+                .map_err(native)?,
             None => {
                 let reader = libvm::LiveObservationReader::open(&self.config).map_err(native)?;
                 if !reader.catalog_exists().map_err(native)? {
                     libvm::require_host_live_operation(&self.live_capabilities().await?, operation)
                         .map_err(native)?;
                 }
-                reader.observe(reference).await.map_err(native)?
+                reader
+                    .observe_for_mutation(reference)
+                    .await
+                    .map_err(native)?
             }
         };
         // This pure guard precedes admit/mutate and every operational reservation.

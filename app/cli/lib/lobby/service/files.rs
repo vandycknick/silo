@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::lobby::caller::Caller;
 use crate::lobby::failure::{Code, Failure, Outcome};
 use crate::lobby::identity::Action;
-use crate::lobby::service::streams::{cancelled, ensure_running, native_failure};
+use crate::lobby::service::streams::{cancelled, native_failure};
 use crate::lobby::service::Service;
 use crate::lobby::session::SessionIo;
 
@@ -95,12 +95,12 @@ impl Service {
     ) -> Outcome<CopySummary> {
         validate_request(&request, true)?;
         let peer = caller.fresh().await?;
-        let snapshot = self.inspect_for(&peer, &request.vm, Action::Files).await?;
-        ensure_running(&snapshot)?;
+        let (machine, snapshot) = self
+            .access_for(&peer, &request.vm, Action::Files, io)
+            .await?;
         let cancel = io.cancel.clone();
         self.run_stream(caller, &snapshot.id.clone(), Action::Files, &cancel, |token| async move {
             let transfer = async {
-                let machine = self.guest_machine(&snapshot.id).await?;
                 match machine.get_file_entry(&request.path).await {
                     Ok(_) if request.no_clobber => return Err(Failure::new(Code::Conflict, "destination exists")),
                     Ok(entry) if entry.kind == MachineEntryKind::Directory => return Err(usage("destination is a directory; give the full target path")),
@@ -152,12 +152,12 @@ impl Service {
     ) -> Outcome<CopySummary> {
         validate_request(&request, false)?;
         let peer = caller.fresh().await?;
-        let snapshot = self.inspect_for(&peer, &request.vm, Action::Files).await?;
-        ensure_running(&snapshot)?;
+        let (machine, snapshot) = self
+            .access_for(&peer, &request.vm, Action::Files, io)
+            .await?;
         let cancel = io.cancel.clone();
         self.run_stream(caller, &snapshot.id.clone(), Action::Files, &cancel, |token| async move {
             let transfer = async {
-                let machine = self.guest_machine(&snapshot.id).await?;
                 let entry = machine.get_file_entry(&request.path).await.map_err(native_failure)?;
                 if entry.kind != MachineEntryKind::File { return Err(usage("source must be a regular file; use exec with tar for directories")); }
                 let mut download = machine.download_file(request.path).await.map_err(native_failure)?;

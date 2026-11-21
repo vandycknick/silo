@@ -94,6 +94,13 @@ impl AppApi {
         }
     }
 
+    pub(crate) async fn hibernate_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
+        match self {
+            Self::Local(service) => service.hibernate_machine(reference).await,
+            Self::Daemon(service) => service.hibernate_machine(reference).await,
+        }
+    }
+
     pub(crate) async fn pause_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
         match self {
             Self::Local(service) => service.pause_machine(reference).await,
@@ -409,6 +416,9 @@ impl AppApi {
         let machine = self.machine(reference).await?;
         let before = machine.inspect().await?;
         crate::commands::start::ensure_startable(&before)?;
+        if matches!(before.status, libvm::MachineStatus::Hibernated { .. }) {
+            crate::ui::waking(&before.name);
+        }
         let options = AppStartOptions::new();
         let start = machine.start_with_options(options).await?;
         if wait_ready && crate::commands::start::requires_guest_readiness(&start.machine) {
@@ -426,10 +436,12 @@ impl AppApi {
         force: bool,
         timeout: Duration,
     ) -> eyre::Result<MachineData> {
-        match self {
-            Self::Local(service) => service.stop_machine(reference, force, timeout).await,
-            Self::Daemon(service) => service.stop_machine(reference, force, timeout).await,
-        }
+        let outcome = match self {
+            Self::Local(service) => service.stop_machine(reference, force, timeout).await?,
+            Self::Daemon(service) => service.stop_machine(reference, force, timeout).await?,
+        };
+        crate::ui::stop_warning(outcome.warning);
+        Ok(outcome.machine)
     }
 
     pub(crate) async fn remove_machine(

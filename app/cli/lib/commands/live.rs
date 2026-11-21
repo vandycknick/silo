@@ -45,6 +45,24 @@ impl CapturePolicyArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(about = "Save a VM's memory and release its host processes")]
+pub struct Hibernate {
+    /// Name or ID of the VM. Defaults to the configured default VM.
+    #[arg(value_name = "VM")]
+    machine: Option<String>,
+}
+
+impl Hibernate {
+    pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
+        let name = context.resolve_machine_name(self.machine.as_deref())?;
+        let spinner = Spinner::start("Hibernating", &name);
+        context.app_api().await?.hibernate_machine(&name).await?;
+        spinner.finish_success("Hibernated");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
 #[command(about = "Pause a running VM (requires live capability admission)")]
 pub struct Pause {
     #[arg(value_name = "VM")]

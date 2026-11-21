@@ -93,6 +93,7 @@ Examples:
 - `silo create ubuntu:24.04 --name dev`
 - `silo create --template rust-dev --name dev`
 - `silo start dev`
+- `silo hibernate dev`
 - `silo stop dev`
 
 ## Images and Snapshots

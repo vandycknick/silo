@@ -71,6 +71,8 @@ inspect it, remove it, or start it as an idle VM:
 
 ```bash
 silo start worker
+silo hibernate worker
+silo start worker # wakes the same VM
 silo stop worker
 silo rm worker
 ```

@@ -120,13 +120,13 @@ impl LocalVmService {
         reference: &MachineRef,
     ) -> eyre::Result<libvm::MachineLiveObservation> {
         Ok(match self {
-            Self::Ready { runtime, .. } => runtime.observe_live(reference).await?,
+            Self::Ready { runtime, .. } => runtime.observe_live_for_mutation(reference).await?,
             Self::Uninitialized {
                 config: Some(config),
                 ..
             } => {
                 libvm::LiveObservationReader::open(config)?
-                    .observe(reference)
+                    .observe_for_mutation(reference)
                     .await?
             }
             Self::Uninitialized { config: None, .. } => {
@@ -172,6 +172,10 @@ impl LocalVmService {
         let reference = MachineRef::parse(reference)?;
         let machine = self.runtime().await?.get_machine(&reference).await?;
         Ok(machine.export_raw_disk(options).await?)
+    }
+
+    pub(crate) async fn hibernate_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
+        Ok(self.machine(reference).await?.hibernate().await?)
     }
 
     pub(crate) async fn pause_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
@@ -327,7 +331,7 @@ impl LocalVmService {
     ) -> eyre::Result<()> {
         let reference = MachineRef::parse(reference)?;
         let observation = match self {
-            Self::Ready { runtime, .. } => runtime.observe_live(&reference).await?,
+            Self::Ready { runtime, .. } => runtime.observe_live_for_mutation(&reference).await?,
             Self::Uninitialized {
                 config: Some(config),
                 ..
@@ -340,7 +344,7 @@ impl LocalVmService {
                         operation,
                     )?;
                 }
-                reader.observe(&reference).await?
+                reader.observe_for_mutation(&reference).await?
             }
             Self::Uninitialized { config: None, .. } => {
                 eyre::bail!("local runtime configuration unavailable")
@@ -492,27 +496,21 @@ impl LocalVmService {
         reference: &str,
         force: bool,
         timeout: Duration,
-    ) -> eyre::Result<MachineData> {
+    ) -> eyre::Result<libvm::MachineStopOutcome> {
         let machine = self.machine(reference).await?;
-        let data = machine.inspect().await?;
-        if !data.is_running() {
-            // Observation is read-only. The lifecycle API must still reconcile
-            // terminal owners, storage outcome and durable operation pins.
-            return Ok(machine
-                .stop_with(MachineStopOptions::new().timeout(timeout))
-                .await?
-                .machine);
-        }
         if force {
             machine
                 .kill_with(MachineKillOptions::new().timeout(timeout))
                 .await?;
+            Ok(libvm::MachineStopOutcome {
+                machine: machine.inspect().await?,
+                warning: None,
+            })
         } else {
-            machine
+            Ok(machine
                 .stop_with(MachineStopOptions::new().timeout(timeout))
-                .await?;
+                .await?)
         }
-        Ok(machine.inspect().await?)
     }
 
     pub(crate) async fn update_machine(
@@ -1690,6 +1688,101 @@ mod tests {
         }
         for reference in ["base", "abab", id.as_str()] {
             assert!(!is_registry_reference(reference), "{reference}");
+        }
+    }
+    #[tokio::test]
+    async fn hibernation_force_stop_discards_even_when_non_running_save_is_unusable() {
+        use vm_spec::live::{LiveAvailability, LiveCapability, LiveCapabilityVector, LiveLane};
+        for force in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let supported = LiveCapability {
+                native: true,
+                availability: LiveAvailability::Supported,
+            };
+            let mut lifecycle = test_utils::LifecycleScenario {
+                same_machine_activation: true,
+                ..Default::default()
+            };
+            lifecycle.capture.ram_bytes = 1 << 20;
+            for provider in &mut lifecycle.providers {
+                if provider.device_id == 2 {
+                    provider.configured_id = "silo-root".into();
+                }
+            }
+            let scenario = test_utils::Scenario {
+                lifecycle: Some(lifecycle),
+                live: Some(test_utils::LiveScenario {
+                    lane: LiveLane::KvmX86_64,
+                    host: LiveCapabilityVector {
+                        pause: supported.clone(),
+                        capture: supported.clone(),
+                        restore: supported.clone(),
+                        fork: supported.clone(),
+                        incremental: supported,
+                    },
+                    machine: None,
+                }),
+                ..Default::default()
+            };
+            let scenario_path = temp.path().join("scenario.json");
+            scenario.write_to(&scenario_path).unwrap();
+            let config =
+                crate::api::tests::isolated_runtime_config(temp.path(), &temp.path().join("home"))
+                    .with_run_root(temp.path().join("run"))
+                    .with_mock_vmm(&scenario_path);
+            let runtime = libvm::Runtime::new(config).await.unwrap();
+            let disk = temp.path().join("disk.raw");
+            disk_image::ext4::Formatter::new(&disk, 4096, 64 << 20)
+                .unwrap()
+                .close()
+                .unwrap();
+            let machine = runtime
+                .machine()
+                .name("saved")
+                .memory(libvm::Memory::mebibytes(1))
+                .image_source(libvm::ImageSource::disk(disk))
+                .network(|network| network.none())
+                .create()
+                .await
+                .unwrap();
+            machine.start().await.unwrap();
+            machine
+                .wait_ready(std::time::Duration::from_secs(30))
+                .await
+                .unwrap();
+            let saved = machine.hibernate().await.unwrap();
+            assert!(!saved.is_running());
+            let save = std::fs::read_dir(saved.machine_dir.join("hibernation"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::remove_file(save.join("memory.ram")).unwrap();
+            let mut local = crate::api::local::LocalVmService::Ready {
+                runtime,
+                mode: libvm::RuntimeOpenMode::Maintenance,
+            };
+            let result = local
+                .stop_machine("saved", force, std::time::Duration::from_secs(30))
+                .await
+                .unwrap();
+            assert_eq!(result.machine.status.label(), "stopped");
+            assert!(result.machine.hibernation.is_none());
+            if force {
+                assert!(
+                    result.warning.is_none(),
+                    "force must discard without attempting wake"
+                );
+            } else {
+                assert!(matches!(
+                    result.warning,
+                    Some(libvm::MachineStopWarning::SavedStateUnusable {
+                        reason:
+                            libvm::storage::hibernate_file::HibernateUnusableReason::FilesMissing,
+                    })
+                ));
+            }
         }
     }
 }

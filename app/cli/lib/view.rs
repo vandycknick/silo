@@ -57,6 +57,8 @@ pub struct MachineView {
     pub lifecycle: Option<libvm::MachineLifecycle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_memory_reclaim: Option<HostMemoryReclaimView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hibernation: Option<HibernationView>,
     pub default: bool,
     pub template_name: Option<String>,
     pub retention: String,
@@ -81,6 +83,34 @@ pub struct MachineView {
     pub spec: VmSpec,
     /// Pinned direct-boot meaning; start never switches bundles implicitly.
     pub boot: Option<MachineBootView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HibernationView {
+    pub hibernated_at: i64,
+    pub saved_state_bytes: u64,
+    pub memory_capture: HibernateMemoryView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HibernateMemoryView {
+    pub mode: vm_spec::lifecycle::CapturePolicy,
+    pub full_reason: Option<vm_spec::capture::CaptureFullReason>,
+    pub stats: vm_spec::capture::CaptureMemoryStats,
+}
+
+impl HibernationView {
+    fn new(value: &libvm::MachineHibernationInfo) -> Self {
+        Self {
+            hibernated_at: value.hibernated_at,
+            saved_state_bytes: value.saved_state_bytes,
+            memory_capture: HibernateMemoryView {
+                mode: value.memory_capture.mode,
+                full_reason: value.memory_capture.full_reason,
+                stats: value.memory_capture.stats.clone(),
+            },
+        }
+    }
 }
 
 /// Presentation of the current monitor report, never persisted machine state.
@@ -324,6 +354,7 @@ impl MachineView {
             prospective_live: data.prospective_live.clone(),
             lifecycle: data.lifecycle.clone(),
             host_memory_reclaim: None,
+            hibernation: data.hibernation.as_ref().map(HibernationView::new),
             default,
             template_name: data.template_name.clone(),
             retention: retention_label(data.retention).to_string(),
@@ -724,5 +755,43 @@ mod tests {
             assert_eq!(json["state"], label);
             assert_eq!(json["ready"], false);
         }
+    }
+    #[test]
+    fn hibernation_info_json_has_explicit_public_field_names_and_native_stats() {
+        let mut data = libvm::MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "saved".into(),
+            vm_spec::VmSpec::current(),
+        );
+        assert!(
+            serde_json::to_value(crate::view::MachineView::new(&data, false))
+                .unwrap()
+                .get("hibernation")
+                .is_none()
+        );
+        data.hibernation = Some(libvm::MachineHibernationInfo {
+            hibernated_at: 1_700_000_000,
+            saved_state_bytes: 8192,
+            memory_capture: vm_spec::capture::HibernateMemoryReceipt {
+                mode: vm_spec::lifecycle::CapturePolicy::Incremental,
+                full_reason: None,
+                stats: vm_spec::capture::CaptureMemoryStats {
+                    logical_bytes: 1 << 20,
+                    overlay_bytes_written: 4096,
+                    ..Default::default()
+                },
+            },
+        });
+        let view = crate::view::MachineView::new(&data, false);
+        let json = serde_json::to_value(&view).unwrap();
+        let hibernation = &json["hibernation"];
+        assert_eq!(hibernation["hibernated_at"], 1_700_000_000);
+        assert_eq!(hibernation["saved_state_bytes"], 8192);
+        assert_eq!(hibernation["memory_capture"]["mode"], "incremental");
+        assert!(hibernation["memory_capture"]["full_reason"].is_null());
+        assert_eq!(
+            hibernation["memory_capture"]["stats"]["overlayBytesWritten"],
+            4096
+        );
     }
 }

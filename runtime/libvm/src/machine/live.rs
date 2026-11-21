@@ -99,6 +99,27 @@ impl MachineLiveObservation {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum LiveObservationPurpose {
+    Observe,
+    Mutate,
+}
+
+impl LiveObservationPurpose {
+    pub(crate) async fn admit(
+        self,
+        store: &ObservationStore,
+        config: &MachineConfig,
+    ) -> Result<(), LibVmError> {
+        if matches!(self, Self::Mutate) && store.has_hibernation(config.id).await? {
+            return Err(LibVmError::HibernatedStartFirst {
+                reference: config.name.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveObservationReader {
     paths: LocalPaths,
@@ -157,6 +178,24 @@ impl LiveObservationReader {
         &self,
         reference: &MachineRef,
     ) -> Result<MachineLiveObservation, LibVmError> {
+        self.observe_with(reference, LiveObservationPurpose::Observe)
+            .await
+    }
+
+    /// Preflight a mutating live operation without opening writable state.
+    pub async fn observe_for_mutation(
+        &self,
+        reference: &MachineRef,
+    ) -> Result<MachineLiveObservation, LibVmError> {
+        self.observe_with(reference, LiveObservationPurpose::Mutate)
+            .await
+    }
+
+    async fn observe_with(
+        &self,
+        reference: &MachineRef,
+        purpose: LiveObservationPurpose,
+    ) -> Result<MachineLiveObservation, LibVmError> {
         if !self.catalog_exists()? {
             return Err(LibVmError::MachineNotFound {
                 reference: crate::store::machine_store::discovery_query(reference).1,
@@ -165,6 +204,7 @@ impl LiveObservationReader {
         let store = ObservationStore::open(&self.catalog).await?;
         let result = async {
             let (config, state) = store.lookup(reference).await?;
+            purpose.admit(&store, &config).await?;
             let pending = store
                 .pending_pause(config.id, state.run_id.as_deref())
                 .await?;

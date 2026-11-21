@@ -45,7 +45,7 @@ pub(crate) fn ensure_startable(data: &MachineData) -> eyre::Result<()> {
     }
     if matches!(
         data.status,
-        MachineStatus::Stopped | MachineStatus::Error { .. }
+        MachineStatus::Stopped | MachineStatus::Error { .. } | MachineStatus::Hibernated { .. }
     ) {
         return Ok(());
     }

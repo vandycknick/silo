@@ -90,6 +90,19 @@ impl DaemonVmService {
         Ok(result)
     }
 
+    pub(crate) async fn hibernate_machine(&self, value: &str) -> eyre::Result<MachineData> {
+        Ok(snapshots::snapshot_from_wire(
+            self.machines
+                .clone()
+                .hibernate_machine(w::LiveMachineRequest {
+                    machine: Some(reference(value)?),
+                })
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
     pub(crate) async fn pause_machine(&self, value: &str) -> eyre::Result<MachineData> {
         Ok(snapshots::snapshot_from_wire(
             self.machines
@@ -459,8 +472,8 @@ impl DaemonVmService {
         value: &str,
         force: bool,
         timeout: Duration,
-    ) -> eyre::Result<MachineData> {
-        Ok(snapshots::snapshot_from_wire(
+    ) -> eyre::Result<libvm::MachineStopOutcome> {
+        let outcome = lifecycle::stop_from_wire(
             self.machines
                 .clone()
                 .stop_machine(w::StopMachineRequest {
@@ -472,7 +485,8 @@ impl DaemonVmService {
                 .await
                 .map_err(native_status)?
                 .into_inner(),
-        )?)
+        )?;
+        Ok(outcome)
     }
     pub(crate) async fn stop_run(
         &self,
@@ -480,7 +494,7 @@ impl DaemonVmService {
         run: MachineRunId,
         options: MachineStopOptions,
     ) -> Result<MachineData, LibVmError> {
-        snapshots::snapshot_from_wire(
+        let outcome = lifecycle::stop_from_wire(
             self.machines
                 .clone()
                 .stop_run(w::StopRunRequest {
@@ -499,7 +513,9 @@ impl DaemonVmService {
                 .map_err(native_status)?
                 .into_inner(),
         )
-        .map_err(invalid_response)
+        .map_err(invalid_response)?;
+        crate::ui::stop_warning(outcome.warning);
+        Ok(outcome.machine)
     }
     pub(crate) async fn kill_run(
         &self,

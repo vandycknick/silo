@@ -771,6 +771,11 @@ impl Machine {
         program: String,
         mut options: ExecutionOptions,
     ) -> Result<ExecutionSession, LibVmError> {
+        self.running_config().await?;
+        self.validate_access_run(
+            &observation.name,
+            observation.run_id.as_ref().map(|run| run.as_str()),
+        )?;
         apply_default_execution_user(&mut options, observation.guest.user.as_ref());
         let reference = observation.name.clone();
         let stdin = std::mem::take(&mut options.stdin);

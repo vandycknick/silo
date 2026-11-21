@@ -66,6 +66,35 @@ impl AppMachine {
         }
     }
 
+    pub(crate) async fn for_access(&self) -> eyre::Result<Self> {
+        let native = self.session_machine().await?;
+        let name = native.inspect().await?.name;
+        let (progress, mut stages) = libvm::LiveOperationProgressSender::default_channel();
+        let operation = native.for_access(Some(&progress));
+        tokio::pin!(operation);
+        let mut reported = false;
+        loop {
+            tokio::select! {
+                biased;
+                Some(stage) = stages.recv() => {
+                    if stage == libvm::LiveOperationProgress::Waking && !reported {
+                        crate::ui::waking(&name);
+                        reported = true;
+                    }
+                }
+                result = &mut operation => {
+                    while let Ok(stage) = stages.try_recv() {
+                        if stage == libvm::LiveOperationProgress::Waking && !reported {
+                            crate::ui::waking(&name);
+                            reported = true;
+                        }
+                    }
+                    return Ok(Self::new(result?, self.home().to_path_buf()));
+                }
+            }
+        }
+    }
+
     fn home(&self) -> &Path {
         match self {
             Self::Local { home, .. } => home,
@@ -134,10 +163,12 @@ impl AppMachine {
             .timeout(Duration::from_secs(60))
             .force_after_timeout(Duration::from_secs(5));
         match self {
-            Self::Local { native, .. } => native
-                .stop_run_with(run_id, options)
-                .await
-                .map(|outcome| outcome.machine),
+            Self::Local { native, .. } => {
+                native.stop_run_with(run_id, options).await.map(|outcome| {
+                    crate::ui::stop_warning(outcome.warning);
+                    outcome.machine
+                })
+            }
             Self::Daemon { id, service, .. } => service.stop_run(id, run_id, options).await,
         }
     }

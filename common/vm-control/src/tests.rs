@@ -871,3 +871,122 @@ fn temporary_policy_updates_preserve_absent_explicit_disk_and_sized_tmpfs() {
     })
     .is_err());
 }
+
+#[test]
+fn hibernation_saved_state_and_stop_warnings_roundtrip() {
+    use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+    use prost::Message;
+    let mut machine = libvm::MachineData::new(
+        "00000000-0000-4000-8000-000000000001".into(),
+        "saved".into(),
+        vm_spec::VmSpec::current(),
+    );
+    machine.status = libvm::MachineStatus::Hibernated { message: None };
+    machine.hibernation = Some(libvm::MachineHibernationInfo {
+        hibernated_at: 1_700_000_000,
+        saved_state_bytes: 8192,
+        memory_capture: vm_spec::capture::HibernateMemoryReceipt {
+            mode: vm_spec::lifecycle::CapturePolicy::Incremental,
+            full_reason: None,
+            stats: vm_spec::capture::CaptureMemoryStats {
+                logical_bytes: 1 << 20,
+                overlay_bytes_written: 4096,
+                ..Default::default()
+            },
+        },
+    });
+    let wire = snapshot_to_wire(&machine).unwrap();
+    let decoded = w::MachineSnapshot::decode(wire.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        snapshot_from_wire(decoded).unwrap().hibernation,
+        machine.hibernation
+    );
+    for warning in [
+        None,
+        Some(libvm::MachineStopWarning::WakeFailed),
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: R::FilesMissing,
+        }),
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: R::FilesChanged,
+        }),
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: R::DisksChanged,
+        }),
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: R::NotCompatible,
+        }),
+    ] {
+        let outcome = libvm::MachineStopOutcome {
+            machine: machine.clone(),
+            warning,
+        };
+        let wire = lifecycle::stop_to_wire(&outcome).unwrap();
+        let decoded = w::MachineSnapshot::decode(wire.encode_to_vec().as_slice()).unwrap();
+        let result = lifecycle::stop_from_wire(decoded).unwrap();
+        assert_eq!(result.warning, warning);
+        assert_eq!(result.machine.hibernation, machine.hibernation);
+    }
+    assert!(lifecycle::unusable_reason_from_wire(0).is_err());
+    assert!(lifecycle::unusable_reason_from_wire(5).is_err());
+}
+
+#[test]
+fn hibernation_errors_keep_their_typed_variant_and_message_over_daemon_transport() {
+    use libvm::LibVmError as E;
+    let reference = || "saved".to_string();
+    let mut errors = vec![
+        E::HibernatedStartFirst {
+            reference: reference(),
+        },
+        E::HibernatedStopFirst {
+            reference: reference(),
+        },
+        E::AlreadyHibernated {
+            reference: reference(),
+        },
+        E::HibernateTemporary {
+            reference: reference(),
+        },
+        E::HibernateBusy {
+            reference: reference(),
+        },
+        E::HibernateOutOfSpace {
+            reference: reference(),
+            needed_bytes: 1024,
+            free_bytes: 1,
+        },
+        E::HibernateFailed {
+            reference: reference(),
+            message: "write failed".into(),
+        },
+        E::WakeFailedBeforeConsume {
+            reference: reference(),
+            source: Box::new(E::InvalidRequest {
+                message: "construction failed".into(),
+            }),
+        },
+        E::WakeConsumed {
+            reference: reference(),
+        },
+    ];
+    use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+    for reason in [
+        R::FilesMissing,
+        R::FilesChanged,
+        R::DisksChanged,
+        R::NotCompatible,
+    ] {
+        errors.push(E::HibernateUnusable {
+            reference: reference(),
+            reason,
+        });
+    }
+    for error in errors {
+        let status = native_error_to_status(&error);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        let result = status_to_native_error(&status).unwrap();
+        assert_eq!(result.variant(), error.variant());
+        assert_eq!(result.to_string(), error.to_string());
+    }
+}

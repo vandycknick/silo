@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added: `silo hibernate` saves a machine's memory and releases its host
+  processes. `silo start`, guest access and opening a forward wake that same
+  machine. Existing connections end; `silo stop` wakes and shuts down cleanly,
+  while `silo stop --force` discards saved memory without waking.
 - Changed: `silo image pull`, `silo create` and `silo run` download up to
   three image layers at once and unpack them while later layers are still
   downloading. Pull progress shows one line per layer in image order, each

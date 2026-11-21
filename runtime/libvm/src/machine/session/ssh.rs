@@ -452,6 +452,7 @@ impl Machine {
         if cancellation.is_cancelled() {
             return Err(guest_session_error("shell", "SSH shell cancelled"));
         }
+        let config = self.running_config().await?;
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let mut client = GuestSshClient::new();
         let mut channel = None;
@@ -463,7 +464,6 @@ impl Machine {
             .map(|a| (u32::from(a.columns), u32::from(a.rows)))
             .unwrap_or_else(host::current_terminal_size);
         let setup = async {
-            let config = self.running_config().await?;
             reference = config.name.clone();
             self.connect_guest_ssh(
                 &config,
@@ -551,6 +551,7 @@ impl Machine {
             .runtime()
             .reconcile_machine_runtime_best_effort(config)
             .await?;
+        self.validate_access_run(reference, status.run_id.as_deref())?;
         let run_id = current_run_id(reference, &status)?;
         let expected_key =
             utils::ssh::read_host_key_pin(self.runtime().machine_paths(self.machine_id()).dir())
@@ -614,6 +615,7 @@ impl Machine {
             .runtime()
             .reconcile_machine_runtime_best_effort(config)
             .await?;
+        self.validate_access_run(reference, current.run_id.as_deref())?;
         if current_run_id(reference, &current)? != run_id {
             return Err(guest_session_error(
                 reference,

@@ -235,6 +235,14 @@ pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, Co
         ));
     }
     Ok(w::MachineSnapshot {
+        hibernation: v.hibernation.as_ref().map(|value| w::MachineHibernation {
+            hibernated_at: Some(timestamp(value.hibernated_at)),
+            saved_state_bytes: value.saved_state_bytes,
+            memory_capture: Some(crate::capture::hibernate_memory_to_wire(
+                &value.memory_capture,
+            )),
+        }),
+        stop_warning: None,
         id: v.id.clone(),
         name: v.name.clone(),
         spec: Some(crate::spec::spec_to_wire(&v.spec)),
@@ -342,6 +350,19 @@ pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, C
         crate::spec::spec_from_wire(required(v.spec, "machine.spec")?)?,
     );
     out.retention = retention_from_wire(v.retention)?;
+    out.hibernation = v
+        .hibernation
+        .map(|value| {
+            Ok::<_, ConversionError>(libvm::MachineHibernationInfo {
+                hibernated_at: timestamp_seconds(value.hibernated_at, "hibernation.hibernated_at")?,
+                saved_state_bytes: value.saved_state_bytes,
+                memory_capture: crate::capture::hibernate_memory_from_wire(required(
+                    value.memory_capture,
+                    "hibernation.memory_capture",
+                )?)?,
+            })
+        })
+        .transpose()?;
     out.process = process_from_wire(required(v.process, "machine.process")?);
     out.template_name = v.template_name;
     out.agent_mode = v.agent_mode.map(agent_from_wire).transpose()?;

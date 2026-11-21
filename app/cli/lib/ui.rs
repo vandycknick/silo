@@ -437,6 +437,16 @@ pub fn hint(message: impl AsRef<str>) {
     eprintln!("   {arrow} {}", message.as_ref());
 }
 
+pub(crate) fn waking(name: &str) {
+    progress_renderer().suspend(|| eprintln!("Waking {name}"));
+}
+
+pub(crate) fn stop_warning(warning: Option<libvm::MachineStopWarning>) {
+    if let Some(warning) = warning {
+        progress_renderer().suspend(|| warn(warning.to_string()));
+    }
+}
+
 pub fn warn(message: impl AsRef<str>) {
     let label = if should_style_stderr() {
         style("warn:").yellow().bold().to_string()

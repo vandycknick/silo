@@ -58,7 +58,10 @@ pub fn print(error: &Report, verbose: u8) {
         return;
     };
 
-    eprintln!("{} {head}", crate::ui::error_label());
+    match head.downcast_ref::<libvm::LibVmError>() {
+        Some(error) => eprintln!("{} {}", crate::ui::error_label(), native_message(error)),
+        None => eprintln!("{} {head}", crate::ui::error_label()),
+    }
 
     if verbose == 0 {
         if causes.len() > 1 {
@@ -69,6 +72,24 @@ pub fn print(error: &Report, verbose: u8) {
 
     for (index, cause) in causes.into_iter().skip(1).enumerate() {
         eprintln!("  {}: {cause}", index + 1);
+    }
+}
+
+pub(crate) fn native_message(error: &libvm::LibVmError) -> String {
+    match error {
+        libvm::LibVmError::HibernateOutOfSpace {
+            reference,
+            needed_bytes,
+            free_bytes,
+        } => format!(
+            "not enough disk space to hibernate `{reference}`: {} needed, {} free",
+            crate::ui::human_bytes(Some(*needed_bytes)),
+            crate::ui::human_bytes(Some(*free_bytes)),
+        ),
+        libvm::LibVmError::MachineNotRunning { reference } => {
+            format!("machine `{reference}` is not running; start it with `silo start {reference}`")
+        }
+        _ => error.to_string(),
     }
 }
 
@@ -129,6 +150,53 @@ mod tests {
         assert_eq!(
             crate::errors::exit_code(&error),
             std::process::ExitCode::FAILURE
+        );
+    }
+    #[test]
+    fn hibernation_diagnostics_match_the_user_contract() {
+        use libvm::LibVmError as E;
+        let reference = || "dev".to_string();
+        for (error, expected) in [
+            (E::HibernatedStartFirst { reference: reference() }, "machine `dev` is hibernated; start it with `silo start dev` first"),
+            (E::HibernatedStopFirst { reference: reference() }, "machine `dev` is hibernated; run `silo stop dev` first"),
+            (E::AlreadyHibernated { reference: reference() }, "machine `dev` is already hibernated; wake it with `silo start dev`"),
+            (E::HibernateTemporary { reference: reference() }, "machine `dev` is a temporary `silo run` machine and cannot be hibernated"),
+            (E::HibernateBusy { reference: reference() }, "machine `dev` is busy with another lifecycle operation; try again when it finishes"),
+            (E::HibernateFailed { reference: reference(), message: "disk write failed".into() }, "could not hibernate `dev`: disk write failed"),
+            (E::WakeFailedBeforeConsume { reference: reference(), source: Box::new(E::InvalidRequest { message: "construction failed".into() }) }, "could not wake `dev`; its saved state was kept; retry `silo start dev`"),
+            (E::WakeConsumed { reference: reference() }, "could not wake `dev`; its saved state is gone and the machine is stopped; run `silo start dev` to boot it"),
+            (E::MachineNotRunning { reference: reference() }, "machine `dev` is not running; start it with `silo start dev`"),
+        ] {
+            assert_eq!(crate::errors::native_message(&error), expected);
+        }
+        let space = E::HibernateOutOfSpace {
+            reference: reference(),
+            needed_bytes: 2 << 30,
+            free_bytes: 1 << 30,
+        };
+        assert_eq!(
+            crate::errors::native_message(&space),
+            format!(
+                "not enough disk space to hibernate `dev`: {} needed, {} free",
+                crate::ui::human_bytes(Some(2 << 30)),
+                crate::ui::human_bytes(Some(1 << 30)),
+            )
+        );
+        use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+        for (reason, text) in [
+            (R::FilesMissing, "files are missing"),
+            (R::FilesChanged, "files were changed"),
+            (R::DisksChanged, "disks were changed"),
+            (R::NotCompatible, "not compatible with this system"),
+        ] {
+            assert_eq!(crate::errors::native_message(&E::HibernateUnusable { reference: reference(), reason }),
+                format!("cannot wake `dev`: its saved state cannot be used ({text}); run `silo stop dev` to discard it, then `silo start dev`"));
+            assert_eq!(libvm::MachineStopWarning::SavedStateUnusable { reason }.to_string(),
+                format!("the guest could not be shut down cleanly because its saved state cannot be used ({text}); the saved state was discarded"));
+        }
+        assert_eq!(
+            libvm::MachineStopWarning::WakeFailed.to_string(),
+            "the guest could not be shut down cleanly because wake failed; the machine is stopped"
         );
     }
 }

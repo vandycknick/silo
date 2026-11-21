@@ -16,7 +16,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 
@@ -48,15 +48,18 @@ class Report:
 
 
 def report(silo: Silo, name: str) -> Report:
-    """Provisional CLI JSON contract, not a fallback to guessed alternate keys."""
+    """Public CLI hibernation report, shared by smoke and performance drivers."""
     info = silo.info(name)
     assert info["state"] == "hibernated" and info["ready"] is False, info
     value = info["hibernation"]
-    timestamp = datetime.fromisoformat(value["hibernated_at"])
+    timestamp = datetime.fromtimestamp(value["hibernated_at"], tz=timezone.utc)
     size = value["saved_state_bytes"]
     assert timestamp.tzinfo is not None and type(size) is int and size > 0, value
     memory = value["memory_capture"]
-    written, reason = memory["bytes_written"], memory["full_reason"]
+    stats = memory["stats"]
+    written = sum(stats[key] for key in ("fullBytesWritten", "overlayBytesWritten",
+                                        "baselineBytesWritten"))
+    reason = memory["full_reason"]
     assert type(written) is int and written >= 0
     assert reason is None or isinstance(reason, str)
     capture = MemoryCapture(MemoryMode(memory["mode"]), written, reason)

@@ -57,6 +57,36 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
         ..Default::default()
     };
     let code = match v {
+        E::HibernatedStartFirst { reference }
+        | E::HibernatedStopFirst { reference }
+        | E::AlreadyHibernated { reference }
+        | E::HibernateTemporary { reference }
+        | E::HibernateBusy { reference }
+        | E::HibernateOutOfSpace { reference, .. }
+        | E::HibernateFailed { reference, .. }
+        | E::HibernateUnusable { reference, .. }
+        | E::WakeFailedBeforeConsume { reference, .. }
+        | E::WakeConsumed { reference } => {
+            d.kind = 4;
+            d.reference = Some(reference.clone());
+            d.safe_message = v.to_string();
+            match v {
+                E::HibernateOutOfSpace {
+                    needed_bytes,
+                    free_bytes,
+                    ..
+                } => {
+                    d.hibernate_needed_bytes = Some(*needed_bytes);
+                    d.hibernate_free_bytes = Some(*free_bytes);
+                }
+                E::HibernateUnusable { reason, .. } => {
+                    d.hibernate_reason = Some(crate::lifecycle::unusable_reason_to_wire(*reason));
+                }
+                E::HibernateFailed { message, .. } => d.hibernate_message = Some(message.clone()),
+                _ => {}
+            }
+            tonic::Code::FailedPrecondition
+        }
         E::StateDatabaseIncompatible { .. } => {
             d.kind = 4;
             d.safe_message = "incompatible state database: this home was written by a different Silo state format and cannot be read or converted; remove the old state and start with a fresh home".into();
@@ -689,88 +719,118 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
                 },
             }
         }
-        7 => match required(d.native_variant, "error.native_variant")?.as_str() {
-            "InvalidKernelArguments" if v.code() == tonic::Code::InvalidArgument && d.kind == 1 => {
-                E::InvalidKernelArguments {
-                    reason: d.safe_message,
+        7 => {
+            match required(d.native_variant, "error.native_variant")?.as_str() {
+                "InvalidKernelArguments"
+                    if v.code() == tonic::Code::InvalidArgument && d.kind == 1 =>
+                {
+                    E::InvalidKernelArguments {
+                        reason: d.safe_message,
+                    }
                 }
-            }
-            "LiveDiscovery" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
-                E::LiveDiscovery {
-                    message: d.safe_message,
+                "LiveDiscovery" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
+                    E::LiveDiscovery {
+                        message: d.safe_message,
+                    }
                 }
-            }
-            "LiveObservation" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
-                E::LiveObservation {
+                "LiveObservation" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
+                    E::LiveObservation {
+                        reference: required(d.reference, "error.reference")?,
+                        message: d.safe_message,
+                    }
+                }
+                "SnapshotPullFailed" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
+                    E::SnapshotPullFailed {
+                        reference: required(d.reference, "error.reference")?,
+                        message: d.safe_message,
+                    }
+                }
+                "LiveProtocol" if v.code() == tonic::Code::DataLoss && d.kind == 8 => {
+                    E::LiveProtocol {
+                        message: d.safe_message,
+                    }
+                }
+                "LiveCapture" if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
+                    E::LiveCapture {
+                        capture_id: required(d.reference, "error.reference")?,
+                        message: d.safe_message,
+                    }
+                }
+                "CaptureRemovalDependency"
+                    if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 =>
+                {
+                    E::CaptureRemovalDependency {
+                        capture_id: required(d.reference, "error.reference")?
+                            .parse()
+                            .map_err(|_| invalid("error.reference", "invalid capture identity"))?,
+                        dependency: d.safe_message,
+                    }
+                }
+                "LiveFork" if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
+                    E::LiveFork {
+                        operation_id: required(d.reference, "error.reference")?,
+                        message: d.safe_message,
+                    }
+                }
+                "LiveForkNotFound" if v.code() == tonic::Code::NotFound && d.kind == 2 => {
+                    E::LiveForkNotFound {
+                        operation_id: required(d.reference, "error.reference")?,
+                    }
+                }
+                "MachineNotFound" => E::MachineNotFound {
                     reference: required(d.reference, "error.reference")?,
-                    message: d.safe_message,
-                }
-            }
-            "SnapshotPullFailed" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
-                E::SnapshotPullFailed {
+                },
+                "ImageNotFound" => E::ImageNotFound {
                     reference: required(d.reference, "error.reference")?,
-                    message: d.safe_message,
+                },
+                "SnapshotNotFound" if v.code() == tonic::Code::NotFound && d.kind == 2 => {
+                    E::SnapshotNotFound {
+                        reference: required(d.reference, "error.reference")?,
+                    }
                 }
-            }
-            "LiveProtocol" if v.code() == tonic::Code::DataLoss && d.kind == 8 => E::LiveProtocol {
-                message: d.safe_message,
-            },
-            "LiveCapture" if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
-                E::LiveCapture {
-                    capture_id: required(d.reference, "error.reference")?,
-                    message: d.safe_message,
+                "ImageNameConflict" if v.code() == tonic::Code::AlreadyExists && d.kind == 3 => {
+                    E::ImageNameConflict {
+                        name: required(d.reference, "error.reference")?,
+                    }
                 }
-            }
-            "CaptureRemovalDependency"
-                if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 =>
-            {
-                E::CaptureRemovalDependency {
-                    capture_id: required(d.reference, "error.reference")?
-                        .parse()
-                        .map_err(|_| invalid("error.reference", "invalid capture identity"))?,
-                    dependency: d.safe_message,
+                "SnapshotNameConflict" if v.code() == tonic::Code::AlreadyExists && d.kind == 3 => {
+                    E::SnapshotNameConflict {
+                        name: required(d.reference, "error.reference")?,
+                    }
                 }
-            }
-            "LiveFork" if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
-                E::LiveFork {
-                    operation_id: required(d.reference, "error.reference")?,
-                    message: d.safe_message,
+                "InvalidRequest" if v.code() == tonic::Code::InvalidArgument && d.kind == 1 => {
+                    E::InvalidRequest {
+                        message: d.safe_message,
+                    }
                 }
-            }
-            "LiveForkNotFound" if v.code() == tonic::Code::NotFound && d.kind == 2 => {
-                E::LiveForkNotFound {
-                    operation_id: required(d.reference, "error.reference")?,
-                }
-            }
-            "MachineNotFound" => E::MachineNotFound {
-                reference: required(d.reference, "error.reference")?,
-            },
-            "ImageNotFound" => E::ImageNotFound {
-                reference: required(d.reference, "error.reference")?,
-            },
-            "SnapshotNotFound" if v.code() == tonic::Code::NotFound && d.kind == 2 => {
-                E::SnapshotNotFound {
-                    reference: required(d.reference, "error.reference")?,
-                }
-            }
-            "ImageNameConflict" if v.code() == tonic::Code::AlreadyExists && d.kind == 3 => {
-                E::ImageNameConflict {
-                    name: required(d.reference, "error.reference")?,
-                }
-            }
-            "SnapshotNameConflict" if v.code() == tonic::Code::AlreadyExists && d.kind == 3 => {
-                E::SnapshotNameConflict {
-                    name: required(d.reference, "error.reference")?,
-                }
-            }
-            "InvalidRequest" if v.code() == tonic::Code::InvalidArgument && d.kind == 1 => {
-                E::InvalidRequest {
-                    message: d.safe_message,
-                }
-            }
-            variant if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
-                let reference = required(d.reference, "error.reference")?;
-                match variant {
+                variant if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
+                    let reference = required(d.reference, "error.reference")?;
+                    match variant {
+                    "HibernatedStartFirst" => E::HibernatedStartFirst { reference },
+                    "HibernatedStopFirst" => E::HibernatedStopFirst { reference },
+                    "AlreadyHibernated" => E::AlreadyHibernated { reference },
+                    "HibernateTemporary" => E::HibernateTemporary { reference },
+                    "HibernateBusy" => E::HibernateBusy { reference },
+                    "HibernateOutOfSpace" => E::HibernateOutOfSpace {
+                        reference,
+                        needed_bytes: required(d.hibernate_needed_bytes, "error.hibernate_needed_bytes")?,
+                        free_bytes: required(d.hibernate_free_bytes, "error.hibernate_free_bytes")?,
+                    },
+                    "HibernateFailed" => E::HibernateFailed {
+                        reference,
+                        message: required(d.hibernate_message, "error.hibernate_message")?,
+                    },
+                    "HibernateUnusable" => E::HibernateUnusable {
+                        reference,
+                        reason: crate::lifecycle::unusable_reason_from_wire(
+                            required(d.hibernate_reason, "error.hibernate_reason")?,
+                        )?,
+                    },
+                    "WakeFailedBeforeConsume" => E::WakeFailedBeforeConsume {
+                        reference,
+                        source: Box::new(E::InvalidRequest { message: "wake construction failed".into() }),
+                    },
+                    "WakeConsumed" => E::WakeConsumed { reference },
                     "SnapshotIsNotAnImage" => E::SnapshotIsNotAnImage { reference },
                     "ImageIsNotASnapshot" => E::ImageIsNotASnapshot { reference },
                     "ArtifactIsSnapshot" => E::ArtifactIsSnapshot { reference },
@@ -789,24 +849,25 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
                         "retain original typed RPC status; native variant cannot be reconstructed",
                     )),
                 }
+                }
+                "ImageReferenceRejected" => E::ImageReferenceRejected {
+                    reference: required(d.reference, "error.reference")?,
+                    message: d.safe_message,
+                },
+                "MachineAlreadyExists" => E::MachineAlreadyExists {
+                    name: required(d.reference, "error.reference")?,
+                },
+                "MachineIdAlreadyExists" => E::MachineIdAlreadyExists {
+                    id: required(d.reference, "error.reference")?,
+                },
+                _ => {
+                    return Err(invalid(
+                        "error.native_variant",
+                        "retain original typed RPC status; native variant cannot be reconstructed",
+                    ))
+                }
             }
-            "ImageReferenceRejected" => E::ImageReferenceRejected {
-                reference: required(d.reference, "error.reference")?,
-                message: d.safe_message,
-            },
-            "MachineAlreadyExists" => E::MachineAlreadyExists {
-                name: required(d.reference, "error.reference")?,
-            },
-            "MachineIdAlreadyExists" => E::MachineIdAlreadyExists {
-                id: required(d.reference, "error.reference")?,
-            },
-            _ => {
-                return Err(invalid(
-                    "error.native_variant",
-                    "retain original typed RPC status; native variant cannot be reconstructed",
-                ))
-            }
-        },
+        }
         _ => return Err(invalid("error.code", "invalid enum")),
     })
 }

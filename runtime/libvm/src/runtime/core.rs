@@ -498,6 +498,30 @@ impl Runtime {
         &self,
         reference: &MachineRef,
     ) -> Result<crate::MachineLiveObservation, LibVmError> {
+        self.observe_live_with(
+            reference,
+            crate::machine::live::LiveObservationPurpose::Observe,
+        )
+        .await
+    }
+
+    /// Live mutation admission refuses saved execution before contacting a monitor.
+    pub async fn observe_live_for_mutation(
+        &self,
+        reference: &MachineRef,
+    ) -> Result<crate::MachineLiveObservation, LibVmError> {
+        self.observe_live_with(
+            reference,
+            crate::machine::live::LiveObservationPurpose::Mutate,
+        )
+        .await
+    }
+
+    async fn observe_live_with(
+        &self,
+        reference: &MachineRef,
+        purpose: crate::machine::live::LiveObservationPurpose,
+    ) -> Result<crate::MachineLiveObservation, LibVmError> {
         let store = self
             .observation_store
             .as_ref()
@@ -506,6 +530,7 @@ impl Runtime {
                 message: "runtime has no native catalog observation adapter".to_string(),
             })?;
         let (config, state) = store.lookup(reference).await?;
+        purpose.admit(store, &config).await?;
         let pending = store
             .pending_pause(config.id, state.run_id.as_deref())
             .await?;

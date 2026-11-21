@@ -87,6 +87,13 @@ impl Machine {
         let config = runtime
             .resolve_machine_config(&MachineRef::id(self.machine_id()))
             .await?;
+        if !runtime
+            .reconcile_machine_runtime_best_effort(&config)
+            .await?
+            .is_active()
+        {
+            return Ok(Vec::new());
+        }
         self.runtime()
             .supervisor()
             .client(self.machine_id())

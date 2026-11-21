@@ -8,6 +8,14 @@ Use it when you need to create, resolve, inspect, start, stop, restart, or
 remove Silo VMs from Rust code. The crate keeps database rows, runtime state
 files, image materialization, and monitor processes behind the API boundary.
 
+`Machine::hibernate` saves and releases a persistent running or paused VM.
+`start` wakes a hibernated VM without cold-boot fallback. Before a guest-access
+command, call `machine.for_access(progress).await?` once and reuse the returned
+handle for every step. It wakes or joins one wake and binds access to that exact
+run. If hibernate, stop or restart ends that run between steps, later steps
+refuse rather than waking or replaying the command. Unbound handles retain
+their existing refusal-only guest-access behavior. Inspection and logs never wake.
+
 Choose an operation by intent, not by whether its output looks like a terminal:
 
 | Rust API | Transport | Purpose | Result |

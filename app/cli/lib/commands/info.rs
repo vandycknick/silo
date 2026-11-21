@@ -105,6 +105,9 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
         ));
     }
 
+    if let Some(hibernation) = &view.hibernation {
+        append_hibernation(&mut rows, hibernation);
+    }
     if let Some(reclaim) = &view.host_memory_reclaim {
         rows.push(("Host memory reclaim".to_string(), reclaim.summary()));
     }
@@ -241,6 +244,27 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
     ui::print_detail_rows(&rows)
 }
 
+fn append_hibernation(rows: &mut Vec<(String, String)>, value: &crate::view::HibernationView) {
+    rows.push(("Hibernated at".into(), ui::format_unix(value.hibernated_at)));
+    rows.push((
+        "Saved state".into(),
+        ui::human_bytes(Some(value.saved_state_bytes)),
+    ));
+    let mode = match value.memory_capture.mode {
+        vm_spec::lifecycle::CapturePolicy::Full => "full",
+        vm_spec::lifecycle::CapturePolicy::Incremental => "incremental",
+    };
+    let stats = &value.memory_capture.stats;
+    let written = stats
+        .full_bytes_written
+        .saturating_add(stats.overlay_bytes_written)
+        .saturating_add(stats.baseline_bytes_written);
+    rows.push((
+        "Memory capture".into(),
+        format!("{mode}, {} written", ui::human_bytes(Some(written))),
+    ));
+}
+
 fn append_issues(rows: &mut Vec<(String, String)>, name: &str, issues: &[libvm::MachineIssue]) {
     for issue in issues {
         rows.push((
@@ -350,5 +374,54 @@ mod tests {
             crate::commands::info::boot_summary(&boot),
             "contained-init -> /sbin/init pid=42"
         );
+    }
+    #[test]
+    fn hibernation_plain_rows_show_time_allocation_and_memory_write_cost() {
+        for (mode, reason, expected) in [
+            (
+                vm_spec::lifecycle::CapturePolicy::Incremental,
+                None,
+                "incremental",
+            ),
+            (
+                vm_spec::lifecycle::CapturePolicy::Full,
+                Some(vm_spec::capture::CaptureFullReason::NoBaseline),
+                "full",
+            ),
+        ] {
+            let value = crate::view::HibernationView {
+                hibernated_at: 1_700_000_000,
+                saved_state_bytes: 8192,
+                memory_capture: crate::view::HibernateMemoryView {
+                    mode,
+                    full_reason: reason,
+                    stats: vm_spec::capture::CaptureMemoryStats {
+                        full_bytes_written: 4096,
+                        overlay_bytes_written: 4096,
+                        baseline_bytes_written: 4096,
+                        ..Default::default()
+                    },
+                },
+            };
+            let mut rows = Vec::new();
+            crate::commands::info::append_hibernation(&mut rows, &value);
+            assert_eq!(
+                rows,
+                vec![
+                    (
+                        "Hibernated at".into(),
+                        crate::ui::format_unix(1_700_000_000)
+                    ),
+                    ("Saved state".into(), crate::ui::human_bytes(Some(8192))),
+                    (
+                        "Memory capture".into(),
+                        format!(
+                            "{expected}, {} written",
+                            crate::ui::human_bytes(Some(12288))
+                        )
+                    ),
+                ]
+            );
+        }
     }
 }

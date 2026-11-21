@@ -50,6 +50,7 @@ pub enum Command {
     List(list::Cmd),
     Info(info::Cmd),
     System(system::Cmd),
+    Hibernate(live::Hibernate),
     Pause(live::Pause),
     Resume(live::Resume),
     Snapshot(live::Snapshot),
@@ -68,7 +69,9 @@ impl Command {
     pub(crate) fn transport_admission(&self) -> silo_vm_control::transport::Admission {
         use silo_vm_control::transport::Admission;
         match self {
-            Self::Pause(_) | Self::Resume(_) | Self::System(_) => Admission::Owned,
+            Self::Hibernate(_) | Self::Pause(_) | Self::Resume(_) | Self::System(_) => {
+                Admission::Owned
+            }
             Self::Snapshot(command) if command.includes_memory() => Admission::Owned,
             Self::Fork(command) if command.is_live() => Admission::Owned,
             Self::Restore(_) => Admission::Owned,
@@ -95,6 +98,7 @@ impl Command {
             Self::List(command) => command.run(context).await,
             Self::Info(command) => command.run(context).await,
             Self::System(command) => command.run(context).await,
+            Self::Hibernate(command) => command.run(context).await,
             Self::Pause(command) => command.run(context).await,
             Self::Resume(command) => command.run(context).await,
             Self::Snapshot(command) => command.run(context).await,

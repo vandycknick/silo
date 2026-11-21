@@ -716,7 +716,7 @@ async fn malformed_stopped_contracts_fail_before_native_initialization() {
 }
 
 #[tokio::test]
-async fn pause_local_and_daemon_routes_share_durable_authority_across_adapters() {
+async fn hibernation_and_pause_local_daemon_routes_share_durable_authority() {
     use vm_spec::live::{LiveAvailability, LiveCapability, LiveCapabilityVector, LiveLane};
     use w::machine_service_client::MachineServiceClient;
     let root = tempfile::Builder::new()
@@ -738,8 +738,18 @@ async fn pause_local_and_daemon_routes_share_durable_authority_across_adapters()
         native: true,
         availability: LiveAvailability::Supported,
     };
+    let mut lifecycle = test_utils::LifecycleScenario {
+        same_machine_activation: true,
+        ..Default::default()
+    };
+    lifecycle.capture.ram_bytes = 1 << 20;
+    for provider in &mut lifecycle.providers {
+        if provider.device_id == 2 {
+            provider.configured_id = "silo-root".into();
+        }
+    }
     let scenario = test_utils::Scenario {
-        lifecycle: Some(Default::default()),
+        lifecycle: Some(lifecycle),
         live: Some(test_utils::LiveScenario {
             lane: LiveLane::KvmX86_64,
             host: LiveCapabilityVector {
@@ -770,12 +780,13 @@ async fn pause_local_and_daemon_routes_share_durable_authority_across_adapters()
         .with_mock_vmm(&scenario_path);
     let runtime = libvm::Runtime::new(config.clone()).await.unwrap();
     let disk = root.path().join("root.raw");
-    disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+    disk_image::ext4::Formatter::new(&disk, 4096, 64 << 20)
         .and_then(|formatter| formatter.close())
         .unwrap();
     let machine = runtime
         .machine()
         .name("pause-api")
+        .memory(libvm::Memory::mebibytes(1))
         .image_source(libvm::ImageSource::Disk(
             crate::commands::create::disk_create_request(disk, &Default::default()).unwrap(),
         ))
@@ -868,6 +879,72 @@ async fn pause_local_and_daemon_routes_share_durable_authority_across_adapters()
     .unwrap();
     assert_eq!(resumed.status.label(), "running");
     assert_eq!(resumed.run_id.as_ref(), Some(&started.run_id));
+    let saved = silo_vm_control::snapshots::snapshot_from_wire(
+        daemon
+            .hibernate_machine(request())
+            .await
+            .unwrap()
+            .into_inner(),
+    )
+    .unwrap();
+    assert_eq!(saved.status.label(), "hibernated");
+    assert!(saved.hibernation.is_some());
+    for error in [
+        local.pause_machine("pause-api").await.unwrap_err(),
+        local.resume_machine("pause-api").await.unwrap_err(),
+    ] {
+        assert!(matches!(
+            error.downcast_ref::<libvm::LibVmError>(),
+            Some(libvm::LibVmError::HibernatedStartFirst { .. })
+        ));
+    }
+    let save = std::fs::read_dir(saved.machine_dir.join("hibernation"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(save.join("memory.ram")).unwrap();
+    let stop = daemon
+        .stop_machine(w::StopMachineRequest {
+            machine: request().machine,
+            force: false,
+            timeout: Some(prost_types::Duration {
+                seconds: 30,
+                nanos: 0,
+            }),
+            expected_run: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let stop = silo_vm_control::lifecycle::stop_from_wire(stop).unwrap();
+    assert_eq!(stop.machine.status.label(), "stopped");
+    assert!(matches!(
+        stop.warning,
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: libvm::storage::hibernate_file::HibernateUnusableReason::FilesMissing,
+        })
+    ));
+    machine.start().await.unwrap();
+    machine.wait_ready(Duration::from_secs(30)).await.unwrap();
+    daemon.hibernate_machine(request()).await.unwrap();
+    let stop = daemon
+        .stop_machine(w::StopMachineRequest {
+            machine: request().machine,
+            force: true,
+            timeout: Some(prost_types::Duration {
+                seconds: 30,
+                nanos: 0,
+            }),
+            expected_run: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let stop = silo_vm_control::lifecycle::stop_from_wire(stop).unwrap();
+    assert_eq!(stop.machine.status.label(), "stopped");
+    assert!(stop.warning.is_none());
     machine.stop().await.unwrap();
     cleanup.0 = None;
     shutdown.cancel();

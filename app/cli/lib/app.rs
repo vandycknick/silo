@@ -80,6 +80,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_hibernate_for_named_and_default_machine() {
+        for args in [vec!["silo", "hibernate"], vec!["silo", "hibernate", "dev"]] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.command, Command::Hibernate(_)));
+            assert_eq!(
+                cli.command.transport_admission(),
+                silo_vm_control::transport::Admission::Owned
+            );
+        }
+        assert!(Cli::try_parse_from(["silo", "hibernate", "dev", "--force"]).is_err());
+    }
+
+    #[test]
     fn live_commands_have_explicit_artifact_kinds() {
         let cli = Cli::try_parse_from(["silo", "info", "vm"]).expect("info parses");
         assert!(matches!(cli.command, Command::Info(_)));

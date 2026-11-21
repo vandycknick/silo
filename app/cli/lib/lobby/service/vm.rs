@@ -48,6 +48,8 @@ pub(crate) fn state(machine: &w::MachineSnapshot) -> &'static str {
         Some(Status::Running(_)) => "running",
         Some(Status::Stopping(_)) => "stopping",
         Some(Status::Error(_)) => "error",
+        Some(Status::Hibernating(_)) => "hibernating",
+        Some(Status::Hibernated(_)) => "hibernated",
         _ => "unknown",
     }
 }
@@ -505,6 +507,29 @@ mod tests {
                     .is_ok(),
                 "{action}"
             );
+        }
+    }
+    #[test]
+    fn hibernation_states_remain_visible_without_guest_access() {
+        for (status, expected) in [
+            (
+                w::machine_status::Status::Hibernating(w::LifecycleDetail { message: None }),
+                "hibernating",
+            ),
+            (
+                w::machine_status::Status::Hibernated(w::LifecycleDetail { message: None }),
+                "hibernated",
+            ),
+        ] {
+            let machine = w::MachineSnapshot {
+                labels: [(OWNER_LABEL.into(), "user:1".into())].into(),
+                status: Some(w::MachineStatus {
+                    status: Some(status),
+                }),
+                ..Default::default()
+            };
+            assert_eq!(state(&machine), expected);
+            assert_eq!(project(&machine).unwrap().state, expected);
         }
     }
 }

@@ -129,7 +129,7 @@ roots are rejected. No EFI layout or provider bootloader is synthesized.
 ## Live operations with stock images
 
 On supported libkrun hosts, stock systemd, busybox and OpenRC images support
-pause/resume, snapshots with memory, restore and live fork without an `init=` override.
+pause/resume, hibernate/wake, snapshots with memory, restore and live fork without an `init=` override.
 The image init remains PID 1 inside a contained cgroup namespace; Silo sessions
 use a separate workload cgroup. `silo info` reports boot mode `contained-init`.
 
@@ -138,10 +138,31 @@ silo create ghcr.io/vandycknick/archlinux:latest --name dev --memory 1gib
 silo start dev
 silo pause dev
 silo resume dev
+silo hibernate dev
+silo start dev
 silo snapshot create dev --memory --name dev-saved
 silo restore dev-saved --name restored
 silo fork dev --live --name child
 ```
+
+### Hibernate and wake
+
+`silo hibernate NAME` saves a persistent VM's memory and execution state, then
+releases its host processes. `silo start`, `exec`, `shell` (including serial
+attach), `cp`, guest file operations and opening a forward wake the same VM.
+Listing machines or forwards, `info` and `logs` never wake it. Wake reports
+`Waking NAME` on stderr, leaving command output, JSON and copied bytes alone.
+
+Existing shell, exec, forward and network connections end at hibernate. Reconnect
+after wake. `silo stop NAME` wakes and shuts down cleanly; if wake is impossible,
+it discards the saved state and warns. `silo stop NAME --force` discards without
+waking, losing anything held only in memory. The next start cold boots.
+
+Hibernate requires a cooperating guest agent with same-machine activation
+support. Older machines need new boot assets: stop them, run
+`silo set NAME boot-assets=packaged`, then start them before hibernating.
+Use `silo info NAME` for the hibernation time, saved-state size and incremental
+or full memory-write statistics.
 
 Lifecycle commands show a spinner on a terminal, then a result with the name,
 short ID and elapsed time. Live fork reports every child, any child failures,

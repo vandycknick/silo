@@ -33,17 +33,6 @@ pub(crate) async fn shell(
         .map_err(Into::into)
 }
 
-pub(crate) fn ensure_running(data: &MachineData) -> eyre::Result<()> {
-    if data.is_running() {
-        return Ok(());
-    }
-    Err(eyre::eyre!(
-        "machine `{}` is not running; start it with `silo start {}`",
-        data.name,
-        data.name
-    ))
-}
-
 pub(crate) fn ensure_guest_ready(data: &MachineData) -> eyre::Result<()> {
     if data.status.guest_ready() {
         return Ok(());

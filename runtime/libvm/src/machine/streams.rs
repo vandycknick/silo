@@ -938,11 +938,11 @@ impl Machine {
         let config = runtime
             .resolve_machine_config(&MachineRef::id(self.machine_id()))
             .await?;
-        if !runtime
+        let status = runtime
             .reconcile_machine_runtime_best_effort(&config)
-            .await?
-            .is_running()
-        {
+            .await?;
+        self.validate_access_run(&config.name, status.run_id.as_deref())?;
+        if !status.is_running() {
             return Err(LibVmError::MachineNotRunning {
                 reference: config.name,
             });

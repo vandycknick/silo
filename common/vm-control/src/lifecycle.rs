@@ -1,6 +1,77 @@
 use crate::snapshots::{snapshot_from_wire, snapshot_to_wire};
 use crate::{invalid, required, ConversionError};
 use silod_spec::daemon::v1 as w;
+
+pub fn unusable_reason_to_wire(
+    value: libvm::storage::hibernate_file::HibernateUnusableReason,
+) -> i32 {
+    use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+    match value {
+        R::FilesMissing => 1,
+        R::FilesChanged => 2,
+        R::DisksChanged => 3,
+        R::NotCompatible => 4,
+    }
+}
+
+pub fn unusable_reason_from_wire(
+    value: i32,
+) -> Result<libvm::storage::hibernate_file::HibernateUnusableReason, ConversionError> {
+    use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+    match value {
+        1 => Ok(R::FilesMissing),
+        2 => Ok(R::FilesChanged),
+        3 => Ok(R::DisksChanged),
+        4 => Ok(R::NotCompatible),
+        _ => Err(invalid(
+            "hibernation.reason",
+            "unknown or unspecified reason",
+        )),
+    }
+}
+
+pub fn stop_to_wire(
+    value: &libvm::MachineStopOutcome,
+) -> Result<w::MachineSnapshot, ConversionError> {
+    use w::machine_stop_warning::Warning;
+    let mut snapshot = snapshot_to_wire(&value.machine)?;
+    snapshot.stop_warning = value.warning.map(|warning| w::MachineStopWarning {
+        warning: Some(match warning {
+            libvm::MachineStopWarning::SavedStateUnusable { reason } => {
+                Warning::SavedStateUnusable(unusable_reason_to_wire(reason))
+            }
+            libvm::MachineStopWarning::WakeFailed => Warning::WakeFailed(()),
+        }),
+    });
+    Ok(snapshot)
+}
+
+pub fn stop_warning_from_wire(
+    value: w::MachineStopWarning,
+) -> Result<libvm::MachineStopWarning, ConversionError> {
+    use w::machine_stop_warning::Warning;
+    Ok(match required(value.warning, "stop.warning")? {
+        Warning::SavedStateUnusable(reason) => libvm::MachineStopWarning::SavedStateUnusable {
+            reason: unusable_reason_from_wire(reason)?,
+        },
+        Warning::WakeFailed(()) => libvm::MachineStopWarning::WakeFailed,
+    })
+}
+
+pub fn stop_from_wire(
+    mut value: w::MachineSnapshot,
+) -> Result<libvm::MachineStopOutcome, ConversionError> {
+    let warning = value
+        .stop_warning
+        .take()
+        .map(stop_warning_from_wire)
+        .transpose()?;
+    Ok(libvm::MachineStopOutcome {
+        machine: snapshot_from_wire(value)?,
+        warning,
+    })
+}
+
 pub fn entrypoint_to_wire(v: &libvm::Entrypoint) -> w::Entrypoint {
     w::Entrypoint {
         program: v.program().into(),

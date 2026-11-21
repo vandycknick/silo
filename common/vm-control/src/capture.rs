@@ -168,9 +168,92 @@ fn identity_read_fallback_from_wire(
     }
 }
 
+pub fn hibernate_memory_to_wire(
+    value: &vm_spec::capture::HibernateMemoryReceipt,
+) -> w::HibernateMemoryReceipt {
+    w::HibernateMemoryReceipt {
+        mode: policy_to_wire(value.mode),
+        full_reason: value.full_reason.map(full_reason_to_wire),
+        stats: Some(stats_to_wire(&value.stats)),
+    }
+}
+
+pub fn hibernate_memory_from_wire(
+    value: w::HibernateMemoryReceipt,
+) -> Result<vm_spec::capture::HibernateMemoryReceipt, ConversionError> {
+    let receipt = vm_spec::capture::HibernateMemoryReceipt {
+        mode: policy_from_wire(value.mode)?,
+        full_reason: value.full_reason.map(full_reason_from_wire).transpose()?,
+        stats: stats_from_wire(required(value.stats, "hibernation.memory_capture.stats")?)?,
+    };
+    receipt
+        .validate()
+        .map_err(|_| invalid("hibernation.memory_capture", "invalid memory receipt"))?;
+    Ok(receipt)
+}
+
+fn stats_to_wire(stats: &CaptureMemoryStats) -> w::CaptureMemoryStats {
+    w::CaptureMemoryStats {
+        seed_method: seed_method_to_wire(stats.seed_method),
+        logical_bytes: stats.logical_bytes,
+        live_bytes_read: stats.live_bytes_read,
+        baseline_bytes_read: stats.baseline_bytes_read,
+        baseline_bytes_written: stats.baseline_bytes_written,
+        overlay_bytes_written: stats.overlay_bytes_written,
+        full_bytes_written: stats.full_bytes_written,
+        layout_bytes_written: stats.layout_bytes_written,
+        baseline_hole_bytes: stats.baseline_hole_bytes,
+        zero_bytes_omitted: stats.zero_bytes_omitted,
+        explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
+        zero_run_bytes_covered: stats.zero_run_bytes_covered,
+        zero_bytes_punched: stats.zero_bytes_punched,
+        known_zero_bytes_skipped: stats.known_zero_bytes_skipped,
+        extent_queries: stats.extent_queries,
+        identity_bytes_hashed: stats.identity_bytes_hashed,
+        whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
+        map_nodes_written: stats.map_nodes_written,
+        identity_dirty_pages: stats.identity_dirty_pages,
+        materialization_dirty_pages: stats.materialization_dirty_pages,
+        live_pages_classified: stats.live_pages_classified,
+        identity_zero_bytes_filled: stats.identity_zero_bytes_filled,
+        full_identity_read_fallback: identity_read_fallback_to_wire(
+            stats.full_identity_read_fallback,
+        ),
+    }
+}
+
+fn stats_from_wire(stats: w::CaptureMemoryStats) -> Result<CaptureMemoryStats, ConversionError> {
+    Ok(CaptureMemoryStats {
+        seed_method: seed_method_from_wire(stats.seed_method)?,
+        logical_bytes: stats.logical_bytes,
+        live_bytes_read: stats.live_bytes_read,
+        baseline_bytes_read: stats.baseline_bytes_read,
+        baseline_bytes_written: stats.baseline_bytes_written,
+        overlay_bytes_written: stats.overlay_bytes_written,
+        full_bytes_written: stats.full_bytes_written,
+        layout_bytes_written: stats.layout_bytes_written,
+        baseline_hole_bytes: stats.baseline_hole_bytes,
+        zero_bytes_omitted: stats.zero_bytes_omitted,
+        explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
+        zero_run_bytes_covered: stats.zero_run_bytes_covered,
+        zero_bytes_punched: stats.zero_bytes_punched,
+        known_zero_bytes_skipped: stats.known_zero_bytes_skipped,
+        extent_queries: stats.extent_queries,
+        identity_bytes_hashed: stats.identity_bytes_hashed,
+        whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
+        map_nodes_written: stats.map_nodes_written,
+        identity_dirty_pages: stats.identity_dirty_pages,
+        materialization_dirty_pages: stats.materialization_dirty_pages,
+        live_pages_classified: stats.live_pages_classified,
+        identity_zero_bytes_filled: stats.identity_zero_bytes_filled,
+        full_identity_read_fallback: identity_read_fallback_from_wire(
+            stats.full_identity_read_fallback,
+        )?,
+    })
+}
+
 fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
     let binding = &value.binding;
-    let stats = &value.stats;
     w::CaptureMemoryEvidence {
         packed_length: value.packed_length,
         page_granule: value.page_granule,
@@ -204,33 +287,7 @@ fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
             } as i32,
             baseline_stream: value.changes.baseline_stream.map(|value| value.to_string()),
         }),
-        stats: Some(w::CaptureMemoryStats {
-            seed_method: seed_method_to_wire(stats.seed_method),
-            logical_bytes: stats.logical_bytes,
-            live_bytes_read: stats.live_bytes_read,
-            baseline_bytes_read: stats.baseline_bytes_read,
-            baseline_bytes_written: stats.baseline_bytes_written,
-            overlay_bytes_written: stats.overlay_bytes_written,
-            full_bytes_written: stats.full_bytes_written,
-            layout_bytes_written: stats.layout_bytes_written,
-            baseline_hole_bytes: stats.baseline_hole_bytes,
-            zero_bytes_omitted: stats.zero_bytes_omitted,
-            explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
-            zero_run_bytes_covered: stats.zero_run_bytes_covered,
-            zero_bytes_punched: stats.zero_bytes_punched,
-            known_zero_bytes_skipped: stats.known_zero_bytes_skipped,
-            extent_queries: stats.extent_queries,
-            identity_bytes_hashed: stats.identity_bytes_hashed,
-            whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
-            map_nodes_written: stats.map_nodes_written,
-            identity_dirty_pages: stats.identity_dirty_pages,
-            materialization_dirty_pages: stats.materialization_dirty_pages,
-            live_pages_classified: stats.live_pages_classified,
-            identity_zero_bytes_filled: stats.identity_zero_bytes_filled,
-            full_identity_read_fallback: identity_read_fallback_to_wire(
-                stats.full_identity_read_fallback,
-            ),
-        }),
+        stats: Some(stats_to_wire(&value.stats)),
     }
 }
 
@@ -301,33 +358,7 @@ fn memory_from_wire(
                 .map(|value| digest(value, "capture.memory.changes.baseline_stream"))
                 .transpose()?,
         },
-        stats: CaptureMemoryStats {
-            seed_method: seed_method_from_wire(stats.seed_method)?,
-            logical_bytes: stats.logical_bytes,
-            live_bytes_read: stats.live_bytes_read,
-            baseline_bytes_read: stats.baseline_bytes_read,
-            baseline_bytes_written: stats.baseline_bytes_written,
-            overlay_bytes_written: stats.overlay_bytes_written,
-            full_bytes_written: stats.full_bytes_written,
-            layout_bytes_written: stats.layout_bytes_written,
-            baseline_hole_bytes: stats.baseline_hole_bytes,
-            zero_bytes_omitted: stats.zero_bytes_omitted,
-            explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
-            zero_run_bytes_covered: stats.zero_run_bytes_covered,
-            zero_bytes_punched: stats.zero_bytes_punched,
-            known_zero_bytes_skipped: stats.known_zero_bytes_skipped,
-            extent_queries: stats.extent_queries,
-            identity_bytes_hashed: stats.identity_bytes_hashed,
-            whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
-            map_nodes_written: stats.map_nodes_written,
-            identity_dirty_pages: stats.identity_dirty_pages,
-            materialization_dirty_pages: stats.materialization_dirty_pages,
-            live_pages_classified: stats.live_pages_classified,
-            identity_zero_bytes_filled: stats.identity_zero_bytes_filled,
-            full_identity_read_fallback: identity_read_fallback_from_wire(
-                stats.full_identity_read_fallback,
-            )?,
-        },
+        stats: stats_from_wire(stats)?,
     };
     memory
         .validate_capture()

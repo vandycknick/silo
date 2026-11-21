@@ -16,8 +16,14 @@ pub(crate) struct Fixture {
     pub(crate) root: tempfile::TempDir,
 }
 pub(crate) async fn fixture() -> Fixture {
+    fixture_with_scenario(None).await
+}
+
+pub(crate) async fn fixture_with_scenario(scenario: Option<test_utils::Scenario>) -> Fixture {
     let root = tempfile::Builder::new().prefix("lobby-").tempdir().unwrap();
-    let (components, native) = if let Some(stage) = std::env::var_os("SILO_LOBBY_E2E_RUNTIME") {
+    let (components, native) = if let Some(stage) =
+        std::env::var_os("SILO_LOBBY_E2E_RUNTIME").filter(|_| scenario.is_none())
+    {
         let stage = std::path::PathBuf::from(stage).canonicalize().unwrap();
         (
             libvm::ResolvedRuntimeComponents::from_paths(
@@ -55,6 +61,11 @@ pub(crate) async fn fixture() -> Fixture {
         .with_runtime_components(components.clone());
     if !native {
         config = config.with_virt_backend(libvm::VirtBackendOverride::Mock { scenario: None });
+        if let Some(scenario) = scenario {
+            let path = root.path().join("scenario.json");
+            scenario.write_to(&path).unwrap();
+            config = config.with_mock_vmm(&path);
+        }
     }
     let runtime = libvm::Runtime::new(config.clone()).await.unwrap();
     let management = Management::for_test_runtime(root.path(), config, runtime, components);

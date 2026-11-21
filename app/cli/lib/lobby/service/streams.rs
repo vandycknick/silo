@@ -63,8 +63,7 @@ impl Service {
             return Err(usage("invalid execution request"));
         }
         let peer = caller.fresh().await?;
-        let snapshot = self.inspect_for(&peer, reference, Action::Shell).await?;
-        ensure_running(&snapshot)?;
+        let (machine, snapshot) = self.access_for(&peer, reference, Action::Shell, io).await?;
         let user = selected_user(user, &snapshot);
         let cancel = io.cancel.clone();
         self.run_stream(
@@ -73,11 +72,9 @@ impl Service {
             Action::Shell,
             &cancel,
             |token| async move {
-                let machine = tokio::select! {
-                    biased;
-                    _ = token.cancelled() => return Err(cancelled()),
-                    machine = self.guest_machine(&snapshot.id) => machine?,
-                };
+                if token.is_cancelled() {
+                    return Err(cancelled());
+                }
                 let _execution = self.jobs().metrics().track("exec", ());
                 attached_shell(&machine, user, term, window, io, token).await
             },
@@ -102,13 +99,11 @@ impl Service {
             None
         };
         let peer = caller.fresh().await?;
-        let snapshot = self.inspect_for(&peer, reference, Action::Exec).await?;
-        ensure_running(&snapshot)?;
+        let (machine, snapshot) = self.access_for(&peer, reference, Action::Exec, io).await?;
         request.user = selected_user(&request.user, &snapshot);
         let cancel = io.cancel.clone();
         self.run_stream(caller, &snapshot.id.clone(), Action::Exec, &cancel, |token| async move {
             let execution = async {
-                let machine = self.guest_machine(&snapshot.id).await?;
                 let account = guest_identity(&machine, &request.user, snapshot.guest.as_ref().and_then(|guest| guest.user.as_ref())).await?;
                 let mut env = BTreeMap::new();
                 if !account.name.is_empty() {
@@ -221,6 +216,47 @@ impl Service {
             };
             tokio::select! { biased; _ = token.cancelled() => Err(cancelled()), result = read => result }
         }).await
+    }
+
+    /// Authorization precedes runtime access, including any wake. The returned
+    /// handle fences all later guest operations to the single admitted run.
+    ///
+    /// Boxed: admission carries the wake path, and inlining it would push
+    /// every access future past a default task stack.
+    pub(crate) fn access_for<'a>(
+        &'a self,
+        peer: &'a crate::lobby::identity::Peer,
+        reference: &'a str,
+        action: Action,
+        io: &'a mut SessionIo,
+    ) -> futures::future::BoxFuture<'a, Outcome<(Handle<Machine>, w::MachineSnapshot)>> {
+        Box::pin(async move {
+            let snapshot = self.inspect_for(peer, reference, action).await?;
+            let machine = self.guest_machine(&snapshot.id).await?;
+            let (progress, mut stages) = libvm::LiveOperationProgressSender::default_channel();
+            let operation = machine.for_access(Some(&progress));
+            tokio::pin!(operation);
+            let mut reported = false;
+            let admitted = loop {
+                tokio::select! {
+                    biased;
+                    _ = io.cancel.cancelled() => return Err(cancelled()),
+                    Some(stage) = stages.recv() => {
+                        if stage == libvm::LiveOperationProgress::Waking && !reported {
+                            io.stderr.write_all(format!("Waking {}\n", snapshot.name).as_bytes()).await
+                                .map_err(|_| lost("progress output transport failed"))?;
+                            reported = true;
+                        }
+                    }
+                    result = &mut operation => break result.map_err(native_failure)?,
+                }
+            };
+            let snapshot = silo_vm_control::snapshots::snapshot_to_wire(
+                &admitted.inspect().await.map_err(native_failure)?,
+            )
+            .map_err(|_| lost("VM observation unavailable"))?;
+            Ok((self.jobs().metrics().track("machine", admitted), snapshot))
+        })
     }
 
     pub(crate) async fn guest_machine(&self, id: &str) -> Outcome<Handle<Machine>> {
@@ -401,20 +437,6 @@ fn terminal(terminal: Option<&Terminal>, missing: &str) -> Outcome<(Window, Stri
         return Err(usage("invalid TERM"));
     }
     Ok((window, term.to_owned()))
-}
-
-pub(crate) fn ensure_running(snapshot: &w::MachineSnapshot) -> Outcome<()> {
-    if matches!(
-        snapshot
-            .status
-            .as_ref()
-            .and_then(|status| status.status.as_ref()),
-        Some(w::machine_status::Status::Running(_))
-    ) {
-        Ok(())
-    } else {
-        Err(Failure::new(Code::Conflict, "VM must be running"))
-    }
 }
 
 fn selected_user(user: &str, snapshot: &w::MachineSnapshot) -> String {
@@ -731,6 +753,85 @@ pub(crate) mod tests {
             return false;
         }
         true
+    }
+
+    #[tokio::test]
+    async fn hibernation_guest_authorization_precedes_wake_for_every_action() {
+        use crate::lobby::identity::Action;
+        use crate::lobby::service::testing::{caller, fixture_with_scenario, stopped_vm};
+        use vm_spec::live::{LiveAvailability, LiveCapability, LiveCapabilityVector, LiveLane};
+        let supported = LiveCapability {
+            native: true,
+            availability: LiveAvailability::Supported,
+        };
+        let mut lifecycle = test_utils::LifecycleScenario {
+            same_machine_activation: true,
+            ..Default::default()
+        };
+        lifecycle.capture.ram_bytes = 1 << 20;
+        for provider in &mut lifecycle.providers {
+            if provider.device_id == 2 {
+                provider.configured_id = "silo-root".into();
+            }
+        }
+        let fixture = fixture_with_scenario(Some(test_utils::Scenario {
+            lifecycle: Some(lifecycle),
+            live: Some(test_utils::LiveScenario {
+                lane: LiveLane::KvmX86_64,
+                host: LiveCapabilityVector {
+                    pause: supported.clone(),
+                    capture: supported.clone(),
+                    restore: supported.clone(),
+                    fork: supported.clone(),
+                    incremental: supported,
+                },
+                machine: None,
+            }),
+            ..Default::default()
+        }))
+        .await;
+        let snapshot = stopped_vm(&fixture, "saved", "user:1").await;
+        let runtime = fixture.management.runtime().await.unwrap();
+        let machine = runtime
+            .get_machine(&libvm::MachineRef::parse(&snapshot.id).unwrap())
+            .await
+            .unwrap();
+        machine
+            .update(libvm::MachineUpdate::new().memory(libvm::Memory::mebibytes(1)))
+            .await
+            .unwrap();
+        machine.start().await.unwrap();
+        machine
+            .wait_ready(std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+        machine.hibernate().await.unwrap();
+        for action in [Action::Shell, Action::Exec, Action::Files] {
+            for (identity, actions, expected) in [
+                ("user:1", Vec::new(), crate::lobby::failure::Code::Forbidden),
+                (
+                    "user:2",
+                    vec![action],
+                    crate::lobby::failure::Code::NotFound,
+                ),
+            ] {
+                let caller = caller(identity, &actions);
+                let mut io = captured_io(Vec::new(), false);
+                let error = fixture
+                    .service
+                    .access_for(&caller.peer, &snapshot.id, action, &mut io.io)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(error.code, expected);
+                assert!(io.stderr.lock().is_empty());
+                assert_eq!(
+                    machine.inspect().await.unwrap().status.label(),
+                    "hibernated"
+                );
+            }
+        }
+        machine.kill().await.unwrap();
     }
 
     #[test]

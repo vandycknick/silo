@@ -59,15 +59,11 @@ impl SystemRuntime {
         timeout: Duration,
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
-        let data = machine.inspect().await?;
-        if !data.is_running() {
-            return Ok(data);
-        }
-        machine
+        let outcome = machine
             .inner
             .stop_with(MachineStopOptions::new().timeout(timeout))
             .await?;
-        Ok(machine.inspect().await?)
+        Ok(stop_result(outcome))
     }
 
     pub(crate) async fn remove_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
@@ -204,16 +200,13 @@ impl SystemMachine {
         self.inner
             .stop_run_with(run_id, stop_options())
             .await
-            .map(|outcome| outcome.machine)
+            .map(stop_result)
     }
 
     /// Stops whichever run is current. The supervisor owns the system VM outright,
     /// so shutdown must not depend on having observed the run that is live now.
     pub(crate) async fn stop(&self) -> Result<MachineData, libvm::LibVmError> {
-        self.inner
-            .stop_with(stop_options())
-            .await
-            .map(|outcome| outcome.machine)
+        self.inner.stop_with(stop_options()).await.map(stop_result)
     }
 
     pub(crate) async fn exec_with_input(
@@ -238,6 +231,13 @@ impl SystemMachine {
     pub(crate) async fn metrics(&self) -> Result<libvm::MachineMetrics, libvm::LibVmError> {
         self.inner.metrics().await
     }
+}
+
+fn stop_result(outcome: libvm::MachineStopOutcome) -> MachineData {
+    if let Some(warning) = outcome.warning {
+        tracing::warn!(machine = outcome.machine.name, "{warning}");
+    }
+    outcome.machine
 }
 
 // silo-vmm can spend 45s stopping the backend, then drain its services. Give that

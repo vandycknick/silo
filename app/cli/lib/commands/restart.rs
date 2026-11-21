@@ -33,7 +33,10 @@ impl Cmd {
             .checked_add(self.timeout)
             .ok_or_else(|| eyre::eyre!("restart timeout is too large"))?;
 
-        if data.status.is_active() || data.run_id.is_some() {
+        if data.status.is_active()
+            || data.run_id.is_some()
+            || matches!(data.status, MachineStatus::Hibernated { .. })
+        {
             if self.force {
                 spinner.step("Killing", &name);
             } else {
@@ -67,10 +70,7 @@ fn ensure_restartable(data: &MachineData) -> eyre::Result<()> {
             data.name, data.name
         );
     }
-    if matches!(
-        data.status,
-        MachineStatus::Hibernating { .. } | MachineStatus::Hibernated { .. }
-    ) {
+    if matches!(data.status, MachineStatus::Hibernating { .. }) {
         eyre::bail!(
             "machine `{}` is {}; restart is not available in this state",
             data.name,
@@ -99,7 +99,7 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use libvm::{MachineData, MachineRetention, DEFAULT_MACHINE_WAIT_TIMEOUT};
+    use libvm::{MachineData, MachineRetention, MachineStatus, DEFAULT_MACHINE_WAIT_TIMEOUT};
 
     use crate::app::Cli;
     use crate::commands::Command;
@@ -146,19 +146,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hibernation_states_until_wake_and_discard_are_available() {
+    fn hibernated_restart_is_admitted_but_capture_in_progress_is_not() {
         let mut data = MachineData::new(
             "00000000-0000-4000-8000-000000000001".into(),
             "saved".into(),
             vm_spec::VmSpec::current(),
         );
         data.retention = MachineRetention::Persistent;
-        for status in [
-            libvm::MachineStatus::Hibernating { message: None },
-            libvm::MachineStatus::Hibernated { message: None },
-        ] {
-            data.status = status;
-            assert!(crate::commands::restart::ensure_restartable(&data).is_err());
-        }
+        data.status = MachineStatus::Hibernating { message: None };
+        assert!(crate::commands::restart::ensure_restartable(&data).is_err());
+        data.status = MachineStatus::Hibernated { message: None };
+        assert!(crate::commands::restart::ensure_restartable(&data).is_ok());
     }
 }

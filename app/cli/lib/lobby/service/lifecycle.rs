@@ -104,7 +104,7 @@ impl Service {
     ) -> Outcome<RemovalTarget> {
         let peer = caller.fresh().await?;
         let machine = self.inspect_for(&peer, reference, Action::Delete).await?;
-        let running = vm::state(&machine) != "stopped";
+        let running = !matches!(vm::state(&machine), "stopped" | "hibernated");
         if running {
             if !force {
                 return Err(running_error());
@@ -168,20 +168,23 @@ impl Service {
                     && vm::state(&machine) != "stopped"
                     && !(vm::state(&machine) == "error" && machine.run_id.is_none())
                 {
-                    let run = machine.run_id.clone().ok_or_else(|| {
-                        Failure::new(Code::Conflict, "VM running generation unavailable")
-                    })?;
+                    let run = stop_generation(&machine)?;
                     progress(format!("stopping {}", machine.name));
                     self.reauthorize(caller, action, &machine).await?;
                     machine = self
                         .management()
-                        .stop(&machine.id, Some(run), false, None)
+                        .stop(&machine.id, run, false, None)
                         .await
                         .map_err(|status| categorize(&status))?;
+                    report_stop_warning(&machine, progress)?;
                 }
                 self.prepare_node(caller, action, &machine).await?;
                 self.reauthorize(caller, action, &machine).await?;
-                progress(format!("starting {}", machine.name));
+                if vm::state(&machine) == "hibernated" {
+                    progress(format!("Waking {}", machine.name));
+                } else {
+                    progress(format!("starting {}", machine.name));
+                }
                 let start = self
                     .management()
                     .start(&machine.id)
@@ -196,21 +199,20 @@ impl Service {
                 {
                     return Ok(());
                 }
-                let run = machine
-                    .run_id
-                    .clone()
-                    .ok_or_else(|| Failure::new(Code::Conflict, "VM is not running"))?;
+                let run = stop_generation(machine)?;
                 self.reauthorize(caller, action, machine).await?;
                 let timeout = (request.timeout != chrono::TimeDelta::zero())
                     .then(|| duration(request.timeout));
-                self.management()
-                    .stop(&machine.id, Some(run), request.force, timeout)
+                let stopped = self
+                    .management()
+                    .stop(&machine.id, run, request.force, timeout)
                     .await
                     .map_err(|status| categorize(&status))?;
+                report_stop_warning(&stopped, progress)?;
                 Ok(())
             }
             Mutation::Remove(request) => {
-                if vm::state(machine) != "stopped" {
+                if !matches!(vm::state(machine), "stopped" | "hibernated") {
                     if !request.force {
                         return Err(running_error());
                     }
@@ -436,6 +438,32 @@ impl Service {
         Ok(())
     }
 }
+fn stop_generation(machine: &w::MachineSnapshot) -> Outcome<Option<String>> {
+    if vm::state(machine) == "hibernated" {
+        Ok(None)
+    } else {
+        machine
+            .run_id
+            .clone()
+            .map(Some)
+            .ok_or_else(|| Failure::new(Code::Conflict, "VM running generation unavailable"))
+    }
+}
+
+fn report_stop_warning(machine: &w::MachineSnapshot, progress: &Progress) -> Outcome<()> {
+    if let Some(warning) = &machine.stop_warning {
+        let warning =
+            silo_vm_control::lifecycle::stop_warning_from_wire(*warning).map_err(|_| {
+                Failure::new(
+                    Code::OperationFailed,
+                    "stop warning could not be read; inspect VM state",
+                )
+            })?;
+        progress(format!("warn: {warning}"));
+    }
+    Ok(())
+}
+
 fn duration(value: chrono::TimeDelta) -> prost_types::Duration {
     prost_types::Duration {
         seconds: value.num_seconds(),
@@ -786,6 +814,36 @@ mod tests {
                 .unwrap_err()
                 .exit,
             3
+        );
+    }
+    #[test]
+    fn hibernation_stop_and_restart_allow_no_live_generation() {
+        let mut machine = silod_spec::daemon::v1::MachineSnapshot {
+            status: Some(silod_spec::daemon::v1::MachineStatus {
+                status: Some(silod_spec::daemon::v1::machine_status::Status::Hibernated(
+                    silod_spec::daemon::v1::LifecycleDetail { message: None },
+                )),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::lobby::service::lifecycle::stop_generation(&machine).unwrap(),
+            None
+        );
+        machine.status = Some(silod_spec::daemon::v1::MachineStatus {
+            status: Some(silod_spec::daemon::v1::machine_status::Status::Running(
+                silod_spec::daemon::v1::RunningStatus {
+                    ready: true,
+                    guest_ready: true,
+                    message: None,
+                },
+            )),
+        });
+        assert!(crate::lobby::service::lifecycle::stop_generation(&machine).is_err());
+        machine.run_id = Some("exact-run".into());
+        assert_eq!(
+            crate::lobby::service::lifecycle::stop_generation(&machine).unwrap(),
+            machine.run_id
         );
     }
 }

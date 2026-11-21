@@ -50,11 +50,10 @@ impl Cmd {
             Some(parse_forward(&self.endpoints, self.name, &cwd)?)
         };
         let (_reference, machine) = context.observation_machine(Some(&self.vm)).await?;
-        let inspect = machine.inspect().await?;
-        guest::ensure_running(&inspect)?;
         if self.list {
             return print_forwards(&machine.list_forwards().await?);
         }
+        let machine = machine.for_access().await?;
 
         let forward = forward.ok_or_else(|| eyre::eyre!("forward endpoints are required"))?;
         let mut session = machine.open_forward(forward).await?;

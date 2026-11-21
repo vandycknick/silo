@@ -327,6 +327,27 @@ pub(crate) fn categorize(status: &Status) -> Failure {
         return Failure::new(Code::Cancelled, "operation cancelled");
     }
     match silo_vm_control::errors::status_error_detail(status) {
+        Ok(Some(detail))
+            if matches!(
+                detail.native_variant.as_deref(),
+                Some(
+                    "HibernatedStartFirst"
+                        | "HibernatedStopFirst"
+                        | "AlreadyHibernated"
+                        | "HibernateTemporary"
+                        | "HibernateBusy"
+                        | "HibernateOutOfSpace"
+                        | "HibernateUnusable"
+                        | "WakeFailedBeforeConsume"
+                        | "WakeConsumed"
+                )
+            ) =>
+        {
+            match silo_vm_control::errors::status_to_native_error(status) {
+                Ok(error) => Failure::new(Code::Conflict, crate::errors::native_message(&error)),
+                Err(_) => unavailable(),
+            }
+        }
         Ok(Some(detail)) => categorize_detail(&detail),
         Err(_) => unavailable(),
         Ok(None) => match status.code() {
@@ -889,6 +910,48 @@ mod tests {
             let failure = categorize_detail(&detail);
             assert_eq!(failure.code, expected);
             assert_eq!(failure.message, message);
+        }
+    }
+    #[test]
+    fn hibernation_lobby_wake_refusals_keep_safe_actionable_diagnostics() {
+        use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+        use libvm::LibVmError as E;
+        for error in [
+            E::HibernatedStartFirst {
+                reference: "dev".into(),
+            },
+            E::HibernatedStopFirst {
+                reference: "dev".into(),
+            },
+            E::HibernateUnusable {
+                reference: "dev".into(),
+                reason: R::FilesMissing,
+            },
+            E::HibernateUnusable {
+                reference: "dev".into(),
+                reason: R::FilesChanged,
+            },
+            E::HibernateUnusable {
+                reference: "dev".into(),
+                reason: R::DisksChanged,
+            },
+            E::HibernateUnusable {
+                reference: "dev".into(),
+                reason: R::NotCompatible,
+            },
+            E::WakeConsumed {
+                reference: "dev".into(),
+            },
+            E::HibernateOutOfSpace {
+                reference: "dev".into(),
+                needed_bytes: 2 << 30,
+                free_bytes: 1 << 30,
+            },
+        ] {
+            let status = silo_vm_control::errors::native_error_to_status(&error);
+            let failure = crate::daemon::control::lobby::categorize(&status);
+            assert_eq!(failure.code, crate::lobby::failure::Code::Conflict);
+            assert_eq!(failure.message, crate::errors::native_message(&error));
         }
     }
 }

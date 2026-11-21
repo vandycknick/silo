@@ -71,6 +71,7 @@ The explicit execution-state command grammar is:
 
 ```sh
 silo pause <VM>
+silo hibernate [<VM>]
 silo snapshot create <VM> --memory [--name <NAME>]
           [--capture-policy full|incremental] [--dirty-crossover-percent 1..60]
 silo fork <VM> --live --name <CHILD> [--name <CHILD>...] [--preserve]
