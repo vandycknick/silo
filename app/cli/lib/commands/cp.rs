@@ -187,7 +187,7 @@ impl Cmd {
             .map_or((None, None), |(uid, gid)| (Some(uid), gid));
         let (_, machine) = context.observation_machine(Some(vm)).await?;
         let machine = machine
-            .for_access(crate::api::machine::WakeNotice::Announce)
+            .for_access(crate::api::machine::WakeNotice::Line)
             .await?;
         let inspect = machine.inspect().await?;
         streams::ensure_guest_ready(&inspect)?;

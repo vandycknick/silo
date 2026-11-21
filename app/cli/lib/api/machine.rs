@@ -14,14 +14,18 @@ use tokio_stream::Stream;
 use crate::api::daemon::DaemonVmService;
 use crate::api::start_options::AppStartOptions;
 
-/// Whether an access command says that it woke a hibernated machine.
+/// How an access command shows that it is waking a hibernated machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeNotice {
     /// Print `Waking NAME` on standard error.
-    Announce,
-    /// Say nothing: the command hands the user a terminal.
-    Silent,
+    Line,
+    /// The command hands the user a terminal: stay silent when the wake is
+    /// quick, and show a spinner that clears itself when it is not.
+    SpinnerIfSlow,
 }
+
+/// A wake that finishes within this goes straight to the prompt.
+const QUIET_WAKE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub(crate) enum AppMachine {
@@ -77,35 +81,52 @@ impl AppMachine {
 
     pub(crate) async fn for_access(&self, notice: WakeNotice) -> eyre::Result<Self> {
         let native = self.session_machine().await?;
-        if notice == WakeNotice::Silent {
-            let admitted = native.for_access(None).await?;
-            return Ok(Self::new(admitted, self.home().to_path_buf()));
-        }
         let name = native.inspect().await?.name;
         let (progress, mut stages) = libvm::LiveOperationProgressSender::default_channel();
         let operation = native.for_access(Some(&progress));
-        tokio::pin!(operation);
-        let mut reported = false;
-        loop {
+        let quiet = tokio::time::sleep(QUIET_WAKE);
+        tokio::pin!(operation, quiet);
+        let mut quiet_over = false;
+        // The latest wake stage; `None` while no wake is happening.
+        let mut stage: Option<libvm::LiveOperationProgress> = None;
+        let mut line_printed = false;
+        let mut spinner: Option<crate::ui::Spinner> = None;
+        let result = loop {
             tokio::select! {
                 biased;
-                Some(stage) = stages.recv() => {
-                    if stage == libvm::LiveOperationProgress::Waking && !reported {
-                        crate::ui::waking(&name);
-                        reported = true;
-                    }
-                }
+                Some(next) = stages.recv() => stage = Some(next),
                 result = &mut operation => {
-                    while let Ok(stage) = stages.try_recv() {
-                        if stage == libvm::LiveOperationProgress::Waking && !reported {
-                            crate::ui::waking(&name);
-                            reported = true;
-                        }
+                    if stage.is_none() {
+                        stage = stages.try_recv().ok();
                     }
-                    return Ok(Self::new(result?, self.home().to_path_buf()));
+                    if notice == WakeNotice::Line && stage.is_some() && !line_printed {
+                        crate::ui::waking(&name);
+                    }
+                    break result;
                 }
+                _ = &mut quiet, if !quiet_over => quiet_over = true,
             }
+            let Some(current) = &stage else { continue };
+            match notice {
+                WakeNotice::Line if !line_printed => {
+                    crate::ui::waking(&name);
+                    line_printed = true;
+                }
+                WakeNotice::Line => {}
+                WakeNotice::SpinnerIfSlow if quiet_over => {
+                    let (label, _) = crate::ui::live_operation_progress_words(current, &name);
+                    match &mut spinner {
+                        Some(spinner) => spinner.step(label, name.as_str()),
+                        None => spinner = Some(crate::ui::Spinner::start(label, name.as_str())),
+                    }
+                }
+                WakeNotice::SpinnerIfSlow => {}
+            }
+        };
+        if let Some(spinner) = spinner {
+            spinner.finish_clear();
         }
+        Ok(Self::new(result?, self.home().to_path_buf()))
     }
 
     fn home(&self) -> &Path {

@@ -54,7 +54,7 @@ impl Cmd {
             return print_forwards(&machine.list_forwards().await?);
         }
         let machine = machine
-            .for_access(crate::api::machine::WakeNotice::Announce)
+            .for_access(crate::api::machine::WakeNotice::Line)
             .await?;
 
         let forward = forward.ok_or_else(|| eyre::eyre!("forward endpoints are required"))?;

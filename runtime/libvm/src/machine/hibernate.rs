@@ -476,6 +476,12 @@ impl Machine {
             .as_ref()
             .map(|run| run.as_str().to_owned())
             .ok_or_else(|| failure(&config, "running generation is missing"))?;
+        if waiting_for_wake {
+            crate::machine::live_operations::report_progress(
+                progress,
+                crate::machine::live_operations::LiveOperationProgress::WaitingForAgent,
+            );
+        }
         let ready = self.wait_ready(Duration::from_secs(60)).await?;
         if !ready.status.readiness.ready {
             return Err(failure(

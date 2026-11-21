@@ -41,7 +41,7 @@ impl Cmd {
             reject_serial_forward_agent(self.forward_agent)?;
         }
         let machine = machine
-            .for_access(crate::api::machine::WakeNotice::Silent)
+            .for_access(crate::api::machine::WakeNotice::SpinnerIfSlow)
             .await?;
 
         if self.attach == Some(AttachMode::Serial) {

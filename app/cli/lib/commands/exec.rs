@@ -43,7 +43,7 @@ impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let (_reference, machine) = context.observation_machine(self.name.as_deref()).await?;
         let machine = machine
-            .for_access(crate::api::machine::WakeNotice::Announce)
+            .for_access(crate::api::machine::WakeNotice::Line)
             .await?;
         let inspect_data = machine.inspect().await?;
 

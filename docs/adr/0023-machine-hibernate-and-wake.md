@@ -282,8 +282,9 @@ The machine lifecycle lock serializes wake against `stop`, `rm` and
 `hibernate`. Any number of concurrent access commands produce one wake. A
 command that waited for a wake prints one line, `Waking NAME`, on standard
 error, so command output, JSON output and copied file contents are unaffected.
-`silo shell` is the exception: it wakes without the line and goes straight to
-the prompt.
+`silo shell` is the exception: it prints no line and goes straight to the
+prompt. If the wake takes longer than half a second it shows a spinner with the
+current step, which clears itself before the prompt appears.
 
 A command issued before a hibernate is never replayed after the wake.
 
