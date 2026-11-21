@@ -498,7 +498,11 @@ impl LocalVmService {
         timeout: Duration,
     ) -> eyre::Result<libvm::MachineStopOutcome> {
         let machine = self.machine(reference).await?;
-        if force {
+        let data = machine.inspect().await?;
+        // Force has something to end only on a running machine or a saved one.
+        // Otherwise the stop path reconciles terminal owners, storage outcome
+        // and durable operation pins, and succeeds on a stopped machine.
+        if force && (data.is_running() || data.hibernation.is_some()) {
             machine
                 .kill_with(MachineKillOptions::new().timeout(timeout))
                 .await?;
@@ -1782,6 +1786,16 @@ mod tests {
                             libvm::storage::hibernate_file::HibernateUnusableReason::FilesMissing,
                     })
                 ));
+            }
+            for repeated_force in [true, false] {
+                let repeated = local
+                    .stop_machine("saved", repeated_force, std::time::Duration::from_secs(30))
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("stopping a stopped machine (force={repeated_force}): {error}")
+                    });
+                assert_eq!(repeated.machine.status.label(), "stopped");
+                assert!(repeated.warning.is_none());
             }
         }
     }
