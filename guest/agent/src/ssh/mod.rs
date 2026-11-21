@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use tokio_vsock::VsockStream;
 use crate::pid1::ProcessSupervisor;
 
 pub(crate) mod agent;
-mod openssh;
+pub(crate) mod openssh;
 
 pub(crate) fn constrain_external_listener(
     process_supervisor: &ProcessSupervisor,
@@ -101,6 +102,28 @@ fn exclusive_sshd_command(command: &str, mode: &str) -> bool {
             "argv[]=/usr/sbin/sshd {mode} -f {} ;",
             crate::provision::ssh::CONFIG
         ))
+}
+
+/// The machine environment an SSH session inherits, identical for the native
+/// and OpenSSH backends. Names a session owns are dropped so they cannot leak
+/// across users: identity (`HOME`, `USER`, ...) comes from the authenticated
+/// account, `TERM` from the PTY request, `SSH_*` from the server and `SILO_*`
+/// from the client. An image's `USER=root` must not follow `silo shell -u alice`.
+pub(crate) fn inherited_environment(
+    environment: &BTreeMap<String, String>,
+) -> impl Iterator<Item = (&str, &str)> {
+    environment
+        .iter()
+        .filter(|(name, _)| !session_owned(name))
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+}
+
+fn session_owned(name: &str) -> bool {
+    matches!(
+        name,
+        "HOME" | "USER" | "LOGNAME" | "SHELL" | "MAIL" | "TERM"
+    ) || name.starts_with("SSH_")
+        || name.starts_with("SILO_")
 }
 
 #[derive(Clone)]

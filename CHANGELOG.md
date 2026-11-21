@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fixed: `silo shell` sessions start from the machine's process environment,
+  as `silo exec` does, so image settings such as `PATH` apply. In
+  `nixos/nix`, `nix` was "command not found" because the shell got a fixed
+  `/usr/bin:/bin` style `PATH`. `HOME`, `USER`, `LOGNAME`, `SHELL` and `TERM`
+  still come from the logged-in user and terminal. Images whose own OpenSSH
+  is older than 7.8 keep SSH working but get `sshd`'s default environment.
+  Running machines pick this up after a restart.
 - Added: `silo hibernate` saves a machine's memory and releases its host
   processes. `silo start`, guest access and opening a forward wake that same
   machine. Existing connections end; `silo stop` wakes and shuts down cleanly,

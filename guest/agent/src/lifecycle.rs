@@ -1227,7 +1227,7 @@ fn validate_hook(hook: &v1::ActivationHook) -> Result<(), Status> {
     }
     let mut names = std::collections::HashSet::new();
     for value in &hook.environment {
-        if !crate::ssh::agent::valid_environment_name(&value.name)
+        if !agent_spec::valid_environment_name(&value.name)
             || value.value.contains('\0')
             || value.value.len() > 32768
             || !names.insert(&value.name)

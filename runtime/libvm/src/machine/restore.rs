@@ -1283,6 +1283,7 @@ async fn launch_restored(
     let provenance = crate::guest_agent::build_config(crate::guest_agent::GuestAgentConfigInput {
         machine_name: &config.name,
         spec: &spec,
+        environment: &config.process.environment,
         network: &network,
         resize_rootfs: false,
         user: config.guest.user.as_ref(),

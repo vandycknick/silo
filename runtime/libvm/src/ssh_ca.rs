@@ -384,6 +384,7 @@ mod tests {
         let guest = crate::guest_agent::build_config(crate::guest_agent::GuestAgentConfigInput {
             machine_name: "snapshot",
             spec: &config.spec,
+            environment: &config.process.environment,
             network: &network,
             resize_rootfs: false,
             user: None,

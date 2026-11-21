@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -51,6 +51,7 @@ pub(crate) struct NativeSshBackend {
     server_config: Arc<Config>,
     process_supervisor: ProcessSupervisor,
     lifecycle: Arc<crate::lifecycle::RuntimeContext>,
+    environment: Arc<[(String, String)]>,
 }
 
 impl NativeSshBackend {
@@ -67,6 +68,9 @@ impl NativeSshBackend {
         lifecycle: Arc<crate::lifecycle::RuntimeContext>,
     ) -> eyre::Result<Self> {
         let auth = Arc::new(AuthDb::from_config(&config)?);
+        let environment = crate::ssh::inherited_environment(&config.environment)
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
         let server_config = Config {
             inactivity_timeout: None,
             methods: russh::MethodSet::from(&[russh::MethodKind::PublicKey][..]),
@@ -81,6 +85,7 @@ impl NativeSshBackend {
             server_config: Arc::new(server_config),
             process_supervisor,
             lifecycle,
+            environment,
         })
     }
 
@@ -118,6 +123,7 @@ impl NativeSshBackend {
             connection_id,
             auth: Arc::clone(&self.auth),
             process_supervisor: process_supervisor.clone(),
+            environment: Arc::clone(&self.environment),
             authenticated_user: None,
             permit_pty: false,
             permit_agent_forwarding: false,
@@ -197,6 +203,7 @@ struct NativeSshHandler {
     connection_id: u64,
     auth: Arc<AuthDb>,
     process_supervisor: ProcessSupervisor,
+    environment: Arc<[(String, String)]>,
     authenticated_user: Option<UserEntry>,
     permit_pty: bool,
     permit_agent_forwarding: bool,
@@ -383,7 +390,7 @@ impl Handler for NativeSshHandler {
             return Ok(());
         };
         if variable_name.starts_with("SILO_")
-            && valid_environment_name(variable_name)
+            && agent_spec::valid_environment_name(variable_name)
             && !variable_value.contains('\0')
         {
             state
@@ -636,6 +643,7 @@ impl NativeSshHandler {
             user,
             request,
             pty: state.pty.clone(),
+            inherited: Arc::clone(&self.environment),
             env: state.env.clone(),
             output: state
                 .output
@@ -758,6 +766,7 @@ struct ProcessLaunch {
     user: UserEntry,
     request: SessionRequest,
     pty: Option<PtyRequest>,
+    inherited: Arc<[(String, String)]>,
     env: HashMap<String, String>,
     agent_socket: Option<PathBuf>,
     output: Arc<russh::ChannelWriteHalf<Msg>>,
@@ -817,20 +826,13 @@ impl ProcessLaunch {
         }
         command.current_dir(&self.user.home);
         command.env_clear();
-        command.env("HOME", &self.user.home);
-        command.env("USER", &self.user.name);
-        command.env("LOGNAME", &self.user.name);
-        command.env("SHELL", shell);
-        command.env("PATH", DEFAULT_PATH);
-        if let Some(pty) = &self.pty {
-            command.env("TERM", &pty.term);
-        }
-        if let Some(agent_socket) = &self.agent_socket {
-            command.env("SSH_AUTH_SOCK", agent_socket);
-        }
-        for (key, value) in &self.env {
-            command.env(key, value);
-        }
+        command.envs(session_environment(
+            &self.inherited,
+            &self.user,
+            self.pty.as_ref().map(|pty| pty.term.as_str()),
+            self.agent_socket.as_deref(),
+            &self.env,
+        ));
         if new_process_group {
             command.process_group(0);
         }
@@ -1703,13 +1705,43 @@ enum OutputStream {
     Terminal,
 }
 
-pub(crate) fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+/// Session environment, later layers win:
+///
+/// ```text
+///   DEFAULT_PATH            fallback for images without PATH
+///   inherited machine env   same base as `silo exec` (session-owned names removed)
+///   session identity        HOME USER LOGNAME SHELL [TERM] [SSH_AUTH_SOCK]
+///   client SILO_*           explicit per-session input
+/// ```
+fn session_environment<'a>(
+    inherited: &'a [(String, String)],
+    user: &'a UserEntry,
+    term: Option<&'a str>,
+    agent_socket: Option<&'a Path>,
+    client: &'a HashMap<String, String>,
+) -> BTreeMap<&'a str, &'a OsStr> {
+    let mut environment = BTreeMap::from([("PATH", OsStr::new(DEFAULT_PATH))]);
+    environment.extend(
+        inherited
+            .iter()
+            .map(|(name, value)| (name.as_str(), OsStr::new(value))),
+    );
+    environment.insert("HOME", user.home.as_os_str());
+    environment.insert("USER", OsStr::new(&user.name));
+    environment.insert("LOGNAME", OsStr::new(&user.name));
+    environment.insert("SHELL", OsStr::new(user.shell()));
+    if let Some(term) = term {
+        environment.insert("TERM", OsStr::new(term));
+    }
+    if let Some(agent_socket) = agent_socket {
+        environment.insert("SSH_AUTH_SOCK", agent_socket.as_os_str());
+    }
+    environment.extend(
+        client
+            .iter()
+            .map(|(name, value)| (name.as_str(), OsStr::new(value))),
+    );
+    environment
 }
 
 fn valid_certificate(cert: &Certificate, ca: &PublicKey, user: &str, now: u64) -> bool {
@@ -2003,6 +2035,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn session_environment_inherits_machine_env_under_session_identity() {
+        use std::ffi::OsStr;
+        let user = crate::ssh::agent::UserEntry {
+            name: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            groups: Vec::new(),
+            home: "/home/alice".into(),
+            shell: "/bin/bash".into(),
+        };
+        let machine = std::collections::BTreeMap::from(
+            [
+                (
+                    "PATH",
+                    "/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin",
+                ),
+                ("NIX_PATH", "/nix/channels"),
+                ("USER", "root"),
+                ("HOME", "/root"),
+                ("LOGNAME", "root"),
+                ("SHELL", "/bin/sh"),
+                ("MAIL", "/var/mail/root"),
+                ("TERM", "dumb"),
+                ("SSH_AUTH_SOCK", "/image/agent.sock"),
+                ("SILO_MODE", "image"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+        );
+        // Same projection NativeSshBackend::new stores for every session.
+        let inherited: Vec<_> = crate::ssh::inherited_environment(&machine)
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        let client = HashMap::from([("SILO_MODE".to_string(), "client".to_string())]);
+        let socket = std::path::Path::new("/run/silo-ssh-agent/1/agent");
+
+        let environment = crate::ssh::agent::session_environment(
+            &inherited,
+            &user,
+            Some("xterm-256color"),
+            Some(socket),
+            &client,
+        );
+        let expected = [
+            (
+                "PATH",
+                "/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin",
+            ),
+            ("NIX_PATH", "/nix/channels"),
+            ("HOME", "/home/alice"),
+            ("USER", "alice"),
+            ("LOGNAME", "alice"),
+            ("SHELL", "/bin/bash"),
+            ("TERM", "xterm-256color"),
+            ("SSH_AUTH_SOCK", "/run/silo-ssh-agent/1/agent"),
+            ("SILO_MODE", "client"),
+        ]
+        .map(|(name, value)| (name, OsStr::new(value)))
+        .into();
+        assert_eq!(environment, expected);
+
+        // Without a PTY, agent forwarding, or client input, image-provided
+        // session names stay dropped instead of resurfacing.
+        let no_client = HashMap::new();
+        let environment =
+            crate::ssh::agent::session_environment(&inherited, &user, None, None, &no_client);
+        for name in ["TERM", "SSH_AUTH_SOCK", "SILO_MODE", "MAIL"] {
+            assert!(!environment.contains_key(name), "{name} leaked");
+        }
+
+        // An image without PATH still gets a usable search path.
+        let environment =
+            crate::ssh::agent::session_environment(&[], &user, None, None, &no_client);
+        assert_eq!(
+            environment["PATH"],
+            OsStr::new(crate::ssh::agent::DEFAULT_PATH)
+        );
+    }
+
+    #[test]
     fn native_host_key_persists_with_private_permissions_and_rejects_corruption() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
@@ -2053,6 +2164,7 @@ pub(crate) mod tests {
             let auth = Arc::new(
                 AuthDb::from_config(&agent_spec::AgentSshConfig {
                     trusted_ca: Some(ca.public_key().to_openssh().unwrap()),
+                    ..Default::default()
                 })
                 .unwrap(),
             );
@@ -2082,6 +2194,7 @@ pub(crate) mod tests {
                         connection_id: 1,
                         auth: auth.clone(),
                         process_supervisor: ProcessSupervisor::default(),
+                        environment: Arc::from([]),
                         authenticated_user: None,
                         permit_pty: false,
                         permit_agent_forwarding: false,

@@ -2715,6 +2715,7 @@ impl Runtime {
                 let agent_config = guest_agent::build_config(GuestAgentConfigInput {
                     machine_name: &config.name,
                     spec: &launch_spec,
+                    environment: &config.process.environment,
                     network,
                     resize_rootfs: resize_rootfs
                         && crate::machine::root_storage::allows_rootfs_resize(&root.storage),

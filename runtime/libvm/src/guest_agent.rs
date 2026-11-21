@@ -3,6 +3,8 @@ use agent_spec::{
     NetworkConfig as ProvisionNetworkConfig, NetworkInterfaceConfig, ProvisionConfig,
     ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType, UserdataRunPolicy,
 };
+use std::collections::BTreeMap;
+
 use utils::format_mac;
 use vm_spec::VmSpec;
 
@@ -18,6 +20,8 @@ use crate::network::VmmNetworkAttachment;
 pub(crate) struct GuestAgentConfigInput<'a> {
     pub(crate) machine_name: &'a str,
     pub(crate) spec: &'a VmSpec,
+    /// Machine process environment; SSH sessions start from it like `silo exec`.
+    pub(crate) environment: &'a BTreeMap<String, String>,
     pub(crate) network: &'a VmmNetworkAttachment,
     pub(crate) resize_rootfs: bool,
     pub(crate) user: Option<&'a MachineUserConfig>,
@@ -49,6 +53,7 @@ pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<Age
     build_config_with_host_context(
         input.machine_name,
         input.spec,
+        input.environment,
         input.network,
         input.resize_rootfs,
         &host_context,
@@ -59,6 +64,7 @@ pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<Age
 fn build_config_with_host_context(
     machine_name: &str,
     spec: &VmSpec,
+    environment: &BTreeMap<String, String>,
     network: &VmmNetworkAttachment,
     resize_rootfs: bool,
     host_context: &GuestAgentHostContext,
@@ -72,7 +78,7 @@ fn build_config_with_host_context(
             resize_rootfs,
             host_context,
         )?,
-        ssh: build_ssh_config(host_context),
+        ssh: build_ssh_config(host_context, environment),
         storage_shutdown: storage_shutdown.clone(),
     })
 }
@@ -186,9 +192,13 @@ fn build_provision_config(
     })
 }
 
-fn build_ssh_config(host_context: &GuestAgentHostContext) -> AgentSshConfig {
+fn build_ssh_config(
+    host_context: &GuestAgentHostContext,
+    environment: &BTreeMap<String, String>,
+) -> AgentSshConfig {
     AgentSshConfig {
         trusted_ca: Some(host_context.ssh_trusted_ca.clone()),
+        environment: environment.clone(),
     }
 }
 
@@ -276,6 +286,7 @@ fn parse_mac_string(mac: &str) -> eyre::Result<[u8; 6]> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use agent_spec::{AgentConfig, UserdataContentType, UserdataRunPolicy};
@@ -385,6 +396,7 @@ mod tests {
         let config = build_config_with_host_context(
             "demo",
             &sample_spec(Vec::new()),
+            &BTreeMap::new(),
             &VmmNetworkAttachment::None,
             false,
             &context,
@@ -656,9 +668,14 @@ mod tests {
 
     #[test]
     fn build_config_combines_provision_and_ssh_config() {
+        let environment = BTreeMap::from([(
+            "PATH".to_string(),
+            "/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin".to_string(),
+        )]);
         let config = build_config_with_host_context(
             "demo",
             &sample_spec(Vec::new()),
+            &environment,
             &VmmNetworkAttachment::None,
             true,
             &host_context(),
@@ -669,6 +686,7 @@ mod tests {
         assert!(config.provision.enabled);
         assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
         assert_eq!(config.ssh.trusted_ca, Some(host_context().ssh_trusted_ca));
+        assert_eq!(config.ssh.environment, environment);
     }
 
     #[test]

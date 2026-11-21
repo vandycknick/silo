@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,13 @@ impl AgentConfig {
             })?;
             if key.algorithm() != ssh_key::Algorithm::Ed25519 {
                 return Err(AgentConfigError::new("ssh.trusted_ca must be Ed25519"));
+            }
+        }
+        for (name, value) in &self.ssh.environment {
+            if !valid_environment_name(name) || value.contains('\0') {
+                return Err(AgentConfigError::new(format!(
+                    "ssh.environment contains an invalid variable {name:?}"
+                )));
             }
         }
 
@@ -109,6 +117,16 @@ impl std::fmt::Display for AgentConfigError {
 }
 
 impl std::error::Error for AgentConfigError {}
+
+/// POSIX portable environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+pub fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
 
 fn validate_nonempty(value: &str, field: &str) -> Result<(), AgentConfigError> {
     if value.trim().is_empty() {
@@ -275,6 +293,10 @@ fn validate_usable_ipv4(address: Ipv4Addr, field: &str) -> Result<(), AgentConfi
 pub struct AgentSshConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_ca: Option<String>,
+    /// Machine process environment that SSH sessions start from, so `silo shell`
+    /// sees the same image `PATH` and variables as `silo exec`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -836,6 +858,11 @@ provision:
                     .to_openssh()
                     .unwrap(),
                 ),
+                environment: [
+                    ("PATH".to_string(), "/root/.nix-profile/bin".to_string()),
+                    ("GREETING".to_string(), "hello \"world\"\n".to_string()),
+                ]
+                .into(),
             },
         };
 
@@ -865,6 +892,32 @@ provision:
         config.ssh.trusted_ca = Some(key.public_key().to_openssh().unwrap());
         config.validate().unwrap();
         assert!(serde_json::from_str::<AgentSshConfig>(r#"{"authorized_users":[]}"#).is_err());
+    }
+
+    #[test]
+    fn ssh_environment_rejects_unrepresentable_variables() {
+        let mut config = launch_config();
+        config.ssh.environment = [
+            ("PATH".to_string(), "/nix/bin:/bin".to_string()),
+            (
+                "_private2".to_string(),
+                "spaces and = signs\nnewline".to_string(),
+            ),
+        ]
+        .into();
+        config.validate().unwrap();
+        for (name, value) in [
+            ("", "empty"),
+            ("2FAST", "leading digit"),
+            ("BAD-NAME", "dash"),
+            ("BAD=NAME", "equals"),
+            ("NUL", "value\0byte"),
+        ] {
+            let mut config = launch_config();
+            config.ssh.environment = [(name.to_string(), value.to_string())].into();
+            let error = config.validate().expect_err(name).to_string();
+            assert!(error.contains("ssh.environment"), "{error}");
+        }
     }
 
     #[test]

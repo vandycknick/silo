@@ -18,7 +18,7 @@ use crate::pid1::ProcessSupervisor;
 
 const SSHD_RUNTIME_DIR: &str = "/run/sshd";
 const SSHD_RUNTIME_DIR_MODE: u32 = 0o755;
-const OPENSSH_SERVER_PATH: &str = "/usr/sbin/sshd";
+pub(crate) const OPENSSH_SERVER_PATH: &str = "/usr/sbin/sshd";
 const OPENSSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENSSH_READY_POLL: Duration = Duration::from_millis(250);
 const UNIX_MODE_BITS: u32 = 0o7777;
@@ -526,7 +526,7 @@ fn log_stderr_blocking(stderr: std::process::ChildStderr) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::ssh::openssh::{
         assess_runtime_dir, SshdRuntimeDirDisposition, SshdRuntimeDirKind, SSHD_RUNTIME_DIR_MODE,
     };
@@ -537,7 +537,7 @@ mod tests {
     use std::process::{Command, ExitStatus};
     use std::sync::{mpsc, Arc};
 
-    fn test_sshd() -> PathBuf {
+    pub(crate) fn test_sshd() -> PathBuf {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
             .map(|dir| dir.join("sshd"))
             .chain([
@@ -671,7 +671,8 @@ mod tests {
         let config = home.path().join("sshd_config");
         std::fs::write(
             &config,
-            crate::provision::ssh::policy(&ca_path, &host_path).replace("UsePAM yes", "UsePAM no"),
+            crate::provision::ssh::policy(&ca_path, &host_path, &Default::default())
+                .replace("UsePAM yes", "UsePAM no"),
         )
         .unwrap();
         crate::ssh::openssh::verify_effective_config(
@@ -837,12 +838,163 @@ mod tests {
         }
     }
 
+    async fn connect_inetd(
+        sshd: &Path,
+        config: &Path,
+        host: &russh::keys::PrivateKey,
+        overrides: &[String],
+    ) -> (
+        russh::client::Handle<crate::ssh::agent::tests::Client>,
+        tokio::process::Child,
+    ) {
+        use std::process::Stdio;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut command = tokio::process::Command::new(sshd);
+        command
+            .arg("-i")
+            .arg("-e")
+            .arg("-f")
+            .arg(config)
+            .args(overrides)
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(
+                server.try_clone().unwrap(),
+            )))
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(server)))
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let stream = tokio::net::TcpStream::from_std(client).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            russh::client::connect_stream(
+                Arc::new(Default::default()),
+                stream,
+                crate::ssh::agent::tests::Client {
+                    key: host.public_key().clone(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        match result {
+            Ok(client) => (client, child),
+            Err(error) => {
+                use tokio::io::AsyncReadExt;
+                let _ = child.kill().await;
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .await
+                    .unwrap();
+                panic!("sshd handshake failed: {error}; {stderr}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn real_sshd_session_inherits_machine_environment_under_session_identity() {
+        use crate::ssh::agent::tests::certificate;
+        use russh::keys::ssh_key::{private::Ed25519Keypair, LineEnding, PrivateKey};
+        let sshd = test_sshd();
+        let home = tempfile::tempdir().unwrap();
+        let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let host = PrivateKey::from(Ed25519Keypair::from_seed(&[5; 32]));
+        let ca_path = home.path().join("ca.pub");
+        let host_path = home.path().join("host");
+        std::fs::write(&ca_path, ca.public_key().to_openssh().unwrap()).unwrap();
+        host.write_openssh_file(&host_path, LineEnding::LF).unwrap();
+        let environment = std::collections::BTreeMap::from(
+            [
+                ("PATH", "/nix/profile/bin:/usr/bin:/bin"),
+                ("TRICKY", "a \"quoted\" \\back # hash 'single'"),
+                ("EMPTY", ""),
+                ("MULTILINE", "first\nsecond"),
+                ("USER", "image-user"),
+                ("HOME", "/image-home"),
+                ("SILO_MODE", "image"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+        );
+        let config = home.path().join("sshd_config");
+        // Unprivileged fixture: PAM account checks need the guest's root-owned
+        // PAM service, so this exercises the same policy with PAM disabled.
+        std::fs::write(
+            &config,
+            crate::provision::ssh::policy(&ca_path, &host_path, &environment)
+                .replace("UsePAM yes", "UsePAM no"),
+        )
+        .unwrap();
+        crate::ssh::openssh::verify_effective_config(
+            &crate::pid1::ProcessSupervisor::default(),
+            &sshd,
+            &config,
+        )
+        .unwrap();
+        let account = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (key, cert) = certificate(&ca, &account.name, now - 60, now + 300, false, false);
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let (mut client, child) = connect_inetd(&sshd, &config, &host, &[]).await;
+            assert!(client
+                .authenticate_openssh_cert(&account.name, key, cert)
+                .await
+                .unwrap()
+                .success());
+            let mut channel = client.channel_open_session().await.unwrap();
+            channel.set_env(true, "SILO_MODE", "client").await.unwrap();
+            channel.exec(true, "env -0").await.unwrap();
+            let mut stdout = Vec::new();
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            client
+                .disconnect(russh::Disconnect::ByApplication, "done", "en")
+                .await
+                .unwrap();
+            drop(child);
+            let session: std::collections::BTreeMap<_, _> = String::from_utf8(stdout)
+                .unwrap()
+                .split('\0')
+                .filter_map(|entry| entry.split_once('='))
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            // sshd runs the command through the account's shell, whose startup
+            // files may prepend entries; sshd's own default PATH never has this.
+            assert!(
+                session["PATH"].ends_with("/nix/profile/bin:/usr/bin:/bin"),
+                "{session:?}"
+            );
+            assert_eq!(session["TRICKY"], "a \"quoted\" \\back # hash 'single'");
+            assert_eq!(session["EMPTY"], "");
+            assert!(!session.contains_key("MULTILINE"), "{session:?}");
+            assert_eq!(session["USER"], account.name);
+            assert_eq!(session["HOME"], account.dir.to_string_lossy());
+            assert_eq!(session["SILO_MODE"], "client");
+        })
+        .await
+        .expect("bounded real sshd session");
+    }
+
     #[tokio::test]
     async fn real_sshd_inetd_is_ca_only_and_ignores_stale_authorized_key() {
-        use crate::ssh::agent::tests::{certificate, Client};
+        use crate::ssh::agent::tests::certificate;
         use russh::keys::ssh_key::{private::Ed25519Keypair, LineEnding, PrivateKey};
-        use std::process::Stdio;
-        use std::sync::Arc;
         let sshd = test_sshd();
         let home = tempfile::tempdir().unwrap();
         let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
@@ -857,7 +1009,8 @@ mod tests {
         // credential policy with account management disabled for its own UID.
         std::fs::write(
             &config,
-            crate::provision::ssh::policy(&ca_path, &host_path).replace("UsePAM yes", "UsePAM no"),
+            crate::provision::ssh::policy(&ca_path, &host_path, &Default::default())
+                .replace("UsePAM yes", "UsePAM no"),
         )
         .unwrap();
         crate::ssh::openssh::verify_effective_config(
@@ -878,63 +1031,8 @@ mod tests {
         let stale = home.path().join("authorized_keys");
         std::fs::write(&stale, key.public_key().to_openssh().unwrap()).unwrap();
 
-        async fn connect(
-            sshd: &std::path::Path,
-            config: &std::path::Path,
-            host: &PrivateKey,
-            overrides: &[String],
-        ) -> (russh::client::Handle<Client>, tokio::process::Child) {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server, _) = listener.accept().unwrap();
-            let mut command = tokio::process::Command::new(sshd);
-            command
-                .arg("-i")
-                .arg("-e")
-                .arg("-f")
-                .arg(config)
-                .args(overrides)
-                .stdin(Stdio::from(std::os::fd::OwnedFd::from(
-                    server.try_clone().unwrap(),
-                )))
-                .stdout(Stdio::from(std::os::fd::OwnedFd::from(server)))
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            let mut child = command.spawn().unwrap();
-            client.set_nonblocking(true).unwrap();
-            let stream = tokio::net::TcpStream::from_std(client).unwrap();
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                russh::client::connect_stream(
-                    Arc::new(Default::default()),
-                    stream,
-                    Client {
-                        key: host.public_key().clone(),
-                    },
-                ),
-            )
-            .await
-            .unwrap();
-            match result {
-                Ok(client) => (client, child),
-                Err(error) => {
-                    use tokio::io::AsyncReadExt;
-                    let _ = child.kill().await;
-                    let mut stderr = String::new();
-                    child
-                        .stderr
-                        .take()
-                        .unwrap()
-                        .read_to_string(&mut stderr)
-                        .await
-                        .unwrap();
-                    panic!("sshd handshake failed: {error}; {stderr}");
-                }
-            }
-        }
-
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (mut client, mut child) = connect(&sshd, &config, &host, &[]).await;
+            let (mut client, mut child) = connect_inetd(&sshd, &config, &host, &[]).await;
             assert!(!client.authenticate_none(&user).await.unwrap().success());
             assert!(!client.authenticate_password(&user, "not-a-password").await.unwrap().success());
             assert!(!client.authenticate_publickey(&user, russh::keys::PrivateKeyWithHashAlg::new(key.clone(), None)).await.unwrap().success());
@@ -951,7 +1049,7 @@ mod tests {
             assert!(log.contains("silo:cli:uid1000:test") && log.contains("CA ED25519"), "{log}");
 
             let overrides = vec!["-o".into(), format!("AuthorizedKeysFile={}", stale.display()), "-o".into(), "PubkeyAcceptedAlgorithms=ssh-ed25519".into(), "-o".into(), "StrictModes=no".into()];
-            let (mut control, _child) = connect(&sshd, &config, &host, &overrides).await;
+            let (mut control, _child) = connect_inetd(&sshd, &config, &host, &overrides).await;
             assert!(control.authenticate_publickey(&user, russh::keys::PrivateKeyWithHashAlg::new(key.clone(), None)).await.unwrap().success(), "stale-key control must authenticate to prove account eligibility");
             control.disconnect(russh::Disconnect::ByApplication, "done", "en").await.unwrap();
             let other = PrivateKey::from(Ed25519Keypair::from_seed(&[4; 32]));
@@ -964,7 +1062,7 @@ mod tests {
                 (&ca, user.as_str(), now - 60, now + 300, false, true),
             ] {
                 let (key, cert) = certificate(signer, principal, after, before, host_type, critical);
-                let (mut client, _child) = connect(&sshd, &config, &host, &[]).await;
+                let (mut client, _child) = connect_inetd(&sshd, &config, &host, &[]).await;
                 assert!(!client.authenticate_openssh_cert(&user, key, cert).await.unwrap().success(), "invalid certificate accepted: {principal} {after} {before} {host_type} {critical}");
                 client.disconnect(russh::Disconnect::ByApplication, "done", "en").await.unwrap();
             }

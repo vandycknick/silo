@@ -11,6 +11,7 @@ use std::sync::{mpsc as std_mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use agent_spec::valid_environment_name;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -34,7 +35,7 @@ use uuid::Uuid;
 use crate::pid1::{ChildGuard, ProcessSupervisor};
 use crate::ssh::agent::{
     attach_pty_slave, open_process_pty, prepare_identity_child, prepare_pty_child,
-    resize_process_pty, signal_process_group, valid_environment_name,
+    resize_process_pty, signal_process_group,
 };
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
