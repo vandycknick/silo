@@ -1122,7 +1122,15 @@ fn validate_activation(
         if let Some(value) = request.ssh_trusted_ca.as_deref() {
             let ca = crate::provision::ssh::parse_ca(value)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            if runtime.ssh_trusted_ca().as_ref().map(|key| key.key_data()) != Some(ca.key_data()) {
+            // A clone activation keeps its replacement authority in memory. A
+            // machine that was only ever booted has none there, and trusts
+            // the authority provisioned on disk at boot.
+            let retained = runtime.ssh_trusted_ca().clone().or_else(|| {
+                std::fs::read_to_string(crate::provision::ssh::CA)
+                    .ok()
+                    .and_then(|line| crate::provision::ssh::parse_ca(&line).ok())
+            });
+            if retained.as_ref().map(|key| key.key_data()) != Some(ca.key_data()) {
                 return Err(Status::failed_precondition(
                     "Cannot wake with different SSH trust; restore the machine's original SSH authority",
                 ));

@@ -53,6 +53,13 @@ pub(crate) enum VmmNetworkAttachment {
     },
 }
 
+/// Guest network settings recorded for a running machine's network instance.
+pub(crate) fn persisted_restore_network(
+    instance: &NetworkInstance,
+) -> Result<vm_spec::restore::RestoreNetwork, serde_json::Error> {
+    netd_driver::persisted_restore_network(&instance.attachment_json)
+}
+
 impl VmmNetworkAttachment {
     pub(crate) fn exit_writer(&self) -> Option<&std::os::fd::OwnedFd> {
         match self {

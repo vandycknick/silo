@@ -750,24 +750,6 @@ fn check_space(config: &MachineConfig, estimate: u64, free_bytes: u64) -> Result
     Ok(())
 }
 
-pub(crate) fn restore_network(
-    network: &crate::network::VmmNetworkAttachment,
-) -> Option<vm_spec::restore::RestoreNetwork> {
-    match network {
-        crate::network::VmmNetworkAttachment::None => None,
-        crate::network::VmmNetworkAttachment::UnixDatagram { mac, ipv4, dns, .. } => {
-            Some(vm_spec::restore::RestoreNetwork {
-                mac: mac.clone(),
-                ipv4: ipv4.address,
-                prefix_length: ipv4.prefix_length,
-                gateway: ipv4.gateway,
-                dns_servers: dns.servers.clone(),
-                dns_search: dns.search.clone(),
-            })
-        }
-    }
-}
-
 async fn saved_network(
     runtime: &Runtime,
     config: &MachineConfig,
@@ -788,9 +770,9 @@ async fn saved_network(
         .network_instance(&attachment.network_instance_id)
         .await?
         .ok_or_else(|| failure(config, "the running network configuration is missing"))?;
-    let network =
-        serde_json::from_str(&instance.attachment_json).map_err(|error| failure(config, error))?;
-    Ok(restore_network(&network))
+    crate::network::persisted_restore_network(&instance)
+        .map(Some)
+        .map_err(|error| failure(config, error))
 }
 
 fn checked_file(

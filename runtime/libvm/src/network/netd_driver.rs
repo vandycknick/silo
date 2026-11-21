@@ -49,12 +49,27 @@ struct NetdDriverState {
     pcap: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct PersistedNetworkAttachment {
     mac: String,
     ipv4: NetworkIpv4Config,
     dns: NetworkDnsConfig,
     requires_certificate_authority: bool,
+}
+
+/// Guest network settings of a running attachment, as wake must reapply them.
+pub(super) fn persisted_restore_network(
+    attachment_json: &str,
+) -> Result<vm_spec::restore::RestoreNetwork, serde_json::Error> {
+    let attachment: PersistedNetworkAttachment = serde_json::from_str(attachment_json)?;
+    Ok(vm_spec::restore::RestoreNetwork {
+        mac: attachment.mac,
+        ipv4: attachment.ipv4.address,
+        prefix_length: attachment.ipv4.prefix_length,
+        gateway: attachment.ipv4.gateway,
+        dns_servers: attachment.dns.servers,
+        dns_search: attachment.dns.search,
+    })
 }
 
 #[async_trait]
@@ -1223,6 +1238,30 @@ netd log: /tmp/silo/netd.log";
         assert_eq!(ipv4.gateway.to_string(), "192.168.105.1");
         assert_eq!(ipv4.prefix_length, 24);
         assert_eq!(dns.servers[0].to_string(), "192.168.105.1");
+    }
+
+    #[test]
+    fn persisted_attachment_yields_the_guest_settings_wake_reapplies() {
+        let (ipv4, dns) =
+            private_ipv4_config("192.168.105.37/24", "devbox").expect("private IPv4 config");
+        let stored =
+            serde_json::to_string(&crate::network::netd_driver::PersistedNetworkAttachment {
+                mac: "02:69:ef:74:77:45".into(),
+                ipv4: ipv4.clone(),
+                dns: dns.clone(),
+                requires_certificate_authority: false,
+            })
+            .unwrap();
+        let restored = crate::network::netd_driver::persisted_restore_network(&stored).unwrap();
+        assert_eq!(restored.mac, "02:69:ef:74:77:45");
+        assert_eq!(restored.ipv4, ipv4.address);
+        assert_eq!(restored.prefix_length, ipv4.prefix_length);
+        assert_eq!(restored.gateway, ipv4.gateway);
+        assert_eq!(restored.dns_servers, dns.servers);
+        assert_eq!(restored.dns_search, dns.search);
+        assert!(
+            crate::network::netd_driver::persisted_restore_network(r#"{"kind":"none"}"#).is_err()
+        );
     }
 
     #[test]

@@ -204,8 +204,10 @@ struct Roles<'a> {
     mux: Option<OwnedFd>,
 }
 
-/// The original writable descriptors and their configured paths must still
-/// match the cut both before construction and before announcing prepared.
+/// The original writable descriptors must still match the cut, and the cut's
+/// host paths must still name those same files, both before construction and
+/// before announcing prepared. The worker's configured disk path is its own
+/// inherited descriptor, so it is not compared.
 fn validate_hibernation_disks(
     config: &KrunConfig,
     request: &RestoreRequest,
@@ -238,7 +240,7 @@ fn validate_hibernation_disks(
         // duplicating its descriptor. The wrapper cannot close it.
         let file =
             std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(descriptor.as_raw_fd()) });
-        crate::restore::inputs::validate_hibernation_file(&file, &disk.path, &saved.file)?;
+        crate::restore::inputs::validate_hibernation_file(&file, &saved.file.path, &saved.file)?;
     }
     Ok(())
 }
@@ -1476,22 +1478,29 @@ pub(crate) mod tests {
                 read_only: false,
             });
         let handles = vec![std::os::fd::OwnedFd::from(file)];
+        // The worker's configured path is its inherited descriptor, never the
+        // host path, so it takes no part in the comparison.
+        config.disks[0].path = std::path::PathBuf::from("/proc/self/fd/9");
         validate_hibernation_disks(&config, &launch.request, &handles).unwrap();
-        config.disks[0].path = directory.join("copy.raw");
-        std::fs::copy(&path, &config.disks[0].path).unwrap();
+        let aside = directory.join("aside.raw");
+        std::fs::copy(&path, directory.join("copy.raw")).unwrap();
+        std::fs::rename(&path, &aside).unwrap();
+        std::fs::rename(directory.join("copy.raw"), &path).unwrap();
         let error = validate_hibernation_disks(&config, &launch.request, &handles).unwrap_err();
         assert!(error
             .get_ref()
             .unwrap()
             .is::<vm_spec::hibernate::HibernateFileMismatch>());
-        config.disks[0].path = path.clone();
         std::os::unix::fs::FileExt::write_all_at(&launch.files.objects[0], b"forbidden", 0)
             .unwrap_err();
-        let replacement = std::fs::File::open(directory.join("copy.raw")).unwrap();
+        let replacement = std::fs::File::open(&path).unwrap();
         assert!(
             validate_hibernation_disks(&config, &launch.request, &[replacement.into()]).is_err()
         );
-        validate_hibernation_disks(&config, &launch.request, &handles).unwrap();
+        // Moving the original changed its ctime, so it stays refused even
+        // when put back: the facts are no longer those of the cut.
+        std::fs::rename(&aside, &path).unwrap();
+        assert!(validate_hibernation_disks(&config, &launch.request, &handles).is_err());
         drop((handles, launch));
         std::fs::remove_dir_all(directory).unwrap();
     }
