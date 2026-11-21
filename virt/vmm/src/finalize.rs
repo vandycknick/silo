@@ -116,7 +116,15 @@ impl Finalization<'_> {
         };
         let last_error = result.as_ref().err().map(format_error_chain);
         if let Some(exec_log) = self.exec_log {
-            exec_log.generation(self.machine_id, self.run_id, "stopped");
+            let state = if backend_exit
+                .as_ref()
+                .is_some_and(|(_, exit)| exit.hibernated())
+            {
+                "hibernated"
+            } else {
+                "stopped"
+            };
+            exec_log.generation(self.machine_id, self.run_id, state);
         }
         if let Some(full_error) = &last_error {
             tracing::error!(error = %full_error, data_dir = %self.data_dir.display(), "silo-vmm exiting with error");

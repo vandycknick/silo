@@ -1142,11 +1142,28 @@ pub(crate) fn control_failure(failure: ControlFailure) -> NativeFailure {
 }
 
 fn live_failure(error: LiveError) -> NativeFailure {
+    if is_out_of_space(&error) {
+        return NativeFailure::with_detail(NativeFailureKind::OutOfSpace, error);
+    }
     match error {
         LiveError::Control(failure) => control_failure(failure),
         LiveError::Operation { cause, .. } => live_failure(cause.as_ref().clone()),
         other => NativeFailure::with_detail(NativeFailureKind::Participant, other),
     }
+}
+
+fn is_out_of_space(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            error.kind() == std::io::ErrorKind::StorageFull
+                || matches!(error.raw_os_error(), Some(code) if code == nix::errno::Errno::ENOSPC as i32 || code == nix::errno::Errno::EDQUOT as i32)
+        }) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1177,6 +1194,27 @@ mod tests {
         generation_failure, provider_device, recoverable_memory_cut,
     };
     use crate::virt::lifecycle::{GenerationFailureKind, ProviderDevice, VirtioKind};
+
+    #[test]
+    fn hibernate_storage_failures_keep_the_typed_out_of_space_reason() {
+        use crate::krun::worker::native::{is_out_of_space, live_failure};
+        use crate::virt::lifecycle::NativeFailureKind;
+        for code in [nix::errno::Errno::ENOSPC, nix::errno::Errno::EDQUOT] {
+            let error = std::io::Error::from_raw_os_error(code as i32);
+            assert!(is_out_of_space(&error));
+            let error = libkrun::live::LiveError::Io {
+                role: libkrun::live::OutputRole::Ram,
+                source: std::sync::Arc::new(error),
+            };
+            assert_eq!(live_failure(error).kind, NativeFailureKind::OutOfSpace);
+        }
+        assert!(!is_out_of_space(&std::io::Error::other(
+            "No space left on device"
+        )));
+        assert!(!is_out_of_space(&std::io::Error::from_raw_os_error(
+            nix::errno::Errno::EIO as i32
+        )));
+    }
 
     #[test]
     fn first_capture_keeps_native_no_baseline_fallback_instead_of_forcing_full() {

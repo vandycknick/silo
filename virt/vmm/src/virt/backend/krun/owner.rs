@@ -58,8 +58,10 @@ impl Phase {
 
 pub(crate) struct Owner {
     pub(crate) state: watch::Sender<Phase>,
+    pub(crate) worker_pid: watch::Sender<Option<u32>>,
     pub(crate) stop: CancellationToken,
     pub(crate) force: CancellationToken,
+    pub(crate) hibernate: CancellationToken,
     pub(crate) reclaim: watch::Sender<Option<HostMemoryReclaimReport>>,
 }
 
@@ -311,6 +313,7 @@ impl Owner {
             );
         }
         let pid = child.id().unwrap_or_default();
+        self.worker_pid.send_replace(Some(pid));
         tracing::info!(worker_pid = pid, "krun worker spawned");
         let tail = Arc::new(Mutex::new(Tail::default()));
         let mut diagnostic_task = tokio::spawn(collect_diagnostics(diagnostics, pid, tail.clone()));
@@ -354,7 +357,14 @@ impl Owner {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 },
-                _ = self.force.cancelled(), if !escalated => {
+                _ = self.hibernate.cancelled(), if !stopping => {
+                    stopping = true;
+                    if let Err(error) = force(&mut child, ForceReason::Hibernate, &mut forced) {
+                        failure.get_or_insert_with(|| format!("release saved worker: {error}"));
+                    }
+                    stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;
+                }
+                _ = self.force.cancelled(), if !escalated && forced != Some(ForceReason::Hibernate) => {
                     escalated = true;
                     shutdown_requested = true;
                     stopping = true;
@@ -464,6 +474,7 @@ impl Owner {
             }
         };
         self.state.send_replace(Phase::Reaped);
+        self.worker_pid.send_replace(None);
         if !transmitted {
             transmission.abort();
             let _ = transmission.await;

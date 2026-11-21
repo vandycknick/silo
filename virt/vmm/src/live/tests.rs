@@ -1511,7 +1511,7 @@ async fn live_capture_failure_before_seal_writes_diagnostics_and_continues() {
     let observation = harness.capture_settled(&request).await;
     assert_eq!(
         failure_code(&observation.operation),
-        LiveFailureCode::MemoryCaptureFailed
+        LiveFailureCode::OutOfSpace
     );
     assert_eq!(observation.state, VmLifecycleState::Running);
     let facts = observation.capture.unwrap();
@@ -2215,4 +2215,409 @@ async fn owned_cut_cancel_and_record_collision_leave_the_source_baseline_unaccep
         assert_eq!(cut.stats.identity_bytes_hashed, 0);
         harness.stop().await;
     }
+}
+
+impl Harness {
+    fn hibernate_plan(
+        &self,
+        request: &LiveId,
+        paused: Option<&vm_spec::lifecycle::CurrentPause>,
+    ) -> vm_spec::capture::CapturePlan {
+        use vm_spec::capture::*;
+        let mut plan = self.capture_plan(
+            request,
+            paused.map_or(CapturePauseAuthority::Acquire, |paused| {
+                CapturePauseAuthority::Borrow {
+                    pause_operation_id: paused.operation_id.clone(),
+                    token: paused.token.clone(),
+                }
+            }),
+            CaptureResumePolicy::Preserve,
+        );
+        plan.mode = CaptureMode::Hibernate {
+            directory: self.root.join("hibernation").join(request.as_str()),
+        };
+        plan.identity_policy = CaptureIdentityPolicy::None;
+        plan.reservation.staging_bytes = 0;
+        // Requiring a clone would fail on unsupported filesystems if Hibernate
+        // accidentally reached the ordinary disk materialization stage.
+        for disk in &mut plan.disks {
+            disk.copy = CaptureDiskCopy::Clone;
+        }
+        plan
+    }
+
+    fn hibernate_status(&self, request: &LiveId) -> vm_spec::capture::HibernateCaptureStatus {
+        self.live
+            .control_hibernate_capture(&self.envelope(&live_id(Uuid::new_v4())), request, false)
+            .unwrap()
+    }
+
+    async fn hibernate_phase(
+        &self,
+        request: &LiveId,
+        phase: vm_spec::capture::HibernateCapturePhase,
+    ) -> vm_spec::capture::HibernateCaptureStatus {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = self.hibernate_status(request);
+            if status.phase == phase {
+                return status;
+            }
+            assert_ne!(
+                status.phase,
+                vm_spec::capture::HibernateCapturePhase::Failed,
+                "{status:?}"
+            );
+            assert!(tokio::time::Instant::now() < deadline, "{status:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn authorize_hibernate_write(&self, request: &LiveId) {
+        self.live
+            .control_hibernate_capture(&self.envelope(&live_id(Uuid::new_v4())), request, true)
+            .unwrap();
+    }
+
+    async fn release_hibernate(
+        &self,
+        request: &LiveId,
+        disposition: vm_spec::capture::CaptureReleaseDisposition,
+    ) -> vm_spec::lifecycle::ReleaseCaptureOutcome {
+        let result = self
+            .run(LiveCommand::ReleaseCapture(
+                vm_spec::lifecycle::ReleaseCaptureCommand {
+                    envelope: self.envelope(&live_id(Uuid::new_v4())),
+                    operation_id: request.clone(),
+                    disposition,
+                },
+            ))
+            .await;
+        let LiveCommandResult::ReleaseCapture(outcome) = result else {
+            panic!("{result:?}")
+        };
+        outcome
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_hibernate_saves_in_place_and_only_commit_kills_without_shutdown() {
+    use std::os::unix::fs::MetadataExt;
+    use vm_spec::capture::{CaptureReleaseDisposition, HibernateCapturePhase};
+    let harness = Harness::start_shaped(
+        Some(serde_json::json!({"capture":{"ramBytes":1 << 20}})),
+        timeouts(),
+        true,
+        Some(1),
+        ROOT_DISK_BYTES,
+    )
+    .await;
+    let request = live_id(Uuid::new_v4());
+    let root_before = std::fs::metadata(harness.root.join("root.raw")).unwrap();
+    harness
+        .capture(harness.hibernate_plan(&request, None))
+        .await;
+    let ready = harness
+        .hibernate_phase(&request, HibernateCapturePhase::AwaitingWrite)
+        .await;
+    assert!(ready.populated_memory_estimate_bytes.unwrap() > 0);
+    let directory = harness.root.join("hibernation").join(request.as_str());
+    assert_eq!(
+        std::fs::metadata(directory.join("memory.ram"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        harness.store.live_snapshot().unwrap().state,
+        VmLifecycleState::Hibernating
+    );
+    harness.authorize_hibernate_write(&request);
+    let prepared = harness
+        .hibernate_phase(&request, HibernateCapturePhase::Prepared)
+        .await;
+    let cut = prepared.cut.unwrap();
+    cut.validate().unwrap();
+    assert_eq!(cut.saved_files.len(), 4);
+    assert_eq!(cut.writable_disks.len(), 1);
+    assert_eq!(cut.writable_disks[0].file.inode, root_before.ino());
+    assert_eq!(
+        cut.writable_disks[0].file.path,
+        harness.root.join("root.raw")
+    );
+    assert_eq!(
+        std::fs::metadata(harness.root.join("root.raw"))
+            .unwrap()
+            .mode(),
+        root_before.mode()
+    );
+    for saved in &cut.saved_files {
+        let file = std::fs::File::open(&saved.file.path).unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.ino(), saved.file.inode);
+        assert_eq!(metadata.len(), saved.file.size);
+        assert_eq!(metadata.mode(), saved.file.mode);
+        assert_eq!(metadata.mtime(), saved.file.modified_seconds);
+        assert_eq!(metadata.mtime_nsec(), saved.file.modified_nanoseconds);
+        assert_eq!(metadata.ctime(), saved.file.changed_seconds);
+        assert_eq!(metadata.ctime_nsec(), saved.file.changed_nanoseconds);
+    }
+    assert!(!directory.join("disks").exists());
+    assert!(!directory.join("map-nodes").exists());
+    assert!(!directory.join("memory.root").exists());
+    assert_eq!(
+        std::fs::metadata(directory.join("memory.changes"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(harness.machine.try_wait().await.unwrap().is_none());
+    assert!(matches!(
+        harness.native_control().await,
+        crate::virt::lifecycle::NativeControl::Paused { .. }
+    ));
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("record.json")).unwrap()).unwrap();
+    assert_eq!(record["status"]["phase"], "prepared");
+    assert_eq!(record["runId"], harness.run_id.as_str());
+    assert!(!directory.join("committed.json").exists());
+    let outcome = harness
+        .release_hibernate(&request, CaptureReleaseDisposition::Published)
+        .await;
+    let vm_spec::lifecycle::ReleaseCaptureOutcome::Released { released } = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(released.state, VmLifecycleState::Hibernated);
+    assert!(harness.machine.wait().await.unwrap().hibernated());
+    assert_eq!(
+        harness.hibernate_status(&request).phase,
+        HibernateCapturePhase::Released
+    );
+    assert_eq!(
+        harness.hibernate_status(&request).terminal_outcome(),
+        Some(vm_spec::capture::CaptureTerminalOutcome::WorkerKilledWithoutShutdown)
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("committed.json")).unwrap()).unwrap();
+    assert_eq!(record["status"]["phase"], "committed");
+    assert_eq!(
+        harness.store.live_snapshot().unwrap().state,
+        VmLifecycleState::Hibernated
+    );
+    assert!(!harness.gate.reopen());
+    assert!(cut.saved_files.iter().all(|saved| saved.file.path.exists()));
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_hibernate_write_failure_and_enospc_roll_back_running_and_user_paused_sources() {
+    use vm_spec::capture::HibernateCapturePhase;
+    for paused in [false, true] {
+        for stage in ["execution", "memory"] {
+            let mut capture = serde_json::json!({"ramBytes":1 << 20});
+            capture[stage] = serde_json::json!([{"result":"fail"}]);
+            let harness = Harness::start_shaped(
+                Some(serde_json::json!({"capture":capture})),
+                timeouts(),
+                true,
+                Some(1),
+                ROOT_DISK_BYTES,
+            )
+            .await;
+            let current = if paused {
+                let pause = harness.pause().await;
+                Some(harness.settled(&pause).await.current_pause.unwrap())
+            } else {
+                None
+            };
+            let request = live_id(Uuid::new_v4());
+            harness
+                .capture(harness.hibernate_plan(&request, current.as_ref()))
+                .await;
+            harness
+                .hibernate_phase(&request, HibernateCapturePhase::AwaitingWrite)
+                .await;
+            harness.authorize_hibernate_write(&request);
+            let failed = harness.capture_settled(&request).await;
+            assert_eq!(
+                failed.state,
+                if paused {
+                    VmLifecycleState::Paused
+                } else {
+                    VmLifecycleState::Running
+                }
+            );
+            assert_eq!(failed.current_pause, current);
+            assert_eq!(
+                failure_code(&failed.operation),
+                if stage == "memory" {
+                    LiveFailureCode::OutOfSpace
+                } else {
+                    LiveFailureCode::ExecutionCaptureFailed
+                }
+            );
+            assert_eq!(
+                harness.hibernate_status(&request).phase,
+                HibernateCapturePhase::Failed
+            );
+            assert!(!harness
+                .root
+                .join("hibernation")
+                .join(request.as_str())
+                .exists());
+            assert!(harness.machine.try_wait().await.unwrap().is_none());
+            harness.stop().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_hibernate_abort_before_commit_removes_files_and_restores_original_pause() {
+    use vm_spec::capture::{CaptureReleaseDisposition, HibernateCapturePhase};
+    for paused in [false, true] {
+        for after_write in [false, true] {
+            let harness = Harness::start_shaped(
+                Some(serde_json::json!({"capture":{"ramBytes":1 << 20}})),
+                timeouts(),
+                true,
+                Some(1),
+                ROOT_DISK_BYTES,
+            )
+            .await;
+            let current = if paused {
+                let pause = harness.pause().await;
+                Some(harness.settled(&pause).await.current_pause.unwrap())
+            } else {
+                None
+            };
+            let request = live_id(Uuid::new_v4());
+            harness
+                .capture(harness.hibernate_plan(&request, current.as_ref()))
+                .await;
+            harness
+                .hibernate_phase(&request, HibernateCapturePhase::AwaitingWrite)
+                .await;
+            if after_write {
+                harness.authorize_hibernate_write(&request);
+                harness
+                    .hibernate_phase(&request, HibernateCapturePhase::Prepared)
+                    .await;
+                assert!(matches!(
+                    harness
+                        .release_hibernate(&request, CaptureReleaseDisposition::Abandoned)
+                        .await,
+                    vm_spec::lifecycle::ReleaseCaptureOutcome::Released { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    harness.cancel(&request).await,
+                    CancelOperationOutcome::Completed { .. }
+                ));
+            }
+            let failed = harness.capture_settled(&request).await;
+            assert_eq!(failure_code(&failed.operation), LiveFailureCode::Cancelled);
+            assert_eq!(
+                failed.state,
+                if paused {
+                    VmLifecycleState::Paused
+                } else {
+                    VmLifecycleState::Running
+                }
+            );
+            assert_eq!(failed.current_pause, current);
+            assert!(!harness
+                .root
+                .join("hibernation")
+                .join(request.as_str())
+                .exists());
+            harness.stop().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_hibernate_manager_disappearance_before_commit_rolls_back() {
+    use vm_spec::capture::HibernateCapturePhase;
+    for after_write in [false, true] {
+        let mut limits = timeouts();
+        limits.native = Duration::from_millis(500);
+        let harness = Harness::start_shaped(
+            Some(serde_json::json!({"capture":{"ramBytes":1 << 20}})),
+            limits,
+            true,
+            Some(1),
+            ROOT_DISK_BYTES,
+        )
+        .await;
+        let request = live_id(Uuid::new_v4());
+        harness
+            .capture(harness.hibernate_plan(&request, None))
+            .await;
+        harness
+            .hibernate_phase(&request, HibernateCapturePhase::AwaitingWrite)
+            .await;
+        if after_write {
+            harness.authorize_hibernate_write(&request);
+            harness
+                .hibernate_phase(&request, HibernateCapturePhase::Prepared)
+                .await;
+        }
+        let failed = harness.capture_settled(&request).await;
+        assert_eq!(
+            failure_code(&failed.operation),
+            LiveFailureCode::DeadlineExceeded
+        );
+        assert_eq!(failed.state, VmLifecycleState::Running);
+        assert!(!harness
+            .root
+            .join("hibernation")
+            .join(request.as_str())
+            .exists());
+        harness.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_hibernate_commit_from_user_pause_keeps_the_original_guest_freeze() {
+    use vm_spec::capture::{CaptureReleaseDisposition, HibernateCapturePhase};
+    let harness = Harness::start_shaped(
+        Some(serde_json::json!({"capture":{"ramBytes":1 << 20}})),
+        timeouts(),
+        true,
+        Some(1),
+        ROOT_DISK_BYTES,
+    )
+    .await;
+    let pause = harness.pause().await;
+    let current = harness.settled(&pause).await.current_pause.unwrap();
+    let request = live_id(Uuid::new_v4());
+    harness
+        .capture(harness.hibernate_plan(&request, Some(&current)))
+        .await;
+    harness
+        .hibernate_phase(&request, HibernateCapturePhase::AwaitingWrite)
+        .await;
+    harness.authorize_hibernate_write(&request);
+    let prepared = harness
+        .hibernate_phase(&request, HibernateCapturePhase::Prepared)
+        .await;
+    let cut = prepared.cut.unwrap();
+    assert_eq!(cut.freeze_operation_id, current.operation_id);
+    assert_eq!(cut.freeze_epoch, current.freeze_epoch);
+    assert_eq!(cut.binding.pause_generation, current.token.generation);
+    assert!(matches!(
+        harness.native_control().await,
+        crate::virt::lifecycle::NativeControl::Paused {
+            owner: crate::virt::lifecycle::NativePauseOwner::User,
+            ..
+        }
+    ));
+    assert!(
+        matches!(harness.release_hibernate(&request, CaptureReleaseDisposition::Published).await,
+        vm_spec::lifecycle::ReleaseCaptureOutcome::Released { released }
+            if released.state == VmLifecycleState::Hibernated)
+    );
+    assert!(harness.machine.wait().await.unwrap().hibernated());
+    harness.stop().await;
 }

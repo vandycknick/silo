@@ -20,6 +20,9 @@ service VmMonitorService {
   rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
   rpc Capture(CaptureRequest) returns (CaptureResponse);
   rpc ReleaseCapture(ReleaseCaptureRequest) returns (ReleaseCaptureResponse);
+  // Observe the paused-memory estimate or authorize writing after the caller's
+  // free-space check. ReleaseCapture(PUBLISHED) remains the durable commit.
+  rpc ControlHibernateCapture(ControlHibernateCaptureRequest) returns (ControlHibernateCaptureResponse);
 }
 
 service VmAccessService {
@@ -496,6 +499,8 @@ enum LiveFailureCode {
   LIVE_FAILURE_CODE_STAGING_BUDGET_EXCEEDED = 34;
   // Workload containment proof failed; the diagnostic identifies escaped guest tasks.
   LIVE_FAILURE_CODE_GUEST_CONTAINMENT_ESCAPED = 35;
+  LIVE_FAILURE_CODE_OUT_OF_SPACE = 36;
+  LIVE_FAILURE_CODE_MEMORY_ESTIMATE_FAILED = 37;
 }
 
 message LiveFailure {
@@ -774,4 +779,21 @@ message ReleaseCaptureResponse {
     CaptureReleased released = 2;
     ReleaseFailed failed = 3;
   }
+}
+
+enum HibernateCaptureAction {
+  HIBERNATE_CAPTURE_ACTION_UNSPECIFIED = 0;
+  HIBERNATE_CAPTURE_ACTION_OBSERVE = 1;
+  HIBERNATE_CAPTURE_ACTION_AUTHORIZE_WRITE = 2;
+}
+
+message ControlHibernateCaptureRequest {
+  LiveCommandEnvelope envelope = 1;
+  optional string operation_id = 2;
+  optional HibernateCaptureAction action = 3;
+}
+
+message ControlHibernateCaptureResponse {
+  // vm_spec::capture::HibernateCaptureStatus JSON, no content identity.
+  optional bytes status = 1;
 }

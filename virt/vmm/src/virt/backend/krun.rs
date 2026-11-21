@@ -41,12 +41,14 @@ pub(crate) struct KrunBackend {
     config: VmConfig,
     attempt: StartAttempt,
     state: watch::Sender<owner::Phase>,
+    worker_pid: watch::Sender<Option<u32>>,
     mux: Arc<AsyncMutex<Option<mux::KrunVsockMux>>>,
     vsock_registry: KrunVsockRegistry,
     session: Arc<KrunVsockSession>,
     host_memory_reclaim: watch::Sender<Option<HostMemoryReclaimReport>>,
     stop: CancellationToken,
     force: CancellationToken,
+    hibernate: CancellationToken,
     console: Mutex<Option<OwnedFd>>,
     serial: Mutex<Option<(File, File)>>,
     attachments: Arc<Mutex<Option<crate::virt::backend::storage::PreparedAttachments>>>,
@@ -233,12 +235,14 @@ impl KrunBackend {
             config,
             attempt: StartAttempt::default(),
             state: watch::Sender::new(owner::Phase::default()),
+            worker_pid: watch::Sender::new(None),
             mux: Arc::new(AsyncMutex::new(None)),
             vsock_registry: KrunVsockRegistry::default(),
             session: KrunVsockSession::new(),
             host_memory_reclaim: watch::Sender::new(None),
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
+            hibernate: CancellationToken::new(),
             console: Mutex::new(Some(pty.slave)),
             serial: Mutex::new(Some((master.try_clone()?, master))),
             attachments: Arc::new(Mutex::new(None)),
@@ -275,6 +279,10 @@ impl Drop for KrunBackend {
 
 #[async_trait]
 impl VirtBackend for KrunBackend {
+    fn worker_process_id(&self) -> Option<u32> {
+        *self.worker_pid.borrow()
+    }
+
     fn serial_available_before_start(&self) -> bool {
         true
     }
@@ -299,8 +307,10 @@ impl VirtBackend for KrunBackend {
         let lifecycle = self.lifecycle.clone();
         let owner = owner::Owner {
             state: self.state.clone(),
+            worker_pid: self.worker_pid.clone(),
             stop: self.stop.clone(),
             force: self.force.clone(),
+            hibernate: self.hibernate.clone(),
             reclaim: self.host_memory_reclaim.clone(),
         };
         // No await between attempt reservation and establishing cleanup ownership.
@@ -400,6 +410,20 @@ impl VirtBackend for KrunBackend {
     async fn force_stop(&self) -> Result<(), VirtError> {
         self.force.cancel();
         self.stop().await
+    }
+
+    async fn hibernate_stop(&self) -> Result<(), VirtError> {
+        self.lifecycle.close_admission();
+        self.hibernate.cancel();
+        self.completion().await.and_then(|exit| {
+            if exit.hibernated() {
+                Ok(())
+            } else {
+                Err(VirtError::Backend(exit.error().unwrap_or_else(|| {
+                    "saved machine did not terminate as requested".into()
+                })))
+            }
+        })
     }
 
     async fn wait(&self) -> Result<VmExit, VirtError> {

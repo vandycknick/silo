@@ -255,6 +255,8 @@ lifecycle_enum!(LiveFailureCode {
     SourceRecordFailed => "source-record-failed",
     ReleaseFailed => "release-failed",
     StagingBudgetExceeded => "staging-budget-exceeded",
+    OutOfSpace => "out-of-space",
+    MemoryEstimateFailed => "memory-estimate-failed",
 });
 
 lifecycle_enum!(LiveRejectionCode {
@@ -302,7 +304,11 @@ impl VmLifecycleState {
                 command,
                 C::Resume | C::Capture | C::GetOperation | C::ReleaseCapture
             ),
-            Self::Capturing | Self::Hibernating => {
+            Self::Hibernating => matches!(
+                command,
+                C::GetOperation | C::CancelOperation | C::ReleaseCapture
+            ),
+            Self::Capturing => {
                 matches!(command, C::GetOperation | C::CancelOperation)
             }
             Self::Restoring | Self::Activating => matches!(command, C::GetOperation),

@@ -161,6 +161,8 @@ wire_enum!(LiveFailureCode <=> LiveFailureCode {
     SourceRecordFailed = SourceRecordFailed,
     ReleaseFailed = ReleaseFailed,
     StagingBudgetExceeded = StagingBudgetExceeded,
+    OutOfSpace = OutOfSpace,
+    MemoryEstimateFailed = MemoryEstimateFailed,
 });
 wire_enum!(LiveRejectionCode <=> LiveRejectionCode {
     WrongMachine = WrongMachine,
@@ -1250,12 +1252,71 @@ impl TryFrom<wire::ReleaseCaptureResponse> for domain::ReleaseCaptureOutcome {
     }
 }
 
+impl TryFrom<capture::HibernateCaptureStatus> for wire::ControlHibernateCaptureResponse {
+    type Error = String;
+    fn try_from(status: capture::HibernateCaptureStatus) -> Result<Self, Self::Error> {
+        Ok(Self {
+            status: Some(status.canonical_bytes()?),
+        })
+    }
+}
+
+impl TryFrom<wire::ControlHibernateCaptureResponse> for capture::HibernateCaptureStatus {
+    type Error = String;
+    fn try_from(response: wire::ControlHibernateCaptureResponse) -> Result<Self, Self::Error> {
+        Self::decode(&required(response.status, "status")?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
 
     use crate::v1 as wire;
     use vm_spec::lifecycle as domain;
+
+    #[test]
+    fn hibernate_capture_barrier_response_round_trips_and_rejects_missing_evidence() {
+        use vm_spec::capture::{HibernateCapturePhase, HibernateCaptureStatus};
+        for phase in [
+            HibernateCapturePhase::Saving,
+            HibernateCapturePhase::AwaitingWrite,
+            HibernateCapturePhase::Writing,
+        ] {
+            let status = HibernateCaptureStatus {
+                phase,
+                populated_memory_estimate_bytes: (phase != HibernateCapturePhase::Saving)
+                    .then_some(4096),
+                cut: None,
+                failure: None,
+            };
+            let response = wire::ControlHibernateCaptureResponse::try_from(status.clone()).unwrap();
+            assert_eq!(HibernateCaptureStatus::try_from(response).unwrap(), status);
+        }
+        assert!(
+            HibernateCaptureStatus::try_from(wire::ControlHibernateCaptureResponse {
+                status: None
+            })
+            .is_err()
+        );
+        let status = HibernateCaptureStatus {
+            phase: HibernateCapturePhase::Prepared,
+            populated_memory_estimate_bytes: Some(4096),
+            cut: None,
+            failure: None,
+        };
+        assert!(wire::ControlHibernateCaptureResponse::try_from(status).is_err());
+        assert!(HibernateCaptureStatus::decode(
+            br#"{"phase":"unknown","populatedMemoryEstimateBytes":null,"cut":null,"failure":null}"#
+        )
+        .is_err());
+        assert!(HibernateCaptureStatus::decode(&vec![
+            0;
+            vm_spec::capture::MAX_CAPTURE_RECORD_BYTES
+                + 1
+        ])
+        .is_err());
+    }
 
     fn id(last: u8) -> domain::LiveId {
         domain::LiveId::parse(&format!("00000000-0000-4000-8000-0000000000{last:02x}")).unwrap()

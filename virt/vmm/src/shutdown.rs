@@ -96,6 +96,11 @@ pub async fn run(
                     tracing::info!(instance = %ctx.machine.name(), "stopping a live-held machine without resuming it");
                     ctx.machine.force_stop().await.map_err(eyre::Report::from)
                 }
+                crate::live::coordinator::StopMode::Hibernate => ctx
+                    .machine
+                    .hibernate_stop()
+                    .await
+                    .map_err(eyre::Report::from),
             };
             if let Err(error) = stopped {
                 errors.push(error.to_string());
@@ -352,11 +357,16 @@ fn vm_stop_info(exit: VmExit) -> VmStopInfo {
     let error = exit.error();
     let message = match &error {
         Some(error) => format!("machine stopped with error: {error}"),
+        None if exit.hibernated() => "machine hibernated".to_string(),
         None if exit.forced() => "machine force-stopped".to_string(),
         None => "machine stopped".to_string(),
     };
     VmStopInfo {
-        state: VmState::Stopped,
+        state: if exit.hibernated() {
+            VmState::Hibernated
+        } else {
+            VmState::Stopped
+        },
         forced: exit.forced(),
         message,
         error,

@@ -113,6 +113,17 @@ impl VirtualMachine {
         self.inner.serial_console.drain().await
     }
 
+    /// Kill and reap a parked run after its hibernation record is durable.
+    pub(crate) async fn hibernate_stop(&self) -> Result<(), VirtError> {
+        self.inner.attempt.close();
+        self.inner.backend.hibernate_stop().await?;
+        self.inner.serial_console.drain().await
+    }
+
+    pub(crate) fn worker_process_id(&self) -> Option<u32> {
+        self.inner.backend.worker_process_id()
+    }
+
     /// Dynamically connect to a guest endpoint port.
     pub async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
         let lease = self.reserve_vsock()?;

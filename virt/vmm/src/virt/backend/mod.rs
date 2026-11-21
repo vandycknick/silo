@@ -56,6 +56,18 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
         self.stop().await
     }
 
+    /// End a durably saved, parked run without executing guest shutdown.
+    async fn hibernate_stop(&self) -> Result<(), VirtError> {
+        Err(VirtError::Backend(
+            "this backend cannot release a saved machine".into(),
+        ))
+    }
+
+    /// Owned worker PID while it remains unreaped.
+    fn worker_process_id(&self) -> Option<u32> {
+        None
+    }
+
     /// Block until the machine exits; resolves immediately once exited.
     async fn wait(&self) -> Result<VmExit, VirtError>;
 

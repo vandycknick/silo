@@ -150,6 +150,7 @@ pub(crate) struct CaptureStaging {
     pool_nodes: std::sync::Mutex<Option<std::sync::Arc<File>>>,
     node_allocation: std::sync::Arc<AtomicU64>,
     node_count: std::sync::Arc<AtomicU64>,
+    hibernate_parent: Option<OwnedFd>,
 }
 
 /// Outcome of a write-once record.
@@ -386,7 +387,90 @@ impl CaptureStaging {
             pool_nodes: std::sync::Mutex::new(None),
             node_allocation: std::sync::Arc::new(AtomicU64::new(0)),
             node_count: std::sync::Arc::new(AtomicU64::new(0)),
+            hibernate_parent: None,
         })
+    }
+
+    /// Hibernate has no disk or map outputs. All path components below the
+    /// already-held machine directory are opened without following links.
+    pub(crate) fn create_hibernate(
+        data_dir: &Path,
+        capture: &LiveId,
+        destination: &Path,
+    ) -> io::Result<Self> {
+        let expected = data_dir.join("hibernation").join(capture.as_str());
+        if destination != expected {
+            return Err(invalid(
+                "save directory differs from this machine's private directory",
+            ));
+        }
+        let data = open(data_dir, directory_flags(), Mode::empty())?;
+        let parent = private_child(&data, "hibernation", false)?;
+        let directory = private_child(&parent, capture.as_str(), true)?;
+        let staging = Self {
+            disks: directory.try_clone()?,
+            nodes: std::sync::Arc::new(File::from(directory.try_clone()?)),
+            retained_nodes: std::sync::Arc::new(File::from(directory.try_clone()?)),
+            directory,
+            path: expected,
+            pool_nodes: std::sync::Mutex::new(None),
+            node_allocation: std::sync::Arc::new(AtomicU64::new(0)),
+            node_count: std::sync::Arc::new(AtomicU64::new(0)),
+            hibernate_parent: Some(parent),
+        };
+        if let Err(error) = nix::unistd::fsync(&data)
+            .map_err(io::Error::from)
+            .and_then(|()| staging.sync_hibernate_directory())
+        {
+            if let Err(cleanup) = staging.remove_hibernate() {
+                tracing::error!(%cleanup, "remove incomplete hibernation directory");
+            }
+            return Err(error);
+        }
+        Ok(staging)
+    }
+
+    pub(crate) fn sync_hibernate_directory(&self) -> io::Result<()> {
+        nix::unistd::fsync(&self.directory)?;
+        if let Some(parent) = &self.hibernate_parent {
+            nix::unistd::fsync(parent)?;
+        }
+        Ok(())
+    }
+
+    /// Called only after native capture abandonment closed all writers.
+    pub(crate) fn remove_hibernate(&self) -> io::Result<()> {
+        let parent = self
+            .hibernate_parent
+            .as_ref()
+            .ok_or_else(|| invalid("only a hibernation directory can be removed here"))?;
+        for name in [
+            "request.json",
+            "execution.state",
+            "devices.state",
+            "memory.ram",
+            "memory-layout.json",
+            "memory.changes",
+            "record.json",
+            "record.tmp",
+        ] {
+            match unlinkat(&self.directory, name, UnlinkatFlags::NoRemoveDir) {
+                Ok(()) | Err(Errno::ENOENT) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let name = self
+            .path
+            .file_name()
+            .ok_or_else(|| invalid("save directory has no name"))?;
+        unlinkat(parent, name, UnlinkatFlags::RemoveDir)?;
+        nix::unistd::fsync(parent)?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_hibernate_record(&self, name: &str) -> io::Result<()> {
+        self.open_entry(name)?.sync_all()?;
+        self.sync_hibernate_directory()
     }
     pub(crate) fn set_node_store(&self, path: Option<&str>) -> io::Result<()> {
         let pool = path

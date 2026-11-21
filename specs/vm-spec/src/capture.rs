@@ -665,25 +665,27 @@ pub enum CaptureIdentityPolicy {
 }
 
 /// Disk ownership and terminal disposition of a capture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CaptureMode {
     Snapshot,
     Fork,
     /// Retain writable disks in place, do no identity hashing, and kill/reap
     /// the worker without shutdown, resume or thaw after durable acceptance.
-    Hibernate,
+    Hibernate {
+        directory: std::path::PathBuf,
+    },
 }
 
 impl CaptureMode {
-    pub const fn clones_disks(self) -> bool {
-        !matches!(self, Self::Hibernate)
+    pub const fn clones_disks(&self) -> bool {
+        !matches!(self, Self::Hibernate { .. })
     }
 
-    pub const fn terminal_outcome(self) -> CaptureTerminalOutcome {
+    pub const fn terminal_outcome(&self) -> CaptureTerminalOutcome {
         match self {
             Self::Snapshot | Self::Fork => CaptureTerminalOutcome::ContinueSource,
-            Self::Hibernate => CaptureTerminalOutcome::WorkerKilledWithoutShutdown,
+            Self::Hibernate { .. } => CaptureTerminalOutcome::WorkerKilledWithoutShutdown,
         }
     }
 }
@@ -693,6 +695,82 @@ impl CaptureMode {
 pub enum CaptureTerminalOutcome {
     ContinueSource,
     WorkerKilledWithoutShutdown,
+}
+
+/// Monitor-side barriers for an in-place capture. Only `Committed` authorizes
+/// ending the old run; `Prepared` still permits rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HibernateCapturePhase {
+    Saving,
+    AwaitingWrite,
+    Writing,
+    Prepared,
+    Committed,
+    Released,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HibernateCaptureStatus {
+    pub phase: HibernateCapturePhase,
+    /// Linux worker Rss + Swap, including worker overhead, sampled while parked.
+    /// Advisory only: write-time ENOSPC rollback remains the safety barrier.
+    pub populated_memory_estimate_bytes: Option<u64>,
+    pub cut: Option<Box<crate::hibernate::HibernateCut>>,
+    pub failure: Option<LiveFailure>,
+}
+
+impl HibernateCaptureStatus {
+    pub fn validate(&self) -> Result<(), String> {
+        let has_cut = matches!(
+            self.phase,
+            HibernateCapturePhase::Prepared
+                | HibernateCapturePhase::Committed
+                | HibernateCapturePhase::Released
+        );
+        if self.cut.is_some() != has_cut
+            || self.failure.is_some() != (self.phase == HibernateCapturePhase::Failed)
+            || (!matches!(
+                self.phase,
+                HibernateCapturePhase::Saving | HibernateCapturePhase::Failed
+            ) && self.populated_memory_estimate_bytes.is_none())
+        {
+            return Err(invalid(
+                "hibernation status has inconsistent barrier evidence",
+            ));
+        }
+        if let Some(cut) = &self.cut {
+            cut.validate()?;
+        }
+        if let Some(failure) = &self.failure {
+            failure.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_CAPTURE_RECORD_BYTES {
+            return Err(invalid("hibernation status exceeds its size bound"));
+        }
+        let status: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        status.validate()?;
+        Ok(status)
+    }
+
+    pub const fn terminal_outcome(&self) -> Option<CaptureTerminalOutcome> {
+        if matches!(self.phase, HibernateCapturePhase::Released) {
+            Some(CaptureTerminalOutcome::WorkerKilledWithoutShutdown)
+        } else {
+            None
+        }
+    }
 }
 
 /// The complete immutable capture plan. `request.json` is exactly
@@ -723,7 +801,22 @@ pub struct CapturePlan {
 
 impl CapturePlan {
     pub fn validate(&self) -> Result<(), String> {
-        if self.mode == CaptureMode::Hibernate
+        if let CaptureMode::Hibernate { directory } = &self.mode {
+            if !directory.is_absolute()
+                || directory.as_os_str().len() > 4095
+                || directory.components().any(|part| {
+                    !matches!(
+                        part,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                })
+            {
+                return Err(invalid(
+                    "hibernation requires its absolute private save directory",
+                ));
+            }
+        }
+        if !self.mode.clones_disks()
             && (self.identity_policy != CaptureIdentityPolicy::None
                 || self.resume_policy != CaptureResumePolicy::Preserve
                 || self.disks.iter().any(|disk| disk.baseline_map.is_some()))
@@ -836,7 +929,7 @@ impl CapturePlan {
                 return Err(invalid("capture disk names must be unique"));
             }
             names.push(&disk.name);
-            if self.mode == CaptureMode::Hibernate {
+            if !self.mode.clones_disks() {
                 continue;
             }
             let charge = match disk.copy {
@@ -858,7 +951,7 @@ impl CapturePlan {
         if stream_bytes > MAX_STREAM_BYTES {
             return Err(invalid("capture closure exceeds 4 TiB of logical streams"));
         }
-        if (self.mode != CaptureMode::Hibernate && self.reservation.staging_bytes < minimum)
+        if (self.mode.clones_disks() && self.reservation.staging_bytes < minimum)
             || self.reservation.launch_lease.inode == 0
         {
             return Err(invalid(
@@ -4209,7 +4302,10 @@ pub(crate) mod tests {
     #[test]
     fn hibernation_capture_mode_keeps_disks_and_requires_no_identity_or_continuation() {
         let mut plan = plan();
-        plan.mode = CaptureMode::Hibernate;
+        plan.mode = CaptureMode::Hibernate {
+            directory: std::path::PathBuf::from("/machine/hibernation")
+                .join(plan.capture_id.as_str()),
+        };
         assert!(plan.validate().is_err());
         plan.identity_policy = CaptureIdentityPolicy::None;
         plan.resume_policy = CaptureResumePolicy::Preserve;

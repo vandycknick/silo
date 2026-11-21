@@ -91,6 +91,8 @@ pub(crate) enum StopMode {
     /// Held by a live lifecycle (paused, fenced, frozen or busy): terminate
     /// through the backend owner; never resume or thaw to stop.
     Terminate,
+    /// Manager committed a save: preserve the hibernated terminal disposition.
+    Hibernate,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -427,6 +429,20 @@ impl LiveCoordinator {
         self.gate.seal();
         match self.store.live_snapshot() {
             Ok(snapshot)
+                if snapshot
+                    .lifecycle
+                    .activity
+                    .as_ref()
+                    .is_some_and(|activity| {
+                        inner
+                            .journal
+                            .operation(&activity.operation_id)
+                            .is_some_and(|record| record.phase == Phase::HibernateCommitted)
+                    }) =>
+            {
+                StopMode::Hibernate
+            }
+            Ok(snapshot)
                 if matches!(
                     snapshot.state,
                     VmLifecycleState::Running | VmLifecycleState::Starting
@@ -603,7 +619,16 @@ impl LiveCoordinator {
                 );
                 self.publish(
                     &inner,
-                    VmLifecycleState::Capturing,
+                    if inner
+                        .journal
+                        .operation(operation)
+                        .and_then(|record| record.capture.as_ref())
+                        .is_some_and(|facts| !facts.plan.mode.clones_disks())
+                    {
+                        VmLifecycleState::Hibernating
+                    } else {
+                        VmLifecycleState::Capturing
+                    },
                     Some(activity),
                     None,
                     false,
@@ -673,7 +698,10 @@ impl LiveCoordinator {
         }
         let holding = matches!(
             state,
-            VmLifecycleState::Pausing | VmLifecycleState::Paused | VmLifecycleState::Capturing
+            VmLifecycleState::Pausing
+                | VmLifecycleState::Paused
+                | VmLifecycleState::Capturing
+                | VmLifecycleState::Hibernating
         );
         let current_pause = (state == VmLifecycleState::Paused)
             .then(|| inner.journal.current.clone())
@@ -706,7 +734,16 @@ impl LiveCoordinator {
         let inner = self.lock();
         let activity = activity(operation, request, command, stage);
         let state = if command == LiveCommandKind::Capture {
-            VmLifecycleState::Capturing
+            if inner
+                .journal
+                .operation(operation)
+                .and_then(|record| record.capture.as_ref())
+                .is_some_and(|facts| !facts.plan.mode.clones_disks())
+            {
+                VmLifecycleState::Hibernating
+            } else {
+                VmLifecycleState::Capturing
+            }
         } else {
             VmLifecycleState::Pausing
         };

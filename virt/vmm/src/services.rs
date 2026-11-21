@@ -268,6 +268,42 @@ impl VmMonitorService for MonitorService {
         .await
     }
 
+    async fn control_hibernate_capture(
+        &self,
+        request: Request<protocol::v1::ControlHibernateCaptureRequest>,
+    ) -> Result<Response<protocol::v1::ControlHibernateCaptureResponse>, Status> {
+        let _permit = admission(&self.finite_capacity, "hibernate capture control")?;
+        let request = request.into_inner();
+        let envelope: vm_spec::lifecycle::LiveCommandEnvelope = request
+            .envelope
+            .ok_or_else(|| Status::invalid_argument("missing command envelope"))?
+            .try_into()
+            .map_err(Status::invalid_argument)?;
+        let operation = vm_spec::lifecycle::LiveId::parse(
+            request
+                .operation_id
+                .as_deref()
+                .ok_or_else(|| Status::invalid_argument("missing operation ID"))?,
+        )
+        .map_err(Status::invalid_argument)?;
+        let action = request
+            .action
+            .and_then(|action| protocol::v1::HibernateCaptureAction::try_from(action).ok())
+            .ok_or_else(|| Status::invalid_argument("missing or unknown hibernation action"))?;
+        let authorize = match action {
+            protocol::v1::HibernateCaptureAction::Observe => false,
+            protocol::v1::HibernateCaptureAction::AuthorizeWrite => true,
+            protocol::v1::HibernateCaptureAction::Unspecified => {
+                return Err(Status::invalid_argument("unspecified hibernation action"))
+            }
+        };
+        let status = self
+            .live
+            .control_hibernate_capture(&envelope, &operation, authorize)
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(status.try_into().map_err(Status::internal)?))
+    }
+
     async fn release_capture(
         &self,
         request: Request<ReleaseCaptureRequest>,

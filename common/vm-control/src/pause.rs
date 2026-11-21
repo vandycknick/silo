@@ -129,7 +129,9 @@ enumeration!(
         SourceRecordFailed,
         ReleaseFailed,
         StagingBudgetExceeded,
-        GuestContainmentEscaped
+        GuestContainmentEscaped,
+        OutOfSpace,
+        MemoryEstimateFailed
     ]
 );
 enumeration!(
@@ -546,6 +548,11 @@ mod tests {
         for code in d::LiveFailureCode::ALL {
             assert_eq!(failure_code_from(failure_code_to(*code)).unwrap(), *code);
         }
+        assert_eq!(failure_code_to(d::LiveFailureCode::OutOfSpace), 36);
+        assert_eq!(
+            failure_code_to(d::LiveFailureCode::MemoryEstimateFailed),
+            37
+        );
         assert!(state_from(0).is_err());
         assert!(stage_from(i32::MAX).is_err());
         assert!(nonzero(0).is_err());

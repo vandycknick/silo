@@ -1,4 +1,4 @@
-//! Snapshot identity and owned live forks on the run's single live coordinator.
+//! Snapshot, owned live fork and in-place hibernate on one run coordinator.
 //!
 //! ```text
 //!  admit ─► prepare[staging, request.json, 5 outputs + launch-lease pin ─► worker]
@@ -15,6 +15,11 @@
 //!  fork: prepare → pause/drain → flush → private disks → state + unhashed RAM
 //!       → close writers → immutable exact-file record → accept owned byte baseline
 //!       → continue source; identified RAM anchor and disk tracking history stay retained.
+//!  hibernate: prepare → pause/drain → flush → report Rss+Swap estimate
+//!       → await write authorization → unhashed state + sparse RAM → fsync cut
+//!       → await durable manager commit → journal committed → kill/reap, no thaw.
+//!  request.json/record.json without committed.json is precommit and reversible;
+//!  committed.json binds the exact old worker PID and start time for recovery.
 //!
 //!  unsealed failure/cancel ─► abort any frozen disk generations ─► resolve RAM candidate
 //!       ─► snapshot-only failed evidence ─► continue once under policy
@@ -46,6 +51,11 @@ use vm_spec::capture::{
     CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE, CAPTURE_LAYOUT_FILE,
     CAPTURE_RECORD_VERSION, CAPTURE_SOURCE_FILE, CAPTURE_SOURCE_TEMPORARY_FILE,
     CAPTURE_STATE_RESERVE_BYTES, MAX_CAPTURE_RECORD_BYTES,
+};
+use vm_spec::capture::{CaptureMode, HibernateCapturePhase, HibernateCaptureStatus};
+use vm_spec::hibernate::{
+    HibernateCut, HibernateDiskBinding, HibernateFileBinding, HibernateSavedFile,
+    HibernateSavedFileRole, HIBERNATE_CUT_VERSION,
 };
 use vm_spec::lifecycle::{
     CancelCompleted, CancelOperationOutcome, CaptureResumePolicy, CurrentPause, Diagnostic,
@@ -91,6 +101,7 @@ pub(crate) struct CaptureContext {
     digests: CaptureDigests,
     baseline: std::sync::Mutex<IdentityAnchor>,
     disk_baselines: std::sync::Mutex<std::collections::BTreeMap<vm_spec::BlockId, Arc<StreamRoot>>>,
+    disk_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +163,11 @@ impl CaptureContext {
             lease: launch.lease.clone(),
             baseline: std::sync::Mutex::new(IdentityAnchor::Unknown),
             disk_baselines: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            disk_paths: spec
+                .storage
+                .as_ref()
+                .map(|storage| storage.disks.iter().map(|disk| disk.path.clone()).collect())
+                .unwrap_or_default(),
         })
     }
 
@@ -211,6 +227,112 @@ fn live_id(value: Uuid) -> Option<LiveId> {
 
 fn digest(value: Digest32) -> Sha256Digest {
     Sha256Digest::from_bytes(value.0)
+}
+
+fn io_capture_failure(
+    error: &io::Error,
+    stage: LiveStage,
+    fallback: LiveFailureCode,
+) -> LiveFailure {
+    let full = error.kind() == io::ErrorKind::StorageFull
+        || matches!(error.raw_os_error(), Some(code) if code == nix::errno::Errno::ENOSPC as i32 || code == nix::errno::Errno::EDQUOT as i32);
+    failure(
+        if full {
+            LiveFailureCode::OutOfSpace
+        } else {
+            fallback
+        },
+        stage,
+        format!("Could not save the machine: {error}; free space or fix the storage and retry"),
+    )
+}
+
+/// Linux smaps_rollup reports KiB. Rss + Swap includes worker overhead and
+/// swapped guest pages, not just resident RAM. This is an advisory space
+/// estimate; ENOSPC during writing must still abandon the cut and resume.
+fn parse_populated_memory_estimate(text: &str) -> io::Result<u64> {
+    let mut rss = None;
+    let mut swap = None;
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let target = match words.next() {
+            Some("Rss:") => &mut rss,
+            Some("Swap:") => &mut swap,
+            _ => continue,
+        };
+        if target.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate memory counter",
+            ));
+        }
+        let value = words
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid memory counter"))?;
+        if words.next() != Some("kB") || words.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid memory counter unit",
+            ));
+        }
+        *target = Some(value);
+    }
+    rss.zip(swap)
+        .and_then(|(rss, swap)| rss.checked_add(swap))
+        .and_then(|kib| kib.checked_mul(1024))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing or overflowing memory counters",
+            )
+        })
+}
+
+fn hibernate_file_binding(file: &File, path: PathBuf) -> io::Result<HibernateFileBinding> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    let binding = HibernateFileBinding {
+        path,
+        inode: metadata.ino(),
+        size: metadata.len(),
+        mode: metadata.mode(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    };
+    binding.validate().map_err(io::Error::other)?;
+    let reopened = File::from(nix::fcntl::open(
+        &binding.path,
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )?);
+    let current = reopened.metadata()?;
+    if metadata.dev() != current.dev()
+        || metadata.ino() != current.ino()
+        || metadata.len() != current.len()
+        || metadata.mode() != current.mode()
+        || metadata.mtime() != current.mtime()
+        || metadata.mtime_nsec() != current.mtime_nsec()
+        || metadata.ctime() != current.ctime()
+        || metadata.ctime_nsec() != current.ctime_nsec()
+    {
+        return Err(io::Error::other("saved path no longer names the held file"));
+    }
+    Ok(binding)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HibernateJournal<'a> {
+    version: u32,
+    machine_id: &'a LiveId,
+    run_id: &'a LiveId,
+    save_id: &'a LiveId,
+    worker_pid: u32,
+    worker_started_at: i64,
+    status: &'a HibernateCaptureStatus,
 }
 
 /// Why the unsealed pipeline stopped.
@@ -497,11 +619,19 @@ impl LiveCoordinator {
     /// against actual staged allocation at verification ([`staging_budget`]),
     /// never against a second allocation sample of the still running guest.
     pub(crate) async fn check_capture(&self, plan: &CapturePlan) -> Result<Eligibility, LiveError> {
-        if plan.mode == vm_spec::capture::CaptureMode::Hibernate {
-            return Ok(Eligibility::Rejected(
-                LiveRejectionReason::InvalidPlan,
-                "Hibernation is not available; use a snapshot instead".into(),
-            ));
+        if let CaptureMode::Hibernate { directory } = &plan.mode {
+            let expected = self.capture.as_ref().map(|context| {
+                context
+                    .data_dir
+                    .join("hibernation")
+                    .join(plan.capture_id.as_str())
+            });
+            if expected.as_ref() != Some(directory) {
+                return Ok(Eligibility::Rejected(
+                    LiveRejectionReason::InvalidPlan,
+                    "Save directory does not belong to this machine; retry hibernation".into(),
+                ));
+            }
         }
         if let Some(subject) = self.native_inventory(&plan.capture_id, true).await {
             return self.device_rejection(LiveOperation::Capture, subject);
@@ -564,6 +694,527 @@ impl LiveCoordinator {
         Ok(Eligibility::Eligible)
     }
 
+    /// The second capture barrier is explicit. Identical authorizations are
+    /// harmless; foreign runs, premature writes and failed captures are refused.
+    pub(crate) fn control_hibernate_capture(
+        &self,
+        envelope: &vm_spec::lifecycle::LiveCommandEnvelope,
+        operation: &LiveId,
+        authorize_write: bool,
+    ) -> Result<HibernateCaptureStatus, String> {
+        let mut inner = self.lock();
+        if &envelope.machine_id != inner.journal.machine_id()
+            || &envelope.run_id != inner.journal.run_id()
+        {
+            return Err("Hibernation request belongs to another machine run".into());
+        }
+        let facts = inner
+            .journal
+            .capture_mut(operation)
+            .ok_or("Hibernation capture is unknown; inspect the machine and retry")?;
+        let status = facts
+            .hibernation
+            .as_ref()
+            .ok_or("This capture does not save the machine in place")?;
+        if authorize_write {
+            if !facts.hibernate_write && status.phase != HibernateCapturePhase::AwaitingWrite {
+                return Err("The machine is not waiting for its storage check".into());
+            }
+            if status.phase == HibernateCapturePhase::Failed {
+                return Err("Hibernation failed; inspect the machine and retry".into());
+            }
+            facts.hibernate_write = true;
+            facts.hibernate_changed.notify_one();
+        }
+        Ok(status.clone())
+    }
+
+    fn signal_hibernate_release(&self, operation: &LiveId) -> bool {
+        let mut inner = self.lock();
+        let Some(record) = inner.journal.operation_mut(operation) else {
+            return false;
+        };
+        let Some(facts) = record.capture.as_mut() else {
+            return false;
+        };
+        if facts.hibernation.is_none() || record.phase == Phase::Settled {
+            return false;
+        }
+        facts.hibernate_changed.notify_one();
+        true
+    }
+
+    async fn await_hibernate_authorization(&self, run: &Run, commit: bool) -> Result<(), Abort> {
+        let deadline = tokio::time::Instant::now() + self.timeouts.native;
+        loop {
+            let (ready, changed) = {
+                let mut inner = self.lock();
+                let facts = inner.journal.capture_mut(&run.operation).ok_or_else(|| {
+                    Abort::Failed(failure(
+                        LiveFailureCode::Cancelled,
+                        LiveStage::CaptureSeal,
+                        "Hibernation capture was lost; retry",
+                    ))
+                })?;
+                (
+                    if commit {
+                        facts.hibernate_release == Some(CaptureReleaseDisposition::Published)
+                    } else {
+                        facts.hibernate_write
+                    },
+                    facts.hibernate_changed.clone(),
+                )
+            };
+            if ready {
+                return Ok(());
+            }
+            self.checkpoint(run, LiveStage::CaptureSeal)?;
+            tokio::select! {
+                () = changed.notified() => {}
+                () = run.cancel.cancelled() => { self.checkpoint(run, LiveStage::CaptureSeal)?; }
+                () = self.stop.cancelled() => return Err(Abort::Stopped),
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(Abort::Failed(failure(LiveFailureCode::DeadlineExceeded,
+                        LiveStage::CaptureSeal, "Hibernation authorization timed out; retry")));
+                }
+            }
+        }
+    }
+
+    async fn hibernate_stages(&self, run: &mut Run) -> Result<(), Abort> {
+        self.stage_prepare(run).await?;
+        self.stage_pause(run).await?;
+        self.stage_flush(run).await?;
+        let pid = self.machine.worker_process_id().ok_or_else(|| {
+            Abort::Failed(failure(
+                LiveFailureCode::MemoryEstimateFailed,
+                LiveStage::CaptureMemory,
+                "Could not inspect the paused worker's memory; retry hibernation",
+            ))
+        })?;
+        let estimated = tokio::task::spawn_blocking(move || {
+            let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))?;
+            parse_populated_memory_estimate(&text)
+        })
+        .await
+        .map_err(|error| {
+            Abort::Failed(failure(
+                LiveFailureCode::MemoryEstimateFailed,
+                LiveStage::CaptureMemory,
+                error.to_string(),
+            ))
+        })?
+        .map_err(|error| {
+            Abort::Failed(failure(
+                LiveFailureCode::MemoryEstimateFailed,
+                LiveStage::CaptureMemory,
+                format!("Could not inspect paused memory: {error}; retry hibernation"),
+            ))
+        })?;
+        if self.machine.worker_process_id() != Some(pid) {
+            return Err(Abort::Failed(failure(
+                LiveFailureCode::WorkerLost,
+                LiveStage::CaptureMemory,
+                "The machine ended during its memory check",
+            )));
+        }
+        if let Some(status) = self
+            .lock()
+            .journal
+            .capture_mut(&run.operation)
+            .and_then(|facts| facts.hibernation.as_mut())
+        {
+            status.phase = HibernateCapturePhase::AwaitingWrite;
+            status.populated_memory_estimate_bytes = Some(estimated);
+        }
+        self.await_hibernate_authorization(run, false).await?;
+        self.checkpoint(run, LiveStage::CaptureMemory)?;
+        if let Some(status) = self
+            .lock()
+            .journal
+            .capture_mut(&run.operation)
+            .and_then(|facts| facts.hibernation.as_mut())
+        {
+            status.phase = HibernateCapturePhase::Writing;
+        }
+        self.stage_execution_and_memory(run).await?;
+        let cut = self.verify_hibernate_cut(run).await?;
+        let status = HibernateCaptureStatus {
+            phase: HibernateCapturePhase::Prepared,
+            populated_memory_estimate_bytes: Some(estimated),
+            cut: Some(Box::new(cut)),
+            failure: None,
+        };
+        self.write_hibernate_journal(run, &status, false).await?;
+        self.checkpoint(run, LiveStage::CaptureSeal)?;
+        {
+            let mut inner = self.lock();
+            if let Some(record) = inner.journal.operation_mut(&run.operation) {
+                record.phase = Phase::HibernatePrepared;
+                if let Some(facts) = record.capture.as_mut() {
+                    facts.hibernation = Some(status);
+                }
+            }
+        }
+        self.await_hibernate_authorization(run, true).await
+    }
+
+    async fn verify_hibernate_cut(&self, run: &Run) -> Result<HibernateCut, Abort> {
+        let fail = |message: String| {
+            Abort::Failed(failure(
+                LiveFailureCode::CaptureVerificationFailed,
+                LiveStage::CaptureVerify,
+                message,
+            ))
+        };
+        if !(run.facts.workloads_frozen
+            && run.facts.vcpus_paused
+            && run.facts.devices_quiesced
+            && run.facts.host_writers_drained
+            && run.facts.host_flush_completed
+            && run.facts.memory_state_sealed)
+        {
+            return Err(fail(
+                "The save lacks complete pause and closed-writer evidence".into(),
+            ));
+        }
+        let Some(CommandOutcome::MemoryCaptured {
+            memory_generation,
+            predecessor_generation,
+            identity_policy,
+            changes,
+            stats,
+            ram,
+            layout,
+            ..
+        }) = run.native_memory.as_ref()
+        else {
+            return Err(fail("The save has no memory receipt".into()));
+        };
+        if *identity_policy != CaptureIdentityPolicy::None
+            || *changes != crate::virt::lifecycle::CaptureRamChangesAuthority::None
+            || stats.identity_bytes_hashed != 0
+            || stats.whole_file_bytes_hashed != 0
+            || stats.map_nodes_written != 0
+        {
+            return Err(fail(
+                "The in-place save unexpectedly computed content identity".into(),
+            ));
+        }
+        let binding = run
+            .binding
+            .as_ref()
+            .ok_or_else(|| fail("Missing execution binding".into()))?;
+        let staging = run
+            .staging
+            .clone()
+            .ok_or_else(|| fail("Missing save directory".into()))?;
+        let outputs = run
+            .outputs
+            .ok_or_else(|| fail("Missing output identities".into()))?;
+        let context = self
+            .capture
+            .as_ref()
+            .ok_or_else(|| fail("Missing launch binding".into()))?;
+        let sources = self
+            .machine
+            .capture_sources()
+            .await
+            .map_err(|error| fail(error.to_string()))?;
+        let paths = context.disk_paths.clone();
+        let configuration = run.plan.configuration.clone();
+        let expected_ram = *ram;
+        let expected_layout = *layout;
+        let (saved_files, writable_disks, geometry) =
+            tokio::task::spawn_blocking(move || -> io::Result<_> {
+                let seal = |role: CaptureRole,
+                            saved_role: HibernateSavedFileRole,
+                            expected: OutputIdentity| {
+                    let (file, facts) = staging.seal_owned(&role)?;
+                    if (facts.device, facts.inode) != (expected.device, expected.inode) {
+                        return Err(io::Error::other(
+                            "saved file differs from its prepared descriptor",
+                        ));
+                    }
+                    file.sync_all()?;
+                    Ok(HibernateSavedFile {
+                        role: saved_role,
+                        file: hibernate_file_binding(
+                            &file,
+                            staging.path().join(role.relative_path()),
+                        )?,
+                    })
+                };
+                let saved_files = [
+                    seal(
+                        CaptureRole::Ram,
+                        HibernateSavedFileRole::Memory,
+                        outputs.ram,
+                    )?,
+                    seal(
+                        CaptureRole::Layout,
+                        HibernateSavedFileRole::MemoryLayout,
+                        outputs.layout,
+                    )?,
+                    seal(
+                        CaptureRole::Execution,
+                        HibernateSavedFileRole::ExecutionState,
+                        outputs.execution,
+                    )?,
+                    seal(
+                        CaptureRole::Devices,
+                        HibernateSavedFileRole::DeviceState,
+                        outputs.devices,
+                    )?,
+                ];
+                let (layout_file, facts) = staging.open_owned(&CaptureRole::Layout)?;
+                if facts.length > MAX_LAYOUT_BYTES
+                    || (facts.device, facts.inode, facts.length)
+                        != (
+                            expected_layout.device,
+                            expected_layout.inode,
+                            expected_layout.length,
+                        )
+                    || saved_files[0].file.size != expected_ram.length
+                {
+                    return Err(io::Error::other(
+                        "saved RAM/layout differs from native completion",
+                    ));
+                }
+                let mut bytes = Vec::new();
+                layout_file
+                    .take(MAX_LAYOUT_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                let geometry = parse_layout(&bytes)?;
+                if geometry.packed_length != saved_files[0].file.size {
+                    return Err(io::Error::other("saved RAM is incomplete"));
+                }
+                let mut disks = Vec::new();
+                for (index, attachment) in configuration.attachments.iter().enumerate() {
+                    if attachment.read_only {
+                        continue;
+                    }
+                    let index_u32 = u32::try_from(index).map_err(io::Error::other)?;
+                    let source = sources
+                        .iter()
+                        .find(|source| source.disk_index == index_u32 && source.writable)
+                        .ok_or_else(|| io::Error::other("writable disk descriptor is missing"))?;
+                    source.file.sync_all()?;
+                    let path = paths
+                        .get(index)
+                        .ok_or_else(|| io::Error::other("disk path is missing"))?;
+                    let file = hibernate_file_binding(&source.file, path.clone())?;
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| io::Error::other("disk parent is missing"))?;
+                    let directory = nix::fcntl::open(
+                        parent,
+                        nix::fcntl::OFlag::O_RDONLY
+                            | nix::fcntl::OFlag::O_DIRECTORY
+                            | nix::fcntl::OFlag::O_NOFOLLOW
+                            | nix::fcntl::OFlag::O_CLOEXEC,
+                        nix::sys::stat::Mode::empty(),
+                    )?;
+                    nix::unistd::fsync(&directory)?;
+                    disks.push(HibernateDiskBinding {
+                        role: attachment.role,
+                        attachment_index: index_u32,
+                        block_id: attachment.block_id.clone(),
+                        file,
+                    });
+                }
+                staging.sync_hibernate_record("request.json")?;
+                Ok((saved_files, disks, geometry))
+            })
+            .await
+            .map_err(|error| fail(error.to_string()))?
+            .map_err(|error| {
+                Abort::Failed(io_capture_failure(
+                    &error,
+                    LiveStage::CaptureVerify,
+                    LiveFailureCode::CaptureVerificationFailed,
+                ))
+            })?;
+        let cut = HibernateCut {
+            version: HIBERNATE_CUT_VERSION,
+            save_id: run.plan.capture_id.clone(),
+            machine_id: run.plan.machine_id.clone(),
+            ended_run_id: run.plan.run_id.clone(),
+            freeze_operation_id: run
+                .borrowed
+                .as_ref()
+                .map_or_else(|| run.operation.clone(), |pause| pause.operation_id.clone()),
+            freeze_epoch: run
+                .freeze_epoch
+                .ok_or_else(|| fail("Missing guest freeze epoch".into()))?,
+            configuration: run.plan.configuration.clone(),
+            binding: CaptureStateBinding {
+                live_state_schema: binding.live_state_schema.clone(),
+                architecture: binding.architecture.clone(),
+                profile: digest(binding.profile),
+                topology: digest(binding.topology),
+                ram_layout: digest(binding.ram_layout),
+                source_run: run.plan.run_id.clone(),
+                pause_generation: NonZeroU64::new(binding.pause_generation.get())
+                    .ok_or_else(|| fail("Missing pause generation".into()))?,
+                capture: run.plan.capture_id.clone(),
+            },
+            materialization_generation: NonZeroU64::new(*memory_generation)
+                .ok_or_else(|| fail("Missing memory generation".into()))?,
+            predecessor_generation: *predecessor_generation,
+            packed_length: geometry.packed_length,
+            page_granule: geometry.page_granule,
+            regions: geometry.regions,
+            saved_files,
+            writable_disks,
+        };
+        cut.validate().map_err(fail)?;
+        Ok(cut)
+    }
+
+    async fn write_hibernate_journal(
+        &self,
+        run: &Run,
+        status: &HibernateCaptureStatus,
+        committed: bool,
+    ) -> Result<(), Abort> {
+        let fail = |message: String| {
+            Abort::Failed(failure(
+                LiveFailureCode::SealFailed,
+                LiveStage::CaptureSeal,
+                message,
+            ))
+        };
+        let staging = run
+            .staging
+            .clone()
+            .ok_or_else(|| fail("Missing save directory".into()))?;
+        let pid = self
+            .machine
+            .worker_process_id()
+            .ok_or_else(|| fail("Saved worker ended before commit".into()))?;
+        let pid_i32 = i32::try_from(pid).map_err(|error| fail(error.to_string()))?;
+        let started = utils::process::start_time(pid_i32)
+            .map_err(|error| fail(error.to_string()))?
+            .ok_or_else(|| fail("Saved worker identity is unavailable".into()))?;
+        let bytes = serde_json::to_vec(&HibernateJournal {
+            version: 1,
+            machine_id: &run.plan.machine_id,
+            run_id: &run.plan.run_id,
+            save_id: &run.plan.capture_id,
+            worker_pid: pid,
+            worker_started_at: started,
+            status,
+        })
+        .map_err(|error| fail(error.to_string()))?;
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let (name, temporary) = if committed {
+                ("committed.json", "committed.tmp")
+            } else {
+                ("record.json", "record.tmp")
+            };
+            match staging.commit_record(name, temporary, &bytes)? {
+                RecordCommit::Complete => staging.sync_hibernate_record(name),
+                RecordCommit::Uncertain(error) => Err(error),
+            }
+        })
+        .await
+        .map_err(|error| fail(error.to_string()))?
+        .map_err(|error| {
+            Abort::Failed(io_capture_failure(
+                &error,
+                LiveStage::CaptureSeal,
+                LiveFailureCode::SealFailed,
+            ))
+        })
+    }
+
+    /// No path after the manager's durable commit may resume or thaw.
+    async fn finish_hibernate(&self, run: Run) {
+        let status = self
+            .lock()
+            .journal
+            .capture_mut(&run.operation)
+            .and_then(|facts| facts.hibernation.clone());
+        let Some(status) = status else { return };
+        if let Err(error) = self.write_hibernate_journal(&run, &status, true).await {
+            let cause = match error {
+                Abort::Failed(cause) => cause,
+                Abort::Stopped => failure(
+                    LiveFailureCode::Stopped,
+                    LiveStage::CaptureSeal,
+                    "Monitor is stopping",
+                ),
+            };
+            // The catalog already committed. Retain the parked worker and files
+            // for exact-run recovery, never enter the precommit unwind.
+            self.complete_hibernate_release(&run.operation, Err(cause));
+            return;
+        }
+        self.gate.seal();
+        let result = self.machine.hibernate_stop().await.map_err(|error| {
+            failure(
+                LiveFailureCode::ReleaseFailed,
+                LiveStage::CaptureRelease,
+                format!("Could not release saved machine: {error}; retry stopping its old run"),
+            )
+        });
+        if result.is_ok() {
+            if let Some(facts) = self.lock().journal.capture_mut(&run.operation) {
+                if let Some(status) = facts.hibernation.as_mut() {
+                    status.phase = HibernateCapturePhase::Released;
+                }
+                facts.worker = WorkerPreparation::Absent;
+            }
+            if let Err(error) = self
+                .store
+                .set_vm_state(protocol::v1::VmState::Hibernated, "machine hibernated")
+            {
+                tracing::error!(%error, "publish hibernation terminal state");
+            }
+        }
+        self.complete_hibernate_release(&run.operation, result);
+    }
+
+    fn complete_hibernate_release(&self, operation: &LiveId, outcome: Result<(), LiveFailure>) {
+        let state = self
+            .store
+            .live_snapshot()
+            .map_or(VmLifecycleState::Stopping, |snapshot| snapshot.state);
+        let mut inner = self.lock();
+        let disposition = inner
+            .journal
+            .capture_mut(operation)
+            .and_then(|facts| facts.hibernate_release);
+        let Some(disposition) = disposition else {
+            return;
+        };
+        let result = match outcome {
+            Ok(()) => {
+                if let Some(facts) = inner.journal.capture_mut(operation) {
+                    facts.release = CaptureReleaseState::Released {
+                        disposition,
+                        baseline_retained: false,
+                    };
+                }
+                LiveCommandResult::ReleaseCapture(ReleaseCaptureOutcome::Released {
+                    released: CaptureReleased {
+                        operation_id: operation.clone(),
+                        disposition,
+                        baseline_retained: false,
+                        state,
+                    },
+                })
+            }
+            Err(cause) => LiveCommandResult::ReleaseCapture(ReleaseCaptureOutcome::Failed {
+                failed: ReleaseFailed { cause, state },
+            }),
+        };
+        for request in inner.journal.take_release_requests(operation) {
+            inner.journal.complete(&request, result.clone());
+        }
+    }
+
     // ------------------------------------------------------------- pipeline
 
     pub(crate) async fn run_capture(
@@ -620,6 +1271,13 @@ impl LiveCoordinator {
             disk_stats: Vec::new(),
             disk_maps: Vec::new(),
         };
+        if !run.plan.mode.clones_disks() {
+            match self.hibernate_stages(&mut run).await {
+                Ok(()) => self.finish_hibernate(run).await,
+                Err(abort) => self.unwind(run, abort).await,
+            }
+            return;
+        }
         match self.capture_stages(&mut run).await {
             Ok(evidence) => self.seal(run, evidence).await,
             Err(abort) => self.unwind(run, abort).await,
@@ -737,30 +1395,54 @@ impl LiveCoordinator {
             let capture = run.plan.capture_id.clone();
             let map_node_store = run.plan.map_node_store.clone();
             let run_identity = run.plan.identity_policy;
+            let mode = run.plan.mode.clone();
             move || -> io::Result<_> {
-                let staging = CaptureStaging::create(&context.data_dir, &capture)?;
-                let request = if run_identity == CaptureIdentityPolicy::None {
-                    staging.write_owned_request(&bytes)?;
-                    None
-                } else {
-                    staging.set_node_store(map_node_store.as_deref())?;
-                    Some(staging.write_request(&bytes)?)
+                let staging = match &mode {
+                    CaptureMode::Hibernate { directory } => {
+                        CaptureStaging::create_hibernate(&context.data_dir, &capture, directory)?
+                    }
+                    _ => CaptureStaging::create(&context.data_dir, &capture)?,
                 };
-                let files = CaptureOutputFiles {
-                    execution: staging.create_output(&CaptureRole::Execution)?,
-                    devices: staging.create_output(&CaptureRole::Devices)?,
-                    ram: staging.create_output(&CaptureRole::Ram)?,
-                    layout: staging.create_output(&CaptureRole::Layout)?,
-                    changes: staging.create_output(&CaptureRole::RamChanges)?,
-                    pin: File::from(context.lease.try_clone()?),
-                };
-                Ok((staging, request, files))
+                let prepared = (|| -> io::Result<_> {
+                    let request = if run_identity == CaptureIdentityPolicy::None {
+                        staging.write_owned_request(&bytes)?;
+                        None
+                    } else {
+                        staging.set_node_store(map_node_store.as_deref())?;
+                        Some(staging.write_request(&bytes)?)
+                    };
+                    let files = CaptureOutputFiles {
+                        execution: staging.create_output(&CaptureRole::Execution)?,
+                        devices: staging.create_output(&CaptureRole::Devices)?,
+                        ram: staging.create_output(&CaptureRole::Ram)?,
+                        layout: staging.create_output(&CaptureRole::Layout)?,
+                        changes: staging.create_output(&CaptureRole::RamChanges)?,
+                        pin: File::from(context.lease.try_clone()?),
+                    };
+                    Ok((request, files))
+                })();
+                match prepared {
+                    Ok((request, files)) => Ok((staging, request, files)),
+                    Err(error) => {
+                        if !mode.clones_disks() {
+                            if let Err(cleanup) = staging.remove_hibernate() {
+                                tracing::error!(%cleanup, "remove incomplete save directory");
+                            }
+                        }
+                        Err(error)
+                    }
+                }
             }
         })
         .await
         .map_err(|error| staging_failed(format!("staging task failed: {error}")))?;
-        let (staging, request, files) =
-            created.map_err(|error| staging_failed(format!("create capture staging: {error}")))?;
+        let (staging, request, files) = created.map_err(|error| {
+            Abort::Failed(io_capture_failure(
+                &error,
+                LiveStage::CapturePrepare,
+                LiveFailureCode::StagingFailed,
+            ))
+        })?;
         tracing::info!(operation = %run.operation, path = %staging.path().display(), "capture staging and request.json are written");
         run.staging = Some(Arc::new(staging));
         run.request_digest = request;
@@ -831,6 +1513,11 @@ impl LiveCoordinator {
                         .map(|baseline| Digest32(*baseline.stream.as_bytes()))
                 },
                 resume_policy: match run.plan.resume_policy {
+                    // Success never continues Hibernate. On failure the native
+                    // owner must allow rollback of the pause we acquired.
+                    _ if !run.plan.mode.clones_disks() && run.borrowed.is_none() => {
+                        NativeResumePolicy::ResumeIfAcquired
+                    }
                     CaptureResumePolicy::ResumeIfAcquired => NativeResumePolicy::ResumeIfAcquired,
                     CaptureResumePolicy::Preserve => NativeResumePolicy::Preserve,
                 },
@@ -1059,7 +1746,17 @@ impl LiveCoordinator {
             }
             Ok(CommandOutcome::CaptureFailed {
                 failure: native, ..
-            }) => Err(fail(native.to_string())),
+            }) => {
+                if native.kind == crate::virt::lifecycle::NativeFailureKind::OutOfSpace {
+                    Err(Abort::Failed(failure(
+                        LiveFailureCode::OutOfSpace,
+                        LiveStage::CaptureFlush,
+                        "Storage filled while flushing the machine; free space and retry",
+                    )))
+                } else {
+                    Err(fail(native.to_string()))
+                }
+            }
             Ok(outcome) => Err(fail(format!("unexpected native flush outcome {outcome:?}"))),
             Err(error) => Err(Abort::native(
                 error,
@@ -1373,7 +2070,16 @@ impl LiveCoordinator {
             }
             Ok(CommandOutcome::CaptureFailed {
                 failure: native, ..
-            }) => return Err(fail_execution(native.to_string())),
+            }) => {
+                if native.kind == crate::virt::lifecycle::NativeFailureKind::OutOfSpace {
+                    return Err(Abort::Failed(failure(
+                        LiveFailureCode::OutOfSpace,
+                        LiveStage::CaptureExecution,
+                        "Storage filled while saving the machine; free space and retry",
+                    )));
+                }
+                return Err(fail_execution(native.to_string()));
+            }
             Ok(outcome) => {
                 return Err(fail_execution(format!(
                     "unexpected native execution outcome {outcome:?}"
@@ -1433,7 +2139,16 @@ impl LiveCoordinator {
             }
             CommandOutcome::CaptureFailed {
                 failure: native, ..
-            } => return Err(fail_memory(native.to_string())),
+            } => {
+                if native.kind == crate::virt::lifecycle::NativeFailureKind::OutOfSpace {
+                    return Err(Abort::Failed(failure(
+                        LiveFailureCode::OutOfSpace,
+                        LiveStage::CaptureMemory,
+                        "Storage filled while saving the machine; free space and retry",
+                    )));
+                }
+                return Err(fail_memory(native.to_string()));
+            }
             outcome => {
                 return Err(fail_memory(format!(
                     "unexpected native RAM outcome {outcome:?}"
@@ -2898,6 +3613,26 @@ impl LiveCoordinator {
     /// preparation first by exact observation), write the failed diagnostic
     /// record, then continue the source under its policy.
     async fn unwind(&self, mut run: Run, abort: Abort) {
+        if !run.plan.mode.clones_disks() {
+            let committed = {
+                let mut inner = self.lock();
+                inner
+                    .journal
+                    .operation_mut(&run.operation)
+                    .is_some_and(|record| {
+                        if record.phase == Phase::HibernateCommitted {
+                            true
+                        } else {
+                            record.phase = Phase::Continuing;
+                            record.cancel.cancel();
+                            false
+                        }
+                    })
+            };
+            if committed {
+                return self.finish_hibernate(run).await;
+            }
+        }
         let disk_settlement = self.settle_disks(&mut run, false).await;
         let cause = match abort {
             Abort::Failed(cause) if !self.stop.is_cancelled() => cause,
@@ -2908,6 +3643,16 @@ impl LiveCoordinator {
                 return self.capture_stopped(&mut run);
             }
         };
+        if let Some(status) = self
+            .lock()
+            .journal
+            .capture_mut(&run.operation)
+            .and_then(|facts| facts.hibernation.as_mut())
+        {
+            status.phase = HibernateCapturePhase::Failed;
+            status.failure = Some(cause.clone());
+            status.cut = None;
+        }
         if let Err(cause) = disk_settlement {
             self.write_failed_record(&run, &cause).await;
             self.finish(&mut run, Finish::Error(cause)).await;
@@ -2939,6 +3684,24 @@ impl LiveCoordinator {
                 self.write_failed_record(&run, &cause).await;
                 return self.finish(&mut run, Finish::Error(unresolved)).await;
             }
+        }
+        if !run.plan.mode.clones_disks() {
+            if let Some(staging) = run.staging.take() {
+                let removed = tokio::task::spawn_blocking(move || staging.remove_hibernate()).await;
+                if !matches!(removed, Ok(Ok(()))) {
+                    tracing::error!(?removed, "remove failed hibernation files");
+                    self.finish(&mut run, Finish::Error(failure(
+                        LiveFailureCode::StagingFailed, LiveStage::CaptureAbandon,
+                        "Could not remove the incomplete save; stop the machine before retrying",
+                    ))).await;
+                    return;
+                }
+            }
+            run.plan.resume_policy = if run.borrowed.is_some() {
+                CaptureResumePolicy::Preserve
+            } else {
+                CaptureResumePolicy::ResumeIfAcquired
+            };
         }
         self.write_failed_record(&run, &cause).await;
         self.continue_source(&mut run).await;
@@ -3120,6 +3883,9 @@ impl LiveCoordinator {
             self.write_source_record(run, &continuation).await;
         }
         self.finish_projection(run, finish, true);
+        if !run.plan.mode.clones_disks() {
+            self.complete_hibernate_release(&run.operation, Ok(()));
+        }
     }
 
     fn finish_projection(&self, run: &mut Run, finish: Finish, settle: bool) {
@@ -3240,6 +4006,9 @@ impl LiveCoordinator {
     /// capture paused or borrowed. A write failure leaves the real outcome
     /// in GetOperation; libvm never resumes because the file is absent.
     async fn write_source_record(&self, run: &Run, continuation: &CaptureContinuation) {
+        if !run.plan.mode.clones_disks() {
+            return;
+        }
         let (Some(staging), Some(cut)) = (run.staging.clone(), run.cut.clone()) else {
             return;
         };
@@ -3328,6 +4097,9 @@ impl LiveCoordinator {
         operation: LiveId,
         disposition: CaptureReleaseDisposition,
     ) {
+        if self.signal_hibernate_release(&operation) {
+            return;
+        }
         let worker = self
             .lock()
             .journal
@@ -3709,6 +4481,40 @@ mod tests {
     use crate::live::coordinator::capture::{staging_budget, RamVerification, Verified};
     use crate::live::staging::CaptureStaging;
     use crate::virt::lifecycle::{CaptureOutputIdentities, OutputIdentity};
+
+    #[test]
+    fn hibernate_memory_estimate_requires_rss_and_swap_with_checked_units() {
+        use crate::live::coordinator::capture::parse_populated_memory_estimate;
+        assert_eq!(
+            parse_populated_memory_estimate(
+                "0000-ffff ---p [rollup]\nRss: 1024 kB\nPss: 99 kB\nSwap: 32 kB\n"
+            )
+            .unwrap(),
+            1056 * 1024
+        );
+        for text in [
+            "",
+            "Rss: 1 kB",
+            "Swap: 1 kB",
+            "Rss: 1 MB\nSwap: 0 kB",
+            "Rss: -1 kB\nSwap: 0 kB",
+            "Rss: 1 kB\nRss: 1 kB\nSwap: 0 kB",
+            "Rss: 18446744073709551615 kB\nSwap: 1 kB",
+            "Rss: 1 kB extra\nSwap: 0 kB",
+            "Rss: 18446744073709551615 kB\nSwap: 0 kB",
+        ] {
+            assert!(parse_populated_memory_estimate(text).is_err(), "{text}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hibernate_memory_estimate_reads_the_current_process_rollup() {
+        let text = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap();
+        assert!(
+            crate::live::coordinator::capture::parse_populated_memory_estimate(&text).unwrap() > 0
+        );
+    }
 
     struct Root(PathBuf);
 

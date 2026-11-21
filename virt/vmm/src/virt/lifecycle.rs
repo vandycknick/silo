@@ -1356,6 +1356,7 @@ pub enum NativeFailureKind {
     FailedFenced,
     Generation(GenerationFailureKind),
     Unexpected,
+    OutOfSpace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

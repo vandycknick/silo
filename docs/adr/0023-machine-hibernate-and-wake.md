@@ -159,11 +159,14 @@ monitor owns the capture. The native worker writes memory and device state.
    workloads through the agent (or validates the user's existing pause),
    pauses the VM natively and flushes every writable disk. This is the ADR
    0021 sequence, unchanged.
-3. **Check space.** The worker reports how much guest memory is populated.
-   `libvm` compares that amount, plus a fixed allowance for state files,
-   against free space on the machine's filesystem. If there is not enough, the
-   guest is resumed and hibernate fails. Silo keeps no space reservation for
-   hibernate.
+3. **Check space.** The monitor estimates how much guest memory is populated
+   from the worker process's resident and swapped memory, as reported by the
+   kernel. The estimate includes the worker's own overhead, so it errs high.
+   `libvm` compares it, plus a fixed allowance for state files, against free
+   space on the machine's filesystem. If there is not enough, the guest is
+   resumed and hibernate fails. The estimate only avoids starting a write
+   that cannot finish; the rollback on a full disk in step 4 is the guard.
+   Silo keeps no space reservation for hibernate.
 4. **Write.** The worker writes CPU state, device state and a complete sparse
    memory file into `<machine-data>/hibernation/<save-id>/`. When the run has
    a byte baseline, the memory file is written incrementally against it, as

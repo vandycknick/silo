@@ -1099,7 +1099,10 @@ impl NativeLifecycle for ScenarioNative {
                 write_ram(&ram, &changes, (length / 2).max(PAGE).min(length)).map(|_| ())
             };
             let failure = match partial {
-                Ok(_) => participant("scripted RAM image write failure (ENOSPC)"),
+                Ok(_) => NativeFailure::with_detail(
+                    NativeFailureKind::OutOfSpace,
+                    "scripted RAM image write failure (ENOSPC)",
+                ),
                 Err(failure) => failure,
             };
             let entry = self.capture(&mut model, capture)?;

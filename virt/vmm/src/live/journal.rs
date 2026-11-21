@@ -161,6 +161,10 @@ pub(crate) enum Phase {
     Sealing,
     /// The capture outcome is final; its source continuation is still running.
     Continuing,
+    /// Saved bytes durable, but manager commit is still cancellable.
+    HibernatePrepared,
+    /// Manager committed the save; killing the exact old run is mandatory.
+    HibernateCommitted,
     /// Finished; cancel has no effect.
     Settled,
 }
@@ -189,6 +193,10 @@ pub(crate) struct CaptureFacts {
     pub(crate) source_record: Option<vm_spec::capture::CaptureSourceReference>,
     /// What the worker may retain for this operation; release resolves it.
     pub(crate) worker: WorkerPreparation,
+    pub(crate) hibernation: Option<vm_spec::capture::HibernateCaptureStatus>,
+    pub(crate) hibernate_write: bool,
+    pub(crate) hibernate_release: Option<CaptureReleaseDisposition>,
+    pub(crate) hibernate_changed: std::sync::Arc<tokio::sync::Notify>,
     release_requests: Vec<LiveId>,
 }
 
@@ -602,6 +610,17 @@ impl Journal {
                 evidence: None,
                 source_record: None,
                 worker: WorkerPreparation::Absent,
+                hibernation: (!plan.mode.clones_disks()).then_some(
+                    vm_spec::capture::HibernateCaptureStatus {
+                        phase: vm_spec::capture::HibernateCapturePhase::Saving,
+                        populated_memory_estimate_bytes: None,
+                        cut: None,
+                        failure: None,
+                    },
+                ),
+                hibernate_write: false,
+                hibernate_release: None,
+                hibernate_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
                 release_requests: Vec::new(),
             }),
         );
@@ -614,7 +633,11 @@ impl Journal {
                 receipt: LiveOperationReceipt {
                     operation_id: operation.clone(),
                     kind: OperationKind::Capture,
-                    state: VmLifecycleState::Capturing,
+                    state: if plan.mode.clones_disks() {
+                        VmLifecycleState::Capturing
+                    } else {
+                        VmLifecycleState::Hibernating
+                    },
                 },
             }),
         );
@@ -647,12 +670,31 @@ impl Journal {
                 "release target is not a capture operation",
             );
         };
-        if operation.phase != Phase::Settled {
+        if operation.phase != Phase::Settled
+            && !(facts.hibernation.is_some()
+                && (release.disposition == CaptureReleaseDisposition::Abandoned
+                    || operation.phase == Phase::HibernatePrepared
+                    || operation.phase == Phase::HibernateCommitted))
+        {
             return self.reject(
                 command,
                 LiveRejectionReason::ContinuationPending,
                 view.state,
                 "the capture or its source continuation has not finished",
+            );
+        }
+        if facts.hibernation.is_some()
+            && (facts
+                .hibernate_release
+                .is_some_and(|pending| pending != release.disposition)
+                || (release.disposition == CaptureReleaseDisposition::Published
+                    && operation.cancel.is_cancelled()))
+        {
+            return self.reject(
+                command,
+                LiveRejectionReason::InvalidState,
+                view.state,
+                "Hibernation already has a different release decision",
             );
         }
         if let CaptureReleaseState::Released {
@@ -675,6 +717,28 @@ impl Journal {
         let receiver = self.pending(command);
         if let Some(facts) = self.capture_mut(&release.operation_id) {
             facts.release_requests.push(request.clone());
+        }
+        if let Some(record) = self.operations.get_mut(&release.operation_id) {
+            if let Some(facts) = record
+                .capture
+                .as_mut()
+                .filter(|facts| facts.hibernation.is_some())
+            {
+                if facts.hibernate_release.is_none() {
+                    facts.hibernate_release = Some(release.disposition);
+                    if release.disposition == CaptureReleaseDisposition::Published {
+                        // The same lock linearizes manager commit against
+                        // cancellation and precommit timeout rollback.
+                        record.phase = Phase::HibernateCommitted;
+                        if let Some(status) = facts.hibernation.as_mut() {
+                            status.phase = vm_spec::capture::HibernateCapturePhase::Committed;
+                        }
+                    } else {
+                        record.cancel.cancel();
+                    }
+                    facts.hibernate_changed.notify_one();
+                }
+            }
         }
         if first {
             Admitted::Release {
@@ -772,7 +836,7 @@ impl Journal {
         match operation.phase {
             // Finished, or a sealed capture continuing its source: never
             // interrupted; the unchanged record is returned.
-            Phase::Settled | Phase::Continuing => {
+            Phase::Settled | Phase::Continuing | Phase::HibernateCommitted => {
                 let result =
                     LiveCommandResult::CancelOperation(CancelOperationOutcome::Completed {
                         completed: CancelCompleted {
@@ -784,7 +848,11 @@ impl Journal {
                 self.record(command, result.clone());
                 Admitted::Answer(Answer::Ready(result))
             }
-            Phase::Pipeline | Phase::IdentityPending | Phase::Cancelling | Phase::Sealing => {
+            Phase::Pipeline
+            | Phase::IdentityPending
+            | Phase::Cancelling
+            | Phase::Sealing
+            | Phase::HibernatePrepared => {
                 let receiver = self.pending(command);
                 if let Some(operation) = self.operations.get_mut(target) {
                     operation.cancel_requests.push(request);
@@ -943,6 +1011,99 @@ mod tests {
     use crate::live::journal::{
         AdmissionView, Admitted, Answer, CaptureBinding, Eligibility, Journal, Phase,
     };
+
+    #[test]
+    fn hibernate_commit_and_cancel_are_linearized_by_admission() {
+        use vm_spec::capture::{CaptureMode, HibernateCapturePhase};
+        for cancel_first in [false, true] {
+            let mut journal = Journal::new(id(MACHINE), id(RUN));
+            let mut capture = capture_command(CAPTURE, CapturePauseAuthority::Acquire);
+            let LiveCommand::Capture(command) = &mut capture else {
+                panic!()
+            };
+            command.plan.mode = CaptureMode::Hibernate {
+                directory: "/machine/hibernation/save".into(),
+            };
+            command.plan.identity_policy = vm_spec::capture::CaptureIdentityPolicy::None;
+            command.plan.resume_policy = CaptureResumePolicy::Preserve;
+            assert!(matches!(
+                journal.admit(
+                    &capture,
+                    &view(VmLifecycleState::Running),
+                    Eligibility::Eligible
+                ),
+                Admitted::Capture { .. }
+            ));
+            let operation = journal.operation_mut(&id(CAPTURE)).unwrap();
+            operation.phase = Phase::HibernatePrepared;
+            operation
+                .capture
+                .as_mut()
+                .unwrap()
+                .hibernation
+                .as_mut()
+                .unwrap()
+                .phase = HibernateCapturePhase::Prepared;
+            let cancel = LiveCommand::CancelOperation(CancelOperationCommand {
+                envelope: envelope(0x61),
+                operation_id: id(CAPTURE),
+            });
+            if cancel_first {
+                assert!(matches!(
+                    journal.admit(
+                        &cancel,
+                        &view(VmLifecycleState::Hibernating),
+                        Eligibility::Unchecked
+                    ),
+                    Admitted::Joined { .. }
+                ));
+            }
+            let release = LiveCommand::ReleaseCapture(ReleaseCaptureCommand {
+                envelope: envelope(0x62),
+                operation_id: id(CAPTURE),
+                disposition: CaptureReleaseDisposition::Published,
+            });
+            let admitted = journal.admit(
+                &release,
+                &view(VmLifecycleState::Hibernating),
+                Eligibility::Unchecked,
+            );
+            if cancel_first {
+                assert!(matches!(
+                    admitted,
+                    Admitted::Answer(Answer::Ready(LiveCommandResult::ReleaseCapture(
+                        ReleaseCaptureOutcome::Rejected { .. }
+                    )))
+                ));
+                assert!(journal
+                    .operation(&id(CAPTURE))
+                    .unwrap()
+                    .cancel
+                    .is_cancelled());
+            } else {
+                assert!(matches!(admitted, Admitted::Release { .. }));
+                assert_eq!(
+                    journal.operation(&id(CAPTURE)).unwrap().phase,
+                    Phase::HibernateCommitted
+                );
+                assert!(!journal
+                    .operation(&id(CAPTURE))
+                    .unwrap()
+                    .cancel
+                    .is_cancelled());
+                assert!(
+                    matches!(journal.admit(&cancel, &view(VmLifecycleState::Hibernating), Eligibility::Unchecked),
+                    Admitted::Answer(Answer::Ready(LiveCommandResult::CancelOperation(
+                        CancelOperationOutcome::Completed { completed }))) if !completed.effective)
+                );
+                assert!(!journal
+                    .operation(&id(CAPTURE))
+                    .unwrap()
+                    .cancel
+                    .is_cancelled());
+            }
+        }
+    }
 
     fn id(last: u8) -> LiveId {
         LiveId::parse(&format!("00000000-0000-4000-8000-0000000000{last:02x}")).unwrap()

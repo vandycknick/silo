@@ -325,6 +325,23 @@ impl VirtBackend for MockBackend {
         Ok(())
     }
 
+    async fn hibernate_stop(&self) -> Result<(), VirtError> {
+        self.lifecycle.close_admission();
+        let _ = self.running.lock().await.take();
+        self.shutdown.send_replace(true);
+        self.cache_exit(VmExit {
+            outcome: crate::virt::exit::VmOutcome::Forced,
+            force_reason: Some(crate::virt::exit::ForceReason::Hibernate),
+            ..VmExit::stopped(StartupStage::Started)
+        });
+        terminate_worker(&self.native, &self.worker_endpoint);
+        Ok(())
+    }
+
+    fn worker_process_id(&self) -> Option<u32> {
+        self.cached_exit().is_none().then(std::process::id)
+    }
+
     /// The scenario backend retains no launch descriptors; it opens its
     /// configured disk files read-only (std opens are close-on-exec) for the
     /// capture's disk seal.
