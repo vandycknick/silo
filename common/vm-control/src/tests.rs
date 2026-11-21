@@ -194,6 +194,12 @@ fn inventory_retains_unreadable_identity_and_all_lifecycle_states() {
             message: Some("user-owned".into()),
         },
         libvm::MachineStatus::Capturing { message: None },
+        libvm::MachineStatus::Hibernating {
+            message: Some("saving".into()),
+        },
+        libvm::MachineStatus::Hibernated {
+            message: Some("saved".into()),
+        },
         libvm::MachineStatus::Restoring { message: None },
         libvm::MachineStatus::Activating { message: None },
         libvm::MachineStatus::ActivationFailed { message: None },

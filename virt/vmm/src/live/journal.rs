@@ -1010,6 +1010,7 @@ mod tests {
     fn plan(request: u8, pause: CapturePauseAuthority) -> CapturePlan {
         let binding = binding();
         CapturePlan {
+            mode: vm_spec::capture::CaptureMode::Snapshot,
             identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
             version: CAPTURE_RECORD_VERSION,
             machine_id: id(MACHINE),

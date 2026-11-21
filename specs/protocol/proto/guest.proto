@@ -168,6 +168,12 @@ message ActivationShutdownContext {
 
 // The trusted monitor sends this only after the exact kernel-generation ack.
 // Replays compare the entire original request, including source identity.
+enum ActivationPurpose {
+  ACTIVATION_PURPOSE_UNSPECIFIED = 0;
+  ACTIVATION_PURPOSE_CLONE = 1;
+  ACTIVATION_PURPOSE_SAME_MACHINE = 2;
+}
+
 message ActivateRequest {
   string activation_id = 1;
   ExpectedGuestIdentity expected = 2;
@@ -181,6 +187,7 @@ message ActivateRequest {
   ActivationShutdownContext shutdown = 10;
   optional uint32 deadline_ms = 11;
   optional string ssh_trusted_ca = 12;
+  optional ActivationPurpose purpose = 13;
 }
 
 message ActivateResponse {

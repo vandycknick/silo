@@ -1098,6 +1098,7 @@ impl Harness {
             .capture_binding_for_tests()
             .expect("capture binding");
         CapturePlan {
+            mode: vm_spec::capture::CaptureMode::Snapshot,
             identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
             version: CAPTURE_RECORD_VERSION,
             machine_id: self.machine_id.clone(),

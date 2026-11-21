@@ -269,21 +269,13 @@ fn validate_start_request(
         {
             return Err(invalid_data("restore requires the krun backend"));
         }
-        let (source_machine, source_run) = match &restore.authority {
-            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => {
-                (&evidence.machine_id, &evidence.run_id)
-            }
-            vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } => {
-                (&cut.machine_id, &cut.run_id)
-            }
-        };
-        if source_machine.as_str() == request.machine_id
-            || source_run.as_str() == request.machine_run_id
-        {
-            return Err(invalid_data(
-                "a restore launch needs a new machine and run identity",
-            ));
-        }
+        restore
+            .validate_activation(
+                &vm_spec::lifecycle::LiveId::parse(&request.machine_id).map_err(invalid_data)?,
+                &vm_spec::lifecycle::LiveId::parse(&request.machine_run_id)
+                    .map_err(invalid_data)?,
+            )
+            .map_err(invalid_data)?;
         destination_ssh_ca(restore.ssh_trusted_ca.as_deref())?;
     }
     Ok(request)

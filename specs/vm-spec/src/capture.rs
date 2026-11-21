@@ -664,6 +664,37 @@ pub enum CaptureIdentityPolicy {
     SinceAnchor,
 }
 
+/// Disk ownership and terminal disposition of a capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureMode {
+    Snapshot,
+    Fork,
+    /// Retain writable disks in place, do no identity hashing, and kill/reap
+    /// the worker without shutdown, resume or thaw after durable acceptance.
+    Hibernate,
+}
+
+impl CaptureMode {
+    pub const fn clones_disks(self) -> bool {
+        !matches!(self, Self::Hibernate)
+    }
+
+    pub const fn terminal_outcome(self) -> CaptureTerminalOutcome {
+        match self {
+            Self::Snapshot | Self::Fork => CaptureTerminalOutcome::ContinueSource,
+            Self::Hibernate => CaptureTerminalOutcome::WorkerKilledWithoutShutdown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureTerminalOutcome {
+    ContinueSource,
+    WorkerKilledWithoutShutdown,
+}
+
 /// The complete immutable capture plan. `request.json` is exactly
 /// [`CapturePlan::canonical_bytes`]; the capture ID is the Capture request
 /// and operation ID.
@@ -671,6 +702,7 @@ pub enum CaptureIdentityPolicy {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapturePlan {
     pub version: u32,
+    pub mode: CaptureMode,
     pub machine_id: LiveId,
     pub run_id: LiveId,
     pub capture_id: LiveId,
@@ -691,6 +723,15 @@ pub struct CapturePlan {
 
 impl CapturePlan {
     pub fn validate(&self) -> Result<(), String> {
+        if self.mode == CaptureMode::Hibernate
+            && (self.identity_policy != CaptureIdentityPolicy::None
+                || self.resume_policy != CaptureResumePolicy::Preserve
+                || self.disks.iter().any(|disk| disk.baseline_map.is_some()))
+        {
+            return Err(invalid(
+                "hibernation requires no identity hashing and a retained native pause",
+            ));
+        }
         if self.identity_policy == CaptureIdentityPolicy::None && self.map_node_store.is_some() {
             return Err(invalid("owned fork capture cannot publish map nodes"));
         }
@@ -795,6 +836,9 @@ impl CapturePlan {
                 return Err(invalid("capture disk names must be unique"));
             }
             names.push(&disk.name);
+            if self.mode == CaptureMode::Hibernate {
+                continue;
+            }
             let charge = match disk.copy {
                 CaptureDiskCopy::Clone => CAPTURE_CLONE_RESERVE_BYTES,
                 // Allocation is measured by the reservation; the logical
@@ -814,7 +858,9 @@ impl CapturePlan {
         if stream_bytes > MAX_STREAM_BYTES {
             return Err(invalid("capture closure exceeds 4 TiB of logical streams"));
         }
-        if self.reservation.staging_bytes < minimum || self.reservation.launch_lease.inode == 0 {
+        if (self.mode != CaptureMode::Hibernate && self.reservation.staging_bytes < minimum)
+            || self.reservation.launch_lease.inode == 0
+        {
             return Err(invalid(
                 "capture reservation is below the staging minimum or lacks its launch lease",
             ));
@@ -2729,6 +2775,7 @@ pub(crate) mod tests {
     fn plan() -> CapturePlan {
         let configuration = CaptureConfiguration::from_spec(&spec()).unwrap();
         CapturePlan {
+            mode: crate::capture::CaptureMode::Snapshot,
             version: CAPTURE_RECORD_VERSION,
             machine_id: machine(),
             run_id: run(),
@@ -3281,6 +3328,7 @@ pub(crate) mod tests {
             }
         });
         RestoreRequest {
+            purpose: crate::restore::ActivationPurpose::Clone,
             disk_tracking_seeds: Vec::new(),
             map_node_store: None,
             version: crate::restore::RESTORE_REQUEST_VERSION,
@@ -4156,5 +4204,74 @@ pub(crate) mod tests {
         assert!(memory.validate_capture().is_err());
         memory.identity_policy = CaptureIdentityPolicy::SinceAnchor;
         assert!(memory.validate_capture().is_err());
+    }
+
+    #[test]
+    fn hibernation_capture_mode_keeps_disks_and_requires_no_identity_or_continuation() {
+        let mut plan = plan();
+        plan.mode = CaptureMode::Hibernate;
+        assert!(plan.validate().is_err());
+        plan.identity_policy = CaptureIdentityPolicy::None;
+        plan.resume_policy = CaptureResumePolicy::Preserve;
+        plan.map_node_store = None;
+        plan.reservation.staging_bytes = 0;
+        plan.validate().unwrap();
+        assert!(!plan.mode.clones_disks());
+        assert_eq!(
+            plan.mode.terminal_outcome(),
+            CaptureTerminalOutcome::WorkerKilledWithoutShutdown
+        );
+        let bytes = plan.canonical_bytes().unwrap();
+        assert_eq!(CapturePlan::decode(&bytes).unwrap(), plan);
+        let mut missing = serde_json::to_value(&plan).unwrap();
+        missing.as_object_mut().unwrap().remove("mode");
+        assert!(serde_json::from_value::<CapturePlan>(missing).is_err());
+        for mode in [CaptureMode::Snapshot, CaptureMode::Fork] {
+            assert!(mode.clones_disks());
+            assert_eq!(
+                mode.terminal_outcome(),
+                CaptureTerminalOutcome::ContinueSource
+            );
+        }
+        plan.disks.clear();
+        assert!(
+            plan.validate().is_err(),
+            "in-place capture still requires flush coverage"
+        );
+    }
+
+    #[test]
+    fn restore_activation_purpose_validates_machine_run_and_hook() {
+        use crate::restore::ActivationPurpose;
+        let mut request = restore_request();
+        let source = match &request.authority {
+            crate::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => {
+                evidence.machine_id.clone()
+            }
+            _ => unreachable!(),
+        };
+        let old_run = request.authority.binding().unwrap().source_run.clone();
+        let other = id("99999999-9999-4999-8999-999999999999");
+        let new_run = id("88888888-8888-4888-8888-888888888888");
+        request.validate_activation(&other, &new_run).unwrap();
+        assert!(request.validate_activation(&source, &new_run).is_err());
+        assert!(request.validate_activation(&other, &old_run).is_err());
+        request.purpose = ActivationPurpose::SameMachine;
+        request.validate_activation(&source, &new_run).unwrap();
+        assert!(request.validate_activation(&other, &new_run).is_err());
+        assert!(request.validate_activation(&source, &old_run).is_err());
+        request.hook = Some(crate::restore::RestoreHook {
+            argv: vec!["/hook".into()],
+            environment: Vec::new(),
+            working_directory: "/".into(),
+            timeout_ms: 1000,
+        });
+        assert!(request.validate_activation(&source, &new_run).is_err());
+        let mut missing = serde_json::to_value(&request).unwrap();
+        missing.as_object_mut().unwrap().remove("purpose");
+        assert!(serde_json::from_value::<crate::restore::RestoreRequest>(missing).is_err());
+        let mut unknown = serde_json::to_value(&request).unwrap();
+        unknown["purpose"] = "unknown".into();
+        assert!(serde_json::from_value::<crate::restore::RestoreRequest>(unknown).is_err());
     }
 }

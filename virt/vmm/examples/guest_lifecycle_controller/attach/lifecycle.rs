@@ -153,6 +153,7 @@ impl ActivateRequest {
 
     fn to_wire(&self) -> eyre::Result<v1::ActivateRequest> {
         Ok(v1::ActivateRequest {
+            purpose: Some(v1::ActivationPurpose::Clone as i32),
             activation_id: self.activation_id.clone(),
             expected: Some((&self.expected).into()),
             freeze_ref: Some((&self.freeze_ref).into()),

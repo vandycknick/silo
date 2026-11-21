@@ -627,6 +627,8 @@ fn attempt<'a>(
             MachineStatus::Pausing { .. }
             | MachineStatus::Paused { .. }
             | MachineStatus::Capturing { .. }
+            | MachineStatus::Hibernating { .. }
+            | MachineStatus::Hibernated { .. }
             | MachineStatus::Restoring { .. }
             | MachineStatus::Activating { .. }
             | MachineStatus::ActivationFailed { .. } => {

@@ -354,6 +354,11 @@ impl SnapshotStore {
             .ok_or_else(|| invalid("capture peak overflow"))?;
         let ram = request.configuration.ram_bytes();
         let plan = CapturePlan {
+            mode: if local_fork {
+                vm_spec::capture::CaptureMode::Fork
+            } else {
+                vm_spec::capture::CaptureMode::Snapshot
+            },
             identity_policy: if local_fork {
                 vm_spec::capture::CaptureIdentityPolicy::None
             } else if request.policy == vm_spec::lifecycle::CapturePolicy::Full {

@@ -1546,6 +1546,7 @@ mod tests {
             let configuration =
                 CaptureConfiguration::from_spec(&vm_spec::VmSpec::current()).expect("projection");
             CapturePlan {
+                mode: vm_spec::capture::CaptureMode::Snapshot,
                 identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
                 version: CAPTURE_RECORD_VERSION,
                 machine_id: id(capture_envelope.machine_id.as_ref()),

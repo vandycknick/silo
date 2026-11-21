@@ -68,6 +68,16 @@ pub fn status_to_wire(v: &libvm::MachineStatus) -> Result<w::MachineStatus, Conv
             libvm::MachineStatus::Capturing { message } => Status::Capturing(w::LifecycleDetail {
                 message: message.clone(),
             }),
+            libvm::MachineStatus::Hibernating { message } => {
+                Status::Hibernating(w::LifecycleDetail {
+                    message: message.clone(),
+                })
+            }
+            libvm::MachineStatus::Hibernated { message } => {
+                Status::Hibernated(w::LifecycleDetail {
+                    message: message.clone(),
+                })
+            }
             libvm::MachineStatus::Restoring { message } => Status::Restoring(w::LifecycleDetail {
                 message: message.clone(),
             }),
@@ -100,6 +110,8 @@ pub fn status_from_wire(v: w::MachineStatus) -> Result<libvm::MachineStatus, Con
         Status::Pausing(v) => libvm::MachineStatus::Pausing { message: v.message },
         Status::Paused(v) => libvm::MachineStatus::Paused { message: v.message },
         Status::Capturing(v) => libvm::MachineStatus::Capturing { message: v.message },
+        Status::Hibernating(v) => libvm::MachineStatus::Hibernating { message: v.message },
+        Status::Hibernated(v) => libvm::MachineStatus::Hibernated { message: v.message },
         Status::Restoring(v) => libvm::MachineStatus::Restoring { message: v.message },
         Status::Activating(v) => libvm::MachineStatus::Activating { message: v.message },
         Status::ActivationFailed(v) => {

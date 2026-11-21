@@ -68,6 +68,8 @@ fn vm_state_to(v: libvm::MachineVmState) -> i32 {
         libvm::MachineVmState::Activating => 10,
         libvm::MachineVmState::ActivationFailed => 11,
         libvm::MachineVmState::Error => 12,
+        libvm::MachineVmState::Hibernating => 13,
+        libvm::MachineVmState::Hibernated => 14,
     }
 }
 fn vm_state_from(v: i32) -> Result<libvm::MachineVmState, ConversionError> {
@@ -84,6 +86,8 @@ fn vm_state_from(v: i32) -> Result<libvm::MachineVmState, ConversionError> {
         10 => Ok(libvm::MachineVmState::Activating),
         11 => Ok(libvm::MachineVmState::ActivationFailed),
         12 => Ok(libvm::MachineVmState::Error),
+        13 => Ok(libvm::MachineVmState::Hibernating),
+        14 => Ok(libvm::MachineVmState::Hibernated),
         _ => Err(invalid("vm_state", "invalid enum")),
     }
 }
@@ -106,6 +110,8 @@ fn readiness_reason_to(v: libvm::MachineReadinessReason) -> i32 {
         libvm::MachineReadinessReason::VmActivating => 15,
         libvm::MachineReadinessReason::VmActivationFailed => 16,
         libvm::MachineReadinessReason::VmError => 17,
+        libvm::MachineReadinessReason::VmHibernating => 18,
+        libvm::MachineReadinessReason::VmHibernated => 19,
     }
 }
 fn readiness_reason_from(v: i32) -> Result<libvm::MachineReadinessReason, ConversionError> {
@@ -127,6 +133,8 @@ fn readiness_reason_from(v: i32) -> Result<libvm::MachineReadinessReason, Conver
         15 => Ok(libvm::MachineReadinessReason::VmActivating),
         16 => Ok(libvm::MachineReadinessReason::VmActivationFailed),
         17 => Ok(libvm::MachineReadinessReason::VmError),
+        18 => Ok(libvm::MachineReadinessReason::VmHibernating),
+        19 => Ok(libvm::MachineReadinessReason::VmHibernated),
         _ => Err(invalid("readiness_reason", "invalid enum")),
     }
 }
@@ -641,4 +649,32 @@ pub fn readiness_from_wire(
         },
         status: monitor_status_from_wire(required(v.status, "readiness.status")?)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::readiness::{
+        readiness_reason_from, readiness_reason_to, vm_state_from, vm_state_to,
+    };
+    use libvm::{MachineReadinessReason, MachineVmState};
+
+    #[test]
+    fn hibernation_readiness_states_roundtrip_without_changing_existing_values() {
+        for (state, value) in [
+            (MachineVmState::Hibernating, 13),
+            (MachineVmState::Hibernated, 14),
+        ] {
+            assert_eq!(vm_state_to(state), value);
+            assert_eq!(vm_state_from(value).unwrap(), state);
+        }
+        for (reason, value) in [
+            (MachineReadinessReason::VmHibernating, 18),
+            (MachineReadinessReason::VmHibernated, 19),
+        ] {
+            assert_eq!(readiness_reason_to(reason), value);
+            assert_eq!(readiness_reason_from(value).unwrap(), reason);
+        }
+        assert_eq!(vm_state_to(MachineVmState::Error), 12);
+        assert_eq!(readiness_reason_to(MachineReadinessReason::VmError), 17);
+    }
 }

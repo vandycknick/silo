@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod hibernate;
 pub mod lifecycle;
 pub mod live;
 pub mod restore;

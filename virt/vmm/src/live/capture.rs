@@ -497,6 +497,12 @@ impl LiveCoordinator {
     /// against actual staged allocation at verification ([`staging_budget`]),
     /// never against a second allocation sample of the still running guest.
     pub(crate) async fn check_capture(&self, plan: &CapturePlan) -> Result<Eligibility, LiveError> {
+        if plan.mode == vm_spec::capture::CaptureMode::Hibernate {
+            return Ok(Eligibility::Rejected(
+                LiveRejectionReason::InvalidPlan,
+                "Hibernation is not available; use a snapshot instead".into(),
+            ));
+        }
         if let Some(subject) = self.native_inventory(&plan.capture_id, true).await {
             return self.device_rejection(LiveOperation::Capture, subject);
         }

@@ -604,6 +604,12 @@ pub enum MachineStatus {
     Capturing {
         message: Option<String>,
     },
+    Hibernating {
+        message: Option<String>,
+    },
+    Hibernated {
+        message: Option<String>,
+    },
     Restoring {
         message: Option<String>,
     },
@@ -647,6 +653,12 @@ impl MachineStatus {
             MachineRuntimeState::Capturing => Self::Capturing {
                 message: last_error,
             },
+            MachineRuntimeState::Hibernating => Self::Hibernating {
+                message: last_error,
+            },
+            MachineRuntimeState::Hibernated => Self::Hibernated {
+                message: last_error,
+            },
             MachineRuntimeState::Restoring => Self::Restoring {
                 message: last_error,
             },
@@ -684,6 +696,8 @@ impl MachineStatus {
             VmState::Pausing => Self::Pausing { message },
             VmState::Paused => Self::Paused { message },
             VmState::Capturing => Self::Capturing { message },
+            VmState::Hibernating => Self::Hibernating { message },
+            VmState::Hibernated => Self::Hibernated { message },
             VmState::Restoring => Self::Restoring { message },
             VmState::Activating => Self::Activating { message },
             VmState::ActivationFailed => Self::ActivationFailed { message },
@@ -702,7 +716,10 @@ impl MachineStatus {
 
     /// A nonterminal lifecycle, including parked and fenced execution.
     pub fn is_active(&self) -> bool {
-        !matches!(self, Self::Stopped | Self::Error { .. })
+        !matches!(
+            self,
+            Self::Stopped | Self::Hibernated { .. } | Self::Error { .. }
+        )
     }
 
     /// Returns true when the machine satisfies its configured readiness policy.
@@ -730,6 +747,8 @@ impl MachineStatus {
             Self::Pausing { .. } => "pausing",
             Self::Paused { .. } => "paused",
             Self::Capturing { .. } => "capturing",
+            Self::Hibernating { .. } => "hibernating",
+            Self::Hibernated { .. } => "hibernated",
             Self::Restoring { .. } => "restoring",
             Self::Activating { .. } => "activating",
             Self::ActivationFailed { .. } => "activation-failed",
@@ -747,6 +766,8 @@ impl MachineStatus {
             | Self::Pausing { message }
             | Self::Paused { message }
             | Self::Capturing { message }
+            | Self::Hibernating { message }
+            | Self::Hibernated { message }
             | Self::Restoring { message }
             | Self::Activating { message }
             | Self::ActivationFailed { message }
@@ -771,6 +792,8 @@ impl From<MachineStatus> for MachineRuntimeState {
             MachineStatus::Pausing { .. } => Self::Pausing,
             MachineStatus::Paused { .. } => Self::Paused,
             MachineStatus::Capturing { .. } => Self::Capturing,
+            MachineStatus::Hibernating { .. } => Self::Hibernating,
+            MachineStatus::Hibernated { .. } => Self::Hibernated,
             MachineStatus::Restoring { .. } => Self::Restoring,
             MachineStatus::Activating { .. } => Self::Activating,
             MachineStatus::ActivationFailed { .. } => Self::ActivationFailed,
@@ -1002,6 +1025,8 @@ mod tests {
             (VmState::Activating, "activating"),
             (VmState::ActivationFailed, "activation-failed"),
             (VmState::Error, "error"),
+            (VmState::Hibernating, "hibernating"),
+            (VmState::Hibernated, "hibernated"),
         ] {
             let status = MachineStatus::from_protocol(HostStatus {
                 vm: Some(VmSnapshot {
@@ -1018,6 +1043,22 @@ mod tests {
             assert!(!status.ready());
             assert!(!status.guest_ready());
             assert!(!status.is_running());
+        }
+    }
+
+    #[test]
+    fn hibernation_status_roundtrips_and_only_hibernating_is_active() {
+        use crate::store::models::MachineRuntimeState;
+        for (state, label, active) in [
+            (MachineRuntimeState::Hibernating, "hibernating", true),
+            (MachineRuntimeState::Hibernated, "hibernated", false),
+        ] {
+            let status = MachineStatus::from_machine_state(state, Some("detail".into()));
+            assert_eq!(status.label(), label);
+            assert_eq!(status.message(), Some("detail"));
+            assert_eq!(status.is_active(), active);
+            assert!(!status.ready());
+            assert_eq!(MachineRuntimeState::from(status), state);
         }
     }
 }

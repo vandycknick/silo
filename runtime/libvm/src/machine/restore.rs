@@ -352,6 +352,7 @@ pub(crate) fn snapshot_restore_request(
         .clone()
         .ok_or_else(|| invalid("capture seal omitted the frozen operation identity"))?;
     let request = RestoreRequest {
+        purpose: vm_spec::restore::ActivationPurpose::Clone,
         disk_tracking_seeds: Vec::new(),
         map_node_store: Some(
             runtime
@@ -1710,6 +1711,7 @@ fn prepare_fork_child_inputs(
         files.push(file);
     }
     let request = RestoreRequest {
+        purpose: vm_spec::restore::ActivationPurpose::Clone,
         disk_tracking_seeds: Vec::new(),
         map_node_store: None,
         version: vm_spec::restore::RESTORE_REQUEST_VERSION,
@@ -2460,6 +2462,7 @@ pub(crate) mod tests {
             })
             .collect();
         let request = vm_spec::restore::RestoreRequest {
+            purpose: vm_spec::restore::ActivationPurpose::Clone,
             version: vm_spec::restore::RESTORE_REQUEST_VERSION,
             activation_id: cut.capture_id.clone(),
             freeze_operation_id: cut.freeze_operation_id.clone(),

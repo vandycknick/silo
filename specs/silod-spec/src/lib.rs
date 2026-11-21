@@ -39,3 +39,49 @@ impl std::fmt::Debug for daemon::v1::SetMachineSecretRequest {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::daemon::v1::{
+        machine_status, LifecycleDetail, MachineStatus, ReadinessReason, VmState,
+    };
+    use prost::Message;
+
+    #[test]
+    fn hibernation_states_append_wire_values_and_roundtrip() {
+        for (state, value, reason, reason_value, status) in [
+            (
+                VmState::Hibernating,
+                13,
+                ReadinessReason::VmHibernating,
+                18,
+                machine_status::Status::Hibernating(LifecycleDetail {
+                    message: Some("saving".into()),
+                }),
+            ),
+            (
+                VmState::Hibernated,
+                14,
+                ReadinessReason::VmHibernated,
+                19,
+                machine_status::Status::Hibernated(LifecycleDetail {
+                    message: Some("saved".into()),
+                }),
+            ),
+        ] {
+            assert_eq!(state as i32, value);
+            assert_eq!(VmState::try_from(value).unwrap(), state);
+            assert_eq!(reason as i32, reason_value);
+            assert_eq!(ReadinessReason::try_from(reason_value).unwrap(), reason);
+            let message = MachineStatus {
+                status: Some(status),
+            };
+            assert_eq!(
+                MachineStatus::decode(message.encode_to_vec().as_slice()).unwrap(),
+                message
+            );
+        }
+        assert_eq!(VmState::Error as i32, 12);
+        assert_eq!(ReadinessReason::VmError as i32, 17);
+    }
+}

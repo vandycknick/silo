@@ -70,6 +70,8 @@ wire_enum!(VmLifecycleState <=> VmState {
     Activating = Activating,
     ActivationFailed = ActivationFailed,
     Error = Error,
+    Hibernating = Hibernating,
+    Hibernated = Hibernated,
 });
 wire_enum!(LiveCommandKind <=> LiveCommandKind {
     Pause = Pause,
@@ -1430,6 +1432,7 @@ mod tests {
         use vm_spec::capture::*;
         let configuration = CaptureConfiguration::from_spec(&vm_spec::VmSpec::current()).unwrap();
         CapturePlan {
+            mode: vm_spec::capture::CaptureMode::Snapshot,
             version: CAPTURE_RECORD_VERSION,
             machine_id: id(1),
             run_id: id(2),

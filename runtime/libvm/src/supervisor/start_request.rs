@@ -441,6 +441,7 @@ mod tests {
         root.validate_role(vm_spec::stream_map::StreamRole::Ram)
             .unwrap();
         let restore = RestoreRequest {
+            purpose: vm_spec::restore::ActivationPurpose::Clone,
             version: vm_spec::restore::RESTORE_REQUEST_VERSION,
             authority: vm_spec::restore::RestoreAuthority::IdentifiedSnapshot {
                 snapshot: vm_spec::capture::Sha256Digest::of_bytes(b"snapshot"),

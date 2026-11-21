@@ -198,6 +198,8 @@ pub(crate) fn project_machine_state(
         VmLifecycleState::Pausing => MachineRuntimeState::Pausing,
         VmLifecycleState::Paused => MachineRuntimeState::Paused,
         VmLifecycleState::Capturing => MachineRuntimeState::Capturing,
+        VmLifecycleState::Hibernating => MachineRuntimeState::Hibernating,
+        VmLifecycleState::Hibernated => MachineRuntimeState::Hibernated,
         VmLifecycleState::Restoring => MachineRuntimeState::Restoring,
         VmLifecycleState::Activating => MachineRuntimeState::Activating,
         VmLifecycleState::ActivationFailed => MachineRuntimeState::ActivationFailed,

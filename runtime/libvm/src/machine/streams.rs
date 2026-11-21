@@ -216,6 +216,8 @@ pub enum MachineVmState {
     Pausing,
     Paused,
     Capturing,
+    Hibernating,
+    Hibernated,
     Restoring,
     Activating,
     ActivationFailed,
@@ -235,6 +237,8 @@ pub enum MachineReadinessReason {
     VmPausing,
     VmPaused,
     VmCapturing,
+    VmHibernating,
+    VmHibernated,
     VmRestoring,
     VmActivating,
     VmActivationFailed,
@@ -1194,8 +1198,8 @@ where
     T::try_from(value).map_err(|_| format!("silo-vmm response has unknown {field} value {value}"))
 }
 macro_rules! protocol_enum { ($name:ident, $wire:ident => $public:ident, { $($source:ident => $target:ident),+ $(,)? }) => { fn $name(value: i32, field: &str) -> Result<$public, String> { match enum_value::<v1::$wire>(value, field)? { $(v1::$wire::$source => Ok($public::$target),)+ v1::$wire::Unspecified => Err(format!("silo-vmm response has unspecified {field}")), } } }; }
-protocol_enum!(vm_state, VmState => MachineVmState, { Starting => Starting, Running => Running, Stopping => Stopping, Stopped => Stopped, Failed => Failed, Pausing => Pausing, Paused => Paused, Capturing => Capturing, Restoring => Restoring, Activating => Activating, ActivationFailed => ActivationFailed, Error => Error });
-protocol_enum!(readiness_reason, ReadinessReason => MachineReadinessReason, { VmStarting => VmStarting, VmStopping => VmStopping, VmStopped => VmStopped, VmFailed => VmFailed, AgentNotRequired => AgentNotRequired, AgentUnavailable => AgentUnavailable, AgentStatusStale => AgentStatusStale, GuestStarting => GuestStarting, GuestFailed => GuestFailed, GuestReportedReady => GuestReportedReady, VmPausing => VmPausing, VmPaused => VmPaused, VmCapturing => VmCapturing, VmRestoring => VmRestoring, VmActivating => VmActivating, VmActivationFailed => VmActivationFailed, VmError => VmError });
+protocol_enum!(vm_state, VmState => MachineVmState, { Starting => Starting, Running => Running, Stopping => Stopping, Stopped => Stopped, Failed => Failed, Pausing => Pausing, Paused => Paused, Capturing => Capturing, Hibernating => Hibernating, Hibernated => Hibernated, Restoring => Restoring, Activating => Activating, ActivationFailed => ActivationFailed, Error => Error });
+protocol_enum!(readiness_reason, ReadinessReason => MachineReadinessReason, { VmStarting => VmStarting, VmStopping => VmStopping, VmStopped => VmStopped, VmFailed => VmFailed, AgentNotRequired => AgentNotRequired, AgentUnavailable => AgentUnavailable, AgentStatusStale => AgentStatusStale, GuestStarting => GuestStarting, GuestFailed => GuestFailed, GuestReportedReady => GuestReportedReady, VmPausing => VmPausing, VmPaused => VmPaused, VmCapturing => VmCapturing, VmHibernating => VmHibernating, VmHibernated => VmHibernated, VmRestoring => VmRestoring, VmActivating => VmActivating, VmActivationFailed => VmActivationFailed, VmError => VmError });
 protocol_enum!(connection_state, AgentConnectionState => MachineAgentConnectionState, { Connecting => Connecting, Responsive => Responsive, Unresponsive => Unresponsive });
 protocol_enum!(freshness, Freshness => MachineFreshness, { Fresh => Fresh, Stale => Stale });
 protocol_enum!(stale_reason, StaleReason => MachineStaleReason, { ReceiptAge => ReceiptAge, MonitorStopping => MonitorStopping });

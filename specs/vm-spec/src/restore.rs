@@ -9,6 +9,37 @@ use crate::capture::{
 };
 use crate::lifecycle::LiveId;
 
+/// Identity policy is explicit. Missing or unknown purposes never preserve identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActivationPurpose {
+    Clone,
+    SameMachine,
+}
+
+impl ActivationPurpose {
+    pub fn validate(
+        self,
+        source_machine_id: &LiveId,
+        source_run_id: &LiveId,
+        destination_machine_id: &LiveId,
+        destination_run_id: &LiveId,
+    ) -> Result<(), String> {
+        if source_run_id == destination_run_id {
+            return Err("activation requires a new run".into());
+        }
+        match self {
+            Self::Clone if source_machine_id == destination_machine_id => {
+                Err("clone activation requires a new machine".into())
+            }
+            Self::SameMachine if source_machine_id != destination_machine_id => {
+                Err("same-machine activation requires the original machine".into())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 pub const RESTORE_REQUEST_VERSION: u32 = 1;
 pub const GENERATION_ACK_TIMEOUT_MS: u64 = 5_000;
 pub const ACTIVATE_TIMEOUT_MS: u64 = 30_000;
@@ -264,6 +295,7 @@ pub fn validate_disk_tracking_seeds(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestoreRequest {
     pub version: u32,
+    pub purpose: ActivationPurpose,
     pub authority: RestoreAuthority,
     pub activation_id: LiveId,
     pub freeze_operation_id: LiveId,
@@ -282,6 +314,24 @@ pub struct RestoreRequest {
 }
 
 impl RestoreRequest {
+    /// Validate the enclosing launch identities before constructing a VM.
+    pub fn validate_activation(&self, machine_id: &LiveId, run_id: &LiveId) -> Result<(), String> {
+        let source_machine = match &self.authority {
+            RestoreAuthority::IdentifiedSnapshot { evidence, .. } => &evidence.machine_id,
+            RestoreAuthority::OwnedLocalCut { cut } => &cut.machine_id,
+        };
+        self.purpose.validate(
+            source_machine,
+            &self.authority.binding()?.source_run,
+            machine_id,
+            run_id,
+        )?;
+        if self.purpose == ActivationPurpose::SameMachine && self.hook.is_some() {
+            return Err("same-machine activation must not run a restore hook".into());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.validate_with_destination_tracking(true)
     }
@@ -1137,6 +1187,7 @@ mod tests {
             }
         }
         let request = RestoreRequest {
+            purpose: crate::restore::ActivationPurpose::Clone,
             version: RESTORE_REQUEST_VERSION,
             authority: RestoreAuthority::OwnedLocalCut {
                 cut: Box::new(cut.clone()),

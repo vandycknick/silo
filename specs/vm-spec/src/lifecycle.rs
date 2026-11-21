@@ -147,6 +147,8 @@ lifecycle_enum!(
         Activating => "activating",
         ActivationFailed => "activation-failed",
         Error => "error",
+        Hibernating => "hibernating",
+        Hibernated => "hibernated",
     }
 );
 
@@ -300,12 +302,16 @@ impl VmLifecycleState {
                 command,
                 C::Resume | C::Capture | C::GetOperation | C::ReleaseCapture
             ),
-            Self::Capturing => matches!(command, C::GetOperation | C::CancelOperation),
+            Self::Capturing | Self::Hibernating => {
+                matches!(command, C::GetOperation | C::CancelOperation)
+            }
             Self::Restoring | Self::Activating => matches!(command, C::GetOperation),
             Self::ActivationFailed | Self::Error => {
                 matches!(command, C::GetOperation | C::ReleaseCapture)
             }
-            Self::Starting | Self::Stopping | Self::Stopped | Self::Failed => false,
+            Self::Starting | Self::Stopping | Self::Stopped | Self::Failed | Self::Hibernated => {
+                false
+            }
         }
     }
 
@@ -316,7 +322,10 @@ impl VmLifecycleState {
 
     /// Stopping or terminal: live commands report `monitor-stopping`.
     pub const fn is_stopping_or_terminal(self) -> bool {
-        matches!(self, Self::Stopping | Self::Stopped | Self::Failed)
+        matches!(
+            self,
+            Self::Stopping | Self::Stopped | Self::Failed | Self::Hibernated
+        )
     }
 }
 
@@ -505,7 +514,7 @@ impl LiveOperationRecord {
 }
 
 /// Active work, present exactly in `Pausing` (including failed Pausing) and
-/// `Capturing` (including post-seal continuation).
+/// `Capturing` (including post-seal continuation) and `Hibernating`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LiveActivity {
@@ -526,22 +535,32 @@ pub struct LiveLifecycle {
 
 impl LiveLifecycle {
     /// Presence rules: current pause iff Paused, activity iff Pausing or
-    /// Capturing, error iff Error.
+    /// Capturing or Hibernating, error iff Error.
     pub fn validate_for(&self, state: VmLifecycleState) -> Result<(), String> {
         if self.current_pause.is_some() != (state == VmLifecycleState::Paused) {
             return Err("current pause is present exactly while paused".into());
         }
         let active = matches!(
             state,
-            VmLifecycleState::Pausing | VmLifecycleState::Capturing
+            VmLifecycleState::Pausing | VmLifecycleState::Capturing | VmLifecycleState::Hibernating
         );
         if self.activity.is_some() != active {
-            return Err("lifecycle activity is present exactly while pausing or capturing".into());
+            return Err(
+                "lifecycle activity is present exactly while pausing, capturing or hibernating"
+                    .into(),
+            );
         }
         if let Some(activity) = &self.activity {
             let capture = activity.command == LiveCommandKind::Capture;
-            if capture != (state == VmLifecycleState::Capturing) {
-                return Err("capture activity is present exactly while capturing".into());
+            if capture
+                != matches!(
+                    state,
+                    VmLifecycleState::Capturing | VmLifecycleState::Hibernating
+                )
+            {
+                return Err(
+                    "capture activity is present exactly while capturing or hibernating".into(),
+                );
             }
         }
         if self.error.is_some() != (state == VmLifecycleState::Error) {
@@ -1040,6 +1059,8 @@ mod tests {
                 &[C::Resume, C::Capture, C::GetOperation, C::ReleaseCapture],
             ),
             (S::Capturing, &[C::GetOperation, C::CancelOperation]),
+            (S::Hibernating, &[C::GetOperation, C::CancelOperation]),
+            (S::Hibernated, &[]),
             (S::Restoring, &[C::GetOperation]),
             (S::Activating, &[C::GetOperation]),
             (S::ActivationFailed, &[C::GetOperation, C::ReleaseCapture]),
@@ -1186,5 +1207,39 @@ mod tests {
             ..paused(token(3))
         };
         assert!(error_with_authority.validate().is_err());
+    }
+
+    #[test]
+    fn hibernation_lifecycle_requires_capture_activity_and_is_never_ready() {
+        let lifecycle = LiveLifecycle {
+            activity: Some(LiveActivity {
+                operation_id: id(1),
+                request_id: id(1),
+                command: LiveCommandKind::Capture,
+                stage: LiveStage::CaptureMemory,
+            }),
+            ..LiveLifecycle::default()
+        };
+        lifecycle
+            .validate_for(VmLifecycleState::Hibernating)
+            .unwrap();
+        assert!(lifecycle
+            .validate_for(VmLifecycleState::Hibernated)
+            .is_err());
+        assert!(LiveLifecycle::default()
+            .validate_for(VmLifecycleState::Hibernating)
+            .is_err());
+        LiveLifecycle::default()
+            .validate_for(VmLifecycleState::Hibernated)
+            .unwrap();
+        for state in [VmLifecycleState::Hibernating, VmLifecycleState::Hibernated] {
+            let json = serde_json::to_value(state).unwrap();
+            assert_eq!(
+                serde_json::from_value::<VmLifecycleState>(json).unwrap(),
+                state
+            );
+            assert!(!state.readiness_eligible());
+        }
+        assert!(VmLifecycleState::Hibernated.is_stopping_or_terminal());
     }
 }

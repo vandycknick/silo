@@ -1045,20 +1045,16 @@ fn completed<T>(value: T) -> CompletionReceiver<T> {
 fn validate_activation(
     request: &v1::ActivateRequest,
 ) -> Result<(Option<agent_spec::NetworkConfig>, StorageShutdownContext), Status> {
+    let purpose =
+        protocol::restore::validate_activate_request(request).map_err(Status::invalid_argument)?;
+    if v1::ActivationPurpose::from(purpose) != v1::ActivationPurpose::Clone {
+        return Err(Status::failed_precondition(
+            "Same-machine activation is not available; do not wake this saved machine yet",
+        ));
+    }
     validate_uuid(&request.activation_id)?;
     validate_uuid(&request.destination_machine_id)?;
     validate_uuid(&request.destination_run_id)?;
-    let expected = request
-        .expected
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("expected identity required"))?;
-    if request.destination_run_id == expected.run_id
-        || request.destination_machine_id == expected.machine_id
-    {
-        return Err(Status::invalid_argument(
-            "activation requires a new machine and run",
-        ));
-    }
     crate::clock::validate_host_time(request.host_time.as_ref())
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let target = request.network.as_ref().map(validate_network).transpose()?;
@@ -1228,6 +1224,7 @@ mod tests {
     #[tokio::test]
     async fn activation_replay_joins_and_retains_exact_terminal_result() {
         let request = v1::ActivateRequest {
+            purpose: Some(v1::ActivationPurpose::Clone as i32),
             activation_id: uuid::Uuid::new_v4().to_string(),
             ..Default::default()
         };

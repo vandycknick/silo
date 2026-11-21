@@ -73,6 +73,8 @@ pub(crate) enum MachineRuntimeState {
     Pausing,
     Paused,
     Capturing,
+    Hibernating,
+    Hibernated,
     Restoring,
     Activating,
     ActivationFailed,
@@ -89,6 +91,8 @@ impl MachineRuntimeState {
             Self::Pausing => "pausing",
             Self::Paused => "paused",
             Self::Capturing => "capturing",
+            Self::Hibernating => "hibernating",
+            Self::Hibernated => "hibernated",
             Self::Restoring => "restoring",
             Self::Activating => "activating",
             Self::ActivationFailed => "activation_failed",
@@ -105,6 +109,8 @@ impl MachineRuntimeState {
             "pausing" => Ok(Self::Pausing),
             "paused" => Ok(Self::Paused),
             "capturing" => Ok(Self::Capturing),
+            "hibernating" => Ok(Self::Hibernating),
+            "hibernated" => Ok(Self::Hibernated),
             "restoring" => Ok(Self::Restoring),
             "activating" => Ok(Self::Activating),
             "activation_failed" => Ok(Self::ActivationFailed),
@@ -121,7 +127,7 @@ impl MachineRuntimeState {
     /// Nonterminal execution states. Error may also retain a live monitor;
     /// callers deciding resource ownership must check the monitor identity.
     pub(crate) fn is_live(self) -> bool {
-        !matches!(self, Self::Stopped | Self::Error)
+        !matches!(self, Self::Stopped | Self::Hibernated | Self::Error)
     }
 }
 
@@ -163,12 +169,20 @@ mod tests {
             MachineRuntimeState::Pausing,
             MachineRuntimeState::Paused,
             MachineRuntimeState::Capturing,
+            MachineRuntimeState::Hibernating,
+            MachineRuntimeState::Hibernated,
             MachineRuntimeState::Restoring,
             MachineRuntimeState::Activating,
             MachineRuntimeState::ActivationFailed,
             MachineRuntimeState::Stopping,
             MachineRuntimeState::Error,
         ] {
+            let json = serde_json::to_value(state).unwrap();
+            assert_eq!(json, state.as_str());
+            assert_eq!(
+                serde_json::from_value::<MachineRuntimeState>(json).unwrap(),
+                state
+            );
             assert_eq!(
                 MachineRuntimeState::parse(state.as_str()).expect("parse runtime state"),
                 state
@@ -246,5 +260,17 @@ mod tests {
             .remove("retention");
 
         assert!(serde_json::from_value::<MachineConfig>(serialized).is_err());
+    }
+
+    #[test]
+    fn hibernation_activity_is_distinct_from_stopped_and_running() {
+        assert!(MachineRuntimeState::Hibernating.is_live());
+        assert!(!MachineRuntimeState::Hibernating.is_running());
+        assert!(!MachineRuntimeState::Hibernated.is_live());
+        assert!(!MachineRuntimeState::Hibernated.is_running());
+        assert_ne!(
+            MachineRuntimeState::Hibernated,
+            MachineRuntimeState::Stopped
+        );
     }
 }

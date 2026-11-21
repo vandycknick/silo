@@ -2223,6 +2223,7 @@ mod tests {
             shares: Vec::new(),
         };
         let plan = CapturePlan {
+            mode: vm_spec::capture::CaptureMode::Snapshot,
             identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
             map_node_store: None,
             version: CAPTURE_RECORD_VERSION,

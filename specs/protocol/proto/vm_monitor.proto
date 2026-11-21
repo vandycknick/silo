@@ -3,6 +3,7 @@ syntax = "proto3";
 package silo.v1;
 
 import "common.proto";
+import "guest.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/empty.proto";
@@ -61,6 +62,8 @@ enum VmState {
   VM_STATE_ACTIVATION_FAILED = 11;
   // Live, fenced and process-owned; only stop leaves it. FAILED stays terminal.
   VM_STATE_ERROR = 12;
+  VM_STATE_HIBERNATING = 13;
+  VM_STATE_HIBERNATED = 14;
 }
 
 enum ReadinessReason {
@@ -82,6 +85,8 @@ enum ReadinessReason {
   READINESS_REASON_VM_ACTIVATING = 15;
   READINESS_REASON_VM_ACTIVATION_FAILED = 16;
   READINESS_REASON_VM_ERROR = 17;
+  READINESS_REASON_VM_HIBERNATING = 18;
+  READINESS_REASON_VM_HIBERNATED = 19;
 }
 
 enum AgentConnectionState {
@@ -740,6 +745,27 @@ message CaptureReleased {
 message ReleaseFailed {
   LiveFailure cause = 1;
   optional VmState state = 2;
+}
+
+// Descriptor-only construction inputs, validated before the first instruction.
+message RestoreRequest {
+  optional bytes request = 1; // vm_spec::restore::RestoreRequest JSON
+  optional ActivationPurpose purpose = 2;
+}
+
+// The VM has been constructed and is parked before its first instruction.
+// It MUST NOT execute until libvm durably consumes the save and sends the
+// matching ConsumeAuthorization. Guest activation is not this barrier.
+message RestorePrepared {
+  optional string machine_id = 1;
+  optional string save_id = 2;
+  optional string new_run_id = 3;
+}
+
+message ConsumeAuthorization {
+  optional string machine_id = 1;
+  optional string save_id = 2;
+  optional string new_run_id = 3;
 }
 
 message ReleaseCaptureResponse {

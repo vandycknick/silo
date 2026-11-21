@@ -699,4 +699,30 @@ mod tests {
         assert_eq!(boot.agent, Some(digest("03").to_string()));
         assert_eq!(boot.packaged_replacement, Some(digest("04").to_string()));
     }
+
+    #[test]
+    fn hibernation_states_are_preserved_in_public_views_without_readiness() {
+        for (status, label) in [
+            (
+                libvm::MachineStatus::Hibernating { message: None },
+                "hibernating",
+            ),
+            (
+                libvm::MachineStatus::Hibernated { message: None },
+                "hibernated",
+            ),
+        ] {
+            let mut data = libvm::MachineData::new(
+                "machine".into(),
+                "saved".into(),
+                vm_spec::VmSpec::current(),
+            );
+            data.status = status;
+            data.observation = libvm::MachineObservation::Observed;
+            let view = crate::view::MachineView::new(&data, false);
+            let json = serde_json::to_value(view).unwrap();
+            assert_eq!(json["state"], label);
+            assert_eq!(json["ready"], false);
+        }
+    }
 }

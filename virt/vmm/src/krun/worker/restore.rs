@@ -632,6 +632,7 @@ pub(crate) mod tests {
             memory_state_sealed: true,
         };
         let request = RestoreRequest {
+            purpose: vm_spec::restore::ActivationPurpose::Clone,
             disk_tracking_seeds: Vec::new(),
             map_node_store: None,
             version: vm_spec::restore::RESTORE_REQUEST_VERSION,

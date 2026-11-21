@@ -1,5 +1,6 @@
 pub mod lifecycle;
 pub mod live;
+pub mod restore;
 pub mod shutdown;
 
 #[allow(clippy::large_enum_variant)]

@@ -31,6 +31,8 @@ enumeration!(
         Pausing,
         Paused,
         Capturing,
+        Hibernating,
+        Hibernated,
         Restoring,
         Activating,
         ActivationFailed,

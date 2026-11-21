@@ -393,7 +393,7 @@ impl InstanceStore {
             }
             state.stopping = matches!(
                 vm_state,
-                VmState::Stopping | VmState::Stopped | VmState::Failed
+                VmState::Stopping | VmState::Stopped | VmState::Failed | VmState::Hibernated
             );
             if state.stopping {
                 // Stop never resumes: the pause authority ends with the run.
@@ -757,7 +757,7 @@ fn session_identity(state: &State, now: Instant) -> Option<ReadyAgentIdentity> {
     let held = state.held_identity.as_ref()?;
     if !matches!(
         state.vm_state,
-        VmState::Pausing | VmState::Paused | VmState::Capturing
+        VmState::Pausing | VmState::Paused | VmState::Capturing | VmState::Hibernating
     ) {
         return None;
     }
@@ -1627,7 +1627,10 @@ fn truncate(value: String, maximum: usize) -> String {
 }
 
 fn readiness(state: &State, now: Instant) -> WaitOutcome {
-    if matches!(state.vm_state, VmState::Stopped | VmState::Failed) {
+    if matches!(
+        state.vm_state,
+        VmState::Stopped | VmState::Failed | VmState::Hibernated
+    ) {
         return WaitOutcome::Terminal;
     }
     let ready = readiness_detail(state, now).0;
@@ -1760,6 +1763,8 @@ fn readiness_detail(state: &State, now: Instant) -> (bool, ReadinessReason) {
         VmState::Pausing => (false, ReadinessReason::VmPausing),
         VmState::Paused => (false, ReadinessReason::VmPaused),
         VmState::Capturing => (false, ReadinessReason::VmCapturing),
+        VmState::Hibernating => (false, ReadinessReason::VmHibernating),
+        VmState::Hibernated => (false, ReadinessReason::VmHibernated),
         VmState::Restoring => (false, ReadinessReason::VmRestoring),
         VmState::Activating => (false, ReadinessReason::VmActivating),
         VmState::ActivationFailed => (false, ReadinessReason::VmActivationFailed),
@@ -3233,5 +3238,34 @@ mod tests {
             store.live_snapshot().unwrap().guest_rejection,
             Some("guest-status-stale")
         );
+    }
+
+    #[test]
+    fn hibernation_states_are_not_ready_and_hibernated_is_terminal() {
+        for (state, reason, outcome) in [
+            (
+                VmState::Hibernating,
+                ReadinessReason::VmHibernating,
+                WaitOutcome::TimedOut,
+            ),
+            (
+                VmState::Hibernated,
+                ReadinessReason::VmHibernated,
+                WaitOutcome::Terminal,
+            ),
+        ] {
+            let store = new_instance_store(
+                uuid::Uuid::new_v4().to_string(),
+                "hibernation".into(),
+                false,
+            );
+            store.set_vm_state(state, "saved execution").unwrap();
+            let status = store.status().unwrap();
+            assert_eq!(status.vm.unwrap().state, Some(state as i32));
+            let readiness = status.readiness.unwrap();
+            assert_eq!(readiness.ready, Some(false));
+            assert_eq!(readiness.reason, Some(reason as i32));
+            assert_eq!(store.readiness().unwrap(), outcome);
+        }
     }
 }

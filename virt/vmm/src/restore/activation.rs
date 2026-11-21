@@ -265,6 +265,18 @@ impl Activation {
         shutdown: &protocol::shutdown::StorageShutdownContext,
         vsock_filename: Option<PathBuf>,
     ) -> eyre::Result<Self> {
+        request
+            .validate_activation(
+                &vm_spec::lifecycle::LiveId::parse(&machine.to_string())
+                    .map_err(eyre::Report::msg)?,
+                &vm_spec::lifecycle::LiveId::parse(&run.to_string()).map_err(eyre::Report::msg)?,
+            )
+            .map_err(eyre::Report::msg)?;
+        if request.purpose != vm_spec::restore::ActivationPurpose::Clone {
+            eyre::bail!(
+                "Wake is not available; keep the machine hibernated until wake is supported"
+            );
+        }
         let activation = Uuid::parse_str(request.activation_id.as_str())
             .map_err(|error| eyre::eyre!("restore activation ID: {error}"))?;
         let ssh_trusted_ca =
@@ -451,6 +463,7 @@ impl Activation {
             timeout_ms: Some(hook.timeout_ms),
         });
         ActivateRequest {
+            purpose: Some(protocol::v1::ActivationPurpose::from(self.request.purpose) as i32),
             activation_id: self.activation.hyphenated().to_string(),
             expected: Some(expected),
             freeze_ref: Some(reference),
@@ -938,6 +951,7 @@ mod tests {
 
     fn request() -> ActivateRequest {
         ActivateRequest {
+            purpose: Some(protocol::v1::ActivationPurpose::Clone as i32),
             activation_id: ACTIVATION.into(),
             freeze_ref: Some(reference(SOURCE_MACHINE, SOURCE_RUN, 3)),
             destination_machine_id: DESTINATION_MACHINE.into(),
