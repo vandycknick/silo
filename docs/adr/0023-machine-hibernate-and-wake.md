@@ -4,11 +4,10 @@ Date: 2026-11-21
 
 ## Status
 
-Proposed
+Accepted
 
-This ADR is implemented on the `feat/adr-14` branch and awaits owner
-acceptance. The conformance section lists what has and has not been
-qualified. It
+This ADR is implemented on the `feat/adr-14` branch. The conformance section
+lists what has and has not been qualified. It
 builds on [ADR 0021](0021-live-snapshots-and-forks.md) for capture, restore
 construction and activation, on
 [ADR 0014](0014-layered-oci-image-storage.md) for storage ownership, and on
@@ -363,10 +362,11 @@ The guest agent embedded in a machine's boot assets must support same-machine
 activation. Hibernate refuses a machine whose agent does not, because the
 agent cannot be replaced while the machine sleeps.
 
-The hibernation row records the host SSH signing key the guest trusts. Wake
-refuses, before consume, when that key is missing or has been replaced on the
-host, because the woken guest would keep trusting a key the host no longer
-uses. The reason reported is "not compatible with this system".
+The hibernation row records the machine's SSH signing key, which Silo keeps
+in the host secret store and the guest trusts. Wake refuses, before consume,
+when that key is missing from the secret store or has been replaced there,
+because the woken guest would keep trusting a key the host can no longer
+sign with. The reason reported is "not compatible with this system".
 
 The daemon gains a `HibernateMachine` call. `StartMachine` wakes. New state
 values are appended to the existing wire enums.

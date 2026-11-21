@@ -43,4 +43,4 @@ and review standards for new and substantially revised records.
 | 0020 | Netd owns the VM tailnet node and relays guest SSH | Accepted | 2026-10-01 | `docs/adr/0020-netd-tailnet-identity.md` |
 | 0021 | Live snapshots and forks of running machines | Accepted | 2026-10-25 | `docs/adr/0021-live-snapshots-and-forks.md` |
 | 0022 | Lobby in silod with a Go tailnet gateway | Accepted | 2026-11-11 | [docs/adr/0022-lobby-in-silod-and-tsgate.md](0022-lobby-in-silod-and-tsgate.md) |
-| 0023 | Hibernate and wake of the same machine | Proposed | 2026-11-21 | [docs/adr/0023-machine-hibernate-and-wake.md](0023-machine-hibernate-and-wake.md) |
+| 0023 | Hibernate and wake of the same machine | Accepted | 2026-11-21 | [docs/adr/0023-machine-hibernate-and-wake.md](0023-machine-hibernate-and-wake.md) |
