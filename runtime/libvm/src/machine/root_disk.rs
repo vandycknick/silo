@@ -222,6 +222,28 @@ impl PreparedPrivateCopy {
         self.map.as_ref()
     }
 
+    /// Syncs the candidate, then moves it out of its staging directory.
+    ///
+    /// The order matters on Btrfs. A file that is renamed out of a directory
+    /// before it was ever synced marks that directory, and the next directory
+    /// sync anywhere above it then forces a commit of the whole filesystem
+    /// transaction instead of a small log write. That commit carries every
+    /// pending change on the filesystem, so its cost is unbounded and lands on
+    /// whichever command happens to sync next (measured: 80 to 280 ms on a
+    /// first restore, against under 3 ms for this sync). Syncing first keeps
+    /// the later directory syncs on the cheap path, and costs nothing extra
+    /// because the file is synced again, as a no-op, when durability completes.
+    fn rename_synced(&self, destination: &OwnedDirectory, name: &str) -> Result<(), RootDiskError> {
+        self.file.sync_all()?;
+        crate::storage::pool::rename_component_no_replace(
+            &self.directory,
+            &self.name,
+            destination,
+            name,
+        )?;
+        Ok(())
+    }
+
     /// Once rename succeeds, a directory-sync error is an uncertain publication.
     /// Keep the complete candidate until catalog reconciliation authorizes removal.
     pub(crate) fn publish(
@@ -231,12 +253,7 @@ impl PreparedPrivateCopy {
     ) -> Result<(), RootDiskError> {
         validate_component(name)?;
         validate_owned_entry(&self.directory, &self.name, &self.file)?;
-        crate::storage::pool::rename_component_no_replace(
-            &self.directory,
-            &self.name,
-            &destination,
-            name,
-        )?;
+        self.rename_synced(&destination, name)?;
         let previous = std::mem::replace(&mut self.directory, destination);
         self.name = name.to_owned();
         self.preserve = true;
@@ -253,12 +270,7 @@ impl PreparedPrivateCopy {
     ) -> Result<(), RootDiskError> {
         validate_component(name)?;
         validate_owned_entry(&self.directory, &self.name, &self.file)?;
-        crate::storage::pool::rename_component_no_replace(
-            &self.directory,
-            &self.name,
-            &destination,
-            name,
-        )?;
+        self.rename_synced(&destination, name)?;
         self.directory = destination;
         self.name = name.to_owned();
         self.preserve = true;

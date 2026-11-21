@@ -387,8 +387,13 @@ impl OwnedDirectory {
             let mut file = File::from(fd);
             file.write_all(contents)
                 .map_err(|error| invalid(&path, error))?;
+            // Always sync before the rename, also when the caller defers
+            // directory durability. On Btrfs a file renamed out of a directory
+            // before its first sync makes the next sync of that directory
+            // commit the whole filesystem transaction, which costs far more
+            // than this sync and lands on an unrelated later call.
+            file.sync_all().map_err(|error| invalid(&path, error))?;
             if sync == Sync::Durable {
-                file.sync_all().map_err(|error| invalid(&path, error))?;
                 checkpoint(AtomicWritePhase::Synced);
             }
             nix::fcntl::renameat(staging.fd(), temporary.as_str(), self.fd(), name)

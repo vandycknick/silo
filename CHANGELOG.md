@@ -6,6 +6,10 @@
   processes. `silo start`, guest access and opening a forward wake that same
   machine. Existing connections end; `silo stop` wakes and shuts down cleanly,
   while `silo stop --force` discards saved memory without waking.
+- Fixed: `silo restore` and live `silo fork` no longer force a commit of the
+  whole filesystem on Btrfs. Restoring a snapshot for the first time took 0.9 s
+  instead of 0.5 s on a busy filesystem, and a live fork spent up to 0.8 s in
+  such commits.
 - Changed: `silo image pull`, `silo create` and `silo run` download up to
   three image layers at once and unpack them while later layers are still
   downloading. Pull progress shows one line per layer in image order, each
