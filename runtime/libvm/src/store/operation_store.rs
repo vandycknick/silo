@@ -1547,6 +1547,35 @@ impl Store {
                         let anchor_only = matches!(capture.state, crate::store::snapshot_store::CaptureState::Released { snapshot: Some(_) })
                             && sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM storage_operation_cut WHERE operation_id=?1 AND role='ram-baseline')")
                                 .bind(capture.launch_operation_id.to_string()).fetch_one(&mut *tx).await?;
+                        // A run keeps one RAM baseline: the latest accepted
+                        // capture. A published capture whose RAM is no longer
+                        // that baseline was superseded by a later one, and
+                        // nothing in the run reads its staging again. Waiting
+                        // for the run to end would keep one staging directory
+                        // and one catalog row per snapshot ever taken.
+                        let superseded = match (&capture.state, capture.evidence.as_deref()) {
+                            (
+                                crate::store::snapshot_store::CaptureState::Released {
+                                    snapshot: Some(_),
+                                },
+                                Some(evidence),
+                            ) => {
+                                let baseline: Option<String> = sqlx::query_scalar("SELECT root_digest FROM storage_operation_memory_baseline WHERE operation_id=?1")
+                                    .bind(capture.launch_operation_id.to_string()).fetch_optional(&mut *tx).await?;
+                                let own =
+                                    vm_spec::capture::CaptureEvidence::decode(evidence.as_bytes())
+                                        .map_err(invalid)?
+                                        .memory
+                                        .map(|memory| {
+                                            crate::storage::identity::ObjectDigest::from_sha256(
+                                                *memory.ram_stream.as_bytes(),
+                                            )
+                                            .to_string()
+                                        });
+                                matches!((baseline, own), (Some(baseline), Some(own)) if baseline != own)
+                            }
+                            _ => false,
+                        };
                         let unused = (capture.evidence.is_none()
                             && (matches!(
                                 capture.state,
@@ -1559,7 +1588,8 @@ impl Store {
                                 crate::store::snapshot_store::CaptureState::ReleasedLocal { .. }
                             ) && capture.plan.identity_policy
                                 == vm_spec::capture::CaptureIdentityPolicy::None)
-                            || anchor_only;
+                            || anchor_only
+                            || superseded;
                         let launch_lease = if unused {
                             None
                         } else {

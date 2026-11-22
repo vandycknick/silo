@@ -5734,6 +5734,81 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn memory_snapshot_superseded_by_a_later_baseline_retires_during_the_run() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let capture = fixture.reservation.record.capture_id;
+        let launch = fixture.reservation.record.launch_operation_id;
+        // The run stays alive for the whole test.
+        let _running = fixture.launch.lock().duplicate().unwrap();
+        fixture
+            .snapshots
+            .publish_capture(
+                capture,
+                directory.path(),
+                fixture.reservation.record.name.clone(),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .finish_capture_release(capture, true)
+            .await
+            .unwrap();
+        let snapshots = fixture.snapshots.clone();
+        let published = snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        let evidence =
+            CaptureEvidence::decode(published.evidence.as_deref().unwrap().as_bytes()).unwrap();
+        let own =
+            ObjectDigest::from_sha256(*evidence.memory.unwrap().ram_stream.as_bytes()).to_string();
+        let baseline = |root: String| {
+            let pool = snapshots.store.pool.clone();
+            async move {
+                sqlx::query("INSERT INTO storage_operation_memory_baseline(operation_id,root_digest) VALUES(?1,?2) ON CONFLICT(operation_id) DO UPDATE SET root_digest=excluded.root_digest")
+                    .bind(launch.to_string())
+                    .bind(root)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        drop(fixture.reservation);
+        drop(fixture.launch);
+
+        // Still the run's baseline: the next incremental capture builds on it.
+        baseline(own.clone()).await;
+        snapshots.store.recover_image_cache().await.unwrap();
+        assert!(snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(directory.path().exists());
+
+        // A later capture became the baseline; this one is dead weight.
+        let later: String = sqlx::query_scalar(
+            "SELECT root_digest FROM stream_map_root WHERE root_digest!=?1 LIMIT 1",
+        )
+        .bind(&own)
+        .fetch_one(&snapshots.store.pool)
+        .await
+        .unwrap();
+        baseline(later).await;
+        snapshots.store.recover_image_cache().await.unwrap();
+        assert!(snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!directory.path().exists());
+    }
+
+    #[tokio::test]
     async fn memory_snapshot_dropped_publication_waiter_retains_its_copy_owner() {
         use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
         let fixture = fixture().await;
