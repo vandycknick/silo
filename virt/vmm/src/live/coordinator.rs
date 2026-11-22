@@ -2035,6 +2035,18 @@ impl LiveCoordinator {
                                         .unwrap_or("guest clock profile is missing"),
                                 )));
                             }
+                            // Keep the evidence with the machine: a native
+                            // pause that follows can stop the guest before
+                            // its status stream repeats this.
+                            self.store
+                                .observe_guest_lifecycle(status)
+                                .map_err(|error| {
+                                    GuestError::Refused(failure(
+                                        LiveFailureCode::FreezeFailed,
+                                        stage,
+                                        error.to_string(),
+                                    ))
+                                })?;
                             return Ok((observation, profile));
                         }
                     }

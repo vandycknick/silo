@@ -592,12 +592,50 @@ impl InstanceStore {
             if state.identity.is_none() {
                 state.agent_services = known_agent_services();
             }
+            // The stream can deliver a report the guest sent before a freeze
+            // after the freeze was already acknowledged directly. Freeze
+            // epochs only grow within one agent instance, so a report with an
+            // older epoch never replaces newer lifecycle evidence.
+            let mut observation = observation;
+            if let Some(known) = state
+                .status
+                .as_ref()
+                .and_then(|status| status.value.lifecycle.as_ref())
+            {
+                if lifecycle_epoch(observation.value.lifecycle.as_ref())
+                    < lifecycle_epoch(Some(known))
+                {
+                    observation.value.lifecycle = Some(known.clone());
+                }
+            }
             state.identity = Some(identity);
             state.connection.state = Some(AgentConnectionState::Responsive as i32);
             state.connection.last_success_at = Some(timestamp(received_at));
             state.connection.code = None;
             state.connection.message = None;
             state.status = Some(observation);
+            Ok(())
+        })
+    }
+
+    /// Records the lifecycle the guest returned in a direct reply.
+    ///
+    /// The status stream reports the same fact on its own schedule. A native
+    /// pause taken right after the reply can stop the guest before that
+    /// report is sent, which would leave the paused machine without the
+    /// freeze evidence a later capture of the same pause requires.
+    pub(crate) fn observe_guest_lifecycle(
+        &self,
+        lifecycle: protocol::v1::GuestLifecycleStatus,
+    ) -> Result<(), StoreError> {
+        self.mutate(|state| {
+            if let Some(status) = &mut state.status {
+                if lifecycle_epoch(Some(&lifecycle))
+                    >= lifecycle_epoch(status.value.lifecycle.as_ref())
+                {
+                    status.value.lifecycle = Some(lifecycle);
+                }
+            }
             Ok(())
         })
     }
@@ -1016,6 +1054,14 @@ pub(crate) fn new_instance_store_with_backend(
         },
     )
     .expect("valid test state")
+}
+
+/// The freeze epoch a lifecycle report refers to; zero before any freeze.
+fn lifecycle_epoch(lifecycle: Option<&protocol::v1::GuestLifecycleStatus>) -> u64 {
+    lifecycle
+        .and_then(|status| status.freeze_ref.as_ref())
+        .and_then(|reference| reference.freeze_epoch)
+        .unwrap_or(0)
 }
 
 fn observation<T>(value: T, freshness: Duration) -> Result<Observation<T>, StoreError> {
@@ -3357,5 +3403,69 @@ mod tests {
                 LiveMachineReport::try_from(store.status().unwrap().live.unwrap()).unwrap();
             assert!(!rejected.supports_same_machine_activation(), "{rejection}");
         }
+    }
+
+    #[test]
+    fn freeze_evidence_from_a_direct_reply_survives_an_older_stream_report() {
+        fn frozen(epoch: u64) -> protocol::v1::GuestLifecycleStatus {
+            let roots = vec!["/sys/fs/cgroup/silo-workloads".to_string()];
+            protocol::v1::GuestLifecycleStatus {
+                state: protocol::v1::GuestLifecycleState::Frozen as i32,
+                workload_roots: roots.clone(),
+                observed_frozen_roots: roots,
+                freeze_ref: Some(protocol::v1::FreezeRef {
+                    freeze_epoch: Some(epoch),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        let lifecycle = |store: &InstanceStore| store.live_snapshot().unwrap().guest_lifecycle;
+        let store = live_store();
+        let instance = uuid::Uuid::new_v4().to_string();
+        let running = live_status(&instance, Some(true));
+        store
+            .observe_status(running.clone(), Duration::from_secs(300))
+            .unwrap();
+
+        // The freeze reply arrives; the stream never repeats it before the
+        // guest stops.
+        store.observe_guest_lifecycle(frozen(7)).unwrap();
+        assert_eq!(lifecycle(&store), Some(frozen(7)));
+
+        // A report the guest sent before freezing is delivered late.
+        store
+            .observe_status(running.clone(), Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(lifecycle(&store), Some(frozen(7)));
+
+        // A thaw of the same freeze is newer evidence and replaces it.
+        let mut thawed = running.clone();
+        let report = thawed.report.as_mut().unwrap().lifecycle.as_mut().unwrap();
+        report.freeze_ref = frozen(7).freeze_ref;
+        store
+            .observe_status(thawed.clone(), Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(
+            lifecycle(&store),
+            thawed.report.as_ref().unwrap().lifecycle.clone()
+        );
+
+        // A stale direct reply cannot roll evidence back either.
+        store.observe_guest_lifecycle(frozen(6)).unwrap();
+        assert_eq!(
+            lifecycle(&store),
+            thawed.report.as_ref().unwrap().lifecycle.clone()
+        );
+
+        // A replacement agent starts from its own reports.
+        let replacement = live_status(&uuid::Uuid::new_v4().to_string(), Some(true));
+        store
+            .observe_status(replacement.clone(), Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(
+            lifecycle(&store),
+            replacement.report.as_ref().unwrap().lifecycle.clone()
+        );
     }
 }
