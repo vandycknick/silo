@@ -2043,10 +2043,12 @@ measurements and the planned map-format change remain required.
 
 ## libkrun Fork Commit Series
 
-Silo pins its own libkrun fork (`vandycknick/libkrun`) at `662b359c` in the root
+Silo pins its own libkrun fork (`vandycknick/libkrun`) at `065326aa` in the root
 `Cargo.toml`, directly from Git without a local path patch. That pin includes
-Linux tracked/restored balloon reclaim (`1742283d`) and pipelined RAM capture
-(`662b359c`). `Cargo.toml` is the authority for the current dependency.
+Linux tracked/restored balloon reclaim (`1742283d`), pipelined RAM capture
+(`662b359c`), per-chunk disk write tracking (`05b9b4b4`) and RAM capture
+without content identity (`452813a9`). `Cargo.toml` is the authority for the
+current dependency.
 
 The table records the original live-state implementation series on historical
 baseline `11dbc786`, which already included Silo's macOS balloon reclaim,
