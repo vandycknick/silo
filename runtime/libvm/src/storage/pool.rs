@@ -26,6 +26,12 @@ use vm_spec::stream_map::{
     ChunkSize, StreamNode, StreamRole, StreamRoot, MAX_NODE_BYTES, MAX_ROOT_BYTES,
 };
 
+/// How long a rejoining owner outwaits another command's liveness probe.
+/// Probes hold the lease for a catalog read at most; a real retirement holds
+/// it until the lease is gone.
+const LEASE_REJOIN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const LEASE_REJOIN_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MapBatchEvent {
     FileSynced(ObjectDigest),
@@ -1140,13 +1146,27 @@ impl StoragePool {
     }
 
     /// Rejoin a registered operation without creating or replacing its lease.
+    ///
+    /// Other commands test whether an operation's owner is alive by taking
+    /// its lease exclusively for a moment. That probe must not fail a live
+    /// owner that rejoins at the same instant, so a busy lease is retried for
+    /// a short while. A lease that stays busy is being retired.
     pub(crate) fn existing_lease(&self, operation: Uuid) -> Result<StorageLock, StorageError> {
-        locks::acquire_existing(
-            &self.leases,
-            &format!("{operation}.lease"),
-            FlockArg::LockSharedNonblock,
-        )?
-        .ok_or_else(|| StorageError::InvalidPath("registered operation is being retired".into()))
+        let name = format!("{operation}.lease");
+        let deadline = std::time::Instant::now() + LEASE_REJOIN_WAIT;
+        loop {
+            if let Some(lease) =
+                locks::acquire_existing(&self.leases, &name, FlockArg::LockSharedNonblock)?
+            {
+                return Ok(lease);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(StorageError::InvalidPath(
+                    "registered operation is being retired".into(),
+                ));
+            }
+            std::thread::sleep(LEASE_REJOIN_POLL);
+        }
     }
 
     /// Never wait for a lease while holding root coordination. The shared
@@ -3470,5 +3490,35 @@ mod tests {
         }
         drop(roots);
         assert_eq!(pool.reap_temporary().unwrap(), 1);
+    }
+
+    #[test]
+    fn rejoining_a_lease_outwaits_a_liveness_probe_but_not_a_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = StoragePool::open(&dir.path().join("images")).unwrap();
+        let operation = uuid::Uuid::new_v4();
+        drop(pool.lease(operation).unwrap());
+
+        let probe = pool.try_exclusive_lease(operation).unwrap().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(probe);
+        });
+        let started = std::time::Instant::now();
+        let rejoined = pool.existing_lease(operation).unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(90));
+        release.join().unwrap();
+        assert!(
+            pool.try_exclusive_lease(operation).unwrap().is_none(),
+            "the rejoined owner must hold the lease"
+        );
+        drop(rejoined);
+
+        let retiring = pool.try_exclusive_lease(operation).unwrap().unwrap();
+        let Err(error) = pool.existing_lease(operation) else {
+            panic!("a lease held for retirement was rejoined");
+        };
+        assert!(error.to_string().contains("being retired"), "{error}");
+        drop(retiring);
     }
 }
