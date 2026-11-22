@@ -124,7 +124,7 @@ The initial official host matrix is:
 
 | Host | Architecture | Initial distribution promise | Active backend | Packaged backends |
 | --- | --- | --- | --- | --- |
-| macOS | arm64 | macOS 26 or newer, app/archive/DMG | VZ | VZ and krun |
+| macOS | arm64 | macOS 26 or newer, app/archive/DMG | krun | krun and VZ |
 | GNU/Linux | amd64, arm64 | glibc 2.39 or newer, runtime and portable CLI archives | krun | krun |
 
 The initial release does not support Intel macOS, macOS before version 26,
@@ -134,9 +134,10 @@ that floor changes the support matrix and requires an ADR update. The official
 promise concerns the GNU/Linux ABI baseline and portable archive, not a specific
 Linux distribution release or package manager.
 
-VZ remains the only selected macOS backend. Silo packages and signs the krun
-backend inside `silo-vmm` on macOS so a later backend selector does not require a new distribution
-layout. Packaging a backend does not make it selectable.
+krun is the default backend on macOS as on GNU/Linux. VZ is an explicit
+selection for machines that need it, and is limited to raw disks
+([ADR 0014](0014-layered-oci-image-storage.md)). Silo packages and signs both
+backends inside `silo-vmm` on macOS.
 
 The default kernel, initramfs, and agent always match the target architecture.
 Optional Rosetta support in VZ does not change the guest kernel architecture.

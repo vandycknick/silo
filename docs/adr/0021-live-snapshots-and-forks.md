@@ -324,7 +324,8 @@ libkrun backend**, built from five commitments:
   database access or a new long-running process.
 
 The capability is admitted per lane: Linux KVM x86_64, Linux KVM arm64 with
-GICv3, and macOS HVF arm64 on macOS 15 or later. VZ machines retain
+GICv3, and macOS HVF arm64. Silo supports macOS 26 or newer
+([ADR 0012](0012-cross-platform-runtime-and-sdk-packaging.md)). VZ machines retain
 [ADR 0014](0014-layered-oci-image-storage.md)'s snapshots without memory only; every
 backend reports what it supports before any live operation starts, and an
 unsupported operation is refused up front, never partway (see Backend
@@ -1610,7 +1611,8 @@ mutation, never discovered halfway through an operation.
 Every backend reports a **live capability vector**: `pause`, `capture`,
 `restore`, `fork` and `incremental`, each `supported` or `unsupported` with
 one typed reason. The reasons are closed: `backend-excluded` (VZ, mock
-without a scenario grant), `host-os-below-floor` (macOS 14 for HVF),
+without a scenario grant), `host-os-below-floor` (a macOS host older than
+Silo's floor, macOS 26),
 `hypervisor-unavailable` (no `/dev/kvm`, no
 Hypervisor.framework entitlement), `build-excluded` (the live ABI not compiled
 in), `not-delivered` (the stage that admits this operation has not shipped in
@@ -1875,9 +1877,11 @@ operation that discards RAM and boots a new machine from private copies of the
 sealed disks with stop outcome `unknown`; the disks may need journal recovery.
 It is never offered as a fallback for a failed restore.
 
-macOS hosts before macOS 15 cannot capture or restore execution state because
-the GIC state APIs are absent; they retain ordinary boot and snapshots without memory.
-A missing API resolves to a typed refusal, never fabricated support.
+The HVF lane needs the Hypervisor.framework GIC state APIs, which macOS 15
+introduced. Silo's macOS floor is 26, so every supported host has them. A
+host below the floor reports `host-os-below-floor` and retains ordinary boot
+and snapshots without memory. A missing API resolves to a typed refusal,
+never fabricated support.
 
 ## Security And Trust
 
@@ -2089,7 +2093,7 @@ above is split, not widened.
    construction-time restore for the devices a minimal guest attaches. One
    fixed-RAM guest, one raw disk, a counter loop with timer wakeups and
    numbered disk writes. Prove continuation, not reboot. Then the same on
-   macOS 15 HVF. Then two children from one RAM file with measured physical
+   macOS HVF. Then two children from one RAM file with measured physical
    sharing. The spike is not an admitted capability: it has no activation,
    no agent protocol and no published artifact, and it reports measured
    pause, copy and restore values that feed the budgets.
@@ -2129,7 +2133,7 @@ runtime contract has been satisfied.
 ## Conformance Requirements
 
 Conformance tests cover each implemented lane (KVM x86_64, KVM arm64 GICv3,
-HVF arm64 on macOS 15 or later); their results do not grant runtime support.
+HVF arm64 on macOS 26 or later); their results do not grant runtime support.
 
 - **Pause linearization.** A busy multi-vCPU guest with active block, network,
   console and vsock traffic: the token arrives only after every vCPU has
@@ -2216,7 +2220,7 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   XSAVE set, timebase, GIC format, host build or kernel identity fails
   preflight with the pin named; disk-only recovery remains available as the
   distinct operation; no implicit reboot.
-- **Early rejection.** On a VZ-backed machine, a macOS 14 host, a lane
+- **Early rejection.** On a VZ-backed machine, a macOS host below the floor, a lane
   without a gate record, and a libkrun machine with a rejected device: `silo
   pause`, `silo snapshot create --memory`, `silo fork` and execution restore fail with
   `LiveOperationUnsupported` and the typed reason before any lock, lease,
@@ -2269,7 +2273,7 @@ HVF arm64 on macOS 15 or later); their results do not grant runtime support.
   Native decoders still validate payloads and host execution prerequisites.
   Snapshots with memory that cannot run stay inspectable and restorable with
   `silo restore REF --without-memory`.
-- macOS 14 hosts never gain the capability.
+- macOS hosts older than macOS 26 never gain the capability.
 - Snapshots with memory carry secrets and the guest's duplicated userspace state;
   users must treat them as credentials.
 
@@ -2368,7 +2372,7 @@ execution profile would be a separate ADR.
   execution restore.
 - No capture of virtiofs, Rosetta, GPU, nested or confidential guests.
 - No capture of VZ machines.
-- macOS 15 or later for the live capability on Apple silicon.
+- macOS 26 or later for the live capability on Apple silicon.
 
 ## What This Does Not Decide
 
