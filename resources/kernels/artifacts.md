@@ -86,7 +86,7 @@ the kernel blob:
   "purpose": "workload",
   "identity": "workload-arm64-sha256-...",
   "track": "stable",
-  "kernelVersion": "7.2.2",
+  "kernelVersion": "7.2.11",
   "architecture": "arm64",
   "platform": {
     "os": "linux",
@@ -103,7 +103,7 @@ the kernel blob:
     "digest": "sha256:..."
   },
   "source": {
-    "url": "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.2.tar.xz",
+    "url": "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.11.tar.xz",
     "digest": "sha256:...",
     "key": "sha256-..."
   },

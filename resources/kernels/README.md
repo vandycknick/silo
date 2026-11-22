@@ -6,9 +6,9 @@ formats and the stable OCI contract.
 
 ## Supported Tracks
 
-- `stable`: `7.2.2`, strict resolved-config validation
-- `longterm`: `6.18.48`, strict resolved-config validation
-- `longterm5`: `5.15.219`, best-effort workload build, opaque raw only
+- `stable`: `7.2.11`, strict resolved-config validation
+- `longterm`: `6.18.57`, strict resolved-config validation
+- `longterm5`: `5.15.223`, best-effort workload build, opaque raw only
 
 `sources.mk` maps each track to an upstream kernel version and kernel.org
 archive checksum. It deliberately contains no architecture or packaging
@@ -107,9 +107,9 @@ content-addressed blobs. It is not a loose directory of kernel files. Inspect
 or pull a local artifact with:
 
 ```bash
-oras manifest fetch --oci-layout target/kernels/stable/x86_64:7.2.2 --pretty
-oras manifest fetch-config --oci-layout target/kernels/stable/x86_64:7.2.2 --pretty
-oras pull --oci-layout target/kernels/stable/x86_64:7.2.2 --output ./kernel
+oras manifest fetch --oci-layout target/kernels/stable/x86_64:7.2.11 --pretty
+oras manifest fetch-config --oci-layout target/kernels/stable/x86_64:7.2.11 --pretty
+oras pull --oci-layout target/kernels/stable/x86_64:7.2.11 --output ./kernel
 ```
 
 Probe layouts remain identity-keyed below
