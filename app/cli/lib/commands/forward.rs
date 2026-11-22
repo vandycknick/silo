@@ -53,9 +53,7 @@ impl Cmd {
         if self.list {
             return print_forwards(&machine.list_forwards().await?);
         }
-        let machine = machine
-            .for_access(crate::api::machine::WakeNotice::Line)
-            .await?;
+        let machine = machine.for_access().await?;
 
         let forward = forward.ok_or_else(|| eyre::eyre!("forward endpoints are required"))?;
         let mut session = machine.open_forward(forward).await?;

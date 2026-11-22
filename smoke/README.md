@@ -1976,8 +1976,7 @@ saved state is fabricated. Collection never starts guests.
 Additional cases cover stopped/already-hibernated/temporary-machine admission
 (an unnamed `silo run`, with stdin held open and guest readiness witnessed),
 observational list/info/logs/forward-list commands, and each access command
-individually waking with exactly one `Waking NAME` line on stderr, except
-`shell`, which leaves no wake line behind.
+individually waking without leaving a wake line in its output.
 All happy-path saves require every discovered saved file to be read-only.
 
 `silo_smoke.hibernate.report()` is the only adapter for public info fields:

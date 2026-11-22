@@ -14,18 +14,8 @@ use tokio_stream::Stream;
 use crate::api::daemon::DaemonVmService;
 use crate::api::start_options::AppStartOptions;
 
-/// How an access command shows that it is waking a hibernated machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WakeNotice {
-    /// Print `Waking NAME` on standard error.
-    Line,
-    /// The command hands the user a terminal: stay silent when the wake is
-    /// quick, and show a spinner that clears itself when it is not.
-    SpinnerIfSlow,
-}
-
-/// A wake that finishes within this goes straight to the prompt.
-const QUIET_WAKE: Duration = Duration::from_millis(500);
+/// A wake that finishes within this is not shown at all.
+pub(crate) const QUIET_WAKE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub(crate) enum AppMachine {
@@ -79,7 +69,10 @@ impl AppMachine {
         }
     }
 
-    pub(crate) async fn for_access(&self, notice: WakeNotice) -> eyre::Result<Self> {
+    /// Admits this command to the machine's current run, waking a hibernated
+    /// machine first. A quick wake is silent; a slow one shows a spinner with
+    /// the current step, cleared before the command's own output starts.
+    pub(crate) async fn for_access(&self) -> eyre::Result<Self> {
         let native = self.session_machine().await?;
         let name = native.inspect().await?.name;
         let (progress, mut stages) = libvm::LiveOperationProgressSender::default_channel();
@@ -89,38 +82,21 @@ impl AppMachine {
         let mut quiet_over = false;
         // The latest wake stage; `None` while no wake is happening.
         let mut stage: Option<libvm::LiveOperationProgress> = None;
-        let mut line_printed = false;
         let mut spinner: Option<crate::ui::Spinner> = None;
         let result = loop {
             tokio::select! {
                 biased;
                 Some(next) = stages.recv() => stage = Some(next),
-                result = &mut operation => {
-                    if stage.is_none() {
-                        stage = stages.try_recv().ok();
-                    }
-                    if notice == WakeNotice::Line && stage.is_some() && !line_printed {
-                        crate::ui::waking(&name);
-                    }
-                    break result;
-                }
+                result = &mut operation => break result,
                 _ = &mut quiet, if !quiet_over => quiet_over = true,
             }
             let Some(current) = &stage else { continue };
-            match notice {
-                WakeNotice::Line if !line_printed => {
-                    crate::ui::waking(&name);
-                    line_printed = true;
+            if quiet_over {
+                let (label, _) = crate::ui::live_operation_progress_words(current, &name);
+                match &mut spinner {
+                    Some(spinner) => spinner.step(label, name.as_str()),
+                    None => spinner = Some(crate::ui::Spinner::start(label, name.as_str())),
                 }
-                WakeNotice::Line => {}
-                WakeNotice::SpinnerIfSlow if quiet_over => {
-                    let (label, _) = crate::ui::live_operation_progress_words(current, &name);
-                    match &mut spinner {
-                        Some(spinner) => spinner.step(label, name.as_str()),
-                        None => spinner = Some(crate::ui::Spinner::start(label, name.as_str())),
-                    }
-                }
-                WakeNotice::SpinnerIfSlow => {}
             }
         };
         if let Some(spinner) = spinner {

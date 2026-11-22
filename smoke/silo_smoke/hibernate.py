@@ -125,11 +125,14 @@ def wake(silo: Silo, name: str) -> str:
     return run
 
 
-def waking(result: Result, name: str, *, required: bool = True) -> int:
-    lines = [line for line in result.stderr.splitlines() if line.startswith("Waking")]
-    assert lines == [f"Waking {name}"] or (not required and not lines), result
-    assert f"Waking {name}" not in result.stdout, result
-    return len(lines)
+def no_wake_line(result: Result, name: str) -> None:
+    """An access command wakes without leaving a line in its output.
+
+    A wake slower than half a second may draw a spinner on a terminal, which
+    clears itself; the plain `Waking NAME` line belongs to `silo start` only.
+    """
+    output = (result.stdout + result.stderr).replace("\r\n", "\n")
+    assert f"Waking {name}" not in [line.strip() for line in output.splitlines()], result
 
 
 def refused(result: Result, message: str) -> None:

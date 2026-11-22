@@ -60,7 +60,6 @@ ID        NAME  STATE       CPUS  MEMORY  DISK
 912322ce  dev   hibernated  2     8G      20GiB
 
 $ silo exec dev -- make test
-   Waking dev
 ... output of make test, running in the session state the guest had before ...
 
 $ silo hibernate dev
@@ -280,11 +279,12 @@ never resumes a paused one.
 
 The machine lifecycle lock serializes wake against `stop`, `rm` and
 `hibernate`. Any number of concurrent access commands produce one wake. A
-command that waited for a wake prints one line, `Waking NAME`, on standard
-error, so command output, JSON output and copied file contents are unaffected.
-`silo shell` is the exception: it prints no line and goes straight to the
-prompt. If the wake takes longer than half a second it shows a spinner with the
-current step, which clears itself before the prompt appears.
+command that wakes the machine prints nothing extra when the wake finishes
+within half a second. Past that, on a terminal, it shows a spinner on standard
+error with the current step (`Waking NAME`, then `Waiting for agent NAME`),
+which clears itself before the command's own output. Command output, JSON
+output and copied file contents are unaffected either way. `silo start` on a
+hibernated machine prints the line `Waking NAME`.
 
 A command issued before a hibernate is never replayed after the wake.
 
@@ -345,7 +345,8 @@ User-facing messages say what happened and what to do:
 | Already hibernated | ``machine `NAME` is already hibernated; wake it with `silo start NAME` `` |
 | Temporary machine | ``machine `NAME` is a temporary `silo run` machine and cannot be hibernated`` |
 | Not enough disk space | ``not enough disk space to hibernate `NAME`: SIZE needed, SIZE free`` |
-| A command wakes a machine | `Waking NAME` |
+| A command wakes a machine | nothing within half a second; then a spinner, `Waking NAME` and `Waiting for agent NAME`, cleared when done |
+| `silo start` on a hibernated machine | `Waking NAME` |
 | Snapshot or fork refused | ``machine `NAME` is hibernated; start it with `silo start NAME` first`` |
 | Configuration change, export or handoff refused | ``machine `NAME` is hibernated; run `silo stop NAME` first`` |
 | Saved state unusable | ``cannot wake `NAME`: its saved state cannot be used (REASON); run `silo stop NAME` to discard it, then `silo start NAME` `` |

@@ -150,10 +150,11 @@ silo fork dev --live --name child
 `silo hibernate NAME` saves a persistent VM's memory and execution state, then
 releases its host processes. `silo start`, `exec`, `shell` (including serial
 attach), `cp`, guest file operations and opening a forward wake the same VM.
-Listing machines or forwards, `info` and `logs` never wake it. Wake reports
-`Waking NAME` on stderr, leaving command output, JSON and copied bytes alone;
-`shell` goes straight to the prompt, showing a spinner only when the wake takes
-longer than half a second.
+Listing machines or forwards, `info` and `logs` never wake it. A command that
+wakes the VM prints nothing extra when the wake takes under half a second;
+past that it shows a spinner with the current step on a terminal, cleared
+before the command's own output. Command output, JSON and copied bytes are
+never touched.
 
 Existing shell, exec, forward and network connections end at hibernate. Reconnect
 after wake. `silo stop NAME` wakes and shuts down cleanly; if wake is impossible,

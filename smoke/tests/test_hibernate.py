@@ -308,7 +308,8 @@ def test_twenty_concurrent_accesses_share_one_wake(silo: Silo, basic_image: str)
         results = list(pool.map(access, range(20)))
     runs = {access.run_id for access in results}
     assert len(runs) == 1 and old_run not in runs
-    assert sum(hibernate.waking(access.result, NAME, required=False) for access in results) >= 1
+    for access in results:
+        hibernate.no_wake_line(access.result, NAME)
     assert hibernate.boot_id(silo, NAME) == boot
 
 
@@ -432,7 +433,7 @@ def test_temporary_run_cannot_hibernate(silo: Silo, basic_image: str) -> None:
 
 
 @pytest.mark.parametrize("access", ["exec", "cp", "shell", "forward"])
-def test_guest_access_wakes_once_on_stderr(silo: Silo, basic_image: str, access: str) -> None:
+def test_guest_access_wakes_without_a_wake_line(silo: Silo, basic_image: str, access: str) -> None:
     hibernate.create(silo, basic_image, NAME)
     boot = hibernate.boot_id(silo, NAME)
     silo.exec(NAME, "sh", "-ec", "printf content >/hibernate-access", user="root")
@@ -458,11 +459,5 @@ def test_guest_access_wakes_once_on_stderr(silo: Silo, basic_image: str, access:
             assert result.returncode == 0
         finally:
             hibernate.terminate(process, silo, "hibernate-access-forward")
-    if access == "shell":
-        # A shell goes straight to the prompt. A slow wake may draw a spinner,
-        # which clears itself; the plain wake line never appears.
-        output = (result.stdout + result.stderr).replace("\r\n", "\n")
-        assert f"Waking {NAME}" not in [line.strip() for line in output.splitlines()], result
-    else:
-        hibernate.waking(result, NAME)
+    hibernate.no_wake_line(result, NAME)
     assert hibernate.boot_id(silo, NAME) == boot

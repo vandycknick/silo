@@ -235,25 +235,29 @@ impl Service {
             let machine = self.guest_machine(&snapshot.id).await?;
             let (progress, mut stages) = libvm::LiveOperationProgressSender::default_channel();
             let operation = machine.for_access(Some(&progress));
-            tokio::pin!(operation);
+            let quiet = tokio::time::sleep(crate::api::machine::QUIET_WAKE);
+            tokio::pin!(operation, quiet);
+            let mut waking = false;
+            let mut quiet_over = false;
             let mut reported = false;
             let admitted = loop {
                 tokio::select! {
                     biased;
                     _ = io.cancel.cancelled() => return Err(cancelled()),
                     Some(stage) = stages.recv() => {
-                        // A shell is a terminal the user is about to type
-                        // into; a wake line above the prompt is only noise.
-                        if stage == libvm::LiveOperationProgress::Waking
-                            && !reported
-                            && !matches!(action, Action::Shell)
-                        {
-                            io.stderr.write_all(format!("Waking {}\n", snapshot.name).as_bytes()).await
-                                .map_err(|_| lost("progress output transport failed"))?;
-                            reported = true;
-                        }
+                        waking |= stage == libvm::LiveOperationProgress::Waking;
                     }
                     result = &mut operation => break result.map_err(native_failure)?,
+                    _ = &mut quiet, if !quiet_over => quiet_over = true,
+                }
+                // A quick wake is silent, as in the CLI. The session stream
+                // cannot animate, so a slow one gets a single line.
+                if waking && quiet_over && !reported {
+                    io.stderr
+                        .write_all(format!("Waking {}\n", snapshot.name).as_bytes())
+                        .await
+                        .map_err(|_| lost("progress output transport failed"))?;
+                    reported = true;
                 }
             };
             let snapshot = silo_vm_control::snapshots::snapshot_to_wire(
