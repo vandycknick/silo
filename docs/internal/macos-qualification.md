@@ -186,10 +186,34 @@ arm64 `.config` has `CONFIG_VIRTIO_SILO_VMGENID=y`, `CONFIG_VMGENID=y`,
 | `store::storage::tests::layered_restart_survives_child_snapshot_prune_and_missing_invalid_baseline` | Takes the fixture's pinned platform with its binding | The fixture record pins an x86_64 bundle; on an arm64 host only the binding was copied, an invalid profile |
 | `rprobe_vz_harness` `Args` tests | Moved to `mod args` | See compile fixes |
 
-### Environment-dependent failure
+### `daemon_run` lobby test: two separate causes
 
 `cli::daemon_run::lobby_failure_is_isolated_from_core_for_explicit_and_persisted_features`
-fails on this Mac while the owner's launchd job `sh.silo.daemon` is loaded:
-launchd labels are per user, so `silo daemon up --foreground` in the test's
-temporary `HOME` finds the real daemon and reports `the running daemon has no
-readable service definition`. Not reproducible on a CI runner; left as is.
+failed for a different reason on CI than on this Mac.
+
+- **CI, all three platforms**: the lobby validates the `tsgate` helper beside
+  the `silo` executable before it reads credentials, and `make test` never
+  built one there, so the diagnostic was `lobby initialization failed: No such
+  file or directory` instead of `cannot read lobby credential`. Reproduced
+  here by hand with an isolated home; with `target/debug/tsgate` present the
+  same run reports `cannot read lobby credential tailscale.lobby.client_secret`.
+  `xtask test` now builds `tsgate` next to the test binaries.
+- **This Mac only**: while the owner's launchd job `sh.silo.daemon` is loaded
+  the test still fails. launchd labels are per user, so `silo daemon up
+  --foreground` in the test's temporary `HOME` finds the real daemon and
+  reports `the running daemon has no readable service definition`. Left as is.
+
+### First CI run past Clippy (run 45243547907, `f917c16d`)
+
+Clippy passed on macOS, Linux arm64 and Linux amd64. The test step failed on
+all three. Linux arm64 had never compiled before, and the last green `Test`
+run on `main` predates the lobby (18 October).
+
+| Failure | Platforms | Cause | Fix |
+|---|---|---|---|
+| Four lobby tests killed at 180 s | macOS (2), Linux (4) | Each builds `tsgate` with `CGO_ENABLED=0` inside the test. The warm-up in `xtask test` built with cgo, so the tests compiled the Tailscale graph themselves under full parallelism. Inferred from the macOS timings, not measured directly: the first `tsgate` log line appears 179 s into a killed test, the third lobby test passed after 171 s, and the fourth, started once that build existed, passed in 11 s | The warm-up uses the tests' flags |
+| `daemon_run::lobby_failure_is_isolated…` | all | No `tsgate` beside `silo` (above) | `xtask test` builds it |
+| `krun_worker::real_child_inherits_exactly_the_lifecycle_endpoint_at_32` | Linux | `/bin/sh` is dash, which rejects `>&32` (`Bad fd number`); POSIX only promises single-digit descriptors | The test runs `bash` |
+| `handoff::tests::unknown_identity_handoff_seals…` | Linux arm64 | **Product defect.** The overlay kernel floor read the release from a bzImage header or an ELF symbol table only, so every arm64 `Image` was refused with `missing Linux boot protocol version header`. Overlay roots could not be admitted on any arm64 host, macOS included | `check_overlay_version` reads `linux_banner` from an arm64 `Image`; the locally built 7.2.11 `Image` is admitted |
+| `handoff::tests::interrupted_prepare_reuses_only_verified_private_files` | Linux | The test compared inode numbers after the corrupt file had been unlinked, so the replacement could be handed the same number | The test holds the interrupted file open across `prepare` |
+| `supervisor::wait_ready_returns_terminal_boot_poweroff_reason_promptly` | Linux amd64, once | Not explained. The exit outcome was not `Error`; it passed on Linux arm64 and macOS in the same run | None |
