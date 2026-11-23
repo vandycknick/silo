@@ -161,7 +161,8 @@ does not require EFI firmware boot or broaden the admitted root filesystem
 beyond ext4; arm64 EFI remains disabled.
 
 The arm64 workload fragment explicitly requires `ARM64_4K_PAGES=y` and
-`ARM64_PAGE_SHIFT=12` for Rosetta. The existing resolved-config validator checks
+`PAGE_SHIFT=12` for Rosetta (the generic symbol; arm64 dropped its own
+`ARM64_PAGE_SHIFT` before the stable and longterm tracks). The existing resolved-config validator checks
 these exact values, including numeric and quoted string defaults, against the
 selected workload fragments. Source settings and validator unit fixtures are
 not evidence of produced kernel page size or runtime boot success. The rprobe

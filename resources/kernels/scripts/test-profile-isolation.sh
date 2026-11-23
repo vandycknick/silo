@@ -156,7 +156,7 @@ CONFIG_NLS_UTF8=y
 CONFIG_FAT_DEFAULT_CODEPAGE=437
 CONFIG_FAT_DEFAULT_IOCHARSET="iso8859-1"
 CONFIG_ARM64_4K_PAGES=y
-CONFIG_ARM64_PAGE_SHIFT=12
+CONFIG_PAGE_SHIFT=12
 EOF
 cat "$kernel_root/configs/common.config" "$kernel_root/configs/arm64.config" > "$temp_dir/workload.config"
 "$kernel_root/scripts/validate-config.sh" "$temp_dir/workload.config" "$temp_dir/required.config"
