@@ -248,9 +248,34 @@ fn io_capture_failure(
     )
 }
 
+/// Advisory space estimate for the paused worker's populated memory. ENOSPC
+/// during writing must still abandon the cut and resume.
+#[cfg(target_os = "linux")]
+fn populated_memory_estimate(pid: u32) -> io::Result<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))?;
+    parse_populated_memory_estimate(&text)
+}
+
+/// Darwin's physical footprint counts the resident and compressed pages the
+/// worker owns, the counterpart of Linux Rss + Swap.
+#[cfg(target_os = "macos")]
+fn populated_memory_estimate(pid: u32) -> io::Result<u64> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "worker pid out of range"))?;
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // nix has no proc_pid_rusage wrapper; the kernel fills the v4 record.
+    let result =
+        unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: proc_pid_rusage succeeded and wrote the whole v4 record.
+    Ok(unsafe { info.assume_init() }.ri_phys_footprint)
+}
+
 /// Linux smaps_rollup reports KiB. Rss + Swap includes worker overhead and
-/// swapped guest pages, not just resident RAM. This is an advisory space
-/// estimate; ENOSPC during writing must still abandon the cut and resume.
+/// swapped guest pages, not just resident RAM.
+#[cfg(any(target_os = "linux", test))]
 fn parse_populated_memory_estimate(text: &str) -> io::Result<u64> {
     let mut rss = None;
     let mut swap = None;
@@ -793,25 +818,22 @@ impl LiveCoordinator {
                 "Could not inspect the paused worker's memory; retry hibernation",
             ))
         })?;
-        let estimated = tokio::task::spawn_blocking(move || {
-            let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))?;
-            parse_populated_memory_estimate(&text)
-        })
-        .await
-        .map_err(|error| {
-            Abort::Failed(failure(
-                LiveFailureCode::MemoryEstimateFailed,
-                LiveStage::CaptureMemory,
-                error.to_string(),
-            ))
-        })?
-        .map_err(|error| {
-            Abort::Failed(failure(
-                LiveFailureCode::MemoryEstimateFailed,
-                LiveStage::CaptureMemory,
-                format!("Could not inspect paused memory: {error}; retry hibernation"),
-            ))
-        })?;
+        let estimated = tokio::task::spawn_blocking(move || populated_memory_estimate(pid))
+            .await
+            .map_err(|error| {
+                Abort::Failed(failure(
+                    LiveFailureCode::MemoryEstimateFailed,
+                    LiveStage::CaptureMemory,
+                    error.to_string(),
+                ))
+            })?
+            .map_err(|error| {
+                Abort::Failed(failure(
+                    LiveFailureCode::MemoryEstimateFailed,
+                    LiveStage::CaptureMemory,
+                    format!("Could not inspect paused memory: {error}; retry hibernation"),
+                ))
+            })?;
         if self.machine.worker_process_id() != Some(pid) {
             return Err(Abort::Failed(failure(
                 LiveFailureCode::WorkerLost,
@@ -4559,12 +4581,16 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn hibernate_memory_estimate_reads_the_current_process_rollup() {
-        let text = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap();
+    fn hibernate_memory_estimate_counts_the_current_process_populated_pages() {
+        // Written pages must be counted: resident or compressed, never zero.
+        let ballast = vec![1_u8; 8 << 20];
+        let estimate =
+            crate::live::coordinator::capture::populated_memory_estimate(std::process::id())
+                .unwrap();
         assert!(
-            crate::live::coordinator::capture::parse_populated_memory_estimate(&text).unwrap() > 0
+            estimate >= std::hint::black_box(&ballast).len() as u64,
+            "{estimate}"
         );
     }
 
@@ -4578,8 +4604,9 @@ mod tests {
 
     const LAYOUT: &[u8] = br#"{"architecture":"x86_64","kind":"ram-layout","magic":"KRUNRAML","packedLength":8192,"pageGranule":4096,"regions":[{"guestPhysicalAddress":0,"length":8192,"streamOffset":0}],"schema":1,"topology":{"ramBelowGap":8192}}"#;
 
-    /// Logical length of the staged fixture's writable source.
-    const SOURCE_BYTES: u64 = 1 << 20;
+    /// Logical length of the staged fixture's writable source. APFS fills
+    /// zero ranges below roughly 16 MiB, so the holes must be larger.
+    const SOURCE_BYTES: u64 = 64 << 20;
     /// Planned RAM of the staged fixture (its RAM image is 8 KiB).
     const PLANNED_RAM: u64 = 1 << 20;
     /// Both bounded control records still to be written at verification.
