@@ -47,10 +47,9 @@ async fn open_runtime(root: &std::path::Path) -> Runtime {
     std::fs::create_dir_all(runtime.asset_directory()).unwrap();
     let kernel = runtime.asset_directory().join("kernel-default");
     let init = runtime.asset_directory().join("initramfs");
-    #[cfg(target_arch = "x86_64")]
-    let kernel_bytes = crate::owned_boot_assets::tests::elf_kernel_with_banner("6.6.0");
-    #[cfg(not(target_arch = "x86_64"))]
-    let kernel_bytes = test_utils::direct_kernel::host_kernel("handoff packaged kernel");
+    // Raw roots admit only the host's direct-boot format and overlay roots read
+    // the release, so the packaged kernel must satisfy both on every host.
+    let kernel_bytes = crate::owned_boot_assets::tests::host_kernel_with_banner("6.6.0");
     std::fs::write(&kernel, kernel_bytes).unwrap();
     std::fs::write(&init, b"handoff packaged base-init bytes").unwrap();
     for asset in [&kernel, &init] {
@@ -1033,13 +1032,15 @@ async fn interrupted_prepare_reuses_only_verified_private_files() {
         }
         let file = crate::image::transport::blobs::create_private_file(&directory, &name).unwrap();
         file.write_all_at(&bytes, 0).unwrap();
-        let interrupted = file.metadata().unwrap().ino();
         drop(file);
+        let path = dir.join(&name);
+        // Held across prepare: a freed inode number may be handed straight to
+        // the replacement, which would then look like a reused file.
+        let interrupted = std::fs::File::open(&path).unwrap();
         let prepared = b.service.prepare(offer.binding()).await.unwrap();
         assert_eq!(prepared.binding, *offer.binding());
-        let path = dir.join(&name);
         assert_eq!(
-            std::fs::metadata(&path).unwrap().ino() == interrupted,
+            std::fs::metadata(&path).unwrap().ino() == interrupted.metadata().unwrap().ino(),
             exact
         );
         assert_eq!(std::fs::read(&path).unwrap(), original);

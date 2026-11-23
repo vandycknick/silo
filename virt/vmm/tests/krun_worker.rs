@@ -1317,7 +1317,9 @@ fn real_child_inherits_exactly_the_lifecycle_endpoint_at_32() {
         drop(unrelated_worker);
         unsafe { OwnedFd::from_raw_fd(raw) }
     };
-    let mut command = Command::new("/bin/sh");
+    // POSIX sh only promises single-digit descriptors in redirections, and
+    // dash holds it to that.
+    let mut command = Command::new("bash");
     command.arg("-c").arg(format!(
         "printf lifecycle >&32 && {{ printf leak >&{} ; }} 2>/dev/null; exit 0",
         unrelated_worker.as_raw_fd()
