@@ -344,7 +344,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TimedIo<S> {
         result
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+        // Darwin's shutdown(2) reports ENOTCONN once the peer has fully closed;
+        // Linux returns success. Either way the write half is already closed.
+        match Pin::new(&mut self.get_mut().stream).poll_shutdown(cx) {
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::NotConnected => {
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
     }
 }
 
@@ -572,7 +579,11 @@ mod tests {
             None,
             CancellationToken::new(),
         ));
-        client.write_all(format!("GET /healthz HTTP/1.1\r\nHost: lobby\r\nX-Oversized: {}\r\nConnection: close\r\n\r\n", "x".repeat(17 * 1024)).as_bytes()).await.unwrap();
+        // Darwin's small socket buffer lets the server refuse and close before
+        // the whole request is written; the refusal is asserted server-side.
+        if let Err(error) = client.write_all(format!("GET /healthz HTTP/1.1\r\nHost: lobby\r\nX-Oversized: {}\r\nConnection: close\r\n\r\n", "x".repeat(17 * 1024)).as_bytes()).await {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
         let mut output = String::new();
         let _ = client.read_to_string(&mut output).await;
         assert!(server.await.unwrap().unwrap_err().is_parse_too_large());
