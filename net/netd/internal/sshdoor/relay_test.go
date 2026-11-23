@@ -112,7 +112,7 @@ func localFixture(t *testing.T, extra ...string) *fixture {
 	config := fmt.Sprintf("HostKey %s\nTrustedUserCAKeys %s\nAuthenticationMethods publickey\nPubkeyAuthentication yes\nPubkeyAcceptedAlgorithms ssh-ed25519-cert-v01@openssh.com\nCASignatureAlgorithms ssh-ed25519\nAuthorizedKeysFile none\nAuthorizedPrincipalsFile none\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nHostbasedAuthentication no\nGSSAPIAuthentication no\nUsePAM no\nPermitRootLogin yes\nAcceptEnv SILO_*\nSubsystem sftp internal-sftp\nLogLevel VERBOSE\n", filepath.Join(dir, "host"), filepath.Join(dir, "ca.pub"))
 	write("config", []byte(config+"MaxSessions 64\n"+strings.Join(extra, "\n")+"\n"))
 	ctx, cancel := context.WithCancel(context.Background())
-	d, err := New(ctx, filepath.Join(dir, "ssh"), filepath.Join(dir, "mux"), caBytes, nil)
+	d, err := New(ctx, filepath.Join(dir, "ssh"), muxSocketPath(t), caBytes, nil)
 	if err != nil {
 		cancel()
 		t.Fatal(err)
