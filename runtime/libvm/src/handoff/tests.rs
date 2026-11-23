@@ -161,8 +161,12 @@ async fn install_layered_root(
     machine: MachineId,
 ) -> crate::store::models::snapshot::SnapshotComposition {
     let store = participant.runtime.native_store().unwrap();
-    let (_images, _, image) =
-        crate::image::transport::tests::layered_image_in(std::sync::Arc::new(store.clone())).await;
+    // The lower must be composed for the userspace this host's raw machine boots.
+    let (_images, _, image) = crate::image::transport::tests::layered_image_in(
+        std::sync::Arc::new(store.clone()),
+        oci::Platform::host().unwrap(),
+    )
+    .await;
     let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
         lower,
         lower_geometry,

@@ -1173,12 +1173,16 @@ pub(crate) mod tests {
         ImageRecord,
     ) {
         let (temp, store) = home().await;
-        let (images, id, record) = layered_image_in(store.clone()).await;
+        let (images, id, record) =
+            layered_image_in(store.clone(), oci::Platform::linux_amd64()).await;
         (temp, store, images, id, record)
     }
 
+    /// A published layered image whose lower is composed for `platform`; its
+    /// boot profile names the same userspace, as every admitted image does.
     pub(crate) async fn layered_image_in(
         store: Arc<Store>,
+        platform: oci::Platform,
     ) -> (StoredImageStore, ImageId, ImageRecord) {
         use crate::store::models::snapshot::{
             SnapshotComposition, SnapshotLayer, SnapshotRootProfile,
@@ -1262,11 +1266,9 @@ pub(crate) mod tests {
             pack: &pack_file,
         };
         let occurrences = [occurrence, occurrence];
-        let recipe = oci::composition::CompositionRecipe::from_layers(
-            oci::Platform::linux_amd64(),
-            &occurrences,
-        )
-        .unwrap();
+        let userspace = crate::LinuxPlatform::from_oci(&platform).unwrap();
+        let recipe =
+            oci::composition::CompositionRecipe::from_layers(platform, &occurrences).unwrap();
         let fsmeta_path = paths.temporary.join("fsmeta");
         let mut fsmeta = std::fs::OpenOptions::new()
             .read(true)
@@ -1354,10 +1356,22 @@ pub(crate) mod tests {
             overlay_profile: crate::OverlayProfile::SiloOverlayV1,
             temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
         };
-        let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut snapshot.boot else {
+        let crate::BootProfile::LinuxDirect {
+            root_selector,
+            userspace_platform,
+            kernel_architecture,
+            binding,
+            ..
+        } = &mut snapshot.boot
+        else {
             panic!("Linux direct fixture");
         };
         *root_selector = crate::RootSelector::ManagedOverlay;
+        *kernel_architecture = userspace.architecture;
+        if let crate::BootBinding::Pinned { architecture, .. } = binding {
+            *architecture = userspace.architecture;
+        }
+        *userspace_platform = userspace;
         let record = ImageRecord {
             schema: 1,
             kind: ImageRecordKind::Image,
