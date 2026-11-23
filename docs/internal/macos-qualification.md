@@ -217,3 +217,11 @@ run on `main` predates the lobby (18 October).
 | `handoff::tests::unknown_identity_handoff_seals…` | Linux arm64 | **Product defect.** The overlay kernel floor read the release from a bzImage header or an ELF symbol table only, so every arm64 `Image` was refused with `missing Linux boot protocol version header`. Overlay roots could not be admitted on any arm64 host, macOS included | `check_overlay_version` reads `linux_banner` from an arm64 `Image`; the locally built 7.2.11 `Image` is admitted |
 | `handoff::tests::interrupted_prepare_reuses_only_verified_private_files` | Linux | The test compared inode numbers after the corrupt file had been unlinked, so the replacement could be handed the same number | The test holds the interrupted file open across `prepare` |
 | `supervisor::wait_ready_returns_terminal_boot_poweroff_reason_promptly` | Linux amd64, once | Not explained. The exit outcome was not `Error`; it passed on Linux arm64 and macOS in the same run | None |
+
+### Second run (45274081273, `fcb961ad`)
+
+| Job | Result |
+|---|---|
+| Core (linux-amd64) | Green. The lobby, `daemon_run`, dash and inode failures are gone and `wait_ready…` did not recur |
+| Core (linux-arm64) | 3938 of 3939 passed. `unknown_identity_handoff_seals…` got past the kernel floor and failed one step later: the layered fixture's lower was always `linux/amd64`, which the destination refuses against an arm64 boot profile. The fixture now takes its platform |
+| Core (macos) | Never ran. GitHub cancelled it after 15 minutes: `The job was not acquired by Runner of type hosted even after multiple attempts` |
