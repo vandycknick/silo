@@ -721,7 +721,8 @@ async fn hibernation_and_pause_local_daemon_routes_share_durable_authority() {
     use w::machine_service_client::MachineServiceClient;
     let root = tempfile::Builder::new()
         .prefix("silo-pause-api-")
-        .tempdir()
+        // The default temp dir is too long for Darwin's 104-byte sun_path.
+        .tempdir_in("/tmp")
         .unwrap();
     let binary = test_utils::mock_vmm_binary();
     for name in ["kernel", "initramfs", "agent"] {
@@ -1039,7 +1040,8 @@ async fn handoff_rejects_malformed_streams_over_private_socket_without_native_ef
 async fn kernel_argument_updates_cross_the_daemon_socket_and_keep_host_admission() {
     use w::machine_service_client::MachineServiceClient;
 
-    let root = tempfile::tempdir().unwrap();
+    // The default temp dir is too long for Darwin's 104-byte sun_path.
+    let root = tempfile::tempdir_in("/tmp").unwrap();
     let binary = test_utils::mock_vmm_binary();
     for name in ["kernel", "initramfs", "agent"] {
         let bytes = if name == "kernel" {

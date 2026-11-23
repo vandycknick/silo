@@ -20,7 +20,13 @@ pub(crate) async fn fixture() -> Fixture {
 }
 
 pub(crate) async fn fixture_with_scenario(scenario: Option<test_utils::Scenario>) -> Fixture {
-    let root = tempfile::Builder::new().prefix("lobby-").tempdir().unwrap();
+    // Short enough for run/machines/<id>/vm.sock to fit Darwin's 104-byte
+    // sun_path, and canonical because the document store refuses symlinked
+    // ancestors (Darwin's /tmp links to /private/tmp).
+    let root = tempfile::Builder::new()
+        .prefix("lobby-")
+        .tempdir_in(std::path::Path::new("/tmp").canonicalize().unwrap())
+        .unwrap();
     let (components, native) = if let Some(stage) =
         std::env::var_os("SILO_LOBBY_E2E_RUNTIME").filter(|_| scenario.is_none())
     {

@@ -573,6 +573,18 @@ pub fn mock_vmm_binary() -> &'static Path {
     &BINARY
 }
 
+/// Copies the mock-enabled monitor to `destination` and executes it once.
+///
+/// A copy is a new executable inode, and macOS policy-scans its first exec for
+/// about a second per 100 MiB, longer when parallel tests scan concurrently.
+/// Paying that here keeps it out of timed launches such as the five-second
+/// capability query.
+pub fn install_mock_vmm(destination: &Path) {
+    std::fs::copy(mock_vmm_binary(), destination)
+        .expect("copy the mock-enabled silo-vmm into the fixture runtime");
+    warm(destination);
+}
+
 /// Cargo uplifts binaries by copying, so every build leaves a fresh inode.
 /// macOS policy-scans the first exec of a new executable inode for about a
 /// second; pay it here, not inside a timed launch.

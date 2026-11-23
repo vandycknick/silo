@@ -429,8 +429,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().expect("helper parent"))
                 .expect("create helper parent");
             if name == "silo-vmm" {
-                std::fs::copy(test_utils::mock_vmm_binary(), &path)
-                    .expect("copy real scenario-capable monitor into private runtime root");
+                test_utils::install_mock_vmm(&path);
             } else {
                 std::fs::write(&path, b"helper").expect("write unused networking helper fixture");
             }

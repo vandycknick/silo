@@ -3575,13 +3575,25 @@ pub(crate) mod tests {
         let mut storage = db.machine_storage(id).await.unwrap().unwrap();
         layered_machine(&mut config, &mut storage, &held);
         if let (
-            crate::BootProfile::LinuxDirect { binding, .. },
             crate::BootProfile::LinuxDirect {
-                binding: captured, ..
+                binding,
+                kernel_architecture,
+                userspace_platform,
+                ..
+            },
+            crate::BootProfile::LinuxDirect {
+                binding: captured,
+                kernel_architecture: captured_kernel,
+                userspace_platform: captured_userspace,
+                ..
             },
         ) = (&mut storage.boot, &record.boot)
         {
             *binding = captured.clone();
+            // The fixture pins an x86_64 bundle; take its platform with it so
+            // the profile stays consistent on any host.
+            *kernel_architecture = *captured_kernel;
+            *userspace_platform = captured_userspace.clone();
         }
         let upper = config.machine_dir.join("upper.raw");
         let file = std::fs::File::open(&upper).unwrap();

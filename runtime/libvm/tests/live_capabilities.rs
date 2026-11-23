@@ -1665,8 +1665,7 @@ async fn live_capabilities_cached_report_cannot_survive_executable_replacement_o
     ] {
         let temp = tempfile::tempdir().expect("private root");
         let first = temp.path().join("monitor-one");
-        std::fs::copy(test_utils::mock_vmm_binary(), &first)
-            .expect("private copy of actual monitor");
+        test_utils::install_mock_vmm(&first);
         std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o700))
             .expect("executable private copy");
         let selected = temp.path().join("selected-monitor");

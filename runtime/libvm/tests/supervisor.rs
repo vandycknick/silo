@@ -42,8 +42,7 @@ fn write_runtime_root(root: &Path) -> PathBuf {
     let supervisor = root.join("bin/silo-vmm");
     // Each fixture owns its inode: parallel link/chmod operations must not
     // change the executable fingerprint another test is authenticating.
-    std::fs::copy(test_utils::mock_vmm_binary(), &supervisor)
-        .expect("install mock-enabled silo-vmm");
+    test_utils::install_mock_vmm(&supervisor);
     std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755))
         .expect("make silo-vmm executable");
     write_file(

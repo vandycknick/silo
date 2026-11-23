@@ -1148,6 +1148,8 @@ mod tests {
             address: std::net::SocketAddr,
             state: &RegistryState,
         ) {
+            // BSD accept inherits the listener's O_NONBLOCK; Linux does not.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

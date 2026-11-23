@@ -3688,10 +3688,11 @@ pub(crate) mod tests {
             .await
             .expect("open runtime");
         let mut config = sample_machine_config(&paths, MachineId::new(), "rosetta-test");
-        spec_hardware_mut(&mut config.spec).rosetta = Some(true);
-        config.guest.agent = crate::machine::MachineAgent::Custom {
-            path: "/custom/agent".into(),
-        };
+        // Rosetta no longer requires the default agent; nested virtualization
+        // is still an eligibility refusal.
+        let hardware = spec_hardware_mut(&mut config.spec);
+        hardware.rosetta = Some(true);
+        hardware.nested_virtualization = Some(true);
 
         let error = runtime
             .prepare_vmm_launch_inputs(
@@ -3716,7 +3717,12 @@ pub(crate) mod tests {
                 },
             )
             .expect_err("reject ineligible durable contract");
-        assert!(error.to_string().contains("installed default guest agent"));
+        assert!(
+            error
+                .to_string()
+                .contains("Rosetta does not support nested virtualization"),
+            "{error}"
+        );
         assert!(!error.to_string().contains("kernel"));
         assert!(!runtime.machine_paths(config.id).vm_spec_path().exists());
     }

@@ -2618,7 +2618,8 @@ mod tests {
     #[test]
     fn sparse_copy_still_hashes_inline_without_identity_completion() {
         let root = root();
-        let length = 2 * STREAM_CHUNK_BYTES + 7;
+        // APFS fills zero ranges below roughly 16 MiB; 8 MiB chunks would not stay holes.
+        let length = 8 * STREAM_CHUNK_BYTES + 7;
         let file = source(
             &root,
             "source.raw",

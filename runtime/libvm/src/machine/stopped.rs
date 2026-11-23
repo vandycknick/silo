@@ -2692,6 +2692,9 @@ mod tests {
         }
     }
 
+    // Boot capture is admitted only on the Linux krun lane
+    // (boot_assets::validate_captured_boot_lane), and memory snapshots need live capture.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn restore_without_memory_turns_a_memory_snapshot_into_a_stopped_machine() {
         use crate::store::MachineStore;

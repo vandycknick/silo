@@ -384,7 +384,11 @@ mod tests {
             .open(path)
             .unwrap();
         let request = nix::libc::flock {
+            // Linux exposes the lock types as c_int, Darwin as c_short.
+            #[cfg(target_os = "linux")]
             l_type: nix::libc::F_WRLCK as i16,
+            #[cfg(not(target_os = "linux"))]
+            l_type: nix::libc::F_WRLCK,
             l_whence: nix::libc::SEEK_SET as i16,
             l_start: 0x4000_0002,
             l_len: 510,

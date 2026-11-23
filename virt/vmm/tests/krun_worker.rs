@@ -15,7 +15,18 @@ mod native_stream_map;
 
 /// A spawned process, its storage lease and, for direct workers, the
 /// monitor-side lifecycle endpoint. Both outlive the child until it is reaped.
-struct Process(Option<Child>, Option<Lease>, Option<OwnedFd>);
+struct Process(
+    Option<Child>,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "held to keep the lease open; read only by Linux tests"
+        )
+    )]
+    Option<Lease>,
+    Option<OwnedFd>,
+);
 impl Process {
     fn output(self) -> Output {
         self.output_with_timeout(Duration::from_secs(5))

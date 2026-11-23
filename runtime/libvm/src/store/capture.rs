@@ -3342,9 +3342,10 @@ pub(crate) mod tests {
     use crate::storage::stream::StreamHasher;
     use crate::store::capture::{
         authenticate_lanes, capture_directory, validate_layout, verify_capture, verify_payload,
-        AdmittedPayload, CaptureAuthentication, VerifiedBytes, VerifiedPayload,
-        AUTHENTICATION_BUFFER_BYTES,
+        AdmittedPayload, CaptureAuthentication, VerifiedBytes,
     };
+    #[cfg(target_os = "linux")]
+    use crate::store::capture::{VerifiedPayload, AUTHENTICATION_BUFFER_BYTES};
 
     use crate::store::models::snapshot::SnapshotMemoryState;
     use crate::store::models::{
@@ -3369,6 +3370,7 @@ pub(crate) mod tests {
         fixture_with_external_data(false).await
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) async fn fixture_with_retention(retention: crate::MachineRetention) -> Fixture {
         fixture_source_profile(false, false, CapturePolicy::Full, 512, false, 2, retention).await
     }
@@ -6916,7 +6918,13 @@ pub(crate) mod tests {
             "length",
             "symlink",
             "writer",
-        ] {
+        ]
+        .into_iter()
+        // Darwin has no read lease, so identity_file::reject_surviving_writer
+        // cannot see a surviving writer there; owned cuts come only from live
+        // capture, which HVF withholds.
+        .filter(|fault| cfg!(target_os = "linux") || *fault != "writer")
+        {
             let fixture = fork_fixture().await;
             let (directory, evidence) = seal_owned(&fixture);
             let capture = fixture.reservation.record.capture_id;
@@ -8333,7 +8341,7 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         let stat = nix::sys::statvfs::fstatvfs(directory.fd()).unwrap();
-        stat.blocks_available()
+        u64::from(stat.blocks_available())
             .checked_mul(stat.fragment_size())
             .unwrap()
     }

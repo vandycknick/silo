@@ -749,6 +749,9 @@ mod tests {
         serde_json::from_str(r#"{"version":"1"}"#).expect("parse minimal template")
     }
 
+    // Stopped boot capture is admitted only on the Linux krun lane
+    // (libvm boot_assets::validate_captured_boot_lane).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn snapshot_names_restore_machines_and_are_refused_as_creation_images() {
         let temp = tempfile::tempdir().unwrap();
@@ -1040,8 +1043,7 @@ mod tests {
         std::fs::create_dir_all(&bin).expect("create binary component fixtures");
         std::fs::create_dir(&assets).expect("create asset component fixtures");
         let supervisor = bin.join("silo-vmm");
-        std::fs::copy(test_utils::mock_vmm_binary(), &supervisor)
-            .expect("install real scenario-capable monitor");
+        test_utils::install_mock_vmm(&supervisor);
         for name in ["netd", "krun"] {
             executable_fixture(&bin, name);
         }

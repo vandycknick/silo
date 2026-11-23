@@ -1698,7 +1698,8 @@ mod tests {
     async fn hibernation_force_stop_discards_even_when_non_running_save_is_unusable() {
         use vm_spec::live::{LiveAvailability, LiveCapability, LiveCapabilityVector, LiveLane};
         for force in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
+            // The default temp dir is too long for Darwin's 104-byte sun_path.
+            let temp = tempfile::tempdir_in("/tmp").unwrap();
             let supported = LiveCapability {
                 native: true,
                 availability: LiveAvailability::Supported,

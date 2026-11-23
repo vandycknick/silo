@@ -378,7 +378,8 @@ mod tests {
 
     #[test]
     fn helpers_follow_portable_and_app_bundle_layouts() {
-        let root = tempfile::tempdir().unwrap();
+        // helper_for_executable resolves links; Darwin's temp dir is under /var -> /private/var.
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let portable = root.path().join("bin");
         let contents = root.path().join("Silo.app/Contents");
         std::fs::create_dir_all(&portable).unwrap();

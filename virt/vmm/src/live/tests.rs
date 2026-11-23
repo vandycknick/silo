@@ -42,8 +42,9 @@ struct Harness {
     guest: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// The harness's default writable raw root attachment.
-const ROOT_DISK_BYTES: u64 = 1 << 20;
+/// The harness's default writable raw root attachment. APFS fills zero ranges
+/// below roughly 16 MiB, so allocation growth is only visible above that.
+const ROOT_DISK_BYTES: u64 = 64 << 20;
 
 fn live_id(value: Uuid) -> LiveId {
     LiveId::parse(&value.hyphenated().to_string()).unwrap()
@@ -1158,7 +1159,8 @@ impl Harness {
         .await
     }
 
-    /// Poll until the capture and its source continuation are terminal.
+    /// Poll until the capture, its outcome and its source continuation are
+    /// terminal. The source can resume before the staged state seals.
     async fn capture_settled(&self, operation: &LiveId) -> OperationObservation {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -1167,7 +1169,8 @@ impl Harness {
                 .capture
                 .as_ref()
                 .is_some_and(|capture| capture.continuation.is_terminal())
-                && observation.state != VmLifecycleState::Capturing;
+                && observation.state != VmLifecycleState::Capturing
+                && observation.operation.outcome != OperationOutcome::InProgress;
             if done {
                 return observation;
             }
@@ -1189,7 +1192,7 @@ fn sealed(observation: &OperationObservation) -> vm_spec::capture::CaptureSealed
         OperationOutcome::CaptureSealed {
             capture: vm_spec::capture::CaptureSuccess::Identified { sealed },
         } => sealed.clone(),
-        outcome => panic!("capture did not seal: {outcome:?}"),
+        _ => panic!("capture did not seal: {observation:?}"),
     }
 }
 

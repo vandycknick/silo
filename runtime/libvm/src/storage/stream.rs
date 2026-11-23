@@ -1570,10 +1570,22 @@ mod tests {
         std::fs::write(&renamed, b"changed").unwrap();
         assert!(authenticated.reopen(File::open(&renamed).unwrap()).is_err());
     }
+
+    /// Descriptor status flags as the copy leaves them. Darwin also reports
+    /// its kernel-owned FWASWRITTEN bit (0x10000) once the descriptor has
+    /// written; no copy path sets or clears it.
+    fn status_flags(file: &File) -> i32 {
+        let flags = nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_GETFL).unwrap();
+        if cfg!(target_os = "macos") {
+            flags & !0x10000
+        } else {
+            flags
+        }
+    }
+
     #[test]
     fn direct_copy_keeps_exact_chunk_identity_sparse_tails_and_descriptor_flags() {
         use crate::storage::stream::CopyWriteback;
-        use nix::fcntl::{fcntl, FcntlArg};
 
         let mut hasher = StreamHasher::with_writeback(
             vm_spec::stream_map::ChunkSize::DISK,
@@ -1594,12 +1606,12 @@ mod tests {
                 .unwrap();
             let receipt = AuthenticatedStream::from_receipt(source, expected.clone()).unwrap();
             let output = tempfile::tempfile().unwrap();
-            let flags = fcntl(&output, FcntlArg::F_GETFL).unwrap();
+            let flags = status_flags(&output);
             let scan = hasher.copy_authenticated(&receipt, &output).unwrap();
             assert_eq!(scan.map, expected);
             assert_eq!(scan.stats.whole_bytes_hashed, 0);
             assert_eq!(output.metadata().unwrap().len(), length as u64);
-            assert_eq!(fcntl(&output, FcntlArg::F_GETFL).unwrap(), flags);
+            assert_eq!(status_flags(&output), flags);
             let mut actual = vec![0; length];
             output.read_exact_at(&mut actual, 0).unwrap();
             assert_eq!(actual, bytes);
@@ -1609,10 +1621,9 @@ mod tests {
     #[test]
     fn direct_copy_retries_real_unaligned_einval_and_restores_flags() {
         use crate::storage::stream::{CopyOutput, CopyWriteback};
-        use nix::fcntl::{fcntl, FcntlArg};
 
         let output = tempfile::tempfile().unwrap();
-        let flags = fcntl(&output, FcntlArg::F_GETFL).unwrap();
+        let flags = status_flags(&output);
         let mut writer = CopyOutput::new(&output, CopyWriteback::Direct).unwrap();
         let rejected = output
             .write_at(b"probe", 1)
@@ -1622,7 +1633,7 @@ mod tests {
             assert!(!writer.direct);
         }
         writer.finish().unwrap();
-        assert_eq!(fcntl(&output, FcntlArg::F_GETFL).unwrap(), flags);
+        assert_eq!(status_flags(&output), flags);
         let mut bytes = [0; 6];
         output.read_exact_at(&mut bytes, 0).unwrap();
         assert_eq!(&bytes, b"\0retry");
@@ -1631,7 +1642,6 @@ mod tests {
     #[test]
     fn direct_copy_corruption_still_fails_without_retaining_direct_descriptor_flags() {
         use crate::storage::stream::CopyWriteback;
-        use nix::fcntl::{fcntl, FcntlArg};
 
         let source = tempfile::tempfile().unwrap();
         source.write_all_at(b"original", 0).unwrap();
@@ -1642,7 +1652,7 @@ mod tests {
         source.write_all_at(b"corrupt!", 0).unwrap();
         let receipt = AuthenticatedStream::from_receipt(source, map).unwrap();
         let output = tempfile::tempfile().unwrap();
-        let flags = fcntl(&output, FcntlArg::F_GETFL).unwrap();
+        let flags = status_flags(&output);
         let error = StreamHasher::with_writeback(
             vm_spec::stream_map::ChunkSize::DISK,
             CopyWriteback::Direct,
@@ -1650,7 +1660,7 @@ mod tests {
         .copy_authenticated(&receipt, &output)
         .unwrap_err();
         assert!(error.to_string().contains("copy-time stream chunks"));
-        assert_eq!(fcntl(&output, FcntlArg::F_GETFL).unwrap(), flags);
+        assert_eq!(status_flags(&output), flags);
     }
 
     #[test]

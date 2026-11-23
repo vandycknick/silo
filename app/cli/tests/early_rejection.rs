@@ -77,13 +77,11 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Entry> {
 fn install_runtime(root: &Path) {
     std::fs::create_dir_all(root.join("bin")).expect("create portable bin");
     std::fs::create_dir(root.join("assets")).expect("create portable assets");
-    let monitor = test_utils::mock_vmm_binary();
     // Networking is disabled; netd is validated but never launched.
     // The actual monitor serves both query and scenario-run requests.
-    for path in ["bin/silo-vmm", "bin/netd"] {
-        std::fs::copy(monitor, root.join(path))
-            .expect("install actual monitor inside portable runtime");
-    }
+    test_utils::install_mock_vmm(&root.join("bin/silo-vmm"));
+    std::fs::copy(test_utils::mock_vmm_binary(), root.join("bin/netd"))
+        .expect("install actual monitor as the unlaunched netd");
     std::fs::write(
         root.join("assets/kernel-default"),
         test_utils::direct_kernel::host_kernel("scenario kernel"),

@@ -1519,13 +1519,15 @@ pub(crate) mod tests {
                 .unwrap()
         };
         let file = open("decoded");
-        let length = 8_u64 << 20;
+        // APFS materializes zero ranges below roughly 16 MiB instead of leaving
+        // holes; 64 MiB keeps the trailing run sparse on APFS and Linux alike.
+        let length = 64_u64 << 20;
         let mut sink = SparseSink::new(&file, length);
         let mut chunk = vec![0; 1 << 20];
         chunk[4096] = 7;
         sink.write_all(&chunk).unwrap();
         let zeros = vec![0; 1 << 20];
-        for _ in 1..8 {
+        for _ in 1..64 {
             sink.write_all(&zeros).unwrap();
         }
         sink.finish().unwrap();

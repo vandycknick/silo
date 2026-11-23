@@ -872,7 +872,9 @@ mod tests {
     #[test]
     fn lifecycle_role_requires_a_distinct_connected_stream_socket() {
         use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
-        let root = std::env::temp_dir().join(format!("worker-lifecycle-{}", uuid::Uuid::new_v4()));
+        // Darwin's temp dir is too long for a 104-byte sun_path.
+        let root =
+            std::path::Path::new("/tmp").join(format!("worker-lifecycle-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let (config, _config_writer) = nix::unistd::pipe().unwrap();
         let (_events_reader, events) = nix::unistd::pipe().unwrap();
