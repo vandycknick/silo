@@ -225,3 +225,17 @@ run on `main` predates the lobby (18 October).
 | Core (linux-amd64) | Green. The lobby, `daemon_run`, dash and inode failures are gone and `wait_ready…` did not recur |
 | Core (linux-arm64) | 3938 of 3939 passed. `unknown_identity_handoff_seals…` got past the kernel floor and failed one step later: the layered fixture's lower was always `linux/amd64`, which the destination refuses against an arm64 boot profile. The fixture now takes its platform |
 | Core (macos) | Never ran. GitHub cancelled it after 15 minutes: `The job was not acquired by Runner of type hosted even after multiple attempts` |
+
+### Third run (45279979177, `b0f2e0ee`)
+
+Linux amd64 green again. Linux arm64 passed all 3939 Rust tests and then
+failed in the Go suite, which no earlier arm64 run had reached:
+`virtualnetwork.TestForwardActualGvisorGuestDialAndFallbackAdmission` ran out
+of its 20 s budget at guest connection 146 of 256 under `-race`.
+
+Reproduced in a Linux arm64 guest on this Mac with the cross-built test
+binary: seven of seven `-race` runs failed after about 20 s, between guest
+connection 109 and 162, on 8, 4 and 2 CPUs; the same test without `-race`
+passed in 0.03 to 0.25 s. Linux amd64 runs the whole package under `-race` in 1.4 s.
+This is the slowdown `xtask test` already avoided on darwin/arm64, so the race
+lane is now Linux amd64 only.

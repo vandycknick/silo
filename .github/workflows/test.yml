@@ -85,7 +85,7 @@ jobs:
 
       # Cargo integration discovery includes tests/krun_worker.rs on both hosts.
       # These real-process boundary tests need no successful hypervisor admission.
-      # make test also tests net/netd and app/tsgate (race-enabled on Linux);
+      # make test also tests net/netd and app/tsgate (race-enabled on Linux amd64);
       # make fmt gofmt-checks both.
       - name: Run host-aware tests, including the private silo-vmm worker boundary
         run: nix develop .#ci --command make test

@@ -249,9 +249,10 @@ fn run_tests(
         for module in GO_MODULES {
             let mut go = Command::new("go");
             go.current_dir(workspace_root.join(module)).arg("test");
-            // The darwin/arm64 race runtime slows gVisor-based stacks by orders
-            // of magnitude, past every real-time budget; Linux carries the race lane.
-            if host != HostTarget::MacosArm64 {
+            // The arm64 race runtime slows gVisor-based stacks by orders of
+            // magnitude, past every real-time budget, on Darwin and Linux
+            // alike; Linux amd64 carries the race lane.
+            if host == HostTarget::LinuxX86_64 {
                 go.arg("-race");
             }
             go.arg("./...");
