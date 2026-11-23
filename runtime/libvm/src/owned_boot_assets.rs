@@ -430,6 +430,8 @@ impl InspectedKernel {
                 + 0x200
         } else if header.starts_with(ELF_MAGIC) {
             self.elf_banner_offset()?
+        } else if header.get(56..60) == Some(ARM64_IMAGE_MAGIC.as_slice()) {
+            self.arm64_banner_offset()?
         } else {
             return Err(invalid("missing Linux boot protocol version header"));
         };
@@ -552,6 +554,38 @@ impl InspectedKernel {
             }
         }
         Err(invalid())
+    }
+
+    /// An arm64 Image has neither a version field nor a symbol table, so the
+    /// release is read where the kernel itself keeps it: the `linux_banner`
+    /// text. The digit keeps format strings such as "Linux version %s" out.
+    fn arm64_banner_offset(&self) -> Result<u64, BootAssetError> {
+        const BANNER: &[u8] = b"Linux version ";
+        let mut buffer = vec![0; 1 << 20];
+        let mut carried = 0;
+        let mut offset = 0;
+        while offset < self.asset.length() {
+            let count = (self.asset.length() - offset).min((buffer.len() - carried) as u64);
+            let filled = carried + count as usize;
+            self.read_exact(&mut buffer[carried..filled], offset)?;
+            let found = buffer[..filled]
+                .windows(BANNER.len() + 1)
+                .position(|window| {
+                    window.starts_with(BANNER) && window[BANNER.len()].is_ascii_digit()
+                });
+            if let Some(found) = found {
+                return Ok(offset - carried as u64 + found as u64);
+            }
+            // A banner may straddle two reads; keep the longest unmatched prefix.
+            let kept = filled.min(BANNER.len());
+            buffer.copy_within(filled - kept..filled, 0);
+            carried = kept;
+            offset += count;
+        }
+        Err(BootAssetError::KernelVersion {
+            path: self.asset.path.clone(),
+            detail: "missing arm64 Image linux_banner",
+        })
     }
 
     fn read_exact(&self, bytes: &mut [u8], offset: u64) -> Result<(), BootAssetError> {
@@ -1094,6 +1128,80 @@ pub(crate) mod tests {
                 result.unwrap_or_else(|error| panic!("version {version}: {error:?}"));
             }
         }
+    }
+
+    /// An arm64 Image whose body is `prefix` followed by `linux_banner`.
+    fn arm64_kernel_with_banner(prefix: &[u8], version: &str) -> Vec<u8> {
+        let mut body = prefix.to_vec();
+        body.extend_from_slice(format!("Linux version {version} (build)\0").as_bytes());
+        direct_kernel_fixture::image(KernelArchitecture::Arm64, &body)
+    }
+
+    /// A kernel in this host's direct-boot format that also states its release.
+    pub(crate) fn host_kernel_with_banner(version: &str) -> Vec<u8> {
+        match KernelArchitecture::host() {
+            KernelArchitecture::Amd64 => elf_kernel_with_banner(version),
+            KernelArchitecture::Arm64 => arm64_kernel_with_banner(&[], version),
+        }
+    }
+
+    #[test]
+    fn overlay_kernel_floor_reads_the_arm64_image_linux_banner() {
+        const HEADER: usize = 64;
+        const READ: usize = 1 << 20;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Image");
+        let check = |bytes: Vec<u8>| {
+            std::fs::write(&path, bytes).unwrap();
+            InspectedKernel::from_open_file(std::fs::File::open(&path).unwrap(), &path)
+                .unwrap()
+                .check_overlay_version()
+        };
+        check(host_kernel_with_banner("6.6.0")).unwrap();
+        for version in ["5.15.219", "6.5.99", "6.6.0", "7.2.11"] {
+            let result = check(arm64_kernel_with_banner(&[], version));
+            if version < "6.6" {
+                let error = result.unwrap_err();
+                assert!(matches!(error, BootAssetError::KernelTooOld { .. }));
+                assert!(error.to_string().contains(version));
+            } else {
+                result.unwrap_or_else(|error| panic!("version {version}: {error:?}"));
+            }
+        }
+        // Every way the banner and its first digit can straddle two reads, at
+        // the first boundary and at a later one that already carries a tail.
+        for boundary in [READ, 3 * READ - 2 * 14] {
+            for before in 0..=16 {
+                let prefix = vec![0x5a; boundary - HEADER - before];
+                let error = check(arm64_kernel_with_banner(&prefix, "5.4.1")).unwrap_err();
+                assert!(
+                    matches!(&error, BootAssetError::KernelTooOld { version } if version == "5.4.1"),
+                    "boundary {boundary}, {before} bytes before it: {error:?}"
+                );
+            }
+        }
+        // A format string is not a release, wherever it sits.
+        let decoy = b"Linux version %s (%s)\0Linux version \0";
+        let error = check(arm64_kernel_with_banner(decoy, "5.4.1")).unwrap_err();
+        assert!(matches!(&error, BootAssetError::KernelTooOld { version } if version == "5.4.1"));
+        for body in [decoy.as_slice(), b"Linux version", b""] {
+            let error = check(direct_kernel_fixture::image(
+                KernelArchitecture::Arm64,
+                body,
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(error, BootAssetError::KernelVersion { detail, .. } if detail.contains("linux_banner")),
+                "{error:?}"
+            );
+        }
+        // A digit with no terminated release behind it is malformed, not absent.
+        let error = check(direct_kernel_fixture::image(
+            KernelArchitecture::Arm64,
+            b"Linux version 6",
+        ))
+        .unwrap_err();
+        assert!(matches!(error, BootAssetError::KernelVersion { .. }));
     }
 
     const ARCHITECTURES: [(KernelArchitecture, GuestArchitecture); 2] = [

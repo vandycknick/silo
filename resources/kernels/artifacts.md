@@ -200,9 +200,16 @@ boot, and guest gates remain the evidence that a kernel actually boots.
 ### Overlay Kernel Floor and Owned Boot Assets
 
 Overlay roots require Linux 6.6 or newer. libvm reads the version from the held
-kernel (the Linux boot protocol header for bzImage, or `linux_banner` in native
-ELF vmlinux) and rejects older or unreadable versions before machine or storage
-effects. Raw roots retain their independent native-format checks. The selected
+kernel and rejects older or unreadable versions before machine or storage
+effects:
+
+| Kernel bytes | Where the release is read |
+| --- | --- |
+| bzImage | Linux boot protocol header |
+| x86-64 ELF `vmlinux` | `linux_banner`, located through the symbol table |
+| arm64 `Image` | `linux_banner`, found by scanning for `Linux version ` followed by a digit, because the `Image` has neither a version field nor a symbol table |
+
+Raw roots retain their independent native-format checks. The selected
 backend must support overlay roots; Mock and VZ are rejected before opening
 overlay boot assets. Kernel track gates verify the required configuration at
 build time; launch does not consult an artifact-specific admission list.
