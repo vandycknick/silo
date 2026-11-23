@@ -340,13 +340,88 @@ fn native_host_admission(report: &native::NativeHostReport) -> HostAdmission {
         native::NativeLane::KvmArm64GicV3 => {
             kvm_host_admission(report.kvm_prerequisites, Some(report.kvm.gic_model))
         }
-        native::NativeLane::HvfArm64GicV3 => HostAdmission {
-            os_floor: HostCheck::NotEvaluated,
-            hypervisor: observed_host_check(report.hvf.vm_admission),
-            lane: observed_host_check(report.hvf.gic_model),
-        },
+        native::NativeLane::HvfArm64GicV3 => {
+            hvf_host_admission(&report.hvf, hvf_os_floor(), hv_support())
+        }
         native::NativeLane::Unsupported => HostAdmission::not_evaluated(),
     }
+}
+
+/// Host-scope HVF admission from facts observable without a VM. libkrun's
+/// machine-less query cannot know VM admission or the VM's actual GIC model;
+/// those belong to per-VM arm64 live admission. Here the hypervisor check is
+/// the loaded framework plus `kern.hv_support`, and the lane check is the GIC
+/// state API the lane depends on.
+fn hvf_host_admission(
+    facts: &native::HvfHostFacts,
+    os_floor: HostCheck,
+    hv_support: HostCheck,
+) -> HostAdmission {
+    let lane = match facts.gic_symbols {
+        native::Observation::Observed(symbols) => HostCheck::from(Some(
+            symbols.blob_group() == native::HvfSymbolGroup::Available
+                && symbols.icc_group() == native::HvfSymbolGroup::Available,
+        )),
+        native::Observation::Unavailable(_) => HostCheck::Failed,
+        native::Observation::NotEvaluated | native::Observation::NotApplicable => {
+            HostCheck::NotEvaluated
+        }
+    };
+    HostAdmission {
+        os_floor,
+        hypervisor: observed_host_check(facts.framework).and(hv_support),
+        lane,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn hv_support() -> HostCheck {
+    match crate::krun::check_host() {
+        Ok(_) => HostCheck::Passed,
+        Err(crate::krun::HvfHostError::Unsupported) => HostCheck::Failed,
+        Err(error) => {
+            tracing::warn!(%error, "read kern.hv_support for the HVF live lane");
+            HostCheck::NotEvaluated
+        }
+    }
+}
+
+/// The HVF lane only exists on macOS; anywhere else its support is unknown.
+#[cfg(not(target_os = "macos"))]
+fn hv_support() -> HostCheck {
+    HostCheck::NotEvaluated
+}
+
+/// ADR 0012 and ADR 0021: Silo, and with it the HVF live lane, needs macOS 26.
+#[cfg(target_os = "macos")]
+const MACOS_FLOOR_MAJOR: u32 = 26;
+
+#[cfg(target_os = "macos")]
+fn hvf_os_floor() -> HostCheck {
+    match crate::krun::sysctl_string(c"kern.osproductversion") {
+        Ok(version) => macos_floor(&version),
+        Err(error) => {
+            tracing::warn!(%error, "read kern.osproductversion for the HVF live floor");
+            HostCheck::NotEvaluated
+        }
+    }
+}
+
+/// The HVF lane only exists on macOS; anywhere else its floor is unknown.
+#[cfg(not(target_os = "macos"))]
+fn hvf_os_floor() -> HostCheck {
+    HostCheck::NotEvaluated
+}
+
+/// An unparsable product version leaves the floor unevaluated, never passed.
+#[cfg(target_os = "macos")]
+fn macos_floor(product_version: &str) -> HostCheck {
+    product_version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .map(|major| major >= MACOS_FLOOR_MAJOR)
+        .into()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +429,17 @@ enum HostCheck {
     NotEvaluated,
     Passed,
     Failed,
+}
+
+impl HostCheck {
+    /// Both checks must pass; a failure outranks an unknown.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
+            (Self::Passed, Self::Passed) => Self::Passed,
+            _ => Self::NotEvaluated,
+        }
+    }
 }
 
 impl From<Option<bool>> for HostCheck {
@@ -987,5 +1073,194 @@ mod tests {
         let mut mismatched = request;
         mismatched.scenario_json = Some("{}".into());
         assert!(ResolvedSelection::from_start(Some(&mismatched)).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capabilities_hvf_floor_is_macos_26_and_never_passes_unknown_versions() {
+        for version in ["26", "26.0", "26.7.1", "27.1"] {
+            assert_eq!(macos_floor(version), HostCheck::Passed, "{version}");
+        }
+        for version in ["25.9.9", "15.6", "11.0"] {
+            assert_eq!(macos_floor(version), HostCheck::Failed, "{version}");
+        }
+        for version in ["", "x.1", "-26", ".26"] {
+            assert_eq!(macos_floor(version), HostCheck::NotEvaluated, "{version:?}");
+        }
+        // The real host answers, so starting a krun VM cannot stall on an
+        // unevaluated floor.
+        assert_ne!(hvf_os_floor(), HostCheck::NotEvaluated);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capabilities_hvf_pause_follows_the_floor_and_withheld_operations_stay_build_excluded() {
+        let facts = |version: &str, operation| EvaluationFacts {
+            backend_allowed: true,
+            // libkrun's HVF lane admits pause and withholds the rest.
+            native: operation == LiveOperation::Pause,
+            delivered: true,
+            host: HostAdmission {
+                os_floor: macos_floor(version),
+                ..admitted()
+            },
+        };
+        let unsupported = |code| LiveAvailability::Unsupported {
+            reason: LiveUnsupportedReason::new(code),
+        };
+        let current = evaluate_vector(|operation| facts("26.0", operation)).expect("evaluated");
+        assert_eq!(current.pause.availability, LiveAvailability::Supported);
+        let older = evaluate_vector(|operation| facts("25.4", operation)).expect("evaluated");
+        assert_eq!(
+            older.pause.availability,
+            unsupported(LiveReasonCode::HostOsBelowFloor)
+        );
+        for vector in [current, older] {
+            for capability in [
+                vector.capture,
+                vector.restore,
+                vector.fork,
+                vector.incremental,
+            ] {
+                assert_eq!(
+                    capability.availability,
+                    unsupported(LiveReasonCode::BuildExcluded)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capabilities_hvf_host_admission_uses_machine_less_facts_only() {
+        let symbols = |presence| {
+            native::Observation::Observed(native::HvfGicSymbols::from_presence(presence))
+        };
+        let unavailable = native::Observation::Unavailable(native::NativeQueryError {
+            operation: native::QueryOperation::LoadHvfFramework,
+            raw_os_error: None,
+            kind: std::io::ErrorKind::Other,
+        });
+        let facts = |framework, gic_symbols| native::HvfHostFacts {
+            framework,
+            // Neither is observable without a VM; host scope must not need them.
+            vm_admission: native::Observation::NotEvaluated,
+            gic_model: native::Observation::NotEvaluated,
+            gic_symbols,
+            gic_blob_symbols: native::Observation::NotEvaluated,
+            gic_icc_symbols: native::Observation::NotEvaluated,
+        };
+        let present = facts(native::Observation::Observed(()), symbols([true; 6]));
+        let pause = |host| {
+            evaluate(EvaluationFacts {
+                backend_allowed: true,
+                native: true,
+                delivered: true,
+                host,
+            })
+        };
+        let unsupported = |code| {
+            Ok(LiveCapability {
+                native: true,
+                availability: LiveAvailability::Unsupported {
+                    reason: LiveUnsupportedReason::new(code),
+                },
+            })
+        };
+        assert_eq!(
+            pause(hvf_host_admission(
+                &present,
+                HostCheck::Passed,
+                HostCheck::Passed
+            )),
+            Ok(LiveCapability {
+                native: true,
+                availability: LiveAvailability::Supported,
+            })
+        );
+        assert_eq!(
+            pause(hvf_host_admission(
+                &present,
+                HostCheck::Failed,
+                HostCheck::Passed
+            )),
+            unsupported(LiveReasonCode::HostOsBelowFloor)
+        );
+        assert_eq!(
+            pause(hvf_host_admission(
+                &present,
+                HostCheck::Passed,
+                HostCheck::Failed
+            )),
+            unsupported(LiveReasonCode::HypervisorUnavailable)
+        );
+        let no_framework = facts(unavailable, symbols([true; 6]));
+        assert_eq!(
+            pause(hvf_host_admission(
+                &no_framework,
+                HostCheck::Passed,
+                HostCheck::Passed
+            )),
+            unsupported(LiveReasonCode::HypervisorUnavailable)
+        );
+        for missing in 0..6 {
+            let mut presence = [true; 6];
+            presence[missing] = false;
+            let partial = facts(native::Observation::Observed(()), symbols(presence));
+            assert_eq!(
+                pause(hvf_host_admission(
+                    &partial,
+                    HostCheck::Passed,
+                    HostCheck::Passed
+                )),
+                unsupported(LiveReasonCode::HypervisorUnavailable),
+                "{missing}"
+            );
+        }
+        // Unknown machine-less facts never become support.
+        for host in [
+            hvf_host_admission(&present, HostCheck::NotEvaluated, HostCheck::Passed),
+            hvf_host_admission(&present, HostCheck::Passed, HostCheck::NotEvaluated),
+            hvf_host_admission(
+                &facts(native::Observation::NotEvaluated, symbols([true; 6])),
+                HostCheck::Passed,
+                HostCheck::Passed,
+            ),
+            hvf_host_admission(
+                &facts(
+                    native::Observation::Observed(()),
+                    native::Observation::NotEvaluated,
+                ),
+                HostCheck::Passed,
+                HostCheck::Passed,
+            ),
+        ] {
+            assert_eq!(pause(host), Err(EvaluationIncomplete));
+        }
+    }
+
+    /// The regression behind every failed krun start on macOS: the real host
+    /// report must evaluate, with pause native and the rest withheld.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capabilities_real_hvf_host_report_evaluates() {
+        let report = ResolvedSelection::from_query(LiveBackend::Krun, None)
+            .unwrap()
+            .host_report()
+            .unwrap();
+        assert_eq!(report.lane, LiveLane::HvfArm64);
+        assert!(report.live.pause.native);
+        for capability in [
+            &report.live.capture,
+            &report.live.restore,
+            &report.live.fork,
+            &report.live.incremental,
+        ] {
+            assert_eq!(
+                capability.availability,
+                LiveAvailability::Unsupported {
+                    reason: LiveUnsupportedReason::new(LiveReasonCode::BuildExcluded)
+                }
+            );
+        }
     }
 }

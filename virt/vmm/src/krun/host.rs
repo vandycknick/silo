@@ -184,6 +184,44 @@ fn validate_hv_support(
     }
 }
 
+/// Reads a string sysctl such as `kern.osproductversion`.
+#[cfg(target_os = "macos")]
+pub(crate) fn sysctl_string(name: &std::ffi::CStr) -> std::io::Result<String> {
+    let mut length = 0_usize;
+    // nix does not expose sysctlbyname, so use its libc re-export for this read-only host probe.
+    let sized = unsafe {
+        nix::libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut value = vec![0_u8; length];
+    let read = unsafe {
+        nix::libc::sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let invalid = |detail| std::io::Error::new(std::io::ErrorKind::InvalidData, detail);
+    std::ffi::CStr::from_bytes_until_nul(&value[..length])
+        .map_err(|_| invalid("sysctl string is not NUL terminated"))?
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| invalid("sysctl string is not UTF-8"))
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]

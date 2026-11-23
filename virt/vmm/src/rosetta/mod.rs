@@ -1,4 +1,4 @@
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::c_void;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -81,7 +81,7 @@ pub(crate) async fn acquire(
         },
     }?;
     tracing::debug!(
-        host_build = ?sysctl_string("kern.osversion").ok(),
+        host_build = ?crate::krun::sysctl_string(c"kern.osversion").ok(),
         translator_sha256 = %encode_hex(&source.sha256),
         kernel_sha256 = %encode_hex(&sha256(&kernel_snapshot.bytes)?),
         kernel = %kernel.display(),
@@ -593,50 +593,6 @@ fn sha256(bytes: &[u8]) -> eyre::Result<[u8; 32]> {
         return Err(eyre!("CommonCrypto SHA-256 failed"));
     }
     Ok(digest)
-}
-
-fn sysctl_string(name: &str) -> eyre::Result<String> {
-    let name = CString::new(name).map_err(|_| eyre!("invalid sysctl name"))?;
-    let mut length = 0_usize;
-    // nix does not expose sysctlbyname on current macOS targets.
-    if unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            std::ptr::null_mut(),
-            &mut length,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-        || length == 0
-    {
-        return Err(eyre!(
-            "read host build size: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let mut value = vec![0_u8; length];
-    if unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            value.as_mut_ptr().cast(),
-            &mut length,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(eyre!(
-            "read host build: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let value = CStr::from_bytes_until_nul(&value[..length])
-        .map_err(|_| eyre!("host build sysctl was not NUL terminated"))?;
-    value
-        .to_str()
-        .map(str::to_owned)
-        .map_err(|_| eyre!("host build sysctl was not UTF-8"))
 }
 
 #[cfg(test)]
