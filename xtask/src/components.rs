@@ -200,11 +200,31 @@ fn run_tests(
     }
     // Real-process tests build private netd and tsgate copies. Warm Go's build
     // cache once before parallel nextest workers compete for the cold graph.
-    for (module, package) in [("net/netd", "./cmd/netd"), ("app/tsgate", "./...")] {
+    // The flags must be the tests' own: tsgate is built without cgo, which
+    // keys the cache differently from a default build.
+    for (module, package, pure) in [
+        ("net/netd", "./cmd/netd", false),
+        ("app/tsgate", "./...", true),
+    ] {
         let mut warm = Command::new("go");
         warm.current_dir(workspace_root.join(module))
             .args(["build", "-o", "/dev/null", package]);
+        if pure {
+            warm.env("CGO_ENABLED", "0");
+        }
         command::run(warm)?;
+    }
+    if !matches!(suite, TestSuite::Unit) {
+        // The daemon resolves tsgate beside its own executable, so black-box
+        // daemon tests need it next to the silo binary Cargo builds for them.
+        let mut tsgate = Command::new("go");
+        tsgate
+            .current_dir(workspace_root.join("app/tsgate"))
+            .env("CGO_ENABLED", "0")
+            .args(["build", "-mod=readonly", "-o"])
+            .arg(target_dir.join("debug/tsgate"))
+            .arg("./cmd/tsgate");
+        command::run(tsgate)?;
     }
 
     command::run(workspace_test_command(
