@@ -330,7 +330,7 @@ fn resources(
                     attachment,
                     mux,
                     cid: engine::GUEST_CID,
-                    agent_port: NonZeroU32::new(crate::guest::GUEST_CONTROL_PORT)
+                    agent_port: NonZeroU32::new(protocol::DEFAULT_GUEST_CONTROL_PORT)
                         .ok_or_else(|| invalid("agent control port is zero"))?,
                 });
             }

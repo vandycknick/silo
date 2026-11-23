@@ -20,7 +20,7 @@ use tower::service_fn;
 
 use crate::state::{InstanceStore, StoreError};
 
-pub(crate) const GUEST_CONTROL_PORT: u32 = 1027;
+pub(crate) const GUEST_CONTROL_PORT: u32 = protocol::DEFAULT_GUEST_CONTROL_PORT;
 const HEARTBEAT: Duration = Duration::from_secs(5);
 pub(crate) const STATUS_FRESHNESS: Duration = HEARTBEAT.saturating_mul(3);
 const METRICS_INTERVAL: Duration = Duration::from_secs(5);

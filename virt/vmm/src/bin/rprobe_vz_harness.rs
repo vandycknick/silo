@@ -4,36 +4,119 @@ fn main() {
     std::process::exit(1);
 }
 
-#[cfg(target_os = "macos")]
+// Production modules are compiled only into the harness executable. Its test
+// build covers the harness's own argument surface; the shared krun tests run
+// once, in the silo-vmm binary that owns them.
+#[cfg(all(target_os = "macos", not(test)))]
 #[path = "rprobe/worker.rs"]
 mod rprobe_worker;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 #[path = "../durable_file.rs"]
 mod durable_file;
 
 // The harness drives the production worker protocol and config types; the
 // rest of the krun module is compiled but unused here.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 #[path = "../krun/mod.rs"]
 #[allow(dead_code, unused_imports)]
 mod krun;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 #[path = "../virt/exit.rs"]
 #[allow(dead_code)]
 mod exit;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
+#[path = "../virt/lifecycle.rs"]
+#[allow(dead_code)]
+mod lifecycle;
+
+#[cfg(all(target_os = "macos", not(test)))]
 mod virt {
     pub(crate) use crate::exit;
+    pub(crate) use crate::lifecycle;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
+#[path = "../restore/inputs.rs"]
+#[allow(dead_code)]
+mod restore_inputs;
+
+#[cfg(all(target_os = "macos", not(test)))]
+mod restore {
+    pub(crate) use crate::restore_inputs as inputs;
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
 #[path = "../rosetta/mod.rs"]
 mod rosetta;
 
 #[cfg(target_os = "macos")]
+mod args {
+    use std::path::PathBuf;
+
+    use clap::Parser;
+
+    const DEFAULT_HOST_ROOT: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux";
+
+    #[derive(Debug, Parser)]
+    pub(crate) struct Args {
+        #[arg(long, value_name = "PATH")]
+        pub(crate) kernel: PathBuf,
+        /// External initramfs, omitted when the probe is embedded in the kernel.
+        #[arg(long, value_name = "PATH")]
+        pub(crate) initramfs: Option<PathBuf>,
+        #[arg(long)]
+        pub(crate) cancel_while_starting: bool,
+        #[arg(long)]
+        pub(crate) cancel_helper_after_spawn: bool,
+        #[arg(long)]
+        pub(crate) translated_workload: bool,
+        #[arg(long, value_name = "PATH")]
+        pub(crate) supervisor: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        pub(crate) guest_kernel: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        pub(crate) guest_initramfs: Option<PathBuf>,
+        /// Owned 0700 directory for the stable helper lease and holder record.
+        #[arg(long, value_name = "PATH")]
+        pub(crate) storage_directory: Option<PathBuf>,
+        #[arg(long, value_name = "PATH", default_value = DEFAULT_HOST_ROOT)]
+        pub(crate) host_root: PathBuf,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::path::PathBuf;
+
+        use clap::Parser;
+
+        use crate::args::Args;
+
+        #[test]
+        fn embedded_probe_needs_only_a_kernel() {
+            let args = Args::try_parse_from(["harness", "--kernel", "rprobe"]).unwrap();
+            assert_eq!(args.kernel, PathBuf::from("rprobe"));
+            assert!(args.initramfs.is_none());
+        }
+
+        #[test]
+        fn external_initramfs_remains_explicit() {
+            let args = Args::try_parse_from([
+                "harness",
+                "--kernel",
+                "Image",
+                "--initramfs",
+                "probe.cpio.gz",
+            ])
+            .unwrap();
+            assert_eq!(args.initramfs, Some(PathBuf::from("probe.cpio.gz")));
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
 mod macos {
     use std::ffi::c_void;
     use std::fs;
@@ -49,6 +132,7 @@ mod macos {
     use std::thread;
     use std::time::{Duration, Instant as StdInstant};
 
+    use crate::args::Args;
     use crate::krun::RosettaLaunchConfig;
     use crate::rprobe_worker::Worker;
     use clap::Parser;
@@ -78,33 +162,6 @@ mod macos {
     const HELPER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_TRANSLATOR_SIZE: usize = 128 * 1024 * 1024;
     const HELPER_DIAGNOSTIC_LIMIT: usize = 4096;
-    const DEFAULT_HOST_ROOT: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux";
-
-    #[derive(Debug, Parser)]
-    struct Args {
-        #[arg(long, value_name = "PATH")]
-        kernel: PathBuf,
-        /// External initramfs, omitted when the probe is embedded in the kernel.
-        #[arg(long, value_name = "PATH")]
-        initramfs: Option<PathBuf>,
-        #[arg(long)]
-        cancel_while_starting: bool,
-        #[arg(long)]
-        cancel_helper_after_spawn: bool,
-        #[arg(long)]
-        translated_workload: bool,
-        #[arg(long, value_name = "PATH")]
-        supervisor: Option<PathBuf>,
-        #[arg(long, value_name = "PATH")]
-        guest_kernel: Option<PathBuf>,
-        #[arg(long, value_name = "PATH")]
-        guest_initramfs: Option<PathBuf>,
-        /// Owned 0700 directory for the stable helper lease and holder record.
-        #[arg(long, value_name = "PATH")]
-        storage_directory: Option<PathBuf>,
-        #[arg(long, value_name = "PATH", default_value = DEFAULT_HOST_ROOT)]
-        host_root: PathBuf,
-    }
 
     struct Capture {
         decoder: Decoder,
@@ -1085,38 +1142,9 @@ mod macos {
     fn frame_error(error: FrameError) -> eyre::Report {
         eyre!("invalid probe frame: {error:?}")
     }
-
-    #[cfg(test)]
-    mod tests {
-        use std::path::PathBuf;
-
-        use clap::Parser;
-
-        use crate::macos::Args;
-
-        #[test]
-        fn embedded_probe_needs_only_a_kernel() {
-            let args = Args::try_parse_from(["harness", "--kernel", "rprobe"]).unwrap();
-            assert_eq!(args.kernel, PathBuf::from("rprobe"));
-            assert!(args.initramfs.is_none());
-        }
-
-        #[test]
-        fn external_initramfs_remains_explicit() {
-            let args = Args::try_parse_from([
-                "harness",
-                "--kernel",
-                "Image",
-                "--initramfs",
-                "probe.cpio.gz",
-            ])
-            .unwrap();
-            assert_eq!(args.initramfs, Some(PathBuf::from("probe.cpio.gz")));
-        }
-    }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 fn main() -> eyre::Result<()> {
     macos::main()
 }
