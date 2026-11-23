@@ -98,25 +98,30 @@ Kconfig sources in the guest cache: `config PAGE_SHIFT` lives in
 
 ## M1. Compile, lint and host tests
 
-Until the fork fix is published and re-pinned, every M1 run builds against the
-local fork checkout through a throwaway `.cargo/config.toml` `[patch]` that is
-removed afterwards; `Cargo.lock` is restored after each run and never
-committed. Commands are the `make clippy` and `make test` cargo invocations
-for `darwin-arm64` (workspace minus `agent`, `init`, `rprobe`, `silo-portd`;
-features `silo-vmm/mock-backend,forward-spec/tokio,disk-image/qcow2`).
+The libkrun fork fix was published as `767e621d` on `silo/v2` (signed by the
+owner) and is pinned in `Cargo.toml`. Runs before the re-pin used the same
+change through a throwaway `.cargo/config.toml` `[patch]` that was never
+committed.
 
-### Results (2026-11-23, fork commit `ddc3464c` through the temporary patch)
+### Results (2026-11-23, libkrun `767e621d`, plain `make` targets)
 
 | Run | Result |
 |---|---|
-| `make clippy` cargo invocation (`.tmp/macos-evidence/m1-clippy-11.log`) | exit 0; no Silo warnings (the remaining dead-code warnings come from the local libkrun path dependency, which a git dependency caps) |
-| `make test` (`.tmp/macos-evidence/m1-make-test-2.log`) | 3512 run: 3511 passed, 1 failed (the environment-dependent `daemon_run` test below), 3 skipped |
+| `make clippy` (`.tmp/macos-evidence/m1-repin-clippy.log`) | exit 0, no warnings |
+| `make test` (`.tmp/macos-evidence/m1-repin-test.log`) | 3512 run: 3511 passed, 1 failed (the environment-dependent `daemon_run` test below), 3 skipped. nextest stops `make test` there, so the guest-library and Go suites ran separately |
 | `cargo nextest run -p rprobe --lib --no-default-features`, same for `init` | 20 and 49 passed |
 | `go test ./...` in `net/netd` and `app/tsgate`; `go vet ./...` in both | all pass after the `sshdoor` socket-path fix |
 | `silo-vmm capabilities --backend krun --json` | `lane: hvf-arm64`, pause `supported`, capture, restore, fork and incremental `build-excluded` |
 
-M1's acceptance also needs the `macos` CI job green, which waits for the fork
-fix to be published and re-pinned (`Cargo.toml` still pins `065326aa`).
+M1's acceptance also needs the `macos` CI job green on the re-pin commit.
+
+### Published kernel
+
+The `Kernel` workflow for `f0930114` passed on both runners and published
+`ghcr.io/vandycknick/silo/kernel:stable` (revision `f0930114`, 7.2.11). Its
+arm64 `.config` has `CONFIG_VIRTIO_SILO_VMGENID=y`, `CONFIG_VMGENID=y`,
+`CONFIG_EROFS_FS=y`, `CONFIG_OVERLAY_FS=y`, `CONFIG_ARM64_4K_PAGES=y` and
+`CONFIG_PAGE_SHIFT=12`.
 
 ### Compile fixes
 
