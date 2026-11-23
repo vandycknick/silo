@@ -1,6 +1,25 @@
 use std::fmt;
 use std::sync::Arc;
 
+/// One manifest-ordered occurrence of a compressed source blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestLayer {
+    pub digest: crate::changeset::ContentDigest,
+    pub size_bytes: u64,
+}
+
+/// After manifest resolution, up to three layer downloads may interleave.
+/// For each 1-based index, downloads emit either `LayerDownloadSkipped` or
+/// `LayerDownloadStarted`, zero or more progress events, verifying, finished.
+/// A complete resumed partial file may emit only verifying and finished.
+/// Before downloads start, libvm emits skipped events for every retained or
+/// repeated occurrence that needs no source I/O. Cached blobs also emit skipped,
+/// but may subsequently be applied. `total` is the manifest's layer count.
+///
+/// `ApplyingLayer` is emitted only when ingest actually starts, sequentially in
+/// ascending index order, and may overlap later downloads. Its unpack ends at
+/// the next applying index or `MaterializingRootfs`. At materialization or
+/// completion every occurrence is final, including skipped occurrences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressEvent {
     ResolvingManifest {
@@ -9,17 +28,7 @@ pub enum ProgressEvent {
     ResolvedManifest {
         image_ref: String,
         manifest_digest: String,
-        layer_count: usize,
-        total_download_bytes: Option<u64>,
-    },
-    CheckingCache {
-        image_ref: String,
-    },
-    CacheHit {
-        image_ref: String,
-    },
-    CacheMiss {
-        image_ref: String,
+        layers: Vec<ManifestLayer>,
     },
     LayerDownloadStarted {
         index: usize,
@@ -55,7 +64,6 @@ pub enum ProgressEvent {
         digest: Option<String>,
     },
     MaterializingRootfs,
-    PublishingRootfs,
 }
 
 #[derive(Clone)]

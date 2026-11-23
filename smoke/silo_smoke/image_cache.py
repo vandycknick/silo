@@ -1,73 +1,150 @@
-"""Reuse registry pulls across the per-test Silo Homes.
+"""Reuse immutable image bytes and a SQLite-only image catalog across workspaces.
 
-Every workspace starts with an empty ``SILO_HOME``, so each test that boots a
-published image (the appliance, the distro images) would pull it again. The
-store under ``<SILO_HOME>/images`` is content addressed (``index.json``, ``blobs``,
-``manifests`` and one directory per manifest digest), so a whole-directory copy
-is a valid store. Workspaces are seeded from ``<cache>/images`` before the test
-and the cache is replaced by the workspace store afterwards when it learned new
-tags; the next run then pulls nothing.
+Snapshots use SQLite's backup API, never copy an active state.db/WAL/SHM. No
+machine, operation, network, private root, lock or temporary state is seeded.
 """
-
 from __future__ import annotations
 
-import json
-import os
+from contextlib import closing, contextmanager
+import fcntl
+from functools import cache
+import hashlib
 from pathlib import Path
 import platform
 import shutil
+import sqlite3
 import subprocess
+from typing import Iterator
+import uuid
 
-STORE_NAME = "images"
-# In-flight pulls land here; never carry them between stores.
-SCRATCH_DIR = "tmp"
+CACHE_NAME = "image-catalog"
+POOL_DIRECTORIES = ("objects", "streams", "source-blobs", "transport")
+# db_config is deliberately absent: each seeded Home must initialize its own
+# persistent runtime identity on first open, never copy the preparer's.
+# An OCI selection is retained as its layered composition graph: rows root
+# every pack stream, fsmeta, record and index object, and embed no paths.
+# image_name also names stored images; only OCI selection names are kept.
+CATALOG_TABLES = {
+    "_sqlx_migrations", "image_manifest", "image_name", "image_config",
+    "image_layer", "image_manifest_layer", "image_composition_artifact",
+    "composition_recipe", "composition_result", "composition_layer",
+    "layer_recipe", "layer_result", "layer_object_dependency",
+    "layer_occurrence_set", "layer_occurrence",
+    "storage_stream", "stream_map_object", "stream_map_root", "stream_map_edge",
+}
 
 
-def _tags(store: Path) -> set[str]:
-    index = store / "index.json"
-    if not index.is_file():
+@cache
+def _schema_identity() -> str:
+    # Freeze the selected schema for this runner. Editing the checkout while a
+    # staged-runtime suite is running must not switch its cache namespace.
+    schema = Path(__file__).resolve().parents[2] / "runtime/libvm/migrations/0001_initial.sql"
+    return hashlib.sha256(schema.read_bytes()).hexdigest()
+
+
+def _cache_home(cache_dir: Path) -> Path:
+    return cache_dir / CACHE_NAME / _schema_identity()
+
+
+@contextmanager
+def _cache_lock(cache_dir: Path) -> Iterator[None]:
+    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (cache_dir / "image-catalog.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+@contextmanager
+def _pool_lock(home: Path) -> Iterator[None]:
+    # Production creates this stable slot before publishing any retained stream.
+    with (home / "images/locks/roots.lock").open("r+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        yield
+
+
+def _catalog(home: Path) -> set[tuple[str, str, str]]:
+    database = home / "state.db"
+    if not database.is_file():
         return set()
     try:
-        document = json.loads(index.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+            return set(connection.execute(
+                "SELECT n.name, a.manifest_digest, a.lower_id "
+                "FROM image_name n JOIN image_composition_artifact a ON a.image_id = n.oci_image_id"
+            ))
+    except sqlite3.DatabaseError:
+        # A cache from an incompatible schema is not reusable after a hard break.
         return set()
-    tags = document.get("tags") if isinstance(document, dict) else None
-    return set(tags) if isinstance(tags, dict) else set()
 
 
-def _copy_store(source: Path, destination: Path) -> None:
-    """Copy a store directory, cloning blocks where the filesystem allows it."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if platform.system() == "Darwin":
-        command = ["cp", "-Rc", str(source), str(destination)]
-    else:
-        command = ["cp", "-R", "--reflink=auto", str(source), str(destination)]
-    subprocess.run(command, check=True, capture_output=True, text=True, timeout=600)
-    shutil.rmtree(destination / SCRATCH_DIR, ignore_errors=True)
+def _copy_pool(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for name in POOL_DIRECTORIES:
+        path = source / name
+        if not path.is_dir():
+            continue
+        command = (["cp", "-Rc"] if platform.system() == "Darwin" else ["cp", "-R", "--reflink=auto"])
+        subprocess.run([*command, str(path), str(destination / name)], check=True, capture_output=True, text=True, timeout=300)
+
+
+def _snapshot(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    database = destination / "state.db"
+    with closing(sqlite3.connect((source / "state.db").as_uri() + "?mode=ro", uri=True)) as original:
+        with closing(sqlite3.connect(database)) as copy:
+            original.backup(copy)
+            copy.execute("PRAGMA foreign_keys = OFF")
+            copy.execute("PRAGMA secure_delete = ON")
+            tables = [row[0] for row in copy.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+            for table in tables:
+                if table not in CATALOG_TABLES and not table.startswith("sqlite_"):
+                    copy.execute('DELETE FROM "' + table.replace('"', '""') + '"')
+            copy.execute("DELETE FROM image_name WHERE oci_image_id IS NULL")
+            copy.commit()
+            copy.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            copy.execute("PRAGMA journal_mode = DELETE")
+            copy.execute("VACUUM")
+    database.chmod(0o600)
+    (destination / "catalog.lock").touch(mode=0o600, exist_ok=False)
 
 
 def seed(cache_dir: Path, silo_home: Path) -> set[str]:
-    """Populate ``<silo_home>/images`` from the cache; returns the tags it carried."""
-    cached = cache_dir / STORE_NAME
-    if not _tags(cached):
-        return set()
-    _copy_store(cached, silo_home / STORE_NAME)
-    return _tags(cached)
+    """Seed an unopened fresh Home from a sanitized image-only snapshot."""
+    with _cache_lock(cache_dir):
+        cached = _cache_home(cache_dir)
+        entries = _catalog(cached)
+        if not entries:
+            return set()
+        if (silo_home / "state.db").exists():
+            raise ValueError("Image cache seeding requires an unopened fresh Silo Home")
+        _copy_pool(cached / "images", silo_home / "images")
+        _snapshot(cached, silo_home)
+        return {reference for reference, _, _ in entries}
 
 
 def persist(cache_dir: Path, silo_home: Path) -> bool:
-    """Replace the cache with the workspace store when it learned new tags."""
-    store = silo_home / STORE_NAME
-    cached = cache_dir / STORE_NAME
-    learned = _tags(store)
-    if not learned or learned <= _tags(cached):
-        return False
-    staging = cache_dir / f"{STORE_NAME}.new-{os.getpid()}"
-    retired = cache_dir / f"{STORE_NAME}.old-{os.getpid()}"
-    shutil.rmtree(staging, ignore_errors=True)
-    _copy_store(store, staging)
-    if cached.exists():
-        cached.rename(retired)
-    staging.rename(cached)
-    shutil.rmtree(retired, ignore_errors=True)
-    return True
+    """Publish immutable bytes with a sanitized, transactionally backed-up catalog."""
+    with _cache_lock(cache_dir):
+        learned = _catalog(silo_home)
+        cached = _cache_home(cache_dir)
+        if not learned or learned == _catalog(cached):
+            return False
+        staging = cache_dir / f"image-catalog.new-{uuid.uuid4()}"
+        retired = cache_dir / f"image-catalog.old-{uuid.uuid4()}"
+        cached.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            with _pool_lock(silo_home):
+                _snapshot(silo_home, staging)
+                _copy_pool(silo_home / "images", staging / "images")
+            if cached.exists():
+                cached.rename(retired)
+            try:
+                staging.rename(cached)
+            except OSError:
+                if retired.exists():
+                    retired.rename(cached)
+                raise
+            return True
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(retired, ignore_errors=True)

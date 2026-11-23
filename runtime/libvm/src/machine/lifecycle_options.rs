@@ -12,7 +12,8 @@ pub const DEFAULT_MACHINE_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 /// supplied to generation-checked lifecycle methods. It is distinct from a
 /// machine ID. Its textual form can be parsed when transferring the token
 /// across a process boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct MachineRunId(String);
 
 impl MachineRunId {
@@ -38,6 +39,20 @@ impl std::str::FromStr for MachineRunId {
 impl fmt::Display for MachineRunId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl TryFrom<String> for MachineRunId {
+    type Error = uuid::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<MachineRunId> for String {
+    fn from(value: MachineRunId) -> Self {
+        value.0
     }
 }
 
@@ -139,7 +154,8 @@ impl MachineKillOptions {
         Self::default()
     }
 
-    /// Sets how long libvm waits after forcing the monitor to exit.
+    /// Sets the shared deadline for monitor termination, attachment-holder
+    /// termination, and exclusive storage-lease reconciliation after force stop.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.wait = self.wait.timeout(timeout);
         self

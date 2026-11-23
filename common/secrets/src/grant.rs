@@ -1,4 +1,4 @@
-//! Run-scoped provider contract. Transport payload v1 embeds provider config v2.
+//! Run-scoped provider contract. Transport payload v1 embeds provider config v1.
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -98,7 +98,7 @@ impl SecretGrant {
         allowed: Vec<AllowedSecret>,
     ) -> Result<Self, SecretError> {
         Ok(Self {
-            version: 2,
+            version: 1,
             store: file_identity(store)?,
             machine,
             run,
@@ -114,7 +114,7 @@ impl SecretGrant {
     ) -> Result<Vec<&'a AllowedSecret>, SecretError> {
         let denied =
             || SecretError::Unauthorized("provider grant does not authorize this request".into());
-        if self.version != 2
+        if self.version != 1
             || self.store != file_identity(store)?
             || self.run.is_empty()
             || self.machine != request.scope.machine
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn grant_round_trip_and_strict_frames() {
         let grant = SecretGrant {
-            version: 2,
+            version: 1,
             store: "file:/tmp/secrets.json".into(),
             machine: MachineScopeId::new("0123456789abcdef0123456789abcdef").unwrap(),
             run: "run".into(),
@@ -252,8 +252,8 @@ mod tests {
         }
         assert!(read_json_frame::<_, SecretGrant>(vec![b'x'; 129].as_slice()).is_err());
         for body in [
-            r#"{"version":2,"unknown":true}"#,
-            r#"{"version":2,"version":2}"#,
+            r#"{"version":1,"unknown":true}"#,
+            r#"{"version":1,"version":1}"#,
         ] {
             let frame = format!("Content-Length: {}\r\n\r\n{body}", body.len());
             assert!(read_json_frame::<_, SecretGrant>(frame.as_bytes()).is_err());

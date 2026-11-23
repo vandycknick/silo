@@ -1,0 +1,1507 @@
+//! Normal-worker restore bootstrap: adopt the inherited state objects and
+//! lower closure, inspect the exact seal against this host, construct every
+//! destination resource and enter `engine::run_restore_process`. Prepared is
+//! reported only after native install and lifecycle service; never started.
+
+use std::fs::File;
+use std::num::NonZeroU32;
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use libkrun::live::inspection::AdmittedDeviceKind;
+use libkrun::live::restore::{
+    RestoreBlock, RestoreConsole, RestoreConsolePort, RestoreInputs, RestoreNetwork,
+    RestoreResources, RestoreVsock, VmdkExtent,
+};
+use vm_spec::restore::RestoreRequest;
+
+use crate::krun::engine::{self, RestoreProcessError};
+use crate::krun::worker::lifecycle::{self, RestoreAuthority};
+use crate::krun::worker::wire::{self, Event};
+use crate::krun::worker::{
+    emit, fds, native, serve_diagnostics, start_status_reporter, EventWriter,
+};
+use crate::krun::{KrunConfig, Network};
+use crate::virt::exit::StartupStage;
+
+/// Native construction budget, including the destination host probe.
+const CONSTRUCTION_BUDGET: Duration = Duration::from_secs(120);
+/// Bounded settlement of a retained failed native owner.
+const CLEANUP_BUDGET: Duration = Duration::from_secs(5);
+
+pub(crate) struct Launch<'a> {
+    pub(crate) config: &'a KrunConfig,
+    pub(crate) request: RestoreRequest,
+    pub(crate) state: fds::RestoreStateFiles,
+    pub(crate) lowers: Vec<File>,
+    pub(crate) raw_handles: &'a [OwnedFd],
+    pub(crate) console: &'a OwnedFd,
+    pub(crate) mux: Option<OwnedFd>,
+    pub(crate) lifecycle: OwnedFd,
+    pub(crate) binding: lifecycle::Binding,
+    pub(in crate::krun::worker) events: &'a Arc<Mutex<EventWriter>>,
+    pub(crate) stage: &'a mut StartupStage,
+}
+
+fn invalid(message: impl Into<String>) -> eyre::Report {
+    eyre::eyre!(message.into())
+}
+
+fn same(file: &File, device: u64, inode: u64, length: u64) -> eyre::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.dev() != device || metadata.ino() != inode || metadata.len() != length {
+        return Err(invalid(
+            "inherited restore role differs from its sealed identity",
+        ));
+    }
+    Ok(())
+}
+
+/// The worker config is the destination launch: its projection must be the
+/// captured configuration, never a reinterpretation of the source.
+pub(crate) fn validate(config: &KrunConfig, request: &RestoreRequest) -> eyre::Result<bool> {
+    request.validate().map_err(invalid)?;
+    let captured = &request.configuration;
+    if config.cpus != captured.cpus {
+        return Err(invalid("restore launch cpus differ from the captured cut"));
+    }
+    if config.memory_mib != captured.memory_mib {
+        return Err(invalid(
+            "restore launch memory differs from the captured cut",
+        ));
+    }
+    if captured.nested_virtualization {
+        return Err(invalid(
+            "restore does not support captured nested virtualization",
+        ));
+    }
+    if captured.rosetta {
+        return Err(invalid("restore does not support captured rosetta"));
+    }
+    if !captured.shares.is_empty() {
+        return Err(invalid("restore does not support captured shares"));
+    }
+    if config.disks.len() != captured.attachments.len() {
+        return Err(invalid(
+            "restore launch disk attachment count differs from the captured cut",
+        ));
+    }
+    for (index, (disk, attachment)) in config.disks.iter().zip(&captured.attachments).enumerate() {
+        let mismatch = |field| {
+            invalid(format!(
+                "restore launch disk attachment {index} {field} differs from the captured cut"
+            ))
+        };
+        if disk.block_id != attachment.block_id {
+            return Err(mismatch("block_id"));
+        }
+        if disk.role != attachment.role {
+            return Err(mismatch("role"));
+        }
+        if disk.format != attachment.format {
+            return Err(mismatch("format"));
+        }
+        if disk.geometry.length != attachment.geometry.length {
+            return Err(mismatch("geometry.length"));
+        }
+        if disk.geometry.logical_sector_size != attachment.geometry.logical_sector_size {
+            return Err(mismatch("geometry.logical_sector_size"));
+        }
+        if disk.read_only != attachment.read_only {
+            return Err(mismatch("read_only"));
+        }
+    }
+    if !config.mounts.is_empty() {
+        return Err(invalid("restore launch mounts must be empty"));
+    }
+    if config.rosetta.is_some() {
+        return Err(invalid("restore launch rosetta must be disabled"));
+    }
+    if config.vsock_cid.is_some() {
+        return Err(invalid(
+            "restore launch standalone vsock CID must be absent",
+        ));
+    }
+    if !config.vsock_mux {
+        return Err(invalid("restore launch vsock mux must be enabled"));
+    }
+    if !config.stdio_console {
+        return Err(invalid("restore launch stdio console must be enabled"));
+    }
+    if !config.balloon {
+        return Err(invalid("restore launch balloon must be enabled"));
+    }
+    match (&config.network, &request.network) {
+        (Network::None, None) => Ok(false),
+        (Network::Unixgram(net), Some(destination))
+            if destination
+                .mac
+                .split(':')
+                .zip(net.mac)
+                .all(|(part, octet)| u8::from_str_radix(part, 16).ok() == Some(octet)) =>
+        {
+            Ok(true)
+        }
+        _ => Err(invalid(
+            "restore launch network differs from the destination binding",
+        )),
+    }
+}
+
+/// Inherited lowers in table order: per request lower, descriptor then extents.
+fn lower_blocks(
+    request: &RestoreRequest,
+    lowers: Vec<File>,
+) -> eyre::Result<Vec<(String, File, Vec<VmdkExtent>)>> {
+    let expected: usize = request
+        .lowers
+        .iter()
+        .map(|lower| 1 + lower.extents.len())
+        .sum();
+    if expected != lowers.len() {
+        return Err(invalid("restore lower roles differ from the lower closure"));
+    }
+    let mut files = lowers.into_iter();
+    let mut next = || {
+        files
+            .next()
+            .ok_or_else(|| invalid("restore lower role is missing"))
+    };
+    let mut blocks = Vec::with_capacity(request.lowers.len());
+    for lower in &request.lowers {
+        let descriptor = next()?;
+        let identity = &lower.descriptor;
+        same(
+            &descriptor,
+            identity.file_device,
+            identity.file_inode,
+            identity.length,
+        )?;
+        let mut extents = Vec::with_capacity(lower.extents.len());
+        for extent in &lower.extents {
+            let file = next()?;
+            same(&file, extent.file_device, extent.file_inode, extent.length)?;
+            extents.push(VmdkExtent {
+                path: PathBuf::from(&extent.path),
+                file,
+            });
+        }
+        blocks.push((lower.block_id.as_str().to_string(), descriptor, extents));
+    }
+    Ok(blocks)
+}
+
+/// Destination roles a restore consumes or borrows from the bootstrap.
+struct Roles<'a> {
+    config: &'a KrunConfig,
+    request: &'a RestoreRequest,
+    lowers: Vec<File>,
+    raw_handles: &'a [OwnedFd],
+    console: &'a OwnedFd,
+    mux: Option<OwnedFd>,
+}
+
+/// The original writable descriptors must still match the cut, and the cut's
+/// host paths must still name those same files, both before construction and
+/// before announcing prepared. The worker's configured disk path is its own
+/// inherited descriptor, so it is not compared.
+fn validate_hibernation_disks(
+    config: &KrunConfig,
+    request: &RestoreRequest,
+    raw_handles: &[OwnedFd],
+) -> std::io::Result<()> {
+    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let vm_spec::restore::RestoreAuthority::Hibernation { cut } = &request.authority else {
+        return Ok(());
+    };
+    for saved in &cut.writable_disks {
+        let index = saved.attachment_index as usize;
+        let disk = config
+            .disks
+            .get(index)
+            .ok_or_else(|| invalid("wake disk attachment is missing"))?;
+        if disk.format != vm_spec::DiskFormat::Raw || disk.read_only {
+            return Err(invalid("wake requires the original writable raw disk"));
+        }
+        let slot = config
+            .storage_context
+            .raw_handles
+            .iter()
+            .position(|binding| binding.disk_index as usize == index)
+            .ok_or_else(|| invalid("wake disk descriptor binding is missing"))?;
+        let descriptor = raw_handles
+            .get(slot)
+            .ok_or_else(|| invalid("wake disk descriptor is missing"))?;
+        // SAFETY: borrow the owned raw role without taking ownership or
+        // duplicating its descriptor. The wrapper cannot close it.
+        let file =
+            std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(descriptor.as_raw_fd()) });
+        crate::restore::inputs::validate_hibernation_file(&file, &saved.file.path, &saved.file)?;
+    }
+    Ok(())
+}
+
+fn resources(
+    roles: Roles<'_>,
+    shape: &libkrun::live::inspection::AdmittedShape,
+) -> eyre::Result<RestoreResources> {
+    let Roles {
+        config,
+        request,
+        lowers,
+        raw_handles,
+        console,
+        mut mux,
+    } = roles;
+    let mut vmdk = lower_blocks(request, lowers)?;
+    let mut resources = RestoreResources::default();
+    for device in shape.devices() {
+        let attachment = device.attachment().clone();
+        match device.kind() {
+            AdmittedDeviceKind::Block(_) => {
+                let index = config
+                    .disks
+                    .iter()
+                    .position(|disk| disk.block_id.as_str() == attachment.configured_id)
+                    .ok_or_else(|| invalid("restored block has no destination disk"))?;
+                let disk = &config.disks[index];
+                match disk.format {
+                    vm_spec::DiskFormat::Raw => {
+                        let slot = config
+                            .storage_context
+                            .raw_handles
+                            .iter()
+                            .position(|binding| binding.disk_index as usize == index)
+                            .ok_or_else(|| invalid("restored Raw disk has no backing role"))?;
+                        let file = File::from(
+                            raw_handles
+                                .get(slot)
+                                .ok_or_else(|| invalid("restored Raw backing role is missing"))?
+                                .try_clone()?,
+                        );
+                        let mut block = RestoreBlock::raw(attachment, file, disk.read_only);
+                        if let Some(seed) = config
+                            .disk_tracking_seeds
+                            .iter()
+                            .find(|seed| seed.block_id == disk.block_id)
+                        {
+                            block = block.with_tracking_seed(
+                                crate::krun::worker::disk_tracking::seed(seed).map_err(invalid)?,
+                            );
+                        }
+                        resources.blocks.push(block);
+                    }
+                    vm_spec::DiskFormat::Vmdk => {
+                        let position = vmdk
+                            .iter()
+                            .position(|(block, _, _)| *block == attachment.configured_id)
+                            .ok_or_else(|| invalid("restored VMDK has no lower closure"))?;
+                        let (_, descriptor, extents) = vmdk.swap_remove(position);
+                        resources
+                            .blocks
+                            .push(RestoreBlock::readonly_vmdk(attachment, descriptor, extents));
+                    }
+                }
+            }
+            AdmittedDeviceKind::Network { .. } => {
+                let Network::Unixgram(net) = &config.network else {
+                    return Err(invalid("restored network has no destination socket"));
+                };
+                let socket = crate::krun::network::open_local_unix_datagram_socket(
+                    &net.peer_path,
+                    &config.id,
+                    "krun",
+                )?;
+                resources.networks.push(RestoreNetwork {
+                    attachment,
+                    socket,
+                    mac: net.mac,
+                });
+            }
+            AdmittedDeviceKind::Vsock { .. } => {
+                let mux = mux
+                    .take()
+                    .ok_or_else(|| invalid("restored vsock has no mux role"))?;
+                resources.vsocks.push(RestoreVsock {
+                    attachment,
+                    mux,
+                    cid: engine::GUEST_CID,
+                    agent_port: NonZeroU32::new(crate::guest::GUEST_CONTROL_PORT)
+                        .ok_or_else(|| invalid("agent control port is zero"))?,
+                });
+            }
+            AdmittedDeviceKind::Console { .. } => {
+                let (name, input, output, terminal) = crate::krun::restore::CONSOLE_PORT;
+                let port = |present: bool| -> eyre::Result<Option<File>> {
+                    if present {
+                        Ok(Some(File::from(console.as_fd().try_clone_to_owned()?)))
+                    } else {
+                        Ok(None)
+                    }
+                };
+                resources.consoles.push(RestoreConsole {
+                    attachment,
+                    ports: vec![RestoreConsolePort {
+                        name: name.to_string(),
+                        input: port(input)?,
+                        output: port(output)?,
+                        terminal,
+                    }],
+                });
+            }
+            AdmittedDeviceKind::Rng
+            | AdmittedDeviceKind::Balloon
+            | AdmittedDeviceKind::Generation => {}
+        }
+    }
+    if !vmdk.is_empty() {
+        return Err(invalid(
+            "restore lower closure names a block that was not captured",
+        ));
+    }
+    Ok(resources)
+}
+
+/// Settle a retained failed native owner. An owner that does not reach
+/// native terminality is kept alive until process exit: an accepted native
+/// user must never observe freed RAM.
+fn settle(failed: libkrun::live::restore::FailedRestore<'_>) {
+    if let Err(retained) = failed.cleanup(Instant::now() + CLEANUP_BUDGET) {
+        std::mem::forget(retained);
+    }
+}
+
+pub(crate) fn run(launch: Launch<'_>) -> eyre::Result<()> {
+    let Launch {
+        config,
+        request,
+        state,
+        lowers,
+        raw_handles,
+        console,
+        mux,
+        lifecycle: endpoint,
+        binding,
+        events,
+        stage,
+    } = launch;
+    let network = validate(config, &request)?;
+    request
+        .validate_activation(
+            &vm_spec::lifecycle::LiveId::parse(&binding.machine_id.to_string()).map_err(invalid)?,
+            &vm_spec::lifecycle::LiveId::parse(&binding.run_id.to_string()).map_err(invalid)?,
+        )
+        .map_err(invalid)?;
+    let fds::RestoreStateFiles {
+        ram,
+        layout,
+        execution,
+        devices,
+        ram_map,
+    } = state;
+    let mut held = vec![
+        ram.try_clone()?,
+        layout.try_clone()?,
+        execution.try_clone()?,
+        devices.try_clone()?,
+    ];
+    let inherited_authority = match (&request.authority, &ram_map) {
+        (
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { .. },
+            fds::RestoreRamMap::Identified(map_file),
+        ) => {
+            let map = crate::restore::inputs::verified_ram_map(&request, map_file)?;
+            held.push(map_file.try_clone()?);
+            crate::virt::lifecycle::CaptureBaselineAuthority::Identified {
+                stream: crate::virt::lifecycle::Digest32(*map.id().as_bytes()),
+            }
+        }
+        (
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut },
+            fds::RestoreRamMap::OwnedLocalCut,
+        ) => {
+            if config
+                .disk_tracking_seeds
+                .iter()
+                .any(|seed| seed.baseline.is_some())
+            {
+                return Err(invalid(
+                    "owned restore cannot seed identified disk tracking",
+                ));
+            }
+            crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut {
+                materialization_generation: cut.materialization_generation.get(),
+            }
+        }
+        (
+            vm_spec::restore::RestoreAuthority::Hibernation { cut },
+            fds::RestoreRamMap::OwnedLocalCut,
+        ) => crate::virt::lifecycle::CaptureBaselineAuthority::OwnedLocalCut {
+            materialization_generation: cut.materialization_generation.get(),
+        },
+        _ => return Err(invalid("restore map descriptor authority is mismatched")),
+    };
+    if held.len() != request.objects.len() {
+        return Err(invalid("restore object descriptors do not match authority"));
+    }
+    for (file, object) in held.iter().zip(&request.objects) {
+        crate::restore::inputs::validate_object(file, object)?;
+    }
+    let inherited_layout = crate::krun::restore::binding(&request)?.ram_layout;
+    let deadline = Instant::now() + CONSTRUCTION_BUDGET;
+    let shape = crate::krun::restore::inspect(
+        &request,
+        network,
+        crate::krun::restore::StateObjects {
+            layout: &layout,
+            execution: &execution,
+            devices: &devices,
+        },
+        deadline,
+    )?;
+    let (expected, _) = crate::krun::restore::identity(&request)?;
+    validate_hibernation_disks(config, &request, raw_handles)?;
+    let resources = resources(
+        Roles {
+            config,
+            request: &request,
+            lowers,
+            raw_handles,
+            console,
+            mux,
+        },
+        &shape,
+    )?;
+    let activation = uuid::Uuid::parse_str(request.activation_id.as_str())
+        .map_err(|error| invalid(format!("activation identity: {error}")))?;
+    let result = engine::run_restore_process(
+        RestoreInputs {
+            ram,
+            layout,
+            execution,
+            devices,
+            expected,
+        },
+        resources,
+        deadline,
+        |control, token| {
+            for (file, object) in held.iter().zip(&request.objects) {
+                crate::restore::inputs::validate_object(file, object)?;
+            }
+            validate_hibernation_disks(config, &request, raw_handles)?;
+            // Serving starts a thread and returns: native dispatch runs only
+            // after this callback, so no blocking native call happens here.
+            let served = lifecycle::serve(
+                endpoint,
+                binding,
+                native::KrunNative::new(control.clone(), config).inherit_baseline(
+                    inherited_authority,
+                    crate::virt::lifecycle::Digest32(*inherited_layout.as_bytes()),
+                ),
+                Some(RestoreAuthority { activation, token }),
+                Box::new(|reason: &str| {
+                    eprintln!("krun lifecycle control lost: {reason}");
+                    // nix exposes no immediate _exit. A worker that lost its
+                    // only lifecycle authority terminates; it never resumes.
+                    unsafe { nix::libc::_exit(124) }
+                }),
+            )?;
+            serve_diagnostics(served, binding)?;
+            start_status_reporter(events.clone(), control)?;
+            emit(events, &Event::RestorePrepared {})?;
+            *stage = StartupStage::Started;
+            Ok(())
+        },
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(RestoreProcessError::Build(failure)) => {
+            let reason = wire::diagnostic(&failure.reason);
+            if let Some(failed) = failure.failed {
+                settle(failed);
+            }
+            Err(invalid(format!("restore construction failed: {reason}")))
+        }
+        Err(RestoreProcessError::Handle { source, failed }) => {
+            settle(failed);
+            Err(invalid(format!("restore control handle failed: {source}")))
+        }
+        Err(RestoreProcessError::PreparedCallback { source, failed }) => {
+            settle(failed);
+            Err(invalid(format!("restore prepared setup failed: {source}")))
+        }
+        Err(RestoreProcessError::EventLoopTerminated) => {
+            Err(invalid("restored libkrun event loop terminated"))
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::num::NonZeroU64;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    use vm_spec::capture::{
+        CaptureConfiguration, CaptureEvidence, CaptureInventoryEntry, CaptureMemoryEvidence,
+        CapturePauseDisposition, CaptureRecordOutcome, CaptureStateBinding, Sha256Digest,
+    };
+    use vm_spec::lifecycle::{PauseOwner, PauseToken};
+    use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
+
+    use crate::krun::worker::restore::{lower_blocks, validate};
+    use crate::krun::KrunConfig;
+
+    pub(crate) fn request() -> RestoreRequest {
+        let id = || vm_spec::lifecycle::LiveId::try_from(uuid::Uuid::new_v4().to_string()).unwrap();
+        let machine = id();
+        let run = id();
+        let capture = id();
+        let digest = Sha256Digest::of_bytes(b"state");
+        let map = vm_spec::stream_map::StreamRoot::empty(4096, vm_spec::stream_map::ChunkSize::RAM)
+            .unwrap();
+        let changes = vm_spec::capture::CaptureRamChanges {
+            byte_len: 16,
+            sha256: Sha256Digest::of_bytes(b"KRUNRAM\0\x01\0\x10\0\0\0\0\0"),
+            record_count: 0,
+            coverage: vm_spec::capture::CaptureRamCoverage::Full,
+            baseline_stream: None,
+        };
+        let configuration = CaptureConfiguration {
+            guest_os: None,
+            cpus: 1,
+            memory_mib: 128,
+            nested_virtualization: false,
+            rosetta: false,
+            kernel_cmdline: vec![],
+            vsock: true,
+            attachments: vec![],
+            shares: vec![],
+        };
+        let objects: Vec<_> = (0..5)
+            .map(|index| RestoreObject {
+                role: RestoreObjectRole::ALL[index],
+                fd: 100 + index as i32,
+                file_device: 1,
+                file_inode: 100 + index as u64,
+                length: match index {
+                    0 => 4096,
+                    4 => 25,
+                    _ => 5,
+                },
+                authority: vm_spec::restore::RestoreObjectAuthority::Identified {
+                    identity: if index == 0 || index == 4 {
+                        map.id()
+                    } else {
+                        digest
+                    },
+                },
+            })
+            .collect();
+        let sealed_evidence = CaptureEvidence {
+            disk_stats: Vec::new(),
+            disk_tracking_receipts: Vec::new(),
+            version: vm_spec::capture::CAPTURE_RECORD_VERSION,
+            machine_id: machine.clone(),
+            run_id: run.clone(),
+            capture_id: capture.clone(),
+            pause_token: Some(PauseToken {
+                machine_id: machine,
+                run_id: run.clone(),
+                generation: NonZeroU64::new(1).unwrap(),
+                owner: PauseOwner::Capture {
+                    operation_id: capture.clone(),
+                },
+            }),
+            pause_disposition: Some(CapturePauseDisposition::Acquired),
+            freeze_epoch: NonZeroU64::new(1),
+            freeze_operation_id: Some(capture.clone()),
+            configuration_digest: configuration.digest().unwrap(),
+            request_digest: digest,
+            memory: Some(CaptureMemoryEvidence {
+                packed_length: 4096,
+                page_granule: 4096,
+                regions: 1,
+                ram_stream: map.id(),
+                binding: CaptureStateBinding {
+                    live_state_schema: "silo.live-state/1".to_string(),
+                    architecture: std::env::consts::ARCH.into(),
+                    profile: digest,
+                    topology: digest,
+                    ram_layout: digest,
+                    source_run: run,
+                    pause_generation: NonZeroU64::new(1).unwrap(),
+                    capture: capture.clone(),
+                },
+                mode: vm_spec::lifecycle::CapturePolicy::Full,
+                identity_policy: vm_spec::capture::CaptureIdentityPolicy::Full,
+                identity_full_reason: Some(vm_spec::capture::CaptureIdentityFullReason::Requested),
+                baseline: None,
+                full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
+                identity_chunk_bytes: 1 << 16,
+                changes: changes.clone(),
+                stats: vm_spec::capture::CaptureMemoryStats {
+                    logical_bytes: 4096,
+                    whole_file_bytes_hashed: 0,
+                    identity_bytes_hashed: 0,
+                    ..Default::default()
+                },
+            }),
+            inventory: objects
+                .iter()
+                .map(|object| CaptureInventoryEntry {
+                    role: object.role.capture_role(),
+                    length: object.length,
+                    sha256: (object.role != RestoreObjectRole::Ram).then_some(
+                        if object.role == RestoreObjectRole::RamMap {
+                            map.id()
+                        } else {
+                            digest
+                        },
+                    ),
+                    identity: (object.role == RestoreObjectRole::Ram).then_some(map.id()),
+                })
+                .chain(std::iter::once(CaptureInventoryEntry {
+                    role: vm_spec::capture::CaptureRole::RamChanges,
+                    length: changes.byte_len,
+                    sha256: Some(changes.sha256),
+                    identity: None,
+                }))
+                .collect(),
+            started_at_unix_ms: 1,
+            completed_at_unix_ms: 2,
+            capture_outcome: CaptureRecordOutcome::Coherent,
+            error: None,
+            workloads_frozen: true,
+            vcpus_paused: true,
+            devices_quiesced: true,
+            host_writers_drained: true,
+            host_flush_completed: true,
+            disk_copies_sealed: true,
+            memory_state_sealed: true,
+        };
+        let request = RestoreRequest {
+            purpose: vm_spec::restore::ActivationPurpose::Clone,
+            disk_tracking_seeds: Vec::new(),
+            map_node_store: None,
+            version: vm_spec::restore::RESTORE_REQUEST_VERSION,
+            authority: vm_spec::restore::RestoreAuthority::IdentifiedSnapshot {
+                snapshot: digest,
+                evidence: Box::new(sealed_evidence),
+            },
+            activation_id: id(),
+            freeze_operation_id: capture,
+            start_paused: true,
+            configuration,
+            objects,
+            lowers: vec![],
+            network: None,
+            hook: None,
+            ssh_trusted_ca: None,
+        };
+        evidence(&request.authority).validate().unwrap();
+        request.validate().unwrap();
+        request
+    }
+
+    pub(crate) fn evidence(authority: &vm_spec::restore::RestoreAuthority) -> &CaptureEvidence {
+        match authority {
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => evidence,
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. }
+            | vm_spec::restore::RestoreAuthority::Hibernation { .. } => {
+                panic!("identified fixture authority")
+            }
+        }
+    }
+
+    pub(crate) fn evidence_mut(
+        authority: &mut vm_spec::restore::RestoreAuthority,
+    ) -> &mut CaptureEvidence {
+        match authority {
+            vm_spec::restore::RestoreAuthority::IdentifiedSnapshot { evidence, .. } => evidence,
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { .. }
+            | vm_spec::restore::RestoreAuthority::Hibernation { .. } => {
+                panic!("identified fixture authority")
+            }
+        }
+    }
+
+    pub(crate) fn launch(directory: &std::path::Path) -> crate::virt::RestoreLaunch {
+        let mut request = request();
+        let nodes = directory.join("map-nodes");
+        std::fs::create_dir(&nodes).unwrap();
+        struct FixtureNodes(std::path::PathBuf);
+        impl vm_spec::stream_map::NodeSink for FixtureNodes {
+            fn write_node(
+                &mut self,
+                bytes: &[u8],
+            ) -> Result<Sha256Digest, vm_spec::stream_map::MapError> {
+                let digest = Sha256Digest::of_bytes(bytes);
+                let spelling = digest.to_string();
+                std::fs::write(self.0.join(&spelling[7..]), bytes)?;
+                Ok(digest)
+            }
+        }
+        let map = vm_spec::stream_map::build_sorted(
+            4096,
+            vm_spec::stream_map::ChunkSize::RAM,
+            [Ok(vm_spec::stream_map::PresentChunk {
+                index: 0,
+                digest: Sha256Digest::of_bytes(&[1; 4096]),
+            })],
+            &mut FixtureNodes(nodes.clone()),
+        )
+        .unwrap();
+        request.map_node_store = Some(nodes.to_str().unwrap().to_owned());
+        let map_bytes = map.canonical_bytes().unwrap();
+        request.objects[4].length = map_bytes.len() as u64;
+        evidence_mut(&mut request.authority).inventory[4].length = map_bytes.len() as u64;
+        evidence_mut(&mut request.authority)
+            .memory
+            .as_mut()
+            .unwrap()
+            .ram_stream = map.id();
+        evidence_mut(&mut request.authority)
+            .memory
+            .as_mut()
+            .unwrap()
+            .stats
+            .identity_bytes_hashed = 4096;
+        let mut change_bytes = b"KRUNRAM\0\x01\0\x10\0\0\0\0\0".to_vec();
+        let mut record = [0; 56];
+        record[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        record[16] = 1;
+        record[24..].copy_from_slice(Sha256Digest::of_bytes(&[1; 4096]).as_bytes());
+        change_bytes.extend_from_slice(&record);
+        std::fs::write(directory.join("memory.changes"), &change_bytes).unwrap();
+        let changes = &mut evidence_mut(&mut request.authority)
+            .memory
+            .as_mut()
+            .unwrap()
+            .changes;
+        changes.byte_len = change_bytes.len() as u64;
+        changes.sha256 = Sha256Digest::of_bytes(&change_bytes);
+        changes.record_count = 1;
+        let (change_length, change_sha256) = (changes.byte_len, changes.sha256);
+        evidence_mut(&mut request.authority).inventory[5].length = change_length;
+        evidence_mut(&mut request.authority).inventory[5].sha256 = Some(change_sha256);
+        let objects = (0..5)
+            .map(|index| {
+                let path = directory.join(format!("restore-object-{index}"));
+                let bytes = if index == 4 {
+                    map_bytes.clone()
+                } else {
+                    vec![index as u8 + 1; request.objects[index].length as usize]
+                };
+                std::fs::write(&path, &bytes).unwrap();
+                let file = File::open(path).unwrap();
+                let metadata = file.metadata().unwrap();
+                let object = &mut request.objects[index];
+                object.fd = file.as_raw_fd();
+                object.file_device = metadata.dev();
+                object.file_inode = metadata.ino();
+                let identity = if object.role == RestoreObjectRole::Ram {
+                    map.id()
+                } else {
+                    Sha256Digest::of_bytes(&bytes)
+                };
+                object.authority =
+                    vm_spec::restore::RestoreObjectAuthority::Identified { identity };
+                if object.role == RestoreObjectRole::Ram {
+                    evidence_mut(&mut request.authority).inventory[index].identity = Some(identity);
+                } else {
+                    evidence_mut(&mut request.authority).inventory[index].sha256 = Some(identity);
+                }
+                file
+            })
+            .collect();
+        evidence(&request.authority).validate().unwrap();
+        request.validate().unwrap();
+        crate::virt::RestoreLaunch {
+            request,
+            files: std::sync::Arc::new(crate::restore::inputs::RestoreFiles {
+                objects,
+                lowers: vec![],
+            }),
+        }
+    }
+
+    pub(crate) fn owned_launch(directory: &std::path::Path) -> crate::virt::RestoreLaunch {
+        use vm_spec::capture::{CaptureMemoryStats, CaptureRole, OwnedCutMember, OwnedLocalCut};
+        let mut launch = launch(directory);
+        let old = evidence(&launch.request.authority).clone();
+        let memory = old.memory.as_ref().unwrap();
+        let packed_length = launch.request.configuration.ram_bytes();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.join("restore-object-0"))
+            .unwrap();
+        writer.set_len(packed_length).unwrap();
+        drop(writer);
+        let files = std::sync::Arc::get_mut(&mut launch.files).unwrap();
+        files.objects.truncate(4);
+        launch.request.objects.truncate(4);
+        let mut members = Vec::new();
+        for (object, file) in launch.request.objects.iter_mut().zip(&files.objects) {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o400))
+                .unwrap();
+            let fingerprint = crate::restore::inputs::fingerprint(file).unwrap();
+            object.length = fingerprint.length;
+            object.authority = vm_spec::restore::RestoreObjectAuthority::Owned {
+                fingerprint: fingerprint.clone(),
+            };
+            members.push(OwnedCutMember {
+                role: object.role.capture_role(),
+                fingerprint,
+                complete: true,
+            });
+        }
+        members.sort_by_key(|member| match member.role {
+            CaptureRole::Execution => 0,
+            CaptureRole::Devices => 1,
+            CaptureRole::Ram => 2,
+            CaptureRole::Layout => 3,
+            _ => 4,
+        });
+        let cut = OwnedLocalCut {
+            version: vm_spec::capture::CAPTURE_RECORD_VERSION,
+            machine_id: old.machine_id,
+            run_id: old.run_id,
+            capture_id: old.capture_id,
+            freeze_operation_id: old.freeze_operation_id.unwrap(),
+            freeze_epoch: old.freeze_epoch.unwrap(),
+            configuration: launch.request.configuration.clone(),
+            binding: memory.binding.clone(),
+            materialization_generation: NonZeroU64::new(1).unwrap(),
+            predecessor_generation: 0,
+            packed_length,
+            page_granule: 4096,
+            regions: 1,
+            members,
+            stats: CaptureMemoryStats {
+                logical_bytes: packed_length,
+                ..Default::default()
+            },
+        };
+        cut.validate().unwrap();
+        launch.request.map_node_store = None;
+        launch.request.authority =
+            vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut: Box::new(cut) };
+        launch.request.validate().unwrap();
+        launch
+    }
+
+    pub(crate) fn config(request: RestoreRequest) -> KrunConfig {
+        KrunConfig {
+            cpus: request.configuration.cpus,
+            memory_mib: request.configuration.memory_mib,
+            vsock_mux: true,
+            stdio_console: true,
+            balloon: true,
+            restore: Some(request),
+            ..KrunConfig::default()
+        }
+    }
+
+    #[test]
+    fn restore_fixture_seals_bind_real_roots_and_change_statistics() {
+        use vm_spec::stream_map::{
+            Chunk, ChunkSize, MapError, NodeSource, StreamRoot, MAX_NODE_BYTES,
+        };
+
+        let empty = request();
+        crate::krun::worker::restore::tests::evidence(&empty.authority)
+            .validate()
+            .unwrap();
+        let empty_memory = crate::krun::worker::restore::tests::evidence(&empty.authority)
+            .memory
+            .as_ref()
+            .unwrap();
+        assert_eq!(empty_memory.stats.identity_bytes_hashed, 0);
+        assert_eq!(empty_memory.changes.record_count, 0);
+        assert_eq!(
+            empty_memory.ram_stream,
+            StreamRoot::empty(4096, ChunkSize::RAM).unwrap().id(),
+        );
+        let directory =
+            std::env::temp_dir().join(format!("restore-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let launch = launch(&directory);
+        crate::krun::worker::restore::tests::evidence(&launch.request.authority)
+            .validate()
+            .unwrap();
+        let memory = crate::krun::worker::restore::tests::evidence(&launch.request.authority)
+            .memory
+            .as_ref()
+            .unwrap();
+        let bytes = std::fs::read(directory.join("restore-object-0")).unwrap();
+        let root = StreamRoot::decode(&std::fs::read(directory.join("restore-object-4")).unwrap())
+            .unwrap();
+        assert_eq!(root.id(), memory.ram_stream);
+        struct Nodes(std::path::PathBuf);
+        impl NodeSource for Nodes {
+            fn read_node(
+                &mut self,
+                digest: Sha256Digest,
+                output: &mut [u8; MAX_NODE_BYTES],
+            ) -> Result<usize, MapError> {
+                let bytes = std::fs::read(self.0.join(&digest.to_string()[7..]))?;
+                assert!(bytes.len() <= output.len());
+                output[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+        }
+        let value = root
+            .lookup(0, &mut Nodes(directory.join("map-nodes")))
+            .unwrap();
+        assert_eq!(value, Chunk::Data(Sha256Digest::of_bytes(&bytes)));
+        root.verify_chunk(0, value, &bytes).unwrap();
+        assert_eq!(memory.stats.identity_bytes_hashed, bytes.len() as u64);
+        let changes = vm_spec::capture::RamChangeReader::new(
+            File::open(directory.join("memory.changes")).unwrap(),
+            bytes.len() as u64,
+            &memory.changes,
+        )
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+        assert_eq!(
+            changes,
+            vec![vm_spec::capture::CaptureRamChange::Data {
+                index: 0,
+                digest: Sha256Digest::of_bytes(&bytes),
+            }]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restore_config_needs_no_kernel_with_or_without_public_vsock() {
+        for vsock in [false, true] {
+            let mut request = request();
+            request.configuration.vsock = vsock;
+            crate::krun::worker::restore::tests::evidence_mut(&mut request.authority)
+                .configuration_digest = request.configuration.digest().unwrap();
+            let destination = config(request.clone());
+            assert!(!validate(&destination, &request).unwrap());
+            crate::krun::validate_config(&destination).unwrap();
+            let cold = KrunConfig {
+                restore: None,
+                ..destination
+            };
+            assert!(
+                crate::krun::validate_config(&cold).is_err(),
+                "cold launch still needs a kernel"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_config_reports_each_destination_mismatch() {
+        let mut request = request();
+        let mut destination = config(request.clone());
+        destination.disks = vec![
+            vm_spec::Disk {
+                path: "/tmp/root.raw".into(),
+                block_id: vm_spec::BlockId::new("root").unwrap(),
+                role: vm_spec::DiskRole::Root,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length: 64 << 20,
+                    logical_sector_size: 512,
+                },
+                read_only: false,
+            },
+            vm_spec::Disk {
+                path: "/tmp/data.raw".into(),
+                block_id: vm_spec::BlockId::new("data").unwrap(),
+                role: vm_spec::DiskRole::Data,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length: 64 << 20,
+                    logical_sector_size: 512,
+                },
+                read_only: false,
+            },
+        ];
+        request.configuration.attachments = destination
+            .disks
+            .iter()
+            .map(|disk| vm_spec::capture::CaptureAttachment {
+                block_id: disk.block_id.clone(),
+                role: disk.role,
+                format: disk.format,
+                geometry: disk.geometry,
+                read_only: disk.read_only,
+            })
+            .collect();
+        crate::krun::worker::restore::tests::evidence_mut(&mut request.authority)
+            .configuration_digest = request.configuration.digest().unwrap();
+        validate(&destination, &request).unwrap();
+
+        type Change = fn(&mut KrunConfig, &mut RestoreRequest);
+        let cases: [(&str, Change); 20] = [
+            (
+                "restore launch cpus differ from the captured cut",
+                |config, _| config.cpus += 1,
+            ),
+            (
+                "restore launch memory differs from the captured cut",
+                |config, _| config.memory_mib += 1,
+            ),
+            (
+                "restore does not support captured nested virtualization",
+                |_, request| request.configuration.nested_virtualization = true,
+            ),
+            ("restore does not support captured rosetta", |_, request| {
+                request.configuration.rosetta = true;
+            }),
+            ("restore does not support captured shares", |_, request| {
+                request.configuration.shares.push(vm_spec::capture::CaptureShare {
+                    tag: "shared".into(),
+                    read_only: true,
+                });
+            }),
+            (
+                "restore launch disk attachment count differs from the captured cut",
+                |config, _| {
+                    config.disks.pop();
+                },
+            ),
+            (
+                "restore launch disk attachment count differs from the captured cut",
+                |config, _| {
+                    config.disks.push(config.disks[1].clone());
+                },
+            ),
+            (
+                "restore launch disk attachment 1 block_id differs from the captured cut",
+                |config, _| {
+                    config.disks[1].block_id = vm_spec::BlockId::new("other").unwrap();
+                },
+            ),
+            (
+                "restore launch disk attachment 1 role differs from the captured cut",
+                |config, _| config.disks[1].role = vm_spec::DiskRole::Root,
+            ),
+            (
+                "restore launch disk attachment 1 format differs from the captured cut",
+                |config, _| config.disks[1].format = vm_spec::DiskFormat::Vmdk,
+            ),
+            (
+                "restore launch disk attachment 1 geometry.length differs from the captured cut",
+                |config, _| config.disks[1].geometry.length *= 2,
+            ),
+            (
+                "restore launch disk attachment 1 geometry.logical_sector_size differs from the captured cut",
+                |config, _| config.disks[1].geometry.logical_sector_size = 4096,
+            ),
+            (
+                "restore launch disk attachment 1 read_only differs from the captured cut",
+                |config, _| config.disks[1].read_only = true,
+            ),
+            ("restore launch mounts must be empty", |config, _| {
+                config.mounts.push(crate::krun::Mount {
+                    tag: "shared".into(),
+                    path: "/tmp/shared".into(),
+                    read_only: true,
+                });
+            }),
+            ("restore launch rosetta must be disabled", |config, _| {
+                config.rosetta = Some(
+                    crate::krun::RosettaLaunchConfig::new(
+                        "/Library/Apple/RosettaLinux".into(),
+                        [0; 32],
+                        0,
+                        [0; 1024],
+                    )
+                    .unwrap(),
+                );
+            }),
+            (
+                "restore launch standalone vsock CID must be absent",
+                |config, _| config.vsock_cid = Some(3),
+            ),
+            ("restore launch vsock mux must be enabled", |config, _| {
+                config.vsock_mux = false;
+            }),
+            (
+                "restore launch stdio console must be enabled",
+                |config, _| config.stdio_console = false,
+            ),
+            ("restore launch balloon must be enabled", |config, _| {
+                config.balloon = false;
+            }),
+            (
+                "restore launch network differs from the destination binding",
+                |config, _| {
+                    config.network = crate::krun::Network::Unixgram(crate::krun::NetUnixgram {
+                        peer_path: "/tmp/destination.sock".into(),
+                        mac: [2, 0, 0, 0, 0, 1],
+                    });
+                },
+            ),
+        ];
+        for (message, change) in cases {
+            let mut destination = destination.clone();
+            let mut request = request.clone();
+            change(&mut destination, &mut request);
+            crate::krun::worker::restore::tests::evidence_mut(&mut request.authority)
+                .configuration_digest = request.configuration.digest().unwrap();
+            assert_eq!(
+                validate(&destination, &request).unwrap_err().to_string(),
+                message,
+            );
+        }
+    }
+
+    #[test]
+    fn restore_worker_network_must_match_the_destination_binding_exactly() {
+        let mut request = request();
+        request.network = Some(vm_spec::restore::RestoreNetwork {
+            mac: "02:00:00:00:00:01".to_string(),
+            ipv4: "192.0.2.2".parse().unwrap(),
+            prefix_length: 24,
+            gateway: "192.0.2.1".parse().unwrap(),
+            dns_servers: vec![],
+            dns_search: vec![],
+        });
+        let mut destination = config(request.clone());
+        assert!(
+            crate::krun::validate_config(&destination).is_err(),
+            "missing destination NIC"
+        );
+        destination.network = crate::krun::Network::Unixgram(crate::krun::NetUnixgram {
+            peer_path: "/tmp/destination.sock".into(),
+            mac: [2, 0, 0, 0, 0, 1],
+        });
+        crate::krun::validate_config(&destination).unwrap();
+        if let crate::krun::Network::Unixgram(network) = &mut destination.network {
+            network.mac[5] = 2;
+        }
+        assert!(
+            crate::krun::validate_config(&destination).is_err(),
+            "a different MAC is not the binding"
+        );
+    }
+
+    #[test]
+    fn restore_lower_closure_keeps_genuine_readonly_vmdk_and_uses_inherited_extents() {
+        use libkrun::live::restore::{RestoreAttachment, RestoreBlock, RestoreBlockBacking};
+        use vm_spec::capture::CaptureAttachment;
+        use vm_spec::restore::{RestoreDescriptor, RestoreExtent, RestoreLower};
+        let root =
+            std::env::temp_dir().join(format!("worker-restore-vmdk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _directory = Directory(root.clone());
+        let extent_path = root.join("extent");
+        let descriptor_path = root.join("descriptor");
+        let extent_bytes = [0x5a; 4096];
+        std::fs::write(&extent_path, extent_bytes).unwrap();
+        let text = format!(
+            "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\nRW 8 FLAT \"{}\" 0\n",
+            extent_path.display()
+        );
+        std::fs::write(&descriptor_path, &text).unwrap();
+        let files = [
+            File::open(&descriptor_path).unwrap(),
+            File::open(&extent_path).unwrap(),
+        ];
+        let descriptor = files[0].metadata().unwrap();
+        let extent = files[1].metadata().unwrap();
+        let launch = launch(&root);
+        let mut request = launch.request.clone();
+        let block_id = vm_spec::BlockId::new("silo-root-lower").unwrap();
+        request.configuration.attachments.push(CaptureAttachment {
+            block_id: block_id.clone(),
+            role: vm_spec::DiskRole::RootLower,
+            format: vm_spec::DiskFormat::Vmdk,
+            geometry: vm_spec::DiskGeometry {
+                length: 4096,
+                logical_sector_size: 512,
+            },
+            read_only: true,
+        });
+        request.configuration.attachments.push(CaptureAttachment {
+            block_id: vm_spec::BlockId::new("silo-root-upper").unwrap(),
+            role: vm_spec::DiskRole::RootUpper,
+            format: vm_spec::DiskFormat::Raw,
+            geometry: vm_spec::DiskGeometry {
+                length: 64 << 20,
+                logical_sector_size: 512,
+            },
+            read_only: false,
+        });
+        crate::krun::worker::restore::tests::evidence_mut(&mut request.authority)
+            .configuration_digest = request.configuration.digest().unwrap();
+        request.lowers.push(RestoreLower {
+            block_id,
+            descriptor: RestoreDescriptor {
+                fd: files[0].as_raw_fd(),
+                file_device: descriptor.dev(),
+                file_inode: descriptor.ino(),
+                length: descriptor.len(),
+            },
+            extents: vec![RestoreExtent {
+                path: extent_path.to_str().unwrap().to_string(),
+                fd: files[1].as_raw_fd(),
+                file_device: extent.dev(),
+                file_inode: extent.ino(),
+                length: extent.len(),
+            }],
+        });
+        request.validate().unwrap();
+        // The native resource must keep using the inherited inode even after
+        // the named path has been replaced with a different regular file.
+        std::fs::remove_file(&extent_path).unwrap();
+        std::fs::write(&extent_path, [0xa5; 4096]).unwrap();
+        let duplicate_files = || {
+            files
+                .iter()
+                .map(|file| file.try_clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let mut blocks = lower_blocks(&request, duplicate_files()).unwrap();
+        let (id, descriptor, extents) = blocks.pop().unwrap();
+        let block = RestoreBlock::readonly_vmdk(
+            RestoreAttachment {
+                configured_id: id,
+                address: 0x1000,
+                irq: 5,
+            },
+            descriptor,
+            extents,
+        );
+        let RestoreBlockBacking::ReadonlyVmdk(mut backing) = block.backing else {
+            panic!("restore must not flatten VMDK to Raw");
+        };
+        let mut actual = String::new();
+        backing.descriptor.read_to_string(&mut actual).unwrap();
+        assert_eq!(actual, text);
+        assert_eq!(backing.extents[0].path, extent_path);
+        assert_eq!(
+            backing.extents[0].file.metadata().unwrap().ino(),
+            extent.ino()
+        );
+        let mut actual = Vec::new();
+        backing.extents[0].file.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, extent_bytes);
+        assert!(backing.extents[0].file.write_all(b"forbidden").is_err());
+        let mut malformed = request.clone();
+        malformed.lowers[0].descriptor.file_inode += 1;
+        assert!(lower_blocks(&malformed, duplicate_files()).is_err());
+        assert!(lower_blocks(&request, vec![files[0].try_clone().unwrap()]).is_err());
+    }
+
+    pub(crate) fn hibernation_launch(directory: &std::path::Path) -> crate::virt::RestoreLaunch {
+        use vm_spec::hibernate::{
+            HibernateCut, HibernateFileBinding, HibernateSavedFile, HibernateSavedFileRole,
+        };
+        let mut launch = owned_launch(directory);
+        let vm_spec::restore::RestoreAuthority::OwnedLocalCut { cut } = &launch.request.authority
+        else {
+            panic!("owned fixture");
+        };
+        let saved_files = std::array::from_fn(|index| {
+            let file = &launch.files.objects[index];
+            let metadata = file.metadata().unwrap();
+            HibernateSavedFile {
+                role: [
+                    HibernateSavedFileRole::Memory,
+                    HibernateSavedFileRole::MemoryLayout,
+                    HibernateSavedFileRole::ExecutionState,
+                    HibernateSavedFileRole::DeviceState,
+                ][index],
+                file: HibernateFileBinding {
+                    path: directory.join(format!("restore-object-{index}")),
+                    inode: metadata.ino(),
+                    size: metadata.len(),
+                    mode: metadata.mode(),
+                    modified_seconds: metadata.mtime(),
+                    modified_nanoseconds: metadata.mtime_nsec(),
+                    changed_seconds: metadata.ctime(),
+                    changed_nanoseconds: metadata.ctime_nsec(),
+                },
+            }
+        });
+        let cut = HibernateCut {
+            version: vm_spec::hibernate::HIBERNATE_CUT_VERSION,
+            save_id: cut.capture_id.clone(),
+            machine_id: cut.machine_id.clone(),
+            ended_run_id: cut.run_id.clone(),
+            freeze_operation_id: cut.freeze_operation_id.clone(),
+            freeze_epoch: cut.freeze_epoch,
+            configuration: cut.configuration.clone(),
+            binding: cut.binding.clone(),
+            materialization_generation: cut.materialization_generation,
+            predecessor_generation: cut.predecessor_generation,
+            packed_length: cut.packed_length,
+            page_granule: cut.page_granule,
+            regions: cut.regions,
+            saved_files,
+            writable_disks: vec![],
+        };
+        cut.validate().unwrap();
+        for (object, saved) in launch.request.objects.iter_mut().zip(&cut.saved_files) {
+            object.authority = vm_spec::restore::RestoreObjectAuthority::Hibernation {
+                file: saved.file.clone(),
+            };
+        }
+        launch.request.purpose = vm_spec::restore::ActivationPurpose::SameMachine;
+        launch.request.authority =
+            vm_spec::restore::RestoreAuthority::Hibernation { cut: Box::new(cut) };
+        launch.request.validate().unwrap();
+        launch
+    }
+
+    #[test]
+    fn wake_uses_owned_native_authority_and_rejects_clone_or_mixed_inputs() {
+        let directory = std::env::temp_dir().join(format!("wake-native-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let launch = hibernation_launch(&directory);
+        validate(&config(launch.request.clone()), &launch.request).unwrap();
+        let wire = protocol::v1::RestoreRequest::try_from(launch.request.clone()).unwrap();
+        assert_eq!(RestoreRequest::try_from(wire).unwrap(), launch.request);
+        let (native, layout) = crate::krun::restore::identity(&launch.request).unwrap();
+        assert!(matches!(
+            native.ram_image,
+            libkrun::live::RamInputAuthority::OwnedLocalCut { .. }
+        ));
+        assert!(matches!(
+            layout,
+            libkrun::live::restore::StateObjectAuthority::OwnedLocalFile { .. }
+        ));
+        for change in 0..4 {
+            let mut request = launch.request.clone();
+            match change {
+                0 => request.purpose = vm_spec::restore::ActivationPurpose::Clone,
+                1 => {
+                    request.objects[0].authority =
+                        vm_spec::restore::RestoreObjectAuthority::Identified {
+                            identity: vm_spec::capture::Sha256Digest::of_bytes(b"foreign"),
+                        }
+                }
+                2 => request.map_node_store = Some("/foreign".into()),
+                _ => {
+                    request.freeze_operation_id =
+                        vm_spec::lifecycle::LiveId::parse(&uuid::Uuid::new_v4().to_string())
+                            .unwrap()
+                }
+            }
+            assert!(request.validate().is_err(), "mutation {change}");
+        }
+        drop(launch);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn wake_binds_the_original_writable_descriptor_and_path_without_copying() {
+        use crate::krun::worker::restore::validate_hibernation_disks;
+        use vm_spec::hibernate::{HibernateDiskBinding, HibernateFileBinding};
+        let directory = std::env::temp_dir().join(format!("wake-disk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let mut launch = hibernation_launch(&directory);
+        let path = directory.join("original.raw");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(4096).unwrap();
+        let metadata = file.metadata().unwrap();
+        let disk = vm_spec::Disk {
+            path: path.clone(),
+            block_id: vm_spec::BlockId::new("root").unwrap(),
+            role: vm_spec::DiskRole::Root,
+            format: vm_spec::DiskFormat::Raw,
+            geometry: vm_spec::DiskGeometry {
+                length: 4096,
+                logical_sector_size: 512,
+            },
+            read_only: false,
+        };
+        let vm_spec::restore::RestoreAuthority::Hibernation { cut } = &mut launch.request.authority
+        else {
+            panic!("wake cut")
+        };
+        cut.configuration
+            .attachments
+            .push(vm_spec::capture::CaptureAttachment {
+                block_id: disk.block_id.clone(),
+                role: disk.role,
+                format: disk.format,
+                geometry: disk.geometry,
+                read_only: false,
+            });
+        cut.writable_disks.push(HibernateDiskBinding {
+            attachment_index: 0,
+            block_id: disk.block_id.clone(),
+            role: disk.role,
+            file: HibernateFileBinding {
+                path: path.clone(),
+                inode: metadata.ino(),
+                size: metadata.len(),
+                mode: metadata.mode(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            },
+        });
+        launch.request.configuration = cut.configuration.clone();
+        launch.request.validate().unwrap();
+        let mut config = config(launch.request.clone());
+        config.disks.push(disk);
+        config
+            .storage_context
+            .raw_handles
+            .push(protocol::shutdown::RawHandleBinding {
+                disk_index: 0,
+                child_fd: 9,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length_bytes: 4096,
+                read_only: false,
+            });
+        let handles = vec![std::os::fd::OwnedFd::from(file)];
+        // The worker's configured path is its inherited descriptor, never the
+        // host path, so it takes no part in the comparison.
+        config.disks[0].path = std::path::PathBuf::from("/proc/self/fd/9");
+        validate_hibernation_disks(&config, &launch.request, &handles).unwrap();
+        let aside = directory.join("aside.raw");
+        std::fs::copy(&path, directory.join("copy.raw")).unwrap();
+        std::fs::rename(&path, &aside).unwrap();
+        std::fs::rename(directory.join("copy.raw"), &path).unwrap();
+        let error = validate_hibernation_disks(&config, &launch.request, &handles).unwrap_err();
+        assert!(error
+            .get_ref()
+            .unwrap()
+            .is::<vm_spec::hibernate::HibernateFileMismatch>());
+        std::os::unix::fs::FileExt::write_all_at(&launch.files.objects[0], b"forbidden", 0)
+            .unwrap_err();
+        let replacement = std::fs::File::open(&path).unwrap();
+        assert!(
+            validate_hibernation_disks(&config, &launch.request, &[replacement.into()]).is_err()
+        );
+        // Moving the original changed its ctime, so it stays refused even
+        // when put back: the facts are no longer those of the cut.
+        std::fs::rename(&aside, &path).unwrap();
+        assert!(validate_hibernation_disks(&config, &launch.request, &handles).is_err());
+        drop((handles, launch));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}

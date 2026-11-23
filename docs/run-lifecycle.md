@@ -63,7 +63,7 @@ exits:
 ```bash
 silo run --detach --name worker ubuntu:26.04 -- sleep 300
 silo logs worker --stream exec --follow
-silo show worker
+silo info worker
 ```
 
 When `sleep` exits, `worker` becomes stopped and remains available. You can then
@@ -71,6 +71,8 @@ inspect it, remove it, or start it as an idle VM:
 
 ```bash
 silo start worker
+silo hibernate worker
+silo start worker # wakes the same VM
 silo stop worker
 silo rm worker
 ```
@@ -92,6 +94,48 @@ silo shell dev
 `create` stores the image process settings but leaves the VM stopped. `start`
 boots it in idle mode, and `exec` or `shell` starts work inside it later.
 
+By default `start` waits for guest agent readiness (unless the agent is disabled).
+`silo start --no-wait dev` returns once the VM is running without waiting for
+the agent. It does not certify a successful guest boot or change later failure
+handling.
+
+## Boot diagnostics and rescue
+
+Any guest bootstrap failure before handoff prints its diagnostic on the serial
+console, synchronizes filesystems and powers off the VM. This applies to every
+root type, including raw disks and managed EROFS overlay roots. A guest poweroff
+before its first readiness is a failed boot, not a normal stop: readiness waits
+end immediately with "guest powered off during boot" and point at
+`silo logs dev --stream serial`, which shows the init diagnostic.
+
+Configure user arguments on a stopped VM with `silo set dev kernel-arg=ARG`.
+The setting may be repeated and appends to the existing direct-boot command
+line. `kernel-args=` clears the user arguments; arguments after that setting
+are appended to the empty list:
+
+```bash
+silo set dev kernel-args= kernel-arg=silo.rescue=on-failure
+silo start --no-wait dev
+silo shell --attach serial dev
+```
+
+`silo.rescue=on-failure` opens a rescue shell on any bootstrap failure instead
+of immediately powering off. `silo.rescue=always` opens the shell just before
+handoff after successful assembly, and also on failure. The shell sees the root
+assembled as far as boot reached and runs on the console, not through the guest
+agent. Leaving it synchronizes filesystems and powers off, never resumes boot.
+Only one `silo.rescue` selector is accepted; duplicate selectors and values
+other than `on-failure` or `always` are boot errors.
+
+Kernel-argument settings cannot be mixed with ordinary settings or boot-bundle
+replacements in a single command. Both local and daemon updates use the stopped
+configuration replacement path. Host admission still rejects `rdinit=`, `root=`,
+`rootfstype=` and `rootflags=` arguments; clearing user arguments never removes
+Silo's generated root selectors. Remove rescue mode with `silo set dev
+kernel-args=` before the next normal boot, re-adding any other desired user
+arguments.
+
+
 ## Output
 
 Detached `run` writes progress and lifecycle guidance to stderr, then writes
@@ -99,5 +143,78 @@ only the machine name to stdout. This keeps command substitution reliable:
 
 ```bash
 machine=$(silo run --detach ubuntu:26.04 -- sleep 300)
-silo show "$machine"
+silo info "$machine"
 ```
+
+`silo info NAME --format json` reports private-copy persistence separately from
+execution state and readiness in `durability`: `constructed` means the child
+is startable but its persistence barrier has not completed, while `durable`
+means that barrier completed. The plain-output row is **Durability**, next to
+**Ready**. Ordinary created machines are durable; restore and fork join their
+child barriers before returning, so healthy completed children are durable.
+In-progress or barrier-failed live children can still be constructed even when
+running. This field is not a guest-filesystem cleanliness certificate.
+
+Ordinary starts publish launch files atomically, then synchronously flush the
+retained kernel copy (with its final read-only mode), composite initramfs,
+layered lower descriptor when present, configuration and generation lease in
+one file pass immediately before spawning the monitor. Each containing
+directory is then flushed once: the machine directory and the pool's stable
+lease directory. Raw and layered starts share this barrier. Start never
+acknowledges readiness ahead of it. Layered graph authentication uses that
+same typed generation lease, not a second consumer registration; its operation
+pins root the composition, layers, pack streams and fsmeta through startup.
+
+Readiness uses the same prerequisites after restore and live-capture resume:
+fresh guest `ready` status and, when SSH is configured, a successful listener
+key exchange checked against the machine's immutable host-key pin. Capture
+temporarily revokes that evidence while it freezes workloads, so
+`WORKLOAD_NOT_READY` during `guest-freeze` is expected even when the source was
+ready at admission. After thaw, public readiness stays false until those
+prerequisites are re-established and the monitor returns to `Running`.
+
+An SSH pin-check timeout immediately reports `SSH_NOT_READY`. The monitor
+still drains the filesystem operation, which cannot be canceled, and consumes
+its eventual result only if the verification target remains current and
+supervision has not been canceled. A delayed successful pin check can thus
+restore readiness without waiting for the next periodic SSH check; a changed
+listener, stopped machine, mismatched pin or canceled supervisor cannot.
+
+## Storage shutdown and recovery
+
+Lifecycle `stopped` is not a storage-consistency certificate. `silo stop`
+first attempts the bounded, run-bound guest orderly-shutdown protocol.
+Storage-clean additionally requires all three independent facts: successful
+guest writer/filesystem shutdown, checked host synchronization after native
+owners terminate, and closure of every qualified attachment handle.
+
+`silo info NAME --format json` exposes the observed terminal
+`storage_stop_outcome` (`clean`, `forced`, `unknown`, or null when storage
+metadata is unavailable). The human-readable view labels it **Last storage
+stop**. This is not a statement that a currently running VM is safe to copy.
+Inspection is read-only: it may classify a current terminal exit before that
+result is committed to the catalog. An explicit lifecycle command such as
+`silo stop NAME` performs durable reconciliation, including for an already
+terminal run, and retires its operation pins only after ownership is settled.
+`vm.exit.json` in the machine log directory retains exact-run evidence and
+diagnostics. A manager-written forced fence can omit `storageShutdown`
+because the killed monitor did not establish finalizer facts; absence does
+not imply either clean storage or observed attachment closure.
+
+Force-stop and native errors cannot certify clean. Missing or incomplete
+current-run shutdown evidence becomes unknown only after attachment holders
+are ruled out. Writable host directory shares, externally writable Data
+disks, unsupported guest authority and unqualified backends remain usable
+but do not receive an all-storage certificate.
+
+Killing a monitor does not authorize deleting or replacing its disks: the
+actual worker may still own attachments and its inherited generation lease.
+Silo retains durable holder identities and operation dependencies until all
+holders are terminal and an independent nonblocking lease probe permits
+reconciliation. Start, removal, replacement and collection fail closed while
+that ownership is unresolved. Do not manually remove lease/holder files to
+clear a busy error. Inspect logs and let the owned worker terminate.
+
+This release is a hard state-format cutover. Reinstall and explicitly reset
+all prior Silo state; no automatic wipe, migration or old-record reader is
+provided. Keep any needed data outside the old Silo state before resetting it.

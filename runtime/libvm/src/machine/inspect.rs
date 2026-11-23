@@ -15,7 +15,7 @@ use crate::network::MachineNetworkConfig;
 use crate::store::models::{MachineConfig, MachineRootfsRecord, MachineRuntimeState, MachineState};
 use crate::ImageSourceKind;
 
-/// Durable pin for the root disk cloned into a machine directory.
+/// Source provenance and the selected private root disk location.
 ///
 /// OCI fields are absent for caller-owned local disks. The launch-time
 /// `Entrypoint` API is intentionally separate from this image metadata.
@@ -32,13 +32,13 @@ pub struct MachineRootfs {
     pub selected_manifest_digest: Option<String>,
     /// OCI configuration digest.
     pub config_digest: Option<String>,
-    /// Materialized rootfs image ID.
+    /// Source image identity, not an identity of the writable private root.
     pub image_id: Option<String>,
     /// Machine-local root disk path.
     pub root_disk_path: PathBuf,
-    /// Size of the machine-local root disk in bytes.
+    /// Selected machine-local virtual disk length in bytes.
     pub root_disk_size_bytes: u64,
-    /// Unix timestamp for when this pin was created.
+    /// Unix timestamp for when this provenance was recorded.
     pub created_at: i64,
 }
 
@@ -125,6 +125,14 @@ pub struct MachineInventoryEntry {
     pub issues: Vec<MachineIssue>,
 }
 
+/// Crash persistence is independent of whether a child is already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineDurability {
+    Constructed,
+    Durable,
+}
+
 /// Public machine snapshot returned by inspect and mutation operations.
 ///
 /// `MachineData` is an owned read model, not a live handle and not a SQLite
@@ -143,8 +151,12 @@ pub struct MachineData {
     pub name: String,
     /// VM specification used to start the machine.
     pub spec: VmSpec,
+    /// Unused execution save, observed without waking the machine.
+    pub hibernation: Option<crate::MachineHibernationInfo>,
     /// Retention policy recorded for this machine.
     pub retention: MachineRetention,
+    /// Private-copy persistence, independent of lifecycle status.
+    pub durability: MachineDurability,
     /// Durable desired process settings. This is not applied by this stage.
     pub process: ProcessConfig,
     /// Selected machine template, when creation used one.
@@ -159,8 +171,22 @@ pub struct MachineData {
     pub modified_at: i64,
     /// Image reference used to create the machine.
     pub image_ref: String,
-    /// Durable rootfs identity and machine-local disk pin, when available.
+    /// Source provenance and the selected machine-local root path, when available.
     pub rootfs: Option<MachineRootfs>,
+    /// Typed root, boot, storage and ownership meaning.
+    pub storage: Option<crate::MachineStorageRecord>,
+    pub ram_identity: crate::store::models::storage::ContentIdentityState,
+    pub disk_identities: Vec<crate::store::models::storage::DiskContentIdentity>,
+    /// Observed terminal storage result, also available through daemon inspection.
+    /// Absent when storage metadata is unavailable.
+    pub storage_stop_outcome: Option<crate::StorageStopOutcome>,
+    /// Pinned boot profile, also available through daemon inspection.
+    pub boot_profile: Option<crate::BootProfile>,
+    /// Distinct locally admitted packaged bundle, without changing the current pin.
+    pub boot_replacement: Option<crate::ObjectDigest>,
+    /// External data disks and host shares, derived from the durable VM specification.
+    /// These mappings are not copied into ownership or represented as self-contained.
+    pub external_resources: Vec<crate::ExternalResource>,
     /// Requested root disk size in bytes, when explicitly configured.
     pub root_disk_size: Option<u64>,
     /// User-defined labels attached to the machine.
@@ -187,6 +213,14 @@ pub struct MachineData {
     /// The current silo-vmm run while the machine is running. Pass it to
     /// `stop_run`/`wait_for_run` to act on exactly this run.
     pub run_id: Option<MachineRunId>,
+    /// Exact run evidence, never relabelled using the current runtime override.
+    pub live: Option<vm_spec::live::LiveMachineReport>,
+    /// Prospective next-start selection, only for an observed stopped machine.
+    pub prospective_live: Option<vm_spec::live::LiveHostReport>,
+    /// Current exact-monitor authority, separate from historical Pause success.
+    pub lifecycle: Option<crate::MachineLifecycle>,
+    /// Retained, unreleased live captures of this machine (any run).
+    pub captures: Vec<crate::MachineCapture>,
     /// Latest guest boot report observed by silo-vmm, when the guest registered one.
     pub boot_report: Option<MachineBootReport>,
     /// Latest guest provisioning report observed by silo-vmm, when the guest registered one.
@@ -203,11 +237,14 @@ impl MachineData {
     /// Constructs an owned observation for adapters without opening a machine handle.
     /// Optional observations remain unavailable until the adapter supplies them.
     pub fn new(id: String, name: String, spec: VmSpec) -> Self {
+        let external_resources = crate::ExternalResource::from_spec(&spec);
         Self {
             id,
             name,
             spec,
+            hibernation: None,
             retention: MachineRetention::Persistent,
+            durability: MachineDurability::Durable,
             process: ProcessConfig::default(),
             template_name: None,
             agent_mode: None,
@@ -216,6 +253,13 @@ impl MachineData {
             modified_at: 0,
             image_ref: String::new(),
             rootfs: None,
+            storage: None,
+            ram_identity: crate::store::models::storage::ContentIdentityState::Unknown,
+            disk_identities: Vec::new(),
+            storage_stop_outcome: None,
+            boot_profile: None,
+            boot_replacement: None,
+            external_resources,
             root_disk_size: None,
             labels: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -226,6 +270,10 @@ impl MachineData {
             observation: MachineObservation::Unavailable,
             issues: Vec::new(),
             run_id: None,
+            live: None,
+            prospective_live: None,
+            lifecycle: None,
+            captures: Vec::new(),
             boot_report: None,
             provision_report: None,
             started_at: None,
@@ -243,6 +291,7 @@ impl MachineData {
         provision_report: Option<MachineProvisionReport>,
         state: MachineState,
     ) -> Self {
+        let external_resources = crate::ExternalResource::from_spec(&config.spec);
         let tailscale = match &config.network {
             crate::store::models::MachineNetworkConfig::Private {
                 policy: Some(policy),
@@ -262,7 +311,9 @@ impl MachineData {
             id: config.id.to_string(),
             name: config.name,
             spec: config.spec,
+            hibernation: None,
             retention: config.retention,
+            durability: MachineDurability::Durable,
             process: config.process,
             template_name: config.template_name,
             agent_mode: config.agent_mode,
@@ -271,6 +322,13 @@ impl MachineData {
             modified_at: config.modified_at,
             image_ref: config.image_ref,
             rootfs: rootfs.map(Into::into),
+            storage: None,
+            ram_identity: crate::store::models::storage::ContentIdentityState::Unknown,
+            disk_identities: Vec::new(),
+            storage_stop_outcome: None,
+            boot_profile: None,
+            boot_replacement: None,
+            external_resources,
             root_disk_size: config.root_disk_size,
             labels: config.labels,
             metadata: config.metadata,
@@ -281,6 +339,10 @@ impl MachineData {
             observation: MachineObservation::Observed,
             issues: Vec::new(),
             run_id,
+            live: None,
+            prospective_live: None,
+            lifecycle: None,
+            captures: Vec::new(),
             boot_report,
             provision_report,
             started_at: state.started_at,
@@ -335,6 +397,7 @@ pub enum MachineBootMode {
     Standard,
     AgentPid1,
     InitChild,
+    ContainedInit,
 }
 
 impl MachineBootMode {
@@ -344,6 +407,7 @@ impl MachineBootMode {
             GuestBootMode::Standard => Self::Standard,
             GuestBootMode::AgentPid1 => Self::AgentPid1,
             GuestBootMode::InitChild => Self::InitChild,
+            GuestBootMode::ContainedInit => Self::ContainedInit,
         }
     }
 
@@ -353,6 +417,7 @@ impl MachineBootMode {
             Self::Standard => "standard",
             Self::AgentPid1 => "agent-pid1",
             Self::InitChild => "init-child",
+            Self::ContainedInit => "contained-init",
         }
     }
 }
@@ -534,6 +599,30 @@ pub enum MachineStatus {
         /// Optional human-readable status detail.
         message: Option<String>,
     },
+    Pausing {
+        message: Option<String>,
+    },
+    Paused {
+        message: Option<String>,
+    },
+    Capturing {
+        message: Option<String>,
+    },
+    Hibernating {
+        message: Option<String>,
+    },
+    Hibernated {
+        message: Option<String>,
+    },
+    Restoring {
+        message: Option<String>,
+    },
+    Activating {
+        message: Option<String>,
+    },
+    ActivationFailed {
+        message: Option<String>,
+    },
     /// silo-vmm is stopping.
     Stopping {
         /// Optional human-readable status detail.
@@ -559,6 +648,30 @@ impl MachineStatus {
                 guest_ready: false,
                 message: None,
             },
+            MachineRuntimeState::Pausing => Self::Pausing {
+                message: last_error,
+            },
+            MachineRuntimeState::Paused => Self::Paused {
+                message: last_error,
+            },
+            MachineRuntimeState::Capturing => Self::Capturing {
+                message: last_error,
+            },
+            MachineRuntimeState::Hibernating => Self::Hibernating {
+                message: last_error,
+            },
+            MachineRuntimeState::Hibernated => Self::Hibernated {
+                message: last_error,
+            },
+            MachineRuntimeState::Restoring => Self::Restoring {
+                message: last_error,
+            },
+            MachineRuntimeState::Activating => Self::Activating {
+                message: last_error,
+            },
+            MachineRuntimeState::ActivationFailed => Self::ActivationFailed {
+                message: last_error,
+            },
             MachineRuntimeState::Stopping => Self::Stopping { message: None },
             MachineRuntimeState::Error => Self::Error {
                 message: non_empty_message(last_error),
@@ -578,27 +691,39 @@ impl MachineStatus {
         match VmState::try_from(vm.state.unwrap_or_default()).unwrap_or(VmState::Unspecified) {
             VmState::Stopped => Self::Stopped,
             VmState::Starting => Self::Starting { message },
-            VmState::Running | VmState::Unspecified => Self::Running {
+            VmState::Running => Self::Running {
                 ready,
                 guest_ready,
                 message,
             },
             VmState::Stopping => Self::Stopping { message },
+            VmState::Pausing => Self::Pausing { message },
+            VmState::Paused => Self::Paused { message },
+            VmState::Capturing => Self::Capturing { message },
+            VmState::Hibernating => Self::Hibernating { message },
+            VmState::Hibernated => Self::Hibernated { message },
+            VmState::Restoring => Self::Restoring { message },
+            VmState::Activating => Self::Activating { message },
+            VmState::ActivationFailed => Self::ActivationFailed { message },
+            VmState::Error => Self::Error { message },
             VmState::Failed => Self::Error { message },
-        }
-    }
-
-    pub(crate) fn running_with_message(message: String) -> Self {
-        Self::Running {
-            ready: false,
-            guest_ready: false,
-            message: non_empty_message(Some(message)),
+            VmState::Unspecified => Self::Error {
+                message: Some("monitor returned an unspecified lifecycle state".into()),
+            },
         }
     }
 
     /// Returns true when silo-vmm is running.
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
+    }
+
+    /// A nonterminal lifecycle, including parked and fenced execution.
+    pub fn is_active(&self) -> bool {
+        !matches!(
+            self,
+            Self::Stopped | Self::Hibernated { .. } | Self::Error { .. }
+        )
     }
 
     /// Returns true when the machine satisfies its configured readiness policy.
@@ -623,6 +748,14 @@ impl MachineStatus {
             Self::Stopped => "stopped",
             Self::Starting { .. } => "starting",
             Self::Running { .. } => "running",
+            Self::Pausing { .. } => "pausing",
+            Self::Paused { .. } => "paused",
+            Self::Capturing { .. } => "capturing",
+            Self::Hibernating { .. } => "hibernating",
+            Self::Hibernated { .. } => "hibernated",
+            Self::Restoring { .. } => "restoring",
+            Self::Activating { .. } => "activating",
+            Self::ActivationFailed { .. } => "activation-failed",
             Self::Stopping { .. } => "stopping",
             Self::Error { .. } => "error",
         }
@@ -634,6 +767,14 @@ impl MachineStatus {
             Self::Stopped => None,
             Self::Starting { message }
             | Self::Running { message, .. }
+            | Self::Pausing { message }
+            | Self::Paused { message }
+            | Self::Capturing { message }
+            | Self::Hibernating { message }
+            | Self::Hibernated { message }
+            | Self::Restoring { message }
+            | Self::Activating { message }
+            | Self::ActivationFailed { message }
             | Self::Stopping { message }
             | Self::Error { message } => message.as_deref(),
         }
@@ -652,6 +793,14 @@ impl From<MachineStatus> for MachineRuntimeState {
             MachineStatus::Stopped => Self::Stopped,
             MachineStatus::Starting { .. } => Self::Starting,
             MachineStatus::Running { .. } => Self::Running,
+            MachineStatus::Pausing { .. } => Self::Pausing,
+            MachineStatus::Paused { .. } => Self::Paused,
+            MachineStatus::Capturing { .. } => Self::Capturing,
+            MachineStatus::Hibernating { .. } => Self::Hibernating,
+            MachineStatus::Hibernated { .. } => Self::Hibernated,
+            MachineStatus::Restoring { .. } => Self::Restoring,
+            MachineStatus::Activating { .. } => Self::Activating,
+            MachineStatus::ActivationFailed { .. } => Self::ActivationFailed,
             MachineStatus::Stopping { .. } => Self::Stopping,
             MachineStatus::Error { .. } => Self::Error,
         }
@@ -718,6 +867,47 @@ fn agent_reports_ready(agent: Option<&HostAgent>) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn boot_modes_preserve_protocol_values_and_public_labels() {
+        use crate::machine::inspect::MachineBootMode;
+        use protocol::v1::GuestBootMode;
+
+        for (wire, mode, label) in [
+            (
+                GuestBootMode::Unspecified,
+                MachineBootMode::Unspecified,
+                "unspecified",
+            ),
+            (
+                GuestBootMode::Standard,
+                MachineBootMode::Standard,
+                "standard",
+            ),
+            (
+                GuestBootMode::AgentPid1,
+                MachineBootMode::AgentPid1,
+                "agent-pid1",
+            ),
+            (
+                GuestBootMode::InitChild,
+                MachineBootMode::InitChild,
+                "init-child",
+            ),
+            (
+                GuestBootMode::ContainedInit,
+                MachineBootMode::ContainedInit,
+                "contained-init",
+            ),
+        ] {
+            assert_eq!(MachineBootMode::from_protocol(wire as i32), mode);
+            assert_eq!(mode.label(), label);
+        }
+        assert_eq!(
+            MachineBootMode::from_protocol(i32::MAX),
+            MachineBootMode::Unspecified
+        );
+    }
+
+    #[test]
     fn retained_guest_ready_does_not_override_stale_current_readiness() {
         let status = MachineStatus::from_protocol(protocol::v1::HostStatus {
             vm: Some(protocol::v1::VmSnapshot {
@@ -769,5 +959,110 @@ mod tests {
 
         assert!(status.ready());
         assert!(!status.guest_ready());
+    }
+
+    #[test]
+    fn external_resource_view_is_derived_from_each_current_specification() {
+        let mut spec = vm_spec::VmSpec::current();
+        spec.storage = Some(vm_spec::Storage {
+            disks: vec![
+                vm_spec::Disk {
+                    path: "root.raw".into(),
+                    role: vm_spec::DiskRole::Root,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-root").unwrap(),
+                    read_only: false,
+                },
+                vm_spec::Disk {
+                    path: "/external/data.raw".into(),
+                    role: vm_spec::DiskRole::Data,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-data-0").unwrap(),
+                    read_only: true,
+                },
+            ],
+        });
+        spec.mounts.push(vm_spec::Mount {
+            source: "/external/workspace".into(),
+            tag: "/workspace".to_string(),
+            read_only: false,
+        });
+        let first =
+            crate::MachineData::new("machine".to_string(), "first".to_string(), spec.clone());
+        assert_eq!(
+            first.external_resources,
+            vec![
+                crate::ExternalResource::Disk {
+                    role: vm_spec::DiskRole::Data,
+                    order: 1,
+                    path: "/external/data.raw".into(),
+                    read_only: true
+                },
+                crate::ExternalResource::Share {
+                    source: "/external/workspace".into(),
+                    tag: "/workspace".to_string(),
+                    read_only: false
+                },
+            ]
+        );
+        spec.storage.as_mut().unwrap().disks.truncate(1);
+        spec.mounts.clear();
+        let second = crate::MachineData::new("machine".to_string(), "second".to_string(), spec);
+        assert!(second.external_resources.is_empty());
+        assert_eq!(first.external_resources.len(), 2);
+    }
+    #[test]
+    fn pause_lifecycle_never_inherits_ready_or_running_from_retained_telemetry() {
+        for (state, label) in [
+            (VmState::Pausing, "pausing"),
+            (VmState::Paused, "paused"),
+            (VmState::Capturing, "capturing"),
+            (VmState::Restoring, "restoring"),
+            (VmState::Activating, "activating"),
+            (VmState::ActivationFailed, "activation-failed"),
+            (VmState::Error, "error"),
+            (VmState::Hibernating, "hibernating"),
+            (VmState::Hibernated, "hibernated"),
+        ] {
+            let status = MachineStatus::from_protocol(HostStatus {
+                vm: Some(VmSnapshot {
+                    state: Some(state as i32),
+                    ..Default::default()
+                }),
+                readiness: Some(Readiness {
+                    ready: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert_eq!(status.label(), label);
+            assert!(!status.ready());
+            assert!(!status.guest_ready());
+            assert!(!status.is_running());
+        }
+    }
+
+    #[test]
+    fn hibernation_status_roundtrips_and_only_hibernating_is_active() {
+        use crate::store::models::MachineRuntimeState;
+        for (state, label, active) in [
+            (MachineRuntimeState::Hibernating, "hibernating", true),
+            (MachineRuntimeState::Hibernated, "hibernated", false),
+        ] {
+            let status = MachineStatus::from_machine_state(state, Some("detail".into()));
+            assert_eq!(status.label(), label);
+            assert_eq!(status.message(), Some("detail"));
+            assert_eq!(status.is_active(), active);
+            assert!(!status.ready());
+            assert_eq!(MachineRuntimeState::from(status), state);
+        }
     }
 }

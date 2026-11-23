@@ -16,7 +16,7 @@ pub fn write_buf(fd: i32, buf: &[u8]) -> isize {
                 buf.len() - written,
             )
         };
-        if ret < 0 {
+        if ret <= 0 {
             return ret;
         }
         written += ret as usize;
@@ -218,6 +218,15 @@ pub fn sleep(seconds: u32) {
     unsafe {
         libc::sleep(seconds);
     }
+}
+
+pub fn sync() {
+    unsafe { libc::sync() }
+}
+
+pub fn power_off() {
+    // This no_std init uses libc wrappers throughout; nix requires std.
+    unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
 }
 
 pub fn exit(code: i32) -> ! {

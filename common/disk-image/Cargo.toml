@@ -12,9 +12,22 @@ keywords = ["disk-image", "ext4", "filesystem"]
 categories = ["filesystem", "os"]
 exclude = ["/tests", "/.github"]
 
+[features]
+qcow2 = ["dep:imago"]
+
 [dependencies]
+rootfs-spec = { path = "../../specs/rootfs-spec" }
 thiserror = "2.0.19"
+utils = { path = "../utils" }
 uuid = { version = "1.24.0", features = ["v4"] }
+imago = { version = "0.2.6", default-features = false, features = ["sync"], optional = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { version = "0.31.3", features = ["fs"] }
+
+[[example]]
+name = "qcow2_decode"
+required-features = ["qcow2"]

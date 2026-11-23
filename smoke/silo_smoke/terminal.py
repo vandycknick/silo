@@ -23,7 +23,8 @@ if TYPE_CHECKING:
 
 
 class PtyCommand:
-    def __init__(self, ws: Workspace, argv: list[str], rows: int = 37, cols: int = 119, label: str = "pty") -> None:
+    def __init__(self, ws: Workspace, argv: list[str], rows: int = 37, cols: int = 119,
+                 label: str = "pty", term: str = "xterm") -> None:
         self.ws = ws
         self.argv = argv
         self.label = label
@@ -46,7 +47,7 @@ class PtyCommand:
                 fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
             env = ws.env()
-            env["TERM"] = "xterm"
+            env["TERM"] = term
             self.proc: subprocess.Popen[bytes] = subprocess.Popen(
                 argv, env=env, stdin=slave, stdout=slave, stderr=slave,
                 preexec_fn=child_setup, pass_fds=(slave,), start_new_session=False,

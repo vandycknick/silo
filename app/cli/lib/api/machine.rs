@@ -14,6 +14,9 @@ use tokio_stream::Stream;
 use crate::api::daemon::DaemonVmService;
 use crate::api::start_options::AppStartOptions;
 
+/// A wake that finishes within this is not shown at all.
+pub(crate) const QUIET_WAKE: Duration = Duration::from_millis(500);
+
 #[derive(Debug, Clone)]
 pub(crate) enum AppMachine {
     Local {
@@ -66,6 +69,42 @@ impl AppMachine {
         }
     }
 
+    /// Admits this command to the machine's current run, waking a hibernated
+    /// machine first. A quick wake is silent; a slow one shows a spinner with
+    /// the current step, cleared before the command's own output starts.
+    pub(crate) async fn for_access(&self) -> eyre::Result<Self> {
+        let native = self.session_machine().await?;
+        let name = native.inspect().await?.name;
+        let (progress, mut stages) = libvm::LiveOperationProgressSender::default_channel();
+        let operation = native.for_access(Some(&progress));
+        let quiet = tokio::time::sleep(QUIET_WAKE);
+        tokio::pin!(operation, quiet);
+        let mut quiet_over = false;
+        // The latest wake stage; `None` while no wake is happening.
+        let mut stage: Option<libvm::LiveOperationProgress> = None;
+        let mut spinner: Option<crate::ui::Spinner> = None;
+        let result = loop {
+            tokio::select! {
+                biased;
+                Some(next) = stages.recv() => stage = Some(next),
+                result = &mut operation => break result,
+                _ = &mut quiet, if !quiet_over => quiet_over = true,
+            }
+            let Some(current) = &stage else { continue };
+            if quiet_over {
+                let (label, _) = crate::ui::live_operation_progress_words(current, &name);
+                match &mut spinner {
+                    Some(spinner) => spinner.step(label, name.as_str()),
+                    None => spinner = Some(crate::ui::Spinner::start(label, name.as_str())),
+                }
+            }
+        };
+        if let Some(spinner) = spinner {
+            spinner.finish_clear();
+        }
+        Ok(Self::new(result?, self.home().to_path_buf()))
+    }
+
     fn home(&self) -> &Path {
         match self {
             Self::Local { home, .. } => home,
@@ -82,7 +121,7 @@ impl AppMachine {
 
     pub(crate) async fn inspect(&self) -> Result<MachineData, libvm::LibVmError> {
         match self {
-            Self::Local { native, .. } => native.inspect().await,
+            Self::Local { native, .. } => Box::pin(native.inspect()).await,
             Self::Daemon { id, service, .. } => service.inspect(id).await,
         }
     }
@@ -93,9 +132,7 @@ impl AppMachine {
     ) -> eyre::Result<MachineStart> {
         let result = match self {
             Self::Local { native, home } => {
-                native
-                    .start_with_options(options.into_native(home, &native.id())?)
-                    .await
+                Box::pin(native.start_with_options(options.into_native(home, &native.id())?)).await
             }
             Self::Daemon { id, service, .. } => service.start_with_options(id, options).await,
         };
@@ -112,6 +149,21 @@ impl AppMachine {
         }
     }
 
+    pub(crate) fn serial_log_path(&self) -> std::path::PathBuf {
+        self.home()
+            .join("logs/machines")
+            .join(self.id())
+            .join("serial.log")
+    }
+
+    pub(crate) fn readiness_failure(&self, readiness: &MachineReadiness) -> eyre::Report {
+        crate::api::readiness_failure(
+            readiness.outcome,
+            readiness.status.vm.message.as_deref(),
+            &readiness.status.name,
+        )
+    }
+
     pub(crate) async fn stop_run(
         &self,
         run_id: MachineRunId,
@@ -121,7 +173,12 @@ impl AppMachine {
             .timeout(Duration::from_secs(60))
             .force_after_timeout(Duration::from_secs(5));
         match self {
-            Self::Local { native, .. } => native.stop_run_with(run_id, options).await,
+            Self::Local { native, .. } => {
+                native.stop_run_with(run_id, options).await.map(|outcome| {
+                    crate::ui::stop_warning(outcome.warning);
+                    outcome.machine
+                })
+            }
             Self::Daemon { id, service, .. } => service.stop_run(id, run_id, options).await,
         }
     }
@@ -154,7 +211,14 @@ impl AppMachine {
     pub(crate) async fn remove(self) -> Result<(), libvm::LibVmError> {
         match self {
             Self::Local { native, .. } => native.remove().await,
-            Self::Daemon { id, service, .. } => service.remove(&id).await,
+            Self::Daemon { id, service, .. } => service.remove(&id, false).await,
+        }
+    }
+
+    pub(crate) async fn remove_force(self) -> Result<(), libvm::LibVmError> {
+        match self {
+            Self::Local { native, .. } => native.remove_force().await,
+            Self::Daemon { id, service, .. } => service.remove(&id, true).await,
         }
     }
 
@@ -229,6 +293,17 @@ impl AppMachine {
                 }
                 libvm::MachineAgentStatus::Disabled => None,
             })
+    }
+
+    /// Best-effort, read-only monitor observation, identical for local and
+    /// daemon sessions.
+    pub(crate) async fn host_memory_reclaim(&self) -> Option<libvm::MachineHostMemoryReclaim> {
+        self.session_machine()
+            .await
+            .ok()?
+            .observe_host_memory_reclaim()
+            .await
+            .ok()?
     }
 
     pub(crate) async fn shell(

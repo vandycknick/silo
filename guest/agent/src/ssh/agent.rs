@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use agent_spec::AgentSshConfig;
@@ -27,7 +27,7 @@ use russh::{Channel, ChannelId, Pty, Sig};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixListener;
 use tokio::runtime::Handle as RuntimeHandle;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_vsock::VsockStream;
 
@@ -39,6 +39,9 @@ const DEFAULT_SHELL_NAME: &str = "sh";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const AGENT_SOCKET_DIR: &str = "/run/silo-ssh-agent";
 const STDERR_EXTENDED_DATA: u32 = 1;
+// Larger than the PTY's kernel output queue, but finite even if a descendant
+// keeps writing after the session leader exits.
+pub(crate) const PTY_EXIT_DRAIN_LIMIT: usize = 1024 * 1024;
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_AGENT_FORWARD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -47,6 +50,8 @@ pub(crate) struct NativeSshBackend {
     auth: Arc<AuthDb>,
     server_config: Arc<Config>,
     process_supervisor: ProcessSupervisor,
+    lifecycle: Arc<crate::lifecycle::RuntimeContext>,
+    environment: Arc<[(String, String)]>,
 }
 
 impl NativeSshBackend {
@@ -60,8 +65,12 @@ impl NativeSshBackend {
     pub(crate) fn new(
         config: AgentSshConfig,
         process_supervisor: ProcessSupervisor,
+        lifecycle: Arc<crate::lifecycle::RuntimeContext>,
     ) -> eyre::Result<Self> {
         let auth = Arc::new(AuthDb::from_config(&config)?);
+        let environment = crate::ssh::inherited_environment(&config.environment)
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
         let server_config = Config {
             inactivity_timeout: None,
             methods: russh::MethodSet::from(&[russh::MethodKind::PublicKey][..]),
@@ -75,6 +84,8 @@ impl NativeSshBackend {
             auth,
             server_config: Arc::new(server_config),
             process_supervisor,
+            lifecycle,
+            environment,
         })
     }
 
@@ -88,6 +99,16 @@ impl NativeSshBackend {
     }
 
     pub(crate) async fn handle_connection(&self, stream: VsockStream) -> io::Result<()> {
+        let mut retirement = self.lifecycle.retirement();
+        let process_supervisor = self.process_supervisor.with_session(
+            self.lifecycle
+                .admit_session()
+                .map_err(|error| io::Error::other(error.to_string()))?,
+            retirement.clone(),
+        );
+        let transport = SessionTransportGuard {
+            fd: stream.as_fd().try_clone_to_owned()?,
+        };
         let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let peer_addr = stream.peer_addr().ok();
         let local_addr = stream.local_addr().ok();
@@ -101,31 +122,48 @@ impl NativeSshBackend {
         let handler = NativeSshHandler {
             connection_id,
             auth: Arc::clone(&self.auth),
-            process_supervisor: self.process_supervisor.clone(),
+            process_supervisor: process_supervisor.clone(),
+            environment: Arc::clone(&self.environment),
             authenticated_user: None,
             permit_pty: false,
             permit_agent_forwarding: false,
             channels: HashMap::new(),
             runtime: RuntimeHandle::current(),
+            _writer: Some(process_supervisor.admit_internal_writer()?),
+            lifecycle: Some(Arc::clone(&self.lifecycle)),
+            retirement: Some(retirement.clone()),
         };
 
-        let session =
-            match russh::server::run_stream(Arc::clone(&self.server_config), stream, handler).await
-            {
-                Ok(session) => session,
-                Err(error) => {
-                    let error = ssh_error_to_io(error);
-                    tracing::warn!(
-                        connection_id,
-                        peer_addr = ?peer_addr,
-                        error = %error,
-                        "native SSH connection failed during handshake"
-                    );
-                    return Err(error);
-                }
-            };
-
-        match session.await {
+        let handshake = russh::server::run_stream(Arc::clone(&self.server_config), stream, handler);
+        tokio::pin!(handshake);
+        let session = match tokio::select! {
+            result = &mut handshake => result,
+            _ = retirement.changed() => {
+                drop(transport);
+                return Ok(());
+            }
+        } {
+            Ok(session) => session,
+            Err(error) => {
+                let error = ssh_error_to_io(error);
+                tracing::warn!(
+                    connection_id,
+                    peer_addr = ?peer_addr,
+                    error = %error,
+                    "native SSH connection failed during handshake"
+                );
+                return Err(error);
+            }
+        };
+        tokio::pin!(session);
+        let result = tokio::select! {
+            result = &mut session => result,
+            _ = retirement.changed() => {
+                drop(transport);
+                session.await
+            }
+        };
+        match result {
             Ok(()) => {
                 tracing::info!(
                     connection_id,
@@ -148,21 +186,47 @@ impl NativeSshBackend {
     }
 }
 
+struct SessionTransportGuard {
+    fd: OwnedFd,
+}
+
+impl Drop for SessionTransportGuard {
+    fn drop(&mut self) {
+        // RunningSession owns a detached russh task. Closing only its JoinHandle
+        // does not stop that task; shutting down the duplicated transport wakes
+        // its actual I/O and drops its handler, including forwarding cleanup.
+        let _ = nix::sys::socket::shutdown(self.fd.as_raw_fd(), nix::sys::socket::Shutdown::Both);
+    }
+}
+
 struct NativeSshHandler {
     connection_id: u64,
     auth: Arc<AuthDb>,
     process_supervisor: ProcessSupervisor,
+    environment: Arc<[(String, String)]>,
     authenticated_user: Option<UserEntry>,
     permit_pty: bool,
     permit_agent_forwarding: bool,
     channels: HashMap<ChannelId, ChannelState>,
     runtime: RuntimeHandle,
+    _writer: Option<crate::pid1::InternalWriterGuard>,
+    lifecycle: Option<Arc<crate::lifecycle::RuntimeContext>>,
+    retirement: Option<watch::Receiver<u64>>,
 }
 
 impl Drop for NativeSshHandler {
     fn drop(&mut self) {
+        let signal = if self
+            .retirement
+            .as_ref()
+            .is_some_and(|retirement| retirement.has_changed().unwrap_or(true))
+        {
+            Signal::SIGKILL
+        } else {
+            Signal::SIGTERM
+        };
         for (_, state) in self.channels.drain() {
-            state.terminate();
+            state.terminate_with_signal(signal);
         }
     }
 }
@@ -214,7 +278,15 @@ impl Handler for NativeSshHandler {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        if !valid_certificate(certificate, &self.auth.ca, user, now) {
+        let destination_ca = self
+            .lifecycle
+            .as_ref()
+            .map(|runtime| runtime.ssh_trusted_ca());
+        let ca = destination_ca
+            .as_ref()
+            .and_then(|guard| guard.as_ref())
+            .unwrap_or(&self.auth.ca);
+        if !valid_certificate(certificate, ca, user, now) {
             return Ok(Auth::reject());
         }
         let Some(account) = self.auth.users.get(user) else {
@@ -272,6 +344,7 @@ impl Handler for NativeSshHandler {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let _mutation = self.admit_mutation()?;
         if !self.permit_pty {
             session.channel_failure(channel)?;
             return Ok(());
@@ -311,12 +384,13 @@ impl Handler for NativeSshHandler {
         variable_value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let _mutation = self.admit_mutation()?;
         let Some(state) = self.channels.get_mut(&channel) else {
             session.channel_failure(channel)?;
             return Ok(());
         };
         if variable_name.starts_with("SILO_")
-            && valid_environment_name(variable_name)
+            && agent_spec::valid_environment_name(variable_name)
             && !variable_value.contains('\0')
         {
             state
@@ -334,6 +408,7 @@ impl Handler for NativeSshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        let _mutation = self.admit_mutation()?;
         if !self.permit_agent_forwarding {
             session.channel_failure(channel)?;
             return Ok(true);
@@ -351,21 +426,26 @@ impl Handler for NativeSshHandler {
             return Ok(true);
         }
         if state.agent_forward.is_none() {
-            let agent_forward =
-                match start_agent_forward(session.handle(), self.connection_id, channel, &user) {
-                    Ok(agent_forward) => agent_forward,
-                    Err(err) => {
-                        tracing::warn!(
-                            connection_id = self.connection_id,
-                            channel = channel.number(),
-                            user = %user.name,
-                            error = %err,
-                            "failed to enable native SSH agent forwarding"
-                        );
-                        session.channel_failure(channel)?;
-                        return Ok(true);
-                    }
-                };
+            let agent_forward = match start_agent_forward(
+                session.handle(),
+                self.connection_id,
+                channel,
+                &user,
+                &self.process_supervisor,
+            ) {
+                Ok(agent_forward) => agent_forward,
+                Err(err) => {
+                    tracing::warn!(
+                        connection_id = self.connection_id,
+                        channel = channel.number(),
+                        user = %user.name,
+                        error = %err,
+                        "failed to enable native SSH agent forwarding"
+                    );
+                    session.channel_failure(channel)?;
+                    return Ok(true);
+                }
+            };
             state.agent_forward = Some(agent_forward);
             tracing::info!(
                 connection_id = self.connection_id,
@@ -402,9 +482,16 @@ impl Handler for NativeSshHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let mutation = self.admit_mutation()?;
         if let Some(state) = self.channels.get(&channel) {
             if let Some(input) = &state.input {
-                if input.send(data.to_vec()).is_err() {
+                if input
+                    .send(InputChunk {
+                        data: data.to_vec(),
+                        _mutation: mutation,
+                    })
+                    .is_err()
+                {
                     tracing::debug!(channel = channel.number(), "SSH session stdin is closed");
                 }
             }
@@ -453,6 +540,7 @@ impl Handler for NativeSshHandler {
         pix_height: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let _mutation = self.admit_mutation()?;
         let Some(state) = self.channels.get_mut(&channel) else {
             session.channel_failure(channel)?;
             return Ok(());
@@ -461,20 +549,17 @@ impl Handler for NativeSshHandler {
             session.channel_failure(channel)?;
             return Ok(());
         };
-        resize_pty(
-            resize,
-            &PtyRequest {
-                term: state
-                    .pty
-                    .as_ref()
-                    .map(|request| request.term.clone())
-                    .unwrap_or_default(),
-                cols: col_width,
-                rows: row_height,
-                width_px: pix_width,
-                height_px: pix_height,
-            },
-        )?;
+        resize.resize(&PtyRequest {
+            term: state
+                .pty
+                .as_ref()
+                .map(|request| request.term.clone())
+                .unwrap_or_default(),
+            cols: col_width,
+            rows: row_height,
+            width_px: pix_width,
+            height_px: pix_height,
+        })?;
         if let Some(pty) = &mut state.pty {
             pty.cols = col_width;
             pty.rows = row_height;
@@ -498,6 +583,7 @@ impl Handler for NativeSshHandler {
         signal: Sig,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let _mutation = self.admit_mutation()?;
         let Some(state) = self.channels.get(&channel) else {
             return Ok(());
         };
@@ -519,12 +605,24 @@ impl Handler for NativeSshHandler {
 }
 
 impl NativeSshHandler {
+    fn admit_mutation(&self) -> eyre::Result<Option<crate::lifecycle::MutationLease>> {
+        self.lifecycle
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .admit_mutation()
+                    .map_err(|error| eyre::eyre!(error.to_string()))
+            })
+            .transpose()
+    }
+
     fn start_process(
         &mut self,
         channel: ChannelId,
         request: SessionRequest,
         session: &mut Session,
     ) -> Result<(), eyre::Report> {
+        let _mutation = self.admit_mutation()?;
         let Some(user) = self.authenticated_user.clone() else {
             session.channel_failure(channel)?;
             return Ok(());
@@ -545,6 +643,7 @@ impl NativeSshHandler {
             user,
             request,
             pty: state.pty.clone(),
+            inherited: Arc::clone(&self.environment),
             env: state.env.clone(),
             output: state
                 .output
@@ -573,6 +672,7 @@ impl NativeSshHandler {
                     .ok_or_else(|| eyre::eyre!("SSH channel disappeared after process spawn"))?;
                 state.input = Some(active.input);
                 state.process_group = Some(process_group);
+                state.pty_exited = active.pty_exited;
                 state.pty_resize = active.pty_resize;
                 state.io_lifetime = Some(active.io_lifetime);
                 session.channel_success(channel)?;
@@ -607,21 +707,42 @@ impl NativeSshHandler {
 struct ChannelState {
     pty: Option<PtyRequest>,
     env: HashMap<String, String>,
-    input: Option<mpsc::Sender<Vec<u8>>>,
+    input: Option<mpsc::UnboundedSender<InputChunk>>,
     process_group: Option<i32>,
-    pty_resize: Option<File>,
+    pty_resize: Option<Arc<PtyResize>>,
+    pty_exited: Option<watch::Receiver<bool>>,
     agent_forward: Option<AgentForward>,
     io_lifetime: Option<watch::Sender<()>>,
     output: Option<Arc<russh::ChannelWriteHalf<Msg>>>,
 }
 
 impl ChannelState {
-    fn terminate(mut self) {
+    fn terminate_with_signal(mut self, signal: Signal) {
         self.input = None;
-        if let Some(process_group) = self.process_group {
-            signal_process_group(process_group, Signal::SIGTERM);
+        if let Some(lifetime) = &self.io_lifetime {
+            lifetime.send_replace(());
+        }
+        if !self
+            .pty_exited
+            .as_ref()
+            .is_some_and(|exited| *exited.borrow())
+        {
+            if let Some(process_group) = self.process_group {
+                signal_process_group(process_group, signal);
+            }
         }
     }
+
+    fn terminate(self) {
+        self.terminate_with_signal(Signal::SIGTERM);
+    }
+}
+
+struct InputChunk {
+    data: Vec<u8>,
+    // Ownership crosses the queue into the actual nonblocking writer. Closing
+    // admission cannot mistake enqueue completion for kernel write completion.
+    _mutation: Option<crate::lifecycle::MutationLease>,
 }
 
 #[derive(Clone)]
@@ -634,9 +755,10 @@ struct PtyRequest {
 }
 
 struct ActiveProcess {
-    input: mpsc::Sender<Vec<u8>>,
+    input: mpsc::UnboundedSender<InputChunk>,
     process_group: i32,
-    pty_resize: Option<File>,
+    pty_resize: Option<Arc<PtyResize>>,
+    pty_exited: Option<watch::Receiver<bool>>,
     io_lifetime: watch::Sender<()>,
 }
 
@@ -644,6 +766,7 @@ struct ProcessLaunch {
     user: UserEntry,
     request: SessionRequest,
     pty: Option<PtyRequest>,
+    inherited: Arc<[(String, String)]>,
     env: HashMap<String, String>,
     agent_socket: Option<PathBuf>,
     output: Arc<russh::ChannelWriteHalf<Msg>>,
@@ -703,20 +826,13 @@ impl ProcessLaunch {
         }
         command.current_dir(&self.user.home);
         command.env_clear();
-        command.env("HOME", &self.user.home);
-        command.env("USER", &self.user.name);
-        command.env("LOGNAME", &self.user.name);
-        command.env("SHELL", shell);
-        command.env("PATH", DEFAULT_PATH);
-        if let Some(pty) = &self.pty {
-            command.env("TERM", &pty.term);
-        }
-        if let Some(agent_socket) = &self.agent_socket {
-            command.env("SSH_AUTH_SOCK", agent_socket);
-        }
-        for (key, value) in &self.env {
-            command.env(key, value);
-        }
+        command.envs(session_environment(
+            &self.inherited,
+            &self.user,
+            self.pty.as_ref().map(|pty| pty.term.as_str()),
+            self.agent_socket.as_deref(),
+            &self.env,
+        ));
         if new_process_group {
             command.process_group(0);
         }
@@ -753,16 +869,24 @@ impl ProcessLaunch {
             .stderr
             .take()
             .ok_or_else(|| eyre::eyre!("SSH session process stderr was not piped"))?;
-        let (input, input_rx) = mpsc::channel();
+        let (input, input_rx) = mpsc::unbounded_channel();
         let (io_lifetime, canceled) = watch::channel(());
 
-        spawn_input_writer(channel, input_rx, stdin, runtime.clone(), canceled.clone());
+        let _ = spawn_input_writer(
+            channel,
+            input_rx,
+            stdin,
+            runtime.clone(),
+            canceled.clone(),
+            guard.writer(),
+        );
         let stdout = spawn_output_reader(
             self.output.clone(),
             &runtime,
             stdout,
             OutputStream::Stdout,
             canceled.clone(),
+            guard.writer(),
         );
         let stderr = spawn_output_reader(
             self.output,
@@ -770,21 +894,27 @@ impl ProcessLaunch {
             stderr,
             OutputStream::Stderr,
             canceled,
+            guard.writer(),
         );
         spawn_exit_waiter(
-            connection_id,
-            channel,
-            handle,
+            SessionChannel {
+                connection_id,
+                channel,
+                handle,
+            },
             runtime,
             child,
             guard,
             [stdout, stderr],
+            process_supervisor.retirement_receiver(),
+            None,
         );
 
         Ok(ActiveProcess {
             input,
             process_group,
             pty_resize: None,
+            pty_exited: None,
             io_lifetime,
         })
     }
@@ -807,6 +937,7 @@ impl ProcessLaunch {
         let reader = master.try_clone().context("clone SSH pty reader")?;
         let writer = master.try_clone().context("clone SSH pty writer")?;
         let resize = master.try_clone().context("clone SSH pty resize handle")?;
+        drop(master);
         attach_pty_slave(&mut command, openpty.slave).context("attach SSH pty slave")?;
         prepare_pty_child(&mut command);
 
@@ -814,31 +945,53 @@ impl ProcessLaunch {
             .spawn_session_child(&mut command, "native ssh pty session")
             .context("spawn SSH pty session process")?;
         let process_group = process_group_from_child(&child)?;
-        let (input, input_rx) = mpsc::channel();
+        let (input, input_rx) = mpsc::unbounded_channel();
         let (io_lifetime, canceled) = watch::channel(());
+        let resize = Arc::new(PtyResize(Mutex::new(Some(resize))));
 
-        spawn_input_writer(channel, input_rx, writer, runtime.clone(), canceled.clone());
+        let writer = spawn_input_writer(
+            channel,
+            input_rx,
+            writer,
+            runtime.clone(),
+            canceled.clone(),
+            guard.writer(),
+        );
         let output = spawn_output_reader(
             self.output,
             &runtime,
             reader,
             OutputStream::Terminal,
             canceled,
+            guard.writer(),
         );
+        let pty_exited = output
+            .as_ref()
+            .ok()
+            .and_then(|output| output.pty_exited.as_ref().map(watch::Sender::subscribe));
         spawn_exit_waiter(
-            connection_id,
-            channel,
-            handle,
+            SessionChannel {
+                connection_id,
+                channel,
+                handle,
+            },
             runtime,
             child,
             guard,
             [output],
+            process_supervisor.retirement_receiver(),
+            Some(PtyCleanup {
+                canceled: io_lifetime.clone(),
+                writer,
+                resize: resize.clone(),
+            }),
         );
 
         Ok(ActiveProcess {
             input,
             process_group,
             pty_resize: Some(resize),
+            pty_exited,
             io_lifetime,
         })
     }
@@ -861,12 +1014,14 @@ impl SessionRequest {
 struct AgentForward {
     path: PathBuf,
     dir: PathBuf,
-    task: JoinHandle<()>,
+    shutdown: watch::Sender<bool>,
+    _task: Option<JoinHandle<()>>,
+    _worker: crate::pid1::InternalWriterGuard,
 }
 
 impl Drop for AgentForward {
     fn drop(&mut self) {
-        self.task.abort();
+        self.shutdown.send_replace(true);
         if let Err(err) = fs::remove_file(&self.path) {
             if err.kind() != io::ErrorKind::NotFound {
                 tracing::debug!(path = %self.path.display(), error = %err, "failed to remove SSH agent socket");
@@ -1063,6 +1218,45 @@ pub(crate) fn prepare_pty_child(command: &mut Command) {
     }
 }
 
+struct PtyResize(Mutex<Option<File>>);
+
+impl PtyResize {
+    fn resize(&self, request: &PtyRequest) -> io::Result<()> {
+        let master = match self.0.lock() {
+            Ok(master) => master,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let master = master
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        resize_pty(master, request)
+    }
+
+    fn close(&self) {
+        let mut master = match self.0.lock() {
+            Ok(master) => master,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        drop(master.take());
+    }
+}
+
+struct PtyCleanup {
+    canceled: watch::Sender<()>,
+    writer: Option<thread::JoinHandle<()>>,
+    resize: Arc<PtyResize>,
+}
+
+impl PtyCleanup {
+    fn close(self) {
+        self.canceled.send_replace(());
+        if let Some(writer) = self.writer {
+            let _ = writer.join();
+        }
+        self.resize.close();
+    }
+}
+
 fn resize_pty(master: &File, pty: &PtyRequest) -> io::Result<()> {
     let winsize = Winsize {
         ws_row: clamp_to_u16(pty.rows),
@@ -1102,52 +1296,127 @@ fn start_agent_forward(
     connection_id: u64,
     channel: ChannelId,
     user: &UserEntry,
+    supervisor: &ProcessSupervisor,
 ) -> io::Result<AgentForward> {
+    let worker = supervisor.admit_internal_writer()?;
     fs::create_dir_all(AGENT_SOCKET_DIR)?;
     fs::set_permissions(AGENT_SOCKET_DIR, fs::Permissions::from_mode(0o755))?;
 
     let dir = create_agent_socket_dir(user, connection_id, channel)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let (shutdown, mut stopped) = watch::channel(false);
+    let mut forward = AgentForward {
+        path: dir.join("agent"),
+        dir,
+        shutdown,
+        _task: None,
+        _worker: worker.clone(),
+    };
+    fs::set_permissions(&forward.dir, fs::Permissions::from_mode(0o700))?;
     chown(
-        &dir,
+        &forward.dir,
         Some(Uid::from_raw(user.uid)),
         Some(Gid::from_raw(user.gid)),
     )
     .map_err(io::Error::from)?;
-
-    let path = dir.join("agent");
-    let listener = UnixListener::bind(&path)?;
+    let listener = UnixListener::bind(&forward.path)?;
     chown(
-        &path,
+        &forward.path,
         Some(Uid::from_raw(user.uid)),
         Some(Gid::from_raw(user.gid)),
     )
     .map_err(io::Error::from)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-
-    let task = tokio::spawn(async move {
+    fs::set_permissions(&forward.path, fs::Permissions::from_mode(0o600))?;
+    let task_shutdown = forward.shutdown.clone();
+    let mut machine_shutdown = supervisor.shutdown_receiver();
+    forward._task = Some(tokio::spawn(async move {
+        let scope = worker;
+        let accepting = listener;
+        let mut proxies = tokio::task::JoinSet::new();
         loop {
-            let (mut local, _) = match listener.accept().await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    tracing::debug!(error = %err, "SSH agent socket accept failed");
+            while let Some(result) = proxies.try_join_next() {
+                if let Err(error) = result {
+                    tracing::debug!(%error, "SSH forwarding proxy task failed");
+                }
+            }
+            let connection = tokio::select! {
+                biased;
+                connection = accept_agent_forward(&accepting, &mut stopped, &mut machine_shutdown) => connection,
+                Some(result) = proxies.join_next(), if !proxies.is_empty() => {
+                    if let Err(error) = result { tracing::debug!(%error, "SSH forwarding proxy task failed"); }
+                    continue;
+                }
+            };
+            let local = match connection {
+                Ok(Some(stream)) => stream,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(%error, "SSH agent socket accept failed");
                     break;
                 }
             };
             let handle = handle.clone();
-            tokio::spawn(async move {
-                let Ok(channel) = handle.channel_open_agent().await else {
-                    tracing::debug!("failed to open SSH agent forwarding channel");
-                    return;
+            let mut proxy_stopped = stopped.clone();
+            let proxy_worker = scope.clone();
+            proxies.spawn(async move {
+                let _worker = proxy_worker;
+                let client = local;
+                let channel = tokio::select! {
+                    biased;
+                    () = forward_stopped(&mut proxy_stopped) => return,
+                    channel = handle.channel_open_agent() => match channel {
+                        Ok(channel) => channel,
+                        Err(error) => { tracing::debug!(%error, "failed to open SSH agent forwarding channel"); return; }
+                    },
                 };
-                let mut remote = channel.into_stream();
-                if let Err(err) = tokio::io::copy_bidirectional(&mut local, &mut remote).await {
-                    tracing::debug!(error = %err, "SSH agent forwarding proxy failed");
+                if let Err(error) = copy_agent_forward(client, channel.into_stream(), &mut proxy_stopped).await {
+                    tracing::debug!(%error, "SSH agent forwarding proxy failed");
                 }
             });
         }
-    });
-    Ok(AgentForward { path, dir, task })
+        task_shutdown.send_replace(true);
+        while proxies.join_next().await.is_some() {}
+    }));
+    Ok(forward)
+}
+
+async fn forward_stopped(stopped: &mut watch::Receiver<bool>) {
+    while !*stopped.borrow() {
+        if stopped.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn accept_agent_forward(
+    listener: &UnixListener,
+    stopped: &mut watch::Receiver<bool>,
+    machine_shutdown: &mut Option<watch::Receiver<bool>>,
+) -> io::Result<Option<tokio::net::UnixStream>> {
+    tokio::select! {
+        biased;
+        () = forward_stopped(stopped) => Ok(None),
+        () = async {
+            match machine_shutdown {
+                Some(receiver) => forward_stopped(receiver).await,
+                None => std::future::pending().await,
+            }
+        } => Ok(None),
+        connection = listener.accept() => connection.map(|(stream, _)| Some(stream)),
+    }
+}
+
+async fn copy_agent_forward(
+    local: tokio::net::UnixStream,
+    remote: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    stopped: &mut watch::Receiver<bool>,
+) -> io::Result<()> {
+    let mut local = local;
+    let mut remote = remote;
+    tokio::select! {
+        biased;
+        () = forward_stopped(stopped) => Ok(()),
+        result = tokio::io::copy_bidirectional(&mut local, &mut remote) => result.map(|_| ()),
+    }
 }
 
 fn create_agent_socket_dir(
@@ -1188,31 +1457,45 @@ fn nonblocking_io<T: AsFd + AsRawFd>(io: T) -> io::Result<AsyncFd<T>> {
 
 fn spawn_input_writer<W>(
     channel: ChannelId,
-    input: mpsc::Receiver<Vec<u8>>,
+    mut input: mpsc::UnboundedReceiver<InputChunk>,
     writer: W,
     runtime: RuntimeHandle,
     mut canceled: watch::Receiver<()>,
-) where
+    worker: Option<crate::pid1::InternalWriterGuard>,
+) -> Option<thread::JoinHandle<()>>
+where
     W: Write + AsFd + AsRawFd + Send + 'static,
 {
-    let mut writer = match nonblocking_io(writer) {
+    let writer = match nonblocking_io(writer) {
         Ok(writer) => writer,
         Err(err) => {
             tracing::warn!(channel = channel.number(), error = %err, "failed to prepare SSH stdin");
-            return;
+            return None;
         }
     };
-    if let Err(err) = thread::Builder::new()
+    match thread::Builder::new()
         .name(format!("silo-ssh-stdin-{}", channel.number()))
         .spawn(move || {
-            for data in input {
+            let _worker = worker;
+            let mut stdin = writer;
+            loop {
+                let data = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = canceled.changed() => None,
+                        data = input.recv() => data,
+                    }
+                });
+                let Some(data) = data else {
+                    break;
+                };
                 let result = runtime.block_on(async {
-                    let mut pending = data.as_slice();
+                    let mut pending = data.data.as_slice();
                     while !pending.is_empty() {
                         let mut ready = tokio::select! {
                             biased;
-                            _ = canceled.changed() => return Ok(()),
-                            ready = writer.writable_mut() => ready?,
+                            _ = canceled.changed() => return Ok(false),
+                            ready = stdin.writable_mut() => ready?,
                         };
                         match ready.try_io(|writer| writer.get_mut().write(pending)) {
                             Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
@@ -1222,9 +1505,9 @@ fn spawn_input_writer<W>(
                             Err(_) => {}
                         }
                     }
-                    Ok::<_, io::Error>(())
+                    Ok::<_, io::Error>(true)
                 });
-                if canceled.has_changed().is_err() {
+                if canceled.has_changed().unwrap_or(true) || matches!(result, Ok(false)) {
                     break;
                 }
                 if let Err(err) = result {
@@ -1236,8 +1519,17 @@ fn spawn_input_writer<W>(
             }
         })
     {
-        tracing::warn!(channel = channel.number(), error = %err, "failed to spawn SSH stdin thread");
+        Ok(writer) => Some(writer),
+        Err(err) => {
+            tracing::warn!(channel = channel.number(), error = %err, "failed to spawn SSH stdin thread");
+            None
+        }
     }
+}
+
+struct OutputReader {
+    task: JoinHandle<io::Result<()>>,
+    pty_exited: Option<watch::Sender<bool>>,
 }
 
 fn spawn_output_reader<R>(
@@ -1246,33 +1538,70 @@ fn spawn_output_reader<R>(
     reader: R,
     stream: OutputStream,
     mut canceled: watch::Receiver<()>,
-) -> io::Result<JoinHandle<io::Result<()>>>
+    worker: Option<crate::pid1::InternalWriterGuard>,
+) -> io::Result<OutputReader>
 where
     R: Read + AsFd + AsRawFd + Send + 'static,
 {
-    let mut reader = nonblocking_io(reader)?;
-    Ok(runtime.spawn(async move {
+    let reader = nonblocking_io(reader)?;
+    let (pty_exited, mut exited) = if matches!(stream, OutputStream::Terminal) {
+        let (sender, receiver) = watch::channel(false);
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let task = runtime.spawn(async move {
+        let _worker = worker;
+        let mut source = reader;
         let mut buffer = [0_u8; 8192];
+        let mut draining = false;
+        let mut remaining = PTY_EXIT_DRAIN_LIMIT;
         loop {
-            let mut ready = tokio::select! {
-                biased;
-                _ = canceled.changed() => return Ok(()),
-                ready = reader.readable_mut() => ready?,
+            let read = if draining {
+                if remaining == 0 {
+                    return Ok(());
+                }
+                let limit = buffer.len().min(remaining);
+                match source.get_mut().read(&mut buffer[..limit]) {
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    result => result,
+                }
+            } else {
+                let mut ready = tokio::select! {
+                    biased;
+                    _ = canceled.changed() => return Ok(()),
+                    _ = async {
+                        match &mut exited {
+                            Some(exited) => { let _ = exited.changed().await; }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        draining = true;
+                        continue;
+                    }
+                    ready = source.readable_mut() => ready?,
+                };
+                match ready.try_io(|reader| reader.get_mut().read(&mut buffer)) {
+                    Ok(result) => result,
+                    Err(_) => continue,
+                }
             };
-            let read = match ready.try_io(|reader| reader.get_mut().read(&mut buffer)) {
-                Ok(Ok(0)) => return Ok(()),
-                Ok(Ok(read)) => read,
-                Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => continue,
+            let read = match read {
+                Ok(0) => return Ok(()),
+                Ok(read) => read,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 // Linux PTY masters report EIO after the last slave closes.
-                Ok(Err(err))
+                Err(err)
                     if matches!(stream, OutputStream::Terminal)
-                        && err.raw_os_error() == Some(libc::EIO) =>
+                        && err.raw_os_error() == Some(nix::errno::Errno::EIO as i32) =>
                 {
                     return Ok(())
                 }
-                Ok(Err(err)) => return Err(err),
-                Err(_) => continue,
+                Err(err) => return Err(err),
             };
+            if draining {
+                remaining -= read;
+            }
             let data = buffer[..read].to_vec();
             let send = async {
                 match stream {
@@ -1288,30 +1617,42 @@ where
                 result = send => result.map_err(|_| io::Error::other("SSH output channel closed"))?,
             }
         }
-    }))
+    });
+    Ok(OutputReader { task, pty_exited })
 }
 
 fn spawn_exit_waiter<const N: usize>(
-    connection_id: u64,
-    channel: ChannelId,
-    handle: russh::server::Handle,
+    session: SessionChannel,
     runtime: RuntimeHandle,
     mut child: Child,
     guard: crate::pid1::ChildGuard,
-    outputs: [io::Result<JoinHandle<io::Result<()>>>; N],
+    outputs: [io::Result<OutputReader>; N],
+    retirement: Option<watch::Receiver<u64>>,
+    pty_cleanup: Option<PtyCleanup>,
 ) {
+    let SessionChannel {
+        connection_id,
+        channel,
+        handle,
+    } = session;
     if let Err(err) = thread::Builder::new()
         .name(format!("silo-ssh-wait-{}", channel.number()))
         .spawn(move || {
-            let status = child.wait();
-            drop(guard);
+            let status = crate::pid1::wait_retiring_child(&mut child, retirement);
+            for output in outputs.iter().flatten() {
+                if let Some(exited) = &output.pty_exited {
+                    exited.send_replace(true);
+                }
+            }
             // All data must enter the same russh queue before terminal frames.
             // Channel cancellation wakes both readiness and flow-control waits,
             // including readers whose pipe/PTY is still held by descendants.
+            // PTYs drain only the buffered tail after the leader exits, not
+            // until descendants release the slave. Pipes retain EOF semantics.
             let mut drained = true;
             for output in outputs {
                 let result = match output {
-                    Ok(output) => runtime.block_on(output)
+                    Ok(output) => runtime.block_on(output.task)
                         .map_err(|err| io::Error::other(err.to_string()))
                         .and_then(|result| result),
                     Err(err) => Err(err),
@@ -1320,6 +1661,9 @@ fn spawn_exit_waiter<const N: usize>(
                     drained = false;
                     tracing::warn!(channel = channel.number(), error = %err, "SSH output drain failed");
                 }
+            }
+            if let Some(pty) = pty_cleanup {
+                pty.close();
             }
             if drained {
                 match status {
@@ -1347,6 +1691,7 @@ fn spawn_exit_waiter<const N: usize>(
             }
             let _ = runtime.block_on(handle.eof(channel));
             let _ = runtime.block_on(handle.close(channel));
+            drop(guard);
         })
     {
         tracing::warn!(channel = channel.number(), error = %err, "failed to spawn SSH wait thread");
@@ -1360,13 +1705,43 @@ enum OutputStream {
     Terminal,
 }
 
-pub(crate) fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+/// Session environment, later layers win:
+///
+/// ```text
+///   DEFAULT_PATH            fallback for images without PATH
+///   inherited machine env   same base as `silo exec` (session-owned names removed)
+///   session identity        HOME USER LOGNAME SHELL [TERM] [SSH_AUTH_SOCK]
+///   client SILO_*           explicit per-session input
+/// ```
+fn session_environment<'a>(
+    inherited: &'a [(String, String)],
+    user: &'a UserEntry,
+    term: Option<&'a str>,
+    agent_socket: Option<&'a Path>,
+    client: &'a HashMap<String, String>,
+) -> BTreeMap<&'a str, &'a OsStr> {
+    let mut environment = BTreeMap::from([("PATH", OsStr::new(DEFAULT_PATH))]);
+    environment.extend(
+        inherited
+            .iter()
+            .map(|(name, value)| (name.as_str(), OsStr::new(value))),
+    );
+    environment.insert("HOME", user.home.as_os_str());
+    environment.insert("USER", OsStr::new(&user.name));
+    environment.insert("LOGNAME", OsStr::new(&user.name));
+    environment.insert("SHELL", OsStr::new(user.shell()));
+    if let Some(term) = term {
+        environment.insert("TERM", OsStr::new(term));
+    }
+    if let Some(agent_socket) = agent_socket {
+        environment.insert("SSH_AUTH_SOCK", agent_socket.as_os_str());
+    }
+    environment.extend(
+        client
+            .iter()
+            .map(|(name, value)| (name.as_str(), OsStr::new(value))),
+    );
+    environment
 }
 
 fn valid_certificate(cert: &Certificate, ca: &PublicKey, user: &str, now: u64) -> bool {
@@ -1492,6 +1867,7 @@ fn ssh_error_to_io(error: eyre::Report) -> io::Error {
 pub(crate) mod tests {
     use crate::pid1::ProcessSupervisor;
     use crate::ssh::agent::{persistent_host_key, valid_certificate, AuthDb, NativeSshHandler};
+
     use russh::keys::ssh_key::{
         certificate::{Builder, CertType},
         private::Ed25519Keypair,
@@ -1501,6 +1877,106 @@ pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::os::fd::{AsFd, AsRawFd};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn forwarding_accept_cancels_and_releases_listener_without_a_peer() {
+        for machine_stop in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let path = fixture.path().join("agent");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let supervisor = ProcessSupervisor::default();
+            let worker = supervisor.admit_internal_writer().unwrap();
+            let (owner, mut stopped) = tokio::sync::watch::channel(false);
+            let (machine, machine_rx) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(async move {
+                let _worker = worker;
+                let accepting = listener;
+                let mut machine_shutdown = Some(machine_rx);
+                crate::ssh::agent::accept_agent_forward(
+                    &accepting,
+                    &mut stopped,
+                    &mut machine_shutdown,
+                )
+                .await
+            });
+            let pending = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                supervisor.wait_internal_writers(),
+            )
+            .await
+            .is_err();
+            supervisor.begin_writer_shutdown().unwrap();
+            if machine_stop {
+                machine.send_replace(true);
+            } else {
+                owner.send_replace(true);
+            }
+            supervisor.wait_internal_writers().await.unwrap();
+            assert!(tokio::net::UnixStream::connect(&path).await.is_err());
+            assert!(task.await.unwrap().unwrap().is_none());
+            assert!(pending);
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarding_proxy_cancels_and_closes_both_streams_before_drain() {
+        use tokio::io::AsyncReadExt;
+        let (client, mut client_peer) = tokio::net::UnixStream::pair().unwrap();
+        let (remote, mut remote_peer) = tokio::net::UnixStream::pair().unwrap();
+        let supervisor = ProcessSupervisor::default();
+        let worker = supervisor.admit_internal_writer().unwrap();
+        let (owner, mut stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _worker = worker;
+            crate::ssh::agent::copy_agent_forward(client, remote, &mut stopped).await
+        });
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            supervisor.wait_internal_writers(),
+        )
+        .await
+        .is_err();
+        supervisor.begin_writer_shutdown().unwrap();
+        owner.send_replace(true);
+        supervisor.wait_internal_writers().await.unwrap();
+        let mut byte = [0_u8];
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client_peer.read(&mut byte)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                remote_peer.read(&mut byte)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            0
+        );
+        task.await.unwrap().unwrap();
+        assert!(pending);
+    }
+
+    #[test]
+    fn canceled_native_session_shuts_down_actual_transport_with_original_fd_alive() {
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let transport = crate::ssh::agent::SessionTransportGuard {
+            fd: stream.as_fd().try_clone_to_owned().unwrap(),
+        };
+        drop(transport);
+        let mut byte = [0_u8];
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        drop(stream);
+    }
 
     pub(crate) fn certificate(
         ca: &PrivateKey,
@@ -1559,6 +2035,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn session_environment_inherits_machine_env_under_session_identity() {
+        use std::ffi::OsStr;
+        let user = crate::ssh::agent::UserEntry {
+            name: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            groups: Vec::new(),
+            home: "/home/alice".into(),
+            shell: "/bin/bash".into(),
+        };
+        let machine = std::collections::BTreeMap::from(
+            [
+                (
+                    "PATH",
+                    "/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin",
+                ),
+                ("NIX_PATH", "/nix/channels"),
+                ("USER", "root"),
+                ("HOME", "/root"),
+                ("LOGNAME", "root"),
+                ("SHELL", "/bin/sh"),
+                ("MAIL", "/var/mail/root"),
+                ("TERM", "dumb"),
+                ("SSH_AUTH_SOCK", "/image/agent.sock"),
+                ("SILO_MODE", "image"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+        );
+        // Same projection NativeSshBackend::new stores for every session.
+        let inherited: Vec<_> = crate::ssh::inherited_environment(&machine)
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        let client = HashMap::from([("SILO_MODE".to_string(), "client".to_string())]);
+        let socket = std::path::Path::new("/run/silo-ssh-agent/1/agent");
+
+        let environment = crate::ssh::agent::session_environment(
+            &inherited,
+            &user,
+            Some("xterm-256color"),
+            Some(socket),
+            &client,
+        );
+        let expected = [
+            (
+                "PATH",
+                "/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin",
+            ),
+            ("NIX_PATH", "/nix/channels"),
+            ("HOME", "/home/alice"),
+            ("USER", "alice"),
+            ("LOGNAME", "alice"),
+            ("SHELL", "/bin/bash"),
+            ("TERM", "xterm-256color"),
+            ("SSH_AUTH_SOCK", "/run/silo-ssh-agent/1/agent"),
+            ("SILO_MODE", "client"),
+        ]
+        .map(|(name, value)| (name, OsStr::new(value)))
+        .into();
+        assert_eq!(environment, expected);
+
+        // Without a PTY, agent forwarding, or client input, image-provided
+        // session names stay dropped instead of resurfacing.
+        let no_client = HashMap::new();
+        let environment =
+            crate::ssh::agent::session_environment(&inherited, &user, None, None, &no_client);
+        for name in ["TERM", "SSH_AUTH_SOCK", "SILO_MODE", "MAIL"] {
+            assert!(!environment.contains_key(name), "{name} leaked");
+        }
+
+        // An image without PATH still gets a usable search path.
+        let environment =
+            crate::ssh::agent::session_environment(&[], &user, None, None, &no_client);
+        assert_eq!(
+            environment["PATH"],
+            OsStr::new(crate::ssh::agent::DEFAULT_PATH)
+        );
+    }
+
+    #[test]
     fn native_host_key_persists_with_private_permissions_and_rejects_corruption() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
@@ -1609,6 +2164,7 @@ pub(crate) mod tests {
             let auth = Arc::new(
                 AuthDb::from_config(&agent_spec::AgentSshConfig {
                     trusted_ca: Some(ca.public_key().to_openssh().unwrap()),
+                    ..Default::default()
                 })
                 .unwrap(),
             );
@@ -1628,6 +2184,9 @@ pub(crate) mod tests {
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
+            let lifecycle = crate::lifecycle::RuntimeContext::for_tests();
+            lifecycle.set_boot_ready(true);
+            let server_lifecycle = lifecycle.clone();
             let server = tokio::spawn(async move {
                 loop {
                     let (stream, _) = listener.accept().await.unwrap();
@@ -1635,11 +2194,15 @@ pub(crate) mod tests {
                         connection_id: 1,
                         auth: auth.clone(),
                         process_supervisor: ProcessSupervisor::default(),
+                        environment: Arc::from([]),
                         authenticated_user: None,
                         permit_pty: false,
                         permit_agent_forwarding: false,
                         channels: HashMap::new(),
                         runtime: tokio::runtime::Handle::current(),
+                        _writer: None,
+                        lifecycle: Some(server_lifecycle.clone()),
+                        retirement: None,
                     };
                     let config = config.clone();
                     tokio::spawn(async move {
@@ -1739,7 +2302,9 @@ pub(crate) mod tests {
             let mut client = russh::client::connect(
                 Arc::new(Default::default()),
                 address,
-                Client { key: host_public },
+                Client {
+                    key: host_public.clone(),
+                },
             )
             .await
             .unwrap();
@@ -1748,6 +2313,33 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .success());
+            let destination = PrivateKey::from(Ed25519Keypair::from_seed(&[9; 32]));
+            *lifecycle.ssh_trusted_ca() = Some(destination.public_key().clone());
+            for (authority, accepted) in [(&ca, false), (&destination, true)] {
+                let (key, cert) = certificate(authority, &user, now - 60, now + 300, false, false);
+                let mut connection = russh::client::connect(
+                    Arc::new(Default::default()),
+                    address,
+                    Client {
+                        key: host_public.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    connection
+                        .authenticate_openssh_cert(&user, key, cert)
+                        .await
+                        .unwrap()
+                        .success(),
+                    accepted,
+                    "new connections must accept only the destination authority after activation",
+                );
+                connection
+                    .disconnect(russh::Disconnect::ByApplication, "done", "en")
+                    .await
+                    .unwrap();
+            }
             server.abort();
         })
         .await
@@ -1767,7 +2359,10 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             for (_, state) in self.channels.drain() {
                 if let Some(group) = state.process_group {
-                    super::signal_process_group(group, nix::sys::signal::Signal::SIGKILL);
+                    crate::ssh::agent::signal_process_group(
+                        group,
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
                 }
                 state.terminate();
             }
@@ -1775,18 +2370,23 @@ pub(crate) mod tests {
     }
 
     fn track_output(
-        output: std::io::Result<tokio::task::JoinHandle<std::io::Result<()>>>,
+        output: std::io::Result<crate::ssh::agent::OutputReader>,
         finished: tokio::sync::mpsc::UnboundedSender<()>,
-    ) -> std::io::Result<tokio::task::JoinHandle<std::io::Result<()>>> {
+    ) -> std::io::Result<crate::ssh::agent::OutputReader> {
         output.map(|output| {
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let result = output
+                    .task
                     .await
                     .map_err(|err| std::io::Error::other(err.to_string()))
                     .and_then(|result| result);
                 let _ = finished.send(());
                 result
-            })
+            });
+            crate::ssh::agent::OutputReader {
+                task,
+                pty_exited: output.pty_exited,
+            }
         })
     }
 
@@ -1853,27 +2453,63 @@ pub(crate) mod tests {
             let runtime = tokio::runtime::Handle::current();
             let handle = session.handle();
             let (lifetime, canceled) = tokio::sync::watch::channel(());
-            state.io_lifetime = Some(lifetime);
+            state.io_lifetime = Some(lifetime.clone());
             let supervisor = ProcessSupervisor::default();
             if let Some(pty) = &state.pty {
                 let pty = super::open_session_pty(pty)?;
                 let master = std::fs::File::from(pty.master);
                 let reader = master.try_clone()?;
+                let (input, input_rx) = tokio::sync::mpsc::unbounded_channel();
+                let writer = crate::ssh::agent::spawn_input_writer(
+                    channel,
+                    input_rx,
+                    master.try_clone()?,
+                    runtime.clone(),
+                    canceled.clone(),
+                    None,
+                );
+                state.input = Some(input);
                 super::attach_pty_slave(&mut command, pty.slave)?;
                 super::prepare_pty_child(&mut command);
                 let (child, guard) =
                     supervisor.spawn_session_child(&mut command, "SSH drain test")?;
                 state.process_group = Some(super::process_group_from_child(&child)?);
-                state.pty_resize = Some(master);
-                let output = super::spawn_output_reader(
+                let resize = Arc::new(crate::ssh::agent::PtyResize(std::sync::Mutex::new(Some(
+                    master,
+                ))));
+                state.pty_resize = Some(resize.clone());
+                let output = crate::ssh::agent::spawn_output_reader(
                     state.output.as_ref().unwrap().clone(),
                     &runtime,
                     reader,
                     super::OutputStream::Terminal,
                     canceled,
+                    guard.writer(),
                 );
+                state.pty_exited = output.as_ref().ok().and_then(|output| {
+                    output
+                        .pty_exited
+                        .as_ref()
+                        .map(tokio::sync::watch::Sender::subscribe)
+                });
                 let output = track_output(output, self.outputs_finished.clone());
-                super::spawn_exit_waiter(1, channel, handle, runtime, child, guard, [output]);
+                crate::ssh::agent::spawn_exit_waiter(
+                    crate::ssh::agent::SessionChannel {
+                        connection_id: 1,
+                        channel,
+                        handle,
+                    },
+                    runtime,
+                    child,
+                    guard,
+                    [output],
+                    supervisor.retirement_receiver(),
+                    Some(crate::ssh::agent::PtyCleanup {
+                        canceled: lifetime,
+                        writer,
+                        resize,
+                    }),
+                );
             } else {
                 command.process_group(0);
                 command
@@ -1882,30 +2518,36 @@ pub(crate) mod tests {
                     .stderr(std::process::Stdio::piped());
                 let (mut child, guard) = supervisor.spawn_child(&mut command, "SSH drain test")?;
                 state.process_group = Some(super::process_group_from_child(&child)?);
-                let stdout = super::spawn_output_reader(
+                let stdout = crate::ssh::agent::spawn_output_reader(
                     state.output.as_ref().unwrap().clone(),
                     &runtime,
                     child.stdout.take().unwrap(),
                     super::OutputStream::Stdout,
                     canceled.clone(),
+                    guard.writer(),
                 );
                 let stdout = track_output(stdout, self.outputs_finished.clone());
-                let stderr = super::spawn_output_reader(
+                let stderr = crate::ssh::agent::spawn_output_reader(
                     state.output.as_ref().unwrap().clone(),
                     &runtime,
                     child.stderr.take().unwrap(),
                     super::OutputStream::Stderr,
                     canceled,
+                    guard.writer(),
                 );
                 let stderr = track_output(stderr, self.outputs_finished.clone());
-                super::spawn_exit_waiter(
-                    1,
-                    channel,
-                    handle,
+                crate::ssh::agent::spawn_exit_waiter(
+                    crate::ssh::agent::SessionChannel {
+                        connection_id: 1,
+                        channel,
+                        handle,
+                    },
                     runtime,
                     child,
                     guard,
                     [stdout, stderr],
+                    supervisor.retirement_receiver(),
+                    None,
                 );
             }
             session.channel_success(channel)?;
@@ -2062,6 +2704,89 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_pty_exit_drains_tail_without_waiting_for_background_slave() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (client, server, mut finished) = process_output_connection().await;
+            let mut channel = client.channel_open_session().await.unwrap();
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(
+                channel.wait().await,
+                Some(russh::ChannelMsg::Success)
+            ));
+            channel
+                .exec(
+                    true,
+                    "trap '' HUP; sleep 600 & printf 'retained:%s\\ndone\\n' \"$$\"; exit 7",
+                )
+                .await
+                .unwrap();
+            let mut output = Vec::new();
+            let mut cleanup = None;
+            let mut status = None;
+            let mut eof = false;
+            let mut closed = false;
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::Success => {}
+                    russh::ChannelMsg::Data { data } => {
+                        assert!(status.is_none() && !eof, "output after terminal frames");
+                        output.extend_from_slice(&data);
+                        if cleanup.is_none() {
+                            if let Some(end) = output.iter().position(|byte| *byte == b'\n') {
+                                let pid = std::str::from_utf8(&output[..end])
+                                    .unwrap()
+                                    .trim()
+                                    .strip_prefix("retained:")
+                                    .unwrap()
+                                    .parse::<i32>()
+                                    .unwrap();
+                                cleanup = Some(KillTestGroup(nix::unistd::Pid::from_raw(pid)));
+                            }
+                        }
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                    russh::ChannelMsg::Eof => {
+                        assert_eq!(status, Some(7));
+                        eof = true;
+                    }
+                    russh::ChannelMsg::Close => {
+                        closed = true;
+                        break;
+                    }
+                    other => panic!("unexpected PTY message: {other:?}"),
+                }
+            }
+            assert!(eof && closed);
+            assert_eq!(status, Some(7));
+            assert!(output.ends_with(b"\r\ndone\r\n"));
+            finished
+                .recv()
+                .await
+                .expect("PTY output reader must finish");
+            // Round-trip another channel so the first channel's close
+            // acknowledgement has reached the server's cleanup callback.
+            let probe = client.channel_open_session().await.unwrap();
+            probe.close().await.unwrap();
+            let cleanup = cleanup.expect("session process group");
+            assert!(
+                nix::sys::signal::killpg(cleanup.0, None).is_ok(),
+                "normal PTY exit must not terminate the background job"
+            );
+            client
+                .disconnect(russh::Disconnect::ByApplication, "done", "en")
+                .await
+                .unwrap();
+            drop(client);
+            server.await.unwrap();
+        })
+        .await
+        .expect("PTY session must close while a descendant holds the slave");
+    }
+
     async fn check_cancel_retained_output(pty: bool, disconnect: bool) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let (client, server, mut finished) = process_output_connection().await;
@@ -2085,7 +2810,11 @@ pub(crate) mod tests {
             channel
                 .exec(
                     true,
-                    "trap '' HUP TERM; sleep 60 & printf 'retained:%s\\n' \"$$\"; exit 7",
+                    if pty {
+                        "trap '' HUP TERM; sleep 60 & printf 'retained:%s\\n' \"$$\"; sleep 60"
+                    } else {
+                        "trap '' HUP TERM; sleep 60 & printf 'retained:%s\\n' \"$$\"; exit 7"
+                    },
                 )
                 .await
                 .unwrap();
@@ -2211,7 +2940,7 @@ pub(crate) mod tests {
             let (client, server, _) = process_output_connection().await;
             let channel = client.channel_open_session().await.unwrap();
             let (mut reader, writer) = if pty {
-                let pty = super::open_process_pty(119, 37, 0, 0).unwrap();
+                let pty = crate::ssh::agent::open_process_pty(119, 37, 0, 0).unwrap();
                 let mut termios = nix::sys::termios::tcgetattr(&pty.slave).unwrap();
                 nix::sys::termios::cfmakeraw(&mut termios);
                 nix::sys::termios::tcsetattr(
@@ -2236,27 +2965,54 @@ pub(crate) mod tests {
                 blocked: Some(blocked),
                 released: Some(released),
             };
-            let (input, receiver) = std::sync::mpsc::channel();
+            let (input, receiver) = tokio::sync::mpsc::unbounded_channel();
             let (lifetime, canceled) = tokio::sync::watch::channel(());
-            super::spawn_input_writer(
+            let writer = crate::ssh::agent::spawn_input_writer(
                 channel.id(),
                 receiver,
                 writer,
                 tokio::runtime::Handle::current(),
                 canceled,
-            );
+                None,
+            )
+            .unwrap();
             let payload = vec![b'b'; 1024 * 1024];
-            input.send(payload.clone()).unwrap();
+            let runtime_context = crate::lifecycle::RuntimeContext::for_tests();
+            input
+                .send(crate::ssh::agent::InputChunk {
+                    data: payload.clone(),
+                    _mutation: Some(runtime_context.admit_mutation().unwrap()),
+                })
+                .unwrap();
             // This notification is issued only for an actual EAGAIN from the
             // real kernel descriptor, after earlier partial writes succeeded.
             let written = blocked_rx.await.unwrap();
             assert!(written > 0 && written < payload.len());
+            assert_eq!(
+                Arc::strong_count(&runtime_context),
+                2,
+                "actual backpressured input must retain its mutation admission"
+            );
             drop(lifetime);
             released_rx
                 .await
                 .expect("cancellation must release the blocked input descriptor");
+            tokio::task::spawn_blocking(move || writer.join())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                Arc::strong_count(&runtime_context),
+                1,
+                "canceled kernel writer must release its mutation admission"
+            );
             assert!(
-                input.send(vec![b'x']).is_err(),
+                input
+                    .send(crate::ssh::agent::InputChunk {
+                        data: vec![b'x'],
+                        _mutation: None
+                    })
+                    .is_err(),
                 "input worker must stop after cancellation"
             );
             if !pty {
@@ -2337,12 +3093,13 @@ pub(crate) mod tests {
                 read: Some(read),
             };
             let (lifetime, canceled) = tokio::sync::watch::channel(());
-            let task = super::spawn_output_reader(
+            let task = crate::ssh::agent::spawn_output_reader(
                 output.clone(),
                 &tokio::runtime::Handle::current(),
                 reader,
                 super::OutputStream::Stdout,
                 canceled,
+                None,
             )
             .unwrap();
             // This test uses the current-thread runtime. The synchronous read
@@ -2351,11 +3108,11 @@ pub(crate) mod tests {
             assert!(observed.await.unwrap() > 0);
             assert_eq!(output.writable_packet_size().await, 0);
             assert!(
-                !task.is_finished(),
+                !task.task.is_finished(),
                 "output must remain blocked on real SSH window credit"
             );
             drop(lifetime);
-            task.await.unwrap().unwrap();
+            task.task.await.unwrap().unwrap();
             assert!(child.wait().unwrap().success());
             channel.close().await.unwrap();
             client

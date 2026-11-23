@@ -1,14 +1,22 @@
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use eyre::Context;
+use nix::fcntl::OFlag;
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::poll::{poll, PollFd, PollFlags};
+use nix::sched::{unshare, CloneFlags};
 use nix::sys::signal::{self, SigHandler, SigSet, SigmaskHow, Signal};
-use nix::unistd::{execv, fork, setsid, ForkResult};
+use nix::unistd::{execv, fork, pipe2, setsid, ForkResult};
 use protocol::v1::{GuestBootMode, GuestBootReport};
+
+use crate::freezer::{Protection, ProtectionFailure, WorkloadController};
 
 const HANDOFF_AUTO: &str = "auto";
 pub(crate) const HANDOFF_AUTO_CANDIDATES: &[&str] = &[
@@ -25,6 +33,11 @@ pub(crate) enum BootMode {
         requested_init: OsString,
     },
     InitChild {
+        requested_init: OsString,
+        init_path: PathBuf,
+        containment_failure: String,
+    },
+    ContainedInit {
         requested_init: OsString,
         init_path: PathBuf,
     },
@@ -59,6 +72,7 @@ impl BootMode {
             Self::InitChild {
                 requested_init,
                 init_path,
+                containment_failure,
             } => GuestBootReport {
                 mode: Some(GuestBootMode::InitChild as i32),
                 requested_init: Some(os_to_string(requested_init)),
@@ -66,8 +80,23 @@ impl BootMode {
                 probed_init_paths: probed_init_paths(requested_init),
                 agent_path: Some(current_agent_path()),
                 agent_pid: Some(agent_pid),
-                agent_is_pid1: Some(agent_pid == 1),
-                message: Some(String::from("agent handed PID 1 to guest init")),
+                agent_is_pid1: Some(false),
+                message: Some(format!(
+                    "agent handed PID 1 to guest init; containment qualification failed: {containment_failure}"
+                )),
+            },
+            Self::ContainedInit {
+                requested_init,
+                init_path,
+            } => GuestBootReport {
+                mode: Some(GuestBootMode::ContainedInit as i32),
+                requested_init: Some(os_to_string(requested_init)),
+                handoff_init_path: Some(init_path.display().to_string()),
+                probed_init_paths: probed_init_paths(requested_init),
+                agent_path: Some(current_agent_path()),
+                agent_pid: Some(agent_pid),
+                agent_is_pid1: Some(false),
+                message: Some(String::from("agent handed PID 1 to a contained guest init")),
             },
         }
     }
@@ -98,7 +127,10 @@ fn os_to_string(value: &OsStr) -> String {
     value.to_string_lossy().into_owned()
 }
 
-pub(crate) fn maybe_handoff_init(requested_init: &OsStr) -> eyre::Result<BootMode> {
+pub(crate) fn maybe_handoff_init(
+    requested_init: &OsStr,
+    workloads: &WorkloadController,
+) -> eyre::Result<BootMode> {
     let Some(target) = resolve_handoff_target(requested_init)? else {
         tracing::info!(
             requested_init = ?requested_init,
@@ -109,7 +141,7 @@ pub(crate) fn maybe_handoff_init(requested_init: &OsStr) -> eyre::Result<BootMod
         });
     };
 
-    fork_handoff_init(requested_init, &target)
+    fork_handoff_init(requested_init, &target, workloads)
 }
 
 fn resolve_handoff_target(requested_init: &OsStr) -> eyre::Result<Option<PathBuf>> {
@@ -169,41 +201,249 @@ fn is_agent_binary(path: &Path, agent_path: &Path) -> bool {
     }
 }
 
-fn fork_handoff_init(requested_init: &OsStr, target: &Path) -> eyre::Result<BootMode> {
+fn fork_handoff_init(
+    requested_init: &OsStr,
+    target: &Path,
+    workloads: &WorkloadController,
+) -> eyre::Result<BootMode> {
     let init = CString::new(target.as_os_str().as_bytes())
         .with_context(|| format!("prepare init path {}", target.display()))?;
+    let (reader, writer) = pipe2(OFlag::O_CLOEXEC).context("create init handoff status pipe")?;
 
     // Fork before constructing the Tokio runtime so the child does not inherit
     // async runtime internals. PID 1 becomes the guest init; the child remains
     // the Silo agent.
     match unsafe { fork() }.context("fork init handoff")? {
-        ForkResult::Parent { .. } => exec_handoff_parent(&init, target),
+        ForkResult::Parent { .. } => {
+            drop(reader);
+            let result = contain_handoff_parent(workloads);
+            if let Err(error) = &result {
+                tracing::error!(%error, "image init containment failed; retaining cold boot");
+            }
+            let status = [u8::from(result.is_err())];
+            loop {
+                match nix::unistd::write(&writer, &status) {
+                    Ok(1) => break,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    result => {
+                        tracing::error!(?result, "failed to report image init containment");
+                        break;
+                    }
+                }
+            }
+            exec_handoff_parent(&init, target, writer)
+        }
         ForkResult::Child => {
+            let agent_protection_setup = protect_agent_child();
+            drop(writer);
             if let Err(err) = setsid() {
                 tracing::warn!(error = %err, "failed to isolate agent child session");
             }
-            tracing::info!(init = %target.display(), "continuing as agent after init handoff");
-            Ok(BootMode::InitChild {
-                requested_init: requested_init.to_os_string(),
-                init_path: target.to_path_buf(),
-            })
+            let containment = observe_handoff(&reader);
+            let observed_protections =
+                observe_agent_protections().and_then(|()| workloads.observe_protections());
+            let protections = workloads
+                .protection_setup()
+                .and(agent_protection_setup.as_ref().copied())
+                .and(observed_protections.as_ref().copied());
+            if let Err(error) = protections {
+                tracing::error!(%error, "required agent protection failed; live operations refused");
+            }
+            if let Err(containment_failure) = &containment {
+                tracing::warn!(%containment_failure, "image init containment not established");
+            }
+            Ok(qualified_handoff_mode(
+                requested_init,
+                target,
+                containment,
+                protections,
+            ))
         }
     }
 }
 
-fn exec_handoff_parent(init: &std::ffi::CStr, target: &Path) -> eyre::Result<BootMode> {
+fn protect_agent_child() -> Result<(), ProtectionFailure> {
+    let oom = fs::write("/proc/self/oom_score_adj", b"-1000")
+        .map_err(|error| ProtectionFailure::new(Protection::AgentOomScoreAdj, error));
+    let dumpable = nix::sys::prctl::set_dumpable(false)
+        .map_err(|error| ProtectionFailure::new(Protection::AgentDumpable, error));
+    oom.and(dumpable)
+}
+
+fn observe_agent_protections() -> Result<(), ProtectionFailure> {
+    let oom = fs::read_to_string("/proc/self/oom_score_adj")
+        .map_err(|error| ProtectionFailure::new(Protection::AgentOomScoreAdj, error))?;
+    let dumpable = nix::sys::prctl::get_dumpable()
+        .map_err(|error| ProtectionFailure::new(Protection::AgentDumpable, error))?;
+    qualify_agent_protections(&oom, dumpable)
+}
+
+fn qualify_agent_protections(oom: &str, dumpable: bool) -> Result<(), ProtectionFailure> {
+    Protection::AgentOomScoreAdj.qualify_value(oom, -1000)?;
+    if dumpable {
+        return Err(ProtectionFailure::new(
+            Protection::AgentDumpable,
+            io::Error::other("agent remains dumpable"),
+        ));
+    }
+    Ok(())
+}
+
+fn qualified_handoff_mode(
+    requested_init: &OsStr,
+    target: &Path,
+    containment: Result<(), String>,
+    protections: Result<(), &ProtectionFailure>,
+) -> BootMode {
+    match protections.map_err(ToString::to_string).and(containment) {
+        Ok(()) => BootMode::ContainedInit {
+            requested_init: requested_init.to_os_string(),
+            init_path: target.to_path_buf(),
+        },
+        Err(containment_failure) => BootMode::InitChild {
+            requested_init: requested_init.to_os_string(),
+            init_path: target.to_path_buf(),
+            containment_failure,
+        },
+    }
+}
+
+fn contain_handoff_parent(workloads: &WorkloadController) -> eyre::Result<()> {
+    workloads
+        .place_handoff_parent()
+        .context("place image PID 1")?;
+    unshare(CloneFlags::CLONE_NEWCGROUP).context("unshare image cgroup namespace")?;
+    umount2("/sys/fs/cgroup", MntFlags::MNT_DETACH).context("detach initial cgroup mount")?;
+    mount(
+        Some("cgroup2"),
+        "/sys/fs/cgroup",
+        Some("cgroup2"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .context("mount image cgroup namespace")
+}
+
+fn read_handoff_status(reader: &OwnedFd) -> io::Result<u8> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut status = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "handoff status/EOF deadline",
+            ));
+        }
+        let mut descriptors = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut descriptors, 10_u16) {
+            Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+            Ok(_) => {}
+            Err(error) => return Err(io::Error::from(error)),
+        }
+        let mut byte = [0_u8; 1];
+        match nix::unistd::read(reader, &mut byte) {
+            Ok(0) => {
+                return status.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "handoff status missing")
+                })
+            }
+            Ok(_) if status.is_none() => status = Some(byte[0]),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "extra handoff status",
+                ))
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+}
+
+fn observe_handoff(reader: &OwnedFd) -> Result<(), String> {
+    let status = read_handoff_status(reader).map_err(|error| format!("status pipe: {error}"))?;
+    let image_namespace = fs::read_link("/proc/1/ns/cgroup")
+        .map_err(|error| format!("PID 1 cgroup namespace: {error}"))?;
+    let agent_namespace = fs::read_link("/proc/self/ns/cgroup")
+        .map_err(|error| format!("agent cgroup namespace: {error}"))?;
+    let membership = fs::read_to_string("/proc/1/cgroup")
+        .map_err(|error| format!("PID 1 cgroup membership: {error}"))?;
+    let mounts = fs::read_to_string("/proc/1/mountinfo")
+        .map_err(|error| format!("PID 1 cgroup mount: {error}"))?;
+    qualify_handoff(
+        status,
+        image_namespace != agent_namespace,
+        &membership,
+        &mounts,
+    )
+    .map_err(str::to_owned)
+}
+
+fn qualify_handoff(
+    status: u8,
+    distinct_namespace: bool,
+    membership: &str,
+    mounts: &str,
+) -> Result<(), &'static str> {
+    if status != 0 {
+        return Err("parent reported cgroup setup failure");
+    }
+    if !distinct_namespace {
+        return Err("PID 1 shares the agent cgroup namespace");
+    }
+    if crate::containment::parse_cgroup(membership) != Ok("/silo/workloads/image") {
+        return Err("PID 1 is not in /silo/workloads/image");
+    }
+    if cgroup_mount_root(mounts) != Some("/silo/workloads/image") {
+        return Err("PID 1 cgroup2 mount root is not /silo/workloads/image");
+    }
+    Ok(())
+}
+
+fn cgroup_mount_root(mounts: &str) -> Option<&str> {
+    let mut root = None;
+    for line in mounts.lines() {
+        let (mount, filesystem) = line.split_once(" - ")?;
+        let mut fields = mount.split_ascii_whitespace();
+        let candidate = fields.nth(3)?;
+        if fields.next()? != "/sys/fs/cgroup" {
+            continue;
+        }
+        if filesystem.split_ascii_whitespace().next()? != "cgroup2" || root.is_some() {
+            return None;
+        }
+        root = Some(candidate);
+    }
+    root
+}
+
+fn exec_handoff_parent(
+    init: &std::ffi::CStr,
+    target: &Path,
+    writer: OwnedFd,
+) -> eyre::Result<BootMode> {
     reset_handoff_exec_state();
     if let Err(err) = std::env::set_current_dir("/") {
         tracing::error!(error = %err, "failed to chdir before init handoff exec");
-        std::process::exit(127);
     }
 
+    // nix has no close_range wrapper. PID 1 must not retain agent cgroup/proc handles.
+    if unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) } < 0 {
+        tracing::error!(error = %io::Error::last_os_error(), "failed to close inherited init descriptors");
+        drop(writer);
+    } else {
+        // close_range consumed this descriptor along with all other agent handles.
+        std::mem::forget(writer);
+    }
     let argv = [init];
-    match execv(init, &argv) {
-        Ok(_) => unreachable!("execv returned after replacing the process"),
-        Err(err) => {
-            tracing::error!(init = %target.display(), error = %err, "failed to exec handoff init");
-            std::process::exit(127);
+    loop {
+        match execv(init, &argv) {
+            Ok(never) => match never {},
+            Err(error) => {
+                tracing::error!(init = %target.display(), %error, "failed to exec handoff init");
+                // Exiting PID 1 panics the kernel; keep it alive if exec becomes unavailable.
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
     }
 }
@@ -372,6 +612,146 @@ mod tests {
         assert!(!should_reset_signal(Signal::SIGSTOP));
         assert!(should_reset_signal(Signal::SIGTERM));
         assert!(should_reset_signal(Signal::SIGCHLD));
+    }
+
+    #[test]
+    fn handoff_qualification_requires_every_observation() {
+        let mounts =
+            "33 22 0:22 /silo/workloads/image /sys/fs/cgroup rw - cgroup2 cgroup2 rw,nsdelegate\n";
+        let membership = "0::/silo/workloads/image\n";
+        assert_eq!(
+            crate::handoff::qualify_handoff(0, true, membership, mounts),
+            Ok(())
+        );
+        assert!(crate::handoff::qualify_handoff(1, true, membership, mounts).is_err());
+        assert!(crate::handoff::qualify_handoff(0, false, membership, mounts).is_err());
+        for invalid in ["", "0::/\n", "0::/silo/workloads/image/child\n"] {
+            assert!(crate::handoff::qualify_handoff(0, true, invalid, mounts).is_err());
+        }
+        for invalid in [
+            "",
+            "invalid",
+            "33 22 0:22 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            "33 22 0:22 /silo/workloads/image /sys/fs/cgroup rw - tmpfs tmpfs rw\n",
+        ] {
+            assert!(crate::handoff::qualify_handoff(0, true, membership, invalid).is_err());
+        }
+        assert_eq!(
+            crate::handoff::cgroup_mount_root(&format!("{mounts}{mounts}")),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_protection_qualification_requires_oom_immunity_and_non_dumpability() {
+        use crate::handoff::qualify_agent_protections;
+
+        qualify_agent_protections("-1000\n", false).unwrap();
+        for oom in ["", "invalid", "-1001", "-999", "-1", "0", "1000"] {
+            assert!(qualify_agent_protections(oom, false).is_err());
+        }
+        assert!(qualify_agent_protections("-1000\n", true).is_err());
+    }
+
+    #[test]
+    fn contained_init_requires_protections_even_when_containment_succeeded() {
+        use crate::freezer::Protection;
+        use crate::handoff::{qualified_handoff_mode, qualify_agent_protections, BootMode};
+
+        let requested_init = OsStr::new("/sbin/init");
+        let target = Path::new("/sbin/init");
+        let qualified = qualified_handoff_mode(requested_init, target, Ok(()), Ok(()));
+        assert!(matches!(qualified, BootMode::ContainedInit { .. }));
+        assert!(matches!(
+            qualified_handoff_mode(
+                requested_init,
+                target,
+                Err("not contained".to_owned()),
+                Ok(())
+            ),
+            BootMode::InitChild { .. },
+        ));
+        for failure in [
+            Protection::SiloMemoryMin.qualify_value("0", 16_777_216),
+            Protection::ControlMemoryMin.qualify_value("0", 16_777_216),
+            Protection::ControlCpuWeight.qualify_value("100", 1000),
+            Protection::WorkloadPidLimit.qualify_value("max", 32256),
+            qualify_agent_protections("0", false),
+            qualify_agent_protections("-1000", true),
+        ] {
+            let error = failure.unwrap_err();
+            let boot = qualified_handoff_mode(requested_init, target, Ok(()), Err(&error));
+            let BootMode::InitChild {
+                containment_failure,
+                ..
+            } = &boot
+            else {
+                panic!("missing protection must not qualify ContainedInit");
+            };
+            assert_eq!(containment_failure, &error.to_string());
+            assert_eq!(boot.report().mode, Some(GuestBootMode::InitChild as i32));
+            assert!(boot.report().message.unwrap().contains(&error.to_string()));
+        }
+    }
+
+    #[test]
+    fn contained_boot_report_is_not_agent_pid1() {
+        let report = crate::handoff::BootMode::ContainedInit {
+            requested_init: OsStr::new("/sbin/init").to_owned(),
+            init_path: "/sbin/init".into(),
+        }
+        .report();
+        assert_eq!(report.mode, Some(GuestBootMode::ContainedInit as i32));
+        assert_eq!(report.agent_is_pid1, Some(false));
+        assert_eq!(
+            report.message.as_deref(),
+            Some("agent handed PID 1 to a contained guest init")
+        );
+    }
+
+    #[test]
+    fn failed_handoff_report_names_the_observation() {
+        let report = crate::handoff::BootMode::InitChild {
+            requested_init: OsStr::new("/sbin/init").to_owned(),
+            init_path: "/sbin/init".into(),
+            containment_failure: "PID 1 shares the agent cgroup namespace".to_owned(),
+        }
+        .report();
+        assert_eq!(report.mode, Some(GuestBootMode::InitChild as i32));
+        assert!(report
+            .message
+            .unwrap()
+            .contains("PID 1 shares the agent cgroup namespace"));
+    }
+
+    #[test]
+    fn handoff_pipe_requires_one_status_byte_and_eof() {
+        for status in [0_u8, 1] {
+            let (reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+            nix::unistd::write(&writer, &[status]).unwrap();
+            drop(writer);
+            assert_eq!(
+                crate::handoff::read_handoff_status(&reader).unwrap(),
+                status
+            );
+        }
+        let (reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+        drop(writer);
+        assert_eq!(
+            crate::handoff::read_handoff_status(&reader)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof,
+        );
+        let (reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+        nix::unistd::write(&writer, &[0, 1]).unwrap();
+        drop(writer);
+        assert_eq!(
+            crate::handoff::read_handoff_status(&reader)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData,
+        );
     }
 
     fn resolve_with_candidates(

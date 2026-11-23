@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -10,8 +11,11 @@ use std::sync::{mpsc as std_mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use agent_spec::valid_environment_name;
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::signal::Signal;
 use nix::unistd::{getgrouplist, Gid};
 use protocol::v1::guest_process_event::Event;
@@ -31,7 +35,7 @@ use uuid::Uuid;
 use crate::pid1::{ChildGuard, ProcessSupervisor};
 use crate::ssh::agent::{
     attach_pty_slave, open_process_pty, prepare_identity_child, prepare_pty_child,
-    resize_process_pty, signal_process_group, valid_environment_name,
+    resize_process_pty, signal_process_group,
 };
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -68,8 +72,7 @@ impl Drop for ProcessEventStream {
 
 #[derive(Clone)]
 pub(crate) struct GuestProcessServiceImpl {
-    instance_id: String,
-    boot_id: String,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
     process_supervisor: ProcessSupervisor,
     active_executions: Arc<Mutex<HashSet<Uuid>>>,
     capacity: Arc<Semaphore>,
@@ -77,13 +80,11 @@ pub(crate) struct GuestProcessServiceImpl {
 
 impl GuestProcessServiceImpl {
     pub(crate) fn new(
-        instance_id: String,
-        boot_id: String,
+        runtime: Arc<crate::lifecycle::RuntimeContext>,
         process_supervisor: ProcessSupervisor,
     ) -> Self {
         Self {
-            instance_id,
-            boot_id,
+            runtime,
             process_supervisor,
             active_executions: Arc::new(Mutex::new(HashSet::new())),
             capacity: Arc::new(Semaphore::new(64)),
@@ -99,11 +100,26 @@ impl GuestProcessService for GuestProcessServiceImpl {
         &self,
         request: Request<tonic::Streaming<protocol::v1::GuestProcessInput>>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
+        let mut retirement = self.runtime.retirement();
+        let session = self.runtime.admit_session()?;
+        let session_supervisor = self
+            .process_supervisor
+            .with_session(session, retirement.clone());
+        let worker = session_supervisor
+            .admit_internal_writer()
+            .map_err(|error| {
+                protocol::detailed_status(Status::unavailable(format!(
+                    "guest process I/O admission stopped: {error}"
+                )))
+            })?;
+        let mut shutdown = self.process_supervisor.shutdown_receiver();
         let mut input = request.into_inner();
-        let first = input
-            .message()
-            .await
-            .map_err(protocol::detailed_status)?
+        let first = tokio::select! {
+            biased;
+            () = machine_io_stopped(&mut shutdown) => return Err(protocol::detailed_status(Status::unavailable("guest process admission is stopping"))),
+            _ = retirement.changed() => return Err(Status::failed_precondition("captured execution transport retired")),
+            message = input.message() => message,
+        }.map_err(protocol::detailed_status)?
             .ok_or_else(|| {
                 invalid_request("the first Execute request must be StartGuestProcess")
             })?;
@@ -131,6 +147,13 @@ impl GuestProcessService for GuestProcessServiceImpl {
             ExecutionLease::acquire(Arc::clone(&self.active_executions), execution_id, permit)?;
         let (events, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (cancel, cancel_receiver) = watch::channel(false);
+        let retirement_cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = retirement.changed() => { retirement_cancel.send_replace(true); }
+                _ = retirement_cancel.closed() => {}
+            }
+        });
 
         let plan = match ProcessPlan::from_start(start) {
             Ok(plan) => plan,
@@ -138,7 +161,12 @@ impl GuestProcessService for GuestProcessServiceImpl {
                 log_launch_failure(execution_id, &failure);
                 let _ = events.try_send(Ok(failure.event()));
                 drop(execution);
-                tokio::spawn(drain_rejected_input(input, cancel_receiver));
+                tokio::spawn(drain_rejected_input(
+                    input,
+                    cancel_receiver,
+                    shutdown,
+                    worker,
+                ));
                 return Ok(Response::new(Box::pin(ProcessEventStream {
                     receiver: ReceiverStream::new(receiver),
                     cancellation: cancel,
@@ -146,30 +174,24 @@ impl GuestProcessService for GuestProcessServiceImpl {
             }
         };
         let (controls, control_receiver) = mpsc::channel(QUEUE_CAPACITY);
-        let input_cancel = cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                match input.message().await {
-                    Ok(Some(control)) => {
-                        if controls.send(control).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => return,
-                    Err(error) => {
-                        tracing::debug!(error = %error, "guest process control stream was lost");
-                        input_cancel.send_replace(true);
-                        return;
-                    }
-                }
-            }
-        });
+        let reader_worker = worker.clone();
+        tokio::spawn(pump_process_input(
+            input,
+            controls,
+            cancel.clone(),
+            cancel_receiver.clone(),
+            shutdown,
+            reader_worker,
+        ));
 
-        let supervisor = self.process_supervisor.clone();
+        let supervisor = session_supervisor;
+        let runtime = self.runtime.clone();
         tokio::spawn(async move {
+            let _worker = worker;
             run_execution(
                 plan,
                 supervisor,
+                runtime,
                 control_receiver,
                 events,
                 cancel_receiver,
@@ -186,18 +208,19 @@ impl GuestProcessService for GuestProcessServiceImpl {
 }
 
 async fn drain_rejected_input(
-    mut input: tonic::Streaming<protocol::v1::GuestProcessInput>,
+    input: impl Stream<Item = Result<protocol::v1::GuestProcessInput, Status>> + Unpin + Send + 'static,
     mut cancellation: watch::Receiver<bool>,
+    mut shutdown: Option<watch::Receiver<bool>>,
+    worker: crate::pid1::InternalWriterGuard,
 ) {
+    let _worker = worker;
+    let mut input = input;
     loop {
         tokio::select! {
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() {
-                    return;
-                }
-            }
-            message = input.message() => {
-                if !matches!(message, Ok(Some(_))) {
+            biased;
+            () = execution_io_stopped(&mut cancellation, &mut shutdown) => return,
+            message = input.next() => {
+                if !matches!(message, Some(Ok(_))) {
                     return;
                 }
             }
@@ -205,14 +228,85 @@ async fn drain_rejected_input(
     }
 }
 
+async fn pump_process_input(
+    input: impl Stream<Item = Result<protocol::v1::GuestProcessInput, Status>> + Unpin + Send + 'static,
+    controls: mpsc::Sender<protocol::v1::GuestProcessInput>,
+    cancel: watch::Sender<bool>,
+    mut cancellation: watch::Receiver<bool>,
+    mut shutdown: Option<watch::Receiver<bool>>,
+    worker: crate::pid1::InternalWriterGuard,
+) {
+    let _worker = worker;
+    let mut input = input;
+    loop {
+        let message = tokio::select! {
+            biased;
+            () = execution_io_stopped(&mut cancellation, &mut shutdown) => {
+                cancel.send_replace(true);
+                return;
+            }
+            () = controls.closed() => return,
+            message = input.next() => message,
+        };
+        match message {
+            Some(Ok(control)) => {
+                tokio::select! {
+                    biased;
+                    () = execution_io_stopped(&mut cancellation, &mut shutdown) => {
+                        cancel.send_replace(true);
+                        return;
+                    }
+                    result = controls.send(control) => if result.is_err() { return; },
+                }
+            }
+            None => return,
+            Some(Err(error)) => {
+                tracing::debug!(error = %error, "guest process control stream was lost");
+                cancel.send_replace(true);
+                return;
+            }
+        }
+    }
+}
+
+async fn execution_io_stopped(
+    cancellation: &mut watch::Receiver<bool>,
+    shutdown: &mut Option<watch::Receiver<bool>>,
+) {
+    loop {
+        if *cancellation.borrow() || shutdown.as_ref().is_some_and(|receiver| *receiver.borrow()) {
+            return;
+        }
+        tokio::select! {
+            changed = cancellation.changed() => if changed.is_err() { return; },
+            () = machine_io_stopped(shutdown) => return,
+        }
+    }
+}
+
+async fn machine_io_stopped(shutdown: &mut Option<watch::Receiver<bool>>) {
+    match shutdown {
+        Some(receiver) => {
+            while !*receiver.borrow() {
+                if receiver.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
 async fn run_execution(
     plan: ProcessPlan,
     supervisor: ProcessSupervisor,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
     mut controls: mpsc::Receiver<protocol::v1::GuestProcessInput>,
     events: EventSender,
     mut cancellation: watch::Receiver<bool>,
     execution: ExecutionLease,
 ) {
+    let retirement = supervisor.retirement_receiver();
     let mut spawn = tokio::task::spawn_blocking(move || spawn_process(plan, &supervisor));
     let mut controls_open = true;
     let mut deferred_control = None;
@@ -284,6 +378,10 @@ async fn run_execution(
             events,
             cancellation,
             execution,
+            ExecutionRuntime {
+                context: runtime,
+                retirement,
+            },
         )
     })
     .await;
@@ -329,7 +427,8 @@ impl GuestProcessServiceImpl {
     fn validate_start(&self, start: &StartGuestProcess) -> Result<Uuid, Status> {
         let execution_id = Uuid::parse_str(&start.execution_id)
             .map_err(|_| invalid_request("execution_id must be a UUID"))?;
-        if start.expected_agent_instance_id != self.instance_id {
+        let current = self.runtime.expected();
+        if start.expected_agent_instance_id != current.agent_instance_id {
             return Err(protocol::status_with_error(
                 tonic::Code::FailedPrecondition,
                 protocol::v1::ErrorCode::PreconditionFailed,
@@ -337,7 +436,7 @@ impl GuestProcessServiceImpl {
                 None,
             ));
         }
-        if start.expected_agent_boot_id != self.boot_id {
+        if start.expected_agent_boot_id != current.boot_id {
             return Err(protocol::status_with_error(
                 tonic::Code::FailedPrecondition,
                 protocol::v1::ErrorCode::PreconditionFailed,
@@ -639,22 +738,136 @@ struct RunningProcess {
     stdin: ProcessInput,
     outputs: Vec<(OutputKind, Box<dyn Read + Send>)>,
     pty_resize: Option<File>,
+    pty_exited: Option<Arc<AtomicBool>>,
+}
+
+struct PtyOutputReader {
+    master: File,
+    exited: Arc<AtomicBool>,
+    remaining: usize,
+}
+
+impl Read for PtyOutputReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let draining = self.exited.load(Ordering::Acquire);
+            if draining && self.remaining == 0 {
+                return Ok(0);
+            }
+            // A zero-time poll after exit drains only buffered output, even
+            // while a descendant retains the slave.
+            let mut descriptors = [PollFd::new(self.master.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut descriptors, if draining { 0_u16 } else { 10_u16 }) {
+                Ok(0) if draining => return Ok(0),
+                Ok(0) => continue,
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let limit = if draining {
+                buffer.len().min(self.remaining)
+            } else {
+                buffer.len()
+            };
+            return match self.master.read(&mut buffer[..limit]) {
+                Ok(read) => {
+                    if draining {
+                        self.remaining -= read;
+                    }
+                    Ok(read)
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if draining {
+                        Ok(0)
+                    } else {
+                        continue;
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(nix::errno::Errno::EIO as i32) => Ok(0),
+                result => result,
+            };
+        }
+    }
+}
+
+struct ProcessInputWriter {
+    master: File,
+    exited: Arc<AtomicBool>,
+}
+
+impl ProcessInputWriter {
+    fn new(master: File, exited: Arc<AtomicBool>) -> io::Result<Self> {
+        let flags = OFlag::from_bits_truncate(fcntl(&master, FcntlArg::F_GETFL)?);
+        fcntl(&master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(Self { master, exited })
+    }
+}
+
+impl Write for ProcessInputWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.exited.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            let mut descriptors = [PollFd::new(self.master.as_fd(), PollFlags::POLLOUT)];
+            match poll(&mut descriptors, 10_u16) {
+                Ok(0) => continue,
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            match self.master.write(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.master.flush()
+    }
 }
 
 enum ProcessInput {
     Null,
     Pipe(Option<ChildStdin>),
-    Pty(File),
+    Pty(ProcessInputWriter),
 }
 
 enum InputCommand {
-    Data(Vec<u8>),
+    Data(Bytes),
 }
 
 enum ActiveInput {
     Null,
-    Pipe(Option<std_mpsc::SyncSender<InputCommand>>),
-    Pty(std_mpsc::SyncSender<InputCommand>),
+    Pipe {
+        sender: Option<std_mpsc::SyncSender<InputCommand>>,
+        writer: Option<thread::JoinHandle<()>>,
+    },
+    Pty {
+        sender: std_mpsc::SyncSender<InputCommand>,
+        writer: Option<thread::JoinHandle<()>>,
+    },
+}
+
+impl ActiveInput {
+    fn close(self) {
+        let (sender, writer) = match self {
+            Self::Pipe { sender, writer } => (sender, writer),
+            Self::Pty { sender, writer } => (Some(sender), writer),
+            Self::Null => return,
+        };
+        drop(sender);
+        if let Some(writer) = writer {
+            let _ = writer.join();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -724,6 +937,7 @@ fn spawn_process(
                     (OutputKind::Stderr, Box::new(stderr)),
                 ],
                 pty_resize: None,
+                pty_exited: None,
             })
         }
         ProcessStdio::Pty { size } => {
@@ -732,7 +946,12 @@ fn spawn_process(
             })?;
             let master = File::from(pty.master);
             let reader = master.try_clone().map_err(LaunchFailure::spawn)?;
-            let writer = master.try_clone().map_err(LaunchFailure::spawn)?;
+            let exited = Arc::new(AtomicBool::new(false));
+            let writer = ProcessInputWriter::new(
+                master.try_clone().map_err(LaunchFailure::spawn)?,
+                Arc::clone(&exited),
+            )
+            .map_err(LaunchFailure::spawn)?;
             let resize = master.try_clone().map_err(LaunchFailure::spawn)?;
             attach_pty_slave(&mut command, pty.slave).map_err(LaunchFailure::spawn)?;
             prepare_pty_child(&mut command);
@@ -745,8 +964,16 @@ fn spawn_process(
                 guard,
                 process_group,
                 stdin: ProcessInput::Pty(writer),
-                outputs: vec![(OutputKind::Terminal, Box::new(reader))],
+                outputs: vec![(
+                    OutputKind::Terminal,
+                    Box::new(PtyOutputReader {
+                        master: reader,
+                        exited: Arc::clone(&exited),
+                        remaining: crate::ssh::agent::PTY_EXIT_DRAIN_LIMIT,
+                    }),
+                )],
                 pty_resize: Some(resize),
+                pty_exited: Some(exited),
             })
         }
     }
@@ -798,6 +1025,11 @@ fn child_process_group(child: &Child) -> Result<i32, LaunchFailure> {
         .map_err(|_| LaunchFailure::spawn_failed("child PID does not fit in i32"))
 }
 
+struct ExecutionRuntime {
+    context: Arc<crate::lifecycle::RuntimeContext>,
+    retirement: Option<watch::Receiver<u64>>,
+}
+
 fn drive_process(
     mut process: RunningProcess,
     mut deferred_control: Option<protocol::v1::GuestProcessInput>,
@@ -805,17 +1037,46 @@ fn drive_process(
     events: EventSender,
     cancellation: watch::Receiver<bool>,
     _execution: ExecutionLease,
+    runtime: ExecutionRuntime,
 ) {
-    let mut input = start_input_writer(std::mem::replace(&mut process.stdin, ProcessInput::Null));
+    let ExecutionRuntime {
+        context: runtime,
+        retirement,
+    } = runtime;
+    let writer = process.guard.writer();
+    let input_exited = Arc::new(AtomicBool::new(false));
+    let mut input = match start_input_writer(
+        std::mem::replace(&mut process.stdin, ProcessInput::Null),
+        writer.clone(),
+        runtime.clone(),
+        retirement,
+        Arc::clone(&input_exited),
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            let _ = events.blocking_send(Err(protocol::detailed_status(Status::internal(
+                format!("prepare guest process stdin: {error}"),
+            ))));
+            terminate_and_reap(&mut process.child, process.process_group);
+            return;
+        }
+    };
     let disconnected = Arc::new(AtomicBool::new(false));
     let readers = process
         .outputs
         .drain(..)
         .filter_map(|(kind, reader)| {
-            spawn_output_reader(kind, reader, events.clone(), Arc::clone(&disconnected))
+            spawn_output_reader(
+                kind,
+                reader,
+                events.clone(),
+                Arc::clone(&disconnected),
+                writer.clone(),
+            )
         })
         .collect::<Vec<_>>();
 
+    let mut stdin_closed = false;
     let status = loop {
         if *cancellation.borrow() || disconnected.load(Ordering::Acquire) {
             terminate_and_reap(&mut process.child, process.process_group);
@@ -824,21 +1085,60 @@ fn drive_process(
         let control = deferred_control
             .take()
             .map_or_else(|| controls.try_recv(), Ok);
+        let mut progressed = false;
         match control {
             Ok(control) => {
-                if let Err(status) = apply_control(&mut process, &mut input, control) {
-                    let _ = events.blocking_send(Err(status));
-                    terminate_and_reap(&mut process.child, process.process_group);
-                    break process.child.wait().ok();
+                let _mutation = match runtime.admit_mutation() {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        deferred_control = Some(control);
+                        thread::sleep(POLL_INTERVAL);
+                        continue;
+                    }
+                };
+                if stdin_closed
+                    && matches!(
+                        &control.message,
+                        Some(Message::StdinData(_) | Message::CloseStdin(_))
+                    )
+                {
+                    progressed = true;
+                } else {
+                    match apply_control(&mut process, &mut input, control) {
+                        Ok(ControlOutcome::Applied) => progressed = true,
+                        Ok(ControlOutcome::Pending(data)) => {
+                            deferred_control = Some(protocol::v1::GuestProcessInput {
+                                message: Some(Message::StdinData(StdinData { data })),
+                            });
+                        }
+                        Ok(ControlOutcome::StdinClosed) => {
+                            stdin_closed = true;
+                            if events
+                                .blocking_send(Ok(GuestProcessEvent {
+                                    event: Some(Event::StdinClosed(
+                                        protocol::v1::GuestProcessStdinClosed {},
+                                    )),
+                                }))
+                                .is_err()
+                            {
+                                disconnected.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(status) => {
+                            let _ = events.blocking_send(Err(status));
+                            terminate_and_reap(&mut process.child, process.process_group);
+                            break process.child.wait().ok();
+                        }
+                    }
                 }
-                continue;
             }
             Err(mpsc::error::TryRecvError::Disconnected)
             | Err(mpsc::error::TryRecvError::Empty) => {}
         }
         match process.child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) => thread::sleep(POLL_INTERVAL),
+            Ok(None) if !progressed => thread::sleep(POLL_INTERVAL),
+            Ok(None) => {}
             Err(error) => {
                 let _ = events.blocking_send(Err(protocol::detailed_status(Status::internal(
                     format!("wait for guest process: {error}"),
@@ -848,10 +1148,16 @@ fn drive_process(
             }
         }
     };
-    drop(input);
+    input_exited.store(true, Ordering::Release);
+    if let Some(exited) = &process.pty_exited {
+        exited.store(true, Ordering::Release);
+    }
+    input.close();
     for reader in readers {
         let _ = reader.join();
     }
+    // Release the last resize master before publishing the terminal event.
+    drop(process.pty_resize.take());
     drop(process.guard);
 
     if disconnected.load(Ordering::Acquire) || *cancellation.borrow() {
@@ -862,31 +1168,80 @@ fn drive_process(
     }
 }
 
-fn start_input_writer(input: ProcessInput) -> ActiveInput {
+fn start_input_writer(
+    input: ProcessInput,
+    worker: Option<crate::pid1::InternalWriterGuard>,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
+    retirement: Option<watch::Receiver<u64>>,
+    exited: Arc<AtomicBool>,
+) -> io::Result<ActiveInput> {
     match input {
-        ProcessInput::Null => ActiveInput::Null,
+        ProcessInput::Null => Ok(ActiveInput::Null),
         ProcessInput::Pipe(writer) => {
             let Some(writer) = writer else {
-                return ActiveInput::Pipe(None);
+                return Ok(ActiveInput::Pipe {
+                    sender: None,
+                    writer: None,
+                });
             };
-            ActiveInput::Pipe(Some(spawn_input_writer(writer)))
+            let writer =
+                ProcessInputWriter::new(File::from(OwnedFd::from(writer)), Arc::clone(&exited))?;
+            let (sender, writer) =
+                spawn_input_writer(writer, worker, runtime, retirement, Some(exited));
+            Ok(ActiveInput::Pipe {
+                sender: Some(sender),
+                writer,
+            })
         }
-        ProcessInput::Pty(writer) => ActiveInput::Pty(spawn_input_writer(writer)),
+        ProcessInput::Pty(writer) => {
+            let exited = Some(Arc::clone(&writer.exited));
+            let (sender, writer) = spawn_input_writer(writer, worker, runtime, retirement, exited);
+            Ok(ActiveInput::Pty { sender, writer })
+        }
     }
 }
 
-fn spawn_input_writer<W>(mut writer: W) -> std_mpsc::SyncSender<InputCommand>
+fn spawn_input_writer<W>(
+    writer: W,
+    worker: Option<crate::pid1::InternalWriterGuard>,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
+    retirement: Option<watch::Receiver<u64>>,
+    exited: Option<Arc<AtomicBool>>,
+) -> (
+    std_mpsc::SyncSender<InputCommand>,
+    Option<thread::JoinHandle<()>>,
+)
 where
     W: Write + Send + 'static,
 {
     let (sender, receiver) = std_mpsc::sync_channel(QUEUE_CAPACITY);
-    let _ = thread::Builder::new()
+    let writer = thread::Builder::new()
         .name("silo-guest-process-stdin".to_string())
         .spawn(move || {
+            let _worker = worker;
+            let mut stdin = writer;
             for command in receiver {
                 match command {
                     InputCommand::Data(data) => {
-                        if let Err(error) = writer.write_all(&data) {
+                        let _mutation = loop {
+                            if exited
+                                .as_ref()
+                                .is_some_and(|exited| exited.load(Ordering::Acquire))
+                            {
+                                return;
+                            }
+                            if retirement
+                                .as_ref()
+                                .is_some_and(|receiver| receiver.has_changed().unwrap_or(true))
+                            {
+                                return;
+                            }
+                            match runtime.admit_mutation() {
+                                Ok(lease) => break lease,
+                                Err(_) => thread::sleep(POLL_INTERVAL),
+                            }
+                        };
+                        if let Err(error) = stdin.write_all(&data) {
                             if error.kind() != io::ErrorKind::BrokenPipe {
                                 tracing::debug!(error = %error, "guest process stdin write failed");
                             }
@@ -895,23 +1250,27 @@ where
                     }
                 }
             }
-        });
-    sender
+        })
+        .ok();
+    (sender, writer)
 }
 
 fn spawn_output_reader(
     kind: OutputKind,
-    mut reader: Box<dyn Read + Send>,
+    reader: Box<dyn Read + Send>,
     events: EventSender,
     disconnected: Arc<AtomicBool>,
+    worker: Option<crate::pid1::InternalWriterGuard>,
 ) -> Option<thread::JoinHandle<()>> {
     let reader_disconnected = Arc::clone(&disconnected);
     match thread::Builder::new()
         .name("silo-guest-process-output".to_string())
         .spawn(move || {
+            let _worker = worker;
+            let mut source = reader;
             let mut buffer = vec![0; protocol::CHUNK_64_KIB];
             loop {
-                let read = match reader.read(&mut buffer) {
+                let read = match source.read(&mut buffer) {
                     Ok(0) => return,
                     Ok(read) => read,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -949,16 +1308,26 @@ fn spawn_output_reader(
     }
 }
 
+enum ControlOutcome {
+    Applied,
+    Pending(Bytes),
+    StdinClosed,
+}
+
 fn apply_control(
     process: &mut RunningProcess,
     input: &mut ActiveInput,
     control: protocol::v1::GuestProcessInput,
-) -> Result<(), Status> {
+) -> Result<ControlOutcome, Status> {
     match control.message {
         Some(Message::StdinData(StdinData { data })) => write_stdin(input, data),
-        Some(Message::CloseStdin(_)) => close_stdin(input),
-        Some(Message::ResizePty(resize)) => resize_pty(process, resize),
-        Some(Message::SignalProcess(signal)) => signal_process(process, signal),
+        Some(Message::CloseStdin(_)) => close_stdin(input).map(|()| ControlOutcome::Applied),
+        Some(Message::ResizePty(resize)) => {
+            resize_pty(process, resize).map(|()| ControlOutcome::Applied)
+        }
+        Some(Message::SignalProcess(signal)) => {
+            signal_process(process, signal).map(|()| ControlOutcome::Applied)
+        }
         Some(Message::Start(_)) => Err(invalid_request(
             "StartGuestProcess is only valid as the first Execute request",
         )),
@@ -966,49 +1335,49 @@ fn apply_control(
     }
 }
 
-fn write_stdin(input: &mut ActiveInput, data: Bytes) -> Result<(), Status> {
+fn write_stdin(input: &mut ActiveInput, data: Bytes) -> Result<ControlOutcome, Status> {
     if data.len() > protocol::CHUNK_64_KIB {
         return Err(invalid_request("stdin data exceeds 64 KiB"));
     }
     let sender = match input {
-        ActiveInput::Pipe(Some(sender)) => sender,
-        ActiveInput::Pipe(None) => {
+        ActiveInput::Pipe {
+            sender: Some(sender),
+            ..
+        } => sender,
+        ActiveInput::Pipe { sender: None, .. } => {
             return Err(protocol::detailed_status(Status::failed_precondition(
                 "stdin is already closed",
             )));
         }
-        ActiveInput::Pty(sender) => sender,
+        ActiveInput::Pty { sender, .. } => sender,
         ActiveInput::Null => {
             return Err(protocol::detailed_status(Status::failed_precondition(
                 "this process has no stdin pipe",
             )));
         }
     };
-    sender
-        .try_send(InputCommand::Data(data.to_vec()))
-        .map_err(|error| match error {
-            std_mpsc::TrySendError::Full(_) => protocol::status_with_error(
-                tonic::Code::ResourceExhausted,
-                protocol::v1::ErrorCode::ResourceExhausted,
-                "guest process stdin queue is full",
-                None,
-            ),
-            std_mpsc::TrySendError::Disconnected(_) => protocol::detailed_status(
-                Status::failed_precondition("guest process stdin is closed"),
-            ),
-        })
+    match sender.try_send(InputCommand::Data(data)) {
+        Ok(()) => Ok(ControlOutcome::Applied),
+        Err(std_mpsc::TrySendError::Full(InputCommand::Data(data))) => {
+            Ok(ControlOutcome::Pending(data))
+        }
+        Err(std_mpsc::TrySendError::Disconnected(_)) => Ok(ControlOutcome::StdinClosed),
+    }
 }
 
 fn close_stdin(input: &mut ActiveInput) -> Result<(), Status> {
     match input {
-        ActiveInput::Pipe(sender @ Some(_)) => {
+        ActiveInput::Pipe {
+            sender: sender @ Some(_),
+            ..
+        } => {
             drop(sender.take());
             Ok(())
         }
-        ActiveInput::Pipe(None) => Err(protocol::detailed_status(Status::failed_precondition(
-            "stdin is already closed",
-        ))),
-        ActiveInput::Pty(_) => Err(protocol::detailed_status(Status::failed_precondition(
+        ActiveInput::Pipe { sender: None, .. } => Err(protocol::detailed_status(
+            Status::failed_precondition("stdin is already closed"),
+        )),
+        ActiveInput::Pty { .. } => Err(protocol::detailed_status(Status::failed_precondition(
             "PTY stdin cannot be half-closed",
         ))),
         ActiveInput::Null => Err(protocol::detailed_status(Status::failed_precondition(
@@ -1160,6 +1529,56 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_input_worker_keeps_pre_activation_retirement_observation() {
+        use std::io::Read;
+        let runtime = crate::lifecycle::RuntimeContext::for_tests();
+        let retirement = runtime.retirement();
+        runtime.stop_admissions();
+        runtime.rotate(runtime.identity().shutdown);
+        let (writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let (sender, writer) =
+            crate::guest_process::spawn_input_writer(writer, None, runtime, Some(retirement), None);
+        sender
+            .send(crate::guest_process::InputCommand::Data(
+                bytes::Bytes::from_static(b"must-not-write"),
+            ))
+            .unwrap();
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert!(output.is_empty());
+        writer.unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn shared_identity_cutover_rejects_captured_native_execute() {
+        let runtime = crate::lifecycle::RuntimeContext::for_tests();
+        let service = crate::guest_process::GuestProcessServiceImpl::new(
+            runtime.clone(),
+            crate::pid1::ProcessSupervisor::default(),
+        );
+        let before = runtime.identity();
+        let mut start = protocol::v1::StartGuestProcess {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            expected_agent_instance_id: before.expected.agent_instance_id.clone(),
+            expected_agent_boot_id: before.expected.boot_id.clone(),
+            process: None,
+        };
+        assert!(service.validate_start(&start).is_ok());
+        let mut context = before.shutdown;
+        context.machine_id = uuid::Uuid::new_v4().to_string();
+        context.run_id = uuid::Uuid::new_v4().to_string();
+        let after = runtime.rotate(context);
+        assert_eq!(
+            service.validate_start(&start).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        start.expected_agent_instance_id = after.agent_instance_id;
+        assert!(service.validate_start(&start).is_ok());
+    }
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -1177,6 +1596,105 @@ mod tests {
         drive_process, resolve_identity, spawn_process, ExecutionLease, ProcessPlan, QUEUE_CAPACITY,
     };
     use crate::pid1::ProcessSupervisor;
+
+    #[tokio::test]
+    async fn process_control_pump_cancels_idle_and_backpressured_input_before_drain() {
+        for backpressured in [false, true] {
+            let supervisor = ProcessSupervisor::default();
+            let worker = supervisor.admit_internal_writer().unwrap();
+            let (incoming, input) = mpsc::channel(2);
+            let (controls, received) = mpsc::channel(1);
+            let (cancel, cancellation) = watch::channel(false);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(crate::guest_process::pump_process_input(
+                tokio_stream::wrappers::ReceiverStream::new(input),
+                controls,
+                cancel.clone(),
+                cancellation,
+                Some(shutdown_rx),
+                worker,
+            ));
+            if backpressured {
+                incoming
+                    .send(Ok(GuestProcessInput { message: None }))
+                    .await
+                    .unwrap();
+                incoming
+                    .send(Ok(GuestProcessInput { message: None }))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while incoming.capacity() != 2 || received.len() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            let pending = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                supervisor.wait_internal_writers(),
+            )
+            .await
+            .is_err();
+            supervisor.begin_writer_shutdown().unwrap();
+            shutdown.send_replace(true);
+            supervisor.wait_internal_writers().await.unwrap();
+            assert!(incoming.is_closed());
+            assert!(*cancel.borrow());
+            task.await.unwrap();
+            assert!(pending);
+            drop(received);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_process_input_cancels_without_waiting_for_peer_fin() {
+        let supervisor = ProcessSupervisor::default();
+        let worker = supervisor.admit_internal_writer().unwrap();
+        let (incoming, input) = mpsc::channel::<Result<GuestProcessInput, tonic::Status>>(1);
+        let (_cancel, cancellation) = watch::channel(false);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(crate::guest_process::drain_rejected_input(
+            tokio_stream::wrappers::ReceiverStream::new(input),
+            cancellation,
+            Some(shutdown_rx),
+            worker,
+        ));
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            supervisor.wait_internal_writers(),
+        )
+        .await
+        .is_err();
+        supervisor.begin_writer_shutdown().unwrap();
+        shutdown.send_replace(true);
+        supervisor.wait_internal_writers().await.unwrap();
+        assert!(incoming.is_closed());
+        task.await.unwrap();
+        assert!(pending);
+    }
+
+    #[tokio::test]
+    async fn completed_execution_closes_its_idle_control_input() {
+        let supervisor = ProcessSupervisor::default();
+        let worker = supervisor.admit_internal_writer().unwrap();
+        let (incoming, input) = mpsc::channel::<Result<GuestProcessInput, tonic::Status>>(1);
+        let (controls, received) = mpsc::channel(1);
+        let (cancel, cancellation) = watch::channel(false);
+        let task = tokio::spawn(crate::guest_process::pump_process_input(
+            tokio_stream::wrappers::ReceiverStream::new(input),
+            controls,
+            cancel,
+            cancellation,
+            None,
+            worker,
+        ));
+        drop(received);
+        supervisor.wait_internal_writers().await.unwrap();
+        assert!(incoming.is_closed());
+        task.await.unwrap();
+    }
 
     fn privileged() -> bool {
         getuid().is_root()
@@ -1220,6 +1738,16 @@ mod tests {
     ) {
         let plan = ProcessPlan::from_spec(spec).expect("valid test process plan");
         let running = spawn_process(plan, &ProcessSupervisor::default()).expect("spawn test child");
+        start_running(running)
+    }
+
+    fn start_running(
+        running: crate::guest_process::RunningProcess,
+    ) -> (
+        mpsc::Sender<GuestProcessInput>,
+        mpsc::Receiver<Result<protocol::v1::GuestProcessEvent, tonic::Status>>,
+        thread::JoinHandle<()>,
+    ) {
         let (controls, control_receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (events, event_receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (_cancel, cancel_receiver) = watch::channel(false);
@@ -1237,6 +1765,10 @@ mod tests {
                 events,
                 cancel_receiver,
                 lease,
+                crate::guest_process::ExecutionRuntime {
+                    context: crate::lifecycle::RuntimeContext::for_tests(),
+                    retirement: None,
+                },
             )
         });
         (controls, event_receiver, task)
@@ -1480,6 +2012,98 @@ mod tests {
             .any(|event| matches!(&event.event, Some(Event::Exited(_)))));
     }
 
+    struct KillTestGroup(nix::unistd::Pid);
+
+    impl Drop for KillTestGroup {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+
+    // Real PTYs/processes exercise the driver without requiring setgroups.
+    fn rootless_pty(script: &str) -> (crate::guest_process::RunningProcess, KillTestGroup) {
+        let pty = crate::ssh::agent::open_process_pty(80, 24, 0, 0).unwrap();
+        let master = std::fs::File::from(pty.master);
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        crate::ssh::agent::attach_pty_slave(&mut command, pty.slave).unwrap();
+        crate::ssh::agent::prepare_pty_child(&mut command);
+        let (child, guard) = ProcessSupervisor::default()
+            .spawn_session_child(&mut command, "guest process PTY exit test")
+            .unwrap();
+        let group = i32::try_from(child.id()).unwrap();
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = crate::guest_process::PtyOutputReader {
+            master: master.try_clone().unwrap(),
+            exited: Arc::clone(&exited),
+            remaining: crate::ssh::agent::PTY_EXIT_DRAIN_LIMIT,
+        };
+        (
+            crate::guest_process::RunningProcess {
+                child,
+                guard,
+                process_group: group,
+                stdin: crate::guest_process::ProcessInput::Pty(
+                    crate::guest_process::ProcessInputWriter::new(
+                        master.try_clone().unwrap(),
+                        Arc::clone(&exited),
+                    )
+                    .unwrap(),
+                ),
+                outputs: vec![(crate::guest_process::OutputKind::Terminal, Box::new(reader))],
+                pty_resize: Some(master),
+                pty_exited: Some(exited),
+            },
+            KillTestGroup(nix::unistd::Pid::from_raw(group)),
+        )
+    }
+
+    async fn check_pty_exit(script: &str, expected: &[u8]) {
+        let (running, cleanup) = rootless_pty(script);
+        let (controls, mut events, task) = start_running(running);
+        drop(controls);
+        let events = tokio::time::timeout(Duration::from_secs(5), collect(&mut events))
+            .await
+            .expect("PTY driver must finish while a descendant holds the slave");
+        task.join().expect("PTY driver");
+        let mut output = Vec::new();
+        let mut exited = false;
+        for event in events {
+            match event.event {
+                Some(Event::TerminalOutput(data)) => {
+                    assert!(!exited, "PTY output after exit event");
+                    output.extend_from_slice(&data.data);
+                }
+                Some(Event::Exited(status)) => {
+                    assert_eq!(status.code, Some(0));
+                    exited = true;
+                }
+                other => panic!("unexpected PTY event: {other:?}"),
+            }
+        }
+        assert!(exited);
+        assert_eq!(output, expected);
+        assert!(
+            nix::sys::signal::killpg(cleanup.0, None).is_ok(),
+            "PTY completion must leave the background job running"
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_exit_delivers_final_output_with_background_slave_holder() {
+        check_pty_exit("trap '' HUP; sleep 600 & echo done", b"done\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn pty_exit_preserves_large_trailing_output_with_background_slave_holder() {
+        let mut expected = b"0123456789abcdef".repeat(16384);
+        expected.extend_from_slice(b"done\r\n");
+        check_pty_exit(
+            "trap '' HUP; sleep 600 & i=0; while [ \"$i\" -lt 16384 ]; do printf '0123456789abcdef'; i=$((i+1)); done; echo done",
+            &expected,
+        ).await;
+    }
+
     #[tokio::test]
     async fn pty_combines_output_supports_resize_and_signal_is_terminal_signal() {
         if !privileged() {
@@ -1565,5 +2189,242 @@ mod tests {
             &event.event,
             Some(Event::Signaled(signal)) if signal.signal == Some(nix::libc::SIGTERM as u32)
         )));
+    }
+
+    #[test]
+    fn pty_exit_cancels_a_backpressured_input_writer() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pty = crate::ssh::agent::open_process_pty(80, 24, 0, 0).unwrap();
+        let mut termios = nix::sys::termios::tcgetattr(&pty.slave).unwrap();
+        nix::sys::termios::cfmakeraw(&mut termios);
+        nix::sys::termios::tcsetattr(&pty.slave, nix::sys::termios::SetArg::TCSANOW, &termios)
+            .unwrap();
+        let exited = Arc::new(AtomicBool::new(false));
+        let mut writer = crate::guest_process::ProcessInputWriter::new(
+            std::fs::File::from(pty.master),
+            Arc::clone(&exited),
+        )
+        .unwrap();
+        let mut saturated = false;
+        for _ in 0..1024 {
+            match writer.master.write(&[0_u8; 8192]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    saturated = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("fill real PTY input queue: {error}"),
+            }
+        }
+        assert!(saturated, "real PTY input queue must be backpressured");
+        let (started, running) = std::sync::mpsc::channel();
+        let (completed, result) = std::sync::mpsc::channel();
+        let pending = vec![0_u8; 1024 * 1024];
+        let task = thread::spawn(move || {
+            started.send(()).unwrap();
+            completed.send(writer.write_all(&pending)).unwrap();
+        });
+        running.recv_timeout(Duration::from_secs(1)).unwrap();
+        exited.store(true, Ordering::Release);
+        let error = result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        task.join().unwrap();
+        drop(pty.slave);
+    }
+
+    fn rootless_pipe(script: &str) -> (crate::guest_process::RunningProcess, KillTestGroup) {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, guard) = ProcessSupervisor::default()
+            .spawn_session_child(&mut command, "guest process stdin test")
+            .unwrap();
+        let group = i32::try_from(child.id()).unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        (
+            crate::guest_process::RunningProcess {
+                child,
+                guard,
+                process_group: group,
+                stdin: crate::guest_process::ProcessInput::Pipe(Some(stdin)),
+                outputs: vec![
+                    (crate::guest_process::OutputKind::Stdout, Box::new(stdout)),
+                    (crate::guest_process::OutputKind::Stderr, Box::new(stderr)),
+                ],
+                pty_resize: None,
+                pty_exited: None,
+            },
+            KillTestGroup(nix::unistd::Pid::from_raw(group)),
+        )
+    }
+
+    async fn send_large_stdin(controls: mpsc::Sender<GuestProcessInput>) -> usize {
+        let mut sent = 0;
+        for chunk in 0..512 {
+            let offset = chunk * protocol::CHUNK_64_KIB;
+            let data: Vec<u8> = (offset..offset + protocol::CHUNK_64_KIB)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            if controls
+                .send(GuestProcessInput {
+                    message: Some(Message::StdinData(StdinData { data: data.into() })),
+                })
+                .await
+                .is_err()
+            {
+                return sent;
+            }
+            sent += protocol::CHUNK_64_KIB;
+        }
+        let _ = controls
+            .send(GuestProcessInput {
+                message: Some(Message::CloseStdin(protocol::v1::CloseStdin {})),
+            })
+            .await;
+        sent
+    }
+
+    #[tokio::test]
+    async fn large_stdin_backpressures_slow_child_and_delivers_ordered_eof() {
+        let (running, _cleanup) = rootless_pipe(
+            "sleep 0.1; i=0; while [ \"$i\" -lt 512 ]; do head -c 65536; sleep 0.001; i=$((i+1)); done; cat",
+        );
+        let (controls, mut events, task) = start_running(running);
+        let sending = tokio::spawn(send_large_stdin(controls));
+        let mut received = 0;
+        let mut exited = false;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(event) = events.recv().await {
+                match event.unwrap().event {
+                    Some(Event::Stdout(output)) => {
+                        for byte in output.data {
+                            assert_eq!(byte, (received % 251) as u8);
+                            received += 1;
+                        }
+                    }
+                    Some(Event::Exited(status)) => {
+                        assert_eq!(status.code, Some(0));
+                        exited = true;
+                    }
+                    other => panic!("unexpected slow-reader event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("slow child must receive all input and EOF");
+        assert!(exited);
+        assert_eq!(received, 32 * 1024 * 1024);
+        assert_eq!(sending.await.unwrap(), received);
+        task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_stdin_preserves_early_exit_and_closed_pipe_status() {
+        for (script, code) in [
+            ("sleep 0.05; exit 7", 7),
+            ("head -n 1; exit 9", 9),
+            ("sleep 600 <&0 >/dev/null 2>&1 & exit 13", 13),
+        ] {
+            let (running, _cleanup) = rootless_pipe(script);
+            let (controls, mut events, task) = start_running(running);
+            let sending = tokio::spawn(send_large_stdin(controls));
+            let events = tokio::time::timeout(Duration::from_secs(5), collect(&mut events))
+                .await
+                .expect("early exit must not wait for a blocked input writer");
+            assert!(events.iter().any(|event| matches!(
+                &event.event, Some(Event::Exited(status)) if status.code == Some(code)
+            )));
+            assert!(sending.await.unwrap() < 32 * 1024 * 1024);
+            task.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_stdin_closes_real_child_pipe() {
+        let (running, _cleanup) = rootless_pipe("cat");
+        let (controls, mut events, task) = start_running(running);
+        controls
+            .send(GuestProcessInput {
+                message: Some(Message::CloseStdin(protocol::v1::CloseStdin {})),
+            })
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), collect(&mut events))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0].event, Some(Event::Exited(status)) if status.code == Some(0)));
+        drop(controls);
+        task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_child_stdin_keeps_process_controls_and_exit_status() {
+        let (running, _cleanup) = rootless_pipe("exec 0<&-; kill -STOP $$; exit 11");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match nix::sys::wait::waitpid(
+                    nix::unistd::Pid::from_raw(running.process_group),
+                    Some(
+                        nix::sys::wait::WaitPidFlag::WNOHANG
+                            | nix::sys::wait::WaitPidFlag::WUNTRACED,
+                    ),
+                )
+                .unwrap()
+                {
+                    nix::sys::wait::WaitStatus::Stopped(_, nix::sys::signal::Signal::SIGSTOP) => {
+                        break
+                    }
+                    nix::sys::wait::WaitStatus::StillAlive => {
+                        tokio::time::sleep(Duration::from_millis(1)).await
+                    }
+                    status => panic!("child must stop with its stdin closed: {status:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (controls, mut events, task) = start_running(running);
+        let sending = tokio::spawn(send_large_stdin(controls.clone()));
+        let closed = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(closed.event, Some(Event::StdinClosed(_))));
+        sending.abort();
+        let _ = sending.await;
+        controls
+            .send(GuestProcessInput {
+                message: Some(Message::SignalProcess(SignalProcess {
+                    signal: Some(nix::sys::signal::Signal::SIGCONT as u32),
+                })),
+            })
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), collect(&mut events))
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event, Some(Event::Exited(status)) if status.code == Some(11)
+        )));
+        drop(controls);
+        task.join().unwrap();
     }
 }

@@ -19,12 +19,14 @@ The formatter now emits classic Linux-growable ext4 metadata: `sparse_super` plu
 |                         |                                                                                                                                |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | **Formatter**           | Create ext4 images from scratch: superblock, group descriptors, inode table, bitmaps, extent trees, and online-resize metadata |
-| **Reader**              | Open existing ext4 images: path resolution, symlink following, file reading                                                    |
+| **Reader**              | Validated, read-only inspection of admitted images, including guest-kernel-mutated uppers: htree directories, deep extent trees, external xattrs, positioned body reads |
 | **Offline Grower**      | Grow clean, unmounted Silo ext4 images without host e2fsprogs                                                                  |
 | **Journal**             | Internal JBD2 journal for kernel crash recovery                                                                                |
-| **Extended Attributes** | Inline and block-level xattrs with name compression                                                                            |
+| **Extended Attributes** | Deterministic inline/block placement, raw Linux names/values, explicit POSIX ACL ABI-to-disk conversion                       |
 | **Hard Links**          | Correct reference counting with deferred block reclamation                                                                     |
 | **Symlinks**            | Fast symlinks (inline, less than 60 bytes) and slow symlinks (data blocks)                                                     |
+| **Special Inodes**      | FIFO, socket, character/block device nodes with checked Linux 12:20-bit device IDs                                           |
+| **Sparse Files**        | Stored-range streaming without hole scans, unaligned ranges and generalized checked extent trees                            |
 
 ## Quick Start
 
@@ -37,38 +39,129 @@ disk-image = { path = "common/disk-image" }
 
 ```rust
 use std::path::Path;
-use disk_image::ext4::{Formatter, constants::{make_mode, file_mode}};
+use disk_image::ext4::{FileData, Formatter, constants::{make_mode, file_mode}};
 
 let mut fmt = Formatter::new(Path::new("rootfs.ext4"), 4096, 64 * 1024 * 1024)?;
 
 // Create directories and files.
 fmt.create("/etc", make_mode(file_mode::S_IFDIR, 0o755),
-    None, None, None, None, None, None)?;
+    None, None, None, None, None, None, None)?;
 fmt.create("/etc/hostname", make_mode(file_mode::S_IFREG, 0o644),
-    None, None, Some(&mut b"silo\n".as_slice()), None, None, None)?;
+    None, None, Some(FileData::Dense(&mut b"silo\n".as_slice())), None, None, None, None)?;
 
 // Create a symlink.
 fmt.create("/etc/localtime", make_mode(file_mode::S_IFLNK, 0o777),
-    Some("/usr/share/zoneinfo/UTC"), None, None, None, None, None)?;
+    Some(b"/usr/share/zoneinfo/UTC"), None, None, None, None, None, None)?;
 
 // Finalize: writes superblock, group descriptors, bitmaps, inode table,
 // backup metadata, and resize inode metadata.
 fmt.close()?;
 ```
 
+Guest paths, directory names, symlink targets and xattr names are raw bytes;
+the same APIs accept UTF-8 strings through `AsRef<[u8]>`. No name or value is
+lossily decoded. `create` takes borrowed xattr name/value pairs, and explicit
+directory creation updates all supplied metadata, including root. Recursive
+parent creation does not overwrite an already supplied directory's metadata.
+`FileTimestamps::from_mtime` checks nanoseconds and ext4's signed-seconds epoch
+carry (including 2038). Hardlinks retain one inode and its complete metadata.
+
+Public xattrs use the Linux ABI: `system.posix_acl_access` and
+`system.posix_acl_default` are version-2 ACL values. The codec explicitly
+encodes ext4 version 1 with short base entries and named-entry IDs; the reader
+returns version 2 again. Capabilities and other opaque values remain byte-exact.
+Only supplied attributes are written, with deterministic placement/order.
+
+`FileData::Sparse(SparseData { reader, length, ranges })` consumes only stored
+bytes in ordered, disjoint `FileRange { offset, length }` records. Holes are
+not scanned or written. Unaligned ranges sharing a block are merged without
+losing either range. The reader returns zeros for holes and unwritten extents.
+An all-hole file does not consume its logical length on the image.
+
+For a final composed namespace, use `FormatSizing::add_inode` once per unique
+inode (including root), with touched 4K data blocks and input extent records;
+hardlink aliases do not repeat data accounting. Use `add_directory` with each
+directory's direct child-name bytes, including aliases. `minimum_size_bytes`
+includes JBD2, reserved inodes/lost+found, descriptor reservations/backups,
+bitmaps, inode tables and extent metadata, with conservative optimizer bounds.
+It returns a sufficient whole-group generic image size, not a fixed padding
+constant, sparse logical size or usable-capacity promise. This policy is
+separate from managed uppers' fixed exact-backing geometry below.
+
+The generic formatter freezes the actual descriptor reservation before placing
+the journal. Appends beyond the initial size consume that same reservation;
+they never infer a larger physical reservation from the grown file length.
+Exhausting the original area fails before descriptor writes could overwrite
+the journal. Managed uppers still reserve their separate fixed 64-block area.
+
+Normalized ingestion/composition acceptance and flat ext4 representability are
+separate. The generic writer retains its checked 65,000 directory-link bound
+(at most 64,998 direct subdirectories); it fails staging rather than clamping
+counts or publishing a partial artifact. The same generic flat artifact also
+seeds writable opaque-raw roots, so a read-only-only DIR_NLINK sentinel shortcut
+would be incorrect after that consumer becomes writable. This change does not
+enable generic htrees/DIR_NLINK or claim every admitted namespace topology is
+flat-renderable. Managed uppers retain their separate fixed profile.
+The 4096-byte ext4 profile also admits symlink targets only through 4095 bytes:
+Linux needs one terminating byte in the target block. A longer normalized
+target may remain stored/composable, but flat materialization rejects it before
+replacing any inode or creating parents, never truncates it.
+
+
 ### Read an ext4 image
 
 ```rust
 use disk_image::ext4::Reader;
 
-let mut reader = Reader::new(std::path::Path::new("rootfs.ext4"))?;
+// `Reader::from_file` holds an already-open descriptor instead.
+let reader = Reader::new(std::path::Path::new("rootfs.ext4"))?;
 
 // Check existence, list directories, read files.
 assert!(reader.exists("/etc/hostname"));
 let entries = reader.list_dir("/etc")?;
 let data = reader.read_file("/etc/hostname", 0, None)?;
 assert_eq!(&data, b"silo\n");
+
+// Whole-namespace cross-check before trusting a kernel-mutated image.
+reader.audit()?;
 ```
+
+The reader implements exactly the features of the formatter and the fixed
+`silo-upper-ext4-v1` profile (`has_journal`, `ext_attr`, `resize_inode`,
+`dir_index`; `filetype`, `extents`, `flex_bg`; `sparse_super`, `large_file`,
+`huge_file`, `gdt_csum`, `dir_nlink`, `extra_isize`) with 4096-byte blocks and
+256-byte inodes. Everything it returns is exact or one of three typed errors:
+
+- `ReadError::RequiresRecovery`: `needs_recovery`, a journal with unreplayed
+  transactions or an abort errno, a nonempty orphan list, or superblock state
+  that is not clean. The journal is never replayed and the image never written;
+  `read_superblock` still exposes superblock facts for exact-copy callers.
+- `ReadError::Unsupported`: any other feature (`inline_data`, `ea_inode`,
+  `64bit`, `metadata_csum`, encryption, casefolding, ...), unknown inode
+  encoding flags, block-mapped (non-extent) inodes with content, EA-inode or
+  `system.data` xattrs, SipHash directories, and the resource bounds
+  (1 TiB files, 4,194,304 extents per inode, 4,000,000 entries per directory).
+- `ReadError::Corrupt`: geometry, group-descriptor checksums and ranges,
+  allocation bitmaps, extent tree depth/order/key/range/cycle checks, exact
+  `i_blocks` accounting, directory record tiling, `.`/`..`, names and types,
+  htree structure and hash placement, xattr layout, symlink lengths and
+  device encodings.
+
+Construction validates the superblock, clean state, every group descriptor
+and the journal superblock; inodes and directories are validated when read.
+`Reader::audit` additionally walks the whole namespace and proves exact hard
+link counts, single-named directories with correct `..`, matching entry types,
+directory link counts (or `dir_nlink`'s 1) and that every allocated inode is
+reachable. All reads are positioned and take `&self`.
+
+Inode-level APIs serve namespace consumers such as the overlay flattener:
+`read_dir`/`lookup` (sorted entries without `.`/`..`), `metadata` (kind,
+device numbers, permissions, ids, nanosecond times, attribute flags),
+`inode_xattrs`, `symlink_target` and `file_body`. A `FileBody` exposes ordered,
+coalesced `stored_ranges` (holes and unwritten extents excluded, allocation
+beyond `i_size` clipped); `read_at` performs positioned logical reads and
+`body_stream` yields exactly the stored bytes, so a body can feed
+`FileData::Sparse` without a staging copy.
 
 ### Probe an image format
 
@@ -80,6 +173,87 @@ assert_eq!(probe(std::path::Path::new("rootfs.ext4"))?, ProbeResult::Ext4);
 
 `probe` checks only the ext4 superblock magic. It reports short files and magic
 mismatches as `ProbeResult::NotExt4`; it does not validate the filesystem.
+
+### Inspect a partition table
+
+Partition facts are provided by the sibling [`disk-partition`](../disk-partition)
+crate, independently of this crate's ext4 and qcow2 code. It is `no_std + alloc`
+by default, with an opt-in `std` feature for a held `Read + Seek` source:
+
+```toml
+[dependencies]
+disk-partition = { path = "common/disk-partition", features = ["std"] }
+```
+
+```rust
+use disk_partition::{Geometry, ReadMode, read_table, validate_linux_direct_table};
+
+let mut source = std::fs::File::open("root.raw")?;
+let geometry = Geometry::new(source.metadata()?.len())?;
+let table = read_table(&mut source, geometry, ReadMode::StrictImport)?;
+validate_linux_direct_table(&table)?;
+```
+
+Guest callers implement `ReadAt` on their held block-device descriptor, with
+their own associated error type. `read_table` returns `Error<R::Error>` and
+preserves the failing byte offset and source error without allocating strings.
+`Geometry::new` performs no I/O and returns `Error<core::convert::Infallible>`,
+so its error type never needs a caller-supplied generic argument.
+
+The shared parser bounds disks to 1 TiB with 512-byte sectors, GPT to 128 entries
+and 128–4096-byte power-of-two strides, and MBR to four primary slots. It checks
+both GPT copies, CRCs, reserved fields, overlaps and duplicate GUIDs. Strict
+import requires GPT at current capacity; guest boot can retain matching
+original GPT copies after opaque disk growth. Corrupt or unsupported tables
+never become a whole-disk fallback.
+
+Linux direct boot additionally requires 128-byte GPT entries, enforced by
+`validate_linux_direct_table`; wider entries remain inspectable. This helper
+does not select a root or admit a filesystem. A `PartitionTable::None` result
+is suitable only for an explicit whole-disk selector.
+
+### Create a private managed upper
+
+```rust
+use disk_image::ext4::upper::format_upper;
+use rootfs_spec::upper_geometry::UpperCapacity;
+
+let capacity = UpperCapacity::new(64 * 1024 * 1024)?;
+let upper = format_upper(std::path::Path::new("upper.raw"), capacity)?;
+```
+
+`silo-upper-ext4-v1` is a separate fixed policy over the same writer, not a
+change to generic OCI formatting. It creates only a new sparse 0600 file, with
+a random v4 UUID, root-owned empty `upper/` (0755), `work/` (0700) and
+`lost+found/` (0700). Existing destinations and symlinks are never overwritten.
+The caller owns failed staging-file cleanup, synchronization and publication.
+
+Capacity accepts every 4096-byte-aligned length from 64 MiB through 1 TiB.
+Backing length is exact. The result separately returns actual filesystem span,
+excluded short-group tail, initial free blocks in bytes and free inodes.
+Free blocks are not mounted statvfs usable capacity or host physical allocation.
+A tail too small for the qualified Linux resize rule adds no filesystem space.
+Shared core-only `rootfs-spec::upper_geometry` arithmetic is used by init to
+reject unexplained undergrowth, not to treat ioctl success as proof.
+
+The fixed profile uses 4096-byte blocks, 256-byte inodes, 8192 inodes/group,
+32-byte descriptors and 64 total active-plus-reserved descriptor blocks
+(63 reserved for small uppers, zero at 1 TiB). Flex log size is 13 (8192 groups,
+covering 1 TiB without signed flex-size overflow); the default hash is signed
+half-MD4 seeded with the UUID's four little-endian words.
+The clean internal JBD2 v2 journal uses 4096-byte blocks, first log block and
+initial sequence 1, one user, no journal feature bits, and the existing size
+ladder evaluated against the actual filesystem span (1024 blocks at 64 MiB).
+Independent Linux `e2fsck`, `dumpe2fs` and `debugfs` tests validate images;
+they are not production dependencies.
+
+Managed uppers must not use the offline grower below. Stopped growth copies
+the old prefix unchanged into a replacement private file of the new exact
+length, without host ext4 metadata changes. Init replays and grows upperfs
+using `EXT4_IOC_RESIZE_FS`; it never uses `resize2fs` or resizes overlay `/`.
+Persistent work/index state is never recreated on restart. Native clean/dirty
+growth, descriptor consumption across 16 GiB and sparse 1 TiB growth remain
+production-path smoke gates, not Cargo VM tests.
 
 ### Grow an ext4 image
 
@@ -110,6 +284,26 @@ Internally, the formatter writes data sequentially and computes the final metada
 3. Block group layout is optimized to minimize group count.
 4. The internal journal, resize inode metadata, backup superblocks, group descriptors, inode tables, bitmaps, and the primary superblock are written.
 
+All freshly formatted filesystems, including managed uppers and generic OCI
+images, leave bitmaps covered by `BLOCK_UNINIT` or `INODE_UNINIT` unwritten.
+The existing `uninit_bg` (`GDT_CSUM`) feature lets ext4 reconstruct these from
+the descriptor's metadata locations. The final block group's block bitmap
+remains initialized, including unavailable blocks past the device end.
+Known-zero inode tables are marked `INODE_ZEROED` (`ITABLE_ZEROED` in
+`dumpe2fs`), including zero-padded tails of active tables, so mounting does not
+schedule background table zeroing. Addresses, free counts, backup placement,
+resize reservations and filesystem features are unchanged.
+
+For unmounted fresh 30/100/500 GiB managed uppers, the Linux sparse-file
+regression test expects 12/18/21 nonzero 8 MiB chunks (one chunk tolerance),
+instead of 240/800/3998. This is a small, near-constant initial footprint,
+not a guarantee of capacity-independent snapshot work: sparse-super backup
+counts still grow, and guest writes can populate further chunks.
+The reader already honors `INODE_UNINIT`; the offline grower only reads the
+initialized final block bitmap and retains its existing new-group writes.
+Real-guest qualification must still mount, write across groups, grow a managed
+upper online and grow a raw root offline.
+
 ## ext4 Feature Flags
 
 This table follows the feature list documented in [`ext4(5)`](https://www.man7.org/linux/man-pages/man5/ext4.5.html). Status describes what `ext4` currently emits or supports.
@@ -119,8 +313,8 @@ This table follows the feature list documented in [`ext4(5)`](https://www.man7.o
 | `64bit`                  | Not supported | Enables the file system to be larger than 2^32 blocks.                                                                                                   |
 | `bigalloc`               | Not supported | Enables clustered block allocation, so the unit of allocation is a power-of-two number of blocks.                                                        |
 | `casefold`               | Not supported | Provides file-system-level character encoding support for directories with the casefold flag enabled.                                                    |
-| `dir_index`              | Not supported | Uses hashed b-trees to speed up name lookups in large directories.                                                                                       |
-| `dir_nlink`              | Not supported | Lifts the normal ext4 limit of 65,000 hard links for directories by using a link count of 1 when the count is not known.                                 |
+| `dir_index`              | Upper profile | Enables half-MD4 directory indexing; the kernel builds htrees when directories grow.                                                                    |
+| `dir_nlink`              | Upper profile | Enables the kernel's large-directory link-count convention.                                                                                             |
 | `ea_inode`               | Not supported | Allows extended attribute values to be placed in data blocks of a separate inode.                                                                        |
 | `encrypt`                | Not supported | Enables file-system-level encryption of data blocks and file names.                                                                                      |
 | `ext_attr`               | Enabled       | Enables the use of extended attributes.                                                                                                                  |
@@ -157,7 +351,7 @@ This table follows the feature list documented in [`ext4(5)`](https://www.man7.o
 - Offline resize supports the Silo formatter profile only and refuses images that require journal recovery.
 - Host-side JBD2 replay is intentionally not implemented; Linux performs recovery before the guest online-resize fallback.
 - `sparse_super2` is intentionally disabled; use classic `sparse_super` plus `resize_inode` for Linux online resize.
-- The formatter writes a focused subset of ext4 metadata. Features outside the table's enabled set should be treated as unsupported even if the reader can tolerate some of their on-disk structures.
+- The formatter writes a focused subset of ext4 metadata. The reader refuses every feature outside the listed reader profile with `ReadError::Unsupported` rather than approximating it.
 
 ## Testing
 
@@ -177,6 +371,15 @@ cargo test -p disk-image
 The e2fsprogs integration tests compile and run only on Linux. They call the
 host `tune2fs`, `e2fsck`, `resize2fs`, and `debugfs` binaries, and they create
 temporary images under the system temp directory outside the workspace.
+
+Directory-hash unit vectors come from e2fsprogs 1.47.4
+[`ext2fs_dirhash`](https://github.com/tytso/e2fsprogs/blob/v1.47.4/lib/ext2fs/dirhash.c),
+queried with exact byte buffers and lengths, without lossy UTF-8 conversion.
+They cover signed/unsigned bytes, seeds, empty names, 16/32-byte chunk
+boundaries, and 255-byte names. The mutated-upper fixture retains the full
+Linux 12:20-bit device boundary: since `debugfs mknod` limits each number to
+16 bits, it creates the inode first and sets the encoded word with
+`set_inode_field` before the independent `e2fsck` clean check.
 
 ```sh
 cargo test -p disk-image --test e2fsprogs -- --nocapture

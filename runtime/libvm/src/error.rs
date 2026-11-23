@@ -5,6 +5,215 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LibVmError {
+    #[error("machine `{reference}` is hibernated; start it with `silo start {reference}` first")]
+    HibernatedStartFirst { reference: String },
+    #[error("machine `{reference}` is hibernated; run `silo stop {reference}` first")]
+    HibernatedStopFirst { reference: String },
+    #[error("machine `{reference}` is already hibernated; wake it with `silo start {reference}`")]
+    AlreadyHibernated { reference: String },
+    #[error("machine `{reference}` is a temporary `silo run` machine and cannot be hibernated")]
+    HibernateTemporary { reference: String },
+    #[error("machine `{reference}` is busy with another lifecycle operation; try again when it finishes")]
+    HibernateBusy { reference: String },
+    #[error("not enough disk space to hibernate `{reference}`: {needed_bytes} bytes needed, {free_bytes} bytes free")]
+    HibernateOutOfSpace {
+        reference: String,
+        needed_bytes: u64,
+        free_bytes: u64,
+    },
+    #[error("could not hibernate `{reference}`: {message}")]
+    HibernateFailed { reference: String, message: String },
+    #[error("cannot wake `{reference}`: its saved state cannot be used ({reason}); run `silo stop {reference}` to discard it, then `silo start {reference}`")]
+    HibernateUnusable {
+        reference: String,
+        reason: crate::storage::hibernate_file::HibernateUnusableReason,
+    },
+    #[error(
+        "could not wake `{reference}`; its saved state was kept; retry `silo start {reference}`"
+    )]
+    WakeFailedBeforeConsume {
+        reference: String,
+        #[source]
+        source: Box<LibVmError>,
+    },
+    #[error("could not wake `{reference}`; its saved state is gone and the machine is stopped; run `silo start {reference}` to boot it")]
+    WakeConsumed {
+        reference: String,
+        /// Why the wake failed, when this process observed it. Absent for a
+        /// caller that only joined a wake another process ran.
+        #[source]
+        source: Option<Box<LibVmError>>,
+    },
+    #[error(transparent)]
+    Handoff(#[from] crate::handoff::types::HandoffError),
+    #[error("{operation} unsupported: {reason} (backend={backend}, lane={lane})")]
+    LiveOperationUnsupported {
+        operation: vm_spec::live::LiveOperation,
+        backend: vm_spec::live::LiveBackend,
+        lane: vm_spec::live::LiveLane,
+        reason: vm_spec::live::LiveUnsupportedReason,
+    },
+    #[error("live capability discovery failed: {message}")]
+    LiveDiscovery { message: String },
+    #[error("live capability protocol failed: {message}")]
+    LiveProtocol { message: String },
+    #[error("live observation for {reference} failed: {message}")]
+    LiveObservation { reference: String, message: String },
+    /// A retained capture produced no admissible snapshot or is still owned
+    /// by its run. The capture identity, reservation and staging are retained.
+    #[error("live capture {capture_id}: {message}")]
+    LiveCapture { capture_id: String, message: String },
+    #[error("invalid name {name:?}: {reason}")]
+    InvalidName { name: String, reason: &'static str },
+    #[error("image name {name} already names a different image")]
+    ImageNameConflict { name: String },
+    #[error("snapshot name {name} already names a different snapshot")]
+    SnapshotNameConflict { name: String },
+    #[error("snapshot name {name} already names a different snapshot; snapshot {snapshot} was kept without the requested name")]
+    CaptureNameConflict {
+        name: String,
+        snapshot: crate::storage::identity::SnapshotId,
+    },
+    #[error("snapshot {reference} not found")]
+    SnapshotNotFound { reference: String },
+    #[error("id prefix {prefix:?} matches {count} records; use more characters")]
+    AmbiguousRecordPrefix { prefix: String, count: usize },
+    #[error("{reference} is a snapshot, not an image; use `silo restore {reference}`")]
+    SnapshotIsNotAnImage { reference: String },
+    #[error("{reference} is an image, not a snapshot; use `silo create {reference}`")]
+    ImageIsNotASnapshot { reference: String },
+    #[error("VM artifact {reference} is a snapshot, not an image; use `silo restore {reference}`")]
+    ArtifactIsSnapshot { reference: String },
+    #[error("VM artifact {reference} is an image, not a snapshot; use `silo create {reference}`")]
+    ArtifactIsImage { reference: String },
+    /// The registry reference names a Silo image artifact, which is pulled
+    /// into a stored image rather than resolved as an OCI container image.
+    #[error("{reference} is a Silo image artifact, not a container image; pull it with `silo image pull {reference}`")]
+    ImageIsVmArtifact { reference: String },
+    #[error(
+        "machine {reference} is running: stop it first, or include its memory in the snapshot"
+    )]
+    SnapshotRequiresStoppedMachine { reference: String },
+    #[error(
+        "machine {reference} is not running: a snapshot with memory requires a running machine"
+    )]
+    MemorySnapshotRequiresRunningMachine { reference: String },
+    #[error("{reference} is in use by an active storage operation; retry when it completes")]
+    RecordInUse { reference: String },
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
+    #[error("live fork {operation_id}: {message}")]
+    LiveFork {
+        operation_id: String,
+        message: String,
+    },
+    #[error("live fork {operation_id} was not found")]
+    LiveForkNotFound { operation_id: String },
+    /// The exact fork child was fenced before its native submission committed.
+    #[error("live fork {operation_id} child {child_index} was cancelled before submission")]
+    ForkChildCancelled {
+        operation_id: uuid::Uuid,
+        child_index: u32,
+    },
+    #[error(transparent)]
+    SnapshotVerification(#[from] crate::store::snapshot_store::SnapshotVerificationError),
+    #[error("snapshot {snapshot} refused at {}: pin {} expected {}, destination {}; no execution child was started", .refusal.stage, .refusal.pin, .refusal.expected, .refusal.actual)]
+    SnapshotPortability {
+        snapshot: String,
+        /// Keep this uncommon diagnostic from enlarging every result and async state.
+        refusal: Box<vm_spec::restore::RestorePortabilityRefusal>,
+    },
+
+    #[error(transparent)]
+    Storage(#[from] crate::storage::StorageError),
+    #[error(transparent)]
+    BootAsset(#[from] crate::owned_boot_assets::BootAssetError),
+    /// A raw root's selected kernel bytes do not establish its direct profile.
+    #[error(transparent)]
+    DirectKernelRejected(#[from] Box<crate::owned_boot_assets::DirectKernelRejected>),
+    #[error("backend {backend:?} does not support layered EROFS overlay roots")]
+    OverlayBackendUnsupported { backend: vm_spec::live::LiveBackend },
+    #[error("boot admission rejected {source_family:?}/{root_profile:?} on {effective_backend:?}: requires {requirement:?}; remedy: {remedy:?}")]
+    BackendAdmissionRejected {
+        source_family: crate::runtime::boot_assets::SourceFamily,
+        root_profile: crate::StorageProfile,
+        requirement: crate::BackendRequirement,
+        effective_backend: vm_spec::live::LiveBackend,
+        remedy: crate::runtime::boot_assets::AdmissionRemedy,
+    },
+    #[error("required translation is unavailable: {reason}")]
+    TranslationUnavailable { reason: String },
+    #[error("boot assets require acquisition of immutable object {missing}")]
+    BootAssetsAcquisitionRequired {
+        missing: crate::storage::identity::ObjectDigest,
+    },
+    #[error("custom base initramfs bytes differ from the supported schema-1 bootstrap; select the packaged base initramfs")]
+    BootBundleAbiUnsupported,
+    #[error("root selection {:?} failed: {}", .0.requested, .0.reason)]
+    RootSelectionFailed(Box<crate::image::import_types::RootSelectionFailed>),
+    #[error(transparent)]
+    DiskImport(#[from] Box<crate::image::import::DiskImportError>),
+    /// A persisted or received root uses a retired or unknown root format.
+    /// Silo never migrates or reinterprets it; recreate it in fresh state.
+    #[error("root profile {profile:?} is retired or unknown; recreate this machine or artifact in a fresh state root")]
+    IncompatibleRootProfile { profile: String },
+    /// A retained layered lower is incomplete locally; explicit image
+    /// acquisition or transfer must restore its exact closure first.
+    #[error("layered lower {lower} requires acquisition of its retained closure: {missing}")]
+    CompositionAcquisitionRequired {
+        lower: crate::storage::identity::LowerResultId,
+        missing: String,
+    },
+    #[error("stored data for image {reference} is damaged or was changed on disk; remove the image if it is still listed (`silo image rm {reference}`), run `silo image prune`, then pull it again ({detail})")]
+    StoredImageDamaged { reference: String, detail: String },
+    /// Raw export refuses a source whose on-disk filesystem state needs
+    /// recovery; Silo never replays a journal or repairs the source.
+    #[error("raw disk export requires a cleanly stopped source: {reason}")]
+    RawExportRecoveryRequired { reason: String },
+    #[error("raw disk export unsupported: {reason}")]
+    RawExportUnsupported { reason: String },
+    /// Names the failing artifact boundary (config, table, transfer map,
+    /// chunk, object, record, provenance) and the stable identity involved.
+    #[error("VM artifact {boundary} rejected: {message}")]
+    ArtifactInvalid {
+        boundary: &'static str,
+        message: String,
+    },
+    #[error(transparent)]
+    ArtifactWire(oci::vm_artifact::Error),
+    #[error("format private overlay upper: {0}")]
+    UpperFormat(#[from] disk_image::ext4::FormatError),
+    #[error(transparent)]
+    Changeset(#[from] oci::changeset::ChangesetError),
+    #[error(transparent)]
+    Namespace(#[from] oci::changeset::namespace::NamespaceError),
+    #[error("blocking storage worker failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+
+    #[error("invalid {record} storage record: {message}")]
+    InvalidStorageRecord {
+        record: &'static str,
+        message: String,
+    },
+
+    #[error("image removal would invalidate machine {machine} dependency {path}")]
+    CacheDependency { machine: String, path: PathBuf },
+
+    #[error("cannot remove capture {capture_id}: {dependency}")]
+    CaptureRemovalDependency {
+        capture_id: uuid::Uuid,
+        dependency: String,
+    },
+
+    /// The SQL commit remains available for idempotent command replay.
+    #[error("catalog transaction committed but is not yet confirmed power-loss durable after 5 seconds; retrying the command is safe")]
+    DurabilityPending,
+
+    #[error("incompatible state database: this home was written by a different Silo state format and cannot be read or converted; remove the old state and start with a fresh home: {source}")]
+    StateDatabaseIncompatible {
+        #[source]
+        source: sqlx::migrate::MigrateError,
+    },
     #[error("network secret slot {slot:?}, store key {key:?}: {code}")]
     SecretResolution {
         slot: String,
@@ -54,40 +263,19 @@ pub enum LibVmError {
     #[error("image {reference} not found")]
     ImageNotFound { reference: String },
 
+    #[error("snapshot {reference} was not found locally; {message}")]
+    SnapshotPullFailed { reference: String, message: String },
+
     #[error("image {reference} is still pinned by {machine_count} machine(s)")]
     ImageInUse {
         reference: String,
         machine_count: u64,
     },
 
-    #[error("image pull policy {policy:?} does not apply to {source_kind:?} image sources")]
+    #[error("pull policy {policy:?} does not apply to {source_kind:?} image sources")]
     ImagePullPolicyUnsupported {
-        policy: crate::ImagePullPolicy,
+        policy: crate::PullPolicy,
         source_kind: crate::ImageSourceKind,
-    },
-
-    #[error("could not canonicalize local disk {path}")]
-    LocalDiskCanonicalize {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("could not inspect local disk {path}")]
-    LocalDiskMetadata {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("local disk {path} is invalid: path must point to a regular file")]
-    LocalDiskNotRegularFile { path: PathBuf },
-
-    #[error("could not read local disk {path}")]
-    LocalDiskUnreadable {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
     },
 
     #[error("image operation for {reference} failed")]
@@ -105,6 +293,11 @@ pub enum LibVmError {
 
     #[error("machine {reference} is already running")]
     MachineAlreadyRunning { reference: String },
+
+    #[error(
+        "machine {reference} is busy with another snapshot or fork; try again when it finishes"
+    )]
+    MachineCaptureBusy { reference: String },
 
     #[error("machine {reference} is not running")]
     MachineNotRunning { reference: String },
@@ -193,6 +386,9 @@ pub enum LibVmError {
     #[error("invalid machine configuration for {reference:?}: {reason}")]
     InvalidMachineConfig { reference: String, reason: String },
 
+    #[error("invalid kernel arguments: {reason}")]
+    InvalidKernelArguments { reason: String },
+
     #[error("unsupported host architecture {arch:?}")]
     UnsupportedHostArchitecture { arch: String },
 
@@ -253,10 +449,14 @@ impl LibVmError {
                 | Self::InvalidOwnedPath { .. }
                 | Self::CorruptState { .. }
                 | Self::StateDecode { .. }
+                | Self::InvalidStorageRecord { .. }
+                | Self::StoredImageDamaged { .. }
+                | Self::Storage(crate::storage::StorageError::Bound(_))
                 | Self::NetworkRuntime { .. }
                 | Self::MonitorConnection { .. }
                 | Self::MonitorProtocol { .. }
                 | Self::InvalidMachineConfig { .. }
+                | Self::InvalidKernelArguments { .. }
                 | Self::Database(sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_))
         )
     }
@@ -267,6 +467,70 @@ impl LibVmError {
     /// cannot silently degrade a binding to message parsing or an unknown kind.
     pub fn variant(&self) -> &'static str {
         match self {
+            Self::HibernatedStartFirst { .. } => "HibernatedStartFirst",
+            Self::HibernatedStopFirst { .. } => "HibernatedStopFirst",
+            Self::AlreadyHibernated { .. } => "AlreadyHibernated",
+            Self::HibernateTemporary { .. } => "HibernateTemporary",
+            Self::HibernateOutOfSpace { .. } => "HibernateOutOfSpace",
+            Self::HibernateFailed { .. } => "HibernateFailed",
+            Self::HibernateUnusable { .. } => "HibernateUnusable",
+            Self::HibernateBusy { .. } => "HibernateBusy",
+            Self::WakeFailedBeforeConsume { .. } => "WakeFailedBeforeConsume",
+            Self::WakeConsumed { .. } => "WakeConsumed",
+            Self::InvalidName { .. } => "InvalidName",
+            Self::ImageNameConflict { .. } => "ImageNameConflict",
+            Self::SnapshotNameConflict { .. } => "SnapshotNameConflict",
+            Self::CaptureNameConflict { .. } => "CaptureNameConflict",
+            Self::SnapshotNotFound { .. } => "SnapshotNotFound",
+            Self::AmbiguousRecordPrefix { .. } => "AmbiguousRecordPrefix",
+            Self::SnapshotIsNotAnImage { .. } => "SnapshotIsNotAnImage",
+            Self::ImageIsNotASnapshot { .. } => "ImageIsNotASnapshot",
+            Self::ArtifactIsSnapshot { .. } => "ArtifactIsSnapshot",
+            Self::ArtifactIsImage { .. } => "ArtifactIsImage",
+            Self::ImageIsVmArtifact { .. } => "ImageIsVmArtifact",
+            Self::SnapshotRequiresStoppedMachine { .. } => "SnapshotRequiresStoppedMachine",
+            Self::MemorySnapshotRequiresRunningMachine { .. } => {
+                "MemorySnapshotRequiresRunningMachine"
+            }
+            Self::RecordInUse { .. } => "RecordInUse",
+            Self::InvalidRequest { .. } => "InvalidRequest",
+            Self::Handoff(_) => "Handoff",
+            Self::LiveOperationUnsupported { .. } => "LiveOperationUnsupported",
+            Self::LiveDiscovery { .. } => "LiveDiscovery",
+            Self::LiveProtocol { .. } => "LiveProtocol",
+            Self::LiveObservation { .. } => "LiveObservation",
+            Self::LiveCapture { .. } => "LiveCapture",
+            Self::SnapshotPortability { .. } => "SnapshotPortability",
+            Self::LiveFork { .. } => "LiveFork",
+            Self::LiveForkNotFound { .. } => "LiveForkNotFound",
+            Self::ForkChildCancelled { .. } => "ForkChildCancelled",
+            Self::SnapshotVerification(_) => "SnapshotVerification",
+            Self::Storage(_) => "Storage",
+            Self::BootAsset(_) => "BootAsset",
+            Self::DirectKernelRejected(_) => "DirectKernelRejected",
+            Self::OverlayBackendUnsupported { .. } => "OverlayBackendUnsupported",
+            Self::BackendAdmissionRejected { .. } => "BackendAdmissionRejected",
+            Self::TranslationUnavailable { .. } => "TranslationUnavailable",
+            Self::BootAssetsAcquisitionRequired { .. } => "BootAssetsAcquisitionRequired",
+            Self::BootBundleAbiUnsupported => "BootBundleAbiUnsupported",
+            Self::RootSelectionFailed(_) => "RootSelectionFailed",
+            Self::DiskImport(_) => "DiskImport",
+            Self::IncompatibleRootProfile { .. } => "IncompatibleRootProfile",
+            Self::CompositionAcquisitionRequired { .. } => "CompositionAcquisitionRequired",
+            Self::StoredImageDamaged { .. } => "StoredImageDamaged",
+            Self::RawExportRecoveryRequired { .. } => "RawExportRecoveryRequired",
+            Self::RawExportUnsupported { .. } => "RawExportUnsupported",
+            Self::ArtifactInvalid { .. } => "ArtifactInvalid",
+            Self::ArtifactWire(_) => "ArtifactWire",
+            Self::UpperFormat(_) => "UpperFormat",
+            Self::Changeset(_) => "Changeset",
+            Self::Namespace(_) => "Namespace",
+            Self::Task(_) => "Task",
+            Self::InvalidStorageRecord { .. } => "InvalidStorageRecord",
+            Self::CacheDependency { .. } => "CacheDependency",
+            Self::CaptureRemovalDependency { .. } => "CaptureRemovalDependency",
+            Self::DurabilityPending => "DurabilityPending",
+            Self::StateDatabaseIncompatible { .. } => "StateDatabaseIncompatible",
             Self::SecretResolution { .. } => "SecretResolution",
             Self::MissingNetworkSecrets { .. } => "MissingNetworkSecrets",
             Self::HomeUnavailable => "HomeUnavailable",
@@ -281,16 +545,14 @@ impl LibVmError {
             Self::MachineNameGenerationFailed { .. } => "MachineNameGenerationFailed",
             Self::MachineNotFound { .. } => "MachineNotFound",
             Self::ImageNotFound { .. } => "ImageNotFound",
+            Self::SnapshotPullFailed { .. } => "SnapshotPullFailed",
             Self::ImageInUse { .. } => "ImageInUse",
             Self::ImagePullPolicyUnsupported { .. } => "ImagePullPolicyUnsupported",
-            Self::LocalDiskCanonicalize { .. } => "LocalDiskCanonicalize",
-            Self::LocalDiskMetadata { .. } => "LocalDiskMetadata",
-            Self::LocalDiskNotRegularFile { .. } => "LocalDiskNotRegularFile",
-            Self::LocalDiskUnreadable { .. } => "LocalDiskUnreadable",
             Self::Image { .. } => "Image",
             Self::ImageReferenceRejected { .. } => "ImageReferenceRejected",
             Self::MachineIdAlreadyExists { .. } => "MachineIdAlreadyExists",
             Self::MachineAlreadyRunning { .. } => "MachineAlreadyRunning",
+            Self::MachineCaptureBusy { .. } => "MachineCaptureBusy",
             Self::MachineNotRunning { .. } => "MachineNotRunning",
             Self::MachineStaleGeneration { .. } => "MachineStaleGeneration",
             Self::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
@@ -312,6 +574,7 @@ impl LibVmError {
             Self::InvalidCreateRequest { .. } => "InvalidCreateRequest",
             Self::InvalidMachineUpdate { .. } => "InvalidMachineUpdate",
             Self::InvalidMachineConfig { .. } => "InvalidMachineConfig",
+            Self::InvalidKernelArguments { .. } => "InvalidKernelArguments",
             Self::UnsupportedHostArchitecture { .. } => "UnsupportedHostArchitecture",
             Self::CorruptState { .. } => "CorruptState",
             Self::VmSpecSerializeFailed { .. } => "VmSpecSerializeFailed",
@@ -331,6 +594,20 @@ impl From<crate::machine::root_disk::RootDiskError> for LibVmError {
     fn from(source: crate::machine::root_disk::RootDiskError) -> Self {
         Self::RootDisk {
             message: source.to_string(),
+        }
+    }
+}
+
+/// A retired or unknown artifact root is the same typed root compatibility
+/// refusal as a retired local root; every other wire failure stays an
+/// artifact error.
+impl From<oci::vm_artifact::Error> for LibVmError {
+    fn from(source: oci::vm_artifact::Error) -> Self {
+        match source {
+            oci::vm_artifact::Error::UnsupportedRoot { root } => {
+                Self::IncompatibleRootProfile { profile: root }
+            }
+            source => Self::ArtifactWire(source),
         }
     }
 }

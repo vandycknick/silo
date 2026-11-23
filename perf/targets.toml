@@ -1,0 +1,47 @@
+tolerance = 0.10
+
+# Mark a target expected_fail (with its slice) only while work toward it is open.
+[silo.arch-30g.image.start]
+seconds = 1.0
+
+# First restore of a snapshot pages its RAM file in for the first time;
+# measured 0.55 to 0.77 s. A RAM-file warm-up is planned after the format change.
+[silo.arch-30g.image.restore_first]
+seconds = 0.75
+
+[silo.arch-30g.image.restore_second]
+seconds = 0.5
+
+[silo.arch-30g.image.fork_second]
+seconds = 1.25
+
+[silo.arch-30g.image.fork_first]
+seconds = 2.0
+
+[silo.arch-30g.image.snapshot_incremental]
+seconds = 1.5
+
+[silo.arch-30g.image.exec]
+seconds = 0.1
+
+[silo.arch-30g.image.snapshot_full]
+seconds = 3.0
+
+[silo.arch-30g.image.create]
+seconds = 1.0
+
+[silo.arch-30g.image.run_true]
+seconds = 2.0
+
+# ADR 0023 targets, confirmed on the first Arch 30 GiB qualification.
+[silo.arch-30g.image.hibernate]
+seconds = 2.0
+
+[silo.arch-30g.image.wake]
+seconds = 0.75
+
+[silo.arch-30g.image.exec_on_hibernated]
+seconds = 0.85
+
+[silo.arch-30g.image.hibernate_after_wake]
+seconds = 1.5

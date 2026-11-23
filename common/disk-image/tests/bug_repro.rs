@@ -28,7 +28,10 @@ fn bug1_remove_original_preserves_hardlink() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "hardlink content".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "hardlink content".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -39,7 +42,7 @@ fn bug1_remove_original_preserves_hardlink() {
     fmt.remove("/original").unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // /alias should still exist and be readable.
     assert!(
@@ -72,7 +75,10 @@ fn bug1b_last_hardlink_reclaims_inode() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "reclaim me".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "reclaim me".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -90,7 +96,8 @@ fn bug1b_last_hardlink_reclaims_inode() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "keep".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "keep".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -99,7 +106,7 @@ fn bug1b_last_hardlink_reclaims_inode() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     assert!(!reader.exists("/original"));
     assert!(!reader.exists("/alias"));
@@ -129,7 +136,8 @@ fn bug1b_last_hardlink_reclaims_inode() {
             make_mode(file_mode::S_IFREG, 0o644),
             None,
             None,
-            Some(&mut "keep".as_bytes()),
+            Some(disk_image::ext4::FileData::Dense(&mut "keep".as_bytes())),
+            None,
             None,
             None,
             None,
@@ -169,7 +177,8 @@ fn bug1c_large_file_hardlink_reclaim() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut pattern.as_slice()),
+        Some(disk_image::ext4::FileData::Dense(&mut pattern.as_slice())),
+        None,
         None,
         None,
         None,
@@ -185,7 +194,8 @@ fn bug1c_large_file_hardlink_reclaim() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "x".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "x".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -194,7 +204,7 @@ fn bug1c_large_file_hardlink_reclaim() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Inode should be fully reclaimed.
     // lost+found=11, bigfile=12, dummy=13
@@ -216,7 +226,8 @@ fn bug1c_large_file_hardlink_reclaim() {
             make_mode(file_mode::S_IFREG, 0o644),
             None,
             None,
-            Some(&mut "x".as_bytes()),
+            Some(disk_image::ext4::FileData::Dense(&mut "x".as_bytes())),
+            None,
             None,
             None,
             None,
@@ -265,7 +276,8 @@ fn bug3_4096_block_size_writes_correct_log() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "hello".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "hello".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -303,13 +315,15 @@ fn bug4_mkdir_p_through_symlink() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
     fmt.create(
         "/sym",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("/real_dir"),
+        Some("/real_dir".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -327,7 +341,8 @@ fn bug4_mkdir_p_through_symlink() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "data".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "data".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -336,7 +351,7 @@ fn bug4_mkdir_p_through_symlink() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // /sym should still be a symlink, not a directory.
     let (_, sym_inode) = reader.stat_no_follow("/sym").unwrap();

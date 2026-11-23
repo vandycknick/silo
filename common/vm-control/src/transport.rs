@@ -38,7 +38,18 @@ pub async fn probe(host: &HostPaths, admission: Admission) -> eyre::Result<Optio
     .await
 }
 
-// Alternate endpoints are private to transport fixtures, never an operator setting.
+/// Select a second runtime without changing process-wide environment.
+/// The selected Home/config roots and same-user peer are checked exactly as
+/// for ordinary management; a lost connection never reconnects implicitly.
+pub async fn probe_selected(
+    host: &HostPaths,
+    run_root: &Path,
+    admission: Admission,
+) -> eyre::Result<Option<SelectedDaemon>> {
+    eyre::ensure!(run_root.is_absolute(), "runtime root must be absolute");
+    probe_at(host, admission, silod_spec::paths::control_socket(run_root)).await
+}
+
 async fn probe_at(
     host: &HostPaths,
     admission: Admission,
@@ -212,6 +223,7 @@ fn admit_status(
         status.product_version == env!("CARGO_PKG_VERSION") && status.protocol_major == 1,
         "daemon product/protocol mismatch; restart with the matching silo installation"
     );
+    crate::live::validate_daemon_status(status)?;
     crate::validate_uuid(&status.generation, "daemon.generation")?;
     let home = crate::path_from_wire(status.home.clone())?;
     let config = crate::path_from_wire(status.config_dir.clone())?;
@@ -252,7 +264,7 @@ fn canonical_selected(path: &Path) -> eyre::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{admit_status, probe_at, Admission};
+    use crate::transport::{admit_status, probe_at, Admission};
     use libvm::HostPaths;
     use silod_spec::daemon::v1::{
         self as w,
@@ -273,24 +285,21 @@ mod tests {
             Ok(tonic::Response::new(self.0.clone()))
         }
 
+        async fn get_live_capabilities(
+            &self,
+            _: tonic::Request<()>,
+        ) -> Result<tonic::Response<w::LiveHostReport>, tonic::Status> {
+            self.0
+                .manager_live
+                .clone()
+                .map(tonic::Response::new)
+                .ok_or_else(|| tonic::Status::unavailable("fixture has no live evidence"))
+        }
+
         async fn get_runtime_info(
             &self,
             _: tonic::Request<()>,
         ) -> Result<tonic::Response<w::RuntimeInfo>, tonic::Status> {
-            Err(tonic::Status::unimplemented("fixture status only"))
-        }
-
-        async fn report_tailscale_status(
-            &self,
-            _: tonic::Request<w::TailscaleStatusReport>,
-        ) -> Result<tonic::Response<()>, tonic::Status> {
-            Err(tonic::Status::unimplemented("fixture status only"))
-        }
-
-        async fn drain_mutations(
-            &self,
-            _: tonic::Request<w::DrainMutationsRequest>,
-        ) -> Result<tonic::Response<()>, tonic::Status> {
             Err(tonic::Status::unimplemented("fixture status only"))
         }
     }
@@ -305,6 +314,7 @@ mod tests {
             home: crate::path_to_wire(&std::fs::canonicalize(host.home()).unwrap()),
             config_dir: crate::path_to_wire(&std::fs::canonicalize(host.config_dir()).unwrap()),
             core: core as i32,
+            live_schema_version: Some(1),
             ..Default::default()
         }
     }
@@ -498,6 +508,7 @@ mod tests {
             home: crate::path_to_wire(&home),
             config_dir: crate::path_to_wire(&home),
             core: silod_spec::daemon::v1::CorePhase::Ready as i32,
+            live_schema_version: Some(1),
             ..Default::default()
         };
         admit_status(&status, &host, Admission::Ready).unwrap();

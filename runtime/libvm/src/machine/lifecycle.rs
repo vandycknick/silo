@@ -1,10 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nix::{
-    errno::Errno,
-    sys::signal::{kill, Signal},
-    unistd::Pid,
-};
+use nix::sys::signal::Signal;
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
@@ -15,15 +11,16 @@ use crate::machine::{
     MachineStart, MachineStartOptions, MachineStopOptions, MachineWaitOptions,
 };
 use crate::runtime::core::{
-    interrupt_monitor, kill_monitor_process_group, monitor_identity as monitor_identity_for_pid,
-    read_monitor_pid, reconcile_root_disk_size, wait_for_monitor_stop, VmmRunIdentity,
+    read_exit_for_reconciliation, reconcile_root_disk_size, wait_for_monitor_stop, RuntimeStatus,
+    VmmRunIdentity,
 };
 use crate::runtime::Runtime;
 use crate::store::models::{MachineConfig, MachineRuntimeState};
-use crate::supervisor::exit_status::{self, VmmExitOutcome, VmmExitStatus};
+use crate::supervisor::exit_status;
 use crate::supervisor::process::ProcessIdentity;
 use crate::supervisor::VmmLaunch;
 use crate::LibVmError;
+use protocol::shutdown::{CurrentExitRecord, ExitOutcome, StorageHolderRole};
 
 const WAIT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -36,9 +33,14 @@ struct WaitTarget {
 }
 
 #[derive(Clone, Copy)]
-enum FailedStartState {
+pub(crate) enum FailedStartState {
     Stopped,
     Error,
+}
+
+pub(crate) struct FailedStartStorage {
+    pub(crate) lease: crate::store::operation_store::LaunchStorageLease,
+    pub(crate) lower: Option<crate::store::composition_store::LaunchLower>,
 }
 
 impl Machine {
@@ -58,15 +60,60 @@ impl Machine {
     }
 
     /// Starts the machine with prebuilt start options.
+    #[tracing::instrument(
+        name = "machine_start",
+        skip_all,
+        fields(machine_id = %self.machine_id(), run_id = tracing::field::Empty)
+    )]
     pub async fn start_with_options(
         &self,
         options: MachineStartOptions,
     ) -> Result<MachineStart, LibVmError> {
+        let machine = self.clone();
+        tokio::spawn(async move { machine.start_inner(options).await }).await?
+    }
+
+    async fn start_inner(&self, options: MachineStartOptions) -> Result<MachineStart, LibVmError> {
         let runtime = self.runtime();
         let supervisor = runtime.supervisor();
+        let mut timeline = crate::runtime::start_timeline::StartTimeline::new(runtime.open_timing);
+        let joining_wake = runtime
+            .native_store()?
+            .has_hibernation(self.machine_id())
+            .await?;
         let (config, run_id) = {
-            let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
+            crate::machine::hibernate::recover_locked(runtime, &config).await?;
+            if let Some(record) = runtime
+                .native_store()?
+                .machine_hibernation(config.id)
+                .await?
+            {
+                return self.wake_locked(&config, record).await;
+            }
+            if joining_wake {
+                let state = runtime.machine_state(config.id).await?;
+                if state.status == MachineRuntimeState::Running {
+                    let run_id = state.run_id.ok_or_else(|| LibVmError::MachineNotRunning {
+                        reference: config.name.clone(),
+                    })?;
+                    return Ok(MachineStart {
+                        machine: runtime.machine_inspect_data(config).await?,
+                        run_id: MachineRunId::from_raw(run_id),
+                    });
+                }
+                return Err(LibVmError::WakeConsumed {
+                    reference: config.name.clone(),
+                    source: None,
+                });
+            }
+            crate::machine::hibernate::fence(
+                runtime,
+                &config,
+                crate::machine::hibernate::HibernateRemedy::Stop,
+            )
+            .await?;
             let _node_state = crate::node_state::acquire(&config).await?;
             let machine_paths = runtime.machine_paths(config.id);
             let pid_path = machine_paths.vmm_pid_path();
@@ -92,19 +139,76 @@ impl Machine {
                     reference: config.name.clone(),
                 });
             }
+            if config.image_ref == "execution-restore" {
+                runtime
+                    .native_store()?
+                    .preflight_restored_cold_start(config.id)
+                    .await?;
+            }
+            let lower_started = std::time::Instant::now();
+            let mut storage = runtime.validate_machine_storage_for_launch(&config).await?;
+            runtime
+                .admit_cold_launch_storage(&mut config, &mut storage)
+                .await?;
+            let qualification = runtime.open_machine_boot(&config, &storage)?;
+            timeline.lower_resolve_authentication += lower_started.elapsed();
 
             let run_uuid = Uuid::new_v4();
             let run_id = run_uuid.to_string();
+            tracing::Span::current().record("run_id", run_id.as_str());
 
+            let storage_lease = runtime
+                .register_launch_storage(&config, run_uuid, &storage)
+                .await?;
             runtime.request_machine_start(&config, &run_id).await?;
-            let (root_disk_resize, mut secrets) = match (|| {
+            if config.image_ref == "execution-restore" {
+                config.image_ref = "stopped-storage".to_owned();
+            }
+            timeline.lifecycle_admission = timeline
+                .elapsed()
+                .saturating_sub(timeline.lower_resolve_authentication);
+            let lower_started = std::time::Instant::now();
+            let mut prepared_root = match runtime
+                .prepare_machine_root(&config, &storage_lease, qualification)
+                .await
+            {
+                Ok(root) => root,
+                Err(error) => {
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Stopped),
+                        None,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: None,
+                        },
+                        error,
+                    )
+                    .await);
+                }
+            };
+            timeline.lower_resolve_authentication += lower_started.elapsed();
+            let secrets_started = std::time::Instant::now();
+            let (root_disk_resize, mut secrets) = match async {
                 let secrets = runtime.resolve_machine_secrets(
                     &config,
                     &run_id,
                     &options.egress_credentials,
                 )?;
-                Ok((reconcile_root_disk_size(&config)?, secrets))
-            })() {
+                let resize = match &storage_lease.storage_record().root {
+                    crate::MachineRoot::OpaqueRaw { path, .. } => {
+                        reconcile_root_disk_size(runtime, &config, path.as_path()).await?
+                    }
+                    crate::MachineRoot::LinuxOverlay { .. } => {
+                        RootDiskResizeOutcome::OfflineComplete
+                    }
+                };
+                Ok((resize, secrets))
+            }
+            .await
+            {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     return Err(finish_failed_start(
@@ -113,6 +217,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         error,
                     )
                     .await);
@@ -120,7 +228,12 @@ impl Machine {
             };
 
             let resolved_network = match runtime
-                .prepare_machine_network(&config, &run_id, &secrets)
+                .prepare_machine_network(
+                    &config,
+                    &run_id,
+                    &secrets,
+                    crate::MachineDurability::Durable,
+                )
                 .await
             {
                 Ok(network) => network,
@@ -131,23 +244,25 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         error,
                     )
                     .await);
                 }
             };
             secrets.infrastructure.clear();
+            timeline.secrets_netd = secrets_started.elapsed();
+            let publication_started = std::time::Instant::now();
             let launch_inputs = match runtime.prepare_vmm_launch_inputs(
                 &config,
+                &run_id,
                 &resolved_network,
                 root_disk_resize == RootDiskResizeOutcome::GuestRequired,
-                secrets.ssh_trusted_ca.as_deref().ok_or_else(|| {
-                    LibVmError::MachinePreparationFailed {
-                        reference: config.name.clone(),
-                        message: "missing resolved SSH CA".into(),
-                    }
-                })?,
-                secrets.tls_certificate.as_deref(),
+                &secrets,
+                &prepared_root,
             ) {
                 Ok(inputs) => inputs,
                 Err(err) => {
@@ -157,6 +272,10 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         err,
                     )
                     .await);
@@ -173,6 +292,10 @@ impl Machine {
                     &run_id,
                     Some(FailedStartState::Stopped),
                     None,
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
                     error,
                 )
                 .await);
@@ -186,13 +309,57 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Stopped),
                         None,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         error,
                     )
                     .await)
                 }
             };
             let startup_command = options.vmm_startup_command();
+            let (file_device, file_inode) = match storage_lease.file_identity() {
+                Ok(identity) => identity,
+                Err(error) => {
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Stopped),
+                        None,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
+                        error.into(),
+                    )
+                    .await)
+                }
+            };
 
+            let disk_tracking_seeds = match crate::machine::root_storage::launch_disk_seeds(
+                &runtime.machine_storage_record(config.id).await?,
+                &config.machine_dir,
+                runtime.local_images_dir(),
+            ) {
+                Ok(seeds) => seeds,
+                Err(error) => {
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Stopped),
+                        None,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
+                        error,
+                    )
+                    .await);
+                }
+            };
             let launch = VmmLaunch {
                 machine_id: config.id,
                 name: &config.name,
@@ -213,34 +380,70 @@ impl Machine {
                 startup_command: startup_command.as_ref(),
                 machine_log_dir: &machine_log_dir,
                 machine_lock: &lifetime_lock,
+                qualification: prepared_root.qualification.as_ref(),
+                storage_lease: storage_lease.lock(),
+                storage_lease_binding: protocol::shutdown::StorageLeaseBinding {
+                    operation_id: storage_lease.operation_id().to_string(),
+                    file_device,
+                    file_inode,
+                },
+                storage_shutdown: &launch_inputs.storage_shutdown,
+                disk_tracking_seeds,
+                restore: None,
             };
-            if let Err(err) = supervisor.spawn(&launch).await {
+            timeline.launch_publication = publication_started.elapsed();
+            let admit_started = std::time::Instant::now();
+            if let Err(error) = runtime
+                .mark_launch_storage_admitted(storage_lease.operation_id())
+                .await
+            {
                 return Err(finish_failed_start(
                     runtime,
                     &config,
                     &run_id,
                     Some(FailedStartState::Stopped),
                     None,
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
+                    error,
+                )
+                .await);
+            }
+            timeline.admit_spawn = admit_started.elapsed();
+            let startup = async {
+                let barrier_started = std::time::Instant::now();
+                launch_inputs.artifacts.sync(&storage_lease)?;
+                timeline.durability_barrier = barrier_started.elapsed();
+                supervisor
+                    .spawn(&launch, Some(&mut timeline))
+                    .await?
+                    .wait()
+                    .await
+            };
+            if let Err(err) = startup.await {
+                return Err(finish_failed_start(
+                    runtime,
+                    &config,
+                    &run_id,
+                    Some(FailedStartState::Stopped),
+                    None,
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
                     err,
                 )
                 .await);
             }
 
-            let pid = match read_monitor_pid(&pid_path) {
-                Ok(pid) => pid,
-                Err(err) => {
-                    return Err(finish_failed_start(
-                        runtime,
-                        &config,
-                        &run_id,
-                        Some(FailedStartState::Error),
-                        None,
-                        err.into(),
-                    )
-                    .await);
-                }
-            };
-            let monitor = match monitor_identity_for_pid(pid, &pid_path, &config.name) {
+            let monitor = match started_run_monitor(
+                runtime,
+                &config,
+                &run_id,
+                storage_lease.operation_id(),
+            ) {
                 Ok(monitor) => monitor,
                 Err(err) => {
                     return Err(finish_failed_start(
@@ -249,11 +452,16 @@ impl Machine {
                         &run_id,
                         Some(FailedStartState::Error),
                         None,
+                        FailedStartStorage {
+                            lease: storage_lease,
+                            lower: prepared_root._lower.take(),
+                        },
                         err,
                     )
                     .await);
                 }
             };
+            let pid = monitor.pid();
             let Some(started_at) = monitor.started_at() else {
                 return Err(finish_failed_start(
                     runtime,
@@ -261,12 +469,13 @@ impl Machine {
                     &run_id,
                     Some(FailedStartState::Error),
                     Some(&monitor),
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
                     LibVmError::MonitorConnection {
                         reference: config.name.clone(),
-                        message: format!(
-                            "silo-vmm pid {pid} from {} has no stable process generation",
-                            pid_path.display()
-                        ),
+                        message: format!("silo-vmm pid {pid} has no stable process generation"),
                     },
                 )
                 .await);
@@ -281,6 +490,10 @@ impl Machine {
                     &run_id,
                     Some(FailedStartState::Error),
                     Some(&monitor),
+                    FailedStartStorage {
+                        lease: storage_lease,
+                        lower: prepared_root._lower.take(),
+                    },
                     err,
                 )
                 .await);
@@ -295,18 +508,25 @@ impl Machine {
     }
 
     /// Stops the machine and returns its updated inspect data.
-    pub async fn stop(&self) -> Result<MachineData, LibVmError> {
-        self.stop_impl(None, MachineStopOptions::default()).await
+    pub async fn stop(&self) -> Result<crate::MachineStopOutcome, LibVmError> {
+        self.stop_impl(None, MachineStopOptions::default(), false)
+            .await
     }
 
     /// Stops the machine with explicit stop options.
-    pub async fn stop_with(&self, options: MachineStopOptions) -> Result<MachineData, LibVmError> {
-        self.stop_impl(None, options).await
+    pub async fn stop_with(
+        &self,
+        options: MachineStopOptions,
+    ) -> Result<crate::MachineStopOutcome, LibVmError> {
+        self.stop_impl(None, options, false).await
     }
 
     /// Stops this exact machine run without affecting a replacement run.
-    pub async fn stop_run(&self, run_id: MachineRunId) -> Result<MachineData, LibVmError> {
-        self.stop_impl(Some(&run_id), MachineStopOptions::default())
+    pub async fn stop_run(
+        &self,
+        run_id: MachineRunId,
+    ) -> Result<crate::MachineStopOutcome, LibVmError> {
+        self.stop_impl(Some(&run_id), MachineStopOptions::default(), false)
             .await
     }
 
@@ -315,24 +535,121 @@ impl Machine {
         &self,
         run_id: MachineRunId,
         options: MachineStopOptions,
-    ) -> Result<MachineData, LibVmError> {
-        self.stop_impl(Some(&run_id), options).await
+    ) -> Result<crate::MachineStopOutcome, LibVmError> {
+        self.stop_impl(Some(&run_id), options, false).await
     }
 
     async fn stop_impl(
         &self,
         expected_run_id: Option<&MachineRunId>,
         options: MachineStopOptions,
+        for_removal: bool,
+    ) -> Result<crate::MachineStopOutcome, LibVmError> {
+        let handle = self.clone();
+        let expected_run_id = expected_run_id.cloned();
+        tokio::spawn(async move {
+            let mut warning = None;
+            let machine = Box::pin(handle.stop_inner(
+                expected_run_id.as_ref(),
+                options,
+                for_removal,
+                &mut warning,
+            ))
+            .await?;
+            Ok(crate::MachineStopOutcome { machine, warning })
+        })
+        .await?
+    }
+
+    async fn stop_inner(
+        &self,
+        expected_run_id: Option<&MachineRunId>,
+        options: MachineStopOptions,
+        for_removal: bool,
+        warning: &mut Option<crate::MachineStopWarning>,
     ) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
         let wait_target = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
-            let status = runtime.reconcile_machine_runtime_locked(&config).await?;
+            if expected_run_id.is_none() {
+                crate::machine::hibernate::recover_locked(runtime, &config).await?;
+                if let Some(record) = runtime
+                    .native_store()?
+                    .machine_hibernation(config.id)
+                    .await?
+                {
+                    if for_removal {
+                        crate::machine::hibernate::discard_locked(runtime, &config).await?;
+                    } else {
+                        match self.wake_locked(&config, record).await {
+                            Ok(_) => {
+                                // A clean shutdown is asked of the agent of the
+                                // new run. Stopping the instant the VM runs
+                                // again finds no agent yet and falls back to a
+                                // forced stop, losing what the guest held in
+                                // memory. If the agent never arrives, the stop
+                                // below still ends the machine.
+                                if let Err(error) =
+                                    self.wait_ready(std::time::Duration::from_secs(60)).await
+                                {
+                                    tracing::debug!(
+                                        %error,
+                                        "agent not ready after wake; stopping without it"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                *warning = Some(match error {
+                                    LibVmError::HibernateUnusable { reason, .. } => {
+                                        crate::MachineStopWarning::SavedStateUnusable { reason }
+                                    }
+                                    LibVmError::WakeConsumed { .. } => {
+                                        crate::MachineStopWarning::WakeFailed
+                                    }
+                                    other => {
+                                        if runtime.machine_state(config.id).await?.status
+                                            != MachineRuntimeState::Hibernated
+                                        {
+                                            return Err(other);
+                                        }
+                                        crate::MachineStopWarning::WakeFailed
+                                    }
+                                });
+                                crate::machine::hibernate::discard_locked(runtime, &config).await?;
+                                return runtime.machine_inspect_data(config).await;
+                            }
+                        }
+                    }
+                }
+            }
+            // Removal must preflight orphan ownership before reconciliation,
+            // which can otherwise write a storage-busy lifecycle projection.
+            let status = if for_removal {
+                RuntimeStatus::from_machine_state(&runtime.machine_state(config.id).await?)
+            } else {
+                runtime.reconcile_machine_runtime_locked(&config).await?
+            };
             require_current_run(&config, &status, expected_run_id)?;
-            if matches!(
-                status.state,
-                MachineRuntimeState::Stopped | MachineRuntimeState::Error
-            ) {
+            let identity = match status.pid {
+                Some(pid) => monitor_identity(&VmmRunIdentity {
+                    pid,
+                    started_at: status.started_at,
+                    run_id: status.run_id.clone(),
+                })?,
+                None => None,
+            };
+            if for_removal && identity.is_none() {
+                // A dead monitor is not a stopped source. Refuse before stop
+                // writes anything if an orphan worker still owns this run.
+                let storage = runtime.machine_storage_record(config.id).await?;
+                storage.ownership.ensure_owned(config.id)?;
+                runtime
+                    .preflight_stopped_generation_locked(&config, &storage)
+                    .await?;
+            }
+            if status.state == MachineRuntimeState::Stopped
+                || (status.state == MachineRuntimeState::Error && status.pid.is_none())
+            {
                 runtime.cleanup_machine_resources_locked(&config).await?;
                 return runtime.machine_inspect_data(config).await;
             }
@@ -344,7 +661,7 @@ impl Machine {
                         started_at: status.started_at,
                         run_id: status.run_id.clone(),
                     };
-                    let Some(identity) = monitor_identity(&generation)? else {
+                    let Some(identity) = identity else {
                         runtime.mark_machine_stopped(config.id, None).await?;
                         runtime.cleanup_machine_resources_locked(&config).await?;
                         return runtime.machine_inspect_data(config).await;
@@ -364,12 +681,19 @@ impl Machine {
                         started_at: status.started_at,
                         run_id: status.run_id.clone(),
                     };
-                    let Some(identity) = monitor_identity(&generation)? else {
+                    let Some(identity) = identity else {
                         runtime.mark_machine_stopped(config.id, None).await?;
                         runtime.cleanup_machine_resources_locked(&config).await?;
                         return runtime.machine_inspect_data(config).await;
                     };
-                    if !interrupt_monitor(&identity)? {
+                    if !identity.signal(Signal::SIGINT)? {
+                        if for_removal {
+                            let storage = runtime.machine_storage_record(config.id).await?;
+                            storage.ownership.ensure_owned(config.id)?;
+                            runtime
+                                .preflight_stopped_generation_locked(&config, &storage)
+                                .await?;
+                        }
                         runtime.mark_machine_stopped(config.id, None).await?;
                         runtime.cleanup_machine_resources_locked(&config).await?;
                         return runtime.machine_inspect_data(config).await;
@@ -532,12 +856,16 @@ impl Machine {
         let runtime = self.runtime();
         let exit = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            if expected_run_id.is_none()
+                && crate::machine::hibernate::discard_locked(runtime, &config).await?
+            {
+                return Ok(MachineExit::already_stopped(
+                    runtime.machine_inspect_data(config).await?,
+                ));
+            }
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             require_current_run(&config, &status, expected_run_id)?;
-            if matches!(
-                status.state,
-                MachineRuntimeState::Stopped | MachineRuntimeState::Error
-            ) {
+            if !status.is_active() {
                 return Err(LibVmError::MachineNotRunning {
                     reference: config.name.clone(),
                 });
@@ -563,16 +891,19 @@ impl Machine {
             let Some(identity) = monitor_identity(&generation)? else {
                 runtime.mark_machine_stopped(config.id, None).await?;
                 runtime.cleanup_machine_resources_locked(&config).await?;
-                let exit_status =
-                    exit_status::read(&runtime.machine_paths(config.id).vmm_exit_status_path())?;
+                let exit_status = read_exit_for_reconciliation(
+                    &runtime.machine_paths(config.id).vmm_exit_status_path(),
+                );
                 let machine = runtime.machine_inspect_data(config).await?;
                 return Ok(machine_exit(machine, generation, false, exit_status));
             };
-            if !kill_monitor_process_group(&identity)? {
+            let stop_deadline = Instant::now() + options.wait_options().timeout_value();
+            if !identity.signal_process_group(Signal::SIGKILL)? {
                 runtime.mark_machine_stopped(config.id, None).await?;
                 runtime.cleanup_machine_resources_locked(&config).await?;
-                let exit_status =
-                    exit_status::read(&runtime.machine_paths(config.id).vmm_exit_status_path())?;
+                let exit_status = read_exit_for_reconciliation(
+                    &runtime.machine_paths(config.id).vmm_exit_status_path(),
+                );
                 let machine = runtime.machine_inspect_data(config).await?;
                 return Ok(machine_exit(machine, generation, false, exit_status));
             }
@@ -584,12 +915,12 @@ impl Machine {
             wait_for_monitor_stop(
                 &identity,
                 &config.name,
-                options.wait_options().timeout_value(),
+                stop_deadline.saturating_duration_since(Instant::now()),
             )
             .await?;
             let path = runtime.machine_paths(config.id).vmm_exit_status_path();
-            let machine_id = config.id.to_string();
-            let recorded = exit_status::read(&path)?;
+            let machine_id = uuid::Uuid::from(config.id).to_string();
+            let recorded = read_exit_for_reconciliation(&path);
             let mut forced_at = None;
             if !recorded.as_ref().is_some_and(|status| {
                 status.machine_id == machine_id
@@ -604,13 +935,25 @@ impl Machine {
                     )?);
                 }
             }
-            if !runtime
-                .complete_stop_locked(&config, generation.clone(), None)
-                .await?
-            {
-                return Err(LibVmError::MachineNotRunning {
-                    reference: config.name,
-                });
+            loop {
+                if runtime
+                    .complete_stop_locked(&config, generation.clone(), None)
+                    .await?
+                {
+                    break;
+                }
+                let now = Instant::now();
+                if now >= stop_deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("timed out waiting for machine {:?} storage holders and lease reconciliation after monitor termination", config.name),
+                    ).into());
+                }
+                sleep(std::cmp::min(
+                    WAIT_TARGET_POLL_INTERVAL,
+                    stop_deadline.saturating_duration_since(now),
+                ))
+                .await;
             }
             let machine = runtime.machine_inspect_data(config).await?;
             let mut exit = machine_exit(machine, generation, true, recorded);
@@ -625,22 +968,59 @@ impl Machine {
 
     /// Removes a stopped machine's durable records and files.
     pub async fn remove(self) -> Result<(), LibVmError> {
-        self.remove_impl(None).await
+        self.remove_impl(None, false).await
+    }
+
+    /// Stop and reap the source, then discard only unreferenced local capture
+    /// staging. Published pool snapshots retain their independent ownership.
+    pub async fn remove_force(self) -> Result<(), LibVmError> {
+        match self
+            .stop_impl(
+                None,
+                MachineStopOptions::new()
+                    .timeout(Duration::from_secs(60))
+                    .force_after_timeout(Duration::from_secs(60)),
+                true,
+            )
+            .await
+        {
+            Ok(_) | Err(LibVmError::MachineNotRunning { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        self.remove_impl(None, true).await
     }
 
     /// Removes a stopped machine only when its latest exit belongs to the
     /// supplied run generation.
     pub async fn remove_after_run(self, run_id: MachineRunId) -> Result<(), LibVmError> {
-        self.remove_impl(Some(run_id)).await
+        self.remove_impl(Some(run_id), false).await
     }
 
-    async fn remove_impl(self, expected_run_id: Option<MachineRunId>) -> Result<(), LibVmError> {
+    async fn remove_impl(
+        self,
+        expected_run_id: Option<MachineRunId>,
+        discard_captures: bool,
+    ) -> Result<(), LibVmError> {
         let runtime = self.runtime();
         if runtime.machine_config(self.machine_id()).await?.is_none() {
             return Ok(());
         }
+        if !discard_captures {
+            crate::machine::live_capture::reconcile_captures(
+                runtime,
+                Some(self.machine_id()),
+                crate::storage::pool::PublicationLockPolicy::Wait,
+            )
+            .await?;
+        }
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
+        crate::machine::hibernate::discard_locked(runtime, &config).await?;
+        let storage = runtime.machine_storage_record(config.id).await?;
+        storage.ownership.ensure_owned(config.id)?;
+        runtime
+            .preflight_stopped_generation_locked(&config, &storage)
+            .await?;
         let _node_state = crate::node_state::acquire_lock(&config).await?;
         runtime.ensure_no_live_vmm_generation(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
@@ -655,9 +1035,10 @@ impl Machine {
         }
 
         if let Some(expected_run_id) = expected_run_id {
-            let exit_status =
-                exit_status::read(&runtime.machine_paths(config.id).vmm_exit_status_path())?;
-            let machine_id = config.id.to_string();
+            let exit_status = read_exit_for_reconciliation(
+                &runtime.machine_paths(config.id).vmm_exit_status_path(),
+            );
+            let machine_id = uuid::Uuid::from(config.id).to_string();
             let current = exit_status
                 .as_ref()
                 .filter(|exit| exit.machine_id == machine_id)
@@ -669,6 +1050,32 @@ impl Machine {
                     current,
                 });
             }
+        }
+        let retained = match runtime.optional_native_store() {
+            Some(store) => {
+                if discard_captures {
+                    store.discard_machine_captures(config.id).await?;
+                    // Only independently owned snapshots and relocated local
+                    // cuts remain. Settle their ended-source continuation and
+                    // release without publishing discarded staging.
+                    crate::machine::live_capture::reconcile_captures(
+                        runtime,
+                        Some(config.id),
+                        crate::storage::pool::PublicationLockPolicy::Defer,
+                    )
+                    .await?;
+                }
+                crate::store::snapshot_store::SnapshotStore::from_store(std::sync::Arc::new(store))
+                    .machine_capture_retained(config.id)
+                    .await?
+            }
+            None => false,
+        };
+        if retained {
+            return Err(LibVmError::MachinePreparationFailed {
+                reference: config.name.clone(),
+                message: "a live capture of this machine is unreconciled or its staging is still leased; reconcile captures before removal".into(),
+            });
         }
 
         runtime.cleanup_machine_resources_locked(&config).await?;
@@ -689,64 +1096,94 @@ impl Machine {
     }
 }
 
-async fn finish_failed_start(
+pub(crate) async fn finish_failed_start(
     runtime: &Runtime,
     config: &MachineConfig,
     run_id: &str,
     start_failure: Option<FailedStartState>,
     monitor: Option<&ProcessIdentity>,
+    resources: FailedStartStorage,
     primary: LibVmError,
 ) -> LibVmError {
+    let FailedStartStorage {
+        lease: storage_lease,
+        lower,
+    } = resources;
     let primary_message = primary.to_string();
     let mut cleanup_errors = Vec::new();
 
-    let discovered_monitor = if monitor.is_none() {
-        match read_monitor_pid(&runtime.machine_paths(config.id).vmm_pid_path()) {
-            Ok(pid) => match ProcessIdentity::for_pid(pid) {
-                Ok(identity) => identity,
+    // Only the run-bound holder authorizes a signal. Without it, closed startup
+    // pipes cancel a pre-holder monitor and lease reconciliation below waits.
+    let discovered_monitor = match monitor {
+        Some(_) => Ok(None),
+        None => run_monitor_identity(runtime, config, run_id, storage_lease.operation_id()),
+    };
+    let monitor_stopped = match discovered_monitor {
+        Ok(discovered) => match monitor.or(discovered.as_ref()) {
+            Some(monitor) => match stop_failed_start_monitor(monitor, &config.name).await {
+                Ok(()) => true,
                 Err(err) => {
-                    cleanup_errors.push(format!("inspect silo-vmm for cleanup: {err}"));
-                    None
+                    cleanup_errors.push(format!("terminate silo-vmm: {err}"));
+                    false
                 }
             },
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-    let monitor_stopped = match monitor.or(discovered_monitor.as_ref()) {
-        Some(monitor) => match stop_failed_start_monitor(monitor, &config.name).await {
-            Ok(()) => true,
-            Err(err) => {
-                cleanup_errors.push(format!("terminate silo-vmm: {err}"));
-                false
-            }
+            None => true,
         },
-        None => true,
+        Err(err) => {
+            cleanup_errors.push(format!("authenticate silo-vmm for cleanup: {err}"));
+            false
+        }
     };
-    if monitor_stopped {
+    if monitor_stopped && config.image_ref != "execution-restore" {
         if let Err(err) = runtime.reconcile_machine_network(config, false).await {
             cleanup_errors.push(format!("reconcile prepared network: {err}"));
         }
     }
+    // Only release the manager's copy after actual startup owner cleanup. A
+    // cancelled waiter leaves the durable operation for later reconciliation.
+    // Lazy lower maps retain a duplicate launch OFD, so retire them before probing the lease.
+    drop(lower);
+    drop(storage_lease);
     let mut terminal_transitioned = false;
     if monitor_stopped {
         if let Some(start_failure) = start_failure {
-            let result = match start_failure {
-                FailedStartState::Stopped => {
-                    runtime
-                        .mark_machine_start_stopped(
-                            config.id,
-                            run_id,
-                            Some(primary_message.clone()),
-                        )
-                        .await
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let result = loop {
+                let result = match start_failure {
+                    FailedStartState::Stopped => {
+                        runtime
+                            .mark_machine_start_stopped(
+                                config.id,
+                                run_id,
+                                Some(primary_message.clone()),
+                            )
+                            .await
+                    }
+                    FailedStartState::Error => {
+                        runtime
+                            .mark_machine_start_error(
+                                config.id,
+                                run_id,
+                                Some(primary_message.clone()),
+                            )
+                            .await
+                    }
+                };
+                if !matches!(&result, Err(LibVmError::MachineAlreadyRunning { .. })) {
+                    break result;
                 }
-                FailedStartState::Error => {
-                    runtime
-                        .mark_machine_start_error(config.id, run_id, Some(primary_message.clone()))
-                        .await
+                let now = Instant::now();
+                if now >= deadline {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("timed out waiting for failed-start storage holders and lease reconciliation for {:?}", config.name),
+                    ).into());
                 }
+                sleep(std::cmp::min(
+                    WAIT_TARGET_POLL_INTERVAL,
+                    deadline.saturating_duration_since(now),
+                ))
+                .await;
             };
             match result {
                 Ok(()) => terminal_transitioned = true,
@@ -754,7 +1191,18 @@ async fn finish_failed_start(
             }
         }
     }
-    if terminal_transitioned && config.retention == crate::MachineRetention::Ephemeral {
+    if terminal_transitioned && config.image_ref == "execution-restore" {
+        // Monitor death does not certify terminal worker/mapping ownership.
+        // Keep the destination reservation until holder/lease reconciliation
+        // above has positively retired this exact restore generation.
+        if let Err(err) = runtime.reconcile_machine_network(config, false).await {
+            cleanup_errors.push(format!("reconcile restored network: {err}"));
+        }
+    }
+    if terminal_transitioned
+        && (config.retention == crate::MachineRetention::Ephemeral
+            || config.image_ref == "execution-restore")
+    {
         if let Err(error) = crate::ssh_ca::delete_scope(runtime.secret_store(), config.id) {
             tracing::error!(machine = %config.id, %error, "delete ephemeral machine secret scope");
             cleanup_errors.push(format!("delete ephemeral machine secret scope: {error}"));
@@ -787,25 +1235,79 @@ async fn stop_failed_start_monitor(
 ) -> Result<(), LibVmError> {
     // Let silo-vmm stop/reap its worker and finalize the generation first. The
     // process-group kill below is only the emergency fallback for a stuck owner.
-    if interrupt_monitor(monitor)?
+    if monitor.signal(Signal::SIGINT)?
         && wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(75))
             .await
             .is_ok()
     {
         return Ok(());
     }
-    if kill_monitor_process_group(monitor)? {
+    if monitor.signal_process_group(Signal::SIGKILL)? || monitor.signal(Signal::SIGKILL)? {
         return wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(5)).await;
     }
-    if !monitor.is_alive()? {
-        return Ok(());
+    Ok(())
+}
+
+/// Resolves the exact monitor of `run_id` from its durable storage holder.
+///
+/// The pidfile is an unauthenticated number: an earlier generation may have
+/// left it, or its process may have exited and the number been reused. The
+/// monitor publishes this run-, operation- and birth-bound holder before any
+/// worker exists. `None` means no live process carries that identity; a holder
+/// of another run names another generation and never authorizes a signal.
+fn run_monitor_identity(
+    runtime: &Runtime,
+    config: &MachineConfig,
+    run_id: &str,
+    operation_id: Uuid,
+) -> Result<Option<ProcessIdentity>, LibVmError> {
+    let path = runtime.machine_paths(config.id).vmm_storage_holder_path();
+    let Some(record) = crate::supervisor::storage_holder::read(&path)? else {
+        return Ok(None);
+    };
+    if record.machine_id != Uuid::from(config.id).to_string()
+        || record.run_id != run_id
+        || record.operation_id != operation_id.to_string()
+    {
+        return Ok(None);
     }
-    match kill(Pid::from_raw(monitor.pid()), Some(Signal::SIGKILL)) {
-        Ok(()) | Err(Errno::ESRCH) => {
-            wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(5)).await
+    let invalid = |message: &str| LibVmError::InvalidStorageRecord {
+        record: "storage-holder",
+        message: message.to_string(),
+    };
+    let holder = record
+        .holders
+        .iter()
+        .find(|holder| holder.role == StorageHolderRole::Monitor)
+        .ok_or_else(|| invalid("holder record has no monitor"))?;
+    let pid = i32::try_from(holder.pid).map_err(|_| invalid("invalid monitor holder pid"))?;
+    let started_at = i64::try_from(holder.started_at)
+        .map_err(|_| invalid("invalid monitor holder start identity"))?;
+    let Some(identity) = ProcessIdentity::for_pid(pid)? else {
+        return Ok(None);
+    };
+    // Another birth identity at the recorded number is a reused PID.
+    if !identity.matches_started_at(Some(started_at)) {
+        return Ok(None);
+    }
+    Ok(Some(identity))
+}
+
+/// The monitor that reported startup must still be this run's holder process.
+pub(crate) fn started_run_monitor(
+    runtime: &Runtime,
+    config: &MachineConfig,
+    run_id: &str,
+    operation_id: Uuid,
+) -> Result<ProcessIdentity, LibVmError> {
+    run_monitor_identity(runtime, config, run_id, operation_id)?.ok_or_else(|| {
+        LibVmError::MonitorConnection {
+            reference: config.name.clone(),
+            message: format!(
+                "silo-vmm reported startup but no live process matches run {run_id}'s storage holder"
+            ),
         }
-        Err(err) => Err(std::io::Error::other(err.to_string()).into()),
-    }
+    })
 }
 
 impl Machine {
@@ -820,12 +1322,7 @@ impl Machine {
         // exiting. Preserve the persisted process identity long enough to wait for that final
         // shutdown work instead of reconciling the missing pidfile as an already-stopped run.
         let persisted = runtime.machine_state(config.id).await?;
-        if matches!(
-            persisted.status,
-            MachineRuntimeState::Starting
-                | MachineRuntimeState::Running
-                | MachineRuntimeState::Stopping
-        ) {
+        if persisted.status.is_live() || persisted.vmm_pid.is_some() {
             if let Some(pid) = persisted.vmm_pid {
                 let generation = VmmRunIdentity {
                     pid,
@@ -882,12 +1379,14 @@ impl Machine {
                     .await?;
                 if !completed {
                     if let Some(expected_run_id) = expected_run_id {
-                        return Err(stale_generation(
-                            &target.config,
-                            expected_run_id,
-                            runtime.machine_state(target.config.id).await?.run_id,
-                        ));
+                        let current = runtime.machine_state(target.config.id).await?.run_id;
+                        if current.as_deref() != Some(expected_run_id.as_str()) {
+                            return Err(stale_generation(&target.config, expected_run_id, current));
+                        }
                     }
+                    return Err(LibVmError::MachineAlreadyRunning {
+                        reference: target.config.name.clone(),
+                    });
                 }
             } else {
                 let status = runtime
@@ -908,14 +1407,19 @@ impl Machine {
                         .cleanup_machine_resources_locked(&target.config)
                         .await?;
                 }
+                if status.is_active() {
+                    return Err(LibVmError::MachineAlreadyRunning {
+                        reference: target.config.name.clone(),
+                    });
+                }
             }
         }
 
-        let exit_status = exit_status::read(
+        let exit_status = read_exit_for_reconciliation(
             &runtime
                 .machine_paths(target.config.id)
                 .vmm_exit_status_path(),
-        )?;
+        );
         let machine = runtime.machine_inspect_data(target.config).await?;
         Ok(machine_exit(
             machine,
@@ -930,18 +1434,23 @@ fn machine_exit(
     machine: MachineData,
     generation: VmmRunIdentity,
     forced: bool,
-    exit_status: Option<VmmExitStatus>,
+    exit_status: Option<CurrentExitRecord>,
 ) -> MachineExit {
     let matching_exit = exit_status.filter(|status| {
-        status.machine_id == machine.id && exit_status_matches_generation(status, &generation)
+        status
+            .machine_id
+            .parse::<uuid::Uuid>()
+            .ok()
+            .is_some_and(|id| machine.id.parse::<uuid::Uuid>().ok() == Some(id))
+            && exit_status_matches_generation(status, &generation)
     });
     let (exited_at, outcome) = match matching_exit {
         Some(status) => (
             unix_time(status.exited_at),
             match status.outcome {
-                VmmExitOutcome::Clean => MachineExitOutcome::Clean,
-                VmmExitOutcome::Forced => MachineExitOutcome::Forced,
-                VmmExitOutcome::Error => MachineExitOutcome::Error {
+                ExitOutcome::Clean => MachineExitOutcome::Clean,
+                ExitOutcome::Forced => MachineExitOutcome::Forced,
+                ExitOutcome::Error => MachineExitOutcome::Error {
                     message: status.error,
                 },
             },
@@ -988,7 +1497,7 @@ fn stale_generation(
     }
 }
 
-fn exit_status_matches_generation(status: &VmmExitStatus, generation: &VmmRunIdentity) -> bool {
+fn exit_status_matches_generation(status: &CurrentExitRecord, generation: &VmmRunIdentity) -> bool {
     generation.run_id.as_deref() == Some(status.run_id.as_str()) && generation.pid == status.pid
 }
 
@@ -1011,10 +1520,56 @@ fn unix_time(timestamp: i64) -> Option<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use crate::machine::lifecycle::stop_failed_start_monitor;
+    use crate::machine::lifecycle::{
+        finish_failed_start, stop_failed_start_monitor, FailedStartState, FailedStartStorage,
+    };
+    use crate::runtime::Runtime;
+    use crate::store::models::{MachineConfig, MachineRuntimeState};
+    use crate::store::operation_store::LaunchStorageLease;
+    use crate::store::{MachineStore, Store};
     use crate::supervisor::process::ProcessIdentity;
+    use crate::LibVmError;
+    use protocol::shutdown::{StorageHolder, StorageHolderRecord, StorageHolderRole};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Command, Stdio};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn public_lifecycle_futures_have_bounded_inline_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (runtime, config, _) =
+            crate::runtime::core::tests::shutdown_storage_fixture(&temporary).await;
+        let machine = crate::Machine::new(runtime, config.id);
+        let sizes = [
+            ("start", std::mem::size_of_val(&machine.start())),
+            (
+                "start_with_options",
+                std::mem::size_of_val(
+                    &machine.start_with_options(crate::MachineStartOptions::default()),
+                ),
+            ),
+            ("stop", std::mem::size_of_val(&machine.stop())),
+            (
+                "stop_with",
+                std::mem::size_of_val(&machine.stop_with(crate::MachineStopOptions::default())),
+            ),
+        ];
+        for (operation, bytes) in sizes {
+            assert!(
+                bytes <= 8 * 1024,
+                "{operation} future has {bytes} bytes of inline state; maximum is 8 KiB",
+            );
+        }
+    }
+
+    const MONITOR_HOLDER_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_HOLDER";
+    const MONITOR_MACHINE_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_MACHINE";
+    const MONITOR_RUN_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_RUN";
+    const MONITOR_OPERATION_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_OPERATION";
+    const MONITOR_WORKER_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_WORKER";
 
     struct Child(std::process::Child);
     impl Drop for Child {
@@ -1024,11 +1579,331 @@ mod tests {
         }
     }
 
+    async fn admitted_start(
+        temp: &tempfile::TempDir,
+    ) -> (Runtime, MachineConfig, String, LaunchStorageLease) {
+        let (runtime, config, storage) =
+            crate::runtime::core::tests::shutdown_storage_fixture(temp).await;
+        let run = uuid::Uuid::new_v4();
+        let run_id = run.to_string();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .request_machine_start(&config, &run_id)
+            .await
+            .unwrap();
+        runtime
+            .mark_launch_storage_admitted(lease.operation_id())
+            .await
+            .unwrap();
+        (runtime, config, run_id, lease)
+    }
+
+    /// Keeps the shared lease OFD open across exec in the spawned process.
+    fn inherit_lease(command: &mut Command, lease: &LaunchStorageLease) -> OwnedFd {
+        let descriptor = lease.lock().duplicate_inheritable().unwrap();
+        let raw = descriptor.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                nix::fcntl::fcntl(
+                    BorrowedFd::borrow_raw(raw),
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                )
+                .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+                Ok(())
+            });
+        }
+        descriptor
+    }
+
+    fn write_holder(
+        runtime: &Runtime,
+        config: &MachineConfig,
+        run_id: &str,
+        lease: &LaunchStorageLease,
+        holders: Vec<StorageHolder>,
+    ) {
+        let record = StorageHolderRecord {
+            schema_version: 1,
+            machine_id: uuid::Uuid::from(config.id).to_string(),
+            run_id: run_id.to_string(),
+            operation_id: lease.operation_id().to_string(),
+            holders,
+        };
+        let path = runtime.machine_paths(config.id).vmm_storage_holder_path();
+        std::fs::write(&path, record.encode().unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A real process outside the launch, standing where a reused PID points.
+    fn unrelated_process() -> Child {
+        Child(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("unrelated process"),
+        )
+    }
+
+    fn write_stale_pidfile(runtime: &Runtime, config: &MachineConfig, pid: u32) {
+        std::fs::write(
+            runtime.machine_paths(config.id).vmm_pid_path(),
+            format!("{pid}\n"),
+        )
+        .unwrap();
+    }
+
+    /// Cleanup waits for every signaled target to exit, so a process that is
+    /// still unreaped afterwards was never signaled by it.
+    fn assert_untouched(mut unrelated: Child) {
+        assert!(
+            unrelated.0.try_wait().unwrap().is_none(),
+            "failed-start cleanup signaled a process named only by stale pid evidence"
+        );
+        unrelated.0.kill().unwrap();
+        assert_eq!(
+            unrelated.0.wait().unwrap().signal(),
+            Some(nix::libc::SIGKILL)
+        );
+    }
+
+    fn rejected_start(config: &MachineConfig) -> LibVmError {
+        LibVmError::MachinePreparationFailed {
+            reference: config.name.clone(),
+            message: "rejected ELF".into(),
+        }
+    }
+
+    fn assert_rejected_start(error: &LibVmError) {
+        assert!(
+            matches!(error, LibVmError::MachinePreparationFailed { message, .. } if message == "rejected ELF"),
+            "cleanup must return the unchanged primary failure, got {error}"
+        );
+    }
+
+    async fn assert_retired(runtime: &Runtime, config: &MachineConfig, state: MachineRuntimeState) {
+        assert_eq!(
+            runtime.machine_state(config.id).await.unwrap().status,
+            state
+        );
+        let store = Store::open(&runtime.local_paths().state_db_path())
+            .await
+            .unwrap();
+        assert!(store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    fn wait_ready(stdout: std::process::ChildStdout) -> std::process::ChildStdout {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_line(&mut line).expect("read monitor stdout");
+            assert!(bytes > 0, "monitor exited before reporting readiness");
+            if line.trim() == "SILO_READY" {
+                return reader.into_inner();
+            }
+        }
+    }
+
+    /// Re-executes this test binary as a monitor of the admitted run. It holds
+    /// the inherited lease, optionally starts a lease-holding worker that exits
+    /// when the monitor's pipe closes, and publishes its own run-bound holder
+    /// before reporting readiness, in the order silo-vmm uses.
+    fn spawn_holder_monitor(
+        runtime: &Runtime,
+        config: &MachineConfig,
+        run_id: &str,
+        lease: &LaunchStorageLease,
+        with_worker: bool,
+    ) -> Child {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "machine::lifecycle::tests::failed_start_monitor_child_process",
+                "--nocapture",
+            ])
+            .env(
+                MONITOR_HOLDER_ENV,
+                runtime.machine_paths(config.id).vmm_storage_holder_path(),
+            )
+            .env(MONITOR_MACHINE_ENV, uuid::Uuid::from(config.id).to_string())
+            .env(MONITOR_RUN_ENV, run_id)
+            .env(MONITOR_OPERATION_ENV, lease.operation_id().to_string())
+            .process_group(0)
+            .stdout(Stdio::piped());
+        if with_worker {
+            command.env(MONITOR_WORKER_ENV, "1");
+        }
+        let descriptor = inherit_lease(&mut command, lease);
+        let mut monitor = Child(command.spawn().unwrap());
+        drop(descriptor);
+        monitor.0.stdout = Some(wait_ready(monitor.0.stdout.take().unwrap()));
+        monitor
+    }
+
+    #[test]
+    fn failed_start_monitor_child_process() {
+        let Some(holder_path) = std::env::var_os(MONITOR_HOLDER_ENV) else {
+            return;
+        };
+        let binding = |name: &str| std::env::var(name).expect("monitor run binding");
+        let holder = |role, pid: u32| StorageHolder {
+            role,
+            pid,
+            started_at: utils::process::start_time(pid as i32)
+                .unwrap()
+                .and_then(|started| u64::try_from(started).ok())
+                .unwrap(),
+        };
+        let mut holders = vec![holder(StorageHolderRole::Monitor, std::process::id())];
+        // Like a krun worker's watchdog, EOF on the monitor-held pipe ends it.
+        let worker = std::env::var_os(MONITOR_WORKER_ENV).map(|_| {
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("worker")
+        });
+        if let Some(worker) = &worker {
+            holders.push(holder(StorageHolderRole::KrunWorker, worker.id()));
+        }
+        let record = StorageHolderRecord {
+            schema_version: 1,
+            machine_id: binding(MONITOR_MACHINE_ENV),
+            run_id: binding(MONITOR_RUN_ENV),
+            operation_id: binding(MONITOR_OPERATION_ENV),
+            holders,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(holder_path)
+            .unwrap();
+        file.write_all(&record.encode().unwrap()).unwrap();
+        file.sync_all().unwrap();
+        println!("SILO_READY");
+        std::io::stdout().flush().unwrap();
+        let _worker = worker;
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// Exercises the restore wait/lock boundary with a re-executed monitor
+    /// holding the launch lease, without needing a hypervisor.
+    #[tokio::test]
+    async fn restore_startup_wait_releases_mutation_lock_and_rejects_superseded_run() {
+        for disposition in [
+            MachineRuntimeState::Stopping,
+            MachineRuntimeState::Running,
+            MachineRuntimeState::ActivationFailed,
+        ] {
+            let replacement = disposition == MachineRuntimeState::Running;
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+            let mut monitor = spawn_holder_monitor(&runtime, &config, &run_id, &lease, true);
+            let identity = ProcessIdentity::for_pid(monitor.0.id() as i32)
+                .unwrap()
+                .unwrap();
+            let started = identity.started_at().unwrap();
+            runtime
+                .mark_machine_monitor_ready(config.id, run_id.clone(), identity.pid(), started)
+                .await
+                .unwrap();
+            let pending = crate::supervisor::launch::PendingStartup::new(
+                monitor.0.stdout.take().unwrap().into(),
+                std::time::Instant::now() + Duration::from_secs(10),
+                runtime.machine_paths(config.id).vm_trace_log_path(),
+            );
+            let (lock, _) = runtime.lock_machine_config(config.id).await.unwrap();
+            let wait = crate::machine::restore::await_restored_start(
+                &runtime,
+                config.id,
+                uuid::Uuid::parse_str(&run_id).unwrap(),
+                lock,
+                pending,
+            );
+            let interrupt = async {
+                let (_lock, _) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    runtime.lock_machine_config(config.id),
+                )
+                .await
+                .expect("stop must acquire mutation lock before startup completes")
+                .unwrap();
+                if disposition != MachineRuntimeState::Stopping {
+                    let mut state = runtime.machine_state(config.id).await.unwrap();
+                    state.status = disposition;
+                    if replacement {
+                        state.run_id = Some(uuid::Uuid::new_v4().to_string());
+                    }
+                    runtime
+                        .native_store()
+                        .unwrap()
+                        .save_machine_state(&state)
+                        .await
+                        .unwrap();
+                } else {
+                    runtime
+                        .request_machine_stop(
+                            config.id,
+                            &crate::runtime::core::VmmRunIdentity {
+                                pid: identity.pid(),
+                                started_at: Some(started),
+                                run_id: Some(run_id.clone()),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                assert!(identity.signal(nix::sys::signal::Signal::SIGINT).unwrap());
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(wait, interrupt)
+            })
+            .await
+            .expect("monitor death must unblock startup without its original deadline");
+            if replacement {
+                assert!(matches!(
+                    result,
+                    Err(LibVmError::MachineStaleGeneration { .. })
+                ));
+            } else if disposition == MachineRuntimeState::ActivationFailed {
+                let Ok((_lock, _, startup)) = result else {
+                    panic!("exact failed activation must retain cleanup authority");
+                };
+                assert!(startup.is_err());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    runtime.machine_state(config.id).await.unwrap().status,
+                    MachineRuntimeState::Stopping,
+                );
+            }
+            assert_eq!(monitor.0.wait().unwrap().signal(), Some(nix::libc::SIGINT));
+            // Stop admission must not retire the manager's construction roots.
+            let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir()).unwrap();
+            assert!(pool
+                .try_exclusive_lease(lease.operation_id())
+                .unwrap()
+                .is_none());
+        }
+    }
+
     /// Generic OS signal mechanics, not a substitute for a silo-vmm/VM test.
     #[tokio::test]
     async fn failed_start_cleanup_interrupts_before_emergency_group_kill() {
         let mut child = Child(
-            std::process::Command::new("/bin/sleep")
+            Command::new("/bin/sleep")
                 .arg("30")
                 .process_group(0)
                 .spawn()
@@ -1055,5 +1930,307 @@ mod tests {
         .expect("cooperative cleanup budget");
         cleanup.expect("cooperative cleanup");
         assert_eq!(status.signal(), Some(nix::libc::SIGINT));
+    }
+
+    #[tokio::test]
+    async fn failed_layered_start_releases_lazy_map_authority_before_lease_reconciliation() {
+        for admitted in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, mut config, mut storage) =
+                crate::runtime::core::tests::shutdown_storage_fixture(&temp).await;
+            let store = runtime.native_store().unwrap();
+            let held =
+                crate::store::storage::tests::retained_lower(&store, temp.path(), b'L').await;
+            crate::store::storage::tests::layered_machine(&mut config, &mut storage, &held);
+            runtime
+                .save_machine_config_with_storage(&config, &storage)
+                .await
+                .unwrap();
+            let run = uuid::Uuid::new_v4();
+            let run_id = run.to_string();
+            let lease = runtime
+                .register_launch_storage(&config, run, &storage)
+                .await
+                .unwrap();
+            runtime
+                .request_machine_start(&config, &run_id)
+                .await
+                .unwrap();
+            let lower = crate::store::layer_store::LayerStore::from_store(store)
+                .launch_lower(&lease, &storage)
+                .await
+                .unwrap();
+            if admitted {
+                runtime
+                    .mark_launch_storage_admitted(lease.operation_id())
+                    .await
+                    .unwrap();
+            }
+            let error = finish_failed_start(
+                &runtime,
+                &config,
+                &run_id,
+                Some(FailedStartState::Stopped),
+                None,
+                FailedStartStorage {
+                    lease,
+                    lower: Some(lower),
+                },
+                rejected_start(&config),
+            )
+            .await;
+            assert_rejected_start(&error);
+            assert_retired(&runtime, &config, MachineRuntimeState::Stopped).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_start_cleanup_never_signals_unrelated_process_from_stale_pid_evidence() {
+        // Monitor died before publishing its holder, or published one whose
+        // number now belongs to a process with another birth identity.
+        for reused_holder in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+            let unrelated = unrelated_process();
+            write_stale_pidfile(&runtime, &config, unrelated.0.id());
+            if reused_holder {
+                let reused = ProcessIdentity::for_pid(unrelated.0.id() as i32)
+                    .unwrap()
+                    .unwrap();
+                let original_birth = u64::try_from(reused.started_at().unwrap())
+                    .unwrap()
+                    .checked_sub(1)
+                    .unwrap();
+                write_holder(
+                    &runtime,
+                    &config,
+                    &run_id,
+                    &lease,
+                    vec![StorageHolder {
+                        role: StorageHolderRole::Monitor,
+                        pid: unrelated.0.id(),
+                        started_at: original_birth,
+                    }],
+                );
+            }
+            let error = tokio::time::timeout(
+                Duration::from_secs(10),
+                finish_failed_start(
+                    &runtime,
+                    &config,
+                    &run_id,
+                    Some(FailedStartState::Stopped),
+                    None,
+                    FailedStartStorage { lease, lower: None },
+                    rejected_start(&config),
+                ),
+            )
+            .await
+            .expect("bounded cleanup");
+            assert_rejected_start(&error);
+            assert_untouched(unrelated);
+            assert_retired(&runtime, &config, MachineRuntimeState::Stopped).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_start_cleanup_interrupts_exact_holder_monitor_not_stale_pidfile_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+        let unrelated = unrelated_process();
+        write_stale_pidfile(&runtime, &config, unrelated.0.id());
+        let mut monitor = spawn_holder_monitor(&runtime, &config, &run_id, &lease, false);
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            finish_failed_start(
+                &runtime,
+                &config,
+                &run_id,
+                Some(FailedStartState::Error),
+                None,
+                FailedStartStorage { lease, lower: None },
+                rejected_start(&config),
+            ),
+        )
+        .await
+        .expect("bounded cleanup");
+        assert_rejected_start(&error);
+        assert_eq!(
+            monitor.0.wait().unwrap().signal(),
+            Some(nix::libc::SIGINT),
+            "the authenticated monitor receives the cooperative interrupt"
+        );
+        assert_untouched(unrelated);
+        assert_retired(&runtime, &config, MachineRuntimeState::Error).await;
+    }
+
+    #[tokio::test]
+    async fn failed_start_after_monitor_death_retires_only_after_genuine_worker_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+        let unrelated = unrelated_process();
+        write_stale_pidfile(&runtime, &config, unrelated.0.id());
+        let mut monitor = spawn_holder_monitor(&runtime, &config, &run_id, &lease, true);
+        let record = crate::supervisor::storage_holder::read(
+            &runtime.machine_paths(config.id).vmm_storage_holder_path(),
+        )
+        .unwrap()
+        .unwrap();
+        let worker = record
+            .holders
+            .iter()
+            .find(|holder| holder.role == StorageHolderRole::KrunWorker)
+            .unwrap();
+        let worker = ProcessIdentity::for_pid(worker.pid as i32)
+            .unwrap()
+            .expect("published worker is live");
+        // Abrupt monitor death before readiness; its worker still holds the lease.
+        monitor.0.kill().unwrap();
+        monitor.0.wait().unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            finish_failed_start(
+                &runtime,
+                &config,
+                &run_id,
+                Some(FailedStartState::Error),
+                None,
+                FailedStartStorage { lease, lower: None },
+                rejected_start(&config),
+            ),
+        )
+        .await
+        .expect("bounded cleanup");
+        assert_rejected_start(&error);
+        assert!(
+            !worker.is_alive().unwrap(),
+            "retirement requires the genuine worker to have exited"
+        );
+        assert_untouched(unrelated);
+        assert_retired(&runtime, &config, MachineRuntimeState::Error).await;
+    }
+
+    #[tokio::test]
+    async fn failed_start_waits_for_registered_holder_and_lease_before_recording_terminal_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let descriptor = inherit_lease(&mut command, &lease);
+        let mut worker = Child(command.spawn().unwrap());
+        drop(descriptor);
+        let identity = ProcessIdentity::for_pid(worker.0.id() as i32)
+            .unwrap()
+            .unwrap();
+        write_holder(
+            &runtime,
+            &config,
+            &run_id,
+            &lease,
+            vec![
+                StorageHolder {
+                    role: StorageHolderRole::Monitor,
+                    pid: i32::MAX as u32,
+                    started_at: 1,
+                },
+                StorageHolder {
+                    role: StorageHolderRole::KrunWorker,
+                    pid: worker.0.id(),
+                    started_at: u64::try_from(identity.started_at().unwrap()).unwrap(),
+                },
+            ],
+        );
+        let cleanup = finish_failed_start(
+            &runtime,
+            &config,
+            &run_id,
+            Some(FailedStartState::Stopped),
+            None,
+            FailedStartStorage { lease, lower: None },
+            rejected_start(&config),
+        );
+        tokio::pin!(cleanup);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut cleanup)
+                .await
+                .is_err(),
+            "failed start must not finish while the actual registered child retains its lease"
+        );
+        assert_eq!(
+            runtime.machine_state(config.id).await.unwrap().status,
+            MachineRuntimeState::Starting
+        );
+        worker.0.kill().unwrap();
+        worker.0.wait().unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), cleanup)
+            .await
+            .unwrap();
+        assert_rejected_start(&error);
+        assert_retired(&runtime, &config, MachineRuntimeState::Stopped).await;
+        assert_eq!(
+            runtime
+                .machine_storage_record(config.id)
+                .await
+                .unwrap()
+                .stop_outcome,
+            crate::StorageStopOutcome::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_removal_refuses_orphan_worker_without_changing_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let descriptor = inherit_lease(&mut command, &lease);
+        let worker = Child(command.spawn().unwrap());
+        drop(descriptor);
+        let worker_identity = ProcessIdentity::for_pid(worker.0.id() as i32)
+            .unwrap()
+            .unwrap();
+        runtime
+            .mark_machine_monitor_ready(config.id, run_id.clone(), i32::MAX, 1)
+            .await
+            .unwrap();
+        write_holder(
+            &runtime,
+            &config,
+            &run_id,
+            &lease,
+            vec![
+                StorageHolder {
+                    role: StorageHolderRole::Monitor,
+                    pid: i32::MAX as u32,
+                    started_at: 1,
+                },
+                StorageHolder {
+                    role: StorageHolderRole::KrunWorker,
+                    pid: worker.0.id(),
+                    started_at: u64::try_from(worker_identity.started_at().unwrap()).unwrap(),
+                },
+            ],
+        );
+        let before = runtime.machine_state(config.id).await.unwrap();
+        let result = crate::machine::Machine::new(runtime.clone(), config.id)
+            .remove_force()
+            .await;
+        assert!(matches!(
+            result,
+            Err(LibVmError::MachineAlreadyRunning { .. })
+        ));
+        assert_eq!(runtime.machine_state(config.id).await.unwrap(), before);
+        assert!(worker_identity.is_alive().unwrap());
+        assert!(runtime.machine_config(config.id).await.unwrap().is_some());
+        assert_eq!(
+            runtime
+                .native_store()
+                .unwrap()
+                .launch_storage_operations(config.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

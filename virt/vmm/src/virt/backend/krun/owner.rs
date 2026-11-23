@@ -1,8 +1,9 @@
 //! The only owner allowed to signal, wait for, or reap a krun worker.
 
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -17,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::krun::worker::wire::{self, Event, MAX_EVENT};
 use crate::krun::worker::WORKER_NAME;
 use crate::virt::backend::krun::{host_memory_reclaim_report, inherit};
+use crate::virt::backend::lifecycle::LifecycleFault;
 use crate::virt::backend::HostMemoryReclaimReport;
 use crate::virt::exit::{Diagnostic, ForceReason, ProcessExit, StartupStage, VmExit, VmOutcome};
 
@@ -26,6 +28,12 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(30);
 const FORCE_OBSERVATION: Duration = Duration::from_secs(5);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const WORKER_EXECUTABLE: &str = "/proc/self/exe";
+// The child-side mapper and the worker's adoption table name one role.
+const _: () = assert!(inherit::LIFECYCLE_CHILD_FD == crate::krun::worker::fds::LIFECYCLE_FD);
+const _: () = assert!(inherit::MAX_LOWER_FDS == crate::krun::worker::fds::MAX_LOWER_FDS);
+const _: () = assert!(inherit::FIRST_LOWER_CHILD_FD == crate::krun::worker::fds::FIRST_LOWER_FD);
 
 /// Published lifecycle of one worker generation. `Reaped` means the child is
 /// gone but the owner is still draining channels; `Exited` is terminal.
@@ -33,6 +41,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) enum Phase {
     #[default]
     Starting,
+    Prepared,
     Started,
     Reaped,
     Exited(VmExit),
@@ -42,15 +51,17 @@ impl Phase {
     pub(crate) fn exit(&self) -> Option<&VmExit> {
         match self {
             Self::Exited(exit) => Some(exit),
-            Self::Starting | Self::Started | Self::Reaped => None,
+            Self::Starting | Self::Prepared | Self::Started | Self::Reaped => None,
         }
     }
 }
 
 pub(crate) struct Owner {
     pub(crate) state: watch::Sender<Phase>,
+    pub(crate) worker_pid: watch::Sender<Option<u32>>,
     pub(crate) stop: CancellationToken,
     pub(crate) force: CancellationToken,
+    pub(crate) hibernate: CancellationToken,
     pub(crate) reclaim: watch::Sender<Option<HostMemoryReclaimReport>>,
 }
 
@@ -63,15 +74,27 @@ struct Spawned {
 }
 
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    #[cfg(not(target_os = "linux"))]
     let (read, write) = nix::unistd::pipe()?;
     Ok((inherit::normalize(read)?, inherit::normalize(write)?))
 }
 
-/// Spawn `krun` with the fixed descriptor table of the worker contract:
-/// 3 config, 4 events, 5 watchdog, 6 console, 7 vsock mux.
-fn spawn(console: OwnedFd, mux: OwnedFd) -> io::Result<Spawned> {
+/// Spawn the exact normal-worker table, including inherited restore objects
+/// at 25..=28 and lower descriptors/extents at 33+ when restoring.
+fn spawn(
+    console: OwnedFd,
+    mux: OwnedFd,
+    lease: &OwnedFd,
+    raw_handles: &[OwnedFd],
+    lifecycle: OwnedFd,
+    restore_objects: &[File],
+    restore_lowers: &[File],
+) -> io::Result<Spawned> {
     let console = inherit::normalize(console)?;
     let mux = inherit::normalize(mux)?;
+    let lifecycle = inherit::normalize(lifecycle)?;
     let (config, send) = pipe()?;
     let (receive, events) = pipe()?;
     let (diagnostics, output) = pipe()?;
@@ -81,17 +104,59 @@ fn spawn(console: OwnedFd, mux: OwnedFd) -> io::Result<Spawned> {
     let config_sender = Sender::from_owned_fd(send)?;
     let event_receiver = Receiver::from_owned_fd(receive)?;
     let diagnostic_receiver = Receiver::from_owned_fd(diagnostics)?;
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new(WORKER_EXECUTABLE);
+    #[cfg(not(target_os = "linux"))]
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg0(WORKER_NAME)
+        .env_remove("_VM_STORAGE_LEASES")
+        .env_remove("_VM_RESTORE_OBJECTS")
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output));
     command.kill_on_drop(true);
-    inherit::install(
-        command.as_std_mut(),
-        &[&config, &events, &watchdog, &console, &mux],
+    if raw_handles.len() > 16 {
+        return Err(wire::invalid(
+            "Raw descriptor table exceeds the total disk bound",
+        ));
+    }
+    if !matches!(restore_objects.len(), 0 | 4 | 5)
+        || restore_lowers.len() > inherit::MAX_LOWER_FDS
+        || (restore_objects.is_empty() && !restore_lowers.is_empty())
+    {
+        return Err(wire::invalid("invalid restore descriptor table"));
+    }
+    let mut mapping =
+        Vec::with_capacity(7 + raw_handles.len() + restore_objects.len() + restore_lowers.len());
+    mapping.extend_from_slice(&[
+        (config.as_raw_fd(), 3),
+        (events.as_raw_fd(), 4),
+        (watchdog.as_raw_fd(), 5),
+        (console.as_raw_fd(), 6),
+        (mux.as_raw_fd(), 7),
+        (lease.as_raw_fd(), 8),
+        (
+            lifecycle.as_raw_fd(),
+            crate::krun::worker::fds::LIFECYCLE_FD,
+        ),
+    ]);
+    for (index, fd) in raw_handles.iter().enumerate() {
+        mapping.push((fd.as_raw_fd(), 9 + index as i32));
+    }
+    mapping.extend(
+        restore_objects
+            .iter()
+            .zip(crate::krun::worker::fds::RESTORE_STATE_FDS)
+            .map(|(file, role)| (file.as_raw_fd(), role)),
     );
+    mapping.extend(restore_lowers.iter().enumerate().map(|(index, file)| {
+        (
+            file.as_raw_fd(),
+            inherit::FIRST_LOWER_CHILD_FD + index as i32,
+        )
+    }));
+    inherit::install(command.as_std_mut(), &mapping)?;
     let child = command.spawn()?;
     Ok(Spawned {
         child,
@@ -171,18 +236,36 @@ fn force(
 }
 
 impl Owner {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run(
         &self,
         config: crate::krun::KrunConfig,
         console: OwnedFd,
         mux: OwnedFd,
+        raw_handles: Vec<OwnedFd>,
+        lifecycle: OwnedFd,
+        mut lifecycle_faults: mpsc::Receiver<LifecycleFault>,
+        vm_config: &crate::virt::config::VmConfig,
     ) -> VmExit {
         if self.stop.is_cancelled() || self.force.is_cancelled() {
             return VmExit::stopped(StartupStage::Spawned);
         }
+        let Some(launch) = vm_config.storage_launch() else {
+            return VmExit::failed(
+                StartupStage::Spawned,
+                "managed worker lacks storage launch identity",
+            );
+        };
         let frame = match wire::encode_config(&config) {
             Ok(frame) => frame,
             Err(error) => return VmExit::failed(StartupStage::Spawned, error.to_string()),
+        };
+        let (restore_objects, restore_lowers) = match vm_config.restore() {
+            Some(restore) => match restore.files.duplicates() {
+                Ok(files) => files,
+                Err(error) => return VmExit::failed(StartupStage::Spawned, error.to_string()),
+            },
+            None => (Vec::new(), Vec::new()),
         };
         let Spawned {
             mut child,
@@ -190,13 +273,47 @@ impl Owner {
             mut events,
             diagnostics,
             _keepalive,
-        } = match spawn(console, mux) {
+        } = match spawn(
+            console,
+            mux,
+            &launch.lease,
+            &raw_handles,
+            lifecycle,
+            &restore_objects,
+            &restore_lowers,
+        ) {
             Ok(spawned) => spawned,
             Err(error) => {
                 return VmExit::failed(StartupStage::Spawned, format!("spawn krun worker: {error}"))
             }
         };
+        // Only the child keeps checked duplicates. Parent proof handles remain
+        // owned by PreparedAttachments through post-reap finalization.
+        drop(raw_handles);
+        drop(restore_objects);
+        drop(restore_lowers);
+        let publication = child
+            .id()
+            .ok_or_else(|| io::Error::other("spawned worker has no process identity"))
+            .and_then(|pid| crate::virt::backend::storage::publish_holders(vm_config, Some(pid)));
+        if let Err(error) = publication {
+            let _ = child.start_kill();
+            loop {
+                match child.wait().await {
+                    Ok(_) => break,
+                    Err(wait_error) => {
+                        tracing::error!(%wait_error, "holder publication failed; retaining worker reaper");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            return VmExit::failed(
+                StartupStage::Spawned,
+                format!("publish storage holders before worker configuration: {error}"),
+            );
+        }
         let pid = child.id().unwrap_or_default();
+        self.worker_pid.send_replace(Some(pid));
         tracing::info!(worker_pid = pid, "krun worker spawned");
         let tail = Arc::new(Mutex::new(Tail::default()));
         let mut diagnostic_task = tokio::spawn(collect_diagnostics(diagnostics, pid, tail.clone()));
@@ -225,6 +342,10 @@ impl Owner {
         let mut shutdown_requested = false;
         let startup_deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         let mut stop_deadline = startup_deadline;
+        let mut lifecycle_open = true;
+        // EOF races the reaper at normal exit; a live worker without its
+        // lifecycle endpoint is a protocol failure after this grace.
+        let mut lifecycle_closed: Option<tokio::time::Instant> = None;
         let status = loop {
             tokio::select! {
                 biased;
@@ -236,7 +357,14 @@ impl Owner {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 },
-                _ = self.force.cancelled(), if !escalated => {
+                _ = self.hibernate.cancelled(), if !stopping => {
+                    stopping = true;
+                    if let Err(error) = force(&mut child, ForceReason::Hibernate, &mut forced) {
+                        failure.get_or_insert_with(|| format!("release saved worker: {error}"));
+                    }
+                    stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;
+                }
+                _ = self.force.cancelled(), if !escalated && forced != Some(ForceReason::Hibernate) => {
                     escalated = true;
                     shutdown_requested = true;
                     stopping = true;
@@ -265,9 +393,16 @@ impl Owner {
                 event = event_rx.recv(), if events_open && !stopping => {
                     let error = match event {
                         Some(Ok(Event::StartupStage { stage: next })) if valid_stage(stage, next) && !started => { stage = next; None }
-                        Some(Ok(Event::BackendStarted {})) if stage == StartupStage::Build && !started => {
-                            started = true; stage = StartupStage::Started;
-                            self.state.send_replace(Phase::Started); None
+                        Some(Ok(event @ (Event::BackendStarted {} | Event::RestorePrepared {}))) if !started => {
+                            match handoff_phase(stage, vm_config.restore().is_some(), &event) {
+                                Some(phase) => {
+                                    started = true;
+                                    stage = StartupStage::Started;
+                                    self.state.send_replace(phase);
+                                    None
+                                }
+                                None => Some("invalid worker startup handoff".to_string()),
+                            }
                         }
                         Some(Ok(Event::StartupFailed { stage: observed, diagnostic })) if observed == stage => Some(diagnostic),
                         Some(Ok(Event::HostMemoryReclaim { status })) if stage == StartupStage::Build || started => {
@@ -289,6 +424,28 @@ impl Owner {
                         if let Err(error) = force(&mut child, reason, &mut forced) { tracing::warn!(%error, "failed to terminate failed worker"); }
                         stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;
                     }
+                }
+                fault = lifecycle_faults.recv(), if lifecycle_open => {
+                    lifecycle_open = false;
+                    match fault {
+                        Some(LifecycleFault::Protocol(message)) if !stopping => {
+                            failure.get_or_insert(format!("worker lifecycle protocol failure: {message}"));
+                            stopping = true;
+                            if let Err(error) = force(&mut child, ForceReason::ProtocolFailure, &mut forced) { tracing::warn!(%error, "failed to terminate worker after lifecycle failure"); }
+                            stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;
+                        }
+                        Some(LifecycleFault::Protocol(_)) => {}
+                        Some(LifecycleFault::Closed) | None => {
+                            lifecycle_closed = Some(tokio::time::Instant::now() + DRAIN_TIMEOUT);
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(lifecycle_closed.unwrap_or(stop_deadline)), if lifecycle_closed.is_some() && !stopping => {
+                    lifecycle_closed = None;
+                    failure.get_or_insert_with(|| "worker closed its lifecycle endpoint while alive".to_string());
+                    stopping = true;
+                    if let Err(error) = force(&mut child, ForceReason::ProtocolFailure, &mut forced) { tracing::warn!(%error, "failed to terminate worker after lifecycle loss"); }
+                    stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;
                 }
                 result = &mut transmission, if !transmitted => {
                     transmitted = true;
@@ -317,6 +474,7 @@ impl Owner {
             }
         };
         self.state.send_replace(Phase::Reaped);
+        self.worker_pid.send_replace(None);
         if !transmitted {
             transmission.abort();
             let _ = transmission.await;
@@ -402,6 +560,14 @@ fn worker_outcome(
     }
 }
 
+fn handoff_phase(stage: StartupStage, restoring: bool, event: &Event) -> Option<Phase> {
+    match (stage, restoring, event) {
+        (StartupStage::Build, true, Event::RestorePrepared {}) => Some(Phase::Prepared),
+        (StartupStage::Build, false, Event::BackendStarted {}) => Some(Phase::Started),
+        _ => None,
+    }
+}
+
 fn valid_stage(current: StartupStage, next: StartupStage) -> bool {
     matches!(
         (current, next),
@@ -415,6 +581,41 @@ mod tests {
     use crate::virt::backend::krun::owner::{valid_stage, worker_outcome, Tail, DIAGNOSTIC_LIMIT};
     use crate::virt::exit::{ForceReason, ProcessExit, StartupStage, VmOutcome};
 
+    #[test]
+    fn restore_prepared_and_cold_started_handoffs_cannot_be_interchanged() {
+        use crate::krun::worker::wire::Event;
+        use crate::virt::backend::krun::owner::{handoff_phase, Phase};
+        assert!(matches!(
+            handoff_phase(StartupStage::Build, true, &Event::RestorePrepared {}),
+            Some(Phase::Prepared)
+        ));
+        assert!(matches!(
+            handoff_phase(StartupStage::Build, false, &Event::BackendStarted {}),
+            Some(Phase::Started)
+        ));
+        assert!(handoff_phase(StartupStage::Build, false, &Event::RestorePrepared {}).is_none());
+        assert!(handoff_phase(StartupStage::Build, true, &Event::BackendStarted {}).is_none());
+        assert!(handoff_phase(
+            StartupStage::Build,
+            true,
+            &Event::StartupStage {
+                stage: StartupStage::Build
+            }
+        )
+        .is_none());
+        for stage in [
+            StartupStage::Spawned,
+            StartupStage::Admission,
+            StartupStage::Started,
+        ] {
+            assert!(handoff_phase(stage, true, &Event::RestorePrepared {}).is_none());
+            assert!(handoff_phase(stage, false, &Event::BackendStarted {}).is_none());
+        }
+        assert!(
+            Phase::Prepared.exit().is_none(),
+            "prepared is a live, non-running worker"
+        );
+    }
     fn process(code: Option<i32>, signal: Option<i32>) -> ProcessExit {
         ProcessExit {
             pid: 123,
@@ -507,5 +708,42 @@ mod tests {
         assert!(!valid_stage(StartupStage::Spawned, StartupStage::Build));
         assert!(!valid_stage(StartupStage::Build, StartupStage::Build));
         assert!(!valid_stage(StartupStage::Started, StartupStage::Admission));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_reexec_uses_loaded_elf_after_monitor_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("silo-vmm-worker-reexec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let temp = TempDir(directory);
+        std::fs::set_permissions(&temp.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = temp.0.join("loaded-monitor");
+        let replacement = temp.0.join("new-monitor");
+        // Create executable files in the child: unrelated test-thread forks must
+        // not inherit a writable fixture descriptor and cause ETXTBSY at exec.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "cp -- /bin/sh \"$1\" && chmod 700 \"$1\" && cp -- /bin/false \"$2\" && \
+                 exec \"$1\" -c 'mv -- \"$1\" \"$2\" || exit 92; \"$2\"; \
+                 test \"$?\" -eq 1 || exit 93; exec \"$3\" -c \"printf loaded-monitor-worker\"' \
+                 worker-reexec-fixture \"$2\" \"$1\" \"$3\"",
+            )
+            .arg("worker-reexec-setup")
+            .arg(&executable)
+            .arg(&replacement)
+            .arg(crate::virt::backend::krun::owner::WORKER_EXECUTABLE)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"loaded-monitor-worker");
     }
 }

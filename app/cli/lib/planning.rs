@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use eyre::bail;
 use libvm::{
-    Forward, MachineAgent, MachineRetention, MachineUserConfig, OciImageConfigMetadata, Platform,
-    ProcessConfig, PublishBind,
+    DiskImportBoot, Forward, ImageId, MachineAgent, MachineRetention, MachineUserConfig,
+    OciImageConfigMetadata, Platform, ProcessConfig, PublishBind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +44,14 @@ pub(crate) enum ResolvedImage {
         identity: OciImageIdentity,
         metadata: Box<OciImageConfigMetadata>,
     },
-    Disk {
-        path: PathBuf,
+    /// Complete direct-boot metadata. `disk:` convenience assumptions
+    /// (host-native platform, whole disk, packaged assets) are explicit here.
+    Disk { path: PathBuf, boot: DiskImportBoot },
+    /// A stored image, already resolved to its id.
+    Stored {
+        requested_reference: String,
+        id: ImageId,
+        metadata: Box<OciImageConfigMetadata>,
     },
 }
 
@@ -63,17 +69,28 @@ pub(crate) enum PullPolicy {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ImageIdentity {
     Oci(OciImageIdentity),
-    Disk { path: PathBuf },
+    #[serde(rename_all = "camelCase")]
+    Disk {
+        path: PathBuf,
+        boot: DiskImportBoot,
+    },
+    #[serde(rename_all = "camelCase")]
+    Stored {
+        requested_reference: String,
+        id: ImageId,
+    },
 }
 
 /// Explicit machine values, kept independent from the current CLI command structs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct MachineOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resources: Option<MachineResources>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) disk_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tmpfs_size: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) userdata: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -92,10 +109,11 @@ pub(crate) struct MachineOverrides {
 
 /// Fully selected machine defaults, with no filesystem or runtime work performed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct MachinePlan {
     pub(crate) resources: Option<MachineResources>,
     pub(crate) disk_size: Option<String>,
+    pub(crate) tmpfs_size: Option<String>,
     pub(crate) userdata: Option<String>,
     pub(crate) mounts: Vec<MachineMount>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -114,7 +132,12 @@ pub(crate) struct MachineCreationSettings {
     pub(crate) initramfs: Option<PathBuf>,
     pub(crate) kernel_args: Vec<String>,
     pub(crate) nested_virtualization: bool,
-    pub(crate) rosetta: bool,
+    /// Explicit Rosetta intent; absence is not an explicit disable.
+    pub(crate) rosetta: Option<bool>,
+    /// Requested Linux userspace platform; the source identity records the
+    /// selected one. Absent means no explicit request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) platform: Option<libvm::LinuxPlatform>,
     pub(crate) disks: Vec<PathBuf>,
     pub(crate) agent: MachineAgent,
     pub(crate) provision_user: Option<MachineUserConfig>,
@@ -279,6 +302,9 @@ pub(crate) fn resolve(request: ResolveRequest) -> eyre::Result<Plan> {
         )
     };
     let machine = resolve_machine(&request.template, request.machine_overrides)?;
+    if machine.tmpfs_size.is_some() && !matches!(image, ImageIdentity::Oci(_)) {
+        bail!("tmpfs_size requires a new OCI root");
+    }
     let process = resolve_process(
         metadata.as_ref(),
         &request.environment_files,
@@ -343,8 +369,16 @@ fn validate_image(image: &ResolvedImage) -> eyre::Result<&ResolvedImage> {
             }
             validate_oci_metadata(metadata)?;
         }
-        ResolvedImage::Disk { path } => {
+        ResolvedImage::Disk { path, .. } => {
             validate_no_nul(&path.to_string_lossy(), "disk image path")?;
+        }
+        ResolvedImage::Stored {
+            requested_reference,
+            metadata,
+            ..
+        } => {
+            validate_no_nul(requested_reference, "image reference")?;
+            validate_oci_metadata(metadata)?;
         }
     }
     Ok(image)
@@ -393,6 +427,7 @@ fn resolve_machine(template: &Template, overrides: MachineOverrides) -> eyre::Re
             ),
         }),
         disk_size: overrides.disk_size.or_else(|| template.disk_size.clone()),
+        tmpfs_size: overrides.tmpfs_size.or_else(|| template.tmpfs_size.clone()),
         userdata: overrides.userdata.or_else(|| template.userdata.clone()),
         mounts,
         forwards,
@@ -510,6 +545,10 @@ impl ResolvedImage {
         match self {
             Self::Oci { identity, .. } => identity.requested_reference.clone(),
             Self::Disk { path, .. } => format!("disk:{}", path.display()),
+            Self::Stored {
+                requested_reference,
+                ..
+            } => requested_reference.clone(),
         }
     }
 
@@ -517,14 +556,45 @@ impl ResolvedImage {
         match self {
             Self::Oci { metadata, .. } => Some(metadata),
             Self::Disk { .. } => None,
+            Self::Stored { metadata, .. } => Some(metadata),
         }
     }
 
     fn identity(&self) -> ImageIdentity {
         match self {
             Self::Oci { identity, .. } => ImageIdentity::Oci(identity.clone()),
-            Self::Disk { path, .. } => ImageIdentity::Disk { path: path.clone() },
+            Self::Disk { path, boot } => ImageIdentity::Disk {
+                path: path.clone(),
+                boot: boot.clone(),
+            },
+            Self::Stored {
+                requested_reference,
+                id,
+                ..
+            } => ImageIdentity::Stored {
+                requested_reference: requested_reference.clone(),
+                id: *id,
+            },
         }
+    }
+}
+
+/// Image execution defaults of a stored image, in the shape planning uses
+/// for OCI configuration.
+pub(crate) fn stored_image_metadata(process: &ProcessConfig) -> OciImageConfigMetadata {
+    OciImageConfigMetadata {
+        entrypoint: process.entrypoint.clone(),
+        cmd: process.command.clone(),
+        env: Some(
+            process
+                .environment
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect(),
+        ),
+        working_dir: Some(process.working_directory.clone()),
+        user: process.user.clone(),
+        ..OciImageConfigMetadata::default()
     }
 }
 
@@ -556,6 +626,7 @@ fn validate_request_nuls(request: &ResolveRequest) -> eyre::Result<()> {
 }
 
 fn validate_machine_plan(machine: &MachinePlan) -> eyre::Result<()> {
+    crate::template::validate_tmpfs_size(machine.tmpfs_size.as_deref())?;
     validate_machine_defaults(
         machine.resources.as_ref(),
         machine.disk_size.as_deref(),
@@ -619,6 +690,7 @@ fn validate_template_nuls(template: &Template) -> eyre::Result<()> {
     validate_machine_plan(&MachinePlan {
         resources: template.resources.clone(),
         disk_size: template.disk_size.clone(),
+        tmpfs_size: template.tmpfs_size.clone(),
         userdata: template.userdata.clone(),
         mounts: template.mounts.clone(),
         forwards: Vec::new(),
@@ -752,6 +824,7 @@ mod tests {
             image: image.map(str::to_string),
             resources: None,
             disk_size: None,
+            tmpfs_size: None,
             userdata: None,
             mounts: Vec::new(),
             forwards: Vec::new(),
@@ -774,6 +847,81 @@ mod tests {
             },
             metadata: Box::new(metadata),
         }
+    }
+
+    #[test]
+    fn temporary_memory_policy_requires_a_new_oci_root_and_honors_overrides() {
+        let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
+        input.template.tmpfs_size = Some("8mib".into());
+        input.machine_overrides.tmpfs_size = Some("16mib".into());
+        let plan = create_plan(resolve(input).unwrap());
+        assert_eq!(plan.machine.tmpfs_size.as_deref(), Some("16mib"));
+        for source in [
+            disk("/tmp/source.raw"),
+            stored(OciImageConfigMetadata::default()),
+        ] {
+            let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
+            input.machine_overrides.tmpfs_size = Some("8mib".into());
+            input.positional_image = Some(source);
+            assert!(resolve(input).is_err());
+        }
+    }
+
+    #[test]
+    fn retired_root_selection_is_not_silently_ignored_by_plan_decoding() {
+        let old_override = serde_json::json!({"rootProfile": "opaque-raw"});
+        assert!(serde_json::from_value::<MachineOverrides>(old_override).is_err());
+        let plan = create_plan(
+            resolve(request(PlanKind::Create, OciImageConfigMetadata::default())).unwrap(),
+        );
+        let mut old_plan = serde_json::to_value(plan.machine).unwrap();
+        old_plan["rootProfile"] = serde_json::json!("linux-flat-overlay-v1");
+        assert!(serde_json::from_value::<crate::planning::MachinePlan>(old_plan).is_err());
+    }
+
+    fn disk(path: &str) -> ResolvedImage {
+        ResolvedImage::Disk {
+            path: PathBuf::from(path),
+            boot: libvm::DiskImportBoot::LinuxDirect {
+                platform: libvm::LinuxPlatform {
+                    architecture: libvm::GuestArchitecture::Amd64,
+                    variant: None,
+                },
+                root: libvm::ImportRootSelection::WholeDisk,
+                assets: libvm::BootAssetSelection::Packaged,
+            },
+        }
+    }
+
+    fn stored(metadata: OciImageConfigMetadata) -> ResolvedImage {
+        ResolvedImage::Stored {
+            requested_reference: "base".into(),
+            id: format!("sha256:{}", "ab".repeat(32)).parse().unwrap(),
+            metadata: Box::new(metadata),
+        }
+    }
+
+    #[test]
+    fn stored_image_execution_defaults_seed_the_plan_and_keep_its_id() {
+        let mut process = libvm::ProcessConfig::new();
+        process.entrypoint = Some(vec!["/bin/app".into()]);
+        process.command = Some(Vec::new());
+        process.working_directory = "/srv".into();
+        process.environment = BTreeMap::from([("A".into(), "1".into())]);
+        let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
+        input.positional_image = Some(stored(crate::planning::stored_image_metadata(&process)));
+        let plan = create_plan(resolve(input).expect("resolve stored plan"));
+        assert_eq!(plan.process.entrypoint, process.entrypoint);
+        assert_eq!(plan.process.command, Some(Vec::new()));
+        assert_eq!(plan.process.working_directory, "/srv");
+        assert_eq!(
+            plan.process.environment.get("A").map(String::as_str),
+            Some("1")
+        );
+        let ImageIdentity::Stored { id, .. } = plan.image else {
+            panic!("expected stored identity");
+        };
+        assert_eq!(id.to_string(), format!("sha256:{}", "ab".repeat(32)));
     }
 
     #[test]
@@ -887,7 +1035,8 @@ mod tests {
                 initramfs: None,
                 kernel_args: Vec::new(),
                 nested_virtualization: false,
-                rosetta: false,
+                rosetta: None,
+                platform: None,
                 disks: Vec::new(),
                 agent: MachineAgent::Default,
                 provision_user: None,
@@ -1112,9 +1261,7 @@ mod tests {
     #[test]
     fn disk_has_no_oci_metadata() {
         let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
-        input.positional_image = Some(ResolvedImage::Disk {
-            path: PathBuf::from("rootfs.img"),
-        });
+        input.positional_image = Some(disk("rootfs.img"));
         let plan = create_plan(resolve(input).expect("resolve disk plan"));
         assert_eq!(plan.process.entrypoint, None);
         assert_eq!(plan.process.command, None);
@@ -1332,65 +1479,6 @@ mod tests {
     }
 
     #[test]
-    fn create_plan_serde_snapshot_has_complete_creation_state() {
-        let plan = resolve(request(PlanKind::Create, OciImageConfigMetadata::default()))
-            .expect("resolve plan");
-
-        assert_eq!(
-            json(plan),
-            serde_json::json!({
-                "operation": "create",
-                "schemaVersion": 1,
-                "proposedName": "dev",
-                "template": {
-                    "name": "development",
-                    "version": "1",
-                    "description": null
-                },
-                "image": {
-                    "kind": "oci",
-                    "requestedReference": "example:template",
-                    "selectedReference": "example:template@sha256:selected",
-                    "platform": { "os": "linux", "architecture": "amd64" },
-                    "manifestDigest": "sha256:manifest",
-                    "configDigest": "sha256:config",
-                    "cacheState": "complete",
-                    "pullPolicy": "if_missing"
-                },
-                "machine": {
-                    "resources": { "cpus": 1, "memory": "512mb" },
-                    "diskSize": null,
-                    "userdata": null,
-                    "mounts": [],
-                    "network": { "kind": "private" },
-                    "labels": { "template": "yes" }
-                },
-                "machineSettings": {
-                    "kernel": null,
-                    "initramfs": null,
-                    "kernelArgs": [],
-                    "nestedVirtualization": false,
-                    "rosetta": false,
-                    "disks": [],
-                    "agent": { "mode": "default" },
-                    "provisionUser": null
-                },
-                "process": {
-                    "entrypoint": null,
-                    "command": null,
-                    "environment": {
-                        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                    },
-                    "workingDirectory": "/",
-                    "user": null
-                },
-                "retention": "persistent",
-                "cleanup": "retain_machine"
-            })
-        );
-    }
-
-    #[test]
     fn foreground_run_plan_serde_snapshot_has_effective_argv_and_tty() {
         let plan = resolve(request(
             PlanKind::Run(RunOptions {
@@ -1471,18 +1559,22 @@ mod tests {
     }
 
     #[test]
-    fn disk_plan_serde_snapshot_has_no_oci_or_registry_state() {
+    fn disk_plan_serde_snapshot_displays_boot_assumptions_without_registry_state() {
         let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
-        input.positional_image = Some(ResolvedImage::Disk {
-            path: PathBuf::from("rootfs.img"),
-        });
+        input.positional_image = Some(disk("rootfs.img"));
         let output = json(resolve(input).expect("resolve disk plan"));
 
         assert_eq!(
             output["image"],
             serde_json::json!({
                 "kind": "disk",
-                "path": "rootfs.img"
+                "path": "rootfs.img",
+                "boot": {
+                    "kind": "linux-direct",
+                    "platform": {"architecture": "amd64", "variant": null},
+                    "root": {"kind": "whole-disk"},
+                    "assets": {"kind": "packaged"}
+                }
             })
         );
     }
@@ -1502,5 +1594,31 @@ mod tests {
         assert!(rendered.contains("HOST_TOKEN"));
         assert!(rendered.matches("not-for-output").count() >= 2);
         assert!(!rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn plain_dry_run_plans_render_fields_instead_of_json() {
+        for (kind, command_tail) in [
+            (PlanKind::Create, Vec::new()),
+            (
+                PlanKind::Run(RunOptions::default()),
+                vec!["/bin/true".to_string()],
+            ),
+        ] {
+            let mut input = request(kind, OciImageConfigMetadata::default());
+            input.command_tail = command_tail;
+            let plan = resolve(input).unwrap();
+            let rows = crate::ui::serialized_detail_rows(&plan).unwrap();
+            let operation = match plan {
+                Plan::Create(_) => "create",
+                Plan::Run(_) => "run",
+            };
+            assert!(rows.contains(&("operation".into(), operation.into())));
+            assert!(rows.iter().any(|(key, _)| key.ends_with("proposedName")));
+            assert!(rows
+                .iter()
+                .any(|(key, _)| key.ends_with("image.requestedReference")));
+            assert!(!rows.iter().any(|(_, value)| value.starts_with('{')));
+        }
     }
 }

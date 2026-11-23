@@ -42,11 +42,23 @@ pub struct MachineView {
     pub id: String,
     pub name: String,
     pub state: &'static str,
+    pub durability: libvm::MachineDurability,
     pub observation: libvm::MachineObservation,
     pub last_known_state: Option<&'static str>,
     pub issues: Vec<libvm::MachineIssue>,
     pub last_error: Option<String>,
     pub run_id: Option<String>,
+    /// Observed terminal storage result; read-only inspection need not persist it.
+    pub storage_stop_outcome: Option<libvm::StorageStopOutcome>,
+    pub ram_identity: libvm::ContentIdentityState,
+    pub disk_identities: Vec<libvm::DiskContentIdentity>,
+    pub live: Option<vm_spec::live::LiveMachineReport>,
+    pub prospective_live: Option<vm_spec::live::LiveHostReport>,
+    pub lifecycle: Option<libvm::MachineLifecycle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_memory_reclaim: Option<HostMemoryReclaimView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hibernation: Option<HibernationView>,
     pub default: bool,
     pub template_name: Option<String>,
     pub retention: String,
@@ -69,6 +81,195 @@ pub struct MachineView {
     pub metadata: BTreeMap<String, String>,
     pub dir: PathBuf,
     pub spec: VmSpec,
+    /// Pinned direct-boot meaning; start never switches bundles implicitly.
+    pub boot: Option<MachineBootView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HibernationView {
+    pub hibernated_at: i64,
+    pub saved_state_bytes: u64,
+    pub memory_capture: HibernateMemoryView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HibernateMemoryView {
+    pub mode: vm_spec::lifecycle::CapturePolicy,
+    pub full_reason: Option<vm_spec::capture::CaptureFullReason>,
+    pub stats: vm_spec::capture::CaptureMemoryStats,
+}
+
+impl HibernationView {
+    fn new(value: &libvm::MachineHibernationInfo) -> Self {
+        Self {
+            hibernated_at: value.hibernated_at,
+            saved_state_bytes: value.saved_state_bytes,
+            memory_capture: HibernateMemoryView {
+                mode: value.memory_capture.mode,
+                full_reason: value.memory_capture.full_reason,
+                stats: value.memory_capture.stats.clone(),
+            },
+        }
+    }
+}
+
+/// Presentation of the current monitor report, never persisted machine state.
+#[derive(Debug, Clone, Serialize)]
+pub struct HostMemoryReclaimView {
+    pub backing: &'static str,
+    pub reason: &'static str,
+    pub requested: bool,
+    pub effective: bool,
+    pub qualification: &'static str,
+    pub released_bytes: u64,
+    pub released_extents: u64,
+    pub skipped_reports: u64,
+    pub failed_operations: u64,
+    pub mapping_limit_skips: u64,
+    pub replaced_islands: u64,
+}
+
+impl HostMemoryReclaimView {
+    pub fn new(report: &libvm::MachineHostMemoryReclaim) -> Self {
+        Self {
+            backing: match report.backing {
+                libvm::MachineHostMemoryReclaimBacking::Boot => "boot",
+                libvm::MachineHostMemoryReclaimBacking::RestoredPrivate => "restored-private",
+            },
+            reason: match report.reason {
+                libvm::MachineHostMemoryReclaimReason::None => "none",
+                libvm::MachineHostMemoryReclaimReason::TrackedCapture => "tracked-capture",
+                libvm::MachineHostMemoryReclaimReason::RestoredPrivateMapping => {
+                    "restored-private-mapping"
+                }
+            },
+            requested: report.requested,
+            effective: report.effective,
+            qualification: match report.qualification {
+                libvm::MachineHostMemoryReclaimQualification::NotRun => "not-run",
+                libvm::MachineHostMemoryReclaimQualification::Passed => "passed",
+                libvm::MachineHostMemoryReclaimQualification::Failed => "failed",
+                libvm::MachineHostMemoryReclaimQualification::Inconclusive => "inconclusive",
+            },
+            released_bytes: report.released_bytes,
+            released_extents: report.released_extents,
+            skipped_reports: report.skipped_reports,
+            failed_operations: report.failed_operations,
+            mapping_limit_skips: report.mapping_limit_skips,
+            replaced_islands: report.replaced_islands,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        if !self.effective {
+            return format!("inhibited ({})", self.reason);
+        }
+        let mut text = format!(
+            "effective ({}), {} released in {} extents",
+            self.backing,
+            crate::ui::human_bytes(Some(self.released_bytes)),
+            self.released_extents,
+        );
+        if self.mapping_limit_skips != 0 {
+            text.push_str(&format!(
+                ", {} skipped at mapping limit",
+                self.mapping_limit_skips
+            ));
+        }
+        text
+    }
+}
+
+/// The machine's pinned boot bundle and platform, plus a newer locally
+/// admitted packaged bundle when one exists. Observation only, no mutation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineBootView {
+    pub platform: String,
+    pub kernel_architecture: String,
+    pub translation: String,
+    /// Explicit Rosetta intent; absent is no intent, false is an explicit disable.
+    pub rosetta_intent: Option<bool>,
+    pub root: String,
+    pub root_filesystem: String,
+    pub bundle: Option<String>,
+    pub kernel: Option<String>,
+    pub base_initramfs: Option<String>,
+    pub agent: Option<String>,
+    pub abi: Option<String>,
+    pub packaged_replacement: Option<String>,
+}
+
+impl MachineBootView {
+    fn new(data: &MachineData) -> Option<Self> {
+        let libvm::BootProfile::LinuxDirect {
+            userspace_platform,
+            kernel_architecture,
+            binding,
+            root_selector,
+            root_filesystem,
+            translation,
+            ..
+        } = data.boot_profile.as_ref()?
+        else {
+            return None;
+        };
+        let architecture = |value: &libvm::GuestArchitecture| match value {
+            libvm::GuestArchitecture::Amd64 => "amd64",
+            libvm::GuestArchitecture::Arm64 => "arm64",
+        };
+        let mut platform = format!("linux/{}", architecture(&userspace_platform.architecture));
+        if let Some(variant) = &userspace_platform.variant {
+            platform.push('/');
+            platform.push_str(variant);
+        }
+        let (bundle, kernel, base_initramfs, agent, abi) = match binding {
+            libvm::BootBinding::Pinned {
+                kernel,
+                base_initramfs,
+                agent,
+                abi,
+                ..
+            } => (
+                binding.digest().ok().map(|digest| digest.to_string()),
+                Some(kernel.to_string()),
+                Some(base_initramfs.to_string()),
+                agent.map(|agent| agent.to_string()),
+                Some(abi.clone()),
+            ),
+            libvm::BootBinding::RuntimeSelected => (None, None, None, None, None),
+        };
+        Some(Self {
+            platform,
+            kernel_architecture: architecture(kernel_architecture).to_string(),
+            translation: match translation {
+                libvm::Translation::None => "none",
+                libvm::Translation::Rosetta => "rosetta",
+            }
+            .to_string(),
+            rosetta_intent: data
+                .spec
+                .hardware
+                .as_ref()
+                .and_then(|hardware| hardware.rosetta),
+            root: match root_selector {
+                libvm::RootSelector::ManagedOverlay => "managed-overlay".to_string(),
+                libvm::RootSelector::WholeDisk => "whole-disk".to_string(),
+                libvm::RootSelector::GptPartition { guid } => format!("gpt:{guid}"),
+                libvm::RootSelector::MbrPartition { number } => format!("mbr:{number}"),
+            },
+            root_filesystem: match root_filesystem {
+                libvm::RootFilesystem::Ext4 => "ext4",
+            }
+            .to_string(),
+            bundle,
+            kernel,
+            base_initramfs,
+            agent,
+            abi,
+            packaged_replacement: data.boot_replacement.map(|digest| digest.to_string()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,12 +340,21 @@ impl MachineView {
             } else {
                 "unknown"
             },
+            durability: data.durability,
             observation: data.observation,
             last_known_state: (data.observation == libvm::MachineObservation::LastKnown)
                 .then(|| state_label(&data.status)),
             issues: data.issues.clone(),
             last_error: data.last_error.clone(),
             run_id: data.run_id.as_ref().map(ToString::to_string),
+            storage_stop_outcome: data.storage_stop_outcome,
+            ram_identity: data.ram_identity.clone(),
+            disk_identities: data.disk_identities.clone(),
+            live: data.live.clone(),
+            prospective_live: data.prospective_live.clone(),
+            lifecycle: data.lifecycle.clone(),
+            host_memory_reclaim: None,
+            hibernation: data.hibernation.as_ref().map(HibernationView::new),
             default,
             template_name: data.template_name.clone(),
             retention: retention_label(data.retention).to_string(),
@@ -181,6 +391,7 @@ impl MachineView {
             metadata: data.metadata.clone(),
             dir: data.machine_dir.clone(),
             spec: data.spec.clone(),
+            boot: MachineBootView::new(data),
         }
     }
 }
@@ -271,6 +482,7 @@ fn image_source_kind_label(source: ImageSourceKind) -> &'static str {
     match source {
         ImageSourceKind::Oci => "oci",
         ImageSourceKind::Disk => "disk",
+        ImageSourceKind::Stored => "stored",
     }
 }
 
@@ -298,6 +510,129 @@ mod tests {
     use crate::view::{agent_label, retention_label};
 
     #[test]
+    fn contained_init_boot_report_retains_label_and_agent_identity() {
+        let report = libvm::MachineBootReport {
+            mode: libvm::MachineBootMode::ContainedInit,
+            requested_init: Some("/sbin/init".into()),
+            handoff_init_path: Some("/sbin/init".into()),
+            probed_init_paths: Vec::new(),
+            agent_path: Some("/run/agent/silo-agent".into()),
+            agent_pid: 42,
+            agent_is_pid1: false,
+            message: None,
+        };
+        let view = crate::view::MachineGuestBootReportView::new(&report);
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json["mode"], "contained-init");
+        assert_eq!(json["agent_pid"], 42);
+        assert_eq!(json["agent_is_pid1"], false);
+        assert_eq!(json["handoff_init_path"], "/sbin/init");
+    }
+
+    fn reclaim_report(
+        backing: libvm::MachineHostMemoryReclaimBacking,
+    ) -> libvm::MachineHostMemoryReclaim {
+        libvm::MachineHostMemoryReclaim {
+            backing,
+            reason: libvm::MachineHostMemoryReclaimReason::None,
+            requested: true,
+            qualification: libvm::MachineHostMemoryReclaimQualification::NotRun,
+            effective: true,
+            released_bytes: 1_073_741_824,
+            released_extents: 340,
+            retried_faults: 0,
+            skipped_reports: 0,
+            failed_operations: 0,
+            mapping_limit_skips: 0,
+            replaced_islands: 0,
+            observed_at: std::time::UNIX_EPOCH,
+        }
+    }
+
+    fn machine_view() -> crate::view::MachineView {
+        crate::view::MachineView::new(
+            &libvm::MachineData::new(
+                "00000000-0000-4000-8000-000000000001".into(),
+                "dev".into(),
+                vm_spec::VmSpec::current(),
+            ),
+            false,
+        )
+    }
+
+    #[test]
+    fn info_reclaim_view_renders_effective_boot_json_and_plain() {
+        let report = reclaim_report(libvm::MachineHostMemoryReclaimBacking::Boot);
+        let reclaim = crate::view::HostMemoryReclaimView::new(&report);
+        assert_eq!(
+            reclaim.summary(),
+            format!(
+                "effective (boot), {} released in 340 extents",
+                crate::ui::human_bytes(Some(report.released_bytes))
+            )
+        );
+        let mut view = machine_view();
+        view.host_memory_reclaim = Some(reclaim);
+        let json = serde_json::to_value(view).expect("serialize info");
+        assert_eq!(
+            json["host_memory_reclaim"],
+            serde_json::json!({
+                "backing": "boot", "reason": "none", "requested": true,
+                "effective": true, "qualification": "not-run",
+                "released_bytes": 1_073_741_824_u64, "released_extents": 340,
+                "skipped_reports": 0, "failed_operations": 0,
+                "mapping_limit_skips": 0, "replaced_islands": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn info_reclaim_view_renders_effective_restored_with_mapping_skips() {
+        let mut report = reclaim_report(libvm::MachineHostMemoryReclaimBacking::RestoredPrivate);
+        report.mapping_limit_skips = 3;
+        report.skipped_reports = 3;
+        report.replaced_islands = 7;
+        let reclaim = crate::view::HostMemoryReclaimView::new(&report);
+        assert_eq!(
+            reclaim.summary(),
+            format!(
+                "effective (restored-private), {} released in 340 extents, 3 skipped at mapping limit",
+                crate::ui::human_bytes(Some(report.released_bytes))
+            )
+        );
+        let mut view = machine_view();
+        view.host_memory_reclaim = Some(reclaim);
+        let json = serde_json::to_value(view).expect("serialize info");
+        assert_eq!(json["host_memory_reclaim"]["backing"], "restored-private");
+        assert_eq!(json["host_memory_reclaim"]["effective"], true);
+        assert_eq!(json["host_memory_reclaim"]["mapping_limit_skips"], 3);
+        assert_eq!(json["host_memory_reclaim"]["replaced_islands"], 7);
+        assert_eq!(json["host_memory_reclaim"]["skipped_reports"], 3);
+    }
+
+    #[test]
+    fn info_reclaim_view_omits_absent_metrics() {
+        let view = machine_view();
+        assert!(view.host_memory_reclaim.is_none());
+        let json = serde_json::to_value(view).expect("serialize info");
+        assert!(json.get("host_memory_reclaim").is_none());
+    }
+
+    #[test]
+    fn info_reclaim_view_renders_inhibition_reason() {
+        let mut report = reclaim_report(libvm::MachineHostMemoryReclaimBacking::RestoredPrivate);
+        report.reason = libvm::MachineHostMemoryReclaimReason::RestoredPrivateMapping;
+        report.requested = false;
+        report.effective = false;
+        report.released_bytes = 0;
+        report.released_extents = 0;
+        assert_eq!(
+            crate::view::HostMemoryReclaimView::new(&report).summary(),
+            "inhibited (restored-private-mapping)"
+        );
+    }
+
+    #[test]
     fn unavailable_inventory_preserves_identity_and_diagnostics_in_json() {
         let entry = libvm::MachineInventoryEntry {
             id: "broken-id".into(),
@@ -318,10 +653,145 @@ mod tests {
     }
 
     #[test]
+    fn machine_view_serializes_machine_durability() {
+        let mut data = libvm::MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "dev".into(),
+            vm_spec::VmSpec::current(),
+        );
+        assert_eq!(data.durability, libvm::MachineDurability::Durable);
+        for (durability, expected) in [
+            (libvm::MachineDurability::Durable, "durable"),
+            (libvm::MachineDurability::Constructed, "constructed"),
+        ] {
+            data.durability = durability;
+            let view = crate::view::MachineView::new(&data, false);
+            assert_eq!(view.durability, durability);
+            let value = serde_json::to_value(&view).expect("serialize machine view");
+            assert_eq!(value["durability"], expected);
+            let entry = libvm::MachineInventoryEntry {
+                id: data.id.clone(),
+                name: data.name.clone(),
+                data: Some(data.clone()),
+                issues: Vec::new(),
+            };
+            let value = serde_json::to_value(crate::view::InventoryView::new(&entry, false))
+                .expect("serialize info inventory view");
+            assert_eq!(value["durability"], expected);
+        }
+    }
+
+    #[test]
     fn labels_persisted_machine_lifecycle_fields() {
         assert_eq!(retention_label(MachineRetention::Ephemeral), "ephemeral");
         assert_eq!(retention_label(MachineRetention::Persistent), "persistent");
         assert_eq!(agent_label(Some(&MachineAgent::Default)), "default");
         assert_eq!(agent_label(Some(&MachineAgent::Disabled)), "disabled");
+    }
+
+    #[test]
+    fn pinned_bundle_platform_and_replacement_are_visible() {
+        let digest = |byte: &str| -> libvm::storage::identity::ObjectDigest {
+            format!("sha256:{}", byte.repeat(32)).parse().unwrap()
+        };
+        let binding = libvm::BootBinding::Pinned {
+            kernel: digest("01"),
+            base_initramfs: digest("02"),
+            agent: Some(digest("03")),
+            architecture: libvm::GuestArchitecture::Arm64,
+            abi: "silo-direct-v1".into(),
+        };
+        let mut data = libvm::MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "dev".into(),
+            vm_spec::VmSpec::current(),
+        );
+        data.boot_profile = Some(libvm::BootProfile::LinuxDirect {
+            userspace_platform: libvm::LinuxPlatform {
+                architecture: libvm::GuestArchitecture::Amd64,
+                variant: None,
+            },
+            kernel_architecture: libvm::GuestArchitecture::Arm64,
+            command_line_policy: libvm::DirectCommandLinePolicy::SiloDirectV1,
+            binding: binding.clone(),
+            root_selector: libvm::RootSelector::MbrPartition { number: 2 },
+            root_filesystem: libvm::RootFilesystem::Ext4,
+            translation: libvm::Translation::Rosetta,
+        });
+        data.boot_replacement = Some(digest("04"));
+        let boot = crate::view::MachineView::new(&data, false)
+            .boot
+            .expect("pinned boot view");
+        assert_eq!(boot.platform, "linux/amd64");
+        assert_eq!(boot.kernel_architecture, "arm64");
+        assert_eq!(boot.translation, "rosetta");
+        assert_eq!(boot.root, "mbr:2");
+        assert_eq!(boot.bundle, Some(binding.digest().unwrap().to_string()));
+        assert_eq!(boot.agent, Some(digest("03").to_string()));
+        assert_eq!(boot.packaged_replacement, Some(digest("04").to_string()));
+    }
+
+    #[test]
+    fn hibernation_states_are_preserved_in_public_views_without_readiness() {
+        for (status, label) in [
+            (
+                libvm::MachineStatus::Hibernating { message: None },
+                "hibernating",
+            ),
+            (
+                libvm::MachineStatus::Hibernated { message: None },
+                "hibernated",
+            ),
+        ] {
+            let mut data = libvm::MachineData::new(
+                "machine".into(),
+                "saved".into(),
+                vm_spec::VmSpec::current(),
+            );
+            data.status = status;
+            data.observation = libvm::MachineObservation::Observed;
+            let view = crate::view::MachineView::new(&data, false);
+            let json = serde_json::to_value(view).unwrap();
+            assert_eq!(json["state"], label);
+            assert_eq!(json["ready"], false);
+        }
+    }
+    #[test]
+    fn hibernation_info_json_has_explicit_public_field_names_and_native_stats() {
+        let mut data = libvm::MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "saved".into(),
+            vm_spec::VmSpec::current(),
+        );
+        assert!(
+            serde_json::to_value(crate::view::MachineView::new(&data, false))
+                .unwrap()
+                .get("hibernation")
+                .is_none()
+        );
+        data.hibernation = Some(libvm::MachineHibernationInfo {
+            hibernated_at: 1_700_000_000,
+            saved_state_bytes: 8192,
+            memory_capture: vm_spec::capture::HibernateMemoryReceipt {
+                mode: vm_spec::lifecycle::CapturePolicy::Incremental,
+                full_reason: None,
+                stats: vm_spec::capture::CaptureMemoryStats {
+                    logical_bytes: 1 << 20,
+                    overlay_bytes_written: 4096,
+                    ..Default::default()
+                },
+            },
+        });
+        let view = crate::view::MachineView::new(&data, false);
+        let json = serde_json::to_value(&view).unwrap();
+        let hibernation = &json["hibernation"];
+        assert_eq!(hibernation["hibernated_at"], 1_700_000_000);
+        assert_eq!(hibernation["saved_state_bytes"], 8192);
+        assert_eq!(hibernation["memory_capture"]["mode"], "incremental");
+        assert!(hibernation["memory_capture"]["full_reason"].is_null());
+        assert_eq!(
+            hibernation["memory_capture"]["stats"]["overlayBytesWritten"],
+            4096
+        );
     }
 }

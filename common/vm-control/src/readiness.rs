@@ -61,6 +61,15 @@ fn vm_state_to(v: libvm::MachineVmState) -> i32 {
         libvm::MachineVmState::Stopping => 3,
         libvm::MachineVmState::Stopped => 4,
         libvm::MachineVmState::Failed => 5,
+        libvm::MachineVmState::Pausing => 6,
+        libvm::MachineVmState::Paused => 7,
+        libvm::MachineVmState::Capturing => 8,
+        libvm::MachineVmState::Restoring => 9,
+        libvm::MachineVmState::Activating => 10,
+        libvm::MachineVmState::ActivationFailed => 11,
+        libvm::MachineVmState::Error => 12,
+        libvm::MachineVmState::Hibernating => 13,
+        libvm::MachineVmState::Hibernated => 14,
     }
 }
 fn vm_state_from(v: i32) -> Result<libvm::MachineVmState, ConversionError> {
@@ -70,6 +79,15 @@ fn vm_state_from(v: i32) -> Result<libvm::MachineVmState, ConversionError> {
         3 => Ok(libvm::MachineVmState::Stopping),
         4 => Ok(libvm::MachineVmState::Stopped),
         5 => Ok(libvm::MachineVmState::Failed),
+        6 => Ok(libvm::MachineVmState::Pausing),
+        7 => Ok(libvm::MachineVmState::Paused),
+        8 => Ok(libvm::MachineVmState::Capturing),
+        9 => Ok(libvm::MachineVmState::Restoring),
+        10 => Ok(libvm::MachineVmState::Activating),
+        11 => Ok(libvm::MachineVmState::ActivationFailed),
+        12 => Ok(libvm::MachineVmState::Error),
+        13 => Ok(libvm::MachineVmState::Hibernating),
+        14 => Ok(libvm::MachineVmState::Hibernated),
         _ => Err(invalid("vm_state", "invalid enum")),
     }
 }
@@ -85,6 +103,15 @@ fn readiness_reason_to(v: libvm::MachineReadinessReason) -> i32 {
         libvm::MachineReadinessReason::GuestStarting => 8,
         libvm::MachineReadinessReason::GuestFailed => 9,
         libvm::MachineReadinessReason::GuestReportedReady => 10,
+        libvm::MachineReadinessReason::VmPausing => 11,
+        libvm::MachineReadinessReason::VmPaused => 12,
+        libvm::MachineReadinessReason::VmCapturing => 13,
+        libvm::MachineReadinessReason::VmRestoring => 14,
+        libvm::MachineReadinessReason::VmActivating => 15,
+        libvm::MachineReadinessReason::VmActivationFailed => 16,
+        libvm::MachineReadinessReason::VmError => 17,
+        libvm::MachineReadinessReason::VmHibernating => 18,
+        libvm::MachineReadinessReason::VmHibernated => 19,
     }
 }
 fn readiness_reason_from(v: i32) -> Result<libvm::MachineReadinessReason, ConversionError> {
@@ -99,6 +126,15 @@ fn readiness_reason_from(v: i32) -> Result<libvm::MachineReadinessReason, Conver
         8 => Ok(libvm::MachineReadinessReason::GuestStarting),
         9 => Ok(libvm::MachineReadinessReason::GuestFailed),
         10 => Ok(libvm::MachineReadinessReason::GuestReportedReady),
+        11 => Ok(libvm::MachineReadinessReason::VmPausing),
+        12 => Ok(libvm::MachineReadinessReason::VmPaused),
+        13 => Ok(libvm::MachineReadinessReason::VmCapturing),
+        14 => Ok(libvm::MachineReadinessReason::VmRestoring),
+        15 => Ok(libvm::MachineReadinessReason::VmActivating),
+        16 => Ok(libvm::MachineReadinessReason::VmActivationFailed),
+        17 => Ok(libvm::MachineReadinessReason::VmError),
+        18 => Ok(libvm::MachineReadinessReason::VmHibernating),
+        19 => Ok(libvm::MachineReadinessReason::VmHibernated),
         _ => Err(invalid("readiness_reason", "invalid enum")),
     }
 }
@@ -178,6 +214,7 @@ fn guest_boot_mode_to(v: libvm::MachineGuestBootMode) -> i32 {
         libvm::MachineGuestBootMode::Standard => 1,
         libvm::MachineGuestBootMode::AgentPid1 => 2,
         libvm::MachineGuestBootMode::InitChild => 3,
+        libvm::MachineGuestBootMode::ContainedInit => 4,
     }
 }
 fn guest_boot_mode_from(v: i32) -> Result<libvm::MachineGuestBootMode, ConversionError> {
@@ -185,6 +222,7 @@ fn guest_boot_mode_from(v: i32) -> Result<libvm::MachineGuestBootMode, Conversio
         1 => Ok(libvm::MachineGuestBootMode::Standard),
         2 => Ok(libvm::MachineGuestBootMode::AgentPid1),
         3 => Ok(libvm::MachineGuestBootMode::InitChild),
+        4 => Ok(libvm::MachineGuestBootMode::ContainedInit),
         _ => Err(invalid("guest_boot_mode", "invalid enum")),
     }
 }
@@ -537,6 +575,12 @@ fn agent_from_wire(v: w::AgentStatus) -> Result<libvm::MachineAgentStatus, Conve
 pub fn monitor_status_to_wire(
     v: &libvm::MachineMonitorStatus,
 ) -> Result<w::MonitorStatus, ConversionError> {
+    crate::pause::validate_monitor_lifecycle(
+        &v.lifecycle,
+        vm_state_to(v.vm.state),
+        v.readiness.ready,
+        &v.live,
+    )?;
     Ok(w::MonitorStatus {
         machine_id: v.machine_id.clone(),
         run_id: v.run_id.as_ref().map(ToString::to_string),
@@ -545,12 +589,26 @@ pub fn monitor_status_to_wire(
         vm: Some(vm_to_wire(&v.vm)?),
         readiness: Some(readiness_state_to_wire(&v.readiness)?),
         agent: Some(agent_to_wire(&v.agent)?),
+        live: Some(crate::live::machine_to_wire(&v.live)?),
+        lifecycle: Some(crate::pause::lifecycle_to_wire(&v.lifecycle)),
     })
 }
 pub fn monitor_status_from_wire(
     v: w::MonitorStatus,
 ) -> Result<libvm::MachineMonitorStatus, ConversionError> {
     validate_uuid(&v.machine_id, "monitor.machine_id")?;
+    let live = crate::live::machine_from_wire(required(v.live, "monitor.live")?)?;
+    let monitor = monitor_from_wire(required(v.monitor, "monitor")?)?;
+    if live.machine_id != v.machine_id
+        || v.run_id.as_deref() != Some(live.run_id.as_str())
+        || live.monitor_id != monitor.instance_id
+    {
+        return Err(invalid("monitor.live", "run/monitor identity mismatch"));
+    }
+    let wire_vm = required(v.vm, "vm")?;
+    let lifecycle = crate::pause::lifecycle_from_wire(required(v.lifecycle, "monitor.lifecycle")?)?;
+    let readiness = readiness_state_from_wire(required(v.readiness, "readiness")?)?;
+    crate::pause::validate_monitor_lifecycle(&lifecycle, wire_vm.state, readiness.ready, &live)?;
     Ok(libvm::MachineMonitorStatus {
         machine_id: v.machine_id,
         run_id: v
@@ -558,10 +616,12 @@ pub fn monitor_status_from_wire(
             .map(|v| v.parse().map_err(|_| invalid("run_id", "invalid UUID")))
             .transpose()?,
         name: v.name,
-        monitor: monitor_from_wire(required(v.monitor, "monitor")?)?,
-        vm: vm_from_wire(required(v.vm, "vm")?)?,
-        readiness: readiness_state_from_wire(required(v.readiness, "readiness")?)?,
+        monitor,
+        vm: vm_from_wire(wire_vm)?,
+        readiness,
         agent: agent_from_wire(required(v.agent, "agent")?)?,
+        live,
+        lifecycle,
     })
 }
 pub fn readiness_to_wire(
@@ -589,4 +649,32 @@ pub fn readiness_from_wire(
         },
         status: monitor_status_from_wire(required(v.status, "readiness.status")?)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::readiness::{
+        readiness_reason_from, readiness_reason_to, vm_state_from, vm_state_to,
+    };
+    use libvm::{MachineReadinessReason, MachineVmState};
+
+    #[test]
+    fn hibernation_readiness_states_roundtrip_without_changing_existing_values() {
+        for (state, value) in [
+            (MachineVmState::Hibernating, 13),
+            (MachineVmState::Hibernated, 14),
+        ] {
+            assert_eq!(vm_state_to(state), value);
+            assert_eq!(vm_state_from(value).unwrap(), state);
+        }
+        for (reason, value) in [
+            (MachineReadinessReason::VmHibernating, 18),
+            (MachineReadinessReason::VmHibernated, 19),
+        ] {
+            assert_eq!(readiness_reason_to(reason), value);
+            assert_eq!(readiness_reason_from(value).unwrap(), reason);
+        }
+        assert_eq!(vm_state_to(MachineVmState::Error), 12);
+        assert_eq!(readiness_reason_to(MachineReadinessReason::VmError), 17);
+    }
 }

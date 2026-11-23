@@ -21,6 +21,10 @@ pub fn update_from_wire(v: w::MachineUpdate) -> Result<libvm::MachineUpdate, Con
     out.cpus = v.cpus.map(cpu_from_wire).transpose()?;
     out.memory = v.memory_bytes.map(memory_from_wire).transpose()?;
     out.root_disk_size = v.root_disk_size_bytes;
+    out.temporary_directory = v
+        .temporary_directory
+        .map(temporary_directory_from_wire)
+        .transpose()?;
     out.nested_virtualization = v.nested_virtualization;
     out.rosetta = v.rosetta;
     out.forwards = v
@@ -62,12 +66,21 @@ pub fn update_from_wire(v: w::MachineUpdate) -> Result<libvm::MachineUpdate, Con
 pub fn update_to_wire(v: &libvm::MachineUpdate) -> Result<w::MachineUpdate, ConversionError> {
     v.validate_network()
         .map_err(|_| invalid("update.network", "invalid native network selection"))?;
+    if let Some(policy) = v.temporary_directory {
+        policy.validate().map_err(|_| {
+            invalid(
+                "update.temporary_directory",
+                "invalid temporary directory capacity",
+            )
+        })?;
+    }
     Ok(w::MachineUpdate {
         name: v.name.clone(),
         labels: v.labels.clone().map(|values| w::StringMap { values }),
         cpus: v.cpus.map(u32::from),
         memory_bytes: v.memory.map(|v| v.as_bytes()),
         root_disk_size_bytes: v.root_disk_size,
+        temporary_directory: v.temporary_directory.map(temporary_directory_to_wire),
         nested_virtualization: v.nested_virtualization,
         rosetta: v.rosetta,
         forwards: v.forwards.as_ref().map(|v| w::ForwardList {
@@ -144,6 +157,12 @@ fn resolved_to_wire(v: &ResolvedNetwork) -> Result<w::ResolvedNetwork, Conversio
 pub fn create_to_wire(
     v: &NormalizedMachineCreate,
 ) -> Result<w::NormalizedMachineCreate, ConversionError> {
+    v.temporary_directory.validate().map_err(|_| {
+        invalid(
+            "create.temporary_directory",
+            "invalid temporary directory capacity",
+        )
+    })?;
     Ok(w::NormalizedMachineCreate {
         name: v.name.clone(),
         template_name: v.template_name.clone(),
@@ -155,6 +174,7 @@ pub fn create_to_wire(
         kernel_args: v.kernel_args.clone(),
         nested_virtualization: v.nested_virtualization,
         rosetta: v.rosetta,
+        platform: v.platform.as_ref().map(crate::boot::platform_to_wire),
         disks: v.disks.iter().map(|v| path_to_wire(v)).collect(),
         mounts: v.mounts.iter().map(mount_to_wire).collect(),
         forwards: v.forwards.iter().map(forward_to_wire).collect(),
@@ -162,6 +182,7 @@ pub fn create_to_wire(
         cpus: v.cpus.map(u32::from),
         memory_bytes: v.memory_bytes,
         root_disk_size_bytes: v.root_disk_size_bytes,
+        temporary_directory: Some(temporary_directory_to_wire(v.temporary_directory)),
         userdata: v.userdata.clone(),
         network: v.network.as_ref().map(resolved_to_wire).transpose()?,
         agent: Some(agent_to_wire(&v.agent)?),
@@ -182,6 +203,10 @@ pub fn create_from_wire(
         kernel_args: v.kernel_args,
         nested_virtualization: v.nested_virtualization,
         rosetta: v.rosetta,
+        platform: v
+            .platform
+            .map(crate::boot::platform_from_wire)
+            .transpose()?,
         disks: v
             .disks
             .into_iter()
@@ -204,6 +229,10 @@ pub fn create_from_wire(
             .map(|v| memory_from_wire(v).map(|v| v.as_bytes()))
             .transpose()?,
         root_disk_size_bytes: v.root_disk_size_bytes,
+        temporary_directory: temporary_directory_from_wire(required(
+            v.temporary_directory,
+            "create.temporary_directory",
+        )?)?,
         userdata: v.userdata,
         network: v
             .network
@@ -224,4 +253,37 @@ pub fn create_from_wire(
         agent: agent_from_wire(required(v.agent, "create.agent")?)?,
         provision_user: v.provision_user.map(user_from_wire),
     })
+}
+
+fn temporary_directory_to_wire(
+    value: libvm::TemporaryDirectoryPolicy,
+) -> w::TemporaryDirectoryPolicy {
+    use w::temporary_directory_policy::Backing;
+    w::TemporaryDirectoryPolicy {
+        backing: Some(match value {
+            libvm::TemporaryDirectoryPolicy::DiskBacked => Backing::DiskBacked(()),
+            libvm::TemporaryDirectoryPolicy::Tmpfs { capacity_bytes } => {
+                Backing::TmpfsCapacityBytes(capacity_bytes)
+            }
+        }),
+    }
+}
+
+fn temporary_directory_from_wire(
+    value: w::TemporaryDirectoryPolicy,
+) -> Result<libvm::TemporaryDirectoryPolicy, ConversionError> {
+    use w::temporary_directory_policy::Backing;
+    let result = match required(value.backing, "create.temporary_directory.backing")? {
+        Backing::DiskBacked(()) => libvm::TemporaryDirectoryPolicy::DiskBacked,
+        Backing::TmpfsCapacityBytes(capacity_bytes) => {
+            libvm::TemporaryDirectoryPolicy::Tmpfs { capacity_bytes }
+        }
+    };
+    result.validate().map_err(|_| {
+        invalid(
+            "create.temporary_directory",
+            "invalid temporary directory capacity",
+        )
+    })?;
+    Ok(result)
 }

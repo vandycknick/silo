@@ -1,0 +1,47 @@
+--- a/drivers/virtio/virtio_silo_vmgenid.c
++++ b/drivers/virtio/virtio_silo_vmgenid.c
+@@ -86,5 +86,7 @@
+ 	spinlock_t evidence_lock;
+ 	struct silo_evidence evidence;
++	u32 proof_phase;
++	u32 proof_gate;
+ };
+ 
+ static u32 silo_read(struct silo_vmgenid *g, unsigned int offset)
+@@ -193,6 +195,8 @@
+ 	return do_settimeofday64(&target);
+ }
+ 
++#include "native_generation_partial.h"
++
+ static void silo_publish(struct silo_vmgenid *g, const struct silo_request *r)
+ {
+ 	unsigned int i;
+@@ -206,6 +210,8 @@
+ 	}
+ 	silo_write(g, offsetof(struct silo_config, processed_sequence_high),
+ 		   upper_32_bits(r->sequence));
++	if (!silo_partial_before_low(g, r))
++		return;
+ 	spin_lock(&g->evidence_lock);
+ 	g->evidence.ack = *r;
+ 	g->evidence.ack_write_count++;
+@@ -373,6 +379,11 @@
+ 	ret = device_create_file(&vdev->dev, &dev_attr_generation_state);
+ 	if (ret)
+ 		goto queues;
++	ret = device_create_file(&vdev->dev, &dev_attr_generation_proof);
++	if (ret) {
++		device_remove_file(&vdev->dev, &dev_attr_generation_state);
++		goto queues;
++	}
+ 	virtio_device_ready(vdev);
+ 	silo_error(g, 0);
+ 	schedule_work(&g->work);
+@@ -394,5 +405,6 @@
+ 	virtio_reset_device(vdev);
+ 	device_remove_file(&vdev->dev, &dev_attr_generation_state);
++	device_remove_file(&vdev->dev, &dev_attr_generation_proof);
+ 	vdev->config->del_vqs(vdev);
+ 	vdev->priv = NULL;
+ 	kfree(g);

@@ -32,7 +32,7 @@ type Source interface {
 	Refresh(context.Context, []string, string) (map[string][]byte, error)
 }
 
-// Provider config v2 is embedded in the unchanged transport payload v1.
+// Provider config v1 is embedded in the transport payload v1.
 type Provider struct {
 	Version            int      `json:"version"`
 	Command            string   `json:"command"`
@@ -141,7 +141,7 @@ func (s *Static) Refresh(ctx context.Context, names []string, reason string) (ma
 }
 
 func validateProvider(p *Provider) error {
-	if p.Version != 2 || !filepath.IsAbs(p.Command) || strings.ContainsRune(p.Command, 0) || p.Args == nil || len(p.Grant) == 0 {
+	if p.Version != 1 || !filepath.IsAbs(p.Command) || strings.ContainsRune(p.Command, 0) || p.Args == nil || len(p.Grant) == 0 {
 		return errors.New("invalid secret provider configuration")
 	}
 	for _, arg := range p.Args {

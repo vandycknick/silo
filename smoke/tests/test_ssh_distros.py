@@ -15,7 +15,7 @@ from silo_smoke import config as smoke_config
 from silo_smoke.cli import Silo
 from silo_smoke.config import SmokeConfig
 from silo_smoke.errors import SmokeEnvironmentError
-from silo_smoke.procs import free_port
+from silo_smoke.procs import bound_port
 from silo_smoke.workspace import Workspace
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -34,22 +34,22 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 
 def _negative_auth(silo: Silo, workspace: Workspace, name: str, key: str) -> None:
-    port = free_port()
     # SSH listens on vsock 22, not the guest TCP loopback used by P:22 shorthand.
-    forward = silo.popen("forward", name, f"host:tcp:127.0.0.1:{port}", "vsock:22")
+    forward = silo.popen("forward", name, "host:tcp:127.0.0.1:0", "vsock:22")
     output = bytearray()
     try:
         assert forward.stdout is not None
         with selectors.DefaultSelector() as selector:
             selector.register(forward.stdout, selectors.EVENT_READ)
             deadline = time.monotonic() + 20
-            while b"Forwarding " not in output:
+            while b"\n" not in output:
                 remaining = deadline - time.monotonic()
                 assert remaining > 0, f"forward did not activate: {output!r}"
                 if selector.select(remaining):
                     chunk = os.read(forward.stdout.fileno(), 4096)
                     assert chunk, f"forward exited before activation: {output!r}"
                     output.extend(chunk)
+        port = bound_port(bytes(output))
         result = subprocess.run(
             ["ssh", "-i", key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no",
              "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -96,8 +96,9 @@ def test_distro_certificate_two_boots(
         "chmod 755 /run/silo-test-login\n"
     )
     name = "certificate-distro"
-    created = silo.create(name, config.distro_images[distro_label], "--pull", "missing", "--vsock",
-                          "--cpus", "1", "--memory", "1GiB", "--network", "none", "--userdata", str(userdata))
+    silo.create(name, config.distro_images[distro_label], "--pull", "missing", "--vsock",
+                "--cpus", "1", "--memory", "1GiB", "--network", "none", "--userdata", str(userdata))
+    created = silo.info(name)
     pin: bytes | None = None
     for _ in range(2):
         silo.start(name)
@@ -126,4 +127,4 @@ def test_distro_certificate_two_boots(
             assert "native SSH certificate authentication succeeded" in serial, serial[-2000:]
             assert 'key_id="silo:cli:' in serial
         silo.stop(name)
-        assert silo.show(name)["state"] == "stopped"
+        assert silo.info(name)["state"] == "stopped"

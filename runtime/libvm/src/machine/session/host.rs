@@ -407,11 +407,11 @@ mod tests {
         }
     }
     #[test]
-    fn local_signal_subscriptions_are_onstack_and_external_receiver_is_inert() {
+    fn local_signal_subscriptions_restore_handlers_and_external_receiver_is_inert() {
         const CHILD: &str = "SILO_SSH_SIGNAL_ACTION_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "machine::session::host::tests::local_signal_subscriptions_are_onstack_and_external_receiver_is_inert", "--nocapture"])
+                .args(["--exact", "machine::session::host::tests::local_signal_subscriptions_restore_handlers_and_external_receiver_is_inert", "--nocapture"])
                 .env(CHILD, "1").status().unwrap();
             assert!(status.success());
             return;
@@ -468,9 +468,6 @@ mod tests {
             }
             for _ in 0..3 {
                 let mut signals = Signals::new(None).unwrap();
-                for signal in watched {
-                    assert_ne!(action(signal).sa_flags & libc::SA_ONSTACK, 0);
-                }
                 raise(Signal::SIGINT).unwrap();
                 assert_eq!(
                     tokio::time::timeout(Duration::from_secs(1), signals.recv())

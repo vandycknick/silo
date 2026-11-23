@@ -1,0 +1,678 @@
+"""Live fork acceptance, crash and physical-sharing gates (ADR 0021 `## Fork`).
+
+Every case drives the real `silo fork --live` against a real guest running the
+detached `restore_execution.c` witness. Results come from the CLI's single
+`LiveForkResult` document, the durable fork journal, the authenticated local
+cut, monitor traces, `/proc` and the guest, using the staged runtime.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import signal
+from uuid import UUID
+
+import pytest
+
+from silo_smoke import capture, fork, pause, procs, restore, shutdown, stopped
+from silo_smoke import restore_lifecycle as lifecycle
+from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
+
+pytestmark = [pytest.mark.linux_only, pytest.mark.slow, pytest.mark.serial]
+
+SOURCE = "fork-source"
+NAMES = ["fork-a", "fork-b", "fork-c", "fork-d"]
+FORWARD = f"host:unix:fork.sock=guest:tcp:127.0.0.1:{lifecycle.LISTEN_PORT}"
+BLOB = 128 * fork.MIB
+DIRTY_MIB = 32
+MIB = fork.MIB
+FAILING_HOOK = {"argv": ["/bin/sh", "-c", "exit 7"], "environment": [], "workingDirectory": "/",
+                "timeoutMs": 5000}
+
+
+@dataclass(frozen=True)
+class Prepared:
+    info: dict
+    initial: dict
+    boot_id: str
+    generation: dict[str, str]
+    blob: str
+
+
+def require_fork(info: dict) -> None:
+    live = info["lifecycle"]["report"]["live"]
+    assert live["fork"]["availability"] == {"status": "supported"}, live["fork"]
+
+
+def create(silo: Silo, image: str, *flags: str, profile: RootProfile, name: str = SOURCE,
+           memory: str = "512mib", network: str = "none") -> None:
+    silo.create(name, silo.root_image(image, profile), "--cpus", "2", "--memory", memory,
+                "--disk-size", "512mib", "--vsock", "--network", network, *flags)
+
+
+def witness_source(silo: Silo, name: str = SOURCE) -> Prepared:
+    """Persistent witness with armed pending timer/signal, plus a RAM-only blob."""
+    info = silo.wait_ready(name)
+    require_fork(info)
+    mark(silo, name, "captured")
+    initial = restore.start_witness(silo, name)
+    armed = restore.witness(silo, name, "arm")
+    assert armed["timerPending"] == armed["signalPending"] == 1
+    # tmpfs pages stay guest-RAM resident: every child reads identical clean
+    # baseline pages, so shared residency is deterministic, not page-cache luck.
+    blob = silo.exec(name, "sh", "-eu", "-c",
+                     "mkdir -p /fork-share; mount -t tmpfs -o size=224m,mode=0700 fork-share /fork-share;"
+                     f" dd if=/dev/urandom of=/fork-share/blob bs=1M count={BLOB // MIB} 2>/dev/null;"
+                     " sha256sum /fork-share/blob", user="root", timeout=120).stdout.split()[0]
+    boot_id = silo.exec(name, "cat", "/proc/sys/kernel/random/boot_id").stdout
+    return Prepared(info, initial, boot_id, pause.generation(silo, name), blob)
+
+
+def prepare(silo: Silo, image: str, *flags: str, profile: RootProfile, memory: str = "512mib",
+            network: str = "none") -> Prepared:
+    create(silo, image, *flags, memory=memory, profile=profile, network=network)
+    silo.start(SOURCE)
+    return witness_source(silo)
+
+
+def mark(silo: Silo, name: str, value: str) -> None:
+    silo.exec(name, "sh", "-eu", "-c", 'printf "%s\\n" "$1" >/fork-private; sync',
+              "fork-private", value, user="root")
+
+
+def marker(silo: Silo, name: str) -> str:
+    return silo.exec(name, "cat", "/fork-private").stdout.strip()
+
+
+def touch_blob(silo: Silo, name: str) -> str:
+    return silo.exec(name, "sha256sum", "/fork-share/blob", user="root", timeout=120).stdout.split()[0]
+
+
+def dirty(silo: Silo, name: str) -> None:
+    silo.exec(name, "sh", "-eu", "-c",
+              f"dd if=/dev/urandom of=/fork-share/private bs=1M count={DIRTY_MIB} 2>/dev/null; sync",
+              user="root", timeout=120)
+
+
+def private_inodes(silo: Silo, names: list[str], cut: Path) -> None:
+    """Writable disks stay private even after obsolete cut disks are retired."""
+    identities = []
+    for path in (cut / "disks").glob("*.raw"):
+        metadata = path.stat()
+        assert metadata.st_nlink == 1, ("cut", path)
+        identities.append((metadata.st_dev, metadata.st_ino))
+    for name in names:
+        for role, path in stopped.writable_paths(silo, name).items():
+            metadata = path.stat()
+            assert metadata.st_nlink == 1, (name, role)
+            identities.append((metadata.st_dev, metadata.st_ino))
+            silo.ws.record("fork-private-inode", json.dumps({
+                "machine": name, "role": role, "path": str(path),
+                "device": metadata.st_dev, "inode": metadata.st_ino}) + "\n")
+    assert len(identities) == len(set(identities)), "writable source/sibling/cut inode alias"
+
+
+def continued(silo: Silo, call: fork.Call, prepared: Prepared, *, profile: RootProfile
+              ) -> tuple[restore.Checkpoint, restore.Cut]:
+    saved = fork.cut(silo, call, prepared.info, prepared.boot_id, prepared.generation)
+    return saved, restore.matched_cut(silo, saved, prepared.initial, profile=profile)
+
+
+def running_children(silo: Silo, result: dict, saved: restore.Checkpoint, prepared: Prepared,
+                     cut: restore.Cut) -> list[str]:
+    names = []
+    for child in result["children"]:
+        if child["outcome"]["kind"] != "running":
+            continue
+        fork.child_identity(silo, child["name"], child, saved)
+        assert marker(silo, child["name"]) == "captured"
+        restore.resumed(silo, child["name"], prepared.initial, cut)
+        names.append(child["name"])
+    return names
+
+
+def gone_after_prune(silo: Silo, *operations: str) -> None:
+    """After the source run and every child generation ended, prune retires each cut.
+
+    A running source may still map an accepted capture baseline, and capture
+    GC waits for its exact launch lease, so callers stop the source first.
+    """
+    shutdown.storage_tool(silo, "prune")
+    for operation in operations:
+        directory = fork.cut_directory(silo, operation)
+        assert not directory.exists(), f"local cut outlived every mapping generation: {directory}"
+        assert not directory.parent.exists(), "fork operation-owned transient root leaked"
+
+
+def source_running(silo: Silo, prepared: Prepared) -> None:
+    current = silo.info(SOURCE)
+    assert current["state"] == "running" and current["run_id"] == prepared.info["run_id"], current
+    restore.advances(silo, SOURCE, restore.witness(silo, SOURCE))
+
+
+# -- acceptance -------------------------------------------------------------------
+
+def test_live_restore_and_fork_without_public_vsock(
+    silo: Silo, restore_image: str,
+) -> None:
+    source = "no-vsock-source"
+    restored = "no-vsock-restored"
+    names = ["no-vsock-fork-a", "no-vsock-fork-b"]
+    silo.create(source, restore_image, "--disk-size", "256mib", "--network", "none",
+                "--cpus", "2", "--memory", "512mib")
+    silo.start(source)
+    source_info = silo.wait_ready(source)
+    require_fork(source_info)
+
+    def running_without_public_vsock(name: str, info: dict) -> None:
+        assert info["state"] == "running" and info["ready"] is True, info
+        assert silo.exec(name, "printf", "%s", "agent-exec-without-public-vsock").stdout == (
+            "agent-exec-without-public-vsock")
+        vsock = stopped.configuration(silo, name)["spec"].get("vsock")
+        assert vsock is None or vsock["enabled"] is False, vsock
+        public_socket = lifecycle.runtime_socket(silo, UUID(info["id"]).hex, "vsock.sock")
+        assert not public_socket.exists(), public_socket
+
+    running_without_public_vsock(source, source_info)
+    initial = restore.start_witness(silo, source)
+    saved = restore.checkpoint(silo, source, alias="no-vsock-checkpoint")
+    child = restore.restore_child(silo, saved, restored)
+    running_without_public_vsock(restored, child)
+    restore.advances(silo, restored, initial)
+
+    silo.run("resume", source)
+    running_without_public_vsock(source, silo.wait_ready(source))
+    call = fork.run(silo, source, names, expect=0)
+    result = call.result
+    assert result is not None and result["stage"] == "finished", call.stderr
+    assert result["capture"]["kind"] == "sealed" and result["source"] == {"kind": "resumed"}, result
+    assert fork.outcomes(result) == ["running", "running"], result
+    for name in names:
+        running_without_public_vsock(name, silo.wait_ready(name))
+        restore.advances(silo, name, initial)
+    running_without_public_vsock(source, silo.wait_ready(source))
+
+
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
+def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
+    silo: Silo, restore_image: str, profile: RootProfile,
+) -> None:
+    prepared = prepare(silo, restore_image, "--forward", FORWARD, profile=profile, network="private")
+    source_identity = lifecycle.guest_identity(silo, SOURCE)
+    source_paths = stopped.writable_paths(silo, SOURCE)
+    call = fork.run(silo, SOURCE, NAMES, expect=0)
+    result = call.result
+    assert result is not None and result["stage"] == "finished" and not result["cancellationRequested"]
+    assert result["capture"]["kind"] == "sealed" and result["source"] == {"kind": "resumed"}, result
+    assert fork.outcomes(result) == ["running"] * len(NAMES), result
+    assert all(child["durability"] == "durable" for child in result["children"]), result
+    assert UUID(result["sourceMachineId"]) == UUID(prepared.info["id"])
+    assert UUID(result["sourceRunId"]) == UUID(prepared.info["run_id"])
+    fork.journal_matches(silo, result)
+    stamps = fork.events(silo, call.operation)
+    fork.ordered_events(call, stamps, running=list(range(len(NAMES))))
+    saved, cut = continued(silo, call, prepared, profile=profile)
+    private_inodes(silo, [SOURCE, *NAMES], saved.staging)
+    # Finished cut disks retire on a maintenance pass, not at command completion.
+    shutdown.storage_tool(silo, "prune")
+    cut_disks = saved.staging / "disks"
+    assert not cut_disks.exists() or not any(cut_disks.iterdir()), "obsolete cut disks retained"
+    assert (saved.staging / "memory.ram").is_file(), "mapped cut RAM was retired"
+    sealed = capture.inventory(saved.staging)
+
+    identities = {SOURCE: source_identity}
+    for child in result["children"]:
+        name = child["name"]
+        identity = lifecycle.guest_identity(silo, name)
+        assert identity == lifecycle.requested_network(silo, UUID(child["machineId"]).hex), name
+        identities[name] = identity
+        # Destination authority: inherited host grants are stripped, never copied.
+        assert stopped.configuration(silo, name)["spec"].get("forwards", []) == [], name
+        assert not lifecycle.runtime_socket(silo, UUID(child["machineId"]).hex, "fork.sock").exists()
+    assert running_children(silo, result, saved, prepared, cut) == NAMES
+    assert len({value.mac for value in identities.values()}) == len(identities), identities
+    networks = {}
+    runs = {SOURCE: prepared.info["run_id"], **{child["name"]: child["runId"] for child in result["children"]}}
+    unix_sockets = [line.split(maxsplit=7) for line in Path("/proc/net/unix").read_text().splitlines()[1:]]
+    for name, identity in identities.items():
+        rows = procs.query(silo.ws.state_db(),
+                           "SELECT c.id,a.network_instance_id,a.guest_mac,json(n.attachment_json),"
+                           "json(n.driver_state_json),n.state FROM machine_config c "
+                           "JOIN network_attachments a ON a.machine_id=c.id "
+                           "JOIN network_instances n ON n.id=a.network_instance_id "
+                           f"WHERE c.id='{procs.machine_id(silo.ws, name)}'")
+        assert len(rows) == 1, (name, rows)
+        machine, network, mac, attachment_json, driver_json, state = rows[0]
+        attachment, driver = json.loads(attachment_json), json.loads(driver_json)
+        assert state == "running" and mac.lower() == identity.mac, rows
+        assert attachment["ipv4"] == {
+            "address": identity.ipv4, "prefix_length": identity.prefix_length, "gateway": identity.gateway,
+        }, attachment
+        assert UUID(driver["machine_id"]) == UUID(machine), driver
+        assert UUID(driver["run_id"]) == UUID(runs[name]), driver
+        pid = int(driver["helper_pid"])
+        args = (Path("/proc") / str(pid) / "cmdline").read_text().split("\0")
+        socket = silo.ws.run_root / "networks" / network / "netd.sock"
+        assert socket.is_socket(), socket
+        assert args[args.index("--network-id") + 1] == network, args
+        assert UUID(args[args.index("--vm-id") + 1]) == UUID(machine), args
+        assert args[args.index("--run-id") + 1] == driver["run_id"], args
+        assert args[args.index("--static-lease") + 1] == f"{identity.ipv4}={identity.mac}", args
+        assert args[args.index("--listen-vfkit") + 1] == f"unixgram://{socket}", args
+        owned = [row for row in unix_sockets if len(row) == 8 and row[7] == str(socket)]
+        assert len(owned) == 1, (socket, owned)
+        inode = int(owned[0][6])
+        descriptors = set()
+        for fd in (Path("/proc") / str(pid) / "fd").iterdir():
+            try:
+                descriptors.add(os.readlink(fd))
+            except FileNotFoundError:
+                continue
+        assert f"socket:[{inode}]" in descriptors, (pid, socket, inode)
+        networks[name] = {"instance": network, "pid": pid, "socket": str(socket),
+                          "socketInode": inode, "mac": identity.mac, "ipv4": identity.ipv4}
+    for key in ("instance", "pid", "socket", "socketInode"):
+        assert len({value[key] for value in networks.values()}) == len(identities), networks
+    assert stopped.configuration(silo, SOURCE)["spec"]["forwards"], "source lost its own grant"
+
+    # The source resumed under its own run and continues the same cut once.
+    source_running(silo, prepared)
+    restore.resumed(silo, SOURCE, prepared.initial, cut)
+    assert silo.exec(SOURCE, "cat", "/proc/sys/kernel/random/boot_id").stdout == prepared.boot_id
+    assert pause.generation(silo, SOURCE)["reseed_count"] == prepared.generation["reseed_count"]
+    assert stopped.writable_paths(silo, SOURCE) == source_paths
+    private_inodes(silo, [SOURCE, *NAMES], saved.staging)
+    shared = fork.sharing(silo, NAMES, saved.staging / "memory.ram")
+    ownership = fork.assert_no_orphans(silo, [SOURCE, *NAMES])
+    for name in (SOURCE, *NAMES):
+        mark(silo, name, name + "-only")
+    assert [marker(silo, name) for name in (SOURCE, *NAMES)] == [name + "-only" for name in (SOURCE, *NAMES)]
+    capture.unchanged(silo, saved.staging, sealed)
+    silo.ws.record("fork-four-children", json.dumps({
+        "operation": call.operation, "result": result, "phases": {f"{key[0]}:{key[1]}": value
+                                                                    for key, value in stamps.items()},
+        "identities": {name: value.__dict__ for name, value in identities.items()},
+        "networks": networks, "sharing": shared, "ownership": ownership, "callerSeconds": call.caller_seconds,
+    }, sort_keys=True) + "\n")
+    fork.stop_and_remove(silo, NAMES)
+    stopped.stop(silo, SOURCE, require_clean=False)
+    gone_after_prune(silo, call.operation)
+
+
+def test_fork_child_failure_after_seal_names_that_child_and_keeps_siblings(
+    silo: Silo, restore_image: str,
+) -> None:
+    prepared = prepare(silo, restore_image, profile="layered")
+    failing = 2
+    call = fork.run(silo, SOURCE, NAMES, hooks={failing: FAILING_HOOK}, expect=1)
+    result = call.result
+    assert result is not None and result["stage"] == "finished", call.stderr
+    assert result["capture"]["kind"] == "sealed" and result["source"] == {"kind": "resumed"}, result
+    failed = result["children"][failing]
+    assert failed["name"] == NAMES[failing]
+    assert failed["outcome"]["kind"] == "failed" and failed["outcome"]["phase"] == "activation", failed
+    assert [kind for index, kind in enumerate(fork.outcomes(result)) if index != failing] == ["running"] * 3
+    fork.journal_matches(silo, result)
+    running = [index for index in range(len(NAMES)) if index != failing]
+    fork.ordered_events(call, fork.events(silo, call.operation), running=running)
+    saved, cut = continued(silo, call, prepared, profile="layered")
+    survivors = running_children(silo, result, saved, prepared, cut)
+    assert survivors == [NAMES[index] for index in running]
+    live = [SOURCE, *survivors]
+    state = failed_child(silo, failed)
+    if state is not None:
+        # Stop-only fenced child: still owned by its exact run until stopped.
+        live.append(NAMES[failing])
+    fork.assert_no_orphans(silo, live)
+    source_running(silo, prepared)
+    silo.ws.record("fork-child-failure", json.dumps({"result": result, "failedState": state},
+                                                    sort_keys=True) + "\n")
+    if state is not None:
+        stopped.stop(silo, NAMES[failing], require_clean=False)
+        silo.rm(NAMES[failing])
+    fork.stop_and_remove(silo, survivors)
+    stopped.stop(silo, SOURCE, require_clean=False)
+    gone_after_prune(silo, call.operation)
+
+
+def failed_child(silo: Silo, child: dict) -> dict | None:
+    """A failed activation is destroyed or left stop-only fenced, never Running."""
+    if child["name"] not in {entry["name"] for entry in silo.ls()}:
+        lifecycle.assert_destroyed(silo, child["name"], UUID(child["machineId"]).hex)
+        return None
+    state = silo.info(child["name"])
+    assert state["ready"] is False and state["state"] == "activation-failed", state
+    assert UUID(state["run_id"]) == UUID(child["runId"]), state
+    return state
+
+
+def test_fork_children_share_one_clean_ram_inode_by_pss_not_rss(
+    silo: Silo, restore_image: str,
+) -> None:
+    prepared = prepare(silo, restore_image, profile="layered")
+    report, operations = [], []
+    for count in (1, 2, 4):
+        names = [f"share-{count}-{index}" for index in range(count)]
+        call = fork.run(silo, SOURCE, names, expect=0)
+        assert fork.outcomes(call.result) == ["running"] * count, call.result
+        operations.append(call.operation)
+        ram = fork.cut_directory(silo, call.operation) / "memory.ram"
+        for name in names:
+            # Running acknowledges activation/exposure, not the asynchronous
+            # guest status stream. Use the same readiness gate as restore_child
+            # before issuing the checksum, without retrying a guest command.
+            silo.wait_ready(name)
+            assert touch_blob(silo, name) == prepared.blob, name
+        before = fork.sharing(silo, names, ram, source=SOURCE)
+        for name in names:
+            totals = before["perChild"][name]["totals"]
+            assert totals["Rss"] >= 0.9 * BLOB, (name, totals)
+            if count > 1:
+                assert totals["Shared_Clean"] >= 0.9 * BLOB, (name, totals)
+        # RSS double-counts shared clean pages; PSS divides them.
+        assert before["rssSumBytes"] - before["childPssBytes"] >= (count - 1) * 0.9 * BLOB, before
+        dirty(silo, names[0])
+        after = fork.sharing(silo, names, ram, source=SOURCE)
+        grown = {name: after["perChild"][name]["totals"]["Private_Dirty"]
+                 - before["perChild"][name]["totals"]["Private_Dirty"] for name in names}
+        assert grown[names[0]] >= 0.9 * DIRTY_MIB * MIB, grown
+        assert all(value < 16 * MIB for name, value in grown.items() if name != names[0]), grown
+        report.append({"children": count, "operation": call.operation, "before": before, "after": after,
+                       "privateDirtyGrowth": grown})
+        fork.stop_and_remove(silo, names)
+    silo.ws.record("fork-physical-sharing", json.dumps(report, sort_keys=True) + "\n")
+    stopped.stop(silo, SOURCE, require_clean=False)
+    gone_after_prune(silo, *operations)
+
+
+def test_fork_children_outlive_source_deletion_and_gc_then_recapture(
+    silo: Silo, restore_image: str,
+) -> None:
+    prepared = prepare(silo, restore_image, profile="layered")
+    names = NAMES[:2]
+    call = fork.run(silo, SOURCE, names, expect=0)
+    saved, cut = continued(silo, call, prepared, profile="layered")
+    assert running_children(silo, call.result, saved, prepared, cut) == names
+    ram = saved.staging / "memory.ram"
+    identity = (ram.stat().st_dev, ram.stat().st_ino)
+    sealed = capture.inventory(saved.staging)
+    stopped.stop(silo, SOURCE, require_clean=False)
+    silo.rm(SOURCE)
+    assert not (silo.ws.silo_home / "machines" / UUID(prepared.info["id"]).hex).exists()
+    shutdown.storage_tool(silo, "prune")
+    # Generation dependencies, not the source or the parent result, root the cut.
+    assert (ram.stat().st_dev, ram.stat().st_ino) == identity
+    capture.unchanged(silo, saved.staging, sealed)
+    assert fork.sharing(silo, names, ram)["children"] == 2
+    for name in names:
+        restore.advances(silo, name, restore.witness(silo, name))
+    assert fork.observe(silo, call.operation)["stage"] == "finished"
+    next_identity = restore.witness(silo, names[0], "arm")
+    recaptured = restore.checkpoint(silo, names[0], alias="fork-recaptured")
+    next_cut = restore.matched_cut(silo, recaptured, next_identity, profile="layered")
+    silo.run("resume", names[0])
+    restore.restore_child(silo, recaptured, "fork-recaptured-child")
+    restore.resumed(silo, "fork-recaptured-child", next_identity, next_cut)
+    fork.assert_no_orphans(silo, [*names, "fork-recaptured-child"])
+    fork.stop_and_remove(silo, names)
+    gone_after_prune(silo, call.operation)
+    restore.advances(silo, "fork-recaptured-child", restore.witness(silo, "fork-recaptured-child"))
+    fork.assert_no_orphans(silo, ["fork-recaptured-child"])
+    silo.ws.record("fork-source-deletion", json.dumps({
+        "operation": call.operation, "ram": list(identity), "recaptured": recaptured.snapshot,
+    }) + "\n")
+    stopped.stop(silo, "fork-recaptured-child", require_clean=False)
+
+
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
+@pytest.mark.parametrize("order", ["child-first", "source-first"])
+def test_force_remove_fork_lineage_preserves_survivors_and_published_snapshot(
+    silo: Silo, restore_image: str, profile: RootProfile, order: str,
+) -> None:
+    source, child, grandchild, restored = "force-source", "force-child", "force-grandchild", "force-restored"
+    restore.create_source(silo, restore_image, profile=profile, name=source)
+    mark(silo, source, "source-cut")
+    initial = restore.start_witness(silo, source)
+    first = fork.run(silo, source, [child], expect=0)
+    assert first.result is not None and fork.outcomes(first.result) == ["running"]
+    silo.wait_ready(child)
+    mark(silo, child, "child-cut")
+    second = fork.run(silo, child, [grandchild], expect=0)
+    assert second.result is not None and fork.outcomes(second.result) == ["running"]
+    silo.wait_ready(grandchild)
+    saved = restore.checkpoint(silo, child, alias="force-lineage-snapshot")
+    restore.restore_child(silo, saved, restored)
+    silo.run("resume", child)
+    expected = {source: "source-cut", child: "child-cut", grandchild: "child-cut", restored: "child-cut"}
+    identities = {name: silo.info(name)["id"] for name in expected}
+    names = ([grandchild, restored, child, source] if order == "child-first"
+             else [source, child, grandchild, restored])
+    for name in names:
+        silo.run("rm", "--force", name, timeout=180)
+        assert not (silo.ws.silo_home / "machines" / UUID(identities[name]).hex).exists()
+        del expected[name]
+        assert {entry["name"] for entry in silo.ls()} == set(expected)
+        for survivor, value in expected.items():
+            assert marker(silo, survivor) == value
+            restore.advances(silo, survivor, restore.witness(silo, survivor))
+    # A snapshot's independent pool roots survive every originating machine.
+    restore.restore_child(silo, saved, "force-after-lineage")
+    assert marker(silo, "force-after-lineage") == "child-cut"
+    restore.advances(silo, "force-after-lineage", initial)
+    silo.run("rm", "--force", "force-after-lineage", timeout=180)
+    silo.run("snapshot", "rm", "force-lineage-snapshot")
+    gone_after_prune(silo, first.operation, second.operation)
+    assert silo.ls() == []
+    for table in ("storage_operation", "capture_resource_reservation", "restore_resource_reservation",
+                  "storage_operation_stream", "storage_operation_object", "storage_operation_layer",
+                  "storage_operation_lower", "storage_operation_cut", "local_cut"):
+        assert procs.query(silo.ws.state_db(), f"SELECT count(*) FROM {table}") == [("0",)], table
+    assert not list((silo.ws.silo_home / "images/tmp").iterdir()), "capture or fork staging leaked"
+    fork.assert_no_orphans(silo, [])
+
+
+# -- pre-freeze refusal -----------------------------------------------------------
+
+def capture_dirs(silo: Silo, machine_id: str) -> set[str]:
+    root = silo.ws.silo_home / "machines" / UUID(machine_id).hex / "captures"
+    return {path.name for path in root.iterdir()} if root.is_dir() else set()
+
+
+def staged_lines(silo: Silo, machine_id: str) -> int:
+    path = fork.source_trace(silo, machine_id)
+    return sum(1 for line in path.read_text(errors="replace").splitlines() if fork.STAGING_WRITTEN in line)
+
+
+def ledger(silo: Silo) -> dict[str, bytes]:
+    """This home's charge records in the same-euid cross-home resource ledger.
+
+    libvm names each record `<state.db device>-<state.db inode>-<id>.json`; the
+    `<device>-<inode>-home.json` anchor only proves the home exists.
+    """
+    directory = Path(f"/tmp/silo-resource-budget-{os.geteuid()}")
+    metadata = silo.ws.state_db().stat()
+    prefix = f"{metadata.st_dev}-{metadata.st_ino}-"
+    if not directory.is_dir():
+        return {}
+    return {path.name: path.read_bytes() for path in sorted(directory.iterdir())
+            if path.name.startswith(prefix) and path.name.endswith(".json")
+            and path.name != f"{prefix}home.json" and path.is_file()}
+
+
+def refused_before_freeze(silo: Silo, prepared: Prepared, names: list[str], *flags: str,
+                          nofile: int | None = None) -> fork.Call:
+    """Whole-batch refusal: no freeze, capture, child, cut or ledger charge."""
+    captures, staged = capture_dirs(silo, prepared.info["id"]), staged_lines(silo, prepared.info["id"])
+    charges = ledger(silo)
+    call = fork.run(silo, SOURCE, names, *flags, nofile=nofile, timeout=120)
+    assert call.returncode != 0, "batch over budget was admitted"
+    if call.result is not None:
+        assert call.result["capture"]["kind"] in {"pending", "abandoned", "failed"}, call.result
+        assert call.result["source"] == {"kind": "unchanged"}, call.result
+        assert "running" not in fork.outcomes(call.result), call.result
+        for child in call.result["children"]:
+            if child["outcome"]["kind"] == "failed":
+                assert child["outcome"]["phase"] == "capture", child
+    assert capture_dirs(silo, prepared.info["id"]) == captures, "refusal staged a capture"
+    assert staged_lines(silo, prepared.info["id"]) == staged, "refused batch froze the source"
+    assert not fork.cut_directory(silo, call.operation).parent.exists()
+    assert ledger(silo) == charges, "refused batch published a cross-home charge"
+    listed = {entry["name"] for entry in silo.ls()}
+    assert not listed & set(names), listed
+    source_running(silo, prepared)
+    silo.ws.record("fork-refusal", json.dumps({
+        "flags": list(flags), "children": len(names), "nofile": nofile, "exit": call.returncode,
+        "stderr": call.stderr, "result": call.result}, sort_keys=True) + "\n")
+    return call
+
+
+def refusal_diagnostic(call: fork.Call) -> str:
+    if call.result is not None:
+        diagnostic = call.result["capture"].get("diagnostic")
+        if diagnostic is not None:
+            assert isinstance(diagnostic, str)
+            return diagnostic
+    return call.stderr
+
+
+def test_fork_refuses_count_and_descriptor_budgets_before_freeze(
+    silo: Silo, restore_image: str,
+) -> None:
+    prepared = prepare(silo, restore_image, profile="layered", memory="1gib")
+    # Count: 17 children exceed the default maximum of 16 without an explicit flag.
+    refused_before_freeze(silo, prepared, [f"count-{index}" for index in range(17)])
+    # Descriptors: the manager's own RLIMIT_NOFILE cannot hold sixteen handoffs.
+    call = refused_before_freeze(silo, prepared, [f"fd-{index}" for index in range(16)], nofile=48)
+    diagnostic = refusal_diagnostic(call)
+    assert "file descriptor budget requires" in diagnostic, diagnostic
+    stopped.stop(silo, SOURCE, require_clean=False)
+
+
+# -- cancellation and manager death ------------------------------------------------
+
+def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest(
+    silo: Silo, restore_image: str,
+) -> None:
+    names = NAMES[:2]
+    create(silo, restore_image, profile="layered")
+    traced = fork.TracedSource(silo, SOURCE, names, "capture-record-settle")
+    try:
+        prepared = witness_source(silo)
+        traced.fork()
+        directory = Path(traced.wait("boundary-held.json")["target"])
+        seal = json.loads((directory / "vm.capture.json").read_bytes())
+        assert seal["members"] and seal["materializationGeneration"] > 0, seal
+        cancelled = fork.observe(silo, traced.operation, cancel=True)
+        assert cancelled["cancellationRequested"] is True, cancelled
+        traced.release()
+        code, result = traced.manager_exit()
+        assert code == 1 and result is not None and result["stage"] == "finished", (code, result)
+        assert result["cancellationRequested"] is True
+        assert result["capture"]["kind"] == "sealed" and result["source"] == {"kind": "resumed"}, result
+        assert set(fork.outcomes(result)) <= {"running", "cancelled"}, result
+        running = []
+        if "running" in fork.outcomes(result):
+            saved, cut = continued(silo, fork.Call(traced.operation, [], code, "", "", result, 0, 0),
+                                   prepared, profile="layered")
+            running = running_children(silo, result, saved, prepared, cut)
+        for child in result["children"]:
+            if child["outcome"]["kind"] == "cancelled":
+                fork.absent(silo, child)
+        if running:
+            assert fork.cut_directory(silo, traced.operation).is_dir(), "running children lost their cut"
+        fork.assert_no_orphans(silo, [SOURCE, *running])
+        source_running(silo, prepared)
+        silo.ws.record("fork-post-seal-cancel", json.dumps({"result": result, "running": running},
+                                                           sort_keys=True) + "\n")
+        for name in running:
+            stopped.stop(silo, name, require_clean=False)
+        traced.finish()
+        for name in running:
+            silo.rm(name)
+        gone_after_prune(silo, traced.operation)
+    finally:
+        traced.close()
+
+
+def test_fork_manager_killed_before_seal_recovers_one_cut_and_abandons_children(
+    silo: Silo, restore_image: str,
+) -> None:
+    names = NAMES[:2]
+    create(silo, restore_image, profile="layered")
+    traced = fork.TracedSource(silo, SOURCE, names, "capture-execution-write")
+    try:
+        prepared = witness_source(silo)
+        traced.fork()
+        assert traced.manager is not None
+        os.kill(traced.manager, signal.SIGKILL)
+        code, printed = traced.manager_exit()
+        assert code == -signal.SIGKILL and printed is None, (code, printed)
+        traced.release()
+        shutdown.until(lambda: fork.CONTINUATION_FINISHED in fork.source_trace(
+            silo, prepared.info["id"]).read_text(errors="replace"), timeout=120,
+            description="the source monitor did not finish the manager-less capture")
+        result = fork.settle(silo, traced.operation)
+        assert result["capture"]["kind"] in {"sealed", "abandoned"}, result
+        assert result["source"] == {"kind": "resumed"}, result
+        assert fork.outcomes(result) == ["abandoned"] * len(names), result
+        for child in result["children"]:
+            fork.absent(silo, child)
+        # Recovery authenticated or abandoned the one cut; it never recaptured.
+        fork.capture_events(silo, prepared.info["id"], result["captureId"])
+        assert staged_lines(silo, prepared.info["id"]) == 1
+        fork.assert_no_orphans(silo, [SOURCE])
+        source_running(silo, prepared)
+        silo.ws.record("fork-manager-killed-pre-seal", json.dumps(result, sort_keys=True) + "\n")
+        traced.finish()
+        gone_after_prune(silo, traced.operation)
+    finally:
+        traced.close()
+
+
+def test_fork_manager_killed_during_child_construction_recovers_without_orphans(
+    silo: Silo, restore_image: str,
+) -> None:
+    prepared = prepare(silo, restore_image, profile="layered")
+    process, args, operation, dispatched = fork.spawn(silo, SOURCE, NAMES)
+    try:
+        def constructing() -> bool:
+            assert process.poll() is None, "fork finished before any child construction was observed"
+            return any(key[0] is not None for key in fork.events(silo, operation))
+        shutdown.until(constructing, timeout=240, description="no child construction began")
+    finally:
+        # Kill immediately after the first durable child stamp (or on any failure).
+        if process.poll() is None:
+            process.send_signal(signal.SIGKILL)
+        call = fork.finish(silo, process, args, operation, dispatched, names=NAMES, timeout=60)
+    assert call.returncode == -signal.SIGKILL, call
+    at_kill = fork.events(silo, operation)
+    assert (None, "finished") not in at_kill and (None, "cut_retained") in at_kill, at_kill
+    result = fork.settle(silo, operation)
+    assert result["capture"]["kind"] == "sealed" and result["source"] == {"kind": "resumed"}, result
+    assert set(fork.outcomes(result)) <= {"running", "abandoned", "failed"}, result
+    saved, cut = continued(silo, fork.Call(operation, args, call.returncode, "", "", result,
+                                           call.dispatched_ns, call.exited_ns), prepared, profile="layered")
+    running = running_children(silo, result, saved, prepared, cut)
+    for child in result["children"]:
+        if child["outcome"]["kind"] == "running":
+            continue
+        if child["name"] in {entry["name"] for entry in silo.ls()}:
+            # Positive exact-run retirement; recovery never leaves it live.
+            state = silo.info(child["name"])
+            assert state["state"] == "stopped" and state["run_id"] is None, (child, state)
+        else:
+            lifecycle.assert_destroyed(silo, child["name"], UUID(child["machineId"]).hex)
+    ownership = fork.assert_no_orphans(silo, [SOURCE, *running])
+    source_running(silo, prepared)
+    silo.ws.record("fork-manager-killed-constructing", json.dumps({
+        "atKill": {f"{key[0]}:{key[1]}": value for key, value in at_kill.items()},
+        "result": result, "ownership": ownership}, sort_keys=True) + "\n")
+    fork.stop_and_remove(silo, running)
+    for child in result["children"]:
+        if child["outcome"]["kind"] != "running" and child["name"] in {entry["name"] for entry in silo.ls()}:
+            silo.rm(child["name"])
+    stopped.stop(silo, SOURCE, require_clean=False)
+    gone_after_prune(silo, operation)
+    assert procs.vmm_pid(silo.ws, SOURCE) is None

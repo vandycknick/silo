@@ -1,14 +1,11 @@
 //! The daemon entrypoint behind `silo daemon run`: argument validation, startup
-//! ordering, and the serve loop that supervises the system VM and the tailscale
-//! helper until it is told to stop.
+//! ordering, and the serve loop that supervises the system VM until told to stop.
 use crate::config::{FeatureOverrides, GlobalConfig};
 use silod_spec::arguments::{SystemArgs, SystemOverrides};
 use silod_spec::paths::DaemonPaths;
 
 use crate::daemon::control;
-use crate::daemon::helper;
 use crate::daemon::record::DaemonRecord;
-use crate::daemon::shutdown;
 use crate::daemon::status;
 use crate::daemon::supervisor::{self, LifetimeLock};
 use crate::daemon::system_config::{self, DesiredSystem};
@@ -29,9 +26,6 @@ pub(crate) struct Run {
     /// Stop the installation's VMs if no daemon is running, then exit.
     #[arg(long)]
     pub(crate) stop: bool,
-    /// Internal Linux user-service ExecStop entrypoint.
-    #[arg(long, hide = true, conflicts_with = "stop")]
-    pub(crate) host_shutdown: bool,
 }
 
 /// A rejected configuration: restarting the daemon cannot fix it, so the service
@@ -98,7 +92,6 @@ pub(crate) async fn stop_installation() -> eyre::Result<()> {
     let publisher = status::StatusPublisher::new(
         &host,
         uuid::Uuid::new_v4(),
-        features,
         configuration_identity,
         Some(system_status.clone()),
     )?;
@@ -119,9 +112,6 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
         return configuration(Err(eyre::eyre!(
             "silo daemon run is a per-user daemon; run without sudo/root"
         )));
-    }
-    if args.host_shutdown {
-        return shutdown::run().await;
     }
     if args.stop {
         return stop_installation().await;
@@ -158,20 +148,23 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
     let publisher = std::sync::Arc::new(status::StatusPublisher::new(
         &host,
         generation,
-        features,
         configuration_identity,
         system_status.clone(),
     )?);
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let helper_config = global.tailscale().clone();
     let registry_policy = global.images().clone();
+    let lobby_host = host.clone();
+    let lobby_settings = global.tailscale().clone();
     let state = std::sync::Arc::new(control::ControlState::new(
         host,
         global,
         generation,
         publisher.clone(),
     ));
+    if let Err(error) = state.publish_live_capabilities().await {
+        tracing::warn!(%error, "manager capability discovery unavailable");
+    }
     let server = match socket_ownership.bind(state.clone()) {
         Ok(server) => server,
         Err(error) => {
@@ -197,15 +190,23 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
     } else {
         None
     };
-    let helper_shutdown = tokio_util::sync::CancellationToken::new();
-    let mut helper_task = features.tailscale.then(|| {
-        tokio::spawn(helper::serve(
-            state.clone(),
-            helper_config,
+    let lobby_shutdown = tokio_util::sync::CancellationToken::new();
+    let mut lobby_task = if features.tailscale {
+        let context = crate::lobby::supervisor::LobbyContext::new(
+            lobby_host,
+            lobby_settings,
+            control::lobby::Management::new(state.clone()),
             publisher.clone(),
-            helper_shutdown.clone(),
-        ))
-    });
+        );
+        publisher.set_lobby(Some(crate::lobby::supervisor::initial_status()))?;
+        Some(tokio::spawn(crate::lobby::supervisor::start(
+            context,
+            publisher.clone(),
+            lobby_shutdown.clone(),
+        )))
+    } else {
+        None
+    };
     publisher.set_core(silod_spec::status::CorePhase::Ready, None)?;
     let api_result = loop {
         tokio::select! {
@@ -231,25 +232,19 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
                 // Optional integration failure does not take away a working core API.
             }
             result = async {
-                match helper_task.as_mut() {
+                match lobby_task.as_mut() {
                     Some(task) => task.await,
                     None => std::future::pending().await,
                 }
             } => {
-                helper_task = None;
-                if let Err(error) = result.map_err(eyre::Report::from).and_then(|r| r) {
-                    state.set_helper_generation(None).await;
-                    publisher.set_tailscale(silod_spec::status::ComponentStatus {
-                        enabled: true,
-                        state: silod_spec::status::ComponentState::Failed,
-                        diagnostic: Some(format!("helper supervisor failed: {error:#}")),
-                        approval_url: None, dns_name: None, restart_count: 0,
-                        shutdown_protection: if cfg!(target_os = "macos") {
-                            silod_spec::status::ShutdownProtection::Unsupported
-                        } else {
-                            silod_spec::status::ShutdownProtection::Unavailable
-                        },
-                    })?;
+                lobby_task = None;
+                if let Err(error) = result {
+                    tracing::error!(%error, "lobby supervisor task failed");
+                    publisher.set_lobby(Some(silod_spec::status::LobbyStatus {
+                        phase: silod_spec::status::LobbyPhase::Failed,
+                        dns_name: None, approval_url: None, diagnostic: Some(format!("lobby supervisor task failed: {error}")),
+                        restart_count: 0, updated_at: supervisor::now(),
+                    }))?;
                 }
             }
         }
@@ -257,18 +252,13 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
     state.begin_stopping().await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(87);
     system_shutdown.cancel();
-    helper_shutdown.cancel();
+    lobby_shutdown.cancel();
     let drained = tokio::time::timeout_at(deadline, async {
-        let helper_result = if let Some(task) = helper_task.as_mut() {
-            task.await.map_err(eyre::Report::from).and_then(|r| r)
-        } else {
-            Ok(())
-        };
-        state.set_helper_generation(None).await;
-        state.seal_mutations().await;
-        state.drain_mutations().await?;
-        helper_result?;
+        state.wait_for_mutations().await?;
         if let Some(task) = system_task {
+            task.await??;
+        }
+        if let Some(task) = lobby_task {
             task.await??;
         }
         Ok::<(), eyre::Report>(())
@@ -276,16 +266,6 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
     .await
     .map_err(|_| eyre::eyre!("daemon shutdown deadline expired with incomplete mutation drain"))
     .and_then(|r| r);
-    if drained.is_err() {
-        if let Some(task) = helper_task.as_mut() {
-            if !task.is_finished() {
-                task.abort();
-                let _ = task.await;
-            }
-        }
-        state.set_helper_generation(None).await;
-        state.seal_mutations().await;
-    }
     api_shutdown.cancel();
     let api_result = match api_result {
         Some(result) => result.map_err(Into::into).and_then(|r| r),
@@ -367,7 +347,6 @@ mod tests {
     fn defaults_require_no_state_or_home_argument() {
         let defaults = parse([]).expect("defaults");
         assert!(!defaults.stop);
-        assert!(!defaults.host_shutdown);
         assert_eq!(
             defaults.system.into_overrides(),
             silod_spec::arguments::SystemOverrides::default()
@@ -375,14 +354,6 @@ mod tests {
         for flag in ["--state", "--home", "--check"] {
             assert!(parse([flag, "/tmp/unused"]).is_err());
         }
-    }
-
-    #[test]
-    fn host_shutdown_is_explicit_and_not_ordinary_stop() {
-        let args = parse(["--host-shutdown"]).expect("host shutdown");
-        assert!(args.host_shutdown);
-        assert!(!args.stop);
-        assert!(parse(["--host-shutdown", "--stop"]).is_err());
     }
 
     #[test]

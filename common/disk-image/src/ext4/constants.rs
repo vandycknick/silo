@@ -31,7 +31,7 @@ pub const XATTR_BLOCK_HEADER_SIZE: u32 = 32;
 pub const MAX_LINKS: u32 = 65000;
 pub const EXT4_NAME_LEN: usize = 255;
 pub const MAX_BLOCKS_PER_EXTENT: u32 = 0x8000;
-pub const MAX_FILE_SIZE: u64 = 128 * 1024 * 1024 * 1024; // 128 GiB
+pub const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 pub const SUPERBLOCK_OFFSET: u64 = 1024;
 
 // ── Inode block field size ──
@@ -132,6 +132,36 @@ pub mod inode_flags {
     pub const INLINE_DATA: u32 = 0x1000_0000;
     pub const PROJECT_ID_INHERIT: u32 = 0x2000_0000;
     pub const RESERVED: u32 = 0x8000_0000;
+
+    /// Attribute flags (`chattr`) that do not change the on-disk encoding.
+    /// A validated reader inode exposes only these bits.
+    pub const USER_ATTRIBUTES: u32 = SECRM
+        | UNRM
+        | SYNC
+        | IMMUTABLE
+        | APPEND
+        | NODUMP
+        | NOATIME
+        | JOURNAL_DATA
+        | NO_TAIL
+        | DIR_SYNC
+        | TOP_DIR
+        | PROJECT_ID_INHERIT;
+    /// Encoding flags the reader implements.
+    pub const READER_ENCODING: u32 = HASHED_INDEX | HUGE_FILE | EXTENTS;
+}
+
+// ── Superblock state and flags ──
+
+pub mod fs_state {
+    pub const VALID: u16 = 0x1;
+    pub const ERROR: u16 = 0x2;
+    pub const ORPHAN: u16 = 0x4;
+}
+
+pub mod fs_flags {
+    pub const SIGNED_HASH: u32 = 0x1;
+    pub const UNSIGNED_HASH: u32 = 0x2;
 }
 
 // ── File mode flags ──

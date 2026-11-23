@@ -4,7 +4,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 pub(crate) const VMM_START_REQUEST_VERSION: u32 = 1;
-pub(crate) const VMM_START_REQUEST_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const VMM_START_REQUEST_MAX_BYTES: usize =
+    vm_spec::capture::MAX_CAPTURE_RECORD_BYTES + (1 << 20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,10 +13,12 @@ pub(crate) struct VmmStartRequest {
     version: u32,
     machine_id: String,
     machine_run_id: String,
+    storage_lease: protocol::shutdown::StorageLeaseBinding,
+    storage_shutdown: protocol::shutdown::StorageShutdownContext,
+    disk_tracking_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
     #[serde(skip_serializing_if = "Option::is_none")]
     startup_command: Option<VmmStartupCommand>,
-    // Optional additive field within version 1; must stay schema-compatible
-    // with silo-vmm's strict (deny_unknown_fields) reader.
+    // Runtime always sends its frozen prospective selection explicitly.
     #[serde(skip_serializing_if = "Option::is_none")]
     virt_backend: Option<VmmVirtBackend>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,6 +26,8 @@ pub(crate) struct VmmStartRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     asset_directory: Option<std::path::PathBuf>,
     startup_budget_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore: Option<vm_spec::restore::RestoreRequest>,
 }
 
 /// Explicit virtualization backend selection.
@@ -32,6 +37,10 @@ pub(crate) struct VmmVirtBackend {
     pub(crate) kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) scenario: Option<std::path::PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scenario_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scenario_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,6 +79,8 @@ impl VmmStartRequest {
         machine_id: impl Into<String>,
         machine_run_id: impl Into<String>,
         startup_command: Option<VmmStartupCommand>,
+        storage_lease: protocol::shutdown::StorageLeaseBinding,
+        storage_shutdown: protocol::shutdown::StorageShutdownContext,
     ) -> Self {
         let startup_budget_ms = if startup_command.is_some() {
             330_000
@@ -80,12 +91,24 @@ impl VmmStartRequest {
             version: VMM_START_REQUEST_VERSION,
             machine_id: machine_id.into(),
             machine_run_id: machine_run_id.into(),
+            storage_lease,
+            storage_shutdown,
+            disk_tracking_seeds: Vec::new(),
             startup_command,
             virt_backend: None,
             rosetta_intent: None,
             asset_directory: None,
             startup_budget_ms,
+            restore: None,
         }
+    }
+
+    pub(crate) fn with_disk_tracking_seeds(
+        mut self,
+        seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
+    ) -> Self {
+        self.disk_tracking_seeds = seeds;
+        self
     }
 
     pub(crate) fn with_virt_backend(mut self, virt_backend: Option<VmmVirtBackend>) -> Self {
@@ -106,6 +129,14 @@ impl VmmStartRequest {
         self
     }
 
+    pub(crate) fn with_restore(
+        mut self,
+        restore: Option<vm_spec::restore::RestoreRequest>,
+    ) -> Self {
+        self.restore = restore;
+        self
+    }
+
     pub(crate) fn with_startup_budget(mut self, budget: std::time::Duration) -> Self {
         self.startup_budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
         self
@@ -113,6 +144,26 @@ impl VmmStartRequest {
 }
 
 pub(crate) fn encode_start_request(request: &VmmStartRequest) -> io::Result<Vec<u8>> {
+    protocol::shutdown::validate_uuid(&request.machine_id)
+        .and_then(|()| protocol::shutdown::validate_uuid(&request.machine_run_id))
+        .and_then(|()| request.storage_lease.validate())
+        .and_then(|()| {
+            request
+                .storage_shutdown
+                .validate_binding(&request.machine_id, &request.machine_run_id)
+        })
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    if let Some(restore) = &request.restore {
+        restore
+            .validate()
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        if request.startup_command.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "restore cannot replay a startup command",
+            ));
+        }
+    }
     let mut encoded = serde_json::to_vec(request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     encoded.push(b'\n');
@@ -120,9 +171,9 @@ pub(crate) fn encode_start_request(request: &VmmStartRequest) -> io::Result<Vec<
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "silo-vmm start request is {} bytes; maximum is {} bytes including newline",
-                encoded.len(),
-                VMM_START_REQUEST_MAX_BYTES
+                "silo-vmm start request is {}; maximum is {} including newline",
+                utils::format_storage_size(encoded.len() as u64),
+                utils::format_storage_size(VMM_START_REQUEST_MAX_BYTES as u64)
             ),
         ));
     }
@@ -138,19 +189,44 @@ mod tests {
         VmmStartRequest, VmmStartupCommand, VMM_START_REQUEST_MAX_BYTES,
     };
 
+    fn lease() -> protocol::shutdown::StorageLeaseBinding {
+        protocol::shutdown::StorageLeaseBinding {
+            operation_id: "33333333-3333-4333-8333-333333333333".into(),
+            file_device: 1,
+            file_inode: 2,
+        }
+    }
+
+    fn context() -> protocol::shutdown::StorageShutdownContext {
+        protocol::shutdown::StorageShutdownContext {
+            version: 1,
+            machine_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            run_id: "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3".into(),
+            manifest: protocol::shutdown::StorageManifest::Unsupported {
+                reason: "fixture has no storage".into(),
+            },
+        }
+    }
     #[test]
-    fn disabled_rosetta_carries_only_the_native_startup_budget_addition() {
+    fn start_request_carries_the_exact_trusted_launch_context() {
         let request = VmmStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
+            lease(),
+            context(),
         )
         .with_rosetta_intent(VmmRosettaIntent::Disabled {});
+        let value = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(
-            String::from_utf8(encode_start_request(&request).expect("encode request"))
-                .expect("UTF-8 request"),
-            "{\"version\":1,\"machineId\":\"01234567-89ab-cdef-0123-456789abcdef\",\"machineRunId\":\"9e7d6ad8-f804-4936-9633-1fd3df6bd7d3\",\"startupBudgetMs\":30000}\n"
+            value["storageShutdown"],
+            serde_json::to_value(context()).unwrap()
         );
+        assert_eq!(
+            value["storageLease"],
+            serde_json::to_value(lease()).unwrap()
+        );
+        assert!(value.get("rosettaIntent").is_none());
     }
 
     #[test]
@@ -172,6 +248,8 @@ mod tests {
                     user: Some("1000:1000".to_string()),
                 },
             }),
+            lease(),
+            context(),
         );
         let encoded = encode_start_request(&request).expect("encode request");
         let value: serde_json::Value =
@@ -191,6 +269,8 @@ mod tests {
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
+            lease(),
+            context(),
         );
         let encoded = encode_start_request(&request).expect("encode request");
         let value: serde_json::Value =
@@ -205,6 +285,8 @@ mod tests {
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
+            lease(),
+            context(),
         )
         .with_rosetta_intent(VmmRosettaIntent::Enabled {});
         let encoded = encode_start_request(&request).expect("encode request");
@@ -225,6 +307,8 @@ mod tests {
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
+            lease(),
+            context(),
         )
         .with_rosetta_intent(VmmRosettaIntent::Enabled {});
         let encoded = encode_start_request(&request).expect("encode request");
@@ -259,10 +343,156 @@ mod tests {
         assert!(encode_start_request(&oversized).is_err());
     }
 
+    #[test]
+    fn start_request_refuses_context_from_another_run_before_handoff() {
+        let mut request = request_with_environment_value(String::new());
+        request.storage_shutdown.run_id = Uuid::new_v4().to_string();
+        assert_eq!(
+            encode_start_request(&request).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        request.storage_shutdown = context();
+        request.storage_lease.operation_id = Uuid::nil().to_string();
+        assert_eq!(
+            encode_start_request(&request).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn start_request_round_trips_disk_root_tracking_profile() {
+        let root =
+            vm_spec::stream_map::StreamRoot::empty(512, vm_spec::stream_map::ChunkSize::DISK)
+                .unwrap();
+        let seed = vm_spec::capture::DiskTrackingSeed {
+            version: vm_spec::capture::DISK_TRACKING_VERSION,
+            map_format: 1,
+            chunk_shift: 23,
+            role: vm_spec::DiskRole::Root,
+            attachment_index: 0,
+            block_id: vm_spec::BlockId::new("root").unwrap(),
+            file_device: 1,
+            file_inode: 2,
+            length: root.length(),
+            chunk_size: root.chunk_size().bytes(),
+            epoch: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+            baseline: Some(root.id()),
+        };
+        seed.validate().unwrap();
+        let request = VmmStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+            lease(),
+            context(),
+        )
+        .with_disk_tracking_seeds(vec![seed.clone()]);
+        let value: serde_json::Value =
+            serde_json::from_slice(&encode_start_request(&request).unwrap()).unwrap();
+        let decoded: Vec<vm_spec::capture::DiskTrackingSeed> =
+            serde_json::from_value(value["diskTrackingSeeds"].clone()).unwrap();
+        assert_eq!(decoded, [seed]);
+        assert_eq!(decoded[0].baseline, Some(root.id()));
+    }
+
+    #[tokio::test]
+    async fn restore_start_round_trips_binary_ram_root_and_shared_node_store() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
+
+        let fixture = crate::store::capture::tests::fixture().await;
+        let (directory, evidence) = crate::store::capture::tests::seal(&fixture);
+        let plan = vm_spec::capture::CapturePlan::decode(
+            &std::fs::read(directory.path().join("request.json")).unwrap(),
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        let objects = RestoreObjectRole::ALL.map(|role| {
+            let file =
+                std::fs::File::open(directory.path().join(role.capture_role().relative_path()))
+                    .unwrap();
+            let metadata = file.metadata().unwrap();
+            let inventory = evidence
+                .inventory
+                .iter()
+                .find(|entry| entry.role == role.capture_role())
+                .unwrap();
+            let identity = if role == RestoreObjectRole::Ram {
+                inventory.identity.unwrap()
+            } else {
+                inventory.sha256.unwrap()
+            };
+            let object = RestoreObject {
+                role,
+                fd: file.as_raw_fd(),
+                file_device: metadata.dev(),
+                file_inode: metadata.ino(),
+                length: metadata.len(),
+                authority: vm_spec::restore::RestoreObjectAuthority::Identified { identity },
+            };
+            files.push(file);
+            object
+        });
+        let root = vm_spec::stream_map::StreamRoot::decode(
+            &std::fs::read(directory.path().join("memory.root")).unwrap(),
+        )
+        .unwrap();
+        root.validate_role(vm_spec::stream_map::StreamRole::Ram)
+            .unwrap();
+        let restore = RestoreRequest {
+            purpose: vm_spec::restore::ActivationPurpose::Clone,
+            version: vm_spec::restore::RESTORE_REQUEST_VERSION,
+            authority: vm_spec::restore::RestoreAuthority::IdentifiedSnapshot {
+                snapshot: vm_spec::capture::Sha256Digest::of_bytes(b"snapshot"),
+                evidence: Box::new(evidence.clone()),
+            },
+            activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+            freeze_operation_id: evidence.freeze_operation_id.clone().unwrap(),
+            start_paused: true,
+            configuration: plan.configuration,
+            disk_tracking_seeds: Vec::new(),
+            map_node_store: Some(
+                directory
+                    .path()
+                    .join("map-nodes")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            objects: objects.into(),
+            lowers: Vec::new(),
+            network: None,
+            ssh_trusted_ca: None,
+            hook: None,
+        };
+        restore.validate().unwrap();
+        let request = VmmStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+            lease(),
+            context(),
+        )
+        .with_restore(Some(restore.clone()));
+        let value: serde_json::Value =
+            serde_json::from_slice(&encode_start_request(&request).unwrap()).unwrap();
+        let decoded: RestoreRequest = serde_json::from_value(value["restore"].clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, restore);
+        for index in [0, 4] {
+            assert_eq!(
+                decoded.objects[index].authority,
+                vm_spec::restore::RestoreObjectAuthority::Identified {
+                    identity: root.id()
+                }
+            );
+        }
+    }
+
     fn request_with_environment_value(value: String) -> VmmStartRequest {
         VmmStartRequest::new(
-            Uuid::nil().to_string(),
-            Uuid::nil().to_string(),
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             Some(VmmStartupCommand {
                 execution_id: Uuid::nil(),
                 process: VmmProcessSpec {
@@ -275,6 +505,8 @@ mod tests {
                     user: None,
                 },
             }),
+            lease(),
+            context(),
         )
     }
 }

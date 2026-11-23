@@ -241,8 +241,10 @@ pub(crate) fn validate_socket_path(path: &Path) -> eyre::Result<()> {
     let limit = unix_socket_path_limit();
     if length > limit {
         return Err(eyre::eyre!(
-            "Unix socket path {} is {length} bytes, exceeding the platform limit of {limit}",
-            path.display()
+            "Unix socket path {} is {}, exceeding the platform limit of {}",
+            path.display(),
+            utils::format_storage_size(length as u64),
+            utils::format_storage_size(limit as u64)
         ));
     }
     Ok(())

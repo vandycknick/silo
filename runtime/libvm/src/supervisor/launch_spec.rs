@@ -17,10 +17,31 @@ pub(crate) fn prepare_launch_spec(input: LaunchSpecInput<'_>) -> eyre::Result<Vm
     Ok(spec)
 }
 
-pub(crate) fn write_launch_spec(path: &Path, spec: &VmSpec) -> eyre::Result<()> {
-    let config = serde_json::to_string_pretty(spec)
+/// Atomically publish the config and retain its exact inode for the launch barrier.
+pub(crate) fn write_launch_spec(path: &Path, spec: &VmSpec) -> eyre::Result<std::fs::File> {
+    use std::io::Write;
+
+    let config = serde_json::to_vec_pretty(spec)
         .with_context(|| format!("serialize vm spec at {}", path.display()))?;
-    std::fs::write(path, config).with_context(|| format!("write vm spec at {}", path.display()))
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre::eyre!("launch spec has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| eyre::eyre!("launch spec has no UTF-8 name"))?;
+    let directory = crate::paths::OwnedDirectory::open_existing_root(parent)?
+        .ok_or_else(|| eyre::eyre!("launch directory disappeared"))?;
+    directory
+        .publish_file_deferred(
+            name,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            |file| {
+                file.write_all(&config)?;
+                Ok(())
+            },
+        )
+        .with_context(|| format!("publish vm spec at {}", path.display()))
 }
 
 fn normalize_mount_sources(spec: &mut VmSpec, relative_mount_base: &Path) -> eyre::Result<()> {
@@ -47,7 +68,7 @@ mod tests {
 
     use crate::supervisor::{prepare_launch_spec, LaunchSpecInput};
 
-    use super::normalize_mount_sources;
+    use crate::supervisor::launch_spec::normalize_mount_sources;
 
     fn sample_spec(kernel_cmdline: Vec<String>) -> VmSpec {
         VmSpec {

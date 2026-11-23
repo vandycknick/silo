@@ -1,17 +1,25 @@
 //! Native adapters for the typed, same-user daemon management contract.
 //! This crate owns no runtime or session implementation.
+pub mod artifacts;
+pub mod boot;
+pub mod capture;
 pub mod create;
 pub mod errors;
+pub mod fork;
+pub mod handoff;
 pub mod images;
 pub mod lifecycle;
+pub mod live;
 pub mod network;
 pub mod node_status;
+pub mod pause;
 pub mod policy;
 pub mod readiness;
 pub mod reports;
 pub mod requests;
 pub mod snapshots;
 pub mod spec;
+pub mod stopped;
 pub mod transport;
 pub mod updates;
 pub mod values;
@@ -46,6 +54,41 @@ pub fn validate_uuid(value: &str, field: &'static str) -> Result<(), ConversionE
     uuid::Uuid::parse_str(value).map_err(|_| invalid(field, "invalid UUID"))?;
     Ok(())
 }
+/// A user-chosen local name for an image or snapshot. libvm owns the grammar;
+/// a registry reference (`:` or `/`) or an id is never a local name.
+pub fn local_name(value: &str) -> Result<String, ConversionError> {
+    if value.contains([':', '/']) {
+        return Err(invalid("name", "a local name contains no ':' or '/'"));
+    }
+    match value.parse::<libvm::ImageRef>() {
+        Ok(libvm::ImageRef::Name(name)) => Ok(name),
+        _ => Err(invalid("name", "invalid local name")),
+    }
+}
+/// Names of one image or snapshot record: local names or pulled registry
+/// references, unique and bounded.
+pub(crate) fn names_from_wire(
+    values: Vec<String>,
+    field: &'static str,
+) -> Result<Vec<String>, ConversionError> {
+    if values.len() > MAX_RECORD_NAMES {
+        return Err(invalid(field, "too many names"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for value in &values {
+        if !matches!(
+            value.parse::<libvm::ImageRef>(),
+            Ok(libvm::ImageRef::Name(_))
+        ) {
+            return Err(invalid(field, "invalid name"));
+        }
+        if !seen.insert(value.as_str()) {
+            return Err(invalid(field, "duplicate name"));
+        }
+    }
+    Ok(values)
+}
+const MAX_RECORD_NAMES: usize = 4096;
 pub fn duration_from_wire(
     value: prost_types::Duration,
 ) -> Result<std::time::Duration, ConversionError> {

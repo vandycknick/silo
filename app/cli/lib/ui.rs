@@ -8,11 +8,68 @@ use clap::builder::styling::{AnsiColor, Effects};
 use clap::builder::Styles;
 use console::{measure_text_width, style, Term};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use libvm::{ImageProgress, ImageProgressReceiver};
 use serde::Serialize;
-use tokio::task::JoinHandle;
 
-const BRAILLE_TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠋"];
+pub(crate) const BRAILLE_TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠋"];
+
+/// One stderr sink and progress renderer per CLI subscriber, shared through
+/// tracing's existing dispatch context rather than a second global registry.
+pub(crate) struct LogWriter {
+    progress: MultiProgress,
+    output: std::io::Stderr,
+}
+
+impl LogWriter {
+    pub(crate) fn new() -> Self {
+        Self {
+            progress: MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10)),
+            output: std::io::stderr(),
+        }
+    }
+}
+
+pub(crate) struct LogLineWriter<'a> {
+    writer: &'a LogWriter,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = LogLineWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogLineWriter { writer: self }
+    }
+}
+
+impl Write for LogLineWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writer
+            .progress
+            .suspend(|| self.writer.output.lock().write(bytes))
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.writer
+            .progress
+            .suspend(|| self.writer.output.lock().write_all(bytes))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer
+            .progress
+            .suspend(|| self.writer.output.lock().flush())
+    }
+}
+
+pub(crate) fn progress_renderer() -> MultiProgress {
+    tracing::dispatcher::get_default(|dispatch| {
+        dispatch
+            .downcast_ref::<LogWriter>()
+            .map(|writer| writer.progress.clone())
+            .unwrap_or_else(|| {
+                MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10))
+            })
+    })
+}
 
 pub fn clap_styles() -> Styles {
     Styles::styled()
@@ -60,10 +117,41 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
+/// Keep user-controlled names in the message, never in the spinner template.
+pub(crate) fn live_operation_progress_words(
+    stage: &libvm::LiveOperationProgress,
+    source: &str,
+) -> (&'static str, String) {
+    use libvm::LiveOperationProgress;
+
+    match stage {
+        LiveOperationProgress::Admitting => ("Admitting", source.into()),
+        LiveOperationProgress::Waking => ("Waking", source.into()),
+        LiveOperationProgress::PausingSource => ("Pausing", source.into()),
+        LiveOperationProgress::CapturingMemory => ("Capturing memory", String::new()),
+        LiveOperationProgress::CapturingDisks => ("Capturing disks", String::new()),
+        LiveOperationProgress::CapturingExecution => ("Capturing execution", String::new()),
+        LiveOperationProgress::VerifyingCapture => ("Verifying capture", String::new()),
+        LiveOperationProgress::FinalizingCapture => ("Finalizing capture", String::new()),
+        LiveOperationProgress::ResumingSource => ("Resuming", source.into()),
+        LiveOperationProgress::PreservingSource => ("Leaving paused", source.into()),
+        LiveOperationProgress::ComputingDiskIdentity => ("Hashing disk", String::new()),
+        LiveOperationProgress::Publishing => ("Publishing snapshot", String::new()),
+        LiveOperationProgress::PreparingChildStorage => ("Preparing child storage", String::new()),
+        LiveOperationProgress::StartingChild { index, total, name } => {
+            ("Starting child", format!("{index} of {total}: {name}"))
+        }
+        LiveOperationProgress::WaitingForAgent => ("Waiting for agent", String::new()),
+        LiveOperationProgress::Done => ("Done", String::new()),
+    }
+}
+
 pub fn print_json(value: &impl Serialize) -> eyre::Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    serde_json::to_writer_pretty(&mut out, value)?;
+    write_json(&mut std::io::stdout().lock(), value)
+}
+
+pub(crate) fn write_json(out: &mut impl Write, value: &impl Serialize) -> eyre::Result<()> {
+    serde_json::to_writer_pretty(&mut *out, value)?;
     writeln!(out)?;
     Ok(())
 }
@@ -71,6 +159,7 @@ pub fn print_json(value: &impl Serialize) -> eyre::Result<()> {
 #[derive(Debug)]
 pub struct Spinner {
     pb: Option<ProgressBar>,
+    mp: Option<MultiProgress>,
     start: Instant,
     target: String,
     quiet: bool,
@@ -79,47 +168,37 @@ pub struct Spinner {
 
 #[cfg(unix)]
 #[derive(Debug)]
-struct EchoGuard {
+pub(crate) struct EchoGuard {
     original: libc::termios,
     fd: i32,
 }
 
 #[cfg(not(unix))]
 #[derive(Debug)]
-struct EchoGuard;
-
-pub struct PullProgressDisplay {
-    mp: MultiProgress,
-    header: ProgressBar,
-    layer_bars: Vec<ProgressBar>,
-    reference: String,
-    download_style: ProgressStyle,
-    materialize_style: ProgressStyle,
-    done_style: ProgressStyle,
-    current_applying_layer: Option<usize>,
-    _echo_guard: Option<EchoGuard>,
-}
+pub(crate) struct EchoGuard;
 
 impl Spinner {
     pub fn start(label: &str, target: impl Into<String>) -> Self {
         let target = target.into();
         let is_tty = stderr_is_interactive();
-        let (pb, echo_guard) = if is_tty {
+        let (pb, mp, echo_guard) = if is_tty {
             let template = format!("   {{spinner}} {label:<12} {{msg}}");
             let style = ProgressStyle::default_spinner()
                 .tick_strings(BRAILLE_TICKS)
                 .template(&template)
                 .unwrap_or_else(|_| ProgressStyle::default_spinner());
-            let pb = ProgressBar::new_spinner().with_style(style);
+            let mp = progress_renderer();
+            let pb = mp.add(ProgressBar::new_spinner().with_style(style));
             pb.set_message(target.clone());
             pb.enable_steady_tick(Duration::from_millis(80));
-            (Some(pb), EchoGuard::acquire())
+            (Some(pb), Some(mp), EchoGuard::acquire())
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         Self {
             pb,
+            mp,
             start: Instant::now(),
             target,
             quiet: false,
@@ -130,6 +209,7 @@ impl Spinner {
     pub fn quiet() -> Self {
         Self {
             pb: None,
+            mp: None,
             start: Instant::now(),
             target: String::new(),
             quiet: true,
@@ -153,9 +233,7 @@ impl Spinner {
     }
 
     pub fn finish_success(mut self, past_tense: &str) {
-        if let Some(pb) = self.pb.take() {
-            pb.finish_and_clear();
-        }
+        self.clear();
 
         if !self.quiet {
             print_success(past_tense, &self.target, self.start.elapsed());
@@ -171,8 +249,15 @@ impl Spinner {
     }
 
     pub fn finish_clear(mut self) {
+        self.clear();
+    }
+
+    fn clear(&mut self) {
         if let Some(pb) = self.pb.take() {
             pb.finish_and_clear();
+            if let Some(mp) = &self.mp {
+                mp.remove(&pb);
+            }
         }
     }
 }
@@ -232,15 +317,13 @@ pub(crate) async fn with_delayed_spinner<T, E>(
 
 impl Drop for Spinner {
     fn drop(&mut self) {
-        if let Some(pb) = self.pb.take() {
-            pb.finish_and_clear();
-        }
+        self.clear();
     }
 }
 
 impl EchoGuard {
     #[cfg(unix)]
-    fn acquire() -> Option<Self> {
+    pub(crate) fn acquire() -> Option<Self> {
         if !std::io::stdin().is_terminal() {
             return None;
         }
@@ -262,7 +345,7 @@ impl EchoGuard {
     }
 
     #[cfg(not(unix))]
-    fn acquire() -> Option<Self> {
+    pub(crate) fn acquire() -> Option<Self> {
         None
     }
 }
@@ -277,230 +360,6 @@ impl Drop for EchoGuard {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
         }
     }
-}
-
-impl PullProgressDisplay {
-    pub fn new(reference: &str) -> Self {
-        Self::new_inner(reference, false)
-    }
-
-    pub fn quiet(reference: &str) -> Self {
-        Self::new_inner(reference, true)
-    }
-
-    fn new_inner(reference: &str, quiet: bool) -> Self {
-        let is_tty = !quiet && stderr_is_interactive();
-        let mp = MultiProgress::new();
-        if is_tty {
-            mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-        } else {
-            mp.set_draw_target(ProgressDrawTarget::hidden());
-        }
-
-        let header = mp.add(ProgressBar::new_spinner());
-        header.set_style(
-            ProgressStyle::default_spinner()
-                .tick_strings(BRAILLE_TICKS)
-                .template("   {spinner} {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        header.set_message(format!("{:<12} {}", "Pulling", reference));
-        header.enable_steady_tick(Duration::from_millis(80));
-
-        Self {
-            mp,
-            header,
-            layer_bars: Vec::new(),
-            reference: reference.to_string(),
-            download_style: ProgressStyle::default_bar()
-                .template(
-                    "     {prefix}  {bar:36.magenta/238}  {bytes}/{total_bytes}  {msg:.magenta}",
-                )
-                .unwrap_or_else(|_| ProgressStyle::default_bar())
-                .progress_chars("━━╌"),
-            materialize_style: ProgressStyle::default_bar()
-                .template("     {prefix}  {bar:36.blue/238}  {msg:.blue}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar())
-                .progress_chars("━━╌"),
-            done_style: ProgressStyle::default_bar()
-                .template("     {prefix}  {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar()),
-            current_applying_layer: None,
-            _echo_guard: if is_tty { EchoGuard::acquire() } else { None },
-        }
-    }
-
-    pub fn handle_event(&mut self, event: ImageProgress) {
-        match event {
-            ImageProgress::ResolvingManifest { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}...", "Resolving", self.reference));
-            }
-            ImageProgress::ResolvedManifest {
-                image_ref,
-                layer_count,
-                ..
-            } => {
-                self.reference = image_ref;
-                self.header.set_message(format!(
-                    "{:<12} {} ({} layer{})",
-                    "Pulling",
-                    self.reference,
-                    layer_count,
-                    if layer_count == 1 { "" } else { "s" }
-                ));
-                self.ensure_layer_bars(layer_count);
-            }
-            ImageProgress::CheckingCache { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Checking", self.reference));
-            }
-            ImageProgress::CacheHit { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Cached", self.reference));
-            }
-            ImageProgress::CacheMiss { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Building", self.reference));
-            }
-            ImageProgress::UsingLocalDisk { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Using", self.reference));
-            }
-            ImageProgress::LayerDownloadStarted {
-                index,
-                total,
-                size_bytes,
-                ..
-            } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_style(self.download_style.clone());
-                    pb.set_position(0);
-                    if let Some(size_bytes) = size_bytes {
-                        pb.set_length(size_bytes);
-                    }
-                    pb.set_message("downloading");
-                }
-            }
-            ImageProgress::LayerDownloadProgress {
-                index,
-                total,
-                downloaded_bytes,
-                size_bytes,
-                ..
-            } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    if let Some(size_bytes) = size_bytes {
-                        pb.set_length(size_bytes);
-                    }
-                    pb.set_position(downloaded_bytes);
-                }
-            }
-            ImageProgress::LayerDownloadVerifying { index, total, .. } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_message("verifying");
-                }
-            }
-            ImageProgress::LayerDownloadFinished { index, total, .. } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_position(pb.length().unwrap_or(0));
-                    pb.set_message("downloaded");
-                }
-            }
-            ImageProgress::LayerDownloadSkipped { index, total, .. } => {
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_position(pb.length().unwrap_or(1));
-                    pb.set_message("cached");
-                }
-            }
-            ImageProgress::ApplyingLayer { index, total, .. } => {
-                self.finish_current_applying_layer();
-                self.ensure_layer_bars(total);
-                if let Some(pb) = self.layer_bar(index) {
-                    pb.set_style(self.materialize_style.clone());
-                    pb.set_length(1);
-                    pb.set_position(0);
-                    pb.set_message("unpacking");
-                }
-                self.current_applying_layer = Some(index);
-            }
-            ImageProgress::MaterializingRootfs => {
-                self.finish_current_applying_layer();
-                self.header
-                    .set_message(format!("{:<12} {}", "Writing", self.reference));
-            }
-            ImageProgress::PublishingRootfs => {
-                self.header
-                    .set_message(format!("{:<12} {}", "Saving", self.reference));
-            }
-            ImageProgress::Complete => {
-                self.finish_current_applying_layer();
-                self.header
-                    .set_message(format!("{:<12} {}", "Pulled", self.reference));
-            }
-        }
-    }
-
-    pub fn finish(mut self) {
-        self.finish_current_applying_layer();
-        let _ = self.mp.clear();
-    }
-
-    fn ensure_layer_bars(&mut self, layer_count: usize) {
-        if self.layer_bars.len() >= layer_count {
-            return;
-        }
-        let width = layer_count.to_string().len();
-        for index in self.layer_bars.len()..layer_count {
-            let pb = self.mp.add(ProgressBar::new(1));
-            pb.set_style(self.download_style.clone());
-            pb.set_prefix(format!("layer {:>width$}/{layer_count}", index + 1));
-            pb.set_message("waiting");
-            self.layer_bars.push(pb);
-        }
-    }
-
-    fn layer_bar(&self, one_based_index: usize) -> Option<&ProgressBar> {
-        one_based_index
-            .checked_sub(1)
-            .and_then(|index| self.layer_bars.get(index))
-    }
-
-    fn finish_current_applying_layer(&mut self) {
-        let Some(index) = self.current_applying_layer.take() else {
-            return;
-        };
-        if let Some(pb) = self.layer_bar(index) {
-            pb.set_position(pb.length().unwrap_or(1));
-            pb.set_style(self.done_style.clone());
-            pb.set_message(format!("{}", style("✓").green()));
-            pb.tick();
-        }
-    }
-}
-
-pub fn watch_image_progress(
-    reference: impl Into<String>,
-    mut events: ImageProgressReceiver,
-) -> JoinHandle<()> {
-    let reference = reference.into();
-    tokio::spawn(async move {
-        let mut display = PullProgressDisplay::new(&reference);
-        while let Some(event) = events.recv().await {
-            display.handle_event(event);
-        }
-        display.finish();
-    })
 }
 
 /// Ask a default-no question between progress phases, after consuming any spinner.
@@ -556,6 +415,19 @@ pub fn success(message: impl AsRef<str>) {
     eprintln!("   {check} {}", message.as_ref());
 }
 
+pub(crate) fn result_message(action: &str, target: &str, id: &str, elapsed: Duration) -> String {
+    format!("{action:<12} {target} [{id}] {}", format_duration(elapsed))
+}
+
+pub(crate) fn secondary(message: impl AsRef<str>) {
+    let message = message.as_ref();
+    if should_style_stderr() {
+        eprintln!("     {}", style(message).dim());
+    } else {
+        eprintln!("     {message}");
+    }
+}
+
 pub fn hint(message: impl AsRef<str>) {
     let arrow = if should_style_stderr() {
         style("→").cyan().to_string()
@@ -563,6 +435,16 @@ pub fn hint(message: impl AsRef<str>) {
         "→".to_string()
     };
     eprintln!("   {arrow} {}", message.as_ref());
+}
+
+pub(crate) fn waking(name: &str) {
+    progress_renderer().suspend(|| eprintln!("Waking {name}"));
+}
+
+pub(crate) fn stop_warning(warning: Option<libvm::MachineStopWarning>) {
+    if let Some(warning) = warning {
+        progress_renderer().suspend(|| warn(warning.to_string()));
+    }
 }
 
 pub fn warn(message: impl AsRef<str>) {
@@ -591,7 +473,7 @@ fn print_success(past_tense: &str, target: &str, elapsed: Duration) {
     }
 }
 
-fn format_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     if duration.as_secs() >= 60 {
         let minutes = duration.as_secs() / 60;
         let seconds = duration.as_secs() % 60;
@@ -620,12 +502,13 @@ impl Table {
     }
 
     pub fn print(&self) -> eyre::Result<()> {
-        let widths = self.column_widths();
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
+        self.write_to(&mut std::io::stdout().lock(), should_style_stdout())
+    }
 
+    pub(crate) fn write_to(&self, out: &mut impl Write, styled: bool) -> eyre::Result<()> {
+        let widths = self.column_widths();
         if !self.headers.is_empty() {
-            let headers = if should_style_stdout() {
+            let headers = if styled {
                 self.headers
                     .iter()
                     .map(|header| style(header).cyan().bold().to_string())
@@ -633,11 +516,11 @@ impl Table {
             } else {
                 self.headers.clone()
             };
-            write_columns(&mut out, &headers, &widths)?;
+            write_columns(out, &headers, &widths)?;
         }
 
         for row in &self.rows {
-            write_columns(&mut out, row, &widths)?;
+            write_columns(out, row, &widths)?;
         }
         Ok(())
     }
@@ -690,6 +573,42 @@ pub fn print_detail_rows(rows: &[(impl AsRef<str>, impl AsRef<str>)]) -> eyre::R
     Ok(())
 }
 
+pub(crate) fn print_serialized_details(value: &impl Serialize) -> eyre::Result<()> {
+    print_detail_rows(&serialized_detail_rows(value)?)
+}
+
+pub(crate) fn serialized_detail_rows(
+    value: &impl Serialize,
+) -> eyre::Result<Vec<(String, String)>> {
+    fn append(rows: &mut Vec<(String, String)>, label: String, value: serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) if !fields.is_empty() => {
+                for (key, value) in fields {
+                    let key = if label.is_empty() {
+                        key
+                    } else {
+                        format!("{label}.{key}")
+                    };
+                    append(rows, key, value);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for (index, value) in items.into_iter().enumerate() {
+                    append(rows, format!("{label}[{index}]"), value);
+                }
+            }
+            serde_json::Value::String(value) => rows.push((label, value)),
+            serde_json::Value::Bool(value) => rows.push((label, yes_no(value).into())),
+            serde_json::Value::Number(value) => rows.push((label, value.to_string())),
+            _ => rows.push((label, "-".into())),
+        }
+    }
+
+    let mut rows = Vec::new();
+    append(&mut rows, String::new(), serde_json::to_value(value)?);
+    Ok(rows)
+}
+
 pub fn human_bytes(size: Option<u64>) -> String {
     size.map(utils::format_storage_size)
         .unwrap_or_else(|| "-".to_string())
@@ -722,15 +641,22 @@ pub fn now_unix() -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
+/// Formats whole-second timestamps using Docker's go-units HumanDuration rules.
+///
+/// Hour thresholds round to the nearest hour; the final year count truncates.
+/// A zero timestamp is missing, and future timestamps have zero elapsed time.
 pub fn relative_time(timestamp: i64, now: i64) -> String {
     if timestamp == 0 {
         return "N/A".to_string();
     }
 
-    let seconds = (now - timestamp).max(0);
+    let seconds = now.saturating_sub(timestamp).max(0);
 
-    if seconds < 5 {
+    if seconds < 1 {
         return "Less than a second ago".to_string();
+    }
+    if seconds == 1 {
+        return "1 second ago".to_string();
     }
     if seconds < 60 {
         return format!("{seconds} seconds ago");
@@ -744,7 +670,7 @@ pub fn relative_time(timestamp: i64, now: i64) -> String {
         return format!("{minutes} minutes ago");
     }
 
-    let hours = minutes / 60;
+    let hours = seconds / 3600 + i64::from(seconds % 3600 >= 1800);
     if hours == 1 {
         return "About an hour ago".to_string();
     }
@@ -752,23 +678,17 @@ pub fn relative_time(timestamp: i64, now: i64) -> String {
         return format!("{hours} hours ago");
     }
 
-    let days = hours / 24;
-    if days < 14 {
-        return format!("{days} days ago");
+    if hours < 24 * 7 * 2 {
+        return format!("{} days ago", hours / 24);
+    }
+    if hours < 24 * 30 * 2 {
+        return format!("{} weeks ago", hours / 24 / 7);
+    }
+    if hours < 24 * 365 * 2 {
+        return format!("{} months ago", hours / 24 / 30);
     }
 
-    let weeks = days / 7;
-    if weeks < 8 {
-        return format!("{weeks} weeks ago");
-    }
-
-    let months = days / 30;
-    if months < 12 {
-        return format!("{months} months ago");
-    }
-
-    let years = days / 365;
-    format!("{years} years ago")
+    format!("{} years ago", seconds / 3600 / 24 / 365)
 }
 
 pub fn format_unix(timestamp: i64) -> String {
@@ -797,9 +717,84 @@ fn write_columns(out: &mut impl Write, values: &[String], widths: &[usize]) -> e
 
 #[cfg(test)]
 mod tests {
-    use libvm::ImageProgress;
+    use crate::ui::{relative_time, short_id, with_delayed_spinner};
+    #[test]
+    fn live_progress_words_describe_each_stage_without_changing_names() {
+        use crate::ui::live_operation_progress_words;
+        use libvm::LiveOperationProgress as Progress;
 
-    use crate::ui::{relative_time, short_id, with_delayed_spinner, PullProgressDisplay};
+        for (stage, expected_label, expected_target) in [
+            (Progress::Admitting, "Admitting", "archy"),
+            (Progress::PausingSource, "Pausing", "archy"),
+            (Progress::CapturingMemory, "Capturing memory", ""),
+            (Progress::CapturingDisks, "Capturing disks", ""),
+            (Progress::CapturingExecution, "Capturing execution", ""),
+            (Progress::VerifyingCapture, "Verifying capture", ""),
+            (Progress::FinalizingCapture, "Finalizing capture", ""),
+            (Progress::ResumingSource, "Resuming", "archy"),
+            (Progress::PreservingSource, "Leaving paused", "archy"),
+            (Progress::ComputingDiskIdentity, "Hashing disk", ""),
+            (Progress::Publishing, "Publishing snapshot", ""),
+            (
+                Progress::PreparingChildStorage,
+                "Preparing child storage",
+                "",
+            ),
+            (
+                Progress::StartingChild {
+                    index: 2,
+                    total: 4,
+                    name: "child {two}".into(),
+                },
+                "Starting child",
+                "2 of 4: child {two}",
+            ),
+            (Progress::WaitingForAgent, "Waiting for agent", ""),
+            (Progress::Done, "Done", ""),
+        ] {
+            assert_eq!(
+                live_operation_progress_words(&stage, "archy"),
+                (expected_label, expected_target.to_owned()),
+            );
+        }
+        assert_eq!(
+            live_operation_progress_words(&Progress::PausingSource, ""),
+            ("Pausing", String::new()),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracing_writer_owns_stderr_not_stdout() {
+        use std::os::fd::AsRawFd;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let writer = crate::ui::LogWriter::new();
+        let event_writer = writer.make_writer();
+        assert_eq!(
+            event_writer.writer.output.as_raw_fd(),
+            std::io::stderr().as_raw_fd()
+        );
+        assert_ne!(
+            event_writer.writer.output.as_raw_fd(),
+            std::io::stdout().as_raw_fd()
+        );
+    }
+
+    #[test]
+    fn progress_renderer_is_owned_by_the_current_subscriber() {
+        let writer = crate::ui::LogWriter::new();
+        let progress = writer.progress.clone();
+        let subscriber =
+            utils::logging::subscriber(utils::logging::Profile::Cli { verbosity: 0 }, writer);
+        tracing::subscriber::with_default(subscriber, || {
+            // Removing a bar through another renderer only works if both
+            // handles point at the same actual indicatif state.
+            let bar = crate::ui::progress_renderer().add(indicatif::ProgressBar::new_spinner());
+            progress.remove(&bar);
+            assert!(bar.is_hidden());
+        });
+    }
 
     #[test]
     fn confirmation_accepts_explicit_choices_and_defaults_to_no() {
@@ -870,105 +865,66 @@ mod tests {
     }
 
     #[test]
-    fn relative_time_formatting() {
-        let now = 1000000;
-
+    fn relative_time_matches_docker_boundaries() {
+        let now = 2_000_000_000;
+        for (seconds, expected) in [
+            (-60, "Less than a second ago"),
+            (0, "Less than a second ago"),
+            (1, "1 second ago"),
+            (2, "2 seconds ago"),
+            (4, "4 seconds ago"),
+            (5, "5 seconds ago"),
+            (59, "59 seconds ago"),
+            (60, "About a minute ago"),
+            (119, "About a minute ago"),
+            (120, "2 minutes ago"),
+            (59 * 60, "59 minutes ago"),
+            (60 * 60 - 1, "59 minutes ago"),
+            (60 * 60, "About an hour ago"),
+            (90 * 60 - 1, "About an hour ago"),
+            (90 * 60, "2 hours ago"),
+            (2 * 3600 - 1, "2 hours ago"),
+            (2 * 3600, "2 hours ago"),
+            (24 * 3600, "24 hours ago"),
+            (47 * 3600, "47 hours ago"),
+            (48 * 3600 - 1801, "47 hours ago"),
+            (48 * 3600 - 1800, "2 days ago"),
+            (48 * 3600 - 1, "2 days ago"),
+            (48 * 3600, "2 days ago"),
+            (3 * 86400 - 1801, "2 days ago"),
+            (3 * 86400 - 1800, "3 days ago"),
+            (7 * 86400, "7 days ago"),
+            (14 * 86400 - 1801, "13 days ago"),
+            (14 * 86400 - 1800, "2 weeks ago"),
+            (14 * 86400 - 1, "2 weeks ago"),
+            (14 * 86400, "2 weeks ago"),
+            (21 * 86400 - 1801, "2 weeks ago"),
+            (21 * 86400 - 1800, "3 weeks ago"),
+            (56 * 86400, "8 weeks ago"),
+            (60 * 86400 - 1801, "8 weeks ago"),
+            (60 * 86400 - 1800, "2 months ago"),
+            (60 * 86400 - 1, "2 months ago"),
+            (60 * 86400, "2 months ago"),
+            (90 * 86400 - 1801, "2 months ago"),
+            (90 * 86400 - 1800, "3 months ago"),
+            (360 * 86400, "12 months ago"),
+            (365 * 86400, "12 months ago"),
+            (730 * 86400 - 1801, "24 months ago"),
+            (730 * 86400 - 1800, "1 years ago"),
+            (730 * 86400 - 1, "1 years ago"),
+            (730 * 86400, "2 years ago"),
+            (3 * 365 * 86400 - 1, "2 years ago"),
+            (3 * 365 * 86400, "3 years ago"),
+        ] {
+            assert_eq!(relative_time(now - seconds, now), expected, "{seconds}s");
+        }
         assert_eq!(relative_time(0, now), "N/A");
-        assert_eq!(relative_time(now, now), "Less than a second ago");
-        assert_eq!(relative_time(now - 3, now), "Less than a second ago");
-        assert_eq!(relative_time(now - 30, now), "30 seconds ago");
-        assert_eq!(relative_time(now - 60, now), "About a minute ago");
-        assert_eq!(relative_time(now - 90, now), "About a minute ago");
-        assert_eq!(relative_time(now - 300, now), "5 minutes ago");
-        assert_eq!(relative_time(now - 3600, now), "About an hour ago");
-        assert_eq!(relative_time(now - 7200, now), "2 hours ago");
-        assert_eq!(relative_time(now - 86400, now), "24 hours ago");
-        assert_eq!(relative_time(now - 172800, now), "2 days ago");
-        assert_eq!(relative_time(now - 604800, now), "7 days ago");
-        assert_eq!(relative_time(now - 604800 * 2, now), "2 weeks ago");
+        assert_eq!(relative_time(i64::MAX, i64::MIN), "Less than a second ago");
     }
 
     #[test]
     fn short_id_uses_first_eight_characters_when_available() {
         assert_eq!(short_id("1234567890abcdef"), "12345678");
         assert_eq!(short_id("1234"), "1234");
-    }
-
-    #[test]
-    fn pull_progress_display_handles_the_complete_image_event_sequence() {
-        let mut display = PullProgressDisplay::quiet("ubuntu:24.04");
-        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-        for event in [
-            ImageProgress::ResolvingManifest {
-                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
-            },
-            ImageProgress::ResolvedManifest {
-                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
-                manifest_digest: digest.to_string(),
-                layer_count: 1,
-                total_download_bytes: Some(1024),
-            },
-            ImageProgress::CheckingCache {
-                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
-            },
-            ImageProgress::CacheMiss {
-                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
-            },
-            ImageProgress::LayerDownloadStarted {
-                index: 1,
-                total: 1,
-                digest: digest.to_string(),
-                size_bytes: Some(1024),
-            },
-            ImageProgress::LayerDownloadProgress {
-                index: 1,
-                total: 1,
-                digest: digest.to_string(),
-                downloaded_bytes: 512,
-                size_bytes: Some(1024),
-            },
-            ImageProgress::LayerDownloadVerifying {
-                index: 1,
-                total: 1,
-                digest: digest.to_string(),
-            },
-            ImageProgress::LayerDownloadFinished {
-                index: 1,
-                total: 1,
-                digest: digest.to_string(),
-            },
-            ImageProgress::ApplyingLayer {
-                index: 1,
-                total: 1,
-                digest: Some(digest.to_string()),
-            },
-        ] {
-            display.handle_event(event);
-        }
-
-        display.handle_event(ImageProgress::MaterializingRootfs);
-        assert_eq!(
-            display.header.message(),
-            "Writing      docker.io/library/ubuntu:24.04"
-        );
-
-        display.handle_event(ImageProgress::PublishingRootfs);
-        assert_eq!(
-            display.header.message(),
-            "Saving       docker.io/library/ubuntu:24.04"
-        );
-
-        display.handle_event(ImageProgress::Complete);
-        assert_eq!(
-            display.header.message(),
-            "Pulled       docker.io/library/ubuntu:24.04"
-        );
-
-        assert_eq!(display.reference, "docker.io/library/ubuntu:24.04");
-        assert_eq!(display.layer_bars.len(), 1);
-        assert_eq!(display.layer_bars[0].position(), 1);
-        assert_eq!(display.current_applying_layer, None);
-        display.finish();
     }
 }

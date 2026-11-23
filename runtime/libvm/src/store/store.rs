@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
 
 #[cfg(test)]
 use crate::paths::LocalPaths;
+use crate::store::catalog_guard::CatalogGuard;
 #[cfg(test)]
 use crate::store::models::DbConfig;
 #[cfg(test)]
@@ -14,14 +15,70 @@ use crate::LibVmError;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// PASSIVE incompleteness is ordinary contention, not a failed transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogCheckpointOutcome {
+    Complete,
+    Incomplete {
+        busy: bool,
+        logged: i64,
+        checkpointed: i64,
+    },
+}
+
+impl CatalogCheckpointOutcome {
+    fn from_counts((busy, logged, checkpointed): (i64, i64, i64)) -> Self {
+        if busy == 0 && logged == checkpointed {
+            Self::Complete
+        } else {
+            Self::Incomplete {
+                busy: busy != 0,
+                logged,
+                checkpointed,
+            }
+        }
+    }
+
+    pub(crate) fn deferral(self) -> Option<crate::store::models::CacheCleanupDeferral> {
+        match self {
+            Self::Complete => None,
+            Self::Incomplete {
+                busy,
+                logged,
+                checkpointed,
+            } => Some(
+                crate::store::models::CacheCleanupDeferral::CatalogCheckpoint {
+                    busy,
+                    logged,
+                    checkpointed,
+                },
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
-    pub(super) pool: SqlitePool,
-    /// `<home>/images`, where cached rootfs artifacts live; `state.db` is `<home>/state.db`.
-    pub(super) images_dir: PathBuf,
+    pub(crate) pool: SqlitePool,
+    pub(in crate::store) home: PathBuf,
+    /// `<home>/images`, the immutable pool; `state.db` is `<home>/state.db`.
+    pub(in crate::store) images_dir: PathBuf,
+    /// Explicit capability for detached filesystem workers, independent of
+    /// SqlitePool::close; native connections retain their own clone as well.
+    pub(in crate::store) catalog: std::sync::Arc<CatalogGuard>,
+    #[cfg(test)]
+    pub(crate) layer_hook: Option<std::sync::Arc<crate::store::layer_store::tests::WorkerHook>>,
+    #[cfg(any(test, feature = "test-isolated-resource-budget"))]
+    pub(in crate::store) resource_budget_directory: Option<PathBuf>,
 }
 
 impl Store {
+    pub(crate) fn home_path(&self) -> &Path {
+        &self.home
+    }
+    pub(crate) fn images_path(&self) -> &Path {
+        &self.images_dir
+    }
     #[cfg(test)]
     pub(crate) async fn new(paths: &LocalPaths) -> Result<Self, LibVmError> {
         let store = Self::open(&paths.state_db_path()).await?;
@@ -36,11 +93,47 @@ impl Store {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn storage_operation_count(&self) -> Result<i64, LibVmError> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn close(self) {
         self.pool.close().await;
     }
 
     pub(crate) async fn open(state_db_path: &Path) -> Result<Self, LibVmError> {
+        let store = Self::admit(state_db_path).await?;
+        if let Err(error) = store.recover().await {
+            store.pool.close().await;
+            return Err(error);
+        }
+        Ok(store)
+    }
+
+    pub(crate) async fn open_observation(state_db_path: &Path) -> Result<Self, LibVmError> {
+        let store = Self::admit(state_db_path).await?;
+        let recovered = async {
+            Self::log_cache_recovery(store.recover_pending_operations().await?);
+            store.reconcile_restore_budget().await
+        }
+        .await;
+        if let Err(error) = recovered {
+            store.pool.close().await;
+            return Err(error);
+        }
+        Ok(store)
+    }
+
+    /// Connection and schema admission only. No operation recovery or collection.
+    pub(crate) async fn admit(state_db_path: &Path) -> Result<Self, LibVmError> {
         let home = state_db_path.parent().ok_or_else(|| {
             std::io::Error::other(format!(
                 "state database {} has no parent directory",
@@ -48,28 +141,166 @@ impl Store {
             ))
         })?;
         std::fs::create_dir_all(home)?;
-        let pool = Self::connect(state_db_path).await?;
-        MIGRATOR.run(&pool).await?;
+        let guard = CatalogGuard::writable(home).await?;
+        let pool = Self::connect_guarded(state_db_path, guard.clone()).await?;
+        if let Err(error) = MIGRATOR.run(&pool).await {
+            pool.close().await;
+            return Err(match error {
+                sqlx::migrate::MigrateError::VersionMismatch(_)
+                | sqlx::migrate::MigrateError::VersionMissing(_) => {
+                    LibVmError::StateDatabaseIncompatible { source: error }
+                }
+                other => other.into(),
+            });
+        }
         Ok(Self {
             pool,
+            home: home.to_path_buf(),
             images_dir: home.join("images"),
+            catalog: guard,
+            #[cfg(test)]
+            layer_hook: None,
+            #[cfg(any(test, feature = "test-isolated-resource-budget"))]
+            resource_budget_directory: Some(home.join("resource-budget")),
         })
     }
 
+    pub(crate) async fn recover(&self) -> Result<(), LibVmError> {
+        Self::log_cache_recovery(self.recover_pending_image_cache().await?);
+        self.reconcile_restore_budget().await?;
+        Ok(())
+    }
+
+    fn log_cache_recovery(report: crate::store::models::CacheRecoveryReport) {
+        for deferred in report.deferred {
+            match deferred {
+                // A held lease belongs to a live producer, e.g. every
+                // running machine's launch. That is steady state, not news.
+                crate::store::models::CacheCleanupDeferral::ActiveLease { .. }
+                | crate::store::models::CacheCleanupDeferral::CatalogCheckpoint { .. } => {
+                    tracing::debug!(
+                        ?deferred,
+                        "image cache cleanup deferred; bytes and pending jobs retained"
+                    );
+                }
+                crate::store::models::CacheCleanupDeferral::ExternalDependency { .. } => {
+                    tracing::warn!(
+                        ?deferred,
+                        "image cache cleanup deferred; bytes and pending jobs retained"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn connect(path: &Path) -> Result<SqlitePool, LibVmError> {
-        let options = Self::sqlite_options(path);
-        Ok(SqlitePoolOptions::new()
+        let home = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("state database has no parent"))?;
+        let guard = CatalogGuard::writable(home).await?;
+        Self::connect_guarded(path, guard).await
+    }
+
+    async fn connect_guarded(
+        path: &Path,
+        guard: std::sync::Arc<CatalogGuard>,
+    ) -> Result<SqlitePool, LibVmError> {
+        let expected = match crate::storage::identity_file::FileIdentity::from_path(path) {
+            Ok(identity) => Some(identity),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let options = CatalogGuard::attach_sqlite(guard, Self::sqlite_options(path));
+        let pool = SqlitePoolOptions::new()
             .acquire_timeout(Duration::from_secs(30))
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    // Native SQLite ownership of catalog.lock is installed
+                    // before these database-touching PRAGMAs can run.
+                    // WAL+NORMAL stays consistent after any crash. Only commits
+                    // since the previous WAL checkpoint may be lost on power
+                    // loss, never on process crash. This deliberately avoids
+                    // ext4 data=ordered commit fsyncs draining dirty private copies.
+                    sqlx::raw_sql("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;")
+                        .execute(connection).await?;
+                    Ok(())
+                })
+            })
             .connect_with(options)
-            .await?)
+            .await?;
+        if let Some(expected) = expected {
+            if expected != crate::storage::identity_file::FileIdentity::from_path(path)? {
+                pool.close().await;
+                return Err(
+                    std::io::Error::other("state database changed identity while opening").into(),
+                );
+            }
+        }
+        Ok(pool)
+    }
+
+    /// Try maintenance without waiting. Incomplete work never authorizes unlink.
+    pub(crate) async fn try_checkpoint_catalog(
+        &self,
+    ) -> Result<CatalogCheckpointOutcome, LibVmError> {
+        #[cfg(test)]
+        if let Some(hook) = &self.layer_hook {
+            hook.hit(crate::store::layer_store::tests::WorkerPoint::CatalogCheckpoint)?;
+        }
+        let counts = sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(CatalogCheckpointOutcome::from_counts(counts))
+    }
+
+    /// Complete a required power-loss durability boundary after catalog commit.
+    ///
+    /// PASSIVE syncs the database when every WAL frame has been checkpointed:
+    /// <https://www.sqlite.org/c3ref/wal_checkpoint_v2.html>. Requiring that
+    /// completed outcome retains the durability proof without FULL's pending
+    /// writer lock, which can starve unrelated child-durability commits.
+    /// A dedicated guarded connection also leaves every Store pool slot free.
+    pub(crate) async fn checkpoint_catalog(&self) -> Result<(), LibVmError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let options = self
+            .pool
+            .connect_options()
+            .as_ref()
+            .clone()
+            .create_if_missing(false)
+            .busy_timeout(Duration::ZERO);
+        tokio::time::timeout_at(deadline, async {
+            // Cloned options retain the catalog guard's native collation.
+            // As with pool setup, database-touching PRAGMAs run only after
+            // that capability is installed on the new SQLite connection.
+            let mut connection = SqliteConnection::connect_with(&options).await?;
+            sqlx::raw_sql("PRAGMA synchronous = NORMAL; PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;")
+                .execute(&mut connection)
+                .await?;
+            loop {
+                let counts = sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+                    .fetch_one(&mut connection)
+                    .await?;
+                if CatalogCheckpointOutcome::from_counts(counts)
+                    == CatalogCheckpointOutcome::Complete
+                {
+                    return Ok::<_, LibVmError>(());
+                }
+                // Neither readers, writers nor competing checkpointers are
+                // waited on inside SQLite. Retry without holding a writer
+                // lock or a pooled connection, and yield between attempts.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| LibVmError::DurabilityPending)?
     }
 
     fn sqlite_options(path: &Path) -> SqliteConnectOptions {
         SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5))
     }
@@ -77,51 +308,69 @@ impl Store {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReadOnlyStore {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl ReadOnlyStore {
     pub(crate) async fn open_if_exists(state_db_path: &Path) -> Result<Option<Self>, LibVmError> {
-        match std::fs::metadata(state_db_path) {
-            Ok(metadata) if metadata.is_file() => {}
+        let metadata = match std::fs::symlink_metadata(state_db_path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() >= 100 => metadata,
             Ok(_) => {
-                return Err(std::io::Error::other("state database is not a regular file").into())
+                return Err(std::io::Error::other(
+                    "state database is not a regular initialized SQLite file",
+                )
+                .into())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
-        }
-        let mut wal_name = state_db_path.as_os_str().to_os_string();
-        wal_name.push("-wal");
-        if std::fs::exists(std::path::Path::new(&wal_name))? {
-            return Err(std::io::Error::other(format!(
-                "state database {} has an active WAL and cannot be planned without local writes",
-                state_db_path.display()
-            ))
-            .into());
-        }
-
-        let options = SqliteConnectOptions::new()
-            .filename(state_db_path)
-            .read_only(true)
-            .immutable(true)
-            .create_if_missing(false)
-            .busy_timeout(Duration::from_secs(5));
+        };
+        let identity = crate::storage::identity_file::FileIdentity::from_metadata(&metadata);
+        let home = state_db_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("state database has no parent"))?;
+        let guard = CatalogGuard::readonly(home)?;
+        let options = CatalogGuard::attach_sqlite(
+            guard,
+            SqliteConnectOptions::new()
+                .filename(state_db_path)
+                .read_only(true)
+                .create_if_missing(false)
+                .shared_cache(false)
+                .busy_timeout(Duration::from_secs(5)),
+        );
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(30))
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA query_only = ON")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect_with(options)
             .await?;
-        validate_embedded_migration_history(&pool).await?;
+        if identity != crate::storage::identity_file::FileIdentity::from_path(state_db_path)? {
+            pool.close().await;
+            return Err(
+                std::io::Error::other("state database changed identity while opening").into(),
+            );
+        }
+        if let Err(error) = validate_embedded_migration_history(&pool).await {
+            pool.close().await;
+            return Err(error);
+        }
         Ok(Some(Self { pool }))
     }
 
     pub(crate) async fn db_config(
         &self,
     ) -> Result<Option<crate::store::models::DbConfig>, LibVmError> {
-        let row = sqlx::query("SELECT os FROM db_config WHERE id = 1")
+        let os = sqlx::query_scalar::<_, String>("SELECT os FROM db_config WHERE id = 1")
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|row| crate::store::models::DbConfig { os: row.get("os") }))
+        Ok(os.map(|os| crate::store::models::DbConfig { os }))
     }
 
     pub(crate) async fn machine_name_exists(&self, name: &str) -> Result<bool, LibVmError> {
@@ -135,7 +384,9 @@ impl ReadOnlyStore {
     }
 }
 
-async fn validate_embedded_migration_history(pool: &SqlitePool) -> Result<(), LibVmError> {
+pub(crate) async fn validate_embedded_migration_history(
+    pool: &SqlitePool,
+) -> Result<(), LibVmError> {
     let rows = sqlx::query(
         "SELECT version, description, success, checksum FROM _sqlx_migrations ORDER BY version",
     )
@@ -146,25 +397,24 @@ async fn validate_embedded_migration_history(pool: &SqlitePool) -> Result<(), Li
         return Err(LibVmError::StateDecode {
             field: "state_db.migrations",
             message: format!(
-                "applied migration count {} does not match embedded migration count {}",
+                "incompatible state: applied migration count {} does not match embedded migration count {}; reinstall Silo and explicitly wipe state",
                 rows.len(),
                 expected.len()
             ),
         });
     }
     for (row, migration) in rows.iter().zip(expected) {
-        let version: i64 = row.get("version");
-        let description: String = row.get("description");
-        let success: bool = row.get("success");
-        let checksum: Vec<u8> = row.get("checksum");
+        let version: i64 = row.try_get("version")?;
+        let description: String = row.try_get("description")?;
+        let success: bool = row.try_get("success")?;
+        let checksum: Vec<u8> = row.try_get("checksum")?;
         if version != migration.version
             || description != migration.description
             || !success
             || migration.checksum != checksum
         {
-            return Err(LibVmError::StateDecode {
-                field: "state_db.migrations",
-                message: format!("migration {version} does not match the embedded schema"),
+            return Err(LibVmError::StateDatabaseIncompatible {
+                source: sqlx::migrate::MigrateError::VersionMismatch(version),
             });
         }
     }
@@ -172,7 +422,7 @@ async fn validate_embedded_migration_history(pool: &SqlitePool) -> Result<(), Li
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
@@ -190,14 +440,594 @@ mod tests {
     use crate::store::{MachineStore, NetworkStore, Store};
     use crate::LibVmError;
 
+    mod logical_catalog {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/live_catalog.rs"
+        ));
+    }
+
     fn temp_paths() -> (tempfile::TempDir, LocalPaths) {
         let dir = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(dir.path());
         (dir, paths)
     }
 
+    /// A stopped machine whose root came from `image`, so the image is in use.
+    pub(crate) async fn machine_using_image(
+        db: &Store,
+        paths: &LocalPaths,
+        source_kind: crate::ImageSourceKind,
+        image: crate::ImageId,
+    ) -> MachineConfig {
+        let id = MachineId::new();
+        let machine = machine_from_path(id, format!("uses-{id}"), paths.machine(id).dir());
+        let rootfs = MachineRootfsRecord {
+            machine_id: id,
+            source_kind,
+            requested_reference: image.to_string(),
+            selected_reference: None,
+            manifest_digest: None,
+            config_digest: None,
+            image_id: Some(image.to_string()),
+            root_disk_path: paths.machine(id).dir().join("root.raw"),
+            root_disk_size_bytes: 64 * 1024 * 1024,
+            created_at: 7,
+        };
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            rootfs.root_disk_size_bytes,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        let _boot = db.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&machine.spec);
+        db.add_machine_with_rootfs(
+            &machine,
+            &machine_state(id, MachineRuntimeState::Stopped),
+            &rootfs,
+            &storage,
+        )
+        .await
+        .unwrap();
+        machine
+    }
+
+    #[tokio::test]
+    async fn lean_admission_retires_pending_work_without_scanning_pool() {
+        let (_temporary, paths) = temp_paths();
+        let store = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let owner = pool.create_operation_with_lease(operation, lease).unwrap();
+        let source = owner.temporary.join("payload");
+        std::fs::write(&source, [7; 512]).unwrap();
+        let (object, roots) = pool.publish_object_for_catalog(&source).unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[], &[object.digest])
+            .await
+            .unwrap();
+        drop(roots);
+        let staging = owner.temporary.clone();
+        drop(owner);
+        store.close().await;
+
+        let lean = Store::open_observation(&paths.state_db_path())
+            .await
+            .unwrap();
+        assert!(object.path.exists());
+        assert!(!staging.exists());
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)"
+        )
+        .bind(operation.to_string())
+        .fetch_one(&lean.pool)
+        .await
+        .unwrap());
+
+        let before = logical_catalog::snapshot(paths.home()).await;
+        lean.close().await;
+        let lean = Store::open_observation(&paths.state_db_path())
+            .await
+            .unwrap();
+        assert_eq!(logical_catalog::snapshot(paths.home()).await, before);
+        assert!(object.path.exists());
+        lean.close().await;
+        let maintenance = Store::open(&paths.state_db_path()).await.unwrap();
+        assert!(!staging.exists());
+        assert!(!object.path.exists());
+        maintenance.close().await;
+    }
+
+    #[tokio::test]
+    async fn observation_preserves_pending_operation_with_another_live_lease_handle() {
+        let (_temporary, paths) = temp_paths();
+        let store = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let live_lease = lease.duplicate().unwrap();
+        let owner = pool.create_operation_with_lease(operation, lease).unwrap();
+        let staging = owner.temporary.clone();
+        std::fs::write(staging.join("payload"), b"live producer").unwrap();
+        drop(owner);
+        store.close().await;
+
+        let observation = Store::open_observation(&paths.state_db_path())
+            .await
+            .unwrap();
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)"
+        )
+        .bind(operation.to_string())
+        .fetch_one(&observation.pool)
+        .await
+        .unwrap());
+        assert!(staging.join("payload").exists());
+        observation.close().await;
+        drop(live_lease);
+
+        let observation = Store::open_observation(&paths.state_db_path())
+            .await
+            .unwrap();
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)"
+        )
+        .bind(operation.to_string())
+        .fetch_one(&observation.pool)
+        .await
+        .unwrap());
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn healthy_maintenance_admission_does_not_read_published_maps_or_mutate_catalog() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temporary, store, _record, _snapshot, owner, representation) =
+            crate::store::stream_representation::tests::retained_paginated(&[3; 512], 1).await;
+        let pool = crate::storage::pool::StoragePool::open(&store.images_dir).unwrap();
+        drop(owner);
+        store.recover_pending_image_cache().await.unwrap();
+        let before = logical_catalog::snapshot(store.home_path()).await;
+        // A broken immutable metadata object makes an accidental authentication
+        // pass observable without depending on filesystem cache state.
+        let path = pool.object_path(&representation);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, b"map read canary").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        store.pool.close().await;
+        let reopened = Store::open(&store.home_path().join("state.db"))
+            .await
+            .unwrap();
+        assert_eq!(logical_catalog::snapshot(store.home_path()).await, before);
+        assert!(path.exists());
+        assert!(
+            reopened.recover_image_cache().await.is_err(),
+            "explicit recovery authenticates the map canary"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_based_collection_preserves_shared_image_snapshot_and_composition_roots() {
+        use crate::storage::pool::StoragePool;
+        use crate::store::snapshot_store::{SnapshotRef, SnapshotStore};
+        use crate::store::stored_image_store::StoredImageStore;
+        use crate::store::ImageStore;
+
+        let (_temporary, store, record, snapshot, snapshot_owner, representation) =
+            crate::store::stream_representation::tests::retained_paginated(&[3; 512], 1).await;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let lower = retained_lower(&store, store.home_path(), b'G').await;
+        let fsmeta = pool.object_path(&lower.retained().fsmeta());
+        let image_record = crate::ImageRecord {
+            schema: 1,
+            kind: crate::ImageRecordKind::Image,
+            root: record.root.clone(),
+            boot: record.boot.clone(),
+            process: crate::ProcessConfig::default(),
+        };
+        let (streams, objects) = image_record.content_dependencies().unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation(
+                "import",
+                &streams.into_iter().collect::<Vec<_>>(),
+                &objects.into_iter().collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        let image_owner = pool
+            .create_operation_with_lease(operation, lease.duplicate().unwrap())
+            .unwrap();
+        let images = StoredImageStore::from_store(store.clone());
+        let image = images
+            .publish_owned(
+                image_record,
+                operation,
+                lease,
+                Some("shared-roots".into()),
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let source = store.home_path().join("orphan");
+        std::fs::write(&source, b"unrooted candidate").unwrap();
+        let orphan = pool.publish_object(&source).unwrap();
+        let candidates = pool
+            .scan_objects()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let roots = pool.lock_roots().unwrap();
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(
+            crate::store::stream_representation::unreachable_objects(&mut tx, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let unreachable =
+            crate::store::stream_representation::unreachable_objects(&mut tx, &candidates)
+                .await
+                .unwrap();
+        tx.commit().await.unwrap();
+        drop(roots);
+        assert_eq!(unreachable, [orphan.digest]);
+        assert_all_retention_root_classes(&store, image.id, snapshot.id, lower.retained().id).await;
+
+        drop(lower);
+        drop(snapshot_owner);
+        drop(image_owner);
+        let snapshots = SnapshotStore::from_store(store.clone());
+        snapshots
+            .remove(&SnapshotRef::Id(snapshot.id))
+            .await
+            .unwrap();
+        store.recover_pending_image_cache().await.unwrap();
+        assert!(
+            fsmeta.exists(),
+            "catalogued composition survives ordinary recovery"
+        );
+        store.prune_images().await.unwrap();
+        assert!(
+            !fsmeta.exists(),
+            "unrooted composition and layer graph was retired"
+        );
+        assert!(!orphan.path.exists());
+        let flat_state: String =
+            sqlx::query_scalar("SELECT flat_state FROM storage_stream WHERE stream_id=?1")
+                .bind(record.root.stream.stream.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            flat_state, "absent",
+            "explicit prune may evict a reconstructible flat"
+        );
+        assert!(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM image_stream_dependency WHERE image_id=?1 AND stream_id=?2)")
+            .bind(image.id.to_string()).bind(record.root.stream.stream.to_string()).fetch_one(&store.pool).await.unwrap());
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM retained_stream WHERE stream_id=?1)"
+        )
+        .bind(record.root.stream.stream.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap());
+        assert!(pool.object_path(&representation).exists());
+        let consumer = images.consume(image.id).await.unwrap();
+        assert_eq!(
+            std::fs::read(pool.stream_path(&record.root.stream.stream)).unwrap(),
+            [3; 512]
+        );
+        drop(consumer);
+
+        let removal = store
+            .remove_image(
+                crate::store::image_store::LocalImage::Stored(image.id),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(removal.names, ["shared-roots"]);
+        assert!(removal.record_removed);
+        store.recover_pending_image_cache().await.unwrap();
+        assert!(!pool.stream_path(&record.root.stream.stream).exists());
+        assert!(!pool.object_path(&representation).exists());
+        assert!(!pool.object_path(&record.root.stream.map).exists());
+    }
+
+    async fn assert_all_retention_root_classes(
+        store: &Store,
+        image: crate::ImageId,
+        snapshot: crate::SnapshotId,
+        lower: crate::storage::identity::LowerResultId,
+    ) {
+        use crate::storage::identity::ObjectDigest;
+        use crate::storage::pool::StoragePool;
+        use crate::store::snapshot_store::publish_map;
+        use crate::store::stream_representation::{insert_object_binding, unreachable_objects};
+
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let paths = LocalPaths::new(store.home_path());
+        let machine =
+            add_catalog_relative_raw_fixture(store, &paths, "retention-root-classes").await;
+        let generation = store
+            .machine_storage(machine.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .storage_generation;
+        let (recipe_object, result_object, fsmeta_object, layer, pack) =
+            sqlx::query_as::<_, (String, String, String, String, String)>(
+                "SELECT p.record_digest,r.record_digest,r.fsmeta_digest,l.id,l.pack_stream FROM composition_result r JOIN composition_recipe p ON p.id=r.recipe_id JOIN composition_layer c ON c.result_id=r.id AND c.position=0 JOIN layer_result l ON l.id=c.layer_result_id WHERE r.id=?1",
+            ).bind(lower.to_string()).fetch_one(&store.pool).await.unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let owner = pool.create_operation_with_lease(operation, lease).unwrap();
+        let source = owner.temporary.join("root-candidate");
+        std::fs::write(&source, b"independent provenance member").unwrap();
+        let auxiliary = pool.publish_object(&source).unwrap().digest;
+
+        // This is the original object authority union, with branch labels.
+        // Savepoint-scoped edges isolate the SQL retention contract from
+        // publication validation; every candidate has real immutable bytes.
+        let original_object_query = "WITH original_roots(kind,object_digest) AS (
+            SELECT 'machine-object',object_digest FROM machine_object_dependency
+            UNION ALL SELECT 'layer-object',object_digest FROM layer_object_dependency
+            UNION ALL SELECT 'composition-recipe',record_digest FROM composition_recipe
+            UNION ALL SELECT 'composition-record',record_digest FROM composition_result
+            UNION ALL SELECT 'composition-fsmeta',fsmeta_digest FROM composition_result
+            UNION ALL SELECT 'operation-object',object_digest FROM storage_operation_object
+            UNION ALL SELECT 'snapshot-object',object_digest FROM snapshot_object_dependency
+            UNION ALL SELECT 'image-object',object_digest FROM image_object_dependency
+            UNION ALL SELECT 'capture-evidence',evidence_digest FROM snapshot_capture_provenance
+            UNION ALL SELECT 'capture-changes',changes_digest FROM snapshot_capture_change
+            UNION ALL SELECT 'imported-provenance',provenance_digest FROM snapshot_imported_capture
+            UNION ALL SELECT 'imported-evidence',evidence_digest FROM snapshot_imported_capture
+            UNION ALL SELECT 'imported-changes',changes_digest FROM snapshot_imported_capture
+            UNION ALL SELECT 'image-acquisition',receipt_digest FROM managed_artifact_acquisition a WHERE managed_kind='image' AND EXISTS(SELECT 1 FROM storage_image WHERE id=a.managed_id)
+            UNION ALL SELECT 'snapshot-acquisition',receipt_digest FROM managed_artifact_acquisition a WHERE managed_kind='snapshot' AND EXISTS(SELECT 1 FROM storage_snapshot WHERE id=a.managed_id)
+            ) SELECT DISTINCT kind FROM original_roots WHERE object_digest=?1 ORDER BY kind";
+        let missing = uuid::Uuid::new_v4();
+        let parents = serde_json::json!({
+            "machine": machine.id.to_string(),
+            "generation": generation,
+            "layer": layer,
+            "operation": operation.to_string(),
+            "snapshot": snapshot.to_string(),
+            "image": image.to_string(),
+            "auxiliary": auxiliary.to_string(),
+            "missing": missing.to_string(),
+        })
+        .to_string();
+        let object_cases = [
+            ("machine-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO machine_object_dependency(machine_id,generation,object_digest) SELECT json_extract(parents,'$.machine'),json_extract(parents,'$.generation'),digest FROM candidate"), true, true),
+            ("layer-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO layer_object_dependency(result_id,object_digest) SELECT json_extract(parents,'$.layer'),digest FROM candidate"), true, true),
+            ("composition-recipe", Some(recipe_object.parse::<ObjectDigest>().unwrap()), None, true, true),
+            ("composition-record", Some(result_object.parse::<ObjectDigest>().unwrap()), None, true, true),
+            ("composition-fsmeta", Some(fsmeta_object.parse::<ObjectDigest>().unwrap()), None, true, true),
+            ("operation-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO storage_operation_object(operation_id,object_digest) SELECT json_extract(parents,'$.operation'),digest FROM candidate"), true, true),
+            ("snapshot-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_object_dependency(snapshot_id,object_digest) SELECT json_extract(parents,'$.snapshot'),digest FROM candidate"), true, true),
+            ("image-object", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO image_object_dependency(image_id,object_digest) SELECT json_extract(parents,'$.image'),digest FROM candidate"), true, true),
+            ("capture-evidence", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes,plan_bytes) SELECT json_extract(parents,'$.operation'),json_extract(parents,'$.snapshot'),digest,bytes,bytes FROM candidate"), true, true),
+            ("capture-changes", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_capture_change(snapshot_id,changes_digest) SELECT json_extract(parents,'$.snapshot'),digest FROM candidate"), true, true),
+            ("imported-provenance", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,changes_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),digest,json_extract(parents,'$.auxiliary'),json_extract(parents,'$.auxiliary'),bytes FROM candidate"), true, true),
+            ("imported-evidence", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,changes_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),json_extract(parents,'$.auxiliary'),digest,json_extract(parents,'$.auxiliary'),bytes FROM candidate"), true, true),
+            ("imported-changes", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO snapshot_imported_capture(snapshot_id,provenance_digest,evidence_digest,changes_digest,provenance_bytes) SELECT json_extract(parents,'$.snapshot'),json_extract(parents,'$.auxiliary'),json_extract(parents,'$.auxiliary'),digest,bytes FROM candidate"), true, true),
+            ("image-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'image',json_extract(parents,'$.image'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), true, true),
+            ("snapshot-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'snapshot',json_extract(parents,'$.snapshot'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), true, true),
+            ("missing-image-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'image',json_extract(parents,'$.missing'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), false, false),
+            ("missing-snapshot-acquisition", None, Some("WITH candidate(digest,bytes,parents) AS (VALUES(?1,?2,json(?3))) INSERT INTO managed_artifact_acquisition(managed_kind,managed_id,index_digest,receipt_digest,receipt_bytes,encoding_bytes) SELECT 'snapshot',json_extract(parents,'$.missing'),json_extract(parents,'$.auxiliary'),digest,bytes,bytes FROM candidate"), false, false),
+            ("representation-object", None, None, false, true),
+        ];
+        for (kind, existing, insert, base_retained, object_retained) in object_cases {
+            let object = match existing {
+                Some(object) => object,
+                None => {
+                    std::fs::write(&source, format!("independent retention object: {kind}"))
+                        .unwrap();
+                    pool.publish_object(&source).unwrap().digest
+                }
+            };
+            let bytes = std::fs::read(pool.object_path(&object)).unwrap();
+            let stream = pool.publish_stream(&pool.object_path(&object)).unwrap();
+            let content = publish_map(&pool, store, operation, &stream.map)
+                .await
+                .unwrap();
+            let _roots = pool.lock_roots().unwrap();
+            let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            // Composition objects may also be pinned by their acquisition.
+            sqlx::query("DELETE FROM storage_operation_object WHERE object_digest=?1")
+                .bind(object.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            // Map publication independently pins the stream; exclude that
+            // authority while testing only the whole-object binding.
+            sqlx::query("DELETE FROM storage_operation_stream WHERE stream_id=?1")
+                .bind(stream.id.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,chunk_shift,flat_state) VALUES(?1,?2,?3,23,'present') ON CONFLICT DO NOTHING")
+                .bind(stream.id.to_string()).bind(stream.length as i64).bind(content.map.to_string())
+                .execute(&mut *tx).await.unwrap();
+            insert_object_binding(&mut tx, object, stream.id)
+                .await
+                .unwrap();
+            if let Some(insert) = insert {
+                sqlx::query(insert)
+                    .bind(object.to_string())
+                    .bind(&bytes)
+                    .bind(&parents)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            if kind == "representation-object" {
+                sqlx::query(
+                    "INSERT INTO stream_representation(stream_id,root_digest) VALUES(?1,?2)",
+                )
+                .bind(stream.id.to_string())
+                .bind(content.map.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO stream_representation_object(stream_id,root_digest,object_digest) VALUES(?1,?2,?3)")
+                    .bind(stream.id.to_string()).bind(content.map.to_string()).bind(object.to_string()).execute(&mut *tx).await.unwrap();
+            }
+            let original = sqlx::query_scalar::<_, String>(original_object_query)
+                .bind(object.to_string())
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+            let expected = if base_retained {
+                vec![kind.to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(original, expected, "{kind}: isolated original authority");
+            assert_eq!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM retained_base_object WHERE object_digest=?1)"
+                )
+                .bind(object.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+                base_retained,
+                "{kind}"
+            );
+            assert_eq!(
+                unreachable_objects(&mut tx, &[object])
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                object_retained,
+                "{kind}: canonical object"
+            );
+            let directly_rooted: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM machine_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM storage_operation_stream WHERE stream_id=?1 UNION ALL SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM image_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM layer_result WHERE pack_stream=?1)",
+            ).bind(stream.id.to_string()).fetch_one(&mut *tx).await.unwrap();
+            assert!(
+                !directly_rooted,
+                "{kind}: whole-object authority must be isolated from direct stream roots"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM retained_stream WHERE stream_id=?1)"
+                )
+                .bind(stream.id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+                base_retained,
+                "{kind}: whole-object stream"
+            );
+            // Representation membership alone must not create a self-rooting
+            // whole-object stream cycle.
+            tx.rollback().await.unwrap();
+        }
+
+        let original_stream_query = "WITH original_roots(kind,stream_id) AS (
+            SELECT 'machine-stream',stream_id FROM machine_stream_dependency
+            UNION ALL SELECT 'operation-stream',stream_id FROM storage_operation_stream
+            UNION ALL SELECT 'snapshot-stream',stream_id FROM snapshot_stream_dependency
+            UNION ALL SELECT 'image-stream',stream_id FROM image_stream_dependency
+            UNION ALL SELECT 'layer-pack',pack_stream FROM layer_result
+            ) SELECT DISTINCT kind FROM original_roots WHERE stream_id=?1 ORDER BY kind";
+        let stream_cases = [
+            ("machine-stream", Some("INSERT INTO machine_stream_dependency(machine_id,generation,stream_id) VALUES(json_extract(?2,'$.machine'),json_extract(?2,'$.generation'),?1)")),
+            ("operation-stream", Some("INSERT INTO storage_operation_stream(operation_id,stream_id) VALUES(json_extract(?2,'$.operation'),?1)")),
+            ("snapshot-stream", Some("INSERT INTO snapshot_stream_dependency(snapshot_id,stream_id) VALUES(json_extract(?2,'$.snapshot'),?1)")),
+            ("image-stream", Some("INSERT INTO image_stream_dependency(image_id,stream_id) VALUES(json_extract(?2,'$.image'),?1)")),
+            ("layer-pack", None),
+        ];
+        for (kind, insert) in stream_cases {
+            if kind == "layer-pack" {
+                let stream: crate::storage::identity::StreamId = pack.parse().unwrap();
+                std::fs::copy(pool.stream_path(&stream), &source).unwrap();
+            } else {
+                std::fs::write(&source, format!("independent retention stream: {kind}")).unwrap();
+            }
+            let published = pool.publish_stream(&source).unwrap();
+            let stream = published.id;
+            let content = publish_map(&pool, store, operation, &published.map)
+                .await
+                .unwrap();
+            let member = pool.publish_object(&source).unwrap().digest;
+            let _roots = pool.lock_roots().unwrap();
+            let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            sqlx::query("DELETE FROM storage_operation_stream WHERE stream_id=?1")
+                .bind(stream.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO storage_stream(stream_id,length,map_digest,chunk_shift,flat_state) VALUES(?1,?2,?3,23,'present') ON CONFLICT DO NOTHING")
+                .bind(stream.to_string()).bind(published.length as i64).bind(content.map.to_string())
+                .execute(&mut *tx).await.unwrap();
+            sqlx::query(
+                "INSERT OR IGNORE INTO stream_representation(stream_id,root_digest) VALUES(?1,?2)",
+            )
+            .bind(stream.to_string())
+            .bind(content.map.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query("INSERT OR IGNORE INTO stream_representation_object(stream_id,root_digest,object_digest) VALUES(?1,?2,?3)")
+                .bind(stream.to_string()).bind(content.map.to_string()).bind(member.to_string()).execute(&mut *tx).await.unwrap();
+            if let Some(insert) = insert {
+                sqlx::query(insert)
+                    .bind(stream.to_string())
+                    .bind(&parents)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let original = sqlx::query_scalar::<_, String>(original_stream_query)
+                .bind(stream.to_string())
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(original, [kind], "{kind}: isolated original authority");
+            let unretained: Vec<String> = sqlx::query_scalar("SELECT c.value FROM json_each(?1) c LEFT JOIN retained_stream r ON r.stream_id=c.value WHERE r.stream_id IS NULL")
+                .bind(serde_json::to_string(&[stream]).unwrap()).fetch_all(&mut *tx).await.unwrap();
+            assert!(unretained.is_empty(), "{kind}: flat anti-join");
+            sqlx::query("DELETE FROM storage_stream WHERE stream_id=?1 AND stream_id NOT IN (SELECT stream_id FROM retained_stream)")
+                .bind(stream.to_string()).execute(&mut *tx).await.unwrap();
+            assert!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM storage_stream WHERE stream_id=?1)"
+                )
+                .bind(stream.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+                "{kind}: retained representation"
+            );
+            assert!(
+                unreachable_objects(&mut tx, &[member])
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{kind}: representation member"
+            );
+            tx.rollback().await.unwrap();
+        }
+        drop(owner);
+        store.remove_machine(&machine).await.unwrap();
+    }
+
     fn machine_from_path(id: MachineId, name: String, machine_dir: &Path) -> MachineConfig {
         MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: LockId::from(0),
             name,
@@ -247,6 +1077,113 @@ mod tests {
         db.add_machine(config, &state)
             .await
             .expect("insert machine");
+    }
+
+    /// A real retained layered lower: one ingested layer composed with a
+    /// repeated occurrence for the host platform. The returned hold leases the
+    /// exact closure until a machine, image or operation roots it.
+    pub(crate) async fn retained_lower(
+        store: &Store,
+        scratch: &Path,
+        byte: u8,
+    ) -> crate::store::composition_store::HeldComposition {
+        let layers = crate::store::layer_store::LayerStore::from_store(store.clone());
+        let staged = crate::store::layer_store::tests::staged_byte(scratch, &layers, byte);
+        let layer = layers
+            .publish(staged, &oci::changeset::ChangesetLimits::default())
+            .await
+            .unwrap();
+        layers
+            .compose_retained(
+                oci::Platform::host().unwrap(),
+                &[layer.id, layer.id],
+                &oci::changeset::ChangesetLimits::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn leased_layered_machine(
+        db: &Store,
+        paths: &LocalPaths,
+        held: &crate::store::composition_store::HeldComposition,
+    ) -> (
+        MachineConfig,
+        crate::store::operation_store::LaunchStorageLease,
+    ) {
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "layered-launch".into(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        seed_machine(db, &config).await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        layered_machine(&mut config, &mut storage, held);
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        let lease = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        (config, lease)
+    }
+
+    /// Turn a seeded raw machine into the exact layered root over `held`:
+    /// freshly formatted private upper, launch roots and the root marker.
+    pub(crate) fn layered_machine(
+        config: &mut MachineConfig,
+        storage: &mut crate::MachineStorageRecord,
+        held: &crate::store::composition_store::HeldComposition,
+    ) {
+        let capacity = 64 * 1024 * 1024;
+        let upper = disk_image::ext4::upper::format_upper(
+            &config.machine_dir.join("upper.raw"),
+            rootfs_spec::upper_geometry::UpperCapacity::new(capacity).unwrap(),
+        )
+        .unwrap();
+        let lower = held.retained().overlay_lower();
+        config.root_disk_size = Some(capacity);
+        config.spec.storage = Some(vm_spec::Storage {
+            disks: vec![
+                crate::machine::root_storage::disk(
+                    "lower.vmdk",
+                    vm_spec::DiskRole::RootLower,
+                    lower.geometry().length,
+                    "silo-root-lower".into(),
+                )
+                .unwrap(),
+                crate::machine::root_storage::disk(
+                    "upper.raw",
+                    vm_spec::DiskRole::RootUpper,
+                    capacity,
+                    "silo-root-upper".into(),
+                )
+                .unwrap(),
+            ],
+        });
+        config.spec.boot = Some(vm_spec::Boot {
+            kernel: Some(vm_spec::Kernel {
+                path: None,
+                initramfs: None,
+                cmdline: vec![crate::machine::root_storage::ROOT_MARKER.into()],
+            }),
+            userdata: None,
+        });
+        storage.root = crate::MachineRoot::LinuxOverlay {
+            lower,
+            upper: crate::PrivatePath::new("upper.raw").unwrap(),
+            upper_uuid: upper.uuid,
+            capacity,
+            ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
+            overlay_profile: crate::OverlayProfile::SiloOverlayV1,
+            temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
+        };
+        storage.profile = crate::StorageProfile::LinuxOverlayV1;
+        storage.backend = crate::BackendRequirement::KrunOverlay;
+        if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
+            *root_selector = crate::RootSelector::ManagedOverlay;
+        }
+        storage.bind_disk_identity_inventory(&config.spec);
+        storage.validate().unwrap();
     }
 
     fn network_instance(id: &str, definition_name: Option<&str>) -> NetworkInstance {
@@ -323,85 +1260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_database_has_complete_schema_without_runtime_paths() {
-        let (_dir, paths) = temp_paths();
-        let db = Store::new(&paths).await.expect("open fresh database");
-
-        let tables = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .expect("list tables")
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        let required_tables = BTreeSet::from([
-            "db_config".to_string(),
-            "machine_config".to_string(),
-            "machine_state".to_string(),
-            "network_instances".to_string(),
-            "network_attachments".to_string(),
-            "network_definitions".to_string(),
-            "image_manifest".to_string(),
-            "image_ref".to_string(),
-            "image_config".to_string(),
-            "image_layer".to_string(),
-            "image_manifest_layer".to_string(),
-            "image_rootfs_artifact".to_string(),
-            "machine_rootfs".to_string(),
-        ]);
-        assert!(required_tables.is_subset(&tables));
-
-        let db_config_columns = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM pragma_table_info('db_config') ORDER BY cid",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .expect("list db_config columns");
-        assert_eq!(db_config_columns, ["id", "os", "created_at", "modified_at"]);
-
-        let network_columns = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM pragma_table_info('network_instances') ORDER BY cid",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .expect("list network instance columns");
-        assert!(!network_columns.iter().any(|column| column == "runtime_dir"));
-
-        let schema_objects = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM sqlite_master WHERE type IN ('index', 'trigger')",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .expect("list indexes and triggers")
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        for object in [
-            "network_instances_definition_name_unique",
-            "image_ref_manifest_digest_idx",
-            "image_manifest_layer_layer_diff_id_idx",
-            "image_rootfs_artifact_manifest_digest_idx",
-            "machine_rootfs_manifest_digest_idx",
-            "db_config_created_at_immutable",
-            "network_instances_created_at_immutable",
-            "network_attachments_created_at_immutable",
-            "network_definitions_created_at_immutable",
-            "image_manifest_created_at_immutable",
-            "image_ref_created_at_immutable",
-            "image_config_created_at_immutable",
-            "image_layer_created_at_immutable",
-            "image_rootfs_artifact_created_at_immutable",
-            "machine_rootfs_created_at_immutable",
-        ] {
-            assert!(
-                schema_objects.contains(object),
-                "missing schema object {object}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn old_migration_history_is_rejected() {
+    async fn incompatible_schema_refusal_preserves_existing_state() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let state_db = dir.path().join("state.db");
         std::fs::File::create(&state_db).expect("create old state database");
@@ -429,15 +1288,36 @@ mod tests {
         .execute(&pool)
         .await
         .expect("record old migration");
+        sqlx::query("CREATE TABLE owner_data (value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO owner_data VALUES ('must survive refusal')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retained_file = dir.path().join("owner-root.raw");
+        std::fs::write(&retained_file, b"owner bytes").unwrap();
         pool.close().await;
 
         let error = Store::open(&state_db)
             .await
             .expect_err("old state database must not be adopted");
-        assert!(
-            error.to_string().contains("migration") || error.to_string().contains("checksum"),
-            "unexpected migration rejection: {error}"
-        );
+        assert!(matches!(
+            error,
+            LibVmError::StateDatabaseIncompatible { .. }
+        ));
+        let retained = sqlx::SqlitePool::connect(&format!("sqlite://{}", state_db.display()))
+            .await
+            .unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM owner_data")
+            .fetch_one(&retained)
+            .await
+            .unwrap();
+        assert_eq!(value, "must survive refusal");
+        retained.close().await;
+        assert_eq!(std::fs::read(retained_file).unwrap(), b"owner bytes");
+        assert!(state_db.is_file());
     }
 
     #[tokio::test]
@@ -460,6 +1340,27 @@ mod tests {
             db.machine_state(id).await.expect("lookup state"),
             Some(state)
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_direct_boot_refuses_transient_selection_without_replacing_old_bundle() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "pinned-only".into(), paths.machine(id).dir());
+        db.add_machine(&config, &machine_state(id, MachineRuntimeState::Stopped))
+            .await
+            .unwrap();
+        let original = db.machine_storage(id).await.unwrap().unwrap();
+        let mut transient = original.clone();
+        if let crate::BootProfile::LinuxDirect { binding, .. } = &mut transient.boot {
+            *binding = crate::BootBinding::RuntimeSelected;
+        }
+        assert!(db
+            .save_machine_config_with_storage(&config, &transient)
+            .await
+            .is_err());
+        assert_eq!(db.machine_storage(id).await.unwrap().unwrap(), original);
     }
 
     #[tokio::test]
@@ -486,15 +1387,24 @@ mod tests {
             manifest_digest: Some("sha256:manifest".to_string()),
             config_digest: Some("sha256:config".to_string()),
             image_id: Some("sha256:image-id".to_string()),
-            root_disk_path: paths.machine(id).dir().join("rootfs.img"),
+            root_disk_path: paths.machine(id).dir().join("root.raw"),
             root_disk_size_bytes: 64 * 1024 * 1024,
             created_at: 7,
         };
 
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            rootfs.root_disk_size_bytes,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        let _boot = db.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&machine.spec);
         db.add_machine_with_rootfs(
             &machine,
             &machine_state(id, MachineRuntimeState::Stopped),
             &rootfs,
+            &storage,
         )
         .await
         .expect("insert machine rootfs pin");
@@ -607,12 +1517,197 @@ mod tests {
         let id_str = id.to_string();
         let prefix = &id_str[..8];
         let found = db
-            .machine_configs_by_id_prefix(prefix)
+            .machine_configs_by_id_prefix(prefix, prefix)
             .await
             .expect("lookup");
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], metadata);
+    }
+
+    #[tokio::test]
+    async fn discovery_filters_constructed_rows_before_name_and_prefix_resolution() {
+        let (_temporary, paths) = temp_paths();
+        let store = Store::new(&paths).await.unwrap();
+        let named_id: MachineId = "11111111111141118111111111111111".parse().unwrap();
+        let first_id: MachineId = "def00000000040008000000000000001".parse().unwrap();
+        let second_id: MachineId = "def00000000040008000000000000002".parse().unwrap();
+        let named = machine_from_path(named_id, "def".into(), paths.machine(named_id).dir());
+        let first = machine_from_path(first_id, "first".into(), paths.machine(first_id).dir());
+        let second = machine_from_path(second_id, "second".into(), paths.machine(second_id).dir());
+        for config in [&named, &first, &second] {
+            seed_machine(&store, config).await;
+        }
+        for id in [named_id, second_id] {
+            sqlx::query("UPDATE machine_config SET durability='constructed' WHERE id=?1")
+                .bind(id.to_string())
+                .execute(store.test_pool())
+                .await
+                .unwrap();
+        }
+        let observer = crate::store::observation::ObservationStore::existing(&store);
+        let reference = crate::MachineRef::parse("def").unwrap();
+        assert_eq!(
+            store
+                .discover_machine(&reference)
+                .await
+                .unwrap()
+                .config
+                .unwrap(),
+            first
+        );
+        assert_eq!(observer.lookup(&reference).await.unwrap().0, first);
+        assert_eq!(store.machine_inventory().await.unwrap().len(), 1);
+        for reference in [
+            crate::MachineRef::id(named_id),
+            crate::MachineRef::id(second_id),
+            crate::MachineRef::parse("second").unwrap(),
+        ] {
+            assert!(matches!(
+                store.discover_machine(&reference).await,
+                Err(LibVmError::MachineNotFound { .. })
+            ));
+            assert!(matches!(
+                observer.lookup(&reference).await,
+                Err(LibVmError::MachineNotFound { .. })
+            ));
+        }
+        assert_eq!(
+            store.machine_config(named_id).await.unwrap(),
+            Some(named.clone())
+        );
+        assert_eq!(
+            store.machine_config_by_name("def").await.unwrap(),
+            Some(named.clone())
+        );
+        assert!(store.machine_name_in_use("def").await.unwrap());
+        store.mark_child_durable(named_id).await.unwrap();
+        assert_eq!(
+            store
+                .discover_machine(&reference)
+                .await
+                .unwrap()
+                .config
+                .unwrap(),
+            named
+        );
+        assert_eq!(observer.lookup(&reference).await.unwrap().0, named);
+        store.mark_child_durable(second_id).await.unwrap();
+        let prefix = crate::MachineRef::parse("def0").unwrap();
+        assert!(matches!(
+            store.discover_machine(&prefix).await,
+            Err(LibVmError::AmbiguousIdPrefix { count: 2, .. })
+        ));
+        assert!(matches!(
+            observer.lookup(&prefix).await,
+            Err(LibVmError::AmbiguousIdPrefix { count: 2, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn lookup_hex_names_precedes_prefixes_in_writable_and_observation_stores() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let named_id: MachineId = "11111111111141118111111111111111".parse().unwrap();
+        let named = machine_from_path(named_id, "def".into(), paths.machine(named_id).dir());
+        seed_machine(&db, &named).await;
+        let observer = crate::store::observation::ObservationStore::existing(&db);
+
+        let found = db.machine_configs_by_id_prefix("def", "def").await.unwrap();
+        assert_eq!(found, vec![named.clone()]);
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("def").unwrap())
+                .await
+                .unwrap()
+                .0,
+            named
+        );
+
+        let first_id: MachineId = "def00000000040008000000000000001".parse().unwrap();
+        let first = machine_from_path(first_id, "first".into(), paths.machine(first_id).dir());
+        seed_machine(&db, &first).await;
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def", "def").await.unwrap(),
+            vec![named.clone()]
+        );
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("def").unwrap())
+                .await
+                .unwrap()
+                .0,
+            named
+        );
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def0", "def0")
+                .await
+                .unwrap(),
+            vec![first.clone()]
+        );
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("DeF0").unwrap())
+                .await
+                .unwrap()
+                .0,
+            first
+        );
+
+        let second_id: MachineId = "def00000000040008000000000000002".parse().unwrap();
+        let second = machine_from_path(second_id, "second".into(), paths.machine(second_id).dir());
+        seed_machine(&db, &second).await;
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def", "def").await.unwrap(),
+            vec![named.clone()]
+        );
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("def").unwrap())
+                .await
+                .unwrap()
+                .0,
+            named
+        );
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def0", "def0")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            observer.lookup(&crate::MachineRef::parse("def0").unwrap()).await,
+            Err(LibVmError::AmbiguousIdPrefix { prefix, count: 2 }) if prefix == "def0"
+        ));
+        assert!(matches!(
+            observer
+                .lookup(&crate::MachineRef::parse("DEF").unwrap())
+                .await,
+            Err(LibVmError::AmbiguousIdPrefix { .. })
+        ));
+        assert!(matches!(
+            observer
+                .lookup(&crate::MachineRef::parse("abc").unwrap())
+                .await,
+            Err(LibVmError::MachineNotFound { .. })
+        ));
+
+        let legacy_id: MachineId = "22222222222242228222222222222222".parse().unwrap();
+        let legacy = machine_from_path(legacy_id, "DeF".into(), paths.machine(legacy_id).dir());
+        seed_machine(&db, &legacy).await;
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def", "DeF").await.unwrap(),
+            vec![legacy.clone()]
+        );
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("DeF").unwrap())
+                .await
+                .unwrap()
+                .0,
+            legacy
+        );
     }
 
     #[tokio::test]
@@ -624,7 +1719,7 @@ mod tests {
 
         for prefix in invalid_prefixes {
             let err = db
-                .machine_configs_by_id_prefix(prefix)
+                .machine_configs_by_id_prefix(prefix, prefix)
                 .await
                 .expect_err("invalid prefix should fail");
             assert!(
@@ -645,6 +1740,7 @@ mod tests {
         metadata.insert("silo.note".to_string(), "test value".to_string());
 
         let machine = MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id,
             lock_id: LockId::from(42),
             name: "jsonb-test".to_string(),
@@ -759,6 +1855,285 @@ mod tests {
         let found = db.machine_config(id).await.expect("lookup");
         assert!(found.is_none());
         assert!(db.machine_state(id).await.expect("lookup").is_none());
+    }
+
+    #[tokio::test]
+    async fn machine_removal_checkpoints_before_releasing_its_identity() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "removed".to_owned(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let mut reader = db.pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM machine_config")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            db.remove_machine(&config),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert!(matches!(error, LibVmError::DurabilityPending), "{error}");
+        assert!(error.to_string().contains("retrying the command is safe"));
+        assert!(db.machine_config(id).await.unwrap().is_none());
+        reader.rollback().await.unwrap();
+        db.remove_machine(&config).await.unwrap();
+    }
+
+    async fn pin_catalog_wal(db: &Store) -> sqlx::Transaction<'static, sqlx::Sqlite> {
+        db.execute_test_sql(
+            "CREATE TABLE checkpoint_probe(value INTEGER NOT NULL); INSERT INTO checkpoint_probe VALUES(0)",
+        )
+        .await
+        .unwrap();
+        db.checkpoint_catalog().await.unwrap();
+        let mut reader = db.pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT value FROM checkpoint_probe")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        db.execute_test_sql("UPDATE checkpoint_probe SET value=1")
+            .await
+            .unwrap();
+        reader
+    }
+
+    #[tokio::test]
+    async fn required_checkpoint_waits_for_reader_then_completes() {
+        use std::time::Duration;
+
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let reader = pin_catalog_wal(&db).await;
+        assert!(matches!(
+            db.try_checkpoint_catalog().await.unwrap(),
+            crate::store::storage::CatalogCheckpointOutcome::Incomplete { .. }
+        ));
+        let boundary = db.checkpoint_catalog();
+        tokio::pin!(boundary);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut boundary)
+                .await
+                .is_err()
+        );
+        reader.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), boundary)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.try_checkpoint_catalog().await.unwrap(),
+            crate::store::storage::CatalogCheckpointOutcome::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn required_checkpoint_retries_a_competing_checkpointer() {
+        use std::time::Duration;
+
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let reader = pin_catalog_wal(&db).await;
+        let mut connection = db.pool.acquire().await.unwrap();
+        connection.close_on_drop();
+        sqlx::query("PRAGMA busy_timeout=10000")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let competing = tokio::spawn(async move {
+            sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(FULL)")
+                .fetch_one(&mut *connection)
+                .await
+        });
+        // Witness SQLite's checkpoint lock, not merely a task being scheduled.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    db.try_checkpoint_catalog().await.unwrap(),
+                    crate::store::storage::CatalogCheckpointOutcome::Incomplete { busy: true, .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let boundary = db.checkpoint_catalog();
+        tokio::pin!(boundary);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut boundary)
+                .await
+                .is_err()
+        );
+        reader.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), boundary)
+            .await
+            .unwrap()
+            .unwrap();
+        let (busy, logged, checkpointed) = competing.await.unwrap().unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(logged, checkpointed);
+    }
+
+    #[tokio::test]
+    async fn required_checkpoint_times_out_behind_a_competing_checkpointer() {
+        use std::time::Duration;
+
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let reader = pin_catalog_wal(&db).await;
+        let mut connection = db.pool.acquire().await.unwrap();
+        // Keep the competing checkpoint lock beyond our five-second deadline.
+        // The connection is discarded so this test-local timeout cannot leak.
+        connection.close_on_drop();
+        sqlx::query("PRAGMA busy_timeout=10000")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let competing = tokio::spawn(async move {
+            sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(FULL)")
+                .fetch_one(&mut *connection)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    db.try_checkpoint_catalog().await.unwrap(),
+                    crate::store::storage::CatalogCheckpointOutcome::Incomplete { busy: true, .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(7), db.checkpoint_catalog())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, LibVmError::DurabilityPending), "{error}");
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        reader.rollback().await.unwrap();
+        let (busy, logged, checkpointed) = competing.await.unwrap().unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(logged, checkpointed);
+        db.checkpoint_catalog().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_checkpoint_leaves_single_connection_writers_unblocked() {
+        use std::time::Duration;
+
+        let (_dir, paths) = temp_paths();
+        let mut db = Store::new(&paths).await.unwrap();
+        let options = db.pool.connect_options().as_ref().clone();
+        let single = db
+            .pool
+            .options()
+            .clone()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        db.pool.close().await;
+        db.pool = single;
+        db.execute_test_sql(
+            "CREATE TABLE checkpoint_probe(value INTEGER NOT NULL); INSERT INTO checkpoint_probe VALUES(0)",
+        )
+        .await
+        .unwrap();
+        db.checkpoint_catalog().await.unwrap();
+        let readers = Store::connect(&paths.state_db_path()).await.unwrap();
+        let mut pinned = readers.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT value FROM checkpoint_probe")
+            .fetch_one(&mut *pinned)
+            .await
+            .unwrap();
+        db.execute_test_sql("UPDATE checkpoint_probe SET value=1")
+            .await
+            .unwrap();
+
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let sampling_pool = readers.clone();
+        let sampler = tokio::spawn(async move {
+            let mut ready = Some(ready);
+            let mut samples = 0;
+            loop {
+                let mut reader = sampling_pool.begin().await.unwrap();
+                sqlx::query_scalar::<_, i64>("SELECT value FROM checkpoint_probe")
+                    .fetch_one(&mut *reader)
+                    .await
+                    .unwrap();
+                reader.rollback().await.unwrap();
+                samples += 1;
+                if let Some(ready) = ready.take() {
+                    ready.send(()).unwrap();
+                }
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+            }
+            samples
+        });
+        tokio::time::timeout(Duration::from_millis(500), started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let checkpoint_store = db.clone();
+        let mut boundary = tokio::spawn(async move { checkpoint_store.checkpoint_catalog().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut boundary)
+                .await
+                .is_err()
+        );
+        // This fails both if the barrier checks out the only pool connection
+        // and if it holds FULL's database-wide writer lock behind the reader.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            db.execute_test_sql("UPDATE checkpoint_probe SET value=2"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut boundary)
+                .await
+                .is_err()
+        );
+        pinned.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), boundary)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // NOOP observes the completed durability proof without making any
+        // checkpoint progress itself.
+        let (busy, logged, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(NOOP)")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(logged, checkpointed);
+        let committed: i64 = sqlx::query_scalar("SELECT value FROM checkpoint_probe")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(committed, 2);
+        stop.send(()).unwrap();
+        assert!(sampler.await.unwrap() > 1);
+        readers.close().await;
     }
 
     #[tokio::test]
@@ -1352,5 +2727,2394 @@ mod tests {
             .expect("should find machine from other connection");
 
         assert_eq!(found.id, id);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_connections_use_wal_normal_and_fullfsync() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let mut first = db.pool.acquire().await.unwrap();
+        let mut second = db.pool.acquire().await.unwrap();
+        for connection in [&mut first, &mut second] {
+            let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            let fullfsync: i64 = sqlx::query_scalar("PRAGMA fullfsync")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            let checkpoint_fullfsync: i64 = sqlx::query_scalar("PRAGMA checkpoint_fullfsync")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            assert_eq!(journal, "wal");
+            assert_eq!(sync, 1);
+            assert_eq!(fullfsync, 1);
+            assert_eq!(checkpoint_fullfsync, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_planning_excludes_writers_and_outliving_pool_clones() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = db.pool.clone();
+        drop(db);
+        assert!(
+            crate::store::ReadOnlyStore::open_if_exists(&paths.state_db_path())
+                .await
+                .is_err()
+        );
+        pool.close().await;
+        drop(pool);
+        let readonly = crate::store::ReadOnlyStore::open_if_exists(&paths.state_db_path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(readonly.db_config().await.unwrap().is_some());
+        // Writers cannot acquire even their first connection during read-only planning.
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            Store::open(&paths.state_db_path())
+        )
+        .await
+        .is_err());
+        let readonly_pool = readonly.pool.clone();
+        drop(readonly);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            Store::open(&paths.state_db_path())
+        )
+        .await
+        .is_err());
+        readonly_pool.close().await;
+        drop(readonly_pool);
+        Store::open(&paths.state_db_path())
+            .await
+            .unwrap()
+            .close()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn unknown_history_dry_run_preserves_logical_catalog_and_noncatalog_state() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET version = 999")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.close().await;
+        let identity =
+            crate::storage::identity_file::FileIdentity::from_path(&paths.state_db_path()).unwrap();
+        let entries = || {
+            std::fs::read_dir(paths.home())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| !matches!(name.to_str(), Some("state.db-wal" | "state.db-shm")))
+                .collect::<BTreeSet<_>>()
+        };
+        let before = entries();
+        let logical_before = logical_catalog::snapshot(paths.home()).await;
+        let error = crate::store::ReadOnlyStore::open_if_exists(&paths.state_db_path())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LibVmError::StateDatabaseIncompatible { .. }
+        ));
+        assert_eq!(entries(), before);
+        assert_eq!(
+            logical_catalog::snapshot(paths.home()).await,
+            logical_before
+        );
+        assert_eq!(
+            crate::storage::identity_file::FileIdentity::from_path(&paths.state_db_path()).unwrap(),
+            identity
+        );
+        let pool = Store::connect(&paths.state_db_path()).await.unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 999);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM db_config")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn storage_insert_failure_rolls_back_machine_state_and_provenance() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        db.execute_test_sql("CREATE TRIGGER reject_storage BEFORE INSERT ON machine_storage BEGIN SELECT RAISE(ABORT, 'reject storage'); END;").await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "atomic".to_string(), paths.machine(id).dir());
+        let rootfs = MachineRootfsRecord {
+            machine_id: id,
+            source_kind: crate::ImageSourceKind::Disk,
+            requested_reference: "/input.raw".to_string(),
+            selected_reference: None,
+            manifest_digest: None,
+            config_digest: None,
+            image_id: None,
+            root_disk_path: config.machine_dir.join("root.raw"),
+            root_disk_size_bytes: 512,
+            created_at: 1,
+        };
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        let _boot = db.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
+        assert!(db
+            .add_machine_with_rootfs(
+                &config,
+                &machine_state(id, MachineRuntimeState::Stopped),
+                &rootfs,
+                &storage
+            )
+            .await
+            .is_err());
+        for (table, query) in [
+            ("machine_config", "SELECT count(*) FROM machine_config"),
+            ("machine_state", "SELECT count(*) FROM machine_state"),
+            ("machine_rootfs", "SELECT count(*) FROM machine_rootfs"),
+            ("machine_storage", "SELECT count(*) FROM machine_storage"),
+        ] {
+            let count: i64 = sqlx::query_scalar(query).fetch_one(&db.pool).await.unwrap();
+            assert_eq!(count, 0, "partial row in {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_operation_fence_round_trip_and_invalid_update_are_atomic() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        seed_machine(
+            &db,
+            &machine_from_path(id, "fenced".to_string(), paths.machine(id).dir()),
+        )
+        .await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        let operation = uuid::Uuid::new_v4();
+        storage.operation = Some(crate::StorageOperationRecord {
+            id: operation,
+            kind: crate::StorageOperationKind::Relocate,
+            state: crate::StorageOperationState::Prepared,
+            machine_id: Some(id.into()),
+            ownership_epoch: 0,
+        });
+        storage.ownership = crate::MachineOwnership::Fenced {
+            operation: crate::handoff::types::OperationId::new(operation).unwrap(),
+            destination_runtime: crate::handoff::types::RuntimeId::new(uuid::Uuid::new_v4())
+                .unwrap(),
+            next_epoch: crate::handoff::types::OwnershipEpoch::new(1).unwrap(),
+        };
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(db.machine_storage(id).await.unwrap(), Some(storage.clone()));
+        let mut invalid = storage.clone();
+        invalid.ownership_epoch = 1;
+        let mut tx = db.pool.begin().await.unwrap();
+        assert!(matches!(
+            Store::write_machine_storage(&mut tx, id, &invalid).await,
+            Err(LibVmError::InvalidStorageRecord { .. })
+        ));
+        tx.rollback().await.unwrap();
+        assert_eq!(db.machine_storage(id).await.unwrap(), Some(storage));
+    }
+
+    #[tokio::test]
+    async fn cache_dependency_preflight_covers_relative_disks_boot_symlinks_and_shares() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "dependencies".to_string(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        let _pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let candidate = paths.images_dir().join("streams/sha256/retained");
+        std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        std::fs::write(&candidate, [0x64; 512]).unwrap();
+        // A source string is provenance only and cannot retain evictable bytes.
+        config.image_ref = candidate.display().to_string();
+        seed_machine(&db, &config).await;
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        crate::store::ensure_cache_paths_unreferenced(
+            &mut tx,
+            std::slice::from_ref(&candidate),
+            &db.home,
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        config.spec.storage = Some(vm_spec::Storage {
+            disks: vec![
+                crate::machine::root_storage::disk(
+                    "root.raw",
+                    vm_spec::DiskRole::Root,
+                    512,
+                    "silo-root".into(),
+                )
+                .unwrap(),
+                vm_spec::Disk {
+                    path: "../../images/streams/sha256/retained".into(),
+                    role: vm_spec::DiskRole::Data,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-data-0").unwrap(),
+                    read_only: false,
+                },
+            ],
+        });
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(matches!(
+            crate::store::ensure_cache_paths_unreferenced(
+                &mut tx,
+                std::slice::from_ref(&candidate),
+                &db.home,
+            )
+            .await,
+            Err(LibVmError::CacheDependency { .. })
+        ));
+        tx.rollback().await.unwrap();
+        config.spec.storage = None;
+        let alias = paths.home().join("kernel-alias");
+        std::os::unix::fs::symlink(&candidate, &alias).unwrap();
+        config.spec.boot = Some(vm_spec::Boot {
+            kernel: Some(vm_spec::Kernel {
+                path: Some(alias),
+                initramfs: None,
+                cmdline: Vec::new(),
+            }),
+            userdata: None,
+        });
+        storage.bind_disk_identity_inventory(&config.spec);
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(crate::store::ensure_cache_paths_unreferenced(
+            &mut tx,
+            std::slice::from_ref(&candidate),
+            &db.home,
+        )
+        .await
+        .is_err());
+        tx.rollback().await.unwrap();
+        config.spec.boot = None;
+        config.spec.mounts.push(vm_spec::Mount {
+            source: paths.images_dir().to_path_buf(),
+            tag: "/images".into(),
+            read_only: true,
+        });
+        db.save_machine_config(&config).await.unwrap();
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(crate::store::ensure_cache_paths_unreferenced(
+            &mut tx,
+            std::slice::from_ref(&candidate),
+            &db.home,
+        )
+        .await
+        .is_err());
+        tx.rollback().await.unwrap();
+        assert_eq!(std::fs::metadata(candidate).unwrap().len(), 512);
+    }
+
+    #[tokio::test]
+    async fn path_identity_preserves_sqlite_writer_locks_across_processes() {
+        const PROBE: &str = "SILO_STORE_IDENTITY_LOCK_PROBE";
+        if let Some(path) = std::env::var_os(PROBE) {
+            let pool = Store::connect(Path::new(&path)).await.unwrap();
+            let mut connection = pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA busy_timeout = 50")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            let result = sqlx::query("UPDATE lock_probe SET value = value + 1")
+                .execute(&mut *connection)
+                .await;
+            let blocked = std::env::var_os("SILO_STORE_EXPECT_BLOCKED").is_some();
+            if blocked {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(&error, sqlx::Error::Database(error) if error.code().is_some_and(|code| code == "5" || code == "SQLITE_BUSY"))
+                );
+            } else {
+                result.unwrap();
+            }
+            drop(connection);
+            pool.close().await;
+            return;
+        }
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        db.execute_test_sql(
+            "CREATE TABLE lock_probe(value INTEGER NOT NULL); INSERT INTO lock_probe VALUES (0);",
+        )
+        .await
+        .unwrap();
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE lock_probe SET value = 10")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            crate::storage::identity_file::FileIdentity::from_path(&paths.state_db_path()).unwrap();
+        }
+        let test = concat!(
+            module_path!(),
+            "::path_identity_preserves_sqlite_writer_locks_across_processes"
+        )
+        .split_once("::")
+        .unwrap()
+        .1;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture"])
+            .env(PROBE, paths.state_db_path())
+            .env("SILO_STORE_EXPECT_BLOCKED", "1");
+        let child = command.output().unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        tx.commit().await.unwrap();
+        let child = command
+            .env_remove("SILO_STORE_EXPECT_BLOCKED")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        let value: i64 = sqlx::query_scalar("SELECT value FROM lock_probe")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 11);
+    }
+
+    #[tokio::test]
+    async fn selected_geometry_and_config_update_commit_or_rollback_together() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "resized".to_string(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        config.root_disk_size = Some(1024);
+        db.save_machine_config(&config).await.unwrap();
+        let selected = db.machine_storage(id).await.unwrap().unwrap();
+        assert!(matches!(
+            selected.root,
+            crate::MachineRoot::OpaqueRaw {
+                geometry: vm_spec::DiskGeometry { length: 1024, .. },
+                ..
+            }
+        ));
+        let mut invalid = config.clone();
+        invalid.name = "must-not-commit".to_string();
+        invalid.root_disk_size = Some(513);
+        assert!(matches!(
+            db.save_machine_config(&invalid).await,
+            Err(LibVmError::Storage(crate::storage::StorageError::Bound(_)))
+        ));
+        assert_eq!(db.machine_config(id).await.unwrap(), Some(config));
+        assert_eq!(db.machine_storage(id).await.unwrap(), Some(selected));
+    }
+
+    #[tokio::test]
+    async fn malformed_or_missing_new_format_storage_is_a_typed_observation_error() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        seed_machine(
+            &db,
+            &machine_from_path(id, "corrupt-storage".to_string(), paths.machine(id).dir()),
+        )
+        .await;
+        assert!(sqlx::query(
+            "UPDATE machine_storage SET record_json = x'ff' WHERE machine_id = ?1"
+        )
+        .bind(id.to_string())
+        .execute(&db.pool)
+        .await
+        .is_err());
+        sqlx::query("UPDATE machine_storage SET record_json = jsonb('{\"diskBaselines\":[]}') WHERE machine_id = ?1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let error = db.machine_storage(id).await.unwrap_err();
+        assert!(matches!(error, LibVmError::InvalidStorageRecord { .. }));
+        assert!(error.is_machine_observation_error());
+        sqlx::query("DELETE FROM machine_storage WHERE machine_id = ?1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let error = db.machine_storage(id).await.unwrap_err();
+        assert!(matches!(error, LibVmError::InvalidStorageRecord { .. }));
+        assert!(error.is_machine_observation_error());
+        assert!(db
+            .machine_storage(MachineId::new())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn deferred_cache_recovery_does_not_strand_private_roots() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let source = paths.home().join("source.raw");
+        std::fs::write(&source, [0x64; 512]).unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        // Deliberately leave this stream unrooted so recovery must discover the
+        // configured external dependency, not an active publication guard.
+        let stream = pool.publish_stream(&source).unwrap();
+        let id = MachineId::new();
+        let mut config =
+            machine_from_path(id, "independent-root".to_string(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        let private_root = config.machine_dir.join("root.raw");
+        std::fs::write(&private_root, [0x65; 512]).unwrap();
+        std::fs::set_permissions(&private_root, std::fs::Permissions::from_mode(0o600)).unwrap();
+        config.spec.storage = Some(vm_spec::Storage {
+            disks: vec![
+                vm_spec::Disk {
+                    path: "root.raw".into(),
+                    role: vm_spec::DiskRole::Root,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-root").unwrap(),
+                    read_only: false,
+                },
+                vm_spec::Disk {
+                    path: stream.path.clone(),
+                    role: vm_spec::DiskRole::Data,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-data-0").unwrap(),
+                    read_only: true,
+                },
+            ],
+        });
+        seed_machine(&db, &config).await;
+        sqlx::query("INSERT INTO image_stream_gc (stream_id, size_bytes) VALUES (?1, 512)")
+            .bind(stream.id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.close().await;
+        let reopened = Store::open(&paths.state_db_path()).await.unwrap();
+        assert_eq!(reopened.machine_config(id).await.unwrap(), Some(config));
+        assert!(reopened.machine_storage(id).await.unwrap().is_some());
+        assert_eq!(std::fs::read(private_root).unwrap(), [0x65; 512]);
+        assert!(stream.path.is_file());
+        let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM image_stream_gc")
+            .fetch_one(&reopened.pool)
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1);
+        assert!(matches!(
+            crate::store::ImageStore::prune_images(&reopened).await,
+            Err(LibVmError::CacheDependency { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn corrupt_recovery_metadata_remains_a_fatal_startup_error() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let id = MachineId::new();
+        let config =
+            machine_from_path(id, "retained-on-error".to_string(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        let private = config.machine_dir.join("root.raw");
+        std::fs::write(&private, [0x65; 512]).unwrap();
+        seed_machine(&db, &config).await;
+        sqlx::query("INSERT INTO image_stream_gc (stream_id, size_bytes) VALUES ('invalid-stream-identity', 512)")
+            .execute(&db.pool).await.unwrap();
+        db.close().await;
+        Store::open(&paths.state_db_path())
+            .await
+            .expect_err("corrupt recovery metadata must not be downgraded to a deferral");
+        let inspected = Store::connect(&paths.state_db_path()).await.unwrap();
+        let job: String = sqlx::query_scalar("SELECT stream_id FROM image_stream_gc")
+            .fetch_one(&inspected)
+            .await
+            .unwrap();
+        assert_eq!(job, "invalid-stream-identity");
+        let machines: i64 = sqlx::query_scalar("SELECT count(*) FROM machine_config")
+            .fetch_one(&inspected)
+            .await
+            .unwrap();
+        assert_eq!(machines, 1);
+        assert_eq!(std::fs::read(private).unwrap(), [0x65; 512]);
+        inspected.close().await;
+        drop(pool);
+    }
+
+    #[tokio::test]
+    async fn object_recovery_defers_persisted_disk_kernel_and_directory_mount_dependencies() {
+        for dependency in ["disk", "kernel", "mount"] {
+            let (_dir, paths) = temp_paths();
+            let db = Store::new(&paths).await.unwrap();
+            let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+            let source = paths.home().join("object-source");
+            std::fs::write(&source, [0x21; 512]).unwrap();
+            let protected = pool.publish_object(&source).unwrap();
+            std::fs::write(&source, [0x22; 512]).unwrap();
+            let orphan = pool.publish_object(&source).unwrap();
+            let unrelated_stream = pool.publish_stream(&source).unwrap();
+            let id = MachineId::new();
+            let mut config =
+                machine_from_path(id, format!("object-{dependency}"), paths.machine(id).dir());
+            std::fs::create_dir_all(&config.machine_dir).unwrap();
+            let private = config.machine_dir.join("root.raw");
+            std::fs::write(&private, [0x23; 512]).unwrap();
+            config.spec.storage = Some(vm_spec::Storage {
+                disks: vec![vm_spec::Disk {
+                    path: private.clone(),
+                    role: vm_spec::DiskRole::Root,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-root").unwrap(),
+                    read_only: false,
+                }],
+            });
+            match dependency {
+                "disk" => config
+                    .spec
+                    .storage
+                    .as_mut()
+                    .unwrap()
+                    .disks
+                    .push(vm_spec::Disk {
+                        path: protected.path.clone(),
+                        role: vm_spec::DiskRole::Data,
+                        format: vm_spec::DiskFormat::Raw,
+                        geometry: vm_spec::DiskGeometry {
+                            length: 512,
+                            logical_sector_size: 512,
+                        },
+                        block_id: vm_spec::BlockId::new("silo-data-0").unwrap(),
+                        read_only: true,
+                    }),
+                "kernel" => {
+                    config.spec.boot = Some(vm_spec::Boot {
+                        kernel: Some(vm_spec::Kernel {
+                            path: Some(protected.path.clone()),
+                            initramfs: None,
+                            cmdline: vec![],
+                        }),
+                        userdata: None,
+                    })
+                }
+                _ => config.spec.mounts.push(vm_spec::Mount {
+                    source: protected.path.parent().unwrap().to_path_buf(),
+                    tag: "/retained-objects".into(),
+                    read_only: true,
+                }),
+            }
+            seed_machine(&db, &config).await;
+            let report = db.recover_image_cache().await.unwrap();
+            assert!(
+                matches!(report.deferred.as_slice(),[crate::store::models::CacheCleanupDeferral::ExternalDependency{machine,..}] if machine==&id.to_string())
+            );
+            assert_eq!(std::fs::read(&protected.path).unwrap(), [0x21; 512]);
+            // Recovery preflights a complete bounded batch before deleting any
+            // member; a protected member conservatively defers its batch peers.
+            assert!(orphan.path.exists());
+            db.close().await;
+            let reopened = Store::open(&paths.state_db_path()).await.unwrap();
+            assert_eq!(reopened.machine_config(id).await.unwrap(), Some(config));
+            assert!(reopened.machine_storage(id).await.unwrap().is_some());
+            assert_eq!(std::fs::read(private).unwrap(), [0x23; 512]);
+            assert_eq!(std::fs::read(protected.path).unwrap(), [0x21; 512]);
+            assert!(orphan.path.exists());
+            assert!(unrelated_stream.path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn layered_machine_roots_retain_exact_composition_through_prune_and_release_last_reference(
+    ) {
+        use crate::store::ImageStore;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let held = retained_lower(&db, paths.home(), b'L').await;
+        let retained = held.retained().clone();
+        let graph = held.snapshot_composition().unwrap();
+        assert_eq!(graph.layers.len(), 2, "repeated occurrence order is exact");
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let fsmeta = pool.object_path(&retained.fsmeta());
+        let pack = pool.stream_path(&graph.layers[0].pack.stream);
+        let mut configs = Vec::new();
+        for index in 0..2 {
+            let id = MachineId::new();
+            let mut config =
+                machine_from_path(id, format!("overlay-{index}"), paths.machine(id).dir());
+            std::fs::create_dir_all(&config.machine_dir).unwrap();
+            seed_machine(&db, &config).await;
+            let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+            layered_machine(&mut config, &mut storage, &held);
+            db.save_machine_config_with_storage(&config, &storage)
+                .await
+                .unwrap();
+            configs.push(config);
+        }
+        // Only the machine rows root the lower once the acquisition lease ends.
+        drop(held);
+        let lowers = |db: &Store| {
+            let pool = db.pool.clone();
+            let id = retained.id.to_string();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM composition_result WHERE id=?1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        db.prune_images().await.unwrap();
+        assert_eq!(lowers(&db).await, 1);
+        assert!(fsmeta.exists() && pack.exists());
+        db.close().await;
+        let db = Store::open(&paths.state_db_path()).await.unwrap();
+        // The exact retained closure reloads without any OCI source.
+        let reloaded = crate::store::layer_store::LayerStore::from_store(db.clone())
+            .hold_composition(retained.id)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.retained(), &retained);
+        drop(reloaded);
+        db.remove_machine(&configs[0]).await.unwrap();
+        db.prune_images().await.unwrap();
+        assert_eq!(lowers(&db).await, 1);
+        assert!(fsmeta.exists() && pack.exists());
+        db.remove_machine(&configs[1]).await.unwrap();
+        db.prune_images().await.unwrap();
+        assert_eq!(lowers(&db).await, 0);
+        assert!(!fsmeta.exists());
+        assert!(!pack.exists());
+    }
+
+    #[tokio::test]
+    async fn launch_publication_barrier_preserves_bytes_modes_and_propagates_sync_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "launch-publications".into(), paths.machine(id).dir());
+        let directory = crate::paths::OwnedDirectory::open_root(&config.machine_dir).unwrap();
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let lease = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        directory
+            .write_file("source-kernel", b"retained kernel bytes")
+            .unwrap();
+        directory
+            .write_file("source-initramfs", b"retained initramfs bytes")
+            .unwrap();
+        let kernel = crate::owned_boot_assets::OwnedBootAsset::open(
+            &config.machine_dir.join("source-kernel"),
+        )
+        .unwrap();
+        let mut artifacts =
+            crate::machine::root_storage::LaunchArtifacts::new(&config.machine_dir).unwrap();
+        let (kernel_path, kernel_file) =
+            crate::machine::root_storage::publish_kernel(&config.machine_dir, &kernel).unwrap();
+        artifacts.files.push(kernel_file);
+        artifacts.files.push(
+            crate::machine::root_storage::publish_descriptor(
+                &config.machine_dir,
+                "published lower descriptor\n",
+            )
+            .unwrap(),
+        );
+        let composite_path = config.machine_dir.join("initramfs");
+        artifacts.files.push(
+            crate::initramfs_overlay::write_composite(
+                crate::initramfs_overlay::CompositeBase::Path(
+                    &config.machine_dir.join("source-initramfs"),
+                ),
+                None,
+                Some(br#"{"root":"unit-publication"}"#),
+                &composite_path,
+            )
+            .unwrap(),
+        );
+        artifacts.files.push(
+            crate::supervisor::write_launch_spec(
+                &config.machine_dir.join("config.json"),
+                &config.spec,
+            )
+            .unwrap(),
+        );
+        assert_eq!(artifacts.files.len(), 4);
+        // One synchronous barrier covers all publications and the existing lease.
+        artifacts.sync(&lease).unwrap();
+        assert_eq!(
+            std::fs::read(kernel_path).unwrap(),
+            b"retained kernel bytes"
+        );
+        assert_eq!(
+            std::fs::read(config.machine_dir.join("lower.vmdk")).unwrap(),
+            b"published lower descriptor\n",
+        );
+        let composite = std::fs::read(composite_path).unwrap();
+        assert!(composite.starts_with(b"retained initramfs bytes"));
+        let bootstrap = br#"{"root":"unit-publication"}"#;
+        assert!(composite
+            .windows(bootstrap.len())
+            .any(|bytes| bytes == bootstrap));
+        assert_eq!(
+            serde_json::from_slice::<VmSpec>(
+                &std::fs::read(config.machine_dir.join("config.json")).unwrap(),
+            )
+            .unwrap(),
+            config.spec,
+        );
+        for (name, mode) in [
+            ("kernel-qualified", 0o400),
+            ("initramfs", 0o600),
+            ("lower.vmdk", 0o600),
+            ("config.json", 0o600),
+        ] {
+            assert_eq!(
+                std::fs::metadata(config.machine_dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                mode,
+            );
+        }
+        assert_eq!(
+            lease
+                .lock()
+                .durability_file()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        // A real non-syncable descriptor exercises error propagation, not an
+        // injected callback pretending that fsync failed.
+        artifacts
+            .files
+            .push(std::fs::File::open("/dev/null").unwrap());
+        assert!(artifacts.sync(&lease).is_err());
+    }
+
+    #[tokio::test]
+    async fn layered_restart_survives_child_snapshot_prune_and_missing_invalid_baseline() {
+        use crate::storage::pool::StoragePool;
+        use crate::storage::stream::StreamHasher;
+        use crate::store::models::snapshot::SnapshotRootProfile;
+        use crate::store::models::storage::DiskBaselineState;
+        use crate::store::snapshot_store::{publish_map, SnapshotRef};
+        use crate::store::ImageStore;
+
+        let (_temporary, snapshots, mut record, publication, publication_lease) =
+            crate::store::snapshot_store::tests::fixture("snapshot").await;
+        let db = &snapshots.store;
+        let paths = LocalPaths::new(db.home_path());
+        let pool = StoragePool::open(paths.images_dir()).unwrap();
+        let held = retained_lower(db, paths.home(), b'R').await;
+        let graph = held.snapshot_composition().unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "restart-parent".into(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        seed_machine(db, &config).await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        layered_machine(&mut config, &mut storage, &held);
+        if let (
+            crate::BootProfile::LinuxDirect { binding, .. },
+            crate::BootProfile::LinuxDirect {
+                binding: captured, ..
+            },
+        ) = (&mut storage.boot, &record.boot)
+        {
+            *binding = captured.clone();
+        }
+        let upper = config.machine_dir.join("upper.raw");
+        let file = std::fs::File::open(&upper).unwrap();
+        let map = StreamHasher::new(vm_spec::stream_map::ChunkSize::DISK)
+            .hash_open_file(&file, file.metadata().unwrap().len())
+            .unwrap()
+            .map;
+        let roots = crate::machine::root_storage::seed_disk(
+            &mut storage,
+            &pool,
+            &config.machine_dir,
+            1,
+            &config.spec.storage.as_ref().unwrap().disks[1],
+            &file,
+            &map,
+        )
+        .unwrap();
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        drop(roots);
+        let baseline = storage.disk_baselines[0].map;
+
+        // Every persisted reference, including Invalid provenance, owns its
+        // graph independently of a publication, child or running generation.
+        for state in [
+            DiskBaselineState::Ready,
+            DiskBaselineState::Running {
+                run_id: uuid::Uuid::new_v4(),
+                seeded: true,
+            },
+            DiskBaselineState::Running {
+                run_id: uuid::Uuid::new_v4(),
+                seeded: false,
+            },
+            DiskBaselineState::Invalid,
+        ] {
+            storage.disk_baselines[0].state = state;
+            db.save_machine_config_with_storage(&config, &storage)
+                .await
+                .unwrap();
+            db.prune_images().await.unwrap();
+            assert!(pool.verify_object(&baseline).is_ok());
+            assert!(sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM machine_object_dependency WHERE machine_id=?1 AND object_digest=?2)",
+            ).bind(id.to_string()).bind(baseline.to_string()).fetch_one(&db.pool).await.unwrap());
+            let retained = pool
+                .load_map(
+                    baseline,
+                    vm_spec::stream_map::StreamRole::Disk,
+                    pool.map_authority(std::sync::Arc::new(())).unwrap(),
+                )
+                .unwrap();
+            for node in retained.nodes() {
+                node.unwrap();
+            }
+        }
+        storage.disk_baselines[0].state = DiskBaselineState::Ready;
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        let run = uuid::Uuid::new_v4();
+        let launch = db
+            .register_launch_storage(id, run, &storage, &config.spec)
+            .await
+            .unwrap();
+        db.mark_launch_storage_admitted(launch.operation_id())
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.machine_storage(id).await.unwrap().unwrap().disk_baselines[0].state,
+            DiskBaselineState::Running { run_id, seeded: true } if run_id == run
+        ));
+
+        let (stream, roots) = pool.publish_stream_for_catalog(&upper).unwrap();
+        db.pin_published_storage_dependencies(publication, &[stream.id], &[])
+            .await
+            .unwrap();
+        drop(roots);
+        record.root.stream = publish_map(&pool, db, publication, &stream.map)
+            .await
+            .unwrap();
+        let crate::MachineRoot::LinuxOverlay {
+            lower,
+            upper_uuid,
+            capacity,
+            ext4_profile,
+            overlay_profile,
+            temporary_directory,
+            ..
+        } = &storage.root
+        else {
+            panic!("layered fixture")
+        };
+        record.root.profile = SnapshotRootProfile::LinuxOverlay {
+            lower: Box::new(graph.clone()),
+            lower_geometry: lower.geometry(),
+            lower_filesystem_uuid: lower.filesystem_uuid(),
+            upper_uuid: *upper_uuid,
+            ext4_profile: *ext4_profile,
+            overlay_profile: *overlay_profile,
+            temporary_directory: *temporary_directory,
+        };
+        record.root.geometry.length = *capacity;
+        record.configuration = crate::SnapshotConfiguration::capture(&config).unwrap();
+        record.boot = storage.boot.clone();
+        let (streams, objects) = record.content_dependencies().unwrap();
+        db.pin_published_storage_dependencies(
+            publication,
+            &streams.into_iter().collect::<Vec<_>>(),
+            &objects.into_iter().collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        let saved = snapshots
+            .publish(&record, publication, Some("restart-first"))
+            .await
+            .unwrap();
+        snapshots
+            .publish(&record, publication, Some("restart-second"))
+            .await
+            .unwrap();
+
+        let child_id = MachineId::new();
+        let mut child = machine_from_path(
+            child_id,
+            "restart-child".into(),
+            paths.machine(child_id).dir(),
+        );
+        std::fs::create_dir_all(&child.machine_dir).unwrap();
+        seed_machine(db, &child).await;
+        child.spec = config.spec.clone();
+        std::fs::copy(&upper, child.machine_dir.join("upper.raw")).unwrap();
+        let child_file = std::fs::File::open(child.machine_dir.join("upper.raw")).unwrap();
+        let mut child_storage = storage.clone();
+        let roots = crate::machine::root_storage::seed_disk(
+            &mut child_storage,
+            &pool,
+            &child.machine_dir,
+            1,
+            &child.spec.storage.as_ref().unwrap().disks[1],
+            &child_file,
+            &map,
+        )
+        .unwrap();
+        db.save_machine_config_with_storage(&child, &child_storage)
+            .await
+            .unwrap();
+        drop(roots);
+        db.remove_machine(&child).await.unwrap();
+        std::fs::remove_dir_all(&child.machine_dir).unwrap();
+        let removal = snapshots.remove(&SnapshotRef::Id(saved.id)).await.unwrap();
+        assert_eq!(removal.names, ["restart-first", "restart-second"]);
+        db.finish_stopped_operation(publication).await.unwrap();
+        drop(publication_lease);
+        drop(held);
+        db.prune_images().await.unwrap();
+
+        let operation = launch.operation_id();
+        drop(launch);
+        let mut stopped = machine_state(id, MachineRuntimeState::Stopped);
+        stopped.run_id = Some(run.to_string());
+        assert!(db
+            .try_retire_launch_storage(
+                operation,
+                run,
+                storage.storage_generation,
+                &stopped,
+                crate::StorageStopOutcome::Clean,
+            )
+            .await
+            .unwrap());
+        db.prune_images().await.unwrap();
+        let ended = db.machine_storage(id).await.unwrap().unwrap();
+        assert!(matches!(
+            ended.disk_baselines[0].state,
+            DiskBaselineState::Invalid
+        ));
+        assert!(pool.verify_object(&baseline).is_ok());
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM machine_lower_dependency WHERE machine_id=?1 AND lower_id=?2)",
+        ).bind(id.to_string()).bind(graph.result.to_string()).fetch_one(&db.pool).await.unwrap());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM storage_operation_lower WHERE lower_id=?1",
+            )
+            .bind(graph.result.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            0
+        );
+
+        // Reproduce an old home's already-collected optional root. Invalid
+        // provenance must not be opened or promoted back to Running.
+        std::fs::remove_file(pool.object_path(&baseline)).unwrap();
+        let next = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &ended, &config.spec)
+            .await
+            .unwrap();
+        db.mark_launch_storage_admitted(next.operation_id())
+            .await
+            .unwrap();
+        assert!(db
+            .machine_storage(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .disk_baselines
+            .is_empty());
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM machine_object_dependency WHERE machine_id=?1 AND object_digest=?2)",
+        ).bind(id.to_string()).bind(baseline.to_string()).fetch_one(&db.pool).await.unwrap());
+        let layers = crate::store::layer_store::LayerStore::from_store(db.as_ref().clone());
+        let resolved = layers
+            .launch_lower(&next, next.storage_record())
+            .await
+            .unwrap();
+        resolved.recheck().unwrap();
+        let lower_root = crate::storage::identity::ObjectDigest::from_sha256(
+            *resolved.retained.result.lower_stream.as_bytes(),
+        );
+        for (root, role) in graph
+            .layers
+            .iter()
+            .map(|layer| (layer.pack.map, vm_spec::stream_map::StreamRole::Pack))
+            .chain(std::iter::once((
+                lower_root,
+                vm_spec::stream_map::StreamRole::Lower,
+            )))
+        {
+            let retained = pool
+                .load_map(
+                    root,
+                    role,
+                    pool.map_authority(std::sync::Arc::new(())).unwrap(),
+                )
+                .unwrap();
+            for node in retained.nodes() {
+                node.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_lease_alone_roots_lower_through_gc_and_prune() {
+        use crate::store::ImageStore;
+
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let held = retained_lower(&db, paths.home(), b'G').await;
+        let retained = held.retained().clone();
+        let graph = held.snapshot_composition().unwrap();
+        let (config, lease) = leased_layered_machine(&db, &paths, &held).await;
+        let operation = lease.operation_id();
+        let layers = crate::store::layer_store::LayerStore::from_store(db.clone());
+        let operations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let lease_files = std::fs::read_dir(pool.lease_directory().unwrap().path())
+            .unwrap()
+            .count();
+        let resolved = layers
+            .launch_lower(&lease, lease.storage_record())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM storage_operation")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            operations,
+            "resolution must not register a second consumer",
+        );
+        assert_eq!(
+            std::fs::read_dir(pool.lease_directory().unwrap().path())
+                .unwrap()
+                .count(),
+            lease_files,
+            "resolution must not create another lease file",
+        );
+        drop(held);
+        // Remove the machine's independent lower root. The exact running
+        // generation's operation is now the only authority for the graph.
+        db.remove_machine(&config).await.unwrap();
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        for _ in 0..2 {
+            db.recover_image_cache().await.unwrap();
+            db.prune_images().await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM composition_result WHERE id=?1")
+                    .bind(retained.id.to_string())
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap(),
+                1,
+            );
+            assert!(pool.verify_object(&retained.fsmeta()).is_ok());
+            assert!(pool.verify_stream(&graph.layers[0].pack.stream).is_ok());
+            crate::storage::vmdk::FlatLowerPlan::new(&resolved.occurrences)
+                .unwrap()
+                .preflight(0)
+                .unwrap()
+                .verify(&pool)
+                .unwrap();
+        }
+        // Retirement is explicit for launch generations, even after all OFDs
+        // close. Prove exclusivity before removing this fixture's final root.
+        drop(resolved);
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        drop(lease);
+        let exclusive = pool.try_exclusive_lease(operation).unwrap().unwrap();
+        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+            .bind(operation.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(exclusive);
+        db.recover_image_cache().await.unwrap();
+        db.prune_images().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM composition_result WHERE id=?1")
+                .bind(retained.id.to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            0,
+        );
+        assert!(!pool.object_path(&retained.fsmeta()).exists());
+        assert!(!pool.stream_path(&graph.layers[0].pack.stream).exists());
+    }
+
+    #[tokio::test]
+    async fn machine_lower_claims_must_equal_the_retained_composition() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let held = retained_lower(&db, paths.home(), b'M').await;
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "claims".into(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        seed_machine(&db, &config).await;
+        let original = db.machine_storage(id).await.unwrap().unwrap();
+        let mut storage = original.clone();
+        layered_machine(&mut config, &mut storage, &held);
+        let crate::MachineRoot::LinuxOverlay { lower, .. } = &mut storage.root else {
+            unreachable!("layered fixture");
+        };
+        let crate::OverlayLower::ErofsComposition {
+            filesystem_uuid, ..
+        } = lower;
+        *filesystem_uuid = uuid::Uuid::new_v4();
+        // A derived UUID claim contradicting the authenticated result is
+        // refused in the same transaction; nothing of the claim persists.
+        assert!(db
+            .save_machine_config_with_storage(&config, &storage)
+            .await
+            .is_err());
+        assert_eq!(db.machine_storage(id).await.unwrap().unwrap(), original);
+        let mut absent = storage.clone();
+        let crate::MachineRoot::LinuxOverlay { lower, .. } = &mut absent.root else {
+            unreachable!("layered fixture");
+        };
+        *lower = held.retained().overlay_lower();
+        let crate::OverlayLower::ErofsComposition { record, .. } = lower;
+        *record = format!("sha256:{}", "07".repeat(32)).parse().unwrap();
+        // A lower without a retained composition is never rooted by claim.
+        assert!(db
+            .save_machine_config_with_storage(&config, &absent)
+            .await
+            .is_err());
+        assert_eq!(db.machine_storage(id).await.unwrap().unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn launch_operation_survives_cancellation_and_retires_exact_generation_atomically() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "retained-launch".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let run = uuid::Uuid::new_v4();
+        let owner = db
+            .register_launch_storage(id, run, &storage, &config.spec)
+            .await
+            .unwrap();
+        let operation = owner.operation_id();
+        let duplicate = owner.lock().duplicate_inheritable().unwrap();
+        let identity = owner.file_identity().unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        drop(owner);
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        drop(duplicate);
+        let operations = db.launch_storage_operations(id).await.unwrap();
+        assert_eq!(operations.len(), 1);
+        assert!(!operations[0].admitted);
+        db.mark_launch_storage_admitted(operation).await.unwrap();
+        assert!(db.launch_storage_operations(id).await.unwrap()[0].admitted);
+        let mut next = machine_state(id, MachineRuntimeState::Stopped);
+        next.updated_at = 7;
+        assert!(db
+            .try_retire_launch_storage(
+                operation,
+                uuid::Uuid::new_v4(),
+                storage.storage_generation,
+                &next,
+                crate::StorageStopOutcome::Forced
+            )
+            .await
+            .is_err());
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        sqlx::query("CREATE TRIGGER reject_retirement BEFORE UPDATE ON machine_state BEGIN SELECT RAISE(ABORT,'retirement interrupted'); END")
+            .execute(&db.pool).await.unwrap();
+        assert!(db
+            .try_retire_launch_storage(
+                operation,
+                run,
+                storage.storage_generation,
+                &next,
+                crate::StorageStopOutcome::Forced
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            db.machine_storage(id).await.unwrap().unwrap().stop_outcome,
+            storage.stop_outcome
+        );
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        sqlx::query("DROP TRIGGER reject_retirement")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .try_retire_launch_storage(
+                operation,
+                run,
+                storage.storage_generation,
+                &next,
+                crate::StorageStopOutcome::Forced
+            )
+            .await
+            .unwrap());
+        assert!(db.launch_storage_operations(id).await.unwrap().is_empty());
+        assert_eq!(db.machine_state(id).await.unwrap().unwrap(), next);
+        assert_eq!(
+            db.machine_storage(id).await.unwrap().unwrap().stop_outcome,
+            crate::StorageStopOutcome::Forced
+        );
+        assert_eq!(
+            pool.try_exclusive_lease(operation)
+                .unwrap()
+                .unwrap()
+                .file_identity()
+                .unwrap(),
+            identity
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_pins_and_external_constraints_survive_machine_row_deletion() {
+        use crate::store::ImageStore;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("stream-source");
+        std::fs::write(&source, [9; 512]).unwrap();
+        let stream = pool.publish_stream(&source).unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "operation-only".into(), paths.machine(id).dir());
+        config.spec.mounts.push(vm_spec::Mount {
+            source: paths.images_dir().join("streams"),
+            tag: "foreign-share".into(),
+            read_only: true,
+        });
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let owner = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        let operation = owner.operation_id();
+        sqlx::query("DELETE FROM machine_config WHERE id=?1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        assert!(matches!(
+            db.prune_images().await,
+            Err(LibVmError::CacheDependency { .. })
+        ));
+        assert_eq!(std::fs::read(&stream.path).unwrap(), [9; 512]);
+        drop(owner);
+        // Free lease is not permission to forget a launch's durable resources.
+        assert!(db.prune_images().await.is_err());
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        let _exclusive = pool.try_exclusive_lease(operation).unwrap().unwrap();
+        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+            .bind(operation.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(_exclusive);
+        db.prune_images().await.unwrap();
+        assert!(!stream.path.exists());
+    }
+
+    #[tokio::test]
+    async fn unknown_busy_or_missing_operation_lease_fails_recovery_closed() {
+        use crate::store::ImageStore;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("source");
+        std::fs::write(&source, [3; 512]).unwrap();
+        let operation = uuid::Uuid::new_v4();
+        let lease = pool.lease(operation).unwrap();
+        let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        assert!(db
+            .pin_published_storage_dependencies(operation, &[stream.id], &[])
+            .await
+            .is_err());
+        drop(roots);
+        assert!(db.prune_images().await.is_err());
+        assert!(stream.path.exists());
+        drop(lease);
+        let operation = uuid::Uuid::new_v4();
+        let lease = db.begin_storage_operation(operation).await.unwrap();
+        let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        db.pin_published_storage_dependencies(operation, &[stream.id], &[])
+            .await
+            .unwrap();
+        drop(roots);
+        drop(lease);
+        let path = paths
+            .images_dir()
+            .join("locks/leases")
+            .join(format!("{operation}.lease"));
+        std::fs::remove_file(&path).unwrap();
+        assert!(db.prune_images().await.is_err());
+        assert!(!path.exists());
+        assert!(stream.path.exists());
+    }
+
+    #[tokio::test]
+    async fn launch_snapshot_pins_managed_data_and_boot_objects_without_machine_roots() {
+        use crate::store::ImageStore;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("source");
+        std::fs::write(&source, [7; 512]).unwrap();
+        let (publication, publication_lease) = db
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let (stream, publication_roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        db.pin_published_storage_dependencies(publication, &[stream.id], &[])
+            .await
+            .unwrap();
+        drop(publication_roots);
+        let object = pool.publish_object(&source).unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "closure-pins".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        storage.disks.push(crate::IncludedDisk {
+            id: uuid::Uuid::new_v4(),
+            role: vm_spec::DiskRole::Data,
+            order: 1,
+            storage: crate::DiskStorage::ManagedReadOnly {
+                stream: stream.id,
+                geometry: vm_spec::DiskGeometry {
+                    length: 512,
+                    logical_sector_size: 512,
+                },
+            },
+        });
+        if let crate::BootProfile::LinuxDirect {
+            binding,
+            kernel_architecture,
+            ..
+        } = &mut storage.boot
+        {
+            *binding = crate::BootBinding::Pinned {
+                kernel: object.digest,
+                base_initramfs: object.digest,
+                agent: Some(object.digest),
+                architecture: *kernel_architecture,
+                abi: crate::runtime::boot_assets::DIRECT_BOOT_ABI.into(),
+            };
+        } else {
+            panic!("fixture must use LinuxDirect");
+        }
+        let crate::BootProfile::LinuxDirect { binding, .. } = &storage.boot else {
+            panic!("direct fixture")
+        };
+        let bundle_input = paths.home().join("bundle");
+        std::fs::write(&bundle_input, binding.canonical_bytes().unwrap()).unwrap();
+        let (bundle, roots) = pool.publish_object_for_catalog(&bundle_input).unwrap();
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        drop(roots);
+        db.finish_stopped_operation(publication).await.unwrap();
+        drop(publication_lease);
+        // Committed semantic roots protect the same projection before launch.
+        db.prune_images().await.unwrap();
+        assert!(object.path.exists());
+        assert!(stream.path.exists());
+        assert!(bundle.path.exists());
+        let owner = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        let op = owner.operation_id();
+        let duplicate = owner.lock().duplicate_inheritable().unwrap();
+        sqlx::query("DELETE FROM machine_config WHERE id=?1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(owner);
+        db.prune_images().await.unwrap();
+        assert_eq!(std::fs::read(&stream.path).unwrap(), [7; 512]);
+        assert_eq!(std::fs::read(&object.path).unwrap(), [7; 512]);
+        assert!(bundle.path.exists());
+        let links: BTreeSet<String> = sqlx::query_scalar(
+            "SELECT object_digest FROM storage_operation_object WHERE operation_id=?1",
+        )
+        .bind(op.to_string())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        assert_eq!(
+            links,
+            BTreeSet::from([
+                stream.id.to_string(),
+                object.digest.to_string(),
+                bundle.digest.to_string(),
+            ])
+        );
+        drop(duplicate);
+        // Launch roots remain until explicit terminal reconciliation, not EX alone.
+        db.prune_images().await.unwrap();
+        assert!(stream.path.exists());
+        assert!(object.path.exists());
+        let _terminal = pool.try_exclusive_lease(op).unwrap().unwrap();
+        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+            .bind(op.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(_terminal);
+        db.prune_images().await.unwrap();
+        assert!(!stream.path.exists());
+        assert!(!object.path.exists());
+    }
+
+    #[tokio::test]
+    async fn replaced_lease_inode_and_malformed_launch_closure_never_authorize_gc() {
+        use crate::store::ImageStore;
+        use std::os::unix::fs::OpenOptionsExt;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("source");
+        std::fs::write(&source, [4; 512]).unwrap();
+        let operation = uuid::Uuid::new_v4();
+        let lease = db.begin_storage_operation(operation).await.unwrap();
+        let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        db.pin_published_storage_dependencies(operation, &[stream.id], &[])
+            .await
+            .unwrap();
+        drop(roots);
+        let path = paths
+            .images_dir()
+            .join("locks/leases")
+            .join(format!("{operation}.lease"));
+        let displaced = paths.home().join("displaced-lease");
+        std::fs::rename(&path, &displaced).unwrap();
+        let replacement = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(db.prune_images().await.is_err());
+        assert!(stream.path.exists());
+        drop(replacement);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&displaced, &path).unwrap();
+        drop(lease);
+        let id = MachineId::new();
+        let config = machine_from_path(id, "malformed-closure".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let owner = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        let json: String = sqlx::query_scalar(
+            "SELECT json(record_json) FROM storage_operation WHERE operation_id=?1",
+        )
+        .bind(owner.operation_id().to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let mut malformed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        malformed["storageGeneration"] = serde_json::json!(storage.storage_generation + 1);
+        sqlx::query("UPDATE storage_operation SET record_json=jsonb(?2) WHERE operation_id=?1")
+            .bind(owner.operation_id().to_string())
+            .bind(malformed.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.prune_images().await.is_err());
+        assert!(stream.path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn roots_waiters_keep_current_thread_executor_available_for_sql_owners() {
+        use crate::store::ImageStore;
+        use std::time::Duration;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "concurrent-roots".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let run = uuid::Uuid::new_v4();
+        let owner = db
+            .register_launch_storage(id, run, &storage, &config.spec)
+            .await
+            .unwrap();
+        let operation = owner.operation_id();
+        drop(owner);
+        let digest = crate::storage::identity::ObjectDigest::of_bytes(&[8; 512]);
+        let cache_operation = uuid::Uuid::new_v4();
+        let _cache_lease = db.begin_storage_operation(cache_operation).await.unwrap();
+        for phase in ["register", "admit", "pin-cache", "retire"] {
+            let images = paths.images_dir().to_path_buf();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, resume) = std::sync::mpsc::channel();
+            // A real OS deadline releases roots even in the regressed code,
+            // where synchronous flock would prevent Tokio timers from firing.
+            let holder = std::thread::spawn(move || {
+                let pool = crate::storage::pool::StoragePool::open(&images).unwrap();
+                let roots = pool.lock_roots().unwrap();
+                entered.send(()).unwrap();
+                let executor_responsive = resume.recv_timeout(Duration::from_secs(3)).is_ok();
+                drop(roots);
+                executor_responsive
+            });
+            ready.await.unwrap();
+            let worker = db.clone();
+            let storage = storage.clone();
+            let spec = config.spec.clone();
+            let task = tokio::spawn(async move {
+                match phase {
+                    "register" => worker
+                        .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &spec)
+                        .await
+                        .map(drop),
+                    "admit" => worker.mark_launch_storage_admitted(operation).await,
+                    "pin-cache" => worker.pin_source_blobs(cache_operation, &[digest]).await,
+                    "retire" => worker
+                        .try_retire_launch_storage(
+                            operation,
+                            run,
+                            storage.storage_generation,
+                            &machine_state(id, MachineRuntimeState::Stopped),
+                            crate::StorageStopOutcome::Unknown,
+                        )
+                        .await
+                        .map(|retired| assert!(retired)),
+                    _ => unreachable!("closed test phase"),
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let sent_while_coordinated = release.send(()).is_ok();
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                holder.join().unwrap(),
+                "{phase} blocked the SQL executor on flock"
+            );
+            assert!(sent_while_coordinated);
+            result.unwrap();
+        }
+    }
+
+    async fn add_catalog_relative_raw_fixture(
+        store: &Store,
+        paths: &LocalPaths,
+        name: &str,
+    ) -> MachineConfig {
+        use std::os::unix::fs::PermissionsExt;
+        let id = MachineId::new();
+        let config = machine_from_path(id, name.into(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        let disk = config.machine_dir.join("root.raw");
+        std::fs::write(&disk, [0x51; 512]).unwrap();
+        std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        let _boot = store.pin_test_boot(&mut storage).await.unwrap();
+        storage.bind_disk_identity_inventory(&config.spec);
+        let rootfs = MachineRootfsRecord {
+            machine_id: id,
+            source_kind: crate::ImageSourceKind::Disk,
+            requested_reference: "source-provenance.raw".into(),
+            selected_reference: None,
+            manifest_digest: None,
+            config_digest: None,
+            image_id: None,
+            root_disk_path: disk,
+            root_disk_size_bytes: 512,
+            created_at: 1,
+        };
+        store
+            .add_machine_with_rootfs(
+                &config,
+                &machine_state(id, MachineRuntimeState::Stopped),
+                &rootfs,
+                &storage,
+            )
+            .await
+            .unwrap();
+        drop(_boot);
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn machine_publication_waits_for_existing_catalog_writer_before_dependency_reads() {
+        use std::time::Duration;
+        let (_temporary, paths) = temp_paths();
+        let store = Store::new(&paths).await.unwrap();
+        let writer = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let worker = store.clone();
+        let mut publication = tokio::spawn(async move {
+            add_catalog_relative_raw_fixture(&worker, &paths, "concurrent-publication").await
+        });
+        let early = tokio::time::timeout(Duration::from_millis(150), &mut publication).await;
+        writer.commit().await.unwrap();
+        assert!(early.is_err(), "publication must wait for write admission, not fail upgrading a read transaction: {early:?}");
+        let config = tokio::time::timeout(Duration::from_secs(5), publication)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.machine_config(config.id).await.unwrap(),
+            Some(config.clone())
+        );
+        let rootfs = store.machine_rootfs(config.id).await.unwrap().unwrap();
+        assert_eq!(rootfs.root_disk_path, config.machine_dir.join("root.raw"));
+        assert_eq!(rootfs.root_disk_size_bytes, 512);
+        assert_eq!(
+            store
+                .machine_state(config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MachineRuntimeState::Stopped
+        );
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn whole_home_rename_derives_all_machine_read_paths_from_current_catalog() {
+        use crate::store::observation::ObservationStore;
+        let temporary = tempfile::tempdir().unwrap();
+        let old_home = temporary.path().join("old catalog home");
+        let new_home = temporary.path().join("moved catalog home");
+        let original_paths = LocalPaths::new(&old_home);
+        let store = Store::new(&original_paths).await.unwrap();
+        let original =
+            add_catalog_relative_raw_fixture(&store, &original_paths, "relocated-machine").await;
+        let id = original.id;
+        let before = logical_catalog::snapshot(&old_home).await;
+        store.close().await;
+        std::fs::rename(&old_home, &new_home).unwrap();
+        // A different real inode at the former spelling must never become
+        // private-machine authority after opening the relocated catalog.
+        std::fs::create_dir_all(&original.machine_dir).unwrap();
+        std::fs::write(original.machine_dir.join("root.raw"), [0x72; 512]).unwrap();
+        let expected = crate::paths::machine_data_dir_in(&new_home, id);
+        let references = [
+            id.to_string(),
+            original.name.clone(),
+            id.to_string()[..8].to_string(),
+        ];
+        let observer = ObservationStore::open(&new_home.join("state.db"))
+            .await
+            .unwrap();
+        for reference in &references {
+            let (config, state) = observer
+                .lookup(&crate::machine::MachineRef::parse(reference.clone()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(config.machine_dir, expected);
+            assert_eq!(state.machine_id, id);
+            assert_eq!(
+                std::fs::read(config.machine_dir.join("root.raw")).unwrap(),
+                [0x51; 512]
+            );
+        }
+        observer.close().await.unwrap();
+        assert_eq!(logical_catalog::snapshot(&new_home).await, before);
+        let store = Store::open(&new_home.join("state.db")).await.unwrap();
+        let mut decoded = vec![
+            store.machine_config(id).await.unwrap().unwrap(),
+            store
+                .machine_config_by_name(&original.name)
+                .await
+                .unwrap()
+                .unwrap(),
+        ];
+        decoded.extend(
+            store
+                .machine_configs_by_id_prefix(&id.to_string()[..8], &id.to_string()[..8])
+                .await
+                .unwrap(),
+        );
+        decoded.extend(store.list_machine_configs().await.unwrap());
+        decoded.extend(
+            store
+                .machine_inventory()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.config.unwrap()),
+        );
+        for config in decoded {
+            assert_eq!(config.machine_dir, expected);
+        }
+        let rootfs = store.machine_rootfs(id).await.unwrap().unwrap();
+        assert_eq!(rootfs.root_disk_path, expected.join("root.raw"));
+        assert_eq!(std::fs::read(&rootfs.root_disk_path).unwrap(), [0x51; 512]);
+        assert_eq!(
+            std::fs::read(original.machine_dir.join("root.raw")).unwrap(),
+            [0x72; 512]
+        );
+        let observer = ObservationStore::existing(&store);
+        assert_eq!(
+            observer
+                .lookup(&crate::machine::MachineRef::parse(original.name.clone()).unwrap())
+                .await
+                .unwrap()
+                .0
+                .machine_dir,
+            expected
+        );
+        observer.close().await.unwrap();
+        assert_eq!(logical_catalog::snapshot(&new_home).await, before);
+        let config = store.machine_config(id).await.unwrap().unwrap();
+        let storage = store.machine_storage(id).await.unwrap().unwrap();
+        let owner = store
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn foreign_machine_directory_is_never_persisted_or_accepted_as_json_authority() {
+        use crate::store::observation::ObservationStore;
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temporary.path().join("catalog home"));
+        let store = Store::new(&paths).await.unwrap();
+        let mut config = add_catalog_relative_raw_fixture(&store, &paths, "foreign-dir").await;
+        let expected = config.machine_dir.clone();
+        let foreign = temporary.path().join("foreign machine dir");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("root.raw"), [0x73; 512]).unwrap();
+        config.machine_dir = foreign.clone();
+        store.save_machine_config(&config).await.unwrap();
+        let json: String =
+            sqlx::query_scalar("SELECT json(config_json) FROM machine_config WHERE id=?1")
+                .bind(config.id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("machineDir").is_none());
+        assert_eq!(
+            store
+                .machine_config(config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .machine_dir,
+            expected
+        );
+        assert_eq!(
+            store
+                .machine_rootfs(config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .root_disk_path,
+            expected.join("root.raw")
+        );
+        // A persisted absolute spelling is not an old-shape reader or a
+        // relocation hint: it is invalid in the current closed schema.
+        value["machineDir"] = serde_json::json!(foreign);
+        sqlx::query("UPDATE machine_config SET config_json=jsonb(?2) WHERE id=?1")
+            .bind(config.id.to_string())
+            .bind(value.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.machine_config(config.id).await.is_err());
+        assert!(store.machine_config_by_name(&config.name).await.is_err());
+        assert!(store
+            .machine_configs_by_id_prefix(&config.id.to_string()[..8], &config.id.to_string()[..8])
+            .await
+            .is_err());
+        assert!(store.list_machine_configs().await.is_err());
+        assert!(store
+            .machine_inventory()
+            .await
+            .unwrap()
+            .remove(0)
+            .config
+            .is_err());
+        let before = logical_catalog::snapshot(paths.home()).await;
+        let observer = ObservationStore::open(&paths.state_db_path())
+            .await
+            .unwrap();
+        for reference in [
+            config.id.to_string(),
+            config.name.clone(),
+            config.id.to_string()[..8].to_string(),
+        ] {
+            assert!(observer
+                .lookup(&crate::machine::MachineRef::parse(reference).unwrap())
+                .await
+                .is_err());
+        }
+        observer.close().await.unwrap();
+        assert_eq!(logical_catalog::snapshot(paths.home()).await, before);
+        assert_eq!(
+            std::fs::read(foreign.join("root.raw")).unwrap(),
+            [0x73; 512]
+        );
+        assert_eq!(
+            std::fs::read(expected.join("root.raw")).unwrap(),
+            [0x51; 512]
+        );
+    }
+    #[tokio::test]
+    async fn machine_dependency_indexes_follow_exact_generation_and_not_raw_provenance() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        seed_machine(
+            &db,
+            &machine_from_path(id, "indexed-closure".into(), paths.machine(id).dir()),
+        )
+        .await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        let source = crate::storage::identity::StreamId::from_sha256([0x42; 32]);
+        let kernel = crate::storage::identity::ObjectDigest::of_bytes(b"indexed boot kernel");
+        if let crate::MachineRoot::OpaqueRaw {
+            initial_content, ..
+        } = &mut storage.root
+        {
+            *initial_content = Some(source);
+        }
+        storage.boot = crate::store::models::snapshot::tests::record(source, kernel, kernel).boot;
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .unwrap();
+        let mut connection = db.pool.acquire().await.unwrap();
+        assert!(
+            crate::store::cache_paths::machine_retains_object(&mut connection, kernel)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !crate::store::cache_paths::machine_retains_stream(&mut connection, source)
+                .await
+                .unwrap()
+        );
+        drop(connection);
+        sqlx::query(
+            "UPDATE machine_object_dependency SET generation=generation+1 WHERE machine_id=?1",
+        )
+        .bind(id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .is_err());
+        storage.storage_generation += 1;
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM machine_object_dependency WHERE object_digest=?1")
+            .bind(kernel.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .is_err());
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query("INSERT INTO machine_stream_dependency(machine_id,generation,stream_id) VALUES(?1,?2,?3)")
+            .bind(id.to_string()).bind(storage.storage_generation as i64).bind(source.to_string()).execute(&db.pool).await.unwrap();
+        assert!(crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn restored_child_cold_start_atomically_retires_completed_binding() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "restored".into(), paths.machine(id).dir());
+        config.image_ref = "execution-restore".into();
+        let restored_run = uuid::Uuid::new_v4().to_string();
+        let mut state = machine_state(id, MachineRuntimeState::Restoring);
+        state.run_id = Some(restored_run.clone());
+        db.add_machine(&config, &state).await.unwrap();
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        storage.snapshot = Some(crate::storage::identity::SnapshotId::from_sha256([7; 32]));
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        state.status = MachineRuntimeState::Running;
+        db.save_machine_state(&state).await.unwrap();
+        for terminal in [MachineRuntimeState::Stopped, MachineRuntimeState::Error] {
+            state.status = terminal;
+            state.run_id = None;
+            db.save_machine_state(&state).await.unwrap();
+            db.preflight_restored_cold_start(id).await.unwrap();
+        }
+        let mut next = machine_state(id, MachineRuntimeState::Starting);
+        next.run_id = Some(uuid::Uuid::new_v4().to_string());
+        db.start_restored_machine(&config, &next).await.unwrap();
+
+        assert_eq!(db.machine_state(id).await.unwrap(), Some(next));
+        assert_eq!(
+            db.machine_config(id).await.unwrap().unwrap().image_ref,
+            "stopped-storage"
+        );
+        let mut expected_storage = storage;
+        expected_storage.snapshot = None;
+        assert_eq!(
+            db.machine_storage(id).await.unwrap(),
+            Some(expected_storage)
+        );
+        let binding: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM machine_restore_binding WHERE machine_id=?1)",
+        )
+        .bind(id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!binding);
+    }
+
+    #[tokio::test]
+    async fn restored_child_cold_start_refuses_incomplete_and_unreconciled_runs() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "unfinished".into(), paths.machine(id).dir());
+        config.image_ref = "execution-restore".into();
+        let restored_run = uuid::Uuid::new_v4();
+        let mut state = machine_state(id, MachineRuntimeState::Restoring);
+        state.run_id = Some(restored_run.to_string());
+        db.add_machine(&config, &state).await.unwrap();
+        let mut next = machine_state(id, MachineRuntimeState::Starting);
+        next.run_id = Some(uuid::Uuid::new_v4().to_string());
+
+        // A different run's readiness must not complete this restore.
+        state.status = MachineRuntimeState::Running;
+        state.run_id = Some(uuid::Uuid::new_v4().to_string());
+        db.save_machine_state(&state).await.unwrap();
+        state.status = MachineRuntimeState::Stopped;
+        state.run_id = None;
+        db.save_machine_state(&state).await.unwrap();
+        assert!(db.start_restored_machine(&config, &next).await.is_err());
+        assert_eq!(db.machine_state(id).await.unwrap(), Some(state.clone()));
+        assert_eq!(db.machine_config(id).await.unwrap(), Some(config.clone()));
+
+        state.status = MachineRuntimeState::Running;
+        state.run_id = Some(restored_run.to_string());
+        db.save_machine_state(&state).await.unwrap();
+        // Observing a late monitor after a terminal state is not activation.
+        state.status = MachineRuntimeState::Stopped;
+        state.run_id = None;
+        db.save_machine_state(&state).await.unwrap();
+        assert!(db.preflight_restored_cold_start(id).await.is_err());
+        state.status = MachineRuntimeState::Restoring;
+        state.run_id = Some(restored_run.to_string());
+        db.save_machine_state(&state).await.unwrap();
+        state.status = MachineRuntimeState::Running;
+        db.save_machine_state(&state).await.unwrap();
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let lease = db
+            .register_launch_storage(id, restored_run, &storage, &config.spec)
+            .await
+            .unwrap();
+        state.status = MachineRuntimeState::Stopped;
+        state.run_id = None;
+        db.save_machine_state(&state).await.unwrap();
+        assert!(db.preflight_restored_cold_start(id).await.is_err());
+        assert!(db.start_restored_machine(&config, &next).await.is_err());
+        assert_eq!(db.machine_state(id).await.unwrap(), Some(state));
+        assert_eq!(db.machine_config(id).await.unwrap(), Some(config));
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        drop(lease);
+    }
+
+    type WaitingLeaseInventory = (
+        tokio::task::JoinHandle<Result<(), crate::LibVmError>>,
+        std::sync::mpsc::Sender<()>,
+    );
+
+    async fn waiting_lease_inventories(db: &Store) -> Vec<WaitingLeaseInventory> {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+
+        let mut pending = Vec::new();
+        let mut entered = Vec::new();
+        for _ in 0..8 {
+            let (hook, receiver, release) = WorkerHook::new(WorkerPoint::LeaseInventoryWait, false);
+            let mut worker = db.clone();
+            worker.layer_hook = Some(hook);
+            let runtime = tokio::runtime::Handle::current();
+            let task = tokio::task::spawn_blocking(move || {
+                runtime.block_on(async {
+                    let pool = crate::storage::pool::StoragePool::open(&worker.images_dir)?;
+                    worker.check_operation_recovery(&pool).await
+                })
+            });
+            pending.push((task, release));
+            entered.push(receiver);
+        }
+        for mut receiver in entered {
+            tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        pending
+    }
+
+    async fn finish_lease_inventories(pending: Vec<WaitingLeaseInventory>) {
+        for (_, release) in &pending {
+            release.send(()).unwrap();
+        }
+        for (task, _) in pending {
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_inventory_waits_for_retired_launch_without_holding_roots() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "concurrent-stop".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let run = uuid::Uuid::new_v4();
+        let owner = db
+            .register_launch_storage(id, run, &storage, &config.spec)
+            .await
+            .unwrap();
+        let operation = owner.operation_id();
+        drop(owner);
+
+        // Hold the real budget lock so retirement pauses after deleting its
+        // catalog row and releasing roots, but before closing its EX lease.
+        let budget = crate::store::restore::budget_directory(&db).unwrap();
+        let admission = crate::storage::locks::blocking(
+            &budget,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .unwrap();
+        let worker = db.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let retiring = tokio::task::spawn_blocking(move || {
+            runtime.block_on(worker.try_retire_launch_storage(
+                operation,
+                run,
+                storage.storage_generation,
+                &machine_state(id, MachineRuntimeState::Stopped),
+                crate::StorageStopOutcome::Forced,
+            ))
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !db.launch_storage_operations(id).await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        let pending = waiting_lease_inventories(&db).await;
+        assert!(pool.try_roots_shared().unwrap().is_some());
+        drop(admission);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), retiring)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        );
+        finish_lease_inventories(pending).await;
+        assert!(db.launch_storage_operations(id).await.unwrap().is_empty());
+        assert_eq!(
+            db.machine_storage(id).await.unwrap().unwrap().stop_outcome,
+            crate::StorageStopOutcome::Forced
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_inventory_waits_for_temporary_scan_before_roots() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let (operation, lease) = db.begin_stopped_operation("fork", &[], &[]).await.unwrap();
+        let workspace = pool
+            .create_operation_with_lease(operation, lease.duplicate().unwrap())
+            .unwrap();
+        std::fs::write(workspace.temporary.join("private"), b"abandoned bytes").unwrap();
+        let path = workspace.temporary.clone();
+        db.finish_stopped_operation(operation).await.unwrap();
+        drop((workspace, lease));
+        db.retire_pending_storage_operations(&pool).await.unwrap();
+
+        // TemporaryScan claims the retired operation's EX lease before the
+        // cleanup caller acquires roots. Inventory must not call it corruption,
+        // and must leave roots available to that caller.
+        let candidate = pool.abandoned_temporary().unwrap().next().unwrap().unwrap();
+        assert_eq!(candidate.path(), path);
+        let pending = waiting_lease_inventories(&db).await;
+        {
+            let _roots = pool.lock_roots().unwrap();
+            candidate.remove().unwrap();
+        }
+        finish_lease_inventories(pending).await;
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn lease_inventory_preserves_unknown_producer_and_malformed_record_detection() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let unknown = pool.lease(uuid::Uuid::new_v4()).unwrap();
+        assert!(matches!(
+            db.check_operation_recovery(&pool).await.unwrap_err(),
+            crate::LibVmError::InvalidStorageRecord { .. }
+        ));
+        drop(unknown);
+        db.check_operation_recovery(&pool).await.unwrap();
+
+        let (operation, producer) = db.begin_stopped_operation("fork", &[], &[]).await.unwrap();
+        db.check_operation_recovery(&pool).await.unwrap();
+        sqlx::query("UPDATE storage_operation SET record_json=jsonb('{\"unexpected\":true}') WHERE operation_id=?1")
+            .bind(operation.to_string()).execute(&db.pool).await.unwrap();
+        assert!(matches!(
+            db.check_operation_recovery(&pool).await.unwrap_err(),
+            crate::LibVmError::InvalidStorageRecord { .. }
+        ));
+        drop(producer);
+        assert!(matches!(
+            db.check_operation_recovery(&pool).await.unwrap_err(),
+            crate::LibVmError::InvalidStorageRecord { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_discards_ram_identity_including_unidentified_fork_memory() {
+        use crate::store::models::storage::ContentIdentityState;
+
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        for identity in [
+            ContentIdentityState::Unknown,
+            ContentIdentityState::UnknownAfterFork,
+            ContentIdentityState::Identified {
+                root: vm_spec::capture::Sha256Digest::from_bytes([1; 32]),
+            },
+        ] {
+            let id = MachineId::new();
+            let config = machine_from_path(id, id.to_string(), paths.machine(id).dir());
+            seed_machine(&db, &config).await;
+            let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+            storage.ram_identity = identity;
+            db.save_machine_config_with_storage(&config, &storage)
+                .await
+                .unwrap();
+            let run = uuid::Uuid::new_v4();
+            let owner = db
+                .register_launch_storage(id, run, &storage, &config.spec)
+                .await
+                .unwrap();
+            let operation = owner.operation_id();
+            drop(owner);
+            assert!(db
+                .try_retire_launch_storage(
+                    operation,
+                    run,
+                    storage.storage_generation,
+                    &machine_state(id, MachineRuntimeState::Stopped),
+                    crate::StorageStopOutcome::Forced,
+                )
+                .await
+                .unwrap());
+            assert_eq!(
+                db.machine_storage(id).await.unwrap().unwrap().ram_identity,
+                ContentIdentityState::Unknown
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_store_opens_and_forced_stop_retirements_are_independent() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let mut launches = Vec::new();
+        for index in 0..8 {
+            let id = MachineId::new();
+            let config = machine_from_path(
+                id,
+                format!("parallel-stop-{index}"),
+                paths.machine(id).dir(),
+            );
+            seed_machine(&db, &config).await;
+            let storage = db.machine_storage(id).await.unwrap().unwrap();
+            let run = uuid::Uuid::new_v4();
+            let owner = db
+                .register_launch_storage(id, run, &storage, &config.spec)
+                .await
+                .unwrap();
+            let mut state = machine_state(id, MachineRuntimeState::Running);
+            state.run_id = Some(run.to_string());
+            db.save_machine_state(&state).await.unwrap();
+            launches.push((id, run, storage.storage_generation, owner.operation_id()));
+            drop(owner);
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let runtime = tokio::runtime::Handle::current();
+        let mut workers = Vec::new();
+        for &(id, run, generation, operation) in &launches {
+            let path = paths.state_db_path();
+            let start = start.clone();
+            let runtime = runtime.clone();
+            workers.push(tokio::task::spawn_blocking(move || {
+                start.wait();
+                runtime.block_on(async {
+                    let store = Store::open(&path).await?;
+                    store
+                        .try_retire_launch_storage(
+                            operation,
+                            run,
+                            generation,
+                            &machine_state(id, MachineRuntimeState::Stopped),
+                            crate::StorageStopOutcome::Forced,
+                        )
+                        .await
+                })
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+            );
+        }
+        for (id, _, _, _) in launches {
+            assert!(db.launch_storage_operations(id).await.unwrap().is_empty());
+            assert_eq!(
+                db.machine_state(id).await.unwrap().unwrap().status,
+                MachineRuntimeState::Stopped
+            );
+            assert_eq!(
+                db.machine_storage(id).await.unwrap().unwrap().stop_outcome,
+                crate::StorageStopOutcome::Forced
+            );
+        }
     }
 }

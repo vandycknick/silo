@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "name": "star-real-socket",
+      "layers": [
+        {
+          "tar": "socket.tar",
+          "blob": "socket.tar",
+          "digest": "sha256:705634a07d5d8c55f7f0ddb6b59c8b3b3a0b73fa339ca9ff77cc65ebd833866c",
+          "size": 10240,
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "diffId": "sha256:705634a07d5d8c55f7f0ddb6b59c8b3b3a0b73fa339ca9ff77cc65ebd833866c",
+          "packLength": 0
+        }
+      ],
+      "expected": [
+        {
+          "path": "",
+          "kind": "directory",
+          "mode": 448,
+          "uid": 1000,
+          "gid": 1000,
+          "mtimeSeconds": 1793516582,
+          "mtimeNanos": 30219771,
+          "xattrs": [],
+          "length": null,
+          "content": null,
+          "target": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "group": null,
+          "links": null
+        },
+        {
+          "path": "c29ja2V0",
+          "kind": "socket",
+          "mode": 493,
+          "uid": 1000,
+          "gid": 1000,
+          "mtimeSeconds": 1,
+          "mtimeNanos": 7,
+          "xattrs": [],
+          "length": null,
+          "content": null,
+          "target": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "group": "c29ja2V0",
+          "links": 1
+        }
+      ],
+      "expectedRejected": false
+    }
+  ]
+}

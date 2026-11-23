@@ -11,6 +11,17 @@ use protocol::v1::{
     VmState,
 };
 use tokio::sync::watch;
+use vm_spec::lifecycle::{LiveLifecycle, VmLifecycleState};
+use vm_spec::live::{
+    LiveBackend, LiveCapabilityVector, LiveLane, LiveMachineReport, LiveScope, LIVE_SCHEMA_VERSION,
+};
+
+pub(crate) struct RunLiveProfile {
+    pub(crate) run_id: String,
+    pub(crate) backend: LiveBackend,
+    pub(crate) lane: LiveLane,
+    pub(crate) live: LiveCapabilityVector,
+}
 
 const TIMESTAMP_MIN_SECONDS: i64 = -62_135_596_800;
 const TIMESTAMP_MAX_SECONDS: i64 = 253_402_300_799;
@@ -72,9 +83,41 @@ struct SshVerification {
 #[derive(Debug, Clone)]
 struct Observation<T> {
     received_at: SystemTime,
+    received: Instant,
     stale_at: SystemTime,
     deadline: Instant,
     value: T,
+}
+
+/// Atomic live-lifecycle projection published by the coordinator.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveTransition {
+    pub(crate) state: VmLifecycleState,
+    pub(crate) lifecycle: LiveLifecycle,
+    pub(crate) message: String,
+    /// Identity existing sessions stay bound to while the lifecycle holds a
+    /// non-Running state. Cleared on Running and Error.
+    pub(crate) held_identity: Option<ReadyAgentIdentity>,
+    /// Native execution is positively parked: agent staleness is suspended.
+    pub(crate) parked: bool,
+    /// Evaluate guest readiness prerequisites (incl. SSH) while still fenced.
+    pub(crate) readiness_probe: bool,
+}
+
+/// Read-only lifecycle admission view.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveSnapshot {
+    pub(crate) state: VmLifecycleState,
+    pub(crate) lifecycle: LiveLifecycle,
+    pub(crate) ready_identity: Option<ReadyAgentIdentity>,
+    pub(crate) observed_identity: Option<ReadyAgentIdentity>,
+    /// Baseline narrowed by the current guest evidence.
+    pub(crate) live: LiveCapabilityVector,
+    pub(crate) guest_rejection: Option<&'static str>,
+    pub(crate) backend: LiveBackend,
+    pub(crate) lane: LiveLane,
+    /// Most recent guest lifecycle status from the current identity.
+    pub(crate) guest_lifecycle: Option<protocol::v1::GuestLifecycleStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,9 +126,11 @@ struct State {
     name: String,
     actual_backend: String,
     monitor_id: String,
+    live: LiveMachineReport,
     vm_state: VmState,
     vm_changed_at: SystemTime,
     running_since: Option<SystemTime>,
+    ever_ready: bool,
     vm_code: Option<String>,
     vm_message: Option<String>,
     agent_enabled: bool,
@@ -99,6 +144,10 @@ struct State {
     last_log_snapshot: Option<StateLogSnapshot>,
     ssh_epoch: u64,
     ssh_verification: Option<SshVerification>,
+    live_lifecycle: LiveLifecycle,
+    held_identity: Option<ReadyAgentIdentity>,
+    parked_since: Option<Instant>,
+    readiness_probe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +166,7 @@ struct StateLogSnapshot {
     agent_message: Option<String>,
     ready: bool,
     readiness_reason: ReadinessReason,
+    session_identity: Option<ReadyAgentIdentity>,
 }
 
 #[derive(Debug)]
@@ -124,6 +174,7 @@ pub(crate) struct InstanceStore {
     state: Mutex<State>,
     generation: watch::Sender<u64>,
     identity_reset: watch::Sender<u64>,
+    agent_parked: watch::Sender<bool>,
     ready_agent_identity: watch::Sender<Option<ReadyAgentIdentity>>,
 }
 
@@ -132,20 +183,37 @@ impl InstanceStore {
         machine_id: String,
         name: String,
         agent_enabled: bool,
-        actual_backend: String,
-    ) -> Self {
+        profile: RunLiveProfile,
+    ) -> Result<Self, StoreError> {
         let now = SystemTime::now();
         let (generation, _) = watch::channel(0);
         let (identity_reset, _) = watch::channel(0);
+        let (agent_parked, _) = watch::channel(false);
         let (ready_agent_identity, _) = watch::channel(None);
+        let monitor_id = uuid::Uuid::new_v4().to_string();
+        let live = LiveMachineReport {
+            schema_version: LIVE_SCHEMA_VERSION,
+            scope: LiveScope::Machine,
+            machine_id: machine_id.clone(),
+            run_id: profile.run_id,
+            monitor_id: monitor_id.clone(),
+            backend: profile.backend,
+            lane: profile.lane,
+            topology_revision: 1,
+            live: profile.live,
+            same_machine_activation: false,
+        };
+        live.validate().map_err(StoreError::Validation)?;
         let mut state = State {
             machine_id,
             name,
-            actual_backend,
-            monitor_id: uuid::Uuid::new_v4().to_string(),
+            actual_backend: profile.backend.as_str().to_string(),
+            monitor_id,
+            live,
             vm_state: VmState::Starting,
             vm_changed_at: now,
             running_since: None,
+            ever_ready: false,
             vm_code: None,
             vm_message: Some("vm starting".to_string()),
             agent_enabled,
@@ -162,14 +230,19 @@ impl InstanceStore {
             last_log_snapshot: None,
             ssh_epoch: 0,
             ssh_verification: None,
+            live_lifecycle: LiveLifecycle::default(),
+            held_identity: None,
+            parked_since: None,
+            readiness_probe: false,
         };
         state.last_log_snapshot = Some(state_log_snapshot(&state, Instant::now()));
-        Self {
+        Ok(Self {
             state: Mutex::new(state),
             generation,
             identity_reset,
+            agent_parked,
             ready_agent_identity,
-        }
+        })
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
@@ -178,6 +251,10 @@ impl InstanceStore {
 
     pub(crate) fn subscribe_identity_reset(&self) -> watch::Receiver<u64> {
         self.identity_reset.subscribe()
+    }
+
+    pub(crate) fn subscribe_agent_parked(&self) -> watch::Receiver<bool> {
+        self.agent_parked.subscribe()
     }
 
     pub(crate) fn ready_agent_identity(&self) -> Result<ReadyAgentIdentity, StoreError> {
@@ -189,6 +266,15 @@ impl InstanceStore {
                     StoreError::Protocol("a ready guest agent identity is required".to_string())
                 })
             })
+    }
+
+    /// Shutdown is also needed for a responsive agent whose workloads or SSH
+    /// are not ready. Bind to the observed identity, not the readiness policy.
+    pub(crate) fn shutdown_agent_identity(&self) -> Result<ReadyAgentIdentity, StoreError> {
+        let state = self.state.lock().map_err(|_| StoreError::Poisoned)?;
+        identity_from_state(&state).ok_or_else(|| {
+            StoreError::Protocol("an observed guest agent identity is required".to_string())
+        })
     }
 
     pub(crate) fn is_stopping(&self) -> Result<bool, StoreError> {
@@ -207,8 +293,8 @@ impl InstanceStore {
     pub(crate) fn status(&self) -> Result<HostStatus, StoreError> {
         self.state
             .lock()
-            .map(|state| project_status(&state, Instant::now(), SystemTime::now()))
             .map_err(|_| StoreError::Poisoned)
+            .and_then(|state| project_status(&state, Instant::now(), SystemTime::now()))
     }
 
     pub(crate) fn metrics(&self) -> Result<HostMetrics, StoreError> {
@@ -222,6 +308,13 @@ impl InstanceStore {
         self.state
             .lock()
             .map(|state| readiness(&state, Instant::now()))
+            .map_err(|_| StoreError::Poisoned)
+    }
+
+    pub(crate) fn has_been_ready(&self) -> Result<bool, StoreError> {
+        self.state
+            .lock()
+            .map(|state| state.ever_ready)
             .map_err(|_| StoreError::Poisoned)
     }
 
@@ -301,10 +394,121 @@ impl InstanceStore {
             }
             state.stopping = matches!(
                 vm_state,
-                VmState::Stopping | VmState::Stopped | VmState::Failed
+                VmState::Stopping | VmState::Stopped | VmState::Failed | VmState::Hibernated
             );
+            if state.stopping {
+                // Stop never resumes: the pause authority ends with the run.
+                state.live_lifecycle = LiveLifecycle::default();
+                state.held_identity = None;
+                state.readiness_probe = false;
+                unpark(state, Instant::now());
+            }
             Ok(())
         })
+    }
+
+    /// Publish one lifecycle transition atomically. Refused (Ok(false)) once
+    /// the monitor is stopping, so a late continuation cannot reopen anything.
+    pub(crate) fn publish_live(&self, transition: LiveTransition) -> Result<bool, StoreError> {
+        transition
+            .lifecycle
+            .validate_for(transition.state)
+            .map_err(StoreError::Validation)?;
+        if transition.state.is_stopping_or_terminal()
+            || transition.state == VmLifecycleState::Starting
+        {
+            return Err(StoreError::Validation(
+                "live transitions never publish startup or terminal states".into(),
+            ));
+        }
+        let mut published = false;
+        self.mutate_if(|state| {
+            if state.stopping {
+                return Ok(false);
+            }
+            let now = Instant::now();
+            match (transition.parked, state.parked_since) {
+                (true, None) => state.parked_since = Some(now),
+                (false, Some(_)) => unpark(state, now),
+                _ => {}
+            }
+            let changed_at = SystemTime::now();
+            state.vm_state = transition.state.into();
+            state.vm_changed_at = changed_at;
+            // A restored run first becomes Running here, never via Starting.
+            if transition.state == VmLifecycleState::Running && state.running_since.is_none() {
+                state.running_since = Some(changed_at);
+            }
+            state.vm_message = Some(truncate(transition.message, protocol::MAX_DIAGNOSTIC_BYTES));
+            state.live_lifecycle = transition.lifecycle;
+            state.held_identity = transition.held_identity;
+            state.readiness_probe = transition.readiness_probe;
+            published = true;
+            Ok(true)
+        })?;
+        Ok(published)
+    }
+
+    pub(crate) fn live_snapshot(&self) -> Result<LiveSnapshot, StoreError> {
+        let state = self.state.lock().map_err(|_| StoreError::Poisoned)?;
+        let now = Instant::now();
+        let lifecycle_state =
+            VmLifecycleState::try_from(state.vm_state).map_err(StoreError::Validation)?;
+        let guest_rejection = guest_rejection(&state, now);
+        Ok(LiveSnapshot {
+            state: lifecycle_state,
+            lifecycle: state.live_lifecycle.clone(),
+            ready_identity: ready_agent_identity(&state, now),
+            observed_identity: identity_from_state(&state),
+            live: crate::capabilities::narrow_for_guest(state.live.live.clone(), guest_rejection),
+            guest_rejection,
+            backend: state.live.backend,
+            lane: state.live.lane,
+            guest_lifecycle: state
+                .status
+                .as_ref()
+                .and_then(|status| status.value.lifecycle.clone()),
+        })
+    }
+
+    /// Start of the positive native park suspending agent staleness, if any.
+    /// One uninterrupted interval keeps the same start.
+    #[cfg(test)]
+    pub(crate) fn parked_since(&self) -> Option<Instant> {
+        self.state.lock().expect("instance store lock").parked_since
+    }
+
+    /// The exact identity, if a status receipt from it arrived strictly after
+    /// `since` (the transport re-handshake after native release).
+    pub(crate) fn status_identity_since(
+        &self,
+        since: Instant,
+    ) -> Result<Option<ReadyAgentIdentity>, StoreError> {
+        let state = self.state.lock().map_err(|_| StoreError::Poisoned)?;
+        Ok(state
+            .status
+            .as_ref()
+            .filter(|status| status.received > since)
+            .and_then(|_| identity_from_state(&state)))
+    }
+
+    /// Guest readiness prerequisites evaluated as if Running, from receipts
+    /// strictly after `since`. Public readiness stays false outside Running.
+    pub(crate) fn prospective_readiness(
+        &self,
+        since: Instant,
+    ) -> Result<(bool, ReadinessReason), StoreError> {
+        let state = self.state.lock().map_err(|_| StoreError::Poisoned)?;
+        let now = Instant::now();
+        if state
+            .status
+            .as_ref()
+            .is_some_and(|status| status.received <= since)
+            && state.agent_enabled
+        {
+            return Ok((false, ReadinessReason::AgentStatusStale));
+        }
+        Ok(running_readiness(&state, now))
     }
 
     /// Records the latest host memory reclaim report from the backend.
@@ -319,11 +523,16 @@ impl InstanceStore {
     }
 
     pub(crate) fn agent_connecting(&self) -> Result<(), StoreError> {
-        self.mutate(|state| {
-            if state.agent_enabled {
-                state.connection.state = Some(AgentConnectionState::Connecting as i32);
+        self.mutate_if(|state| {
+            // Resume barriers can restore responsiveness while a reconnect
+            // backoff is still sleeping. That retry is no longer evidence of loss.
+            if !state.agent_enabled
+                || state.connection.state != Some(AgentConnectionState::Unresponsive as i32)
+            {
+                return Ok(false);
             }
-            Ok(())
+            state.connection.state = Some(AgentConnectionState::Connecting as i32);
+            Ok(true)
         })
     }
 
@@ -357,10 +566,11 @@ impl InstanceStore {
 
         self.mutate(|state| {
             // A new receipt cannot revive evidence whose previous receipt expired.
+            let now = Instant::now();
             if state
                 .status
                 .as_ref()
-                .is_some_and(|status| status.deadline <= Instant::now())
+                .is_some_and(|status| !observation_live(state, status.deadline, now))
             {
                 invalidate_ssh_verification(state)?;
             }
@@ -382,12 +592,50 @@ impl InstanceStore {
             if state.identity.is_none() {
                 state.agent_services = known_agent_services();
             }
+            // The stream can deliver a report the guest sent before a freeze
+            // after the freeze was already acknowledged directly. Freeze
+            // epochs only grow within one agent instance, so a report with an
+            // older epoch never replaces newer lifecycle evidence.
+            let mut observation = observation;
+            if let Some(known) = state
+                .status
+                .as_ref()
+                .and_then(|status| status.value.lifecycle.as_ref())
+            {
+                if lifecycle_epoch(observation.value.lifecycle.as_ref())
+                    < lifecycle_epoch(Some(known))
+                {
+                    observation.value.lifecycle = Some(known.clone());
+                }
+            }
             state.identity = Some(identity);
             state.connection.state = Some(AgentConnectionState::Responsive as i32);
             state.connection.last_success_at = Some(timestamp(received_at));
             state.connection.code = None;
             state.connection.message = None;
             state.status = Some(observation);
+            Ok(())
+        })
+    }
+
+    /// Records the lifecycle the guest returned in a direct reply.
+    ///
+    /// The status stream reports the same fact on its own schedule. A native
+    /// pause taken right after the reply can stop the guest before that
+    /// report is sent, which would leave the paused machine without the
+    /// freeze evidence a later capture of the same pause requires.
+    pub(crate) fn observe_guest_lifecycle(
+        &self,
+        lifecycle: protocol::v1::GuestLifecycleStatus,
+    ) -> Result<(), StoreError> {
+        self.mutate(|state| {
+            if let Some(status) = &mut state.status {
+                if lifecycle_epoch(Some(&lifecycle))
+                    >= lifecycle_epoch(status.value.lifecycle.as_ref())
+                {
+                    status.value.lifecycle = Some(lifecycle);
+                }
+            }
             Ok(())
         })
     }
@@ -466,11 +714,19 @@ impl InstanceStore {
                 .last_log_snapshot
                 .clone()
                 .unwrap_or_else(|| state_log_snapshot(&state, Instant::now()));
+            let was_parked = state.parked_since.is_some();
             if !update(&mut state)? {
                 return Ok(());
             }
             refresh_ssh_verification(&mut state, Instant::now())?;
+            let parked = state.parked_since.is_some();
+            if parked != was_parked {
+                // Publish under the state lock so rapid park/release transitions
+                // cannot reorder. Watch versions retain even coalesced transitions.
+                self.agent_parked.send_replace(parked);
+            }
             let after = state_log_snapshot(&state, Instant::now());
+            state.ever_ready |= after.ready;
             state.last_log_snapshot = Some(after.clone());
             (before, after)
         };
@@ -526,16 +782,107 @@ fn known_agent_services() -> Vec<String> {
     .collect()
 }
 
+/// Identity existing sessions are bound to: the ready identity, or while a
+/// live lifecycle holds the machine, the identity held at its admission as
+/// long as no other identity was observed. `None` means sessions are lost.
 fn ready_agent_identity_from_snapshot(snapshot: &StateLogSnapshot) -> Option<ReadyAgentIdentity> {
-    if !snapshot.ready {
+    snapshot.session_identity.clone()
+}
+
+fn session_identity(state: &State, now: Instant) -> Option<ReadyAgentIdentity> {
+    if let Some(ready) = ready_agent_identity(state, now) {
+        return Some(ready);
+    }
+    let held = state.held_identity.as_ref()?;
+    if !matches!(
+        state.vm_state,
+        VmState::Pausing | VmState::Paused | VmState::Capturing | VmState::Hibernating
+    ) {
         return None;
     }
-    let instance_id = snapshot.agent_instance_id.as_deref()?;
-    let boot_id = snapshot.agent_boot_id.as_deref()?;
-    Some(ReadyAgentIdentity {
-        instance_id: uuid::Uuid::parse_str(instance_id).ok()?,
-        boot_id: uuid::Uuid::parse_str(boot_id).ok()?,
-    })
+    match identity_from_state(state) {
+        Some(observed) if &observed != held => None,
+        _ => Some(held.clone()),
+    }
+}
+
+/// Extends retained receipts by the parked interval so suspended staleness
+/// resumes from where it stopped. Expired receipts stay expired.
+fn unpark(state: &mut State, now: Instant) {
+    let Some(since) = state.parked_since.take() else {
+        return;
+    };
+    let parked = now.saturating_duration_since(since);
+    if let Some(status) = state.status.as_mut() {
+        extend(status, since, parked);
+    }
+    if let Some(metrics) = state.metrics.as_mut() {
+        extend(metrics, since, parked);
+    }
+}
+
+fn extend<T>(observation: &mut Observation<T>, since: Instant, parked: Duration) {
+    if observation.deadline <= since {
+        return;
+    }
+    if let (Some(deadline), Some(stale_at)) = (
+        observation.deadline.checked_add(parked),
+        observation.stale_at.checked_add(parked),
+    ) {
+        observation.deadline = deadline;
+        observation.stale_at = stale_at;
+    }
+}
+
+/// Receipt freshness with staleness suspended only while natively parked.
+fn observation_live(state: &State, deadline: Instant, now: Instant) -> bool {
+    deadline > now || state.parked_since.is_some_and(|since| deadline > since)
+}
+
+/// Positive guest live evidence for a new pause, or the rejection profile.
+fn guest_rejection(state: &State, now: Instant) -> Option<&'static str> {
+    if !state.agent_enabled {
+        return Some("guest-agent-disabled");
+    }
+    let Some(status) = state.status.as_ref() else {
+        return Some("guest-agent-unavailable");
+    };
+    if identity_from_state(state).is_none() {
+        return Some("guest-agent-unavailable");
+    }
+    if state.stopping || !observation_live(state, status.deadline, now) {
+        return Some("guest-status-stale");
+    }
+    let report = &status.value;
+    match report
+        .boot
+        .as_ref()
+        .map(|boot| (boot.mode, boot.agent_is_pid1))
+    {
+        Some((Some(mode), Some(true))) if mode == protocol::v1::GuestBootMode::AgentPid1 as i32 => {
+        }
+        Some((Some(mode), Some(false)))
+            if mode == protocol::v1::GuestBootMode::ContainedInit as i32 => {}
+        Some((Some(mode), _)) if mode == protocol::v1::GuestBootMode::InitChild as i32 => {
+            return Some("guest-init-not-contained");
+        }
+        _ => return Some("guest-profile-unsupported"),
+    }
+    let Some(lifecycle) = report.lifecycle.as_ref() else {
+        return Some("guest-lifecycle-unreported");
+    };
+    if lifecycle.unsupported_reason.is_some() || lifecycle.workload_roots.is_empty() {
+        return Some("guest-containment-unsupported");
+    }
+    if lifecycle.generation_driver_ready != Some(true) {
+        return Some("guest-generation-driver-missing");
+    }
+    if (!lifecycle.machine_id.is_empty() && lifecycle.machine_id != state.machine_id)
+        || (!lifecycle.run_id.is_empty() && lifecycle.run_id != state.live.run_id)
+    {
+        return Some("guest-lifecycle-identity-mismatch");
+    }
+    None
 }
 
 fn ready_agent_identity(state: &State, now: Instant) -> Option<ReadyAgentIdentity> {
@@ -555,7 +902,7 @@ fn identity_from_state(state: &State) -> Option<ReadyAgentIdentity> {
 
 fn eligible_ssh(state: &State, now: Instant) -> Option<&protocol::v1::SshListenerReport> {
     if !state.agent_enabled
-        || state.vm_state != VmState::Running
+        || !(state.vm_state == VmState::Running || state.readiness_probe)
         || state.stopping
         || state.connection.state != Some(AgentConnectionState::Responsive as i32)
     {
@@ -674,13 +1021,47 @@ pub(crate) fn new_instance_store(
     new_instance_store_with_backend(machine_id, name, agent_enabled, "mock".to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn new_instance_store_with_backend(
     machine_id: String,
     name: String,
     agent_enabled: bool,
     actual_backend: String,
 ) -> InstanceStore {
-    InstanceStore::new(machine_id, name, agent_enabled, actual_backend)
+    let backend = match actual_backend.as_str() {
+        "krun" => LiveBackend::Krun,
+        "vz" => LiveBackend::Vz,
+        _ => LiveBackend::Mock,
+    };
+    let lane = if backend == LiveBackend::Krun {
+        LiveLane::KvmX86_64
+    } else {
+        LiveLane::NotApplicable
+    };
+    InstanceStore::new(
+        machine_id,
+        name,
+        agent_enabled,
+        RunLiveProfile {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            backend,
+            lane,
+            live: LiveCapabilityVector::all_unsupported(if backend == LiveBackend::Krun {
+                vm_spec::live::LiveReasonCode::NotDelivered
+            } else {
+                vm_spec::live::LiveReasonCode::BackendExcluded
+            }),
+        },
+    )
+    .expect("valid test state")
+}
+
+/// The freeze epoch a lifecycle report refers to; zero before any freeze.
+fn lifecycle_epoch(lifecycle: Option<&protocol::v1::GuestLifecycleStatus>) -> u64 {
+    lifecycle
+        .and_then(|status| status.freeze_ref.as_ref())
+        .and_then(|reference| reference.freeze_epoch)
+        .unwrap_or(0)
 }
 
 fn observation<T>(value: T, freshness: Duration) -> Result<Observation<T>, StoreError> {
@@ -688,11 +1069,11 @@ fn observation<T>(value: T, freshness: Duration) -> Result<Observation<T>, Store
     let stale_at = received_at
         .checked_add(freshness)
         .ok_or(StoreError::Clock)?;
-    let deadline = Instant::now()
-        .checked_add(freshness)
-        .ok_or(StoreError::Clock)?;
+    let received = Instant::now();
+    let deadline = received.checked_add(freshness).ok_or(StoreError::Clock)?;
     Ok(Observation {
         received_at,
+        received,
         stale_at,
         deadline,
         value,
@@ -731,6 +1112,7 @@ fn state_log_snapshot(state: &State, now: Instant) -> StateLogSnapshot {
             .and_then(|report| report.message.map(str::to_owned)),
         ready,
         readiness_reason,
+        session_identity: session_identity(state, now),
     }
 }
 
@@ -1035,6 +1417,9 @@ fn validate_metrics(metrics: &AgentMetrics) -> Result<(), StoreError> {
         .snapshot
         .as_ref()
         .ok_or_else(|| invalid("metrics.snapshot is required"))?;
+    if let Some(root) = &snapshot.root_storage {
+        protocol::validate_root_storage_metrics(root).map_err(|error| invalid(&error))?;
+    }
     if let Some(memory) = &snapshot.memory {
         let total = memory
             .total_bytes
@@ -1289,7 +1674,10 @@ fn truncate(value: String, maximum: usize) -> String {
 }
 
 fn readiness(state: &State, now: Instant) -> WaitOutcome {
-    if matches!(state.vm_state, VmState::Stopped | VmState::Failed) {
+    if matches!(
+        state.vm_state,
+        VmState::Stopped | VmState::Failed | VmState::Hibernated
+    ) {
         return WaitOutcome::Terminal;
     }
     let ready = readiness_detail(state, now).0;
@@ -1300,7 +1688,23 @@ fn readiness(state: &State, now: Instant) -> WaitOutcome {
     }
 }
 
-fn project_status(state: &State, now: Instant, observed_at: SystemTime) -> HostStatus {
+fn project_status(
+    state: &State,
+    now: Instant,
+    observed_at: SystemTime,
+) -> Result<HostStatus, StoreError> {
+    let mut live = state.live.clone();
+    let guest_rejection = guest_rejection(state, now);
+    live.live = crate::capabilities::narrow_for_guest(live.live, guest_rejection);
+    // Clone/capture support predates wake. Only the current, live guest can
+    // positively advertise identity-preserving activation; old agents cannot.
+    live.same_machine_activation = guest_rejection.is_none()
+        && state
+            .status
+            .as_ref()
+            .and_then(|status| status.value.lifecycle.as_ref())
+            .is_some_and(|lifecycle| lifecycle.same_machine_activation == Some(true));
+    let live = live.try_into().map_err(StoreError::Validation)?;
     let (ready, reason) = readiness_detail(state, now);
     let agent = if state.agent_enabled {
         HostAgent {
@@ -1319,8 +1723,9 @@ fn project_status(state: &State, now: Instant, observed_at: SystemTime) -> HostS
             mode: Some(protocol::v1::host_agent::Mode::Disabled(DisabledAgent {})),
         }
     };
-    HostStatus {
-        run_id: None,
+    Ok(HostStatus {
+        run_id: Some(state.live.run_id.clone()),
+        live: Some(live),
         machine_id: Some(state.machine_id.clone()),
         name: Some(state.name.clone()),
         monitor: Some(MonitorSnapshot {
@@ -1339,7 +1744,8 @@ fn project_status(state: &State, now: Instant, observed_at: SystemTime) -> HostS
             reason: Some(reason as i32),
         }),
         agent: Some(agent),
-    }
+        lifecycle: Some(state.live_lifecycle.clone().into()),
+    })
 }
 
 fn project_metrics(state: &State, now: Instant, observed_at: SystemTime) -> HostMetrics {
@@ -1390,7 +1796,7 @@ fn status_observation(
 }
 
 fn freshness(state: &State, deadline: Instant, now: Instant) -> Freshness {
-    if !state.stopping && deadline > now {
+    if !state.stopping && observation_live(state, deadline, now) {
         Freshness::Fresh
     } else {
         Freshness::Stale
@@ -1410,22 +1816,38 @@ fn readiness_detail(state: &State, now: Instant) -> (bool, ReadinessReason) {
         VmState::Stopping => (false, ReadinessReason::VmStopping),
         VmState::Stopped => (false, ReadinessReason::VmStopped),
         VmState::Failed => (false, ReadinessReason::VmFailed),
-        VmState::Running if !state.agent_enabled => (true, ReadinessReason::AgentNotRequired),
-        VmState::Running => match &state.status {
-            Some(status) if state.stopping || status.deadline <= now => {
-                (false, ReadinessReason::AgentStatusStale)
-            }
-            Some(status) => match effective_status(state, &status.value, now)
-                .state
-                .and_then(|value| AgentStatusState::try_from(value).ok())
-            {
-                Some(AgentStatusState::Starting) => (false, ReadinessReason::GuestStarting),
-                Some(AgentStatusState::Failed) => (false, ReadinessReason::GuestFailed),
-                Some(AgentStatusState::Ready) => (true, ReadinessReason::GuestReportedReady),
-                _ => (false, ReadinessReason::AgentUnavailable),
-            },
-            None => (false, ReadinessReason::AgentUnavailable),
+        VmState::Pausing => (false, ReadinessReason::VmPausing),
+        VmState::Paused => (false, ReadinessReason::VmPaused),
+        VmState::Capturing => (false, ReadinessReason::VmCapturing),
+        VmState::Hibernating => (false, ReadinessReason::VmHibernating),
+        VmState::Hibernated => (false, ReadinessReason::VmHibernated),
+        VmState::Restoring => (false, ReadinessReason::VmRestoring),
+        VmState::Activating => (false, ReadinessReason::VmActivating),
+        VmState::ActivationFailed => (false, ReadinessReason::VmActivationFailed),
+        VmState::Error => (false, ReadinessReason::VmError),
+        VmState::Running => running_readiness(state, now),
+    }
+}
+
+/// Readiness of a running machine: agent evidence and host-verified SSH.
+fn running_readiness(state: &State, now: Instant) -> (bool, ReadinessReason) {
+    if !state.agent_enabled {
+        return (true, ReadinessReason::AgentNotRequired);
+    }
+    match &state.status {
+        Some(status) if state.stopping || status.deadline <= now => {
+            (false, ReadinessReason::AgentStatusStale)
+        }
+        Some(status) => match effective_status(state, &status.value, now)
+            .state
+            .and_then(|value| AgentStatusState::try_from(value).ok())
+        {
+            Some(AgentStatusState::Starting) => (false, ReadinessReason::GuestStarting),
+            Some(AgentStatusState::Failed) => (false, ReadinessReason::GuestFailed),
+            Some(AgentStatusState::Ready) => (true, ReadinessReason::GuestReportedReady),
+            _ => (false, ReadinessReason::AgentUnavailable),
         },
+        None => (false, ReadinessReason::AgentUnavailable),
     }
 }
 
@@ -1475,8 +1897,12 @@ mod tests {
     };
 
     use crate::state::{
-        new_instance_store, InstanceStore, StateLogSnapshot, StoreError, WaitOutcome,
+        new_instance_store, InstanceStore, RunLiveProfile, StateLogSnapshot, StoreError,
+        WaitOutcome,
     };
+    use protocol::v1::Freshness;
+    use vm_spec::lifecycle::{LiveLifecycle, VmLifecycleState};
+    use vm_spec::live::{LiveBackend, LiveCapabilityVector, LiveLane, LiveMachineReport};
 
     fn ready_status(instance: &str) -> AgentStatus {
         AgentStatus {
@@ -1547,7 +1973,7 @@ mod tests {
     }
 
     fn ssh_store() -> InstanceStore {
-        let store = new_instance_store("machine-1".into(), "ssh-test".into(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "ssh-test".into(), true);
         store.set_vm_state(VmState::Running, "running").unwrap();
         store
             .observe_status(ssh_status(1), Duration::from_secs(300))
@@ -1648,6 +2074,164 @@ mod tests {
             projected_report(&store).code.as_deref(),
             Some("SSH_NOT_READY")
         );
+    }
+
+    #[tokio::test]
+    async fn late_pin_completion_rechecks_current_fenced_readiness() {
+        #[derive(Clone, Copy, Debug)]
+        enum Completion {
+            Current,
+            Replaced,
+            Stopping,
+            Canceled,
+            Mismatch,
+        }
+
+        for completion in [
+            Completion::Current,
+            Completion::Replaced,
+            Completion::Stopping,
+            Completion::Canceled,
+            Completion::Mismatch,
+        ] {
+            let store = ssh_store();
+            let original = store.ssh_verification_target().unwrap().unwrap();
+            store.complete_ssh_verification(&original, Ok(())).unwrap();
+            assert_eq!(store.readiness().unwrap(), WaitOutcome::Ready);
+            let mut transition = crate::state::LiveTransition {
+                state: VmLifecycleState::Capturing,
+                lifecycle: LiveLifecycle {
+                    activity: Some(vm_spec::lifecycle::LiveActivity {
+                        operation_id: vm_spec::lifecycle::LiveId::parse(
+                            &uuid::Uuid::new_v4().to_string(),
+                        )
+                        .unwrap(),
+                        request_id: vm_spec::lifecycle::LiveId::parse(
+                            &uuid::Uuid::new_v4().to_string(),
+                        )
+                        .unwrap(),
+                        command: vm_spec::lifecycle::LiveCommandKind::Capture,
+                        stage: vm_spec::lifecycle::LiveStage::GuestFreeze,
+                    }),
+                    ..LiveLifecycle::default()
+                },
+                message: "guest-freeze".into(),
+                held_identity: Some(original.identity.clone()),
+                parked: false,
+                readiness_probe: false,
+            };
+            assert!(store.publish_live(transition.clone()).unwrap());
+            assert!(store.ssh_verification_target().unwrap().is_none());
+            let mut frozen = ssh_status(1);
+            let report = frozen.report.as_mut().unwrap();
+            report.state = Some(AgentStatusState::Starting as i32);
+            report.code = Some("WORKLOAD_NOT_READY".into());
+            report.message = Some("workload lifecycle is not ready".into());
+            store
+                .observe_status(frozen, Duration::from_secs(300))
+                .unwrap();
+            transition.readiness_probe = true;
+            transition.lifecycle.activity.as_mut().unwrap().stage =
+                vm_spec::lifecycle::LiveStage::Readiness;
+            assert!(store.publish_live(transition).unwrap());
+            let since = Instant::now();
+            store
+                .observe_status(ssh_status(1), Duration::from_secs(300))
+                .unwrap();
+            let target = store.ssh_verification_target().unwrap().unwrap();
+            assert!(target.epoch > original.epoch);
+
+            let directory =
+                std::env::temp_dir().join(format!("silo-late-pin-{}", uuid::Uuid::new_v4()));
+            let expected = russh::keys::PublicKey::from_openssh(&target.host_public_key).unwrap();
+            let pinned = if matches!(completion, Completion::Mismatch) {
+                russh::keys::PrivateKey::from(
+                    russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[2; 32]),
+                )
+                .public_key()
+                .clone()
+            } else {
+                expected.clone()
+            };
+            utils::ssh::verify_host_key_pin(&directory, &pinned).unwrap();
+            let (release, wait) = std::sync::mpsc::channel();
+            let path = directory.clone();
+            let pin = tokio::task::spawn_blocking(move || {
+                // Sequence real filesystem verification after the timeout, with
+                // a bound so a failed assertion cannot strand the test runtime.
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                utils::ssh::try_verify_host_key_pin(&path, &expected)
+            });
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let mut generation = store.subscribe();
+            let mut changes = store.subscribe();
+            let finish = crate::guest::ssh::finish_pin(
+                &store,
+                &target,
+                &shutdown,
+                &mut generation,
+                pin,
+                tokio::time::Instant::now(),
+            );
+            tokio::pin!(finish);
+            tokio::select! {
+                result = &mut finish => panic!("pin completed before release: {result:?}"),
+                changed = changes.changed() => changed.unwrap(),
+            }
+            assert_eq!(
+                projected_report(&store).message.as_deref(),
+                Some("SSH listener pin verification timed out"),
+            );
+            assert!(!store.prospective_readiness(since).unwrap().0);
+            assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+            match completion {
+                Completion::Replaced => store
+                    .observe_status(ssh_status(2), Duration::from_secs(300))
+                    .unwrap(),
+                Completion::Stopping => store.set_vm_state(VmState::Stopping, "stop").unwrap(),
+                Completion::Canceled => shutdown.cancel(),
+                Completion::Current | Completion::Mismatch => {}
+            }
+            release.send(()).unwrap();
+            let completed = finish.await.unwrap();
+            if matches!(completion, Completion::Current) {
+                assert!(completed.is_some());
+                assert!(store.prospective_readiness(since).unwrap().0);
+                assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+                assert!(projected_report(&store).ssh.unwrap().kex_verified);
+                assert!(store
+                    .publish_live(crate::state::LiveTransition {
+                        state: VmLifecycleState::Running,
+                        lifecycle: LiveLifecycle::default(),
+                        message: "running".into(),
+                        held_identity: None,
+                        parked: false,
+                        readiness_probe: false,
+                    })
+                    .unwrap());
+                assert_eq!(store.readiness().unwrap(), WaitOutcome::Ready);
+            } else {
+                assert!(!store.prospective_readiness(since).unwrap().0);
+                assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+                assert!(!projected_report(&store).ssh.unwrap().kex_verified);
+                if matches!(completion, Completion::Mismatch) {
+                    assert!(completed.is_some());
+                    assert_eq!(
+                        projected_report(&store).message.as_deref(),
+                        Some("guest SSH host key changed; existing pin is preserved"),
+                    );
+                } else {
+                    assert!(completed.is_none());
+                }
+            }
+            assert_eq!(
+                utils::ssh::read_host_key_pin(&directory)
+                    .unwrap()
+                    .key_data(),
+                pinned.key_data(),
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
@@ -1798,7 +2382,10 @@ mod tests {
             store.complete_ssh_verification(&target, Ok(())).unwrap();
             match transition {
                 0 => store.agent_failure("connection lost").unwrap(),
-                1 => store.agent_connecting().unwrap(),
+                1 => {
+                    store.agent_failure("connection lost").unwrap();
+                    store.agent_connecting().unwrap();
+                }
                 2 => store.set_vm_state(VmState::Stopping, "stopping").unwrap(),
                 3 => {
                     let mut status = ssh_status(1);
@@ -1847,6 +2434,40 @@ mod tests {
             store.agent_failure("still unavailable").unwrap();
             assert_eq!(store.state.lock().expect("state lock").ssh_epoch, epoch);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_reconnect_cannot_revoke_a_resumed_agent_session() {
+        let store = ssh_store();
+        store.agent_failure("status stream became silent").unwrap();
+        let reconnect = async {
+            tokio::time::sleep(Duration::from_millis(1750)).await;
+            store.agent_connecting().unwrap();
+        };
+        tokio::pin!(reconnect);
+        assert!(futures::poll!(reconnect.as_mut()).is_pending());
+        store
+            .observe_status(ssh_status(1), Duration::from_secs(300))
+            .unwrap();
+        let target = store.ssh_verification_target().unwrap().unwrap();
+        store.complete_ssh_verification(&target, Ok(())).unwrap();
+        let mut sessions = store.subscribe_ready_agent_identity();
+        let identity = sessions.borrow_and_update().clone();
+        assert!(identity.is_some());
+        let generation = store.subscribe();
+
+        // The pre-pause reconnect backoff wakes after the resume barrier.
+        tokio::time::advance(Duration::from_millis(1750)).await;
+        reconnect.await;
+
+        assert_eq!(*sessions.borrow(), identity);
+        assert!(!sessions.has_changed().unwrap());
+        assert!(!generation.has_changed().unwrap());
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::Ready);
+        assert!(Arc::ptr_eq(
+            &target,
+            &store.ssh_verification_target().unwrap().unwrap()
+        ));
     }
 
     #[test]
@@ -1900,7 +2521,7 @@ mod tests {
     #[tokio::test]
     async fn ready_status_wakes_generation_waiters() {
         let store = Arc::new(new_instance_store(
-            "machine-1".to_string(),
+            uuid::Uuid::new_v4().to_string(),
             "test".to_string(),
             true,
         ));
@@ -1927,7 +2548,7 @@ mod tests {
 
     #[test]
     fn logging_snapshot_ignores_heartbeat_refreshes() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -1957,7 +2578,7 @@ mod tests {
 
     #[test]
     fn logging_snapshot_tracks_guest_status_and_readiness() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -1986,7 +2607,7 @@ mod tests {
 
     #[test]
     fn logging_snapshot_records_time_derived_staleness_on_next_mutation() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -2017,7 +2638,7 @@ mod tests {
 
     #[test]
     fn identity_replacement_clears_retained_metrics() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .observe_status(
                 ready_status("00000000-0000-4000-8000-000000000002"),
@@ -2035,7 +2656,7 @@ mod tests {
 
     #[test]
     fn capability_cache_is_identity_scoped_and_does_not_change_readiness() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -2084,7 +2705,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_identity_subscription_observes_instance_and_boot_replacement() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -2125,7 +2746,7 @@ mod tests {
 
     #[test]
     fn invalid_observation_is_not_a_poisoned_store() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         let error = store
             .observe_status(AgentStatus::default(), Duration::from_secs(15))
             .expect_err("invalid status");
@@ -2141,7 +2762,7 @@ mod tests {
         report.code = Some("STARTING".to_string());
         report.message = Some("agent starting".to_string());
 
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .observe_status(status, Duration::from_secs(15))
             .expect("starting status");
@@ -2165,7 +2786,7 @@ mod tests {
     #[test]
     fn metrics_report_the_backend_that_created_the_monitor() {
         let store = crate::state::new_instance_store_with_backend(
-            "machine-1".to_string(),
+            uuid::Uuid::new_v4().to_string(),
             "test".to_string(),
             true,
             "krun".to_string(),
@@ -2173,6 +2794,678 @@ mod tests {
         assert_eq!(
             store.metrics().expect("metrics").actual_backend.as_deref(),
             Some("krun")
+        );
+    }
+
+    #[test]
+    fn capabilities_store_rejects_nil_identity_and_invalid_outbound_evidence() {
+        let valid = uuid::Uuid::new_v4().to_string();
+        let nil = uuid::Uuid::nil().to_string();
+        for (machine_id, run_id) in [(&nil, &valid), (&valid, &nil)] {
+            let result = crate::state::InstanceStore::new(
+                machine_id.clone(),
+                "invalid".into(),
+                false,
+                crate::state::RunLiveProfile {
+                    run_id: run_id.clone(),
+                    backend: vm_spec::live::LiveBackend::Mock,
+                    lane: vm_spec::live::LiveLane::NotApplicable,
+                    live: vm_spec::live::LiveCapabilityVector::all_unsupported(
+                        vm_spec::live::LiveReasonCode::BackendExcluded,
+                    ),
+                },
+            );
+            assert!(matches!(result, Err(StoreError::Validation(_))));
+        }
+        let store = new_instance_store(valid, "outbound".into(), false);
+        store.state.lock().expect("state").live.run_id = nil;
+        assert!(matches!(store.status(), Err(StoreError::Validation(_))));
+    }
+
+    #[test]
+    fn capabilities_live_status_preserves_actual_run_across_state_changes() {
+        let machine_id = uuid::Uuid::new_v4().to_string();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut live = vm_spec::live::LiveCapabilityVector::all_unsupported(
+            vm_spec::live::LiveReasonCode::BackendExcluded,
+        );
+        live.pause = vm_spec::live::LiveCapability {
+            native: true,
+            availability: vm_spec::live::LiveAvailability::Supported,
+        };
+        let store = crate::state::InstanceStore::new(
+            machine_id.clone(),
+            "actual-run".into(),
+            false,
+            crate::state::RunLiveProfile {
+                run_id: run_id.clone(),
+                backend: vm_spec::live::LiveBackend::Mock,
+                lane: vm_spec::live::LiveLane::HvfArm64,
+                live: live.clone(),
+            },
+        )
+        .expect("valid state");
+        let initial = store.status().expect("initial");
+        let evidence =
+            vm_spec::live::LiveMachineReport::try_from(initial.live.expect("mandatory live"))
+                .expect("valid report");
+        assert_eq!(evidence.machine_id, machine_id);
+        assert_eq!(evidence.run_id, run_id);
+        assert!(evidence.live.pause.native);
+        assert_eq!(
+            evidence.live.pause.availability,
+            vm_spec::live::LiveAvailability::Unsupported {
+                reason: vm_spec::live::LiveUnsupportedReason::device(
+                    vm_spec::live::LiveDeviceSubject::GuestProfile {
+                        profile: "guest-agent-disabled".into(),
+                    },
+                ),
+            },
+        );
+        assert_eq!(evidence.live.capture, live.capture);
+        assert_eq!(evidence.backend, vm_spec::live::LiveBackend::Mock);
+        store
+            .set_vm_state(VmState::Running, "running")
+            .expect("running");
+        store
+            .set_vm_state(VmState::Stopped, "stopped")
+            .expect("stopped");
+        let terminal = store.status().expect("terminal");
+        assert_eq!(
+            vm_spec::live::LiveMachineReport::try_from(terminal.live.expect("live"))
+                .expect("report"),
+            evidence
+        );
+        assert_eq!(
+            store.metrics().expect("metrics").actual_backend.as_deref(),
+            Some("mock")
+        );
+    }
+    fn root_metrics() -> protocol::v1::RootStorageMetrics {
+        use protocol::v1::{
+            RootStorageKind, RootStorageMetrics, TemporaryDirectoryKind, TemporaryDirectoryMetrics,
+        };
+        RootStorageMetrics {
+            kind: Some(RootStorageKind::LinuxErofsOverlayV1 as i32),
+            upper_profile: Some("silo-upper-ext4-v1".into()),
+            upper_uuid: Some("12345678-1234-4234-8234-123456789abc".into()),
+            upper_backing_bytes: Some(67_112_960),
+            upper_filesystem_bytes: Some(67_108_864),
+            unusable_tail_bytes: Some(4096),
+            filesystem_overhead_bytes: Some(5_668_864),
+            upper_usable_bytes: Some(61_440_000),
+            upper_used_bytes: Some(53_248_000),
+            upper_free_bytes: Some(8_192_000),
+            upper_available_bytes: Some(4_096_000),
+            upper_total_inodes: Some(8192),
+            upper_free_inodes: Some(0),
+            upper_available_inodes: Some(0),
+            shared_lower_logical_bytes: Some(268_435_456),
+            temporary_directory: Some(TemporaryDirectoryMetrics {
+                kind: Some(TemporaryDirectoryKind::Upper as i32),
+                capacity_bytes: Some(61_440_000),
+                used_bytes: Some(53_248_000),
+                free_bytes: Some(8_192_000),
+                available_bytes: Some(4_096_000),
+                persistent: Some(true),
+                memory_charged: Some(false),
+            }),
+        }
+    }
+
+    #[test]
+    fn root_metrics_relay_preserves_exact_payload_and_existing_staleness() {
+        let instance = "00000000-0000-4000-8000-000000000002";
+        for freshness in [Duration::ZERO, Duration::from_secs(300)] {
+            let store = new_instance_store(
+                uuid::Uuid::new_v4().to_string(),
+                "root-metrics".into(),
+                true,
+            );
+            store.set_vm_state(VmState::Running, "running").unwrap();
+            store
+                .observe_status(ready_status(instance), Duration::from_secs(300))
+                .unwrap();
+            let mut metrics = metrics_for(instance);
+            let root = root_metrics();
+            metrics
+                .report
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .root_storage = Some(root.clone());
+            store.observe_metrics(metrics.clone(), freshness).unwrap();
+            let observation = store.metrics().unwrap().metrics.unwrap();
+            assert_eq!(observation.agent_instance_id.as_deref(), Some(instance));
+            assert_eq!(observation.report, metrics.report);
+            assert_eq!(
+                observation.report.unwrap().snapshot.unwrap().root_storage,
+                Some(root)
+            );
+            assert_eq!(
+                observation.freshness,
+                Some(if freshness.is_zero() {
+                    protocol::v1::Freshness::Stale as i32
+                } else {
+                    protocol::v1::Freshness::Fresh as i32
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn root_metrics_relay_rejects_invalid_payload_without_replacing_last_observation() {
+        let instance = "00000000-0000-4000-8000-000000000002";
+        let store = new_instance_store(
+            uuid::Uuid::new_v4().to_string(),
+            "root-metrics".into(),
+            true,
+        );
+        store
+            .observe_status(ready_status(instance), Duration::from_secs(300))
+            .unwrap();
+        let valid = metrics_for(instance);
+        store
+            .observe_metrics(valid.clone(), Duration::from_secs(300))
+            .unwrap();
+        let mut invalid = valid.clone();
+        let mut root = root_metrics();
+        root.upper_used_bytes = Some(u64::MAX);
+        invalid
+            .report
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .root_storage = Some(root);
+        assert!(matches!(
+            store.observe_metrics(invalid, Duration::from_secs(300)),
+            Err(StoreError::Validation(_))
+        ));
+        assert_eq!(
+            store.metrics().unwrap().metrics.unwrap().report,
+            valid.report
+        );
+    }
+
+    fn live_status(instance: &str, driver_ready: Option<bool>) -> AgentStatus {
+        let mut status = ready_status(instance);
+        let report = status.report.as_mut().unwrap();
+        report.boot = Some(protocol::v1::GuestBootReport {
+            mode: Some(protocol::v1::GuestBootMode::AgentPid1 as i32),
+            agent_is_pid1: Some(true),
+            ..Default::default()
+        });
+        report.lifecycle = Some(protocol::v1::GuestLifecycleStatus {
+            state: protocol::v1::GuestLifecycleState::Running as i32,
+            workload_roots: vec!["/sys/fs/cgroup/silo-workloads".into()],
+            generation_driver_ready: driver_ready,
+            ..Default::default()
+        });
+        status
+    }
+
+    fn live_store() -> InstanceStore {
+        let mut live =
+            LiveCapabilityVector::all_unsupported(vm_spec::live::LiveReasonCode::NotDelivered);
+        live.pause = vm_spec::live::LiveCapability {
+            native: true,
+            availability: vm_spec::live::LiveAvailability::Supported,
+        };
+        let store = InstanceStore::new(
+            uuid::Uuid::new_v4().to_string(),
+            "live".into(),
+            true,
+            RunLiveProfile {
+                run_id: uuid::Uuid::new_v4().to_string(),
+                backend: LiveBackend::Mock,
+                lane: LiveLane::NotApplicable,
+                live,
+            },
+        )
+        .unwrap();
+        store.set_vm_state(VmState::Running, "running").unwrap();
+        store
+    }
+
+    fn paused_transition(store: &InstanceStore, parked: bool) -> crate::state::LiveTransition {
+        let identity = store.live_snapshot().unwrap().observed_identity;
+        let snapshot = store.status().unwrap();
+        let id =
+            |value: Option<String>| vm_spec::lifecycle::LiveId::parse(&value.unwrap()).unwrap();
+        let token = vm_spec::lifecycle::PauseToken {
+            machine_id: id(snapshot.machine_id.clone()),
+            run_id: id(snapshot.run_id.clone()),
+            generation: std::num::NonZeroU64::new(1).unwrap(),
+            owner: vm_spec::lifecycle::PauseOwner::User,
+        };
+        crate::state::LiveTransition {
+            state: VmLifecycleState::Paused,
+            lifecycle: LiveLifecycle {
+                current_pause: Some(vm_spec::lifecycle::CurrentPause {
+                    token,
+                    operation_id: id(Some(uuid::Uuid::new_v4().to_string())),
+                    freeze_epoch: std::num::NonZeroU64::new(1).unwrap(),
+                }),
+                ..LiveLifecycle::default()
+            },
+            message: "paused".into(),
+            held_identity: identity,
+            parked,
+            readiness_probe: false,
+        }
+    }
+
+    #[test]
+    fn agent_deadlines_follow_native_park_and_release_not_status_updates() {
+        let store = live_store();
+        let mut parked = store.subscribe_agent_parked();
+        assert!(!*parked.borrow_and_update());
+        assert!(store.publish_live(paused_transition(&store, true)).unwrap());
+        assert!(parked.has_changed().unwrap());
+        assert!(*parked.borrow_and_update());
+
+        // A capture preserving an existing pause must not restart its clock.
+        assert!(store.publish_live(paused_transition(&store, true)).unwrap());
+        store
+            .observe_status(
+                live_status("00000000-0000-4000-8000-000000000002", Some(true)),
+                Duration::from_secs(15),
+            )
+            .unwrap();
+        assert!(!parked.has_changed().unwrap());
+
+        assert!(store
+            .publish_live(crate::state::LiveTransition {
+                state: VmLifecycleState::Running,
+                lifecycle: LiveLifecycle::default(),
+                message: "running".into(),
+                held_identity: None,
+                parked: false,
+                readiness_probe: false,
+            })
+            .unwrap());
+        assert!(parked.has_changed().unwrap());
+        assert!(!*parked.borrow_and_update());
+
+        // Even a park/release pair coalesced into the same final bool is seen.
+        assert!(store.publish_live(paused_transition(&store, true)).unwrap());
+        store.set_vm_state(VmState::Stopping, "stop").unwrap();
+        assert!(parked.has_changed().unwrap());
+        assert!(!*parked.borrow_and_update());
+        assert!(!store.publish_live(paused_transition(&store, true)).unwrap());
+        assert!(!parked.has_changed().unwrap());
+    }
+
+    #[test]
+    fn live_guest_profile_narrows_status_and_admission_from_the_baseline() {
+        let store = live_store();
+        let rejection = |store: &InstanceStore| store.live_snapshot().unwrap().guest_rejection;
+        assert_eq!(rejection(&store), Some("guest-agent-unavailable"));
+        let instance = "00000000-0000-4000-8000-000000000002";
+        store
+            .observe_status(ready_status(instance), Duration::from_secs(15))
+            .unwrap();
+        assert_eq!(rejection(&store), Some("guest-profile-unsupported"));
+        store
+            .observe_status(live_status(instance, Some(false)), Duration::from_secs(15))
+            .unwrap();
+        assert_eq!(rejection(&store), Some("guest-generation-driver-missing"));
+        let status = store.status().unwrap();
+        let live = LiveMachineReport::try_from(status.live.unwrap()).unwrap();
+        assert!(matches!(
+            live.live.pause.availability,
+            vm_spec::live::LiveAvailability::Unsupported { ref reason }
+                if reason.code == vm_spec::live::LiveReasonCode::DeviceProfileRejected
+        ));
+        // Positive evidence widens back to the baseline, never beyond it.
+        store
+            .observe_status(live_status(instance, Some(true)), Duration::from_secs(15))
+            .unwrap();
+        assert_eq!(rejection(&store), None);
+        let live = LiveMachineReport::try_from(store.status().unwrap().live.unwrap()).unwrap();
+        assert_eq!(
+            live.live.pause.availability,
+            vm_spec::live::LiveAvailability::Supported
+        );
+        assert!(matches!(
+            live.live.capture.availability,
+            vm_spec::live::LiveAvailability::Unsupported { ref reason }
+                if reason.code == vm_spec::live::LiveReasonCode::NotDelivered
+        ));
+    }
+
+    #[test]
+    fn live_guest_profile_requires_matching_boot_mode_and_pid1_flag() {
+        use protocol::v1::{GuestBootMode, GuestBootReport};
+
+        let instance = "00000000-0000-4000-8000-000000000002";
+        for mode in [
+            None,
+            Some(GuestBootMode::Unspecified as i32),
+            Some(GuestBootMode::Standard as i32),
+            Some(GuestBootMode::AgentPid1 as i32),
+            Some(GuestBootMode::InitChild as i32),
+            Some(GuestBootMode::ContainedInit as i32),
+            Some(i32::MAX),
+        ] {
+            for agent_is_pid1 in [None, Some(false), Some(true)] {
+                let store = live_store();
+                store
+                    .observe_status(live_status(instance, Some(true)), Duration::from_secs(15))
+                    .unwrap();
+                let mut state = store.state.lock().unwrap();
+                state.status.as_mut().unwrap().value.boot = Some(GuestBootReport {
+                    mode,
+                    agent_is_pid1,
+                    ..Default::default()
+                });
+                let now = Instant::now();
+                let expected = match (mode, agent_is_pid1) {
+                    (Some(mode), Some(true)) if mode == GuestBootMode::AgentPid1 as i32 => None,
+                    (Some(mode), Some(false)) if mode == GuestBootMode::ContainedInit as i32 => {
+                        None
+                    }
+                    (Some(mode), _) if mode == GuestBootMode::InitChild as i32 => {
+                        Some("guest-init-not-contained")
+                    }
+                    _ => Some("guest-profile-unsupported"),
+                };
+                assert_eq!(
+                    crate::state::guest_rejection(&state, now),
+                    expected,
+                    "mode={mode:?}, agent_is_pid1={agent_is_pid1:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_states_keep_readiness_false_and_project_lifecycle() {
+        let store = live_store();
+        store
+            .observe_status(
+                live_status("00000000-0000-4000-8000-000000000002", Some(true)),
+                Duration::from_secs(15),
+            )
+            .unwrap();
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::Ready);
+        assert!(store.publish_live(paused_transition(&store, true)).unwrap());
+        let status = store.status().unwrap();
+        let readiness = status.readiness.unwrap();
+        assert_eq!(readiness.ready, Some(false));
+        assert_eq!(readiness.reason, Some(ReadinessReason::VmPaused as i32));
+        let (state, lifecycle) = protocol::lifecycle::status_lifecycle(&status).unwrap();
+        assert_eq!(state, VmLifecycleState::Paused);
+        assert!(lifecycle.current_pause.is_some());
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+        // Presence rules are enforced on publication.
+        let mut invalid = paused_transition(&store, true);
+        invalid.lifecycle.current_pause = None;
+        assert!(store.publish_live(invalid).is_err());
+        let mut terminal = paused_transition(&store, false);
+        terminal.state = VmLifecycleState::Stopped;
+        assert!(store.publish_live(terminal).is_err());
+    }
+
+    #[tokio::test]
+    async fn live_held_identity_keeps_sessions_and_stop_clears_authority() {
+        let store = live_store();
+        let instance = "00000000-0000-4000-8000-000000000002";
+        store
+            .observe_status(live_status(instance, Some(true)), Duration::from_secs(15))
+            .unwrap();
+        let mut sessions = store.subscribe_ready_agent_identity();
+        let ready = store.ready_agent_identity().unwrap();
+        assert!(store.publish_live(paused_transition(&store, true)).unwrap());
+        assert_eq!(sessions.borrow_and_update().clone(), Some(ready.clone()));
+        assert!(
+            store.ready_agent_identity().is_err(),
+            "new sessions need readiness"
+        );
+        // A different agent instance ends the held binding.
+        store
+            .observe_status(
+                live_status("00000000-0000-4000-8000-000000000009", Some(true)),
+                Duration::from_secs(15),
+            )
+            .unwrap();
+        assert_eq!(sessions.borrow_and_update().clone(), None);
+        // Stop never keeps pause authority and refuses later continuations.
+        store.set_vm_state(VmState::Stopping, "stop").unwrap();
+        let (state, lifecycle) =
+            protocol::lifecycle::status_lifecycle(&store.status().unwrap()).unwrap();
+        assert_eq!(state, VmLifecycleState::Stopping);
+        assert_eq!(lifecycle, LiveLifecycle::default());
+        assert!(!store.publish_live(paused_transition(&store, true)).unwrap());
+        assert_eq!(
+            store.status().unwrap().vm.unwrap().state,
+            Some(VmState::Stopping as i32)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_parked_interval_suspends_agent_staleness_and_resumes_after_release() {
+        let store = live_store();
+        store
+            .observe_status(
+                live_status("00000000-0000-4000-8000-000000000002", Some(true)),
+                Duration::from_millis(200),
+            )
+            .unwrap();
+        let fresh = |store: &InstanceStore| {
+            let status = store.status().unwrap();
+            let Some(protocol::v1::host_agent::Mode::Enabled(agent)) = status.agent.unwrap().mode
+            else {
+                panic!("agent enabled");
+            };
+            agent.status.unwrap().freshness == Some(Freshness::Fresh as i32)
+        };
+        assert!(store.publish_live(paused_transition(&store, true)).unwrap());
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(fresh(&store), "parked interval suspends staleness");
+        assert_eq!(store.live_snapshot().unwrap().guest_rejection, None);
+        // Release: the remaining freshness budget continues, then expires.
+        let mut releasing = paused_transition(&store, false);
+        releasing.state = VmLifecycleState::Pausing;
+        releasing.lifecycle = LiveLifecycle {
+            activity: Some(vm_spec::lifecycle::LiveActivity {
+                operation_id: vm_spec::lifecycle::LiveId::parse(
+                    "00000000-0000-4000-8000-000000000010",
+                )
+                .unwrap(),
+                request_id: vm_spec::lifecycle::LiveId::parse(
+                    "00000000-0000-4000-8000-000000000011",
+                )
+                .unwrap(),
+                command: vm_spec::lifecycle::LiveCommandKind::Resume,
+                stage: vm_spec::lifecycle::LiveStage::ResumeHandshake,
+            }),
+            ..LiveLifecycle::default()
+        };
+        assert!(store.publish_live(releasing).unwrap());
+        assert!(fresh(&store), "remaining budget survives the release");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!fresh(&store), "staleness resumes after release");
+        assert_eq!(
+            store.live_snapshot().unwrap().guest_rejection,
+            Some("guest-status-stale")
+        );
+    }
+
+    #[test]
+    fn hibernation_states_are_not_ready_and_hibernated_is_terminal() {
+        for (state, reason, outcome) in [
+            (
+                VmState::Hibernating,
+                ReadinessReason::VmHibernating,
+                WaitOutcome::TimedOut,
+            ),
+            (
+                VmState::Hibernated,
+                ReadinessReason::VmHibernated,
+                WaitOutcome::Terminal,
+            ),
+        ] {
+            let store = new_instance_store(
+                uuid::Uuid::new_v4().to_string(),
+                "hibernation".into(),
+                false,
+            );
+            store.set_vm_state(state, "saved execution").unwrap();
+            let status = store.status().unwrap();
+            assert_eq!(status.vm.unwrap().state, Some(state as i32));
+            let readiness = status.readiness.unwrap();
+            assert_eq!(readiness.ready, Some(false));
+            assert_eq!(readiness.reason, Some(reason as i32));
+            assert_eq!(store.readiness().unwrap(), outcome);
+        }
+    }
+
+    #[test]
+    fn same_machine_activation_relay_requires_explicit_current_guest_support() {
+        let instance = "00000000-0000-4000-8000-000000000002";
+        for supported in [None, Some(false), Some(true)] {
+            let store = live_store();
+            let initial =
+                LiveMachineReport::try_from(store.status().unwrap().live.unwrap()).unwrap();
+            assert!(!initial.supports_same_machine_activation());
+            let mut status = live_status(instance, Some(true));
+            status
+                .report
+                .as_mut()
+                .unwrap()
+                .lifecycle
+                .as_mut()
+                .unwrap()
+                .same_machine_activation = supported;
+            store
+                .observe_status(status, Duration::from_secs(15))
+                .unwrap();
+            let status = store.status().unwrap();
+            let report = LiveMachineReport::try_from(status.live.unwrap()).unwrap();
+            assert_eq!(
+                report.live.pause.availability,
+                vm_spec::live::LiveAvailability::Supported,
+            );
+            assert_eq!(
+                report.supports_same_machine_activation(),
+                supported == Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn same_machine_activation_relay_rejects_stale_or_mismatched_guest_evidence() {
+        let instance = "00000000-0000-4000-8000-000000000002";
+        for rejection in 0..3 {
+            let store = live_store();
+            let mut status = live_status(instance, Some(true));
+            status
+                .report
+                .as_mut()
+                .unwrap()
+                .lifecycle
+                .as_mut()
+                .unwrap()
+                .same_machine_activation = Some(true);
+            store
+                .observe_status(status, Duration::from_secs(15))
+                .unwrap();
+            let supported =
+                LiveMachineReport::try_from(store.status().unwrap().live.unwrap()).unwrap();
+            assert!(supported.supports_same_machine_activation());
+            {
+                let mut state = store.state.lock().unwrap();
+                match rejection {
+                    0 => {
+                        state.status.as_mut().unwrap().deadline =
+                            Instant::now() - Duration::from_secs(1)
+                    }
+                    1 => {
+                        state
+                            .status
+                            .as_mut()
+                            .unwrap()
+                            .value
+                            .lifecycle
+                            .as_mut()
+                            .unwrap()
+                            .machine_id = uuid::Uuid::new_v4().to_string()
+                    }
+                    _ => state.agent_enabled = false,
+                }
+            }
+            let rejected =
+                LiveMachineReport::try_from(store.status().unwrap().live.unwrap()).unwrap();
+            assert!(!rejected.supports_same_machine_activation(), "{rejection}");
+        }
+    }
+
+    #[test]
+    fn freeze_evidence_from_a_direct_reply_survives_an_older_stream_report() {
+        fn frozen(epoch: u64) -> protocol::v1::GuestLifecycleStatus {
+            let roots = vec!["/sys/fs/cgroup/silo-workloads".to_string()];
+            protocol::v1::GuestLifecycleStatus {
+                state: protocol::v1::GuestLifecycleState::Frozen as i32,
+                workload_roots: roots.clone(),
+                observed_frozen_roots: roots,
+                freeze_ref: Some(protocol::v1::FreezeRef {
+                    freeze_epoch: Some(epoch),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        let lifecycle = |store: &InstanceStore| store.live_snapshot().unwrap().guest_lifecycle;
+        let store = live_store();
+        let instance = uuid::Uuid::new_v4().to_string();
+        let running = live_status(&instance, Some(true));
+        store
+            .observe_status(running.clone(), Duration::from_secs(300))
+            .unwrap();
+
+        // The freeze reply arrives; the stream never repeats it before the
+        // guest stops.
+        store.observe_guest_lifecycle(frozen(7)).unwrap();
+        assert_eq!(lifecycle(&store), Some(frozen(7)));
+
+        // A report the guest sent before freezing is delivered late.
+        store
+            .observe_status(running.clone(), Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(lifecycle(&store), Some(frozen(7)));
+
+        // A thaw of the same freeze is newer evidence and replaces it.
+        let mut thawed = running.clone();
+        let report = thawed.report.as_mut().unwrap().lifecycle.as_mut().unwrap();
+        report.freeze_ref = frozen(7).freeze_ref;
+        store
+            .observe_status(thawed.clone(), Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(
+            lifecycle(&store),
+            thawed.report.as_ref().unwrap().lifecycle.clone()
+        );
+
+        // A stale direct reply cannot roll evidence back either.
+        store.observe_guest_lifecycle(frozen(6)).unwrap();
+        assert_eq!(
+            lifecycle(&store),
+            thawed.report.as_ref().unwrap().lifecycle.clone()
+        );
+
+        // A replacement agent starts from its own reports.
+        let replacement = live_status(&uuid::Uuid::new_v4().to_string(), Some(true));
+        store
+            .observe_status(replacement.clone(), Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(
+            lifecycle(&store),
+            replacement.report.as_ref().unwrap().lifecycle.clone()
         );
     }
 }

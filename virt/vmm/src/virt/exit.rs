@@ -21,6 +21,8 @@ pub(crate) enum ForceReason {
     ProtocolFailure,
     GracefulTimeout,
     Escalated,
+    /// Durable same-machine save, followed by no-shutdown worker termination.
+    Hibernate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,10 @@ impl VmExit {
             VmOutcome::Failed(error) => Some(error.clone()),
             VmOutcome::Clean | VmOutcome::Forced => None,
         }
+    }
+
+    pub(crate) fn hibernated(&self) -> bool {
+        self.outcome == VmOutcome::Forced && self.force_reason == Some(ForceReason::Hibernate)
     }
 
     pub(crate) fn forced(&self) -> bool {

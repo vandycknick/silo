@@ -9,24 +9,14 @@ from uuid import UUID
 
 import pytest
 
-from silo_smoke import images
 from silo_smoke.cli import Silo
-from silo_smoke.config import SmokeConfig
 from silo_smoke.errors import SmokeAssertion
-from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
 
 
 KEY = "openai_codex_oauth.personal.oauth"
 EXPIRED_TOKEN = "expired-initial-payload"
 REFRESHED_TOKEN = "synthetic-sec02-refreshed-access"
-
-
-@pytest.fixture(scope="session")
-def ca_trust_image(config: SmokeConfig, registry: LoopbackRegistry) -> str:
-    return registry.publish(
-        images.build(images.CA_TRUST, images.fetch_alpine(config.cache_dir)), "ca-trust",
-    )
 
 
 def _replace_record(store: Path, token: str, expiry: str) -> None:
@@ -93,7 +83,7 @@ def test_secret_provider_reloads_expired_payload(
         machine = UUID(ready["id"]).hex
         names = ["personal.oauth.access_token", "personal.oauth.expires_at"]
         grant = {
-            "version": 2, "store": f"file:{store}", "machine": machine,
+            "version": 1, "store": f"file:{store}", "machine": machine,
             "run": ready["run_id"], "issued_at": datetime.now(timezone.utc).isoformat(),
             "allowed": [
                 {"slot": slot, "key": KEY, "field": field, "backing_scope": "Home"}
@@ -101,7 +91,7 @@ def test_secret_provider_reloads_expired_payload(
             ],
         }
         request = json.dumps({
-            "version": 2, "operation": "get",
+            "version": 1, "operation": "get",
             "grant": base64.b64encode(json.dumps(grant).encode()).decode(),
             "scope": {"machine": machine, "run": ready["run_id"]},
             "names": names, "reason": "expired",
@@ -113,7 +103,7 @@ def test_secret_provider_reloads_expired_payload(
         header, body = stdout.split(b"\r\n\r\n", 1)
         assert header == f"Content-Length: {len(body)}".encode()
         response = json.loads(body)
-        assert response["version"] == 2
+        assert response["version"] == 1
         assert response["status"] == "ok"
         projected = {item["name"]: base64.b64decode(item["value"]).decode() for item in response["secrets"]}
         assert projected == {
@@ -121,7 +111,7 @@ def test_secret_provider_reloads_expired_payload(
         }
         assert store.read_bytes() == before
         silo.stop(name)
-        assert silo.show(name)["state"] == "stopped"
+        assert silo.info(name)["state"] == "stopped"
         silo.rm(name)
     finally:
         if provider.poll() is None:

@@ -13,6 +13,9 @@
 //! - The exit status is cached: `wait`/`try_wait` after the machine exits (or
 //!   after `stop`) resolve immediately and never hang.
 //! - `open_serial` is called exactly once per boot, by the serial console.
+//! - `lifecycle` is the finite native pause/resume seam. Accepted native work
+//!   outlives a dropped caller; backends without a native pause authority
+//!   refuse every request as `Unsupported`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -28,8 +31,10 @@ use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
 use crate::virt::VmExit;
 
 mod krun;
+pub(crate) mod lifecycle;
 #[cfg(feature = "mock-backend")]
 pub(crate) mod mock;
+pub(crate) mod storage;
 #[cfg(target_os = "macos")]
 mod vz;
 
@@ -51,6 +56,18 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
         self.stop().await
     }
 
+    /// End a durably saved, parked run without executing guest shutdown.
+    async fn hibernate_stop(&self) -> Result<(), VirtError> {
+        Err(VirtError::Backend(
+            "this backend cannot release a saved machine".into(),
+        ))
+    }
+
+    /// Owned worker PID while it remains unreaped.
+    fn worker_process_id(&self) -> Option<u32> {
+        None
+    }
+
     /// Block until the machine exits; resolves immediately once exited.
     async fn wait(&self) -> Result<VmExit, VirtError>;
 
@@ -60,6 +77,14 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
     /// Includes observed death while the immutable terminal report is draining.
     async fn is_terminated(&self) -> Result<bool, VirtError> {
         Ok(self.try_wait().await?.is_some())
+    }
+
+    /// Finalize retained storage only after every native owner is terminal.
+    async fn finalize_storage(
+        &self,
+        _guest_protocol_completed: bool,
+    ) -> Result<StorageFinalization, VirtError> {
+        Ok(StorageFinalization::default())
     }
 
     /// Dynamically connect to a guest endpoint port, consuming its admission lease.
@@ -87,6 +112,46 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
     ) -> Option<watch::Receiver<Option<HostMemoryReclaimReport>>> {
         None
     }
+
+    /// Owned duplicates of the run's retained disk attachments, the held
+    /// sources a live capture clones or copies without re-resolving any
+    /// pathname. Backends without retained attachments cannot capture.
+    async fn capture_sources(&self) -> Result<Vec<CaptureSource>, VirtError> {
+        Err(VirtError::Backend(
+            "this backend retains no capture sources".into(),
+        ))
+    }
+
+    /// The finite native lifecycle seam. Backends without a native pause
+    /// authority refuse every request, including observation, as Unsupported.
+    /// `rights` is the command's fixed descriptor set (`None` for most).
+    async fn lifecycle(
+        &self,
+        request: crate::virt::lifecycle::LifecycleRequest,
+        rights: crate::virt::lifecycle::LifecycleRights,
+    ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>;
+
+    /// Permanently close native mutator submission, synchronously: once this
+    /// returns no new lifecycle mutator can reach the worker, while
+    /// observation and replays of already admitted commands stay available.
+    /// Backends without a native lifecycle seam have nothing to close.
+    fn close_lifecycle_admission(&self) {}
+}
+
+/// Independently observed host storage facts, never inferred from exit status.
+#[derive(Debug, Clone, Default)]
+pub struct StorageFinalization {
+    pub host_writes_flushed: bool,
+    pub attachments_closed: bool,
+    pub error: Option<String>,
+}
+
+/// One retained disk attachment, duplicated for a capture's disk seal.
+#[derive(Debug)]
+pub(crate) struct CaptureSource {
+    pub(crate) disk_index: u32,
+    pub(crate) file: std::fs::File,
+    pub(crate) writable: bool,
 }
 
 /// A single launch attempt, including failures before a VM exists.
@@ -106,15 +171,23 @@ impl StartAttempt {
 /// Host memory reclaim state of the running VM as last reported by the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostMemoryReclaimReport {
+    /// `boot` or `restored-private`.
+    pub backing: &'static str,
+    /// `none`, `tracked-capture`, or `restored-private-mapping`.
+    pub reason: &'static str,
     pub requested: bool,
     /// `not-run`, `passed`, `failed`, or `inconclusive`.
     pub qualification: &'static str,
     pub effective: bool,
+    /// Process-local successfully advised bytes/ranges, including repeats.
     pub released_bytes: u64,
     pub released_extents: u64,
     pub retried_faults: u64,
+    /// Skipped operations, not a universal count of queue heads or pages.
     pub skipped_reports: u64,
     pub failed_operations: u64,
+    pub mapping_limit_skips: u64,
+    pub replaced_islands: u64,
     pub observed_at: SystemTime,
 }
 
@@ -152,25 +225,6 @@ impl BackendKind {
             BackendKind::Mock,
         ]
     }
-
-    /// Today's pinned selection policy: krun on Linux and macOS.
-    ///
-    /// A future user-facing backend picker replaces callers of this with
-    /// "user preference, validated against `compiled()` + `probe()`".
-    pub fn default_for_host() -> Result<BackendKind, VirtError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            Ok(BackendKind::Krun)
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            Err(VirtError::UnsupportedBackend {
-                kind: "none",
-                reason: "no virtualization backend is available for this host platform".to_string(),
-            })
-        }
-    }
 }
 
 impl fmt::Display for BackendKind {
@@ -184,6 +238,13 @@ pub(crate) fn create_backend(
     kind: BackendKind,
     config: VmConfig,
 ) -> Result<Arc<dyn VirtBackend>, VirtError> {
+    if config.restore().is_some() && kind != BackendKind::Krun {
+        return Err(VirtError::InvalidConfig {
+            name: config.name().to_string(),
+            reason: "execution restore requires the krun backend".to_string(),
+        });
+    }
+    storage::publish_holders(&config, None)?;
     match kind {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         BackendKind::Krun => Ok(Arc::new(krun::KrunBackend::new(config)?)),
@@ -201,7 +262,7 @@ pub(crate) fn create_backend(
 
 #[cfg(test)]
 mod tests {
-    use crate::virt::backend::{BackendKind, StartAttempt};
+    use crate::virt::backend::StartAttempt;
 
     #[test]
     fn attempts_are_terminal_even_before_a_vm_exists() {
@@ -230,14 +291,5 @@ mod tests {
                 1
             );
         });
-    }
-
-    #[test]
-    fn default_backend_matches_platform() {
-        let kind = BackendKind::default_for_host().expect("host platform should be supported");
-        #[cfg(target_os = "linux")]
-        assert_eq!(kind, BackendKind::Krun);
-        #[cfg(target_os = "macos")]
-        assert_eq!(kind, BackendKind::Krun);
     }
 }

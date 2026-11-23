@@ -1,14 +1,27 @@
 use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use crate::krun::{Disk, KrunConfig, Mount, Network};
+use libkrun::control::{ControlFailure, ControlState, OperationId, PauseOwner, PauseToken};
+use libkrun::live::restore::{
+    FailedRestore, RestoreBuildFailure, RestoreInputs, RestoreResources, RestoreToken,
+};
+use libkrun::live::{
+    BaselineImage, BaselineToken, CaptureId, CaptureStatus, CaptureTicket, CompletedCapture,
+    ExecutionCaptureReceipt, ExecutionOutputs, FlushReceipt, GenerationKind, GenerationObservation,
+    GenerationSnapshot, GenerationTicket, LiveError, MemoryCaptureRequest, MemoryOutputs,
+    StateBinding, StoppedOwner,
+};
+
+use crate::krun::{KrunConfig, Mount, Network};
 use libkrun::{
-    BalloonDevice, BlockDevice, ConsoleDevice, DiskFormat, FsDevice, KernelFormat,
-    MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice, RosettaFsConfig, RosettaFsDevice,
-    RosettaProfile, SyncMode, TsiFlags, VmmBuilder, VmmError, VsockDevice,
+    BalloonDevice, BlockDevice, ConsoleDevice, DiskFormat, FsDevice, GenerationDevice,
+    KernelFormat, MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice, RosettaFsConfig,
+    RosettaFsDevice, RosettaProfile, SyncMode, TsiFlags, VmmBuilder, VmmError, VsockDevice,
 };
 use thiserror::Error;
+use vm_spec::Disk;
 
 // Process entry points choose if and when global native logging is installed.
 pub use libkrun::{init_log, LogLevel, LogOptions, LogStyle};
@@ -17,15 +30,26 @@ pub use libkrun::{init_log, LogLevel, LogOptions, LogStyle};
 pub struct Resources<'a> {
     pub console: ConsoleFds<'a>,
     pub vsock_mux: Option<OwnedFd>,
+    pub console_ports: Vec<ConsolePort<'a>>,
+    pub managed_network: Option<OwnedFd>,
+}
+
+/// Extra finite console bindings, borrowed through native terminality.
+pub struct ConsolePort<'a> {
+    pub name: &'a str,
+    pub input: Option<BorrowedFd<'a>>,
+    pub output: Option<BorrowedFd<'a>>,
 }
 
 /// Process-local controls, not a reusable VM or a process lifecycle handle.
 #[derive(Clone)]
 pub struct Control {
-    #[cfg(target_os = "macos")]
     handle: std::sync::Arc<libkrun::VmmHandle>,
 }
 
+// The worker consumes every control except stop, the generation snapshot and
+// the baseline query, which only the standalone native witness drives.
+#[allow(dead_code)]
 impl Control {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn request_shutdown(&self) -> Result<(), Error> {
@@ -34,9 +58,257 @@ impl Control {
             .map_err(|source| libkrun_error("request shutdown", source))
     }
 
-    #[cfg(target_os = "macos")]
     pub fn host_memory_reclaim(&self) -> crate::krun::HostMemoryReclaimStatus {
         host_memory_reclaim_status(&self.handle)
+    }
+
+    /// These calls retain native tokens/errors unchanged. A caller deadline is
+    /// never a cancellation or permission to reuse an accepted output.
+    pub fn pause(
+        &self,
+        owner: PauseOwner,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<PauseToken, ControlFailure> {
+        self.handle.pause(owner, operation, deadline)
+    }
+
+    /// Recover the exact failed memory cut without restoring dirty coverage.
+    pub fn recover_memory_cut(
+        &self,
+        pausing: OperationId,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<PauseToken, LiveError> {
+        self.handle.recover_memory_cut(pausing, operation, deadline)
+    }
+
+    pub fn resume(
+        &self,
+        pause: PauseToken,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), ControlFailure> {
+        self.handle.resume(pause, operation, deadline)
+    }
+
+    pub fn cancel_pause(
+        &self,
+        pausing: OperationId,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), ControlFailure> {
+        self.handle.cancel_pause(pausing, operation, deadline)
+    }
+
+    pub fn control_state(&self, deadline: Instant) -> Result<ControlState, ControlFailure> {
+        self.handle.control_state(deadline)
+    }
+
+    pub fn stop(&self, operation: OperationId, deadline: Instant) -> Result<(), ControlFailure> {
+        self.handle.stop(operation, deadline)
+    }
+
+    pub fn flush_writable_disks(
+        &self,
+        pause: &PauseToken,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<FlushReceipt, LiveError> {
+        self.handle.flush_writable_disks(pause, operation, deadline)
+    }
+
+    pub fn freeze_disk_generations(
+        &self,
+        pause: &PauseToken,
+        capture: libkrun::live::CaptureId,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<libkrun::live::DiskTrackingCut, LiveError> {
+        self.handle
+            .freeze_disk_generations(pause, capture, operation, deadline)
+    }
+
+    pub fn settle_disk_generation(
+        &self,
+        attachment: libkrun::live::AttachmentIdentity,
+        token: libkrun::live::DiskGenerationToken,
+        settlement: libkrun::live::DiskGenerationSettlement,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), LiveError> {
+        self.handle
+            .settle_disk_generation(attachment, token, settlement, operation, deadline)
+    }
+
+    pub fn capture_execution(
+        &self,
+        pause: &PauseToken,
+        binding: StateBinding,
+        outputs: ExecutionOutputs,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<ExecutionCaptureReceipt, LiveError> {
+        self.handle
+            .capture_execution(pause, binding, outputs, operation, deadline)
+    }
+
+    pub fn capture_memory(
+        &self,
+        ticket: &CaptureTicket,
+        request: MemoryCaptureRequest,
+        outputs: MemoryOutputs,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<CompletedCapture, LiveError> {
+        self.handle
+            .capture_memory(ticket, request, outputs, operation, deadline)
+    }
+
+    pub fn capture_status(
+        &self,
+        capture: CaptureId,
+        deadline: Instant,
+    ) -> Result<CaptureStatus, LiveError> {
+        self.handle.capture_status(capture, deadline)
+    }
+
+    pub fn accept_baseline(
+        &self,
+        ticket: &CaptureTicket,
+        sealed: BaselineImage,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<BaselineToken, LiveError> {
+        self.handle
+            .accept_baseline(ticket, sealed, operation, deadline)
+    }
+
+    pub fn abandon_capture(
+        &self,
+        ticket: &CaptureTicket,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), LiveError> {
+        self.handle.abandon_capture(ticket, operation, deadline)
+    }
+
+    pub fn release_capture(
+        &self,
+        capture: CaptureId,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), LiveError> {
+        self.handle.release_capture(capture, operation, deadline)
+    }
+
+    pub fn preserve_pause(
+        &self,
+        pause: PauseToken,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<PauseToken, LiveError> {
+        self.handle.preserve_pause(pause, operation, deadline)
+    }
+
+    pub fn prepare_generation(
+        &self,
+        owner: StoppedOwner<'_>,
+        kind: GenerationKind,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<GenerationTicket, LiveError> {
+        self.handle
+            .prepare_generation(owner, kind, operation, deadline)
+    }
+
+    pub fn poll_generation(
+        &self,
+        ticket: &GenerationTicket,
+        deadline: Instant,
+    ) -> Result<GenerationObservation, LiveError> {
+        self.handle.poll_generation(ticket, deadline)
+    }
+
+    pub fn generation_snapshot(&self, deadline: Instant) -> Result<GenerationSnapshot, LiveError> {
+        self.handle.generation_snapshot(deadline)
+    }
+
+    pub fn resume_generation(
+        &self,
+        pause: PauseToken,
+        generation: &GenerationTicket,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), LiveError> {
+        self.handle
+            .resume_generation(pause, generation, operation, deadline)
+    }
+
+    pub fn resume_restored(
+        &self,
+        restore: &RestoreToken,
+        generation: &GenerationTicket,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), LiveError> {
+        self.handle
+            .resume_restored(restore, generation, operation, deadline)
+    }
+
+    pub fn release_activation_fences(
+        &self,
+        restore: &RestoreToken,
+        generation: &GenerationTicket,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), LiveError> {
+        self.handle
+            .release_activation_fences(restore, generation, operation, deadline)
+    }
+
+    pub fn ram_layout(
+        &self,
+        deadline: Instant,
+    ) -> Result<std::sync::Arc<libkrun::live::ValidatedRamLayout>, LiveError> {
+        self.handle.ram_layout(deadline)
+    }
+
+    pub fn live_snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<libkrun::live::LiveSnapshot, LiveError> {
+        self.handle.live_snapshot(deadline)
+    }
+
+    pub fn baseline(&self, deadline: Instant) -> Result<Option<BaselineToken>, LiveError> {
+        self.handle.baseline(deadline)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub fn set_capture_profile(
+        &self,
+        profile: libkrun::live::KvmCaptureProfile,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), LiveError> {
+        self.handle
+            .set_capture_profile(profile, operation, deadline)
+    }
+
+    /// Candidate-only native IRQ witness access; never part of a normal build.
+    #[cfg(all(
+        feature = "restore-irq-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub fn irq_probe(
+        &self,
+        request: libkrun::live::irq_probe::ProbeRequest,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<libkrun::live::irq_probe::ProbeObservation, LiveError> {
+        self.handle.irq_probe(request, operation, deadline)
     }
 }
 
@@ -99,6 +371,7 @@ enum DeviceKind {
     Network,
     Rng,
     Balloon,
+    Generation,
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +385,7 @@ enum DeviceConfig<'a> {
     Network(&'a Network),
     Rng,
     Balloon,
+    Generation,
 }
 
 #[cfg(test)]
@@ -127,6 +401,7 @@ impl DeviceConfig<'_> {
             Self::Network(_) => DeviceKind::Network,
             Self::Rng => DeviceKind::Rng,
             Self::Balloon => DeviceKind::Balloon,
+            Self::Generation => DeviceKind::Generation,
         }
     }
 }
@@ -146,10 +421,20 @@ pub fn run_process(
     let Resources {
         console: console_fds,
         vsock_mux: mut vsock_mux_fd,
+        console_ports,
+        managed_network: mut managed_network_fd,
     } = resources;
     if config.vsock_mux != vsock_mux_fd.is_some() {
         return Err(crate::krun::KrunBackendError::InvalidConfig(
             "vsock mux configuration and resource must agree".to_string(),
+        )
+        .into());
+    }
+    if (!console_ports.is_empty() && !config.stdio_console)
+        || (managed_network_fd.is_some() && !matches!(config.network, Network::Unixgram(_)))
+    {
+        return Err(crate::krun::KrunBackendError::InvalidConfig(
+            "console/network resource roles disagree with the device plan".to_string(),
         )
         .into());
     }
@@ -182,6 +467,11 @@ pub fn run_process(
                         Some(console_fds.stderr),
                     )
                     .map_err(|source| libkrun_error("configure console", source))?;
+                for port in &console_ports {
+                    builder
+                        .add_inout_port(port.name, port.input, port.output)
+                        .map_err(|source| libkrun_error("configure console port", source))?;
+                }
                 devices.add(
                     builder
                         .build()
@@ -190,13 +480,22 @@ pub fn run_process(
             }
             DeviceConfig::Disk(disk) => {
                 let mut device = BlockDevice::new(
-                    &disk.block_id,
+                    disk.block_id.as_str(),
                     path_str(&disk.path, "disk")?,
-                    DiskFormat::Raw,
+                    disk_format(disk.format),
                 )
                 .map_err(|source| libkrun_error("create block device", source))?;
                 device.set_read_only(disk.read_only);
                 device.set_sync_mode(disk_sync_mode());
+                if let Some(seed) = config
+                    .disk_tracking_seeds
+                    .iter()
+                    .find(|seed| seed.block_id == disk.block_id)
+                {
+                    let seed = crate::krun::worker::disk_tracking::seed(seed)
+                        .map_err(crate::krun::KrunBackendError::InvalidConfig)?;
+                    device.set_disk_tracking_seed(seed);
+                }
                 devices.add(device);
             }
             DeviceConfig::Mount(mount) => {
@@ -242,30 +541,38 @@ pub fn run_process(
                         ));
                     }
                     Network::Unixgram(net) => {
-                        let socket = crate::krun::network::open_local_unix_datagram_socket(
-                            &net.peer_path,
-                            &config.id,
-                            "krun",
-                        )
-                        .map_err(Error::OpenUnixgramSocket)?;
-                        NetDevice::new_unixgram_fd(
-                            "net0",
-                            OwnedFd::from(socket),
+                        let fd = match managed_network_fd.take() {
+                            Some(fd) => fd,
+                            None => OwnedFd::from(
+                                crate::krun::network::open_local_unix_datagram_socket(
+                                    &net.peer_path,
+                                    &config.id,
+                                    "krun",
+                                )
+                                .map_err(Error::OpenUnixgramSocket)?,
+                            ),
+                        };
+                        NetDevice::new_managed_unixgram_fd(
+                            vm_spec::restore::RESTORE_NETWORK_ID,
+                            fd,
                             &net.mac,
                             COMPAT_NET_FEATURES,
                             NetFlags::empty(),
                         )
                     }
                     Network::Unixstream(net) => NetDevice::new_unixstream_path(
-                        "net0",
+                        vm_spec::restore::RESTORE_NETWORK_ID,
                         path_str(&net.peer_path, "network peer")?,
                         &net.mac,
                         COMPAT_NET_FEATURES,
                         NetFlags::empty(),
                     ),
-                    Network::Tap(net) => {
-                        NetDevice::new_tap("net0", &net.name, &net.mac, COMPAT_NET_FEATURES)
-                    }
+                    Network::Tap(net) => NetDevice::new_tap(
+                        vm_spec::restore::RESTORE_NETWORK_ID,
+                        &net.name,
+                        &net.mac,
+                        COMPAT_NET_FEATURES,
+                    ),
                 }
                 .map_err(|source| libkrun_error("create network device", source))?;
                 devices.add(device);
@@ -281,6 +588,9 @@ pub fn run_process(
                     BalloonDevice::new()
                         .map_err(|source| libkrun_error("create balloon device", source))?,
                 );
+            }
+            DeviceConfig::Generation => {
+                devices.add(GenerationDevice::new());
             }
         }
     }
@@ -303,12 +613,10 @@ pub fn run_process(
     let vmm = builder
         .build()
         .map_err(|source| libkrun_error("build VMM", source))?;
-    #[cfg(target_os = "macos")]
     let handle = vmm
         .handle()
         .map_err(|source| libkrun_error("obtain VMM control handle", source))?;
     on_built(Control {
-        #[cfg(target_os = "macos")]
         handle: std::sync::Arc::new(handle),
     })
     .map_err(Error::PostBuild)?;
@@ -316,13 +624,79 @@ pub fn run_process(
     Err(Error::EventLoopTerminated)
 }
 
-#[cfg(target_os = "macos")]
+/// A restore construction failure retains the native failed owner, rather than
+/// flattening it into the cold-build error's diagnostic.
+pub enum RestoreProcessError<'a> {
+    Build(RestoreBuildFailure<'a>),
+    Handle {
+        source: VmmError,
+        failed: FailedRestore<'a>,
+    },
+    PreparedCallback {
+        source: io::Error,
+        failed: FailedRestore<'a>,
+    },
+    EventLoopTerminated,
+}
+
+/// Enter a descriptor-fed restore in a dedicated worker process.
+///
+/// There is intentionally no `KrunConfig`, payload, kernel or cold device plan.
+/// Preparation is parked/fenced, not BackendStarted. `on_prepared` must return
+/// before dispatch; move controls to another thread before making blocking calls.
+/// The process owner retains leases and console bindings through actual reap,
+/// including errors. A build failure must retain/settle its native failed owner.
+pub fn run_restore_process<'a>(
+    inputs: RestoreInputs,
+    resources: RestoreResources,
+    deadline: Instant,
+    on_prepared: impl FnOnce(Control, RestoreToken) -> io::Result<()>,
+) -> Result<(), RestoreProcessError<'a>> {
+    let (vmm, restore) = VmmBuilder::new()
+        .build_restored(inputs, resources, deadline)
+        .map_err(RestoreProcessError::Build)?;
+    let handle = match vmm.handle() {
+        Ok(handle) => handle,
+        Err(source) => {
+            return Err(RestoreProcessError::Handle {
+                source,
+                failed: vmm.retain_failed_restore(),
+            })
+        }
+    };
+    if let Err(source) = on_prepared(
+        Control {
+            handle: std::sync::Arc::new(handle),
+        },
+        restore,
+    ) {
+        return Err(RestoreProcessError::PreparedCallback {
+            source,
+            failed: vmm.retain_failed_restore(),
+        });
+    }
+    vmm.run();
+    Err(RestoreProcessError::EventLoopTerminated)
+}
+
 fn host_memory_reclaim_status(handle: &libkrun::VmmHandle) -> crate::krun::HostMemoryReclaimStatus {
-    use crate::krun::HostMemoryReclaimQualification as Q;
-    use libkrun::HostReclaimQualification;
+    use crate::krun::{
+        HostMemoryReclaimBacking as B, HostMemoryReclaimQualification as Q,
+        HostMemoryReclaimReason as R,
+    };
+    use libkrun::{HostReclaimBacking, HostReclaimQualification, HostReclaimReason};
 
     let status = handle.host_reclaim_status();
     crate::krun::HostMemoryReclaimStatus {
+        backing: match status.backing {
+            HostReclaimBacking::Boot => B::Boot,
+            HostReclaimBacking::RestoredPrivate => B::RestoredPrivate,
+        },
+        reason: match status.reason {
+            HostReclaimReason::None => R::None,
+            HostReclaimReason::TrackedCapture => R::TrackedCapture,
+            HostReclaimReason::RestoredPrivateMapping => R::RestoredPrivateMapping,
+        },
         requested: status.requested,
         qualification: match status.qualification {
             HostReclaimQualification::NotRun => Q::NotRun,
@@ -336,6 +710,8 @@ fn host_memory_reclaim_status(handle: &libkrun::VmmHandle) -> crate::krun::HostM
         retried_faults: status.retried_faults,
         skipped_reports: status.skipped_reports,
         failed_operations: status.failed_operations,
+        mapping_limit_skips: status.mapping_limit_skips,
+        replaced_islands: status.replaced_islands,
     }
 }
 
@@ -348,7 +724,7 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
             + usize::from(config.vsock_mux)
             + usize::from(config.vsock_cid.is_some())
             + usize::from(!matches!(config.network, Network::None))
-            + 2,
+            + 3,
     );
     if config.stdio_console {
         devices.push(DeviceConfig::Console);
@@ -371,6 +747,7 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
     if config.balloon {
         devices.push(DeviceConfig::Balloon);
     }
+    devices.push(DeviceConfig::Generation);
     devices
 }
 
@@ -388,11 +765,11 @@ fn rosetta_device(config: &crate::krun::RosettaLaunchConfig) -> Result<RosettaFs
         config.data().as_bytes(),
     )
     .map_err(|source| libkrun_error("configure Rosetta filesystem", source))?;
-    RosettaFsDevice::new("rosetta", config)
+    RosettaFsDevice::new(rootfs_spec::rosetta::SHARE_TAG, config)
         .map_err(|source| libkrun_error("create Rosetta filesystem", source))
 }
 
-const GUEST_CID: u64 = 3;
+pub(crate) const GUEST_CID: u64 = 3;
 
 fn protect_stream_socket(device: &mut VsockDevice, fd: BorrowedFd<'_>) -> Result<(), Error> {
     if nix::sys::socket::getsockopt(&fd, nix::sys::socket::sockopt::SockType)
@@ -417,6 +794,13 @@ fn external_kernel_format() -> KernelFormat {
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     {
         KernelFormat::Raw
+    }
+}
+
+pub(crate) fn disk_format(format: vm_spec::DiskFormat) -> DiskFormat {
+    match format {
+        vm_spec::DiskFormat::Raw => DiskFormat::Raw,
+        vm_spec::DiskFormat::Vmdk => DiskFormat::Vmdk,
     }
 }
 
@@ -448,14 +832,14 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::krun::config::NetUnixstream;
-    use crate::krun::{Disk, KrunConfig, Mount, Network, RosettaLaunchConfig};
-    use libkrun::{KernelFormat, SyncMode};
+    use crate::krun::{KrunConfig, Mount, Network, RosettaLaunchConfig};
+    use libkrun::KernelFormat;
+    use vm_spec::Disk;
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use crate::krun::engine::rosetta_device;
     use crate::krun::engine::{
-        device_plan, disk_sync_mode, external_kernel_format, path_str, DeviceConfig, DeviceKind,
-        Error, COMPAT_NET_FEATURES,
+        device_plan, external_kernel_format, path_str, DeviceConfig, DeviceKind, Error,
     };
 
     #[test]
@@ -477,6 +861,8 @@ mod tests {
                     stderr: console.as_fd(),
                 },
                 vsock_mux: None,
+                console_ports: Vec::new(),
+                managed_network: None,
             },
             |_| panic!("invalid config must not reach post-build hook"),
         );
@@ -504,6 +890,8 @@ mod tests {
                         stderr: console.as_fd(),
                     },
                     vsock_mux: if enabled { None } else { Some(mux.into()) },
+                    console_ports: Vec::new(),
+                    managed_network: None,
                 },
                 |_| panic!("mismatched resources must not reach build"),
             );
@@ -518,16 +906,6 @@ mod tests {
 
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         assert_eq!(external_kernel_format(), KernelFormat::Raw);
-    }
-
-    #[test]
-    fn disks_use_relaxed_sync() {
-        assert_eq!(disk_sync_mode(), SyncMode::Relaxed);
-    }
-
-    #[test]
-    fn compatibility_network_features_remain_stable() {
-        assert_eq!(COMPAT_NET_FEATURES, 19_587);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -578,8 +956,14 @@ mod tests {
         let config = KrunConfig {
             stdio_console: true,
             disks: vec![Disk {
-                block_id: "root".to_string(),
-                path: PathBuf::from("root.img"),
+                block_id: vm_spec::BlockId::new("explicit-root").expect("valid ID"),
+                path: PathBuf::from("root.raw"),
+                role: vm_spec::DiskRole::Root,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length: 4096,
+                    logical_sector_size: 512,
+                },
                 read_only: false,
             }],
             mounts: vec![Mount {
@@ -612,6 +996,7 @@ mod tests {
             DeviceKind::Network,
             DeviceKind::Rng,
             DeviceKind::Balloon,
+            DeviceKind::Generation,
         ];
         assert_eq!(
             device_plan(&config)
@@ -644,7 +1029,7 @@ mod tests {
                 .iter()
                 .map(DeviceConfig::kind)
                 .collect::<Vec<_>>(),
-            vec![DeviceKind::Network, DeviceKind::Rng]
+            vec![DeviceKind::Network, DeviceKind::Rng, DeviceKind::Generation]
         );
         assert!(matches!(
             standalone_plan.first(),
@@ -655,7 +1040,12 @@ mod tests {
                 .iter()
                 .map(DeviceConfig::kind)
                 .collect::<Vec<_>>(),
-            vec![DeviceKind::Vsock, DeviceKind::Network, DeviceKind::Rng,]
+            vec![
+                DeviceKind::Vsock,
+                DeviceKind::Network,
+                DeviceKind::Rng,
+                DeviceKind::Generation
+            ]
         );
     }
 

@@ -113,6 +113,17 @@ impl VirtualMachine {
         self.inner.serial_console.drain().await
     }
 
+    /// Kill and reap a parked run after its hibernation record is durable.
+    pub(crate) async fn hibernate_stop(&self) -> Result<(), VirtError> {
+        self.inner.attempt.close();
+        self.inner.backend.hibernate_stop().await?;
+        self.inner.serial_console.drain().await
+    }
+
+    pub(crate) fn worker_process_id(&self) -> Option<u32> {
+        self.inner.backend.worker_process_id()
+    }
+
     /// Dynamically connect to a guest endpoint port.
     pub async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
         let lease = self.reserve_vsock()?;
@@ -203,6 +214,60 @@ impl VirtualMachine {
     /// Non-blocking exit check.
     pub async fn try_wait(&self) -> Result<Option<VmExit>, VirtError> {
         self.inner.backend.try_wait().await
+    }
+
+    /// Owned duplicates of the retained disk attachments for a live
+    /// capture's disk seal; never a pathname re-resolution.
+    pub(crate) async fn capture_sources(
+        &self,
+    ) -> Result<Vec<crate::virt::CaptureSource>, VirtError> {
+        self.inner.backend.capture_sources().await
+    }
+
+    /// The finite native lifecycle seam (pause, ClockOnly resume, cancel,
+    /// capture stages, observation). Dropping the returned future never
+    /// cancels accepted native work; an identical retry joins it.
+    pub async fn lifecycle(
+        &self,
+        request: crate::virt::lifecycle::LifecycleRequest,
+    ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
+    {
+        self.inner
+            .backend
+            .lifecycle(request, crate::virt::lifecycle::LifecycleRights::None)
+            .await
+    }
+
+    /// A rights-bearing lifecycle command (`PrepareCapture`, `AcceptCapture`).
+    /// `rights` are owned duplicates; a replay that joins the retained command
+    /// checks and closes them without resending.
+    pub async fn lifecycle_with_rights(
+        &self,
+        request: crate::virt::lifecycle::LifecycleRequest,
+        rights: crate::virt::lifecycle::LifecycleRights,
+    ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
+    {
+        self.inner.backend.lifecycle(request, rights).await
+    }
+
+    /// The synchronous stop fence on native mutator submission: once this
+    /// returns, a lifecycle mutator either was enqueued before it or is
+    /// refused `Stopping` without effect. Observation and replays of admitted
+    /// commands stay available.
+    pub(crate) fn close_lifecycle_admission(&self) {
+        self.inner.backend.close_lifecycle_admission();
+    }
+
+    /// Finish checked attachment cleanup after every native owner is terminal.
+    /// A terminal exit code itself supplies none of the storage facts.
+    pub(crate) async fn finalize_storage(
+        &self,
+        guest_protocol_completed: bool,
+    ) -> Result<crate::virt::StorageFinalization, VirtError> {
+        self.inner
+            .backend
+            .finalize_storage(guest_protocol_completed)
+            .await
     }
 
     /// Fence readiness publication as soon as death is observed, including
@@ -374,6 +439,15 @@ mod tests {
             let (device, _peer) = tokio::io::duplex(1);
             Ok(SerialDevice::from_duplex(device))
         }
+
+        async fn lifecycle(
+            &self,
+            _request: crate::virt::lifecycle::LifecycleRequest,
+            _rights: crate::virt::lifecycle::LifecycleRights,
+        ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
+        {
+            Err(crate::virt::lifecycle::LifecycleError::Unsupported { backend: "test" })
+        }
     }
 
     fn machine(backend: Arc<TestBackend>, limit: usize) -> VirtualMachine {
@@ -381,7 +455,7 @@ mod tests {
         VirtualMachine {
             inner: Arc::new(MachineInner {
                 name: "capacity-test".to_string(),
-                kind: BackendKind::default_for_host().expect("test host backend kind"),
+                kind: BackendKind::Krun,
                 serial_console: Arc::new(SerialConsole::new(backend_trait.clone())),
                 backend: backend_trait,
                 vsock_capacity: VsockCapacity::test_with_limit("capacity-test", limit),

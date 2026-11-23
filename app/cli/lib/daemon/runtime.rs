@@ -1,10 +1,9 @@
 //! libvm operations for the managed appliance, independent of CLI policy and UI.
 use eyre::Context as _;
 use libvm::{
-    ExecutionOutput, Forward, ImagePullPolicy, ImageResolveOptions, MachineData, MachineReadiness,
-    MachineRef, MachineRetention, MachineRunId, MachineStart, MachineStartOptions,
-    MachineStopOptions, MachineUpdate, Memory, ProcessConfig, ResolvedOciImage, Runtime,
-    RuntimeConfig,
+    ExecutionOutput, Forward, ImageResolveOptions, MachineData, MachineReadiness, MachineRef,
+    MachineRetention, MachineRunId, MachineStart, MachineStartOptions, MachineStopOptions,
+    MachineUpdate, Memory, ProcessConfig, PullPolicy, ResolvedOciImage, Runtime, RuntimeConfig,
 };
 use silod_spec::labels::{INSTALLATION_LABEL, MANAGED_ROLE, MANAGED_ROLE_LABEL};
 use std::time::Duration;
@@ -30,7 +29,7 @@ impl SystemRuntime {
             match machine.data {
                 Some(snapshot) => data.push(snapshot),
                 None => eprintln!(
-                    "machine {} ({}) configuration unavailable: {:?}; inspect with silo show",
+                    "machine {} ({}) configuration unavailable: {:?}; inspect with silo info",
                     machine.name, machine.id, machine.issues
                 ),
             }
@@ -60,15 +59,11 @@ impl SystemRuntime {
         timeout: Duration,
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
-        let data = machine.inspect().await?;
-        if !data.is_running() {
-            return Ok(data);
-        }
-        machine
+        let outcome = machine
             .inner
             .stop_with(MachineStopOptions::new().timeout(timeout))
             .await?;
-        Ok(machine.inspect().await?)
+        Ok(stop_result(outcome))
     }
 
     pub(crate) async fn remove_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
@@ -86,12 +81,8 @@ impl SystemRuntime {
     }
 
     pub(crate) async fn ensure_name_available(&mut self, name: &str) -> eyre::Result<()> {
-        let reference = MachineRef::parse(name)?;
-        match self.runtime.get_machine(&reference).await {
-            Ok(_) => eyre::bail!("machine {name:?} already exists"),
-            Err(libvm::LibVmError::MachineNotFound { .. }) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        self.runtime.ensure_name_available(name).await?;
+        Ok(())
     }
 
     /// Resolves `reference` without materializing it. `Always` asks the registry
@@ -99,7 +90,7 @@ impl SystemRuntime {
     pub(crate) async fn resolve_image(
         &mut self,
         reference: &str,
-        policy: ImagePullPolicy,
+        policy: PullPolicy,
     ) -> eyre::Result<ResolvedOciImage> {
         Ok(self
             .runtime
@@ -108,6 +99,7 @@ impl SystemRuntime {
                 reference.to_string(),
                 ImageResolveOptions {
                     policy: Some(policy),
+                    platform: None,
                 },
             )
             .await?)
@@ -139,11 +131,26 @@ impl SystemRuntime {
         )
         .with_name("docker");
         forward.validate()?;
-        let machine = self
-            .runtime
-            .machine()
+        let builder = match config.backend {
+            crate::daemon::system_config::SystemBackend::Krun => {
+                self.runtime.machine().resolved_image(image)
+            }
+            crate::daemon::system_config::SystemBackend::Vz => {
+                let converted = self
+                    .runtime
+                    .images()
+                    .convert(&image, libvm::RawConversionOptions { name: None })
+                    .await
+                    .context("convert appliance OCI root for VZ raw storage")?;
+                self.runtime
+                    .machine()
+                    .image_source(libvm::ImageSource::Stored(libvm::ImageRef::Id(
+                        converted.id,
+                    )))
+            }
+        };
+        let machine = builder
             .name(name)
-            .resolved_image(image)
             .label(MANAGED_ROLE_LABEL, MANAGED_ROLE)
             .label(INSTALLATION_LABEL, installation_id.to_string())
             .retention(MachineRetention::Persistent)
@@ -152,7 +159,7 @@ impl SystemRuntime {
             .memory(Memory::bytes(config.memory_bytes))
             .root_disk_size(config.root_size_bytes)
             .disks(vec![data_image.to_path_buf()])
-            .rosetta(config.rosetta)
+            .rosetta(config.rosetta_explicit.then_some(config.rosetta))
             .mounts(mounts)
             .forwards(vec![forward])
             .network(|network| network.private().publish(config.publish_bind))
@@ -190,13 +197,16 @@ impl SystemMachine {
         &self,
         run_id: MachineRunId,
     ) -> Result<MachineData, libvm::LibVmError> {
-        self.inner.stop_run_with(run_id, stop_options()).await
+        self.inner
+            .stop_run_with(run_id, stop_options())
+            .await
+            .map(stop_result)
     }
 
     /// Stops whichever run is current. The supervisor owns the system VM outright,
     /// so shutdown must not depend on having observed the run that is live now.
     pub(crate) async fn stop(&self) -> Result<MachineData, libvm::LibVmError> {
-        self.inner.stop_with(stop_options()).await
+        self.inner.stop_with(stop_options()).await.map(stop_result)
     }
 
     pub(crate) async fn exec_with_input(
@@ -221,6 +231,13 @@ impl SystemMachine {
     pub(crate) async fn metrics(&self) -> Result<libvm::MachineMetrics, libvm::LibVmError> {
         self.inner.metrics().await
     }
+}
+
+fn stop_result(outcome: libvm::MachineStopOutcome) -> MachineData {
+    if let Some(warning) = outcome.warning {
+        tracing::warn!(machine = outcome.machine.name, "{warning}");
+    }
+    outcome.machine
 }
 
 // silo-vmm can spend 45s stopping the backend, then drain its services. Give that

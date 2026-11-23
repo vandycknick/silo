@@ -1,9 +1,10 @@
 use agent_spec::{
-    AgentConfig, AgentRosettaConfig, AgentSshConfig, CertificateAuthorityConfig,
-    MountConfig as ProvisionMountConfig, NetworkConfig as ProvisionNetworkConfig,
-    NetworkInterfaceConfig, ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig,
-    UserdataContentType, UserdataRunPolicy,
+    AgentConfig, AgentSshConfig, CertificateAuthorityConfig, MountConfig as ProvisionMountConfig,
+    NetworkConfig as ProvisionNetworkConfig, NetworkInterfaceConfig, ProvisionConfig,
+    ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType, UserdataRunPolicy,
 };
+use std::collections::BTreeMap;
+
 use utils::format_mac;
 use vm_spec::VmSpec;
 
@@ -19,11 +20,14 @@ use crate::network::VmmNetworkAttachment;
 pub(crate) struct GuestAgentConfigInput<'a> {
     pub(crate) machine_name: &'a str,
     pub(crate) spec: &'a VmSpec,
+    /// Machine process environment; SSH sessions start from it like `silo exec`.
+    pub(crate) environment: &'a BTreeMap<String, String>,
     pub(crate) network: &'a VmmNetworkAttachment,
     pub(crate) resize_rootfs: bool,
     pub(crate) user: Option<&'a MachineUserConfig>,
     pub(crate) ssh_trusted_ca: &'a str,
     pub(crate) tls_certificate: Option<&'a str>,
+    pub(crate) storage_shutdown: &'a protocol::shutdown::StorageShutdownContext,
 }
 
 struct GuestAgentHostContext {
@@ -35,6 +39,10 @@ struct GuestAgentHostContext {
 }
 
 pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<AgentConfig> {
+    input
+        .storage_shutdown
+        .validate()
+        .map_err(eyre::Report::msg)?;
     let host_context = GuestAgentHostContext {
         user: input.user.cloned(),
         ssh_trusted_ca: input.ssh_trusted_ca.into(),
@@ -45,18 +53,22 @@ pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<Age
     build_config_with_host_context(
         input.machine_name,
         input.spec,
+        input.environment,
         input.network,
         input.resize_rootfs,
         &host_context,
+        input.storage_shutdown,
     )
 }
 
 fn build_config_with_host_context(
     machine_name: &str,
     spec: &VmSpec,
+    environment: &BTreeMap<String, String>,
     network: &VmmNetworkAttachment,
     resize_rootfs: bool,
     host_context: &GuestAgentHostContext,
+    storage_shutdown: &protocol::shutdown::StorageShutdownContext,
 ) -> eyre::Result<AgentConfig> {
     Ok(AgentConfig {
         provision: build_provision_config(
@@ -66,8 +78,68 @@ fn build_config_with_host_context(
             resize_rootfs,
             host_context,
         )?,
-        ssh: build_ssh_config(host_context),
+        ssh: build_ssh_config(host_context, environment),
+        storage_shutdown: storage_shutdown.clone(),
     })
+}
+
+/// One immutable inventory is injected into the guest and sent to the monitor.
+/// A generation lease excludes Silo reuse, not arbitrary external host writers.
+pub(crate) fn storage_shutdown_context(
+    machine_id: &str,
+    run_id: &str,
+    spec: &VmSpec,
+    effective_rosetta: rootfs_spec::RosettaMode,
+) -> eyre::Result<protocol::shutdown::StorageShutdownContext> {
+    use protocol::shutdown::{StorageAttachment, StorageManifest, StorageShutdownContext};
+    let disks = spec
+        .storage
+        .as_ref()
+        .map_or(&[][..], |storage| storage.disks.as_slice());
+    let mounts = vm_spec::project_mounts(&spec.mounts).map_err(eyre::Report::msg)?;
+    let rosetta = effective_rosetta != rootfs_spec::RosettaMode::Disabled;
+    let count = disks.len() + mounts.len() + usize::from(rosetta);
+    let manifest = if count > protocol::shutdown::MAX_MANIFEST_ENTRIES {
+        StorageManifest::Unsupported {
+            reason: "complete attachment inventory exceeds shutdown manifest bound".into(),
+        }
+    } else {
+        let mut attachments = Vec::with_capacity(count);
+        attachments.extend(disks.iter().map(|disk| StorageAttachment::Block {
+            block_id: disk.block_id.clone(),
+            role: disk.role,
+            format: disk.format,
+            geometry: disk.geometry,
+            read_only: disk.read_only,
+            exclusive_writer: matches!(
+                disk.role,
+                vm_spec::DiskRole::Root | vm_spec::DiskRole::RootUpper
+            ),
+        }));
+        attachments.extend(mounts.into_iter().map(|mount| StorageAttachment::Share {
+            tag: mount.backend_tag,
+            read_only: mount.read_only,
+        }));
+        if rosetta {
+            attachments.push(StorageAttachment::Share {
+                tag: rootfs_spec::rosetta::SHARE_TAG.into(),
+                read_only: true,
+            });
+        }
+        let complete = StorageManifest::Complete { attachments };
+        match complete.validate() {
+            Ok(()) => complete,
+            Err(reason) => StorageManifest::Unsupported { reason },
+        }
+    };
+    let context = StorageShutdownContext {
+        version: 1,
+        machine_id: machine_id.into(),
+        run_id: run_id.into(),
+        manifest,
+    };
+    context.validate().map_err(eyre::Report::msg)?;
+    Ok(context)
 }
 
 fn build_provision_config(
@@ -115,22 +187,18 @@ fn build_provision_config(
             .collect(),
         certificate_authority,
         network: build_provision_network_config(network)?,
-        rosetta: AgentRosettaConfig {
-            enabled: spec
-                .hardware
-                .as_ref()
-                .and_then(|hardware| hardware.rosetta)
-                .unwrap_or(false),
-            ..AgentRosettaConfig::default()
-        },
         mounts: provision_mount_entries(spec)?,
         userdata: provision_userdata(spec)?,
     })
 }
 
-fn build_ssh_config(host_context: &GuestAgentHostContext) -> AgentSshConfig {
+fn build_ssh_config(
+    host_context: &GuestAgentHostContext,
+    environment: &BTreeMap<String, String>,
+) -> AgentSshConfig {
     AgentSshConfig {
         trusted_ca: Some(host_context.ssh_trusted_ca.clone()),
+        environment: environment.clone(),
     }
 }
 
@@ -218,6 +286,7 @@ fn parse_mac_string(mac: &str) -> eyre::Result<[u8; 6]> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use agent_spec::{AgentConfig, UserdataContentType, UserdataRunPolicy};
@@ -280,6 +349,16 @@ mod tests {
         }
     }
 
+    fn shutdown_context() -> protocol::shutdown::StorageShutdownContext {
+        crate::guest_agent::storage_shutdown_context(
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            &sample_spec(Vec::new()),
+            rootfs_spec::RosettaMode::Disabled,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn provision_network_is_absent_without_attachment() {
         let config = build_provision_network_config(&VmmNetworkAttachment::None)
@@ -317,9 +396,11 @@ mod tests {
         let config = build_config_with_host_context(
             "demo",
             &sample_spec(Vec::new()),
+            &BTreeMap::new(),
             &VmmNetworkAttachment::None,
             false,
             &context,
+            &shutdown_context(),
         )
         .expect("build agent config");
 
@@ -454,10 +535,6 @@ mod tests {
         assert!(decoded.provision.enabled);
         assert!(decoded.provision.resize_rootfs.enabled);
         assert_eq!(
-            decoded.provision.rosetta.mount_tag,
-            agent_spec::ROSETTA_MOUNT_TAG
-        );
-        assert_eq!(
             decoded
                 .provision
                 .network
@@ -570,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn provision_config_enables_rosetta_from_vm_settings() {
+    fn provision_config_never_owns_rosetta_even_when_requested() {
         let mut spec = sample_spec(Vec::new());
         hardware_mut(&mut spec).rosetta = Some(true);
 
@@ -583,24 +660,121 @@ mod tests {
         )
         .expect("resolve provision config");
 
-        assert!(provision.rosetta.enabled);
-        assert_eq!(provision.rosetta.mount_tag, agent_spec::ROSETTA_MOUNT_TAG);
-        assert_eq!(provision.rosetta.mount_path, agent_spec::ROSETTA_MOUNT_PATH);
+        assert!(serde_json::to_value(provision)
+            .unwrap()
+            .get("rosetta")
+            .is_none());
     }
 
     #[test]
     fn build_config_combines_provision_and_ssh_config() {
+        let environment = BTreeMap::from([(
+            "PATH".to_string(),
+            "/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin".to_string(),
+        )]);
         let config = build_config_with_host_context(
             "demo",
             &sample_spec(Vec::new()),
+            &environment,
             &VmmNetworkAttachment::None,
             true,
             &host_context(),
+            &shutdown_context(),
         )
         .expect("build agent config");
 
         assert!(config.provision.enabled);
         assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
         assert_eq!(config.ssh.trusted_ca, Some(host_context().ssh_trusted_ca));
+        assert_eq!(config.ssh.environment, environment);
+    }
+
+    #[test]
+    fn shutdown_manifest_covers_data_and_generated_shares_without_claiming_external_exclusion() {
+        use protocol::shutdown::{StorageAttachment, StorageManifest};
+        let mut spec = sample_spec(Vec::new());
+        spec.storage = Some(Storage {
+            disks: vec![
+                crate::machine::root_storage::disk(
+                    "root.raw",
+                    vm_spec::DiskRole::Root,
+                    512,
+                    "silo-root".into(),
+                )
+                .unwrap(),
+                crate::machine::root_storage::disk(
+                    "/external/data.raw",
+                    vm_spec::DiskRole::Data,
+                    1024,
+                    "data".into(),
+                )
+                .unwrap(),
+            ],
+        });
+        spec.mounts.push(Mount {
+            source: "/external/share".into(),
+            tag: "data-share".into(),
+            read_only: false,
+        });
+        hardware_mut(&mut spec).rosetta = None;
+        let context = crate::guest_agent::storage_shutdown_context(
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            &spec,
+            rootfs_spec::RosettaMode::Required,
+        )
+        .unwrap();
+        let StorageManifest::Complete { attachments } = &context.manifest else {
+            panic!("inventory must not be narrowed")
+        };
+        assert_eq!(attachments.len(), 4);
+        assert!(matches!(
+            &attachments[0],
+            StorageAttachment::Block {
+                exclusive_writer: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &attachments[1],
+            StorageAttachment::Block {
+                exclusive_writer: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &attachments[2],
+            StorageAttachment::Share {
+                read_only: false,
+                ..
+            }
+        ));
+        assert!(
+            matches!(&attachments[3], StorageAttachment::Share { tag, read_only: true } if tag == rootfs_spec::rosetta::SHARE_TAG)
+        );
+        assert!(context.manifest.unsupported_reason().is_some());
+    }
+
+    #[test]
+    fn shutdown_inventory_overflow_is_explicitly_unsupported_not_truncated() {
+        let mut spec = sample_spec(Vec::new());
+        spec.mounts = (0..65)
+            .map(|index| Mount {
+                source: format!("/share/{index}").into(),
+                tag: format!("share-{index}"),
+                read_only: true,
+            })
+            .collect();
+        let context = crate::guest_agent::storage_shutdown_context(
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            &spec,
+            rootfs_spec::RosettaMode::Disabled,
+        )
+        .unwrap();
+        assert!(matches!(
+            context.manifest,
+            protocol::shutdown::StorageManifest::Unsupported { .. }
+        ));
     }
 }

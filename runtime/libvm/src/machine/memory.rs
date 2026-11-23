@@ -56,7 +56,10 @@ impl Memory {
         let mebibytes = self.bytes.div_ceil(BYTES_PER_MEBIBYTE);
         u32::try_from(mebibytes).map_err(|_| LibVmError::InvalidCreateRequest {
             name: name.to_string(),
-            reason: format!("memory is too large: {} bytes", self.bytes),
+            reason: format!(
+                "memory is too large: {}",
+                utils::format_storage_size(self.bytes)
+            ),
         })
     }
 
@@ -71,7 +74,10 @@ impl Memory {
         let mebibytes = self.bytes.div_ceil(BYTES_PER_MEBIBYTE);
         u32::try_from(mebibytes).map_err(|_| LibVmError::InvalidMachineUpdate {
             reference: reference.to_string(),
-            reason: format!("memory is too large: {} bytes", self.bytes),
+            reason: format!(
+                "memory is too large: {}",
+                utils::format_storage_size(self.bytes)
+            ),
         })
     }
 }

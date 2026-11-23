@@ -2,131 +2,55 @@
 
 ## Integrated native product packages
 
-`make build` produces the CLI (which contains the daemon), taild and its adjacent native Go bridge
-alongside the ordinary runtime assets. Taild builds directly from `app/taild`
-with the source SDK and generated management-module replacements. Its build
-ensures the bridge once, uses `CGO_ENABLED=1`, and never assembles or installs a
-standalone SDK distribution. This graph supports native Linux and macOS.
-Netd's `CGO_ENABLED=0` recipe must not be used for taild.
+`make build` produces the CLI (which contains the daemon), the pure-Go `tsgate`
+lobby gateway helper, and the ordinary runtime assets on native Linux and macOS.
+Netd and tsgate use `CGO_ENABLED=0`.
 
-`make archive` stages the release runtime, produces runtime-only and portable
-archives, and qualifies the existing bridge for independent standalone SDK
-assembly. Linux release CGO uses native `/usr/bin` compiler/linker tools; macOS
-uses the existing Xcode/deployment-target configuration. Cross compilation is
-not native runtime qualification.
+`make archive` stages the release runtime and produces runtime-only and portable
+CLI archives. Cross compilation is not native runtime qualification.
 
 Both runtime roots include `runtime-manifest.json`: `{version, target, files}`.
-Version equals the exact SDK product version. Targets are `linux-amd64-gnu`,
-`linux-arm64-gnu`, or `darwin-arm64`, matching SDK runtime identifiers. Files are
-the complete current bin/assets inventory mapped to lowercase SHA-256 digests;
-manifest metadata is never a made-up constant. Stage validation rejects unexpected
-entries/symlinks and verifies manifest bytes against current components and VERSION.
-Qualified standalone SDK releases still embed runtime archive checksums and
-bridge bytes through `make assemble-go-sdk`. Those APIs remain supported.
-The integrated product instead loads the canonical adjacent sidecar, verifies
-its ABI/product version and uses the exact manager-selected six components.
-`make version-check` also checks the standalone SDK bundle cache-version constant.
+Version equals the exact product version. Targets are `linux-amd64-gnu`,
+`linux-arm64-gnu`, or `darwin-arm64`. Files are the complete current bin/assets
+inventory mapped to lowercase SHA-256 digests; manifest metadata is never a
+made-up constant. Stage validation rejects unexpected entries/symlinks and
+verifies manifest bytes against current components and VERSION.
 
-Portable archives on both operating systems include `bin/silo`,
-`bin/taild` and `bin/libsilo_go_ffi.so` (or `.dylib`). Runtime-only SDK archives
-contain VMM/netd/guest assets, never those frontends or bridge. Product archives
-include only useful `share/silo-taild/examples`, not standalone units, sysusers,
-configuration or acceptance tooling. Existing installed standalone state is
-not removed or migrated.
-
-Generated `LICENSES/taild` material comes from the exact Go module graph;
-missing license material is fatal. Review `modules.json`, SBOM and provenance.
-Runtime notices retain the locked libkrun revision, vendored signal-registry
-attribution and Apache license. Product provenance records actual helper and
-bridge hashes. These are archive outputs, not distro-package/signature claims.
+Portable archives include `bin/silo` and `bin/tsgate` alongside the
+VMM/netd/guest assets. Runtime-only archives exclude both product executables.
+Release tsgate builds generate Go dependency notices from the exact target's
+import graph into `target/release/share/licenses/tsgate/`; portable archives
+ship them at `share/licenses/tsgate/`, including the `modules.json` inventory.
+Review the notices, SBOM and provenance before distributing either archive.
+Runtime notices retain the exact locked libkrun revision for Git sources.
+For an explicit local native patch, staging reuses the native build's dependency
+resolver and reads the copied monitor's compiled source revision, content
+fingerprint and clean/dirty/unknown state through the excluded VZ capability
+query, which performs no KVM/HVF discovery. Validation binds notices to those
+compiled observations rather than relabeling patched bytes with the declared
+Git baseline. Dirty/unknown source is not a source attestation or a live
+qualification. Product provenance records the actual packaged file hashes.
+These are archive outputs, not distro-package/signature claims.
 
 For bounded cold builds, build release components separately and inspect any
-timeout instead of blindly retrying. `make taild PROFILE=release` already
-builds its bridge dependency. After coordinated `make stage PROFILE=release`:
+timeout instead of blindly retrying. After `make stage PROFILE=release`:
 
 ```sh
 make runtime-archive PROFILE=release
-make qualify-go-bridge PROFILE=release
 make portable-archive
-CGO_ENABLED=1 go -C app/taild build \
-  -o "$PWD/target/artifact-driver" ../../packaging/silo-taild/kvm.go
-python3 packaging/silo-taild/verify-artifact.py \
-  target/packages/0.1.0/linux-amd64-gnu/silo-0.1.0-linux-amd64-gnu.tar.zst \
-  target/packages/0.1.0/linux-amd64-gnu/silo-runtime-0.1.0-linux-amd64-gnu.tar.zst \
-  --driver "$PWD/target/artifact-driver"
 ```
 
-Use the source VERSION and native target. Build the acceptance driver in the
-same native release toolchain as the product; a Nix-linked observation tool
-cannot execute with `/nix` hidden.
+Debug archives use `target/packages-debug`, separate from release outputs,
+with build profile recorded in provenance.
 
-The verifier extracts real archives into fresh canonical Home/config roots,
-starts the packaged daemon (`silo daemon run`) and taild, observes the mapped sidecar and checks
-exact six-component selection over the real management API. It creates no SDK
-installation/cache. Missing bridge, malformed library, dependency, ABI and
-version failures leave core inventory usable. Missing shared guest assets leave
-the core status RPC ready but correctly prevent operations needing that runtime.
-Only disposable extracted copies are damaged by negative cases.
-
-Historical 2026-10-01 standalone SDK memory runs passed release guests at 256MiB
-(agent 10,444,032 bytes) and debug guests at 1GiB (agent 173,188,384 bytes).
-They do not qualify the newly integrated product, other workloads or architectures.
-Debug archives/bridges use `target/packages-debug`, separate from release
-outputs, with build profile recorded in provenance.
-
-Linux release commands use verified `/usr/bin` C tools, clear Nix wrapper flags,
-and give CGO `-B/usr/bin` to select native assembler/linker subprograms. An absolute
-CC alone is insufficient because GCC otherwise searches PATH for `as`/`ld`.
-Artifact acceptance checks dynamic loaders/search paths and runs without inherited
-loader overrides. The host must supply `libgcc_s.so.1` and its normal glibc libraries.
-Provenance records the actual module-selected Go toolchains and native compiler.
-
-Release archiving and bridge qualification fail closed on the native ELF audit:
-standard interpreter, no RPATH/RUNPATH or absolute DT_NEEDED entries, complete
-dependency resolution using the designated system loader with its cache disabled
-and only native system library directories, and imported GLIBC versions no newer
-than ADR0012's 2.39 floor. GNU host linker subprograms are pinned for Rust as well
-as CGO. Do not repair a too-new ABI by merely removing an interpreter/search path
-or copying an arbitrary system library closure.
-
-With available rootless user/mount namespaces, the verifier hides `/nix` while
-preserving the service UID. `--require-no-nix` makes that isolation mandatory.
-`--audit-only` still starts real helpers and verifies mapping/RPC admission, but
-omits negative artifact mutations. Neither mode implies VM boot, live tailnet
-authentication or host reboot qualification.
-
-Hosted Go lanes run the native bridge/control tests; VM-fixture tests retain
-their explicit disk/rootfs and execution opt-ins. The release-tip package lanes
-require actual helper startup and bridge mapping. Neither substitutes for the
-native VM, live-tailnet or shutdown qualification scenarios.
-
-On native macOS, pass `--app /absolute/path/Silo.app` after `make app`. The app
-contains taild and the bridge under `Contents/Helpers`, and complete notices
-under `Contents/Resources`. The dylib is signed first, then executables and the
-outer app, all with the selected identity. Only silo-vmm receives virtualization
-entitlements; library validation is not disabled. Nested certificate identity
-is checked, and `Silo.app.provenance.json` records actual post-sign bytes outside
-the sealed bundle. Ad-hoc validation is not Developer-ID qualification.
-
-For real KVM/HVF guest execution, the source acceptance driver connects to an
-already-running packaged manager with isolated Home and an absolute disposable
-bootable Linux disk. Lifecycle uses management RPC; guest exec uses an exact-ID
-SDK handle with authoritative `GetRuntimeInfo` paths, not a guessed runtime root:
-
-```sh
-SILO_E2E_VM=1 target/artifact-driver \
-  --endpoint /absolute/path/control.sock \
-  --home /absolute/path/isolated-state \
-  --config-dir /absolute/path/isolated-config/silo \
-  --bridge /absolute/path/product/bin/libsilo_go_ffi.so \
-  --components-root /absolute/path/product \
-  --disk /absolute/path/disposable-linux.ext4 --memory-mib 1024
-```
-
-For an app, use its canonical root and `Contents/Helpers/libsilo_go_ffi.dylib`.
-The driver refuses oversized agents at 256MiB; that size screen alone is not
-memory qualification. Native macOS/HVF/Developer-ID, real tailnet credentials
-and permitted login1/reboot access remain separate platform gates.
+On native macOS, `make app` packages the CLI under `Contents/MacOS`, runtime
+helpers (including tsgate) under `Contents/Helpers`, and complete notices under
+`Contents/Resources` (tsgate's Go notices are under `LICENSES/tsgate`).
+Executables are signed before the outer app, all with the selected identity.
+Only silo-vmm receives virtualization entitlements; library validation is not
+disabled. Nested certificate identity is checked, and `Silo.app.provenance.json`
+records actual post-sign bytes outside the sealed bundle. Ad-hoc validation is
+not Developer-ID qualification.
 
 This guide is for Silo contributors and downstream package maintainers. It
 describes how to build the package formats that exist in this source tree, how
@@ -151,7 +75,6 @@ implemented yet.
 | macOS arm64 | Runtime and portable archives, `Silo.app`, optional DMG, main Release Tip CI | Notarization, stapling, Homebrew Cask |
 | Linux amd64 | Runtime and portable archives, main Release Tip CI | Archive signing |
 | Linux arm64 | Runtime and portable archives, main Release Tip CI | Archive signing |
-| SDKs | Node native addon build; Go SDK, native bridge, and explicit runtime installer | Runtime-carrying Node packages, Python wheels, published Go release metadata |
 
 The current commands do not produce notarized macOS artifacts, release
 signatures, or published releases. Official Linux distribution is archive-only;
@@ -175,7 +98,7 @@ Enter the repository's release shell before running packaging commands:
 nix develop .#release
 ```
 
-The shell provides the Rust, Go, Node, Zig, archive, SBOM, and OCI tools used by
+The shell provides the Rust, Go, Zig, archive, SBOM, and OCI tools used by
 the build. `flake.lock` pins the Nix package graph and `rust-toolchain.toml` pins
 the Rust release. Packaging does not download a second compiler toolchain or
 fall back to ambient release tools when Nix evaluation fails.
@@ -250,7 +173,7 @@ Version changes are source changes, not packaging flags:
 
 1. Update `VERSION`.
 2. Synchronize the product manifests checked by `xtask/src/version.rs`.
-3. Refresh `Cargo.lock` and `sdk/node/package-lock.json` without upgrading unrelated dependencies.
+3. Refresh `Cargo.lock` without upgrading unrelated dependencies.
 4. Inspect the lockfile diffs.
 5. Run `make version-check` until it succeeds.
 6. Run `make fmt`, `make clippy`, and `make test` before packaging.
@@ -281,12 +204,12 @@ target/silo-runtime/<target>/release/
        +----------------------+--------------------------+
        |                      |                          |
        v                      v                          v
-Runtime archive       Portable CLI archive       macOS application package
-runtime + notices     runtime + CLI + notices    Silo.app / optional DMG
+Runtime archive       Portable product archive   macOS application package
+runtime + notices     runtime + silo + tsgate    Silo.app / optional DMG
        |                      |                          |
        |                      |                          |
        v                      v                          v
-SDK or embedding      Direct CLI distribution    macOS distribution
+Embedding             Direct CLI distribution    macOS distribution
 transport              (official Linux transport)
 ```
 
@@ -303,9 +226,9 @@ target/silo-runtime/<target>/release/
     agent
 ```
 
-The stage deliberately excludes the public `silo` frontend (and with it the appliance daemon). Product and SDK
-packagers add their frontend or native binding without rebuilding or replacing
-the staged runtime files.
+The stage deliberately excludes the public `silo` frontend (and with it the
+appliance daemon) and `tsgate`. Product packagers add both executables and
+tsgate's dependency notices without rebuilding or replacing staged runtime files.
 
 ## Archive Types
 
@@ -313,7 +236,7 @@ the staged runtime files.
 
 | Archive | Intended use | Includes `bin/silo` |
 | --- | --- | --- |
-| `silo-runtime-<version>-<target>.tar.zst` | Runtime transport for SDKs, embedders, and installers that provide their own frontend | No |
+| `silo-runtime-<version>-<target>.tar.zst` | Runtime transport for embedders and installers that provide their own frontend | No |
 | `silo-<version>-<target>.tar.zst` | Self-contained portable CLI distribution | Yes |
 
 The runtime archive contains:
@@ -332,10 +255,10 @@ silo-runtime-<version>-<target>/
     APACHE-2.0.txt
 ```
 
-The portable CLI archive contains the same files plus `bin/silo`, which is both
-the CLI and the daemon (`silo daemon run`). `Silo.app` places it at
-`Contents/MacOS/silo` and signs it without virtualization entitlements (the VMM
-owns virtualization):
+The portable product archive contains the same files plus `bin/silo`, which is
+both the CLI and the daemon (`silo daemon run`), `bin/tsgate`, and tsgate's Go
+dependency notices. `Silo.app` places the CLI at `Contents/MacOS/silo` and tsgate
+at `Contents/Helpers/tsgate`. Neither receives virtualization entitlements:
 
 ```text
 silo-<version>-<target>/
@@ -343,6 +266,7 @@ silo-<version>-<target>/
     silo
     silo-vmm
     netd
+    tsgate
   assets/
     kernel-default
     initramfs
@@ -350,6 +274,9 @@ silo-<version>-<target>/
   THIRD_PARTY_NOTICES
   LICENSES/
     APACHE-2.0.txt
+  share/licenses/tsgate/
+    modules.json
+    <module>/<version>/LICENSE...
 ```
 
 Each archive has an adjacent SHA-256 checksum, SPDX JSON SBOM, and provenance
@@ -374,6 +301,13 @@ make archive
 canonical stage, and produces both archives, checksums, SBOMs, and provenance
 documents. Successful construction in the qualified native release environment
 is the release correctness signal.
+
+The Linux ELF audit covers tsgate and accepts a static executable only when it
+has neither an ELF interpreter nor `DT_NEEDED` dependencies. Release Tip runs
+`scripts/accept-packaged-product.sh PACKAGE_DIRECTORY` after archiving: it extracts
+both archives, runs the packaged CLI and gateway version commands, and starts,
+observes ready status, and stops the packaged daemon with system and Tailscale
+features disabled, using an isolated temporary Home and the extracted runtime.
 
 ## Packaging macOS
 
@@ -480,10 +414,9 @@ of routine CI or archive construction.
 
 Downstream maintainers producing a CLI package should repackage the official
 portable CLI archive for the exact revision and target they distribute, not
-rebuild Silo from source. The runtime-only archive remains the input for SDKs
-and embedders that provide their own frontend. This guide is revision-local:
-read the `PACKAGING.md` from the archive's source revision before qualifying a
-package.
+rebuild Silo from source. The runtime-only archive is available for embedders
+that provide their own frontend. This guide is revision-local: read the
+`PACKAGING.md` from the archive's source revision before qualifying a package.
 
 Select the exact target, then verify the archive against its adjacent SHA-256
 checksum before extraction. When release signatures are introduced, verify them
@@ -508,22 +441,6 @@ Package uninstallers must not delete user-owned state: the Silo home
 (`~/.silo`, including installed runtimes, caches, and logs) and the
 configuration directory (`~/.config/silo`).
 
-## Go Runtime Installer Contract
-
-The Go SDK implements the explicit runtime-only archive installer specified by ADR 0012. It
-selects the current supported target and exact SDK version, verifies the release-compiled SHA-256
-digest, rejects path traversal, links, devices, and unexpected files, preserves and validates
-modes and notices, stages into a temporary sibling, and atomically installs a complete runtime
-below the user-owned Silo home (`~/.silo/runtimes`). It supports exact offline archives and mirrors without
-allowing callers to replace the expected digest. Installation never occurs at SDK import,
-runtime open, machine creation, or VM start, and it never deletes user-owned state.
-
-Release preparation builds the private Go FFI bridge on each native target. After the qualified
-target artifacts are collected under `target/packages`, `make assemble-go-sdk` verifies their
-checksum sidecars and combines the bridge binaries and runtime archive digests into generated Go
-SDK release source before the nested module tag is created. Ordinary development uses
-`SILO_GO_FFI_PATH` instead of committing placeholder native binaries.
-
 ## Kernel Selection
 
 Release artifacts include the resolved default kernel bytes. A normal first VM
@@ -535,17 +452,21 @@ The default kernel reference can be replaced with another OCI reference:
 make archive KERNEL_REFERENCE=registry.example/silo/kernel:stable
 ```
 
-Use an absolute path to package a local architecture-matched kernel:
+Package a local architecture-matched kernel with `KERNEL_PATH`. On Linux,
+`make kernel` builds one from `resources/kernels` (inside the Nix kernel shell)
+and prints the path:
 
 ```sh
-make archive KERNEL_PATH=/absolute/path/to/kernel
+make kernel
+make archive KERNEL_PATH=target/kernel-stable
 ```
 
-Control registry access and cache refresh explicitly:
+Every build follows the reference to whatever is currently published; content
+is cached by digest, so an unchanged tag downloads nothing. Disable registry
+access entirely with:
 
 ```sh
 make archive KERNEL_OFFLINE=1
-make archive KERNEL_REFRESH=1
 ```
 
 The same kernel options apply to `make build`, `make stage`, `make app`, and
@@ -553,10 +474,10 @@ The same kernel options apply to `make build`, `make stage`, `make app`, and
 see the [kernel documentation](resources/kernels/README.md).
 
 Apple Silicon macOS builds also resolve and include the Rosetta probe from
-`ghcr.io/vandycknick/silo/rprobe:stable`. It uses the same verification and cache
-mechanism as the kernel, with separate `rprobe-cache` and `rprobe-provenance`
-directories. Override it with `RPROBE_REFERENCE` or `RPROBE_PATH`; control cache
-use with `RPROBE_OFFLINE=1` and `RPROBE_REFRESH=1`. For a fully offline build,
+`ghcr.io/vandycknick/silo/rprobe:stable`. It uses the same cache mechanism as the
+kernel, with separate `rprobe-cache` and `rprobe-provenance` directories. Override
+it with `RPROBE_REFERENCE` or `RPROBE_PATH`, or disable registry access with
+`RPROBE_OFFLINE=1`. For a fully offline build,
 set both `KERNEL_OFFLINE=1` and `RPROBE_OFFLINE=1`. Existing adjacent probe files
 are not an implicit override. Linux runtime builds do not download the probe.
 
@@ -579,15 +500,10 @@ application packagers.
 
 ## Continuous Integration
 
-`Test` validates pull requests, pushes to `main`, and manual dispatches as a
-left-to-right pipeline: change detection fans out to parallel per-OS core check
-jobs (Clippy, Cargo tests, and on the primary Linux cell also formatting and
-version consistency) and to Node and Go SDK matrices that run only when their
-SDK source or shared native contracts changed (manual dispatches run both).
-Native SDK bridges build and test on every supported target, while
-platform-independent SDK checks run on one primary cell. Everything flows into
-a final summary job that gives branch protection one stable result even when an
-SDK matrix is skipped.
+`Test` validates pull requests, pushes to `main`, and manual dispatches with
+parallel core checks on Linux amd64, Linux arm64, and macOS arm64. Core checks
+run Clippy and Cargo tests, plus formatting and version consistency on the
+primary Linux cell. A final summary job gives branch protection one stable result.
 
 CI enters the `.#ci` shell rather than `.#default`. That shell carries the
 toolchain needed to compile, lint, and test the workspace but omits the
@@ -610,32 +526,24 @@ itself, so it can never feed `main` or release runs.
 
 `Release Tip` runs after a successful `Test` for a push to `main` (or by manual
 dispatch). Automatic runs package the exact SHA validated by `Test`; manual runs
-package the selected dispatch SHA. Release preparation has four stages:
+package the selected dispatch SHA. Release preparation resolves the exact source
+revision and version, then builds core archives on Linux amd64, Linux arm64, and
+macOS arm64; the macOS cell also builds the application package and DMG.
 
-1. Resolve the exact source revision and version.
-2. Build core archives on Linux amd64, Linux arm64, and macOS arm64; the macOS
-   cell also builds the application package and DMG.
-3. Build the Go FFI bridge and Node native addon on every supported target.
-4. Assemble and test the embedded Go release source and a publish-ready npm
-   package containing all three Node addons.
-
-The Rust caches are isolated by core/SDK stage and platform. Release work has no
-path filtering because commit metadata affects artifacts and every SDK package
-must use the same qualified core revision.
+The Rust caches are isolated by platform. Release work has no path filtering
+because commit metadata affects artifacts.
 
 GitHub zips Actions artifacts and does not preserve executable modes, so the
 DMG is the permission-preserving transport for the runnable macOS app. The
 workflow still builds and verifies the loose `Silo.app` on-runner before it
-creates and verifies the DMG. Downloading the core and native-SDK artifact for
-each target into `target/packages` reconstructs one `target/packages/<version>`
-root with sibling `darwin-arm64`, `linux-amd64-gnu`, and `linux-arm64-gnu`
-directories. Targets and versions can coexist without path or filename
-collisions. The SDK packaging jobs additionally upload generated Go module
-source and an npm `.tgz` that is ready for a later publication step.
+creates and verifies the DMG. Downloading each target's core artifacts into
+`target/packages` reconstructs one `target/packages/<version>` root with sibling
+`darwin-arm64`, `linux-amd64-gnu`, and `linux-arm64-gnu` directories. Targets and
+versions can coexist without path or filename collisions.
 
 CI artifacts are retained for 14 days. This is build validation and packaging,
 not release publication: CI does not currently create release signatures,
-notarize macOS output, run `npm publish`, or publish release assets.
+notarize macOS output, or publish release assets.
 
 ## Architecture and Release Internals
 

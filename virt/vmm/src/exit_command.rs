@@ -22,7 +22,7 @@
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -76,7 +76,10 @@ impl ExitRunner {
         }
         let mut envp = Vec::new();
         for (name, value) in std::env::vars_os() {
-            if name == MACHINE_ID_ENV || name == MACHINE_RUN_ID_ENV {
+            if name == MACHINE_ID_ENV
+                || name == MACHINE_RUN_ID_ENV
+                || name == crate::startup::ENV_STORAGE_LEASES
+            {
                 continue;
             }
             let mut entry = name.into_encoded_bytes();
@@ -126,9 +129,12 @@ impl ExitRunner {
 }
 
 fn run_child(trigger: OwnedFd, program: &CString, argv: &[CString], envp: &[CString]) -> ! {
-    // Failures here cannot be reported anywhere useful; the command still runs.
-    let _ = redirect_stdio_to_null();
-    let _ = close_all_except(trigger.as_raw_fd());
+    // Fork-only helpers do not benefit from CLOEXEC while waiting. Never wait
+    // with storage ownership if descriptor sanitation could not be completed.
+    if redirect_stdio_to_null().is_err() || close_all_except(trigger.as_raw_fd()).is_err() {
+        // nix exposes no immediate _exit; no parent destructors may run here.
+        unsafe { nix::libc::_exit(126) }
+    }
     // One byte or EOF releases the runner; only EINTR keeps waiting.
     let mut byte = [0_u8; 1];
     while let Err(nix::errno::Errno::EINTR) = nix::unistd::read(&trigger, &mut byte) {}
@@ -163,7 +169,8 @@ fn close_all_except(keep: RawFd) -> nix::Result<()> {
             nix::sys::stat::Mode::empty(),
         )?;
         let own = directory.as_raw_fd();
-        for entry in directory.iter().flatten() {
+        for entry in directory.iter() {
+            let entry = entry?;
             if let Some(fd) = entry
                 .file_name()
                 .to_str()
@@ -177,8 +184,8 @@ fn close_all_except(keep: RawFd) -> nix::Result<()> {
         }
     }
     for fd in open {
-        // SAFETY: the single-threaded child owns every inherited descriptor.
-        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        // close reports errors explicitly; Drop would silently ignore them.
+        nix::unistd::close(fd)?;
     }
     Ok(())
 }
@@ -420,5 +427,54 @@ mod tests {
             fs::set_permissions(&path, permissions).unwrap();
         }
         path
+    }
+
+    #[test]
+    fn runner_cleanup_failure_child() {
+        if std::env::var_os("SILO_TEST_EXIT_RUNNER_CLEANUP_FAILURE").is_none() {
+            return;
+        }
+        let (trigger, _keep_waiting) = nix::unistd::pipe().unwrap();
+        let program = std::ffi::CString::new("/bin/true").unwrap();
+        let argv = [program.clone()];
+        let (_, hard) =
+            nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
+        // A real OS boundary: sanitation cannot open /dev/null with no FD slots.
+        nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, 0, hard)
+            .unwrap();
+        crate::exit_command::run_child(trigger, &program, &argv, &[]);
+    }
+
+    #[test]
+    fn cleanup_os_error_terminates_runner_instead_of_waiting_with_inherited_fds() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exit_command::tests::runner_cleanup_failure_child",
+                "--nocapture",
+            ])
+            .env("SILO_TEST_EXIT_RUNNER_CLEANUP_FAILURE", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(
+                    status.code(),
+                    Some(126),
+                    "runner must fail before waiting or exec"
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("runner waited despite cleanup failure");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

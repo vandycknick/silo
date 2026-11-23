@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, ValueEnum};
 use eyre::Context as _;
 use libvm::{
-    ImageProgressSender, ImagePullPolicy, MachineAgent, MachineRetention, MachineUserConfig,
-    PublishBind, RuntimeConfig,
+    ImageProgressSender, MachineAgent, MachineRetention, MachineUserConfig, PublishBind,
+    RuntimeConfig,
 };
 use nix::unistd::{Uid, User};
 
@@ -17,8 +17,9 @@ use crate::planning::{
     self, MachineCreationSettings, MachineOverrides, Plan, PlanKind, ProcessOverrides, PullPolicy,
     ResolveRequest, ResolvedImage,
 };
+use crate::pull_progress::watch_image_progress;
 use crate::template::{Template, TemplateStore};
-use crate::ui::{success, watch_image_progress, OutputFormat, Spinner};
+use crate::ui::{success, OutputFormat, Spinner};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum Pull {
@@ -28,11 +29,11 @@ pub(crate) enum Pull {
 }
 
 impl Pull {
-    pub(crate) fn policy(self) -> ImagePullPolicy {
+    pub(crate) fn policy(self) -> libvm::PullPolicy {
         match self {
-            Self::Always => ImagePullPolicy::Always,
-            Self::Missing => ImagePullPolicy::IfMissing,
-            Self::Never => ImagePullPolicy::Never,
+            Self::Always => libvm::PullPolicy::Always,
+            Self::Missing => libvm::PullPolicy::IfMissing,
+            Self::Never => libvm::PullPolicy::Never,
         }
     }
 
@@ -44,7 +45,7 @@ impl Pull {
         }
     }
 
-    pub(crate) fn policies(self) -> (ImagePullPolicy, PullPolicy) {
+    pub(crate) fn policies(self) -> (libvm::PullPolicy, PullPolicy) {
         (self.policy(), self.plan_policy())
     }
 }
@@ -66,15 +67,33 @@ pub(crate) struct VmOverrideArgs {
     /// Append an argument to the Linux kernel command line. May be repeated.
     #[arg(long = "kernel-arg", value_name = "ARG")]
     pub(crate) kernel_args: Vec<String>,
-    /// Resize the image-backed root disk, for example 10gb or 512mb.
+    /// Root disk size, or private upper backing capacity for a layered OCI root.
     #[arg(long = "disk-size", value_name = "SIZE")]
     pub(crate) disk_size: Option<String>,
+    /// Explicit memory-charged, nonpersistent /tmp tmpfs capacity.
+    #[arg(long, value_name = "SIZE")]
+    pub(crate) tmpfs_size: Option<String>,
     /// Enable nested virtualization for supported VZ guests.
     #[arg(long)]
     pub(crate) nested_virtualization: bool,
-    /// Enable Rosetta for x86_64 Linux binaries on a supported backend and host.
-    #[arg(long)]
-    pub(crate) rosetta: bool,
+    /// Rosetta intent: `--rosetta` enables, `--rosetta=false` explicitly disables,
+    /// absence leaves no intent. Required translation is derived from the platform.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub(crate) rosetta: Option<bool>,
+    /// Linux userspace platform: OCI manifest selection or disk import metadata
+    /// (linux/amd64, linux/arm64[/v8]). Defaults to the host-native platform.
+    #[arg(long, value_name = "PLATFORM", value_parser = parse_platform_arg)]
+    pub(crate) platform: Option<libvm::LinuxPlatform>,
+    /// Root of a disk: source: whole-disk (default), auto (GPT discoverable
+    /// partitions), gpt:GUID or mbr:N. Never inferred from a partitioned disk.
+    #[arg(long, value_name = "SELECTION", value_parser = parse_root_arg)]
+    pub(crate) root: Option<libvm::ImportRootSelection>,
     /// Path to userdata file.
     #[arg(long, value_name = "PATH")]
     pub(crate) userdata: Option<PathBuf>,
@@ -127,8 +146,9 @@ pub(crate) struct MachineCliOptions {
     pub(crate) initramfs: Option<PathBuf>,
     pub(crate) kernel_args: Vec<String>,
     pub(crate) nested_virtualization: bool,
-    pub(crate) rosetta: bool,
+    pub(crate) rosetta: Option<bool>,
     pub(crate) disks: Vec<PathBuf>,
+    pub(crate) source: crate::api::types::SourceOptions,
     pub(crate) agent: Option<PathBuf>,
     pub(crate) no_agent: bool,
     pub(crate) provision_user: Option<MachineUserConfig>,
@@ -165,6 +185,7 @@ impl VmOverrideArgs {
             overrides: MachineOverrides {
                 resources,
                 disk_size: self.disk_size.clone(),
+                tmpfs_size: self.tmpfs_size.clone(),
                 userdata,
                 mounts: self.mounts.clone(),
                 forwards: (!self.forwards.is_empty()).then(|| self.forwards.clone()),
@@ -179,6 +200,10 @@ impl VmOverrideArgs {
             nested_virtualization: self.nested_virtualization,
             rosetta: self.rosetta,
             disks: self.disks.clone(),
+            source: crate::api::types::SourceOptions {
+                platform: self.platform.clone(),
+                root: self.root.clone(),
+            },
             agent: None,
             no_agent: false,
             provision_user: self
@@ -191,9 +216,12 @@ impl VmOverrideArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Create a persistent stopped VM from an image or template")]
+#[command(
+    about = "Create a persistent stopped VM from an image or template",
+    long_about = "Create a persistent stopped VM from an image or template.\n\nIMAGE is an image only: a local image name, an image id or unique id prefix, a registry reference, or disk:PATH. A local name wins; short registry names such as alpine:3.21 expand through search_registries (docker.io by default). Snapshots become machines through `silo restore`."
+)]
 pub struct Cmd {
-    /// OCI registry reference or disk:PATH. Overrides the template image.
+    /// Image name, id, registry reference or disk:PATH. Overrides the template image.
     #[arg(value_name = "IMAGE")]
     image: Option<String>,
     /// Template providing VM defaults.
@@ -245,6 +273,7 @@ impl Cmd {
                 self.image.as_deref(),
                 &template.template,
                 self.pull.map(Pull::policies),
+                &machine.source,
             )
             .await?;
             let settings = machine_settings(&machine);
@@ -283,6 +312,7 @@ impl Cmd {
                     self.image.as_deref(),
                     &template.template,
                     self.pull.map(Pull::policies),
+                    &machine.source,
                     image_progress.clone(),
                 )
                 .await?;
@@ -346,6 +376,68 @@ pub(crate) fn selected_image_reference(
         .ok_or_else(|| eyre::eyre!("an image is required when the template does not provide one"))
 }
 
+/// A source spelling, parsed the same way by both transports: `disk:` paths,
+/// otherwise an image reference for the shared name resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceSpelling {
+    Disk(PathBuf),
+    Reference(String),
+}
+
+pub(crate) fn parse_source(reference: &str) -> eyre::Result<SourceSpelling> {
+    if let Some(path) = reference.strip_prefix("disk:") {
+        return Ok(SourceSpelling::Disk(disk_source_path(reference, path)?));
+    }
+    Ok(SourceSpelling::Reference(reference.to_owned()))
+}
+
+/// Source options belong to the selected source family; they are never
+/// silently ignored for another one.
+pub(crate) fn validate_source_options(
+    spelling: &SourceSpelling,
+    options: &crate::api::types::SourceOptions,
+    pull: bool,
+) -> eyre::Result<()> {
+    match spelling {
+        SourceSpelling::Reference(_) => {
+            if options.root.is_some() {
+                eyre::bail!("--root selects a partition of a disk: source only");
+            }
+        }
+        SourceSpelling::Disk(_) => {
+            if pull {
+                eyre::bail!("--pull is only supported for image references");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `disk:` convenience: host-native userspace, whole-disk direct boot and
+/// packaged assets pinned at creation, unless explicitly selected. The
+/// assumption is complete and visible in the plan; creation publishes no name.
+pub(crate) fn disk_create_request(
+    path: PathBuf,
+    options: &crate::api::types::SourceOptions,
+) -> eyre::Result<libvm::DiskImportRequest> {
+    let platform = match &options.platform {
+        Some(platform) => platform.clone(),
+        None => silo_vm_control::boot::host_platform()?,
+    };
+    Ok(libvm::DiskImportRequest {
+        path,
+        boot: libvm::DiskImportBoot::LinuxDirect {
+            platform,
+            root: options
+                .root
+                .clone()
+                .unwrap_or(libvm::ImportRootSelection::WholeDisk),
+            assets: libvm::BootAssetSelection::Packaged,
+        },
+        name: None,
+    })
+}
+
 fn disk_path(reference: &str, path: &str) -> eyre::Result<PathBuf> {
     if path.trim().is_empty() {
         eyre::bail!("local image source path cannot be empty in {reference}");
@@ -353,18 +445,40 @@ fn disk_path(reference: &str, path: &str) -> eyre::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-pub(crate) fn canonical_disk_source(reference: &str, path: &str) -> eyre::Result<PathBuf> {
+/// Absolute source path with canonical parent directories. The final component
+/// is never resolved: libvm opens it without following symbolic links, so a
+/// symlinked source is refused rather than silently replaced by its target.
+pub(crate) fn disk_source_path(reference: &str, path: &str) -> eyre::Result<PathBuf> {
     let path = resolve_host_path(&disk_path(reference, path)?)?;
-    let path = std::fs::canonicalize(&path)
-        .with_context(|| format!("resolve local image disk {}", path.display()))?;
-    let metadata = std::fs::metadata(&path)
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        eyre::bail!("local image disk path has no file name: {}", path.display());
+    };
+    let path = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolve local image disk directory {}", parent.display()))?
+        .join(name);
+    let metadata = std::fs::symlink_metadata(&path)
         .with_context(|| format!("inspect local image disk {}", path.display()))?;
-    if !metadata.is_file() {
-        eyre::bail!("local image disk path is not a file: {}", path.display());
+    if metadata.file_type().is_symlink() {
+        eyre::bail!(
+            "local image disk is a symbolic link; pass the quiesced regular file itself: {}",
+            path.display()
+        );
     }
-    std::fs::File::open(&path)
-        .with_context(|| format!("read local image disk {}", path.display()))?;
+    if !metadata.is_file() {
+        eyre::bail!(
+            "local image disk path is not a regular file: {}",
+            path.display()
+        );
+    }
     Ok(path)
+}
+
+fn parse_platform_arg(value: &str) -> Result<libvm::LinuxPlatform, String> {
+    silo_vm_control::boot::parse_platform(value).map_err(|error| error.to_string())
+}
+
+fn parse_root_arg(value: &str) -> Result<libvm::ImportRootSelection, String> {
+    silo_vm_control::boot::parse_import_root(value).map_err(|error| error.to_string())
 }
 
 pub(crate) struct PlanInputs {
@@ -441,6 +555,7 @@ pub(crate) fn machine_settings(options: &MachineCliOptions) -> MachineCreationSe
         kernel_args: options.kernel_args.clone(),
         nested_virtualization: options.nested_virtualization,
         rosetta: options.rosetta,
+        platform: options.source.platform.clone(),
         disks: options.disks.clone(),
         agent,
         provision_user: options.provision_user.clone(),
@@ -450,10 +565,7 @@ pub(crate) fn machine_settings(options: &MachineCliOptions) -> MachineCreationSe
 pub(crate) fn render_plan(plan: &Plan, format: OutputFormat) -> eyre::Result<()> {
     match format {
         OutputFormat::Json => crate::ui::print_json(plan),
-        OutputFormat::Plain => {
-            println!("{}", serde_json::to_string(plan)?);
-            Ok(())
-        }
+        OutputFormat::Plain => crate::ui::print_serialized_details(plan),
     }
 }
 
@@ -464,6 +576,7 @@ fn empty_template() -> Template {
         image: None,
         resources: None,
         disk_size: None,
+        tmpfs_size: None,
         userdata: None,
         mounts: Vec::new(),
         forwards: Vec::new(),
@@ -480,6 +593,26 @@ pub(crate) fn preflight_create(
     policy_config_dir: Option<&Path>,
 ) -> eyre::Result<()> {
     validate_machine_cli_options(options)?;
+    crate::template::validate_tmpfs_size(
+        options
+            .overrides
+            .tmpfs_size
+            .as_deref()
+            .or(template.tmpfs_size.as_deref()),
+    )?;
+    let reference = selected_image_reference(positional_image, template)?;
+    if options
+        .overrides
+        .tmpfs_size
+        .as_ref()
+        .or(template.tmpfs_size.as_ref())
+        .is_some()
+        && reference.starts_with("disk:")
+    {
+        eyre::bail!("--tmpfs-size requires a new OCI root");
+    }
+    let spelling = parse_source(&reference)?;
+    validate_source_options(&spelling, &options.source, false)?;
     for (label, path) in [
         ("custom guest agent", options.agent.as_ref()),
         ("kernel", options.kernel.as_ref()),
@@ -492,12 +625,8 @@ pub(crate) fn preflight_create(
     for disk in &options.disks {
         validate_readable_file(disk, "extra disk")?;
     }
-    if let Some(path) = selected_image_reference(positional_image, template)?.strip_prefix("disk:")
-    {
-        validate_readable_file(
-            &disk_path(&format!("disk:{path}"), path)?,
-            "local image disk",
-        )?;
+    if let SourceSpelling::Disk(path) = &spelling {
+        validate_readable_file(path, "local image disk")?;
     }
 
     let mounts = template
@@ -723,10 +852,112 @@ mod tests {
     use crate::app::Cli;
     use crate::commands::Command;
 
+    use crate::api::types::SourceOptions;
     use crate::commands::create::{
-        canonical_disk_source, empty_template, preflight_create, validate_process_overrides, Pull,
-        VmOverrideArgs,
+        disk_create_request, disk_source_path, empty_template, parse_source, preflight_create,
+        validate_process_overrides, validate_source_options, Pull, SourceSpelling, VmOverrideArgs,
     };
+
+    #[test]
+    fn rosetta_intent_is_tri_state_and_platform_root_are_typed() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["silo", "create", "disk:rootfs.img"];
+            argv.extend_from_slice(args);
+            let Command::Create(create) = Cli::try_parse_from(argv).expect("parse").command else {
+                panic!("expected create")
+            };
+            create.overrides
+        };
+        assert_eq!(parse(&[]).rosetta, None);
+        assert_eq!(parse(&["--rosetta"]).rosetta, Some(true));
+        assert_eq!(parse(&["--rosetta=false"]).rosetta, Some(false));
+        assert_eq!(parse(&["--rosetta=true"]).rosetta, Some(true));
+        let overrides = parse(&["--platform", "linux/arm64/v8", "--root", "mbr:4"]);
+        assert_eq!(
+            overrides.platform,
+            Some(libvm::LinuxPlatform {
+                architecture: libvm::GuestArchitecture::Arm64,
+                variant: Some("v8".into()),
+            })
+        );
+        assert_eq!(
+            overrides.root,
+            Some(libvm::ImportRootSelection::MbrPartition { number: 4 })
+        );
+        for invalid in [
+            ["--platform", "linux/riscv64"],
+            ["--platform", "linux/amd64/v3"],
+            ["--platform", "windows/amd64"],
+            ["--root", "mbr:0"],
+            ["--root", "mbr:5"],
+            ["--root", "mbr:256"],
+            ["--root", "gpt:00000000-0000-0000-0000-000000000000"],
+            ["--root", "largest"],
+        ] {
+            let mut argv = vec!["silo", "create", "disk:rootfs.img"];
+            argv.extend_from_slice(&invalid);
+            assert!(Cli::try_parse_from(argv).is_err(), "{invalid:?}");
+        }
+        assert!(Cli::try_parse_from(["silo", "create", "x", "--rosetta=maybe"]).is_err());
+    }
+
+    #[test]
+    fn disk_spelling_is_parsed_before_references_and_options_follow_the_family() {
+        for reference in [
+            "base",
+            "ubuntu:24.04",
+            "ghcr.io/acme/app:1",
+            "abc123",
+            &format!("sha256:{}", "ab".repeat(32)),
+        ] {
+            assert_eq!(
+                parse_source(reference).unwrap(),
+                SourceSpelling::Reference(reference.into())
+            );
+        }
+        assert!(parse_source("disk:").is_err());
+        let root = SourceOptions {
+            platform: None,
+            root: Some(libvm::ImportRootSelection::AutoGpt),
+        };
+        let platform = SourceOptions {
+            platform: Some(silo_vm_control::boot::parse_platform("arm64").unwrap()),
+            root: None,
+        };
+        let reference = SourceSpelling::Reference("ubuntu".into());
+        let disk = SourceSpelling::Disk("/disk.raw".into());
+        assert!(validate_source_options(&reference, &root, false).is_err());
+        assert!(validate_source_options(&reference, &platform, true).is_ok());
+        assert!(validate_source_options(&disk, &root, false).is_ok());
+        assert!(validate_source_options(&disk, &platform, true).is_err());
+    }
+
+    #[test]
+    fn disk_convenience_is_complete_host_native_whole_disk_packaged_without_alias() {
+        let request = disk_create_request("/disk.raw".into(), &SourceOptions::default()).unwrap();
+        assert_eq!(
+            request,
+            libvm::DiskImportRequest {
+                path: "/disk.raw".into(),
+                boot: libvm::DiskImportBoot::LinuxDirect {
+                    platform: silo_vm_control::boot::host_platform().unwrap(),
+                    root: libvm::ImportRootSelection::WholeDisk,
+                    assets: libvm::BootAssetSelection::Packaged,
+                },
+                name: None,
+            }
+        );
+        let explicit = SourceOptions {
+            platform: Some(silo_vm_control::boot::parse_platform("linux/amd64").unwrap()),
+            root: Some(libvm::ImportRootSelection::AutoGpt),
+        };
+        let libvm::DiskImportBoot::LinuxDirect { platform, root, .. } =
+            disk_create_request("/disk.raw".into(), &explicit)
+                .unwrap()
+                .boot;
+        assert_eq!(Some(platform), explicit.platform);
+        assert_eq!(root, libvm::ImportRootSelection::AutoGpt);
+    }
 
     #[test]
     fn create_parses_the_final_image_first_form() {
@@ -851,21 +1082,28 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp root");
         let data_root = temp.path().join("data");
         let disk = temp.path().join("disk.img");
-        std::fs::write(&disk, b"disk").expect("write disk");
+        std::fs::write(&disk, [0u8; 512]).expect("write disk");
         let disk_source = AppApi::resolve_read_only_creation(
             RuntimeConfig::local(&data_root),
             None,
             Some(&format!("disk:{}", disk.display())),
             &empty_template(),
             None,
+            &SourceOptions::default(),
         )
         .await
         .expect("resolve disk source")
         .source;
-        let crate::planning::ResolvedImage::Disk { path } = &disk_source.plan_image else {
+        let crate::planning::ResolvedImage::Disk { path, boot } = &disk_source.plan_image else {
             panic!("expected disk source")
         };
         assert_eq!(path, &std::fs::canonicalize(&disk).expect("canonical disk"));
+        assert_eq!(
+            boot,
+            &disk_create_request(path.clone(), &SourceOptions::default())
+                .unwrap()
+                .boot
+        );
 
         let oci_result = AppApi::resolve_read_only_creation(
             RuntimeConfig::local(&data_root),
@@ -873,6 +1111,7 @@ mod tests {
             Some("example.test/missing:latest"),
             &empty_template(),
             Some(Pull::Never.policies()),
+            &SourceOptions::default(),
         )
         .await;
         let Err(oci_error) = oci_result else {
@@ -896,33 +1135,35 @@ mod tests {
                 Some(&format!("disk:{}", disk.display())),
                 &empty_template(),
                 Some(pull.policies()),
+                &SourceOptions::default(),
             )
             .await
             .expect_err("explicit disk pull policy must fail");
             assert!(error
                 .to_string()
-                .contains("--pull is only supported for OCI image sources"));
+                .contains("--pull is only supported for image references"));
         }
     }
 
     #[test]
-    fn disk_source_is_canonicalized_before_planning() {
+    fn disk_source_keeps_the_final_component_and_refuses_symlinks_and_special_files() {
         let temp = tempfile::tempdir().expect("create temp root");
         let disk = temp.path().join("disk.img");
         let alias = temp.path().join("alias.img");
         std::fs::write(&disk, b"disk").expect("write disk");
         std::os::unix::fs::symlink(&disk, &alias).expect("create disk alias");
-
-        let canonical = canonical_disk_source(
-            &format!("disk:{}", alias.display()),
-            alias.to_str().expect("alias path is UTF-8"),
-        )
-        .expect("canonicalize disk source");
-
+        let spelled = temp.path().join("sub").join("..").join("disk.img");
+        std::fs::create_dir(temp.path().join("sub")).expect("subdirectory");
         assert_eq!(
-            canonical,
+            disk_source_path("disk:", spelled.to_str().unwrap()).expect("regular disk"),
             std::fs::canonicalize(&disk).expect("canonical disk")
         );
+        let error = disk_source_path("disk:", alias.to_str().unwrap()).expect_err("symlink");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        let error =
+            disk_source_path("disk:", temp.path().to_str().unwrap()).expect_err("directory");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(disk_source_path("disk:", " ").is_err());
     }
 
     #[test]

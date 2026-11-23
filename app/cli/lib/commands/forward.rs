@@ -49,12 +49,11 @@ impl Cmd {
             let cwd = std::env::current_dir()?;
             Some(parse_forward(&self.endpoints, self.name, &cwd)?)
         };
-        let (_reference, machine) = context.machine(Some(&self.vm)).await?;
-        let inspect = machine.inspect().await?;
-        guest::ensure_running(&inspect)?;
+        let (_reference, machine) = context.observation_machine(Some(&self.vm)).await?;
         if self.list {
             return print_forwards(&machine.list_forwards().await?);
         }
+        let machine = machine.for_access().await?;
 
         let forward = forward.ok_or_else(|| eyre::eyre!("forward endpoints are required"))?;
         let mut session = machine.open_forward(forward).await?;
@@ -125,7 +124,10 @@ fn parse_bare_port(value: &str) -> eyre::Result<u16> {
 
 fn absolutize_host_unix(endpoint: ForwardEndpoint, cwd: &Path) -> ForwardEndpoint {
     match endpoint {
-        ForwardEndpoint::Host(ForwardAddress::Unix(path)) if path.is_relative() => {
+        ForwardEndpoint::Host(ForwardAddress::Unix(path))
+            if path.is_relative()
+                && path.file_name().is_none_or(|name| name != path.as_os_str()) =>
+        {
             ForwardEndpoint::Host(ForwardAddress::Unix(cwd.join(path)))
         }
         endpoint => endpoint,
@@ -269,6 +271,20 @@ mod tests {
             ForwardEndpoint::Host(ForwardAddress::Unix(
                 Path::new("/workspace/./x.sock").into()
             ))
+        );
+    }
+
+    #[test]
+    fn bare_host_socket_names_remain_machine_relative() {
+        let forward = parse_forward(
+            &["host:unix:svc.sock".into(), "guest:tcp:7301".into()],
+            None,
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        assert_eq!(
+            forward.listen,
+            ForwardEndpoint::Host(ForwardAddress::Unix("svc.sock".into()))
         );
     }
 

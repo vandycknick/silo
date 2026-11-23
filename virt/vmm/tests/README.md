@@ -4,12 +4,67 @@ Run the real executable boundary tests without a working hypervisor:
 
 ```sh
 cargo test --locked -p silo-vmm --test krun_worker -- --nocapture
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm krun::worker::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm virt::backend::krun::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm exit_command::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm virt::serial::tests::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm krun::worker::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm virt::backend::krun::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm exit_command::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm virt::serial::tests::
 cargo test --locked -p libvm machine::lifecycle::tests::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm machine::tests::vm_spec_machine_config_attaches_spec_disks_in_order
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm virt::config::tests::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm krun::engine::tests::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm capabilities::
+cargo test --locked -p silo-vmm --features mock-backend --test capabilities
 ```
+
+The ordinary host suite excludes diagnostic native probe features. Build and
+exercise `restore-irq-probe` separately. Diagnostic instrumentation is not a
+separate state format and cannot substitute for native decoder validation.
+
+Capability Cargo tests use pure lane/format constants or the VZ/scenario backend,
+never native host discovery. Real `--backend krun` queries consume the
+dependency's read-only system KVM/HVF observations and live in
+`smoke/tests/test_native_capabilities.py`, even though they create no VM.
+
+Phase 11 linked-fact tests expect native pause on all three recognized lanes.
+KVM x86_64 also supports native capture, restore, fork and incremental; those
+four primitives remain unsupported and pending on KVM arm64 and HVF arm64.
+Excluded lanes support none of the five primitives. Public pause, capture,
+restore, fork and incremental are delivered and supported wherever the native
+primitive exists and host checks pass. Tests distinguish native support, public
+delivery and host admission. Capture receipts carry `liveStateSchema` and
+`architecture`, not build fingerprints. Each native decoder checks its own magic
+and schema. Restore inspection rejects mismatched schema or architecture before
+activation, while the complete device inventory remains required:
+
+The inspection envelope uses `RESTORE_INSPECTION_VERSION` (v1), independently of
+the native `silo.live-state/1` metadata codec. Sender, report verifier and
+inspector must validate that shared envelope for both owned and identified
+authority. Invalid envelope/device-profile requests and native admission
+errors produce typed `restore-preflight` refusals, including the native reason;
+they are not machine-storage record errors. Real executable tests cover refusal
+framing without requiring a hypervisor.
+
+```sh
+cargo test --locked -p vm-spec inspection_requires_complete_exact_devices_without_imposing_envelope_order
+```
+
+
+To query the actual monitor, build its binary (not only the unit-test harness)
+in the repository development shell with the configured libkrun dependency
+available:
+
+```sh
+cargo build --locked -p silo-vmm --bin silo-vmm
+target/debug/silo-vmm capabilities --backend krun --json
+```
+
+The development shell supplies the native compiler and libclang prerequisites.
+Use the corresponding output path if `CARGO_TARGET_DIR` or an explicit target is
+set. The krun query performs read-only host discovery, not a VM run. Its
+`native: true` fields follow the lane matrix above. Delivered native operations
+are supported subject to host checks; attached devices and guest profiles may
+narrow the running machine's vector. Runtime suites use the staged monitor
+directly.
 
 `make test` discovers these integration tests on the Linux and macOS CI lanes.
 `CARGO_BIN_EXE_silo-vmm` identifies the actual executable, never the Rust
@@ -26,15 +81,26 @@ unit-test harness. The worker is that same executable spawned with argv[0]
 | 5 | watchdog FIFO |
 | 6 | console PTY slave |
 | 7 | vsock mux stream, only when the config enables it |
+| 8 | one generation lease, required even before config arrives |
+| 9..24 | retained Raw handles in manifest order, at most 16 |
+| 25..28 | restore-only RAM, layout, execution and devices objects |
+| 29..31 | forbidden in normal workers (standalone-native endpoints only) |
+| 32 | monitor lifecycle stream, required in every normal worker |
+| 33 | restore-only binary RAM stream root (`memory.root`) |
+| 34+ | restore-only VMDK descriptors and inherited extents, at most 16 + 1536 |
 
 The tests cover:
 
 - The fixed descriptor mapping: wrong access modes, repeated or aliased
   resources, opposite ends of one pipe, a pipe where a TTY is required, a
-  missing role, a datagram or unconnected vsock mux, and any inherited
-  descriptor above fd 7 all fail closed before the worker emits an event.
+  missing role, a datagram or unconnected vsock mux, and unexpected inherited
+  descriptors (including optional-role holes) all fail closed before events.
 - The config read: empty, truncated, trailing, and oversized (above 16 MiB)
   documents are rejected, and decode errors are redacted.
+- Typed storage private-boundary checks: required role, format, geometry,
+  identity and access; complete lower/upper pairs; exact managed serials;
+  duplicate identities; roots preceding Data; malformed, unknown and old
+  ordered-only disk shapes. These tests execute parsers and projections only.
 - Bounded event framing, watchdog closure while the config is still incomplete
   and while the event channel is full, partial-request signal and parent-loss
   cancellation, and native startup-failure finalization. The latter uses an
@@ -42,6 +108,25 @@ The tests cover:
   successful virtualization.
 - The exit runner: it exists only when `--exit-command` is given, holds only its
   trigger descriptor, and still runs the command when the supervisor is killed.
+- Real Linux child descriptor enumeration, CLOEXEC restoration, a shared-flock
+  OFD held through exec and watchdog exit, and an unrelated child remaining
+  alive without delaying lease release. Colliding source/target mappings run
+  through the production pre-exec installer, not a synthetic FD mapper.
+- Restore bootstrap admits the exact state and lower table, restores CLOEXEC
+  before reading configuration, and rejects partial state, writable objects,
+  orphaned lowers and cross-role aliases before emitting any worker event.
+  Pure worker journal tests cover activation authority, serialized admission,
+  replay conflicts, exposure gating and private stop-only parking. Descriptor
+  tests preserve a generated read-only VMDK rather than flattening it, and keep
+  reading the inherited extent inode after its pathname is replaced. These are
+  descriptor/journal unit tests, not proof of native guest restore execution.
+- Manager launch unit tests execute a retained ELF through `/proc/self/fd/N`
+  after child cleanup and check that its CLOEXEC executable FD is absent after
+  exec. These tests need no guest or hypervisor.
+- The loaded-monitor replacement test creates executable copies in its child,
+  then replaces the pathname and re-execs `/proc/self/exe`. This preserves the
+  real ELF ownership check without letting other test threads' forks inherit
+  writable fixture descriptors and race exec with `ETXTBSY`.
 
 Every launched fixture has a deadline and a separate owned process group for
 failure cleanup. Tests never kill system-wide processes. Tests that use a generic
@@ -52,6 +137,61 @@ real child output. No production fake-VMM mode or successful worker stub exists.
 The default suite does **not** qualify successful guest boot, macOS entitlements,
 graceful HVF/VZ shutdown, or Rosetta. Native qualification is explicitly ignored
 unless requested, rather than silently passing when assets or a hypervisor are absent.
+
+## Capture verification ownership
+
+At `CaptureVerify`, native execution/RAM completion must already have closed
+all five output writers (execution, devices, RAM, layout and changes). RAM is
+never read back: the monitor streams the authenticated `memory.changes` records
+into the sparse Merkle codec against the exact retained baseline root, then
+checks the prepared inode, layout and length. Full coverage builds from an
+implicit zero root; incremental zero runs replace affected baseline units,
+including a short final unit. RAM identity units are 64 KiB.
+
+Sparse disk copies hash data-bearing 8 MiB identity units while copying, skip
+complete holes without reading, and publish `disks/<name>.root` with binary
+nodes in `map-nodes/<sha256 hex>`. Clones retain a single authentication scan
+because no copy bytes traverse the monitor. RAM and disk inventory entries
+carry stream `identity`, never byte `sha256`; state, roots and the change file
+retain whole-file SHA-256.
+
+Capture writes and closes files, maps and the coherent `vm.capture.json` record
+without file or directory durability barriers. There is no `cut` field or
+durability mode. Coherence still requires all seven observed cut facts.
+Checkpoint pool publication owns durability; fork children retain their
+independent background barriers.
+
+The binary `memory.root` (wire role `ram-map`) and disk roots use ADR 0014's
+canonical stream-map v1 codec. Evidence contains bounded change-file summaries,
+not per-unit digest lists. Root/node/change storage is charged separately from
+bounded control records and the state allowance. Retained and candidate roots
+have operation/run lifetimes, not a TTL; result release never discards the
+source's baseline or its shared nodes.
+
+The `native-live-api` diagnostic supports `capture <directory> fork` for the
+same no-identity RAM path used by live forks. It writes complete RAM, layout,
+execution/device state and private disks, then records exact closed-file
+fingerprints in `api-capture.json` with explicit `owned-local-cut` authority.
+It emits no RAM map or change records and reports identity bytes, whole-file
+hash bytes and map nodes as zero. `accept` adopts owned byte authority without
+moving an identified anchor. A later snapshot selects full identity if that
+anchor is unknown, independently of incremental byte materialization.
+
+Identified diagnostic captures retain `memory.changes`, `memory.root`, their
+bounded change summary and the immutable shared `map_node_store`. Restore
+descriptor tables require exactly four objects for owned cuts or five for
+identified snapshots. No missing map or receipt switches authority.
+`guest-lifecycle-controller` command lines and output files are unchanged.
+
+Real-file module regressions cover identities independently recomputed from
+sparse disk bytes, full/incremental RAM change assembly, private inodes,
+cancellation, layout/length failures, staged allocation accounting,
+canonical root/node inventory and write-once publication:
+
+```sh
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm live::coordinator::capture::tests::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm live::staging::tests::
+```
 
 ## Native guest acceptance
 
@@ -75,6 +215,7 @@ rustc --edition=2024 --target "$GUEST_TARGET" \
 
 SILO_TEST_KERNEL="$PWD/target/debug/assets/kernel-default" \
 SILO_TEST_INITRAMFS="$PWD/target/debug/assets/initramfs" \
+SILO_TEST_INIT="$PWD/target/$GUEST_TARGET/debug/init" \
 SILO_TEST_SHUTDOWN="$PWD/target/krun-guest-shutdown" \
   cargo test --locked -p silo-vmm --test krun_worker \
   native_guest_devices_shutdown_crash_and_new_generation -- --ignored --nocapture
@@ -95,15 +236,20 @@ first with `cargo test --locked -p silo-vmm --test krun_worker --no-run`, sign
 without changing build inputs. Native macOS execution remains a separate required
 qualification; Linux success does not establish it.
 
-The test boots the real Silo initramfs into its rescue shell, without a guest-agent
-stub, and runs these scenarios as consecutive generations in the same machine
+The test formats a whole-disk ext4 root carrying the multicall Silo binary
+(`SILO_TEST_INIT`) as `/bin/sh`, attaches it as `silo-root`, and appends a
+schema-1 whole-disk launch bootstrap to the real base initramfs, as libvm
+composes it. The real Silo init resolves that root only through the bootstrap,
+then hands off to `init=/bin/sh`; there is no kernel `root=` argument and no
+rescue-shell path. Without a guest-agent stub, it runs these scenarios as
+consecutive generations in the same machine
 directory: two intentional stops, an unexpected SIGKILL of the worker, a guest
 reboot, and a guest poweroff. Each generation exercises bidirectional serial RPC,
 block ordering/read-only flags, virtio-fs reads and read-only enforcement,
 vsock/balloon device enumeration, a single `krun` child whose argv is exactly
 `krun` (and whose executable is `silo-vmm` on Linux), the `backend` block
 of `vm.exit.json`, and reap. Guest reboot and poweroff follow libkrun's init
-convention and must end the worker cleanly, not restart it. A bare rescue guest
+convention and must end the worker cleanly, not restart it. A bare shell guest
 may also require macOS's forced fallback rather than acknowledging a graceful
 power-button request.
 
@@ -112,3 +258,10 @@ reclaim savings, and explicit VZ operation need their separate real-host scenari
 See [silo-vmm architecture](../../../docs/architecture/silo-vmm.md) for
 results and remaining limitations. A debug stage is not release-archive or
 macOS-signature qualification.
+
+Flat-overlay/VMDK runtime qualification uses `smoke/tests/`, through the real
+libvm, monitor and worker path, not additional native Cargo tests. In particular,
+read-only handle evidence must inspect the actual worker's descriptor and every
+lower backing handle, not the monitor. Serial fault fixtures are isolated
+source-copy builds, never a shipped validation bypass. Private wire-contract
+and VZ rejection unit tests do not qualify a native host lane.

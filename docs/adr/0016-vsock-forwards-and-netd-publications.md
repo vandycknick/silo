@@ -238,6 +238,16 @@ sequenceDiagram
 Neither side runs custom code beyond the agent and `silo-vmm`. The guest image
 ships no bridge unit.
 
+The system appliance's engine activation is distinct from socket forwarding and
+agent readiness. With ADR 0021's contained image init, Silo delegates every
+available cgroup controller, including `cpuset`; the appliance requires
+`cpu`, `cpuset`, `io`, `memory` and `pids`. Before starting its Docker target,
+the appliance waits up to 30 seconds for systemd boot state `running` or
+`degraded`. An early successful manager property query does not prove its boot
+transaction or control bus has settled. This is ordinary appliance startup,
+not a pre-thaw live activation hook, which must not call frozen image services.
+See the [appliance contract](../../resources/images/system/README.md#activation-request).
+
 ### Inbound Forward Without The Agent: A Raw Vsock Target
 
 ```yaml
@@ -1390,7 +1400,7 @@ host bind. The section stays rejected; see the non-decisions below.
 - Whether the SDKs expose session-scoped forwards as a first-class object with a
   cancellation-safe handle, given the Go FFI's current mutation-cancellation
   constraints.
-- Whether `silo show` should display active forwards and publications, which
+- Whether `silo info` should display active forwards and publications, which
   for publications requires a host-side inventory netd does not yet serve.
 - Whether a `vsock:` connect endpoint should be validated at forward
   creation by an immediate probe, or remain lazy as specified.

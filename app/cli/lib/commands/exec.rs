@@ -41,10 +41,10 @@ pub struct Cmd {
 
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let (_reference, machine) = context.machine(self.name.as_deref()).await?;
+        let (_reference, machine) = context.observation_machine(self.name.as_deref()).await?;
+        let machine = machine.for_access().await?;
         let inspect_data = machine.inspect().await?;
 
-        guest::ensure_running(&inspect_data)?;
         guest::ensure_guest_ready(&inspect_data)?;
         let command = resolve_command(
             inspect_data.process.entrypoint.as_deref(),
@@ -62,13 +62,27 @@ impl Cmd {
             .or(inspect_data.process.user.as_deref());
 
         let status = if self.tty {
-            guest::attach_command(&machine, user, &command, working_directory, &environment)
-                .await
-                .map_err(execution_infrastructure)?
+            guest::attach_command(
+                &machine,
+                &inspect_data,
+                user,
+                &command,
+                working_directory,
+                &environment,
+            )
+            .await
+            .map_err(execution_infrastructure)?
         } else {
-            guest::run_command_streaming(&machine, user, &command, working_directory, &environment)
-                .await
-                .map_err(execution_infrastructure)?
+            guest::run_command_streaming(
+                &machine,
+                &inspect_data,
+                user,
+                &command,
+                working_directory,
+                &environment,
+            )
+            .await
+            .map_err(execution_infrastructure)?
         };
         if let Some(message) = execution_failure_message(&status) {
             eprintln!("{} {message}", crate::ui::error_label());

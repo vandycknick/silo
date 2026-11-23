@@ -86,7 +86,7 @@ async fn stream_cat(machine: &Machine) -> Result<i32, Box<dyn Error>> {
                 stderr.flush().await?;
                 return result_code(&result);
             }
-            ExecutionEvent::Accepted => {}
+            ExecutionEvent::Accepted | ExecutionEvent::StdinClosed => {}
         }
     }
 }

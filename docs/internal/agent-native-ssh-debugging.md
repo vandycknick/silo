@@ -44,8 +44,8 @@ The probe sends a local SSH disconnect and joins the connection task after KEX. 
 
 Actual authenticated SSH sessions check the existing immutable host pin and use
 certificate authentication. Cached readiness is not a replacement for those
-session security checks, nor a gate on already-pinned SSH access. `silo shell`,
-libvm `shell`, and taild Shell use SSH over `VmAccessService.OpenSsh` to vsock 22,
+session security checks, nor a gate on already-pinned SSH access. `silo shell`
+and libvm `shell` use SSH over `VmAccessService.OpenSsh` to vsock 22,
 without guest identity/process RPC. They require a Running, non-stopping VM
 generation, the prior pin, a matching server key and an accepted user certificate.
 There is no interactive first-use pinning.
@@ -267,8 +267,8 @@ native SSH backend is ready
 ```
 
 These logs identify the native backend as the owner of vsock 22 for that run.
-The CLI command does not select the SSH server implementation: `silo shell` and
-taild Shell can also reach an agent-managed OpenSSH backend or the validated
+The CLI command does not select the SSH server implementation: `silo shell`
+can also reach an agent-managed OpenSSH backend or the validated
 systemd-owned listener. An `sshd-session` process is valid in those cases. Check
 the current listener descriptor and process tree, not the client command name.
 

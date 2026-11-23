@@ -4,7 +4,9 @@ use alloc::vec::Vec;
 use crate::applets::{self, install};
 use crate::io;
 
-const DEFAULT_ROOT: &[u8] = b"/dev/vda";
+#[path = "freezer.rs"]
+mod freezer;
+
 pub(crate) const DEFAULT_INIT: &[u8] = b"/sbin/init";
 const MNT_ROOT: &[u8] = b"/mnt/root";
 const AGENT_PAYLOAD_DIR: &[u8] = b"/agent";
@@ -18,43 +20,80 @@ const AGENT_INIT_ARG: &[u8] = b"--init";
 const AGENT_HANDOFF_ARG_PREFIX: &[u8] = b"--handoff=";
 
 struct BootConfig {
-    root: Vec<u8>,
     init: Vec<u8>,
     init_explicit: bool,
-    rootfstype: Option<Vec<u8>>,
+}
+
+struct BootPolicy {
+    label: &'static str,
+    rescue: Option<::init::boot_args::Rescue>,
 }
 
 pub(crate) fn init(_argc: i32, _argv: *const *const u8) -> i32 {
-    if let Err(message) = run_init() {
+    let mut policy = BootPolicy {
+        label: "root",
+        rescue: None,
+    };
+    if let Err(message) = run_init(&mut policy) {
         io::write(io::STDERR, "init: ");
         io::write(io::STDERR, message);
         io::write(io::STDERR, "\n");
-        rescue_shell();
+        io::write(io::STDERR, "init: ");
+        io::write(io::STDERR, policy.label);
+        io::write(io::STDERR, ": boot failed; workload prohibited\n");
+        if ::init::boot_policy::action(policy.rescue, true) == ::init::boot_policy::Action::Rescue {
+            rescue_shell();
+        }
+        power_off();
     }
     0
 }
 
-fn run_init() -> Result<(), &'static str> {
+fn run_init(policy: &mut BootPolicy) -> Result<(), &'static str> {
     if io::getpid() != 1 {
         return Err("refusing to run init outside PID 1");
     }
 
     prepare_directories()?;
     mount_essential_filesystems()?;
+    if let Err(message) = freezer::prepare() {
+        // Cold boot remains usable on kernels without the live profile. The
+        // retained agent controller reports this as unsupported, never frozen.
+        io::write(io::STDERR, "init: live workload containment unavailable: ");
+        io::write(io::STDERR, message);
+        io::write(io::STDERR, "\n");
+    }
     install(b"/bin");
     install(b"/sbin");
 
-    let config = read_boot_config();
-    if !config.root.starts_with(b"/") {
-        return Err("root= must be an absolute device path");
+    let cmdline = read_cmdline();
+    let args = ::init::boot_args::parse(&cmdline)?;
+    policy.rescue = args.rescue;
+    if args.marker.is_some() {
+        policy.label = "overlay";
     }
-    if !is_block_device(&config.root) {
-        return Err("root= does not point at a block device");
+    let bootstrap = crate::bootstrap::load()?;
+    match bootstrap.root {
+        rootfs_spec::Root::ErofsOverlay(root) => {
+            policy.label = "overlay";
+            if args.marker != Some(::init::boot_args::RootMarker::ErofsOverlay) {
+                return Err("overlay: missing managed kernel marker");
+            }
+            crate::overlay::assemble(root)?;
+        }
+        rootfs_spec::Root::Raw(root) => {
+            if args.marker.is_some() {
+                return Err("raw: managed overlay marker on a raw root");
+            }
+            crate::raw::mount(&root)?;
+        }
     }
-
-    if mount_root(&config) != 0 {
-        return Err("failed to mount root filesystem");
-    }
+    // Before either switch_root branch, with or without an injected agent.
+    crate::rosetta::prepare(bootstrap.rosetta)?;
+    let config = BootConfig {
+        init: args.init.unwrap_or(DEFAULT_INIT).to_vec(),
+        init_explicit: args.init.is_some(),
+    };
 
     if prepare_agent_boot()? {
         let handoff_arg = agent_handoff_arg(&config);
@@ -64,6 +103,7 @@ fn run_init() -> Result<(), &'static str> {
             AGENT_INIT_ARG,
             handoff_arg.as_slice(),
         ];
+        rescue_before_handoff(policy);
         if do_switch_root(MNT_ROOT, AGENT_RUN_BINARY, &init_argv) != 0 {
             return Err("switch_root failed");
         }
@@ -73,7 +113,17 @@ fn run_init() -> Result<(), &'static str> {
             return Err("target init is not executable");
         }
 
+        if let Err(message) = freezer::place_image_init() {
+            io::write(
+                io::STDERR,
+                "init: image init cgroup placement unavailable: ",
+            );
+            io::write(io::STDERR, message);
+            io::write(io::STDERR, "\n");
+        }
+
         let init_argv = [config.init.as_slice()];
+        rescue_before_handoff(policy);
         if do_switch_root(MNT_ROOT, &config.init, &init_argv) != 0 {
             return Err("switch_root failed");
         }
@@ -124,56 +174,14 @@ fn mount_ignore_busy(source: &[u8], target: &[u8], fstype: &[u8]) -> Result<(), 
     Err("failed to mount initramfs filesystem")
 }
 
-fn read_boot_config() -> BootConfig {
+fn read_cmdline() -> Vec<u8> {
     let fd = io::open(b"/proc/cmdline", libc::O_RDONLY, 0);
-    let cmdline = if fd >= 0 {
-        let bytes = io::read_all(fd);
-        io::close(fd);
-        bytes
-    } else {
-        Vec::new()
-    };
-
-    let init = cmdline_value(&cmdline, b"init=");
-
-    BootConfig {
-        root: cmdline_value(&cmdline, b"root=")
-            .unwrap_or(DEFAULT_ROOT)
-            .to_vec(),
-        init: init.unwrap_or(DEFAULT_INIT).to_vec(),
-        init_explicit: init.is_some(),
-        rootfstype: cmdline_value(&cmdline, b"rootfstype=").map(|value| value.to_vec()),
+    if fd < 0 {
+        return Vec::new();
     }
-}
-
-fn cmdline_value<'a>(cmdline: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    let mut start = 0;
-    for index in 0..=cmdline.len() {
-        if index == cmdline.len() || cmdline[index].is_ascii_whitespace() {
-            let token = &cmdline[start..index];
-            if token.starts_with(key) {
-                return Some(&token[key.len()..]);
-            }
-            start = index + 1;
-        }
-    }
-    None
-}
-
-fn is_block_device(path: &[u8]) -> bool {
-    let mut stat = io::stat_zeroed();
-    if io::stat(path, &mut stat) != 0 {
-        return false;
-    }
-    (stat.st_mode & libc::S_IFMT) == libc::S_IFBLK
-}
-
-fn mount_root(config: &BootConfig) -> i32 {
-    if let Some(fstype) = config.rootfstype.as_deref() {
-        applets::system::mount_one(&config.root, MNT_ROOT, Some(fstype), 0, None)
-    } else {
-        applets::system::mount_block_auto(&config.root, MNT_ROOT)
-    }
+    let bytes = io::read_all(fd);
+    io::close(fd);
+    bytes
 }
 
 fn prepare_agent_boot() -> Result<bool, &'static str> {
@@ -287,12 +295,28 @@ fn target_init_path(init: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn do_switch_root(new_root: &[u8], init: &[u8], init_argv: &[&[u8]]) -> i32 {
-    move_mount_if_present(b"/dev", new_root);
-    move_mount_if_present(b"/proc", new_root);
-    move_mount_if_present(b"/sys", new_root);
-    // Match util-linux switch_root behavior for /run. Silo relies on this to
-    // carry the copied /run/agent/silo-agent into the real root.
-    move_mount_if_present(b"/run", new_root);
+    // Validate every destination before the first move. mount(MS_MOVE)
+    // follows a destination symlink, which could otherwise strand /run.
+    let root = io::open(
+        new_root,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    );
+    if root < 0 {
+        return -1;
+    }
+    let prepared = ::init::handoff::prepare_mount_destinations(root);
+    let closed = io::close(root);
+    if prepared.is_err() || closed != 0 {
+        return -1;
+    }
+    for path in [b"/dev".as_slice(), b"/proc", b"/sys", b"/run"] {
+        // /run carries the agent and the managed root maintenance subtree.
+        // Continuing after any required move would hide mounts from PID 1.
+        if move_mount(path, new_root) != 0 {
+            return -1;
+        }
+    }
 
     if io::chdir(new_root) != 0 {
         return -1;
@@ -310,15 +334,11 @@ pub(crate) fn do_switch_root(new_root: &[u8], init: &[u8], init_argv: &[&[u8]]) 
     exec_init(init, init_argv)
 }
 
-fn move_mount_if_present(path: &[u8], new_root: &[u8]) {
-    if io::access(path, libc::F_OK) != 0 {
-        return;
-    }
+fn move_mount(path: &[u8], new_root: &[u8]) -> i32 {
     let Some(target) = join_path(new_root, path) else {
-        return;
+        return -1;
     };
-    applets::files::mkdir_parents(&target, 0o755);
-    applets::system::mount_one(path, &target, None, libc::MS_MOVE, None);
+    applets::system::mount_one(path, &target, None, libc::MS_MOVE, None)
 }
 
 fn join_path(prefix: &[u8], suffix: &[u8]) -> Option<Vec<u8>> {
@@ -363,20 +383,47 @@ fn c_string(input: &[u8]) -> Vec<u8> {
     out
 }
 
-fn rescue_shell() -> ! {
-    io::write(io::STDERR, "init: starting rescue shell\n");
-    loop {
-        exec_shell_once();
-        let sh = *b"sh\0";
-        let interactive = *b"-i\0";
-        let argv = [
-            sh.as_ptr().cast::<u8>(),
-            interactive.as_ptr().cast::<u8>(),
-            core::ptr::null(),
-        ];
-        applets::run_applet(b"sh", 2, argv.as_ptr());
-        io::sleep(1);
+fn rescue_before_handoff(policy: &BootPolicy) {
+    if ::init::boot_policy::action(policy.rescue, false) == ::init::boot_policy::Action::Rescue {
+        rescue_shell();
     }
+}
+
+fn power_off() -> ! {
+    io::sync();
+    io::power_off();
+    // PID 1 cannot return if the backend did not handle poweroff.
+    loop {
+        io::sleep(3600);
+    }
+}
+
+fn rescue_shell() -> ! {
+    io::setsid();
+    let console = io::open(b"/dev/console", libc::O_RDWR, 0);
+    if console >= 0 {
+        let attached = io::dup2(console, io::STDIN) >= 0
+            && io::dup2(console, io::STDOUT) >= 0
+            && io::dup2(console, io::STDERR) >= 0;
+        if console > io::STDERR {
+            io::close(console);
+        }
+        if !attached {
+            power_off();
+        }
+    } else {
+        power_off();
+    }
+    io::write(io::STDERR, "init: starting rescue shell\n");
+    let sh = *b"sh\0";
+    let interactive = *b"-i\0";
+    let argv = [
+        sh.as_ptr().cast::<u8>(),
+        interactive.as_ptr().cast::<u8>(),
+        core::ptr::null(),
+    ];
+    applets::run_applet(b"sh", 2, argv.as_ptr());
+    power_off();
 }
 
 pub(crate) fn exec_shell_once() {

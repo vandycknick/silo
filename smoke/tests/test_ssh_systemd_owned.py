@@ -31,7 +31,7 @@ def iproute_image(config: SmokeConfig, registry: LoopbackRegistry) -> str:
 @pytest.fixture
 def systemd_image(config: SmokeConfig) -> str:
     if config.systemd_image is None:
-        pytest.skip("SILO_SMOKE_SYSTEMD_IMAGE not set")
+        pytest.skip("owner-published systemd/OpenSSH image required; enable with SILO_SMOKE_SYSTEMD_IMAGE=<accessible-oci-reference> make smoke SMOKE_MARK= SMOKE_ARGS='tests/test_ssh_systemd_owned.py'")
     return config.systemd_image
 
 
@@ -92,7 +92,8 @@ def _profile_start(workspace: Workspace, name: str) -> tuple[int, ProcessSample]
         return None
     pid = procs.vmm_pid(workspace, name)
     assert pid is not None
-    assert "silo-vmm" in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[0].decode()
+    # The monitor is exec'd from a retained descriptor, so argv[0] is /proc/self/fd/N.
+    assert Path(f"/proc/{pid}/exe").resolve().name == "silo-vmm"
     return pid, ProcessSample.read(pid)
 
 
@@ -109,7 +110,7 @@ def _profile_finish(workspace: Workspace, initial: tuple[int, ProcessSample] | N
 
 
 def _fresh(silo: Silo, name: str) -> dict[str, Any]:
-    status = silo.show(name)
+    status = silo.info(name)
     assert status["observation"] == "observed", status
     assert status["state"] == "running", status
     assert status["guest"]["status"] == "running", status

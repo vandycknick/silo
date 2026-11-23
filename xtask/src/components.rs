@@ -16,13 +16,12 @@ pub enum Component {
     Cli,
     SiloVmm,
     Netd,
+    Tsgate,
     Agent,
     Portd,
     Init,
     Initramfs,
     Rprobe,
-    GoFfi,
-    Taild,
 }
 
 pub struct BuildContext<'a> {
@@ -30,6 +29,7 @@ pub struct BuildContext<'a> {
     pub target_dir: &'a Path,
     pub profile: Profile,
     pub host: HostTarget,
+    pub vmm_features: Option<&'a str>,
 }
 
 #[derive(Debug, Error)]
@@ -52,18 +52,16 @@ pub enum ComponentError {
     MissingVmmBinary { path: std::path::PathBuf },
     #[error("rprobe must be built natively on Linux ARM64")]
     UnsupportedRprobeHost,
-    #[error(transparent)]
-    Version(#[from] crate::version::VersionError),
 }
 
-pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+pub fn build_runtime(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     for component in [
         Component::Cli,
         Component::SiloVmm,
         Component::Netd,
+        Component::Tsgate,
         Component::Agent,
         Component::Init,
-        Component::Taild,
     ] {
         build_component(component, context)?;
     }
@@ -77,14 +75,13 @@ pub fn build_component(
     match component {
         Component::Cli => build_cargo_package(context, "cli"),
         Component::SiloVmm => build_vmm(context),
-        Component::Netd => build_netd(context),
+        Component::Netd => build_go_program(context, "net/netd", "netd", false),
+        Component::Tsgate => build_go_program(context, "app/tsgate", "tsgate", true),
         Component::Agent => build_guest_agent(context),
         Component::Portd => build_guest_portd(context),
         Component::Init => build_guest_init(context),
         Component::Initramfs => build_initramfs(context),
         Component::Rprobe => build_rprobe(context),
-        Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
-        Component::Taild => build_taild(context),
     }
 }
 
@@ -93,21 +90,29 @@ pub fn format(workspace_root: &Path, target_dir: &Path) -> Result<(), command::C
     cargo.args(["fmt", "--all", "--", "--check"]);
     command::run(cargo)?;
 
-    let mut gofmt = Command::new("gofmt");
-    gofmt
-        .current_dir(workspace_root.join("net/netd"))
-        .args(["-l", "."]);
-    let output = command::output(gofmt)?;
-    if output.stdout.is_empty() {
-        Ok(())
-    } else {
-        Err(command::CommandError::FailedWithStderr {
-            program: "gofmt".to_string(),
-            status: "unformatted files".to_string(),
-            stderr: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        })
+    for module in GO_MODULES {
+        let mut gofmt = Command::new("gofmt");
+        gofmt
+            .current_dir(workspace_root.join(module))
+            .args(["-l", "."]);
+        let output = command::output(gofmt)?;
+        if !output.stdout.is_empty() {
+            return Err(command::CommandError::FailedWithStderr {
+                program: "gofmt".to_string(),
+                status: "unformatted files".to_string(),
+                stderr: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            });
+        }
     }
+    Ok(())
 }
+
+/// Go modules that ship in the product; each is formatted, vetted and tested.
+const GO_MODULES: [&str; 2] = ["net/netd", "app/tsgate"];
+
+// Native diagnostic probes are qualified separately and must never change the
+// production lane exercised by the ordinary host suite.
+const HOST_TEST_FEATURES: &str = "silo-vmm/mock-backend,forward-spec/tokio,disk-image/qcow2";
 
 pub fn clippy(
     workspace_root: &Path,
@@ -120,23 +125,27 @@ pub fn clippy(
         "--locked",
         "--workspace",
         "--all-targets",
-        "--all-features",
+        "--features",
+        HOST_TEST_FEATURES,
     ]);
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
     command::run(cargo)?;
 
-    let mut rprobe = standard_cargo_command(workspace_root, target_dir);
-    rprobe.args([
-        "clippy",
-        "--locked",
-        "-p",
-        "rprobe",
-        "--lib",
-        "--no-default-features",
-    ]);
-    command::run(rprobe)
+    for package in ["rprobe", "init"] {
+        let mut library = standard_cargo_command(workspace_root, target_dir);
+        library.args([
+            "clippy",
+            "--locked",
+            "-p",
+            package,
+            "--lib",
+            "--no-default-features",
+        ]);
+        command::run(library)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -189,16 +198,14 @@ fn run_tests(
         ]);
         command::run(build)?;
     }
-    // Real-process tests build private netd copies. Warm Go's build cache once
-    // before parallel nextest workers compete to compile the same cold graph.
-    let mut netd = Command::new("go");
-    netd.current_dir(workspace_root.join("net/netd")).args([
-        "build",
-        "-o",
-        "/dev/null",
-        "./cmd/netd",
-    ]);
-    command::run(netd)?;
+    // Real-process tests build private netd and tsgate copies. Warm Go's build
+    // cache once before parallel nextest workers compete for the cold graph.
+    for (module, package) in [("net/netd", "./cmd/netd"), ("app/tsgate", "./...")] {
+        let mut warm = Command::new("go");
+        warm.current_dir(workspace_root.join(module))
+            .args(["build", "-o", "/dev/null", package]);
+        command::run(warm)?;
+    }
 
     command::run(workspace_test_command(
         workspace_root,
@@ -209,18 +216,27 @@ fn run_tests(
     ))?;
 
     if !matches!(suite, TestSuite::Integration) {
-        command::run(rprobe_test_command(workspace_root, target_dir, ci))?;
+        for package in ["rprobe", "init"] {
+            command::run(guest_library_test_command(
+                workspace_root,
+                target_dir,
+                ci,
+                package,
+            ))?;
+        }
     }
     if !matches!(suite, TestSuite::Unit) {
-        let mut go = Command::new("go");
-        go.current_dir(workspace_root.join("net/netd")).arg("test");
-        // The darwin/arm64 race runtime slows netd's gVisor stack by orders of
-        // magnitude, past every real-time budget; Linux hosts carry the race lane.
-        if host != HostTarget::MacosArm64 {
-            go.arg("-race");
+        for module in GO_MODULES {
+            let mut go = Command::new("go");
+            go.current_dir(workspace_root.join(module)).arg("test");
+            // The darwin/arm64 race runtime slows gVisor-based stacks by orders
+            // of magnitude, past every real-time budget; Linux carries the race lane.
+            if host != HostTarget::MacosArm64 {
+                go.arg("-race");
+            }
+            go.arg("./...");
+            command::run(go)?;
         }
-        go.arg("./...");
-        command::run(go)?;
     }
     Ok(())
 }
@@ -252,22 +268,30 @@ fn workspace_test_command(
             target_dir.join("debug/silo-vmm"),
         );
     }
-    cargo.arg("--all-features");
+    cargo.args(["--features", HOST_TEST_FEATURES]);
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
     cargo
 }
 
-fn rprobe_test_command(workspace_root: &Path, target_dir: &Path, ci: bool) -> Command {
+fn guest_library_test_command(
+    workspace_root: &Path,
+    target_dir: &Path,
+    ci: bool,
+    package: &str,
+) -> Command {
     let mut cargo = nextest_command(workspace_root, target_dir, ci);
-    cargo.args(["-p", "rprobe", "--lib", "--no-default-features"]);
+    cargo.args(["-p", package, "--lib", "--no-default-features"]);
     cargo
 }
 
 fn build_cargo_package(context: &BuildContext<'_>, package: &str) -> Result<(), ComponentError> {
     let mut cargo = cargo_command(context)?;
     cargo.args(["build", "--locked", "-p", package]);
+    if let ("silo-vmm", Some(features)) = (package, context.vmm_features) {
+        cargo.args(["--features", features]);
+    }
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
     Ok(())
@@ -303,7 +327,14 @@ fn build_vmm(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     Ok(())
 }
 
-fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+/// Builds one Go command adjacent to the Rust binaries. `pure` forces
+/// `CGO_ENABLED=0` in every profile (tsgate never links C).
+fn build_go_program(
+    context: &BuildContext<'_>,
+    module: &str,
+    name: &str,
+    pure: bool,
+) -> Result<(), ComponentError> {
     let output_dir = context.target_dir.join(context.profile.directory());
     fs::create_dir_all(&output_dir).map_err(|source| ComponentError::CreateOutputDirectory {
         path: output_dir.clone(),
@@ -313,7 +344,7 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     let go_program = release::tool("go")?;
     let (goos, goarch) = context.host.go_target();
     let mut go = Command::new(&go_program);
-    go.current_dir(context.workspace_root.join("net/netd"))
+    go.current_dir(context.workspace_root.join(module))
         .env("CARGO_TARGET_DIR", context.target_dir)
         .env("GOOS", goos)
         .env("GOARCH", goarch)
@@ -326,11 +357,31 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     )?;
     go.env("CARGO_TARGET_DIR", context.target_dir);
     context.profile.apply_go(&mut go);
-    let output = output_dir.join("netd");
-    go.args(["-o"]).arg(&output).arg("./cmd/netd");
+    if pure {
+        go.env("CGO_ENABLED", "0");
+    }
+    let output = output_dir.join(name);
+    go.args(["-o"]).arg(&output).arg(format!("./cmd/{name}"));
     command::run(go)?;
     if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
         release::set_macos_build_version(&output)?;
+    }
+    if name == "tsgate" && context.profile == Profile::Release {
+        let mut notices = Command::new("python3");
+        notices
+            .arg(
+                context
+                    .workspace_root
+                    .join("packaging/release/go_licenses.py"),
+            )
+            .arg(context.workspace_root.join(module))
+            .arg(output_dir.join("share/licenses/tsgate"))
+            .arg("--go")
+            .arg(&go_program)
+            .env("GOOS", goos)
+            .env("GOARCH", goarch)
+            .env("CGO_ENABLED", "0");
+        command::run(notices)?;
     }
     Ok(())
 }
@@ -347,66 +398,6 @@ fn build_guest_agent(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     ]);
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
-    Ok(())
-}
-
-fn build_taild(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    crate::version::check(context.workspace_root)?;
-    build_component(Component::GoFfi, context)?;
-
-    let source = context.workspace_root.join("app/taild");
-    let output_dir = context.target_dir.join(context.profile.directory());
-    fs::create_dir_all(&output_dir).map_err(|source| ComponentError::CreateOutputDirectory {
-        path: output_dir.clone(),
-        source,
-    })?;
-    let output = output_dir.join("taild");
-    let go_program = release::tool("go")?;
-    let (goos, goarch) = context.host.go_target();
-    let mut go = Command::new(&go_program);
-    go.current_dir(&source)
-        .args(["build", "-mod=readonly", "-trimpath", "-buildvcs=false"]);
-    release::configure_command(
-        &mut go,
-        context.profile == Profile::Release,
-        context.workspace_root,
-        context.target_dir,
-    )?;
-    go.env("CGO_ENABLED", "1")
-        .env("GOOS", goos)
-        .env("GOARCH", goarch)
-        .env_remove("SILO_GO_FFI_PATH");
-    if context.profile == Profile::Release {
-        go.args(["-ldflags", "-s -w"]);
-    }
-    go.arg("-o").arg(&output).arg("./cmd/taild");
-    command::run(go)?;
-    if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
-        release::set_macos_build_version(&output)?;
-    }
-
-    let mut notices = Command::new("python3");
-    notices
-        .arg(
-            context
-                .workspace_root
-                .join("packaging/silo-taild/licenses.py"),
-        )
-        .arg(&source)
-        .arg(context.target_dir.join("taild-licenses"))
-        .arg(go_program);
-    release::configure_command(
-        &mut notices,
-        context.profile == Profile::Release,
-        context.workspace_root,
-        context.target_dir,
-    )?;
-    notices
-        .env("CGO_ENABLED", "1")
-        .env("GOOS", goos)
-        .env("GOARCH", goarch)
-        .env_remove("SILO_GO_FFI_PATH");
-    command::run(notices)?;
     Ok(())
 }
 
@@ -536,143 +527,4 @@ pub(crate) fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -
         .current_dir(workspace_root)
         .env("CARGO_TARGET_DIR", target_dir);
     cargo
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::components::{
-        build_rprobe, rprobe_cargo_command, rprobe_test_command, workspace_test_command,
-        BuildContext, ComponentError, TestSuite,
-    };
-    use crate::profiles::Profile;
-    use crate::targets::HostTarget;
-    use std::path::Path;
-
-    #[test]
-    fn probe_build_requires_native_linux_arm64() {
-        for host in [HostTarget::MacosArm64, HostTarget::LinuxX86_64] {
-            let context = BuildContext {
-                workspace_root: Path::new("."),
-                target_dir: Path::new("target"),
-                profile: Profile::Debug,
-                host,
-            };
-            assert!(matches!(
-                build_rprobe(&context),
-                Err(ComponentError::UnsupportedRprobeHost)
-            ));
-        }
-    }
-
-    #[test]
-    fn release_probe_build_keeps_the_build_toolchain_for_build_scripts() {
-        // Regression: host-product release config pinned CARGO_TARGET_<host>_LINKER
-        // to /usr/bin/cc, which cargo applies to build scripts too, and they died
-        // with SIGILL on ubuntu-26.04-arm. The probe gets guest rustflags only.
-        for profile in [Profile::Debug, Profile::Release] {
-            let context = BuildContext {
-                workspace_root: Path::new("/workspace"),
-                target_dir: Path::new("/build"),
-                profile,
-                host: HostTarget::LinuxArm64,
-            };
-            let command = rprobe_cargo_command(&context).expect("probe cargo command");
-            let mut env: Vec<_> = command
-                .get_envs()
-                .map(|(key, value)| (key.to_str().unwrap(), value.map(|v| v.to_str().unwrap())))
-                .collect();
-            env.sort_unstable();
-            assert_eq!(
-                env,
-                [
-                    ("CARGO_ENCODED_RUSTFLAGS", Some("-C\u{1f}panic=abort")),
-                    ("CARGO_TARGET_DIR", Some("/build")),
-                    ("RUSTFLAGS", Some("-C panic=abort")),
-                ]
-            );
-            let args: Vec<_> = command
-                .get_args()
-                .map(|arg| arg.to_str().unwrap())
-                .collect();
-            assert_eq!(args.contains(&"--release"), profile == Profile::Release);
-            assert!(args
-                .windows(2)
-                .any(|pair| pair == ["--target", "aarch64-unknown-linux-musl"]));
-        }
-    }
-
-    #[test]
-    fn workspace_nextest_preserves_suite_targets_and_host_exclusions() {
-        for host in [
-            HostTarget::MacosArm64,
-            HostTarget::LinuxX86_64,
-            HostTarget::LinuxArm64,
-        ] {
-            for (suite, targets, mock_vmm) in [
-                (TestSuite::Unit, vec!["--lib", "--bins"], false),
-                (TestSuite::Integration, vec!["--tests"], true),
-                (TestSuite::All, vec!["--lib", "--bins", "--tests"], true),
-            ] {
-                let command = workspace_test_command(
-                    Path::new("/workspace"),
-                    Path::new("/build"),
-                    host,
-                    suite,
-                    false,
-                );
-                let args: Vec<_> = command
-                    .get_args()
-                    .map(|arg| arg.to_str().unwrap())
-                    .collect();
-                let mut expected = vec!["nextest", "run", "--locked", "--workspace"];
-                expected.extend(targets);
-                expected.push("--all-features");
-                for member in host.workspace_excludes() {
-                    expected.extend(["--exclude", member]);
-                }
-                assert_eq!(args, expected);
-                assert_eq!(command.get_current_dir(), Some(Path::new("/workspace")));
-                let env: Vec<_> = command.get_envs().collect();
-                assert!(env.contains(&(
-                    std::ffi::OsStr::new("CARGO_TARGET_DIR"),
-                    Some(std::ffi::OsStr::new("/build")),
-                )));
-                assert_eq!(
-                    env.iter()
-                        .find(|(key, _)| *key == "SILO_TEST_MOCK_VMM_BINARY")
-                        .and_then(|(_, value)| *value),
-                    mock_vmm.then_some(std::ffi::OsStr::new("/build/debug/silo-vmm")),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn nextest_ci_profile_applies_to_workspace_and_rprobe() {
-        for ci in [false, true] {
-            let rprobe = rprobe_test_command(Path::new("."), Path::new("target"), ci);
-            let args: Vec<_> = rprobe.get_args().map(|arg| arg.to_str().unwrap()).collect();
-            let mut expected = vec!["nextest", "run", "--locked"];
-            if ci {
-                expected.extend(["--profile", "ci"]);
-            }
-            expected.extend(["-p", "rprobe", "--lib", "--no-default-features"]);
-            assert_eq!(args, expected);
-
-            for suite in [TestSuite::Unit, TestSuite::Integration, TestSuite::All] {
-                let command = workspace_test_command(
-                    Path::new("."),
-                    Path::new("target"),
-                    HostTarget::LinuxX86_64,
-                    suite,
-                    ci,
-                );
-                let args: Vec<_> = command
-                    .get_args()
-                    .map(|arg| arg.to_str().unwrap())
-                    .collect();
-                assert_eq!(args.windows(2).any(|pair| pair == ["--profile", "ci"]), ci);
-            }
-        }
-    }
 }

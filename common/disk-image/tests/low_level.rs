@@ -44,11 +44,13 @@ fn build_standard_fs() -> (Reader, NamedTempFile) {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     fmt.create(
         "/test/foo",
         make_mode(file_mode::S_IFDIR, 0o755),
+        None,
         None,
         None,
         None,
@@ -66,6 +68,7 @@ fn build_standard_fs() -> (Reader, NamedTempFile) {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -75,7 +78,8 @@ fn build_standard_fs() -> (Reader, NamedTempFile) {
         make_mode(file_mode::S_IFREG, 0o755),
         None,
         None,
-        Some(&mut "test".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "test".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -89,7 +93,8 @@ fn build_standard_fs() -> (Reader, NamedTempFile) {
     fmt.create(
         "/y",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("test/foo"),
+        Some("test/foo".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -285,7 +290,7 @@ fn test_internal_journal_inode_and_superblock() {
         .close()
         .unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let sb = reader.superblock().clone();
     let journal = reader.get_inode(8).unwrap();
     assert_eq!(journal.mode & file_mode::TYPE_MASK, file_mode::S_IFREG);
@@ -327,13 +332,13 @@ fn test_resize_inode_and_backup_sparse_super_layout() {
     let fmt = Formatter::new(tmp.path(), 4096, 512 * 1024 * 1024).unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let sb = reader.superblock().clone();
     let block_size = 1024u64 * (1 << sb.log_block_size);
 
     let root_entries = reader.children_of(ROOT_INODE).unwrap();
     assert!(
-        root_entries.iter().any(|(name, _)| name == "lost+found"),
+        root_entries.iter().any(|(name, _)| name == b"lost+found"),
         "root directory entries must survive final metadata writes"
     );
 
@@ -422,7 +427,7 @@ fn test_resize_inode_and_backup_sparse_super_layout() {
 
 #[test]
 fn test_group_descriptor_fields() {
-    let (mut reader, _tmp) = build_standard_fs();
+    let (reader, _tmp) = build_standard_fs();
     let sb = reader.superblock().clone();
     let gd = reader.get_group_descriptor(0).unwrap();
 
@@ -468,7 +473,7 @@ fn test_group_descriptor_fields() {
 
 #[test]
 fn test_inode_table_via_get_inode() {
-    let (mut reader, _tmp) = build_standard_fs();
+    let (reader, _tmp) = build_standard_fs();
 
     // -- Root inode (2) -------------------------------------------------------
     let root = reader.get_inode(ROOT_INODE).unwrap();
@@ -544,7 +549,7 @@ fn test_inode_table_via_get_inode() {
 
 #[test]
 fn test_block_and_inode_bitmaps() {
-    let (mut reader, tmp) = build_standard_fs();
+    let (reader, tmp) = build_standard_fs();
     let sb = reader.superblock().clone();
     let gd = reader.get_group_descriptor(0).unwrap();
     let block_size = 1024u64 * (1 << sb.log_block_size);
@@ -606,7 +611,7 @@ fn test_group_descriptor_counts_match_bitmaps() {
     let fmt = Formatter::new(tmp.path(), 4096, 512 * 1024 * 1024).unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let sb = reader.superblock().clone();
     let block_size = 1024u64 * (1 << sb.log_block_size);
     let group_count = (sb.blocks_count_lo - 1) / sb.blocks_per_group + 1;
@@ -616,7 +621,8 @@ fn test_group_descriptor_counts_match_bitmaps() {
 
     for group in 0..group_count {
         let gd = reader.get_group_descriptor(group).unwrap();
-        let block_bitmap = read_block(&mut file, gd.block_bitmap_lo, block_size);
+        assert_ne!(gd.flags & bg_flags::INODE_ZEROED, 0);
+        let mut block_bitmap = read_block(&mut file, gd.block_bitmap_lo, block_size);
         let inode_bitmap = read_block(&mut file, gd.inode_bitmap_lo, block_size);
 
         let group_start = group * sb.blocks_per_group;
@@ -625,6 +631,34 @@ fn test_group_descriptor_counts_match_bitmaps() {
         } else {
             sb.blocks_per_group
         };
+
+        if gd.flags & bg_flags::BLOCK_UNINIT != 0 {
+            assert!(block_bitmap.iter().all(|byte| *byte == 0));
+            assert_ne!(gd.flags & bg_flags::INODE_UNINIT, 0);
+            assert_eq!(blocks_in_group, sb.blocks_per_group);
+            // Reconstruct the bitmap from metadata locations, independently
+            // of the descriptor's free count, as ext4 does for UNINIT groups.
+            if rootfs_spec::upper_geometry::has_sparse_super(group) {
+                let descriptor_blocks =
+                    (group_count as u64 * GroupDescriptor::SIZE as u64).div_ceil(block_size);
+                for index in 0..1 + descriptor_blocks + sb.reserved_gdt_blocks as u64 {
+                    block_bitmap[index as usize / 8] |= 1 << (index % 8);
+                }
+            }
+            let table_blocks =
+                (sb.inodes_per_group as u64 * sb.inode_size as u64).div_ceil(block_size) as u32;
+            for block in std::iter::once(gd.block_bitmap_lo)
+                .chain(std::iter::once(gd.inode_bitmap_lo))
+                .chain(gd.inode_table_lo..gd.inode_table_lo + table_blocks)
+            {
+                assert!(block >= group_start && block < group_start + blocks_in_group);
+                let index = (block - group_start) as usize;
+                block_bitmap[index / 8] |= 1 << (index % 8);
+            }
+        }
+        if gd.flags & bg_flags::INODE_UNINIT != 0 {
+            assert!(inode_bitmap.iter().all(|byte| *byte == 0));
+        }
 
         let free_blocks = count_free_bits(&block_bitmap, blocks_in_group);
         assert_eq!(
@@ -677,7 +711,10 @@ fn test_inode_dtime_after_removal() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "delete me".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "delete me".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -699,7 +736,8 @@ fn test_inode_dtime_after_removal() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "keep me".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "keep me".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -708,7 +746,7 @@ fn test_inode_dtime_after_removal() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let victim = reader.get_inode(victim_ino).unwrap();
 
     // After removal the formatter zeros the inode but sets dtime.
@@ -732,7 +770,8 @@ fn test_hardlink_links_count() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "data".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "data".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -744,7 +783,7 @@ fn test_hardlink_links_count() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let (_, inode) = reader.stat("/original").unwrap();
 
     // Original file + 2 hard links = 3.
@@ -763,7 +802,8 @@ fn test_removing_hardlink_does_not_decrement_parent_directory_link_count() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "data".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "data".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -775,7 +815,7 @@ fn test_removing_hardlink_does_not_decrement_parent_directory_link_count() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let root = reader.get_inode(ROOT_INODE).unwrap();
     assert_eq!(
         root.links_count, 3,
@@ -798,7 +838,8 @@ fn test_failed_hardlink_does_not_mutate_target_link_count() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "data".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "data".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -813,7 +854,7 @@ fn test_failed_hardlink_does_not_mutate_target_link_count() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let (_, inode) = reader.stat("/target").unwrap();
     assert_eq!(
         inode.links_count, 1,
@@ -832,7 +873,8 @@ fn test_directory_entry_name_length_boundaries() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "ascii".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "ascii".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -847,7 +889,8 @@ fn test_directory_entry_name_length_boundaries() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "utf8".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "utf8".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -861,7 +904,10 @@ fn test_directory_entry_name_length_boundaries() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "too long".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "too long".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -879,7 +925,10 @@ fn test_directory_entry_name_length_boundaries() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "too long".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "too long".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -894,7 +943,8 @@ fn test_directory_entry_name_length_boundaries() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "target".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "target".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -908,7 +958,7 @@ fn test_directory_entry_name_length_boundaries() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     assert!(reader.exists(&ascii_path));
     assert!(reader.exists(&utf8_path));
 }
@@ -917,8 +967,8 @@ fn test_directory_entry_name_length_boundaries() {
 fn test_xattr_name_length_boundaries() {
     let (mut fmt, tmp) = new_formatter();
 
-    let suffix_255 = "x".repeat(EXT4_NAME_LEN);
-    let max_name = format!("user.{suffix_255}");
+    let suffix_250 = "x".repeat(EXT4_NAME_LEN - b"user.".len());
+    let max_name = format!("user.{suffix_250}");
     let mut max_xattrs = HashMap::new();
     max_xattrs.insert(max_name, vec![1]);
     fmt.create(
@@ -926,15 +976,21 @@ fn test_xattr_name_length_boundaries() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "ok".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "ok".as_bytes())),
         None,
         None,
-        Some(&max_xattrs),
+        Some(
+            &max_xattrs
+                .iter()
+                .map(|(name, value)| (name.as_bytes(), value.as_slice()))
+                .collect::<Vec<_>>(),
+        ),
+        None,
     )
     .unwrap();
 
-    let suffix_256 = "y".repeat(EXT4_NAME_LEN + 1);
-    let too_long_name = format!("user.{suffix_256}");
+    let suffix_251 = "y".repeat(EXT4_NAME_LEN - b"user.".len() + 1);
+    let too_long_name = format!("user.{suffix_251}");
     let mut too_long_xattrs = HashMap::new();
     too_long_xattrs.insert(too_long_name.clone(), vec![1]);
     let result = fmt.create(
@@ -942,19 +998,25 @@ fn test_xattr_name_length_boundaries() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "bad".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "bad".as_bytes())),
         None,
         None,
-        Some(&too_long_xattrs),
+        Some(
+            &too_long_xattrs
+                .iter()
+                .map(|(name, value)| (name.as_bytes(), value.as_slice()))
+                .collect::<Vec<_>>(),
+        ),
+        None,
     );
     assert!(
-        matches!(result, Err(FormatError::InvalidName(name)) if name == too_long_name),
-        "xattr suffixes longer than 255 bytes must be rejected before e_name_len truncates"
+        matches!(result, Err(FormatError::InvalidXattrName(name)) if name == too_long_name.as_bytes()),
+        "Linux xattr full names longer than 255 bytes must be rejected"
     );
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     assert!(reader.stat("/max-xattr-name").unwrap().1.xattr_block_lo != 0);
 }
 
@@ -972,10 +1034,16 @@ fn test_i_blocks_accounts_for_external_xattr_blocks() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut data_reader),
+        Some(disk_image::ext4::FileData::Dense(&mut data_reader)),
         None,
         None,
-        Some(&xattrs),
+        Some(
+            &xattrs
+                .iter()
+                .map(|(name, value)| (name.as_bytes(), value.as_slice()))
+                .collect::<Vec<_>>(),
+        ),
+        None,
     )
     .unwrap();
 
@@ -987,13 +1055,19 @@ fn test_i_blocks_accounts_for_external_xattr_blocks() {
         None,
         None,
         None,
-        Some(&xattrs),
+        Some(
+            &xattrs
+                .iter()
+                .map(|(name, value)| (name.as_bytes(), value.as_slice()))
+                .collect::<Vec<_>>(),
+        ),
+        None,
     )
     .unwrap();
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let (_, with_data) = reader.stat("/with-data").unwrap();
     assert_ne!(with_data.xattr_block_lo, 0);
     assert_ne!(with_data.flags & inode_flags::HUGE_FILE, 0);
@@ -1022,10 +1096,18 @@ fn test_hardlink_external_xattr_blocks_are_reclaimed() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "xattr content".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "xattr content".as_bytes(),
+        )),
         None,
         None,
-        Some(&xattrs),
+        Some(
+            &xattrs
+                .iter()
+                .map(|(name, value)| (name.as_bytes(), value.as_slice()))
+                .collect::<Vec<_>>(),
+        ),
+        None,
     )
     .unwrap();
     fmt.link("/alias", "/original").unwrap();
@@ -1036,7 +1118,8 @@ fn test_hardlink_external_xattr_blocks_are_reclaimed() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "keep".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "keep".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -1044,7 +1127,7 @@ fn test_hardlink_external_xattr_blocks_are_reclaimed() {
     .unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let deleted_inode = reader.get_inode(12).unwrap();
     assert_eq!(deleted_inode.links_count, 0);
     assert_ne!(deleted_inode.dtime, 0);
@@ -1058,7 +1141,8 @@ fn test_hardlink_external_xattr_blocks_are_reclaimed() {
             make_mode(file_mode::S_IFREG, 0o644),
             None,
             None,
-            Some(&mut "keep".as_bytes()),
+            Some(disk_image::ext4::FileData::Dense(&mut "keep".as_bytes())),
+            None,
             None,
             None,
             None,
@@ -1091,11 +1175,13 @@ fn test_directory_links_count() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     fmt.create(
         "/parent/child1",
         make_mode(file_mode::S_IFDIR, 0o755),
+        None,
         None,
         None,
         None,
@@ -1113,12 +1199,13 @@ fn test_directory_links_count() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let (_, parent_inode) = reader.stat("/parent").unwrap();
 
     // A directory's links_count = 2 (. and ..) + number of child directories.
@@ -1143,7 +1230,8 @@ fn test_create_overwrite_semantics() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "v1".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "v1".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -1156,7 +1244,8 @@ fn test_create_overwrite_semantics() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "v2".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "v2".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -1167,6 +1256,7 @@ fn test_create_overwrite_semantics() {
     let result = fmt.create(
         "/file",
         make_mode(file_mode::S_IFDIR, 0o755),
+        None,
         None,
         None,
         None,
@@ -1189,6 +1279,7 @@ fn test_create_overwrite_semantics() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -1196,6 +1287,7 @@ fn test_create_overwrite_semantics() {
     fmt.create(
         "/dir",
         make_mode(file_mode::S_IFDIR, 0o755),
+        None,
         None,
         None,
         None,
@@ -1211,7 +1303,8 @@ fn test_create_overwrite_semantics() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "nope".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "nope".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -1228,7 +1321,8 @@ fn test_create_overwrite_semantics() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "data".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "data".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -1238,6 +1332,7 @@ fn test_create_overwrite_semantics() {
     let result = fmt.create(
         "/file2/sub",
         make_mode(file_mode::S_IFDIR, 0o755),
+        None,
         None,
         None,
         None,

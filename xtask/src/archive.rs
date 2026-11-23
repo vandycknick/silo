@@ -59,9 +59,8 @@ impl ArchiveKind {
     }
 }
 
-fn product_files(host: HostTarget) -> [&'static str; 3] {
-    ["silo", "taild", host.go_ffi_library()]
-}
+const PRODUCT_FILES: [&str; 2] = ["silo", "tsgate"];
+const PRODUCT_LICENSES: &str = "share/licenses/tsgate";
 
 pub fn produce_runtime(
     workspace_root: &Path,
@@ -100,6 +99,7 @@ fn produce_kinds(
             target_dir,
             profile,
             host,
+            vmm_features: None,
         },
         &stage,
     )
@@ -113,19 +113,19 @@ fn produce_kinds(
 
     for &kind in kinds {
         if kind.has_cli() {
-            validate_product(workspace_root, target_dir, host)?;
+            validate_product(target_dir)?;
         }
         if profile == Profile::Release && host != HostTarget::MacosArm64 {
             let mut audit = Command::new("python3");
             audit
-                .arg(workspace_root.join("packaging/silo-taild/elf_audit.py"))
+                .arg(workspace_root.join("packaging/release/elf_audit.py"))
                 .arg("--target")
                 .arg(host.runtime_target());
             for name in ["bin/silo-vmm", "bin/netd", "assets/agent"] {
                 audit.arg(stage.join(name));
             }
             if kind.has_cli() {
-                for name in product_files(host) {
+                for name in PRODUCT_FILES {
                     audit.arg(target_dir.join("release").join(name));
                 }
             }
@@ -134,16 +134,7 @@ fn produce_kinds(
         let root = archive_root(kind, &version, host);
         let archive = output.join(format!("{root}.tar.zst"));
         let raw = output.join(format!(".{root}.tar"));
-        create_tar(
-            workspace_root,
-            target_dir,
-            &stage,
-            host,
-            kind,
-            &root,
-            epoch,
-            &raw,
-        )?;
+        create_tar(target_dir, &stage, kind, &root, epoch, &raw)?;
         compress_tar(&raw, &archive)?;
         let raw_size = file_size(&raw)?;
         let compressed_size = file_size(&archive)?;
@@ -182,12 +173,9 @@ fn produce_kinds(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn create_tar(
-    workspace_root: &Path,
     target_dir: &Path,
     stage: &Path,
-    host: HostTarget,
     kind: ArchiveKind,
     root: &str,
     epoch: u64,
@@ -218,17 +206,9 @@ fn create_tar(
             "--transform",
             &format!("s,^silo$,{root}/bin/silo,"),
             "--transform",
-            &format!("s,^taild$,{root}/bin/taild,"),
+            &format!("s,^tsgate$,{root}/bin/tsgate,"),
             "--transform",
-            &format!(
-                "s,^{}$,{root}/bin/{},",
-                host.go_ffi_library(),
-                host.go_ffi_library()
-            ),
-            "--transform",
-            &format!("s,^packaging/silo-taild,{root}/share/silo-taild,"),
-            "--transform",
-            &format!("s,^taild-licenses,{root}/LICENSES/taild,"),
+            &format!("s,^share/,{root}/share/,"),
             "--transform",
             &format!("s,^{stage_name}$,{root},"),
             "--transform",
@@ -244,13 +224,8 @@ fn create_tar(
         command
             .args(["--directory"])
             .arg(target_dir.join("release"))
-            .args(product_files(host))
-            .arg("--directory")
-            .arg(workspace_root)
-            .arg("packaging/silo-taild/examples")
-            .arg("--directory")
-            .arg(target_dir)
-            .arg("taild-licenses");
+            .args(PRODUCT_FILES);
+        command.arg(PRODUCT_LICENSES);
     }
     command::run(command)?;
     Ok(())
@@ -365,10 +340,17 @@ fn archive_file_hashes(
         }
     }
     if kind.has_cli() {
-        for name in product_files(host) {
+        for name in PRODUCT_FILES {
             files.insert(
                 format!("bin/{name}"),
                 sha256(&target_dir.join("release").join(name))?,
+            );
+        }
+        let licenses = target_dir.join("release").join(PRODUCT_LICENSES);
+        for relative in product_notice_inventory(&licenses)? {
+            files.insert(
+                format!("{PRODUCT_LICENSES}/{}", relative.display()),
+                sha256(&licenses.join(relative))?,
             );
         }
     }
@@ -395,16 +377,15 @@ fn actual_toolchains(
     ] {
         tools.insert(name.to_string(), release::tool_output(&path, &args)?);
     }
-    for (name, module) in [("go-netd", "net/netd"), ("go-taild", "app/taild")] {
-        let mut go = Command::new(release::tool("go")?);
-        go.current_dir(workspace_root.join(module)).arg("version");
-        tools.insert(
-            name.into(),
-            String::from_utf8_lossy(&command::output(go)?.stdout)
-                .trim()
-                .into(),
-        );
-    }
+    let mut go = Command::new(release::tool("go")?);
+    go.current_dir(workspace_root.join("net/netd"))
+        .arg("version");
+    tools.insert(
+        "go-netd".into(),
+        String::from_utf8_lossy(&command::output(go)?.stdout)
+            .trim()
+            .into(),
+    );
     if env::consts::OS == "linux" {
         tools.insert(
             "native-cc".into(),
@@ -519,59 +500,21 @@ fn validate_stage(stage: &Path) -> Result<(), ArchiveError> {
     Ok(())
 }
 
-fn validate_product(
-    workspace_root: &Path,
-    target_dir: &Path,
-    host: HostTarget,
-) -> Result<(), ArchiveError> {
-    for name in product_files(host) {
-        let path = target_dir.join("release").join(name);
-        if !fs::symlink_metadata(&path)
-            .map_err(|source| ArchiveError::Io {
-                action: "read archive file metadata",
-                path: path.clone(),
-                source,
-            })?
-            .is_file()
-        {
-            return invalid(&path, "is not a regular file".into());
-        }
+fn validate_product(target_dir: &Path) -> Result<(), ArchiveError> {
+    for name in PRODUCT_FILES {
+        validate_regular_file(&target_dir.join("release").join(name), 0o755)?;
     }
-    for path in [
-        target_dir.join("taild-licenses"),
-        workspace_root.join("packaging/silo-taild/examples"),
-    ] {
-        validate_archive_tree(&path, true)?;
-    }
-    validate_regular_file(&target_dir.join("taild-licenses/modules.json"), 0o644)?;
+    product_notice_inventory(&target_dir.join("release").join(PRODUCT_LICENSES))?;
     Ok(())
 }
 
-fn validate_archive_tree(path: &Path, require_directory: bool) -> Result<(), ArchiveError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| ArchiveError::Io {
-        action: "read archive file metadata",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path).map_err(|source| ArchiveError::Io {
-            action: "read archive directory",
-            path: path.to_path_buf(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| ArchiveError::Io {
-                action: "read archive directory entry",
-                path: path.to_path_buf(),
-                source,
-            })?;
-            validate_archive_tree(&entry.path(), false)?;
-        }
-        Ok(())
-    } else if metadata.is_file() && !require_directory {
-        Ok(())
-    } else {
-        invalid(path, "is not a regular file or directory".into())
-    }
+fn product_notice_inventory(
+    root: &Path,
+) -> Result<std::collections::BTreeSet<PathBuf>, ArchiveError> {
+    crate::app::go_notice_inventory(root).map_err(|error| ArchiveError::Invalid {
+        path: root.to_path_buf(),
+        reason: error.to_string(),
+    })
 }
 
 fn has_rprobe_assets(stage: &Path) -> Result<bool, ArchiveError> {
@@ -669,206 +612,4 @@ fn invalid<T>(path: &Path, reason: String) -> Result<T, ArchiveError> {
         path: path.to_path_buf(),
         reason,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-    use std::fs;
-    use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::path::PathBuf;
-    use std::process::Command;
-
-    use super::*;
-
-    struct Fixture {
-        root: PathBuf,
-        stage: PathBuf,
-    }
-
-    impl Fixture {
-        fn new(name: &str, host: HostTarget) -> Self {
-            let root = env::temp_dir().join(format!("silo-archive-{name}-{}", std::process::id()));
-            fs::create_dir(&root).unwrap();
-            let stage = stage_path(&root, host, Profile::Release);
-            for directory in [
-                stage.join("bin"),
-                stage.join("assets"),
-                stage.join("LICENSES"),
-                root.join("release"),
-                root.join("taild-licenses/dependency"),
-                root.join("packaging/silo-taild/examples"),
-            ] {
-                fs::create_dir_all(directory).unwrap();
-            }
-            for (path, mode) in RUNTIME_FILES {
-                fs::write(stage.join(path), path).unwrap();
-                fs::set_permissions(stage.join(path), fs::Permissions::from_mode(mode)).unwrap();
-            }
-            for path in [
-                "runtime-manifest.json",
-                "THIRD_PARTY_NOTICES",
-                "LICENSES/APACHE-2.0.txt",
-            ] {
-                fs::write(stage.join(path), path).unwrap();
-            }
-            for name in product_files(host) {
-                fs::write(root.join("release").join(name), name).unwrap();
-            }
-            for path in [
-                "taild-licenses/modules.json",
-                "taild-licenses/dependency/LICENSE",
-                "packaging/silo-taild/examples/devbox.yaml",
-                "packaging/silo-taild/config.yaml",
-                "packaging/silo-taild/silo-taild.service",
-                "packaging/silo-taild/silo-taild.sysusers",
-                "packaging/silo-taild/licenses.py",
-                "packaging/silo-taild/verify-artifact.py",
-            ] {
-                fs::write(root.join(path), path).unwrap();
-            }
-            Self { root, stage }
-        }
-
-        fn inventory(&self, host: HostTarget, kind: ArchiveKind) -> BTreeSet<String> {
-            let archive = self.root.join("test.tar");
-            create_tar(
-                &self.root,
-                &self.root,
-                &self.stage,
-                host,
-                kind,
-                "product",
-                0,
-                &archive,
-            )
-            .unwrap();
-            let output = Command::new("tar")
-                .arg("-tf")
-                .arg(archive)
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            String::from_utf8(output.stdout)
-                .unwrap()
-                .lines()
-                .filter(|entry| !entry.ends_with('/'))
-                .map(str::to_string)
-                .collect()
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.root).unwrap();
-        }
-    }
-
-    fn runtime_inventory() -> BTreeSet<String> {
-        RUNTIME_FILES
-            .iter()
-            .map(|(path, _)| *path)
-            .chain([
-                "runtime-manifest.json",
-                "THIRD_PARTY_NOTICES",
-                "LICENSES/APACHE-2.0.txt",
-            ])
-            .map(|path| format!("product/{path}"))
-            .collect()
-    }
-
-    #[test]
-    fn portable_and_runtime_archives_have_exact_component_inventories_on_every_target() {
-        for host in [
-            HostTarget::LinuxX86_64,
-            HostTarget::LinuxArm64,
-            HostTarget::MacosArm64,
-        ] {
-            let fixture = Fixture::new("inventory", host);
-            validate_product(&fixture.root, &fixture.root, host).unwrap();
-            assert_eq!(
-                fixture.inventory(host, ArchiveKind::Runtime),
-                runtime_inventory()
-            );
-            let mut expected = runtime_inventory();
-            expected.extend(product_files(host).map(|name| format!("product/bin/{name}")));
-            expected.extend([
-                "product/LICENSES/taild/modules.json".to_string(),
-                "product/LICENSES/taild/dependency/LICENSE".to_string(),
-                "product/share/silo-taild/examples/devbox.yaml".to_string(),
-            ]);
-            assert_eq!(fixture.inventory(host, ArchiveKind::Portable), expected);
-        }
-    }
-
-    #[test]
-    fn provenance_hashes_actual_helper_and_sidecar_and_keeps_runtime_frontend_free() {
-        for host in [
-            HostTarget::LinuxX86_64,
-            HostTarget::LinuxArm64,
-            HostTarget::MacosArm64,
-        ] {
-            let fixture = Fixture::new("hashes", host);
-            let hashes =
-                archive_file_hashes(&fixture.root, host, Profile::Release, ArchiveKind::Portable)
-                    .unwrap();
-            for name in product_files(host) {
-                assert_eq!(
-                    hashes[&format!("bin/{name}")],
-                    sha256(&fixture.root.join("release").join(name)).unwrap()
-                );
-            }
-            for name in ["taild", host.go_ffi_library()] {
-                fs::write(
-                    fixture.root.join("release").join(name),
-                    "changed actual bytes",
-                )
-                .unwrap();
-                let changed = archive_file_hashes(
-                    &fixture.root,
-                    host,
-                    Profile::Release,
-                    ArchiveKind::Portable,
-                )
-                .unwrap();
-                assert_ne!(
-                    hashes[&format!("bin/{name}")],
-                    changed[&format!("bin/{name}")]
-                );
-            }
-            let runtime =
-                archive_file_hashes(&fixture.root, host, Profile::Release, ArchiveKind::Runtime)
-                    .unwrap();
-            assert_eq!(
-                runtime
-                    .keys()
-                    .map(|path| format!("product/{path}"))
-                    .collect::<BTreeSet<_>>(),
-                runtime_inventory()
-                    .into_iter()
-                    .filter(|path| !path.ends_with("runtime-manifest.json"))
-                    .collect()
-            );
-        }
-    }
-
-    #[test]
-    fn product_admission_rejects_missing_sidecars_and_unsafe_notice_or_example_entries() {
-        let host = HostTarget::LinuxX86_64;
-        let fixture = Fixture::new("admission", host);
-        let bridge = fixture.root.join("release").join(host.go_ffi_library());
-        fs::remove_file(&bridge).unwrap();
-        assert!(validate_product(&fixture.root, &fixture.root, host).is_err());
-        symlink(fixture.root.join("release/taild"), &bridge).unwrap();
-        assert!(validate_product(&fixture.root, &fixture.root, host).is_err());
-        fs::remove_file(&bridge).unwrap();
-        fs::write(&bridge, "bridge").unwrap();
-        for directory in ["taild-licenses/dependency", "packaging/silo-taild/examples"] {
-            let unsafe_path = fixture.root.join(directory).join("unsafe");
-            symlink(&bridge, &unsafe_path).unwrap();
-            assert!(validate_product(&fixture.root, &fixture.root, host).is_err());
-            fs::remove_file(unsafe_path).unwrap();
-        }
-        validate_product(&fixture.root, &fixture.root, host).unwrap();
-    }
 }

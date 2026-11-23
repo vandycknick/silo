@@ -1,0 +1,15 @@
+[package]
+name = "disk-partition"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Bounded disk-local partition facts for import and trusted guest init"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vandycknick/silo"
+
+[features]
+default = []
+std = []
+
+[dependencies]
+uuid = { version = "1.24.0", default-features = false }

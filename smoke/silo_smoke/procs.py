@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
+import sys
 import time
 from typing import Any
+from uuid import UUID
 
 from .errors import SmokeAssertion
 from .workspace import Workspace
@@ -38,9 +41,21 @@ def free_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def bound_port(status: bytes) -> int:
+    """Read the port actually owned by a session forward that requested port zero."""
+    match = re.search(rb"(?m)^Forwarding host:tcp:127\.0\.0\.1:([0-9]+) -> [^\n]+\n", status)
+    assert match is not None, f"Missing bound forwarding address: {status!r}"
+    port = int(match[1])
+    assert 0 < port <= 65535, status
+    return port
+
+
 def query(db: Path, sql: str) -> list[tuple[str, ...]]:
     try:
-        result = subprocess.run(["sqlite3", "-readonly", "-separator", "\x1f", str(db), sql], capture_output=True, text=True, timeout=15)
+        result = subprocess.run(
+            ["sqlite3", "-readonly", "-cmd", ".timeout 5000", "-separator", "\x1f", str(db), sql],
+            capture_output=True, text=True, timeout=15,
+        )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise SmokeAssertion(f"Cannot query {db}: {error}") from error
     if result.returncode:
@@ -48,8 +63,32 @@ def query(db: Path, sql: str) -> list[tuple[str, ...]]:
     return [tuple(row.split("\x1f")) for row in result.stdout.splitlines()]
 
 
+def catalog(db: Path) -> dict[str, list[tuple[str, ...]]]:
+    """Observe the complete catalog in one independent read transaction."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("catalog_observer.py")), str(db)],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SmokeAssertion(f"Cannot observe {db}: {error}") from error
+    if result.returncode:
+        raise SmokeAssertion(f"Catalog observation failed for {db}: {result.stderr}")
+    return {table: [tuple(row) for row in rows] for table, rows in json.loads(result.stdout).items()}
+
+
 def _name(name: str) -> str:
     return "'" + name.replace("'", "''") + "'"
+
+
+def machine_id(ws: Workspace, name: str) -> str:
+    # Path lookup needs catalog identity, not live status reconciliation.
+    # Keep this in the separate read-only process used by all catalog oracles.
+    rows = query(ws.state_db(), f"SELECT id FROM machine_config WHERE name={_name(name)}")
+    assert len(rows) == 1
+    identity = UUID(rows[0][0]).hex
+    assert identity == rows[0][0]
+    return identity
 
 
 def _state_value(ws: Workspace, name: str, expression: str) -> str | None:

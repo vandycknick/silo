@@ -45,6 +45,14 @@ impl<'a> Provisioner<'a> for ResizeRootfs<'a> {
         }
 
         let mount = root_mount(context)?;
+        if mount.fstype == "overlay" {
+            crate::root_storage::retained_root()?.ok_or_else(|| {
+                eyre::eyre!("overlay resize requires validated retained root context")
+            })?;
+            return Ok(ProvisionOutcome::skipped(
+                "managed upper growth completed by init before overlay assembly",
+            ));
+        }
         tracing::info!(source = %mount.source, fstype = %mount.fstype, "resizing root filesystem");
         let outcome = resize_filesystem(context, &mount)?;
         if let ProvisionOutcome::Succeeded { changed, .. } = &outcome {
@@ -242,6 +250,21 @@ mod tests {
         target_block_count, RootMount,
     };
     use crate::provision::{ProvisionContext, ProvisionOutcome};
+
+    #[test]
+    fn overlay_never_reaches_ext4_resize_ioctl() {
+        let temp = tempfile::tempdir().expect("fixture");
+        let context = ProvisionContext::for_test(temp.path());
+        let mount = RootMount {
+            device_id: "0:42".to_string(),
+            source: "overlay".to_string(),
+            fstype: "overlay".to_string(),
+        };
+        assert!(matches!(
+            resize_filesystem(&context, &mount),
+            Ok(ProvisionOutcome::Unsupported { .. })
+        ));
+    }
 
     #[test]
     fn parses_root_mount_from_mountinfo_without_external_tools() {

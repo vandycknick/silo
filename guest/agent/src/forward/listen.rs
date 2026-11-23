@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -16,11 +17,12 @@ use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixA
 use protocol::v1::guest_forward_service_server::GuestForwardService;
 use protocol::v1::listen_event::Event;
 use protocol::v1::{
-    ErrorCode, ErrorDetail, ListenEvent, ListenRequest, ListenerBound, ListenerFailed,
+    ActivationListener, ActivationListenerBound, ErrorCode, ErrorDetail, ListenEvent,
+    ListenRequest, ListenerBound, ListenerFailed,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, UnixListener};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_vsock::{VsockAddr, VsockStream, VMADDR_CID_HOST};
 use tonic::{Request, Response, Status};
@@ -56,19 +58,100 @@ impl ReturnConnector for VsockReturnConnector {
     }
 }
 
+enum ListenerOwner {
+    Stream(tokio::sync::mpsc::Sender<Result<ListenEvent, Status>>),
+    Activation { name: String },
+}
+
+struct ListenerControl {
+    owner: ListenerOwner,
+    shutdown: Option<watch::Receiver<bool>>,
+    cancelled: watch::Receiver<bool>,
+}
+
+struct OwnedForwardTask {
+    cancel: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+impl OwnedForwardTask {
+    fn cancel(&self) {
+        self.cancel.send_replace(true);
+    }
+}
+
+impl Drop for OwnedForwardTask {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+// Handles stay owned until joined, including when the caller awaiting a reset
+// is cancelled. A subsequent reset still observes actual cleanup completion.
+#[derive(Default)]
+struct ForwardRegistry {
+    tasks: Vec<OwnedForwardTask>,
+}
+
+impl ForwardRegistry {
+    async fn reap_finished(&mut self) -> Result<(), Status> {
+        let mut index = 0;
+        while index < self.tasks.len() {
+            if self.tasks[index].task.is_finished() {
+                let result = (&mut self.tasks[index].task).await;
+                self.tasks.swap_remove(index);
+                task_result(result)?;
+            } else {
+                index += 1;
+            }
+        }
+        Ok(())
+    }
+
+    async fn drain(&mut self) -> Result<(), Status> {
+        for task in &self.tasks {
+            task.cancel();
+        }
+        let mut failure = None;
+        while let Some(task) = self.tasks.last_mut() {
+            let result = (&mut task.task).await;
+            self.tasks.pop();
+            if let Err(error) = task_result(result) {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+fn task_result(result: Result<io::Result<()>, tokio::task::JoinError>) -> Result<(), Status> {
+    result
+        .map_err(|error| Status::internal(format!("forward task failed to drain: {error}")))?
+        .map_err(|error| Status::internal(format!("forward cleanup failed: {error}")))
+}
+
 #[derive(Clone)]
 pub(crate) struct GuestForwardServiceImpl {
     listen_capacity: Arc<Semaphore>,
     connection_capacity: Arc<Semaphore>,
     connector: Arc<dyn ReturnConnector>,
+    supervisor: crate::pid1::ProcessSupervisor,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
+    registry: Arc<Mutex<ForwardRegistry>>,
 }
 
 impl GuestForwardServiceImpl {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(
+        supervisor: crate::pid1::ProcessSupervisor,
+        runtime: Arc<crate::lifecycle::RuntimeContext>,
+    ) -> Self {
         Self {
             listen_capacity: Arc::new(Semaphore::new(MAX_LISTEN_STREAMS)),
             connection_capacity: Arc::new(Semaphore::new(MAX_ACCEPTED_CONNECTIONS)),
             connector: Arc::new(VsockReturnConnector),
+            supervisor,
+            runtime,
+            registry: Arc::new(Mutex::new(ForwardRegistry::default())),
         }
     }
 
@@ -78,7 +161,148 @@ impl GuestForwardServiceImpl {
             listen_capacity: Arc::new(Semaphore::new(MAX_LISTEN_STREAMS)),
             connection_capacity: Arc::new(Semaphore::new(MAX_ACCEPTED_CONNECTIONS)),
             connector,
+            supervisor: crate::pid1::ProcessSupervisor::default(),
+            runtime: crate::lifecycle::RuntimeContext::for_tests(),
+            registry: Arc::new(Mutex::new(ForwardRegistry::default())),
         }
+    }
+
+    pub(crate) async fn reset_for_activation(&self) -> Result<(), Status> {
+        self.registry.lock().await.drain().await
+    }
+
+    pub(crate) async fn register_activation(
+        &self,
+        registrations: &[ActivationListener],
+    ) -> Result<Vec<ActivationListenerBound>, Status> {
+        validate_activation_listeners(registrations)?;
+        let mut registry = self.registry.lock().await;
+        registry.reap_finished().await?;
+        let mut bounds = Vec::with_capacity(registrations.len());
+        for registration in registrations {
+            let request = registration.registration.as_ref().ok_or_else(|| {
+                Status::invalid_argument("activation listener registration is required")
+            })?;
+            let (token, address) = parse_request(request)?;
+            let result = self
+                .install_listener(
+                    &mut registry,
+                    address,
+                    request.unix_mode,
+                    token,
+                    ListenerOwner::Activation {
+                        name: registration.name.clone(),
+                    },
+                )
+                .await;
+            match result {
+                Ok(bound) => bounds.push(ActivationListenerBound {
+                    name: registration.name.clone(),
+                    bound: Some(ListenerBound { address: bound }),
+                }),
+                Err(error) => {
+                    // Partial destination registrations are not left live after
+                    // a bind failure. The lifecycle owner records sticky failure.
+                    registry.drain().await?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(bounds)
+    }
+
+    async fn install_listener(
+        &self,
+        registry: &mut ForwardRegistry,
+        address: Address,
+        unix_mode: Option<u32>,
+        token: Token,
+        owner: ListenerOwner,
+    ) -> Result<String, Status> {
+        let worker = self
+            .supervisor
+            .admit_internal_writer()
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let permit = Arc::clone(&self.listen_capacity)
+            .try_acquire_owned()
+            .map_err(|_| {
+                forward_status(
+                    tonic::Code::ResourceExhausted,
+                    ErrorCode::ForwardLimit,
+                    "forward listener capacity is exhausted",
+                )
+            })?;
+        let listener = OwnedListener::bind(address, unix_mode)
+            .await
+            .map_err(bind_status)?;
+        let bound = listener.bound_address().to_string();
+        if let ListenerOwner::Stream(sender) = &owner {
+            sender
+                .try_send(Ok(ListenEvent {
+                    event: Some(Event::Bound(ListenerBound {
+                        address: bound.clone(),
+                    })),
+                }))
+                .map_err(|_| Status::internal("failed to initialize forward listener stream"))?;
+        }
+        let (cancel, cancelled) = watch::channel(false);
+        let connection_capacity = Arc::clone(&self.connection_capacity);
+        let connector = Arc::clone(&self.connector);
+        let shutdown = self.supervisor.shutdown_receiver();
+        let task = tokio::spawn(async move {
+            let _worker = worker;
+            run_listener(
+                listener,
+                token,
+                permit,
+                connection_capacity,
+                connector,
+                ListenerControl {
+                    owner,
+                    shutdown,
+                    cancelled,
+                },
+            )
+            .await
+        });
+        registry.tasks.push(OwnedForwardTask { cancel, task });
+        Ok(bound)
+    }
+
+    pub(crate) async fn handle_dialer<S>(&self, stream: S) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let admission = self.runtime.admit_mutation().map_err(io::Error::other)?;
+        let worker = self.supervisor.admit_internal_writer()?;
+        let mut registry = self.registry.lock().await;
+        registry.reap_finished().await.map_err(io::Error::other)?;
+        let permit = Arc::clone(&self.connection_capacity)
+            .try_acquire_owned()
+            .map_err(|_| io::Error::other("forward connection capacity is exhausted"))?;
+        let (cancel, mut cancelled) = watch::channel(false);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut shutdown = self.supervisor.shutdown_receiver();
+        let task = tokio::spawn(async move {
+            let _worker = worker;
+            let _permit = permit;
+            let mut sender = sender;
+            let result = tokio::select! {
+                biased;
+                () = wait_shutdown(&mut shutdown) => Ok(()),
+                () = wait_cancelled(&mut cancelled) => Ok(()),
+                () = sender.closed() => Ok(()),
+                result = crate::forward::dialer::handle(stream) => result,
+            };
+            let _ = sender.send(result);
+            Ok(())
+        });
+        registry.tasks.push(OwnedForwardTask { cancel, task });
+        drop(registry);
+        drop(admission);
+        receiver
+            .await
+            .map_err(|_| io::Error::other("forward dialer task stopped"))?
     }
 }
 
@@ -90,68 +314,142 @@ impl GuestForwardService for GuestForwardServiceImpl {
         &self,
         request: Request<ListenRequest>,
     ) -> Result<Response<Self::ListenStream>, Status> {
-        let permit = self
-            .listen_capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                forward_status(
-                    tonic::Code::ResourceExhausted,
-                    ErrorCode::ForwardLimit,
-                    "forward listener capacity is exhausted",
-                )
-            })?;
+        let _admission = self.runtime.admit_mutation()?;
         let request = request.into_inner();
-        let token = Token::try_from(request.token.as_ref()).map_err(|error| {
-            forward_status(
-                tonic::Code::InvalidArgument,
-                ErrorCode::ForwardInvalid,
-                error.to_string(),
-            )
-        })?;
-        let address = request.listen.parse::<Address>().map_err(|error| {
-            forward_status(
-                tonic::Code::InvalidArgument,
-                ErrorCode::ForwardInvalid,
-                error.to_string(),
-            )
-        })?;
-        validate_request(&address, request.unix_mode)?;
-
-        let listener = match OwnedListener::bind(address, request.unix_mode).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                let event = ListenEvent {
-                    event: Some(Event::Failed(ListenerFailed {
-                        error: Some(bind_error_detail(&error)),
-                    })),
-                };
-                return Ok(Response::new(Box::pin(tokio_stream::iter([Ok(event)]))));
-            }
-        };
-        let bound = listener.bound_address().to_string();
+        let (token, address) = parse_request(&request)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        sender
-            .try_send(Ok(ListenEvent {
-                event: Some(Event::Bound(ListenerBound { address: bound })),
-            }))
-            .map_err(|_| Status::internal("failed to initialize forward listener stream"))?;
-        let connection_capacity = Arc::clone(&self.connection_capacity);
-        let connector = Arc::clone(&self.connector);
-        tokio::spawn(async move {
-            run_listener(
-                listener,
+        let mut registry = self.registry.lock().await;
+        registry.reap_finished().await?;
+        if let Err(error) = self
+            .install_listener(
+                &mut registry,
+                address,
+                request.unix_mode,
                 token,
-                permit,
-                connection_capacity,
-                connector,
-                sender,
+                ListenerOwner::Stream(sender),
             )
-            .await;
-        });
+            .await
+        {
+            // Listen preserves its terminal bind-failure event contract.
+            if error.code() == tonic::Code::ResourceExhausted
+                || error.code() == tonic::Code::Unavailable
+            {
+                return Err(error);
+            }
+            let detail = protocol::decode_error_detail(error.details()).unwrap_or(ErrorDetail {
+                code: Some(ErrorCode::AgentUnavailable as i32),
+                retry_after: None,
+            });
+            let event = ListenEvent {
+                event: Some(Event::Failed(ListenerFailed {
+                    error: Some(detail),
+                })),
+            };
+            return Ok(Response::new(Box::pin(tokio_stream::iter([Ok(event)]))));
+        }
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
+}
+
+async fn wait_shutdown(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match shutdown {
+        Some(receiver) => {
+            while !*receiver.borrow() {
+                if receiver.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_cancelled(cancelled: &mut watch::Receiver<bool>) {
+    while !*cancelled.borrow() {
+        if cancelled.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn wait_owner_closed(owner: &ListenerOwner) {
+    match owner {
+        ListenerOwner::Stream(sender) => sender.closed().await,
+        ListenerOwner::Activation { .. } => std::future::pending().await,
+    }
+}
+
+fn parse_request(request: &ListenRequest) -> Result<(Token, Address), Status> {
+    let invalid = |message: String| {
+        forward_status(
+            tonic::Code::InvalidArgument,
+            ErrorCode::ForwardInvalid,
+            message,
+        )
+    };
+    let token =
+        Token::try_from(request.token.as_ref()).map_err(|error| invalid(error.to_string()))?;
+    let address = request
+        .listen
+        .parse::<Address>()
+        .map_err(|error| invalid(error.to_string()))?;
+    validate_request(&address, request.unix_mode)?;
+    Ok((token, address))
+}
+
+pub(crate) fn validate_activation_listeners(
+    registrations: &[ActivationListener],
+) -> Result<(), Status> {
+    if registrations.len() > MAX_LISTEN_STREAMS {
+        return Err(forward_status(
+            tonic::Code::ResourceExhausted,
+            ErrorCode::ForwardLimit,
+            "too many activation listeners",
+        ));
+    }
+    let mut names = HashSet::new();
+    let mut addresses = HashSet::new();
+    for registration in registrations {
+        if registration.name.is_empty()
+            || registration.name.len() > 128
+            || !names.insert(registration.name.as_str())
+        {
+            return Err(Status::invalid_argument(
+                "activation listener names must be unique and contain 1 through 128 bytes",
+            ));
+        }
+        let request = registration.registration.as_ref().ok_or_else(|| {
+            Status::invalid_argument("activation listener registration is required")
+        })?;
+        let (_, address) = parse_request(request)?;
+        // Port zero allocates distinct ephemeral bindings; fixed endpoints must
+        // be unique, including alternate textual spellings of the same address.
+        if !matches!(&address, Address::Tcp(address) if address.port() == 0)
+            && !addresses.insert(address.to_string())
+        {
+            return Err(Status::invalid_argument(
+                "activation listener addresses must be unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bind_status(error: io::Error) -> Status {
+    let code = match error.kind() {
+        io::ErrorKind::AddrInUse | io::ErrorKind::AlreadyExists => tonic::Code::AlreadyExists,
+        io::ErrorKind::PermissionDenied => tonic::Code::PermissionDenied,
+        _ => tonic::Code::Internal,
+    };
+    let detail = bind_error_detail(&error);
+    protocol::status_with_error(
+        code,
+        ErrorCode::try_from(detail.code.unwrap_or(ErrorCode::AgentUnavailable as i32))
+            .unwrap_or(ErrorCode::AgentUnavailable),
+        error.to_string(),
+        None,
+    )
 }
 
 fn validate_request(address: &Address, unix_mode: Option<u32>) -> Result<(), Status> {
@@ -183,12 +481,15 @@ async fn run_listener(
     _permit: OwnedSemaphorePermit,
     connection_capacity: Arc<Semaphore>,
     connector: Arc<dyn ReturnConnector>,
-    sender: tokio::sync::mpsc::Sender<Result<ListenEvent, Status>>,
-) {
+    mut control: ListenerControl,
+) -> io::Result<()> {
     let mut relays = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
-            _ = sender.closed() => break,
+            biased;
+            () = wait_shutdown(&mut control.shutdown) => break,
+            () = wait_cancelled(&mut control.cancelled) => break,
+            () = wait_owner_closed(&control.owner) => break,
             accepted = listener.accept() => match accepted {
                 Ok(mut client) => {
                     let permit = match Arc::clone(&connection_capacity).try_acquire_owned() {
@@ -217,6 +518,10 @@ async fn run_listener(
     }
     relays.abort_all();
     while relays.join_next().await.is_some() {}
+    if let ListenerOwner::Activation { name } = &control.owner {
+        tracing::debug!(%name, "activation-owned forward listener drained");
+    }
+    listener.close()
 }
 
 async fn relay_connection(
@@ -307,6 +612,19 @@ impl OwnedListener {
                 .map(|(stream, _)| Box::pin(stream) as BoxedStream),
         }
     }
+
+    fn close(self) -> io::Result<()> {
+        match self {
+            Self::Tcp { listener, .. } => {
+                drop(listener);
+                Ok(())
+            }
+            Self::Unix { listener, socket } => {
+                drop(listener);
+                socket.unlink()
+            }
+        }
+    }
 }
 
 struct OwnedUnixSocket {
@@ -330,21 +648,31 @@ impl OwnedUnixSocket {
             inode: metadata.ino(),
         })
     }
+
+    fn unlink(&self) -> io::Result<()> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            match fs::remove_file(&self.path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for OwnedUnixSocket {
     fn drop(&mut self) {
-        let matches = fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
-            metadata.file_type().is_socket()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
-        });
-        if matches {
-            if let Err(error) = fs::remove_file(&self.path) {
-                if error.kind() != io::ErrorKind::NotFound {
-                    tracing::debug!(path = %self.path.display(), %error, "failed to clean up forward Unix listener");
-                }
-            }
+        if let Err(error) = self.unlink() {
+            tracing::debug!(path = %self.path.display(), %error, "failed to clean up forward Unix listener");
         }
     }
 }
@@ -420,14 +748,41 @@ mod tests {
 
     use protocol::v1::guest_forward_service_server::GuestForwardService;
     use protocol::v1::listen_event::Event;
-    use protocol::v1::ListenRequest;
+    use protocol::v1::{ActivationListener, ListenRequest};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
     use tonic::{Code, Request};
 
     use crate::forward::listen::{
         BoxedStream, ConnectFuture, GuestForwardServiceImpl, ListenStream, ReturnConnector,
+        MAX_ACCEPTED_CONNECTIONS, MAX_LISTEN_STREAMS,
     };
+
+    // This connector uses a real local return-port socket, exercising the same
+    // CONNECT authorization and relay implementation as the vsock transport.
+    struct TcpReturnConnector(std::net::SocketAddr);
+
+    impl ReturnConnector for TcpReturnConnector {
+        fn connect(&self) -> ConnectFuture {
+            let address = self.0;
+            Box::pin(async move {
+                tokio::net::TcpStream::connect(address)
+                    .await
+                    .map(|stream| Box::pin(stream) as BoxedStream)
+            })
+        }
+    }
+
+    fn activation_listener(name: &str, path: &std::path::Path, token: u8) -> ActivationListener {
+        ActivationListener {
+            name: name.to_string(),
+            registration: Some(request(
+                format!("unix:{}", path.display()),
+                [token; 16],
+                None,
+            )),
+        }
+    }
 
     struct TestConnector {
         streams: Mutex<VecDeque<BoxedStream>>,
@@ -471,6 +826,47 @@ mod tests {
             Event::Bound(bound) => bound.address,
             Event::Failed(_) => panic!("listener unexpectedly failed"),
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_actual_unix_listener_and_unlinks_before_writer_drain() {
+        use futures::StreamExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("forward.sock");
+        let supervisor = crate::pid1::ProcessSupervisor::default();
+        let service = GuestForwardServiceImpl::new(
+            supervisor.clone(),
+            crate::lifecycle::RuntimeContext::for_tests(),
+        );
+        let mut stream = service
+            .listen(Request::new(request(
+                format!("unix:{}", path.display()),
+                [7; 16],
+                None,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        let _ = bound_address(&mut stream).await;
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        supervisor.begin_writer_shutdown().unwrap();
+        supervisor.wait_internal_writers().await.unwrap();
+        assert!(!path.exists());
+        let mut byte = [0];
+        let eof = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(matches!(eof, Ok(0) | Err(_)));
+        assert!(service
+            .listen(Request::new(request(
+                format!("unix:{}", path.display()),
+                [8; 16],
+                None,
+            )))
+            .await
+            .is_err());
+        // The host's listen stream was deliberately not dropped to cause drain.
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
@@ -604,7 +1000,10 @@ mod tests {
         let path = directory.path().join("live.sock");
         let _original = UnixListener::bind(&path).unwrap();
         let metadata = fs::symlink_metadata(&path).unwrap();
-        let service = GuestForwardServiceImpl::new();
+        let service = GuestForwardServiceImpl::new(
+            crate::pid1::ProcessSupervisor::default(),
+            crate::lifecycle::RuntimeContext::for_tests(),
+        );
         let mut stream = service
             .listen(Request::new(request(
                 format!("unix:{}", path.display()),
@@ -754,5 +1153,248 @@ mod tests {
         assert!(matches!(event.event, Some(Event::Failed(_))));
         assert!(stream.next().await.is_none());
         assert_eq!(fs::read(path).expect("regular file remains"), b"keep");
+    }
+
+    #[tokio::test]
+    async fn activation_drains_inherited_stream_and_relays_before_named_rebind() {
+        use futures::StreamExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("machine.sock");
+        let return_port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service = GuestForwardServiceImpl::with_connector(Arc::new(TcpReturnConnector(
+            return_port.local_addr().unwrap(),
+        )));
+        let mut inherited = service
+            .listen(Request::new(request(
+                format!("unix:{}", path.display()),
+                [1; 16],
+                None,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        bound_address(&mut inherited).await;
+        let mut old_client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (mut old_return, _) = return_port.accept().await.unwrap();
+        assert_eq!(
+            forward_spec::io::read_line(&mut old_return, 512)
+                .await
+                .unwrap(),
+            b"CONNECT 01010101010101010101010101010101\n",
+        );
+        old_return.write_all(b"OK\n").await.unwrap();
+        old_client.write_all(b"old").await.unwrap();
+        let mut payload = [0; 3];
+        old_return.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"old");
+
+        service.reset_for_activation().await.unwrap();
+        assert!(!path.exists());
+        assert!(inherited.next().await.is_none());
+        let mut byte = [0];
+        assert_eq!(old_client.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(old_return.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(
+            service.connection_capacity.available_permits(),
+            MAX_ACCEPTED_CONNECTIONS
+        );
+        assert_eq!(
+            service.listen_capacity.available_permits(),
+            MAX_LISTEN_STREAMS
+        );
+
+        let bounds = service
+            .register_activation(&[activation_listener("machine", &path, 2)])
+            .await
+            .unwrap();
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].name, "machine");
+        assert_eq!(
+            bounds[0].bound.as_ref().unwrap().address,
+            format!("unix:{}", path.display()),
+        );
+        // No Listen response stream owns this destination listener.
+        let mut new_client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (mut new_return, _) = return_port.accept().await.unwrap();
+        assert_eq!(
+            forward_spec::io::read_line(&mut new_return, 512)
+                .await
+                .unwrap(),
+            b"CONNECT 02020202020202020202020202020202\n",
+        );
+        new_return.write_all(b"OK\n").await.unwrap();
+        new_client.write_all(b"new").await.unwrap();
+        new_return.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"new");
+        service.reset_for_activation().await.unwrap();
+        assert!(!path.exists());
+        assert_eq!(new_client.read(&mut byte).await.unwrap(), 0);
+        service.reset_for_activation().await.unwrap();
+        assert!(service.register_activation(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn activation_bind_failure_drains_partial_bindings_and_preserves_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.sock");
+        let conflict = root.path().join("conflict.sock");
+        let occupied = UnixListener::bind(&conflict).unwrap();
+        let metadata = fs::symlink_metadata(&conflict).unwrap();
+        let service = GuestForwardServiceImpl::new(
+            crate::pid1::ProcessSupervisor::default(),
+            crate::lifecycle::RuntimeContext::for_tests(),
+        );
+        let error = service
+            .register_activation(&[
+                activation_listener("first", &first, 3),
+                activation_listener("conflict", &conflict, 4),
+            ])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::AlreadyExists);
+        assert_eq!(
+            protocol::decode_error_detail(error.details()).unwrap().code,
+            Some(protocol::v1::ErrorCode::ForwardAddressInUse as i32),
+        );
+        assert!(!first.exists());
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::symlink_metadata(&conflict).unwrap().ino(),
+            metadata.ino()
+        );
+        assert_eq!(
+            service.listen_capacity.available_permits(),
+            MAX_LISTEN_STREAMS
+        );
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn activation_validation_rejects_invalid_registration_before_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("never-bound.sock");
+        let valid = activation_listener("one", &path, 5);
+        let mut bad_token = valid.clone();
+        bad_token.registration.as_mut().unwrap().token = vec![1; 15].into();
+        let service = GuestForwardServiceImpl::new(
+            crate::pid1::ProcessSupervisor::default(),
+            crate::lifecycle::RuntimeContext::for_tests(),
+        );
+        for registrations in [
+            vec![valid.clone(), valid.clone()],
+            vec![ActivationListener {
+                name: String::new(),
+                ..valid.clone()
+            }],
+            vec![ActivationListener {
+                name: "x".repeat(129),
+                ..valid.clone()
+            }],
+            vec![ActivationListener {
+                name: "missing".to_string(),
+                registration: None,
+            }],
+            vec![bad_token],
+            vec![
+                valid.clone(),
+                ActivationListener {
+                    name: "two".to_string(),
+                    ..valid
+                },
+            ],
+        ] {
+            assert_eq!(
+                service
+                    .register_activation(&registrations)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument,
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_reset_drains_real_incoming_dialer_connection() {
+        let service = GuestForwardServiceImpl::new(
+            crate::pid1::ProcessSupervisor::default(),
+            crate::lifecycle::RuntimeContext::for_tests(),
+        );
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, incoming) = tokio::net::UnixStream::pair().unwrap();
+        let forwards = service.clone();
+        let task = tokio::spawn(async move { forwards.handle_dialer(incoming).await });
+        client
+            .write_all(format!("CONNECT tcp:{}\n", target.local_addr().unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let (mut target_stream, _) = target.accept().await.unwrap();
+        assert_eq!(
+            forward_spec::io::read_line(&mut client, 512).await.unwrap(),
+            b"OK\n"
+        );
+        client.write_all(b"payload").await.unwrap();
+        let mut payload = [0; 7];
+        target_stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"payload");
+        service.reset_for_activation().await.unwrap();
+        task.await.unwrap().unwrap();
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(target_stream.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(
+            service.connection_capacity.available_permits(),
+            MAX_ACCEPTED_CONNECTIONS
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_activation_owned_named_listener_without_stream_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("machine.sock");
+        let supervisor = crate::pid1::ProcessSupervisor::default();
+        let service = GuestForwardServiceImpl::new(
+            supervisor.clone(),
+            crate::lifecycle::RuntimeContext::for_tests(),
+        );
+        service
+            .register_activation(&[activation_listener("machine", &path, 6)])
+            .await
+            .unwrap();
+        assert!(path.exists());
+        supervisor.begin_writer_shutdown().unwrap();
+        supervisor.wait_internal_writers().await.unwrap();
+        assert!(!path.exists());
+        service.reset_for_activation().await.unwrap();
+        assert!(service
+            .register_activation(&[activation_listener("machine", &path, 7)])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn activation_listener_lifetime_follows_last_shared_registry_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("machine.sock");
+        let service = GuestForwardServiceImpl::new(
+            crate::pid1::ProcessSupervisor::default(),
+            crate::lifecycle::RuntimeContext::for_tests(),
+        );
+        service
+            .register_activation(&[activation_listener("machine", &path, 8)])
+            .await
+            .unwrap();
+        let retained = service.clone();
+        drop(service);
+        assert!(path.exists());
+        drop(retained);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

@@ -84,17 +84,59 @@ The guest OS believes it is running on real hardware, even though a VMM and host
 
 In user-facing Silo documentation, use "VM" when referring to an instance created, started, stopped, or deleted by Silo.
 
-For `silo create` and `silo run`, the positional operand is an image source. A
-bare value is an OCI reference; `disk:PATH` selects an existing local disk.
-Templates are selected separately with `--template` and can supply the image
-when no positional source is given.
+For `silo create` and `silo run`, the positional operand is an image source.
+`disk:PATH` selects an existing local disk. Templates are selected separately
+with `--template` and can supply the image when no positional source is given.
 
 Examples:
 
 - `silo create ubuntu:24.04 --name dev`
 - `silo create --template rust-dev --name dev`
 - `silo start dev`
+- `silo hibernate dev`
 - `silo stop dev`
+
+## Images and Snapshots
+
+Images and snapshots are separate concepts with separate commands. They share
+one storage pool.
+
+| Term | Meaning |
+|---|---|
+| Image | A template for new machines: root disk, boot profile and default process. Hardware and config are chosen at `create`. Kinds: cached OCI image (layered EROFS lower) and stored raw image (import, convert, pulled image artifact). Managed with `silo image`. |
+| Snapshot | A saved machine: disks plus full machine configuration. `silo restore` gives back that machine. Managed with `silo snapshot`. |
+| Snapshot memory | `none`: restore gives a stopped VM that boots normally. `included`: also RAM, CPU and device state; restore resumes a running VM. Set with `silo snapshot create --memory`. |
+| Name | A tag pointing to exactly one image or one snapshot. A record has zero or more names. Images and snapshots have separate name tables, so an image `hello` and a snapshot `hello` can coexist. |
+| Id | Content identity `sha256:HEX`. Can be abbreviated to a unique hex prefix of at least 3 characters. |
+
+Use "snapshot" for the saved machine whether or not it includes memory. Do not
+use "checkpoint", "live snapshot" or "stopped snapshot" as names. In
+`silo fork --live`, "live" describes the operation.
+
+### Short and Full References
+
+A local name cannot contain `:` or `/`. A reference containing either is always
+a registry reference: `hello:v2`, `nixos/nix` and `ghcr.io/org/app:1` are
+remote. A full reference names the registry, for example
+`docker.io/library/alpine:3.21`. A short reference such as `alpine:3.21` is
+expanded through each entry of `search_registries` (default `docker.io`).
+
+`create` and `run` expect an image; `restore` expects a snapshot. Each resolves
+in this order:
+
+1. Exact local name of the expected kind.
+2. Each `search_registries` expansion, in order, already stored locally.
+3. Pull, following `--pull always|missing|never` (default `missing`).
+4. Unique id prefix of the expected kind.
+
+A local name shadows a registry short name. When a name exists only as the
+other kind, the error names the right command. There is no `image:` prefix.
+
+Pulling `REF` adds the name `REF`. When `--pull always` moves a tag, the name
+moves to the new record and the old record stays listed by id. `rm NAME`
+removes the name, and the record goes with its last name; `rm ID` removes the
+record and all its names; `silo image prune` removes images with no names that
+no machine uses. Removing a record never breaks a machine.
 
 ## Hypervisor
 
@@ -221,12 +263,16 @@ flowchart TD
 
 A virtualization backend is the concrete host implementation Silo uses to run a VM.
 
-Current Silo runtime backend selection is internal and host-driven:
+Current Silo runtime backend selection defaults to libkrun on both Linux and
+macOS. Virtualization.framework (`vz`) is an explicit macOS runtime selection:
 
-- macOS uses Apple Virtualization.framework through `vz`
-- Linux uses libkrun/krun through `krun`
+- `krun` supports layered EROFS OCI roots and admitted opaque raw roots.
+- `vz` supports raw roots only. OCI users must explicitly convert with
+  `silo image convert REF --disk-format raw` before creating a machine.
 
-Users do not select a backend in `VmSpec`. `VmSpec` describes the VM, while Silo chooses the host implementation at compile time.
+Users do not select a backend in `VmSpec`. `VmSpec` describes the VM; runtime
+configuration selects the backend, and root/backend admission rejects unsupported
+combinations rather than silently flattening or changing the root family.
 
 In Silo, "backend" is a practical project term. It names the concrete implementation path selected by host platform; it is not meant to replace the more precise ecosystem terms VMM, hypervisor, VM, or KVM.
 
@@ -277,7 +323,7 @@ The **supervisor process** is the lifecycle-owning part of `silo-vmm`. With libk
 
 `virt` is Silo's host virtualization facade, a module inside `silo-vmm`.
 
-It exposes the common Rust API that `silo-vmm` uses to create, start, stop, and communicate with a VM. Each machine runs on one backend driver (`krun` or `vz`); the default is selected per host platform.
+It exposes the common Rust API that `silo-vmm` uses to create, start, stop, and communicate with a VM. Each machine runs on one backend driver (`krun` or `vz`); the runtime defaults to libkrun on both host platforms.
 
 The exported `VirtualMachine` type is Silo's per-instance VM handle. It is not the guest OS and it is not the underlying VMM implementation. It is the API handle used by Silo code to control one VM.
 
@@ -298,6 +344,22 @@ It supervises one running VM, exposes monitor and control APIs, tracks lifecycle
 It owns product-level lifecycle semantics, persisted state, image handling, launch flow, and interaction with `silo-vmm`.
 
 Its role is similar in spirit to how libpod sits above lower-level container runtime pieces.
+
+### Lobby
+
+The lobby is the optional tailnet VM-management service inside silod, implemented
+in Rust under `app/cli/lib/lobby/`. It owns SSH commands, authorization, jobs,
+documents, consent and HTTP handling, and calls management functions and libvm
+in process. Enable it with `silo daemon up --tailscale`. Its private state is
+`<Home>/lobby/`. See the [operator guide](lobby/operator.md).
+
+### `tsgate`
+
+`tsgate` is silod's same-user, pure-Go tailnet transport child. It owns the
+lobby's tsnet node, enrollment, TCP 22, TLS termination on TCP 443 and stream
+forwarding to silod over a private inherited Unix socket. It does not manage
+VMs. Its node state is `<Home>/tsgate/`; netd separately owns each VM's node.
+See [ADR 0022](adr/0022-lobby-in-silod-and-tsgate.md).
 
 ### Guest Agent
 

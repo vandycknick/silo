@@ -27,17 +27,14 @@ image/policy operations. Rust adapters in `common/vm-control` preserve native
 snapshots, run identities, errors, byte-valued host paths and absent-versus-empty
 updates. Local creation uses the same normalized builder application.
 
-Committed Go clients live in `specs/protocol/go`; regenerate with
-`make protocol-go` and verify drift with `make protocol-go-check`. Both commands
-use pinned Go generators and vendored protoc. Guest execution and secret reads
-are deliberately absent from this management protocol. Session transport stays
-in libvm and its SDK bindings.
+Guest execution and secret reads are deliberately absent from this management
+protocol. Session transport stays in libvm.
 
 The foreground daemon serves management on
 `<HostPaths::run_root()>/silod/control.sock`, with a private 0700 directory,
 0600 socket, same-UID peer admission, and one active daemon per UID. Core status
 does not open the VM store. Ordinary runtime initialization is lazy and retryable;
-its exact six-component selection is shared with native SDK sessions.
+its exact six-component selection is shared with native libvm sessions.
 
 Accepted native mutations remain tracked after a client disconnects. Admission
 is bounded to 64 active mutations; shutdown seals admission and drains actual
@@ -76,6 +73,12 @@ dispatch, so the daemon's working directory cannot change their meaning.
   provisioning, supervision and image upgrades. Appliance networking remains
   separate from ordinary VM networking.
 
+Appliance startup runs on the normal bounded Tokio worker stack. Its large
+provisioning, upgrade-recovery and cold-start futures are heap-pinned at their
+startup boundaries so nested inspection and RPC decoding do not exhaust that
+stack. They remain owned by the same startup attempt; shutdown cancellation
+and retry deadlines are unchanged.
+
 `silo daemon run` has no further subcommands: running it starts the foreground
 daemon. The CLI registers the native service without copying default-filled
 configuration into arguments. The service reads configuration on every launch
@@ -86,14 +89,18 @@ in-process, so invalid configuration does not replace the service.
 overrides without persisting feature choices.
 Every `--system-*` argument configures the system appliance, not defaults for
 ordinary VMs. The daemon implements the local management API through libvm;
-guest execution remains a direct libvm/SDK session, not a daemon stream relay.
+guest execution remains a direct libvm session, not a daemon stream relay.
 
-`make build` produces the CLI, taild and native bridge together. Portable
-installations keep them in `bin/`; macOS bundles keep `silo` in
-`Contents/MacOS/` and place taild and the bridge under `Contents/Helpers/`.
+`make build` produces the CLI and runtime assets together. Portable installations
+keep `silo` in `bin/`; macOS bundles keep it in `Contents/MacOS/`.
 The service definition points at the `silo` executable that registered it.
 Rebuilding alone does not replace a running process; `silo daemon up` restarts
 the service when its definition changed.
+
+Linux service executable paths may contain spaces, dollar signs and percent
+signs; quotes, backslashes and control characters are rejected before installing
+an invalid unit. Executable and argument escaping differ under
+[systemd command-line rules](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Command%20Lines).
 
 ## Prerequisites
 
@@ -186,6 +193,14 @@ VMs the daemon creates carry the `io.silo.system.role=system` and
 `io.silo.system.installation` labels so they can be tracked. Ordinary `silo`
 commands (`stop`, `rm`, `set`, ...) work on them like on any other VM.
 
+On startup retries and daemon adoption, host-side data-disk validation reads only
+the backing-file size and primary ext4 superblock identity/geometry. The appliance
+may already have the data filesystem mounted, so its namespace is not safe for a
+host reader. Guest activation validates the mounted UUID, layout marker and engine
+directories before Docker starts. Fresh-image and offline upgrade validation still
+use the strict ext4 namespace reader, which refuses filesystems requiring recovery.
+The host never replays the data filesystem's journal.
+
 Global `networking.drivers.netd` settings apply only to direct CLI/libvm operations,
 not the system appliance. Its networking uses the runtime defaults plus the
 explicit system publication setting.
@@ -196,16 +211,20 @@ guest has touched, so a busy engine's host footprint can grow toward `memory`
 while idle.
 
 Memory reclamation is automatic, with no daemon policy knobs. silo-vmm enables a
-balloon; libkrun advertises free-page reporting only when the backend supports
-it and its qualification succeeds. Otherwise the basic balloon remains.
-`HostMemoryRemapper` maintains compatible private RAM mappings independently of
-the balloon and its reporting capability.
+balloon; libkrun selects reporting according to backend support and, on HVF,
+qualification. Capture-tracked boot RAM and restored file-private RAM inhibit
+destructive reclaim and the HVF periodic remapper. Negotiated reporting can
+still complete without discarding backing; that is not discard qualification.
 
 The managed agent's `GuestCacheReclaimer` detects negotiated reporting and
 writable cgroup v2 reclaim interfaces. After two idle minutes it requests
 bounded file-cache reclaim, with no global cache-drop fallback. Unsupported
 guests retain their cache. `daemon status` reports the last guest reclaim run
-and host qualification/cumulative advised bytes, not current physical savings.
+and actual host backing, inhibition reason, qualification and cumulative advised
+bytes, not current physical savings. Native fields remain absent before the
+first report. Tracked/restored RAM reports reclaim ineffective with qualification
+`not-run`; ordinary untracked Linux RAM can reclaim with `not-run` because it
+does not use the HVF qualification probe.
 
 Remove the retired `memory-reclaim`, `memory-reclaim-after`, and
 `host-memory-reclaim` YAML keys when upgrading. See
@@ -376,8 +395,8 @@ and guest/host memory-reclaim observations. A system retry does not change a
 working core API into a failed daemon.
 
 
-`--format json` returns the view with the schema-2 record under `daemon`.
-`daemon.core` is independent of optional `daemon.system` and `daemon.tailscale`.
+`--format json` returns the view with the schema-1 record under `daemon`.
+`daemon.core` is independent of optional `daemon.system` and `daemon.lobby`.
 One publisher merges component updates for the status file and gRPC API.
 
 The appliance ships no OpenSSH server. `silo shell silo-system` and
@@ -466,37 +485,21 @@ Common failures are actionable:
 - No root daemon, global socket takeover, automatic host-tool installation or
   Kubernetes service is included. Management RPC is private and same-user only.
   Image upgrades are automatic; there is no switch to pin the running image yet.
-## Optional tailnet helper
 
-`silo daemon up --tailscale` enables the same-user `taild` child. It is not a
-remote host-login interface. The existing user service owns the daemon, and the daemon owns
-the helper through a private bootstrap/lifetime pipe. Core readiness remains
-independent of tailnet enrollment and reports pending authentication separately.
+## Tailscale lobby
 
-The helper uses normal Silo Home/config paths and exact manager-selected native
-assets. Its stable identity, pins and audit remain under `<Home>/taild`; optional
-frontend credentials come from plain Home-scope secrets. See the
-[operator guide](taild/operator.md) for setup and authorization.
+Enable the optional lobby with `silo daemon up --tailscale`, or add
+`--system=false` to run it without the system appliance. The Rust lobby runs
+inside silod and manages owned VMs through libvm; silod supervises the pure-Go
+`tsgate` child for tailnet SSH transport and HTTPS termination.
 
-Helper crashes get bounded restart backoff. Normal daemon termination drains and
-reaps the helper; owner-pipe EOF after an unexpected parent death cancels it
-within five seconds. Neither event stops VMs. `KillMode=process` preserves VM
-descendants while the daemon explicitly owns helper cleanup.
+Core readiness does not imply lobby readiness. `silo daemon status` reports the
+lobby DNS name, pending approval URL and gateway restart state separately.
+Gateway restarts drop lobby connections without stopping VMs; ordinary daemon
+stop/restart is not a VM-stop request. No host-shutdown protection is provided.
 
-Linux `ExecStop` uses `silo daemon run --host-shutdown`, not a VM-stop request on ordinary
-service termination. The adjacent shutdown-only helper authorizes stops only
-after real `systemctl` state is `stopping`, existing ownership is read and the
-helper lease is held. A live manager remains authoritative; proven absence
-permits a temporary, doubly locked API restricted to inspection, draining and
-run-fenced stops. No SDK/bridge/assets or frontend enrollment are required.
-Actual native drain and a fresh final inventory protect against late creations.
-macOS reports shutdown protection as unsupported.
+- [Operator guide](lobby/operator.md): configuration, credentials, enrollment,
+  state, limits and restart behavior.
+- [User reference](lobby/user.md): SSH usage, commands, file transfer and JSON.
+- [Tailnet policy](lobby/tailnet-policy.md): tags, application grants and ACLs.
 
-Linux service executable paths may contain spaces, dollar signs and percent
-signs; quotes, backslashes and control characters are rejected before installing
-an invalid unit. Executable and argument escaping differ under
-[systemd command-line rules](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Command%20Lines).
-
-Real logind/systemd survival, live tailnet authentication, native macOS/HVF and
-soak qualification require their corresponding hosts/credentials; Linux fixture
-results do not establish those gates.

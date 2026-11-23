@@ -46,7 +46,7 @@ impl From<LogStream> for MachineLogSource {
 
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let (_name, machine) = context.machine(self.name.as_deref()).await?;
+        let (_name, machine) = context.observation_machine(self.name.as_deref()).await?;
         let mut logs = machine
             .logs(
                 self.stream.into(),

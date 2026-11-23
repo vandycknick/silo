@@ -190,8 +190,8 @@ func TestManagedIdentityMetadata(t *testing.T) {
 	if v, err := ParseIdentity(nil); err != nil || v != nil {
 		t.Fatal(v, err)
 	}
-	v, err := ParseIdentity(map[string]any{IdentityMetadata: `{"owner":"user:7","tailnet":"a","suffix":"b"}`})
-	if err != nil || v.Owner != "user:7" {
+	v, err := ParseIdentity(map[string]any{"io.silo.lobby.node": `{"owner":"user:7","tailnet":"a","suffix":"b"}`})
+	if err != nil || v == nil || v.Owner != "user:7" {
 		t.Fatal(v, err)
 	}
 }

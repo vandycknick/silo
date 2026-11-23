@@ -1,6 +1,7 @@
 use crate::errors::{native_error_to_status, status_to_native_error};
 use crate::snapshots::{snapshot_from_wire, snapshot_to_wire};
 use crate::*;
+use libvm::ObjectDigest;
 use silod_spec::daemon::v1 as w;
 use std::collections::BTreeMap;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -116,7 +117,7 @@ fn invalid_required_values_fail_without_echoing_inputs() {
 }
 fn snapshot() -> libvm::MachineData {
     let spec = spec::spec_from_wire(w::VmSpec {
-        spec_version: "1.0.0".into(),
+        spec_version: "0.2.0".into(),
         ..Default::default()
     })
     .unwrap();
@@ -188,6 +189,20 @@ fn inventory_retains_unreadable_identity_and_all_lifecycle_states() {
             message: None,
         },
         libvm::MachineStatus::Stopping { message: None },
+        libvm::MachineStatus::Pausing { message: None },
+        libvm::MachineStatus::Paused {
+            message: Some("user-owned".into()),
+        },
+        libvm::MachineStatus::Capturing { message: None },
+        libvm::MachineStatus::Hibernating {
+            message: Some("saving".into()),
+        },
+        libvm::MachineStatus::Hibernated {
+            message: Some("saved".into()),
+        },
+        libvm::MachineStatus::Restoring { message: None },
+        libvm::MachineStatus::Activating { message: None },
+        libvm::MachineStatus::ActivationFailed { message: None },
         libvm::MachineStatus::Error {
             message: Some("failed".into()),
         },
@@ -265,8 +280,20 @@ fn image_progress_preserves_layer_accounting_and_absence() {
         libvm::ImageProgress::ResolvedManifest {
             image_ref: "image".into(),
             manifest_digest: "sha256:abc".into(),
-            layer_count: 3,
-            total_download_bytes: None,
+            layers: vec![
+                libvm::ImageProgressLayer {
+                    digest: ObjectDigest::of_bytes(b"first"),
+                    size_bytes: 123,
+                },
+                libvm::ImageProgressLayer {
+                    digest: ObjectDigest::of_bytes(b"second"),
+                    size_bytes: 456,
+                },
+                libvm::ImageProgressLayer {
+                    digest: ObjectDigest::of_bytes(b"first"),
+                    size_bytes: 123,
+                },
+            ],
         },
         libvm::ImageProgress::LayerDownloadProgress {
             index: 2,
@@ -289,6 +316,21 @@ fn image_progress_preserves_layer_accounting_and_absence() {
         );
     }
     assert!(images::progress_from_wire(w::ImageProgress::default()).is_err());
+    for digest in ["", "sha256:abc", "sha256:🌳", "other:abc"] {
+        let event = w::ImageProgress {
+            event: Some(w::image_progress::Event::ResolvedManifest(
+                w::ManifestProgress {
+                    image_ref: "image".into(),
+                    manifest_digest: "manifest".into(),
+                    layers: vec![w::ManifestLayerProgress {
+                        digest: digest.into(),
+                        size_bytes: 0,
+                    }],
+                },
+            )),
+        };
+        assert!(images::progress_from_wire(event).is_err());
+    }
 }
 #[test]
 fn canonical_policy_retains_explicit_deny_and_secret_metadata() {
@@ -440,10 +482,10 @@ fn readiness_preserves_each_outcome_and_reason() {
                 outcome,
                 status: libvm::MachineMonitorStatus {
                     machine_id: "12345678-1234-4234-8234-123456789abc".into(),
-                    run_id: None,
+                    run_id: Some("22345678-1234-4234-8234-123456789abc".parse().unwrap()),
                     name: "test".into(),
                     monitor: libvm::MachineMonitorSnapshot {
-                        instance_id: "monitor".into(),
+                        instance_id: "32345678-1234-4234-8234-123456789abc".into(),
                         observed_at: now,
                     },
                     vm: libvm::MachineVmSnapshot {
@@ -458,6 +500,21 @@ fn readiness_preserves_each_outcome_and_reason() {
                         reason,
                     },
                     agent: libvm::MachineAgentStatus::Disabled,
+                    lifecycle: Default::default(),
+                    live: vm_spec::live::LiveMachineReport {
+                        schema_version: 1,
+                        scope: vm_spec::live::LiveScope::Machine,
+                        machine_id: "12345678-1234-4234-8234-123456789abc".into(),
+                        run_id: "22345678-1234-4234-8234-123456789abc".into(),
+                        monitor_id: "32345678-1234-4234-8234-123456789abc".into(),
+                        backend: vm_spec::live::LiveBackend::Mock,
+                        lane: vm_spec::live::LiveLane::NotApplicable,
+                        topology_revision: 1,
+                        live: vm_spec::live::LiveCapabilityVector::all_unsupported(
+                            vm_spec::live::LiveReasonCode::BackendExcluded,
+                        ),
+                        same_machine_activation: false,
+                    },
                 },
             };
             let decoded =
@@ -466,6 +523,10 @@ fn readiness_preserves_each_outcome_and_reason() {
             assert_eq!(decoded, native);
             assert_eq!(decoded.status.monitor.observed_at, now);
             assert_eq!(decoded.status.readiness.reason, reason);
+            let mut noncanonical_monitor = readiness::readiness_to_wire(&native).unwrap();
+            noncanonical_monitor.status.as_mut().unwrap().machine_id =
+                "12345678123442348234123456789abc".into();
+            assert!(readiness::readiness_from_wire(noncanonical_monitor).is_err());
         }
     }
     assert!(readiness::readiness_from_wire(w::MachineReadiness {
@@ -486,7 +547,7 @@ fn immutable_image_verification_ignores_cache_warming_but_not_identity() {
         pull_policy: 3,
     };
     let selection = images::identity_from_wire(identity.clone()).unwrap();
-    assert_eq!(selection.pull_policy, libvm::ImagePullPolicy::Never);
+    assert_eq!(selection.pull_policy, libvm::PullPolicy::Never);
     assert_eq!(selection.platform.variant.as_deref(), Some("v8"));
     let metadata = libvm::OciImageConfigMetadata::default();
     for cache_state in [1, 2] {
@@ -521,16 +582,7 @@ fn immutable_image_verification_ignores_cache_warming_but_not_identity() {
 }
 
 #[test]
-fn bootstrap_and_secret_debug_never_include_values() {
-    let bootstrap = w::HelperBootstrap {
-        client_secret: Some(b"never-show-this".to_vec()),
-        oauth_app_secret: Some(b"never-show-this".to_vec()),
-        api_token: Some(b"never-show-this".to_vec()),
-        ..Default::default()
-    };
-    assert!(!format!("{bootstrap:?}").contains("never-show-this"));
-    assert!(format!("{bootstrap:?}").contains("<redacted>"));
-    assert!(!format!("{bootstrap:?}").contains(&format!("{:?}", b"never-show-this".to_vec())));
+fn secret_debug_never_includes_values() {
     let request = w::SetMachineSecretRequest {
         id: "12345678-1234-4234-8234-123456789abc".into(),
         name: "tailscale.vm.auth_key".into(),
@@ -575,6 +627,7 @@ fn references_use_native_id_name_and_prefix_semantics() {
     for (text, kind) in [
         ("ab", 2),
         ("a1b2c3", 3),
+        ("DeF", 3),
         ("12345678-1234-4234-8234-123456789abc", 1),
         ("Legacy_name", 2),
     ] {
@@ -588,10 +641,20 @@ fn references_use_native_id_name_and_prefix_semantics() {
         ));
         assert_eq!(lifecycle::reference_from_wire(wire).unwrap(), native);
     }
-    assert!(lifecycle::reference_from_wire(w::MachineRef {
-        reference: Some(w::machine_ref::Reference::Name("a1b2c3".into()))
-    })
-    .is_err());
+    let exact = libvm::MachineRef::parse_exact("a1b2c3").unwrap();
+    let wire = lifecycle::reference_to_wire(&exact).unwrap();
+    assert!(matches!(
+        &wire.reference,
+        Some(w::machine_ref::Reference::Name(name)) if name == "a1b2c3"
+    ));
+    assert_eq!(lifecycle::reference_from_wire(wire).unwrap(), exact);
+    let mixed_case = libvm::MachineRef::parse("DeF").unwrap();
+    let wire = lifecycle::reference_to_wire(&mixed_case).unwrap();
+    assert!(matches!(
+        &wire.reference,
+        Some(w::machine_ref::Reference::IdPrefix(name)) if name == "DeF"
+    ));
+    assert_eq!(lifecycle::reference_from_wire(wire).unwrap(), mixed_case);
     assert!(lifecycle::reference_from_wire(w::MachineRef {
         reference: Some(w::machine_ref::Reference::IdPrefix("ab".into()))
     })
@@ -610,4 +673,321 @@ fn conflicting_rich_status_code_does_not_reconstruct_a_native_error() {
         status.details().to_vec().into(),
     );
     assert!(status_to_native_error(&contradictory).is_err());
+}
+
+#[test]
+fn snapshot_requires_explicit_run_prospective_or_unavailable_evidence() {
+    let input = snapshot();
+    let mut wire = snapshot_to_wire(&input).unwrap();
+    assert_eq!(wire.live_evidence, Some(3));
+    assert!(snapshot_from_wire(wire.clone()).is_ok());
+    wire.live_evidence = None;
+    assert!(snapshot_from_wire(wire.clone()).is_err());
+    wire.live_evidence = Some(1);
+    assert!(snapshot_from_wire(wire.clone()).is_err());
+    wire.live_evidence = Some(99);
+    assert!(snapshot_from_wire(wire).is_err());
+}
+
+#[test]
+fn snapshot_carries_storage_stop_outcome_and_refuses_unknown_values() {
+    let mut data = snapshot();
+    let wire = snapshot_to_wire(&data).unwrap();
+    assert_eq!(wire.storage_stop_outcome, None);
+    assert_eq!(snapshot_from_wire(wire).unwrap().storage_stop_outcome, None);
+    for (outcome, expected) in [
+        (
+            libvm::StorageStopOutcome::Clean,
+            w::StorageStopOutcome::Clean,
+        ),
+        (
+            libvm::StorageStopOutcome::Forced,
+            w::StorageStopOutcome::Forced,
+        ),
+        (
+            libvm::StorageStopOutcome::Unknown,
+            w::StorageStopOutcome::Unknown,
+        ),
+    ] {
+        data.storage_stop_outcome = Some(outcome);
+        let wire = snapshot_to_wire(&data).unwrap();
+        assert_eq!(wire.storage_stop_outcome, Some(expected as i32));
+        assert_eq!(
+            snapshot_from_wire(wire).unwrap().storage_stop_outcome,
+            Some(outcome)
+        );
+    }
+    let mut wire = snapshot_to_wire(&data).unwrap();
+    for invalid in [w::StorageStopOutcome::Unspecified as i32, 4, -1] {
+        wire.storage_stop_outcome = Some(invalid);
+        assert!(snapshot_from_wire(wire.clone()).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn snapshot_matches_compact_durable_machine_id_to_canonical_live_uuid() {
+    use vm_spec::live::*;
+    let mut data = snapshot();
+    data.id = "12345678123442348234123456789abc".into();
+    data.run_id = Some("22345678-1234-4234-8234-123456789abc".parse().unwrap());
+    data.live = Some(LiveMachineReport {
+        schema_version: 1,
+        scope: LiveScope::Machine,
+        machine_id: "12345678-1234-4234-8234-123456789abc".into(),
+        run_id: "22345678-1234-4234-8234-123456789abc".into(),
+        monitor_id: "32345678-1234-4234-8234-123456789abc".into(),
+        backend: LiveBackend::Mock,
+        lane: LiveLane::NotApplicable,
+        topology_revision: 1,
+        live: LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded),
+        same_machine_activation: false,
+    });
+    let wire = snapshot_to_wire(&data).unwrap();
+    let decoded = snapshot_from_wire(wire.clone()).unwrap();
+    assert_eq!(decoded.id, data.id);
+    assert_eq!(decoded.live, data.live);
+    let mut wrong_machine = wire.clone();
+    wrong_machine.live.as_mut().unwrap().machine_id =
+        Some("42345678-1234-4234-8234-123456789abc".into());
+    assert!(snapshot_from_wire(wrong_machine).is_err());
+    let mut wrong_run = wire.clone();
+    wrong_run.live.as_mut().unwrap().run_id = Some("52345678-1234-4234-8234-123456789abc".into());
+    assert!(snapshot_from_wire(wrong_run).is_err());
+    let mut noncanonical_report = wire;
+    noncanonical_report.live.as_mut().unwrap().machine_id = Some(data.id);
+    assert!(snapshot_from_wire(noncanonical_report).is_err());
+}
+
+#[test]
+fn current_typed_disks_survive_management_wire_without_inference() {
+    let disk = |role, format, serial, read_only| vm_spec::Disk {
+        path: format!("/home with spaces/{serial}.not-an-extension-hint").into(),
+        role,
+        format,
+        geometry: vm_spec::DiskGeometry {
+            length: 64 << 20,
+            logical_sector_size: 512,
+        },
+        block_id: vm_spec::BlockId::new(serial).unwrap(),
+        read_only,
+    };
+    let current = vm_spec::VmSpec {
+        storage: Some(vm_spec::Storage {
+            disks: vec![
+                disk(
+                    vm_spec::DiskRole::RootLower,
+                    vm_spec::DiskFormat::Vmdk,
+                    "silo-root-lower",
+                    true,
+                ),
+                disk(
+                    vm_spec::DiskRole::RootUpper,
+                    vm_spec::DiskFormat::Raw,
+                    "silo-root-upper",
+                    false,
+                ),
+                disk(
+                    vm_spec::DiskRole::Data,
+                    vm_spec::DiskFormat::Raw,
+                    "data-exact",
+                    true,
+                ),
+            ],
+        }),
+        ..vm_spec::VmSpec::current()
+    };
+    let wire = spec::spec_to_wire(&current);
+    assert_eq!(spec::spec_from_wire(wire.clone()).unwrap(), current);
+    for field in ["role", "format", "geometry", "block_id", "read_only"] {
+        let mut invalid = wire.clone();
+        let disk = &mut invalid.storage.as_mut().unwrap().disks[0];
+        match field {
+            "role" => disk.role = None,
+            "format" => disk.format = None,
+            "geometry" => disk.geometry = None,
+            "block_id" => disk.block_id = None,
+            "read_only" => disk.read_only = None,
+            _ => unreachable!(),
+        }
+        assert!(spec::spec_from_wire(invalid).is_err(), "{field}");
+    }
+    let mut old = wire.clone();
+    old.spec_version = "0.1.0".into();
+    assert!(spec::spec_from_wire(old).is_err());
+    let mut invalid = wire.clone();
+    invalid.storage.as_mut().unwrap().disks[0].format = Some(999);
+    assert!(spec::spec_from_wire(invalid).is_err());
+    let mut duplicate = wire;
+    duplicate.storage.as_mut().unwrap().disks[2].block_id = Some("silo-root-lower".into());
+    assert!(spec::spec_from_wire(duplicate).is_err());
+}
+
+#[test]
+fn create_tmpfs_wire_policy_requires_nonzero_explicit_capacity() {
+    let input = w::NormalizedMachineCreate {
+        process: Some(w::ProcessConfig::default()),
+        retention: values::retention_to_wire(libvm::MachineRetention::Persistent),
+        agent: Some(values::agent_to_wire(&libvm::MachineAgent::Default).unwrap()),
+        temporary_directory: Some(w::TemporaryDirectoryPolicy {
+            backing: Some(w::temporary_directory_policy::Backing::TmpfsCapacityBytes(
+                64 << 20,
+            )),
+        }),
+        ..Default::default()
+    };
+    let mut missing_policy = input.clone();
+    missing_policy.temporary_directory = None;
+    assert!(updates::create_from_wire(missing_policy).is_err());
+    let mut invalid_policy = input;
+    invalid_policy.temporary_directory.as_mut().unwrap().backing = Some(
+        w::temporary_directory_policy::Backing::TmpfsCapacityBytes(0),
+    );
+    assert!(updates::create_from_wire(invalid_policy).is_err());
+}
+
+#[test]
+fn temporary_policy_updates_preserve_absent_explicit_disk_and_sized_tmpfs() {
+    assert!(updates::update_from_wire(w::MachineUpdate::default())
+        .unwrap()
+        .temporary_directory
+        .is_none());
+    for policy in [
+        libvm::TemporaryDirectoryPolicy::DiskBacked,
+        libvm::TemporaryDirectoryPolicy::Tmpfs {
+            capacity_bytes: 4096,
+        },
+    ] {
+        let native = libvm::MachineUpdate::new().temporary_directory(policy);
+        assert_eq!(
+            updates::update_from_wire(updates::update_to_wire(&native).unwrap())
+                .unwrap()
+                .temporary_directory,
+            Some(policy)
+        );
+    }
+    assert!(updates::update_from_wire(w::MachineUpdate {
+        temporary_directory: Some(w::TemporaryDirectoryPolicy { backing: None }),
+        ..Default::default()
+    })
+    .is_err());
+}
+
+#[test]
+fn hibernation_saved_state_and_stop_warnings_roundtrip() {
+    use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+    use prost::Message;
+    let mut machine = libvm::MachineData::new(
+        "00000000-0000-4000-8000-000000000001".into(),
+        "saved".into(),
+        vm_spec::VmSpec::current(),
+    );
+    machine.status = libvm::MachineStatus::Hibernated { message: None };
+    machine.hibernation = Some(libvm::MachineHibernationInfo {
+        hibernated_at: 1_700_000_000,
+        saved_state_bytes: 8192,
+        memory_capture: vm_spec::capture::HibernateMemoryReceipt {
+            mode: vm_spec::lifecycle::CapturePolicy::Incremental,
+            full_reason: None,
+            stats: vm_spec::capture::CaptureMemoryStats {
+                logical_bytes: 1 << 20,
+                overlay_bytes_written: 4096,
+                ..Default::default()
+            },
+        },
+    });
+    let wire = snapshot_to_wire(&machine).unwrap();
+    let decoded = w::MachineSnapshot::decode(wire.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        snapshot_from_wire(decoded).unwrap().hibernation,
+        machine.hibernation
+    );
+    for warning in [
+        None,
+        Some(libvm::MachineStopWarning::WakeFailed),
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: R::FilesMissing,
+        }),
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: R::FilesChanged,
+        }),
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: R::DisksChanged,
+        }),
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: R::NotCompatible,
+        }),
+    ] {
+        let outcome = libvm::MachineStopOutcome {
+            machine: machine.clone(),
+            warning,
+        };
+        let wire = lifecycle::stop_to_wire(&outcome).unwrap();
+        let decoded = w::MachineSnapshot::decode(wire.encode_to_vec().as_slice()).unwrap();
+        let result = lifecycle::stop_from_wire(decoded).unwrap();
+        assert_eq!(result.warning, warning);
+        assert_eq!(result.machine.hibernation, machine.hibernation);
+    }
+    assert!(lifecycle::unusable_reason_from_wire(0).is_err());
+    assert!(lifecycle::unusable_reason_from_wire(5).is_err());
+}
+
+#[test]
+fn hibernation_errors_keep_their_typed_variant_and_message_over_daemon_transport() {
+    use libvm::LibVmError as E;
+    let reference = || "saved".to_string();
+    let mut errors = vec![
+        E::HibernatedStartFirst {
+            reference: reference(),
+        },
+        E::HibernatedStopFirst {
+            reference: reference(),
+        },
+        E::AlreadyHibernated {
+            reference: reference(),
+        },
+        E::HibernateTemporary {
+            reference: reference(),
+        },
+        E::HibernateBusy {
+            reference: reference(),
+        },
+        E::HibernateOutOfSpace {
+            reference: reference(),
+            needed_bytes: 1024,
+            free_bytes: 1,
+        },
+        E::HibernateFailed {
+            reference: reference(),
+            message: "write failed".into(),
+        },
+        E::WakeFailedBeforeConsume {
+            reference: reference(),
+            source: Box::new(E::InvalidRequest {
+                message: "construction failed".into(),
+            }),
+        },
+        E::WakeConsumed {
+            reference: reference(),
+            source: None,
+        },
+    ];
+    use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+    for reason in [
+        R::FilesMissing,
+        R::FilesChanged,
+        R::DisksChanged,
+        R::NotCompatible,
+    ] {
+        errors.push(E::HibernateUnusable {
+            reference: reference(),
+            reason,
+        });
+    }
+    for error in errors {
+        let status = native_error_to_status(&error);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        let result = status_to_native_error(&status).unwrap();
+        assert_eq!(result.variant(), error.variant());
+        assert_eq!(result.to_string(), error.to_string());
+    }
 }

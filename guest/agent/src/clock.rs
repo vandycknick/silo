@@ -41,11 +41,34 @@ impl std::error::Error for ClockSyncError {}
 pub(crate) fn sync_realtime(
     host_time: Option<&prost_types::Timestamp>,
 ) -> Result<ClockSyncOutcome, ClockSyncError> {
+    sync_realtime_policy(host_time, false)
+}
+
+pub(crate) fn activate_realtime(
+    host_time: Option<&prost_types::Timestamp>,
+) -> Result<ClockSyncOutcome, ClockSyncError> {
+    sync_realtime_policy(host_time, true)
+}
+
+pub(crate) fn validate_host_time(
+    host_time: Option<&prost_types::Timestamp>,
+) -> Result<(), ClockSyncError> {
+    host_nanos(host_time).map(|_| ())
+}
+
+fn sync_realtime_policy(
+    host_time: Option<&prost_types::Timestamp>,
+    activation: bool,
+) -> Result<ClockSyncOutcome, ClockSyncError> {
     let host = host_nanos(host_time)?;
     let guest = nix::time::clock_gettime(ClockId::CLOCK_REALTIME).map_err(ClockSyncError::Read)?;
     let guest = i128::from(guest.tv_sec()) * NANOS_PER_SECOND + i128::from(guest.tv_nsec());
     let offset_nanos = host - guest;
-    if !should_step(offset_nanos) {
+    if !(if activation {
+        should_activate_step(offset_nanos)
+    } else {
+        should_step(offset_nanos)
+    }) {
         return Ok(ClockSyncOutcome {
             offset_nanos,
             stepped: false,
@@ -84,11 +107,18 @@ fn host_nanos(host_time: Option<&prost_types::Timestamp>) -> Result<i128, ClockS
     if host_time.seconds < MIN_HOST_UNIX_SECONDS {
         return Err(ClockSyncError::Invalid("before 2024-01-01"));
     }
+    if host_time.seconds > 253_402_300_799 {
+        return Err(ClockSyncError::Invalid("after protobuf timestamp maximum"));
+    }
     Ok(i128::from(host_time.seconds) * NANOS_PER_SECOND + i128::from(host_time.nanos))
 }
 
 fn should_step(offset_nanos: i128) -> bool {
     offset_nanos.abs() > STEP_THRESHOLD_NANOS
+}
+
+fn should_activate_step(offset_nanos: i128) -> bool {
+    offset_nanos > 0
 }
 
 #[cfg(test)]
@@ -97,6 +127,15 @@ mod tests {
         host_nanos, offset_duration, should_step, ClockSyncError, MIN_HOST_UNIX_SECONDS,
         STEP_THRESHOLD_NANOS,
     };
+
+    #[test]
+    fn activation_steps_subsecond_forward_offsets_and_never_rewinds() {
+        assert!(crate::clock::should_activate_step(1));
+        assert!(crate::clock::should_activate_step(999_999_999));
+        assert!(!crate::clock::should_activate_step(0));
+        assert!(!crate::clock::should_activate_step(-1));
+        assert!(!crate::clock::should_activate_step(-2_000_000_000));
+    }
 
     #[test]
     fn steps_only_beyond_threshold() {
@@ -128,6 +167,11 @@ mod tests {
             host_nanos(Some(&too_old)),
             Err(ClockSyncError::Invalid("before 2024-01-01"))
         ));
+        assert!(host_nanos(Some(&prost_types::Timestamp {
+            seconds: i64::MAX,
+            nanos: 0
+        }))
+        .is_err());
         let valid = prost_types::Timestamp {
             seconds: MIN_HOST_UNIX_SECONDS,
             nanos: 5,

@@ -246,7 +246,7 @@ root.
 
 ### Agent
 
-When the later handoff contract invokes a default or custom agent, every
+When the handoff contract invokes a default or custom agent, every
 `libvm`-managed invocation has `--config=<path>`. The agent:
 
 1. Parses its process arguments.
@@ -261,6 +261,16 @@ changes. The explicit configuration path is mandatory. There is no implicit
 managed-config path, environment-variable fallback, or discovery mechanism.
 The path is not sensitive and may appear in process arguments; configuration
 contents must never appear in arguments, environment variables, or logs.
+
+The default image-init handoff now preserves live operations through
+[ADR 0021's contained-init profile](0021-live-snapshots-and-forks.md#guest-profiles-and-contained-image-init).
+The image retains PID 1 in `silo/workloads/image`; the agent remains in
+`silo/control` with descriptors retained before the namespace remount. An
+uncontained handoff can still cold boot, but reports `InitChild` and refuses
+live operations. Agent-PID-1 boots use the same layout without image handoff.
+This changes no payload-copy or configuration provenance rule here. Restore
+activation updates runtime identity and network state through its separate
+bounded protocol, not by rereading the cold-boot configuration.
 
 ## Configuration And Failure Semantics
 
@@ -285,10 +295,12 @@ reports the machine and relevant host path without configuration contents.
 If injection is disabled, `/agent` is absent from the generated overlay and
 ADR 0008 guest-agent readiness is not required. The base remains independently
 bootable. If `/agent` exists, both payload files are mandatory.
-Any missing, invalid, or uncopyable binary or configuration enters the
-`silo-init` rescue shell before the deferred root transition. There is no
-partial payload preparation and no fallback to an older agent or configuration
-source.
+Any missing, invalid, or uncopyable binary or configuration fails boot before
+the deferred root transition. Init prints a diagnostic, synchronizes filesystems
+and powers off by default. Explicit `silo.rescue=on-failure` or
+`silo.rescue=always` selects the console rescue shell; leaving it powers off.
+There is no partial payload preparation and no fallback to an older agent or
+configuration source.
 
 An agent that cannot parse or validate the copied JSON fails managed boot before
 proceeding beyond configuration validation, writes a bounded diagnostic to the
@@ -357,7 +369,8 @@ Unit and integration tests cover:
 - Explicit custom-initramfs composition.
 - Launch failure before `silo-vmm` starts when generation fails.
 - Copying both payloads into the early `/run` mount.
-- Rescue behavior for each missing, invalid, and failed-copy payload.
+- Default poweroff and explicitly selected rescue behavior for each missing,
+  invalid, and failed-copy payload.
 - Agent configuration parsing and validation when invoked with
   `--config=/run/agent/config.json` by the later handoff contract.
 - Absence of configuration bytes from logs and errors.

@@ -5,57 +5,71 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-/// First descriptor number of the worker contract; roles follow in order.
-pub(crate) const FIRST_CHILD_FD: libc::c_int = 3;
-const MAX_CHILD_FDS: usize = 5;
+/// Fixed roles, sixteen Raw attachments, five restore state objects, the
+/// lifecycle endpoint and sixteen lower descriptors plus 1536 extents.
+pub(crate) const MAX_LOWER_FDS: usize = 16 + 1536;
+const MAX_CHILD_FDS: usize = 7 + 16 + 5 + MAX_LOWER_FDS;
+const LAST_RAW_CHILD_FD: i32 = 24;
+pub(crate) const FIRST_LOWER_CHILD_FD: i32 = 34;
+const LAST_CHILD_FD: i32 = FIRST_LOWER_CHILD_FD + MAX_LOWER_FDS as i32 - 1;
+/// The worker's lifecycle role. Kept literal so this policy compiles standalone
+/// in the real-executable tests; the owner asserts it equals the worker table.
+pub(crate) const LIFECYCLE_CHILD_FD: i32 = 32;
 
-/// Map `descriptors` onto the child's fixed numbers 3, 4, ... in order and let
-/// nothing else survive exec.
-///
-/// ```text
-/// parent fds (any numbers)      child after exec
-///   descriptors[0] ──────────►  3
-///   descriptors[1] ──────────►  4
-///   ...                         ...
-///   everything else ─ CLOEXEC ► closed
-/// ```
-pub(crate) fn install(command: &mut Command, descriptors: &[&OwnedFd]) {
-    let count = descriptors.len();
-    let mut sources = [-1; MAX_CHILD_FDS];
-    for (slot, fd) in sources.iter_mut().zip(descriptors) {
-        *slot = fd.as_raw_fd();
+fn child_target(target: i32) -> bool {
+    (3..=LAST_RAW_CHILD_FD).contains(&target)
+        || (25..=28).contains(&target)
+        || target == LIFECYCLE_CHILD_FD
+        || target == 33
+        || (FIRST_LOWER_CHILD_FD..=LAST_CHILD_FD).contains(&target)
+}
+
+/// Install an exact, bounded child-only descriptor map. Source copies are parked
+/// above every target before any target is overwritten, including mapping cycles.
+pub(crate) fn install(command: &mut Command, descriptors: &[(i32, i32)]) -> io::Result<()> {
+    if descriptors.len() > MAX_CHILD_FDS {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    // Raw libc, not nix: nix's descriptor wrappers need borrowed fds that cannot
-    // be constructed soundly from this pre-fork number array.
-    // SAFETY: child setup uses only raw OS descriptor operations on a fixed-size
-    // stack array. OS errors are represented inline by from_raw_os_error, so this
-    // path neither allocates nor takes locks.
+    let mut mappings = Vec::with_capacity(descriptors.len());
+    for (index, &(source, target)) in descriptors.iter().enumerate() {
+        if source < 3
+            || !child_target(target)
+            || descriptors[..index]
+                .iter()
+                .any(|&(_, prior)| prior == target)
+        {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        mappings.push((source, target));
+    }
+    let count = mappings.len();
+    let first_parked = mappings
+        .iter()
+        .map(|&(_, target)| target)
+        .max()
+        .map_or(3, |last| last + 1);
+    let mut parked = vec![-1; count];
+    // SAFETY: only bounded numeric OS operations run after fork. Errors contain
+    // inline errno values, never allocated messages or synchronization.
     unsafe {
         command.pre_exec(move || {
-            if count > MAX_CHILD_FDS {
-                return Err(io::Error::from_raw_os_error(libc::EINVAL));
-            }
             mark_child_fds_cloexec()?;
-            // Park every source above the target range first: a source may
-            // already occupy another role's target number.
-            let floor = FIRST_CHILD_FD + count as libc::c_int;
-            let mut parked = [-1; MAX_CHILD_FDS];
             for index in 0..count {
-                let high = libc::fcntl(sources[index], libc::F_DUPFD_CLOEXEC, floor);
-                if high < 0 {
-                    return Err(child_last_os_error());
-                }
-                parked[index] = high;
+                let source = std::os::fd::BorrowedFd::borrow_raw(mappings[index].0);
+                parked[index] = fcntl(source, FcntlArg::F_DUPFD_CLOEXEC(first_parked))
+                    .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
             }
-            // dup2 clears FD_CLOEXEC on the target; the parked copies close at exec.
-            for (index, high) in parked.iter().copied().enumerate().take(count) {
-                if libc::dup2(high, FIRST_CHILD_FD + index as libc::c_int) < 0 {
+            // nix's owned dup2 wrapper would close these intentionally inherited
+            // targets when it drops; raw dup2 leaves ownership with exec.
+            for index in 0..count {
+                if libc::dup2(parked[index], mappings[index].1) < 0 {
                     return Err(child_last_os_error());
                 }
             }
             Ok(())
         });
     }
+    Ok(())
 }
 
 pub(crate) fn normalize(fd: OwnedFd) -> io::Result<OwnedFd> {

@@ -108,7 +108,7 @@ fn start_requested(
     run_id: String,
     now: i64,
 ) -> Result<MachineState, TransitionError> {
-    if is_active(state.status) {
+    if is_active(state.status) || state.vmm_pid.is_some() {
         return Err(TransitionError::AlreadyActive);
     }
 
@@ -130,7 +130,14 @@ fn monitor_ready(
     started_at: i64,
     now: i64,
 ) -> Result<MachineState, TransitionError> {
-    require_state(state.status, MachineRuntimeState::Starting, "MonitorReady")?;
+    if !matches!(
+        state.status,
+        MachineRuntimeState::Restoring
+            | MachineRuntimeState::Activating
+            | MachineRuntimeState::Running
+    ) {
+        require_state(state.status, MachineRuntimeState::Starting, "MonitorReady")?;
+    }
     require_run_id(&state, Some(run_id.as_str()))?;
 
     Ok(replace_runtime(
@@ -152,10 +159,10 @@ fn monitor_observed(
     now: i64,
 ) -> Result<MachineState, TransitionError> {
     let status = match state.status {
-        MachineRuntimeState::Starting => MachineRuntimeState::Starting,
-        MachineRuntimeState::Stopping => MachineRuntimeState::Stopping,
-        _ => MachineRuntimeState::Running,
+        MachineRuntimeState::Stopped => MachineRuntimeState::Running,
+        status => status,
     };
+    let last_error = state.last_error.clone();
 
     Ok(replace_runtime(
         state,
@@ -163,7 +170,7 @@ fn monitor_observed(
         Some(pid),
         started_at,
         run_id,
-        None,
+        last_error,
         now,
     ))
 }
@@ -175,7 +182,14 @@ fn start_failed(
     error: Option<String>,
     now: i64,
 ) -> Result<MachineState, TransitionError> {
-    require_state(state.status, MachineRuntimeState::Starting, "StartFailed")?;
+    if !matches!(
+        state.status,
+        MachineRuntimeState::Restoring
+            | MachineRuntimeState::Activating
+            | MachineRuntimeState::ActivationFailed
+    ) {
+        require_state(state.status, MachineRuntimeState::Starting, "StartFailed")?;
+    }
     require_run_id(&state, Some(run_id.as_str()))?;
 
     let status = match failure {
@@ -192,10 +206,9 @@ fn stop_requested(
     run_id: Option<String>,
     now: i64,
 ) -> Result<MachineState, TransitionError> {
-    if matches!(
-        state.status,
-        MachineRuntimeState::Stopped | MachineRuntimeState::Error
-    ) {
+    if state.status == MachineRuntimeState::Stopped
+        || (state.status == MachineRuntimeState::Error && state.vmm_pid.is_none())
+    {
         return Err(TransitionError::NotRunning);
     }
     require_generation(&state, pid, started_at, run_id.as_deref())?;
@@ -342,17 +355,14 @@ fn replace_runtime(
 }
 
 fn is_active(status: MachineRuntimeState) -> bool {
-    matches!(
-        status,
-        MachineRuntimeState::Starting
-            | MachineRuntimeState::Running
-            | MachineRuntimeState::Stopping
-    )
+    status.is_live()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{reduce, Event, StartFailure, TransitionError, START_TIMEOUT_ERROR};
+    use crate::runtime::transitions::{
+        reduce, Event, StartFailure, TransitionError, START_TIMEOUT_ERROR,
+    };
     use crate::store::models::{MachineId, MachineRuntimeState, MachineState};
 
     const NOW: i64 = 100;
@@ -541,6 +551,29 @@ mod tests {
     }
 
     #[test]
+    fn observed_activation_failure_cleanup_requires_its_exact_run() {
+        let mut failed = state(MachineRuntimeState::ActivationFailed);
+        failed.vmm_pid = Some(123);
+        failed.started_at = Some(42);
+        failed.run_id = Some("restore-run".into());
+        let event = |run: &str| Event::StartFailed {
+            run_id: run.into(),
+            failure: StartFailure::Error,
+            error: Some("activation refused".into()),
+        };
+        assert_eq!(
+            reduce(failed.clone(), event("replaced-run"), NOW).unwrap_err(),
+            TransitionError::StaleGeneration
+        );
+        let terminal = reduce(failed, event("restore-run"), NOW).unwrap();
+        assert_eq!(terminal.status, MachineRuntimeState::Error);
+        assert_eq!(terminal.vmm_pid, None);
+        assert_eq!(terminal.started_at, None);
+        assert_eq!(terminal.run_id, None);
+        assert_eq!(terminal.last_error.as_deref(), Some("activation refused"));
+    }
+
+    #[test]
     fn running_machine_can_stop() {
         let next = reduce(
             running(),
@@ -673,5 +706,70 @@ mod tests {
         assert_eq!(next.status, MachineRuntimeState::Error);
         assert_eq!(next.run_id, None);
         assert_eq!(next.last_error.as_deref(), Some(START_TIMEOUT_ERROR));
+    }
+
+    #[test]
+    fn pause_reconnect_preserves_every_live_state_and_error_then_stops_without_resume() {
+        for status in [
+            MachineRuntimeState::Pausing,
+            MachineRuntimeState::Paused,
+            MachineRuntimeState::Capturing,
+            MachineRuntimeState::Restoring,
+            MachineRuntimeState::Activating,
+            MachineRuntimeState::ActivationFailed,
+            MachineRuntimeState::Error,
+        ] {
+            let mut original = running();
+            original.status = status;
+            original.last_error = Some("retained lifecycle failure".into());
+            let observed = reduce(
+                original.clone(),
+                Event::MonitorObserved {
+                    pid: 123,
+                    started_at: Some(42),
+                    run_id: Some("run-1".into()),
+                },
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(observed.status, status);
+            assert_eq!(observed.last_error, original.last_error);
+            assert_eq!(observed.run_id, original.run_id);
+            assert_eq!(
+                reduce(
+                    observed.clone(),
+                    Event::StartRequested {
+                        run_id: "replacement".into()
+                    },
+                    NOW
+                ),
+                Err(TransitionError::AlreadyActive)
+            );
+            let stopping = reduce(
+                observed,
+                Event::StopRequested {
+                    pid: 123,
+                    started_at: Some(42),
+                    run_id: Some("run-1".into()),
+                },
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(stopping.status, MachineRuntimeState::Stopping);
+            assert_eq!(stopping.run_id.as_deref(), Some("run-1"));
+            let terminal = reduce(
+                stopping,
+                Event::StopCompleted {
+                    pid: 123,
+                    started_at: Some(42),
+                    run_id: Some("run-1".into()),
+                    last_error: None,
+                },
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(terminal.status, MachineRuntimeState::Stopped);
+            assert_eq!(terminal.vmm_pid, None);
+        }
     }
 }

@@ -12,7 +12,7 @@ ephemeral runtime socket from the run root (`/tmp/silo-<euid>` unless
 
 ```bash
 VM=dev
-MACHINE_ID="$(silo status "$VM" --format json | jq -r '.id')"
+MACHINE_ID="$(silo info "$VM" --format json | jq -r '.id')"
 RUN_ROOT="${SILO_RUN_ROOT:-/tmp/silo-$(id -u)}"
 SOCKET="$RUN_ROOT/machines/$MACHINE_ID/vm.sock"
 GRPC_TARGET="unix://$SOCKET"
@@ -20,7 +20,7 @@ GRPC_TARGET="unix://$SOCKET"
 test -S "$SOCKET" && printf 'Using %s\n' "$SOCKET"
 ```
 
-`silo status` already exercises `VmMonitorService.GetStatus`. If it fails
+`silo info` already exercises `VmMonitorService.GetStatus`. If it fails
 before printing the machine ID, inspect the run root directly:
 
 ```bash

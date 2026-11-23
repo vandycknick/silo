@@ -1,10 +1,11 @@
 //! GuestCacheReclaimer automatically reclaims cold file cache when a negotiated
 //! FreePageReporter and writable cgroup v2 reclaim interfaces are available.
+//! Reclaim targets the retained workloads directory, never the image's remounted cgroup root.
 
-use std::fs;
-use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::fs::{self, File};
+use std::io::{self, Read as _, Write as _};
+use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,8 @@ const COMPACT_MEMORY: &str = "/proc/sys/vm/compact_memory";
 #[derive(Clone, Default)]
 pub(crate) struct MemoryReclaimStatus {
     last: Arc<Mutex<Option<MemoryReclaimReport>>>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 impl MemoryReclaimStatus {
@@ -35,19 +38,57 @@ impl MemoryReclaimStatus {
             *last = Some(report);
         }
     }
+
+    pub(crate) async fn shutdown(&self) -> eyre::Result<()> {
+        {
+            let (stopped, wake) = &*self.stop;
+            *stopped
+                .lock()
+                .map_err(|_| eyre::eyre!("reclaimer stop lock poisoned"))? = true;
+            wake.notify_all();
+        }
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|_| eyre::eyre!("reclaimer worker lock poisoned"))?
+            .take();
+        if let Some(worker) = worker {
+            let join = tokio::task::spawn_blocking(move || {
+                worker
+                    .join()
+                    .map_err(|_| eyre::eyre!("memory reclaimer panicked"))
+            });
+            tokio::time::timeout(Duration::from_secs(3), join)
+                .await
+                .map_err(|_| eyre::eyre!("memory reclaimer did not stop before shutdown"))?
+                .map_err(|error| eyre::eyre!("memory reclaimer join failed: {error}"))??;
+        }
+        Ok(())
+    }
 }
 
-pub(crate) fn start() -> MemoryReclaimStatus {
+pub(crate) fn start(controller: &crate::freezer::WorkloadController) -> MemoryReclaimStatus {
+    let directory = match controller.reclaim_directory() {
+        Ok(directory) => directory,
+        Err(error) => {
+            tracing::warn!(%error, "workload memory reclaim descriptor unavailable");
+            None
+        }
+    };
     let status = MemoryReclaimStatus::default();
     let thread_status = status.clone();
-    if let Err(error) = thread::Builder::new()
+    match thread::Builder::new()
         .name("guest-cache-reclaimer".to_string())
         .spawn(move || {
             lower_to_idle_priority();
-            GuestCacheReclaimer::new().run(&thread_status);
-        })
-    {
-        tracing::warn!(%error, "failed to start GuestCacheReclaimer");
+            GuestCacheReclaimer::new().run(&thread_status, directory);
+        }) {
+        Ok(worker) => {
+            if let Ok(mut slot) = status.worker.lock() {
+                *slot = Some(worker);
+            }
+        }
+        Err(error) => tracing::warn!(%error, "failed to start GuestCacheReclaimer"),
     }
     status
 }
@@ -110,32 +151,18 @@ fn free_page_reporter_available(devices: &Path) -> bool {
     })
 }
 
-fn reclaim_targets(root: &Path) -> Vec<PathBuf> {
-    if !root.join("cgroup.controllers").exists() {
-        return Vec::new();
+struct ReclaimTarget {
+    stat: File,
+    reclaim: File,
+}
+
+impl ReclaimTarget {
+    fn open(directory: &File) -> io::Result<Self> {
+        Ok(Self {
+            stat: crate::freezer::open_file(directory, "memory.stat", false)?,
+            reclaim: crate::freezer::open_file(directory, "memory.reclaim", true)?,
+        })
     }
-    let writable = |path: &Path| {
-        fs::OpenOptions::new()
-            .write(true)
-            .open(path.join("memory.reclaim"))
-            .is_ok()
-    };
-    if writable(root) {
-        return vec![root.to_path_buf()];
-    }
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut targets: Vec<_> = entries
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path())
-        .filter(|path| writable(path))
-        .collect();
-    // Top-level memory.stat/reclaim include descendants, so never reclaim both
-    // a parent and its children in one policy pass.
-    targets.sort();
-    targets
 }
 
 fn cgroup_cache_bytes(stat: &str) -> Option<u64> {
@@ -163,7 +190,6 @@ fn cpu_sample() -> Option<CpuSample> {
 struct GuestCacheReclaimer {
     tracker: IdleTracker,
     previous: Option<CpuSample>,
-    next_target: usize,
     runs: u64,
 }
 
@@ -172,22 +198,35 @@ impl GuestCacheReclaimer {
         Self {
             tracker: IdleTracker::new(IDLE_WINDOW),
             previous: None,
-            next_target: 0,
             runs: 0,
         }
     }
 
-    fn run(mut self, status: &MemoryReclaimStatus) {
+    fn run(mut self, status: &MemoryReclaimStatus, directory: Option<File>) {
         let mut last_availability = None;
         loop {
-            thread::sleep(POLL_INTERVAL);
-            let reporter = free_page_reporter_available(Path::new("/sys/bus/virtio/devices"));
-            let targets = if reporter {
-                reclaim_targets(Path::new("/sys/fs/cgroup"))
-            } else {
-                Vec::new()
+            let (stopped, wake) = &*status.stop;
+            let Ok(stopped) = stopped.lock() else {
+                return;
             };
-            let availability = (reporter, !targets.is_empty());
+            let Ok((stopped, _)) =
+                wake.wait_timeout_while(stopped, POLL_INTERVAL, |stopped| !*stopped)
+            else {
+                return;
+            };
+            if *stopped {
+                return;
+            }
+            drop(stopped);
+            let reporter = free_page_reporter_available(Path::new("/sys/bus/virtio/devices"));
+            let mut target = if reporter {
+                directory
+                    .as_ref()
+                    .and_then(|directory| ReclaimTarget::open(directory).ok())
+            } else {
+                None
+            };
+            let availability = (reporter, target.is_some());
             if last_availability != Some(availability) {
                 tracing::info!(
                     reporter,
@@ -220,9 +259,7 @@ impl GuestCacheReclaimer {
             if !idle.window_idle || !idle.interval_idle {
                 continue;
             }
-            let index = self.next_target % targets.len();
-            self.next_target = index + 1;
-            if let Some(target) = targets.get(index) {
+            if let Some(target) = target.as_mut() {
                 self.reclaim(target, status);
             }
             // Do not count this worker's CPU time as workload activity.
@@ -233,7 +270,7 @@ impl GuestCacheReclaimer {
         }
     }
 
-    fn reclaim(&mut self, target: &Path, status: &MemoryReclaimStatus) {
+    fn reclaim(&mut self, target: &mut ReclaimTarget, status: &MemoryReclaimStatus) {
         let Ok(meminfo) = fs::read_to_string("/proc/meminfo") else {
             return;
         };
@@ -243,25 +280,25 @@ impl GuestCacheReclaimer {
         let Some(cached_before) = meminfo_value(&meminfo, "Cached:") else {
             return;
         };
-        let Some(cache) = fs::read_to_string(target.join("memory.stat"))
-            .ok()
-            .and_then(|text| cgroup_cache_bytes(&text))
-        else {
+        let mut stat = String::new();
+        if target.stat.read_to_string(&mut stat).is_err() {
+            return;
+        }
+        let Some(cache) = cgroup_cache_bytes(&stat) else {
             return;
         };
         let requested = reclaim_budget(cache, total);
         if requested == 0 {
             return;
         }
-        let result = write_control(
-            &target.join("memory.reclaim"),
-            &format!("{requested} swappiness=0"),
-        );
+        let result = target
+            .reclaim
+            .write_all(format!("{requested} swappiness=0").as_bytes());
         let outcome = match result {
             Ok(()) => "reclaimed",
             Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => "partial",
             Err(error) => {
-                tracing::warn!(%error, cgroup = %target.display(), "GuestCacheReclaimer unavailable or failed; no global cache-drop fallback");
+                tracing::warn!(%error, cgroup = "/silo/workloads", "GuestCacheReclaimer unavailable or failed; no global cache-drop fallback");
                 self.tracker.reset();
                 "failed"
             }
@@ -394,6 +431,16 @@ fn is_idle(busy: u64, total: u64) -> bool {
 mod tests {
     use crate::memory_reclaim::*;
     const MEMINFO_FIXTURE: &str = "MemTotal:        8388608 kB\nMemFree:         6291456 kB\nCached:          1048576 kB\nActive(file):     524288 kB\nInactive(file):   393216 kB\nShmem:            262144 kB\nSReclaimable:      65536 kB\n";
+
+    #[tokio::test]
+    async fn shutdown_joins_reclaimer_without_waiting_for_poll_interval() {
+        let status = crate::memory_reclaim::start(&crate::freezer::WorkloadController::discover());
+        tokio::time::timeout(std::time::Duration::from_secs(2), status.shutdown())
+            .await
+            .expect("shutdown wakes sleeping reclaimer")
+            .expect("reclaimer joined");
+        assert!(status.worker.lock().expect("worker lock").is_none());
+    }
 
     #[test]
     fn reporter_requires_negotiation_and_ready_driver_status() {

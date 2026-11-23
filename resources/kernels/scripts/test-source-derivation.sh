@@ -24,6 +24,9 @@ mkdir -p "$derived_root"
 
 printf '%s\n' '--- a/value' '+++ b/value' '@@ -1 +1 @@' '-base' '+first' > "$temp_dir/01.patch"
 printf '%s\n' '--- a/value' '+++ b/value' '@@ -1 +1 @@' '-first' '+second' > "$temp_dir/02.patch"
+# Neither side matches the partially patched tree. Repeating 01.patch is not
+# an invalid-patch fixture: patch --batch may legitimately apply it in reverse.
+printf '%s\n' '--- a/value' '+++ b/value' '@@ -1 +1 @@' '-absent-before' '+absent-after' > "$temp_dir/invalid.patch"
 
 derive() {
     profile=$1
@@ -47,6 +50,28 @@ derive workload "$temp_dir/01.patch"
 cmp "$derived_root/rprobe/value" /dev/stdin <<EOF
 second
 EOF
+
+# No-patch probe derivation is pristine, regardless of workload patch order.
+derive probe-unpatched
+cmp "$pristine/value" "$derived_root/probe-unpatched/value"
+
+# Failed ordered application must not replace an existing owned source, make
+# pristine writable, or leave a partially published destination.
+if derive workload "$temp_dir/02.patch" > /dev/null 2>&1; then
+    printf 'out-of-order patch application succeeded\n' >&2
+    exit 1
+fi
+cmp "$derived_root/workload/value" /dev/stdin <<EOF
+first
+EOF
+if derive incomplete "$temp_dir/01.patch" "$temp_dir/invalid.patch" > /dev/null 2>&1; then
+    printf 'invalid second patch application succeeded\n' >&2
+    exit 1
+fi
+if [ -e "$derived_root/incomplete" ]; then
+    printf 'failed derivation published a partial source\n' >&2
+    exit 1
+fi
 if find "$pristine" \( -type f -o -type d \) -perm /222 -print -quit | grep -q .; then
     printf 'source derivation changed pristine permissions\n' >&2
     exit 1

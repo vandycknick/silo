@@ -26,6 +26,7 @@ use crate::exec_log::{ExecLogSource, ExecLogWriter};
 use crate::guest::process_client;
 use crate::state::{InstanceStore, ReadyAgentIdentity};
 
+#[path = "execution/startup.rs"]
 mod startup;
 pub(crate) use startup::{spawn_startup_command, StartupCommandHandle, StartupCommandStartError};
 
@@ -45,6 +46,7 @@ pub(crate) struct ExecutionService {
     shutdown: CancellationToken,
     active: Arc<ActiveExecutions>,
     exec_log: Option<ExecLogWriter>,
+    gate: Arc<crate::live::gate::LiveGate>,
 }
 
 impl ExecutionService {
@@ -57,6 +59,7 @@ impl ExecutionService {
             shutdown: ctx.shutdown.clone(),
             active: Arc::new(ActiveExecutions::new(EXECUTION_CAPACITY)),
             exec_log,
+            gate: ctx.live.gate().clone(),
         }
     }
 
@@ -110,6 +113,12 @@ impl VmExecutionService for ExecutionService {
             ));
         };
         let (execution_id, agent) = self.validate_start(&start)?;
+        // Covers session setup until the guest reports start, never the
+        // lifetime of the process.
+        let setup = self
+            .gate
+            .try_admit(crate::live::gate::GateKind::ExecSession)
+            .map_err(crate::live::gate::GateRefusal::status)?;
         let lease = self.active.acquire(execution_id)?;
         let identity_changes = self.store.subscribe_ready_agent_identity();
         let (events, receiver) = mpsc::channel(QUEUE_CAPACITY);
@@ -134,6 +143,10 @@ impl VmExecutionService for ExecutionService {
             cancellation.clone(),
             identity_changes,
             lease,
+            ExecutionFence {
+                gate: self.gate.clone(),
+                _setup: Some(setup),
+            },
         ));
         Ok(Response::new(Box::pin(HostEventStream {
             receiver: ReceiverStream::new(receiver),
@@ -230,6 +243,7 @@ async fn run_execution(
     cancellation: CancellationToken,
     mut identity_changes: tokio::sync::watch::Receiver<Option<ReadyAgentIdentity>>,
     _lease: ExecutionLease,
+    mut fence: ExecutionFence,
 ) {
     let current = match store.ready_agent_identity() {
         Ok(identity) => identity,
@@ -338,6 +352,29 @@ async fn run_execution(
     let mut guest_events = response.into_inner();
     let mut input_open = true;
     let mut guest_state = GuestEventState::default();
+    let (stdin_closed, mut stdin_state) = tokio::sync::watch::channel(false);
+    let input_identity = identity_changes.clone();
+    let gate = Arc::clone(&fence.gate);
+    let forwarding = async {
+        while let Some(control) = input.message().await? {
+            ensure_agent_generation(&expected_agent, &input_identity)?;
+            let control = guest_control(control)?;
+            let is_stdin = matches!(
+                &control.message,
+                Some(
+                    protocol::v1::guest_process_input::Message::StdinData(_)
+                        | protocol::v1::guest_process_input::Message::CloseStdin(_)
+                )
+            );
+            tokio::select! {
+                biased;
+                _ = stdin_state.wait_for(|closed| *closed), if is_stdin => {}
+                result = forward_guest_control(control, &guest_inputs, &gate, &cancellation, &shutdown) => result?,
+            }
+        }
+        Ok::<(), Status>(())
+    };
+    tokio::pin!(forwarding);
     loop {
         tokio::select! {
             biased;
@@ -370,6 +407,11 @@ async fn run_execution(
                         translate_event(guest, &mut guest_state).map_err(Status::unavailable)
                     }) {
                     Ok((event, terminal)) => {
+                        // The guest settled session setup (started or failed).
+                        fence._setup = None;
+                        if matches!(&event.event, Some(ExecutionEventKind::StdinClosed(_))) {
+                            stdin_closed.send_replace(true);
+                        }
                         log_execution_output(exec_log.as_ref(), execution_id, &event);
                         if events.send(Ok(event)).await.is_err() { return; }
                         if terminal { return; }
@@ -393,39 +435,26 @@ async fn run_execution(
                     return;
                 }
             },
-            control = input.message(), if input_open => match control {
-                Ok(Some(control)) => {
-                    let current = identity_changes.borrow().clone();
-                    if let Some((reason, message)) = identity_loss(expected_agent.clone(), current) {
-                        send_lost(&events, reason, message).await;
+            result = &mut forwarding, if input_open => {
+                input_open = false;
+                match result {
+                    Ok(()) if !guest_state.started => {
                         cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
+                        let _ = events.send(Ok(cancelled_before_start_event())).await;
                         return;
                     }
-                    match guest_control(control) {
-                    Ok(control) => match forward_guest_control(control, &guest_inputs, &cancellation, &shutdown).await {
-                        Ok(()) => {}
-                        Err(error) => {
-                            let _ = events.send(Err(protocol::detailed_status(error))).await;
-                            cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
-                            return;
-                        }
-                    },
+                    Ok(()) => {}
+                    Err(_) if guest_inputs.is_closed() => {}
                     Err(error) => {
-                        let _ = events.send(Err(protocol::detailed_status(error))).await;
+                        let current = identity_changes.borrow().clone();
+                        if let Some((reason, message)) = identity_loss(expected_agent.clone(), current) {
+                            send_lost(&events, reason, message).await;
+                        } else {
+                            let _ = events.send(Err(protocol::detailed_status(error))).await;
+                        }
                         cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
                         return;
                     }
-                    }
-                },
-                Ok(None) if !guest_state.started => {
-                    cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
-                    let _ = events.send(Ok(cancelled_before_start_event())).await;
-                    return;
-                }
-                Ok(None) => input_open = false,
-                Err(_) => {
-                    cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
-                    return;
                 }
             }
         }
@@ -441,12 +470,27 @@ fn cancelled_before_start_event() -> ExecutionEvent {
     }
 }
 
+/// Live lifecycle fence of one execution: setup admission plus the gate
+/// every later stdin/signal/resize input waits on while fenced.
+struct ExecutionFence {
+    gate: Arc<crate::live::gate::LiveGate>,
+    _setup: Option<crate::live::gate::GatePermit>,
+}
+
 async fn forward_guest_control(
     control: GuestProcessInput,
     guest_inputs: &mpsc::Sender<GuestProcessInput>,
+    gate: &Arc<crate::live::gate::LiveGate>,
     cancellation: &CancellationToken,
     shutdown: &CancellationToken,
 ) -> Result<(), Status> {
+    let _input = tokio::select! {
+        permit = gate.admit(crate::live::gate::GateKind::SessionInput) => {
+            permit.map_err(crate::live::gate::GateRefusal::status)?
+        }
+        _ = cancellation.cancelled() => return Err(Status::cancelled("execution client disconnected")),
+        _ = shutdown.cancelled() => return Err(stopping()),
+    };
     tokio::select! {
         result = guest_inputs.send(control) => result.map_err(|_| protocol::detailed_status(Status::unavailable("guest input stream closed"))),
         _ = cancellation.cancelled() => Err(Status::cancelled("execution client disconnected")),
@@ -602,6 +646,13 @@ pub(super) fn translate_event(
             (ExecutionEventKind::Started(ExecutionStarted {}), false)
         }
         Some(GuestEventKind::Started(_)) => return Err("guest process emitted duplicate Started"),
+        Some(GuestEventKind::StdinClosed(_)) if state.started => (
+            ExecutionEventKind::StdinClosed(protocol::v1::ExecutionStdinClosed {}),
+            false,
+        ),
+        Some(GuestEventKind::StdinClosed(_)) => {
+            return Err("guest process closed stdin before Started")
+        }
         Some(GuestEventKind::Stdout(stdout))
             if state.started && stdout.data.len() <= protocol::CHUNK_64_KIB =>
         {
@@ -1071,6 +1122,24 @@ mod tests {
         assert!(matches!(
             identity_loss(expected, Some(replacement)),
             Some((protocol::v1::LostReason::AgentInstanceReplaced, _))
+        ));
+    }
+
+    #[test]
+    fn guest_stdin_closure_is_nonterminal_and_requires_started() {
+        let event = || GuestProcessEvent {
+            event: Some(GuestEventKind::StdinClosed(
+                protocol::v1::GuestProcessStdinClosed {},
+            )),
+        };
+        let mut state = GuestEventState::default();
+        assert!(translate_event(event(), &mut state).is_err());
+        state.started = true;
+        let (event, terminal) = translate_event(event(), &mut state).unwrap();
+        assert!(!terminal);
+        assert!(matches!(
+            event.event,
+            Some(ExecutionEventKind::StdinClosed(_))
         ));
     }
 }

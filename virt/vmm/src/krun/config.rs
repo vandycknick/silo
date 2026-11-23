@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::krun::error::{KrunBackendError, Result};
-use crate::krun::rosetta::{RosettaLaunchConfig, ROSETTA_MOUNT_TAG};
+use crate::krun::rosetta::RosettaLaunchConfig;
+use protocol::shutdown::WorkerStorageContext;
+use rootfs_spec::rosetta::SHARE_TAG;
+use vm_spec::Disk;
 
 pub const DEFAULT_ID: &str = "anonymous-instance";
 const STANDALONE_VSOCK_CID: u64 = 3;
@@ -18,21 +21,19 @@ pub struct KrunConfig {
     pub initramfs: Option<PathBuf>,
     pub cmdline: Vec<String>,
     pub disks: Vec<Disk>,
+    pub disk_tracking_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
     pub mounts: Vec<Mount>,
     pub vsock_mux: bool,
+    pub storage_context: WorkerStorageContext,
     pub vsock_cid: Option<u64>,
     pub network: Network,
     pub stdio_console: bool,
     pub balloon: bool,
     pub rosetta: Option<RosettaLaunchConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Disk {
-    pub block_id: String,
-    pub path: PathBuf,
-    pub read_only: bool,
+    /// A descriptor-fed restore launch: exact object and lower identities.
+    /// The worker adopts the inherited roles; the request's own descriptor
+    /// numbers are the monitor's and never authorize anything here.
+    pub restore: Option<vm_spec::restore::RestoreRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -83,18 +84,86 @@ impl Default for KrunConfig {
             initramfs: None,
             cmdline: Vec::new(),
             disks: Vec::new(),
+            disk_tracking_seeds: Vec::new(),
             mounts: Vec::new(),
             vsock_mux: false,
+            storage_context: WorkerStorageContext::default(),
             vsock_cid: None,
             network: Network::None,
             stdio_console: false,
             balloon: false,
             rosetta: None,
+            restore: None,
         }
     }
 }
 
+pub(crate) fn validate_worker_storage(config: &KrunConfig) -> std::result::Result<(), String> {
+    config.storage_context.validate()?;
+    let mut bindings = config.storage_context.raw_handles.iter();
+    for (index, disk) in config.disks.iter().enumerate() {
+        if disk.format != vm_spec::DiskFormat::Raw {
+            continue;
+        }
+        let binding = bindings
+            .next()
+            .ok_or("Raw backing is missing from worker descriptor coverage")?;
+        if binding.disk_index as usize != index
+            || binding.length_bytes != disk.geometry.length
+            || binding.read_only != disk.read_only
+        {
+            return Err("Raw backing binding differs from the current disk contract".to_string());
+        }
+    }
+    if bindings.next().is_some() {
+        return Err("worker descriptor coverage includes a non-Raw or absent disk".to_string());
+    }
+    let mut previous = None;
+    let mut epochs = std::collections::BTreeSet::new();
+    for seed in &config.disk_tracking_seeds {
+        seed.validate()?;
+        let disk = config
+            .disks
+            .get(seed.attachment_index as usize)
+            .ok_or("disk tracking seed attachment is absent")?;
+        let binding = config
+            .storage_context
+            .raw_handles
+            .iter()
+            .find(|binding| binding.disk_index == seed.attachment_index)
+            .ok_or("disk tracking seed has no raw handle")?;
+        if previous.is_some_and(|index| seed.attachment_index <= index)
+            || !epochs.insert(seed.epoch.clone())
+            || disk.read_only
+            || disk.format != vm_spec::DiskFormat::Raw
+            || disk.block_id != seed.block_id
+            || disk.role != seed.role
+            || binding.device != seed.file_device
+            || binding.inode != seed.file_inode
+            || binding.length_bytes != seed.length
+        {
+            return Err("disk tracking seed differs from adopted writable backing".into());
+        }
+        previous = Some(seed.attachment_index);
+    }
+    if let Some(request) = &config.restore {
+        for seed in &request.disk_tracking_seeds {
+            if !config
+                .disk_tracking_seeds
+                .iter()
+                .any(|configured| configured == seed)
+            {
+                return Err(
+                    "restore request disk seeds differ from worker construction seeds".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_config(config: &KrunConfig) -> Result<()> {
+    vm_spec::Storage::validate_disks(&config.disks).map_err(KrunBackendError::InvalidConfig)?;
     if config.cpus == 0 {
         return Err(KrunBackendError::InvalidConfig(
             "krun requires at least one vCPU".to_string(),
@@ -105,7 +174,7 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
             "krun requires memory_mib to be greater than zero".to_string(),
         ));
     }
-    if config.kernel.is_none() {
+    if config.kernel.is_none() && config.restore.is_none() {
         return Err(KrunBackendError::InvalidConfig(
             "krun requires a kernel".to_string(),
         ));
@@ -115,14 +184,9 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
             "standalone vsock and the vsock mux cannot be used together".to_string(),
         ));
     }
-    if config.rosetta.is_some()
-        && config
-            .mounts
-            .iter()
-            .any(|mount| mount.tag == ROSETTA_MOUNT_TAG)
-    {
+    if config.rosetta.is_some() && config.mounts.iter().any(|mount| mount.tag == SHARE_TAG) {
         return Err(KrunBackendError::InvalidConfig(format!(
-            "mount tag {ROSETTA_MOUNT_TAG:?} is reserved for Rosetta"
+            "mount tag {SHARE_TAG:?} is reserved for Rosetta"
         )));
     }
     if config
@@ -152,6 +216,10 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
                 "net tap is only supported on Linux".to_string(),
             ));
         }
+    }
+    if let Some(request) = &config.restore {
+        crate::krun::worker::restore::validate(config, request)
+            .map_err(|error| KrunBackendError::InvalidConfig(error.to_string()))?;
     }
     Ok(())
 }

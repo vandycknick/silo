@@ -1,0 +1,1128 @@
+use std::time::Duration;
+
+use uuid::Uuid;
+use vm_spec::lifecycle::{
+    CancelOperationCommand, GetOperationCommand, GetOperationOutcome, LiveCommand,
+    LiveCommandEnvelope, LiveCommandResult, LiveId, LiveStage, OperationOutcome, PauseCommand,
+    PauseOutcome, ResumeCommand, ResumeOutcome, VmLifecycleState,
+};
+use vm_spec::live::LiveOperation;
+
+use crate::machine::live::{require_live_operation, MachineLiveObservation};
+use crate::machine::{Machine, MachineRef};
+use crate::store::live_store::{LiveCommandIntent, MachineLifecycle};
+use crate::store::models::{MachineConfig, MachineRuntimeState, MachineState};
+use crate::store::Store;
+use crate::{LibVmError, Runtime};
+
+/// Best-effort presentation stages, independent of durable operation outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveOperationProgress {
+    Admitting,
+    Waking,
+    PausingSource,
+    CapturingMemory,
+    CapturingDisks,
+    CapturingExecution,
+    VerifyingCapture,
+    FinalizingCapture,
+    ResumingSource,
+    PreservingSource,
+    ComputingDiskIdentity,
+    Publishing,
+    PreparingChildStorage,
+    StartingChild {
+        /// One-based position in the requested child batch.
+        index: usize,
+        total: usize,
+        name: String,
+    },
+    WaitingForAgent,
+    Done,
+}
+
+impl From<LiveStage> for LiveOperationProgress {
+    fn from(stage: LiveStage) -> Self {
+        match stage {
+            LiveStage::Admission => Self::Admitting,
+            LiveStage::MonitorDrain
+            | LiveStage::GuestFreeze
+            | LiveStage::NativePause
+            | LiveStage::PauseFailed
+            | LiveStage::RecoveryFreeze
+            | LiveStage::RecoveryPause => Self::PausingSource,
+            LiveStage::RollbackThaw
+            | LiveStage::CancelNative
+            | LiveStage::CancelThaw
+            | LiveStage::ResumeNative
+            | LiveStage::ResumeClock
+            | LiveStage::ResumeHandshake
+            | LiveStage::ResumeThaw => Self::ResumingSource,
+            LiveStage::Readiness => Self::WaitingForAgent,
+            LiveStage::CapturePrepare | LiveStage::CaptureFlush | LiveStage::CaptureDisks => {
+                Self::CapturingDisks
+            }
+            LiveStage::CaptureDiskIdentity => Self::ComputingDiskIdentity,
+            LiveStage::CaptureExecution => Self::CapturingExecution,
+            LiveStage::CaptureMemory => Self::CapturingMemory,
+            LiveStage::CaptureVerify => Self::VerifyingCapture,
+            LiveStage::CapturePreserve => Self::PreservingSource,
+            LiveStage::CaptureSeal
+            | LiveStage::CaptureAccept
+            | LiveStage::CaptureAbandon
+            | LiveStage::CaptureSourceRecord
+            | LiveStage::CaptureRelease => Self::FinalizingCapture,
+        }
+    }
+}
+
+pub type LiveOperationProgressReceiver = tokio::sync::mpsc::Receiver<LiveOperationProgress>;
+
+/// Bounded and nonblocking, like image progress. Full or closed channels are ignored.
+#[derive(Debug, Clone)]
+pub struct LiveOperationProgressSender {
+    tx: tokio::sync::mpsc::Sender<LiveOperationProgress>,
+}
+
+impl LiveOperationProgressSender {
+    pub fn channel(bound: usize) -> (Self, LiveOperationProgressReceiver) {
+        let (tx, rx) = tokio::sync::mpsc::channel(bound.max(1));
+        (Self { tx }, rx)
+    }
+
+    pub fn default_channel() -> (Self, LiveOperationProgressReceiver) {
+        Self::channel(256)
+    }
+
+    pub fn send(&self, stage: LiveOperationProgress) {
+        let _ = self.tx.try_send(stage);
+    }
+}
+
+pub(crate) fn report_progress(
+    progress: Option<&LiveOperationProgressSender>,
+    stage: LiveOperationProgress,
+) {
+    if let Some(progress) = progress {
+        progress.send(stage);
+    }
+}
+
+fn protocol(message: impl Into<String>) -> LibVmError {
+    LibVmError::LiveProtocol {
+        message: message.into(),
+    }
+}
+fn id(value: &str) -> Result<LiveId, LibVmError> {
+    LiveId::parse(value).map_err(protocol)
+}
+fn uuid(value: &LiveId) -> Result<Uuid, LibVmError> {
+    Uuid::parse_str(value.as_str()).map_err(|error| protocol(error.to_string()))
+}
+
+pub(crate) fn missing_pause_authority(
+    observation: &MachineLiveObservation,
+    lifecycle: &vm_spec::lifecycle::LiveLifecycle,
+    pending_resume: Result<Option<&LiveId>, &LibVmError>,
+    message: &str,
+) -> LibVmError {
+    let state = observation
+        .state()
+        .map_or("unavailable", VmLifecycleState::as_str);
+    let pending_request = match &pending_resume {
+        Ok(request) => *request,
+        Err(_) => None,
+    }
+    .or_else(|| {
+        lifecycle
+            .activity
+            .as_ref()
+            .filter(|activity| activity.command == vm_spec::lifecycle::LiveCommandKind::Resume)
+            .map(|activity| &activity.request_id)
+    });
+    protocol(format!(
+        "{message}; observed_state={state}; activity={:?}; last_live_error={:?}; machine_id={}; run_id={}; pending_resume_request_id={}; pending_resume_lookup_error={:?}",
+        lifecycle.activity,
+        lifecycle.error,
+        observation.report().machine_id,
+        observation.report().run_id,
+        pending_request.map_or("none", LiveId::as_str),
+        pending_resume.err(),
+    ))
+}
+
+pub(crate) fn envelope(
+    observation: &MachineLiveObservation,
+    request_id: Uuid,
+) -> Result<LiveCommandEnvelope, LibVmError> {
+    if request_id.is_nil() {
+        return Err(protocol("nil lifecycle request identity"));
+    }
+    Ok(LiveCommandEnvelope {
+        machine_id: id(&observation.report().machine_id)?,
+        run_id: id(&observation.report().run_id)?,
+        request_id: id(&request_id.to_string())?,
+    })
+}
+
+pub(crate) fn projection(
+    observation: &MachineLiveObservation,
+) -> Result<MachineLifecycle, LibVmError> {
+    let state = observation.state()?;
+    let lifecycle = observation.lifecycle()?;
+    lifecycle.validate_for(state).map_err(protocol)?;
+    if let Some(pause) = &lifecycle.current_pause {
+        if pause.token.machine_id.as_str() != observation.report().machine_id
+            || pause.token.run_id.as_str() != observation.report().run_id
+        {
+            return Err(protocol("current pause belongs to another machine/run"));
+        }
+    }
+    Ok(MachineLifecycle {
+        report: observation.report().clone(),
+        state,
+        lifecycle,
+        operation: None,
+    })
+}
+
+pub(crate) fn project_machine_state(
+    mut state: MachineState,
+    current: &MachineLifecycle,
+) -> MachineState {
+    state.status = match current.state {
+        VmLifecycleState::Starting => MachineRuntimeState::Starting,
+        VmLifecycleState::Running => MachineRuntimeState::Running,
+        VmLifecycleState::Stopping => MachineRuntimeState::Stopping,
+        VmLifecycleState::Stopped => MachineRuntimeState::Stopped,
+        VmLifecycleState::Failed | VmLifecycleState::Error => MachineRuntimeState::Error,
+        VmLifecycleState::Pausing => MachineRuntimeState::Pausing,
+        VmLifecycleState::Paused => MachineRuntimeState::Paused,
+        VmLifecycleState::Capturing => MachineRuntimeState::Capturing,
+        VmLifecycleState::Hibernating => MachineRuntimeState::Hibernating,
+        VmLifecycleState::Hibernated => MachineRuntimeState::Hibernated,
+        VmLifecycleState::Restoring => MachineRuntimeState::Restoring,
+        VmLifecycleState::Activating => MachineRuntimeState::Activating,
+        VmLifecycleState::ActivationFailed => MachineRuntimeState::ActivationFailed,
+    };
+    state.last_error = current.lifecycle.error.as_ref().map(ToString::to_string);
+    state.updated_at = chrono::Utc::now().timestamp();
+    state
+}
+
+impl Machine {
+    /// Submit a caller-chosen identity through the durable manager journal.
+    /// Exact retries recover the original response, not a replacement command.
+    /// A NEW Capture is only created by [`Machine::submit_capture`], which
+    /// registers its reservation and plan first; raw input can only replay it.
+    pub async fn live_command(
+        &self,
+        observation: &MachineLiveObservation,
+        command: LiveCommand,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        if matches!(command, LiveCommand::Pause(_) | LiveCommand::Resume(_)) {
+            let config = self
+                .runtime()
+                .resolve_machine_config(&MachineRef::id(self.machine_id()))
+                .await?;
+            crate::machine::hibernate::fence(
+                self.runtime(),
+                &config,
+                crate::machine::hibernate::HibernateRemedy::Start,
+            )
+            .await?;
+        }
+        if let LiveCommand::Capture(capture) = &command {
+            capture.validate_plan().map_err(protocol)?;
+        }
+        if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
+            return Err(LibVmError::LiveObservation {
+                reference: self.id(),
+                message: "observation belongs to another machine".into(),
+            });
+        }
+        if command.envelope().machine_id.as_str() != Uuid::from(self.machine_id()).to_string()
+            || command.envelope().run_id.as_str() != observation.report().run_id
+        {
+            return Err(protocol(
+                "live command differs from its admission observation",
+            ));
+        }
+        let runtime = self.runtime();
+        let store = runtime.native_store()?;
+        let e = command.envelope();
+        let existing = store
+            .live_command_record(self.machine_id(), uuid(&e.run_id)?, uuid(&e.request_id)?)
+            .await?;
+        if let Some(existing) = &existing {
+            if existing.intent.report.monitor_id != observation.report().monitor_id {
+                return Err(protocol(
+                    "retained lifecycle command belongs to another monitor",
+                ));
+            }
+            if existing.intent.command != command {
+                return Ok(LiveCommandResult::rejected(
+                    command.kind(),
+                    vm_spec::lifecycle::LiveRejection::new(
+                        vm_spec::lifecycle::LiveRejectionReason::RequestConflict,
+                        observation.state()?,
+                        "request identity conflicts with persisted inputs",
+                    ),
+                ));
+            }
+            if let Some(result) = &existing.result {
+                return Ok(result.clone());
+            }
+        } else {
+            if matches!(command, LiveCommand::Capture(_)) {
+                return Err(protocol(
+                    "a new capture must be reserved and journaled through submit_capture",
+                ));
+            }
+            if let Some(rejection) = require_new_command(observation, &command)? {
+                return Ok(rejection);
+            }
+        }
+        let prepared = {
+            let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
+            require_same_observation(observation, &fresh)?;
+            if existing.is_none() {
+                if let Some(rejection) = require_new_command(&fresh, &command)? {
+                    return Ok(rejection);
+                }
+            }
+            let intent =
+                existing
+                    .map(|record| record.intent)
+                    .unwrap_or_else(|| LiveCommandIntent {
+                        report: observation.report().clone(),
+                        command,
+                    });
+            let e = intent.command.envelope();
+            store
+                .prepare_live_command(config.id, uuid(&e.run_id)?, uuid(&e.request_id)?, &intent)
+                .await?
+        };
+        if let Some(result) = prepared.result {
+            return Ok(result);
+        }
+        self.send_prepared(prepared.intent).await
+    }
+
+    /// Send an already durable intent and persist its exact result. Capture
+    /// dispatch holds the machine lock through acknowledgment to serialize
+    /// fork cancellation; no database transaction spans the monitor round trip.
+    pub(crate) async fn send_prepared(
+        &self,
+        intent: LiveCommandIntent,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        let runtime = self.runtime();
+        let store = runtime.native_store()?;
+        let capture_lock = if let LiveCommand::Capture(command) = &intent.command {
+            let (lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            if let Some(retained) = store
+                .live_command_record(
+                    config.id,
+                    uuid(&command.envelope.run_id)?,
+                    uuid(&command.envelope.request_id)?,
+                )
+                .await?
+            {
+                if let Some(result) = retained.result {
+                    return Ok(result);
+                }
+            }
+            if let Err(error) = store.require_capture_dispatch(command).await {
+                let snapshots = crate::store::snapshot_store::SnapshotStore::from_store(
+                    std::sync::Arc::new(store.clone()),
+                );
+                let capture = uuid(&command.plan.capture_id)?;
+                if snapshots
+                    .capture_reservation(capture)
+                    .await?
+                    .is_some_and(|record| record.dispatch_attempted)
+                {
+                    return Err(error);
+                }
+                let result = LiveCommandResult::rejected(
+                    intent.command.kind(),
+                    vm_spec::lifecycle::LiveRejection::new(
+                        vm_spec::lifecycle::LiveRejectionReason::InvalidPlan,
+                        if matches!(
+                            command.plan.pause,
+                            vm_spec::capture::CapturePauseAuthority::Borrow { .. }
+                        ) {
+                            vm_spec::lifecycle::VmLifecycleState::Paused
+                        } else {
+                            vm_spec::lifecycle::VmLifecycleState::Running
+                        },
+                        format!("dispatch refusal before send: {error}"),
+                    ),
+                );
+                let envelope = intent.command.envelope();
+                store
+                    .complete_live_command(
+                        config.id,
+                        uuid(&envelope.run_id)?,
+                        uuid(&envelope.request_id)?,
+                        &intent.report.monitor_id,
+                        &result,
+                        None,
+                    )
+                    .await?;
+                crate::store::snapshot_store::SnapshotStore::from_store(std::sync::Arc::new(
+                    store.clone(),
+                ))
+                .abandon_capture(uuid(&envelope.request_id)?)
+                .await?;
+                return Ok(result);
+            }
+            Some(lock)
+        } else {
+            None
+        };
+        let result = runtime
+            .supervisor()
+            .client(self.machine_id())
+            .lifecycle(intent.command.clone())
+            .await
+            .map_err(|error| {
+                protocol(format!(
+                    "lifecycle outcome uncertain; original request {} retained: {error}",
+                    intent.command.envelope().request_id
+                ))
+            })?;
+        drop(capture_lock);
+        let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+        save_result(runtime, &store, &config, &intent, &result).await?;
+        Ok(result)
+    }
+
+    pub async fn pause_with_request(
+        &self,
+        observation: &MachineLiveObservation,
+        request_id: Uuid,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        self.live_command(
+            observation,
+            LiveCommand::Pause(PauseCommand {
+                envelope: envelope(observation, request_id)?,
+            }),
+        )
+        .await
+    }
+
+    pub async fn resume_with_request(
+        &self,
+        observation: &MachineLiveObservation,
+        request_id: Uuid,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        crate::machine::hibernate::fence(
+            self.runtime(),
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Start,
+        )
+        .await?;
+        let lifecycle = observation.lifecycle()?;
+        let current = match lifecycle.current_pause {
+            Some(current) => current,
+            None => {
+                let pending = self
+                    .pending_command(observation, vm_spec::lifecycle::LiveCommandKind::Resume)
+                    .await;
+                return Err(missing_pause_authority(
+                    observation,
+                    &lifecycle,
+                    pending.as_ref().map(|command| {
+                        command
+                            .as_ref()
+                            .map(|command| &command.envelope().request_id)
+                    }),
+                    "machine has no current pause authority",
+                ));
+            }
+        };
+        self.live_command(
+            observation,
+            LiveCommand::Resume(ResumeCommand {
+                envelope: envelope(observation, request_id)?,
+                operation_id: current.operation_id,
+                token: current.token,
+            }),
+        )
+        .await
+    }
+
+    pub async fn get_operation(
+        &self,
+        observation: &MachineLiveObservation,
+        request_id: Uuid,
+        operation_id: LiveId,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        self.live_command(
+            observation,
+            LiveCommand::GetOperation(GetOperationCommand {
+                envelope: envelope(observation, request_id)?,
+                operation_id,
+            }),
+        )
+        .await
+    }
+
+    /// Observe retained operation authority without adding durable command
+    /// history. Explicit `get_operation` requests and recovery retain their
+    /// journaled replay semantics.
+    pub(crate) async fn observe_operation(
+        &self,
+        observation: &MachineLiveObservation,
+        operation_id: LiveId,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
+            return Err(LibVmError::LiveObservation {
+                reference: self.id(),
+                message: "observation belongs to another machine".into(),
+            });
+        }
+        let command = LiveCommand::GetOperation(GetOperationCommand {
+            envelope: envelope(observation, Uuid::new_v4())?,
+            operation_id,
+        });
+        if let Some(rejection) = require_new_command(observation, &command)? {
+            return Ok(rejection);
+        }
+        let runtime = self.runtime();
+        {
+            let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
+            require_same_observation(observation, &fresh)?;
+            if let Some(rejection) = require_new_command(&fresh, &command)? {
+                return Ok(rejection);
+            }
+        }
+        let result = runtime
+            .supervisor()
+            .client(self.machine_id())
+            .lifecycle(command)
+            .await
+            .map_err(|error| protocol(format!("operation observation: {error}")))?;
+        if !matches!(result, LiveCommandResult::GetOperation(_)) {
+            return Err(protocol("monitor returned another command's response"));
+        }
+        result.validate().map_err(protocol)?;
+        Ok(result)
+    }
+
+    pub async fn cancel_operation(
+        &self,
+        observation: &MachineLiveObservation,
+        request_id: Uuid,
+        operation_id: LiveId,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        self.live_command(
+            observation,
+            LiveCommand::CancelOperation(CancelOperationCommand {
+                envelope: envelope(observation, request_id)?,
+                operation_id,
+            }),
+        )
+        .await
+    }
+
+    pub async fn resume(
+        &self,
+        observation: &MachineLiveObservation,
+    ) -> Result<MachineLifecycle, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        crate::machine::hibernate::fence(
+            self.runtime(),
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Start,
+        )
+        .await?;
+        let pending = self
+            .pending_command(observation, vm_spec::lifecycle::LiveCommandKind::Resume)
+            .await?;
+        let result = if let Some(command) = pending {
+            if fenced_failure(observation)? {
+                return Err(protocol(
+                    "resume outcome uncertain in fenced failure; inspect operation or stop",
+                ));
+            }
+            self.live_command(observation, command).await?
+        } else {
+            self.resume_with_request(observation, Uuid::new_v4())
+                .await?
+        };
+        match result {
+            LiveCommandResult::Resume(ResumeOutcome::Resumed { .. }) => {
+                projection(&self.observe_live().await?)
+            }
+            LiveCommandResult::Resume(ResumeOutcome::Failed { failed }) => Err(protocol(format!(
+                "{}; recovered state {}",
+                failed.cause, failed.state
+            ))),
+            result => Err(result_error(&result)),
+        }
+    }
+
+    pub(crate) async fn pause_and_wait(
+        &self,
+        observation: &MachineLiveObservation,
+    ) -> Result<MachineLifecycle, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        crate::machine::hibernate::fence(
+            self.runtime(),
+            &config,
+            crate::machine::hibernate::HibernateRemedy::Start,
+        )
+        .await?;
+        if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
+            return Err(LibVmError::LiveObservation {
+                reference: self.id(),
+                message: "observation belongs to another machine".into(),
+            });
+        }
+        observation.require_pause_submission()?;
+        let pending = self
+            .pending_command(observation, vm_spec::lifecycle::LiveCommandKind::Pause)
+            .await?;
+        let request_id = pending
+            .as_ref()
+            .map(|command| uuid(&command.envelope().request_id))
+            .transpose()?
+            .unwrap_or_else(Uuid::new_v4);
+        let operation_id = id(&request_id.to_string())?;
+        if pending.is_none() || !fenced_failure(observation)? {
+            match self.pause_with_request(observation, request_id).await? {
+                LiveCommandResult::Pause(PauseOutcome::Accepted { .. }) => {}
+                result => return Err(result_error(&result)),
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let fresh = self.observe_live().await?;
+            require_same_observation(observation, &fresh)?;
+            match self.observe_operation(&fresh, operation_id.clone()).await? {
+                LiveCommandResult::GetOperation(GetOperationOutcome::Observation {
+                    observation: observed,
+                }) => match observed.operation.outcome.clone() {
+                    OperationOutcome::Succeeded { .. } => {
+                        let mut current = projection(&self.observe_live().await?)?;
+                        current.operation = Some(observed.operation);
+                        return Ok(current);
+                    }
+                    OperationOutcome::Failed { failure } => {
+                        return Err(protocol(failure.to_string()))
+                    }
+                    OperationOutcome::CaptureSealed { .. } => {
+                        return Err(protocol("pause operation returned a capture seal"))
+                    }
+                    OperationOutcome::InProgress => {}
+                },
+                result => return Err(result_error(&result)),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(protocol(format!(
+                    "pause {operation_id} remains pending; operation retained, not cancelled"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    async fn pending_command(
+        &self,
+        observation: &MachineLiveObservation,
+        kind: vm_spec::lifecycle::LiveCommandKind,
+    ) -> Result<Option<LiveCommand>, LibVmError> {
+        if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
+            return Err(LibVmError::LiveObservation {
+                reference: self.id(),
+                message: "observation belongs to another machine".into(),
+            });
+        }
+        let run = Uuid::parse_str(&observation.report().run_id)
+            .map_err(|error| protocol(error.to_string()))?;
+        Ok(self
+            .runtime()
+            .native_store()?
+            .pending_live_commands(self.machine_id(), run, &observation.report().monitor_id)
+            .await?
+            .into_iter()
+            .find(|record| record.intent.command.kind() == kind)
+            .map(|record| record.intent.command))
+    }
+
+    /// Reconcile only retained identities against this generation, then
+    /// advance this machine's retained captures (publish valid seals, settle
+    /// continuation facts). This never creates a replacement Pause or Capture
+    /// and never applies a manager-loss resume policy.
+    pub async fn reconcile_live(&self) -> Result<MachineLifecycle, LibVmError> {
+        let runtime = self.runtime();
+        {
+            let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            reconcile(runtime, &config).await?;
+        }
+        crate::machine::live_capture::reconcile_captures(
+            runtime,
+            Some(self.machine_id()),
+            crate::storage::pool::PublicationLockPolicy::Wait,
+        )
+        .await?;
+        projection(&self.observe_live().await?)
+    }
+}
+
+fn fenced_failure(observation: &MachineLiveObservation) -> Result<bool, LibVmError> {
+    Ok(observation.state()? == VmLifecycleState::Error
+        || observation
+            .lifecycle()?
+            .activity
+            .as_ref()
+            .is_some_and(|activity| activity.stage == LiveStage::PauseFailed))
+}
+
+/// Only NEW Pause and Capture are capability gated. Releasing, observing,
+/// cancelling or resuming retained authority never depends on a fresh vector.
+fn require_new_command(
+    observation: &MachineLiveObservation,
+    command: &LiveCommand,
+) -> Result<Option<LiveCommandResult>, LibVmError> {
+    match command {
+        LiveCommand::Pause(_) => require_live_operation(observation, LiveOperation::Pause)?,
+        LiveCommand::Capture(_) => require_live_operation(observation, LiveOperation::Capture)?,
+        _ => {}
+    }
+    let state = observation.state()?;
+    if matches!(command, LiveCommand::CancelOperation(_))
+        && matches!(state, VmLifecycleState::Running | VmLifecycleState::Paused)
+    {
+        // Only the monitor knows whether this exact target still owns an
+        // identity-pending cut after its source continuation.
+        return Ok(None);
+    }
+    Ok((!state.admits(command.kind())).then(|| {
+        LiveCommandResult::rejected(
+            command.kind(),
+            vm_spec::lifecycle::LiveRejection::new(
+                vm_spec::lifecycle::LiveRejectionReason::InvalidState,
+                state,
+                "command is not admitted in the observed lifecycle state",
+            ),
+        )
+    }))
+}
+
+pub(crate) fn result_error(result: &LiveCommandResult) -> LibVmError {
+    protocol(
+        result
+            .rejection()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unexpected lifecycle command result".into()),
+    )
+}
+
+pub(crate) fn require_same_observation(
+    expected: &MachineLiveObservation,
+    fresh: &MachineLiveObservation,
+) -> Result<(), LibVmError> {
+    let a = expected.report();
+    let b = fresh.report();
+    if a.machine_id != b.machine_id
+        || a.run_id != b.run_id
+        || a.monitor_id != b.monitor_id
+        || a.backend != b.backend
+        || a.lane != b.lane
+        || a.topology_revision != b.topology_revision
+    {
+        return Err(protocol(
+            "machine/run/monitor/topology changed since capability admission",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn save_result(
+    runtime: &Runtime,
+    store: &Store,
+    config: &MachineConfig,
+    intent: &LiveCommandIntent,
+    result: &LiveCommandResult,
+) -> Result<(), LibVmError> {
+    if result.kind() != intent.command.kind() {
+        return Err(protocol("monitor returned another command's response"));
+    }
+    result.validate().map_err(protocol)?;
+    let mut current = match runtime.observe_live(&MachineRef::id(config.id)).await {
+        Ok(observation)
+            if observation.report().run_id == intent.report.run_id
+                && observation.report().monitor_id == intent.report.monitor_id =>
+        {
+            Some(projection(&observation)?)
+        }
+        _ => None,
+    };
+    if let Some(current) = &mut current {
+        current.operation = match result {
+            LiveCommandResult::GetOperation(GetOperationOutcome::Observation { observation }) => {
+                Some(observation.operation.clone())
+            }
+            LiveCommandResult::CancelOperation(
+                vm_spec::lifecycle::CancelOperationOutcome::Completed { completed },
+            ) => Some(completed.operation.clone()),
+            LiveCommandResult::CancelOperation(
+                vm_spec::lifecycle::CancelOperationOutcome::Failed { failed },
+            ) => Some(failed.operation.clone()),
+            _ => None,
+        };
+    }
+    let state = runtime.machine_state(config.id).await?;
+    let next = current
+        .as_ref()
+        .map(|current| project_machine_state(state, current));
+    let e = intent.command.envelope();
+    store
+        .complete_live_command(
+            config.id,
+            uuid(&e.run_id)?,
+            uuid(&e.request_id)?,
+            &intent.report.monitor_id,
+            result,
+            current.as_ref().zip(next.as_ref()),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Called under the existing machine lock. Reconnect never invents a Pause,
+/// resumes a user pause, or retries fenced Error / failed-Pausing work.
+pub(crate) async fn reconcile(runtime: &Runtime, config: &MachineConfig) -> Result<(), LibVmError> {
+    let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
+    let current = projection(&fresh)?;
+    let store = runtime.native_store()?;
+    let run =
+        Uuid::parse_str(&fresh.report().run_id).map_err(|error| protocol(error.to_string()))?;
+    let state = runtime.machine_state(config.id).await?;
+    let next = project_machine_state(state, &current);
+    store
+        .save_live_projection(config.id, &current, &next)
+        .await?;
+    let fenced = fenced_failure(&fresh)?;
+    for retained in store
+        .pending_live_commands(config.id, run, &fresh.report().monitor_id)
+        .await?
+    {
+        if retained.intent.report.topology_revision != fresh.report().topology_revision {
+            continue;
+        }
+        if !matches!(retained.intent.command, LiveCommand::GetOperation(_)) {
+            let command = LiveCommand::GetOperation(GetOperationCommand {
+                envelope: envelope(&fresh, Uuid::new_v4())?,
+                operation_id: retained.intent.command.target_operation_id().clone(),
+            });
+            let intent = LiveCommandIntent {
+                report: fresh.report().clone(),
+                command,
+            };
+            let e = intent.command.envelope();
+            store
+                .prepare_live_command(config.id, uuid(&e.run_id)?, uuid(&e.request_id)?, &intent)
+                .await?;
+            let result = runtime
+                .supervisor()
+                .client(config.id)
+                .lifecycle(intent.command.clone())
+                .await
+                .map_err(|error| {
+                    protocol(format!("operation reconciliation observation: {error}"))
+                })?;
+            save_result(runtime, &store, config, &intent, &result).await?;
+        }
+        let latest = runtime.observe_live(&MachineRef::id(config.id)).await?;
+        if (fenced || fenced_failure(&latest)?)
+            && !matches!(retained.intent.command, LiveCommand::GetOperation(_))
+        {
+            continue;
+        }
+        let result = runtime
+            .supervisor()
+            .client(config.id)
+            .lifecycle(retained.intent.command.clone())
+            .await
+            .map_err(|error| {
+                protocol(format!(
+                    "retained lifecycle request reconciliation: {error}"
+                ))
+            })?;
+        save_result(runtime, &store, config, &retained.intent, &result).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::machine::live::MachineLiveObservation;
+    use crate::machine::live_operations::missing_pause_authority;
+    use vm_spec::lifecycle::{
+        LiveActivity, LiveCommandKind, LiveFailure, LiveFailureCode, LiveId, LiveLifecycle,
+        LiveStage, VmLifecycleState,
+    };
+    use vm_spec::live::{
+        LiveBackend, LiveCapabilityVector, LiveLane, LiveMachineReport, LiveReasonCode, LiveScope,
+    };
+
+    #[test]
+    fn monitor_stages_have_user_meaningful_progress() {
+        use crate::machine::live_operations::LiveOperationProgress as Progress;
+
+        let mut covered = Vec::new();
+        for (stages, expected) in [
+            (vec![LiveStage::Admission], Progress::Admitting),
+            (
+                vec![
+                    LiveStage::MonitorDrain,
+                    LiveStage::GuestFreeze,
+                    LiveStage::NativePause,
+                    LiveStage::PauseFailed,
+                    LiveStage::RecoveryFreeze,
+                    LiveStage::RecoveryPause,
+                ],
+                Progress::PausingSource,
+            ),
+            (
+                vec![
+                    LiveStage::RollbackThaw,
+                    LiveStage::CancelNative,
+                    LiveStage::CancelThaw,
+                    LiveStage::ResumeNative,
+                    LiveStage::ResumeClock,
+                    LiveStage::ResumeHandshake,
+                    LiveStage::ResumeThaw,
+                ],
+                Progress::ResumingSource,
+            ),
+            (vec![LiveStage::Readiness], Progress::WaitingForAgent),
+            (
+                vec![
+                    LiveStage::CapturePrepare,
+                    LiveStage::CaptureFlush,
+                    LiveStage::CaptureDisks,
+                ],
+                Progress::CapturingDisks,
+            ),
+            (
+                vec![LiveStage::CaptureDiskIdentity],
+                Progress::ComputingDiskIdentity,
+            ),
+            (
+                vec![LiveStage::CaptureExecution],
+                Progress::CapturingExecution,
+            ),
+            (vec![LiveStage::CaptureMemory], Progress::CapturingMemory),
+            (vec![LiveStage::CaptureVerify], Progress::VerifyingCapture),
+            (vec![LiveStage::CapturePreserve], Progress::PreservingSource),
+            (
+                vec![
+                    LiveStage::CaptureSeal,
+                    LiveStage::CaptureAccept,
+                    LiveStage::CaptureAbandon,
+                    LiveStage::CaptureSourceRecord,
+                    LiveStage::CaptureRelease,
+                ],
+                Progress::FinalizingCapture,
+            ),
+        ] {
+            for stage in stages {
+                assert_eq!(Progress::from(stage), expected, "{stage:?}");
+                assert!(!covered.contains(&stage), "duplicate stage {stage:?}");
+                covered.push(stage);
+            }
+        }
+        assert_eq!(covered.len(), LiveStage::ALL.len());
+        assert!(LiveStage::ALL.iter().all(|stage| covered.contains(stage)));
+    }
+
+    #[test]
+    fn progress_is_best_effort_when_full_or_closed() {
+        use crate::machine::live_operations::{LiveOperationProgress, LiveOperationProgressSender};
+
+        let (sender, mut receiver) = LiveOperationProgressSender::channel(0);
+        sender.send(LiveOperationProgress::Admitting);
+        sender.send(LiveOperationProgress::Done);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            LiveOperationProgress::Admitting
+        );
+        drop(receiver);
+        sender.send(LiveOperationProgress::Done);
+    }
+
+    fn id(last: u8) -> LiveId {
+        LiveId::parse(&format!("00000000-0000-4000-8000-0000000000{last:02x}")).unwrap()
+    }
+
+    fn observed(state: VmLifecycleState, lifecycle: LiveLifecycle) -> MachineLiveObservation {
+        MachineLiveObservation::for_test(
+            LiveMachineReport {
+                schema_version: 1,
+                scope: LiveScope::Machine,
+                machine_id: id(1).to_string(),
+                run_id: id(2).to_string(),
+                monitor_id: id(3).to_string(),
+                backend: LiveBackend::Mock,
+                lane: LiveLane::NotApplicable,
+                topology_revision: 1,
+                same_machine_activation: false,
+                live: LiveCapabilityVector::all_unsupported(LiveReasonCode::NotDelivered),
+            },
+            state,
+            lifecycle,
+        )
+    }
+
+    #[test]
+    fn missing_pause_authority_names_the_observed_state_and_capture() {
+        let lifecycle = LiveLifecycle {
+            activity: Some(LiveActivity {
+                operation_id: id(4),
+                request_id: id(5),
+                command: LiveCommandKind::Capture,
+                stage: LiveStage::CaptureSourceRecord,
+            }),
+            ..LiveLifecycle::default()
+        };
+        let observation = observed(VmLifecycleState::Capturing, lifecycle.clone());
+        let message = missing_pause_authority(
+            &observation,
+            &lifecycle,
+            Ok(None),
+            "machine has no current pause authority",
+        )
+        .to_string();
+        for detail in [
+            "machine has no current pause authority",
+            "observed_state=capturing",
+            "CaptureSourceRecord",
+            "00000000-0000-4000-8000-000000000004",
+            "00000000-0000-4000-8000-000000000005",
+            &format!("machine_id={}", id(1)),
+            &format!("run_id={}", id(2)),
+            "pending_resume_request_id=none",
+        ] {
+            assert!(message.contains(detail), "{message}");
+        }
+    }
+
+    #[test]
+    fn missing_pause_authority_includes_live_error_and_pending_resume() {
+        let lifecycle = LiveLifecycle {
+            error: Some(LiveFailure::new(
+                LiveFailureCode::AbandonFailed,
+                LiveStage::CaptureAbandon,
+                "native capture ownership is unresolved",
+            )),
+            ..LiveLifecycle::default()
+        };
+        let observation = observed(VmLifecycleState::Error, lifecycle.clone());
+        let pending = id(6);
+        let message = missing_pause_authority(
+            &observation,
+            &lifecycle,
+            Ok(Some(&pending)),
+            "machine has no current pause authority",
+        )
+        .to_string();
+        assert!(message.contains("observed_state=error"), "{message}");
+        assert!(
+            message.contains("native capture ownership is unresolved"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("pending_resume_request_id={pending}")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn missing_pause_authority_retains_observed_resume_during_lookup_failure() {
+        let lifecycle = LiveLifecycle {
+            activity: Some(LiveActivity {
+                operation_id: id(4),
+                request_id: id(5),
+                command: LiveCommandKind::Resume,
+                stage: LiveStage::ResumeNative,
+            }),
+            ..LiveLifecycle::default()
+        };
+        let observation = observed(VmLifecycleState::Pausing, lifecycle.clone());
+        let lookup_error = crate::LibVmError::LiveProtocol {
+            message: "journal unavailable".into(),
+        };
+        let message = missing_pause_authority(
+            &observation,
+            &lifecycle,
+            Err(&lookup_error),
+            "machine has no current pause authority",
+        )
+        .to_string();
+        assert!(message.contains("observed_state=pausing"), "{message}");
+        assert!(
+            message.contains(&format!("pending_resume_request_id={}", id(5))),
+            "{message}"
+        );
+        assert!(message.contains("journal unavailable"), "{message}");
+    }
+
+    #[test]
+    fn stable_source_cancellation_defers_target_phase_to_monitor_without_changing_matrix() {
+        use crate::machine::live_operations::{envelope, require_new_command};
+        use vm_spec::lifecycle::{CancelOperationCommand, LiveCommand};
+
+        for state in [VmLifecycleState::Running, VmLifecycleState::Paused] {
+            let observation = observed(state, LiveLifecycle::default());
+            let command = LiveCommand::CancelOperation(CancelOperationCommand {
+                envelope: envelope(&observation, uuid::Uuid::from_u128(9)).unwrap(),
+                operation_id: id(4),
+            });
+            assert!(!state.admits(command.kind()));
+            assert!(require_new_command(&observation, &command)
+                .unwrap()
+                .is_none());
+        }
+        for state in [
+            VmLifecycleState::Starting,
+            VmLifecycleState::Stopped,
+            VmLifecycleState::Error,
+        ] {
+            let observation = observed(state, LiveLifecycle::default());
+            let command = LiveCommand::CancelOperation(CancelOperationCommand {
+                envelope: envelope(&observation, uuid::Uuid::from_u128(9)).unwrap(),
+                operation_id: id(4),
+            });
+            let rejected = require_new_command(&observation, &command)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                rejected,
+                vm_spec::lifecycle::LiveCommandResult::rejected(
+                    LiveCommandKind::CancelOperation,
+                    vm_spec::lifecycle::LiveRejection::new(
+                        vm_spec::lifecycle::LiveRejectionReason::InvalidState,
+                        state,
+                        "command is not admitted in the observed lifecycle state",
+                    ),
+                ),
+            );
+        }
+    }
+}

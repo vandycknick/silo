@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+mod capabilities;
 mod clock_sync;
 mod context;
+mod durable_file;
 mod exec_log;
 mod execution;
 mod exit_command;
@@ -15,8 +17,10 @@ mod finalize;
 mod forward;
 mod guest;
 mod krun;
+mod live;
 mod lock;
 mod machine;
+mod restore;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod rosetta;
 mod secure_file;
@@ -92,21 +96,29 @@ fn main() -> eyre::Result<()> {
     if krun::worker::invoked_as_worker() {
         return krun::worker::main();
     }
+    if let Some(result) = capabilities::dispatch() {
+        return result;
+    }
+    if let Some(result) = restore::inspect::dispatch() {
+        return result;
+    }
     let args = Args::parse();
     let inherited_fds = InheritedPipeFds::from_env()?;
 
-    let inherited_fds = if args.foreground {
+    let mut inherited_fds = if args.foreground {
         inherited_fds
     } else {
         inherited_fds.require_for_daemon()?
     };
 
     if !args.foreground {
-        daemonize(&args, inherited_fds)?;
+        daemonize(&args, &inherited_fds)?;
     }
 
+    let storage_lease = inherited_fds.take_storage_lease()?;
     let start_request = StartRequestPipe::from_fd(inherited_fds.startpipe)
-        .map_err(|err| eyre::eyre!("open start request pipe: {err}"))?;
+        .map_err(|err| eyre::eyre!("open start request pipe: {err}"))?
+        .with_storage_lease(storage_lease.clone());
     let sync_reporter = SyncReporter::from_fd(inherited_fds.syncpipe)
         .map_err(|err| eyre::eyre!("open syncpipe reporter: {err}"))?;
     let machine_log_dir = inherited_fds.machine_log_dir;
@@ -114,6 +126,8 @@ fn main() -> eyre::Result<()> {
     // Held through backend shutdown/finalization. This is a one-way lifetime
     // lease, not a health check; netd death never stops the VM.
     let _netd_exit = inherited_fds.take_netd_exit()?;
+    // Validated at entry, adopted only by a restore start request.
+    let restore_fds = inherited_fds.take_restore();
 
     // Fork the exit runner while this process is still single-threaded: the
     // tracing appender below starts the first thread.
@@ -126,15 +140,7 @@ fn main() -> eyre::Result<()> {
     let trace_file = secure_file::open_append(&args.trace_log)?;
 
     let (writer, _guard) = tracing_appender::non_blocking(trace_file);
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_level(true)
-        .with_writer(writer)
-        .try_init()
+    utils::logging::init(utils::logging::Profile::Monitor, writer)
         .map_err(|err| eyre::eyre!("initialize silo-vmm tracing: {err}"))?;
 
     tracing::info!(
@@ -155,7 +161,7 @@ fn main() -> eyre::Result<()> {
     let mut serial_file = secure_file::open_append(&args.serial_log)?;
     write_serial_generation_boundary(&mut serial_file, &args.id, &args.run_id)?;
 
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| eyre::eyre!("build tokio runtime: {err}"))?
@@ -166,7 +172,11 @@ fn main() -> eyre::Result<()> {
             serial_file,
             machine_log_dir,
             exit_runner,
-        ))
+            restore_fds,
+        ));
+    // The entry owner outlives backend finalization and durable exit publication.
+    drop(storage_lease);
+    result
 }
 
 fn write_serial_generation_boundary(
@@ -229,6 +239,7 @@ async fn run(
     serial_file: std::fs::File,
     machine_log_dir: Option<std::os::fd::RawFd>,
     exit_runner: Option<ExitRunner>,
+    restore_fds: Vec<std::os::fd::RawFd>,
 ) -> eyre::Result<()> {
     let mut start_request = start_request;
     let mut sync_reporter = sync_reporter;
@@ -273,6 +284,7 @@ async fn run(
         agent_enabled: args.agent_enabled,
         serial_file,
         primary_machine: &primary_machine,
+        restore_fds,
     };
     let result = match startup::init(
         &runtime,
@@ -294,6 +306,7 @@ async fn run(
                     require_guest_ready: initialized.require_guest_ready,
                     deadline: initialized.startup_deadline,
                     cancelled: initialized.startup_cancel.clone(),
+                    activation: initialized.activation,
                 },
             )
             .await
@@ -375,7 +388,7 @@ fn install_signal_handlers(
 }
 
 #[cfg(target_os = "macos")]
-fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
+fn daemonize(args: &Args, inherited_fds: &InheritedPipeFds) -> eyre::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -417,7 +430,7 @@ fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
     for arg in &args.exit_command_args {
         cmd.arg("--exit-command-arg").arg(arg);
     }
-    inherited_fds.clear_cloexec()?;
+    inherited_fds.configure_reexec(&mut cmd)?;
     unsafe {
         cmd.pre_exec(|| {
             nix::unistd::setsid()
@@ -434,7 +447,7 @@ fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn daemonize(_args: &Args, _inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
+fn daemonize(_args: &Args, _inherited_fds: &InheritedPipeFds) -> eyre::Result<()> {
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Parent { .. }) => std::process::exit(0),
         Ok(nix::unistd::ForkResult::Child) => {}

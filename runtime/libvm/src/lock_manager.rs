@@ -85,6 +85,25 @@ pub(crate) struct MachineLifetimeLock {
 impl MachineLifetimeLock {
     pub(crate) fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
         let file = open_lock_file(path)?;
+        Self::try_lock(file)
+    }
+
+    /// Noncreating observation, including a generation with no runtime tree.
+    pub(crate) fn available_existing(path: &Path) -> io::Result<bool> {
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags((nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NOFOLLOW).bits())
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        Ok(Self::try_lock(file)?.is_some())
+    }
+
+    fn try_lock(file: File) -> io::Result<Option<Self>> {
         loop {
             #[allow(deprecated)]
             match nix::fcntl::flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
@@ -204,9 +223,9 @@ fn create_lock_allocation(path: &Path) -> io::Result<()> {
 }
 
 fn open_lock_file(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    // Directory ownership belongs to LockManager, node-state data admission,
+    // or the machine runtime-path owner. Opening a lock must never recreate a
+    // removed directory using ambient umask permissions.
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -316,6 +335,16 @@ mod tests {
             .try_lock()
             .expect("try lock allocation")
             .is_none());
+    }
+
+    #[test]
+    fn lifetime_lock_does_not_create_an_unadmitted_parent_directory() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let parent = temp.path().join("missing/runtime/machine");
+        let result = MachineLifetimeLock::try_acquire(&parent.join("vmm.lock"));
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::NotFound));
+        assert!(!parent.exists());
+        assert!(!temp.path().join("missing").exists());
     }
 
     #[test]

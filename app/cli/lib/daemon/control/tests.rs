@@ -18,7 +18,6 @@ fn state(root: &std::path::Path) -> Arc<ControlState> {
         crate::daemon::status::StatusPublisher::new(
             &host,
             generation,
-            features,
             global.daemon_identity(features).unwrap(),
             None,
         )
@@ -86,7 +85,7 @@ async fn canceled_waiter_does_not_drain_accepted_work() {
     let owner = state.clone();
     let waiter = tokio::spawn(async move {
         owner
-            .mutate(&Request::new(()), false, async move {
+            .mutate(async move {
                 let _ = entered_tx.send(());
                 release_rx.await.unwrap();
                 Ok::<_, Status>(())
@@ -95,35 +94,43 @@ async fn canceled_waiter_does_not_drain_accepted_work() {
     });
     entered_rx.await.unwrap();
     waiter.abort();
-    state.seal_mutations().await;
+    state.begin_stopping().await.unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), state.drain_mutations())
+        tokio::time::timeout(Duration::from_millis(20), state.wait_for_mutations())
             .await
             .is_err()
     );
     release_tx.send(()).unwrap();
-    state.drain_mutations().await.unwrap();
-    assert!(state.admit(&Request::new(()), false).await.is_err());
+    state.wait_for_mutations().await.unwrap();
+    assert!(state.admit().await.is_err());
 }
 #[tokio::test]
-async fn stale_helper_and_public_stopping_requests_rejected() {
+async fn stopping_requests_are_rejected() {
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
-    let generation = uuid::Uuid::new_v4();
-    state.set_helper_generation(Some(generation)).await;
     state.begin_stopping().await.unwrap();
-    assert!(state.admit(&Request::new(()), false).await.is_err());
-    let mut request = Request::new(());
-    request.metadata_mut().insert(
-        "x-silo-helper-generation",
-        generation.to_string().parse().unwrap(),
+    assert!(state.admit().await.is_err());
+}
+
+#[tokio::test]
+async fn mutation_rejection_metadata_marks_only_work_that_was_never_admitted() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let error = state
+        .mutate(async { Err::<(), _>(Status::unavailable("work failed after admission")) })
+        .await
+        .unwrap_err();
+    assert!(error.metadata().get("x-silo-mutation-rejected").is_none());
+    state.begin_stopping().await.unwrap();
+    let error = state
+        .mutate(async { Ok::<_, Status>(()) })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        error.metadata().get("x-silo-mutation-rejected").unwrap(),
+        "true",
     );
-    drop(state.admit(&request, false).await.unwrap());
-    request.metadata_mut().insert(
-        "x-silo-helper-generation",
-        uuid::Uuid::new_v4().to_string().parse().unwrap(),
-    );
-    assert!(state.admit(&request, false).await.is_err());
 }
 
 #[tokio::test]
@@ -134,7 +141,7 @@ async fn invalid_mutations_fail_before_runtime_or_admission() {
     };
     let root = tempfile::tempdir().unwrap();
     let owner = state(root.path());
-    owner.seal_mutations().await;
+    owner.begin_stopping().await.unwrap();
     let service = Service(owner.clone());
     assert_eq!(
         service
@@ -155,6 +162,28 @@ async fn invalid_mutations_fail_before_runtime_or_admission() {
     assert_eq!(
         service
             .update_machine(Request::new(w::UpdateMachineRequest::default()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
+            .update_kernel_args(Request::new(w::UpdateKernelArgsRequest::default()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
+            .update_kernel_args(Request::new(w::UpdateKernelArgsRequest {
+                machine: Some(w::MachineRef {
+                    reference: Some(w::machine_ref::Reference::Name("vm".into())),
+                }),
+                clear: false,
+                append: Vec::new(),
+            }))
             .await
             .unwrap_err()
             .code(),
@@ -184,88 +213,39 @@ async fn invalid_mutations_fail_before_runtime_or_admission() {
         .resolve_image(Request::new(w::ResolveImageRequest {
             reference: "valid".into(),
             pull_policy: 0,
+            platform: None,
         }))
         .await;
     assert!(matches!(&result, Err(e) if e.code() == tonic::Code::InvalidArgument));
-    let result = service
-        .pull_image(Request::new(w::PullImageRequest {
-            reference: String::new(),
-        }))
-        .await;
-    assert!(matches!(&result, Err(e) if e.code() == tonic::Code::InvalidArgument));
+    for request in [
+        w::PullImageRequest::default(),
+        w::PullImageRequest {
+            reference: "alpine".into(),
+            pull_policy: 99,
+        },
+    ] {
+        let result = service.pull_image(Request::new(request)).await;
+        assert!(matches!(&result, Err(e) if e.code() == tonic::Code::InvalidArgument));
+    }
     assert!(owner.runtime.get().is_none());
     assert!(owner.components.get().is_none());
     assert_eq!(owner.capacity.available_permits(), 64);
 }
 
 #[tokio::test]
-async fn mutation_capacity_and_shutdown_marker_are_enforced() {
+async fn mutation_capacity_is_enforced() {
     let root = tempfile::tempdir().unwrap();
     let owner = state(root.path());
     let mut permits = Vec::new();
     for _ in 0..64 {
-        permits.push(owner.admit(&Request::new(()), false).await.unwrap());
+        permits.push(owner.admit().await.unwrap());
     }
     assert_eq!(
-        owner
-            .admit(&Request::new(()), false)
-            .await
-            .unwrap_err()
-            .code(),
+        owner.admit().await.unwrap_err().code(),
         tonic::Code::ResourceExhausted
     );
     drop(permits);
-    std::fs::create_dir_all(owner.host.home().join("taild")).unwrap();
-    // Even an unreadable/symlink marker seals protected operations. No repair occurs.
-    std::os::unix::fs::symlink(
-        root.path().join("missing"),
-        owner.host.home().join("taild/shutdown"),
-    )
-    .unwrap();
-    assert_eq!(
-        owner
-            .admit(&Request::new(()), true)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    drop(owner.admit(&Request::new(()), false).await.unwrap());
-    assert!(
-        std::fs::symlink_metadata(owner.host.home().join("taild/shutdown"))
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-}
-
-#[tokio::test]
-async fn drain_rpc_requires_generation_and_sealed_admission() {
-    use w::daemon_service_server::DaemonService;
-    let root = tempfile::tempdir().unwrap();
-    let owner = state(root.path());
-    let service = Service(owner.clone());
-    let request = || {
-        Request::new(w::DrainMutationsRequest {
-            expected_generation: owner.generation.to_string(),
-        })
-    };
-    assert_eq!(
-        service.drain_mutations(request()).await.unwrap_err().code(),
-        tonic::Code::FailedPrecondition
-    );
-    owner.seal_mutations().await;
-    assert_eq!(
-        service
-            .drain_mutations(Request::new(w::DrainMutationsRequest {
-                expected_generation: uuid::Uuid::new_v4().to_string()
-            }))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    service.drain_mutations(request()).await.unwrap();
+    drop(owner.admit().await.unwrap());
 }
 
 #[tokio::test]
@@ -302,7 +282,7 @@ async fn closing_response_streams_does_not_cancel_native_mutations() {
     let worker = owner.clone();
     let waiter = tokio::spawn(async move {
         worker
-            .mutate(&Request::new(()), false, async move {
+            .mutate(async move {
                 entered_tx.send(()).unwrap();
                 release_rx.await.unwrap();
                 Ok::<_, Status>(())
@@ -314,104 +294,15 @@ async fn closing_response_streams_does_not_cancel_native_mutations() {
     assert!(response.next().await.is_none());
     drop(response);
     tx.closed().await;
-    owner.seal_mutations().await;
+    owner.begin_stopping().await.unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), owner.drain_mutations())
+        tokio::time::timeout(Duration::from_millis(20), owner.wait_for_mutations())
             .await
             .is_err()
     );
     release_tx.send(()).unwrap();
     waiter.await.unwrap().unwrap();
-    owner.drain_mutations().await.unwrap();
-}
-
-#[tokio::test]
-async fn helper_reports_preserve_instance_and_reject_stale_generations() {
-    use w::daemon_service_server::DaemonService;
-    let root = tempfile::tempdir().unwrap();
-    let owner = state(root.path());
-    let generation = uuid::Uuid::new_v4();
-    owner
-        .publisher
-        .set_tailscale(silod_spec::status::ComponentStatus {
-            enabled: true,
-            state: silod_spec::status::ComponentState::Starting,
-            diagnostic: None,
-            approval_url: None,
-            dns_name: None,
-            restart_count: 3,
-            shutdown_protection: silod_spec::status::ShutdownProtection::Unavailable,
-        })
-        .unwrap();
-    owner.set_helper_generation(Some(generation)).await;
-    let service = Service(owner.clone());
-    let report = |generation: uuid::Uuid, instance: &str| {
-        let mut request = Request::new(w::TailscaleStatusReport {
-            helper_generation: generation.to_string(),
-            status: Some(w::ComponentStatus {
-                enabled: true,
-                state: w::ComponentState::NeedsAuth as i32,
-                shutdown_protection: w::ShutdownProtection::Unavailable as i32,
-                ..Default::default()
-            }),
-            instance: Some(instance.into()),
-        });
-        request.metadata_mut().insert(
-            "x-silo-helper-generation",
-            generation.to_string().parse().unwrap(),
-        );
-        request
-    };
-    let instance = "0123456789abcdef0123456789abcdef";
-    service
-        .report_tailscale_status(report(generation, instance))
-        .await
-        .unwrap();
-    let replacement = uuid::Uuid::new_v4();
-    owner.set_helper_generation(Some(replacement)).await;
-    assert_eq!(
-        service
-            .report_tailscale_status(report(generation, instance))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    service
-        .report_tailscale_status(report(replacement, instance))
-        .await
-        .unwrap();
-    assert_eq!(
-        service
-            .report_tailscale_status(report(replacement, "bad"))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::InvalidArgument
-    );
-    assert_eq!(
-        service
-            .report_tailscale_status(report(replacement, "ffffffffffffffffffffffffffffffff"))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    assert_eq!(
-        owner.get_status().await.unwrap().tailscale.unwrap().state,
-        w::ComponentState::NeedsAuth as i32
-    );
-    assert_eq!(
-        owner
-            .get_status()
-            .await
-            .unwrap()
-            .tailscale
-            .unwrap()
-            .restart_count,
-        3
-    );
-    assert!(owner.runtime.get().is_none());
+    owner.wait_for_mutations().await.unwrap();
 }
 
 #[tokio::test]
@@ -435,117 +326,6 @@ async fn real_uds_server_stops_without_runtime_initialization() {
     assert!(!dir.join("control.sock").exists());
     assert!(owner.runtime.get().is_none());
     assert!(owner.components.get().is_none());
-}
-
-#[tokio::test]
-async fn stale_helper_reads_rejected_at_every_rpc_service_boundary() {
-    let root = tempfile::tempdir().unwrap();
-    let owner = state(root.path());
-    let generation = uuid::Uuid::new_v4();
-    owner.set_helper_generation(Some(generation)).await;
-    let dir = root.path().join("control");
-    let server = socket::BoundServer::bind_at(owner.clone(), dir.clone()).unwrap();
-    let shutdown = tokio_util::sync::CancellationToken::new();
-    let task = tokio::spawn(server.serve(shutdown.clone()));
-    let path = dir.join("control.sock");
-    let channel = tonic::transport::Endpoint::from_static("http://localhost")
-        .connect_with_connector(tower::service_fn(move |_| {
-            let path = path.clone();
-            async move {
-                tokio::net::UnixStream::connect(path)
-                    .await
-                    .map(hyper_util::rt::TokioIo::new)
-            }
-        }))
-        .await
-        .unwrap();
-    let stale = || {
-        let mut request = Request::new(());
-        request.metadata_mut().insert(
-            "x-silo-helper-generation",
-            uuid::Uuid::new_v4().to_string().parse().unwrap(),
-        );
-        request
-    };
-    let mut daemon = w::daemon_service_client::DaemonServiceClient::new(channel.clone());
-    assert_eq!(
-        daemon.get_status(stale()).await.unwrap_err().code(),
-        tonic::Code::FailedPrecondition
-    );
-    assert_eq!(
-        daemon.get_runtime_info(stale()).await.unwrap_err().code(),
-        tonic::Code::FailedPrecondition
-    );
-    let mut machine = w::machine_service_client::MachineServiceClient::new(channel.clone());
-    assert_eq!(
-        machine.list_machines(stale()).await.unwrap_err().code(),
-        tonic::Code::FailedPrecondition
-    );
-    let mut network = w::network_service_client::NetworkServiceClient::new(channel.clone());
-    assert_eq!(
-        network
-            .list_network_definitions(stale())
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    let mut runtime = w::runtime_service_client::RuntimeServiceClient::new(channel);
-    assert_eq!(
-        runtime
-            .propose_machine_name(stale())
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    let mut current = Request::new(());
-    current.metadata_mut().insert(
-        "x-silo-helper-generation",
-        generation.to_string().parse().unwrap(),
-    );
-    owner.begin_stopping().await.unwrap();
-    assert!(daemon.get_status(current).await.is_ok());
-    assert!(daemon.get_status(Request::new(())).await.is_ok());
-    assert!(owner.runtime.get().is_none());
-    assert!(owner.components.get().is_none());
-    shutdown.cancel();
-    tokio::time::timeout(Duration::from_secs(2), task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
-async fn draining_helper_can_finish_mutations_before_final_seal() {
-    let root = tempfile::tempdir().unwrap();
-    let owner = state(root.path());
-    let generation = uuid::Uuid::new_v4();
-    owner.set_helper_generation(Some(generation)).await;
-    owner.begin_stopping().await.unwrap();
-    assert!(owner.admit(&Request::new(()), false).await.is_err());
-    let mut request = Request::new(());
-    request.metadata_mut().insert(
-        "x-silo-helper-generation",
-        generation.to_string().parse().unwrap(),
-    );
-    let permit = owner.admit(&request, false).await.unwrap();
-    // This represents helper exit: invalidate identity before final admission
-    // seal, but do not count cancellation of its waiter as native completion.
-    owner.set_helper_generation(None).await;
-    owner.seal_mutations().await;
-    assert!(owner.admit(&request, false).await.is_err());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), owner.drain_mutations())
-            .await
-            .is_err()
-    );
-    drop(permit);
-    tokio::time::timeout(Duration::from_secs(1), owner.drain_mutations())
-        .await
-        .unwrap()
-        .unwrap();
 }
 
 #[tokio::test]
@@ -576,72 +356,620 @@ async fn ownership_acquisition_does_not_replace_socket_and_retains_both_locks() 
 }
 
 #[tokio::test]
-async fn marker_drain_tracks_real_work_without_queueing_ahead_of_stops() {
-    use w::daemon_service_server::DaemonService;
-    let root = tempfile::tempdir().unwrap();
-    let owner = state(root.path());
-    let initial = owner.admit(&Request::new(()), true).await.unwrap();
-    std::fs::create_dir_all(owner.host.home().join("taild")).unwrap();
-    std::fs::write(owner.host.home().join("taild/shutdown"), b"sealed").unwrap();
-    let service = Service(owner.clone());
-    let drain_request = || {
-        Request::new(w::DrainMutationsRequest {
-            expected_generation: owner.generation.to_string(),
-        })
+async fn early_rejection_precedes_stopping_and_exhausted_daemon_admission() {
+    use vm_spec::live::{LiveBackend, LiveLane, LiveOperation, LiveReasonCode};
+    use w::{
+        daemon_service_client::DaemonServiceClient, machine_service_client::MachineServiceClient,
+        runtime_service_client::RuntimeServiceClient,
     };
-    let mut drain = Box::pin(service.drain_mutations(drain_request()));
-    assert!(tokio::time::timeout(Duration::from_millis(20), &mut drain)
+    let root = tempfile::tempdir().unwrap();
+    let mut owner = state(root.path());
+    let config = libvm::RuntimeConfig::local(root.path().join("home"))
+        .with_supervisor_path(test_utils::mock_vmm_binary())
+        .with_virt_backend(libvm::VirtBackendOverride::Vz)
+        .with_run_root(root.path().join("run"));
+    Arc::get_mut(&mut owner).unwrap().config = config;
+    owner.begin_stopping().await.unwrap();
+    let permits = owner.capacity.clone().acquire_many_owned(64).await.unwrap();
+    let status_before = std::fs::read(owner.host.home().join("daemon/status.json")).unwrap();
+    let control = root.path().join("control");
+    let server = socket::BoundServer::bind_at(owner.clone(), control.clone()).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let socket = control.join("control.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
         .await
-        .is_err());
-    // Drain does not consume/queue all semaphore permits: safe stop admission
-    // remains available while protected mutations are sealed by the marker.
-    let stop = owner.admit(&Request::new(()), false).await.unwrap();
-    assert!(owner.admit(&Request::new(()), true).await.is_err());
-    drop(initial);
-    assert!(tokio::time::timeout(Duration::from_millis(20), &mut drain)
-        .await
-        .is_err());
-    drop(stop);
-    tokio::time::timeout(Duration::from_secs(1), &mut drain)
+        .unwrap();
+    let mut daemon = DaemonServiceClient::new(channel.clone());
+    assert_eq!(
+        daemon.get_status(()).await.unwrap().into_inner().core,
+        w::CorePhase::Stopping as i32
+    );
+    let mut machines = MachineServiceClient::new(channel.clone());
+    let mut runtime = RuntimeServiceClient::new(channel);
+    let host = daemon.get_live_capabilities(()).await.unwrap().into_inner();
+    let host = silo_vm_control::live::host_from_wire(host).unwrap();
+    assert_eq!(host.backend, LiveBackend::Vz);
+    assert_eq!(host.scope, vm_spec::live::LiveScope::Host);
+    let request = || w::LiveMachineRequest {
+        machine: Some(w::MachineRef {
+            reference: Some(w::machine_ref::Reference::Name("not-created".into())),
+        }),
+    };
+    let fork_request = || w::LiveForkRequest {
+        machine: request().machine,
+        operation_id: "00000000-0000-4000-8000-0000000000aa".into(),
+        children: vec![w::LiveForkChild {
+            name: "child".into(),
+            activation_hook: None,
+            destination: Some(w::ForkDestination::default()),
+        }],
+        max_children: 16,
+        resume_policy: w::CaptureResumePolicy::ResumeIfAcquired as i32,
+        policy: w::CapturePolicy::Full as i32,
+        dirty_crossover_percent: 60,
+    };
+    let results = [
+        (
+            LiveOperation::Pause,
+            machines.pause_machine(request()).await.unwrap_err(),
+        ),
+        (
+            LiveOperation::Capture,
+            machines
+                .create_snapshot(w::CreateSnapshotRequest {
+                    machine: request().machine,
+                    memory: true,
+                    capture_policy: Some(w::CapturePolicy::Full as i32),
+                    dirty_crossover_percent: Some(60),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+        ),
+        (
+            LiveOperation::Fork,
+            machines.fork_execution(fork_request()).await.unwrap_err(),
+        ),
+        (
+            LiveOperation::Restore,
+            runtime
+                .restore_snapshot(
+                    silo_vm_control::stopped::restore_request_to_wire(
+                        &libvm::RestoreSource::Local("snap".parse().unwrap()),
+                        &libvm::RestoreOptions {
+                            name: Some("child".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap_err(),
+        ),
+    ];
+    for (expected, status) in results {
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        match silo_vm_control::errors::status_to_native_error(&status).unwrap() {
+            libvm::LibVmError::LiveOperationUnsupported {
+                operation,
+                backend,
+                lane,
+                reason,
+            } => {
+                assert_eq!(operation, expected);
+                assert_eq!(backend, LiveBackend::Vz);
+                assert_eq!(lane, LiveLane::NotApplicable);
+                assert_eq!(reason.code, LiveReasonCode::BackendExcluded);
+            }
+            error => panic!("not a typed live refusal: {error:?}"),
+        }
+    }
+    // Malformed fork requests and operation references are refused before
+    // capability evidence, admission or runtime initialization.
+    let mut duplicate = fork_request();
+    duplicate.children.push(duplicate.children[0].clone());
+    let mut nil = fork_request();
+    nil.operation_id = "00000000-0000-0000-0000-000000000000".into();
+    for request in [duplicate, nil] {
+        assert_eq!(
+            machines.fork_execution(request).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    for (policy, crossover) in [
+        (w::CapturePolicy::Unspecified as i32, 60),
+        (i32::MAX, 60),
+        (w::CapturePolicy::Incremental as i32, 0),
+        (w::CapturePolicy::Incremental as i32, 61),
+        (w::CapturePolicy::Full as i32, u32::MAX),
+    ] {
+        let status = machines
+            .create_snapshot(w::CreateSnapshotRequest {
+                machine: request().machine,
+                memory: true,
+                capture_policy: Some(policy),
+                dirty_crossover_percent: Some(crossover),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let mut fork = fork_request();
+        fork.policy = policy;
+        fork.dirty_crossover_percent = crossover;
+        assert_eq!(
+            machines.fork_execution(fork).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    let mut invalid_restore = silo_vm_control::stopped::restore_request_to_wire(
+        &libvm::RestoreSource::Local("missing".parse().unwrap()),
+        &libvm::RestoreOptions {
+            without_memory: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    invalid_restore.name = Some("../escape".into());
+    assert_eq!(
+        runtime
+            .restore_snapshot(invalid_restore)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    let invalid = || w::ForkOperationRef {
+        operation_id: "00000000-0000-0000-0000-000000000000".into(),
+    };
+    assert_eq!(
+        runtime.get_fork(invalid()).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        runtime.cancel_fork(invalid()).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.components.get().is_none());
+    assert_eq!(owner.capacity.available_permits(), 0);
+    assert!(!root.path().join("run").exists());
+    assert!(!owner.host.home().join("state.db").exists());
+    assert_eq!(
+        std::fs::read(owner.host.home().join("daemon/status.json")).unwrap(),
+        status_before
+    );
+    drop(permits);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn removal_mutations_obey_stopping_without_runtime_initialization() {
+    use w::runtime_service_server::RuntimeService;
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    owner.begin_stopping().await.unwrap();
+    let service = Service(owner.clone());
+    let snapshot = silo_vm_control::stopped::reference_to_wire(&"snap".parse().unwrap());
     assert_eq!(
         service
-            .drain_mutations(Request::new(w::DrainMutationsRequest {
-                expected_generation: uuid::Uuid::new_v4().to_string(),
+            .remove_snapshot(Request::new(snapshot))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable,
+    );
+    let image = silo_vm_control::images::image_ref_to_wire(&"hello".parse().unwrap()).unwrap();
+    assert_eq!(
+        service
+            .remove_image(Request::new(image))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable,
+    );
+    assert_eq!(
+        service
+            .prune_images(Request::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable,
+    );
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.components.get().is_none());
+    assert_eq!(owner.capacity.available_permits(), 64);
+    assert!(!owner.host.home().join("state.db").exists());
+}
+
+#[tokio::test]
+async fn malformed_stopped_contracts_fail_before_native_initialization() {
+    use w::{machine_service_server::MachineService, runtime_service_server::RuntimeService};
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    let service = Service(owner.clone());
+    let machine = Some(w::MachineRef {
+        reference: Some(w::machine_ref::Reference::Name("source".into())),
+    });
+    assert_eq!(
+        service
+            .fork_stopped(Request::new(w::StoppedForkRequest {
+                machine: machine.clone(),
+                name: Some("child".into()),
+                external_resources: None,
             }))
             .await
             .unwrap_err()
             .code(),
-        tonic::Code::FailedPrecondition
+        tonic::Code::InvalidArgument,
     );
-    owner.seal_mutations().await;
-    assert!(owner.admit(&Request::new(()), false).await.is_err());
+    assert_eq!(
+        service
+            .create_snapshot(Request::new(w::CreateSnapshotRequest {
+                machine: None,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert_eq!(
+        service
+            .restore_snapshot(Request::new(w::RestoreSnapshotRequest::default()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert_eq!(
+        service
+            .remove_image(Request::new(w::ImageRef {
+                reference: Some(w::image_ref::Reference::Name(format!(
+                    "sha256:{}",
+                    "a".repeat(64)
+                ))),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    let reject = || {
+        Some(silo_vm_control::stopped::policy_to_wire(
+            &libvm::ExternalResourcePolicy::Reject,
+        ))
+    };
+    for name in ["INVALID", "trailing-", "contains space"] {
+        assert_eq!(
+            service
+                .fork_stopped(Request::new(w::StoppedForkRequest {
+                    machine: machine.clone(),
+                    name: Some(name.into()),
+                    external_resources: reject(),
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument,
+        );
+        assert_eq!(
+            service
+                .restore_snapshot(Request::new(
+                    silo_vm_control::stopped::restore_request_to_wire(
+                        &libvm::RestoreSource::Local("snap".parse().unwrap()),
+                        &libvm::RestoreOptions::default(),
+                    )
+                    .map(|mut request| {
+                        request.name = Some(name.into());
+                        request
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument,
+        );
+    }
+    assert_eq!(
+        service
+            .create_snapshot(Request::new(w::CreateSnapshotRequest {
+                machine: machine.clone(),
+                name: Some("invalid name".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert_eq!(
+        service
+            .create_snapshot(Request::new(w::CreateSnapshotRequest {
+                machine,
+                name: Some("registry/name:tag".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.components.get().is_none());
+    assert!(!owner.host.home().join("state.db").exists());
 }
 
 #[tokio::test]
-async fn unsafe_marker_parent_seals_admission_and_allows_drain() {
-    use w::daemon_service_server::DaemonService;
-    let root = tempfile::tempdir().unwrap();
-    let owner = state(root.path());
-    std::os::unix::fs::symlink(root.path().join("missing"), owner.host.home().join("taild"))
+async fn hibernation_and_pause_local_daemon_routes_share_durable_authority() {
+    use vm_spec::live::{LiveAvailability, LiveCapability, LiveCapabilityVector, LiveLane};
+    use w::machine_service_client::MachineServiceClient;
+    let root = tempfile::Builder::new()
+        .prefix("silo-pause-api-")
+        .tempdir()
         .unwrap();
-    assert!(owner.admit(&Request::new(()), true).await.is_err());
-    drop(owner.admit(&Request::new(()), false).await.unwrap());
-    Service(owner.clone())
-        .drain_mutations(Request::new(w::DrainMutationsRequest {
-            expected_generation: owner.generation.to_string(),
+    let binary = test_utils::mock_vmm_binary();
+    for name in ["kernel", "initramfs", "agent"] {
+        let path = root.path().join(name);
+        let bytes = if name == "kernel" {
+            test_utils::direct_kernel::host_kernel("pause-api")
+        } else {
+            b"scenario-asset".to_vec()
+        };
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let supported = LiveCapability {
+        native: true,
+        availability: LiveAvailability::Supported,
+    };
+    let mut lifecycle = test_utils::LifecycleScenario {
+        same_machine_activation: true,
+        ..Default::default()
+    };
+    lifecycle.capture.ram_bytes = 1 << 20;
+    for provider in &mut lifecycle.providers {
+        if provider.device_id == 2 {
+            provider.configured_id = "silo-root".into();
+        }
+    }
+    let scenario = test_utils::Scenario {
+        lifecycle: Some(lifecycle),
+        live: Some(test_utils::LiveScenario {
+            lane: LiveLane::KvmX86_64,
+            host: LiveCapabilityVector {
+                pause: supported.clone(),
+                capture: supported.clone(),
+                restore: supported.clone(),
+                fork: supported.clone(),
+                incremental: supported,
+            },
+            machine: None,
+        }),
+        ..Default::default()
+    };
+    let scenario_path = root.path().join("scenario.json");
+    scenario.write_to(&scenario_path).unwrap();
+    let components = libvm::ResolvedRuntimeComponents::from_paths(
+        binary.to_path_buf(),
+        binary.to_path_buf(),
+        root.path().join("kernel"),
+        root.path().join("initramfs"),
+        root.path().join("agent"),
+        root.path().to_path_buf(),
+    )
+    .unwrap();
+    let config = libvm::RuntimeConfig::local(root.path().join("home"))
+        .with_run_root(root.path().join("run"))
+        .with_runtime_components(components.clone())
+        .with_mock_vmm(&scenario_path);
+    let runtime = libvm::Runtime::new(config.clone()).await.unwrap();
+    let disk = root.path().join("root.raw");
+    disk_image::ext4::Formatter::new(&disk, 4096, 64 << 20)
+        .and_then(|formatter| formatter.close())
+        .unwrap();
+    let machine = runtime
+        .machine()
+        .name("pause-api")
+        .memory(libvm::Memory::mebibytes(1))
+        .image_source(libvm::ImageSource::Disk(
+            crate::commands::create::disk_create_request(disk, &Default::default()).unwrap(),
+        ))
+        .network(|network| network.none())
+        .create()
+        .await
+        .unwrap();
+    let started = machine.start().await.unwrap();
+    assert_eq!(
+        machine
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .unwrap()
+            .outcome,
+        libvm::MachineReadinessOutcome::Ready
+    );
+    struct Cleanup(Option<nix::unistd::Pid>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+            }
+        }
+    }
+    let pid: i32 = std::fs::read_to_string(
+        root.path()
+            .join("run/machines")
+            .join(machine.id())
+            .join("vm.pid"),
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    let mut cleanup = Cleanup(Some(nix::unistd::Pid::from_raw(pid)));
+    let mut owner = state(root.path());
+    Arc::get_mut(&mut owner).unwrap().config = config.clone();
+    assert!(owner.runtime.set(runtime).is_ok());
+    assert!(owner.components.set(components).is_ok());
+    let control = root.path().join("control");
+    let server = socket::BoundServer::bind_at(owner, control.clone()).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let socket = control.join("control.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
         }))
         .await
         .unwrap();
+    let mut daemon = MachineServiceClient::new(channel);
+    let request = || w::LiveMachineRequest {
+        machine: Some(w::MachineRef {
+            reference: Some(w::machine_ref::Reference::Name("pause-api".into())),
+        }),
+    };
+    let parked = silo_vm_control::snapshots::snapshot_from_wire(
+        daemon.pause_machine(request()).await.unwrap().into_inner(),
+    )
+    .unwrap();
+    assert_eq!(parked.status.label(), "paused");
+    assert!(!parked.status.ready());
+    let authority = parked.lifecycle.unwrap().lifecycle.current_pause.unwrap();
+    assert_eq!(authority.token.owner, vm_spec::lifecycle::PauseOwner::User);
+    assert_eq!(parked.run_id.as_ref(), Some(&started.run_id));
+    let mut local = crate::api::AppApi::local(config);
+    let resumed = local.resume_machine("pause-api").await.unwrap();
+    assert_eq!(resumed.status.label(), "running");
+    assert_eq!(resumed.run_id.as_ref(), Some(&started.run_id));
+    let parked_again = local.pause_machine("pause-api").await.unwrap();
+    assert!(
+        parked_again
+            .lifecycle
+            .unwrap()
+            .lifecycle
+            .current_pause
+            .unwrap()
+            .token
+            .generation
+            > authority.token.generation
+    );
+    let resumed = silo_vm_control::snapshots::snapshot_from_wire(
+        daemon.resume_machine(request()).await.unwrap().into_inner(),
+    )
+    .unwrap();
+    assert_eq!(resumed.status.label(), "running");
+    assert_eq!(resumed.run_id.as_ref(), Some(&started.run_id));
+    let saved = silo_vm_control::snapshots::snapshot_from_wire(
+        daemon
+            .hibernate_machine(request())
+            .await
+            .unwrap()
+            .into_inner(),
+    )
+    .unwrap();
+    assert_eq!(saved.status.label(), "hibernated");
+    assert!(saved.hibernation.is_some());
+    for error in [
+        local.pause_machine("pause-api").await.unwrap_err(),
+        local.resume_machine("pause-api").await.unwrap_err(),
+    ] {
+        assert!(matches!(
+            error.downcast_ref::<libvm::LibVmError>(),
+            Some(libvm::LibVmError::HibernatedStartFirst { .. })
+        ));
+    }
+    let save = std::fs::read_dir(saved.machine_dir.join("hibernation"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(save.join("memory.ram")).unwrap();
+    let stop = daemon
+        .stop_machine(w::StopMachineRequest {
+            machine: request().machine,
+            force: false,
+            timeout: Some(prost_types::Duration {
+                seconds: 30,
+                nanos: 0,
+            }),
+            expected_run: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let stop = silo_vm_control::lifecycle::stop_from_wire(stop).unwrap();
+    assert_eq!(stop.machine.status.label(), "stopped");
+    assert!(matches!(
+        stop.warning,
+        Some(libvm::MachineStopWarning::SavedStateUnusable {
+            reason: libvm::storage::hibernate_file::HibernateUnusableReason::FilesMissing,
+        })
+    ));
+    machine.start().await.unwrap();
+    machine.wait_ready(Duration::from_secs(30)).await.unwrap();
+    daemon.hibernate_machine(request()).await.unwrap();
+    let stop = daemon
+        .stop_machine(w::StopMachineRequest {
+            machine: request().machine,
+            force: true,
+            timeout: Some(prost_types::Duration {
+                seconds: 30,
+                nanos: 0,
+            }),
+            expected_run: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let stop = silo_vm_control::lifecycle::stop_from_wire(stop).unwrap();
+    assert_eq!(stop.machine.status.label(), "stopped");
+    assert!(stop.warning.is_none());
+    let repeated = daemon
+        .stop_machine(w::StopMachineRequest {
+            machine: request().machine,
+            force: true,
+            timeout: Some(prost_types::Duration {
+                seconds: 30,
+                nanos: 0,
+            }),
+            expected_run: None,
+        })
+        .await
+        .expect("force stop of a stopped machine succeeds")
+        .into_inner();
+    let repeated = silo_vm_control::snapshots::snapshot_from_wire(repeated).unwrap();
+    assert_eq!(repeated.status.label(), "stopped");
+    machine.stop().await.unwrap();
+    cleanup.0 = None;
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
-async fn shutdown_only_real_transport_enforces_every_protocol_method() {
+async fn handoff_rejects_malformed_streams_over_private_socket_without_native_effects() {
     let root = tempfile::tempdir().unwrap();
-    let mut owner = state(root.path());
-    Arc::get_mut(&mut owner).unwrap().shutdown_only = true;
+    let owner = state(root.path());
     let dir = root.path().join("control");
     let server = socket::BoundServer::bind_at(owner.clone(), dir.clone()).unwrap();
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -658,88 +986,193 @@ async fn shutdown_only_real_transport_enforces_every_protocol_method() {
         }))
         .await
         .unwrap();
-    let mut daemon = w::daemon_service_client::DaemonServiceClient::new(channel.clone());
+    let mut client = w::handoff_service_client::HandoffServiceClient::new(channel);
+    for frames in [
+        vec![],
+        vec![w::HandoffWriteRequest { part: None }],
+        vec![w::HandoffWriteRequest {
+            part: Some(w::handoff_write_request::Part::Frame(vec![1])),
+        }],
+        vec![w::HandoffWriteRequest {
+            part: Some(w::handoff_write_request::Part::Header(
+                w::HandoffPayloadRequest {
+                    operation: uuid::Uuid::nil().to_string(),
+                    descriptor: None,
+                    length: 1,
+                },
+            )),
+        }],
+        vec![w::HandoffWriteRequest {
+            part: Some(w::handoff_write_request::Part::Header(
+                w::HandoffPayloadRequest {
+                    operation: uuid::Uuid::new_v4().to_string(),
+                    descriptor: Some(w::HandoffPayloadDescriptor {
+                        payload: Some(w::handoff_payload_descriptor::Payload::StreamChunk(
+                            w::HandoffStreamChunk {
+                                stream: format!("sha256:{}", "ab".repeat(32)),
+                                index: 0,
+                                length: 1,
+                            },
+                        )),
+                    }),
+                    length: 2,
+                },
+            )),
+        }],
+    ] {
+        let error = client
+            .write_payload(tokio_stream::iter(frames))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.handoff.get().is_none());
+    assert!(owner.components.get().is_none());
+    owner.wait_for_mutations().await.unwrap();
+    assert_eq!(owner.capacity.available_permits(), 64);
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn kernel_argument_updates_cross_the_daemon_socket_and_keep_host_admission() {
+    use w::machine_service_client::MachineServiceClient;
+
+    let root = tempfile::tempdir().unwrap();
+    let binary = test_utils::mock_vmm_binary();
+    for name in ["kernel", "initramfs", "agent"] {
+        let bytes = if name == "kernel" {
+            test_utils::direct_kernel::host_kernel("kernel-args-api")
+        } else {
+            b"fixture".to_vec()
+        };
+        let path = root.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let components = libvm::ResolvedRuntimeComponents::from_paths(
+        binary.to_path_buf(),
+        binary.to_path_buf(),
+        root.path().join("kernel"),
+        root.path().join("initramfs"),
+        root.path().join("agent"),
+        root.path().to_path_buf(),
+    )
+    .unwrap();
+    let config = libvm::RuntimeConfig::local(root.path().join("home"))
+        .with_run_root(root.path().join("run"))
+        .with_runtime_components(components.clone())
+        .with_virt_backend(libvm::VirtBackendOverride::Mock { scenario: None });
+    let runtime = libvm::Runtime::new(config.clone()).await.unwrap();
+    let disk = root.path().join("root.raw");
+    disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+        .and_then(|formatter| formatter.close())
+        .unwrap();
+    let machine = runtime
+        .machine()
+        .name("kernel-args-api")
+        .image_source(libvm::ImageSource::Disk(
+            crate::commands::create::disk_create_request(disk, &Default::default()).unwrap(),
+        ))
+        .network(|network| network.none())
+        .create()
+        .await
+        .unwrap();
+    let original = machine.inspect().await.unwrap().spec;
+    let mut owner = state(root.path());
+    Arc::get_mut(&mut owner).unwrap().config = config;
+    assert!(owner.runtime.set(runtime).is_ok());
+    assert!(owner.components.set(components).is_ok());
+    let control = root.path().join("control");
+    let server = socket::BoundServer::bind_at(owner, control.clone()).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let socket = control.join("control.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let mut daemon = MachineServiceClient::new(channel);
+    let reference = w::MachineRef {
+        reference: Some(w::machine_ref::Reference::Name("kernel-args-api".into())),
+    };
+    for argument in ["quiet", "silo.rescue=on-failure"] {
+        daemon
+            .update_kernel_args(w::UpdateKernelArgsRequest {
+                machine: Some(reference.clone()),
+                clear: false,
+                append: vec![argument.into()],
+            })
+            .await
+            .unwrap();
+    }
+    let accepted = machine.inspect().await.unwrap().spec;
     assert_eq!(
-        daemon.get_status(()).await.unwrap().into_inner().generation,
-        owner.generation.to_string()
+        accepted
+            .boot
+            .as_ref()
+            .unwrap()
+            .kernel
+            .as_ref()
+            .unwrap()
+            .cmdline,
+        ["quiet", "silo.rescue=on-failure"]
     );
-    std::fs::create_dir_all(owner.host.home().join("taild")).unwrap();
-    std::fs::write(owner.host.home().join("taild/shutdown"), b"sealed").unwrap();
+    for reserved in [
+        "rdinit=/bin/sh",
+        "root=/dev/vdb",
+        "rootfstype=ext4",
+        "rootflags=ro",
+    ] {
+        let error = daemon
+            .update_kernel_args(w::UpdateKernelArgsRequest {
+                machine: Some(reference.clone()),
+                clear: true,
+                append: vec![reserved.into()],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(
+            silo_vm_control::errors::status_to_native_error(&error).unwrap(),
+            libvm::LibVmError::InvalidKernelArguments { reason } if reason.contains("reserved")
+        ));
+        assert!(error.message().contains("reserved"), "{error}");
+        assert_eq!(machine.inspect().await.unwrap().spec, accepted);
+    }
     daemon
-        .drain_mutations(w::DrainMutationsRequest {
-            expected_generation: owner.generation.to_string(),
+        .update_kernel_args(w::UpdateKernelArgsRequest {
+            machine: Some(reference.clone()),
+            clear: true,
+            append: Vec::new(),
         })
         .await
         .unwrap();
-    // Parse the authoritative protocol, so additions must explicitly be admitted.
-    let mut service = "";
-    let mut denied = 0;
-    for line in include_str!("../../../../../specs/silod-spec/proto/daemon.proto").lines() {
-        if let Some(declaration) = line.strip_prefix("service ") {
-            service = declaration.split_whitespace().next().unwrap();
-        } else if let Some(declaration) = line.trim().strip_prefix("rpc ") {
-            let method = declaration.split('(').next().unwrap();
-            if matches!(
-                (service, method),
-                ("DaemonService", "GetStatus" | "DrainMutations")
-                    | (
-                        "MachineService",
-                        "ListMachines" | "InspectInventory" | "InspectMachine" | "StopMachine"
-                    )
-            ) {
-                continue;
-            }
-            let uri = format!("/silo.daemon.v1.{service}/{method}");
-            let mut grpc = tonic::client::Grpc::new(channel.clone());
-            grpc.ready().await.unwrap();
-            let result: Result<tonic::Response<()>, tonic::Status> = grpc
-                .unary(
-                    Request::new(()),
-                    tonic::codegen::http::uri::PathAndQuery::try_from(uri.clone()).unwrap(),
-                    tonic_prost::ProstCodec::default(),
-                )
-                .await;
-            assert_eq!(
-                result.unwrap_err().code(),
-                tonic::Code::PermissionDenied,
-                "{uri}"
-            );
-            denied += 1;
-        }
-    }
-    assert!(denied > 20);
-    let mut machines = w::machine_service_client::MachineServiceClient::new(channel);
-    // Allowed methods reach validation rather than the URI denial.
-    assert_eq!(
-        machines
-            .inspect_machine(w::MachineRef::default())
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::InvalidArgument
-    );
-    assert_eq!(
-        machines
-            .inspect_inventory(w::MachineRef::default())
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::InvalidArgument
-    );
-    assert_eq!(
-        machines
-            .stop_machine(w::StopMachineRequest::default())
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::InvalidArgument
-    );
-    assert!(owner.components.get().is_none());
-    assert!(owner.runtime.get().is_none());
-    shutdown.cancel();
-    tokio::time::timeout(Duration::from_secs(2), task)
+    assert_eq!(machine.inspect().await.unwrap().spec, original);
+    machine.start().await.unwrap();
+    let error = daemon
+        .update_kernel_args(w::UpdateKernelArgsRequest {
+            machine: Some(reference),
+            clear: false,
+            append: vec!["debug".into()],
+        })
         .await
-        .unwrap()
-        .unwrap()
+        .unwrap_err();
+    machine
+        .kill_with(libvm::MachineKillOptions::new().timeout(Duration::from_secs(10)))
+        .await
         .unwrap();
+    assert!(error.message().contains("running"), "{error}");
+    assert_eq!(machine.inspect().await.unwrap().spec, original);
+    machine.remove().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
 }

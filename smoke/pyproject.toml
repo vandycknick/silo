@@ -2,21 +2,28 @@
 name = "silo-smoke"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["pytest>=8"]
+dependencies = [
+    "pytest>=8",
+    "pytest-xdist>=3.6",
+]
 
-[tool.uv]
-package = false
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["silo_smoke*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not slow'"
 markers = [
   "daemon: starts a private Silo daemon",
   "system: needs SILO_SMOKE_SYSTEM_IMAGE",
-  "sdk: runs SDK example programs",
   "linux_only: requires Linux",
   "macos_only: requires macOS",
   "slow: extended real-VM qualification",
+  "serial: must not overlap other VM work (reclaim or fixed-port ownership)",
   "live: requires internet access and explicit selection",
 ]

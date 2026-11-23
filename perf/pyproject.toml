@@ -1,0 +1,25 @@
+[project]
+name = "silo-perf"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["pytest>=8", "silo-smoke"]
+
+[tool.uv.sources]
+silo-smoke = { path = "../smoke", editable = true }
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["silo_perf*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/test_live.py"]
+pythonpath = [".", ".."]
+addopts = "-ra --strict-markers"
+markers = [
+  "linux_only: requires Linux",
+  "macos_only: requires macOS",
+  "system: needs a published system image",
+]

@@ -115,16 +115,6 @@ pub(crate) fn mount_one(
     }
 }
 
-pub(crate) fn mount_block_auto(source: &[u8], target: &[u8]) -> i32 {
-    const TYPES: &[&[u8]] = &[b"ext4", b"xfs", b"btrfs", b"erofs", b"squashfs"];
-    for &fstype in TYPES {
-        if mount_one(source, target, Some(fstype), 0, None) == 0 {
-            return 0;
-        }
-    }
-    -1
-}
-
 fn parse_mount_flags(options: &[u8]) -> libc::c_ulong {
     #[cfg(feature = "alloc")]
     {

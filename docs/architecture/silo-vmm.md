@@ -12,7 +12,7 @@ is built.
 ## Process Model
 
 ```text
-libvm / CLI / SDK
+CLI -> libvm
   -> silo-vmm                      daemonized, one per generation
        Tokio, control API, guest services, forwards, finalization
        |
@@ -72,18 +72,29 @@ another role's number), and `dup2`s them onto a fixed table:
 | 5 | watchdog: POLLHUP means the monitor is gone | FIFO, read-only |
 | 6 | console | TTY (PTY slave), read-write |
 | 7 | vsock mux, present iff `config.vsock_mux` | connected `SOCK_STREAM` |
+| 8 | generation lease | euid-owned regular file, mode 0600, nlink 1, read-write, exact device/inode binding |
+| 9..24 | retained Raw backing handles, in manifest order | at most 16, exact config binding and access |
 
-The worker validates every role, direction and type, rejects descriptors that
-alias the same resource (on macOS also the two ends of one pipe, through
-`proc_pidfdinfo`), and fails closed if anything above the table is open. Only
-then does it adopt the descriptors and restore close-on-exec on them. No
-configuration travels through argv or the environment.
+The worker validates the entire set before taking ownership, restores CLOEXEC,
+and rejects unexpected descriptors, including fd 7 when the mux is absent.
+Protocol/lease roles must not alias a resource (on macOS, neither end of one
+pipe may fill another role, checked through `proc_pidfdinfo`). Raw disks may
+share a backing inode when the existing disk contract permits it; each still
+has a distinct descriptor and manifest binding. No configuration travels
+through argv or the environment. FD 8 is required even while config is withheld,
+and the worker retains its storage descriptors through actual process exit.
+
+The manager likewise changes only its child's inheritance flags. The
+qualified executable FD stays open but CLOEXEC during pre-exec cleanup so
+Linux can resolve its retained ELF; it does not survive into the monitor.
+Native Linux worker re-exec uses `/proc/self/exe`, never the restaged pathname.
 
 `KrunConfig` is the single wire type. The monitor validates and serializes it
 and closes fd 3, which marks the end of the config. The worker reads to EOF
-under a 16 MiB cap, decodes with `deny_unknown_fields`, and never echoes decode
-errors (they could contain private values). The engine validates the config
-once at entry. Rosetta launch data is a typed field with a redacted `Debug`.
+under a 16 MiB cap, decodes with `deny_unknown_fields`, and validates before host
+admission or native logging. Decode and validation errors do not echo private
+request values. The engine independently validates at entry. Rosetta launch
+data is a typed field with a redacted `Debug`.
 
 | Resource | Bound |
 | --- | --- |
@@ -102,6 +113,33 @@ Worker events are `startup_stage`, `backend_started`, `startup_failed` and
 `host_memory_reclaim`. Stages advance `spawned -> admission -> build ->
 started`; a config failure reports `spawned`. `backend_started` acknowledges
 construction, not guest readiness.
+
+## Typed Storage Attachments
+
+The current VM spec is `0.2.0`. The monitor, backend-neutral configuration and
+private `KrunConfig` all carry `vm_spec::Disk` directly: required path, role,
+format, exact virtual geometry, validated block ID and read-only access.
+There is no private ordered-only disk decoder or defaulted attachment metadata.
+Both monitor backend validation and the worker use
+`vm_spec::Storage::validate_disks` for the same root-pair, ordering, uniqueness
+and geometry rules. User data attachments follow the explicitly typed roots.
+
+For the opt-in development flat-overlay profile, libvm supplies a generated
+VMDK `RootLower` with serial `silo-root-lower` and read-only access, followed by
+a raw writable `RootUpper` with serial `silo-root-upper`. Its VMDK geometry is
+the virtual lower length, not the descriptor's host file size. The engine maps
+only the closed `Raw` and `Vmdk` types to libkrun and passes the supplied serial
+unchanged. It never infers a format from a filename or a role from an index.
+VZ rejects VMDK and either managed overlay role before framework attachment
+construction. Opaque raw roots retain their existing explicit boot contract.
+
+Guest flush behavior remains libkrun `SyncMode::Relaxed`, not `None`. Native
+libkrun diagnostics still flow through the worker's stdout/stderr pipe into the
+bounded monitor diagnostic tail, including actual host I/O errors. The pinned
+native request-error log preserves the host errno but does not identify the
+attachment role; a bounded host-exhaustion qualification must establish which
+backing was exhausted rather than relabeling a guest `EIO` as host `ENOSPC`.
+The worker diagnostic tail is not a lossless audit channel.
 
 ## Ownership and Stopping
 
@@ -134,10 +172,239 @@ had a process, and the diagnostic tail.
   Linux's normal stop. Force intent alone never rewrites another signal.
 - An earlier startup error stays the primary error.
 
+The lifecycle outcome named `clean` is not a storage shutdown certificate.
+Neither a zero worker exit, device drop nor observed process reap proves the
+independent `storageShutdown`, `hostFlushCompleted` or `attachmentsClosed` facts.
+
 `finalize.rs` is the only code that ends a generation. It stops a failed live
 machine, reads the cached exit, writes `vm.exit.json` (with the `backend`
 block described in ADR 0018), reports failure on the syncpipe, removes the
 pidfile and triggers the exit runner, in that order.
+
+## Guest execution streams
+
+`silo exec` uses libvm's `ExecutionSession`, the monitor's bidirectional
+`VmExecutionService::Execute` RPC and the agent's
+`GuestProcessService::Execute` RPC. This is not the opaque SSH relay:
+`silo shell` still uses SSH and is unaffected by these stdin changes.
+The protobuf contracts are
+[`execution.proto`](../../specs/protocol/proto/execution.proto) and
+[`guest_process.proto`](../../specs/protocol/proto/guest_process.proto).
+
+Stdin is backpressured end to end. Host input is read on demand through bounded
+queues; libvm requests, monitor forwarding, agent controls and the child-input
+writer each have bounded queues. Data messages are at most 64 KiB. A full guest
+writer queue retains one pending chunk and retries instead of failing the
+execution and killing the command. Upstream producers wait as those queues and
+the gRPC transport fill. The monitor continues receiving guest events while
+input forwarding waits, so output and terminal events are not blocked behind
+stdin production.
+
+When a send observes that the guest command's input writer has closed, the
+agent emits `GuestProcessStdinClosed`; the monitor translates it to the
+nonterminal `ExecutionStdinClosed` event, exposed by libvm as `StdinClosed`.
+The monitor stops forwarding stdin data and EOF, libvm wakes blocked stdin
+sends, and the CLI drops its host-input producer. The event does not cancel
+the command or its output stream, close unrelated controls, or manufacture an
+exit status. Process exit may produce a terminal result without a preceding
+`StdinClosed`; the terminal result independently stops input production.
+The CLI still drains events and returns the guest's terminal result rather
+than replacing it with a guest-closed-stdin write error.
+
+Preloaded stdin bytes are streamed by a session-owned cancellable task, in
+bounded chunks, followed by EOF for pipe stdin. Setup no longer waits for all
+preloaded bytes to enter a bounded request queue before returning the session.
+The caller can receive output and terminal events while that producer waits
+for capacity. `StdinClosed`, terminal completion, stream failure, cancellation
+or session drop stops the producer; it cannot outlive the session.
+
+Agent, monitor and host/libvm/CLI must implement the matching stdin-close
+protocol. This fresh-state cutover adds no mixed-version fallback or event alias.
+
+## Live Pause Ownership
+
+`live/coordinator.rs` owns the run's Pause/Resume/Cancel journal and fences.
+The manager persists each exact request before sending it over `vm.sock`;
+reconnection observes the same operation and current pause authority, rather
+than creating another pause. Historical success does not authorize a consumed
+token. A new `CancelOperation` is rejected while `Paused`; cancellation is
+the recovery exit from an unfinished or failed `Pausing`.
+Manager journal and authority updates acquire the SQLite writer reservation
+before reading current state, so concurrent snapshot publication cannot
+invalidate a deferred read-to-write upgrade.
+Missing pause authority diagnostics include observed state, activity, last live
+error and pending resume identity. They never manufacture authority from an old
+successful command.
+
+The monitor drains new session, mutation and forward-connection setup before
+freezing the workload. Existing streams remain attached. The worker's dedicated
+lifecycle socket owns native tokens; only a positive native barrier publishes
+`Paused`. Stop terminates a paused worker without resuming it.
+Host forward arrivals are refused while fenced even when guest transport is
+unavailable; they cannot be parked for admission after resume.
+
+Guest admission accepts agent PID 1 or an observed contained image init, not
+PID 1 ownership alone. Both use `silo/{control,activation,workloads/{image,exec}}`;
+the image and root Silo sessions receive subtree-rooted cgroup namespaces.
+Every available controller is delegated, and freeze/activation checks use retained
+cgroup/procfs descriptors. Uncontained handoff, unsupported profiles and escapes
+report `guest-init-not-contained`, `guest-profile-unsupported` and
+`guest-containment-escaped` respectively. ADR 0021 specifies the required
+protections, accepted guest-root residuals and fail-closed child behavior.
+
+On Linux x86_64, the guest reports actual same-boot clock evidence, refreshed
+after Freeze: TSC, every online CPU's deadline clockevent, a non-PIT broadcast
+device (including a completed empty read), and absence of speaker consumers.
+When `/proc/modules` is absent, the agent verifies `CONFIG_MODULES` in a bounded
+decode of the running kernel's `/proc/config.gz`. Missing or contradictory
+evidence fails closed. The coordinator checks the boot identity; the worker
+installs the observed retired-PIT profile before native pause.
+
+Resume retains parked-status freshness until native positively releases the
+pause. After the ClockOnly generation acknowledgement, it requests `GetStatus`
+over a new agent-control connection, checks the returned instance and boot against
+the held source identity, and validates the full envelope (including version
+continuity) through the ordinary status store. It does not wait for an unsolicited
+watch heartbeat. Exact guest Thaw and fresh post-thaw readiness are still required
+before reporting `Running`. A lost Thaw acknowledgement requires
+a new freeze and native pause, with a new token; failed recovery stays fenced.
+Operation deadlines are never extended by parked freshness or transport retries.
+
+## Live Capture Ownership
+
+`live/capture.rs` coordinates workload freeze, native pause and provider drain,
+disk flush/copy, execution/device state and RAM capture. The worker receives
+owned output descriptors over its lifecycle socket. Capture staging is private
+(`0700` directories, `0600` files). The plan and write-once `vm.capture.json`
+have one capture mode: writers close without synchronizing files or directories.
+Coherent records require all seven positively observed cut facts.
+
+Live fork is a distinct identity policy, not a different snapshot mode.
+It materializes complete owned RAM/state and private disk clones or sparse
+copies without content hashing, map nodes or pool publication. Held descriptors,
+exact device/inode/length/mode/mtime/ctime checks and native closed-writer,
+run/cut-generation bindings admit these internal files. They are not
+cryptographically authenticated: bit rot is not detected until the child is
+snapshotted, which establishes identity at that later cut. Snapshot capture
+and authentication below are unchanged; missing snapshot receipts never fall
+back to owned-local-cut authority.
+
+The source retains separate latest byte and identified RAM baselines, plus
+dirty-page coverage accumulated across forks. Disk baseline/history do not
+advance on fork. Its next snapshot hashes changes since its last identified
+snapshot. Children begin with typed unknown-after-fork RAM/disk identity;
+the first snapshot hashes full resulting RAM during the pause and full disk
+identity after resume, reports why, and seeds ordinary later incrementals.
+Fork-of-fork needs only complete owned byte authority.
+
+The worker supplies RAM chunk digests with an affected-chunk bitmap. The
+monitor resolves clean incremental chunks from its exact retained baseline
+map, checks the closed RAM inode and layout length, and never reads RAM back.
+Sparse disk copies compute each 8 MiB chunk digest while copying, skipping
+whole holes without reads. A qualified reflink/clonefile still requires a
+single scan of the clone to derive its chunk map. RAM and disks record only
+their canonical stream `identity`; small state and map roles retain byte
+`sha256`. Disk map roles (`disks/<name>.map.json`) immediately follow their
+disk in the closed inventory; RAM retains `memory.map.json` (`ram-map`).
+
+libvm reserves staging space before freeze. Admission validates the held source
+identities and lengths, not a second allocation sample while the guest can still
+write. Before sealing, the monitor checks actual staged allocation against that
+reservation. Exceeding it fails capture with `staging-budget-exceeded` and applies
+the recorded continuation policy. This accounting is not a filesystem quota.
+
+A running source acquires capture-owned pause authority. `resume-if-acquired`
+continues that source; `preserve` transfers authority to the user. Capturing an
+already user-paused source resolves the default policy to `preserve` at
+admission, records it in the capture plan and borrows its exact token, never
+resumes it. Cancellation before sealing abandons the cut and applies
+the continuation policy; cancellation after sealing cannot discard the cut.
+`vm.capture-source.json` records continuation separately from capture success.
+
+libvm verifies the sealed closure and native envelope bindings before publishing
+a `live-execution` snapshot. Publication serializes concurrent consumers and
+retains independent pool RAM, dependency roots and native baseline leases.
+First owned reflink RAM publication binds producer identities to unchanged inode
+facts without reading RAM back. Replay from sealed state authenticates staged
+bytes again; copy fallback hashes inline and independent dedup authenticates
+the existing inode. Publication establishes no warm verification receipt.
+Reconciliation can publish a coherent cut even when source continuation is
+unknown; uncertainty does not authorize releasing a live owner's storage.
+Terminal staging reclamation preserves the capture evidence separately.
+Snapshot publication synchronizes every immutable pool payload and its
+publication directories before the catalog's stable-storage barrier. Local
+fork retention instead relocates without durability barriers; each fork child
+retains its independent background durability barrier.
+
+## Execution Restore Ownership
+
+Restore verifies retained closure shape and native compatibility before
+allocating a child. Cold durable byte authentication overlaps private disk
+construction and must finish before child publication; warm restores may reuse
+matching independently verified inode receipts. Local forks instead use exact
+owned-file authority without producer content identities or a first-use RAM
+rehash. A local cut cannot be verified, exported, pushed or substituted for
+identified snapshot handoff authority; snapshot the child first. Normal
+stopped-machine handoff authenticates its current storage independently.
+The worker reconstructs private RAM mappings and disk
+attachments from held descriptors, starts paused, and keeps network and vsock
+providers fenced. Activation requires the exact fresh VM-generation
+acknowledgement, destination guest identity and SSH CA, listener preparation,
+and exact Thaw acknowledgement before native exposure commits.
+
+Pre-allocation inspection requires four owned-cut state descriptors, or five
+identified-snapshot descriptors including the RAM map, to be read-only buffered
+regular files with their declared identities and sizes. It uses the same
+descriptor admission checks as launch, before native compatibility inspection,
+so inspection cannot approve writable RAM that launch would reject.
+
+Inspection precedes private disk allocation and may omit destination tracking
+seeds. Final activation binds the child's real private disk seeds before strict
+validation. An owned cut requires exactly one unidentified seed per writable
+attachment, no identified baseline or map store, and no writable inode alias
+with any cut member. The retained inspection binding excludes destination seeds,
+network and public SSH CA only; source authority and every state descriptor
+remain exact.
+
+Capture bindings and snapshot compatibility profiles carry `liveStateSchema`
+and guest `architecture`. The restoring monitor compares those with the native
+`LIVE_STATE_SCHEMA` and its guest architecture; mismatches produce typed
+expected/found refusals before child allocation. Every native state component
+also checks its own magic and schema while decoding. Build identity, source
+revision and compiler settings are not compatibility gates. The informational
+monitor `buildIdentity` is only `v1:silo:<target>:<package-version>`, with no
+native-source observation.
+
+All fallible preparation precedes the shared native exposure commit. Its
+deadline is bounded by the original startup deadline. After confirmed exposure,
+the monitor publishes `Running` and reports startup directly, without entering
+cold-start readiness checks or running a cold-start command. Lost release or
+startup-report evidence is terminal uncertainty, not proof that the child stayed
+fenced; cleanup retains ownership until the child is positively reaped.
+
+Before exposure, an activation failure permits only inspection and stop when
+the child is positively parked and fenced. Otherwise the child is reaped.
+Neither path silently falls back to cold boot.
+
+Activation observes the backend's retained terminal result alongside the guest
+protocol sequence. Worker death terminates activation without waiting for the
+startup deadline; cleanup still retains the normal backend reap owner. Manager
+death before startup acknowledgement cancels startup rather than authorizing
+an independently running child.
+
+Inspection may observe the same live run while the restore manager holds the
+mutation lock. It authenticates the monitor status against that run and does
+not write the observation back to the catalog. Terminal reconciliation still
+requires exclusion from concurrent machine mutation.
+
+After handing the restore request to the monitor, the manager releases mutation
+authority while waiting for startup. It retains its lifetime and storage leases,
+then reacquires mutation authority and authenticates the same run before
+publishing readiness or cleaning up failure. Concurrent stop can terminate the
+child without manager progress; final storage retirement also waits for the
+manager's lease to close. A replaced or stopping run supersedes the startup waiter.
+New live commands reject inadmissible lifecycle states before acquiring mutation
+authority; exact request replays retain their existing durable semantics.
 
 ## Exit Runner
 
@@ -145,10 +412,12 @@ When `--exit-command` is given, `main()` forks an idle runner immediately after
 daemonizing and taking the machine lock. At that point the process is still
 single-threaded: the tracing appender, which starts the first thread, is set up
 afterwards. The runner points stdio at `/dev/null`, closes every other
-descriptor (so it never holds `vm.lock`, whose flock state belongs to the open
-file description, nor the log directory or supervisor pipes) and blocks on a
-pipe. Finalization writes one byte; if the monitor dies first, EOF releases the
-runner. It then execs the command with `SILO_MACHINE_ID` and
+descriptor (including machine/storage locks, retained backing handles, log
+directories and supervisor pipes), and blocks on a pipe only if sanitation
+succeeds. Cleanup failure immediately exits the runner instead of retaining
+storage ownership while waiting. Finalization writes one byte; if the monitor
+dies first, EOF releases the runner. It removes `_VM_STORAGE_LEASES` from the
+environment before execing the command with `SILO_MACHINE_ID` and
 `SILO_MACHINE_RUN_ID`. The monitor exits without reaping it; it is reparented.
 
 ## Confinement
@@ -188,16 +457,6 @@ both end the generation cleanly.
 | `virt/vmm/src/krun/` | `KrunConfig`, engine, host checks, Rosetta data. |
 | `virt/vmm/src/krun/worker/` | Worker entry, descriptor adoption (`fds.rs`), wire format (`wire.rs`), HVF admission. |
 
-See [process and native test instructions](../../virt/vmm/tests/README.md),
-[packaging](../../PACKAGING.md) and [native dependencies](../libkrun-deps.md).
+See [process and native test instructions](../../virt/vmm/tests/README.md)
+and [packaging](../../PACKAGING.md).
 
-## Qualification
-
-| Check | Result |
-| --- | --- |
-| Real-process worker boundary: fixed descriptors, bad roles, aliasing, fd above the table, config EOF read and limits, watchdog, full event pipe | Passed on macOS |
-| Exit runner: once after the record, on monitor SIGKILL, absent without the flag, holds only its trigger | Passed on macOS |
-| Signed macOS HVF native gate: devices, serial RPC, block and virtio-fs, stop, worker SIGKILL, reboot, poweroff, new generation | Passed before the executable and worker rename; rerun required |
-| Linux KVM native gate, including x86-64 poweroff with a kernel built from this tree | Not yet run |
-| Linux `/proc/<pid>/comm` is `krun` | Not yet run |
-| VZ backend under the renamed binary | Not yet run |

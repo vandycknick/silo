@@ -15,7 +15,6 @@ impl StatusPublisher {
     pub(crate) fn new(
         host: &libvm::HostPaths,
         generation: uuid::Uuid,
-        features: crate::config::FeatureSelection,
         configuration_identity: String,
         system: Option<SystemStatus>,
     ) -> eyre::Result<Self> {
@@ -23,7 +22,7 @@ impl StatusPublisher {
             path: silod_spec::paths::DaemonPaths::new(host.home()).status(),
             config_dir: host.config_dir().into(),
             status: Mutex::new(DaemonStatus {
-                schema: 2,
+                schema: 1,
                 generation,
                 pid: std::process::id(),
                 process_start: process_start_identity()?,
@@ -33,24 +32,10 @@ impl StatusPublisher {
                 updated_at: now(),
                 last_error: None,
                 system,
+                lobby: None,
                 configuration_identity,
-                tailscale: ComponentStatus {
-                    enabled: features.tailscale,
-                    state: if features.tailscale {
-                        ComponentState::Starting
-                    } else {
-                        ComponentState::Disabled
-                    },
-                    diagnostic: None,
-                    approval_url: None,
-                    dns_name: None,
-                    restart_count: 0,
-                    shutdown_protection: if cfg!(target_os = "macos") {
-                        ShutdownProtection::Unsupported
-                    } else {
-                        ShutdownProtection::Unavailable
-                    },
-                },
+                manager_live: None,
+                appliance_live: None,
             }),
         };
         publisher.update(|_| {})?;
@@ -75,8 +60,20 @@ impl StatusPublisher {
             s.last_error = error;
         })
     }
+    pub(crate) fn set_manager_live(
+        &self,
+        report: vm_spec::live::LiveHostReport,
+    ) -> eyre::Result<()> {
+        self.update(|s| s.manager_live = Some(report))
+    }
     pub(crate) fn set_system(&self, system: SystemStatus) -> eyre::Result<()> {
-        self.update(|s| s.system = Some(system))
+        self.update(|s| {
+            s.appliance_live = system.prospective_live.clone();
+            s.system = Some(system);
+        })
+    }
+    pub(crate) fn set_lobby(&self, lobby: Option<LobbyStatus>) -> eyre::Result<()> {
+        self.update(|s| s.lobby = lobby)
     }
     pub(crate) fn fail_system(&self, error: String) -> eyre::Result<()> {
         self.update(|s| {
@@ -87,28 +84,13 @@ impl StatusPublisher {
             }
         })
     }
-    pub(crate) fn set_tailscale(&self, mut component: ComponentStatus) -> eyre::Result<()> {
-        if cfg!(target_os = "macos") {
-            component.shutdown_protection = ShutdownProtection::Unsupported;
-        }
-        self.update(|s| s.tailscale = component)
-    }
-    pub(crate) fn report_tailscale(&self, mut component: ComponentStatus) -> eyre::Result<()> {
-        if cfg!(target_os = "macos") {
-            component.shutdown_protection = ShutdownProtection::Unsupported;
-        }
-        self.update(|status| {
-            component.restart_count = status.tailscale.restart_count;
-            component.enabled = status.tailscale.enabled;
-            status.tailscale = component;
-        })
-    }
     pub(crate) fn wire(&self) -> eyre::Result<w::DaemonStatus> {
         let s = self
             .status
             .lock()
             .map_err(|_| eyre::eyre!("status publisher poisoned"))?;
         Ok(w::DaemonStatus {
+            live_schema_version: Some(1),
             product_version: env!("CARGO_PKG_VERSION").into(),
             protocol_major: 1,
             generation: s.generation.to_string(),
@@ -127,8 +109,18 @@ impl StatusPublisher {
             control_endpoint: silo_vm_control::path_to_wire(&s.control_endpoint),
             updated_at: timestamp(&s.updated_at),
             last_error: s.last_error.clone(),
-            system: s.system.as_ref().map(system_wire),
-            tailscale: Some(component_wire(&s.tailscale)),
+            manager_live: s
+                .manager_live
+                .as_ref()
+                .map(silo_vm_control::live::host_to_wire)
+                .transpose()?,
+            appliance_live: s
+                .appliance_live
+                .as_ref()
+                .map(silo_vm_control::live::host_to_wire)
+                .transpose()?,
+            system: s.system.as_ref().map(system_wire).transpose()?,
+            lobby: s.lobby.as_ref().map(lobby_wire),
         })
     }
 }
@@ -140,30 +132,26 @@ fn timestamp(s: &str) -> Option<prost_types::Timestamp> {
             nanos: t.timestamp_subsec_nanos() as i32,
         })
 }
-fn component_wire(s: &ComponentStatus) -> w::ComponentStatus {
-    w::ComponentStatus {
-        enabled: s.enabled,
-        state: match s.state {
-            ComponentState::Disabled => w::ComponentState::Disabled,
-            ComponentState::Starting => w::ComponentState::Starting,
-            ComponentState::NeedsAuth => w::ComponentState::NeedsAuth,
-            ComponentState::Ready => w::ComponentState::Ready,
-            ComponentState::Degraded => w::ComponentState::Degraded,
-            ComponentState::Failed => w::ComponentState::Failed,
+fn lobby_wire(s: &LobbyStatus) -> w::LobbyStatus {
+    w::LobbyStatus {
+        phase: match s.phase {
+            LobbyPhase::Starting => w::LobbyPhase::Starting,
+            LobbyPhase::NeedsLogin => w::LobbyPhase::NeedsLogin,
+            LobbyPhase::NeedsTag => w::LobbyPhase::NeedsTag,
+            LobbyPhase::Ready => w::LobbyPhase::Ready,
+            LobbyPhase::Degraded => w::LobbyPhase::Degraded,
+            LobbyPhase::Failed => w::LobbyPhase::Failed,
         } as i32,
-        diagnostic: s.diagnostic.clone(),
-        approval_url: s.approval_url.clone(),
         dns_name: s.dns_name.clone(),
-        restart_count: s.restart_count.into(),
-        shutdown_protection: match s.shutdown_protection {
-            ShutdownProtection::Active => w::ShutdownProtection::Active,
-            ShutdownProtection::Unavailable => w::ShutdownProtection::Unavailable,
-            ShutdownProtection::Unsupported => w::ShutdownProtection::Unsupported,
-        } as i32,
+        approval_url: s.approval_url.clone(),
+        diagnostic: s.diagnostic.clone(),
+        restart_count: s.restart_count,
+        updated_at: timestamp(&s.updated_at),
     }
 }
-fn system_wire(s: &SystemStatus) -> w::SystemStatus {
-    w::SystemStatus {
+fn system_wire(s: &SystemStatus) -> eyre::Result<w::SystemStatus> {
+    Ok(w::SystemStatus {
+        live_schema_version: Some(1),
         phase: match s.phase {
             SystemPhase::PreparingStorage => w::SystemPhase::PreparingStorage,
             SystemPhase::Creating => w::SystemPhase::Creating,
@@ -184,6 +172,16 @@ fn system_wire(s: &SystemStatus) -> w::SystemStatus {
         configured_image: s.configured_image.clone(),
         memory_bytes: s.memory_bytes,
         actual_backend: s.actual_backend.clone(),
+        live: s
+            .live
+            .as_ref()
+            .map(silo_vm_control::live::machine_to_wire)
+            .transpose()?,
+        prospective_live: s
+            .prospective_live
+            .as_ref()
+            .map(silo_vm_control::live::host_to_wire)
+            .transpose()?,
         docker_socket: silo_vm_control::path_to_wire(std::path::Path::new(&s.docker_socket)),
         last_error: s.last_error.clone(),
         restart_count: s.restart_count.into(),
@@ -204,7 +202,11 @@ fn system_wire(s: &SystemStatus) -> w::SystemStatus {
         host_memory_reclaim_qualification: s.host_memory_reclaim_qualification.clone(),
         host_memory_reclaim_released_bytes: s.host_memory_reclaim_released_bytes,
         host_memory_reclaim_failed_operations: s.host_memory_reclaim_failed_operations,
-    }
+        host_memory_reclaim_backing: s.host_memory_reclaim_backing.clone(),
+        host_memory_reclaim_reason: s.host_memory_reclaim_reason.clone(),
+        host_memory_reclaim_mapping_limit_skips: s.host_memory_reclaim_mapping_limit_skips,
+        host_memory_reclaim_replaced_islands: s.host_memory_reclaim_replaced_islands,
+    })
 }
 
 #[cfg(test)]
@@ -212,8 +214,106 @@ mod tests {
     use crate::daemon::status::*;
     use std::sync::Arc;
 
+    fn lobby_status(phase: LobbyPhase) -> LobbyStatus {
+        LobbyStatus {
+            phase,
+            dns_name: Some("lobby.example.ts.net".into()),
+            approval_url: Some("https://login.tailscale.com/a/example".into()),
+            diagnostic: Some("waiting for approval".into()),
+            restart_count: 3,
+            updated_at: "2026-11-11T00:00:00.123Z".into(),
+        }
+    }
+
     #[test]
-    fn component_updates_share_one_root_identity_and_api_snapshot() {
+    fn lobby_wire_preserves_all_phases_and_details() {
+        for (phase, wire_phase) in [
+            (LobbyPhase::Starting, w::LobbyPhase::Starting),
+            (LobbyPhase::NeedsLogin, w::LobbyPhase::NeedsLogin),
+            (LobbyPhase::NeedsTag, w::LobbyPhase::NeedsTag),
+            (LobbyPhase::Ready, w::LobbyPhase::Ready),
+            (LobbyPhase::Degraded, w::LobbyPhase::Degraded),
+            (LobbyPhase::Failed, w::LobbyPhase::Failed),
+        ] {
+            let status = lobby_status(phase);
+            let wire = lobby_wire(&status);
+            assert_eq!(wire.phase, wire_phase as i32);
+            assert_eq!(wire.dns_name, status.dns_name);
+            assert_eq!(wire.approval_url, status.approval_url);
+            assert_eq!(wire.diagnostic, status.diagnostic);
+            assert_eq!(wire.restart_count, status.restart_count);
+            assert_eq!(
+                wire.updated_at,
+                Some(prost_types::Timestamp {
+                    seconds: 1_794_355_200,
+                    nanos: 123_000_000,
+                })
+            );
+        }
+        let status = LobbyStatus {
+            dns_name: None,
+            approval_url: None,
+            diagnostic: None,
+            ..lobby_status(LobbyPhase::Starting)
+        };
+        let wire = lobby_wire(&status);
+        assert!(wire.dns_name.is_none());
+        assert!(wire.approval_url.is_none());
+        assert!(wire.diagnostic.is_none());
+    }
+
+    #[test]
+    fn lobby_updates_and_disablement_share_disk_and_api_state() {
+        let root = tempfile::tempdir().unwrap();
+        let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
+        let publisher =
+            StatusPublisher::new(&host, uuid::Uuid::new_v4(), "test".into(), None).unwrap();
+        assert!(publisher.wire().unwrap().lobby.is_none());
+        let lobby = lobby_status(LobbyPhase::NeedsLogin);
+        publisher.set_lobby(Some(lobby.clone())).unwrap();
+        let disk: DaemonStatus =
+            serde_json::from_slice(&std::fs::read(&publisher.path).unwrap()).unwrap();
+        assert_eq!(disk.lobby, Some(lobby.clone()));
+        assert_eq!(publisher.wire().unwrap().lobby, Some(lobby_wire(&lobby)));
+        publisher.set_lobby(None).unwrap();
+        let disk: DaemonStatus =
+            serde_json::from_slice(&std::fs::read(&publisher.path).unwrap()).unwrap();
+        assert!(disk.lobby.is_none());
+        assert!(publisher.wire().unwrap().lobby.is_none());
+    }
+
+    #[test]
+    fn failed_lobby_publication_does_not_advance_api_state() {
+        let root = tempfile::tempdir().unwrap();
+        let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
+        let publisher =
+            StatusPublisher::new(&host, uuid::Uuid::new_v4(), "test".into(), None).unwrap();
+        let lobby = lobby_status(LobbyPhase::Ready);
+        publisher.set_lobby(Some(lobby.clone())).unwrap();
+        std::fs::remove_file(&publisher.path).unwrap();
+        std::fs::create_dir(&publisher.path).unwrap();
+        assert!(publisher
+            .set_lobby(Some(lobby_status(LobbyPhase::Failed)))
+            .is_err());
+        assert_eq!(publisher.wire().unwrap().lobby, Some(lobby_wire(&lobby)));
+        assert!(publisher.set_lobby(None).is_err());
+        assert_eq!(publisher.wire().unwrap().lobby, Some(lobby_wire(&lobby)));
+    }
+    #[test]
+    fn system_wire_preserves_reclaim_mapping_counters() {
+        let mut status = crate::daemon::supervisor::initial_status(std::path::Path::new(
+            "/tmp/silo-test-docker.sock",
+        ))
+        .expect("initial status");
+        status.host_memory_reclaim_mapping_limit_skips = Some(3);
+        status.host_memory_reclaim_replaced_islands = Some(7);
+        let wire = system_wire(&status).expect("status wire");
+        assert_eq!(wire.host_memory_reclaim_mapping_limit_skips, Some(3));
+        assert_eq!(wire.host_memory_reclaim_replaced_islands, Some(7));
+    }
+
+    #[test]
+    fn system_updates_share_one_root_identity_and_api_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
         let generation = uuid::Uuid::new_v4();
@@ -223,10 +323,6 @@ mod tests {
             StatusPublisher::new(
                 &host,
                 generation,
-                crate::config::FeatureSelection {
-                    system: true,
-                    tailscale: true,
-                },
                 "effective-config".into(),
                 Some(system.clone()),
             )
@@ -244,17 +340,7 @@ mod tests {
             }
         });
         for _ in 0..10 {
-            publisher
-                .set_tailscale(ComponentStatus {
-                    enabled: true,
-                    state: ComponentState::NeedsAuth,
-                    diagnostic: None,
-                    approval_url: Some("https://login.tailscale.com/a/test".into()),
-                    dns_name: None,
-                    restart_count: 2,
-                    shutdown_protection: ShutdownProtection::Unavailable,
-                })
-                .unwrap();
+            publisher.set_core(CorePhase::Ready, None).unwrap();
         }
         thread.join().unwrap();
         let disk: DaemonStatus = serde_json::from_slice(
@@ -262,7 +348,7 @@ mod tests {
         )
         .unwrap();
         let api = publisher.wire().unwrap();
-        assert_eq!(disk.schema, 2);
+        assert_eq!(disk.schema, 1);
         assert_eq!(disk.generation, generation);
         assert_eq!(api.generation, generation.to_string());
         assert_eq!(api.pid, disk.pid);
@@ -273,11 +359,6 @@ mod tests {
         assert_eq!(disk.configuration_identity, "effective-config");
         assert_eq!(disk.system.as_ref().unwrap().phase, SystemPhase::Retrying);
         assert_eq!(api.system.unwrap().phase, w::SystemPhase::Retrying as i32);
-        assert_eq!(disk.tailscale.state, ComponentState::NeedsAuth);
-        assert_eq!(
-            api.tailscale.unwrap().approval_url,
-            disk.tailscale.approval_url
-        );
         publisher.fail_system("supervisor exited".into()).unwrap();
         assert_eq!(
             publisher
@@ -296,17 +377,8 @@ mod tests {
     fn failed_publication_does_not_advance_api_state() {
         let root = tempfile::tempdir().unwrap();
         let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
-        let publisher = StatusPublisher::new(
-            &host,
-            uuid::Uuid::new_v4(),
-            crate::config::FeatureSelection {
-                system: false,
-                tailscale: false,
-            },
-            "test".into(),
-            None,
-        )
-        .unwrap();
+        let publisher =
+            StatusPublisher::new(&host, uuid::Uuid::new_v4(), "test".into(), None).unwrap();
         std::fs::remove_file(&publisher.path).unwrap();
         std::fs::create_dir(&publisher.path).unwrap();
         assert!(publisher.set_core(CorePhase::Ready, None).is_err());

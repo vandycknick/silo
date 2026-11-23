@@ -23,6 +23,7 @@ tower = { version = "0.5.3", features = ["util"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 
 [dev-dependencies]
+libvm = { path = "../../runtime/libvm", features = ["test-isolated-resource-budget"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "io-util"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }

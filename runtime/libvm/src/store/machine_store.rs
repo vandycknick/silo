@@ -7,6 +7,50 @@ use crate::store::row::{DbMachineConfig, DbMachineState};
 use crate::store::{MachineStore, Store};
 use crate::LibVmError;
 
+pub(crate) const MACHINE_CONFIGS_BY_ID_PREFIX: &str =
+    "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json
+     FROM machine_config
+     WHERE name = ?1 OR (id LIKE ?2 AND NOT EXISTS (SELECT 1 FROM machine_config WHERE name = ?1))";
+
+/// Public discovery excludes construction rows even while their owner is alive.
+/// Name reservation and operation-owned ID lookups use the unfiltered catalog.
+pub(crate) fn discovery_query(
+    reference: &crate::MachineRef,
+) -> (&'static str, String, Option<String>) {
+    match reference.kind() {
+        crate::machine::MachineRefKind::Id(id) => (
+            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE durability='durable' AND id=?1 LIMIT 2",
+            id.to_string(),
+            None,
+        ),
+        crate::machine::MachineRefKind::Name(name) => (
+            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE durability='durable' AND name=?1 LIMIT 2",
+            name.clone(),
+            None,
+        ),
+        crate::machine::MachineRefKind::IdPrefix { name, prefix } => (
+            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE durability='durable' AND (name=?1 OR (id LIKE ?2 AND NOT EXISTS(SELECT 1 FROM machine_config WHERE durability='durable' AND name=?1)))",
+            name.clone(),
+            Some(format!("{prefix}%")),
+        ),
+    }
+}
+
+fn has_pool_roots(storage: &crate::MachineStorageRecord) -> bool {
+    matches!(&storage.root, crate::MachineRoot::LinuxOverlay { .. })
+        || storage
+            .disks
+            .iter()
+            .any(|disk| matches!(&disk.storage, crate::DiskStorage::ManagedReadOnly { .. }))
+        || matches!(
+            &storage.boot,
+            crate::BootProfile::LinuxDirect {
+                binding: crate::BootBinding::Pinned { .. },
+                ..
+            }
+        )
+}
+
 pub(crate) struct InventoryRecord {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -15,18 +59,77 @@ pub(crate) struct InventoryRecord {
 
 #[async_trait]
 impl MachineStore for Store {
+    fn native_store(&self) -> Option<Store> {
+        Some(self.clone())
+    }
+    async fn register_launch_storage(
+        &self,
+        machine_id: MachineId,
+        run_id: uuid::Uuid,
+        storage: &crate::MachineStorageRecord,
+        spec: &vm_spec::VmSpec,
+    ) -> Result<crate::store::operation_store::LaunchStorageLease, LibVmError> {
+        let store = self.clone();
+        let storage = storage.clone();
+        let spec = spec.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(
+                store.register_launch_storage_inner(machine_id, run_id, &storage, &spec, None),
+            )
+        })
+        .await?
+    }
+    async fn mark_launch_storage_admitted(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> Result<(), LibVmError> {
+        let store = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(store.mark_launch_storage_admitted_inner(operation_id))
+        })
+        .await?
+    }
+    async fn launch_storage_operations(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Vec<crate::store::operation_store::RetainedStorageOperation>, LibVmError> {
+        self.launch_storage_operations_inner(machine_id).await
+    }
+    async fn try_retire_launch_storage(
+        &self,
+        operation_id: uuid::Uuid,
+        run_id: uuid::Uuid,
+        generation: u64,
+        next_state: &MachineState,
+        outcome: crate::StorageStopOutcome,
+    ) -> Result<bool, LibVmError> {
+        let store = self.clone();
+        let next_state = next_state.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(store.try_retire_launch_storage_inner(
+                operation_id,
+                run_id,
+                generation,
+                &next_state,
+                outcome,
+            ))
+        })
+        .await?
+    }
     async fn machine_inventory(&self) -> Result<Vec<InventoryRecord>, LibVmError> {
-        use sqlx::FromRow;
         // Guard JSON conversion per row: malformed JSONB must not abort the
         // entire SELECT before we can retain its indexed identity.
-        let rows = sqlx::query("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config ORDER BY name")
+        let rows = sqlx::query("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE durability='durable' ORDER BY name")
             .fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
                 Ok(InventoryRecord {
                     id: row.try_get("id")?,
                     name: row.try_get("name")?,
-                    config: DbMachineConfig::from_row(&row)
+                    config: DbMachineConfig::from_row_in(&row, &self.home)
                         .map(|DbMachineConfig(config)| config)
                         .map_err(Into::into),
                 })
@@ -47,8 +150,30 @@ impl MachineStore for Store {
             });
         }
 
-        let mut tx = self.pool.begin().await?;
-        Self::insert_machine_config_and_state(&mut tx, config, initial_state).await?;
+        let platform = oci::Platform::host().map_err(|error| LibVmError::InvalidStorageRecord {
+            record: "machine-storage",
+            message: error.to_string(),
+        })?;
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new(crate::paths::root_disk_relative_path())?,
+            512,
+            &platform,
+        )?;
+        let _boot = self.pin_test_boot(&mut storage).await?;
+        storage.bind_disk_identity_inventory(&config.spec);
+        let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
+        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots_shared()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_cleaning_dependencies(&mut tx, &paths).await?;
+        Self::insert_machine_config_and_state(
+            &mut tx,
+            config,
+            initial_state,
+            crate::MachineDurability::Durable,
+        )
+        .await?;
+        Self::write_machine_storage(&mut tx, config.id, &storage).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -58,25 +183,24 @@ impl MachineStore for Store {
         config: &MachineConfig,
         initial_state: &MachineState,
         rootfs: &MachineRootfsRecord,
+        storage: &crate::MachineStorageRecord,
     ) -> Result<(), LibVmError> {
-        if initial_state.machine_id != config.id {
-            return Err(LibVmError::InvalidCreateRequest {
-                name: config.name.clone(),
-                reason: "initial machine state id does not match machine config id".to_string(),
-            });
-        }
-        if rootfs.machine_id != config.id {
-            return Err(LibVmError::InvalidCreateRequest {
-                name: config.name.clone(),
-                reason: "machine rootfs id does not match machine config id".to_string(),
-            });
-        }
-
-        let mut tx = self.pool.begin().await?;
-        Self::insert_machine_config_and_state(&mut tx, config, initial_state).await?;
-        Self::insert_machine_rootfs(&mut tx, rootfs).await?;
-        tx.commit().await?;
-        Ok(())
+        let store = self.clone();
+        let config = config.clone();
+        let initial_state = initial_state.clone();
+        let rootfs = rootfs.clone();
+        let storage = storage.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(store.add_machine_with_rootfs_inner(
+                &config,
+                &initial_state,
+                &rootfs,
+                &storage,
+                crate::MachineDurability::Durable,
+            ))
+        })
+        .await?
     }
 
     async fn machine_state(
@@ -97,15 +221,41 @@ impl MachineStore for Store {
         machine_id: MachineId,
     ) -> Result<Option<MachineRootfsRecord>, LibVmError> {
         let row = sqlx::query(
-            "SELECT machine_id, source_kind, requested_reference, selected_reference,
-                    manifest_digest, config_digest, image_id, root_disk_path,
-                    root_disk_size_bytes, created_at
-             FROM machine_rootfs WHERE machine_id = ?1",
+            "SELECT r.machine_id, r.source_kind, r.requested_reference, r.selected_reference,
+                    r.manifest_digest, r.config_digest, r.image_id, r.created_at,
+                    CASE WHEN json_valid(s.record_json, 8) THEN json(s.record_json) ELSE '{}' END AS storage_json
+             FROM machine_rootfs r JOIN machine_storage s ON s.machine_id = r.machine_id
+             WHERE r.machine_id = ?1",
         )
         .bind(machine_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(machine_rootfs_from_row).transpose()
+        row.map(|row| machine_rootfs_from_row(row, &self.home))
+            .transpose()
+    }
+
+    async fn machine_storage(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Option<crate::MachineStorageRecord>, LibVmError> {
+        let json = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT CASE WHEN s.machine_id IS NULL THEN NULL WHEN json_valid(s.record_json, 8) THEN json(s.record_json) ELSE '{}' END FROM machine_config c LEFT JOIN machine_storage s ON s.machine_id = c.id WHERE c.id = ?1",
+        )
+        .bind(machine_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        match json {
+            None => Ok(None),
+            Some(None) => Err(LibVmError::InvalidStorageRecord {
+                record: "machine-storage",
+                message: "machine has no storage record".to_string(),
+            }),
+            Some(Some(json)) => {
+                let storage = crate::MachineStorageRecord::decode(&json)?;
+                storage.validate_for_machine(machine_id.into())?;
+                Ok(Some(storage))
+            }
+        }
     }
 
     async fn save_machine_state(&self, state: &MachineState) -> Result<(), LibVmError> {
@@ -124,7 +274,26 @@ impl MachineStore for Store {
         Ok(())
     }
 
+    async fn save_machine_config_with_storage(
+        &self,
+        config: &MachineConfig,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<(), LibVmError> {
+        let store = self.clone();
+        let config = config.clone();
+        let storage = storage.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(store.save_machine_config_with_storage_inner(&config, &storage))
+        })
+        .await?
+    }
+
     async fn save_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError> {
+        let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::ensure_machine_owned(&mut tx, config.id).await?;
+        self.check_cleaning_dependencies(&mut tx, &paths).await?;
         let result = sqlx::query(
             "UPDATE machine_config
              SET name = ?1, config_json = jsonb(?2)
@@ -133,7 +302,7 @@ impl MachineStore for Store {
         .bind(&config.name)
         .bind(Self::serialize("machine_config.config_json", config)?)
         .bind(config.id.to_string())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -141,65 +310,133 @@ impl MachineStore for Store {
                 reference: config.id.to_string(),
             });
         }
+        let json = sqlx::query_scalar::<_, String>(
+            "SELECT CASE WHEN json_valid(record_json, 8) THEN json(record_json) ELSE '{}' END FROM machine_storage WHERE machine_id = ?1",
+        ).bind(config.id.to_string()).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| LibVmError::InvalidStorageRecord { record: "machine-storage", message: "machine has no storage record".to_string() })?;
+        let mut storage = crate::MachineStorageRecord::decode(&json)?;
+        storage.validate_disk_identity_inventory(&config.spec)?;
+        if let Some(length) = config.root_disk_size {
+            match &mut storage.root {
+                crate::MachineRoot::OpaqueRaw { geometry, .. } => geometry.length = length,
+                crate::MachineRoot::LinuxOverlay {
+                    capacity, upper, ..
+                } => {
+                    let disk = config
+                        .spec
+                        .storage
+                        .as_ref()
+                        .and_then(|storage| {
+                            storage
+                                .disks
+                                .iter()
+                                .find(|disk| disk.role == vm_spec::DiskRole::RootUpper)
+                        })
+                        .ok_or_else(|| LibVmError::InvalidStorageRecord {
+                            record: "machine-storage",
+                            message: "overlay update has no upper attachment".into(),
+                        })?;
+                    if *capacity != length || upper.as_path() != disk.path {
+                        *upper = crate::PrivatePath::new(disk.path.clone())?;
+                        *capacity = length;
+                        storage.storage_generation = storage
+                            .storage_generation
+                            .checked_add(1)
+                            .ok_or_else(|| LibVmError::InvalidStorageRecord {
+                                record: "machine-storage",
+                                message: "storage generation overflow".into(),
+                            })?;
+                    }
+                }
+            }
+            Self::write_machine_storage(&mut tx, config.id, &storage).await?;
+        }
+        tx.commit().await?;
 
         Ok(())
     }
 
     async fn machine_config(&self, id: MachineId) -> Result<Option<MachineConfig>, LibVmError> {
-        let machine = sqlx::query_as::<_, DbMachineConfig>(
+        let machine = sqlx::query(
             "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(machine.map(|DbMachineConfig(machine)| machine))
+        machine
+            .map(|row| {
+                DbMachineConfig::from_row_in(&row, &self.home).map(|DbMachineConfig(config)| config)
+            })
+            .transpose()
+            .map_err(Into::into)
     }
 
     async fn machine_config_by_name(
         &self,
         name: &str,
     ) -> Result<Option<MachineConfig>, LibVmError> {
-        let machine = sqlx::query_as::<_, DbMachineConfig>(
+        let machine = sqlx::query(
             "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE name = ?1",
         )
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(machine.map(|DbMachineConfig(machine)| machine))
+        machine
+            .map(|row| {
+                DbMachineConfig::from_row_in(&row, &self.home).map(|DbMachineConfig(config)| config)
+            })
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    async fn machine_name_in_use(&self, name: &str) -> Result<bool, LibVmError> {
+        let id = name.parse::<MachineId>().ok().map(|id| id.to_string());
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM machine_config WHERE name = ?1 OR id = ?2)",
+        )
+        .bind(name)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     async fn machine_configs_by_id_prefix(
         &self,
         prefix: &str,
+        name: &str,
     ) -> Result<Vec<MachineConfig>, LibVmError> {
         Self::validate_machine_id_prefix(prefix)?;
         let pattern = format!("{prefix}%");
-        let rows = sqlx::query_as::<_, DbMachineConfig>(
-            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE id LIKE ?1",
-        )
-        .bind(pattern)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|DbMachineConfig(machine)| machine)
-            .collect())
+        let rows = sqlx::query(MACHINE_CONFIGS_BY_ID_PREFIX)
+            .bind(name)
+            .bind(pattern)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                DbMachineConfig::from_row_in(row, &self.home).map(|DbMachineConfig(config)| config)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError> {
-        let rows = sqlx::query_as::<_, DbMachineConfig>(
+        let rows = sqlx::query(
             "SELECT id, name, json(config_json) AS config_json FROM machine_config ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|DbMachineConfig(machine)| machine)
-            .collect())
+        rows.iter()
+            .map(|row| {
+                DbMachineConfig::from_row_in(row, &self.home).map(|DbMachineConfig(config)| config)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     async fn remove_machine(&self, machine: &MachineConfig) -> Result<(), LibVmError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::ensure_machine_owned(&mut tx, machine.id).await?;
         sqlx::query("DELETE FROM machine_state WHERE machine_id = ?1")
             .bind(machine.id.to_string())
             .execute(&mut *tx)
@@ -209,23 +446,704 @@ impl MachineStore for Store {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        // The caller releases the machine's reusable lock slot after this.
+        self.checkpoint_catalog().await?;
         Ok(())
     }
 }
 
 impl Store {
+    pub(crate) async fn accept_capture_disk_baselines(
+        &self,
+        record: &crate::store::snapshot_store::CaptureRecord,
+    ) -> Result<(), LibVmError> {
+        if record.plan.identity_policy == vm_spec::capture::CaptureIdentityPolicy::None {
+            return Ok(());
+        }
+        use crate::store::models::storage::{DiskBaseline, DiskBaselineState};
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let Some(bytes) = &record.evidence else {
+            return Ok(());
+        };
+        let evidence = vm_spec::capture::CaptureEvidence::decode(bytes.as_bytes())
+            .map_err(crate::machine::root_storage::invalid)?;
+        evidence
+            .validate_against_plan(
+                &record.plan,
+                &vm_spec::capture::Sha256Digest::of_bytes(
+                    &record
+                        .plan
+                        .canonical_bytes()
+                        .map_err(crate::machine::root_storage::invalid)?,
+                ),
+            )
+            .map_err(crate::machine::root_storage::invalid)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND machine_id=?2 AND run_id=?3 AND kind='launch')")
+            .bind(record.launch_operation_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *tx).await?;
+        if !current {
+            return Ok(());
+        }
+        let json: String =
+            sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
+                .bind(record.machine_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    crate::machine::root_storage::invalid(format!(
+                        "machine storage {} is missing during capture baseline reconciliation",
+                        record.machine_id
+                    ))
+                })?;
+        let mut storage = crate::MachineStorageRecord::decode(&json)?;
+        if storage.storage_generation != record.storage.storage_generation {
+            return Ok(());
+        }
+        if let Some(memory) = &evidence.memory {
+            storage.ram_identity =
+                crate::store::models::storage::ContentIdentityState::Identified {
+                    root: memory.ram_stream,
+                };
+        }
+        for disk in &record.plan.disks {
+            let root = evidence
+                .inventory
+                .iter()
+                .find(|entry| entry.role == vm_spec::capture::CaptureRole::Disk(disk.name.clone()))
+                .and_then(|entry| entry.identity)
+                .ok_or_else(|| {
+                    crate::machine::root_storage::invalid("identified capture disk root missing")
+                })?;
+            storage
+                .disk_identities
+                .retain(|identity| identity.attachment_index != disk.attachment_index);
+            storage
+                .disk_identities
+                .push(crate::store::models::storage::DiskContentIdentity {
+                    attachment_index: disk.attachment_index,
+                    block_id: disk.block_id.clone(),
+                    identity: crate::store::models::storage::ContentIdentityState::Identified {
+                        root,
+                    },
+                });
+        }
+        storage
+            .disk_identities
+            .sort_unstable_by_key(|identity| identity.attachment_index);
+        let directory = crate::paths::machine_data_dir_in(&self.home, record.machine_id);
+        let owned_directory = crate::paths::OwnedDirectory::open_existing_root(&directory)?
+            .ok_or_else(|| {
+                crate::machine::root_storage::invalid(
+                    "running disk baseline machine directory disappeared",
+                )
+            })?;
+        for receipt in &evidence.disk_tracking_receipts {
+            receipt
+                .validate()
+                .map_err(crate::machine::root_storage::invalid)?;
+            if receipt.token.capture_id != record.plan.capture_id
+                || evidence
+                    .pause_token
+                    .as_ref()
+                    .is_none_or(|pause| pause.generation.get() != receipt.token.pause_generation)
+            {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk receipt differs from accepted capture",
+                ));
+            }
+            let seed = &receipt.seed;
+            let Some(plan) = record.plan.disks.iter().find(|disk| {
+                disk.attachment_index == seed.attachment_index && disk.block_id == seed.block_id
+            }) else {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk tracker lacks its planned attachment",
+                ));
+            };
+            if !plan.tracking_eligible {
+                continue;
+            }
+            if record
+                .plan
+                .configuration
+                .attachments
+                .get(seed.attachment_index as usize)
+                .is_none_or(|attachment| {
+                    attachment.role != seed.role
+                        || attachment.geometry.length != seed.length
+                        || attachment.read_only
+                })
+            {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk receipt role or geometry changed",
+                ));
+            }
+            if storage.disk_baselines.iter().any(|baseline| baseline.seed.attachment_index == seed.attachment_index
+                && matches!(baseline.state, DiskBaselineState::Running { run_id, seeded: true } if run_id == record.run_id)
+                && baseline.seed.epoch != seed.epoch) {
+                return Err(crate::machine::root_storage::invalid("sealed disk receipt changes the running tracking epoch"));
+            }
+            let Some(identity) = evidence
+                .inventory
+                .iter()
+                .find(|entry| entry.role == vm_spec::capture::CaptureRole::Disk(plan.name.clone()))
+                .and_then(|entry| entry.identity)
+            else {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk lacks map identity",
+                ));
+            };
+            if storage.disk_baselines.iter().any(|baseline| {
+                baseline.seed.attachment_index == seed.attachment_index
+                    && baseline.seed.epoch == seed.epoch
+                    && baseline.generation >= receipt.token.generation
+            }) {
+                continue;
+            }
+            let Ok(path) =
+                crate::store::capture::writable_path(&storage, seed.attachment_index, seed.role)
+            else {
+                continue;
+            };
+            let source = crate::machine::stopped::open_private(
+                &owned_directory,
+                &crate::PrivatePath::new(path)?,
+                seed.length,
+            )?;
+            let metadata = source.file.metadata()?;
+            if metadata.dev() != seed.file_device
+                || metadata.ino() != seed.file_inode
+                || metadata.len() != seed.length
+            {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk tracker differs from running backing",
+                ));
+            }
+            let map_path = crate::machine::root_storage::baseline_map_path(&identity)?;
+            let mut map_bytes = Vec::new();
+            std::fs::File::open(directory.join(map_path.as_path()))?
+                .take(vm_spec::stream_map::MAX_ROOT_BYTES as u64 + 1)
+                .read_to_end(&mut map_bytes)?;
+            let map = vm_spec::stream_map::StreamRoot::decode(&map_bytes)
+                .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
+            map.validate_role(vm_spec::stream_map::StreamRole::Disk)
+                .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
+            if map.id() != identity || map.length() != seed.length {
+                return Err(crate::machine::root_storage::invalid(
+                    "sealed disk baseline map identity changed",
+                ));
+            }
+            let mut seed = seed.clone();
+            seed.baseline = Some(identity);
+            storage
+                .disk_baselines
+                .retain(|baseline| baseline.seed.attachment_index != seed.attachment_index);
+            storage.disk_baselines.push(DiskBaseline {
+                seed,
+                map: crate::storage::identity::ObjectDigest::from_sha256(*identity.as_bytes()),
+                storage_generation: storage.storage_generation,
+                generation: receipt.token.generation,
+                state: DiskBaselineState::Running {
+                    run_id: record.run_id,
+                    seeded: true,
+                },
+                fingerprint: crate::storage::identity_file::SourceFingerprint::new(&metadata),
+            });
+        }
+        storage
+            .disk_baselines
+            .sort_by_key(|baseline| baseline.seed.attachment_index);
+        Self::write_machine_storage(&mut tx, record.machine_id, &storage).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate_machine_disk_baselines(
+        &self,
+        machine: MachineId,
+    ) -> Result<(), LibVmError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let json: String =
+            sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
+                .bind(machine.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    crate::machine::root_storage::invalid(format!(
+                        "machine storage {machine} is missing during baseline invalidation"
+                    ))
+                })?;
+        let mut storage = crate::MachineStorageRecord::decode(&json)?;
+        storage.invalidate_disk_baselines();
+        Self::write_machine_storage(&mut tx, machine, &storage).await?;
+        tx.commit().await?;
+        self.checkpoint_catalog().await
+    }
+
+    pub(crate) async fn discover_machine(
+        &self,
+        reference: &crate::MachineRef,
+    ) -> Result<InventoryRecord, LibVmError> {
+        let (statement, value, prefix) = discovery_query(reference);
+        let query = sqlx::query(statement).bind(&value);
+        let query = match &prefix {
+            Some(prefix) => query.bind(prefix),
+            None => query,
+        };
+        let rows = query.fetch_all(&self.pool).await?;
+        match rows.as_slice() {
+            [] => Err(LibVmError::MachineNotFound { reference: value }),
+            [row] => Ok(InventoryRecord {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                config: DbMachineConfig::from_row_in(row, &self.home)
+                    .map(|DbMachineConfig(config)| config)
+                    .map_err(Into::into),
+            }),
+            _ => Err(LibVmError::AmbiguousIdPrefix {
+                prefix: reference.id_prefix().unwrap_or(&value).to_string(),
+                count: rows.len(),
+            }),
+        }
+    }
+
+    pub(crate) async fn preflight_restored_cold_start(
+        &self,
+        machine: MachineId,
+    ) -> Result<(), LibVmError> {
+        let mut connection = self.pool.acquire().await?;
+        Self::ensure_restored_cold_start(&mut connection, machine, None).await
+    }
+
+    async fn ensure_restored_cold_start(
+        connection: &mut sqlx::SqliteConnection,
+        machine: MachineId,
+        new_run: Option<&str>,
+    ) -> Result<(), LibVmError> {
+        let safe: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM machine_restore_binding b
+                JOIN machine_state s ON s.machine_id=b.machine_id
+                JOIN machine_config c ON c.id=b.machine_id
+                WHERE b.machine_id=?1 AND b.completed=1
+                AND (?2 IS NULL OR b.run_id != ?2)
+                AND s.status IN ('stopped','error')
+                AND json_extract(s.state_json,'$.vmmonPid') IS NULL
+                AND json_extract(s.state_json,'$.runId') IS NULL
+                AND json_extract(c.config_json,'$.imageRef')='execution-restore'
+                AND NOT EXISTS(
+                    SELECT 1 FROM storage_operation o WHERE o.kind='launch'
+                    AND o.machine_id=b.machine_id AND o.run_id IS NOT ?2)
+            )",
+        )
+        .bind(machine.to_string())
+        .bind(new_run)
+        .fetch_one(connection)
+        .await?;
+        if !safe {
+            return Err(crate::machine::root_storage::invalid(
+                "an incomplete or unreconciled execution-restore child cannot cold boot; retry the retained snapshot under a new restore run",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Retire one-shot restore authority in the same transaction as cold-start
+    /// admission. The independently retained snapshot is never deleted.
+    pub(crate) async fn start_restored_machine(
+        &self,
+        config: &MachineConfig,
+        next: &MachineState,
+    ) -> Result<(), LibVmError> {
+        let invalid = crate::machine::root_storage::invalid;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::ensure_restored_cold_start(&mut tx, config.id, next.run_id.as_deref()).await?;
+        if next.machine_id != config.id
+            || next.status != crate::store::models::MachineRuntimeState::Starting
+            || next.run_id.is_none()
+        {
+            return Err(invalid(
+                "restore retirement requires this machine's new start generation",
+            ));
+        }
+        sqlx::query("UPDATE machine_config SET config_json=jsonb(json_set(config_json,'$.imageRef','stopped-storage')) WHERE id=?1")
+            .bind(config.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE machine_storage SET record_json=jsonb(json_set(record_json,'$.snapshot',NULL)) WHERE machine_id=?1")
+            .bind(config.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE machine_state SET status=?2,state_json=jsonb(?3) WHERE machine_id=?1")
+            .bind(config.id.to_string())
+            .bind(next.status.as_str())
+            .bind(Self::serialize("machine_state.state_json", next)?)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM machine_restore_binding WHERE machine_id=?1")
+            .bind(config.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn machine_durability(
+        &self,
+        machine: MachineId,
+    ) -> Result<Option<crate::MachineDurability>, LibVmError> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT durability FROM machine_config WHERE id=?1")
+                .bind(machine.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        value
+            .map(|value| match value.as_str() {
+                "constructed" => Ok(crate::MachineDurability::Constructed),
+                "durable" => Ok(crate::MachineDurability::Durable),
+                _ => Err(crate::machine::root_storage::invalid(
+                    "invalid machine durability",
+                )),
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn constructed_machines(&self) -> Result<Vec<MachineId>, LibVmError> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM machine_config WHERE durability='constructed' ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        ids.into_iter()
+            .map(|id| {
+                id.parse::<MachineId>()
+                    .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn mark_child_durable(&self, machine: MachineId) -> Result<bool, LibVmError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let changed = sqlx::query(
+            "UPDATE machine_config SET durability='durable' WHERE id=?1 AND durability='constructed'",
+        )
+        .bind(machine.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() == 1;
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    /// Unit-store fixtures own real immutable objects and a real operation OFD.
+    /// The caller keeps this lease until its machine publication commits.
+    #[cfg(test)]
+    pub(crate) async fn pin_test_boot(
+        &self,
+        storage: &mut crate::MachineStorageRecord,
+    ) -> Result<crate::storage::locks::StorageLock, LibVmError> {
+        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+        let (operation, lease) = self.begin_stopped_operation("import", &[], &[]).await?;
+        pool.create_operation_with_lease(operation, lease.duplicate()?)?;
+        let input = crate::store::snapshot_store::RecordInput::new(
+            &self.images_dir,
+            operation,
+            &test_utils::direct_kernel::host_kernel("unit-store"),
+        )?;
+        let (object, roots) = pool.publish_object_for_catalog(&input.path())?;
+        self.pin_published_storage_dependencies(operation, &[], &[object.digest])
+            .await?;
+        drop(roots);
+        let crate::BootProfile::LinuxDirect {
+            kernel_architecture,
+            binding,
+            ..
+        } = &mut storage.boot
+        else {
+            return Err(LibVmError::InvalidStorageRecord {
+                record: "test-storage",
+                message: "fixture requires direct boot".into(),
+            });
+        };
+        *binding = crate::BootBinding::Pinned {
+            kernel: object.digest,
+            base_initramfs: object.digest,
+            agent: None,
+            architecture: *kernel_architecture,
+            abi: crate::runtime::boot_assets::DIRECT_BOOT_ABI.into(),
+        };
+        let bytes = binding.canonical_bytes()?;
+        let input =
+            crate::store::snapshot_store::RecordInput::new(&self.images_dir, operation, &bytes)?;
+        let (bundle, roots) = pool.publish_object_for_catalog(&input.path())?;
+        self.pin_published_storage_dependencies(operation, &[], &[bundle.digest])
+            .await?;
+        drop(roots);
+        self.finish_stopped_operation(operation).await?;
+        Ok(lease)
+    }
+    pub(crate) async fn add_machine_with_rootfs_inner(
+        &self,
+        config: &MachineConfig,
+        initial_state: &MachineState,
+        rootfs: &MachineRootfsRecord,
+        storage: &crate::MachineStorageRecord,
+        durability: crate::MachineDurability,
+    ) -> Result<(), LibVmError> {
+        if initial_state.machine_id != config.id {
+            return Err(LibVmError::InvalidCreateRequest {
+                name: config.name.clone(),
+                reason: "initial machine state id does not match machine config id".to_string(),
+            });
+        }
+        if rootfs.machine_id != config.id {
+            return Err(LibVmError::InvalidCreateRequest {
+                name: config.name.clone(),
+                reason: "machine rootfs id does not match machine config id".to_string(),
+            });
+        }
+        storage.validate_disk_identity_inventory(&config.spec)?;
+        let machine_dir = crate::paths::machine_data_dir_in(&self.home, config.id);
+        let matches_root = match &storage.root {
+            crate::MachineRoot::OpaqueRaw { path, geometry, .. } => {
+                machine_dir.join(path.as_path()) == rootfs.root_disk_path
+                    && geometry.length == rootfs.root_disk_size_bytes
+            }
+            crate::MachineRoot::LinuxOverlay {
+                upper, capacity, ..
+            } => {
+                machine_dir.join(upper.as_path()) == rootfs.root_disk_path
+                    && *capacity == rootfs.root_disk_size_bytes
+            }
+        };
+        if !matches_root {
+            return Err(LibVmError::InvalidStorageRecord {
+                record: "machine-storage",
+                message: "root provenance path or length differs from the selected root"
+                    .to_string(),
+            });
+        }
+
+        let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
+        let pool = if has_pool_roots(storage) {
+            Some(
+                crate::storage::pool::StoragePool::open_existing(&self.images_dir)?.ok_or_else(
+                    || {
+                        crate::machine::root_storage::invalid(
+                            "retained lower pool disappeared before machine publication",
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let _roots = pool
+            .as_ref()
+            .map(|pool| pool.lock_roots_shared())
+            .transpose()?;
+        // Acquire write admission before dependency reads, avoiding a read
+        // transaction upgrade racing another child's publication.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_cleaning_dependencies(&mut tx, &paths).await?;
+        Self::insert_machine_config_and_state(&mut tx, config, initial_state, durability).await?;
+        Self::insert_machine_rootfs(&mut tx, rootfs).await?;
+        Self::write_machine_storage(&mut tx, config.id, storage).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    async fn save_machine_config_with_storage_inner(
+        &self,
+        config: &MachineConfig,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<(), LibVmError> {
+        storage.validate_disk_identity_inventory(&config.spec)?;
+        let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
+        let pool = if has_pool_roots(storage) {
+            Some(
+                crate::storage::pool::StoragePool::open_existing(&self.images_dir)?.ok_or_else(
+                    || {
+                        crate::machine::root_storage::invalid(
+                            "retained lower pool disappeared before semantic update",
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let _roots = pool
+            .as_ref()
+            .map(|pool| pool.lock_roots_shared())
+            .transpose()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::ensure_machine_owned(&mut tx, config.id).await?;
+        storage.ownership.ensure_owned(config.id)?;
+        self.check_cleaning_dependencies(&mut tx, &paths).await?;
+        let result =
+            sqlx::query("UPDATE machine_config SET name=?1, config_json=jsonb(?2) WHERE id=?3")
+                .bind(&config.name)
+                .bind(Self::serialize("machine_config.config_json", config)?)
+                .bind(config.id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        if result.rows_affected() != 1 {
+            return Err(LibVmError::MachineNotFound {
+                reference: config.id.to_string(),
+            });
+        }
+        Self::write_machine_storage(&mut tx, config.id, storage).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    pub(crate) async fn ensure_machine_owned(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        machine_id: MachineId,
+    ) -> Result<(), LibVmError> {
+        let json: Option<String> =
+            sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
+                .bind(machine_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+        if let Some(json) = json {
+            crate::MachineStorageRecord::decode(&json)?
+                .ownership
+                .ensure_owned(machine_id)?;
+        }
+        Ok(())
+    }
+    pub(crate) async fn write_machine_storage(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        machine_id: MachineId,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<(), LibVmError> {
+        storage.validate_for_machine(machine_id.into())?;
+        storage.validate_persistent()?;
+        let json = Self::serialize("machine_storage.record_json", storage)?;
+        crate::storage::limits::Resource::MetadataPageBytes
+            .check(json.len() as u64)
+            .map_err(crate::storage::StorageError::from)?;
+        sqlx::query("INSERT INTO machine_storage (machine_id, record_json) VALUES (?1, jsonb(?2)) ON CONFLICT(machine_id) DO UPDATE SET record_json = excluded.record_json")
+            .bind(machine_id.to_string())
+            .bind(json)
+            .execute(&mut **tx).await?;
+        let crate::store::cache_paths::PoolDependencies {
+            streams,
+            objects,
+            lowers,
+        } = crate::store::cache_paths::storage_pool_dependencies(storage)?;
+        if storage.disk_baselines.iter().any(|baseline| {
+            !matches!(
+                baseline.state,
+                crate::store::models::storage::DiskBaselineState::Invalid
+            )
+        }) {
+            let database: String =
+                sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name='main'")
+                    .fetch_one(&mut **tx)
+                    .await?;
+            let home = std::path::Path::new(&database).parent().ok_or_else(|| {
+                crate::store::models::snapshot::invalid("catalog database has no home")
+            })?;
+            let pool = crate::storage::pool::StoragePool::open(&home.join("images"))?;
+            for baseline in &storage.disk_baselines {
+                if matches!(
+                    baseline.state,
+                    crate::store::models::storage::DiskBaselineState::Invalid
+                ) {
+                    continue;
+                }
+                let bytes =
+                    pool.read_object(&baseline.map, vm_spec::stream_map::MAX_ROOT_BYTES as u64)?;
+                let root = vm_spec::stream_map::StreamRoot::decode(&bytes)
+                    .map_err(crate::store::models::snapshot::invalid)?;
+                root.validate_role(vm_spec::stream_map::StreamRole::Disk)
+                    .map_err(crate::store::models::snapshot::invalid)?;
+                if root.id().as_bytes() != baseline.map.as_bytes()
+                    || root.length() != baseline.seed.length
+                {
+                    return Err(crate::store::models::snapshot::invalid(
+                        "machine baseline root contradicts tracking seed",
+                    ));
+                }
+                crate::store::map_store::admit_graph(&mut *tx, &pool, &root).await?;
+            }
+        }
+        let generation =
+            i64::try_from(storage.storage_generation).map_err(|error| LibVmError::StateDecode {
+                field: "machine_storage.storage_generation",
+                message: error.to_string(),
+            })?;
+        if let (crate::MachineRoot::LinuxOverlay { lower, .. }, false) =
+            (&storage.root, lowers.is_empty())
+        {
+            // Derived lower claims are checked against the retained canonical
+            // result in the same transaction that roots it.
+            let bytes: Option<Vec<u8>> =
+                sqlx::query_scalar("SELECT record_bytes FROM composition_result WHERE id=?1")
+                    .bind(lower.record().to_string())
+                    .fetch_optional(&mut **tx)
+                    .await?;
+            let bytes = bytes.ok_or_else(|| LibVmError::CompositionAcquisitionRequired {
+                lower: lower.record(),
+                missing: "retained composition record".into(),
+            })?;
+            let result = oci::composition::CompositionResult::decode(&bytes).map_err(|error| {
+                LibVmError::StateDecode {
+                    field: "composition_result.record_bytes",
+                    message: error.to_string(),
+                }
+            })?;
+            if lower.geometry().length != result.lower_length
+                || lower.filesystem_uuid() != uuid::Uuid::from_bytes(result.fsmeta.uuid)
+            {
+                return Err(LibVmError::InvalidStorageRecord {
+                    record: "machine-storage",
+                    message: "lower claims contradict the retained composition".into(),
+                });
+            }
+        }
+        for statement in [
+            "DELETE FROM machine_stream_dependency WHERE machine_id=?1",
+            "DELETE FROM machine_object_dependency WHERE machine_id=?1",
+            "DELETE FROM machine_lower_dependency WHERE machine_id=?1",
+        ] {
+            sqlx::query(statement)
+                .bind(machine_id.to_string())
+                .execute(&mut **tx)
+                .await?;
+        }
+        for stream in streams {
+            sqlx::query("INSERT INTO machine_stream_dependency(machine_id,generation,stream_id) VALUES(?1,?2,?3)")
+                .bind(machine_id.to_string()).bind(generation).bind(stream.to_string()).execute(&mut **tx).await?;
+        }
+        for object in objects {
+            sqlx::query("INSERT INTO machine_object_dependency(machine_id,generation,object_digest) VALUES(?1,?2,?3)")
+                .bind(machine_id.to_string()).bind(generation).bind(object.to_string()).execute(&mut **tx).await?;
+        }
+        for lower in lowers {
+            sqlx::query("INSERT INTO machine_lower_dependency(machine_id,generation,lower_id) VALUES(?1,?2,?3)")
+                .bind(machine_id.to_string()).bind(generation).bind(lower.to_string()).execute(&mut **tx).await?;
+        }
+        Ok(())
+    }
     async fn insert_machine_config_and_state(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         config: &MachineConfig,
         initial_state: &MachineState,
+        durability: crate::MachineDurability,
     ) -> Result<(), LibVmError> {
         sqlx::query(
-            "INSERT INTO machine_config (id, name, config_json)
-             VALUES (?1, ?2, jsonb(?3))",
+            "INSERT INTO machine_config (id, name, config_json, durability)
+             VALUES (?1, ?2, jsonb(?3), ?4)",
         )
         .bind(config.id.to_string())
         .bind(&config.name)
         .bind(Self::serialize("machine_config.config_json", config)?)
+        .bind(match durability {
+            crate::MachineDurability::Constructed => "constructed",
+            crate::MachineDurability::Durable => "durable",
+        })
         .execute(&mut **tx)
         .await
         .map_err(|err| Self::map_add_machine_error(err, &config.name))?;
@@ -239,6 +1157,21 @@ impl Store {
         .bind(Self::serialize("machine_state.state_json", initial_state)?)
         .execute(&mut **tx)
         .await?;
+        if config.image_ref == "execution-restore" {
+            let run = initial_state.run_id.as_deref().ok_or_else(|| {
+                crate::machine::root_storage::invalid("restore child has no construction run")
+            })?;
+            if initial_state.status != crate::store::models::MachineRuntimeState::Restoring {
+                return Err(crate::machine::root_storage::invalid(
+                    "restore child must begin in its restoring generation",
+                ));
+            }
+            sqlx::query("INSERT INTO machine_restore_binding(machine_id,run_id) VALUES(?1,?2)")
+                .bind(config.id.to_string())
+                .bind(run)
+                .execute(&mut **tx)
+                .await?;
+        }
         Ok(())
     }
 
@@ -249,9 +1182,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO machine_rootfs
                 (machine_id, source_kind, requested_reference, selected_reference,
-                 manifest_digest, config_digest, image_id, root_disk_path,
-                 root_disk_size_bytes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 manifest_digest, config_digest, image_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(rootfs.machine_id.to_string())
         .bind(rootfs.source_kind.as_str())
@@ -260,11 +1192,6 @@ impl Store {
         .bind(&rootfs.manifest_digest)
         .bind(&rootfs.config_digest)
         .bind(&rootfs.image_id)
-        .bind(rootfs.root_disk_path.to_string_lossy().as_ref())
-        .bind(Self::i64_from_u64(
-            "machine_rootfs.root_disk_size_bytes",
-            rootfs.root_disk_size_bytes,
-        )?)
         .bind(rootfs.created_at)
         .execute(&mut **tx)
         .await?;
@@ -315,7 +1242,7 @@ impl Store {
                 .contains("UNIQUE constraint failed: machine_config.name")
     }
 
-    fn serialize<T>(field: &'static str, value: &T) -> Result<String, LibVmError>
+    pub(crate) fn serialize<T>(field: &'static str, value: &T) -> Result<String, LibVmError>
     where
         T: serde::Serialize,
     {
@@ -324,22 +1251,17 @@ impl Store {
             reason: format!("serialize {field}: {err}"),
         })
     }
-
-    fn i64_from_u64(field: &'static str, value: u64) -> Result<i64, LibVmError> {
-        i64::try_from(value).map_err(|_| LibVmError::StateDecode {
-            field,
-            message: format!("value {value} does not fit in i64"),
-        })
-    }
 }
 
 fn machine_rootfs_from_row(
     row: sqlx::sqlite::SqliteRow,
+    home: &std::path::Path,
 ) -> Result<MachineRootfsRecord, LibVmError> {
     let source_kind: String = row.try_get("source_kind")?;
     let source_kind = match source_kind.as_str() {
         "oci" => crate::ImageSourceKind::Oci,
         "disk" => crate::ImageSourceKind::Disk,
+        "stored" => crate::ImageSourceKind::Stored,
         _ => {
             return Err(LibVmError::StateDecode {
                 field: "machine_rootfs.source_kind",
@@ -347,28 +1269,124 @@ fn machine_rootfs_from_row(
             });
         }
     };
-    let root_disk_size_bytes = row.try_get::<i64, _>("root_disk_size_bytes")?;
+    let storage = crate::MachineStorageRecord::decode(&row.try_get::<String, _>("storage_json")?)?;
+    let (path, length) = match storage.root {
+        crate::MachineRoot::OpaqueRaw { path, geometry, .. } => (path, geometry.length),
+        crate::MachineRoot::LinuxOverlay {
+            upper, capacity, ..
+        } => (upper, capacity),
+    };
+    let machine_id = row
+        .try_get::<String, _>("machine_id")?
+        .parse::<MachineId>()
+        .map_err(|error| LibVmError::StateDecode {
+            field: "machine_rootfs.machine_id",
+            message: error.to_string(),
+        })?;
+    let machine_dir = crate::paths::machine_data_dir_in(home, machine_id);
     Ok(MachineRootfsRecord {
-        machine_id: row
-            .try_get::<String, _>("machine_id")?
-            .parse::<MachineId>()
-            .map_err(|error| LibVmError::StateDecode {
-                field: "machine_rootfs.machine_id",
-                message: error.to_string(),
-            })?,
+        machine_id,
         source_kind,
         requested_reference: row.try_get("requested_reference")?,
         selected_reference: row.try_get("selected_reference")?,
         manifest_digest: row.try_get("manifest_digest")?,
         config_digest: row.try_get("config_digest")?,
         image_id: row.try_get("image_id")?,
-        root_disk_path: row.try_get::<String, _>("root_disk_path")?.into(),
-        root_disk_size_bytes: u64::try_from(root_disk_size_bytes).map_err(|_| {
-            LibVmError::StateDecode {
-                field: "machine_rootfs.root_disk_size_bytes",
-                message: format!("value {root_disk_size_bytes} is negative"),
-            }
-        })?,
+        root_disk_path: machine_dir.join(path.as_path()),
+        root_disk_size_bytes: length,
         created_at: row.try_get("created_at")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::traits::MachineStore;
+
+    #[tokio::test]
+    async fn semantic_save_preserves_the_supplied_identity_record_exactly() {
+        let fixture = crate::store::capture::tests::fixture_source_with_disk_length(
+            true,
+            false,
+            vm_spec::lifecycle::CapturePolicy::Full,
+            512,
+        )
+        .await;
+        let store = &fixture.snapshots.store;
+        let mut storage = store
+            .machine_storage(fixture.config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage.disk_identities.len(), 2);
+        storage.disk_identities[0].identity =
+            crate::store::models::storage::ContentIdentityState::UnknownAfterFork;
+        storage.validate().unwrap();
+
+        store
+            .save_machine_config_with_storage(&fixture.config, &storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.machine_storage(fixture.config.id).await.unwrap(),
+            Some(storage.clone())
+        );
+        storage.disk_identities.reverse();
+        assert!(storage.validate().is_err());
+        assert!(store
+            .save_machine_config_with_storage(&fixture.config, &storage)
+            .await
+            .is_err());
+        storage.disk_identities.reverse();
+        assert_eq!(
+            store.machine_storage(fixture.config.id).await.unwrap(),
+            Some(storage)
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_saves_reject_identity_inventory_mismatches_without_rewriting_records() {
+        let fixture = crate::store::capture::tests::fixture_source_with_disk_length(
+            true,
+            false,
+            vm_spec::lifecycle::CapturePolicy::Full,
+            512,
+        )
+        .await;
+        let store = &fixture.snapshots.store;
+        let original = store
+            .machine_storage(fixture.config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        for case in 0..3 {
+            let mut changed = original.clone();
+            match case {
+                0 => {
+                    changed.disk_identities.pop();
+                }
+                1 => changed.disk_identities[1].block_id = vm_spec::BlockId::new("wrong").unwrap(),
+                _ => changed.disk_identities[1].attachment_index = 9,
+            }
+            assert!(store
+                .save_machine_config_with_storage(&fixture.config, &changed)
+                .await
+                .is_err());
+            assert_eq!(
+                store.machine_storage(fixture.config.id).await.unwrap(),
+                Some(original.clone())
+            );
+        }
+        let mut config = fixture.config.clone();
+        config.spec.storage.as_mut().unwrap().disks[1].block_id =
+            vm_spec::BlockId::new("renamed-unbound").unwrap();
+        assert!(store.save_machine_config(&config).await.is_err());
+        assert_eq!(
+            store.machine_config(config.id).await.unwrap(),
+            Some(fixture.config.clone())
+        );
+        assert_eq!(
+            store.machine_storage(config.id).await.unwrap(),
+            Some(original)
+        );
+    }
 }

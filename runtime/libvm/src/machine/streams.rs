@@ -78,8 +78,9 @@ fn poll_chunk(
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "{label} returned a {} byte chunk, maximum is {ACCEPTED_CHUNK_BYTES}",
-                            data.len()
+                            "{label} returned a {} chunk, maximum is {}",
+                            utils::format_storage_size(data.len() as u64),
+                            utils::format_storage_size(ACCEPTED_CHUNK_BYTES as u64)
                         ),
                     )));
                 }
@@ -182,13 +183,15 @@ impl AsyncRead for MachineFileDownload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineMonitorStatus {
     pub machine_id: String,
-    /// Launch generation, never the monitor instance ID. None denotes an older monitor.
+    /// Exact mandatory launch generation, never the monitor instance ID.
     pub run_id: Option<MachineRunId>,
     pub name: String,
     pub monitor: MachineMonitorSnapshot,
     pub vm: MachineVmSnapshot,
     pub readiness: MachineReadinessState,
     pub agent: MachineAgentStatus,
+    pub live: vm_spec::live::LiveMachineReport,
+    pub lifecycle: vm_spec::lifecycle::LiveLifecycle,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineMonitorSnapshot {
@@ -210,6 +213,15 @@ pub enum MachineVmState {
     Stopping,
     Stopped,
     Failed,
+    Pausing,
+    Paused,
+    Capturing,
+    Hibernating,
+    Hibernated,
+    Restoring,
+    Activating,
+    ActivationFailed,
+    Error,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineReadinessState {
@@ -222,6 +234,15 @@ pub enum MachineReadinessReason {
     VmStopping,
     VmStopped,
     VmFailed,
+    VmPausing,
+    VmPaused,
+    VmCapturing,
+    VmHibernating,
+    VmHibernated,
+    VmRestoring,
+    VmActivating,
+    VmActivationFailed,
+    VmError,
     AgentNotRequired,
     AgentUnavailable,
     AgentStatusStale,
@@ -361,6 +382,7 @@ pub enum MachineGuestBootMode {
     Standard,
     AgentPid1,
     InitChild,
+    ContainedInit,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineProvisioningReport {
@@ -416,18 +438,38 @@ pub struct MachineMetrics {
 /// Host memory reclaim state as last reported by the VM backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineHostMemoryReclaim {
-    /// Whether the runtime asked the backend to release guest RAM to the host.
+    pub backing: MachineHostMemoryReclaimBacking,
+    /// Structural inhibition, not an explanation of every ineffective state.
+    pub reason: MachineHostMemoryReclaimReason,
+    /// Finalized runtime policy, false for structurally inhibited mappings.
     pub requested: bool,
-    /// Outcome of the backend's per-VM qualification probe.
+    /// Outcome of the host-specific per-VM probe; Linux does not run one.
     pub qualification: MachineHostMemoryReclaimQualification,
-    /// True only while free-page reports are actually released to the host.
+    /// Actual permission to release reported free pages, not measured savings.
     pub effective: bool,
+    /// Successfully advised bytes, including repeats, not physical memory saved.
     pub released_bytes: u64,
     pub released_extents: u64,
     pub retried_faults: u64,
+    /// Skipped operations, not a universal count of queue heads or pages.
     pub skipped_reports: u64,
     pub failed_operations: u64,
+    /// Discards skipped at the host mapping-count bound.
+    pub mapping_limit_skips: u64,
+    /// Current anonymous replacement islands in restored RAM.
+    pub replaced_islands: u64,
     pub observed_at: SystemTime,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineHostMemoryReclaimBacking {
+    Boot,
+    RestoredPrivate,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineHostMemoryReclaimReason {
+    None,
+    TrackedCapture,
+    RestoredPrivateMapping,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineHostMemoryReclaimQualification {
@@ -461,6 +503,9 @@ pub struct MachineMetricSnapshot {
     pub block_devices: Vec<MachineBlockDeviceMetrics>,
     /// Last guest page-cache reclaim run by the agent, once it has run.
     pub memory_reclaim: Option<MachineMemoryReclaimReport>,
+    /// Writable upper accounting and actual `/tmp` backing for managed roots.
+    /// Shared lower logical bytes are not host physical allocation.
+    pub root_storage: Option<MachineRootStorageMetrics>,
 }
 /// One guest memory reclaim run, as the agent reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,6 +563,53 @@ pub struct MachineFilesystemMetrics {
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub available_bytes: u64,
+}
+/// Managed root identity; opaque raw roots retain ordinary filesystem metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineRootStorageKind {
+    LinuxErofsOverlayV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineTemporaryDirectoryKind {
+    Upper,
+    Tmpfs,
+    Other,
+}
+
+/// One upper's capacity. Never add this to overlay `/` filesystem totals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineRootStorageMetrics {
+    pub kind: MachineRootStorageKind,
+    pub upper_profile: String,
+    pub upper_uuid: String,
+    pub upper_backing_bytes: u64,
+    pub upper_filesystem_bytes: u64,
+    pub unusable_tail_bytes: u64,
+    pub filesystem_overhead_bytes: u64,
+    pub upper_usable_bytes: u64,
+    pub upper_used_bytes: u64,
+    pub upper_free_bytes: u64,
+    pub upper_available_bytes: u64,
+    pub upper_total_inodes: u64,
+    pub upper_free_inodes: u64,
+    pub upper_available_inodes: u64,
+    /// Logical length of the immutable shared lower, not allocated host bytes.
+    pub shared_lower_logical_bytes: u64,
+    pub temporary_directory: MachineTemporaryDirectoryMetrics,
+}
+
+/// Observed `/tmp` state, which image-owned init can change after boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineTemporaryDirectoryMetrics {
+    pub kind: MachineTemporaryDirectoryKind,
+    pub capacity_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub available_bytes: u64,
+    /// Unknown for an unclassified image-owned mount.
+    pub persistent: Option<bool>,
+    pub memory_charged: Option<bool>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineNetworkInterfaceMetrics {
@@ -600,7 +692,7 @@ impl Machine {
         self.runtime().machine_inspect_data(config).await
     }
     pub async fn monitor_status(&self) -> Result<MachineMonitorStatus, LibVmError> {
-        let config = self.running_config().await?;
+        let config = self.live_config().await?;
         self.runtime()
             .supervisor()
             .client(self.machine_id())
@@ -610,7 +702,7 @@ impl Machine {
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn wait_ready(&self, timeout: Duration) -> Result<MachineReadiness, LibVmError> {
-        let config = self.running_config().await?;
+        let config = self.live_config().await?;
         self.runtime()
             .supervisor()
             .client(self.machine_id())
@@ -620,13 +712,31 @@ impl Machine {
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn metrics(&self) -> Result<MachineMetrics, LibVmError> {
-        let config = self.running_config().await?;
+        let config = self.live_config().await?;
         self.runtime()
             .supervisor()
             .client(self.machine_id())
             .metrics()
             .await
             .and_then(|value| MachineMetrics::try_from(value).map_err(Into::into))
+            .map_err(|message| monitor_error(config.name, message))
+    }
+    /// Observes the monitor's host memory reclaim report without reconciling
+    /// or persisting machine state, so inspection stays read-only.
+    pub async fn observe_host_memory_reclaim(
+        &self,
+    ) -> Result<Option<MachineHostMemoryReclaim>, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        self.runtime()
+            .supervisor()
+            .client(self.machine_id())
+            .metrics()
+            .await
+            .and_then(|value| MachineMetrics::try_from(value).map_err(Into::into))
+            .map(|metrics| metrics.host_memory_reclaim)
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn get_file_entry(
@@ -806,7 +916,7 @@ impl Machine {
             .await
             .map_err(|message| monitor_error(config.name, message))
     }
-    pub(crate) async fn running_config(&self) -> Result<MachineConfig, LibVmError> {
+    async fn live_config(&self) -> Result<MachineConfig, LibVmError> {
         let runtime = self.runtime();
         let config = runtime
             .resolve_machine_config(&MachineRef::id(self.machine_id()))
@@ -814,8 +924,25 @@ impl Machine {
         if !runtime
             .reconcile_machine_runtime_best_effort(&config)
             .await?
-            .is_running()
+            .is_active()
         {
+            return Err(LibVmError::MachineNotRunning {
+                reference: config.name,
+            });
+        }
+        Ok(config)
+    }
+
+    pub(crate) async fn running_config(&self) -> Result<MachineConfig, LibVmError> {
+        let runtime = self.runtime();
+        let config = runtime
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        let status = runtime
+            .reconcile_machine_runtime_best_effort(&config)
+            .await?;
+        self.validate_access_run(&config.name, status.run_id.as_deref())?;
+        if !status.is_running() {
             return Err(LibVmError::MachineNotRunning {
                 reference: config.name,
             });
@@ -910,8 +1037,8 @@ fn validate_path(path: String) -> Result<String, LibVmError> {
         || path.as_bytes().contains(&0)
     {
         return Err(request_error(format!(
-            "path must be an absolute non-NUL UTF-8 string no longer than {} bytes",
-            protocol::MAX_PATH_BYTES
+            "path must be an absolute non-NUL UTF-8 string no longer than {}",
+            utils::format_storage_size(protocol::MAX_PATH_BYTES as u64)
         )));
     }
     if path != "/"
@@ -954,8 +1081,8 @@ fn validate_page(limit: Option<u32>, cursor: Option<&[u8]>) -> Result<(), LibVmE
     }
     if cursor.is_some_and(|value| value.len() > protocol::MAX_CURSOR_BYTES) {
         return Err(request_error(format!(
-            "directory cursor must be no longer than {} bytes",
-            protocol::MAX_CURSOR_BYTES
+            "directory cursor must be no longer than {}",
+            utils::format_storage_size(protocol::MAX_CURSOR_BYTES as u64)
         )));
     }
     Ok(())
@@ -1071,13 +1198,13 @@ where
     T::try_from(value).map_err(|_| format!("silo-vmm response has unknown {field} value {value}"))
 }
 macro_rules! protocol_enum { ($name:ident, $wire:ident => $public:ident, { $($source:ident => $target:ident),+ $(,)? }) => { fn $name(value: i32, field: &str) -> Result<$public, String> { match enum_value::<v1::$wire>(value, field)? { $(v1::$wire::$source => Ok($public::$target),)+ v1::$wire::Unspecified => Err(format!("silo-vmm response has unspecified {field}")), } } }; }
-protocol_enum!(vm_state, VmState => MachineVmState, { Starting => Starting, Running => Running, Stopping => Stopping, Stopped => Stopped, Failed => Failed });
-protocol_enum!(readiness_reason, ReadinessReason => MachineReadinessReason, { VmStarting => VmStarting, VmStopping => VmStopping, VmStopped => VmStopped, VmFailed => VmFailed, AgentNotRequired => AgentNotRequired, AgentUnavailable => AgentUnavailable, AgentStatusStale => AgentStatusStale, GuestStarting => GuestStarting, GuestFailed => GuestFailed, GuestReportedReady => GuestReportedReady });
+protocol_enum!(vm_state, VmState => MachineVmState, { Starting => Starting, Running => Running, Stopping => Stopping, Stopped => Stopped, Failed => Failed, Pausing => Pausing, Paused => Paused, Capturing => Capturing, Hibernating => Hibernating, Hibernated => Hibernated, Restoring => Restoring, Activating => Activating, ActivationFailed => ActivationFailed, Error => Error });
+protocol_enum!(readiness_reason, ReadinessReason => MachineReadinessReason, { VmStarting => VmStarting, VmStopping => VmStopping, VmStopped => VmStopped, VmFailed => VmFailed, AgentNotRequired => AgentNotRequired, AgentUnavailable => AgentUnavailable, AgentStatusStale => AgentStatusStale, GuestStarting => GuestStarting, GuestFailed => GuestFailed, GuestReportedReady => GuestReportedReady, VmPausing => VmPausing, VmPaused => VmPaused, VmCapturing => VmCapturing, VmHibernating => VmHibernating, VmHibernated => VmHibernated, VmRestoring => VmRestoring, VmActivating => VmActivating, VmActivationFailed => VmActivationFailed, VmError => VmError });
 protocol_enum!(connection_state, AgentConnectionState => MachineAgentConnectionState, { Connecting => Connecting, Responsive => Responsive, Unresponsive => Unresponsive });
 protocol_enum!(freshness, Freshness => MachineFreshness, { Fresh => Fresh, Stale => Stale });
 protocol_enum!(stale_reason, StaleReason => MachineStaleReason, { ReceiptAge => ReceiptAge, MonitorStopping => MonitorStopping });
 protocol_enum!(agent_status_state, AgentStatusState => MachineAgentStatusState, { Starting => Starting, Ready => Ready, Failed => Failed });
-protocol_enum!(boot_mode, GuestBootMode => MachineGuestBootMode, { Standard => Standard, AgentPid1 => AgentPid1, InitChild => InitChild });
+protocol_enum!(boot_mode, GuestBootMode => MachineGuestBootMode, { Standard => Standard, AgentPid1 => AgentPid1, InitChild => InitChild, ContainedInit => ContainedInit });
 protocol_enum!(provision_status, ProvisionOverallStatus => MachineProvisionOverallStatus, { Succeeded => Succeeded, Degraded => Degraded, Skipped => Skipped, FailedBoot => FailedBoot });
 protocol_enum!(step_status, ProvisionStepStatus => MachineAgentProvisionStepStatus, { Succeeded => Succeeded, Failed => Failed, Skipped => Skipped, Unsupported => Unsupported });
 protocol_enum!(failure_policy, ProvisionFailurePolicy => MachineAgentProvisionFailurePolicy, { BestEffort => BestEffort, FailBoot => FailBoot });
@@ -1085,6 +1212,22 @@ protocol_enum!(failure_policy, ProvisionFailurePolicy => MachineAgentProvisionFa
 impl TryFrom<v1::HostStatus> for MachineMonitorStatus {
     type Error = String;
     fn try_from(value: v1::HostStatus) -> Result<Self, Self::Error> {
+        let live =
+            crate::machine::live::report_from_status(&value).map_err(|error| error.to_string())?;
+        let vm = required(value.vm, "vm")?;
+        let lifecycle: vm_spec::lifecycle::LiveLifecycle =
+            required(value.lifecycle, "lifecycle")?.try_into()?;
+        let state = protocol::lifecycle::vm_state_from_wire(vm.state)?;
+        lifecycle.validate_for(state)?;
+        if !state.readiness_eligible()
+            && value
+                .readiness
+                .as_ref()
+                .and_then(|readiness| readiness.ready)
+                == Some(true)
+        {
+            return Err("monitor reports readiness outside Running".into());
+        }
         Ok(Self {
             machine_id: canonical_uuid(value.machine_id, "machine_id")?,
             run_id: value
@@ -1097,9 +1240,11 @@ impl TryFrom<v1::HostStatus> for MachineMonitorStatus {
                 .transpose()?,
             name: required_text(value.name, "name", protocol::MAX_INFO_BYTES)?,
             monitor: required(value.monitor, "monitor")?.try_into()?,
-            vm: required(value.vm, "vm")?.try_into()?,
+            vm: vm.try_into()?,
             readiness: required(value.readiness, "readiness")?.try_into()?,
             agent: required(value.agent, "agent")?.try_into()?,
+            live,
+            lifecycle,
         })
     }
 }
@@ -1455,6 +1600,37 @@ impl TryFrom<v1::HostMetrics> for MachineMetrics {
 impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
     type Error = String;
     fn try_from(value: v1::HostMemoryReclaim) -> Result<Self, Self::Error> {
+        let backing = match required_text(
+            value.backing,
+            "host_memory_reclaim.backing",
+            protocol::MAX_INFO_BYTES,
+        )?
+        .as_str()
+        {
+            "boot" => MachineHostMemoryReclaimBacking::Boot,
+            "restored-private" => MachineHostMemoryReclaimBacking::RestoredPrivate,
+            other => {
+                return Err(format!(
+                    "silo-vmm response has unknown host_memory_reclaim.backing {other:?}"
+                ))
+            }
+        };
+        let reason = match required_text(
+            value.reason,
+            "host_memory_reclaim.reason",
+            protocol::MAX_INFO_BYTES,
+        )?
+        .as_str()
+        {
+            "none" => MachineHostMemoryReclaimReason::None,
+            "tracked-capture" => MachineHostMemoryReclaimReason::TrackedCapture,
+            "restored-private-mapping" => MachineHostMemoryReclaimReason::RestoredPrivateMapping,
+            other => {
+                return Err(format!(
+                    "silo-vmm response has unknown host_memory_reclaim.reason {other:?}"
+                ))
+            }
+        };
         let qualification = match required_text(
             value.qualification,
             "host_memory_reclaim.qualification",
@@ -1472,15 +1648,74 @@ impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
                 ))
             }
         };
+        let requested = required(value.requested, "host_memory_reclaim.requested")?;
+        let effective = required(value.effective, "host_memory_reclaim.effective")?;
+        let released_bytes = required(value.released_bytes, "host_memory_reclaim.released_bytes")?;
+        let released_extents = required(
+            value.released_extents,
+            "host_memory_reclaim.released_extents",
+        )?;
+        let mapping_limit_skips = required(
+            value.mapping_limit_skips,
+            "host_memory_reclaim.mapping_limit_skips",
+        )?;
+        let replaced_islands = required(
+            value.replaced_islands,
+            "host_memory_reclaim.replaced_islands",
+        )?;
+        let backing_matches_reason = matches!(
+            (backing, reason),
+            (
+                MachineHostMemoryReclaimBacking::Boot,
+                MachineHostMemoryReclaimReason::None
+            ) | (
+                MachineHostMemoryReclaimBacking::Boot,
+                MachineHostMemoryReclaimReason::TrackedCapture
+            ) | (
+                MachineHostMemoryReclaimBacking::RestoredPrivate,
+                MachineHostMemoryReclaimReason::None
+            ) | (
+                MachineHostMemoryReclaimBacking::RestoredPrivate,
+                MachineHostMemoryReclaimReason::RestoredPrivateMapping
+            )
+        );
+        if !backing_matches_reason {
+            return Err(
+                "silo-vmm response has contradictory host_memory_reclaim backing/reason".into(),
+            );
+        }
+        if reason != MachineHostMemoryReclaimReason::None
+            && (requested
+                || effective
+                || qualification != MachineHostMemoryReclaimQualification::NotRun
+                || released_bytes != 0
+                || released_extents != 0
+                || mapping_limit_skips != 0
+                || replaced_islands != 0)
+        {
+            return Err(
+                "silo-vmm response has contradictory inhibited host_memory_reclaim state".into(),
+            );
+        }
         Ok(Self {
-            requested: required(value.requested, "host_memory_reclaim.requested")?,
+            backing,
+            reason,
+            requested,
             qualification,
-            effective: required(value.effective, "host_memory_reclaim.effective")?,
-            released_bytes: value.released_bytes.unwrap_or_default(),
-            released_extents: value.released_extents.unwrap_or_default(),
-            retried_faults: value.retried_faults.unwrap_or_default(),
-            skipped_reports: value.skipped_reports.unwrap_or_default(),
-            failed_operations: value.failed_operations.unwrap_or_default(),
+            effective,
+            released_bytes,
+            released_extents,
+            retried_faults: required(value.retried_faults, "host_memory_reclaim.retried_faults")?,
+            skipped_reports: required(
+                value.skipped_reports,
+                "host_memory_reclaim.skipped_reports",
+            )?,
+            failed_operations: required(
+                value.failed_operations,
+                "host_memory_reclaim.failed_operations",
+            )?,
+            mapping_limit_skips,
+            replaced_islands,
             observed_at: timestamp(value.observed_at, "host_memory_reclaim.observed_at")?,
         })
     }
@@ -1549,6 +1784,7 @@ impl TryFrom<v1::MetricSnapshot> for MachineMetricSnapshot {
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
             memory_reclaim: value.memory_reclaim.map(TryInto::try_into).transpose()?,
+            root_storage: value.root_storage.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -1663,6 +1899,104 @@ impl TryFrom<v1::FilesystemMetrics> for MachineFilesystemMetrics {
             total_bytes,
             used_bytes,
             available_bytes,
+        })
+    }
+}
+
+impl TryFrom<v1::RootStorageMetrics> for MachineRootStorageMetrics {
+    type Error = String;
+
+    fn try_from(value: v1::RootStorageMetrics) -> Result<Self, Self::Error> {
+        protocol::validate_root_storage_metrics(&value)?;
+        Ok(Self {
+            kind: MachineRootStorageKind::LinuxErofsOverlayV1,
+            upper_profile: required(value.upper_profile, "metrics.root_storage.upper_profile")?,
+            upper_uuid: required(value.upper_uuid, "metrics.root_storage.upper_uuid")?,
+            upper_backing_bytes: required(
+                value.upper_backing_bytes,
+                "metrics.root_storage.upper_backing_bytes",
+            )?,
+            upper_filesystem_bytes: required(
+                value.upper_filesystem_bytes,
+                "metrics.root_storage.upper_filesystem_bytes",
+            )?,
+            unusable_tail_bytes: required(
+                value.unusable_tail_bytes,
+                "metrics.root_storage.unusable_tail_bytes",
+            )?,
+            filesystem_overhead_bytes: required(
+                value.filesystem_overhead_bytes,
+                "metrics.root_storage.filesystem_overhead_bytes",
+            )?,
+            upper_usable_bytes: required(
+                value.upper_usable_bytes,
+                "metrics.root_storage.upper_usable_bytes",
+            )?,
+            upper_used_bytes: required(
+                value.upper_used_bytes,
+                "metrics.root_storage.upper_used_bytes",
+            )?,
+            upper_free_bytes: required(
+                value.upper_free_bytes,
+                "metrics.root_storage.upper_free_bytes",
+            )?,
+            upper_available_bytes: required(
+                value.upper_available_bytes,
+                "metrics.root_storage.upper_available_bytes",
+            )?,
+            upper_total_inodes: required(
+                value.upper_total_inodes,
+                "metrics.root_storage.upper_total_inodes",
+            )?,
+            upper_free_inodes: required(
+                value.upper_free_inodes,
+                "metrics.root_storage.upper_free_inodes",
+            )?,
+            upper_available_inodes: required(
+                value.upper_available_inodes,
+                "metrics.root_storage.upper_available_inodes",
+            )?,
+            shared_lower_logical_bytes: required(
+                value.shared_lower_logical_bytes,
+                "metrics.root_storage.shared_lower_logical_bytes",
+            )?,
+            temporary_directory: required(
+                value.temporary_directory,
+                "metrics.root_storage.temporary_directory",
+            )?
+            .try_into()?,
+        })
+    }
+}
+
+impl TryFrom<v1::TemporaryDirectoryMetrics> for MachineTemporaryDirectoryMetrics {
+    type Error = String;
+
+    fn try_from(value: v1::TemporaryDirectoryMetrics) -> Result<Self, Self::Error> {
+        protocol::validate_temporary_directory_metrics(&value)?;
+        let kind = match value
+            .kind
+            .and_then(|kind| v1::TemporaryDirectoryKind::try_from(kind).ok())
+        {
+            Some(v1::TemporaryDirectoryKind::Upper) => MachineTemporaryDirectoryKind::Upper,
+            Some(v1::TemporaryDirectoryKind::Tmpfs) => MachineTemporaryDirectoryKind::Tmpfs,
+            Some(v1::TemporaryDirectoryKind::Other) => MachineTemporaryDirectoryKind::Other,
+            _ => return Err("metrics.root_storage.temporary_directory.kind is invalid".to_string()),
+        };
+        Ok(Self {
+            kind,
+            capacity_bytes: required(
+                value.capacity_bytes,
+                "metrics.temporary_directory.capacity_bytes",
+            )?,
+            used_bytes: required(value.used_bytes, "metrics.temporary_directory.used_bytes")?,
+            free_bytes: required(value.free_bytes, "metrics.temporary_directory.free_bytes")?,
+            available_bytes: required(
+                value.available_bytes,
+                "metrics.temporary_directory.available_bytes",
+            )?,
+            persistent: value.persistent,
+            memory_charged: value.memory_charged,
         })
     }
 }
@@ -1826,7 +2160,15 @@ impl TryFrom<v1::WaitReadyResponse> for MachineReadiness {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::machine::streams::*;
+
+    #[test]
+    fn contained_init_boot_mode_is_preserved() {
+        assert_eq!(
+            boot_mode(v1::GuestBootMode::ContainedInit as i32, "boot.mode").unwrap(),
+            MachineGuestBootMode::ContainedInit
+        );
+    }
 
     struct ErrorAfterChunk(bool);
 
@@ -1854,7 +2196,26 @@ mod tests {
 
     fn status() -> v1::HostStatus {
         v1::HostStatus {
+            live: Some(
+                vm_spec::live::LiveMachineReport {
+                    schema_version: 1,
+                    scope: vm_spec::live::LiveScope::Machine,
+                    machine_id: "00000000-0000-4000-8000-000000000001".into(),
+                    run_id: "00000000-0000-4000-8000-000000000003".into(),
+                    monitor_id: "00000000-0000-4000-8000-000000000002".into(),
+                    backend: vm_spec::live::LiveBackend::Mock,
+                    lane: vm_spec::live::LiveLane::NotApplicable,
+                    topology_revision: 1,
+                    same_machine_activation: false,
+                    live: vm_spec::live::LiveCapabilityVector::all_unsupported(
+                        vm_spec::live::LiveReasonCode::BackendExcluded,
+                    ),
+                }
+                .try_into()
+                .unwrap(),
+            ),
             run_id: Some("00000000-0000-4000-8000-000000000003".into()),
+            lifecycle: Some(Default::default()),
             machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             name: Some("machine".to_string()),
             monitor: Some(v1::MonitorSnapshot {
@@ -1893,6 +2254,7 @@ mod tests {
                         stale_reason: Some(v1::StaleReason::ReceiptAge as i32),
                         report: Some(v1::AgentStatusReport {
                             ssh: None,
+                            lifecycle: None,
                             observed_at: Some(timestamp()),
                             state: Some(v1::AgentStatusState::Ready as i32),
                             code: Some("ready".to_string()),
@@ -1996,6 +2358,151 @@ mod tests {
         })
         .is_err());
     }
+
+    fn host_reclaim_report() -> v1::HostMemoryReclaim {
+        v1::HostMemoryReclaim {
+            backing: Some("restored-private".into()),
+            reason: Some("restored-private-mapping".into()),
+            requested: Some(false),
+            qualification: Some("not-run".into()),
+            effective: Some(false),
+            released_bytes: Some(0),
+            released_extents: Some(0),
+            retried_faults: Some(0),
+            skipped_reports: Some(3),
+            failed_operations: Some(0),
+            mapping_limit_skips: Some(0),
+            replaced_islands: Some(0),
+            observed_at: Some(timestamp()),
+        }
+    }
+
+    #[test]
+    fn host_reclaim_rejects_missing_and_unknown_policy_fields() {
+        for field in ["backing", "reason", "qualification"] {
+            for invalid in [None, Some(""), Some("unknown"), Some("Boot")] {
+                let mut report = host_reclaim_report();
+                let target = match field {
+                    "backing" => &mut report.backing,
+                    "reason" => &mut report.reason,
+                    "qualification" => &mut report.qualification,
+                    _ => unreachable!(),
+                };
+                *target = invalid.map(str::to_owned);
+                let error = MachineHostMemoryReclaim::try_from(report).expect_err(field);
+                assert!(error.contains(field), "{field}: {error}");
+            }
+        }
+        for field in [
+            "requested",
+            "effective",
+            "observed_at",
+            "released_bytes",
+            "released_extents",
+            "retried_faults",
+            "skipped_reports",
+            "failed_operations",
+            "mapping_limit_skips",
+            "replaced_islands",
+        ] {
+            let mut report = host_reclaim_report();
+            match field {
+                "requested" => report.requested = None,
+                "effective" => report.effective = None,
+                "observed_at" => report.observed_at = None,
+                "released_bytes" => report.released_bytes = None,
+                "released_extents" => report.released_extents = None,
+                "retried_faults" => report.retried_faults = None,
+                "skipped_reports" => report.skipped_reports = None,
+                "failed_operations" => report.failed_operations = None,
+                "mapping_limit_skips" => report.mapping_limit_skips = None,
+                "replaced_islands" => report.replaced_islands = None,
+                _ => unreachable!(),
+            }
+            let error = MachineHostMemoryReclaim::try_from(report).expect_err(field);
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn host_reclaim_rejects_inhibited_policy_and_advice_contradictions() {
+        for (backing, reason) in [
+            ("restored-private", "restored-private-mapping"),
+            ("boot", "tracked-capture"),
+        ] {
+            let mut valid = host_reclaim_report();
+            valid.backing = Some(backing.into());
+            valid.reason = Some(reason.into());
+            assert!(MachineHostMemoryReclaim::try_from(valid.clone()).is_ok());
+            for field in [
+                "requested",
+                "effective",
+                "qualification",
+                "released_bytes",
+                "released_extents",
+                "mapping_limit_skips",
+                "replaced_islands",
+            ] {
+                let mut contradictory = valid.clone();
+                match field {
+                    "requested" => contradictory.requested = Some(true),
+                    "effective" => contradictory.effective = Some(true),
+                    "qualification" => contradictory.qualification = Some("passed".into()),
+                    "released_bytes" => contradictory.released_bytes = Some(4096),
+                    "released_extents" => contradictory.released_extents = Some(1),
+                    "mapping_limit_skips" => contradictory.mapping_limit_skips = Some(1),
+                    "replaced_islands" => contradictory.replaced_islands = Some(1),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    MachineHostMemoryReclaim::try_from(contradictory).is_err(),
+                    "{backing}/{reason}: {field}"
+                );
+            }
+        }
+        for (backing, reason) in [
+            ("restored-private", "tracked-capture"),
+            ("boot", "restored-private-mapping"),
+        ] {
+            let mut report = host_reclaim_report();
+            report.backing = Some(backing.into());
+            report.reason = Some(reason.into());
+            assert!(MachineHostMemoryReclaim::try_from(report).is_err());
+        }
+
+        // Linux does not run the HVF probe. NotRun must not imply ineffective.
+        let mut ordinary = host_reclaim_report();
+        ordinary.backing = Some("boot".into());
+        ordinary.reason = Some("none".into());
+        ordinary.requested = Some(true);
+        ordinary.effective = Some(true);
+        ordinary.released_bytes = Some(8192);
+        ordinary.released_extents = Some(2);
+        assert!(MachineHostMemoryReclaim::try_from(ordinary).is_ok());
+    }
+
+    #[test]
+    fn host_reclaim_restored_effective_preserves_counters() {
+        let mut report = host_reclaim_report();
+        report.reason = Some("none".into());
+        report.requested = Some(true);
+        report.effective = Some(true);
+        report.released_bytes = Some(4_194_304);
+        report.released_extents = Some(2);
+        report.mapping_limit_skips = Some(3);
+        report.replaced_islands = Some(7);
+        let converted = MachineHostMemoryReclaim::try_from(report).expect("effective restored RAM");
+        assert_eq!(
+            converted.backing,
+            MachineHostMemoryReclaimBacking::RestoredPrivate
+        );
+        assert_eq!(converted.reason, MachineHostMemoryReclaimReason::None);
+        assert!(converted.requested && converted.effective);
+        assert_eq!(converted.released_bytes, 4_194_304);
+        assert_eq!(converted.released_extents, 2);
+        assert_eq!(converted.mapping_limit_skips, 3);
+        assert_eq!(converted.replaced_islands, 7);
+    }
     #[test]
     fn status_conversion_preserves_nested_agent_observation() {
         let converted = MachineMonitorStatus::try_from(status()).expect("valid status");
@@ -2034,9 +2541,9 @@ mod tests {
     }
     #[test]
     fn status_run_identity_is_validated_without_substituting_monitor_identity() {
-        let mut legacy = status();
-        legacy.run_id = None;
-        assert_eq!(MachineMonitorStatus::try_from(legacy).unwrap().run_id, None);
+        let mut missing = status();
+        missing.run_id = None;
+        assert!(MachineMonitorStatus::try_from(missing).is_err());
         let mut invalid = status();
         invalid.run_id = Some("not-a-run".into());
         assert!(MachineMonitorStatus::try_from(invalid)
@@ -2091,6 +2598,8 @@ mod tests {
             name: Some("machine".to_string()),
             actual_backend: Some("krun".to_string()),
             host_memory_reclaim: Some(v1::HostMemoryReclaim {
+                backing: Some("boot".to_string()),
+                reason: Some("none".to_string()),
                 requested: Some(true),
                 qualification: Some("passed".to_string()),
                 effective: Some(true),
@@ -2099,6 +2608,8 @@ mod tests {
                 retried_faults: Some(1),
                 skipped_reports: Some(0),
                 failed_operations: Some(0),
+                mapping_limit_skips: Some(3),
+                replaced_islands: Some(7),
                 observed_at: Some(timestamp()),
             }),
             monitor: Some(v1::MonitorSnapshot {
@@ -2167,6 +2678,7 @@ mod tests {
                             compacted: Some(true),
                             runs: Some(3),
                         }),
+                        root_storage: Some(root_metrics()),
                     }),
                 }),
                 agent_instance_id: Some("00000000-0000-4000-8000-000000000003".to_string()),
@@ -2192,6 +2704,8 @@ mod tests {
         );
         assert_eq!(reclaim.released_bytes, 4_194_304);
         assert_eq!(reclaim.retried_faults, 1);
+        assert_eq!(reclaim.mapping_limit_skips, 3);
+        assert_eq!(reclaim.replaced_islands, 7);
         let snapshot = metrics
             .metrics
             .map(|metrics| metrics.report.snapshot)
@@ -2203,6 +2717,25 @@ mod tests {
         assert_eq!(snapshot.filesystems.len(), 1);
         assert_eq!(snapshot.network_interfaces.len(), 1);
         assert_eq!(snapshot.block_devices.len(), 1);
+        let root = snapshot.root_storage.expect("root storage");
+        assert_eq!(root.upper_backing_bytes, 134_221_824);
+        assert_eq!(root.upper_filesystem_bytes, 134_217_728);
+        assert_eq!(root.unusable_tail_bytes, 4096);
+        assert_eq!(root.filesystem_overhead_bytes, 8_388_608);
+        assert_eq!(root.upper_usable_bytes, 125_829_120);
+        assert_eq!(root.upper_used_bytes, 83_886_080);
+        assert_eq!(root.upper_free_bytes, 41_943_040);
+        assert_eq!(root.upper_available_bytes, 33_554_432);
+        assert_eq!(root.upper_total_inodes, 8192);
+        assert_eq!(root.upper_free_inodes, 0);
+        assert_eq!(root.upper_available_inodes, 0);
+        assert_eq!(root.shared_lower_logical_bytes, 4_831_838_208);
+        assert_eq!(
+            root.temporary_directory.kind,
+            MachineTemporaryDirectoryKind::Tmpfs
+        );
+        assert_eq!(root.temporary_directory.persistent, Some(false));
+        assert_eq!(root.temporary_directory.memory_charged, Some(true));
     }
 
     #[test]
@@ -2290,5 +2823,95 @@ mod tests {
                 .expect("aborted producer closes request stream")
                 .is_none()
         );
+    }
+    fn root_metrics() -> v1::RootStorageMetrics {
+        v1::RootStorageMetrics {
+            kind: Some(v1::RootStorageKind::LinuxErofsOverlayV1 as i32),
+            upper_profile: Some("silo-upper-ext4-v1".into()),
+            upper_uuid: Some("12345678-1234-4234-8234-123456789abc".into()),
+            upper_backing_bytes: Some(134_221_824),
+            upper_filesystem_bytes: Some(134_217_728),
+            unusable_tail_bytes: Some(4096),
+            filesystem_overhead_bytes: Some(8_388_608),
+            upper_usable_bytes: Some(125_829_120),
+            upper_used_bytes: Some(83_886_080),
+            upper_free_bytes: Some(41_943_040),
+            upper_available_bytes: Some(33_554_432),
+            upper_total_inodes: Some(8192),
+            upper_free_inodes: Some(0),
+            upper_available_inodes: Some(0),
+            shared_lower_logical_bytes: Some(4_831_838_208),
+            temporary_directory: Some(v1::TemporaryDirectoryMetrics {
+                kind: Some(v1::TemporaryDirectoryKind::Tmpfs as i32),
+                capacity_bytes: Some(1_048_576),
+                used_bytes: Some(4096),
+                free_bytes: Some(1_044_480),
+                available_bytes: Some(1_044_480),
+                persistent: Some(false),
+                memory_charged: Some(true),
+            }),
+        }
+    }
+
+    #[test]
+    fn root_metrics_conversion_rejects_incomplete_overflow_and_unknown_kinds() {
+        let mutations: &[fn(&mut v1::RootStorageMetrics)] = &[
+            |value| value.kind = Some(999),
+            |value| value.upper_used_bytes = Some(u64::MAX),
+            |value| value.upper_free_bytes = None,
+            |value| value.unusable_tail_bytes = Some(0),
+            |value| value.temporary_directory = None,
+        ];
+        for mutation in mutations {
+            let mut root = root_metrics();
+            mutation(&mut root);
+            assert!(MachineRootStorageMetrics::try_from(root).is_err());
+        }
+        let mut temporary = root_metrics().temporary_directory.unwrap();
+        temporary.kind = Some(999);
+        assert!(MachineTemporaryDirectoryMetrics::try_from(temporary).is_err());
+    }
+
+    #[test]
+    fn root_metrics_conversion_preserves_existing_freshness_and_identity_frame() {
+        for freshness in [v1::Freshness::Fresh, v1::Freshness::Stale] {
+            let wire = v1::AgentMetricsObservation {
+                agent_instance_id: Some("00000000-0000-4000-8000-000000000003".into()),
+                received_at: Some(timestamp()),
+                stale_at: Some(timestamp()),
+                freshness: Some(freshness as i32),
+                stale_reason: Some(v1::StaleReason::ReceiptAge as i32),
+                report: Some(v1::AgentMetricReport {
+                    observed_at: Some(timestamp()),
+                    snapshot: Some(v1::MetricSnapshot {
+                        root_storage: Some(root_metrics()),
+                        ..Default::default()
+                    }),
+                }),
+            };
+            let converted = MachineAgentMetricsObservation::try_from(wire).unwrap();
+            assert_eq!(
+                converted.agent_instance_id,
+                "00000000-0000-4000-8000-000000000003"
+            );
+            assert_eq!(
+                converted.freshness,
+                if freshness == v1::Freshness::Fresh {
+                    MachineFreshness::Fresh
+                } else {
+                    MachineFreshness::Stale
+                }
+            );
+            assert_eq!(converted.stale_reason, Some(MachineStaleReason::ReceiptAge));
+            assert_eq!(
+                converted
+                    .report
+                    .snapshot
+                    .root_storage
+                    .unwrap()
+                    .unusable_tail_bytes,
+                4096
+            );
+        }
     }
 }

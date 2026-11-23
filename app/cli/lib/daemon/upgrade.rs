@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eyre::{bail, Context as _};
-use libvm::{ExecutionResult, ImagePullPolicy, MachineData, MachineReadinessOutcome};
+use libvm::{ExecutionResult, MachineData, MachineReadinessOutcome, PullPolicy};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -101,9 +101,9 @@ pub(crate) async fn check(
     active: &MachineData,
 ) -> eyre::Result<Option<libvm::ResolvedOciImage>> {
     let policy = if reference.contains("@sha256:") {
-        ImagePullPolicy::IfMissing
+        PullPolicy::IfMissing
     } else {
-        ImagePullPolicy::Always
+        PullPolicy::Always
     };
     let image = runtime
         .resolve_image(reference, policy)
@@ -548,11 +548,13 @@ fn sparse_copy(source_path: &Path, destination_path: &Path) -> eyre::Result<u64>
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt as _;
     let required = std::fs::metadata(source_path)?.blocks().saturating_mul(512);
-    if available < required.saturating_add(required / 10) {
+    let required_with_headroom = required.saturating_add(required / 10);
+    if available < required_with_headroom {
         bail!(
-            "insufficient backup space: need approximately {} bytes, {} available",
-            required,
-            available
+            "insufficient backup space: need approximately {} including headroom, {} available (short by {})",
+            crate::ui::human_bytes(Some(required_with_headroom)),
+            crate::ui::human_bytes(Some(available)),
+            crate::ui::human_bytes(Some(required_with_headroom.saturating_sub(available)))
         );
     }
     let temporary = destination_path.with_extension(format!("{}.tmp", Uuid::new_v4()));

@@ -13,10 +13,11 @@ use crate::store::models::MachineId;
 
 mod client;
 pub(crate) mod exit_status;
-mod launch;
+pub(crate) mod launch;
 mod launch_spec;
 pub(crate) mod process;
 pub(crate) mod start_request;
+pub(crate) mod storage_holder;
 
 pub use client::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub(crate) use client::{forward_rpc_error, ForwardClientError, VmmClient, VmmClientError};
@@ -28,14 +29,16 @@ pub(crate) use launch_spec::{prepare_launch_spec, write_launch_spec, LaunchSpecI
 pub(crate) struct VmSupervisor {
     paths: LocalPaths,
     executable: PathBuf,
-    virt_backend: Option<crate::runtime::VirtBackendOverride>,
+    selection: std::sync::Arc<crate::runtime::capabilities::ResolvedBackendSelection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct VmmLaunchInputs {
     pub(crate) agent_enabled: bool,
     pub(crate) rosetta_intent: start_request::VmmRosettaIntent,
     pub(crate) asset_directory: PathBuf,
+    pub(crate) storage_shutdown: protocol::shutdown::StorageShutdownContext,
+    pub(crate) artifacts: crate::machine::root_storage::LaunchArtifacts,
 }
 
 impl VmSupervisor {
@@ -43,12 +46,12 @@ impl VmSupervisor {
     pub(crate) fn new(
         paths: LocalPaths,
         executable: PathBuf,
-        virt_backend: Option<crate::runtime::VirtBackendOverride>,
+        selection: std::sync::Arc<crate::runtime::capabilities::ResolvedBackendSelection>,
     ) -> Self {
         Self {
             paths,
             executable,
-            virt_backend,
+            selection,
         }
     }
 
@@ -58,48 +61,17 @@ impl VmSupervisor {
 
     /// Explicit backend selection forwarded in every start request.
     pub(crate) fn virt_backend_request(&self) -> Option<start_request::VmmVirtBackend> {
-        self.virt_backend.as_ref().map(|selection| match selection {
-            crate::runtime::VirtBackendOverride::Krun => start_request::VmmVirtBackend {
-                kind: "krun".to_string(),
-                scenario: None,
-            },
-            crate::runtime::VirtBackendOverride::Vz => start_request::VmmVirtBackend {
-                kind: "vz".to_string(),
-                scenario: None,
-            },
-            crate::runtime::VirtBackendOverride::Mock { scenario } => {
-                start_request::VmmVirtBackend {
-                    kind: "mock".to_string(),
-                    scenario: scenario.clone(),
-                }
-            }
-        })
+        Some(self.selection.request())
     }
 
     pub(crate) fn rosetta_intent_request(
         &self,
         config: &crate::store::models::MachineConfig,
+        effective_rosetta: rootfs_spec::RosettaMode,
     ) -> Result<start_request::VmmRosettaIntent, String> {
         let hardware = config.spec.hardware.as_ref();
-        if !hardware
-            .and_then(|hardware| hardware.rosetta)
-            .unwrap_or(false)
-        {
+        if effective_rosetta == rootfs_spec::RosettaMode::Disabled {
             return Ok(start_request::VmmRosettaIntent::Disabled {});
-        }
-
-        if config.guest.agent != crate::machine::MachineAgent::Default {
-            return Err("Rosetta requires the installed default guest agent".to_string());
-        }
-        if config
-            .spec
-            .boot
-            .as_ref()
-            .and_then(|boot| boot.kernel.as_ref())
-            .and_then(|kernel| kernel.path.as_ref())
-            .is_some()
-        {
-            return Err("Rosetta requires the runtime's default workload kernel".to_string());
         }
         if hardware
             .and_then(|hardware| hardware.nested_virtualization)
@@ -111,11 +83,11 @@ impl VmSupervisor {
             .map_err(|error| format!("validate Rosetta mount contract: {error}"))?;
         if mounts
             .iter()
-            .any(|mount| mount.backend_tag == agent_spec::ROSETTA_MOUNT_TAG)
+            .any(|mount| mount.backend_tag == rootfs_spec::rosetta::SHARE_TAG)
         {
             return Err(format!(
                 "mount tag {:?} is reserved for Rosetta",
-                agent_spec::ROSETTA_MOUNT_TAG
+                rootfs_spec::rosetta::SHARE_TAG
             ));
         }
 
@@ -130,13 +102,12 @@ impl VmSupervisor {
 #[cfg(test)]
 mod tests {
     use crate::runtime::VirtBackendOverride;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use crate::store::models::{MachineConfig, MachineId, MachineNetworkConfig};
     use crate::supervisor::VmSupervisor;
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn rosetta_machine_config() -> MachineConfig {
         MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id: MachineId::new(),
             lock_id: crate::lock_manager::LockId::from(0),
             name: "rosetta-test".to_string(),
@@ -182,7 +153,8 @@ mod tests {
             let supervisor = VmSupervisor::new(
                 crate::paths::LocalPaths::new("/tmp/silo-test"),
                 "/tmp/silo-vmm".into(),
-                Some(selection),
+                crate::runtime::capabilities::ResolvedBackendSelection::resolve(Some(&selection))
+                    .expect("selection"),
             );
             let request = supervisor.virt_backend_request().expect("backend request");
             assert_eq!(request.kind, expected);
@@ -190,7 +162,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn durable_rosetta_eligibility_uses_guest_contract_not_completed_assets_or_legacy_label() {
         use crate::supervisor::start_request::VmmRosettaIntent;
@@ -198,18 +169,20 @@ mod tests {
         let supervisor = VmSupervisor::new(
             crate::paths::LocalPaths::new("/tmp/silo-test"),
             "/operator/silo-vmm".into(),
-            Some(VirtBackendOverride::Krun),
+            crate::runtime::capabilities::ResolvedBackendSelection::resolve(Some(
+                &VirtBackendOverride::Krun,
+            ))
+            .expect("selection"),
         );
         let config = rosetta_machine_config();
         assert_eq!(
             supervisor
-                .rosetta_intent_request(&config)
+                .rosetta_intent_request(&config, rootfs_spec::RosettaMode::Required)
                 .expect("default durable contract"),
             VmmRosettaIntent::Enabled {}
         );
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn rosetta_intent_is_backend_independent() {
         use crate::supervisor::start_request::VmmRosettaIntent;
@@ -222,31 +195,44 @@ mod tests {
             let supervisor = VmSupervisor::new(
                 crate::paths::LocalPaths::new("/tmp/silo-test"),
                 "/operator/silo-vmm".into(),
-                backend,
+                crate::runtime::capabilities::ResolvedBackendSelection::resolve(backend.as_ref())
+                    .expect("selection"),
             );
             assert_eq!(
                 supervisor
-                    .rosetta_intent_request(&rosetta_machine_config())
+                    .rosetta_intent_request(
+                        &rosetta_machine_config(),
+                        rootfs_spec::RosettaMode::Optional
+                    )
                     .expect("generic Rosetta intent"),
                 VmmRosettaIntent::Enabled {}
             );
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn durable_rosetta_eligibility_rejects_custom_agent_kernel_nested_and_reserved_tag() {
+    fn init_owned_rosetta_allows_custom_assets_but_rejects_nested_and_reserved_tag() {
         let supervisor = VmSupervisor::new(
             crate::paths::LocalPaths::new("/tmp/silo-test"),
             "/operator/silo-vmm".into(),
-            Some(VirtBackendOverride::Vz),
+            crate::runtime::capabilities::ResolvedBackendSelection::resolve(Some(
+                &VirtBackendOverride::Vz,
+            ))
+            .expect("selection"),
         );
 
         let mut custom_agent = rosetta_machine_config();
         custom_agent.guest.agent = crate::machine::MachineAgent::Custom {
             path: "/custom/agent".into(),
         };
-        assert!(supervisor.rosetta_intent_request(&custom_agent).is_err());
+        assert!(supervisor
+            .rosetta_intent_request(&custom_agent, rootfs_spec::RosettaMode::Required)
+            .is_ok());
+        custom_agent.guest.agent = crate::machine::MachineAgent::Disabled;
+        custom_agent.spec.hardware.as_mut().unwrap().rosetta = None;
+        assert!(supervisor
+            .rosetta_intent_request(&custom_agent, rootfs_spec::RosettaMode::Required)
+            .is_ok());
 
         let mut custom_kernel = rosetta_machine_config();
         custom_kernel
@@ -256,7 +242,9 @@ mod tests {
             .and_then(|boot| boot.kernel.as_mut())
             .expect("kernel")
             .path = Some("/custom/kernel".into());
-        assert!(supervisor.rosetta_intent_request(&custom_kernel).is_err());
+        assert!(supervisor
+            .rosetta_intent_request(&custom_kernel, rootfs_spec::RosettaMode::Optional)
+            .is_ok());
 
         let mut nested = rosetta_machine_config();
         nested
@@ -265,16 +253,18 @@ mod tests {
             .as_mut()
             .expect("hardware")
             .nested_virtualization = Some(true);
-        assert!(supervisor.rosetta_intent_request(&nested).is_err());
+        assert!(supervisor
+            .rosetta_intent_request(&nested, rootfs_spec::RosettaMode::Required)
+            .is_err());
 
         let mut collision = rosetta_machine_config();
         collision.spec.mounts.push(vm_spec::Mount {
             source: "/host/share".into(),
-            tag: agent_spec::ROSETTA_MOUNT_TAG.to_string(),
+            tag: rootfs_spec::rosetta::SHARE_TAG.to_string(),
             read_only: true,
         });
         let error = supervisor
-            .rosetta_intent_request(&collision)
+            .rosetta_intent_request(&collision, rootfs_spec::RosettaMode::Required)
             .expect_err("reject reserved mount tag");
         assert!(error.contains("reserved for Rosetta"));
     }

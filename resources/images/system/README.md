@@ -49,10 +49,20 @@ units, proxy binaries, static portd installation, and records the package lock.
 
 After rebuilding the image, `make verify-systemd IMAGE=<built-image>` tests the
 activation readiness helper against real systemd: absent-manager timeout,
-delayed manager startup, and an already available manager. It uses a temporary
+delayed manager startup, a responsive manager whose boot transaction is still
+unfinished, and an already available manager. It uses a temporary
 privileged container with private cgroup and tmpfs mounts, and requires a Docker
 host that supports running systemd with cgroup v2. It does not start the host's
 Silo daemon or replace its system image.
+
+For a daemon smoke gate of current appliance changes, build the current image
+first and publish it to an OCI registry the private smoke workspace can reach.
+Set `SILO_SMOKE_SYSTEM_IMAGE` to that image's immutable registry digest when running
+`make smoke SMOKE_ARGS="tests/test_daemon_system.py::test_graceful_restart_adopts_running_appliance"`.
+The `build` target only loads Docker's local image store; Silo does not resolve
+that store, so a local tag alone is not sufficient. A cached published `dev` image
+may predate current activation resources, including the bounded systemd-manager
+wait, and does not qualify the current appliance source.
 
 ## Activation request
 
@@ -74,7 +84,9 @@ The helper verifies the immutable image contract, cgroup v2, guest route/DNS,
 every requested virtiofs mount, the ext4 UUID, and the existing data-layout marker before it
 mounts anything. It never formats a disk or creates data directories. It then
 bind-mounts the existing `docker` and `containerd` directories over their
-upstream locations and starts `silo-system-docker.target` synchronously.
+upstream locations, waits up to 30 seconds for systemd to finish booting
+(`running` or `degraded`, not merely an early successful property query), and
+starts `silo-system-docker.target` synchronously.
 Repeated activation validates an already healthy engine without restarting it.
 
 Docker, containerd, their socket activation, distro networking, and OpenSSH

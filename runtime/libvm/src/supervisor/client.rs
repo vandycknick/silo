@@ -51,6 +51,7 @@ impl From<String> for VmmClientError {
 
 pub const DEFAULT_GUEST_READINESS_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
 const FILE_RPC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ACCESS_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const FORWARD_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -69,17 +70,174 @@ impl VmmClient {
     }
 
     pub(crate) async fn status(&self) -> Result<HostStatus, VmmClientError> {
-        const INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
+        const TIMED_OUT: &str = "vm monitor inspection timed out after 2s";
         tokio::time::timeout(INSPECT_TIMEOUT, async {
             let mut client = monitor_client(self.channel().await?);
             client
                 .get_status(timed_request(GetStatusRequest {}, INSPECT_TIMEOUT))
                 .await
                 .map(|response| response.into_inner())
-                .map_err(|error| rpc_error("vm monitor get_status RPC failed", error))
+                .map_err(|error| {
+                    inspect_error("vm monitor get_status RPC failed", TIMED_OUT, error)
+                })
         })
         .await
-        .map_err(|_| VmmClientError::Protocol("vm monitor inspection timed out after 2s".into()))?
+        .map_err(|_| VmmClientError::Protocol(TIMED_OUT.into()))?
+    }
+
+    /// One exact, already-durable command. A transport timeout never implies
+    /// cancellation or grants permission to submit a replacement identity.
+    pub(crate) async fn lifecycle(
+        &self,
+        command: vm_spec::lifecycle::LiveCommand,
+    ) -> Result<vm_spec::lifecycle::LiveCommandResult, VmmClientError> {
+        use vm_spec::lifecycle::{LiveCommand as C, LiveCommandResult as R};
+        if let C::Capture(capture) = &command {
+            capture.validate_plan().map_err(VmmClientError::Protocol)?;
+        }
+        let mut client = monitor_client(self.channel().await?);
+        let result = match command {
+            C::Pause(command) => R::Pause(
+                client
+                    .pause(timed_request(
+                        protocol::v1::PauseRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("pause RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::Resume(command) => R::Resume(
+                client
+                    .resume(timed_request(
+                        protocol::v1::ResumeRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("resume RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::GetOperation(command) => R::GetOperation(
+                client
+                    .get_operation(timed_request(
+                        protocol::v1::GetOperationRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("get-operation RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::CancelOperation(command) => R::CancelOperation(
+                client
+                    .cancel_operation(timed_request(
+                        protocol::v1::CancelOperationRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("cancel-operation RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::Capture(command) => R::Capture(
+                client
+                    .capture(timed_request(
+                        protocol::v1::CaptureRequest::try_from(*command)
+                            .map_err(VmmClientError::Protocol)?,
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("capture RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::ReleaseCapture(command) => R::ReleaseCapture(
+                client
+                    .release_capture(timed_request(
+                        protocol::v1::ReleaseCaptureRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("release-capture RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+        };
+        result.validate().map_err(VmmClientError::Protocol)?;
+        Ok(result)
+    }
+
+    pub(crate) async fn control_hibernate(
+        &self,
+        envelope: vm_spec::lifecycle::LiveCommandEnvelope,
+        operation_id: vm_spec::lifecycle::LiveId,
+        authorize: bool,
+    ) -> Result<vm_spec::capture::HibernateCaptureStatus, VmmClientError> {
+        let mut client = monitor_client(self.channel().await?);
+        let response = client
+            .control_hibernate_capture(timed_request(
+                protocol::v1::ControlHibernateCaptureRequest {
+                    envelope: Some(envelope.into()),
+                    operation_id: Some(operation_id.to_string()),
+                    action: Some(if authorize {
+                        protocol::v1::HibernateCaptureAction::AuthorizeWrite
+                    } else {
+                        protocol::v1::HibernateCaptureAction::Observe
+                    } as i32),
+                },
+                RPC_TIMEOUT,
+            ))
+            .await
+            .map_err(|error| rpc_error("hibernate control failed", error))?
+            .into_inner();
+        vm_spec::capture::HibernateCaptureStatus::decode(
+            response
+                .status
+                .as_deref()
+                .ok_or_else(|| VmmClientError::Protocol("hibernate status missing".into()))?,
+        )
+        .map_err(VmmClientError::Protocol)
+    }
+
+    pub(crate) async fn restore_prepared(
+        &self,
+    ) -> Result<Option<vm_spec::hibernate::RestorePrepared>, VmmClientError> {
+        let mut client = monitor_client(self.channel().await?);
+        client
+            .get_restore_prepared(timed_request((), RPC_TIMEOUT))
+            .await
+            .map_err(|error| rpc_error("wake preparation failed", error))?
+            .into_inner()
+            .prepared
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(VmmClientError::Protocol)
+    }
+
+    pub(crate) async fn authorize_consume(
+        &self,
+        authorization: vm_spec::hibernate::ConsumeAuthorization,
+    ) -> Result<(), VmmClientError> {
+        let mut client = monitor_client(self.channel().await?);
+        client
+            .authorize_consume(timed_request(
+                protocol::v1::ConsumeAuthorization::from(authorization),
+                RPC_TIMEOUT,
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|error| rpc_error("wake execution authorization failed", error))
+    }
+
+    pub(crate) async fn abandon_restore(&self) -> Result<(), VmmClientError> {
+        let mut client = monitor_client(self.channel().await?);
+        client
+            .abandon_restore(timed_request((), RPC_TIMEOUT))
+            .await
+            .map(|_| ())
+            .map_err(|error| rpc_error("wake cancellation failed", error))
     }
 
     pub(crate) async fn wait_ready(
@@ -106,12 +264,19 @@ impl VmmClient {
     }
 
     pub(crate) async fn metrics(&self) -> Result<HostMetrics, VmmClientError> {
-        let mut client = monitor_client(self.channel().await?);
-        client
-            .get_metrics(timed_request(GetMetricsRequest {}, RPC_TIMEOUT))
-            .await
-            .map(|response| response.into_inner())
-            .map_err(|error| rpc_error("vm monitor get_metrics RPC failed", error))
+        const TIMED_OUT: &str = "vm monitor metrics timed out after 2s";
+        tokio::time::timeout(INSPECT_TIMEOUT, async {
+            let mut client = monitor_client(self.channel().await?);
+            client
+                .get_metrics(timed_request(GetMetricsRequest {}, INSPECT_TIMEOUT))
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|error| {
+                    inspect_error("vm monitor get_metrics RPC failed", TIMED_OUT, error)
+                })
+        })
+        .await
+        .map_err(|_| VmmClientError::Protocol(TIMED_OUT.into()))?
     }
 
     pub(crate) async fn get_entry(
@@ -337,7 +502,21 @@ fn timed_request<T>(message: T, timeout: Duration) -> Request<T> {
     request
 }
 
+/// The request deadline and the surrounding deadline are the same duration, so
+/// either may fire first. Both report the same timeout.
+fn inspect_error(context: &str, timed_out: &str, status: Status) -> VmmClientError {
+    match status.code() {
+        tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => {
+            VmmClientError::Protocol(timed_out.into())
+        }
+        _ => rpc_error(context, status),
+    }
+}
+
 fn rpc_error(context: &str, status: Status) -> VmmClientError {
+    if status.code() == tonic::Code::Unavailable {
+        return VmmClientError::Connection(format!("{context}: {}", status.message()));
+    }
     let detail = protocol::decode_error_detail(status.details())
         .ok()
         .and_then(|detail| detail.code)
@@ -364,8 +543,11 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
     while let Some(error) = source {
-        message.push_str(": ");
-        message.push_str(&error.to_string());
+        let cause = error.to_string();
+        if !message.ends_with(&cause) {
+            message.push_str(": ");
+            message.push_str(&cause);
+        }
         source = error.source();
     }
     message
@@ -403,6 +585,25 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn telemetry_deadlines_include_an_unresponsive_socket_handshake() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("monitor.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let client = VmmClient::new(socket);
+        let (status, metrics) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(client.status(), client.metrics())
+        })
+        .await
+        .expect("both telemetry calls must include connection setup in their deadline");
+        assert!(
+            matches!(status, Err(VmmClientError::Protocol(message)) if message.contains("timed out"))
+        );
+        assert!(
+            matches!(metrics, Err(VmmClientError::Protocol(message)) if message.contains("timed out"))
+        );
+    }
+
     #[test]
     fn guest_status_details_classify_missing_paths() {
         let missing = crate::supervisor::client::rpc_error(
@@ -433,5 +634,20 @@ mod tests {
             );
             assert!(matches!(error, VmmClientError::Protocol(_)), "{error:?}");
         }
+    }
+    #[test]
+    fn error_chain_does_not_repeat_a_wrapped_cause() {
+        let error = std::io::Error::other(std::io::Error::other("connection refused"));
+        assert_eq!(
+            crate::supervisor::client::error_chain(&error),
+            "connection refused"
+        );
+        assert!(matches!(
+            crate::supervisor::client::rpc_error(
+                "capture",
+                tonic::Status::unavailable("lost contact")
+            ),
+            VmmClientError::Connection(_)
+        ));
     }
 }

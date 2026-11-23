@@ -1,7 +1,7 @@
 //! Real executable bootstrap tests, no hypervisor or synthetic VMM required.
 
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -10,7 +10,12 @@ use std::time::{Duration, Instant};
 #[path = "../src/virt/backend/krun/inherit.rs"]
 mod fd_policy;
 
-struct Process(Option<Child>);
+#[path = "../examples/native_live_api/stream_map.rs"]
+mod native_stream_map;
+
+/// A spawned process, its storage lease and, for direct workers, the
+/// monitor-side lifecycle endpoint. Both outlive the child until it is reaped.
+struct Process(Option<Child>, Option<Lease>, Option<OwnedFd>);
 impl Process {
     fn output(self) -> Output {
         self.output_with_timeout(Duration::from_secs(5))
@@ -70,6 +75,8 @@ impl Drop for Process {
             }
             let _ = child.wait();
         }
+        // The monitor end of the lifecycle pair closes only after the reap.
+        drop(self.2.take());
     }
 }
 
@@ -80,11 +87,14 @@ fn command() -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    fd_policy::install(&mut command, &[]);
+    fd_policy::install(&mut command, &[]).expect("empty descriptor allowlist");
     command
 }
 
 fn pipe() -> (OwnedFd, OwnedFd) {
+    #[cfg(target_os = "linux")]
+    let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("pipe");
+    #[cfg(not(target_os = "linux"))]
     let (read, write) = nix::unistd::pipe().expect("pipe");
     (
         fd_policy::normalize(read).expect("normalize reader"),
@@ -100,12 +110,37 @@ fn worker_command() -> Command {
     command
 }
 
+/// Connected lifecycle stream pair: (monitor end, worker end). Both are CLOEXEC;
+/// only an explicit mapping onto the lifecycle role reaches the worker.
+fn lifecycle_pair() -> (OwnedFd, OwnedFd) {
+    let (monitor, worker) = std::os::unix::net::UnixStream::pair().expect("lifecycle pair");
+    (monitor.into(), worker.into())
+}
+
 fn worker() -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
     worker_with_events(|_| {})
 }
 
 fn worker_with_events(
     prepare: impl FnOnce(&OwnedFd),
+) -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
+    worker_with_attachments(prepare, &[], None)
+}
+
+fn worker_with_attachments(
+    prepare: impl FnOnce(&OwnedFd),
+    raw_handles: &[&OwnedFd],
+    mux: Option<&OwnedFd>,
+) -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
+    worker_with_tables(prepare, raw_handles, mux, &[], &[])
+}
+
+fn worker_with_tables(
+    prepare: impl FnOnce(&OwnedFd),
+    raw_handles: &[&OwnedFd],
+    mux: Option<&OwnedFd>,
+    state: &[&std::fs::File],
+    lowers: &[&std::fs::File],
 ) -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
     let (config, writer) = pipe();
     let (events, reporter) = pipe();
@@ -120,20 +155,124 @@ fn worker_with_events(
         .expect("cloexec");
     }
     let mut command = worker_command();
-    // Deliberately inheritable opposite endpoints must still be closed by exec.
-    for fd in [&writer, &events, &keepalive] {
-        nix::fcntl::fcntl(
-            fd,
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
-        )
-        .expect("inheritable sentinel");
+    // Introduce inheritable opposite endpoints only in this isolated child,
+    // before the production mapper sanitizes them. Parent flags stay CLOEXEC so
+    // unrelated children cannot accidentally keep config/watchdog pipes alive.
+    let sentinels = [
+        writer.as_raw_fd(),
+        events.as_raw_fd(),
+        keepalive.as_raw_fd(),
+    ];
+    unsafe {
+        command.pre_exec(move || {
+            for raw in sentinels {
+                let flags = nix::libc::fcntl(raw, nix::libc::F_GETFD);
+                if flags < 0
+                    || nix::libc::fcntl(raw, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
     }
-    fd_policy::install(&mut command, &[&config, &reporter, &watchdog, &pty.slave]);
-    let child = Process(Some(command.spawn().expect("spawn actual worker")));
+    let lease = Lease::new();
+    let (lifecycle, lifecycle_worker) = lifecycle_pair();
+    let mut mapping = mapping(&[&config, &reporter, &watchdog, &pty.slave]);
+    mapping.push((lease.file.as_raw_fd(), 8));
+    mapping.push((lifecycle_worker.as_raw_fd(), fd_policy::LIFECYCLE_CHILD_FD));
+    if let Some(mux) = mux {
+        mapping.push((mux.as_raw_fd(), 7));
+    }
+    mapping.extend(
+        raw_handles
+            .iter()
+            .enumerate()
+            .map(|(index, fd)| (fd.as_raw_fd(), 9 + index as i32)),
+    );
+    mapping.extend(
+        state
+            .iter()
+            .zip([25, 26, 27, 28, 33])
+            .map(|(file, role)| (file.as_raw_fd(), role)),
+    );
+    mapping.extend(lowers.iter().enumerate().map(|(index, file)| {
+        (
+            file.as_raw_fd(),
+            fd_policy::FIRST_LOWER_CHILD_FD + index as i32,
+        )
+    }));
+    fd_policy::install(&mut command, &mapping).expect("worker descriptors");
+    let child = Process(
+        Some(command.spawn().expect("spawn actual worker")),
+        Some(lease),
+        Some(lifecycle),
+    );
     (child, writer.into(), keepalive, events.into(), pty.master)
 }
 
-struct SupervisorFixture(std::path::PathBuf, uuid::Uuid);
+struct Lease {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    operation_id: uuid::Uuid,
+}
+
+impl Lease {
+    fn new() -> Self {
+        use std::os::unix::fs::OpenOptionsExt;
+        let operation_id = uuid::Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!("silo-worker-{operation_id}.lease"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("fresh lease");
+        #[allow(deprecated)]
+        nix::fcntl::flock(file.as_raw_fd(), nix::fcntl::FlockArg::LockSharedNonblock)
+            .expect("lease SH");
+        Self {
+            path,
+            file,
+            operation_id,
+        }
+    }
+
+    fn binding(&self) -> serde_json::Value {
+        let stat = nix::sys::stat::fstat(&self.file).expect("lease identity");
+        serde_json::json!({
+            "operationId": self.operation_id.to_string(),
+            "fileDevice": stat.st_dev as u64, "fileInode": stat.st_ino as u64
+        })
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn mapping(descriptors: &[&OwnedFd]) -> Vec<(i32, i32)> {
+    descriptors
+        .iter()
+        .enumerate()
+        .map(|(index, fd)| (fd.as_raw_fd(), 3 + index as i32))
+        .collect()
+}
+
+fn install_supervisor(
+    command: &mut Command,
+    fixture: &SupervisorFixture,
+    descriptors: &[&OwnedFd],
+) {
+    let mut mapping = mapping(descriptors);
+    mapping.push((fixture.2.file.as_raw_fd(), 8));
+    fd_policy::install(command, &mapping).expect("supervisor descriptor allowlist");
+}
+
+struct SupervisorFixture(std::path::PathBuf, uuid::Uuid, Lease);
 
 impl SupervisorFixture {
     fn new() -> Self {
@@ -166,16 +305,17 @@ impl SupervisorFixture {
             serde_json::to_vec(&spec).expect("spec encoding"),
         )
         .expect("write spec");
-        Self(root, uuid::Uuid::new_v4())
+        Self(root, uuid::Uuid::new_v4(), Lease::new())
     }
 
-    fn command(&self) -> Command {
+    fn command_base(&self) -> (Command, String) {
         let mut command = command();
+        let run_id = uuid::Uuid::new_v4().to_string();
         command.arg("--foreground").args([
             "--id",
             &self.1.to_string(),
             "--run-id",
-            &uuid::Uuid::new_v4().to_string(),
+            &run_id,
             "--name",
             "worker-failure",
         ]);
@@ -198,6 +338,38 @@ impl SupervisorFixture {
             "_VM_MACHINE_LOG_DIR",
         ] {
             command.env_remove(name);
+        }
+        command.env("_VM_STORAGE_LEASES", "[8]");
+        (command, run_id)
+    }
+
+    fn command(&self) -> Command {
+        let (mut command, run_id) = self.command_base();
+        let (request, writer) = pipe();
+        let mut writer = std::fs::File::from(writer);
+        let mut encoded = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "machineId": self.1.to_string(), "machineRunId": run_id,
+            "storageLease": self.2.binding(),
+            "diskTrackingSeeds": [],
+            "storageShutdown": {
+                "version": 1, "machineId": self.1.to_string(), "runId": run_id,
+                "manifest": {"kind":"unsupported","reason":"worker startup failure fixture"}
+            }
+        }))
+        .expect("current request");
+        encoded.push(b'\n');
+        writer.write_all(&encoded).expect("request bytes");
+        drop(writer);
+        command
+            .env("_VM_STARTPIPE", "3")
+            .env("_VM_STORAGE_LEASES", "[8]");
+        install_supervisor(&mut command, self, &[&request]);
+        // Command owns the source until spawn, without modifying parent flags.
+        unsafe {
+            command.pre_exec(move || {
+                let _ = &request;
+                Ok(())
+            });
         }
         command
     }
@@ -222,10 +394,17 @@ impl SupervisorFixture {
             .as_mut()
             .expect("kernel");
         kernel.path = Some(asset("SILO_TEST_KERNEL"));
-        kernel.initramfs = Some(asset("SILO_TEST_INITRAMFS"));
+        // The root is selected only by the launch bootstrap; its harness shell
+        // is the multicall Silo binary, run as the image init.
+        let root = fixture.0.join("root.raw");
+        let root_length = native_root(&root, &asset("SILO_TEST_INIT"));
+        let initramfs = fixture.0.join("initramfs");
+        compose_initramfs(&asset("SILO_TEST_INITRAMFS"), root_length, &initramfs);
+        kernel.initramfs = Some(initramfs);
         kernel.cmdline = vec![
             "loglevel=4".to_string(),
             "silo.qualification=krun-worker".to_string(),
+            "init=/bin/sh".to_string(),
         ];
         spec.hardware.as_mut().expect("hardware").memory = Some(256);
         let share = fixture.0.join("share");
@@ -244,14 +423,39 @@ impl SupervisorFixture {
             tag: "acceptance".to_string(),
             read_only: true,
         });
+        let data = fixture.0.join("data.raw");
+        std::fs::File::create(&data)
+            .expect("disk")
+            .set_len(8 * 1024 * 1024)
+            .expect("disk size");
         let mut disks = Vec::new();
-        for (name, read_only) in [("first.raw", false), ("second.raw", true)] {
-            let path = fixture.0.join(name);
-            std::fs::File::create(&path)
-                .expect("disk")
-                .set_len(8 * 1024 * 1024)
-                .expect("disk size");
-            disks.push(vm_spec::Disk { path, read_only });
+        for (path, length, block_id, role, read_only) in [
+            (
+                root,
+                root_length,
+                "silo-root",
+                vm_spec::DiskRole::Root,
+                false,
+            ),
+            (
+                data,
+                8 * 1024 * 1024,
+                "native-data",
+                vm_spec::DiskRole::Data,
+                true,
+            ),
+        ] {
+            disks.push(vm_spec::Disk {
+                path,
+                role,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length,
+                    logical_sector_size: 512,
+                },
+                block_id: vm_spec::BlockId::new(block_id).expect("valid native ID"),
+                read_only,
+            });
         }
         spec.storage = Some(vm_spec::Storage { disks });
         std::fs::write(
@@ -266,7 +470,11 @@ impl SupervisorFixture {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let console = std::fs::read_to_string(self.0.join("serial.log")).unwrap_or_default();
-            if console.matches("starting rescue shell").count() > previous_generations {
+            if console
+                .matches("init: raw: verified bootstrap-selected root")
+                .count()
+                > previous_generations
+            {
                 return;
             }
             assert!(
@@ -316,6 +524,111 @@ impl Drop for SupervisorFixture {
     }
 }
 
+/// Formats the whole-disk ext4 root: the multicall Silo binary as `/bin/sh`,
+/// applet links for the harness commands, and an empty `/mnt`.
+fn native_root(path: &std::path::Path, init: &std::path::Path) -> u64 {
+    use disk_image::ext4::constants::{file_mode, make_mode};
+    let mut root =
+        disk_image::ext4::Formatter::new(path, 4096, 64 * 1024 * 1024).expect("format native root");
+    let mut binary = std::fs::File::open(init).expect("open multicall Silo binary");
+    root.create(
+        "/bin/sh",
+        make_mode(file_mode::S_IFREG, 0o755),
+        None,
+        None,
+        Some(disk_image::ext4::FileData::Dense(&mut binary)),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("root shell");
+    for applet in ["cat", "echo", "mount"] {
+        root.create(
+            format!("/bin/{applet}"),
+            make_mode(file_mode::S_IFLNK, 0o777),
+            Some(b"sh".as_slice()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("applet link");
+    }
+    root.create(
+        "/mnt",
+        make_mode(file_mode::S_IFDIR, 0o755),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("mount point");
+    root.close().expect("finish native root");
+    let length = std::fs::metadata(path).expect("root length").len();
+    assert_eq!(length % 512, 0, "root attachment is sector aligned");
+    length
+}
+
+/// Appends the launch-only schema-1 whole-disk bootstrap to the base
+/// initramfs, as libvm composes it: a 4-byte aligned uncompressed newc tail.
+fn compose_initramfs(base: &std::path::Path, root_length: u64, destination: &std::path::Path) {
+    let bootstrap = rootfs_spec::Bootstrap {
+        root: rootfs_spec::Root::Raw(rootfs_spec::RawRoot {
+            device: rootfs_spec::RawDeviceExpectation {
+                serial: rootfs_spec::RawSerial::Root,
+                length_bytes: root_length,
+                logical_sector_size: 512,
+                read_only: false,
+            },
+            selector: rootfs_spec::RawSelector::WholeDisk,
+            filesystem: rootfs_spec::RootFilesystem::Ext4,
+        }),
+        rosetta: rootfs_spec::RosettaMode::Disabled,
+    };
+    let mut encoded = vec![0; rootfs_spec::MAX_JSON_BYTES];
+    let length = rootfs_spec::encode_bootstrap(&bootstrap, &mut encoded).expect("bootstrap");
+    encoded.truncate(length);
+    let mut output = std::fs::read(base).expect("base initramfs");
+    output.resize(output.len().next_multiple_of(4), 0);
+    let entry = |name: &str, inode: u32, mode: u32, file_type: cpio::newc::ModeFileType| {
+        cpio::NewcBuilder::new(name)
+            .ino(inode)
+            .uid(0)
+            .gid(0)
+            .nlink(
+                if matches!(file_type, cpio::newc::ModeFileType::Directory) {
+                    2
+                } else {
+                    1
+                },
+            )
+            .mode(mode)
+            .mtime(0)
+            .set_mode_file_type(file_type)
+    };
+    entry("silo", 1, 0o700, cpio::newc::ModeFileType::Directory)
+        .write(&mut output, 0)
+        .finish()
+        .expect("bootstrap directory");
+    let mut member = entry(
+        "silo/rootfs.json",
+        2,
+        0o600,
+        cpio::newc::ModeFileType::Regular,
+    )
+    .write(&mut output, u32::try_from(encoded.len()).expect("bounded"));
+    member.write_all(&encoded).expect("bootstrap bytes");
+    member.finish().expect("bootstrap member");
+    cpio::newc::trailer(&mut output).expect("archive trailer");
+    std::fs::write(destination, output).expect("composite initramfs");
+}
+
 #[test]
 fn executable_and_worker_have_distinct_names() {
     let help = command().arg("--help").output().expect("supervisor help");
@@ -362,12 +675,12 @@ fn supervisor_launches_one_real_worker_and_exits_on_native_startup_failure() {
             "--exit-command",
             "/bin/sh",
             "--exit-command-arg=-c",
-            "--exit-command-arg=test -f \"$(dirname \"$1\")/vm.exit.json\" && printf '%s %s\\n' \"$SILO_MACHINE_ID\" \"$SILO_MACHINE_RUN_ID\" >> \"$1\"",
+            "--exit-command-arg=test -z \"${_VM_STORAGE_LEASES+x}\" && test -f \"$(dirname \"$1\")/vm.exit.json\" && printf '%s %s\\n' \"$SILO_MACHINE_ID\" \"$SILO_MACHINE_RUN_ID\" >> \"$1\"",
             "--exit-command-arg=record",
         ])
         .arg("--exit-command-arg")
         .arg(&marker);
-    let process = Process(Some(command.spawn().expect("supervisor")));
+    let process = Process(Some(command.spawn().expect("supervisor")), None, None);
     let supervisor_pid = process.0.as_ref().expect("child").id();
     let output = process.output();
     assert!(!output.status.success());
@@ -462,7 +775,7 @@ fn parked_supervisor(
     exit_command: Option<&std::path::Path>,
 ) -> (Process, OwnedFd) {
     let (request, keep_request_open) = pipe();
-    let mut command = fixture.command();
+    let mut command = fixture.command_base().0;
     // The shared inheritance helper maps descriptors onto 3, 4, ... in order.
     command.env("_VM_STARTPIPE", "3");
     if let Some(marker) = exit_command {
@@ -471,14 +784,14 @@ fn parked_supervisor(
                 "--exit-command",
                 "/bin/sh",
                 "--exit-command-arg=-c",
-                "--exit-command-arg=printf '%s\\n' \"$SILO_MACHINE_RUN_ID\" >> \"$1\"",
+                "--exit-command-arg=test -z \"${_VM_STORAGE_LEASES+x}\" && printf '%s\\n' \"$SILO_MACHINE_RUN_ID\" >> \"$1\"",
                 "--exit-command-arg=record",
             ])
             .arg("--exit-command-arg")
             .arg(marker);
     }
-    fd_policy::install(&mut command, &[&request]);
-    let process = Process(Some(command.spawn().expect("supervisor")));
+    install_supervisor(&mut command, fixture, &[&request]);
+    let process = Process(Some(command.spawn().expect("supervisor")), None, None);
     drop(request);
     fixture.wait_for_request();
     (process, keep_request_open)
@@ -551,11 +864,11 @@ fn exit_runner_exists_only_with_an_exit_command_and_holds_only_its_trigger() {
 fn startup_signal_cancels_an_incomplete_request_without_a_blocking_reader() {
     let fixture = SupervisorFixture::new();
     let (reader, writer) = pipe();
-    let mut command = fixture.command();
+    let mut command = fixture.command_base().0;
     // The shared inheritance helper maps descriptors onto 3, 4, ... in order.
     command.env("_VM_STARTPIPE", "3");
-    fd_policy::install(&mut command, &[&reader]);
-    let process = Process(Some(command.spawn().expect("supervisor")));
+    install_supervisor(&mut command, &fixture, &[&reader]);
+    let process = Process(Some(command.spawn().expect("supervisor")), None, None);
     drop(reader);
     let mut writer = std::fs::File::from(writer);
     writer.write_all(b"{").expect("partial supervisor request");
@@ -587,10 +900,10 @@ fn parent_loss_cancels_an_incomplete_supervisor_request() {
     let fixture = SupervisorFixture::new();
     let (request, _keep_request_open) = pipe();
     let (parent, sync) = pipe();
-    let mut command = fixture.command();
+    let mut command = fixture.command_base().0;
     command.env("_VM_STARTPIPE", "3").env("_VM_SYNCPIPE", "4");
-    fd_policy::install(&mut command, &[&request, &sync]);
-    let process = Process(Some(command.spawn().expect("supervisor")));
+    install_supervisor(&mut command, &fixture, &[&request, &sync]);
+    let process = Process(Some(command.spawn().expect("supervisor")), None, None);
     drop((request, sync));
     fixture.wait_for_request();
     drop(parent);
@@ -621,6 +934,30 @@ fn watchdog_runs_before_the_config_is_complete() {
     drop(config);
 }
 
+/// Spawn the actual worker with `roles` on 3.., a fresh lease on 8 and, when
+/// present, `lifecycle` on the lifecycle role, then wait for its exit.
+fn spawn_worker_roles(
+    roles: &[&OwnedFd],
+    lifecycle: Option<&OwnedFd>,
+    configure: impl FnOnce(&mut Command),
+) -> Output {
+    let mut command = worker_command();
+    let lease = Lease::new();
+    let mut mapped = mapping(roles);
+    mapped.push((lease.file.as_raw_fd(), 8));
+    if let Some(lifecycle) = lifecycle {
+        mapped.push((lifecycle.as_raw_fd(), fd_policy::LIFECYCLE_CHILD_FD));
+    }
+    fd_policy::install(&mut command, &mapped).expect("worker role mapping");
+    configure(&mut command);
+    Process(
+        Some(command.spawn().expect("spawn worker")),
+        Some(lease),
+        None,
+    )
+    .output()
+}
+
 #[test]
 fn invalid_descriptor_roles_fail_before_any_worker_event() {
     let (config, writer) = pipe();
@@ -629,6 +966,9 @@ fn invalid_descriptor_roles_fail_before_any_worker_event() {
     let alias = config.try_clone().expect("aliased resource");
     let pty = nix::pty::openpty(None, None).expect("PTY");
     let valid = [&config, &reporter, &watchdog, &pty.slave];
+    // Every case carries a valid lifecycle endpoint unless that role is under
+    // test, so each failure is attributable to exactly one invalid role.
+    let (_monitor, lifecycle) = lifecycle_pair();
     for (label, slot, bad) in [
         ("write-only config", 0, &keepalive),
         ("read-only events", 1, &events),
@@ -639,20 +979,19 @@ fn invalid_descriptor_roles_fail_before_any_worker_event() {
     ] {
         let mut roles = valid;
         roles[slot] = bad;
-        let mut command = worker_command();
-        fd_policy::install(&mut command, &roles);
-        let output = Process(Some(command.spawn().expect("spawn worker with a bad role"))).output();
+        let output = spawn_worker_roles(&roles, Some(&lifecycle), |_| {});
         assert!(!output.status.success(), "{label}");
     }
 
-    let mut missing = worker_command();
-    fd_policy::install(&mut missing, &valid[..3]);
     assert!(
-        !Process(Some(missing.spawn().expect("worker without console")))
-            .output()
+        !spawn_worker_roles(&valid[..3], Some(&lifecycle), |_| {})
             .status
             .success(),
-        "missing role"
+        "missing console role"
+    );
+    assert!(
+        !spawn_worker_roles(&valid, None, |_| {}).status.success(),
+        "normal worker without its lifecycle endpoint"
     );
 
     let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().expect("datagram");
@@ -666,36 +1005,45 @@ fn invalid_descriptor_roles_fail_before_any_worker_event() {
     .expect("unconnected stream");
     let unconnected = fd_policy::normalize(unconnected).expect("normalize unconnected stream");
     for mux in [&datagram, &unconnected] {
-        let mut command = worker_command();
-        fd_policy::install(
-            &mut command,
-            &[&config, &reporter, &watchdog, &pty.slave, mux],
-        );
-        assert!(!Process(Some(command.spawn().expect("invalid mux worker")))
-            .output()
+        let roles = [&config, &reporter, &watchdog, &pty.slave, mux];
+        assert!(!spawn_worker_roles(&roles, Some(&lifecycle), |_| {})
             .status
             .success());
     }
 
-    // An inherited descriptor above the fixed table fails closed.
-    let mut extra = worker_command();
-    fd_policy::install(&mut extra, &valid);
-    // SAFETY: dup2 is async-signal-safe; this runs after the fixed mapping.
-    unsafe {
-        extra.pre_exec(|| {
-            if nix::libc::dup2(3, 9) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    // The lifecycle role is a connected stream socket distinct from every role.
+    let (lifecycle_fifo, _fifo_writer) = pipe();
+    for (label, bad) in [
+        ("datagram lifecycle", &datagram),
+        ("unconnected lifecycle", &unconnected),
+        ("pipe lifecycle", &lifecycle_fifo),
+    ] {
+        let output = spawn_worker_roles(&valid, Some(bad), |_| {});
+        assert!(!output.status.success(), "{label}");
     }
+    let (mux, _mux_peer) = std::os::unix::net::UnixStream::pair().expect("mux pair");
+    let mux: OwnedFd = mux.into();
+    let roles = [&config, &reporter, &watchdog, &pty.slave, &mux];
     assert!(
-        !Process(Some(extra.spawn().expect("worker with extra fd")))
-            .output()
+        !spawn_worker_roles(&roles, Some(&mux), |_| {})
             .status
             .success(),
-        "descriptor above the table"
+        "lifecycle aliases the mux"
     );
+
+    // An inherited descriptor above the fixed table fails closed.
+    let extra = spawn_worker_roles(&valid, Some(&lifecycle), |command| {
+        // SAFETY: dup2 is async-signal-safe; this runs after the fixed mapping.
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::dup2(3, 9) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    });
+    assert!(!extra.status.success(), "descriptor above the table");
 
     drop(reporter);
     let mut bytes = Vec::new();
@@ -743,6 +1091,421 @@ fn watchdog_terminates_worker_with_a_full_event_channel() {
     assert_eq!(child.output().status.code(), Some(125));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_lease_continues_the_ofd_until_process_exit_without_unrelated_leaks() {
+    use std::os::unix::fs::MetadataExt;
+    let (mut worker, config_writer, keepalive, event_reader, console) = worker();
+    use std::os::fd::AsFd;
+    for fd in [
+        config_writer.as_fd(),
+        keepalive.as_fd(),
+        event_reader.as_fd(),
+        console.as_fd(),
+    ] {
+        let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert!(
+            nix::fcntl::FdFlag::from_bits_retain(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC),
+            "parent fixture descriptors must not leak into unrelated execs"
+        );
+    }
+    let pid = worker.0.as_ref().expect("worker").id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            worker.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "worker died before config"
+        );
+        if std::fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .count()
+            >= 2
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "watchdog did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut descriptors = open_descriptors(pid);
+    descriptors.sort_unstable();
+    assert_eq!(
+        descriptors,
+        [0, 1, 2, 3, 4, 5, 6, 8, 32],
+        "exact table, including mux hole and the lifecycle endpoint"
+    );
+    let lease = worker.1.as_mut().expect("lease fixture");
+    let identity = lease.file.metadata().unwrap();
+    assert!(nix::fcntl::FdFlag::from_bits_retain(
+        nix::fcntl::fcntl(&lease.file, nix::fcntl::FcntlArg::F_GETFD).unwrap()
+    )
+    .contains(nix::fcntl::FdFlag::FD_CLOEXEC));
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lease.path)
+        .unwrap();
+    let unrelated = Process(
+        Some(Command::new("/bin/sleep").arg("30").spawn().unwrap()),
+        None,
+        None,
+    );
+    let unrelated_pid = unrelated.0.as_ref().unwrap().id();
+    for entry in std::fs::read_dir(format!("/proc/{unrelated_pid}/fd")).unwrap() {
+        let path = entry.unwrap().path();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_ne!(
+            (metadata.dev(), metadata.ino()),
+            (identity.dev(), identity.ino()),
+            "unrelated exec inherited storage lease: descriptor={}, target={:?}, fdinfo={:?}",
+            path.display(),
+            std::fs::read_link(&path),
+            std::fs::read_to_string(
+                path.parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("fdinfo")
+                    .join(path.file_name().unwrap())
+            )
+        );
+    }
+    let inherited = std::fs::metadata(format!("/proc/{pid}/fd/8")).unwrap();
+    assert_eq!(
+        (inherited.dev(), inherited.ino()),
+        (identity.dev(), identity.ino())
+    );
+    let flags = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/8")).unwrap();
+    let flags = flags
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:\t"))
+        .unwrap();
+    assert_ne!(
+        u32::from_str_radix(flags, 8).unwrap() & 0o2000000,
+        0,
+        "worker restored CLOEXEC"
+    );
+    drop(std::mem::replace(
+        &mut lease.file,
+        std::fs::File::open("/dev/null").unwrap(),
+    ));
+    #[allow(deprecated)]
+    let blocked = nix::fcntl::flock(
+        probe.as_raw_fd(),
+        nix::fcntl::FlockArg::LockExclusiveNonblock,
+    );
+    assert_eq!(
+        blocked,
+        Err(nix::errno::Errno::EAGAIN),
+        "child retains original shared OFD"
+    );
+    drop(keepalive);
+    assert_eq!(worker.output().status.code(), Some(125));
+    #[allow(deprecated)]
+    nix::fcntl::flock(
+        probe.as_raw_fd(),
+        nix::fcntl::FlockArg::LockExclusiveNonblock,
+    )
+    .unwrap();
+    assert!(
+        !open_descriptors(unrelated_pid).is_empty(),
+        "unrelated process remains alive after release"
+    );
+    drop(unrelated);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mapped_inheritance_parks_source_cycles_above_all_targets() {
+    use std::os::fd::FromRawFd;
+    let mut first = Lease::new();
+    let mut second = Lease::new();
+    first.file.write_all(b"first").unwrap();
+    second.file.write_all(b"second").unwrap();
+    let high = |file: &std::fs::File| {
+        let raw = nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(32)).unwrap();
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    };
+    let first_source = high(&first.file);
+    let second_source = high(&second.file);
+    let (a, b) = (first_source.as_raw_fd(), second_source.as_raw_fd());
+    let mut child = Command::new("/bin/sh");
+    child.arg("-c").arg("test \"$(cat /proc/self/fd/20)\" = second && test \"$(cat /proc/self/fd/21)\" = first && test ! -e /proc/self/fd/7");
+    // Establish deliberately colliding source numbers only in the isolated child.
+    unsafe {
+        child.pre_exec(move || {
+            if nix::libc::dup2(a, 20) < 0 || nix::libc::dup2(b, 21) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    fd_policy::install(&mut child, &[(20, 21), (21, 20)]).unwrap();
+    assert!(child.status().unwrap().success());
+    for fd in [&first_source, &second_source] {
+        let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert!(
+            nix::fcntl::FdFlag::from_bits_retain(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+        );
+    }
+}
+
+#[test]
+fn only_managed_restore_roles_cross_into_the_extended_descriptor_range() {
+    let (_monitor, worker) = lifecycle_pair();
+    let source = worker.as_raw_fd();
+    for target in [
+        0,
+        2,
+        29,
+        30,
+        31,
+        fd_policy::FIRST_LOWER_CHILD_FD + fd_policy::MAX_LOWER_FDS as i32,
+    ] {
+        assert!(
+            fd_policy::install(&mut Command::new("/bin/sh"), &[(source, target)]).is_err(),
+            "target {target} is not a normal worker role"
+        );
+    }
+    assert!(
+        fd_policy::install(&mut Command::new("/bin/sh"), &[(2, 32)]).is_err(),
+        "stdio is never a mapping source"
+    );
+    // Every cold and restore role at once fits the bounded mapping table.
+    let mut table: Vec<_> = (3..=28)
+        .chain([fd_policy::LIFECYCLE_CHILD_FD, 33])
+        .chain(
+            fd_policy::FIRST_LOWER_CHILD_FD
+                ..fd_policy::FIRST_LOWER_CHILD_FD + fd_policy::MAX_LOWER_FDS as i32,
+        )
+        .map(|target| (source, target))
+        .collect();
+    fd_policy::install(&mut Command::new("/bin/sh"), &table).expect("full bounded restore table");
+    table.push((source, 3));
+    assert!(
+        fd_policy::install(&mut Command::new("/bin/sh"), &table).is_err(),
+        "bounded table"
+    );
+    assert!(
+        fd_policy::install(&mut Command::new("/bin/sh"), &[(source, 32), (source, 32)]).is_err(),
+        "duplicate target"
+    );
+}
+
+#[test]
+fn real_child_inherits_exactly_the_lifecycle_endpoint_at_32() {
+    use std::os::fd::FromRawFd;
+    let (monitor, worker) = lifecycle_pair();
+    let (unrelated, unrelated_worker) = lifecycle_pair();
+    // Park the unrelated end above 32 so its number never names the role.
+    let unrelated_worker = {
+        let raw = nix::fcntl::fcntl(
+            &unrelated_worker,
+            nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(fd_policy::LIFECYCLE_CHILD_FD + 1),
+        )
+        .expect("park unrelated endpoint");
+        drop(unrelated_worker);
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    };
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(format!(
+        "printf lifecycle >&32 && {{ printf leak >&{} ; }} 2>/dev/null; exit 0",
+        unrelated_worker.as_raw_fd()
+    ));
+    fd_policy::install(&mut command, &[(worker.as_raw_fd(), 32)]).expect("install");
+    assert!(command.status().expect("spawn real child").success());
+    // The parent's copies must not keep either pair open.
+    drop(worker);
+    drop(unrelated_worker);
+    for (endpoint, expected) in [(monitor, "lifecycle"), (unrelated, "")] {
+        let mut received = String::new();
+        std::os::unix::net::UnixStream::from(endpoint)
+            .read_to_string(&mut received)
+            .expect("read until EOF");
+        assert_eq!(received, expected, "only FD 32 is inherited");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_adopts_only_the_optional_mux_and_bounded_raw_table_before_config() {
+    use std::os::unix::fs::MetadataExt;
+    let raw = Lease::new();
+    let first = OwnedFd::from(raw.file.try_clone().unwrap());
+    let second = OwnedFd::from(raw.file.try_clone().unwrap());
+    let (mux, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mux = OwnedFd::from(mux);
+    let (mut child, _config, keepalive, _events, _console) =
+        worker_with_attachments(|_| {}, &[&first, &second], Some(&mux));
+    let pid = child.0.as_ref().unwrap().id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        if std::fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .count()
+            >= 2
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut descriptors = open_descriptors(pid);
+    descriptors.sort_unstable();
+    assert_eq!(
+        descriptors,
+        (0..=10).chain([32]).collect::<Vec<_>>(),
+        "fixed roles, mux, Raw table and the lifecycle endpoint only"
+    );
+    let expected = raw.file.metadata().unwrap();
+    for fd in [9, 10] {
+        let actual = std::fs::metadata(format!("/proc/{pid}/fd/{fd}")).unwrap();
+        assert_eq!(
+            (actual.dev(), actual.ino()),
+            (expected.dev(), expected.ino())
+        );
+        let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:\t"))
+            .unwrap();
+        assert_ne!(u32::from_str_radix(flags, 8).unwrap() & 0o2000000, 0);
+    }
+    drop(keepalive);
+    assert_eq!(child.output().status.code(), Some(125));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restore_worker_inherits_exactly_state_and_lower_roles_and_restores_cloexec() {
+    use std::os::unix::fs::MetadataExt;
+    let mut sources: Vec<_> = (0..7).map(|_| Lease::new()).collect();
+    for (index, source) in sources.iter_mut().enumerate() {
+        source.file.write_all(&[index as u8 + 1; 8]).unwrap();
+    }
+    let files: Vec<_> = sources
+        .iter()
+        .map(|source| std::fs::File::open(&source.path).unwrap())
+        .collect();
+    let state: Vec<_> = files[..5].iter().collect();
+    let lowers: Vec<_> = files[5..].iter().collect();
+    let (mut child, _config, keepalive, _events, _console) =
+        worker_with_tables(|_| {}, &[], None, &state, &lowers);
+    let pid = child.0.as_ref().unwrap().id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        if std::fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .count()
+            >= 2
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut descriptors = open_descriptors(pid);
+    descriptors.sort_unstable();
+    assert_eq!(
+        descriptors,
+        (0..=6)
+            .chain([8, 25, 26, 27, 28, 32, 33, 34, 35])
+            .collect::<Vec<_>>()
+    );
+    for (file, role) in files.iter().zip([25, 26, 27, 28, 33, 34, 35]) {
+        let expected = file.metadata().unwrap();
+        let actual = std::fs::metadata(format!("/proc/{pid}/fd/{role}")).unwrap();
+        assert_eq!(
+            (actual.dev(), actual.ino()),
+            (expected.dev(), expected.ino())
+        );
+        let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{role}")).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:\t"))
+            .unwrap();
+        assert_ne!(u32::from_str_radix(flags, 8).unwrap() & 0o2000000, 0);
+    }
+    drop(keepalive);
+    assert_eq!(child.output().status.code(), Some(125));
+}
+
+#[test]
+fn restore_worker_refuses_partial_state_or_cross_role_aliases_before_config() {
+    let mut sources: Vec<_> = (0..6).map(|_| Lease::new()).collect();
+    for source in &mut sources {
+        source.file.write_all(b"state").unwrap();
+    }
+    let files: Vec<_> = sources
+        .iter()
+        .map(|source| std::fs::File::open(&source.path).unwrap())
+        .collect();
+    for (state, lowers) in [
+        (vec![&files[0], &files[1], &files[2]], vec![]),
+        (vec![&files[0], &files[1], &files[2], &files[0]], vec![]),
+        (vec![], vec![&files[5]]),
+        (
+            vec![&files[0], &files[1], &files[2], &files[3]],
+            vec![&files[0]],
+        ),
+        (
+            vec![&sources[0].file, &files[1], &files[2], &files[3]],
+            vec![],
+        ),
+        (
+            vec![&files[0], &files[1], &files[2], &files[3], &files[4]],
+            vec![&files[0]],
+        ),
+        (
+            vec![&sources[0].file, &files[1], &files[2], &files[3], &files[4]],
+            vec![],
+        ),
+        (
+            vec![&files[0], &files[1], &files[2], &files[3], &files[0]],
+            vec![],
+        ),
+    ] {
+        let (child, _config, _keepalive, mut events, _console) =
+            worker_with_tables(|_| {}, &[], None, &state, &lowers);
+        let output = child.output();
+        assert!(!output.status.success());
+        let mut bytes = Vec::new();
+        events.read_to_end(&mut bytes).unwrap();
+        assert!(
+            bytes.is_empty(),
+            "invalid inherited roles fail before a worker event"
+        );
+    }
+}
+
+#[test]
+fn owned_and_identified_restore_tables_exit_and_close_events_on_config_refusal() {
+    let mut sources: Vec<_> = (0..5).map(|_| Lease::new()).collect();
+    for source in &mut sources {
+        source.file.write_all(b"state").unwrap();
+    }
+    let files: Vec<_> = sources
+        .iter()
+        .map(|source| std::fs::File::open(&source.path).unwrap())
+        .collect();
+    for count in [4, 5] {
+        let state: Vec<_> = files[..count].iter().collect();
+        let (child, config, _keepalive, mut events, _console) =
+            worker_with_tables(|_| {}, &[], None, &state, &[]);
+        // Both complete tables are valid before their typed config arrives.
+        // EOF refuses that config rather than leaving a worker or writer alive.
+        drop(config);
+        assert_eq!(child.output().status.code(), Some(1));
+        let mut bytes = Vec::new();
+        events.read_to_end(&mut bytes).unwrap();
+        assert!(
+            !bytes.is_empty(),
+            "a complete table reaches config admission"
+        );
+    }
+}
+
 async fn native_serial(
     path: &std::path::Path,
 ) -> (
@@ -780,7 +1543,7 @@ enum NativeExit {
 }
 
 #[tokio::test]
-#[ignore = "requires native hypervisor and SILO_TEST_KERNEL/INITRAMFS/SHUTDOWN; macOS silo-vmm must be signed"]
+#[ignore = "requires native hypervisor and SILO_TEST_KERNEL/INITRAMFS/INIT/SHUTDOWN; macOS silo-vmm must be signed"]
 async fn native_guest_devices_shutdown_crash_and_new_generation() {
     native_guest_cases(&[
         NativeExit::Stop,
@@ -799,7 +1562,11 @@ async fn native_guest_cases(scenarios: &[NativeExit]) {
     let mut previous_run = None;
     let mut previous_worker = None;
     for (generation, &scenario) in scenarios.iter().enumerate() {
-        let mut process = Process(Some(fixture.command().spawn().expect("native supervisor")));
+        let mut process = Process(
+            Some(fixture.command().spawn().expect("native supervisor")),
+            None,
+            None,
+        );
         fixture.wait_for_guest(&mut process, generation).await;
         let supervisor = process.0.as_ref().expect("supervisor").id();
         let children = Command::new("pgrep")
@@ -844,7 +1611,7 @@ async fn native_guest_cases(scenarios: &[NativeExit]) {
         let mut input =
             "echo DISKS_BEGIN; cat /sys/block/vda/ro /sys/block/vdb/ro; echo DISKS_END; "
                 .to_string();
-        // The rescue shell does not expand globs. Enumerate the console, two
+        // The harness shell does not expand globs. Enumerate the console, two
         // block devices, filesystem, vsock, RNG, and balloon explicitly.
         for index in 0..7 {
             input.push_str(&format!(
@@ -1007,4 +1774,41 @@ fn malformed_config_is_redacted_and_does_not_require_a_hypervisor() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("must-not-appear"));
+}
+
+#[test]
+fn real_inspector_emits_typed_preflight_failures_before_native_resources() {
+    for request in [
+        b"{}\n".as_slice(),
+        b"not json\n".as_slice(),
+        b"{}\n{}\n".as_slice(),
+    ] {
+        let mut command = command();
+        command.arg("inspect-restore").stdin(Stdio::piped());
+        let mut child = Process(
+            Some(command.spawn().expect("spawn real inspector")),
+            None,
+            None,
+        );
+        let mut stdin = child.0.as_mut().unwrap().stdin.take().unwrap();
+        stdin.write_all(request).unwrap();
+        drop(stdin);
+        let output = child.output();
+        assert!(!output.status.success());
+        assert!(output.stdout.ends_with(b"\n"));
+        assert_eq!(
+            output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+            1
+        );
+        let failure: vm_spec::restore::RestoreInspectionFailure =
+            serde_json::from_slice(&output.stdout).expect("one typed inspection refusal");
+        failure.validate().unwrap();
+        assert_eq!(
+            failure.version,
+            vm_spec::restore::RESTORE_INSPECTION_VERSION
+        );
+        assert_eq!(failure.refusal.stage, "restore-preflight");
+        assert_eq!(failure.refusal.pin, "restore-inputs");
+        assert!(!failure.refusal.actual.is_empty());
+    }
 }

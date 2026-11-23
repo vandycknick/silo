@@ -10,9 +10,10 @@ use protocol::v1::{
 };
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 
-use crate::machine::{Machine, MachineRef, MachineUserConfig};
+use crate::machine::{Machine, MachineData, MachineObservation, MachineUserConfig};
 use crate::runtime::core::RuntimeStatus;
 use crate::store::models::MachineRuntimeState;
 use crate::LibVmError;
@@ -46,7 +47,7 @@ pub struct ExecutionOptionsBuilder {
     options: ExecutionOptions,
 }
 
-/// Owned initial RPC stdin policy. Bytes are sent before Started, followed by pipe
+/// Owned initial RPC stdin policy. Bytes stream automatically, followed by pipe
 /// EOF; Pipe exposes Started-gated live input. See [execution examples](crate).
 #[derive(Debug, Clone, Default)]
 pub enum StdinMode {
@@ -125,6 +126,7 @@ pub enum ExecutionLostReason {
 pub enum ExecutionEvent {
     Accepted,
     Started,
+    StdinClosed,
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     TerminalOutput(Vec<u8>),
@@ -180,6 +182,7 @@ impl ExecutionOutput {
 pub struct ExecutionSession {
     control: ExecutionControl,
     events: Option<tonic::Streaming<WireExecutionEvent>>,
+    initial_stdin: Option<AbortOnDropHandle<()>>,
 }
 
 /// Cloneable request-side controls for a live RPC call; terminal/cancel/drop
@@ -192,7 +195,7 @@ pub struct ExecutionControl {
 struct ExecutionControlState {
     reference: String,
     requests: Mutex<Option<mpsc::Sender<ExecuteInput>>>,
-    input_open: AtomicBool,
+    input_open: watch::Sender<bool>,
     started: AtomicBool,
     input_order: AsyncMutex<()>,
     request_closed: watch::Sender<bool>,
@@ -235,18 +238,25 @@ impl ExecutionSession {
             Ok(Some(event)) => {
                 let event = execution_event_from_wire(event);
                 mark_execution_started(&event, &self.control.state.started);
+                if matches!(event, ExecutionEvent::StdinClosed) {
+                    self.control.state.input_open.send_replace(false);
+                    self.initial_stdin = None;
+                }
                 if matches!(event, ExecutionEvent::Terminal(_)) {
+                    self.initial_stdin = None;
                     self.close_requests();
                     self.events = None;
                 }
                 Ok(Some(event))
             }
             Ok(None) => {
+                self.initial_stdin = None;
                 self.events = None;
                 self.close_requests();
                 Ok(None)
             }
             Err(error) => {
+                self.initial_stdin = None;
                 self.events = None;
                 self.close_requests();
                 if caller_status(error.code()) {
@@ -304,6 +314,7 @@ impl ExecutionSession {
     /// Drops the response stream and closes requests. This requests cancellation,
     /// not an awaited guest-process join. See [execution examples](crate).
     pub fn cancel(&mut self) {
+        self.initial_stdin = None;
         self.close_requests();
         self.events = None;
     }
@@ -341,7 +352,9 @@ impl ExecutionSession {
                         terminal_output,
                     });
                 }
-                ExecutionEvent::Accepted | ExecutionEvent::Started => {}
+                ExecutionEvent::Accepted
+                | ExecutionEvent::Started
+                | ExecutionEvent::StdinClosed => {}
             }
         }
         Err(guest_session_error(
@@ -356,9 +369,7 @@ impl ExecutionControl {
     /// Returns None before Started or after input/request closure. See [examples](crate).
     pub fn stdin(&self) -> Option<ExecutionStdin> {
         self.state.requests.lock().ok()?.as_ref()?;
-        if !self.state.started.load(Ordering::Acquire)
-            || !self.state.input_open.load(Ordering::Acquire)
-        {
+        if !self.state.started.load(Ordering::Acquire) || !*self.state.input_open.borrow() {
             return None;
         }
         Some(ExecutionStdin {
@@ -385,14 +396,14 @@ impl ExecutionControl {
         }
         let _order = self.state.input_order.lock().await;
         self.ensure_started()?;
-        if !self.state.input_open.load(Ordering::Acquire) {
+        if !*self.state.input_open.borrow() {
             return Err(guest_session_error(
                 &self.state.reference,
                 "execution input is closed",
             ));
         }
         self.send(ExecuteMessage::CloseStdin(CloseStdin {})).await?;
-        self.state.input_open.store(false, Ordering::Release);
+        self.state.input_open.send_replace(false);
         Ok(())
     }
 
@@ -440,7 +451,7 @@ impl ExecutionControl {
         if let Ok(mut requests) = self.state.requests.lock() {
             requests.take();
         }
-        self.state.input_open.store(false, Ordering::Release);
+        self.state.input_open.send_replace(false);
     }
 
     async fn send(&self, message: ExecuteMessage) -> Result<(), LibVmError> {
@@ -454,12 +465,18 @@ impl ExecutionControl {
             .clone();
         let requests = requests.ok_or_else(|| self.closed_request_error())?;
         let mut request_closed = self.state.request_closed.subscribe();
-        if *request_closed.borrow() {
+        let mut input_open = self.state.input_open.subscribe();
+        let stdin_message = matches!(
+            &message,
+            ExecuteMessage::StdinData(_) | ExecuteMessage::CloseStdin(_)
+        );
+        if *request_closed.borrow() || (stdin_message && !*input_open.borrow()) {
             return Err(self.closed_request_error());
         }
         tokio::select! {
             biased;
             _ = request_closed.changed() => Err(self.closed_request_error()),
+            _ = input_open.wait_for(|open| !*open), if stdin_message => Err(guest_session_error(&self.state.reference, "guest process stdin is closed")),
             result = requests.send(ExecuteInput { message: Some(message) }) =>
                 result.map_err(|_| self.closed_request_error()),
         }
@@ -472,7 +489,7 @@ impl ExecutionControl {
     async fn send_stdin_data(&self, data: Vec<u8>) -> Result<(), LibVmError> {
         let _order = self.state.input_order.lock().await;
         self.ensure_started()?;
-        if !self.state.input_open.load(Ordering::Acquire) {
+        if !*self.state.input_open.borrow() {
             return Err(guest_session_error(
                 &self.state.reference,
                 "execution input is closed",
@@ -606,7 +623,7 @@ impl ExecutionOptionsBuilder {
         self.options.stdin = StdinMode::Pipe;
         self
     }
-    /// Moves initial bytes into the request stream before Started, then sends pipe
+    /// Streams owned initial bytes concurrently with events, followed by pipe
     /// EOF. Later stdin setters replace this owned payload.
     /// See [execution examples](crate).
     pub fn stdin_bytes(mut self, data: impl Into<Vec<u8>>) -> Self {
@@ -657,7 +674,11 @@ impl Machine {
     ) -> Result<ExecutionOutput, LibVmError> {
         let options = configure(ExecutionOptionsBuilder::default()).build();
         let timeout = options.timeout;
-        let mut session = self.start_execution(program.into(), options).await?;
+        let observation = self.inspect().await?;
+        let run_id = observed_execution_run(self.machine_id(), &observation)?;
+        let mut session = self
+            .start_execution(&observation, run_id, program.into(), options)
+            .await?;
         if let Some(timeout) = timeout {
             match tokio::time::timeout(timeout, session.collect()).await {
                 Ok(output) => output,
@@ -697,7 +718,23 @@ impl Machine {
         program: impl Into<String>,
         configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
     ) -> Result<ExecutionSession, LibVmError> {
+        let observation = self.inspect().await?;
+        self.spawn_observed_with(&observation, program, configure)
+            .await
+    }
+
+    /// Executes against the exact ready run already returned by `inspect`.
+    /// A replacement run is rejected by the monitor, never silently selected.
+    pub async fn spawn_observed_with(
+        &self,
+        observation: &MachineData,
+        program: impl Into<String>,
+        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
+    ) -> Result<ExecutionSession, LibVmError> {
+        let run_id = observed_execution_run(self.machine_id(), observation)?;
         self.start_execution(
+            observation,
+            run_id,
             program.into(),
             configure(ExecutionOptionsBuilder::default()).build(),
         )
@@ -729,20 +766,18 @@ impl Machine {
 
     async fn start_execution(
         &self,
+        observation: &MachineData,
+        run_id: Uuid,
         program: String,
         mut options: ExecutionOptions,
     ) -> Result<ExecutionSession, LibVmError> {
-        let config = self
-            .runtime()
-            .resolve_machine_config(&MachineRef::id(self.machine_id()))
-            .await?;
-        let status = self
-            .runtime()
-            .reconcile_machine_runtime_best_effort(&config)
-            .await?;
-        let run_id = current_run_id(&config.name, &status)?;
-        apply_default_execution_user(&mut options, config.guest.user.as_ref());
-        let reference = config.name;
+        self.running_config().await?;
+        self.validate_access_run(
+            &observation.name,
+            observation.run_id.as_ref().map(|run| run.as_str()),
+        )?;
+        apply_default_execution_user(&mut options, observation.guest.user.as_ref());
+        let reference = observation.name.clone();
         let stdin = std::mem::take(&mut options.stdin);
         let tty = options.tty;
         let pipe_stdin = !tty && matches!(stdin, StdinMode::Pipe | StdinMode::Bytes(_));
@@ -771,24 +806,49 @@ impl Machine {
             .execute(ReceiverStream::new(receiver))
             .await
             .map_err(|error| guest_session_error(&reference, error.to_string()))?;
-        if let StdinMode::Bytes(data) = stdin {
-            send_initial_stdin(&requests, &reference, data, pipe_stdin).await?;
-        }
+        let request_closed = watch::channel(false).0;
+        let initial_stdin = match stdin {
+            StdinMode::Bytes(data) => Some(spawn_initial_stdin(
+                requests.clone(),
+                reference.clone(),
+                data,
+                pipe_stdin,
+                request_closed.subscribe(),
+            )),
+            StdinMode::Null | StdinMode::Pipe => None,
+        };
         Ok(ExecutionSession {
             control: ExecutionControl {
                 state: Arc::new(ExecutionControlState {
                     reference,
                     requests: Mutex::new(Some(requests)),
-                    input_open: AtomicBool::new(input_open),
+                    input_open: watch::channel(input_open).0,
                     started: AtomicBool::new(false),
                     input_order: AsyncMutex::new(()),
-                    request_closed: watch::channel(false).0,
+                    request_closed,
                     pipe_stdin,
                 }),
             },
             events: Some(events),
+            initial_stdin,
         })
     }
+}
+
+fn spawn_initial_stdin(
+    requests: mpsc::Sender<ExecuteInput>,
+    reference: String,
+    data: Vec<u8>,
+    pipe_stdin: bool,
+    mut request_closed: watch::Receiver<bool>,
+) -> AbortOnDropHandle<()> {
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = request_closed.wait_for(|closed| *closed) => {}
+            _ = send_initial_stdin(&requests, &reference, data, pipe_stdin) => {}
+        }
+    }))
 }
 
 fn stdin_chunks(data: Vec<u8>) -> impl Iterator<Item = bytes::Bytes> {
@@ -821,6 +881,37 @@ async fn send_initial_stdin(
             .map_err(|_| guest_session_error(reference, "execution request stream is closed"))?;
     }
     Ok(())
+}
+
+fn observed_execution_run(
+    machine: crate::store::models::MachineId,
+    observation: &MachineData,
+) -> Result<Uuid, LibVmError> {
+    if observation.id != machine.to_string() {
+        return Err(guest_session_error(
+            &observation.name,
+            "observation belongs to another machine",
+        ));
+    }
+    if observation.observation != MachineObservation::Observed
+        || !observation.is_running()
+        || !observation.status.guest_ready()
+    {
+        return Err(guest_session_error(
+            &observation.name,
+            "machine has no observed ready run",
+        ));
+    }
+    let run = observation
+        .run_id
+        .as_ref()
+        .ok_or_else(|| guest_session_error(&observation.name, "running machine has no run ID"))?;
+    Uuid::parse_str(run.as_str()).map_err(|error| {
+        guest_session_error(
+            &observation.name,
+            format!("running machine has invalid run ID: {error}"),
+        )
+    })
 }
 
 pub(super) fn current_run_id(reference: &str, status: &RuntimeStatus) -> Result<Uuid, LibVmError> {
@@ -892,6 +983,7 @@ pub(crate) fn execution_event_from_wire(event: WireExecutionEvent) -> ExecutionE
     match event.event {
         Some(ExecutionWireEvent::Accepted(_)) => ExecutionEvent::Accepted,
         Some(ExecutionWireEvent::Started(_)) => ExecutionEvent::Started,
+        Some(ExecutionWireEvent::StdinClosed(_)) => ExecutionEvent::StdinClosed,
         Some(ExecutionWireEvent::Stdout(output)) => ExecutionEvent::Stdout(output.data.to_vec()),
         Some(ExecutionWireEvent::Stderr(output)) => ExecutionEvent::Stderr(output.data.to_vec()),
         Some(ExecutionWireEvent::TerminalOutput(output)) => {
@@ -1003,16 +1095,60 @@ pub(super) fn guest_session_error(reference: &str, message: impl Into<String>) -
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use protocol::v1::execute_input::Message as ExecuteMessage;
     use tokio::sync::{watch, Mutex as AsyncMutex};
 
-    use super::{
+    use crate::machine::session::{
         apply_default_execution_user, execution_event_from_wire, mark_execution_started,
         process_spec, ExecutionControl, ExecutionControlState, ExecutionEvent, ExecutionLostReason,
         ExecutionOptions, ExecutionResult, StdinMode,
     };
     use crate::machine::MachineUserConfig;
+
+    #[test]
+    fn observed_execution_preserves_exact_ready_run_and_rejects_unproven_observations() {
+        use crate::machine::session::observed_execution_run;
+        use crate::machine::{MachineData, MachineObservation, MachineStatus};
+        let machine = crate::store::models::MachineId::new();
+        let run = uuid::Uuid::new_v4();
+        let mut observation = MachineData::new(
+            machine.to_string(),
+            "ready-run".into(),
+            vm_spec::VmSpec::current(),
+        );
+        observation.observation = MachineObservation::Observed;
+        observation.status = MachineStatus::Running {
+            ready: true,
+            guest_ready: true,
+            message: None,
+        };
+        observation.run_id = Some(run.to_string().parse().unwrap());
+        assert_eq!(observed_execution_run(machine, &observation).unwrap(), run);
+        assert!(
+            observed_execution_run(crate::store::models::MachineId::new(), &observation).is_err()
+        );
+
+        observation.observation = MachineObservation::LastKnown;
+        assert!(observed_execution_run(machine, &observation).is_err());
+        observation.observation = MachineObservation::Observed;
+        observation.status = MachineStatus::Running {
+            ready: false,
+            guest_ready: false,
+            message: None,
+        };
+        assert!(observed_execution_run(machine, &observation).is_err());
+        observation.status = MachineStatus::Stopped;
+        assert!(observed_execution_run(machine, &observation).is_err());
+        observation.status = MachineStatus::Running {
+            ready: true,
+            guest_ready: true,
+            message: None,
+        };
+        observation.run_id = None;
+        assert!(observed_execution_run(machine, &observation).is_err());
+    }
 
     #[test]
     fn vmm_execution_process_spec_preserves_argv_environment_and_pipe_stdin() {
@@ -1095,6 +1231,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vmm_stdin_closed_event_is_not_a_terminal_failure() {
+        assert_eq!(
+            execution_event_from_wire(protocol::v1::ExecutionEvent {
+                event: Some(protocol::v1::execution_event::Event::StdinClosed(
+                    protocol::v1::ExecutionStdinClosed {},
+                )),
+            }),
+            ExecutionEvent::StdinClosed,
+        );
+    }
+
     #[tokio::test]
     async fn foreground_controls_follow_the_started_event_before_sending_input_or_resize() {
         let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
@@ -1102,7 +1250,7 @@ mod tests {
             state: Arc::new(ExecutionControlState {
                 reference: "dev".to_string(),
                 requests: Mutex::new(Some(requests)),
-                input_open: AtomicBool::new(true),
+                input_open: watch::channel(true).0,
                 started: AtomicBool::new(false),
                 input_order: AsyncMutex::new(()),
                 request_closed: watch::channel(false).0,
@@ -1148,7 +1296,7 @@ mod tests {
             state: Arc::new(ExecutionControlState {
                 reference: "dev".to_string(),
                 requests: Mutex::new(Some(pending_requests)),
-                input_open: AtomicBool::new(true),
+                input_open: watch::channel(true).0,
                 started: AtomicBool::new(false),
                 input_order: AsyncMutex::new(()),
                 request_closed: watch::channel(false).0,
@@ -1167,7 +1315,7 @@ mod tests {
             state: Arc::new(ExecutionControlState {
                 reference: "dev".to_string(),
                 requests: Mutex::new(Some(running_requests)),
-                input_open: AtomicBool::new(true),
+                input_open: watch::channel(true).0,
                 started: AtomicBool::new(true),
                 input_order: AsyncMutex::new(()),
                 request_closed: watch::channel(false).0,
@@ -1192,7 +1340,7 @@ mod tests {
             state: Arc::new(ExecutionControlState {
                 reference: "dev".to_string(),
                 requests: Mutex::new(Some(requests)),
-                input_open: AtomicBool::new(true),
+                input_open: watch::channel(true).0,
                 started: AtomicBool::new(true),
                 input_order: AsyncMutex::new(()),
                 request_closed: watch::channel(false).0,
@@ -1226,7 +1374,7 @@ mod tests {
             state: Arc::new(ExecutionControlState {
                 reference: "dev".to_string(),
                 requests: Mutex::new(Some(requests)),
-                input_open: AtomicBool::new(false),
+                input_open: watch::channel(false).0,
                 started: AtomicBool::new(true),
                 input_order: AsyncMutex::new(()),
                 request_closed: watch::channel(false).0,
@@ -1244,7 +1392,7 @@ mod tests {
             state: Arc::new(ExecutionControlState {
                 reference: "dev".to_string(),
                 requests: Mutex::new(Some(requests)),
-                input_open: AtomicBool::new(true),
+                input_open: watch::channel(true).0,
                 started: AtomicBool::new(true),
                 input_order: AsyncMutex::new(()),
                 request_closed: watch::channel(false).0,
@@ -1276,7 +1424,7 @@ mod tests {
             state: Arc::new(ExecutionControlState {
                 reference: "dev".to_string(),
                 requests: Mutex::new(Some(requests)),
-                input_open: AtomicBool::new(true),
+                input_open: watch::channel(true).0,
                 started: AtomicBool::new(true),
                 input_order: AsyncMutex::new(()),
                 request_closed: watch::channel(false).0,
@@ -1305,7 +1453,7 @@ mod tests {
             state: Arc::new(ExecutionControlState {
                 reference: "regression".into(),
                 requests: Mutex::new(Some(requests)),
-                input_open: AtomicBool::new(true),
+                input_open: watch::channel(true).0,
                 started: AtomicBool::new(true),
                 input_order: AsyncMutex::new(()),
                 request_closed: watch::channel(false).0,
@@ -1363,7 +1511,10 @@ mod tests {
             let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
             let sender = tokio::spawn({
                 let input = input.clone();
-                async move { super::send_initial_stdin(&requests, "preload", input, true).await }
+                async move {
+                    crate::machine::session::send_initial_stdin(&requests, "preload", input, true)
+                        .await
+                }
             });
             let mut received = Vec::new();
             let mut eof = 0;
@@ -1395,9 +1546,10 @@ mod tests {
             async move { stdin.write(vec![9]).await }
         });
         tokio::task::yield_now().await;
-        drop(super::ExecutionSession {
+        drop(crate::machine::session::ExecutionSession {
             control: control.clone(),
             events: None,
+            initial_stdin: None,
         });
         assert!(pending.await.unwrap().is_err());
         assert!(stdin.write(Vec::new()).await.is_err());
@@ -1422,5 +1574,65 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         control.signal(15).await.unwrap();
         assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn guest_stdin_closure_wakes_blocked_writer_without_closing_controls() {
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+        let control = live_control(requests);
+        control.write_stdin(vec![1]).await.unwrap();
+        let sending = tokio::spawn({
+            let control = control.clone();
+            async move { control.write_stdin(vec![2; protocol::CHUNK_64_KIB]).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!sending.is_finished());
+        control.state.input_open.send_replace(false);
+        assert!(tokio::time::timeout(Duration::from_secs(1), sending)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(control.stdin().is_none());
+        receiver.recv().await.unwrap();
+        control.signal(15).await.unwrap();
+        assert!(matches!(
+            receiver.recv().await.unwrap().message,
+            Some(ExecuteMessage::SignalProcess(_))
+        ));
+        assert!(!*control.state.request_closed.borrow());
+    }
+
+    #[tokio::test]
+    async fn session_drop_cancels_a_backpressured_initial_stdin_producer() {
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+        let control = live_control(requests.clone());
+        let producer = crate::machine::session::spawn_initial_stdin(
+            requests,
+            "preload".to_string(),
+            vec![3; 3 * protocol::CHUNK_64_KIB],
+            true,
+            control.state.request_closed.subscribe(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while receiver.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!producer.is_finished());
+        drop(crate::machine::session::ExecutionSession {
+            control,
+            events: None,
+            initial_stdin: Some(producer),
+        });
+        assert!(receiver.recv().await.is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -6,6 +6,7 @@
 
 use crate::ext4::constants::*;
 use crate::ext4::error::FormatError;
+use std::borrow::Cow;
 
 // ---------------------------------------------------------------------------
 // Prefix table
@@ -13,14 +14,14 @@ use crate::ext4::error::FormatError;
 
 /// Known xattr name prefixes.  The index is stored on disk; the prefix string
 /// is stripped from (or prepended to) the attribute name.
-const XATTR_PREFIXES: &[(u8, &str)] = &[
-    (1, "user."),
-    (2, "system.posix_acl_access"),
-    (3, "system.posix_acl_default"),
-    (4, "trusted."),
-    (6, "security."),
-    (7, "system."),
-    (8, "system.richacl"),
+const XATTR_PREFIXES: &[(u8, &[u8])] = &[
+    (1, b"user."),
+    (2, b"system.posix_acl_access"),
+    (3, b"system.posix_acl_default"),
+    (4, b"trusted."),
+    (6, b"security."),
+    (7, b"system."),
+    (8, b"system.richacl"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -40,55 +41,60 @@ fn align_up(n: usize, align: usize) -> usize {
 /// A single extended attribute, with the name already compressed (prefix
 /// stripped) for on-disk storage.
 #[derive(Debug, Clone)]
-pub struct ExtendedAttribute {
-    /// The name with its prefix stripped (the "suffix").
-    pub name: String,
-    /// Prefix index (see `XATTR_PREFIXES`).
+pub(crate) struct ExtendedAttribute<'a> {
+    /// Raw suffix, borrowed from the caller's full Linux attribute name.
+    pub name: &'a [u8],
     pub index: u8,
-    /// Raw attribute value.
-    pub value: Vec<u8>,
+    /// Opaque values borrow caller storage; ACL transcoding owns its disk value.
+    pub value: Cow<'a, [u8]>,
 }
 
-impl ExtendedAttribute {
+impl<'a> ExtendedAttribute<'a> {
     /// Create from a full attribute name (e.g. "user.mime_type") and value.
     /// The name is automatically compressed by finding the longest matching
     /// prefix.
-    pub fn new(full_name: &str, value: Vec<u8>) -> Self {
+    pub fn new<N: AsRef<[u8]> + ?Sized>(full_name: &'a N, value: impl Into<Cow<'a, [u8]>>) -> Self {
         let (index, suffix) = Self::compress_name(full_name);
         Self {
             name: suffix,
             index,
-            value,
+            value: value.into(),
         }
     }
 
     /// Compress an attribute name by finding the longest matching prefix.
     /// Returns `(prefix_index, suffix)`.  If no prefix matches, index 0 is
     /// returned and the full name is kept.
-    pub fn compress_name(name: &str) -> (u8, String) {
+    pub fn compress_name<N: AsRef<[u8]> + ?Sized>(name: &N) -> (u8, &[u8]) {
+        let name = name.as_ref();
         let mut best_index = 0u8;
         let mut best_prefix_len = 0usize;
 
         for &(idx, prefix) in XATTR_PREFIXES {
-            if name.starts_with(prefix) && prefix.len() > best_prefix_len {
+            if name.starts_with(prefix)
+                && prefix.len() > best_prefix_len
+                && (!matches!(idx, 2 | 3 | 8) || name.len() == prefix.len())
+            {
                 best_index = idx;
                 best_prefix_len = prefix.len();
             }
         }
 
         let suffix = &name[best_prefix_len..];
-        (best_index, suffix.to_string())
+        (best_index, suffix)
     }
 
     /// Reconstruct the full attribute name from a prefix index and suffix.
-    pub fn decompress_name(index: u8, suffix: &str) -> String {
-        for &(idx, prefix) in XATTR_PREFIXES {
-            if idx == index {
-                return format!("{}{}", prefix, suffix);
-            }
-        }
-        // Unknown index -- return the suffix as-is.
-        suffix.to_string()
+    pub fn decompress_name(index: u8, suffix: impl AsRef<[u8]>) -> Vec<u8> {
+        let suffix = suffix.as_ref();
+        let prefix = XATTR_PREFIXES
+            .iter()
+            .find_map(|(idx, prefix)| (*idx == index).then_some(*prefix))
+            .unwrap_or_default();
+        let mut name = Vec::with_capacity(prefix.len() + suffix.len());
+        name.extend_from_slice(prefix);
+        name.extend_from_slice(suffix);
+        name
     }
 
     /// On-disk size of the entry header + name (aligned to 4 bytes).
@@ -115,7 +121,7 @@ impl ExtendedAttribute {
     pub fn hash(&self) -> u32 {
         // Hash the name.
         let mut h = 0u32;
-        for &b in self.name.as_bytes() {
+        for &b in self.name {
             h = (h << NAME_HASH_SHIFT) ^ (h >> (8 * 4 - NAME_HASH_SHIFT)) ^ (b as u32);
         }
 
@@ -155,15 +161,15 @@ const VALUE_HASH_SHIFT: u32 = 16;
 
 /// Tracks which extended attributes go inline (in the inode's extra space)
 /// versus in a separate xattr block.
-pub struct XattrState {
+pub(crate) struct XattrState<'a> {
     /// Capacity for inline xattrs (typically `INODE_EXTRA_SIZE` = 96).
     inode_capacity: u32,
     /// Capacity for block xattrs (one full filesystem block).
     block_capacity: u32,
     /// Attributes assigned to inline storage.
-    inline_attrs: Vec<ExtendedAttribute>,
+    inline_attrs: Vec<ExtendedAttribute<'a>>,
     /// Attributes assigned to block storage.
-    block_attrs: Vec<ExtendedAttribute>,
+    block_attrs: Vec<ExtendedAttribute<'a>>,
     /// Bytes consumed in the inline area (includes the 4-byte magic header).
     used_inline: u32,
     /// Bytes consumed in the block area (includes the 32-byte block header).
@@ -172,7 +178,7 @@ pub struct XattrState {
     inode_number: u32,
 }
 
-impl XattrState {
+impl<'a> XattrState<'a> {
     /// Create a new xattr state tracker for the given inode.
     pub fn new(inode: u32, inode_capacity: u32, block_capacity: u32) -> Self {
         Self {
@@ -188,12 +194,50 @@ impl XattrState {
         }
     }
 
+    pub(crate) fn from_linux(
+        inode: u32,
+        attrs: &'a [(&'a [u8], &'a [u8])],
+        inode_capacity: u32,
+        block_capacity: u32,
+    ) -> Result<Self, FormatError> {
+        let mut encoded = Vec::with_capacity(attrs.len());
+        for &(name, value) in attrs {
+            if name.is_empty() || name.len() > EXT4_NAME_LEN || name.contains(&0) {
+                return Err(FormatError::InvalidXattrName(name.to_vec()));
+            }
+            let value = if name == b"system.posix_acl_access" || name == b"system.posix_acl_default"
+            {
+                Cow::Owned(crate::ext4::acl::to_disk(value)?)
+            } else {
+                Cow::Borrowed(value)
+            };
+            encoded.push(ExtendedAttribute::new(name, value));
+        }
+        encoded.sort_by(|a, b| {
+            a.index
+                .cmp(&b.index)
+                .then_with(|| a.name.len().cmp(&b.name.len()))
+                .then_with(|| a.name.cmp(b.name))
+        });
+        if encoded
+            .windows(2)
+            .any(|pair| pair[0].index == pair[1].index && pair[0].name == pair[1].name)
+        {
+            return Err(FormatError::DuplicateXattr);
+        }
+        let mut state = Self::new(inode, inode_capacity, block_capacity);
+        for attr in encoded {
+            state.add(attr)?;
+        }
+        Ok(state)
+    }
+
     /// Add an attribute.  It is placed inline if there is room; otherwise it
     /// goes into the block area.  Returns an error if neither has enough space.
-    pub fn add(&mut self, attr: ExtendedAttribute) -> Result<(), FormatError> {
+    pub fn add(&mut self, attr: ExtendedAttribute<'a>) -> Result<(), FormatError> {
         if attr.name.len() > EXT4_NAME_LEN {
-            return Err(FormatError::InvalidName(
-                ExtendedAttribute::decompress_name(attr.index, &attr.name),
+            return Err(FormatError::InvalidXattrName(
+                ExtendedAttribute::decompress_name(attr.index, attr.name),
             ));
         }
 
@@ -259,7 +303,7 @@ impl XattrState {
             }
             write_xattr_entry(
                 &mut buf[entry_offset..],
-                &attr.name,
+                attr.name,
                 attr.index,
                 rel_value_offset as u16,
                 attr.value.len() as u32,
@@ -293,12 +337,12 @@ impl XattrState {
         // Bytes 12..32 are zero (already zeroed).
 
         // Sort attributes by (index, name_len, name) for deterministic output.
-        let mut sorted: Vec<&ExtendedAttribute> = self.block_attrs.iter().collect();
+        let mut sorted: Vec<&ExtendedAttribute<'_>> = self.block_attrs.iter().collect();
         sorted.sort_by(|a, b| {
             a.index
                 .cmp(&b.index)
                 .then_with(|| a.name.len().cmp(&b.name.len()))
-                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.name.cmp(b.name))
         });
 
         let mut entry_offset = XATTR_BLOCK_HEADER_SIZE as usize;
@@ -318,7 +362,7 @@ impl XattrState {
             }
             write_xattr_entry(
                 &mut buf[entry_offset..],
-                &attr.name,
+                attr.name,
                 attr.index,
                 rel_value_offset as u16,
                 attr.value.len() as u32,
@@ -337,13 +381,13 @@ impl XattrState {
 /// Write a single xattr entry (16-byte header + name + padding) into `buf`.
 fn write_xattr_entry(
     buf: &mut [u8],
-    name: &str,
+    name: &[u8],
     name_index: u8,
     value_offset: u16,
     value_size: u32,
     hash: u32,
 ) {
-    let name_bytes = name.as_bytes();
+    let name_bytes = name;
 
     // name_len (1 byte)
     buf[0] = name_bytes.len() as u8;
@@ -364,20 +408,21 @@ fn write_xattr_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ext4::constants::*;
+    use crate::ext4::xattr::*;
 
     #[test]
     fn test_compress_name_user_prefix() {
         let (idx, suffix) = ExtendedAttribute::compress_name("user.mime_type");
         assert_eq!(idx, 1);
-        assert_eq!(suffix, "mime_type");
+        assert_eq!(suffix, b"mime_type");
     }
 
     #[test]
     fn test_compress_name_security_prefix() {
         let (idx, suffix) = ExtendedAttribute::compress_name("security.selinux");
         assert_eq!(idx, 6);
-        assert_eq!(suffix, "selinux");
+        assert_eq!(suffix, b"selinux");
     }
 
     #[test]
@@ -386,39 +431,39 @@ mod tests {
         // longer than the generic "system." prefix (index 7).
         let (idx, suffix) = ExtendedAttribute::compress_name("system.posix_acl_access");
         assert_eq!(idx, 2);
-        assert_eq!(suffix, "");
+        assert_eq!(suffix, b"");
     }
 
     #[test]
     fn test_compress_name_system_generic() {
         let (idx, suffix) = ExtendedAttribute::compress_name("system.something");
         assert_eq!(idx, 7);
-        assert_eq!(suffix, "something");
+        assert_eq!(suffix, b"something");
     }
 
     #[test]
     fn test_compress_name_no_match() {
         let (idx, suffix) = ExtendedAttribute::compress_name("unknown.attr");
         assert_eq!(idx, 0);
-        assert_eq!(suffix, "unknown.attr");
+        assert_eq!(suffix, b"unknown.attr");
     }
 
     #[test]
     fn test_decompress_name() {
         assert_eq!(
             ExtendedAttribute::decompress_name(1, "mime_type"),
-            "user.mime_type"
+            b"user.mime_type"
         );
         assert_eq!(
             ExtendedAttribute::decompress_name(6, "selinux"),
-            "security.selinux"
+            b"security.selinux"
         );
         assert_eq!(
             ExtendedAttribute::decompress_name(2, ""),
-            "system.posix_acl_access"
+            b"system.posix_acl_access"
         );
         // Unknown index returns suffix as-is.
-        assert_eq!(ExtendedAttribute::decompress_name(99, "foo"), "foo");
+        assert_eq!(ExtendedAttribute::decompress_name(99, "foo"), b"foo");
     }
 
     #[test]
@@ -499,8 +544,12 @@ mod tests {
         ];
         for full_name in names {
             let (idx, suffix) = ExtendedAttribute::compress_name(full_name);
-            let reconstructed = ExtendedAttribute::decompress_name(idx, &suffix);
-            assert_eq!(reconstructed, full_name, "roundtrip failed for {full_name}");
+            let reconstructed = ExtendedAttribute::decompress_name(idx, suffix);
+            assert_eq!(
+                reconstructed,
+                full_name.as_bytes(),
+                "roundtrip failed for {full_name}"
+            );
         }
     }
 
@@ -648,6 +697,39 @@ mod tests {
             first_entry_index,
             second_entry_index,
         );
+    }
+
+    #[test]
+    fn linux_xattrs_are_raw_deterministic_and_do_not_invent_attributes() {
+        let large = vec![0x7f; 2750];
+        let attrs = [
+            (b"user.raw\xff".as_slice(), b"\0binary\xff".as_slice()),
+            (b"security.capability", b"\x01\0\0\x02\0\0\0\0"),
+            (b"user.large", large.as_slice()),
+        ];
+        let reverse: Vec<_> = attrs.iter().copied().rev().collect();
+        let first = XattrState::from_linux(12, &attrs, 96, 4096).unwrap();
+        let second = XattrState::from_linux(12, &reverse, 96, 4096).unwrap();
+        assert_eq!(
+            first.write_inline().unwrap(),
+            second.write_inline().unwrap()
+        );
+        assert_eq!(first.write_block().unwrap(), second.write_block().unwrap());
+        assert_eq!(
+            first.inline_attrs.len() + first.block_attrs.len(),
+            attrs.len()
+        );
+        assert!(
+            first
+                .inline_attrs
+                .iter()
+                .chain(first.block_attrs.iter())
+                .any(|attr| attr.name == b"raw\xff" && attr.value.as_ref() == b"\0binary\xff")
+        );
+        assert!(
+            XattrState::from_linux(12, &[(b"user.a", b"1"), (b"user.a", b"2")], 96, 4096).is_err()
+        );
+        assert!(XattrState::from_linux(12, &[(b"user.\0", b"value")], 96, 4096).is_err());
     }
 
     /// Helper matching the crate-private `align_up` for test assertions.

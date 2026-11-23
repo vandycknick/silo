@@ -52,8 +52,8 @@ fn actual_provider_get_projects_and_denies_entire_request_before_io() {
     let file = dir.path().join("custom.json");
     let before=serde_json::to_vec(&serde_json::json!({key:{"type":"oauth","access_token":"selected-access","refresh_token":"private-refresh","expires_at":"2099-01-01T00:00:00Z"}})).unwrap();
     std::fs::write(&file, &before).unwrap();
-    let grant = serde_json::json!({"version":2,"store":format!("file:{}",file.display()),"machine":id,"run":"run","issued_at":"2026-09-30T00:00:00Z","allowed":[{"slot":"personal.oauth.access_token","key":key,"field":"OAuthAccessToken","backing_scope":"Home"},{"slot":"personal.oauth.expires_at","key":key,"field":"OAuthExpiresAt","backing_scope":"Home"}]});
-    let request = serde_json::json!({"version":2,"operation":"get","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"scope":{"machine":id,"run":"run"},"names":["personal.oauth.access_token","personal.oauth.expires_at"],"reason":"expired"});
+    let grant = serde_json::json!({"version":1,"store":format!("file:{}",file.display()),"machine":id,"run":"run","issued_at":"2026-09-30T00:00:00Z","allowed":[{"slot":"personal.oauth.access_token","key":key,"field":"OAuthAccessToken","backing_scope":"Home"},{"slot":"personal.oauth.expires_at","key":key,"field":"OAuthExpiresAt","backing_scope":"Home"}]});
+    let request = serde_json::json!({"version":1,"operation":"get","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"scope":{"machine":id,"run":"run"},"names":["personal.oauth.access_token","personal.oauth.expires_at"],"reason":"expired"});
     let (response, wire) = provider_get(&file, &request);
     assert_eq!(response["status"], "ok");
     assert_eq!(response["secrets"].as_array().unwrap().len(), 2);
@@ -252,9 +252,9 @@ fn provider_grants_and_arbitrary_store_file_are_preserved() {
         (path.clone(), true, "double", "unauthorized"),
         (path.clone(), true, "version", "unauthorized"),
     ] {
-        let grant = serde_json::json!({"version":if encoding == "version" {1} else {2},"store":format!("file:{}",grant_path.display()),"machine":"0123456789abcdef0123456789abcdef","run":"run","issued_at":"2026-09-30T00:00:00Z","allowed":if allowed { vec![serde_json::json!({"slot":"personal.oauth.access_token","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccessToken","backing_scope":"Home"})] } else { vec![] }});
+        let grant = serde_json::json!({"version":if encoding == "version" {2} else {1},"store":format!("file:{}",grant_path.display()),"machine":"0123456789abcdef0123456789abcdef","run":"run","issued_at":"2026-09-30T00:00:00Z","allowed":if allowed { vec![serde_json::json!({"slot":"personal.oauth.access_token","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccessToken","backing_scope":"Home"})] } else { vec![] }});
         let encoded = STANDARD.encode(serde_json::to_vec(&grant).unwrap());
-        let mut request = serde_json::json!({"version":2,"operation":"get","grant":"","scope":{"machine":"0123456789abcdef0123456789abcdef","run":"run"},"names":["personal.oauth.access_token"],"reason":"expired"});
+        let mut request = serde_json::json!({"version":1,"operation":"get","grant":"","scope":{"machine":"0123456789abcdef0123456789abcdef","run":"run"},"names":["personal.oauth.access_token"],"reason":"expired"});
         if encoding != "missing" {
             request["grant"] = Value::String(match encoding {
                 "malformed" => "%%%".to_string(),
@@ -290,7 +290,7 @@ fn provider_grants_and_arbitrary_store_file_are_preserved() {
         let (header, body) = frame.split_once("\r\n\r\n").unwrap();
         assert_eq!(header, format!("Content-Length: {}", body.len()));
         let response: Value = serde_json::from_str(body).unwrap();
-        assert_eq!(response["version"], 2);
+        assert_eq!(response["version"], 1);
         assert_eq!(response["status"], "error");
         assert_eq!(response["error"]["code"], code);
         assert!(!frame.contains("private-token"));
@@ -351,8 +351,8 @@ fn actual_provider_reads_exact_granted_scope_without_home_fallback() {
         std::fs::write(&machine_file, serde_json::to_vec(&records).unwrap()).unwrap();
         let before_home = std::fs::read(&home_file).unwrap();
         let before_machine = std::fs::read(&machine_file).unwrap();
-        let grant = serde_json::json!({"version":2,"store":format!("file:{}",home_file.display()),"machine":machine,"run":run_id,"issued_at":"2026-09-30T00:00:00Z","allowed":[{"slot":"personal.oauth.access_token","key":key,"field":"OAuthAccessToken","backing_scope":{"Machine":{"id":id}}}]});
-        let request = serde_json::json!({"version":2,"operation":"get","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"scope":{"machine":id,"run":"run"},"names":["personal.oauth.access_token"],"reason":"expired"});
+        let grant = serde_json::json!({"version":1,"store":format!("file:{}",home_file.display()),"machine":machine,"run":run_id,"issued_at":"2026-09-30T00:00:00Z","allowed":[{"slot":"personal.oauth.access_token","key":key,"field":"OAuthAccessToken","backing_scope":{"Machine":{"id":id}}}]});
+        let request = serde_json::json!({"version":1,"operation":"get","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"scope":{"machine":id,"run":"run"},"names":["personal.oauth.access_token"],"reason":"expired"});
         let request = serde_json::to_vec(&request).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_silo"))
             .env_clear()
@@ -403,8 +403,8 @@ fn scoped_provider_waits_for_selected_scope_transaction_and_rereads() {
     std::fs::create_dir_all(machine_file.parent().unwrap()).unwrap();
     std::fs::write(&machine_file, br#"{"openai_codex_oauth.personal.oauth":{"type":"oauth","access_token":"access","refresh_token":"","expires_at":"2026-09-30T00:00:00Z"}}"#).unwrap();
     let mut transaction = store.begin_transaction(&scope).unwrap();
-    let grant = serde_json::json!({"version":2,"store":format!("file:{}",store.path().display()),"machine":id,"run":"run","issued_at":"2026-09-30T00:00:00Z","allowed":[{"slot":"personal.oauth.access_token","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccessToken","backing_scope":scope}]});
-    let request = serde_json::to_vec(&serde_json::json!({"version":2,"operation":"get","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"scope":{"machine":id,"run":"run"},"names":["personal.oauth.access_token"],"reason":"expired"})).unwrap();
+    let grant = serde_json::json!({"version":1,"store":format!("file:{}",store.path().display()),"machine":id,"run":"run","issued_at":"2026-09-30T00:00:00Z","allowed":[{"slot":"personal.oauth.access_token","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccessToken","backing_scope":scope}]});
+    let request = serde_json::to_vec(&serde_json::json!({"version":1,"operation":"get","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"scope":{"machine":id,"run":"run"},"names":["personal.oauth.access_token"],"reason":"expired"})).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_silo"))
         .env_clear()
         .args(["secret", "provide", "--store-file"])

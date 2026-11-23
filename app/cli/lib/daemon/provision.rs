@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use eyre::{bail, Context as _};
-use libvm::{ImagePullPolicy, MachineData, MachineStatus, Memory};
+use libvm::{MachineData, Memory, PullPolicy};
 use uuid::Uuid;
 
 use crate::daemon::record::DaemonRecord;
 use crate::daemon::runtime::SystemRuntime;
-use crate::daemon::storage::{ensure_data_image, validate_data_image};
+use crate::daemon::storage::{ensure_data_image, validate_data_image_identity};
 use crate::daemon::system_config::{DesiredSystem, ResolvedSystemConfig};
 use silod_spec::paths::DaemonPaths;
 
@@ -29,7 +29,7 @@ pub(crate) async fn ensure_system_machine(
         None => {
             runtime.ensure_name_available(SYSTEM_MACHINE_NAME).await?;
             let image = runtime
-                .resolve_image(&desired.image, ImagePullPolicy::IfMissing)
+                .resolve_image(&desired.image, PullPolicy::IfMissing)
                 .await
                 .context("could not fetch the system image")?;
             installation.configured_image = desired.image.clone();
@@ -73,17 +73,20 @@ pub(crate) fn prepare_installation(
         }
     };
 
-    let prepare_data = if installation.machine_id.is_some() {
-        validate_data_image
+    if installation.machine_id.is_some() {
+        validate_data_image_identity(
+            &paths.data_image(),
+            installation.data_size_bytes,
+            installation.data_uuid,
+        )?;
     } else {
-        ensure_data_image
-    };
-    prepare_data(
-        &paths.data_image(),
-        installation.data_size_bytes,
-        installation.installation_id,
-        installation.data_uuid,
-    )?;
+        ensure_data_image(
+            &paths.data_image(),
+            installation.data_size_bytes,
+            installation.installation_id,
+            installation.data_uuid,
+        )?;
+    }
 
     Ok(installation)
 }
@@ -196,12 +199,7 @@ pub(crate) async fn find_system_machine(
 }
 
 pub(crate) fn is_live(machine: &MachineData) -> bool {
-    matches!(
-        machine.status,
-        MachineStatus::Running { .. }
-            | MachineStatus::Starting { .. }
-            | MachineStatus::Stopping { .. }
-    )
+    machine.status.is_active() || machine.run_id.is_some()
 }
 
 /// Whether libvm labels mark `machine` as belonging to this installation.
@@ -240,6 +238,18 @@ pub(crate) fn validate_installation(
     Ok(())
 }
 
+fn installation_data_disk(disks: &[vm_spec::Disk]) -> Option<&vm_spec::Disk> {
+    let mut attached = disks
+        .iter()
+        .filter(|disk| disk.role == vm_spec::DiskRole::Data);
+    let disk = attached.next()?;
+    if attached.next().is_some() {
+        None
+    } else {
+        Some(disk)
+    }
+}
+
 pub(crate) fn validate_machine(
     machine: &MachineData,
     record: &DaemonRecord,
@@ -259,15 +269,9 @@ pub(crate) fn validate_machine(
         .as_ref()
         .map(|storage| storage.disks.as_slice())
         .unwrap_or_default();
-    // The machine's own root disk is recorded as a relative path inside its data
-    // directory; every other attachment must be the installation data image.
-    let attached: Vec<_> = disks
-        .iter()
-        .filter(|disk| disk.path.is_absolute())
-        .collect();
-    let valid_attachment = match attached.as_slice() {
-        [disk] => attachment_matches_data_image(&disk.path, disk.read_only, data_image)?,
-        _ => false,
+    let valid_attachment = match installation_data_disk(disks) {
+        Some(disk) => attachment_matches_data_image(&disk.path, disk.read_only, data_image)?,
+        None => false,
     };
     if !valid_attachment {
         bail!(
@@ -302,6 +306,47 @@ mod tests {
         validate_installation, SystemHardware,
     };
     use crate::daemon::record::tests::fixture;
+
+    #[test]
+    fn installation_data_discovery_uses_role_not_position_or_absolute_path() {
+        let disk = |role, path: &str, id: &str| vm_spec::Disk {
+            path: path.into(),
+            role,
+            format: if role == vm_spec::DiskRole::RootLower {
+                vm_spec::DiskFormat::Vmdk
+            } else {
+                vm_spec::DiskFormat::Raw
+            },
+            geometry: vm_spec::DiskGeometry {
+                length: 64 * 1024 * 1024,
+                logical_sector_size: 512,
+            },
+            block_id: vm_spec::BlockId::new(id).expect("test serial"),
+            read_only: role == vm_spec::DiskRole::RootLower,
+        };
+        let mut disks = vec![
+            disk(
+                vm_spec::DiskRole::RootLower,
+                "/absolute/lower.vmdk",
+                "silo-root-lower",
+            ),
+            disk(
+                vm_spec::DiskRole::RootUpper,
+                "/absolute/upper.raw",
+                "silo-root-upper",
+            ),
+            disk(vm_spec::DiskRole::Data, "relative-data.raw", "silo-data-0"),
+        ];
+        assert_eq!(
+            crate::daemon::provision::installation_data_disk(&disks)
+                .expect("data role")
+                .path,
+            std::path::Path::new("relative-data.raw")
+        );
+        assert!(crate::daemon::provision::installation_data_disk(&disks[..2]).is_none());
+        disks.push(disk(vm_spec::DiskRole::Data, "/another.raw", "silo-data-1"));
+        assert!(crate::daemon::provision::installation_data_disk(&disks).is_none());
+    }
 
     #[test]
     fn persisted_data_share_and_endpoint_changes_fail_closed() {
@@ -344,6 +389,47 @@ mod tests {
             inode,
             std::fs::metadata(paths.data_image()).expect("disk").ino()
         );
+    }
+
+    #[test]
+    fn provisioned_installation_accepts_mounted_data_without_reading_its_namespace() {
+        use std::os::unix::fs::FileExt as _;
+
+        use disk_image::ext4::constants::{incompat, SUPERBLOCK_OFFSET};
+        use disk_image::ext4::types::SUPERBLOCK_SIZE;
+        use disk_image::ext4::{read_superblock, ReadError, Reader};
+
+        let temp = tempfile::tempdir().expect("temp");
+        let (paths, state) = fixture(temp.path());
+        state.save(&paths).expect("initial identity");
+        let mut state = prepare_installation(&paths, &state.config).expect("fresh storage");
+        state.machine_id = Some("running-vm".to_string());
+        state.save(&paths).expect("record VM before activation");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.data_image())
+            .expect("data image");
+        let mut superblock = read_superblock(&file).expect("superblock");
+        superblock.feature_incompat |= incompat::RECOVER;
+        let mut before = [0; SUPERBLOCK_SIZE];
+        superblock.write_to(&mut before);
+        file.write_all_at(&before, SUPERBLOCK_OFFSET)
+            .expect("mounted state");
+
+        for _ in 0..2 {
+            let resumed = prepare_installation(&paths, &state.config)
+                .expect("activation retry or daemon adoption must use only attachment identity");
+            assert_eq!(resumed, state);
+            assert!(matches!(
+                Reader::new(&paths.data_image()),
+                Err(ReadError::RequiresRecovery(_))
+            ));
+        }
+        let mut after = [0; SUPERBLOCK_SIZE];
+        file.read_exact_at(&mut after, SUPERBLOCK_OFFSET)
+            .expect("unchanged");
+        assert_eq!(after, before);
     }
 
     #[test]

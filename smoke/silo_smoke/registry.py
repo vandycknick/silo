@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+import fcntl
 import http.server
 import re
 import shutil
@@ -14,11 +17,19 @@ from urllib.parse import urlsplit
 from .images import OciImage
 
 
-_CA_LOCK = threading.Lock()
-
 
 def ca_cert_path(cache_dir: Path) -> Path:
     return cache_dir / "registry-ca" / "ca.pem"
+
+
+@contextmanager
+def _ca_lock(cache_dir: Path) -> Iterator[None]:
+    directory = ca_cert_path(cache_dir).parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Separate pytest processes share the CA and OpenSSL's mutable serial file.
+    with (directory / "ca.lock").open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
 
 
 def _openssl(*args: str) -> None:
@@ -28,10 +39,9 @@ def _openssl(*args: str) -> None:
 def ensure_ca(cache_dir: Path) -> tuple[Path, Path]:
     cert = ca_cert_path(cache_dir)
     key = cert.with_name("ca.key")
-    with _CA_LOCK:
+    with _ca_lock(cache_dir):
         if cert.is_file() and key.is_file():
             return cert, key
-        cert.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.TemporaryDirectory(dir=cert.parent) as temporary:
             temporary_key = Path(temporary) / "ca.key"
             temporary_cert = Path(temporary) / "ca.pem"
@@ -45,6 +55,27 @@ def ensure_ca(cache_dir: Path) -> tuple[Path, Path]:
     return cert, key
 
 
+def issue_leaf_certificate(cache_dir: Path, directory: Path) -> tuple[Path, Path]:
+    """Issue a loopback server certificate signed by the shared suite CA.
+
+    Returns `(certificate, key)` inside the caller-owned `directory`, so every
+    smoke workspace trusting the suite CA through `SSL_CERT_FILE` trusts it.
+    """
+    ca_path, ca_key = ensure_ca(cache_dir)
+    leaf = directory / "leaf.pem"
+    key = directory / "leaf.key"
+    csr = directory / "leaf.csr"
+    extensions = directory / "leaf.ext"
+    _openssl("ecparam", "-genkey", "-name", "prime256v1", "-out", str(key))
+    key.chmod(0o600)
+    _openssl("req", "-new", "-key", str(key), "-subj", "/CN=localhost", "-out", str(csr))
+    extensions.write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n")
+    with _ca_lock(cache_dir):
+        _openssl("x509", "-req", "-in", str(csr), "-CA", str(ca_path), "-CAkey", str(ca_key),
+                 "-CAcreateserial", "-days", "3650", "-extfile", str(extensions), "-out", str(leaf))
+    return leaf, key
+
+
 @dataclass(frozen=True)
 class _Publication:
     name: str
@@ -54,7 +85,7 @@ class _Publication:
 
 class LoopbackRegistry:
     def __init__(self, cache_dir: Path) -> None:
-        self.ca_path, ca_key = ensure_ca(cache_dir)
+        self.ca_path, _ = ensure_ca(cache_dir)
         self.host = "127.0.0.1"
         self.requests = 0
         self._publications: list[_Publication] = []
@@ -62,19 +93,9 @@ class LoopbackRegistry:
         self._thread: threading.Thread | None = None
         self._stopped = False
         self._leaf_dir = Path(tempfile.mkdtemp(prefix="silo-smoke-registry-"))
-        leaf = self._leaf_dir / "leaf.pem"
-        key = self._leaf_dir / "leaf.key"
-        csr = self._leaf_dir / "leaf.csr"
-        extensions = self._leaf_dir / "leaf.ext"
         self._server: http.server.ThreadingHTTPServer | None = None
         try:
-            _openssl("ecparam", "-genkey", "-name", "prime256v1", "-out", str(key))
-            key.chmod(0o600)
-            _openssl("req", "-new", "-key", str(key), "-subj", "/CN=localhost", "-out", str(csr))
-            extensions.write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n")
-            with _CA_LOCK:
-                _openssl("x509", "-req", "-in", str(csr), "-CA", str(self.ca_path), "-CAkey", str(ca_key),
-                         "-CAcreateserial", "-days", "3650", "-extfile", str(extensions), "-out", str(leaf))
+            leaf, key = issue_leaf_certificate(cache_dir, self._leaf_dir)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(leaf, key)
@@ -172,3 +193,26 @@ class LoopbackRegistry:
             self._publications = [entry for entry in self._publications if (entry.name, entry.tag) != (name, tag)]
             self._publications.append(_Publication(name, tag, image))
         return f"{self.host}:{self.port}/smoke/{name}:{tag}"
+
+    @contextmanager
+    def unpublished(self, reference: str) -> Iterator[None]:
+        """Temporarily make one exact source OCI publication unavailable.
+
+        The session registry and every other publication stay live. Restore the
+        fixture on every exit so source-free gates do not poison later tests.
+        """
+        with self._lock:
+            matches = [entry for entry in self._publications
+                       if reference == f"{self.host}:{self.port}/smoke/{entry.name}:{entry.tag}"]
+            if self._stopped or len(matches) != 1:
+                raise ValueError("source-free gate requires one exact live OCI publication")
+            removed = matches[0]
+            self._publications.remove(removed)
+        try:
+            yield
+        finally:
+            with self._lock:
+                if any((entry.name, entry.tag) == (removed.name, removed.tag)
+                       for entry in self._publications):
+                    raise RuntimeError("source OCI publication was replaced while unavailable")
+                self._publications.append(removed)

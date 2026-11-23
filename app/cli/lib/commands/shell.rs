@@ -1,7 +1,6 @@
 use clap::{Args, ValueEnum};
 use eyre::bail;
 
-use crate::api::streams as guest;
 use crate::context::Context;
 use crate::terminal;
 use crate::ui;
@@ -37,13 +36,13 @@ pub struct Cmd {
 
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let (_reference, machine) = context.machine(self.name.as_deref()).await?;
-        let inspect_data = machine.inspect().await?;
-
-        guest::ensure_running(&inspect_data)?;
-
+        let (_reference, machine) = context.observation_machine(self.name.as_deref()).await?;
         if self.attach == Some(AttachMode::Serial) {
             reject_serial_forward_agent(self.forward_agent)?;
+        }
+        let machine = machine.for_access().await?;
+
+        if self.attach == Some(AttachMode::Serial) {
             if self.user.is_some() {
                 ui::warn("--user is ignored for serial attach");
             }

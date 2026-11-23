@@ -91,9 +91,6 @@ impl Cmd {
                 let features = context
                     .config()?
                     .resolve_features(selection, existing_installation);
-                let mut arguments = context.config()?.daemon_overrides()?.to_args();
-                arguments.push(format!("--system-enabled={}", features.system).into());
-                arguments.push(format!("--tailscale-enabled={}", features.tailscale).into());
                 let socket = paths.docker_socket();
                 let live = service::status(&paths)?.is_some();
                 if features.system {
@@ -111,7 +108,6 @@ impl Cmd {
                         system_enabled: selected.system,
                         tailscale_enabled: selected.tailscale,
                         stop: false,
-                        host_shutdown: false,
                     })
                     .await;
                 }
@@ -132,16 +128,13 @@ impl Cmd {
                 let features =
                     persisted.resolve_features(Default::default(), existing_installation);
                 let identity = persisted.daemon_identity(features)?;
-                let status = service::up(
-                    &service,
-                    &identity,
-                    features.system,
-                    command.tailscale == Some(true),
-                    &mut spinner,
-                )
-                .await?;
+                service::up(&service, &identity, features.system, &mut spinner).await?;
                 spinner.finish_success("Started");
-                report_tailscale(&status);
+                if features.tailscale {
+                    if let Some(status) = service::status(&paths)? {
+                        report_lobby(&status);
+                    }
+                }
                 if features.system {
                     crate::daemon::docker::integrate(&socket, !command.no_switch_context)?;
                     crate::ui::hint(format!("Docker endpoint: unix://{}", socket.display()));
@@ -219,6 +212,10 @@ impl DaemonStatusView {
     }
 
     fn print_human(&self) -> eyre::Result<()> {
+        crate::ui::print_detail_rows(&self.human_rows())
+    }
+
+    fn human_rows(&self) -> Vec<(String, String)> {
         let mut rows: Vec<(String, String)> = Vec::new();
         rows.push(("Core".to_string(), self.state.to_string()));
         rows.push((
@@ -248,27 +245,6 @@ impl DaemonStatusView {
                 daemon.control_endpoint.display().to_string(),
             ));
             rows.push((
-                "Tailscale".to_string(),
-                component_state(daemon.tailscale.state).to_string(),
-            ));
-            rows.push((
-                "Tailscale shutdown protection".to_string(),
-                format!("{:?}", daemon.tailscale.shutdown_protection).to_lowercase(),
-            ));
-            rows.push((
-                "Tailscale restarts".to_string(),
-                daemon.tailscale.restart_count.to_string(),
-            ));
-            if let Some(url) = &daemon.tailscale.approval_url {
-                rows.push(("Tailscale login".to_string(), url.clone()));
-            }
-            if let Some(diagnostic) = &daemon.tailscale.diagnostic {
-                rows.push(("Tailscale diagnostic".to_string(), diagnostic.clone()));
-            }
-            if let Some(dns) = &daemon.tailscale.dns_name {
-                rows.push(("Tailscale DNS".to_string(), dns.clone()));
-            }
-            rows.push((
                 "System".to_string(),
                 daemon
                     .system
@@ -276,8 +252,49 @@ impl DaemonStatusView {
                     .map(|system| format!("{:?}", system.phase))
                     .unwrap_or_else(|| "disabled".into()),
             ));
+            rows.push((
+                "Lobby".to_string(),
+                daemon
+                    .lobby
+                    .as_ref()
+                    .map(|lobby| lobby.phase.to_string())
+                    .unwrap_or_else(|| "disabled".into()),
+            ));
+            if let Some(lobby) = &daemon.lobby {
+                if let Some(dns_name) = &lobby.dns_name {
+                    rows.push(("Lobby DNS".to_string(), dns_name.clone()));
+                }
+                if let Some(approval_url) = &lobby.approval_url {
+                    rows.push(("Lobby login".to_string(), approval_url.clone()));
+                }
+                if let Some(diagnostic) = &lobby.diagnostic {
+                    rows.push(("Lobby diagnostic".to_string(), diagnostic.clone()));
+                }
+                rows.push((
+                    "Lobby restarts".to_string(),
+                    lobby.restart_count.to_string(),
+                ));
+            }
             if let Some(error) = &daemon.last_error {
                 rows.push(("Core error".to_string(), error.clone()));
+            }
+            if let Some(live) = &daemon.manager_live {
+                crate::commands::system::append_live_rows(
+                    &mut rows,
+                    "Manager prospective host",
+                    live.backend,
+                    live.lane,
+                    &live.live,
+                );
+            }
+            if let Some(live) = &daemon.appliance_live {
+                crate::commands::system::append_live_rows(
+                    &mut rows,
+                    "Appliance prospective host",
+                    live.backend,
+                    live.lane,
+                    &live.live,
+                );
             }
         }
         if let Some(status) = self
@@ -285,6 +302,15 @@ impl DaemonStatusView {
             .as_ref()
             .and_then(|daemon| daemon.system.as_ref())
         {
+            if let Some(live) = &status.live {
+                crate::commands::system::append_live_rows(
+                    &mut rows,
+                    "Appliance machine run",
+                    live.backend,
+                    live.lane,
+                    &live.live,
+                );
+            }
             if let Some(machine_id) = &status.machine_id {
                 rows.push(("Machine".to_string(), machine_id.clone()));
             }
@@ -319,12 +345,7 @@ impl DaemonStatusView {
                 ));
                 rows.push((
                     "Host memory reclaim".to_string(),
-                    format_host_memory_reclaim(
-                        status.host_memory_reclaim_requested,
-                        status.host_memory_reclaim_effective,
-                        status.host_memory_reclaim_qualification.as_deref(),
-                        status.host_memory_reclaim_released_bytes,
-                    ),
+                    format_host_memory_reclaim(status),
                 ));
             }
             if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&status.updated_at) {
@@ -344,7 +365,17 @@ impl DaemonStatusView {
                 rows.push(("Error".to_string(), error.clone()));
             }
         }
-        crate::ui::print_detail_rows(&rows)
+        rows
+    }
+}
+
+/// Show the lobby's current phase and any approval action after starting the daemon.
+pub(crate) fn report_lobby(status: &DaemonStatus) {
+    if let Some(lobby) = &status.lobby {
+        crate::ui::hint(format!("Lobby: {}", lobby.phase));
+        if let Some(approval_url) = &lobby.approval_url {
+            crate::ui::hint(format!("Lobby login: {approval_url}"));
+        }
     }
 }
 
@@ -364,33 +395,6 @@ fn format_update_check(status: &SystemStatus) -> String {
     match &status.update_error {
         Some(error) => format!("{checked}; {error}"),
         None => checked,
-    }
-}
-
-fn component_state(state: silod_spec::status::ComponentState) -> &'static str {
-    use silod_spec::status::ComponentState;
-    match state {
-        ComponentState::Disabled => "disabled",
-        ComponentState::Starting => "starting (lobby readiness not established)",
-        ComponentState::NeedsAuth => "needs authentication (lobby not ready)",
-        ComponentState::Ready => "ready",
-        ComponentState::Degraded => "degraded",
-        ComponentState::Failed => "failed",
-    }
-}
-
-fn report_tailscale(status: &DaemonStatus) {
-    if status.tailscale.enabled {
-        crate::ui::hint(format!(
-            "Tailscale: {}",
-            component_state(status.tailscale.state)
-        ));
-        if let Some(url) = &status.tailscale.approval_url {
-            crate::ui::hint(format!("Tailscale login: {url}"));
-        }
-        if let Some(diagnostic) = &status.tailscale.diagnostic {
-            crate::ui::hint(format!("Tailscale: {diagnostic}"));
-        }
     }
 }
 
@@ -427,27 +431,44 @@ fn format_guest_reclaim(
     format!("; last idle {mode} reclaim in the guest {outcome} {when}{reclaimed}")
 }
 
-fn format_host_memory_reclaim(
-    requested: bool,
-    effective: Option<bool>,
-    qualification: Option<&str>,
-    released_bytes: Option<u64>,
-) -> String {
-    let requested = if requested { "auto" } else { "off" };
-    let effective_text = match effective {
+fn format_host_memory_reclaim(status: &silod_spec::status::SystemStatus) -> String {
+    let requested = if status.host_memory_reclaim_requested {
+        "auto"
+    } else {
+        "off"
+    };
+    let effective_text = match status.host_memory_reclaim_effective {
         Some(true) => "on",
         Some(false) => "off",
         None => "unknown (not yet reported by the VM backend)",
     };
     let mut text = format!("requested {requested}; effective {effective_text}");
-    if let Some(qualification) = qualification {
+    if let Some(qualification) = &status.host_memory_reclaim_qualification {
         text.push_str(&format!(" (probe {qualification})"));
     }
-    if let (Some(_), Some(bytes)) = (effective, released_bytes) {
+    if let Some(backing) = &status.host_memory_reclaim_backing {
+        text.push_str(&format!("; backing {backing}"));
+    }
+    if let Some(reason) = &status.host_memory_reclaim_reason {
+        text.push_str(&format!("; reason {reason}"));
+    }
+    if let (Some(_), Some(bytes)) = (
+        status.host_memory_reclaim_effective,
+        status.host_memory_reclaim_released_bytes,
+    ) {
         text.push_str(&format!(
-            "; {} advised free since VM start",
+            "; {} released since VM start",
             crate::ui::human_bytes(Some(bytes))
         ));
+    }
+    if let Some(skips) = status
+        .host_memory_reclaim_mapping_limit_skips
+        .filter(|skips| *skips != 0)
+    {
+        text.push_str(&format!("; {skips} skipped at mapping limit"));
+    }
+    if let Some(islands) = status.host_memory_reclaim_replaced_islands {
+        text.push_str(&format!("; {islands} replaced islands"));
     }
     text
 }
@@ -481,9 +502,103 @@ async fn follow_logs(path: &std::path::Path) -> eyre::Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use crate::commands::daemon::{
-        format_actual_backend, format_host_memory_reclaim, format_update_check,
-    };
+    use crate::commands::daemon::{format_update_check, DaemonStatusView};
+    use silod_spec::status::{LobbyPhase, LobbyStatus};
+
+    fn status_view(lobby: Option<LobbyStatus>) -> DaemonStatusView {
+        let daemon = serde_json::from_value(serde_json::json!({
+            "schema": 1, "generation": "00000000-0000-4000-8000-000000000004",
+            "pid": 1, "process_start": "1", "core": "ready", "home": "/tmp/home",
+            "control_endpoint": "/tmp/control", "updated_at": "2026-11-11T00:00:00Z",
+            "last_error": null, "system": null, "lobby": lobby,
+            "configuration_identity": "test", "manager_live": null, "appliance_live": null,
+        }))
+        .unwrap();
+        DaemonStatusView {
+            state: "ready",
+            autostart: Some(true),
+            linger: None,
+            endpoint: None,
+            memory_bytes: None,
+            daemon: Some(daemon),
+        }
+    }
+
+    #[test]
+    fn lobby_status_rows_render_all_phases_and_details() {
+        for phase in [
+            LobbyPhase::Starting,
+            LobbyPhase::NeedsLogin,
+            LobbyPhase::NeedsTag,
+            LobbyPhase::Ready,
+            LobbyPhase::Degraded,
+            LobbyPhase::Failed,
+        ] {
+            let view = status_view(Some(LobbyStatus {
+                phase,
+                dns_name: Some("lobby.example.ts.net".into()),
+                approval_url: Some("https://login.tailscale.com/a/example".into()),
+                diagnostic: Some("waiting for approval".into()),
+                restart_count: 3,
+                updated_at: "2026-11-11T00:00:00Z".into(),
+            }));
+            let rows: Vec<_> = view
+                .human_rows()
+                .into_iter()
+                .filter(|(key, _)| key.starts_with("Lobby"))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    ("Lobby".into(), phase.to_string()),
+                    ("Lobby DNS".into(), "lobby.example.ts.net".into()),
+                    (
+                        "Lobby login".into(),
+                        "https://login.tailscale.com/a/example".into()
+                    ),
+                    ("Lobby diagnostic".into(), "waiting for approval".into()),
+                    ("Lobby restarts".into(), "3".into()),
+                ]
+            );
+            let json = serde_json::to_value(&view).unwrap();
+            assert_eq!(
+                json["daemon"]["lobby"],
+                serde_json::to_value(view.daemon.as_ref().unwrap().lobby.as_ref()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn lobby_status_rows_omit_unavailable_details_and_mark_disabled() {
+        let view = status_view(None);
+        let rows: Vec<_> = view
+            .human_rows()
+            .into_iter()
+            .filter(|(key, _)| key.starts_with("Lobby"))
+            .collect();
+        assert_eq!(rows, vec![("Lobby".into(), "disabled".into())]);
+        assert!(serde_json::to_value(&view).unwrap()["daemon"]["lobby"].is_null());
+        let view = status_view(Some(LobbyStatus {
+            phase: LobbyPhase::Starting,
+            dns_name: None,
+            approval_url: None,
+            diagnostic: None,
+            restart_count: 0,
+            updated_at: "2026-11-11T00:00:00Z".into(),
+        }));
+        let rows: Vec<_> = view
+            .human_rows()
+            .into_iter()
+            .filter(|(key, _)| key.starts_with("Lobby"))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Lobby".into(), "starting".into()),
+                ("Lobby restarts".into(), "0".into()),
+            ]
+        );
+    }
 
     #[test]
     fn feature_flags_distinguish_omitted_enabled_and_disabled() {
@@ -510,23 +625,6 @@ mod tests {
         assert_eq!(reversed.up.tailscale, Some(false));
         assert!(Options::try_parse_from(["up", "--foreground", "--linger"]).is_err());
         assert!(Options::try_parse_from(["up", "--system=invalid"]).is_err());
-    }
-
-    #[test]
-    fn pending_authentication_never_claims_lobby_readiness() {
-        use silod_spec::status::ComponentState;
-        assert!(
-            crate::commands::daemon::component_state(ComponentState::Starting)
-                .contains("not established")
-        );
-        assert!(
-            crate::commands::daemon::component_state(ComponentState::NeedsAuth)
-                .contains("lobby not ready")
-        );
-        assert_eq!(
-            crate::commands::daemon::component_state(ComponentState::Ready),
-            "ready"
-        );
     }
 
     #[test]
@@ -557,36 +655,13 @@ mod tests {
     }
 
     #[test]
-    fn status_wording_cases() {
-        use silod_spec::status::MemoryReclaimOutcome;
-
-        for (label, actual, expected) in [
-            ("off_off", format_host_memory_reclaim(false, Some(false), None, None), "requested off; effective off"),
-            ("off_on", format_host_memory_reclaim(false, Some(true), None, None), "requested off; effective on"),
-            ("off_unknown", format_host_memory_reclaim(false, None, None, None), "requested off; effective unknown (not yet reported by the VM backend)"),
-            ("auto_off", format_host_memory_reclaim(true, Some(false), None, None), "requested auto; effective off"),
-            ("auto_on", format_host_memory_reclaim(true, Some(true), None, None), "requested auto; effective on"),
-            ("auto_unknown", format_host_memory_reclaim(true, None, None, None), "requested auto; effective unknown (not yet reported by the VM backend)"),
-            ("passed_probe", format_host_memory_reclaim(true, Some(true), Some("passed"), Some(6 * 1024 * 1024)), "requested auto; effective on (probe passed); 6MiB advised free since VM start"),
-            ("failed_probe", format_host_memory_reclaim(true, Some(false), Some("failed"), Some(0)), "requested auto; effective off (probe failed); 0B advised free since VM start"),
-            ("unreported_counter", format_host_memory_reclaim(true, None, None, Some(10)), "requested auto; effective unknown (not yet reported by the VM backend)"),
-            ("partial_gradual", crate::commands::daemon::format_guest_reclaim(Some("gradual"), MemoryReclaimOutcome::Partial, Some(512 * 1024 * 1024), "2 minutes ago".to_string()), "; last idle gradual reclaim in the guest reclaimed partially 2 minutes ago, guest cache fell by 512MiB"),
-            ("failed_dropcache", crate::commands::daemon::format_guest_reclaim(Some("dropcache"), MemoryReclaimOutcome::Failed, Some(7), "just now".to_string()), "; last idle cache drop reclaim in the guest failed just now"),
-            ("nothing_default", crate::commands::daemon::format_guest_reclaim(None, MemoryReclaimOutcome::Nothing, Some(0), "just now".to_string()), "; last idle gradual reclaim in the guest found nothing reclaimable just now, guest cache fell by 0B"),
-            ("unknown_backend", format_actual_backend(None).to_string(), "unknown"),
-            ("krun_backend", format_actual_backend(Some("krun")).to_string(), "krun"),
-        ] {
-            assert_eq!(actual, expected, "{label}");
-        }
-    }
-
-    #[test]
     fn update_check_row_reports_errors_alongside_the_last_check() {
         let mut status: silod_spec::status::SystemStatus =
             serde_json::from_value(serde_json::json!({
                 "phase": "ready", "machine_id": null, "run_id": null,
                 "image_digest": null, "docker_socket": "/tmp/test.sock",
                 "updated_at": "2026-01-01T00:00:00Z", "last_error": null, "restart_count": 0,
+                "live": null, "prospective_live": null,
             }))
             .expect("status");
         assert_eq!(format_update_check(&status), "not checked yet");

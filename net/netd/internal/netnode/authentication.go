@@ -198,8 +198,8 @@ func (api authAPI) mint(ctx context.Context, secret string, tags []string) (stri
 	return result.Key, nil
 }
 
-// Expiry policy is node maintenance, not a taild job. Failures are retried and
-// exposed in status without preventing guest readiness or holding a VM lock.
+// Expiry policy is node maintenance. Failures are retried and exposed in status
+// without preventing guest readiness or holding a VM lock.
 func (n *Node) maintain(ctx context.Context, s *ipnstate.Status) {
 	if n.options.Identity == nil || !n.options.Identity.DisableKeyExpiry {
 		return

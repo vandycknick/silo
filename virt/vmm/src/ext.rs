@@ -12,14 +12,14 @@ impl VmSpecExt for VmSpec {
         self.hardware
             .as_ref()
             .and_then(|hardware| hardware.cpus)
-            .unwrap_or(1)
+            .unwrap_or(vm_spec::DEFAULT_CPUS)
     }
 
     fn memory_or_default(&self) -> u32 {
         self.hardware
             .as_ref()
             .and_then(|hardware| hardware.memory)
-            .unwrap_or(512)
+            .unwrap_or(vm_spec::DEFAULT_MEMORY_MIB)
     }
 
     fn nested_virtualization_or_default(&self) -> bool {

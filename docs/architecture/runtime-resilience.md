@@ -6,6 +6,16 @@ Opening libvm validates the installation and global storage. Missing/invalid
 runtime components, incompatible state databases, and database-wide I/O failures
 remain fatal. Opening the runtime does not reconcile every VM.
 
+The SQLite catalog uses WAL with `synchronous=NORMAL` (`fullfsync` and
+`checkpoint_fullfsync` remain enabled): every crash leaves it consistent and a
+process crash loses no committed transactions, but power loss or an OS crash
+may lose transactions since the previous WAL checkpoint. Avoiding a commit
+fsync is deliberate: ext4 `data=ordered` drains all dirty private-copy data on
+each journal commit. Snapshot publication and handoff receipt/ownership
+boundaries explicitly checkpoint before acknowledgment or replay; an incomplete
+checkpoint is an error, never a claim of power-loss durability. Destructive
+collection checkpoints retired roots and cleanup/eviction authority before unlink.
+
 `Runtime::inventory()` and `Runtime::inspect_inventory()` return indexed identity
 plus best-effort machine details. An individually undecodable configuration is an
 entry with `data: None` and configuration issues, not a failed fleet inventory.
@@ -36,11 +46,152 @@ make readiness unavailable without implying that the VM stopped.
 ```sh
 silo ls
 silo ls --format json
-silo show <VM>                  # alias: silo status <VM>
-silo show <VM> --format json
+silo info <VM>
+silo info <VM> --format json
+silo system info --format json
 silo logs <VM>
 silo logs <VM> --stream network
 ```
+
+`silo info` reports exact running-monitor live evidence (`scope: machine`),
+including its backend and lane. A stopped machine reports separately labelled
+prospective next-start host evidence, not a fabricated run report.
+`silo system info` reports prospective manager capabilities and, when enabled,
+the separately configured system appliance host capabilities. Each vector has
+`pause`, `capture`, `restore`, `fork`, and `incremental`, with `native` and
+tagged `supported`/`unsupported` availability and a closed reason code.
+The native implementation bit is diagnostic, not product admission.
+
+Host-capability discovery hashes the selected monitor executable in bounded
+chunks. The streaming buffer is heap-owned only while a cache-miss digest is
+computed; cached executable identities do not allocate it. The buffer is not
+embedded in the inspection and lifecycle futures that await capability evidence.
+
+The explicit execution-state command grammar is:
+
+```sh
+silo pause <VM>
+silo hibernate [<VM>]
+silo snapshot create <VM> --memory [--name <NAME>]
+          [--capture-policy full|incremental] [--dirty-crossover-percent 1..60]
+silo fork <VM> --live --name <CHILD> [--name <CHILD>...] [--preserve]
+          [--max-children <N>]
+          [--operation-id <UUID>]
+          [--capture-policy full|incremental] [--dirty-crossover-percent 1..60]
+silo fork <VM> --live --children-json '<JSON array>'
+silo fork --operation <UUID> [--cancel]
+silo restore <SNAPSHOT> [--name <CHILD>] [--pull always|missing|never]
+silo restore <SNAPSHOT> --without-memory --name <CHILD>
+```
+
+These endpoints refuse unsupported operations with typed capability errors.
+They never stop a machine, capture only its disks, or cold boot as a fallback.
+`snapshot create` on a running VM without `--memory` is refused ("VM is running:
+stop it first, or use --memory to include its memory"), and `--memory` on a
+stopped VM is refused. For VZ the ordinary alternative is to use `silo stop`,
+then the snapshot workflow without memory.
+
+Snapshot-with-memory and live fork requests default to incremental capture and a 60 percent
+dirty crossover. `--capture-policy full` forces full capture; the existing
+`incremental` value expresses the default preference without a new policy mode.
+Before reservation, libvm resolves that preference to full when the exact
+backend/host report does not admit incremental capture. Normal Capture/Fork
+admission still applies. Incremental captures reuse producer-computed clean-chunk
+identities and publish complete RAM maps, not a full-file RAM SHA-256. Cold
+durable restore and export authenticate RAM; warm durable restore can reuse an
+unchanged-inode receipt and local forks trust producer identities and owned inode
+facts. First owned reflink publication creates no warm receipt and does no RAM
+readback; replay, copy fallback and independent dedup still hash. Missing
+baselines, changed topology or epochs, uncertain coverage and the selected dirty
+threshold cause an explicitly reported full capture, never an incomplete delta
+chain. A booted VM's first default capture reports `no-baseline`; restored and
+forked children inherit their source snapshot as their first baseline.
+
+Execution portability refusal names the exact pin, expected and destination
+values, and `restore-preflight` stage before child allocation.
+`restore --without-memory` is a separate explicit operation: it authenticates
+storage and captured boot assets, makes private disks and a fresh stopped
+machine, and records an unknown stop outcome. It installs no RAM or execution
+state, and the disks may need journal recovery on boot. `silo start` cold-boots
+that recovered machine; restore never invokes recovery implicitly. On a snapshot
+without memory the flag changes nothing.
+
+A live fork is one durable operation: one capture of the source, one restored
+running child per `--name` (or `--children-json` entry of `name`,
+`activationHook` and `destination`). Children receive no host forwards or guest
+publication unless that entry's `destination` grants them. Sixteen is the
+default fan-out bound, never an implied child count; more children require an
+explicit `--max-children`. The CLI selects the operation UUID before submission
+unless `--operation-id` supplies it; repeating identical options replays that
+operation, while changed options conflict. Every accepted operation prints one
+complete JSON result naming each child with its reserved machine and run IDs,
+the capture and the independent source outcome. The exit status is zero only
+when the operation finished uncancelled with every child running and the source
+resumed (or preserved with `--preserve`); otherwise it is nonzero after the
+JSON is printed. A failed child never rolls back its siblings, and a nonzero
+status or an interrupted client never stops running children or cancels the
+operation. `silo fork --operation` observes the operation by ID even after its
+source is removed; `--cancel` records durable cancellation intent, so
+unsubmitted children never start and report `cancelled` after ownership cleanup,
+while submitted children settle normally. An exact cancelled pre-launch handoff
+is not a child failure; genuinely lost identities remain failures.
+
+Stopped-storage operations are separate mutations, never a live fallback:
+
+```sh
+silo fork <VM> --name <CHILD>
+silo snapshot create <VM> [--name <NAME>]
+silo snapshot inspect <NAME>
+silo snapshot list
+silo restore <NAME> --name <CHILD>
+silo snapshot rm <NAME|ID>
+silo image rm <NAME|ID>
+silo image prune
+```
+
+Fork supports admitted stopped opaque raw and development flat-overlay roots.
+Snapshots and stopped restoration support opaque raw only. Images and snapshots
+share one storage pool but have separate name tables. A name or a unique
+`sha256:HEX` id prefix of at least 3 characters resolves within the expected
+kind; a name of the other kind gets a hint naming the right command. `rm NAME`
+removes that name, and the record goes with its last name; `rm ID` removes the
+record and all its names. `image prune` removes images with no names that no
+machine uses. Machines and in-flight operations continue rooting shared bytes
+after a record is removed.
+
+Exact copies preserve credentials, guest keys, dirty journals and deleted-data
+remnants. They do not sanitize, repair or replay source storage, nor implicitly
+start or stop a machine. Managed writable disks are included by default.
+External resources default to refusal. `--external-requirements` explicitly
+omits them while recording required destination mappings. Snapshot creation
+accepts only default refusal or required declarations, never destination host
+paths. On fork and restore, `--map-disk ORDER=PATH` and `--map-share TAG=PATH`
+explicitly select absolute destination paths.
+Unresolved requirements block start, and shared external mappings do not imply
+self-contained or independently writable storage.
+
+Admission has two explicit intervals: read-only catalog lookup and monitor
+status observation may happen first; the actual operation consumes that exact
+run-bound observation and refuses before new operational locks, mutation
+permits, leases, budgets, workspace allocation, or lifecycle RPCs. Cold discovery
+does not initialize writable runtime state. A running monitor's backend takes
+precedence over the current prospective backend override.
+Live-refusal commands and `system info` can use an authenticated normal daemon
+whose core is stopping; ordinary management still requires a ready core.
+Stopped fork, snapshot creation, restore and image or snapshot removal require
+normal mutation readiness and drain admission, including when live refusal
+would be permitted. Read-only preflight rejects unsupported root, boot,
+resource or artifact kinds before writable initialization where possible;
+the library repeats authoritative checks under its runtime locks.
+Daemon capability reports and typed refusals are validated before encoding.
+Invalid outbound evidence is a protocol failure, never a substitute
+`unsupported` reason or a successful response.
+At durable-machine boundaries, compact stored machine IDs and canonical live
+machine IDs are matched by UUID value. Live reports and monitor outer identities
+retain their strict canonical representation; run and monitor fences remain exact.
+
+The replacement commands do not retain top-level `show`/`status` aliases.
+`silo daemon status` remains the separate daemon lifecycle/status command.
 
 Inventory/partial inspection succeeds with explicit issues. Missing requested
 VMs, global runtime failures, and failed mutations return nonzero. Use `-v` to
@@ -134,6 +285,13 @@ provide stream-style EOF. No watchdog, packet probe, or universal network-health
 policy is part of this design.
 
 ## Verification
+
+The storage-holder reconciliation test waits for a real child process to report
+userspace readiness before dropping the launch lease and asserting a free flock.
+This establishes that inherited close-on-exec descriptors have finished teardown;
+an exec-status notification alone is not the fixture's readiness boundary. The
+same live-holder fence is exercised with clean, missing, and malformed exit
+records, and the child is killed and reaped before terminal reconciliation.
 
 Focused process tests use the real netd binary and actual child processes. The
 real-host smoke tests require built/signed runtime components and disposable VMs:

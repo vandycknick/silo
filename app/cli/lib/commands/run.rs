@@ -18,7 +18,8 @@ use crate::commands::create::{
 };
 use crate::environment::EnvironmentOverride;
 use crate::planning::{Plan, PlanKind, ProcessOverrides, RunOptions, TtyCapabilities, TtyMode};
-use crate::ui::{self, watch_image_progress, OutputFormat, Spinner};
+use crate::pull_progress::watch_image_progress;
+use crate::ui::{self, OutputFormat, Spinner};
 
 const FAILED_READINESS_EXIT_WAIT: Duration = Duration::from_secs(2);
 const SHUTDOWN_PROGRESS_DELAY: Duration = Duration::from_secs(5);
@@ -37,7 +38,7 @@ const EXAMPLES: &[&str] = &[
     after_help = after_help()
 )]
 pub struct Cmd {
-    /// OCI registry reference or disk:PATH. Overrides the template image.
+    /// Image name, id, registry reference or disk:PATH. Overrides the template image.
     #[arg(value_name = "IMAGE")]
     image: Option<String>,
     /// Template providing VM defaults.
@@ -152,6 +153,7 @@ impl Cmd {
                 self.image.as_deref(),
                 &template.template,
                 self.pull.map(Pull::policies),
+                &machine.source,
             )
             .await
             .map_err(execution_infrastructure)?;
@@ -191,6 +193,7 @@ impl Cmd {
                     self.image.as_deref(),
                     &template.template,
                     self.pull.map(Pull::policies),
+                    &machine.source,
                     image_progress.clone(),
                 )
                 .await
@@ -293,15 +296,7 @@ impl Cmd {
             }
         };
         if readiness.outcome != MachineReadinessOutcome::Ready {
-            let error = if readiness.outcome == MachineReadinessOutcome::Terminal {
-                diagnose_backend_exit(&machine, start.run_id.clone(), plan.create.retention)
-                    .await
-                    .unwrap_or_else(|| {
-                        eyre::eyre!("guest readiness check ended with {:?}", readiness.outcome)
-                    })
-            } else {
-                eyre::eyre!("guest readiness check ended with {:?}", readiness.outcome)
-            };
+            let error = machine.readiness_failure(&readiness);
             let stop = stop_run(&machine, start.run_id, plan.create.retention, None).await;
             return Err(foreground_stop_failure(stop, error));
         }
@@ -508,8 +503,9 @@ async fn diagnose_backend_exit(
         "rerun with `--name` to retain the machine's serial log".to_string()
     } else {
         format!(
-            "inspect backend output with `silo logs {} --stream serial`",
-            machine.id()
+            "inspect backend output with `silo logs {} --stream serial` (serial log: {})",
+            machine.id(),
+            machine.serial_log_path().display()
         )
     };
     Some(eyre::eyre!(

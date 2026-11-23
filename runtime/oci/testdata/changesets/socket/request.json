@@ -1,0 +1,69 @@
+{
+  "cases": [
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:705634a07d5d8c55f7f0ddb6b59c8b3b3a0b73fa339ca9ff77cc65ebd833866c",
+          "directory": "silo-artifacts/case-0000/layer-0000",
+          "indexRoot": "sha256:85c862319badb92f19cc5f5a0574efa549a478490cbca1aeee32becc24ab77c1",
+          "packLength": 0,
+          "packStream": "sha256:47941bc06f254fc52f532f896db1d880035734d4b5a44bbc4684e95e8d9ec72a",
+          "recipe": "sha256:fa3a5b4ab4b571f7a43d4094206627ef7330e2b6de8fdfb8814b75b3abaded8c",
+          "result": "sha256:fbbef2f44402f5461ec70404fd6a2e64171f9871a55a35dd55ad1b7a224e9100"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "c29ja2V0",
+          "kind": "socket",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "c29ja2V0",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "socket.tar",
+          "diffId": "sha256:705634a07d5d8c55f7f0ddb6b59c8b3b3a0b73fa339ca9ff77cc65ebd833866c",
+          "digest": "sha256:705634a07d5d8c55f7f0ddb6b59c8b3b3a0b73fa339ca9ff77cc65ebd833866c",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "socket.tar"
+        }
+      ],
+      "name": "star-real-socket",
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    }
+  ],
+  "schema": 1
+}

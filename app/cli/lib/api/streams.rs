@@ -33,17 +33,6 @@ pub(crate) async fn shell(
         .map_err(Into::into)
 }
 
-pub(crate) fn ensure_running(data: &MachineData) -> eyre::Result<()> {
-    if data.is_running() {
-        return Ok(());
-    }
-    Err(eyre::eyre!(
-        "machine `{}` is not running; start it with `silo start {}`",
-        data.name,
-        data.name
-    ))
-}
-
 pub(crate) fn ensure_guest_ready(data: &MachineData) -> eyre::Result<()> {
     if data.status.guest_ready() {
         return Ok(());
@@ -58,6 +47,7 @@ pub(crate) fn ensure_guest_ready(data: &MachineData) -> eyre::Result<()> {
 
 pub(crate) async fn run_command_streaming(
     machine: &AppMachine,
+    observation: &MachineData,
     user: Option<&str>,
     argv: &[String],
     working_directory: &str,
@@ -67,7 +57,7 @@ pub(crate) async fn run_command_streaming(
     let mut session = machine
         .session_machine()
         .await?
-        .spawn_with(program, |options| {
+        .spawn_observed_with(observation, program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment).stdin_pipe()
         })
         .await?;
@@ -76,6 +66,7 @@ pub(crate) async fn run_command_streaming(
 
 pub(crate) async fn attach_command(
     machine: &AppMachine,
+    observation: &MachineData,
     user: Option<&str>,
     argv: &[String],
     working_directory: &str,
@@ -85,7 +76,7 @@ pub(crate) async fn attach_command(
     let mut session = machine
         .session_machine()
         .await?
-        .spawn_with(program, |options| {
+        .spawn_observed_with(observation, program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment)
                 .stdin_pipe()
                 .tty(true)
@@ -102,9 +93,11 @@ pub(crate) async fn run_process(
     argv: &[String],
     tty: bool,
 ) -> eyre::Result<ExecutionResult> {
+    let observation = machine.inspect().await?;
     if tty {
         return attach_command(
             machine,
+            &observation,
             process.user.as_deref(),
             argv,
             &process.working_directory,
@@ -114,6 +107,7 @@ pub(crate) async fn run_process(
     }
     run_command_streaming(
         machine,
+        &observation,
         process.user.as_deref(),
         argv,
         &process.working_directory,
@@ -126,6 +120,11 @@ pub(crate) async fn run_process(
 enum StreamMode {
     Piped,
     Interactive,
+}
+
+enum HostControl {
+    Resize { rows: u16, columns: u16 },
+    Signal(u32),
 }
 
 async fn stream_events(
@@ -143,8 +142,9 @@ async fn stream_events(
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let control = session.control();
-    let mut stdin: Option<libvm::ExecutionStdin> = None;
-    let mut stdin_closed = false;
+    let mut input = std::pin::pin!(None);
+    let mut pending_control = std::pin::pin!(None);
+    let mut input_error = None;
     let mut started = false;
     let mut launch_cancelled = false;
     let mut signals = match mode {
@@ -155,26 +155,36 @@ async fn stream_events(
     loop {
         let event = tokio::select! {
             event = session.recv() => event?,
-            read = read_host_input(&mut host_stdin), if started && !launch_cancelled && !stdin_closed => {
-                let input = read.context("read host stdin")?;
-                if input.is_empty() {
-                    stdin_closed = true;
-                    if mode == StreamMode::Piped {
-                        if let Some(stdin) = stdin.as_ref() {
-                            stdin.close().await.context("close guest stdin")?;
-                        }
-                    }
-                } else if let Some(stdin) = stdin.as_ref() {
-                    stdin.write(input).await.context("write guest stdin")?;
+            result = async {
+                match input.as_mut().as_pin_mut() {
+                    Some(input) => input.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                input.set(None);
+                input_error = result?;
+                continue;
+            }
+            result = async {
+                match pending_control.as_mut().as_pin_mut() {
+                    Some(control) => control.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                pending_control.set(None);
+                if let Err(error) = result {
+                    input_error = Some(error);
                 }
                 continue;
             }
-            signal = signals.recv(), if signals_open => {
+            signal = signals.recv(), if signals_open && pending_control.is_none() => {
                 if let Some(signal) = signal {
                     if mode == StreamMode::Interactive && signal == libc::SIGWINCH as u32 {
                         if started && !launch_cancelled {
                             let (rows, columns) = current_terminal_size();
-                            control.resize_pty(rows, columns).await.context("resize guest terminal")?;
+                            pending_control.set(Some(forward_host_control(
+                                control.clone(), HostControl::Resize { rows, columns },
+                            )));
                         }
                     } else {
                         let signal = if mode == StreamMode::Interactive {
@@ -182,7 +192,14 @@ async fn stream_events(
                         } else {
                             signal
                         };
-                        forward_signal(&control, started, &mut launch_cancelled, signal).await?;
+                        if !started {
+                            control.close_requests();
+                            launch_cancelled = true;
+                        } else if !launch_cancelled {
+                            pending_control.set(Some(forward_host_control(
+                                control.clone(), HostControl::Signal(signal),
+                            )));
+                        }
                     }
                 } else {
                     signals_open = false;
@@ -203,10 +220,16 @@ async fn stream_events(
                     host_stdin =
                         Some(libvm::host_input::HostInput::stdin().context("open host stdin")?);
                 }
-                stdin = control.stdin();
+                if let (Some(host_stdin), Some(stdin)) = (host_stdin.take(), control.stdin()) {
+                    input.set(Some(forward_host_input(host_stdin, stdin, mode)));
+                }
                 started = true;
             }
             ExecutionEvent::Started => started = true,
+            ExecutionEvent::StdinClosed => {
+                input.set(None);
+                host_stdin = None;
+            }
             ExecutionEvent::Stdout(data) => {
                 stdout
                     .write_all(&data)
@@ -244,15 +267,41 @@ async fn stream_events(
             ExecutionEvent::Terminal(result) => return Ok(result),
         }
     }
+    if let Some(error) = input_error {
+        return Err(error);
+    }
     eyre::bail!("guest command ended without a terminal result")
 }
 
-async fn read_host_input(
-    input: &mut Option<libvm::host_input::HostInput>,
-) -> std::io::Result<Vec<u8>> {
-    match input {
-        Some(input) => input.read().await,
-        None => std::future::pending().await,
+async fn forward_host_input(
+    mut input: libvm::host_input::HostInput,
+    stdin: libvm::ExecutionStdin,
+    mode: StreamMode,
+) -> eyre::Result<Option<eyre::Report>> {
+    loop {
+        let data = input.read().await.context("read host stdin")?;
+        if data.is_empty() {
+            if mode == StreamMode::Piped {
+                return Ok(stdin.close().await.context("close guest stdin").err());
+            }
+            return Ok(None);
+        }
+        if let Err(error) = stdin.write(data).await.context("write guest stdin") {
+            return Ok(Some(error));
+        }
+    }
+}
+
+async fn forward_host_control(control: ExecutionControl, request: HostControl) -> eyre::Result<()> {
+    match request {
+        HostControl::Resize { rows, columns } => control
+            .resize_pty(rows, columns)
+            .await
+            .context("resize guest terminal"),
+        HostControl::Signal(signal) => control
+            .signal(signal)
+            .await
+            .wrap_err_with(|| format!("forward host signal {signal} to guest")),
     }
 }
 
@@ -360,28 +409,6 @@ fn forwardable_signals() -> impl Iterator<Item = u32> {
             libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD | libc::SIGWINCH
         )
     })
-}
-
-async fn forward_signal(
-    control: &ExecutionControl,
-    started: bool,
-    launch_cancelled: &mut bool,
-    signal: u32,
-) -> eyre::Result<()> {
-    if !started {
-        if !*launch_cancelled {
-            control.close_requests();
-            *launch_cancelled = true;
-        }
-        return Ok(());
-    }
-    if *launch_cancelled {
-        return Ok(());
-    }
-    control
-        .signal(signal)
-        .await
-        .wrap_err_with(|| format!("forward host signal {signal} to guest"))
 }
 
 fn command_argv(argv: &[String]) -> eyre::Result<(String, Vec<String>)> {

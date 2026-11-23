@@ -185,9 +185,9 @@ impl Cmd {
             .map(parse_owner)
             .transpose()?
             .map_or((None, None), |(uid, gid)| (Some(uid), gid));
-        let (_, machine) = context.machine(Some(vm)).await?;
+        let (_, machine) = context.observation_machine(Some(vm)).await?;
+        let machine = machine.for_access().await?;
         let inspect = machine.inspect().await?;
-        streams::ensure_running(&inspect)?;
         streams::ensure_guest_ready(&inspect)?;
         let digest = Arc::new(Mutex::new(TransferDigest::default()));
         let disposition = if upload {

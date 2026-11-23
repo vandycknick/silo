@@ -1,0 +1,976 @@
+//! Bounded, digest-sealed handoff documents and wire values.
+//!
+//! Every document crossing the control channel is canonical JSON whose SHA-256
+//! is its identity. A receiver re-decodes the exact bytes with unknown fields
+//! rejected and re-encodes them; any non-canonical spelling fails closed, so an
+//! approval digest names exactly one plan.
+//!
+//! ```text
+//!  source              coordinator                 destination
+//!  observe_source ───► SourceObservation ───────► preflight_destination
+//!                      HandoffProposal ◄────────── (plan + estimate)
+//!                      ApprovedPlan (caller approves the plan digest)
+//!  begin_source  ◄──── plan ─────────────────────► receive
+//!  read_payload  ◄──── needs/frames ─────────────► list_needs / open_payload
+//!  capture_source ───► CaptureOffer ─────────────► offer_capture
+//!                      needs/frames again, then prepare/fence/commit/resolve
+//! ```
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::handoff::types::{
+    CaptureId, HandoffBinding, HandoffError, HandoffIntent, HandoffMode, OperationId,
+    OwnershipEpoch, RuntimeId,
+};
+use crate::storage::identity::{ObjectDigest, StreamId};
+use crate::{
+    BootProfile, ExternalResourcePolicy, ExternalResourceRequirement, GuestArchitecture,
+    LibVmError, MachineId, MachineStorageRecord, SnapshotConfiguration, StorageStopOutcome,
+};
+
+/// Largest payload frame either participant produces or accepts.
+pub const MAX_FRAME_BYTES: u32 = 1 << 20;
+/// Largest number of descriptors in one needs page.
+pub const MAX_PAGE_ENTRIES: u32 = 1024;
+/// Largest sealed document. Plans and manifests are metadata, never payload.
+pub const MAX_DOCUMENT_BYTES: u32 = 1 << 20;
+
+pub(crate) fn invalid(message: impl std::fmt::Display) -> LibVmError {
+    LibVmError::InvalidStorageRecord {
+        record: "handoff",
+        message: message.to_string(),
+    }
+}
+
+/// Exact canonical bytes of one immutable handoff document and their digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedDocument {
+    digest: ObjectDigest,
+    bytes: Vec<u8>,
+}
+
+impl SealedDocument {
+    /// Admit wire bytes: bounded length and matching SHA-256. Typed decoding
+    /// happens in the specific document constructor.
+    pub fn new(digest: ObjectDigest, bytes: Vec<u8>) -> Result<Self, LibVmError> {
+        if bytes.is_empty() || bytes.len() > MAX_DOCUMENT_BYTES as usize {
+            return Err(invalid("handoff document is empty or exceeds its bound"));
+        }
+        if ObjectDigest::of_bytes(&bytes) != digest {
+            return Err(invalid("handoff document digest does not match its bytes"));
+        }
+        Ok(Self { digest, bytes })
+    }
+
+    pub fn digest(&self) -> ObjectDigest {
+        self.digest
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub(crate) fn seal<T: Serialize>(value: &T) -> Result<Self, LibVmError> {
+        let value = serde_json::to_value(value).map_err(invalid)?;
+        let bytes = crate::store::models::snapshot::canonical_value(&value)?;
+        Self::new(ObjectDigest::of_bytes(&bytes), bytes)
+    }
+
+    fn open<T: Serialize + DeserializeOwned>(&self) -> Result<T, LibVmError> {
+        let value = crate::store::models::snapshot::decode_identity_value(&self.bytes)?;
+        if value.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+            return Err(invalid(
+                "unsupported handoff protocol version: expected version 1",
+            ));
+        }
+        let decoded: T = serde_json::from_value(value.clone()).map_err(invalid)?;
+        if serde_json::to_value(&decoded).map_err(invalid)? != value {
+            return Err(invalid("handoff document is not its closed canonical form"));
+        }
+        Ok(decoded)
+    }
+}
+
+/// One writable private role of a stopped machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum WritableRole {
+    Root,
+    Disk { order: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WritableFile {
+    pub(crate) role: WritableRole,
+    pub(crate) length: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImmutableObject {
+    pub(crate) digest: ObjectDigest,
+    pub(crate) length: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImmutableStream {
+    pub(crate) stream: StreamId,
+    pub(crate) length: u64,
+}
+
+/// The source's exact immutable closure. Destination presence is decided by
+/// local verification, never by an untrusted `have` list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImmutableClosure {
+    pub(crate) composition: Option<crate::store::models::snapshot::SnapshotComposition>,
+    pub(crate) oci_source: Option<crate::image::oci::OciCompositionSource>,
+    pub(crate) objects: Vec<ImmutableObject>,
+    pub(crate) streams: Vec<ImmutableStream>,
+}
+
+/// Running plans name one execution; stopped plans name the private bytes'
+/// filesystem generation without hashing those bytes during preflight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum SourceExecution {
+    Running {
+        run: uuid::Uuid,
+    },
+    Stopped {
+        files: Vec<crate::storage::identity_file::SourceFingerprint>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ObservationBody {
+    pub(crate) schema: u32,
+    pub(crate) runtime: RuntimeId,
+    pub(crate) machine: MachineId,
+    pub(crate) name: String,
+    pub(crate) ownership_epoch: OwnershipEpoch,
+    pub(crate) storage_generation: u64,
+    pub(crate) execution: SourceExecution,
+    pub(crate) configuration: SnapshotConfiguration,
+    pub(crate) storage: MachineStorageRecord,
+    pub(crate) external_requirements: Vec<ExternalResourceRequirement>,
+    pub(crate) immutable: ImmutableClosure,
+    pub(crate) writable: Vec<WritableFile>,
+}
+
+/// A read-only description of a source machine. Not a reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceObservation {
+    document: SealedDocument,
+    body: ObservationBody,
+}
+
+impl SourceObservation {
+    pub(crate) fn new(body: ObservationBody) -> Result<Self, LibVmError> {
+        body.validate()?;
+        Ok(Self {
+            document: SealedDocument::seal(&body)?,
+            body,
+        })
+    }
+
+    pub fn from_document(document: SealedDocument) -> Result<Self, LibVmError> {
+        let body: ObservationBody = document.open()?;
+        body.validate()?;
+        Ok(Self { document, body })
+    }
+
+    pub fn document(&self) -> &SealedDocument {
+        &self.document
+    }
+
+    pub fn runtime(&self) -> RuntimeId {
+        self.body.runtime
+    }
+
+    pub fn machine(&self) -> MachineId {
+        self.body.machine
+    }
+
+    pub fn name(&self) -> &str {
+        &self.body.name
+    }
+
+    pub fn ownership_epoch(&self) -> OwnershipEpoch {
+        self.body.ownership_epoch
+    }
+
+    pub(crate) fn body(&self) -> &ObservationBody {
+        &self.body
+    }
+}
+
+impl ObservationBody {
+    fn validate(&self) -> Result<(), LibVmError> {
+        if self.schema != 1 {
+            return Err(invalid(
+                "unsupported handoff protocol version: expected version 1",
+            ));
+        }
+        if uuid::Uuid::from(self.machine).is_nil() {
+            return Err(invalid(
+                "source observation has an invalid machine identity",
+            ));
+        }
+        self.storage.validate()?;
+        self.storage.ownership.ensure_owned(self.machine)?;
+        if self.storage.ownership_epoch != self.ownership_epoch.get()
+            || self.storage.storage_generation != self.storage_generation
+            || self.storage.operation.is_some()
+        {
+            return Err(invalid("source observation contradicts its storage record"));
+        }
+        let mut roles = std::collections::BTreeSet::new();
+        if self.writable.first().map(|file| file.role) != Some(WritableRole::Root)
+            || !self.writable.iter().all(|file| roles.insert(file.role))
+        {
+            return Err(invalid("source observation writable roles are invalid"));
+        }
+        match &self.execution {
+            SourceExecution::Running { run } if run.is_nil() => {
+                return Err(invalid("source observation has no run identity"));
+            }
+            SourceExecution::Stopped { files } if files.len() != self.writable.len() => {
+                return Err(invalid(
+                    "source observation omits a writable file generation",
+                ));
+            }
+            _ => {}
+        }
+        for requirement in &self.external_requirements {
+            requirement.validate()?;
+        }
+        let sorted = |items: &[ImmutableObject]| items.windows(2).all(|pair| pair[0] < pair[1]);
+        if !sorted(&self.immutable.objects)
+            || !self
+                .immutable
+                .streams
+                .windows(2)
+                .all(|pair| pair[0].stream < pair[1].stream)
+        {
+            return Err(invalid("immutable closure is not canonical"));
+        }
+        match (&self.storage.root, &self.immutable.composition) {
+            (
+                crate::MachineRoot::LinuxOverlay {
+                    lower: crate::OverlayLower::ErofsComposition { record, .. },
+                    ..
+                },
+                Some(composition),
+            ) if *record == composition.result => {}
+            (crate::MachineRoot::OpaqueRaw { .. }, None) => {}
+            _ => {
+                return Err(invalid(
+                    "immutable composition contradicts the machine root",
+                ))
+            }
+        }
+        if self.immutable.oci_source.is_some() && self.immutable.composition.is_none() {
+            return Err(invalid(
+                "OCI reconstruction provenance requires a composition",
+            ));
+        }
+        let crate::store::cache_paths::PoolDependencies {
+            streams: mut expected_streams,
+            objects: mut expected_objects,
+            ..
+        } = crate::store::cache_paths::storage_pool_dependencies(&self.storage)?;
+        if let Some(lower) = &self.immutable.composition {
+            lower.validate_shape()?;
+            expected_objects.extend(lower.objects());
+            for layer in &lower.layers {
+                expected_objects.insert(layer.pack.map);
+                expected_streams.insert(layer.pack.stream);
+                if self
+                    .immutable
+                    .streams
+                    .iter()
+                    .find(|entry| entry.stream == layer.pack.stream)
+                    .is_none_or(|entry| entry.length != layer.pack.length)
+                {
+                    return Err(invalid("immutable pack length contradicts the composition"));
+                }
+            }
+        }
+        if self
+            .immutable
+            .objects
+            .iter()
+            .map(|entry| entry.digest)
+            .ne(expected_objects.iter().copied())
+            || self
+                .immutable
+                .streams
+                .iter()
+                .map(|entry| entry.stream)
+                .ne(expected_streams.iter().copied())
+        {
+            return Err(invalid(
+                "immutable closure differs from the root and boot graph",
+            ));
+        }
+        let BootProfile::LinuxDirect {
+            binding:
+                crate::BootBinding::Pinned {
+                    kernel,
+                    base_initramfs,
+                    agent,
+                    ..
+                },
+            ..
+        } = &self.storage.boot
+        else {
+            return Err(invalid(
+                "handoff requires a pinned Linux direct boot closure",
+            ));
+        };
+        let mut bulk_objects = std::collections::BTreeSet::from([*kernel, *base_initramfs]);
+        bulk_objects.extend(agent.iter().copied());
+        for object in &self.immutable.objects {
+            let bound = if self
+                .immutable
+                .composition
+                .as_ref()
+                .is_some_and(|lower| lower.fsmeta == object.digest)
+            {
+                bulk_objects.insert(object.digest);
+                crate::storage::limits::Resource::FsmetaBytes
+            } else if bulk_objects.contains(&object.digest) {
+                crate::storage::limits::Resource::VirtualDiskBytes
+            } else {
+                crate::storage::limits::Resource::MetadataPageBytes
+            };
+            bound
+                .check(object.length)
+                .map_err(crate::storage::StorageError::from)?;
+        }
+        for stream in &self.immutable.streams {
+            crate::storage::limits::Resource::VirtualDiskBytes
+                .check(stream.length)
+                .map_err(crate::storage::StorageError::from)?;
+        }
+        crate::storage::limits::Resource::ArtifactStreamBytes
+            .sum(
+                self.immutable
+                    .streams
+                    .iter()
+                    .map(|entry| entry.length)
+                    .chain(self.writable.iter().map(|entry| entry.length))
+                    .chain(
+                        self.immutable
+                            .objects
+                            .iter()
+                            .filter(|entry| bulk_objects.contains(&entry.digest))
+                            .map(|entry| entry.length),
+                    ),
+            )
+            .map_err(crate::storage::StorageError::from)?;
+        Ok(())
+    }
+}
+
+/// Boot approval: keep the exact recorded tuple or adopt one complete
+/// destination bundle (including its derived translation) at commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum BootSelection {
+    ExactRecorded,
+    DestinationBundle { bundle: ObjectDigest },
+}
+
+/// Caller choices for a destination preflight. `operation` is chosen once by
+/// the caller; a fork's destination machine ID derives from it, so repeated
+/// preflight of the same request yields the same plan digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DestinationRequest {
+    pub operation: OperationId,
+    pub mode: HandoffMode,
+    pub name: Option<String>,
+    pub boot_bundle: Option<ObjectDigest>,
+    pub resources: ExternalResourcePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PlanBody {
+    pub(crate) schema: u32,
+    pub(crate) operation: OperationId,
+    pub(crate) mode: HandoffMode,
+    pub(crate) observation: ObservationBody,
+    pub(crate) observation_digest: ObjectDigest,
+    pub(crate) destination_runtime: RuntimeId,
+    pub(crate) destination_machine: MachineId,
+    pub(crate) destination_name: String,
+    pub(crate) boot_selection: BootSelection,
+    pub(crate) boot: BootProfile,
+    pub(crate) configuration: SnapshotConfiguration,
+    pub(crate) external_requirements: Vec<ExternalResourceRequirement>,
+    pub(crate) resources: ExternalResourcePolicy,
+}
+
+impl PlanBody {
+    fn validate(&self) -> Result<(), LibVmError> {
+        self.observation.validate()?;
+        if self.schema != 1
+            || SealedDocument::seal(&self.observation)?.digest() != self.observation_digest
+        {
+            return Err(invalid("handoff plan observation binding is invalid"));
+        }
+        crate::validate_new_machine_name(&self.destination_name)?;
+        self.boot.validate()?;
+        if !matches!(
+            &self.boot,
+            BootProfile::LinuxDirect {
+                binding: crate::BootBinding::Pinned { .. },
+                ..
+            }
+        ) {
+            return Err(invalid("approved destination boot must be a pinned bundle"));
+        }
+        if let BootSelection::DestinationBundle { bundle } = self.boot_selection {
+            if boot_bundle(&self.boot)? != bundle {
+                return Err(invalid("approved boot bundle contradicts the plan boot"));
+            }
+        } else if self.boot != self.observation.storage.boot {
+            return Err(invalid(
+                "exact recorded boot differs from the source record",
+            ));
+        }
+        for requirement in &self.external_requirements {
+            requirement.validate()?;
+        }
+        self.intent()?.validate()?;
+        Ok(())
+    }
+
+    pub(crate) fn intent(&self) -> Result<HandoffIntent, LibVmError> {
+        let mut intent = HandoffIntent {
+            operation: self.operation,
+            mode: self.mode,
+            source_runtime: self.observation.runtime,
+            destination_runtime: self.destination_runtime,
+            source_machine: self.observation.machine,
+            destination_machine: self.destination_machine,
+            from_epoch: self.observation.ownership_epoch,
+            intent_digest: ObjectDigest::of_bytes(&[]),
+            approved_plan_digest: SealedDocument::seal(self)?.digest(),
+        };
+        intent.intent_digest = SealedDocument::seal(&IntentIdentity {
+            operation: intent.operation,
+            mode: intent.mode,
+            source_runtime: intent.source_runtime,
+            destination_runtime: intent.destination_runtime,
+            source_machine: intent.source_machine,
+            destination_machine: intent.destination_machine,
+            from_epoch: intent.from_epoch,
+            approved_plan_digest: intent.approved_plan_digest,
+        })?
+        .digest();
+        Ok(intent)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IntentIdentity {
+    operation: OperationId,
+    mode: HandoffMode,
+    source_runtime: RuntimeId,
+    destination_runtime: RuntimeId,
+    source_machine: MachineId,
+    destination_machine: MachineId,
+    from_epoch: OwnershipEpoch,
+    approved_plan_digest: ObjectDigest,
+}
+
+pub(crate) fn boot_bundle(boot: &BootProfile) -> Result<ObjectDigest, LibVmError> {
+    match boot {
+        BootProfile::LinuxDirect { binding, .. } => binding.digest(),
+        _ => Err(invalid("handoff requires Linux direct boot")),
+    }
+}
+
+/// A complete destination proposal. Its digest is what a caller approves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffPlan {
+    document: SealedDocument,
+    body: PlanBody,
+}
+
+impl HandoffPlan {
+    pub(crate) fn new(body: PlanBody) -> Result<Self, LibVmError> {
+        body.validate()?;
+        Ok(Self {
+            document: SealedDocument::seal(&body)?,
+            body,
+        })
+    }
+
+    pub fn from_document(document: SealedDocument) -> Result<Self, LibVmError> {
+        let body: PlanBody = document.open()?;
+        body.validate()?;
+        Ok(Self { document, body })
+    }
+
+    pub fn document(&self) -> &SealedDocument {
+        &self.document
+    }
+
+    pub fn digest(&self) -> ObjectDigest {
+        self.document.digest
+    }
+
+    pub fn operation(&self) -> OperationId {
+        self.body.operation
+    }
+
+    pub fn mode(&self) -> HandoffMode {
+        self.body.mode
+    }
+
+    pub fn source_runtime(&self) -> RuntimeId {
+        self.body.observation.runtime
+    }
+
+    pub fn destination_runtime(&self) -> RuntimeId {
+        self.body.destination_runtime
+    }
+
+    pub fn source_machine(&self) -> MachineId {
+        self.body.observation.machine
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.body.observation.name
+    }
+
+    pub fn destination_machine(&self) -> MachineId {
+        self.body.destination_machine
+    }
+
+    pub fn destination_name(&self) -> &str {
+        &self.body.destination_name
+    }
+
+    pub fn boot_selection(&self) -> BootSelection {
+        self.body.boot_selection
+    }
+
+    pub fn boot_bundle(&self) -> Result<ObjectDigest, LibVmError> {
+        boot_bundle(&self.body.boot)
+    }
+
+    pub fn kernel_architecture(&self) -> Option<GuestArchitecture> {
+        match &self.body.boot {
+            BootProfile::LinuxDirect {
+                kernel_architecture,
+                ..
+            } => Some(*kernel_architecture),
+            _ => None,
+        }
+    }
+
+    /// Exactly the caller choices this plan was produced from. A retried
+    /// transfer with different options must replan, never reuse this plan.
+    pub fn validate_request(&self, request: &DestinationRequest) -> Result<(), LibVmError> {
+        let name = request
+            .name
+            .as_deref()
+            .unwrap_or(&self.body.observation.name);
+        let boot = match request.boot_bundle {
+            None => BootSelection::ExactRecorded,
+            Some(bundle) => BootSelection::DestinationBundle { bundle },
+        };
+        if request.operation != self.body.operation
+            || request.mode != self.body.mode
+            || name != self.body.destination_name
+            || boot != self.body.boot_selection
+            || request.resources != self.body.resources
+        {
+            return Err(HandoffError::OperationConflict {
+                operation: self.body.operation,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Explicit caller approval of exactly this digest.
+    pub fn approve(self, approved: ObjectDigest) -> Result<ApprovedPlan, LibVmError> {
+        if self.document.digest != approved {
+            return Err(HandoffError::AdmissionStale.into());
+        }
+        Ok(ApprovedPlan { plan: self })
+    }
+
+    pub(crate) fn body(&self) -> &PlanBody {
+        &self.body
+    }
+}
+
+/// Preflight result: the plan to approve plus a non-binding cost estimate.
+/// The estimate depends on the destination cache and is not part of the digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffProposal {
+    pub plan: HandoffPlan,
+    pub estimate: TransferEstimate,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransferEstimate {
+    /// Logical bytes of the private writable files to capture.
+    pub writable_bytes: u64,
+    /// Bytes of the immutable closure.
+    pub immutable_bytes: u64,
+    /// Immutable bytes not verifiably present at the destination now.
+    pub missing_immutable_bytes: u64,
+    /// Free bytes on the destination home filesystem at preflight.
+    pub available_bytes: u64,
+}
+
+/// A plan the caller approved. Participants accept only this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedPlan {
+    plan: HandoffPlan,
+}
+
+impl ApprovedPlan {
+    /// A plan document received from a coordinator that already approved its
+    /// digest. Each participant binds the digest into the durable intent.
+    pub fn from_document(document: SealedDocument) -> Result<Self, LibVmError> {
+        Ok(Self {
+            plan: HandoffPlan::from_document(document)?,
+        })
+    }
+
+    pub fn plan(&self) -> &HandoffPlan {
+        &self.plan
+    }
+
+    pub fn document(&self) -> &SealedDocument {
+        &self.plan.document
+    }
+
+    pub fn digest(&self) -> ObjectDigest {
+        self.plan.document.digest
+    }
+
+    /// The deterministic intent both participants persist.
+    pub fn intent(&self) -> Result<HandoffIntent, LibVmError> {
+        let intent = self.plan.body.intent()?;
+        if intent.approved_plan_digest != self.digest() {
+            return Err(invalid("approved plan digest contradicts its body"));
+        }
+        Ok(intent)
+    }
+
+    pub(crate) fn body(&self) -> &PlanBody {
+        &self.plan.body
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CapturedFile {
+    pub(crate) role: WritableRole,
+    pub(crate) stream: StreamId,
+    pub(crate) length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ManifestBody {
+    pub(crate) schema: u32,
+    pub(crate) capture: CaptureId,
+    pub(crate) operation: OperationId,
+    pub(crate) approved_plan_digest: ObjectDigest,
+    pub(crate) stop_outcome: StorageStopOutcome,
+    pub(crate) files: Vec<CapturedFile>,
+}
+
+/// One sealed stopped cut: every writable role's exact stream identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureManifest {
+    document: SealedDocument,
+    body: ManifestBody,
+}
+
+impl CaptureManifest {
+    pub(crate) fn new(body: ManifestBody) -> Result<Self, LibVmError> {
+        body.validate()?;
+        Ok(Self {
+            document: SealedDocument::seal(&body)?,
+            body,
+        })
+    }
+
+    pub fn from_document(document: SealedDocument) -> Result<Self, LibVmError> {
+        let body: ManifestBody = document.open()?;
+        body.validate()?;
+        Ok(Self { document, body })
+    }
+
+    pub fn document(&self) -> &SealedDocument {
+        &self.document
+    }
+
+    pub fn capture(&self) -> CaptureId {
+        self.body.capture
+    }
+
+    pub(crate) fn body(&self) -> &ManifestBody {
+        &self.body
+    }
+}
+
+impl ManifestBody {
+    fn validate(&self) -> Result<(), LibVmError> {
+        let mut roles = std::collections::BTreeSet::new();
+        if self.schema != 1
+            || self.files.first().map(|file| file.role) != Some(WritableRole::Root)
+            || !self.files.iter().all(|file| roles.insert(file.role))
+        {
+            return Err(invalid("capture manifest is invalid"));
+        }
+        Ok(())
+    }
+
+    /// Exactly the plan's writable roles and lengths, in order.
+    pub(crate) fn check_plan(&self, plan: &ApprovedPlan) -> Result<(), LibVmError> {
+        let expected = &plan.body().observation.writable;
+        if self.operation != plan.body().operation
+            || self.approved_plan_digest != plan.digest()
+            || self.files.len() != expected.len()
+            || self.files.iter().zip(expected).any(|(file, expected)| {
+                file.role != expected.role || file.length != expected.length
+            })
+        {
+            return Err(HandoffError::ReceiptMismatch.into());
+        }
+        Ok(())
+    }
+}
+
+/// A source's bound cut, as sent to the destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureOffer {
+    binding: HandoffBinding,
+    manifest: CaptureManifest,
+}
+
+impl CaptureOffer {
+    pub fn new(binding: HandoffBinding, manifest: CaptureManifest) -> Result<Self, LibVmError> {
+        binding.intent.validate()?;
+        if binding.capture != manifest.capture()
+            || binding.capture_manifest_digest != manifest.document().digest()
+            || manifest.body.operation != binding.intent.operation
+            || manifest.body.approved_plan_digest != binding.intent.approved_plan_digest
+        {
+            return Err(HandoffError::ReceiptMismatch.into());
+        }
+        Ok(Self { binding, manifest })
+    }
+
+    pub fn binding(&self) -> &HandoffBinding {
+        &self.binding
+    }
+
+    pub fn manifest(&self) -> &CaptureManifest {
+        &self.manifest
+    }
+}
+
+/// A validated height in the fixed-depth stream tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct MapNodeHeight(u8);
+impl MapNodeHeight {
+    pub fn new(value: u8) -> Result<Self, LibVmError> {
+        if value >= vm_spec::stream_map::TREE_DEPTH {
+            return Err(invalid("map node height exceeds tree depth"));
+        }
+        Ok(Self(value))
+    }
+    pub fn get(self) -> u8 {
+        self.0
+    }
+    pub fn span(self) -> u64 {
+        1u64 << (6 * (u32::from(self.0) + 1))
+    }
+}
+impl TryFrom<u8> for MapNodeHeight {
+    type Error = LibVmError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<MapNodeHeight> for u8 {
+    fn from(value: MapNodeHeight) -> Self {
+        value.get()
+    }
+}
+
+/// Logical identity index, not a byte or transport-payload offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct MapNodeIndex(u64);
+impl MapNodeIndex {
+    pub fn new(value: u64) -> Result<Self, LibVmError> {
+        if value >= vm_spec::stream_map::MAX_INDICES {
+            return Err(invalid("map node index exceeds stream-map geometry"));
+        }
+        Ok(Self(value))
+    }
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+impl TryFrom<u64> for MapNodeIndex {
+    type Error = LibVmError;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<MapNodeIndex> for u64 {
+    fn from(value: MapNodeIndex) -> Self {
+        value.get()
+    }
+}
+
+/// Verified objects, binary root headers, map nodes and decoded 8 MiB payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum PayloadDescriptor {
+    Object {
+        digest: ObjectDigest,
+        length: u64,
+    },
+    StreamMap {
+        stream: StreamId,
+    },
+    MapNode {
+        digest: ObjectDigest,
+        stream: StreamId,
+        height: MapNodeHeight,
+        first_index: MapNodeIndex,
+    },
+    /// An 8 MiB payload authenticated by the root's smaller identity units.
+    StreamChunk {
+        stream: StreamId,
+        index: u64,
+        length: u64,
+    },
+}
+
+impl PayloadDescriptor {
+    pub fn validate(&self) -> Result<(), LibVmError> {
+        match *self {
+            Self::Object { length, .. } if length == 0 || length > i64::MAX as u64 => Err(invalid(
+                "immutable object length is outside supported bounds",
+            )),
+            Self::StreamChunk { length, .. }
+                if length == 0 || length > crate::storage::limits::CHUNK_SIZE as u64 =>
+            {
+                Err(invalid("chunk descriptor length is outside 1..=8 MiB"))
+            }
+            Self::StreamChunk { index, .. }
+                if index
+                    .checked_mul(crate::storage::limits::CHUNK_SIZE as u64)
+                    .is_none() =>
+            {
+                Err(invalid("payload index overflows its byte offset"))
+            }
+            Self::MapNode {
+                height,
+                first_index,
+                ..
+            } if first_index.get() % height.span() != 0 => {
+                Err(invalid("map node first index is not subtree-aligned"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Exact payload length, when the descriptor names it.
+    pub fn exact_length(&self) -> Option<u64> {
+        match *self {
+            Self::Object { length, .. } | Self::StreamChunk { length, .. } => Some(length),
+            Self::StreamMap { .. } | Self::MapNode { .. } => None,
+        }
+    }
+
+    /// Largest payload a writer accepts for this descriptor.
+    pub fn max_length(&self) -> u64 {
+        match self {
+            Self::StreamMap { .. } => vm_spec::stream_map::MAX_ROOT_BYTES as u64,
+            Self::MapNode { .. } => vm_spec::stream_map::MAX_NODE_BYTES as u64,
+            _ => self.exact_length().unwrap_or(0),
+        }
+    }
+}
+
+/// Opaque cursor into the destination's complete inventory for one operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NeedCursor(pub u64);
+
+/// One bounded page of descriptors the destination cannot satisfy locally.
+/// `next` indexes the current graph frontier, not the filtered needs. Repeat
+/// complete passes until no needs remain: received roots and nodes reveal
+/// further subtree and payload needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeedsPage {
+    pub needs: Vec<PayloadDescriptor>,
+    pub next: Option<NeedCursor>,
+}
+
+/// One bounded slice of a source payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadFrame {
+    pub bytes: Vec<u8>,
+    /// The descriptor's complete payload length; identical in every frame.
+    pub total_length: u64,
+    /// True when `offset + bytes.len() == total_length`.
+    pub end: bool,
+}
+
+/// A verified, durable destination publication of one descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadReceipt {
+    pub descriptor: PayloadDescriptor,
+    pub bytes: u64,
+}
+
+/// Whether capture may deliberately stop a running source after reserving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceStop {
+    RequireStopped,
+    StopRunning,
+}
+
+/// This runtime's identity and handoff bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoffCapabilities {
+    pub protocol_version: u32,
+    pub runtime: RuntimeId,
+    pub kernel_architecture: GuestArchitecture,
+    pub backend: vm_spec::live::LiveBackend,
+    pub max_frame_bytes: u32,
+    pub max_page_entries: u32,
+    pub max_document_bytes: u32,
+}

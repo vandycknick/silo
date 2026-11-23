@@ -22,7 +22,9 @@ use vz::{
 
 use crate::virt::backend::{StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
-use crate::virt::config::{validate_common, MachineIdentifier, NetworkMode, VmConfig};
+use crate::virt::config::{
+    validate_common, validate_vz_disks, MachineIdentifier, NetworkMode, VmConfig,
+};
 use crate::virt::error::VirtError;
 use crate::virt::exit::StartupStage;
 use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
@@ -136,6 +138,16 @@ impl VzBackend {
 
 #[async_trait]
 impl VirtBackend for VzBackend {
+    async fn lifecycle(
+        &self,
+        _request: crate::virt::lifecycle::LifecycleRequest,
+        _rights: crate::virt::lifecycle::LifecycleRights,
+    ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
+    {
+        // Virtualization.framework exposes no native pause authority here.
+        Err(crate::virt::lifecycle::LifecycleError::Unsupported { backend: "vz" })
+    }
+
     async fn start(&self) -> Result<(), VirtError> {
         if !self.attempt.reserve() {
             return Err(VirtError::AlreadyRunning {
@@ -428,8 +440,9 @@ impl VirtualMachineDelegate for ExitDelegate {
 }
 
 fn validate(config: &VmConfig) -> Result<(), VirtError> {
-    validate_support()?;
     validate_common(config)?;
+    validate_vz_disks(config)?;
+    validate_support()?;
     validate_machine_config(config)
 }
 
@@ -439,6 +452,7 @@ fn validate_support() -> Result<(), VirtError> {
 }
 
 fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration), VirtError> {
+    validate_vz_disks(config)?;
     let serial_port = SerialPortConfiguration::virtio_console().map_err(vz_error)?;
 
     let mut builder = VirtualMachine::builder()
@@ -464,7 +478,12 @@ fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguratio
 
     for disk in config.disks() {
         builder = builder.add_storage_device(
-            StorageDeviceConfiguration::new(disk.path.clone(), disk.read_only).map_err(vz_error)?,
+            StorageDeviceConfiguration::new(
+                disk.path.clone(),
+                disk.read_only,
+                disk.block_id.as_str(),
+            )
+            .map_err(vz_error)?,
         );
     }
 
@@ -479,7 +498,7 @@ fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguratio
 
     if config.rosetta() == crate::virt::RosettaIntent::VzNative {
         let mut rosetta_config =
-            VirtioFileSystemDeviceConfiguration::new(agent_spec::ROSETTA_MOUNT_TAG)
+            VirtioFileSystemDeviceConfiguration::new(rootfs_spec::rosetta::SHARE_TAG)
                 .map_err(vz_error)?;
         rosetta_config.set_rosetta_share(LinuxRosettaDirectoryShare::new().map_err(vz_error)?);
         builder = builder.add_directory_share(rosetta_config);

@@ -23,27 +23,6 @@ enum KernelProfile {
 }
 
 impl KernelProfile {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Workload => "workload",
-            Self::Rprobe => "rprobe",
-        }
-    }
-
-    fn artifact_type(self) -> &'static str {
-        match self {
-            Self::Workload => ARTIFACT_TYPE,
-            Self::Rprobe => "application/vnd.silo.rprobe-kernel.v1",
-        }
-    }
-
-    fn config_type(self) -> &'static str {
-        match self {
-            Self::Workload => CONFIG_MEDIA_TYPE,
-            Self::Rprobe => "application/vnd.silo.rprobe-kernel.config.v1+json",
-        }
-    }
-
     fn image_type(self) -> &'static str {
         match self {
             Self::Workload => KERNEL_MEDIA_TYPE,
@@ -60,8 +39,6 @@ pub struct RprobeOptions {
     rprobe_path: Option<PathBuf>,
     #[arg(long)]
     rprobe_offline: bool,
-    #[arg(long)]
-    rprobe_refresh: bool,
 }
 
 pub fn resolve_rprobe(
@@ -85,20 +62,12 @@ pub fn resolve_rprobe(
             reference: options.rprobe_reference.clone(),
             path,
             offline: options.rprobe_offline,
-            refresh: options.rprobe_refresh,
             profile: KernelProfile::Rprobe,
         },
     )
 }
 
-const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
-const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
-const ARTIFACT_TYPE: &str = "application/vnd.silo.kernel.v1";
-const CONFIG_MEDIA_TYPE: &str = "application/vnd.silo.kernel.config.v1+json";
 const KERNEL_MEDIA_TYPE: &str = "application/vnd.silo.kernel.image.v1";
-const KCONFIG_MEDIA_TYPE: &str = "application/vnd.silo.kernel.kconfig.v1";
-const SYSTEM_MAP_MEDIA_TYPE: &str = "application/vnd.silo.kernel.system-map.v1";
-const DEBUG_MEDIA_TYPE: &str = "application/vnd.silo.kernel.debug.v1+xz";
 
 #[derive(Debug, Args)]
 pub struct KernelOptions {
@@ -108,8 +77,6 @@ pub struct KernelOptions {
     path: Option<PathBuf>,
     #[arg(long)]
     offline: bool,
-    #[arg(long)]
-    refresh: bool,
     #[arg(skip)]
     profile: KernelProfile,
 }
@@ -118,23 +85,11 @@ pub struct KernelArtifact {
     pub path: PathBuf,
 }
 
-impl KernelOptions {
-    pub fn refresh(&self) -> bool {
-        self.refresh
-    }
-}
-
 #[derive(Clone)]
 struct Descriptor {
-    media_type: String,
     digest: String,
     size: u64,
     value: Value,
-}
-
-struct ManifestArtifacts {
-    config: Descriptor,
-    layers: Vec<Descriptor>,
 }
 
 #[derive(Debug, Error)]
@@ -223,7 +178,6 @@ fn resolve_local_kernel(
         path: path.to_path_buf(),
         source,
     })?;
-    validate_kernel(&bytes, context)?;
     let digest = sha256_digest(&bytes);
     let cached = cache_bytes(cache_root, &digest, &bytes)?;
     Ok((
@@ -242,6 +196,7 @@ fn resolve_oci_kernel(
     options: &KernelOptions,
 ) -> Result<(PathBuf, Value), KernelError> {
     let reference = &options.reference;
+    let repository = repository(reference)?;
     let reference_key = sha256_digest(reference.as_bytes());
     let references = cache_root.join("references");
     create_directory(&references)?;
@@ -251,57 +206,52 @@ fn resolve_oci_kernel(
             .unwrap_or(&reference_key),
     );
 
-    let index_descriptor = if options.offline || (!options.refresh() && reference_record.exists()) {
+    // Always follow the tag to whatever is published right now. Content is
+    // cached by digest, so an unchanged tag costs one lookup and zero downloads.
+    let index_descriptor = if options.offline {
         read_reference_record(&reference_record, reference, context)?
     } else {
-        let descriptor = fetch_manifest_descriptor(reference)?;
-        if descriptor.media_type != OCI_INDEX_MEDIA_TYPE {
-            return Err(KernelError::Invalid(format!(
-                "OCI reference {reference} resolved to {}, expected {OCI_INDEX_MEDIA_TYPE}",
-                descriptor.media_type
-            )));
-        }
-        let repository = repository(reference)?;
-        let immutable_reference = format!("{repository}@{}", descriptor.digest);
-        let _ = fetch_or_cached_manifest(cache_root, &descriptor, &immutable_reference, false)?;
-        write_reference_record(&reference_record, reference, context, &descriptor)?;
-        descriptor
+        fetch_manifest_descriptor(reference)?
     };
-
-    if index_descriptor.media_type != OCI_INDEX_MEDIA_TYPE {
-        return Err(KernelError::Invalid(format!(
-            "cached index descriptor has media type {}, expected {OCI_INDEX_MEDIA_TYPE}",
-            index_descriptor.media_type
-        )));
+    let index = fetch_or_cached_manifest(
+        cache_root,
+        &index_descriptor,
+        &format!("{repository}@{}", index_descriptor.digest),
+        options.offline,
+    )?;
+    if !options.offline {
+        write_reference_record(&reference_record, reference, context, &index_descriptor)?;
     }
-    let index = read_cached(cache_root, &index_descriptor)?;
     let index = parse_json(&index, "OCI index")?;
-    validate_index(&index, options.profile)?;
     let manifest_descriptor = select_manifest(&index, context)?;
-    let repository = repository(reference)?;
-    let manifest_reference = format!("{repository}@{}", manifest_descriptor.digest);
     let manifest = fetch_or_cached_manifest(
         cache_root,
         &manifest_descriptor,
-        &manifest_reference,
+        &format!("{repository}@{}", manifest_descriptor.digest),
         options.offline,
     )?;
     let manifest = parse_json(&manifest, "platform OCI manifest")?;
-    let artifacts = validate_manifest(&manifest, context, options.profile)?;
-    let config = fetch_or_cached_blob(cache_root, &artifacts.config, repository, options.offline)?;
+    let config_descriptor = descriptor(
+        manifest.get("config").ok_or_else(|| {
+            KernelError::Invalid("OCI manifest has no config descriptor".to_string())
+        })?,
+        "OCI config descriptor",
+    )?;
+    let config = fetch_or_cached_blob(cache_root, &config_descriptor, repository, options.offline)?;
     let config = parse_json(&config, "kernel artifact config")?;
-    validate_config(&config, context, options.profile)?;
-    let mut kernel_path = None;
-    for layer in &artifacts.layers {
-        let bytes = fetch_or_cached_blob(cache_root, layer, repository, options.offline)?;
-        if layer.media_type == options.profile.image_type() {
-            validate_kernel(&bytes, context)?;
-            kernel_path = Some(cache_path(cache_root, &layer.digest)?);
-        }
-    }
-    let kernel_path = kernel_path.ok_or_else(|| {
-        KernelError::Invalid("OCI manifest has no validated kernel layer".to_string())
-    })?;
+    let image_type = options.profile.image_type();
+    let kernel = manifest
+        .get("layers")
+        .and_then(Value::as_array)
+        .and_then(|layers| {
+            layers
+                .iter()
+                .find(|layer| layer.get("mediaType").and_then(Value::as_str) == Some(image_type))
+        })
+        .ok_or_else(|| KernelError::Invalid(format!("OCI manifest has no {image_type} layer")))?;
+    let kernel = descriptor(kernel, "OCI kernel layer")?;
+    fetch_or_cached_blob(cache_root, &kernel, repository, options.offline)?;
+    let kernel_path = cache_path(cache_root, &kernel.digest)?;
 
     Ok((
         kernel_path,
@@ -314,35 +264,11 @@ fn resolve_oci_kernel(
             },
             "index": index_descriptor.value,
             "manifest": manifest_descriptor.value,
-            "config": artifacts.config.value,
-            "layers": artifacts.layers.iter().map(|layer| layer.value.clone()).collect::<Vec<_>>(),
+            "config": config_descriptor.value,
+            "kernel": kernel.value,
+            "artifactConfig": config,
         }),
     ))
-}
-
-fn validate_index(index: &Value, profile: KernelProfile) -> Result<(), KernelError> {
-    require_u64(index, "schemaVersion", "OCI index", 2)?;
-    require_string_value(index, "mediaType", "OCI index", OCI_INDEX_MEDIA_TYPE)?;
-    require_string_value(index, "artifactType", "OCI index", profile.artifact_type())?;
-    let manifests = index
-        .get("manifests")
-        .and_then(Value::as_array)
-        .ok_or_else(|| KernelError::Invalid("OCI index manifests must be an array".to_string()))?;
-    if manifests.is_empty() {
-        return Err(KernelError::Invalid(
-            "OCI index has no manifests".to_string(),
-        ));
-    }
-    for manifest in manifests {
-        let descriptor = descriptor(manifest, "OCI index manifest")?;
-        if descriptor.media_type != OCI_MANIFEST_MEDIA_TYPE {
-            return Err(KernelError::Invalid(format!(
-                "OCI index manifest {} has media type {}, expected {OCI_MANIFEST_MEDIA_TYPE}",
-                descriptor.digest, descriptor.media_type
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn select_manifest(index: &Value, context: &BuildContext<'_>) -> Result<Descriptor, KernelError> {
@@ -351,9 +277,9 @@ fn select_manifest(index: &Value, context: &BuildContext<'_>) -> Result<Descript
         .and_then(Value::as_array)
         .ok_or_else(|| KernelError::Invalid("OCI index manifests must be an array".to_string()))?;
     let expected_architecture = context.host.oci_architecture();
-    let matches = manifests
+    let manifest = manifests
         .iter()
-        .filter(|manifest| {
+        .find(|manifest| {
             manifest
                 .get("platform")
                 .and_then(Value::as_object)
@@ -361,226 +287,14 @@ fn select_manifest(index: &Value, context: &BuildContext<'_>) -> Result<Descript
                     platform.get("os").and_then(Value::as_str) == Some("linux")
                         && platform.get("architecture").and_then(Value::as_str)
                             == Some(expected_architecture)
-                        && platform.get("variant").is_none()
                 })
         })
-        .collect::<Vec<_>>();
-    if matches.len() != 1 {
-        return Err(KernelError::Invalid(format!(
-            "OCI index must contain exactly one linux/{expected_architecture} manifest, found {}",
-            matches.len()
-        )));
-    }
-    descriptor(matches[0], "selected OCI platform manifest")
-}
-
-fn validate_manifest(
-    manifest: &Value,
-    context: &BuildContext<'_>,
-    profile: KernelProfile,
-) -> Result<ManifestArtifacts, KernelError> {
-    require_u64(manifest, "schemaVersion", "OCI manifest", 2)?;
-    require_string_value(
-        manifest,
-        "mediaType",
-        "OCI manifest",
-        OCI_MANIFEST_MEDIA_TYPE,
-    )?;
-    require_string_value(
-        manifest,
-        "artifactType",
-        "OCI manifest",
-        profile.artifact_type(),
-    )?;
-    let config = descriptor(
-        manifest.get("config").ok_or_else(|| {
-            KernelError::Invalid("OCI manifest has no config descriptor".to_string())
-        })?,
-        "OCI config descriptor",
-    )?;
-    if config.media_type != profile.config_type() {
-        return Err(KernelError::Invalid(format!(
-            "OCI config has media type {}, expected {}",
-            config.media_type,
-            profile.config_type()
-        )));
-    }
-    let layers = manifest
-        .get("layers")
-        .and_then(Value::as_array)
-        .ok_or_else(|| KernelError::Invalid("OCI manifest layers must be an array".to_string()))?;
-    let mut kernel = None;
-    let mut kconfig = 0;
-    let mut system_map = 0;
-    let mut debug = 0;
-    let mut descriptors = Vec::with_capacity(layers.len());
-    for layer in layers {
-        let descriptor = descriptor(layer, "OCI layer descriptor")?;
-        match descriptor.media_type.as_str() {
-            media_type if media_type == profile.image_type() => {
-                if kernel.replace(descriptor.clone()).is_some() {
-                    return Err(KernelError::Invalid(
-                        "OCI manifest contains more than one kernel layer".to_string(),
-                    ));
-                }
-            }
-            KCONFIG_MEDIA_TYPE => kconfig += 1,
-            SYSTEM_MAP_MEDIA_TYPE => system_map += 1,
-            DEBUG_MEDIA_TYPE => debug += 1,
-            other => {
-                return Err(KernelError::Invalid(format!(
-                    "OCI manifest contains unsupported layer media type {other}"
-                )));
-            }
-        }
-        descriptors.push(descriptor);
-    }
-    let expected_debug = usize::from(context.host.oci_architecture() == "arm64");
-    if kernel.is_none() || kconfig != 1 || system_map != 1 || debug != expected_debug {
-        return Err(KernelError::Invalid(format!(
-            "OCI manifest layer contract is invalid (kernel={}, kconfig={kconfig}, system-map={system_map}, debug={debug})",
-            kernel.is_some()
-        )));
-    }
-    match kernel {
-        Some(_) => Ok(ManifestArtifacts {
-            config,
-            layers: descriptors,
-        }),
-        None => Err(KernelError::Invalid(
-            "OCI manifest has no kernel layer".to_string(),
-        )),
-    }
-}
-
-fn validate_config(
-    config: &Value,
-    context: &BuildContext<'_>,
-    profile: KernelProfile,
-) -> Result<(), KernelError> {
-    if profile == KernelProfile::Rprobe {
-        require_string_value(config, "profile", "kernel artifact config", profile.name())?;
-        require_string_value(
-            config,
-            "purpose",
-            "kernel artifact config",
-            "rosetta-acquisition-probe",
-        )?;
-    }
-    require_u64(config, "schemaVersion", "kernel artifact config", 1)?;
-    require_string_value(config, "track", "kernel artifact config", "stable")?;
-    require_string_value(
-        config,
-        "architecture",
-        "kernel artifact config",
-        context.host.kernel_architecture(),
-    )?;
-    let platform = config
-        .get("platform")
-        .and_then(Value::as_object)
         .ok_or_else(|| {
-            KernelError::Invalid("kernel artifact config platform must be an object".to_string())
+            KernelError::Invalid(format!(
+                "OCI index has no linux/{expected_architecture} manifest"
+            ))
         })?;
-    if platform.get("os").and_then(Value::as_str) != Some("linux")
-        || platform.get("architecture").and_then(Value::as_str)
-            != Some(context.host.oci_architecture())
-    {
-        return Err(KernelError::Invalid(format!(
-            "kernel artifact config platform must be linux/{}",
-            context.host.oci_architecture()
-        )));
-    }
-    let kernel = config
-        .get("kernel")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            KernelError::Invalid("kernel artifact config kernel must be an object".to_string())
-        })?;
-    if kernel.get("mediaType").and_then(Value::as_str) != Some(profile.image_type()) {
-        return Err(KernelError::Invalid(
-            "kernel artifact config has an invalid kernel media type".to_string(),
-        ));
-    }
-    let expected_format = if context.host.oci_architecture() == "arm64" {
-        "arm64-image"
-    } else {
-        "elf"
-    };
-    if kernel.get("format").and_then(Value::as_str) != Some(expected_format) {
-        return Err(KernelError::Invalid(format!(
-            "kernel artifact config format must be {expected_format}"
-        )));
-    }
-    let source = config
-        .get("source")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            KernelError::Invalid("kernel artifact config source must be an object".to_string())
-        })?;
-    let source_digest = source
-        .get("digest")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            KernelError::Invalid("kernel artifact config source digest is missing".to_string())
-        })?;
-    validate_digest(source_digest)?;
-    Ok(())
-}
-
-fn validate_kernel(bytes: &[u8], context: &BuildContext<'_>) -> Result<(), KernelError> {
-    match context.host.oci_architecture() {
-        "arm64" => validate_arm64_image(bytes),
-        "amd64" => validate_x86_64_elf(bytes),
-        architecture => Err(KernelError::Invalid(format!(
-            "unsupported kernel architecture {architecture}"
-        ))),
-    }
-}
-
-fn validate_arm64_image(bytes: &[u8]) -> Result<(), KernelError> {
-    const ARM64_IMAGE_HEADER_SIZE: usize = 64;
-    const ARM64_IMAGE_MAGIC_OFFSET: usize = 0x38;
-    const ARM64_IMAGE_MAGIC: &[u8; 4] = b"ARM\x64";
-
-    if bytes.len() < ARM64_IMAGE_HEADER_SIZE {
-        return Err(KernelError::Invalid(
-            "arm64 kernel is shorter than the Linux Image header".to_string(),
-        ));
-    }
-    if bytes.get(ARM64_IMAGE_MAGIC_OFFSET..ARM64_IMAGE_MAGIC_OFFSET + ARM64_IMAGE_MAGIC.len())
-        != Some(ARM64_IMAGE_MAGIC)
-    {
-        return Err(KernelError::Invalid(
-            "arm64 kernel is not an uncompressed Linux Image".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_x86_64_elf(bytes: &[u8]) -> Result<(), KernelError> {
-    const ELF_HEADER_SIZE: usize = 64;
-    const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
-    const ELFCLASS64: u8 = 2;
-    const ELFDATA2LSB: u8 = 1;
-    const EV_CURRENT: u8 = 1;
-    const EM_X86_64: u16 = 62;
-
-    let machine = bytes
-        .get(18..20)
-        .and_then(|value| <&[u8; 2]>::try_from(value).ok())
-        .map(|value| u16::from_le_bytes(*value));
-    if bytes.len() < ELF_HEADER_SIZE
-        || bytes.get(0..4) != Some(ELF_MAGIC)
-        || bytes.get(4) != Some(&ELFCLASS64)
-        || bytes.get(5) != Some(&ELFDATA2LSB)
-        || bytes.get(6) != Some(&EV_CURRENT)
-        || machine != Some(EM_X86_64)
-    {
-        return Err(KernelError::Invalid(
-            "amd64 kernel is not a 64-bit little-endian x86-64 ELF file".to_string(),
-        ));
-    }
-    Ok(())
+    descriptor(manifest, "selected OCI platform manifest")
 }
 
 fn fetch_or_cached_manifest(
@@ -677,7 +391,6 @@ fn read_cached(cache_root: &Path, descriptor: &Descriptor) -> Result<Vec<u8>, Ke
 
 fn cache_bytes(cache_root: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf, KernelError> {
     let descriptor = Descriptor {
-        media_type: "cached content".to_string(),
         digest: digest.to_string(),
         size: bytes.len() as u64,
         value: Value::Null,
@@ -838,7 +551,6 @@ fn parse_json(bytes: &[u8], source: &str) -> Result<Value, KernelError> {
 }
 
 fn descriptor(value: &Value, source: &str) -> Result<Descriptor, KernelError> {
-    let media_type = required_string(value, "mediaType", source)?.to_string();
     let digest = required_string(value, "digest", source)?.to_string();
     validate_digest(&digest)?;
     let size = value
@@ -847,7 +559,6 @@ fn descriptor(value: &Value, source: &str) -> Result<Descriptor, KernelError> {
         .filter(|size| *size > 0)
         .ok_or_else(|| KernelError::Invalid(format!("{source} size must be a positive integer")))?;
     Ok(Descriptor {
-        media_type,
         digest,
         size,
         value: value.clone(),
@@ -860,32 +571,6 @@ fn required_string<'a>(value: &'a Value, key: &str, source: &str) -> Result<&'a 
         .and_then(Value::as_str)
         .filter(|string| !string.is_empty())
         .ok_or_else(|| KernelError::Invalid(format!("{source} {key} must be a non-empty string")))
-}
-
-fn require_string_value(
-    value: &Value,
-    key: &str,
-    source: &str,
-    expected: &str,
-) -> Result<(), KernelError> {
-    let actual = required_string(value, key, source)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(KernelError::Invalid(format!(
-            "{source} {key} must be {expected}, got {actual}"
-        )))
-    }
-}
-
-fn require_u64(value: &Value, key: &str, source: &str, expected: u64) -> Result<(), KernelError> {
-    if value.get(key).and_then(Value::as_u64) == Some(expected) {
-        Ok(())
-    } else {
-        Err(KernelError::Invalid(format!(
-            "{source} {key} must be {expected}"
-        )))
-    }
 }
 
 fn validate_digest(digest: &str) -> Result<(), KernelError> {

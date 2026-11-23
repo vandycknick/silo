@@ -1,5 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+pub mod logging;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod process;
 pub mod ssh;

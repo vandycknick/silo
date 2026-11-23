@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::virt::{
-    DiskImage, MachineIdentifier, SharedDirectory, VirtError, VmConfig, VmConfigBuilder,
-};
+use crate::virt::{MachineIdentifier, SharedDirectory, VirtError, VmConfig, VmConfigBuilder};
 use protocol::guest_port_arg;
 use thiserror::Error;
 use utils::parse_mac;
@@ -89,8 +87,12 @@ pub(crate) fn vm_spec_machine_config(
 
     if let Some(storage) = inputs.spec.storage.as_ref() {
         for disk in &storage.disks {
-            let disk_image = DiskImage {
+            let disk_image = vm_spec::Disk {
                 path: resolve_spec_path(inputs.data_dir, &disk.path),
+                role: disk.role,
+                format: disk.format,
+                geometry: disk.geometry,
+                block_id: disk.block_id.clone(),
                 read_only: disk.read_only,
             };
 
@@ -441,11 +443,25 @@ mod tests {
         spec.storage = Some(Storage {
             disks: vec![
                 Disk {
-                    path: PathBuf::from("rootfs.img"),
+                    path: PathBuf::from("root.raw"),
+                    role: vm_spec::DiskRole::Root,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 4096,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("explicit-root").expect("valid ID"),
                     read_only: false,
                 },
                 Disk {
                     path: PathBuf::from(DATA_DISK),
+                    role: vm_spec::DiskRole::Data,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 8192,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("explicit-data").expect("valid ID"),
                     read_only: true,
                 },
             ],
@@ -465,13 +481,18 @@ mod tests {
         .expect("machine config should resolve");
 
         assert_eq!(machine_config.config.disks().len(), 2);
-        assert_eq!(
-            machine_config.config.disks()[0].path,
-            dir.join("rootfs.img")
-        );
+        assert_eq!(machine_config.config.disks()[0].path, dir.join("root.raw"));
         assert!(!machine_config.config.disks()[0].read_only);
         assert_eq!(machine_config.config.disks()[1].path, dir.join(DATA_DISK));
         assert!(machine_config.config.disks()[1].read_only);
+        let expected = spec.storage.as_ref().expect("storage");
+        for (actual, declared) in machine_config.config.disks().iter().zip(&expected.disks) {
+            assert_eq!(actual.role, declared.role);
+            assert_eq!(actual.format, declared.format);
+            assert_eq!(actual.geometry, declared.geometry);
+            assert_eq!(actual.block_id, declared.block_id);
+            assert_eq!(actual.read_only, declared.read_only);
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

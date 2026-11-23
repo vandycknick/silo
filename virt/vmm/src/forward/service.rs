@@ -204,6 +204,7 @@ fn map_open_error(error: OpenError) -> Status {
             ErrorCode::BackendUnavailable,
             message,
         ),
+        OpenError::Fenced(refusal) => refusal.status(),
     }
 }
 

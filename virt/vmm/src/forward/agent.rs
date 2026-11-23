@@ -162,7 +162,11 @@ async fn check_capability(machine: &VirtualMachine) -> Result<bool, tonic::Statu
     }
 }
 
-pub(crate) async fn supervise_listener(machine: VirtualMachine, entry: Arc<ForwardEntry>) {
+pub(crate) async fn supervise_listener(
+    machine: VirtualMachine,
+    entry: Arc<ForwardEntry>,
+    gate: Arc<crate::live::gate::LiveGate>,
+) {
     let mut availability = entry.availability.subscribe();
     loop {
         let current = availability.borrow_and_update().clone();
@@ -173,12 +177,30 @@ pub(crate) async fn supervise_listener(machine: VirtualMachine, entry: Arc<Forwa
             }
             continue;
         };
+        if let Some(address) = entry.activation_bound(&identity) {
+            // Restore Activate registered this listener for exactly this agent
+            // instance, which owns it until replaced: never re-register it.
+            let owner = GuestHalfAvailability::Available(Some(identity.clone()));
+            if entry.activate_guest_listener(&identity, address) {
+                let current = tokio::select! {
+                    _ = entry.shutdown.cancelled() => return,
+                    changed = availability.wait_for(|current| *current != owner) => changed.is_ok(),
+                };
+                entry.end_guest_listener();
+                if !current {
+                    return;
+                }
+            } else if entry.shutdown.is_cancelled() {
+                return;
+            }
+            continue;
+        }
         let mut backoff = ReconnectBackoff::new();
         loop {
             entry.set_state(ForwardState::Pending, None);
             let result = tokio::select! {
                 _ = entry.shutdown.cancelled() => return,
-                result = listen_once(&machine, &entry, &identity, &mut availability) => result,
+                result = listen_once(&machine, &entry, &identity, &mut availability, &gate) => result,
             };
             entry.end_guest_listener();
             if availability.borrow().clone()
@@ -216,9 +238,17 @@ async fn listen_once(
     entry: &ForwardEntry,
     identity: &crate::state::ReadyAgentIdentity,
     availability: &mut tokio::sync::watch::Receiver<GuestHalfAvailability>,
+    gate: &Arc<crate::live::gate::LiveGate>,
 ) -> eyre::Result<()> {
     let forward_spec::Endpoint::Guest(requested) = &entry.spec.listen else {
         return Err(eyre::eyre!("outbound agent forward has no guest listener"));
+    };
+    // A guest listener (re)registration is a guest mutation: it waits for
+    // live fences to reopen and holds a permit only until ListenerBound.
+    let registration = tokio::select! {
+        permit = gate.admit(crate::live::gate::GateKind::ForwardRegistration) => permit
+            .map_err(|refusal| eyre::eyre!("guest forward registration refused: {refusal}"))?,
+        _ = entry.shutdown.cancelled() => return Ok(()),
     };
     let token = entry
         .token
@@ -254,6 +284,7 @@ async fn listen_once(
             if !entry.activate_guest_listener(identity, actual) {
                 return Ok(());
             }
+            drop(registration);
         }
         Some(Event::Failed(failed)) => {
             entry.status.send_modify(|snapshot| {
@@ -284,7 +315,7 @@ async fn listen_once(
     }
 }
 
-fn validate_bound(
+pub(crate) fn validate_bound(
     requested: &forward_spec::Address,
     actual: &forward_spec::Address,
 ) -> eyre::Result<()> {

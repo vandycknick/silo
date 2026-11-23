@@ -9,6 +9,26 @@ pub type OciResult<T> = Result<T, OciError>;
 
 #[derive(Debug, Error)]
 pub enum OciError {
+    #[error(transparent)]
+    Changeset(#[from] crate::changeset::ChangesetError),
+    #[error(transparent)]
+    Namespace(#[from] crate::changeset::namespace::NamespaceError),
+    #[error(transparent)]
+    VmArtifact(#[from] crate::vm_artifact::Error),
+    #[error("OCI reference {reference:?} is not a Silo VM artifact")]
+    NotVmArtifact { reference: String },
+    #[error("OCI reference {reference:?} is a Silo VM artifact (index {index_digest}), not a container image; acquire it as a VM artifact")]
+    VmArtifactRequiresAcquisition {
+        reference: String,
+        index_digest: String,
+    },
+    #[error(
+        "registry {reference:?} does not preserve the required OCI VM artifact graph: {message}"
+    )]
+    ArtifactRegistryIncompatible { reference: String, message: String },
+    #[error("invalid staging operation ID {value:?}: expected a canonical lowercase UUID")]
+    InvalidOperationId { value: String },
+
     #[error("unsupported host architecture {arch:?}; supported OCI image platforms are linux/amd64 and linux/arm64")]
     UnsupportedHostArchitecture { arch: String },
 
@@ -56,7 +76,7 @@ pub enum OciError {
         actual: String,
     },
 
-    #[error("cached OCI layer {digest} at {path} has {actual} bytes; expected {expected}")]
+    #[error("cached OCI layer {digest} at {path} has {}; expected {}", utils::format_storage_size(*actual), utils::format_storage_size(*expected))]
     LayerSizeMismatch {
         digest: String,
         path: PathBuf,
@@ -96,26 +116,30 @@ pub enum OciError {
     #[error("image config for {reference:?} is invalid: {message}")]
     ImageConfig { reference: String, message: String },
 
-    #[error("unsupported OCI layer media type {media_type}")]
-    UnsupportedLayerMediaType { media_type: String },
-
-    #[error("invalid tar entry path {path:?}: {reason}")]
-    InvalidTarPath { path: String, reason: &'static str },
-
-    #[error("invalid symlink target for {path}: {target:?}: {reason}")]
-    InvalidSymlinkTarget {
-        path: String,
-        target: String,
-        reason: &'static str,
+    #[error(
+        "{content} for {reference:?} has {}; expected {}, maximum {}",
+        utils::format_storage_size(*actual),
+        expected.map(utils::format_storage_size).unwrap_or_else(|| "unspecified".to_string()),
+        utils::format_storage_size(*limit)
+    )]
+    MetadataSize {
+        reference: String,
+        content: &'static str,
+        expected: Option<u64>,
+        actual: u64,
+        limit: u64,
     },
-
-    #[error("cache entry at {path} is corrupt: {reason}")]
-    CorruptCacheEntry { path: PathBuf, reason: String },
 
     #[error("ext4 rootfs conversion failed")]
     FlatExt4 {
         #[source]
         source: disk_image::ext4::FormatError,
+    },
+
+    #[error("held ext4 upper read failed")]
+    UpperRead {
+        #[source]
+        source: disk_image::ext4::ReadError,
     },
 
     #[error(transparent)]
@@ -174,6 +198,10 @@ impl OciError {
 
     pub(crate) fn flat_ext4(source: disk_image::ext4::FormatError) -> Self {
         Self::FlatExt4 { source }
+    }
+
+    pub(crate) fn upper_read(source: disk_image::ext4::ReadError) -> Self {
+        Self::UpperRead { source }
     }
 }
 
@@ -276,6 +304,25 @@ mod tests {
     };
 
     use crate::OciError;
+
+    #[test]
+    fn metadata_size_errors_format_known_and_unknown_expected_sizes() {
+        for (expected, text) in [(Some(1 << 20), "1MiB"), (None, "unspecified")] {
+            assert_eq!(
+                OciError::MetadataSize {
+                    reference: "example:latest".into(),
+                    content: "OCI manifest",
+                    expected,
+                    actual: 2 << 20,
+                    limit: 4 << 20,
+                }
+                .to_string(),
+                format!(
+                    "OCI manifest for \"example:latest\" has 2MiB; expected {text}, maximum 4MiB"
+                )
+            );
+        }
+    }
 
     #[test]
     fn manifest_unknown_reports_missing_tag() {

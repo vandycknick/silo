@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use clap::Args;
-use libvm::{MachineStatus, DEFAULT_GUEST_READINESS_TIMEOUT};
+use libvm::{MachineData, MachineRetention, MachineStatus, DEFAULT_GUEST_READINESS_TIMEOUT};
 
 use crate::commands::stop::parse_timeout;
 use crate::context::Context;
@@ -28,26 +28,15 @@ impl Cmd {
         let mut spinner = Spinner::start("Finding", self.name.as_deref().unwrap_or("default VM"));
         let name = context.resolve_machine_name(self.name.as_deref())?;
         let data = context.app_api().await?.inspect_machine(&name).await?;
-        if data.retention == libvm::MachineRetention::Ephemeral {
-            eyre::bail!(
-                "machine `{}` is ephemeral and cannot be restarted; use `silo run` instead",
-                data.name
-            );
-        }
-        if matches!(data.status, MachineStatus::Starting { .. }) {
-            eyre::bail!(
-                "machine `{}` is starting; wait for it to become ready",
-                data.name
-            );
-        }
+        ensure_restartable(&data)?;
         let deadline = Instant::now()
             .checked_add(self.timeout)
             .ok_or_else(|| eyre::eyre!("restart timeout is too large"))?;
 
-        if matches!(
-            data.status,
-            MachineStatus::Running { .. } | MachineStatus::Stopping { .. }
-        ) {
+        if data.status.is_active()
+            || data.run_id.is_some()
+            || matches!(data.status, MachineStatus::Hibernated { .. })
+        {
             if self.force {
                 spinner.step("Killing", &name);
             } else {
@@ -65,13 +54,36 @@ impl Cmd {
         let started = context
             .app_api()
             .await?
-            .start_machine(&name, timeout)
+            .start_machine(&name, timeout, true)
             .await?;
 
         spinner.step("Ready", &started.name);
         spinner.finish_success("Restarted");
         Ok(())
     }
+}
+
+fn ensure_restartable(data: &MachineData) -> eyre::Result<()> {
+    if data.retention == MachineRetention::Ephemeral {
+        eyre::bail!(
+            "machine `{}` is an ephemeral `silo run` machine and cannot be restarted; remove it with `silo rm {}`",
+            data.name, data.name
+        );
+    }
+    if matches!(data.status, MachineStatus::Hibernating { .. }) {
+        eyre::bail!(
+            "machine `{}` is {}; restart is not available in this state",
+            data.name,
+            data.status.label()
+        );
+    }
+    if matches!(data.status, MachineStatus::Starting { .. }) {
+        eyre::bail!(
+            "machine `{}` is starting; wait for it to become ready",
+            data.name
+        );
+    }
+    Ok(())
 }
 
 fn remaining(deadline: Instant) -> eyre::Result<Duration> {
@@ -87,10 +99,28 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use libvm::DEFAULT_MACHINE_WAIT_TIMEOUT;
+    use libvm::{MachineData, MachineRetention, MachineStatus, DEFAULT_MACHINE_WAIT_TIMEOUT};
 
     use crate::app::Cli;
     use crate::commands::Command;
+
+    #[test]
+    fn rejects_ephemeral_restart_with_removal_hint() {
+        let mut data = MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "temporary".into(),
+            vm_spec::VmSpec::current(),
+        );
+        data.retention = MachineRetention::Ephemeral;
+        let error = crate::commands::restart::ensure_restartable(&data).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ephemeral `silo run` machine"));
+        assert!(message.contains("cannot be restarted"));
+        assert!(message.contains("silo rm temporary"));
+        assert!(!message.contains("use `silo run` instead"));
+        data.retention = MachineRetention::Persistent;
+        assert!(crate::commands::restart::ensure_restartable(&data).is_ok());
+    }
 
     #[test]
     fn restart_parses_force_and_total_timeout() {
@@ -113,5 +143,19 @@ mod tests {
             panic!("expected restart command");
         };
         assert_eq!(restart.timeout, DEFAULT_MACHINE_WAIT_TIMEOUT);
+    }
+
+    #[test]
+    fn hibernated_restart_is_admitted_but_capture_in_progress_is_not() {
+        let mut data = MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "saved".into(),
+            vm_spec::VmSpec::current(),
+        );
+        data.retention = MachineRetention::Persistent;
+        data.status = MachineStatus::Hibernating { message: None };
+        assert!(crate::commands::restart::ensure_restartable(&data).is_err());
+        data.status = MachineStatus::Hibernated { message: None };
+        assert!(crate::commands::restart::ensure_restartable(&data).is_ok());
     }
 }

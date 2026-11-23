@@ -1,26 +1,34 @@
 use std::path::PathBuf;
 
 /// Errors that can occur when reading an ext4 filesystem.
+///
+/// Callers distinguish three filesystem classes and never receive an
+/// approximate answer instead of one of them:
+///
+/// - [`ReadError::RequiresRecovery`]: on-disk state is not clean; only the
+///   kernel (journal replay, orphan cleanup) or fsck may make it readable.
+/// - [`ReadError::Unsupported`]: a valid ext4 encoding this reader does not
+///   implement, or a resource bound it refuses to exceed.
+/// - [`ReadError::Corrupt`]: an inconsistent or malformed structure.
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
     #[error("file at path {0} not found")]
     NotFound(PathBuf),
-    #[error("could not read {2} bytes of superblock from {0} at offset {1}")]
-    CouldNotReadSuperBlock(PathBuf, u64, usize),
-    #[error("not a valid ext4 superblock")]
+    #[error("not an ext4 filesystem: missing superblock magic")]
     InvalidSuperBlock,
-    #[error("deep extents (depth > 1) are not supported")]
-    DeepExtentsUnsupported,
-    #[error("extents invalid or corrupted")]
-    InvalidExtents,
-    #[error("invalid extended attribute entry")]
-    InvalidXattrEntry,
-    #[error("could not read block {0}")]
-    CouldNotReadBlock(u32),
-    #[error("could not read inode {0}")]
-    CouldNotReadInode(u32),
-    #[error("could not read group descriptor {0}")]
-    CouldNotReadGroup(u32),
+    #[error("ext4 filesystem requires kernel recovery before host reading: {0}")]
+    RequiresRecovery(RecoveryReason),
+    #[error("unsupported ext4 layout: {0}")]
+    Unsupported(Unsupported),
+    #[error("corrupt ext4 filesystem: {0}")]
+    Corrupt(Corruption),
+    #[error("read of {} at offset {offset} exceeds inode {inode} size {}", utils::format_storage_size(*length), utils::format_storage_size(*size))]
+    OutOfRange {
+        inode: u32,
+        offset: u64,
+        length: u64,
+        size: u64,
+    },
     #[error("no such file or directory: {0}")]
     PathNotFound(String),
     #[error("not a regular file: {0}")]
@@ -37,6 +45,125 @@ pub enum ReadError {
     Io(#[from] std::io::Error),
 }
 
+impl ReadError {
+    pub(crate) fn corrupt(structure: Structure, inode: Option<u32>, reason: &'static str) -> Self {
+        Self::Corrupt(Corruption {
+            structure,
+            inode,
+            reason,
+        })
+    }
+}
+
+/// Fallible metadata allocation failure surfaces as host out-of-memory I/O,
+/// separately from format and corruption errors.
+impl From<std::collections::TryReserveError> for ReadError {
+    fn from(error: std::collections::TryReserveError) -> Self {
+        Self::Io(std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))
+    }
+}
+
+/// On-disk state that only kernel recovery or fsck can resolve. The host never
+/// replays the journal or repairs the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RecoveryReason {
+    #[error("the journal needs recovery (RECOVER is set)")]
+    JournalNeedsRecovery,
+    #[error("the journal superblock records unreplayed transactions")]
+    JournalNotEmpty,
+    #[error("the journal recorded an abort (errno {0})")]
+    JournalAborted(i32),
+    #[error("the orphan inode list is not empty (first orphan inode {0})")]
+    OrphanInodes(u32),
+    #[error("the filesystem is not marked cleanly unmounted (state {0:#06x})")]
+    NotCleanlyUnmounted(u16),
+    #[error("the filesystem recorded errors (state {0:#06x}); run fsck")]
+    RecordedErrors(u16),
+}
+
+/// Valid ext4 encodings outside the admitted reader profile, and resource
+/// bounds the reader refuses to exceed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Unsupported {
+    #[error(
+        "features compat {compat:#x}, incompat {incompat:#x}, ro_compat {ro_compat:#x} are not implemented"
+    )]
+    Features {
+        compat: u32,
+        incompat: u32,
+        ro_compat: u32,
+    },
+    #[error("required incompatible features {0:#x} are absent")]
+    MissingFeatures(u32),
+    #[error("superblock revision {0} (only dynamic revision 1)")]
+    Revision(u32),
+    #[error("creator OS {0} (only the Linux inode layout)")]
+    CreatorOs(u32),
+    #[error("log block size {0} (only 4096-byte blocks)")]
+    BlockSize(u32),
+    #[error("inode size {} (only 256-byte inodes)", utils::format_storage_size(u64::from(*.0)))]
+    InodeSize(u16),
+    #[error("external or non-inode-8 journal")]
+    ExternalJournal,
+    #[error("inode {inode} uses inode flags {flags:#x}")]
+    InodeFlags { inode: u32, flags: u32 },
+    #[error("inode {inode} has extra inode size {} (only 32B)", utils::format_storage_size(u64::from(*extra_isize)))]
+    InodeExtraSize { inode: u32, extra_isize: u16 },
+    #[error("inode {0} uses indirect block maps instead of extents")]
+    BlockMappedInode(u32),
+    #[error("inode {inode} size {} exceeds the 1 TiB reader bound", utils::format_storage_size(*size))]
+    FileTooLarge { inode: u32, size: u64 },
+    #[error("inode {inode} has more than {limit} extents")]
+    TooManyExtents { inode: u32, limit: usize },
+    #[error("directory inode {inode} has more than {limit} entries")]
+    DirectoryTooLarge { inode: u32, limit: usize },
+    #[error("directory inode {inode} uses hash version {version}")]
+    HashVersion { inode: u32, version: u8 },
+    #[error("indexed directory inode {0} but the superblock records no hash signedness")]
+    HashSignedness(u32),
+    #[error("inode {inode} uses xattr name index {index}")]
+    XattrNamespace { inode: u32, index: u8 },
+    #[error("inode {0} stores inline data (system.data)")]
+    InlineData(u32),
+    #[error("inode {0} stores an xattr value in an EA inode")]
+    XattrValueInode(u32),
+}
+
+/// The ext4 structure in which a [`Corruption`] was detected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Structure {
+    Superblock,
+    GroupDescriptor(u32),
+    Journal,
+    Inode,
+    ExtentTree,
+    Directory,
+    HashIndex,
+    Xattr,
+    Symlink,
+    Namespace,
+}
+
+/// A malformed or inconsistent on-disk structure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Corruption {
+    pub structure: Structure,
+    pub inode: Option<u32>,
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for Corruption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.structure)?;
+        if let Some(inode) = self.inode {
+            write!(f, " of inode {inode}")?;
+        }
+        write!(f, ": {}", self.reason)
+    }
+}
+
+impl std::error::Error for Corruption {}
+
 /// Errors that can occur when formatting an ext4 filesystem.
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
@@ -52,7 +179,7 @@ pub enum FormatError {
     UnsupportedFiletype,
     #[error("maximum links exceeded for path: {0}")]
     MaximumLinksExceeded(PathBuf),
-    #[error("{0} exceeds max file size (128 GiB)")]
+    #[error("{} exceeds max file size (1 TiB)", utils::format_storage_size(*.0))]
     FileTooBig(u64),
     #[error("'{0}' is an invalid link")]
     InvalidLink(PathBuf),
@@ -64,9 +191,9 @@ pub enum FormatError {
     InsufficientSpaceForGroupDescriptorBlocks,
     #[error("cannot create hard links to directory target: {0}")]
     CannotHardlinkDirectory(PathBuf),
-    #[error("unsupported block size {0} (only 4096 is supported)")]
+    #[error("unsupported block size {} (only 4096B is supported)", utils::format_storage_size(u64::from(*.0)))]
     UnsupportedBlockSize(u32),
-    #[error("invalid filesystem size {size}: {reason}")]
+    #[error("invalid filesystem size {}: {reason}", utils::format_storage_size(*size))]
     InvalidSize { size: u64, reason: &'static str },
     #[error("invalid volume label: {0}")]
     InvalidLabel(String),
@@ -74,15 +201,31 @@ pub enum FormatError {
     CannotTruncateFile(PathBuf),
     #[error("cannot create sparse file at {0}")]
     CannotCreateSparseFile(PathBuf),
-    #[error("cannot resize fs to {0} bytes")]
+    #[error("cannot resize fs to {}", utils::format_storage_size(*.0))]
     CannotResizeFs(u64),
     #[error("cannot fit xattr for inode {0}")]
     XattrInsufficientSpace(u32),
     #[error("malformed extended attribute buffer")]
     MalformedXattrBuffer,
+    #[error("malformed POSIX ACL xattr")]
+    MalformedAcl,
+    #[error("invalid raw xattr name {0:?}")]
+    InvalidXattrName(Vec<u8>),
+    #[error("duplicate xattr name")]
+    DuplicateXattr,
+    #[error("device ID is outside Linux's 12-bit major / 20-bit minor encoding")]
+    InvalidDevice,
+    #[error("symlink target length {} exceeds the ext4 maximum {}", utils::format_storage_size(*length), utils::format_storage_size(*maximum))]
+    SymlinkTargetTooLong { length: u64, maximum: u64 },
+    #[error("invalid inode metadata or content: {0}")]
+    InvalidMetadata(&'static str),
+    #[error("invalid sparse file ranges: {0}")]
+    InvalidSparse(&'static str),
+    #[error("filesystem size calculation overflow")]
+    SizeOverflow,
     #[error("cannot convert string '{0}' to ASCII")]
     InvalidAsciiString(String),
-    #[error("invalid path encoding for '{0}', must be ascii or utf8")]
+    #[error("invalid ext4 path '{0}'")]
     InvalidPathEncoding(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -97,7 +240,7 @@ pub enum ResizeError {
     Unsupported(&'static str),
     #[error("invalid or corrupt ext4 filesystem: {0}")]
     Corrupt(&'static str),
-    #[error("resize target {0} is not aligned to the 4096-byte filesystem block size")]
+    #[error("resize target {} is not aligned to the 4096-byte filesystem block size", utils::format_storage_size(*.0))]
     UnalignedSize(u64),
     #[error(
         "refusing to shrink ext4 filesystem from {current_blocks} to {requested_blocks} blocks"
@@ -138,3 +281,38 @@ impl ResizeError {
 pub type ReadResult<T> = std::result::Result<T, ReadError>;
 pub type FormatResult<T> = std::result::Result<T, FormatError>;
 pub type ResizeResult<T> = std::result::Result<T, ResizeError>;
+
+#[cfg(test)]
+mod tests {
+    use crate::ext4::{FormatError, ReadError, ResizeError};
+
+    #[test]
+    fn filesystem_size_errors_use_storage_units() {
+        assert_eq!(
+            FormatError::InvalidSize {
+                size: 1 << 30,
+                reason: "not admitted",
+            }
+            .to_string(),
+            "invalid filesystem size 1GiB: not admitted"
+        );
+        assert_eq!(
+            FormatError::CannotResizeFs(2 << 30).to_string(),
+            "cannot resize fs to 2GiB"
+        );
+        assert_eq!(
+            ResizeError::UnalignedSize((1 << 30) + 1).to_string(),
+            "resize target 1.0GiB is not aligned to the 4096-byte filesystem block size"
+        );
+        assert_eq!(
+            ReadError::OutOfRange {
+                inode: 7,
+                offset: 0,
+                length: 2 << 20,
+                size: 1 << 20,
+            }
+            .to_string(),
+            "read of 2MiB at offset 0 exceeds inode 7 size 1MiB"
+        );
+    }
+}

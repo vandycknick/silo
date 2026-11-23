@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 
 use agent_spec::AgentSshConfig;
 use eyre::Context;
@@ -7,19 +9,21 @@ use tokio_vsock::VsockStream;
 use crate::pid1::ProcessSupervisor;
 
 pub(crate) mod agent;
-mod openssh;
+pub(crate) mod openssh;
 
-pub(crate) fn constrain_external_listener() -> eyre::Result<()> {
-    use std::process::Command;
-    let socket = Command::new("systemctl")
-        .args([
+pub(crate) fn constrain_external_listener(
+    process_supervisor: &ProcessSupervisor,
+) -> eyre::Result<()> {
+    let socket = process_supervisor.output(
+        "systemctl",
+        [
             "show",
             "sshd-vsock.socket",
             "--property=ActiveState",
             "--property=Listen",
             "--property=Accept",
-        ])
-        .output()?;
+        ],
+    )?;
     let socket = if socket.status.success() {
         String::from_utf8(socket.stdout)?
     } else {
@@ -39,9 +43,10 @@ pub(crate) fn constrain_external_listener() -> eyre::Result<()> {
     // inspection instance without starting it.
     let unit = "sshd-vsock@.service";
     let inspection = "sshd-vsock@silo-policy-check.service";
-    let output = Command::new("systemctl")
-        .args(["show", inspection, "--property=ExecStart", "--value"])
-        .output()?;
+    let output = process_supervisor.output(
+        "systemctl",
+        ["show", inspection, "--property=ExecStart", "--value"],
+    )?;
     let command = String::from_utf8(output.stdout)?;
     if !output.status.success()
         || !command.contains("path=/usr/sbin/sshd ;")
@@ -57,25 +62,30 @@ pub(crate) fn constrain_external_listener() -> eyre::Result<()> {
         true,
     );
     std::fs::write(dir.join("00-silo-ca.conf"), expected)?;
-    let status = Command::new("systemctl").arg("daemon-reload").status()?;
+    let status = process_supervisor
+        .output("systemctl", ["daemon-reload"])?
+        .status;
     if !status.success() {
         eyre::bail!("cannot reload constrained external SSH listener");
     }
-    let output = Command::new("systemctl")
-        .args(["show", inspection, "--property=ExecStart", "--value"])
-        .output()?;
+    let output = process_supervisor.output(
+        "systemctl",
+        ["show", inspection, "--property=ExecStart", "--value"],
+    )?;
     let actual = String::from_utf8(output.stdout)?;
     if !output.status.success() || !exclusive_external_command(&actual) {
         eyre::bail!("external SSH listener override did not take effect");
     }
-    let output = Command::new("systemctl")
-        .args(["show", inspection, "--property=ExecStartPre", "--value"])
-        .output()?;
+    let output = process_supervisor.output(
+        "systemctl",
+        ["show", inspection, "--property=ExecStartPre", "--value"],
+    )?;
     if !output.status.success() || !exclusive_sshd_command(&String::from_utf8(output.stdout)?, "-t")
     {
         eyre::bail!("external SSH listener preflight override did not take effect");
     }
     openssh::verify_effective_config(
+        process_supervisor,
         std::path::Path::new("/usr/sbin/sshd"),
         std::path::Path::new(crate::provision::ssh::CONFIG),
     )
@@ -94,9 +104,32 @@ fn exclusive_sshd_command(command: &str, mode: &str) -> bool {
         ))
 }
 
+/// The machine environment an SSH session inherits, identical for the native
+/// and OpenSSH backends. Names a session owns are dropped so they cannot leak
+/// across users: identity (`HOME`, `USER`, ...) comes from the authenticated
+/// account, `TERM` from the PTY request, `SSH_*` from the server and `SILO_*`
+/// from the client. An image's `USER=root` must not follow `silo shell -u alice`.
+pub(crate) fn inherited_environment(
+    environment: &BTreeMap<String, String>,
+) -> impl Iterator<Item = (&str, &str)> {
+    environment
+        .iter()
+        .filter(|(name, _)| !session_owned(name))
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+}
+
+fn session_owned(name: &str) -> bool {
+    matches!(
+        name,
+        "HOME" | "USER" | "LOGNAME" | "SHELL" | "MAIL" | "TERM"
+    ) || name.starts_with("SSH_")
+        || name.starts_with("SILO_")
+}
+
 #[derive(Clone)]
 pub(crate) struct SshService {
     backend: SshBackend,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
 }
 
 #[derive(Clone)]
@@ -139,17 +172,24 @@ impl SshService {
     pub(crate) fn new(
         config: AgentSshConfig,
         process_supervisor: ProcessSupervisor,
+        runtime: Arc<crate::lifecycle::RuntimeContext>,
     ) -> eyre::Result<Self> {
         if openssh::exists() {
             tracing::info!(backend = "openssh", "selected SSH backend");
             return Ok(Self {
                 backend: SshBackend::OpenSsh { process_supervisor },
+                runtime,
             });
         }
 
         tracing::info!(backend = "agent", "selected SSH backend");
         Ok(Self {
-            backend: SshBackend::Agent(agent::NativeSshBackend::new(config, process_supervisor)?),
+            backend: SshBackend::Agent(agent::NativeSshBackend::new(
+                config,
+                process_supervisor,
+                Arc::clone(&runtime),
+            )?),
+            runtime,
         })
     }
 
@@ -168,7 +208,12 @@ impl SshService {
     pub(crate) async fn handle_connection(&self, stream: VsockStream) -> io::Result<()> {
         match &self.backend {
             SshBackend::OpenSsh { process_supervisor } => {
-                openssh::handle_connection(process_supervisor.clone(), stream).await
+                openssh::handle_connection(
+                    process_supervisor.clone(),
+                    stream,
+                    Arc::clone(&self.runtime),
+                )
+                .await
             }
             SshBackend::Agent(agent) => agent.handle_connection(stream).await,
         }

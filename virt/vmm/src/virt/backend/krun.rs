@@ -3,12 +3,16 @@ mod inherit;
 mod mux;
 mod owner;
 
-use crate::krun::{Disk as KrunDisk, Mount as KrunMount};
+use crate::krun::Mount as KrunMount;
+use crate::virt::backend::lifecycle::{LifecycleClient, LifecycleSlot};
 use crate::virt::backend::{HostMemoryReclaimReport, StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission, MAX_ACTIVE_VSOCK_CONNECTIONS};
-use crate::virt::config::{validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig};
+use crate::virt::config::{validate_common, NetworkMode, SharedDirectory, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::exit::StartupStage;
+use crate::virt::lifecycle::{
+    LifecycleError, LifecycleRejection, LifecycleRequest, LifecycleResponse, LifecycleRights,
+};
 use crate::virt::stream::{
     KrunVsockSession, PendingUnixVsock, SerialDevice, VsockListener, VsockStream,
 };
@@ -37,14 +41,22 @@ pub(crate) struct KrunBackend {
     config: VmConfig,
     attempt: StartAttempt,
     state: watch::Sender<owner::Phase>,
+    worker_pid: watch::Sender<Option<u32>>,
     mux: Arc<AsyncMutex<Option<mux::KrunVsockMux>>>,
     vsock_registry: KrunVsockRegistry,
     session: Arc<KrunVsockSession>,
     host_memory_reclaim: watch::Sender<Option<HostMemoryReclaimReport>>,
     stop: CancellationToken,
     force: CancellationToken,
+    hibernate: CancellationToken,
     console: Mutex<Option<OwnedFd>>,
     serial: Mutex<Option<(File, File)>>,
+    attachments: Arc<Mutex<Option<crate::virt::backend::storage::PreparedAttachments>>>,
+    storage_finalization: watch::Sender<Option<crate::virt::backend::StorageFinalization>>,
+    storage_finalization_started: std::sync::atomic::AtomicBool,
+    /// The run's lifecycle client, present from worker spawn onward, and the
+    /// stop fence on its mutator submission.
+    lifecycle: Arc<LifecycleSlot>,
 }
 
 #[derive(Clone, Copy)]
@@ -223,15 +235,25 @@ impl KrunBackend {
             config,
             attempt: StartAttempt::default(),
             state: watch::Sender::new(owner::Phase::default()),
+            worker_pid: watch::Sender::new(None),
             mux: Arc::new(AsyncMutex::new(None)),
             vsock_registry: KrunVsockRegistry::default(),
             session: KrunVsockSession::new(),
             host_memory_reclaim: watch::Sender::new(None),
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
+            hibernate: CancellationToken::new(),
             console: Mutex::new(Some(pty.slave)),
             serial: Mutex::new(Some((master.try_clone()?, master))),
+            attachments: Arc::new(Mutex::new(None)),
+            storage_finalization: watch::Sender::new(None),
+            storage_finalization_started: std::sync::atomic::AtomicBool::new(false),
+            lifecycle: Arc::new(LifecycleSlot::default()),
         })
+    }
+
+    fn lifecycle_client(&self) -> Option<LifecycleClient> {
+        self.lifecycle.client()
     }
 
     async fn completion(&self) -> Result<VmExit, VirtError> {
@@ -257,6 +279,10 @@ impl Drop for KrunBackend {
 
 #[async_trait]
 impl VirtBackend for KrunBackend {
+    fn worker_process_id(&self) -> Option<u32> {
+        *self.worker_pid.borrow()
+    }
+
     fn serial_available_before_start(&self) -> bool {
         true
     }
@@ -270,6 +296,7 @@ impl VirtBackend for KrunBackend {
         let guard = self.stop.clone().drop_guard();
         let config = self.config.clone();
         let running_mux = self.mux.clone();
+        let attachments = self.attachments.clone();
         let registry = self.vsock_registry.clone();
         let session = self.session.clone();
         let console = self
@@ -277,24 +304,53 @@ impl VirtBackend for KrunBackend {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        let lifecycle = self.lifecycle.clone();
         let owner = owner::Owner {
             state: self.state.clone(),
+            worker_pid: self.worker_pid.clone(),
             stop: self.stop.clone(),
             force: self.force.clone(),
+            hibernate: self.hibernate.clone(),
             reclaim: self.host_memory_reclaim.clone(),
         };
         // No await between attempt reservation and establishing cleanup ownership.
         tokio::spawn(async move {
             let result = async {
                 prepare(&config)?;
-                let launch = engine_config(&config)?;
+                let mut launch = engine_config(&config)?;
+                let mut prepared =
+                    crate::virt::backend::storage::PreparedAttachments::open(&config)?;
+                let handles = prepared.worker_handles()?;
+                launch.storage_context = crate::virt::backend::storage::worker_context(
+                    config
+                        .storage_launch()
+                        .ok_or_else(|| VirtError::Backend("missing storage launch".to_string()))?,
+                    std::mem::take(&mut prepared.raw_bindings),
+                );
+                *attachments.lock().unwrap_or_else(PoisonError::into_inner) = Some(prepared);
                 let console = console.ok_or_else(|| {
                     VirtError::Backend("krun console already consumed".to_string())
                 })?;
+                let binding = crate::virt::backend::lifecycle::launch_binding(&config)
+                    .ok_or_else(|| VirtError::Backend("missing storage launch".to_string()))??;
+                let (parent_lifecycle, child_lifecycle) =
+                    crate::virt::backend::lifecycle::lifecycle_pair()?;
+                let (client, lifecycle_faults) = LifecycleClient::start(parent_lifecycle, binding)?;
+                lifecycle.install(client);
                 let (mux, task, child_mux) =
                     mux::KrunVsockMux::pair(registry.clone(), session.clone(), &[])?;
                 *running_mux.lock().await = Some(mux.clone());
-                let exit = owner.run(launch, console, child_mux).await;
+                let exit = owner
+                    .run(
+                        launch,
+                        console,
+                        child_mux,
+                        handles,
+                        child_lifecycle,
+                        lifecycle_faults,
+                        &config,
+                    )
+                    .await;
                 session.shutdown();
                 registry.fence_session(&session);
                 mux.shutdown().await;
@@ -320,7 +376,7 @@ impl VirtBackend for KrunBackend {
                         "worker stopped before startup handoff".to_string()
                     })));
                 }
-                owner::Phase::Started => {
+                owner::Phase::Prepared | owner::Phase::Started => {
                     guard.disarm();
                     return Ok(());
                 }
@@ -335,6 +391,9 @@ impl VirtBackend for KrunBackend {
 
     async fn stop(&self) -> Result<(), VirtError> {
         self.stop.cancel();
+        // Stop never resumes: it only closes lifecycle admission; the owner
+        // terminates the worker and the endpoint reports the loss.
+        self.lifecycle.close_admission();
         if self.attempt.reserve() {
             self.session.shutdown();
             self.vsock_registry.fence_session(&self.session);
@@ -353,6 +412,20 @@ impl VirtBackend for KrunBackend {
         self.stop().await
     }
 
+    async fn hibernate_stop(&self) -> Result<(), VirtError> {
+        self.lifecycle.close_admission();
+        self.hibernate.cancel();
+        self.completion().await.and_then(|exit| {
+            if exit.hibernated() {
+                Ok(())
+            } else {
+                Err(VirtError::Backend(exit.error().unwrap_or_else(|| {
+                    "saved machine did not terminate as requested".into()
+                })))
+            }
+        })
+    }
+
     async fn wait(&self) -> Result<VmExit, VirtError> {
         self.completion().await
     }
@@ -365,6 +438,40 @@ impl VirtBackend for KrunBackend {
             *self.state.borrow(),
             owner::Phase::Reaped | owner::Phase::Exited(_)
         ))
+    }
+
+    async fn finalize_storage(
+        &self,
+        guest_protocol_completed: bool,
+    ) -> Result<crate::virt::backend::StorageFinalization, VirtError> {
+        self.completion().await?;
+        if !self
+            .storage_finalization_started
+            .swap(true, Ordering::AcqRel)
+        {
+            let prepared = self
+                .attachments
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let completion = self.storage_finalization.clone();
+            // Ownership transfers without an intervening await, so cancelling
+            // this waiter cannot cancel synchronization or release its lease.
+            crate::virt::backend::storage::spawn_finalization(
+                prepared,
+                completion,
+                guest_protocol_completed,
+            );
+        }
+        let mut completion = self.storage_finalization.subscribe();
+        loop {
+            if let Some(report) = completion.borrow().clone() {
+                return Ok(report);
+            }
+            completion.changed().await.map_err(|_| {
+                VirtError::Backend("storage finalizer closed without completion".to_string())
+            })?;
+        }
     }
 
     async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError> {
@@ -410,6 +517,34 @@ impl VirtBackend for KrunBackend {
         Some(self.host_memory_reclaim.subscribe())
     }
 
+    async fn capture_sources(&self) -> Result<Vec<crate::virt::backend::CaptureSource>, VirtError> {
+        let attachments = self
+            .attachments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(prepared) = attachments.as_ref() else {
+            return Err(VirtError::NotRunning {
+                name: self.config.name().to_string(),
+            });
+        };
+        Ok(prepared.capture_sources()?)
+    }
+
+    async fn lifecycle(
+        &self,
+        request: LifecycleRequest,
+        rights: LifecycleRights,
+    ) -> Result<LifecycleResponse, LifecycleError> {
+        request.validate().map_err(LifecycleError::Rejected)?;
+        match self.lifecycle_client() {
+            Some(client) => client.lifecycle(request, rights).await,
+            None if self.stop.is_cancelled() || self.lifecycle.closed() => {
+                Err(LifecycleError::Rejected(LifecycleRejection::Stopping))
+            }
+            None => Err(LifecycleError::Rejected(LifecycleRejection::NotReady)),
+        }
+    }
+
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {
         let (read, write) = self
             .serial
@@ -421,12 +556,18 @@ impl VirtBackend for KrunBackend {
             })?;
         Ok(SerialDevice::from_pty_files(read, write)?)
     }
+
+    fn close_lifecycle_admission(&self) {
+        self.lifecycle.close_admission();
+    }
 }
 
 fn host_memory_reclaim_report(
     status: crate::krun::HostMemoryReclaimStatus,
 ) -> HostMemoryReclaimReport {
     HostMemoryReclaimReport {
+        backing: status.backing.as_str(),
+        reason: status.reason.as_str(),
         requested: status.requested,
         qualification: status.qualification.as_str(),
         effective: status.effective,
@@ -435,6 +576,8 @@ fn host_memory_reclaim_report(
         retried_faults: status.retried_faults,
         skipped_reports: status.skipped_reports,
         failed_operations: status.failed_operations,
+        mapping_limit_skips: status.mapping_limit_skips,
+        replaced_islands: status.replaced_islands,
         observed_at: SystemTime::now(),
     }
 }
@@ -506,17 +649,27 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
             }
         }
     }
+    if config.restore().is_some() {
+        crate::krun::validate_config(&engine_config(config)?).map_err(|error| {
+            VirtError::InvalidConfig {
+                name: config.name().to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
 
     Ok(())
 }
 
 fn prepare(config: &VmConfig) -> Result<(), VirtError> {
-    let kernel = config
-        .kernel_path()
-        .ok_or_else(|| VirtError::Backend("validated kernel missing".to_string()))?;
-    ensure_path_exists(config, kernel, "kernel image")?;
-    if let Some(initramfs) = config.initramfs_path() {
-        ensure_path_exists(config, initramfs, "initramfs")?;
+    if config.restore().is_none() {
+        let kernel = config
+            .kernel_path()
+            .ok_or_else(|| VirtError::Backend("validated kernel missing".to_string()))?;
+        ensure_path_exists(config, kernel, "kernel image")?;
+        if let Some(initramfs) = config.initramfs_path() {
+            ensure_path_exists(config, initramfs, "initramfs")?;
+        }
     }
     for (index, disk) in config.disks().iter().enumerate() {
         ensure_path_exists(config, &disk.path, &format!("disk #{index}"))?;
@@ -562,15 +715,14 @@ fn engine_config(config: &VmConfig) -> Result<crate::krun::KrunConfig, VirtError
         kernel: config.kernel_path().map(Path::to_path_buf),
         initramfs: config.initramfs_path().map(Path::to_path_buf),
         cmdline: build_boot_args(config),
-        disks: config
-            .disks()
-            .iter()
-            .enumerate()
-            .map(|(index, disk)| krun_disk(format!("disk{index}"), disk))
-            .collect(),
+        disks: config.disks().to_vec(),
+        disk_tracking_seeds: config
+            .storage_launch()
+            .map_or_else(Vec::new, |launch| launch.disk_tracking_seeds.clone()),
         mounts: config.mounts().iter().map(krun_mount).collect(),
         vsock_mux: true,
         vsock_cid: None,
+        storage_context: protocol::shutdown::WorkerStorageContext::default(),
         network: match config.network() {
             NetworkMode::UnixDatagram { peer_path, mac } => {
                 crate::krun::Network::Unixgram(crate::krun::NetUnixgram {
@@ -583,15 +735,8 @@ fn engine_config(config: &VmConfig) -> Result<crate::krun::KrunConfig, VirtError
         stdio_console: true,
         balloon: true,
         rosetta: config.krun().prepared_rosetta.clone(),
+        restore: config.restore().map(|launch| launch.request.clone()),
     })
-}
-
-fn krun_disk(block_id: String, disk: &DiskImage) -> KrunDisk {
-    KrunDisk {
-        block_id,
-        path: disk.path.clone(),
-        read_only: disk.read_only,
-    }
 }
 
 fn krun_mount(mount: &SharedDirectory) -> KrunMount {
@@ -690,6 +835,40 @@ mod tests {
             "silo-vmm-resolved-krun-{}-{timestamp}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn restore_backend_projects_the_exact_request_without_opening_provenance_boot_assets() {
+        use crate::virt::backend::krun::{engine_config, prepare};
+        let directory = test_dir();
+        fs::create_dir(&directory).unwrap();
+        let restore = crate::krun::worker::restore::tests::launch(&directory);
+        let expected = restore.request.clone();
+        let builder = VmConfig::builder("restore")
+            .vm_id("destination")
+            .base_directory(&directory)
+            .cpus(1)
+            .memory(128);
+        let descriptor_only = builder.clone().build().with_restore(restore.clone());
+        validate(&descriptor_only).expect("restore requires no cold kernel");
+        prepare(&descriptor_only).unwrap();
+        let config = builder
+            .kernel("/missing/provenance-only/kernel")
+            .initramfs("/missing/provenance-only/initramfs")
+            .build()
+            .with_restore(restore);
+        validate(&config).unwrap();
+        prepare(&config).expect("restore does not open a cold kernel or provenance initramfs");
+        assert_eq!(
+            engine_config(&config).unwrap().restore.as_ref(),
+            Some(&expected)
+        );
+        #[cfg(feature = "mock-backend")]
+        assert!(
+            crate::virt::backend::create_backend(crate::virt::BackendKind::Mock, config).is_err(),
+            "mock backend must not simulate a production restore"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 //! ```
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
@@ -18,8 +19,9 @@ use std::time::Duration;
 use crate::daemon::status::StatusPublisher;
 use eyre::{bail, Context as _};
 use libvm::{
-    MachineHostMemoryReclaim, MachineHostMemoryReclaimQualification, MachineMemoryReclaimReport,
-    MachineReadinessOutcome, MachineStatus,
+    MachineHostMemoryReclaim, MachineHostMemoryReclaimBacking,
+    MachineHostMemoryReclaimQualification, MachineHostMemoryReclaimReason,
+    MachineMemoryReclaimReport, MachineReadinessOutcome, MachineStatus,
 };
 use nix::fcntl::{Flock, FlockArg};
 use silod_spec::status::{MemoryReclaimOutcome, SystemPhase, SystemStatus};
@@ -109,6 +111,8 @@ pub(crate) fn initial_status(docker_socket: &Path) -> eyre::Result<SystemStatus>
         configured_image: None,
         memory_bytes: None,
         actual_backend: None,
+        live: None,
+        prospective_live: None,
         docker_socket: docker_socket.display().to_string(),
         updated_at: now(),
         last_error: None,
@@ -125,6 +129,10 @@ pub(crate) fn initial_status(docker_socket: &Path) -> eyre::Result<SystemStatus>
         host_memory_reclaim_qualification: None,
         host_memory_reclaim_released_bytes: None,
         host_memory_reclaim_failed_operations: None,
+        host_memory_reclaim_backing: None,
+        host_memory_reclaim_reason: None,
+        host_memory_reclaim_mapping_limit_skips: None,
+        host_memory_reclaim_replaced_islands: None,
     })
 }
 
@@ -289,10 +297,18 @@ impl Supervisor {
             return Ok(());
         };
         if let Some(candidate) = &upgrade.candidate_machine_id {
-            if let Some(digest) = runtime
-                .inspect_machine(candidate)
-                .await
-                .ok()
+            let observed = runtime.inspect_machine(candidate).await.ok();
+            if observed.as_ref().is_some_and(|machine| {
+                machine.run_id.is_some()
+                    && !machine.status.is_running()
+                    && !matches!(
+                        machine.status,
+                        MachineStatus::Starting { .. } | MachineStatus::Stopping { .. }
+                    )
+            }) {
+                return Ok(());
+            }
+            if let Some(digest) = observed
                 .and_then(|machine| machine.rootfs)
                 .and_then(|rootfs| rootfs.selected_manifest_digest)
             {
@@ -381,6 +397,9 @@ impl Supervisor {
         let runtime = connected(&mut self.runtime)?;
         let checked = async {
             let current = runtime.inspect_machine(&active.machine_id).await?;
+            if !current.status.is_running() {
+                return Ok(None);
+            }
             crate::daemon::upgrade::check(runtime, &self.desired.image, &current).await
         }
         .await;
@@ -536,78 +555,129 @@ fn connected(runtime: &mut Option<SystemRuntime>) -> eyre::Result<&mut SystemRun
         .ok_or_else(|| eyre::eyre!("the libvm runtime is not connected"))
 }
 
+fn live_report_for_run(
+    report: Option<vm_spec::live::LiveMachineReport>,
+    machine_id: &str,
+    run_id: &str,
+) -> eyre::Result<vm_spec::live::LiveMachineReport> {
+    let report =
+        report.ok_or_else(|| eyre::eyre!("system monitor live observation unavailable"))?;
+    if !silo_vm_control::live::same_machine_identity(&report.machine_id, machine_id)
+        || report.run_id != run_id
+    {
+        bail!("system monitor live observation belongs to a different machine/run");
+    }
+    Ok(report)
+}
+
 /// One startup attempt: recover an interrupted upgrade, ensure the VM exists, boot or
 /// adopt it, and activate the engine.
-async fn attempt(
-    runtime: &mut Option<SystemRuntime>,
-    runtime_config: &libvm::RuntimeConfig,
-    paths: &DaemonPaths,
-    desired: &DesiredSystem,
-    status: &mut SystemStatus,
-    publisher: &StatusPublisher,
-) -> eyre::Result<Active> {
-    if runtime.is_none() {
-        *runtime = Some(SystemRuntime::connect(runtime_config.clone()).await?);
-    }
-    let runtime = connected(runtime)?;
-    crate::daemon::upgrade::remove_abandoned_qualifications(runtime).await?;
-    if DaemonRecord::load(paths)?
-        .and_then(|record| record.upgrade)
-        .is_some_and(|upgrade| !upgrade.complete)
-    {
-        append_log(paths, "recovering an interrupted system image upgrade")?;
-        crate::daemon::upgrade::recover(runtime, paths).await?;
-    }
-    status.phase = SystemPhase::Creating;
-    publish(publisher, status)?;
-    ensure_docker_socket_parent(&desired.config.docker_socket)?;
-    let (record, machine_data) = ensure_system_machine(runtime, paths, desired).await?;
-    status.machine_id = Some(machine_data.id.clone());
-    status.image_digest = machine_data
-        .rootfs
-        .as_ref()
-        .and_then(|rootfs| rootfs.selected_manifest_digest.clone());
-    let machine = runtime.machine(&machine_data.id).await?;
-    let run_id = match machine_data.status {
-        MachineStatus::Running { .. } | MachineStatus::Starting { .. } => machine_data
-            .run_id
-            .clone()
-            .ok_or_else(|| eyre::eyre!("the running system VM reports no run ID"))?,
-        MachineStatus::Stopping { .. } => bail!("recorded system VM is stopping; wait and retry"),
-        _ => {
-            status.phase = SystemPhase::StartingVm;
-            publish(publisher, status)?;
-            let options = libvm::MachineStartOptions::new();
-            machine.start_with_options(options).await?.run_id
+fn attempt<'a>(
+    runtime: &'a mut Option<SystemRuntime>,
+    runtime_config: &'a libvm::RuntimeConfig,
+    paths: &'a DaemonPaths,
+    desired: &'a DesiredSystem,
+    status: &'a mut SystemStatus,
+    publisher: &'a StatusPublisher,
+) -> impl Future<Output = eyre::Result<Active>> + 'a {
+    // Construct the large provisioning future outside the caller's poll frame.
+    // Boxing inside start still reserves its construction temporary on that
+    // frame throughout every nested poll, overflowing a Tokio worker stack.
+    Box::pin(async move {
+        status.live = None;
+        status.prospective_live = None;
+        publish(publisher, status)?;
+        status.prospective_live = Some(
+            libvm::LiveCapabilityQuery::open(runtime_config)?
+                .host_report()
+                .await?,
+        );
+        publish(publisher, status)?;
+        if runtime.is_none() {
+            *runtime = Some(SystemRuntime::connect(runtime_config.clone()).await?);
         }
-    };
-    status.run_id = Some(run_id.to_string());
-    status.actual_backend = machine.metrics().await?.actual_backend;
-    status.phase = SystemPhase::WaitingGuest;
-    publish(publisher, status)?;
-    let readiness = machine.wait_ready(READY_TIMEOUT).await?;
-    if readiness.outcome != MachineReadinessOutcome::Ready {
-        bail!("system guest readiness ended with {:?}", readiness.outcome);
-    }
-    status.phase = SystemPhase::ActivatingEngine;
-    publish(publisher, status)?;
-    activate(
-        &machine,
-        &desired.config,
-        &machine_data.spec,
-        record.data_uuid,
-    )
-    .await?;
-    // Activation returns once the guest units are up; the host-side socket forward
-    // becomes live shortly after the guest half exists, so poll rather than probe once.
-    wait_docker_socket(&desired.config.docker_socket, ENGINE_REACHABLE_TIMEOUT).await?;
-    status.phase = SystemPhase::Ready;
-    status.last_error = None;
-    publish(publisher, status)?;
-    append_log(paths, "system Docker engine ready")?;
-    Ok(Active {
-        machine,
-        machine_id: machine_data.id,
+        let runtime = connected(runtime)?;
+        crate::daemon::upgrade::remove_abandoned_qualifications(runtime).await?;
+        if DaemonRecord::load(paths)?
+            .and_then(|record| record.upgrade)
+            .is_some_and(|upgrade| !upgrade.complete)
+        {
+            append_log(paths, "recovering an interrupted system image upgrade")?;
+            Box::pin(crate::daemon::upgrade::recover(runtime, paths)).await?;
+        }
+        status.phase = SystemPhase::Creating;
+        publish(publisher, status)?;
+        ensure_docker_socket_parent(&desired.config.docker_socket)?;
+        let (record, machine_data) =
+            Box::pin(ensure_system_machine(runtime, paths, desired)).await?;
+        status.machine_id = Some(machine_data.id.clone());
+        status.image_digest = machine_data
+            .rootfs
+            .as_ref()
+            .and_then(|rootfs| rootfs.selected_manifest_digest.clone());
+        let machine = runtime.machine(&machine_data.id).await?;
+        let run_id = match machine_data.status {
+            MachineStatus::Running { .. } | MachineStatus::Starting { .. } => machine_data
+                .run_id
+                .clone()
+                .ok_or_else(|| eyre::eyre!("the running system VM reports no run ID"))?,
+            MachineStatus::Stopping { .. } => {
+                bail!("recorded system VM is stopping; wait and retry")
+            }
+            MachineStatus::Pausing { .. }
+            | MachineStatus::Paused { .. }
+            | MachineStatus::Capturing { .. }
+            | MachineStatus::Hibernating { .. }
+            | MachineStatus::Hibernated { .. }
+            | MachineStatus::Restoring { .. }
+            | MachineStatus::Activating { .. }
+            | MachineStatus::ActivationFailed { .. } => {
+                bail!(
+                    "recorded system VM is {}; explicit user action required",
+                    machine_data.status.label()
+                )
+            }
+            MachineStatus::Error { .. } if machine_data.run_id.is_some() => {
+                bail!("recorded system VM is fenced in error; stop it explicitly")
+            }
+            _ => {
+                status.phase = SystemPhase::StartingVm;
+                publish(publisher, status)?;
+                let options = libvm::MachineStartOptions::new();
+                Box::pin(machine.start_with_options(options)).await?.run_id
+            }
+        };
+        let run_id = run_id.to_string();
+        let live = live_report_for_run(machine.inspect().await?.live, &machine_data.id, &run_id)?;
+        status.run_id = Some(run_id);
+        status.actual_backend = Some(live.backend.to_string());
+        status.live = Some(live);
+        status.phase = SystemPhase::WaitingGuest;
+        publish(publisher, status)?;
+        let readiness = machine.wait_ready(READY_TIMEOUT).await?;
+        if readiness.outcome != MachineReadinessOutcome::Ready {
+            bail!("system guest readiness ended with {:?}", readiness.outcome);
+        }
+        status.phase = SystemPhase::ActivatingEngine;
+        publish(publisher, status)?;
+        activate(
+            &machine,
+            &desired.config,
+            &machine_data.spec,
+            record.data_uuid,
+        )
+        .await?;
+        // Activation returns once the guest units are up; the host-side socket forward
+        // becomes live shortly after the guest half exists, so poll rather than probe once.
+        wait_docker_socket(&desired.config.docker_socket, ENGINE_REACHABLE_TIMEOUT).await?;
+        status.phase = SystemPhase::Ready;
+        status.last_error = None;
+        publish(publisher, status)?;
+        append_log(paths, "system Docker engine ready")?;
+        Ok(Active {
+            machine,
+            machine_id: machine_data.id,
+        })
     })
 }
 
@@ -677,21 +747,40 @@ fn apply_host_memory_reclaim(
     let Some(report) = report else {
         return false;
     };
+    let backing = match report.backing {
+        MachineHostMemoryReclaimBacking::Boot => "boot",
+        MachineHostMemoryReclaimBacking::RestoredPrivate => "restored-private",
+    };
+    let reason = match report.reason {
+        MachineHostMemoryReclaimReason::None => "none",
+        MachineHostMemoryReclaimReason::TrackedCapture => "tracked-capture",
+        MachineHostMemoryReclaimReason::RestoredPrivateMapping => "restored-private-mapping",
+    };
     let qualification = match report.qualification {
         MachineHostMemoryReclaimQualification::NotRun => "not-run",
         MachineHostMemoryReclaimQualification::Passed => "passed",
         MachineHostMemoryReclaimQualification::Failed => "failed",
         MachineHostMemoryReclaimQualification::Inconclusive => "inconclusive",
     };
-    let changed = status.host_memory_reclaim_effective != Some(report.effective)
+    let changed = status.host_memory_reclaim_requested != report.requested
+        || status.host_memory_reclaim_backing.as_deref() != Some(backing)
+        || status.host_memory_reclaim_reason.as_deref() != Some(reason)
+        || status.host_memory_reclaim_effective != Some(report.effective)
         || status.host_memory_reclaim_qualification.as_deref() != Some(qualification)
         || status.host_memory_reclaim_released_bytes != Some(report.released_bytes)
-        || status.host_memory_reclaim_failed_operations != Some(report.failed_operations);
+        || status.host_memory_reclaim_failed_operations != Some(report.failed_operations)
+        || status.host_memory_reclaim_mapping_limit_skips != Some(report.mapping_limit_skips)
+        || status.host_memory_reclaim_replaced_islands != Some(report.replaced_islands);
     if changed {
+        status.host_memory_reclaim_requested = report.requested;
+        status.host_memory_reclaim_backing = Some(backing.to_string());
+        status.host_memory_reclaim_reason = Some(reason.to_string());
         status.host_memory_reclaim_effective = Some(report.effective);
         status.host_memory_reclaim_qualification = Some(qualification.to_string());
         status.host_memory_reclaim_released_bytes = Some(report.released_bytes);
         status.host_memory_reclaim_failed_operations = Some(report.failed_operations);
+        status.host_memory_reclaim_mapping_limit_skips = Some(report.mapping_limit_skips);
+        status.host_memory_reclaim_replaced_islands = Some(report.replaced_islands);
     }
     changed
 }
@@ -772,6 +861,53 @@ mod tests {
     };
 
     #[test]
+    fn host_reclaim_updates_mapping_counters_without_policy_changes() {
+        let mut status = crate::daemon::supervisor::initial_status(std::path::Path::new(
+            "/tmp/silo-test-docker.sock",
+        ))
+        .expect("initial status");
+        let mut report = libvm::MachineHostMemoryReclaim {
+            backing: libvm::MachineHostMemoryReclaimBacking::RestoredPrivate,
+            reason: libvm::MachineHostMemoryReclaimReason::None,
+            requested: true,
+            qualification: libvm::MachineHostMemoryReclaimQualification::NotRun,
+            effective: true,
+            released_bytes: 4_194_304,
+            released_extents: 2,
+            retried_faults: 0,
+            skipped_reports: 0,
+            failed_operations: 0,
+            mapping_limit_skips: 0,
+            replaced_islands: 2,
+            observed_at: std::time::UNIX_EPOCH,
+        };
+        assert!(!crate::daemon::supervisor::apply_host_memory_reclaim(
+            &mut status,
+            None
+        ));
+        assert!(crate::daemon::supervisor::apply_host_memory_reclaim(
+            &mut status,
+            Some(&report)
+        ));
+        assert!(!crate::daemon::supervisor::apply_host_memory_reclaim(
+            &mut status,
+            Some(&report)
+        ));
+        report.mapping_limit_skips = 3;
+        report.replaced_islands = 7;
+        assert!(crate::daemon::supervisor::apply_host_memory_reclaim(
+            &mut status,
+            Some(&report)
+        ));
+        assert_eq!(status.host_memory_reclaim_mapping_limit_skips, Some(3));
+        assert_eq!(status.host_memory_reclaim_replaced_islands, Some(7));
+        let json = serde_json::to_value(&status).expect("status JSON");
+        let decoded: SystemStatus = serde_json::from_value(json).expect("decode status JSON");
+        assert_eq!(decoded.host_memory_reclaim_mapping_limit_skips, Some(3));
+        assert_eq!(decoded.host_memory_reclaim_replaced_islands, Some(7));
+    }
+
+    #[test]
     fn manager_detach_preserves_the_vm_generation_without_a_runtime() {
         let temp = tempfile::tempdir().expect("temp");
         let paths = silod_spec::paths::DaemonPaths::new(temp.path().join("home"));
@@ -787,15 +923,10 @@ mod tests {
         status.machine_id = Some("existing-vm".into());
         status.run_id = Some("existing-run".into());
         let host = libvm::HostPaths::new(paths.home().to_path_buf(), temp.path().join("config"));
-        let features = crate::config::FeatureSelection {
-            system: true,
-            tailscale: false,
-        };
         let publisher = std::sync::Arc::new(
             crate::daemon::status::StatusPublisher::new(
                 &host,
                 uuid::Uuid::new_v4(),
-                features,
                 "test".into(),
                 Some(status.clone()),
             )
@@ -870,6 +1001,7 @@ mod tests {
             "docker_socket": "/tmp/silo.sock",
             "updated_at": "2026-09-14T00:00:00Z",
             "last_error": null,
+            "live": null, "prospective_live": null,
             "restart_count": 0
         }))
         .expect("status");
@@ -937,5 +1069,113 @@ mod tests {
         drop(first);
         assert!(path.exists());
         LifetimeLock::acquire(&path).expect("released");
+    }
+
+    #[test]
+    fn appliance_live_report_must_match_selected_machine_and_run() {
+        use vm_spec::live::*;
+        let report = LiveMachineReport {
+            schema_version: 1,
+            scope: LiveScope::Machine,
+            machine_id: "12345678-1234-4234-8234-123456789abc".into(),
+            run_id: "22345678-1234-4234-8234-123456789abc".into(),
+            monitor_id: "32345678-1234-4234-8234-123456789abc".into(),
+            backend: LiveBackend::Mock,
+            lane: LiveLane::NotApplicable,
+            topology_revision: 1,
+            live: LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded),
+            same_machine_activation: false,
+        };
+        assert!(crate::daemon::supervisor::live_report_for_run(
+            None,
+            &report.machine_id,
+            &report.run_id
+        )
+        .is_err());
+        assert!(crate::daemon::supervisor::live_report_for_run(
+            Some(report.clone()),
+            "other-machine",
+            &report.run_id
+        )
+        .is_err());
+        assert!(crate::daemon::supervisor::live_report_for_run(
+            Some(report.clone()),
+            &report.machine_id,
+            "other-run"
+        )
+        .is_err());
+        assert!(crate::daemon::supervisor::live_report_for_run(
+            Some(report.clone()),
+            "42345678123442348234123456789abc",
+            &report.run_id
+        )
+        .is_err());
+        assert_eq!(
+            crate::daemon::supervisor::live_report_for_run(
+                Some(report.clone()),
+                "12345678123442348234123456789abc",
+                &report.run_id
+            )
+            .unwrap(),
+            report
+        );
+        assert_eq!(
+            crate::daemon::supervisor::live_report_for_run(
+                Some(report.clone()),
+                &report.machine_id,
+                &report.run_id
+            )
+            .unwrap(),
+            report
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_appliance_discovery_clears_previously_published_prospective_report() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = silod_spec::paths::DaemonPaths::new(root.path().join("home"));
+        let host = libvm::HostPaths::new(paths.home(), root.path().join("config"));
+        let query = libvm::LiveCapabilityQuery::open(
+            &libvm::RuntimeConfig::local(paths.home())
+                .with_supervisor_path(test_utils::mock_vmm_binary())
+                .with_virt_backend(libvm::VirtBackendOverride::Vz),
+        )
+        .unwrap();
+        let mut status = crate::daemon::supervisor::initial_status(&paths.docker_socket()).unwrap();
+        status.prospective_live = Some(query.host_report().await.unwrap());
+        let publisher = crate::daemon::status::StatusPublisher::new(
+            &host,
+            uuid::Uuid::new_v4(),
+            "test".into(),
+            Some(status.clone()),
+        )
+        .unwrap();
+        publisher.set_system(status.clone()).unwrap();
+        assert!(publisher.wire().unwrap().appliance_live.is_some());
+        let desired = crate::daemon::system_config::resolve(
+            &silod_spec::arguments::SystemOverrides::default(),
+            root.path(),
+            &paths.docker_socket(),
+            None,
+        )
+        .unwrap();
+        let config = libvm::RuntimeConfig::local(paths.home())
+            .with_supervisor_path(root.path().join("missing-monitor"));
+        let mut runtime = None;
+        assert!(crate::daemon::supervisor::attempt(
+            &mut runtime,
+            &config,
+            &paths,
+            &desired,
+            &mut status,
+            &publisher,
+        )
+        .await
+        .is_err());
+        assert!(runtime.is_none());
+        assert!(status.prospective_live.is_none());
+        let wire = publisher.wire().unwrap();
+        assert!(wire.appliance_live.is_none());
+        assert!(wire.system.unwrap().prospective_live.is_none());
     }
 }

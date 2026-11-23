@@ -18,9 +18,14 @@ fn temporary_home() -> tempfile::TempDir {
 }
 
 fn command(home: &std::path::Path) -> Command {
+    let mut command = silo_command(home);
+    command.args(["daemon", "run"]);
+    command
+}
+
+fn silo_command(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_silo"));
     command
-        .args(["daemon", "run"])
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
@@ -83,6 +88,97 @@ fn invalid_system_configuration_exits_two_before_startup() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("at least 128MiB"));
     assert!(!root.path().join("runtime-home").exists());
+}
+
+#[test]
+fn lobby_failure_is_isolated_from_core_for_explicit_and_persisted_features() {
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    for persisted in [false, true] {
+        for mode in ["foreground", "run"] {
+            let root = temporary_home();
+            let config_path = root.path().join(".config/silo/config.yaml");
+            let config = b"daemon:\n  version: '1'\n  system:\n    enabled: false\n  tailscale:\n    enabled: true\n";
+            if persisted {
+                std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+                std::fs::write(&config_path, config).unwrap();
+            }
+            let home = root.path().join("runtime-home");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("secrets.json"), b"corrupt secret store").unwrap();
+            let mut command = silo_command(root.path());
+            if mode == "run" {
+                command.args(["daemon", "run", "--system-enabled=false"]);
+                if !persisted {
+                    command.arg("--tailscale-enabled=true");
+                }
+            } else {
+                command.args(["daemon", "up", "--system=false", "--foreground"]);
+                if !persisted {
+                    command.arg("--tailscale");
+                }
+            }
+            let mut child = Process(
+                command
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let paths = DaemonPaths::new(&home);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = read_status(&paths) {
+                    if status.core == CorePhase::Ready
+                        && status.lobby.as_ref().is_some_and(|lobby| {
+                            lobby.phase == silod_spec::status::LobbyPhase::Failed
+                        })
+                    {
+                        break status;
+                    }
+                }
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "daemon exited before lobby failure"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "lobby did not fail independently"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(status.system.is_none());
+            assert!(status
+                .lobby
+                .unwrap()
+                .diagnostic
+                .unwrap()
+                .contains("cannot read lobby credential"));
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child.0.id().try_into().unwrap()),
+                nix::sys::signal::Signal::SIGTERM,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(exit) = child.0.try_wait().unwrap() {
+                    assert!(exit.success(), "{exit}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon did not stop after lobby failure"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if persisted {
+                assert_eq!(std::fs::read(&config_path).unwrap(), config);
+            } else {
+                assert!(!config_path.exists());
+            }
+        }
+    }
 }
 
 #[test]

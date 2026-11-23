@@ -10,6 +10,7 @@ import pytest
 from .errors import SmokeEnvironmentError
 
 RUN_ROOT_PARENT = "/private/tmp" if platform.system() == "Darwin" else "/tmp"
+TMPFS_MAGIC = 0x01021994
 REPO = Path(__file__).resolve().parents[2]
 # Published multi-arch images every lane can rely on: the appliance comes from
 # .github/workflows/system-image.yml (the same dev default the daemon uses), the Arch
@@ -30,10 +31,6 @@ def runtime_target() -> str:
     raise SmokeEnvironmentError(f"Unsupported smoke host: {system} {machine}")
 
 
-def go_ffi_library() -> str:
-    return "libsilo_go_ffi.dylib" if platform.system() == "Darwin" else "libsilo_go_ffi.so"
-
-
 @dataclass(frozen=True)
 class SmokeConfig:
     bin_dir: Path
@@ -44,7 +41,6 @@ class SmokeConfig:
     system_image: str | None
     distro_images: dict[str, str]
     systemd_image: str | None
-    curl_image: str | None
 
     @property
     def silo(self) -> Path:
@@ -74,6 +70,8 @@ def _published(variable: str, default: str) -> str | None:
 
 
 def resolve(pytestconfig: pytest.Config) -> SmokeConfig:
+    from .prereqs import bin_dir, target_dir
+
     backend = pytestconfig.getoption("--backend") or os.environ.get("SILO_SMOKE_BACKEND", "krun")
     if backend not in {"krun", "vz"}:
         raise SmokeEnvironmentError(f"Invalid backend {backend!r}; use krun or vz")
@@ -88,13 +86,12 @@ def resolve(pytestconfig: pytest.Config) -> SmokeConfig:
         distro_images[label] = reference
     keep = pytestconfig.getoption("--keep")
     return SmokeConfig(
-        bin_dir=_path(pytestconfig, "--silo-bin-dir", "SILO_SMOKE_BIN_DIR", REPO / "target/debug"),
-        runtime_dir=_path(pytestconfig, "--silo-runtime-dir", "SILO_SMOKE_RUNTIME_DIR", REPO / "target/silo-runtime" / runtime_target() / "debug"),
+        bin_dir=_path(pytestconfig, "--silo-bin-dir", "SILO_SMOKE_BIN_DIR", bin_dir()),
+        runtime_dir=_path(pytestconfig, "--silo-runtime-dir", "SILO_SMOKE_RUNTIME_DIR", target_dir() / "silo-runtime" / runtime_target() / os.environ.get("PROFILE", "release")),
         backend=backend,
         cache_dir=_path(pytestconfig, "--cache-dir", "SILO_SMOKE_CACHE", Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "silo-smoke"),
         keep=bool(keep) if keep is not None else os.environ.get("SILO_SMOKE_KEEP") == "1",
         system_image=_published("SILO_SMOKE_SYSTEM_IMAGE", DEFAULT_SYSTEM_IMAGE),
         distro_images=distro_images,
         systemd_image=os.environ.get("SILO_SMOKE_SYSTEMD_IMAGE") or None,
-        curl_image=os.environ.get("SILO_SMOKE_CURL_IMAGE") or None,
     )

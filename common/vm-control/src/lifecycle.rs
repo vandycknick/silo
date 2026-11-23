@@ -1,6 +1,77 @@
 use crate::snapshots::{snapshot_from_wire, snapshot_to_wire};
 use crate::{invalid, required, ConversionError};
 use silod_spec::daemon::v1 as w;
+
+pub fn unusable_reason_to_wire(
+    value: libvm::storage::hibernate_file::HibernateUnusableReason,
+) -> i32 {
+    use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+    match value {
+        R::FilesMissing => 1,
+        R::FilesChanged => 2,
+        R::DisksChanged => 3,
+        R::NotCompatible => 4,
+    }
+}
+
+pub fn unusable_reason_from_wire(
+    value: i32,
+) -> Result<libvm::storage::hibernate_file::HibernateUnusableReason, ConversionError> {
+    use libvm::storage::hibernate_file::HibernateUnusableReason as R;
+    match value {
+        1 => Ok(R::FilesMissing),
+        2 => Ok(R::FilesChanged),
+        3 => Ok(R::DisksChanged),
+        4 => Ok(R::NotCompatible),
+        _ => Err(invalid(
+            "hibernation.reason",
+            "unknown or unspecified reason",
+        )),
+    }
+}
+
+pub fn stop_to_wire(
+    value: &libvm::MachineStopOutcome,
+) -> Result<w::MachineSnapshot, ConversionError> {
+    use w::machine_stop_warning::Warning;
+    let mut snapshot = snapshot_to_wire(&value.machine)?;
+    snapshot.stop_warning = value.warning.map(|warning| w::MachineStopWarning {
+        warning: Some(match warning {
+            libvm::MachineStopWarning::SavedStateUnusable { reason } => {
+                Warning::SavedStateUnusable(unusable_reason_to_wire(reason))
+            }
+            libvm::MachineStopWarning::WakeFailed => Warning::WakeFailed(()),
+        }),
+    });
+    Ok(snapshot)
+}
+
+pub fn stop_warning_from_wire(
+    value: w::MachineStopWarning,
+) -> Result<libvm::MachineStopWarning, ConversionError> {
+    use w::machine_stop_warning::Warning;
+    Ok(match required(value.warning, "stop.warning")? {
+        Warning::SavedStateUnusable(reason) => libvm::MachineStopWarning::SavedStateUnusable {
+            reason: unusable_reason_from_wire(reason)?,
+        },
+        Warning::WakeFailed(()) => libvm::MachineStopWarning::WakeFailed,
+    })
+}
+
+pub fn stop_from_wire(
+    mut value: w::MachineSnapshot,
+) -> Result<libvm::MachineStopOutcome, ConversionError> {
+    let warning = value
+        .stop_warning
+        .take()
+        .map(stop_warning_from_wire)
+        .transpose()?;
+    Ok(libvm::MachineStopOutcome {
+        machine: snapshot_from_wire(value)?,
+        warning,
+    })
+}
+
 pub fn entrypoint_to_wire(v: &libvm::Entrypoint) -> w::Entrypoint {
     w::Entrypoint {
         program: v.program().into(),
@@ -143,8 +214,8 @@ pub fn reference_to_wire(v: &libvm::MachineRef) -> Result<w::MachineRef, Convers
         Reference::Id(id.simple().to_string())
     } else if let Some(name) = v.name() {
         Reference::Name(name.into())
-    } else if let Some(prefix) = v.id_prefix() {
-        Reference::IdPrefix(prefix.into())
+    } else if let Some(name) = v.id_prefix_name() {
+        Reference::IdPrefix(name.into())
     } else {
         return Err(invalid("machine.reference", "unsupported native variant"));
     };
@@ -161,8 +232,12 @@ pub fn reference_from_wire(v: w::MachineRef) -> Result<libvm::MachineRef, Conver
         Reference::Name(v) => (v, 2),
         Reference::IdPrefix(v) => (v, 3),
     };
-    let native = libvm::MachineRef::parse(text)
-        .map_err(|_| invalid("machine.reference", "invalid native reference"))?;
+    crate::images::reject_local_cut(&text)?;
+    let native = match kind {
+        2 => libvm::MachineRef::parse_exact(text),
+        _ => libvm::MachineRef::parse(text),
+    }
+    .map_err(|_| invalid("machine.reference", "invalid native reference"))?;
     let matches = match kind {
         1 => native.id_uuid().is_some(),
         2 => native.name().is_some(),

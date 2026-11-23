@@ -8,19 +8,20 @@ mod error;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod host;
 mod network;
+pub(crate) mod restore;
 mod rosetta;
 mod status;
+pub(crate) mod storage_holder;
 pub(crate) mod worker;
 
-pub(crate) use crate::krun::config::{
-    validate_config, Disk, KrunConfig, Mount, NetUnixgram, Network,
-};
+pub(crate) use crate::krun::config::{validate_config, KrunConfig, Mount, NetUnixgram, Network};
 pub(crate) use crate::krun::error::KrunBackendError;
 #[cfg(target_os = "linux")]
 pub(crate) use crate::krun::host::check_host;
 #[cfg(target_os = "macos")]
 pub(crate) use crate::krun::host::{check_host, HvfHostError, HvfHostInfo};
 pub(crate) use crate::krun::rosetta::{RosettaLaunchConfig, RosettaProfileId};
-#[cfg(target_os = "macos")]
-pub(crate) use crate::krun::status::HostMemoryReclaimQualification;
-pub(crate) use crate::krun::status::HostMemoryReclaimStatus;
+pub(crate) use crate::krun::status::{
+    HostMemoryReclaimBacking, HostMemoryReclaimQualification, HostMemoryReclaimReason,
+    HostMemoryReclaimStatus,
+};

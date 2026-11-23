@@ -9,6 +9,7 @@ use crate::services::ServiceHandles;
 
 // Allow the backend's graceful stop budget before requesting escalation.
 const VM_STOP_TIMEOUT: Duration = Duration::from_secs(65);
+const GUEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(55);
 const SERVICE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// SIGINT and SIGTERM listeners for one consumer.
@@ -75,30 +76,53 @@ pub async fn run(
         }
     };
 
+    // Seal live admission, native mutator submission and continuations before
+    // any await, so no late pause/resume/capture step can reach the worker,
+    // reopen fences or publish a state.
+    let stop_mode = ctx.live.begin_stop();
     handles.mark_stopping().await;
-    ctx.shutdown.cancel();
-    stop_forwards(&mut handles).await;
-    stop_vsock_surface(&mut handles).await;
     match trigger {
         ShutdownTrigger::Requested(message) => {
             if let Err(error) = ctx.store.set_vm_state(VmState::Stopping, message) {
                 errors.push(error.to_string());
             }
-            if let Err(error) = graceful_stop(&ctx, &mut signals).await {
+            let stopped = match stop_mode {
+                crate::live::coordinator::StopMode::Graceful => {
+                    graceful_stop(&ctx, &mut signals).await
+                }
+                // A paused, fenced or frozen machine is never resumed or
+                // thawed to stop it: the backend owner terminates and reaps.
+                crate::live::coordinator::StopMode::Terminate => {
+                    tracing::info!(instance = %ctx.machine.name(), "stopping a live-held machine without resuming it");
+                    ctx.machine.force_stop().await.map_err(eyre::Report::from)
+                }
+                crate::live::coordinator::StopMode::Hibernate => ctx
+                    .machine
+                    .hibernate_stop()
+                    .await
+                    .map_err(eyre::Report::from),
+            };
+            if let Err(error) = stopped {
                 errors.push(error.to_string());
             }
             match wait_for_machine_stop(&ctx.machine).await {
-                Ok(info) => record_stop(&ctx, info, &mut errors),
+                Ok(info) => record_stop(&ctx.store, info, false, &mut errors),
                 Err(error) => errors.push(error.to_string()),
             }
         }
         ShutdownTrigger::Backend(info) => {
-            record_stop(&ctx, info, &mut errors);
+            record_stop(&ctx.store, info, true, &mut errors);
             if let Err(error) = ctx.machine.stop().await {
                 errors.push(error.to_string());
             }
         }
     }
+
+    // The internal connection and guest status observers must survive the
+    // handshake and writer drains. Public teardown may now close transport.
+    ctx.shutdown.cancel();
+    stop_forwards(&mut handles).await;
+    stop_vsock_surface(&mut handles).await;
 
     handles.mark_not_serving().await;
     handles.server_shutdown.cancel();
@@ -115,13 +139,57 @@ pub async fn run(
     }
 }
 
-fn record_stop(ctx: &DaemonContext, info: VmStopInfo, errors: &mut Vec<String>) {
-    if let Err(error) = ctx.store.set_vm_state(VmState::Stopped, info.message) {
+fn record_stop(
+    store: &crate::state::InstanceStore,
+    mut info: VmStopInfo,
+    guest_initiated: bool,
+    errors: &mut Vec<String>,
+) {
+    if guest_initiated {
+        match store.has_been_ready() {
+            Ok(false) if info.error.is_none() && !info.forced => {
+                info.state = VmState::Failed;
+                info.message = BOOT_POWER_OFF_MESSAGE.to_string();
+                info.error = Some(info.message.clone());
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if let Err(error) = store.set_vm_state(info.state, info.message) {
         errors.push(error.to_string());
     }
     if let Some(error) = info.error {
-        errors.push(format!("virtual machine exited with error: {error}"));
+        errors.push(error);
     }
+}
+
+pub(crate) const BOOT_POWER_OFF_MESSAGE: &str = "guest powered off during boot";
+
+pub(crate) fn backend_exit_error(
+    store: &crate::state::InstanceStore,
+    exit: Result<VmExit, crate::virt::VirtError>,
+) -> eyre::Report {
+    let mut errors = Vec::new();
+    match exit {
+        Ok(exit) => record_stop(store, vm_stop_info(exit), true, &mut errors),
+        Err(error) => errors.push(error.to_string()),
+    }
+    if errors.is_empty() {
+        eyre::eyre!("guest exited before startup completed")
+    } else {
+        eyre::eyre!(errors.join("; "))
+    }
+}
+
+pub(crate) async fn ensure_boot_alive(
+    machine: &crate::virt::VirtualMachine,
+    store: &crate::state::InstanceStore,
+) -> eyre::Result<()> {
+    if let Some(exit) = machine.try_wait().await? {
+        return Err(backend_exit_error(store, Ok(exit)));
+    }
+    Ok(())
 }
 
 enum ShutdownTrigger {
@@ -152,6 +220,40 @@ async fn stop_forwards(handles: &mut ServiceHandles) {
 }
 
 async fn graceful_stop(ctx: &DaemonContext, signals: &mut ShutdownSignals) -> eyre::Result<()> {
+    let protocol = tokio::select! {
+        result = crate::guest::shutdown::orderly_shutdown(ctx) => result,
+        result = signals.recv() => {
+            if let Err(error) = result {
+                tracing::warn!(%error, "shutdown signal listener failed");
+            }
+            tracing::warn!("second shutdown signal received during guest drain; forcing stop");
+            ctx.machine.force_stop().await?;
+            return Ok(());
+        }
+        () = tokio::time::sleep(GUEST_SHUTDOWN_TIMEOUT) => {
+            Err(eyre::eyre!("guest orderly shutdown deadline elapsed"))
+        }
+    };
+    if protocol.is_ok() {
+        // orderly_shutdown retains the RPC through machine.wait(): success is
+        // already terminal. The select above bounds receipt AND poweroff, not
+        // just queuing ALLOW_POWEROFF.
+        return Ok(());
+    }
+    // A failed/missing exchange is never a certificate. The backend still owns
+    // escalation and reaping; cancellation must not abandon that owner.
+    if let Err(error) = &protocol {
+        tracing::warn!(%error, "guest orderly shutdown not completed; stopping backend");
+    }
+    let stopped = stop_backend(ctx, signals).await;
+    match (protocol, stopped) {
+        (Err(protocol), Err(stop)) => Err(eyre::eyre!("{protocol}; backend stop failed: {stop}")),
+        (Err(protocol), Ok(())) => Err(protocol),
+        (Ok(()), result) => result,
+    }
+}
+
+async fn stop_backend(ctx: &DaemonContext, signals: &mut ShutdownSignals) -> eyre::Result<()> {
     let mut stop_task = tokio::spawn({
         let machine = ctx.machine.clone();
         async move { machine.stop().await }
@@ -238,6 +340,8 @@ async fn drain_result_task(
 }
 
 struct VmStopInfo {
+    state: VmState,
+    forced: bool,
     message: String,
     error: Option<String>,
 }
@@ -253,10 +357,20 @@ fn vm_stop_info(exit: VmExit) -> VmStopInfo {
     let error = exit.error();
     let message = match &error {
         Some(error) => format!("machine stopped with error: {error}"),
+        None if exit.hibernated() => "machine hibernated".to_string(),
         None if exit.forced() => "machine force-stopped".to_string(),
         None => "machine stopped".to_string(),
     };
-    VmStopInfo { message, error }
+    VmStopInfo {
+        state: if exit.hibernated() {
+            VmState::Hibernated
+        } else {
+            VmState::Stopped
+        },
+        forced: exit.forced(),
+        message,
+        error,
+    }
 }
 
 async fn cleanup(_runtime: &RuntimeContext, ctx: &DaemonContext) -> eyre::Result<()> {
@@ -295,5 +409,88 @@ mod tests {
 
         assert_eq!(info.message, "machine stopped");
         assert_eq!(info.error, None);
+    }
+
+    #[cfg(feature = "mock-backend")]
+    #[tokio::test]
+    async fn guest_boot_poweroff_fails_but_host_stop_remains_stopped() {
+        use crate::shutdown::{record_stop, wait_for_machine_stop, BOOT_POWER_OFF_MESSAGE};
+        use crate::virt::{BackendKind, VirtualMachine, VmConfig};
+        use protocol::v1::VmState;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        for (guest_initiated, expected) in [(true, VmState::Failed), (false, VmState::Stopped)] {
+            let root = std::env::temp_dir().join(format!("boot-poweroff-{}", uuid::Uuid::new_v4()));
+            let mut config = VmConfig::builder("boot-poweroff")
+                .base_directory(&root)
+                .kernel("/mock-kernel")
+                .build();
+            config.set_resolved_mock_scenario(Arc::new(test_utils::Scenario {
+                run: test_utils::RunScenario {
+                    power_off_after_ms: guest_initiated.then_some(10),
+                    ..Default::default()
+                },
+                agent: test_utils::AgentScenario {
+                    never_ready: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+            let machine = VirtualMachine::with_backend(BackendKind::Mock, config).unwrap();
+            let store = crate::state::new_instance_store(
+                uuid::Uuid::new_v4().to_string(),
+                "boot-poweroff".into(),
+                true,
+            );
+            machine.start().await.unwrap();
+            store.set_vm_state(VmState::Running, "running").unwrap();
+            if !guest_initiated {
+                machine.stop().await.unwrap();
+            }
+            let info =
+                tokio::time::timeout(Duration::from_secs(2), wait_for_machine_stop(&machine))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut errors = Vec::new();
+            record_stop(&store, info, guest_initiated, &mut errors);
+            let vm = store.status().unwrap().vm.unwrap();
+            assert_eq!(vm.state, Some(expected as i32));
+            if guest_initiated {
+                assert_eq!(vm.message.as_deref(), Some(BOOT_POWER_OFF_MESSAGE));
+                assert_eq!(errors, [BOOT_POWER_OFF_MESSAGE]);
+            } else {
+                assert_eq!(vm.message.as_deref(), Some("machine stopped"));
+                assert!(errors.is_empty());
+            }
+            machine.stop().await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn guest_poweroff_after_first_readiness_is_not_a_boot_failure() {
+        use protocol::v1::VmState;
+        let store = crate::state::new_instance_store(
+            uuid::Uuid::new_v4().to_string(),
+            "ready-once".into(),
+            false,
+        );
+        store.set_vm_state(VmState::Running, "running").unwrap();
+        assert!(store.has_been_ready().unwrap());
+        store.set_vm_state(VmState::Stopping, "stopping").unwrap();
+        let mut errors = Vec::new();
+        crate::shutdown::record_stop(
+            &store,
+            crate::shutdown::vm_stop_info(VmExit::stopped(StartupStage::Started)),
+            true,
+            &mut errors,
+        );
+        assert_eq!(
+            store.status().unwrap().vm.unwrap().state,
+            Some(VmState::Stopped as i32)
+        );
+        assert!(errors.is_empty());
     }
 }

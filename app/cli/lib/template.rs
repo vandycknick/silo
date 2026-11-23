@@ -31,6 +31,8 @@ pub(crate) struct Template {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) disk_size: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tmpfs_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) userdata: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) mounts: Vec<MachineMount>,
@@ -204,6 +206,7 @@ pub(crate) fn validate_template(template: &Template) -> eyre::Result<()> {
     {
         bail!("template image cannot be empty");
     }
+    validate_tmpfs_size(template.tmpfs_size.as_deref())?;
     validate_machine_defaults(
         template.resources.as_ref(),
         template.disk_size.as_deref(),
@@ -212,6 +215,15 @@ pub(crate) fn validate_template(template: &Template) -> eyre::Result<()> {
         template.network.as_ref(),
     )
     .map_err(|error| eyre::eyre!("template {error}"))
+}
+
+pub(crate) fn validate_tmpfs_size(tmpfs_size: Option<&str>) -> eyre::Result<()> {
+    if let Some(size) = tmpfs_size {
+        if let Some(capacity_bytes) = crate::machine_defaults::disk_size_bytes(Some(size))? {
+            libvm::TemporaryDirectoryPolicy::Tmpfs { capacity_bytes }.validate()?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_template_name(name: &str) -> eyre::Result<()> {
@@ -268,6 +280,7 @@ mod tests {
                 memory: Some("4gb".to_string()),
             }),
             disk_size: Some("40gb".to_string()),
+            tmpfs_size: None,
             userdata: Some("#!/bin/sh\nset -eu\n".to_string()),
             mounts: vec![MachineMount {
                 source: "/tmp/workspace".into(),

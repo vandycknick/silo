@@ -9,7 +9,6 @@ let
   releasePackages = [
     rustToolchain
     portableGo
-    pkgs.nodejs_26
     zig
     pkgs.cargo-zigbuild
     pkgs.git
@@ -26,7 +25,6 @@ let
   ciPackages = [
       rustToolchain
       pkgs.go
-      pkgs.nodejs_26
       pkgs.cargo-nextest
       pkgs.git
       pkgs.gnumake
@@ -57,6 +55,10 @@ let
       pkgs.grpcurl
       pkgs.uv
       pkgs.openssl
+    ]
+    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      pkgs.pkg-config
+      pkgs.virglrenderer
     ];
   workspaceHook = ''
     workspace_root="$(pwd -P)"

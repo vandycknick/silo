@@ -36,12 +36,13 @@ impl Store {
         let now = now_unix();
         sqlx::query(
             "INSERT INTO db_config
-                (id, os, created_at, modified_at)
-             VALUES (?1, ?2, ?3, ?3)
+                (id, os, runtime_id, created_at, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(DB_CONFIG_ID)
         .bind(&seed.os)
+        .bind(uuid::Uuid::new_v4().to_string())
         .bind(now)
         .execute(&self.pool)
         .await?;

@@ -7,18 +7,22 @@
 //! `machine` and `network` and are converted at the crate boundary.
 
 mod db_config;
-mod image;
+pub(crate) mod image;
 mod machine;
 mod machine_id;
 mod network;
+pub(crate) mod snapshot;
+pub(crate) mod storage;
 
 pub(crate) use db_config::DbConfig;
 pub(crate) use image::{
-    ImageConfigRecord, ImageLayerRecord, ImageManifestLayerRecord, ImageManifestRecord,
-    ImageRefRecord, ImageRootfsArtifactRecord, MachineRootfsRecord, OciImageRecord,
+    CacheCleanupDeferral, CacheRecoveryReport, ImageCompositionArtifactRecord, ImageConfigRecord,
+    ImageLayerRecord, ImageManifestLayerRecord, ImageManifestRecord, ImageRefRecord,
+    MachineRootfsRecord, OciImageRecord,
 };
 pub(crate) use machine::{MachineConfig, MachineRuntimeState, MachineState};
-pub(crate) use machine_id::{looks_like_id_prefix, MachineId};
+pub(crate) use machine_id::looks_like_id_prefix;
+pub use machine_id::{MachineId, MachineIdParseError};
 pub(crate) use network::{
     GuestPublish, MachineNetworkConfig, NetworkDefinition, NetworkDriverPreference,
     NetworkInstanceState, NetworkTopology, PublishBind,

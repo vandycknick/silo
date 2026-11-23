@@ -96,12 +96,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets a portable runtime root bundled by an SDK frontend.
-    pub fn bundled_runtime_root(mut self, bundled_runtime_root: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_bundled_runtime_root(bundled_runtime_root);
-        self
-    }
-
     /// Opens the runtime.
     pub async fn open(self) -> Result<Runtime, LibVmError> {
         Runtime::new(self.config).await
@@ -127,7 +121,6 @@ mod tests {
             .initramfs_path("/runtime/assets/initramfs")
             .agent_path("/runtime/assets/agent")
             .runtime_root("/runtime")
-            .bundled_runtime_root("/bundled-runtime")
             .into_config();
 
         assert_eq!(
@@ -154,10 +147,6 @@ mod tests {
         assert_eq!(
             config.runtime_root.as_deref(),
             Some(std::path::Path::new("/runtime"))
-        );
-        assert_eq!(
-            config.bundled_runtime_root.as_deref(),
-            Some(std::path::Path::new("/bundled-runtime"))
         );
     }
 }

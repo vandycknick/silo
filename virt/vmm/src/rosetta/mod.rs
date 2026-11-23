@@ -142,7 +142,7 @@ pub(crate) async fn acquire(
     });
     let platform = GenericPlatform::new();
     platform.set_nested_virtualization_enabled(false);
-    let mut filesystem = VirtioFileSystemDeviceConfiguration::new(agent_spec::ROSETTA_MOUNT_TAG)
+    let mut filesystem = VirtioFileSystemDeviceConfiguration::new(rootfs_spec::rosetta::SHARE_TAG)
         .wrap_err("construct Rosetta probe filesystem")?;
     filesystem.set_rosetta_share(
         LinuxRosettaDirectoryShare::new().wrap_err("construct Rosetta probe share")?,
@@ -569,8 +569,8 @@ async fn drain_diagnostics(mut stream: SerialPortStream) -> eyre::Result<Diagnos
 fn acquisition_error(error: eyre::Report, diagnostics: &DiagnosticStats) -> eyre::Report {
     let retained = &diagnostics.retained[..diagnostics.retained.len().min(ERROR_DIAGNOSTIC_LIMIT)];
     eyre!(
-        "{error}; probe diagnostics bytes={} retained={:?}",
-        diagnostics.total,
+        "{error}; probe diagnostics size={} retained={:?}",
+        utils::format_storage_size(diagnostics.total),
         String::from_utf8_lossy(retained).escape_debug().to_string()
     )
 }
@@ -660,7 +660,13 @@ mod tests {
             }),
         );
         let error = result.err().expect("must fail").to_string();
-        for context in ["bad frame", "stop failed", "trailing byte", "guest failed"] {
+        for context in [
+            "bad frame",
+            "stop failed",
+            "trailing byte",
+            "guest failed",
+            "probe diagnostics size=12B",
+        ] {
             assert!(error.contains(context), "missing {context}: {error}");
         }
     }

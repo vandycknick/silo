@@ -6,7 +6,8 @@ use std::os::fd::{FromRawFd, RawFd};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const VMM_START_REQUEST_VERSION: u32 = 1;
-pub(crate) const VMM_START_REQUEST_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const VMM_START_REQUEST_MAX_BYTES: usize =
+    vm_spec::capture::MAX_CAPTURE_RECORD_BYTES + (1 << 20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -14,7 +15,10 @@ pub(crate) struct VmmStartRequest {
     version: u32,
     machine_id: String,
     machine_run_id: String,
+    pub(crate) storage_lease: protocol::shutdown::StorageLeaseBinding,
+    pub(crate) storage_shutdown: protocol::shutdown::StorageShutdownContext,
     pub(crate) startup_command: Option<StartupCommand>,
+    pub(crate) disk_tracking_seeds: Vec<vm_spec::capture::DiskTrackingSeed>,
     // Optional additive field within version 1: absent means the
     // platform-default backend. NEVER feature-gate this field — both sides of
     // the pipe must parse the same schema regardless of compiled features.
@@ -26,6 +30,10 @@ pub(crate) struct VmmStartRequest {
     pub(crate) asset_directory: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     startup_budget_ms: Option<u64>,
+    /// ADR 0018 restore inputs: descriptor-only, capability-gated. Present
+    /// only on a restore launch; never a cold-start modifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore: Option<vm_spec::restore::RestoreRequest>,
 }
 
 /// Explicit virtualization backend selection carried in the start request.
@@ -37,6 +45,10 @@ pub(crate) struct VirtBackendRequest {
     /// Absolute path to a mock scenario file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scenario: Option<std::path::PathBuf>,
+    /// Exact frozen scenario bytes, supplied by backend selection.
+    pub(crate) scenario_json: Option<String>,
+    /// Lowercase SHA-256 of scenario_json's UTF-8 bytes.
+    pub(crate) scenario_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -71,6 +83,7 @@ pub(crate) struct StartupEnvironmentVariable {
 
 pub(crate) struct StartRequestPipe {
     file: Option<File>,
+    storage_lease: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
 impl StartRequestPipe {
@@ -79,10 +92,30 @@ impl StartRequestPipe {
             Some(fd) => {
                 crate::startup::set_cloexec(fd, true)?;
                 let file = unsafe { File::from_raw_fd(fd) };
-                Ok(Self { file: Some(file) })
+                Ok(Self {
+                    file: Some(file),
+                    storage_lease: None,
+                })
             }
-            None => Ok(Self { file: None }),
+            None => Ok(Self {
+                file: None,
+                storage_lease: None,
+            }),
         }
+    }
+
+    pub(crate) fn with_storage_lease(
+        mut self,
+        lease: std::sync::Arc<std::os::fd::OwnedFd>,
+    ) -> Self {
+        self.storage_lease = Some(lease);
+        self
+    }
+
+    pub(crate) fn storage_lease(&self) -> io::Result<std::sync::Arc<std::os::fd::OwnedFd>> {
+        self.storage_lease
+            .clone()
+            .ok_or_else(|| invalid_data("missing inherited generation lease"))
     }
 
     pub(crate) async fn read(
@@ -91,24 +124,9 @@ impl StartRequestPipe {
         expected_machine_run_id: &str,
     ) -> io::Result<VmmStartRequest> {
         let Some(file) = self.file.take() else {
-            tracing::info!(
-                event = "start_request_idle",
-                "no inherited start request pipe; using foreground idle mode"
-            );
-            return validate_start_request(
-                VmmStartRequest {
-                    version: VMM_START_REQUEST_VERSION,
-                    machine_id: expected_machine_id.to_string(),
-                    machine_run_id: expected_machine_run_id.to_string(),
-                    startup_command: None,
-                    virt_backend: None,
-                    rosetta_intent: None,
-                    asset_directory: None,
-                    startup_budget_ms: None,
-                },
-                expected_machine_id,
-                expected_machine_run_id,
-            );
+            return Err(invalid_data(
+                "managed launch requires an inherited start request pipe",
+            ));
         };
         tracing::info!(
             event = "start_request_wait",
@@ -122,6 +140,16 @@ impl StartRequestPipe {
             .read_to_end(&mut encoded)
             .await?;
         let request = decode_start_request(&encoded, expected_machine_id, expected_machine_run_id)?;
+        let lease = self.storage_lease()?;
+        use std::os::fd::AsFd;
+        let stat = nix::sys::stat::fstat(lease.as_fd())?;
+        if stat.st_dev as u64 != request.storage_lease.file_device
+            || stat.st_ino as u64 != request.storage_lease.file_inode
+        {
+            return Err(invalid_data(
+                "storageLease does not match inherited generation lease",
+            ));
+        }
         tracing::info!(
             event = "start_request_accepted",
             startup_command = request.startup_command.is_some(),
@@ -144,8 +172,8 @@ fn decode_start_request(
     }
     if encoded.len() > VMM_START_REQUEST_MAX_BYTES {
         return Err(invalid_data(format!(
-            "silo-vmm start request exceeds {} bytes",
-            VMM_START_REQUEST_MAX_BYTES
+            "silo-vmm start request exceeds {}",
+            utils::format_storage_size(VMM_START_REQUEST_MAX_BYTES as u64)
         )));
     }
     if encoded.last() != Some(&b'\n') {
@@ -190,6 +218,23 @@ fn validate_start_request(
             "silo-vmm start request machineRunId does not match --run-id",
         ));
     }
+    request.storage_lease.validate().map_err(invalid_data)?;
+    request.storage_shutdown.validate().map_err(invalid_data)?;
+    if request.disk_tracking_seeds.len() > 16 {
+        return Err(invalid_data(
+            "disk tracking seeds exceed the attachment limit",
+        ));
+    }
+    for seed in &request.disk_tracking_seeds {
+        seed.validate().map_err(invalid_data)?;
+    }
+    if request.storage_shutdown.machine_id != request.machine_id
+        || request.storage_shutdown.run_id != request.machine_run_id
+    {
+        return Err(invalid_data(
+            "storageShutdown identity does not match start request",
+        ));
+    }
     if let Some(command) = &request.startup_command {
         parse_uuid("startupCommand.executionId", &command.execution_id)?;
         validate_process(&command.process)?;
@@ -210,7 +255,52 @@ fn validate_start_request(
     {
         return Err(invalid_data("assetDirectory must be an absolute path"));
     }
+    if let Some(restore) = &request.restore {
+        restore.validate().map_err(invalid_data)?;
+        if request.startup_command.is_some() {
+            return Err(invalid_data(
+                "a restore launch continues the captured workload; it has no startup command",
+            ));
+        }
+        if request
+            .virt_backend
+            .as_ref()
+            .is_some_and(|backend| backend.kind != "krun")
+        {
+            return Err(invalid_data("restore requires the krun backend"));
+        }
+        restore
+            .validate_activation(
+                &vm_spec::lifecycle::LiveId::parse(&request.machine_id).map_err(invalid_data)?,
+                &vm_spec::lifecycle::LiveId::parse(&request.machine_run_id)
+                    .map_err(invalid_data)?,
+            )
+            .map_err(invalid_data)?;
+        destination_ssh_ca(restore.ssh_trusted_ca.as_deref())?;
+    }
     Ok(request)
+}
+
+/// The guest's bound on one OpenSSH public key line.
+const MAX_SSH_CA_BYTES: usize = 1024;
+
+/// The destination's public SSH CA a restore launch hands the guest in
+/// Activate: one OpenSSH Ed25519 public key line, admitted by the same rule
+/// the guest applies. Only pre-allocation inspection may omit it.
+pub(crate) fn destination_ssh_ca(value: Option<&str>) -> io::Result<&str> {
+    let value =
+        value.ok_or_else(|| invalid_data("a restore launch requires restore.sshTrustedCa"))?;
+    if value.len() > MAX_SSH_CA_BYTES || value.trim().contains(['\n', '\r']) {
+        return Err(invalid_data(
+            "restore.sshTrustedCa must be one OpenSSH public key line of at most 1024 bytes",
+        ));
+    }
+    let key = russh::keys::PublicKey::from_openssh(value)
+        .map_err(|error| invalid_data(format!("restore.sshTrustedCa: {error}")))?;
+    if key.algorithm() != russh::keys::ssh_key::Algorithm::Ed25519 {
+        return Err(invalid_data("restore.sshTrustedCa must be an Ed25519 key"));
+    }
+    Ok(value)
 }
 
 impl VmmStartRequest {
@@ -225,10 +315,27 @@ impl VmmStartRequest {
     }
 }
 
-fn validate_backend_request(backend: &VirtBackendRequest) -> io::Result<()> {
+pub(crate) fn validate_backend_request(backend: &VirtBackendRequest) -> io::Result<()> {
     match backend.kind.as_str() {
-        "mock" => Ok(()),
-        "krun" | "vz" if backend.scenario.is_none() => Ok(()),
+        "mock" => {
+            match (&backend.scenario, &backend.scenario_json, &backend.scenario_digest) {
+                (None, None, None) => Ok(()),
+                (Some(path), Some(json), Some(digest)) if path.is_absolute() => {
+                    crate::capabilities::validate_scenario_bytes(json.as_bytes(), digest)
+                        .map_err(|error| invalid_data(error.to_string()))
+                }
+                _ => Err(invalid_data(
+                    "mock scenario requires an absolute path, scenarioJson and matching scenarioDigest",
+                )),
+            }
+        }
+        "krun" | "vz"
+            if backend.scenario.is_none()
+                && backend.scenario_json.is_none()
+                && backend.scenario_digest.is_none() =>
+        {
+            Ok(())
+        }
         "krun" | "vz" => Err(invalid_data(format!(
             "silo-vmm start request backend {:?} cannot include a mock scenario",
             backend.kind
@@ -285,9 +392,13 @@ fn valid_environment_name(name: &str) -> bool {
         })
 }
 
-fn parse_uuid(field: &str, value: &str) -> io::Result<uuid::Uuid> {
-    uuid::Uuid::parse_str(value)
-        .map_err(|error| invalid_data(format!("{field} must be a UUID: {error}")))
+pub(crate) fn parse_uuid(field: &str, value: &str) -> io::Result<uuid::Uuid> {
+    let id = uuid::Uuid::parse_str(value)
+        .map_err(|error| invalid_data(format!("{field} must be a UUID: {error}")))?;
+    if id.is_nil() {
+        return Err(invalid_data(format!("{field} must not be the nil UUID")));
+    }
+    Ok(id)
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -300,24 +411,16 @@ mod tests {
     use uuid::Uuid;
 
     use crate::start_request::{
-        decode_start_request, RosettaIntentRequest, StartRequestPipe, VMM_START_REQUEST_MAX_BYTES,
-        VMM_START_REQUEST_VERSION,
+        decode_start_request, destination_ssh_ca, RosettaIntentRequest, StartRequestPipe,
+        VMM_START_REQUEST_MAX_BYTES, VMM_START_REQUEST_VERSION,
     };
 
     #[tokio::test]
-    async fn missing_inherited_pipe_is_explicit_idle_mode() {
+    async fn managed_start_requires_an_inherited_request_pipe() {
         let machine_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
-        let mut pipe = StartRequestPipe::from_fd(None).expect("open idle start request");
-
-        let request = pipe
-            .read(&machine_id, &run_id)
-            .await
-            .expect("read idle request");
-
-        assert_eq!(request.machine_id, machine_id);
-        assert_eq!(request.machine_run_id, run_id);
-        assert!(request.startup_command.is_none());
+        let mut pipe = StartRequestPipe::from_fd(None).expect("construct missing-pipe input");
+        assert!(pipe.read(&machine_id, &run_id).await.is_err());
     }
 
     #[test]
@@ -353,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_requests_derive_budget_from_startup_command_presence() {
+    fn current_requests_derive_budget_from_startup_command_presence() {
         let machine_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
         let idle = encode(json!({
@@ -361,7 +464,7 @@ mod tests {
             "machineId": machine_id,
             "machineRunId": run_id,
         }));
-        let idle = decode_start_request(&idle, &machine_id, &run_id).expect("decode legacy idle");
+        let idle = decode_start_request(&idle, &machine_id, &run_id).expect("decode current idle");
         assert_eq!(idle.effective_startup_budget_ms(), 30_000);
 
         let startup = encode(json!({
@@ -374,7 +477,7 @@ mod tests {
             }
         }));
         let startup =
-            decode_start_request(&startup, &machine_id, &run_id).expect("decode legacy startup");
+            decode_start_request(&startup, &machine_id, &run_id).expect("decode current startup");
         assert_eq!(startup.effective_startup_budget_ms(), 330_000);
     }
 
@@ -521,6 +624,58 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_start_reader_rejects_matching_nil_machine_and_run_ids() {
+        let nil = Uuid::nil().to_string();
+        let valid = Uuid::new_v4().to_string();
+        for (machine_id, run_id) in [(&nil, &valid), (&valid, &nil)] {
+            let request = encode(json!({
+                "version": VMM_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+            }));
+            let error =
+                decode_start_request(&request, machine_id, run_id).expect_err("nil identity");
+            assert!(
+                error.to_string().contains("must not be the nil UUID"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_start_scenario_requires_exact_frozen_bytes_and_digest() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let json = "{ }";
+        let valid = json!({
+            "version": VMM_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "virtBackend": {
+                "kind": "mock", "scenario": "/missing/source.json",
+                "scenarioJson": json,
+                "scenarioDigest": crate::capabilities::scenario_digest(json.as_bytes())
+            }
+        });
+        decode_start_request(&encode(valid.clone()), &machine_id, &run_id)
+            .expect("frozen bytes accepted");
+        for field in ["scenario", "scenarioJson", "scenarioDigest"] {
+            let mut missing = valid.clone();
+            missing["virtBackend"]
+                .as_object_mut()
+                .expect("backend")
+                .remove(field);
+            assert!(decode_start_request(&encode(missing), &machine_id, &run_id).is_err());
+        }
+        let mut changed = valid.clone();
+        changed["virtBackend"]["scenarioJson"] = json!("{}");
+        assert!(decode_start_request(&encode(changed), &machine_id, &run_id).is_err());
+        let mut relative = valid;
+        relative["virtBackend"]["scenario"] = json!("relative.json");
+        assert!(decode_start_request(&encode(relative), &machine_id, &run_id).is_err());
+    }
+
+    #[test]
     fn strict_reader_rejects_framing_and_schema_errors() {
         let machine_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
@@ -621,9 +776,111 @@ mod tests {
         assert!(decode_start_request(&encode(oversized), &machine_id, &run_id).is_err());
     }
 
-    fn encode(value: serde_json::Value) -> Vec<u8> {
+    fn encode(mut value: serde_json::Value) -> Vec<u8> {
+        if value.get("diskTrackingSeeds").is_none() {
+            value["diskTrackingSeeds"] = json!([]);
+        }
+        value["storageLease"] = json!({
+            "operationId": "33333333-3333-4333-8333-333333333333",
+            "fileDevice": 1, "fileInode": 1
+        });
+        value["storageShutdown"] = json!({
+            "version": 1,
+            "machineId": value["machineId"],
+            "runId": value["machineRunId"],
+            "manifest": {"kind": "unsupported", "reason": "unit fixture has no attachments"}
+        });
         let mut encoded = serde_json::to_vec(&value).expect("encode JSON");
         encoded.push(b'\n');
         encoded
+    }
+
+    #[test]
+    fn managed_request_requires_exact_current_storage_metadata() {
+        let machine = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        let encoded = encode(json!({"version":1,"machineId":machine,"machineRunId":run}));
+        let current: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        for field in ["storageLease", "storageShutdown"] {
+            let mut missing = current.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let mut bytes = serde_json::to_vec(&missing).unwrap();
+            bytes.push(b'\n');
+            assert!(decode_start_request(&bytes, &machine, &run).is_err());
+        }
+        for field in ["operationId", "fileDevice", "fileInode"] {
+            let mut missing = current.clone();
+            missing["storageLease"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let mut bytes = serde_json::to_vec(&missing).unwrap();
+            bytes.push(b'\n');
+            assert!(decode_start_request(&bytes, &machine, &run).is_err());
+        }
+        let mut wrong = current;
+        wrong["storageShutdown"]["runId"] = json!(Uuid::new_v4().to_string());
+        let mut bytes = serde_json::to_vec(&wrong).unwrap();
+        bytes.push(b'\n');
+        assert!(decode_start_request(&bytes, &machine, &run).is_err());
+    }
+
+    #[test]
+    fn restore_launch_admits_only_one_destination_ed25519_ca_line() {
+        let private = russh::keys::PrivateKey::from(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]),
+        );
+        let ed25519 = private.public_key().to_openssh().unwrap();
+        assert_eq!(destination_ssh_ca(Some(&ed25519)).unwrap(), ed25519);
+        // Only pre-allocation inspection may omit it; a launch never does.
+        assert!(destination_ssh_ca(None).is_err());
+        for invalid in [
+            String::new(),
+            "not a key".to_string(),
+            format!("{ed25519}\n{ed25519}"),
+            format!("{ed25519} {}", "c".repeat(1024)),
+            // A private key is never trust.
+            private
+                .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                .unwrap()
+                .to_string(),
+        ] {
+            assert!(destination_ssh_ca(Some(&invalid)).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn start_request_carries_strict_optional_disk_seeds() {
+        use vm_spec::capture::{
+            DiskTrackingSeed, Sha256Digest, DISK_TRACKING_VERSION, STREAM_CHUNK_BYTES,
+        };
+        let machine = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        let seed = DiskTrackingSeed {
+            version: DISK_TRACKING_VERSION,
+            map_format: 1,
+            chunk_shift: 23,
+            role: vm_spec::DiskRole::Root,
+            attachment_index: 0,
+            block_id: vm_spec::BlockId::new("root").unwrap(),
+            file_device: 1,
+            file_inode: 2,
+            length: STREAM_CHUNK_BYTES + 512,
+            chunk_size: STREAM_CHUNK_BYTES,
+            epoch: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+            baseline: Some(Sha256Digest::of_bytes(b"map")),
+        };
+        let request = json!({
+            "version": VMM_START_REQUEST_VERSION, "machineId": machine, "machineRunId": run,
+            "diskTrackingSeeds": [seed],
+        });
+        let decoded = decode_start_request(&encode(request.clone()), &machine, &run).unwrap();
+        assert_eq!(decoded.disk_tracking_seeds, vec![seed]);
+        let mut invalid = request.clone();
+        invalid["diskTrackingSeeds"][0]["chunkSize"] = json!(4096);
+        assert!(decode_start_request(&encode(invalid), &machine, &run).is_err());
+        let mut invalid = request;
+        invalid["diskTrackingSeeds"][0]["unrecognized"] = json!(true);
+        assert!(decode_start_request(&encode(invalid), &machine, &run).is_err());
     }
 }

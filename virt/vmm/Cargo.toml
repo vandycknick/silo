@@ -12,14 +12,29 @@ path = "src/main.rs"
 name = "silo-rprobe-vz-harness"
 path = "src/bin/rprobe_vz_harness.rs"
 
+[[example]]
+name = "guest-lifecycle-controller"
+path = "examples/guest_lifecycle_controller.rs"
+test = false
+
+[[example]]
+name = "native-live-api"
+path = "examples/native_live_api.rs"
+test = false
+
 [features]
 # Compiles the in-process mock virtualization backend for tests. Never enabled
-# in release builds; test runs use --all-features.
+# in release builds; host test and clippy runs select it explicitly.
 mock-backend = ["dep:test-utils"]
+# Diagnostic native IRQ witness transport for restore acceptance (Linux x86_64).
+# Never a default or production feature; instrumentation does not change the
+# native state format or restore compatibility.
+restore-irq-probe = ["libkrun/native-device-probe"]
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
 forward-spec = { path = "../../specs/forward-spec", features = ["tokio"] }
+rootfs-spec = { path = "../../specs/rootfs-spec" }
 async-trait = "0.1"
 base64 = "0.23.0"
 chrono = "0.4.45"
@@ -38,6 +53,7 @@ prost-types = "0.14.4"
 rand = "0.10.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "signal", "sync", "fs", "process"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
@@ -49,7 +65,6 @@ thiserror = "2.0.19"
 tracing = "0.1.44"
 russh = "0.62.4"
 tracing-appender = "0.2.5"
-tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 test-utils = { path = "../../runtime/test-utils", optional = true }
 libkrun = { workspace = true }
@@ -65,3 +80,10 @@ kvm-ioctls = "0.22.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 rprobe = { path = "../../guest/rprobe" }
 vz = { path = "../../virt/vz" }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util"] }
+# Native guest fixture: whole-disk ext4 root and its schema-1 launch bootstrap,
+# composed with the same newc crate as libvm.
+cpio = "0.4.1"
+disk-image = { path = "../../common/disk-image" }

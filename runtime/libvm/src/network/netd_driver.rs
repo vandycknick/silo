@@ -49,12 +49,27 @@ struct NetdDriverState {
     pcap: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct PersistedNetworkAttachment {
     mac: String,
     ipv4: NetworkIpv4Config,
     dns: NetworkDnsConfig,
     requires_certificate_authority: bool,
+}
+
+/// Guest network settings of a running attachment, as wake must reapply them.
+pub(super) fn persisted_restore_network(
+    attachment_json: &str,
+) -> Result<vm_spec::restore::RestoreNetwork, serde_json::Error> {
+    let attachment: PersistedNetworkAttachment = serde_json::from_str(attachment_json)?;
+    Ok(vm_spec::restore::RestoreNetwork {
+        mac: attachment.mac,
+        ipv4: attachment.ipv4.address,
+        prefix_length: attachment.ipv4.prefix_length,
+        gateway: attachment.ipv4.gateway,
+        dns_servers: attachment.dns.servers,
+        dns_search: attachment.dns.search,
+    })
 }
 
 #[async_trait]
@@ -101,8 +116,31 @@ async fn prepare_netd_runtime(
     let network_id = MachineId::new().to_string();
     let network_paths = paths.network(&network_id)?;
     let machine_paths = paths.machine(metadata.id);
-    let runtime_directory = paths.ensure_network_run_dir(&network_id)?;
-    let log_directory = paths.ensure_machine_network_logs_dir(metadata.id)?;
+    let (runtime_directory, log_directory) =
+        if ctx.durability == crate::MachineDurability::Constructed {
+            let root = crate::paths::OwnedDirectory::open_root_deferred(paths.run_root())?;
+            let runtime = root
+                .ensure_dir_deferred("networks")?
+                .ensure_dir_deferred(&network_id)?;
+            let logs = crate::paths::OwnedDirectory::open_existing_root(
+                machine_paths.network_logs_dir().parent().ok_or_else(|| {
+                    LibVmError::NetworkRuntime {
+                        reference: metadata.name.clone(),
+                        message: "network logs have no parent".into(),
+                    }
+                })?,
+            )?
+            .ok_or_else(|| LibVmError::NetworkRuntime {
+                reference: metadata.name.clone(),
+                message: "child logs disappeared".into(),
+            })?;
+            (runtime, logs.ensure_dir_deferred("network")?)
+        } else {
+            (
+                paths.ensure_network_run_dir(&network_id)?,
+                paths.ensure_machine_network_logs_dir(metadata.id)?,
+            )
+        };
     let mut startup = NetdStartupGuard::new(paths.clone(), network_id.clone());
     // std creates non-inheritable pipes on both macOS and Linux, coordinating
     // its pipe+fcntl fallback with concurrent std::process launches.
@@ -123,7 +161,13 @@ async fn prepare_netd_runtime(
     let log_path = machine_paths.network_service_log_path();
     let policy_path = if let Some(policy) = request.policy() {
         let path = network_paths.policy_path();
-        write_runtime_policy_file(&metadata.name, policy, &runtime_directory, &path)?;
+        write_runtime_policy_file(
+            &metadata.name,
+            policy,
+            &runtime_directory,
+            &path,
+            ctx.durability,
+        )?;
         Some(path)
     } else {
         None
@@ -477,6 +521,7 @@ fn write_runtime_policy_file(
     policy: &NetworkPolicy,
     runtime_directory: &crate::paths::OwnedDirectory,
     path: &Path,
+    durability: crate::MachineDurability,
 ) -> Result<(), LibVmError> {
     let normalized = policy
         .clone()
@@ -498,12 +543,15 @@ fn write_runtime_policy_file(
                 path.display()
             ),
         })?;
-    runtime_directory
-        .write_file(file_name, &bytes)
-        .map_err(|err| LibVmError::NetworkRuntime {
-            reference: machine_name.into(),
-            message: format!("write generated network policy {}: {err}", path.display()),
-        })
+    (if durability == crate::MachineDurability::Constructed {
+        runtime_directory.write_file_atomic_deferred(file_name, &bytes)
+    } else {
+        runtime_directory.write_file(file_name, &bytes)
+    })
+    .map_err(|err| LibVmError::NetworkRuntime {
+        reference: machine_name.into(),
+        message: format!("write generated network policy {}: {err}", path.display()),
+    })
 }
 
 #[derive(Deserialize)]
@@ -924,6 +972,7 @@ mod tests {
             &policy,
             &directory,
             &file,
+            crate::MachineDurability::Durable,
         )
         .unwrap();
         let generated = silo_policy::NetworkPolicy::from_json_file(file).unwrap();
@@ -1116,7 +1165,7 @@ mod tests {
         assert_eq!(
             hook_json,
             &json!({
-                "version": 2,
+                "version": 1,
                 "command": "/usr/bin/silo",
                 "args": ["secret", "provide"],
                 "timeout_ms": 2500,
@@ -1192,6 +1241,30 @@ netd log: /tmp/silo/netd.log";
     }
 
     #[test]
+    fn persisted_attachment_yields_the_guest_settings_wake_reapplies() {
+        let (ipv4, dns) =
+            private_ipv4_config("192.168.105.37/24", "devbox").expect("private IPv4 config");
+        let stored =
+            serde_json::to_string(&crate::network::netd_driver::PersistedNetworkAttachment {
+                mac: "02:69:ef:74:77:45".into(),
+                ipv4: ipv4.clone(),
+                dns: dns.clone(),
+                requires_certificate_authority: false,
+            })
+            .unwrap();
+        let restored = crate::network::netd_driver::persisted_restore_network(&stored).unwrap();
+        assert_eq!(restored.mac, "02:69:ef:74:77:45");
+        assert_eq!(restored.ipv4, ipv4.address);
+        assert_eq!(restored.prefix_length, ipv4.prefix_length);
+        assert_eq!(restored.gateway, ipv4.gateway);
+        assert_eq!(restored.dns_servers, dns.servers);
+        assert_eq!(restored.dns_search, dns.search);
+        assert!(
+            crate::network::netd_driver::persisted_restore_network(r#"{"kind":"none"}"#).is_err()
+        );
+    }
+
+    #[test]
     fn private_ipv4_config_rejects_too_small_subnet() {
         let err = private_ipv4_config("192.168.105.0/30", "devbox")
             .expect_err("small subnet should fail");
@@ -1264,6 +1337,7 @@ netd log: /tmp/silo/netd.log";
         let store = Store::new(&paths).await.expect("open store");
         let machine_id = MachineId::new();
         let metadata = MachineConfig {
+            secret_scope: crate::SecretScopePolicy::default(),
             id: machine_id,
             lock_id: LockId::from(0),
             name: "netd-resolved-path".to_string(),
@@ -1308,6 +1382,7 @@ netd log: /tmp/silo/netd.log";
             config: &networking,
             netd_path: &netd,
             egress_credentials: &launch,
+            durability: crate::MachineDurability::Durable,
         };
 
         let attachment =
@@ -1465,6 +1540,7 @@ netd log: /tmp/silo/netd.log";
             let machine_id = MachineId::new();
             let policy = oauth_policy();
             let metadata = MachineConfig {
+                secret_scope: crate::SecretScopePolicy::default(),
                 id: machine_id,
                 lock_id: LockId::from(0),
                 name: "transport-test".into(),
@@ -1544,6 +1620,7 @@ os.write(int(flag('--startup-fd')),json.dumps(report).encode()+b'\n')
                 config: &networking,
                 netd_path: &executable,
                 egress_credentials: &launch,
+                durability: crate::MachineDurability::Durable,
             };
             let request = NetworkAttachmentRequest::private(Some(&policy), None);
             let start = std::time::Instant::now();

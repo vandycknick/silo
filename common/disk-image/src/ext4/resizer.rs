@@ -729,7 +729,8 @@ mod tests {
                 ),
                 None,
                 None,
-                Some(&mut "hello".as_bytes()),
+                Some(crate::ext4::FileData::Dense(&mut "hello".as_bytes())),
+                None,
                 None,
                 None,
                 None,
@@ -750,7 +751,7 @@ mod tests {
         assert!(outcome.changed());
         assert_eq!(outcome.new_blocks * 4096, target);
 
-        let mut reader = Reader::new(&path).expect("open grown image");
+        let reader = Reader::new(&path).expect("open grown image");
         assert_eq!(
             reader.read_file("/hello", 0, None).expect("read file"),
             b"hello"
@@ -862,7 +863,6 @@ mod tests {
 
         assert_eq!(outcome.new_groups, 129);
         assert_eq!(after.superblock().reserved_gdt_blocks, 30);
-        let mut after = after;
         let resize_inode = after.get_inode(7).expect("read resize inode");
         let dind_block = u32::from_le_bytes(resize_inode.block[52..56].try_into().unwrap());
         let mut file = std::fs::File::open(&path).expect("open image");

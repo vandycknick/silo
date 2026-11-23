@@ -3,7 +3,7 @@
 ## Scope and verdict
 
 Reviewed the engine/worker/lifecycle changes from `0e727a6a` through `577338de`,
-the adjacent daemon changes, and searched the runtime, specs, CLI, SDKs, netd,
+the adjacent daemon changes, and searched the runtime, specs, CLI, netd,
 packaging and scripts for older compatibility paths and historical tests.
 This is a source review, not fresh native-HVF/Rosetta/release qualification.
 The inventory below is the concrete debt found, not a proof that every possible
