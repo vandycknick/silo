@@ -251,6 +251,13 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
     };
     state.begin_stopping().await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(87);
+    // A lobby publishes its failure before its task returns, so a stop signal
+    // can arrive while the failed task is still unobserved above. That earlier
+    // failure stays isolated from the core; only a failure to stop is ours.
+    let lobby_already_failed = publisher
+        .wire()?
+        .lobby
+        .is_some_and(|lobby| lobby.phase() == silod_spec::daemon::v1::LobbyPhase::Failed);
     system_shutdown.cancel();
     lobby_shutdown.cancel();
     let drained = tokio::time::timeout_at(deadline, async {
@@ -259,7 +266,10 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
             task.await??;
         }
         if let Some(task) = lobby_task {
-            task.await??;
+            let stopped = task.await?;
+            if !lobby_already_failed {
+                stopped?;
+            }
         }
         Ok::<(), eyre::Report>(())
     })

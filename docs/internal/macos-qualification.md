@@ -239,3 +239,15 @@ connection 109 and 162, on 8, 4 and 2 CPUs; the same test without `-race`
 passed in 0.03 to 0.25 s. Linux amd64 runs the whole package under `-race` in 1.4 s.
 This is the slowdown `xtask test` already avoided on darwin/arm64, so the race
 lane is now Linux amd64 only.
+
+macOS got a runner this time: 3512 of 3513 passed and the lobby tests no
+longer time out. `daemon_run::lobby_failure_is_isolated…` got past the
+credential diagnostic and failed on the daemon's exit status after `SIGTERM`.
+
+That is a daemon race, not a test fault. The lobby publishes `failed` before
+its task returns, and a stop signal arriving in between made the shutdown
+drain return the lobby's old error, so `silo daemon run` exited 1 with `cannot
+read lobby credential`. Measured here by signalling the moment the status
+file shows the failure: 59 of 60 runs exited 1 before the fix, 60 of 60 exited
+0 after. The drain now ignores the result of a lobby that had already failed
+when shutdown began.
