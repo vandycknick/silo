@@ -309,7 +309,7 @@ func (r *Reader) Receive() (m Message, fd *os.File, err error) {
 }
 
 func SocketPair() (*net.UnixConn, *net.UnixConn, error) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	fds, err := cloexecSocketpair()
 	if err != nil {
 		return nil, nil, err
 	}
