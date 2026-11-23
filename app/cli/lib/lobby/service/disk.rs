@@ -51,8 +51,7 @@ impl Service {
         let stat = nix::sys::statvfs::statvfs(&self.config.home)
             .map_err(|_| Failure::new(Code::Unavailable, "disk availability unavailable"))?;
         let block = stat.fragment_size();
-        let available = stat
-            .blocks_available()
+        let available = u64::from(stat.blocks_available())
             .checked_mul(block)
             .filter(|_| block > 0)
             .ok_or_else(|| Failure::new(Code::Unavailable, "disk availability invalid"))?;

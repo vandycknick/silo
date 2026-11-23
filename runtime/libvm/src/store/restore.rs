@@ -525,8 +525,7 @@ impl crate::store::Store {
             .copied()
             .unwrap_or_default();
         let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).map_err(std::io::Error::from)?;
-        let available = filesystem
-            .blocks_available()
+        let available = u64::from(filesystem.blocks_available())
             .checked_mul(filesystem.fragment_size())
             .ok_or_else(|| invalid("restore disk availability overflow"))?;
         if disk_required > available {
@@ -600,8 +599,7 @@ impl crate::store::Store {
         let mut budget = RestoreBudget::read(self, &directory)?;
         budget.add_capture(&inventory)?;
         let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).map_err(std::io::Error::from)?;
-        let available = filesystem
-            .blocks_available()
+        let available = u64::from(filesystem.blocks_available())
             .checked_mul(filesystem.fragment_size())
             .ok_or_else(|| invalid("copy disk availability overflow"))?;
         let required = budget
@@ -1509,8 +1507,7 @@ impl crate::store::Store {
             let stat = nix::sys::stat::fstat(disk.fd()).map_err(std::io::Error::from)?;
             let filesystem =
                 nix::sys::statvfs::fstatvfs(disk.fd()).map_err(std::io::Error::from)?;
-            let available = filesystem
-                .blocks_available()
+            let available = u64::from(filesystem.blocks_available())
                 .checked_mul(filesystem.fragment_size())
                 .ok_or_else(|| invalid("capture free space overflow"))?;
             let required = budget
@@ -1860,8 +1857,7 @@ impl crate::store::Store {
             .ok_or_else(|| invalid("fork destination disappeared"))?;
         let stat = nix::sys::stat::fstat(disk.fd()).map_err(std::io::Error::from)?;
         let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).map_err(std::io::Error::from)?;
-        let available = filesystem
-            .blocks_available()
+        let available = u64::from(filesystem.blocks_available())
             .checked_mul(filesystem.fragment_size())
             .ok_or_else(|| invalid("fork disk availability overflow"))?;
         let required = budget
@@ -2290,8 +2286,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).unwrap();
-        let available = filesystem
-            .blocks_available()
+        let available = u64::from(filesystem.blocks_available())
             .checked_mul(filesystem.fragment_size())
             .unwrap();
         // Real capacity, no test admission override or allocation of a huge
@@ -2751,8 +2746,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).unwrap();
-        let available = filesystem
-            .blocks_available()
+        let available = u64::from(filesystem.blocks_available())
             .checked_mul(filesystem.fragment_size())
             .unwrap();
         let peak = record

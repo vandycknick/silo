@@ -357,8 +357,8 @@ impl crate::image::Images {
     /// for SDK and daemon callers until it has an encryption design for
     /// disks and memory (DESIGN section 9); tests exercise the exporter.
     #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "snapshot push is reachable from tests only")
+        any(not(test), not(target_os = "linux")),
+        expect(dead_code, reason = "snapshot push is reachable from Linux tests only")
     )]
     pub(crate) async fn publish_snapshot_artifact(
         &self,
@@ -2265,8 +2265,7 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).unwrap();
-        let available = filesystem
-            .blocks_available()
+        let available = u64::from(filesystem.blocks_available())
             .checked_mul(filesystem.fragment_size())
             .unwrap();
         let blocked = available / 4 * 3;

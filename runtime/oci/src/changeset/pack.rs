@@ -8,8 +8,7 @@ use crate::changeset::{ChangesetError, ChangesetLimits, ChangesetResult, Payload
 
 pub(crate) fn ensure_space(path: &Path, required: u64) -> ChangesetResult<()> {
     let stats = nix::sys::statvfs::statvfs(path).map_err(std::io::Error::from)?;
-    let available = stats
-        .blocks_available()
+    let available = u64::from(stats.blocks_available())
         .checked_mul(stats.fragment_size())
         .ok_or_else(|| ChangesetError::Invalid("available staging space overflows".into()))?;
     if required > available {

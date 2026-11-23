@@ -1646,7 +1646,7 @@ async fn abandon_failed(
         let directory = OwnedDirectory::open_existing_root(&filesystem)?
             .ok_or_else(|| protocol("staging filesystem disappeared"))?;
         let stat = nix::sys::statvfs::fstatvfs(directory.fd()).map_err(std::io::Error::from)?;
-        stat.blocks_available()
+        u64::from(stat.blocks_available())
             .checked_mul(stat.fragment_size())
             .ok_or_else(|| protocol("staging filesystem availability overflow"))
     })()

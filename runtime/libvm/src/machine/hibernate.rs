@@ -383,7 +383,7 @@ impl Machine {
                     check_space(
                         config,
                         estimate,
-                        fs.blocks_available().saturating_mul(fs.fragment_size()),
+                        u64::from(fs.blocks_available()).saturating_mul(fs.fragment_size()),
                     )?;
                     client
                         .control_hibernate(
