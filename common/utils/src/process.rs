@@ -159,6 +159,92 @@ fn boot_time() -> io::Result<i64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing btime in /proc/stat"))
 }
 
+/// Marks every open descriptor at or above 3 close-on-exec in a forked child.
+///
+/// Darwin has no `close_range`, and scanning every number below
+/// `RLIMIT_NOFILE` costs one `fcntl` per slot: billions under an unlimited
+/// limit. The child lists its actual table instead, into storage reserved
+/// before the fork because nothing may allocate after it. The slack covers
+/// descriptors other threads open before the fork; a table that outgrew it
+/// fails the spawn rather than leaking an inheritable descriptor.
+#[cfg(target_os = "macos")]
+pub struct CloexecTable {
+    entries: Vec<libc::proc_fdinfo>,
+}
+
+#[cfg(target_os = "macos")]
+impl CloexecTable {
+    /// Reserves room for the current table plus slack. Call before the fork.
+    pub fn reserve() -> io::Result<Self> {
+        // nix has no proc_pidinfo wrapper. A null buffer only asks for the size.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        let bytes = usize::try_from(bytes)
+            .ok()
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(io::Error::last_os_error)?;
+        let open = bytes / std::mem::size_of::<libc::proc_fdinfo>();
+        let empty = libc::proc_fdinfo {
+            proc_fd: -1,
+            proc_fdtype: 0,
+        };
+        Ok(Self {
+            entries: vec![empty; open.saturating_mul(2).saturating_add(64)],
+        })
+    }
+
+    /// Lists the calling process's descriptors and sets `FD_CLOEXEC` on each
+    /// one at or above 3.
+    ///
+    /// # Safety
+    ///
+    /// Intended for `pre_exec`: it only issues syscalls and reads errno, but
+    /// the caller must uphold the post-fork rules of that context.
+    pub unsafe fn mark_all(&mut self) -> io::Result<()> {
+        let capacity = std::mem::size_of_val(self.entries.as_slice());
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                self.entries.as_mut_ptr().cast(),
+                libc::c_int::try_from(capacity).unwrap_or(libc::c_int::MAX),
+            )
+        };
+        let Ok(filled) = usize::try_from(filled) else {
+            return Err(io::Error::last_os_error());
+        };
+        if filled == 0 || filled >= capacity {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        let count = filled / std::mem::size_of::<libc::proc_fdinfo>();
+        for entry in &self.entries[..count] {
+            let raw = entry.proc_fd;
+            if raw < 3 {
+                continue;
+            }
+            let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+            if flags < 0 {
+                if io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+                    continue;
+                }
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::process::start_time;

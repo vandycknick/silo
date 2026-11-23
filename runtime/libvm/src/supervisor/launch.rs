@@ -540,32 +540,7 @@ pub(crate) fn install_child_inheritance(
     allowed: impl AsRef<[Option<i32>]> + Send + Sync + 'static,
 ) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    let ceiling = {
-        let mut ceiling =
-            nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)?
-                .0
-                .min(i32::MAX as u64) as i32;
-        // Existing descriptors may exceed a subsequently lowered soft limit.
-        let mut directory = nix::dir::Dir::open(
-            "/dev/fd",
-            nix::fcntl::OFlag::O_RDONLY
-                | nix::fcntl::OFlag::O_DIRECTORY
-                | nix::fcntl::OFlag::O_CLOEXEC,
-            nix::sys::stat::Mode::empty(),
-        )?;
-        for entry in directory.iter() {
-            let entry = entry?;
-            if let Some(raw) = entry
-                .file_name()
-                .to_str()
-                .ok()
-                .and_then(|name| name.parse::<i32>().ok())
-            {
-                ceiling = ceiling.max(raw.saturating_add(1));
-            }
-        }
-        ceiling
-    };
+    let mut table = utils::process::CloexecTable::reserve()?;
     // SAFETY: only numeric OS operations and inline errno errors after fork.
     unsafe {
         command.pre_exec(move || {
@@ -584,18 +559,7 @@ pub(crate) fn install_child_inheritance(
                 }
             }
             #[cfg(target_os = "macos")]
-            for raw in 3..ceiling {
-                let flags = nix::libc::fcntl(raw, nix::libc::F_GETFD);
-                if flags < 0 {
-                    if *nix::libc::__error() == nix::libc::EBADF {
-                        continue;
-                    }
-                    return Err(io::Error::last_os_error());
-                }
-                if nix::libc::fcntl(raw, nix::libc::F_SETFD, flags | nix::libc::FD_CLOEXEC) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
+            table.mark_all()?;
             for raw in allowed.as_ref().iter().copied().flatten() {
                 let fd = BorrowedFd::borrow_raw(raw);
                 let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD)
@@ -728,7 +692,7 @@ mod tests {
         // macOS has no pipe2; this leaves a window of two syscalls, not the whole test.
         #[cfg(not(target_os = "linux"))]
         {
-            let (read, write) = pipe().expect("create pipe");
+            let (read, write) = nix::unistd::pipe().expect("create pipe");
             crate::supervisor::launch::set_cloexec(&read, true).expect("cloexec read end");
             crate::supervisor::launch::set_cloexec(&write, true).expect("cloexec write end");
             (read, write)

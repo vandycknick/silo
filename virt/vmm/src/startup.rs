@@ -182,47 +182,11 @@ impl InheritedPipeFds {
         use std::os::unix::process::CommandExt;
         let descriptors = self.descriptors();
         let restore = self.restore.clone();
-        let mut ceiling =
-            nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)?
-                .0
-                .min(i32::MAX as u64) as i32;
-        let mut directory = nix::dir::Dir::open(
-            "/dev/fd",
-            nix::fcntl::OFlag::O_RDONLY
-                | nix::fcntl::OFlag::O_DIRECTORY
-                | nix::fcntl::OFlag::O_CLOEXEC,
-            nix::sys::stat::Mode::empty(),
-        )?;
-        for entry in directory.iter() {
-            let entry = entry?;
-            if let Some(raw) = entry
-                .file_name()
-                .to_str()
-                .ok()
-                .and_then(|name| name.parse::<i32>().ok())
-            {
-                ceiling = ceiling.max(raw.saturating_add(1));
-            }
-        }
-        drop(directory);
+        let mut table = utils::process::CloexecTable::reserve()?;
         // SAFETY: fixed numeric allowlist and allocation-free fcntl errors.
         unsafe {
             command.pre_exec(move || {
-                // Darwin lacks close_range(CLOEXEC). Scan the precomputed soft
-                // limit without allocating or closing pre-exec-only handles.
-                for raw in 3..ceiling {
-                    let flags = nix::libc::fcntl(raw, nix::libc::F_GETFD);
-                    if flags < 0 {
-                        if *nix::libc::__error() == nix::libc::EBADF {
-                            continue;
-                        }
-                        return Err(io::Error::last_os_error());
-                    }
-                    if nix::libc::fcntl(raw, nix::libc::F_SETFD, flags | nix::libc::FD_CLOEXEC) < 0
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
+                table.mark_all()?;
                 for raw in descriptors
                     .into_iter()
                     .flatten()
