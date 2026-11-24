@@ -14,12 +14,13 @@ import platform
 import shutil
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import time
 from uuid import UUID, uuid4
 
-from . import overlay, prereqs, toolchain
+from . import overlay, prereqs, procs, toolchain
 from .cli import Silo
 from .config import REPO
 
@@ -29,6 +30,26 @@ def bounded_log(path: Path) -> str:
     assert len(data) <= 2 * 1024**2, f"candidate log exceeds 2MiB fixture bound: {path}"
     return data.decode(errors="replace")
 
+
+def spawned_worker_pid(trace: str) -> int:
+    """The private monitor's single worker spawn record."""
+    matches = re.findall(r"^\S+ +INFO +krun worker spawned worker_pid=([1-9][0-9]*)$", trace, re.MULTILINE)
+    assert len(matches) == 1, f"expected one krun worker spawn record, found {matches}"
+    return int(matches[0])
+
+
+def _signal_group(process: subprocess.Popen[bytes], sig: signal.Signals) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError as denied:
+        # Darwin can return EPERM for the group of an exiting monitor.
+        # Do not treat a permission failure on a live monitor as success.
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            raise denied from None
 
 
 def cpio(entries: list[tuple[str, bytes, int]]) -> bytes:
@@ -50,7 +71,7 @@ class Candidate:
         self.root.mkdir(mode=0o700)
         self.serial = self.root / "serial.log"
         self.trace = self.root / "trace.log"
-        self.process: subprocess.Popen | None = None
+        self.process: subprocess.Popen[bytes] | None = None
         self.closed = False
         self.lease_fd: int | None = None
         self.monitor = silo.ws.config.runtime_dir / "bin/silo-vmm"
@@ -265,9 +286,13 @@ class Candidate:
                 os.close(writer)
 
     def wait(self, *, rejected: bool = False) -> str:
+        process = self.process
+        assert process is not None, "candidate monitor was not started"
         deadline = time.monotonic() + 90
         while True:
-            self.capture_worker()
+            exited = process.poll() is not None
+            # Read after polling so this is the final log if the monitor has
+            # exited. A serial snapshot taken before exit can miss its tail.
             text = bounded_log(self.serial) if self.serial.exists() else ""
             if self.mapping_only:
                 assert not rejected
@@ -278,8 +303,11 @@ class Candidate:
             if rejected:
                 assert "SILO_OVERLAY_WORKLOAD_REACHED" not in text
                 assert "starting rescue shell" not in text
-                if "init: overlay: boot failed; workload prohibited" in text:
-                    self.observe_worker()
+                if exited and "init: overlay: boot failed; workload prohibited" in text:
+                    trace = bounded_log(self.trace)
+                    self.identities["monitorPid"] = process.pid
+                    self.identities["workerPid"] = spawned_worker_pid(trace)
+                    self.identities["workerPidSource"] = "monitor-spawn-trace"
                     return text
             elif "SILO_OVERLAY_WORKLOAD_REACHED" in text:
                 assert "SILO_OVERLAY_CANDIDATE_BEGIN" in text
@@ -288,7 +316,7 @@ class Candidate:
                 assert '"filesystem":"erofs"' in text.replace(" ", "")
                 self.observe_worker()
                 return text
-            if self.process is None or self.process.poll() is not None:
+            if exited:
                 raise AssertionError(f"candidate monitor exited before guest evidence; serial={text}; trace={bounded_log(self.trace) if self.trace.exists() else ''}")
             if time.monotonic() >= deadline:
                 raise AssertionError(f"candidate did not produce explicit {'guest rejection' if rejected else 'success'} evidence: {text}")
@@ -297,46 +325,41 @@ class Candidate:
     def logs(self) -> str:
         return "\n".join(bounded_log(path) for path in self.root.glob("*.log"))
 
-    def capture_worker(self) -> None:
-        # A rejected guest powers off right after printing its verdict, so the
-        # worker must be identified while it is still running.
-        if self.process is None or "workerPid" in self.identities or platform.system() != "Linux":
-            return
-        workers = overlay.krun_workers(self.process.pid)
-        if len(workers) != 1:
-            return
-        try:
-            actual = overlay.digest(Path(f"/proc/{workers[0]}/exe"))
-        except FileNotFoundError:
-            return
-        assert actual == self.identities["monitorWorkerSha256"], "worker did not execute captured monitor bytes"
-        self.identities["workerPid"] = workers[0]
-        self.identities["actualWorkerSha256"] = actual
-
     def observe_worker(self) -> None:
         assert self.process is not None
+        workers = procs.krun_workers(self.process.pid)
+        assert len(workers) == 1, f"expected one live krun worker of monitor {self.process.pid}, found {workers}"
+        worker = workers[0]
+        executable = procs.executable_path(worker)
+        # Darwin returns a pathname rather than an openable procfs link.
+        # This snapshot is private and never replaced during the launch.
+        assert executable.resolve(strict=True) == self.monitor.resolve(strict=True)
+        actual = overlay.digest(executable)
+        assert actual == self.identities["monitorWorkerSha256"], "worker did not execute captured monitor bytes"
         self.identities["monitorPid"] = self.process.pid
-        if platform.system() == "Linux":
-            self.capture_worker()
-            assert "workerPid" in self.identities, f"never observed the krun worker of monitor {self.process.pid}"
+        self.identities["workerPid"] = worker
+        self.identities["actualWorkerSha256"] = actual
 
     def close(self) -> None:
         if self.closed:
             return
-        if self.process is not None:
-            try:
-                os.killpg(self.process.pid, signal.SIGTERM)
-                self.process.wait(timeout=20)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                if self.process.poll() is None:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                    self.process.wait(timeout=10)
-        for label, path in [("candidate-serial", self.serial), ("candidate-trace", self.trace), ("candidate-monitor-output", self.root / "monitor-output.log")]:
-            if path.exists():
-                self.silo.ws.record(label, bounded_log(path))
-        assert all(overlay.digest(path) == expected for path, expected in self.occurrence_digests.items())
-        if self.lease_fd is not None:
-            os.close(self.lease_fd)
-            self.lease_fd = None
+        process = self.process
+        try:
+            if process is not None and process.poll() is None:
+                _signal_group(process, signal.SIGTERM)
+                try:
+                    process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    if process.poll() is None:
+                        _signal_group(process, signal.SIGKILL)
+                        process.wait(timeout=10)
+            for label, path in [("candidate-serial", self.serial), ("candidate-trace", self.trace), ("candidate-monitor-output", self.root / "monitor-output.log")]:
+                if path.exists():
+                    self.silo.ws.record(label, bounded_log(path))
+            assert all(overlay.digest(path) == expected for path, expected in self.occurrence_digests.items())
+        finally:
+            if self.lease_fd is not None:
+                os.close(self.lease_fd)
+                self.lease_fd = None
         self.closed = True
 

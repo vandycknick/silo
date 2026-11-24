@@ -6,9 +6,7 @@ from uuid import uuid4
 import pytest
 
 from silo_smoke import pause, shutdown
-from silo_smoke.cli import Silo
-
-pytestmark = pytest.mark.linux_only
+from silo_smoke.cli import Silo, Vm
 
 
 def test_pause_resume_retains_guest_session_and_user_authority(silo: Silo, basic_image: str) -> None:
@@ -91,19 +89,29 @@ def test_pause_resume_retains_guest_session_and_user_authority(silo: Silo, basic
         assert second["state"] == "paused"
         assert second["lifecycle"]["lifecycle"]["currentPause"]["token"]["generation"] > current["token"]["generation"]
         counter.stationary()
-        holders, lease = shutdown.holder(silo, name)
-        processes = [shutdown.Process(entry["pid"]) for entry in holders["holders"]]
-        try:
-            silo.stop(name)
-            for process in processes:
-                process.wait()
-            assert not shutdown.lease_busy(lease)
-            assert silo.info(name)["state"] == "stopped"
-            output, errors = counter.process.communicate(timeout=10)
-            silo.ws.record("pause-stop-counter", (output + b"\n[stderr]\n" + errors).decode(errors="replace"))
-            assert output == b"", "stop resumed the paused workload before terminating it"
-        finally:
-            for process in processes:
-                process.close()
+        silo.stop(name)
+        assert silo.info(name)["state"] == "stopped"
+        output, errors = counter.process.communicate(timeout=10)
+        silo.ws.record("pause-stop-counter", (output + b"\n[stderr]\n" + errors).decode(errors="replace"))
+        assert output == b"", "stop resumed the paused workload before terminating it"
     finally:
         counter.close()
+
+
+@pytest.mark.linux_only(reason="requires procfs start times and pidfds for exact paused-run storage holders")
+def test_pause_stop_releases_exact_storage_holders(silo: Silo, vm: Vm) -> None:
+    silo.run("pause", vm.name)
+    assert silo.info(vm.name)["state"] == "paused"
+    holders, lease = shutdown.holder(silo, vm.name)
+    processes: list[shutdown.Process] = []
+    try:
+        for entry in holders["holders"]:
+            processes.append(shutdown.Process(entry["pid"]))
+        silo.stop(vm.name)
+        for process in processes:
+            process.wait()
+        assert not shutdown.lease_busy(lease)
+        assert silo.info(vm.name)["state"] == "stopped"
+    finally:
+        for process in processes:
+            process.close()

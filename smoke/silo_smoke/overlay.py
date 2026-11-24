@@ -383,25 +383,8 @@ def worker_pid(silo: Silo, name: str) -> int:
     return worker_pid_of_monitor(monitor)
 
 
-def krun_workers(monitor: int) -> list[int]:
-    children: set[str] = set()
-    for task in Path(f"/proc/{monitor}/task").iterdir():
-        try:
-            children.update((task / "children").read_text().split())
-        except FileNotFoundError:
-            continue
-    workers = []
-    for pid in children:
-        try:
-            if Path(f"/proc/{pid}/comm").read_text().strip() == "krun":
-                workers.append(int(pid))
-        except FileNotFoundError:
-            continue
-    return workers
-
-
 def worker_pid_of_monitor(monitor: int) -> int:
-    workers = krun_workers(monitor)
+    workers = procs.krun_workers(monitor)
     assert len(workers) == 1, f"Expected actual krun worker child of {monitor}: {workers}"
     return workers[0]
 
@@ -417,21 +400,15 @@ def readonly_handle_evidence(ws: Workspace, pid: int, descriptor: Path, upper_fi
     observed: Counter[str] = Counter()
     upper_path = str(upper_file.resolve())
     upper_seen = False
-    for fd in Path(f"/proc/{pid}/fd").iterdir():
-        try:
-            path = os.readlink(fd)
-            info = Path(f"/proc/{pid}/fdinfo/{fd.name}").read_text()
-        except FileNotFoundError:
-            continue
-        flags = int(next(line.split()[1] for line in info.splitlines() if line.startswith("flags:")), 8)
+    for fd, path, mode in procs.file_access_modes(pid):
         if path in expected:
-            assert flags & os.O_ACCMODE == os.O_RDONLY, (pid, fd, path, info)
+            assert mode == os.O_RDONLY, (pid, fd, path, mode)
             observed[path] += 1
         if path == upper_path:
-            assert flags & os.O_ACCMODE == os.O_RDWR, (pid, fd, path, info)
+            assert mode == os.O_RDWR, (pid, fd, path, mode)
             upper_seen = True
         if path in expected or path == upper_path:
-            ws.record("overlay-worker-handles", f"worker={pid} fd={fd.name} path={path} {info}\n")
+            ws.record("overlay-worker-handles", f"worker={pid} fd={fd} path={path} accessMode={mode}\n")
     assert observed == expected, (observed, expected)
     assert upper_seen
 

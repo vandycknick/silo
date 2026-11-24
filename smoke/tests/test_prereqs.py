@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
 
@@ -105,10 +106,11 @@ def test_release_paths_and_evidence_do_not_need_manual_environment(tmp_path: Pat
     assert result.returncode == 0, result.stderr
     binary, workspace, first, second = map(Path, result.stdout.splitlines())
     assert binary == tmp_path / "release"
-    # An explicit TMPDIR remains a supported scratch override; otherwise a short
-    # durable cache directory keeps socket paths under SUN_LEN.
-    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
-    assert workspace == Path(os.environ.get("TMPDIR", str(cache / "silo/smoke"))).resolve()
+    if platform.system() == "Darwin":
+        assert workspace == Path("/private/tmp")
+    else:
+        cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+        assert workspace == Path(os.environ.get("TMPDIR", str(cache / "silo/smoke"))).expanduser().resolve()
     assert first.parent == second.parent == tmp_path / "smoke/evidence"
     assert first != second and first.is_dir() and second.is_dir()
 
@@ -156,6 +158,7 @@ def test_every_smoke_module_has_an_area_and_every_area_names_real_modules() -> N
     assert mapped - modules == set(), "areas name missing modules"
 
 
+@pytest.mark.linux_only(reason="requires a native C compiler with static libc, unavailable on macOS")
 def test_static_cc_autodetects_a_compiler_that_links_static(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CC", raising=False)
     toolchain.static_cc.cache_clear()
@@ -165,6 +168,7 @@ def test_static_cc_autodetects_a_compiler_that_links_static(monkeypatch: pytest.
         toolchain.static_cc.cache_clear()
 
 
+@pytest.mark.linux_only(reason="requires a native C compiler with static libc, unavailable on macOS")
 def test_static_cc_prefers_cc_but_falls_back_when_it_cannot_link_static(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CC", "false")
     toolchain.static_cc.cache_clear()

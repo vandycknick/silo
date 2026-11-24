@@ -30,15 +30,16 @@ It checks a deterministic 64 MiB stdin SHA-256 digest, first-line and no-reader
 early exits, an explicitly closed guest input pipe, empty input and `/dev/null`.
 Run it with `make smoke SMOKE_ARGS='tests/test_exec_stdin.py'`.
 
-Run as an ordinary user on a dev box with readable/writable `/dev/kvm` (or Apple
-Silicon HVF). Use the repository's normal Rust/Go toolchain, Python 3.12+, `uv`,
-ORAS, a C compiler that can link static binaries, `openssl`, `sqlite3`, OpenSSH, GNU coreutils, util-linux
-(`findmnt`, `sfdisk`, `blkid`, `unshare`, `mount`, `umount`) and e2fsprogs
-(`mkfs.ext4`, `e2fsck`, `debugfs`). The Rust toolchain file supplies both guest
-musl targets. EROFS qualification additionally needs `fsck.erofs` and `dump.erofs`
-from erofs-utils on PATH; those cases skip with an installation reason if absent.
-First runs need internet access for pinned Cargo/Go modules, the published kernel,
-Alpine fixture bytes and verified Distribution releases.
+Run as an ordinary user on a dev box with readable/writable `/dev/kvm` or Apple
+Silicon HVF. Use the repository's normal Rust/Go toolchain, Python 3.12+, `uv`,
+ORAS, `openssl`, `sqlite3` and OpenSSH. Linux qualification lanes also use a
+C compiler that links static guest probes, GNU coreutils, util-linux (`findmnt`,
+`sfdisk`, `blkid`, `unshare`, `mount`, `umount`) and e2fsprogs. The Rust toolchain
+file supplies both guest musl targets. EROFS encoder qualification additionally
+needs `fsck.erofs` and `dump.erofs` from erofs-utils on PATH; those cases skip
+with an installation reason if absent. First runs need internet access for
+pinned Cargo/Go modules, the published kernel, Alpine fixture bytes and verified
+Distribution releases.
 
 `smoke-prereqs` reuses `stage`, builds every Rust helper in `SMOKE_PROFILE` and
 `CARGO_TARGET_DIR`, resolves Cargo's pinned libkrun sources and fetches the exact
@@ -60,6 +61,8 @@ live under `${XDG_CACHE_HOME:-~/.cache}/silo/smoke`, which must be disk-backed:
 guest disks are multi-GiB sparse files and reflink copies, and `/tmp` is usually
 tmpfs (RAM). `TMPDIR` overrides the location (for example `TMPDIR=~/sm`) and is
 refused if it is tmpfs. Long paths move only sockets/locks to `/tmp`.
+macOS uses disk-backed `/private/tmp` for Homes and the pytest base even when
+the login environment sets `TMPDIR`.
 Retained per-run evidence defaults to `$CARGO_TARGET_DIR/smoke/evidence/run-*`,
 with unique cohort/worker suffixes. Failed workspaces remain; `--keep` also keeps
 successes. Never share a live VM or mutable Home across workers.
@@ -101,7 +104,7 @@ automatically provisioned and never touch hosted credentials. Internet-dependent
 | IRQ diagnostic producer/witness | Separate `smoke-diagnostic` target directory and real xtask stage with `restore-irq-probe`; per-test private runtime and automatically assembled witness |
 | `SILO_SMOKE_FILESYSTEM_OBSERVER` / Go extractor | Existing `changeset-extractor` Make target, `CGO_ENABLED=0`, local Go >=1.26.6, only for eligible slow cases; precise Go skip otherwise |
 | `SILO_SMOKE_EVIDENCE`, `SILO_SMOKE_RESTORED_EVIDENCE` | Automatically created durable per-run evidence; env overrides optional |
-| `TMPDIR` | Optional durable scratch root (default `${XDG_CACHE_HOME:-~/.cache}/silo/smoke`); refused on tmpfs; runtime sockets stay short and separate |
+| `TMPDIR` | Linux durable scratch override (default `${XDG_CACHE_HOME:-~/.cache}/silo/smoke`); refused on tmpfs. macOS Homes and pytest base use `/private/tmp` |
 | `SILO_SMOKE_STOPPED_DIR`, `SILO_SMOKE_STOPPED_FS` | Only actual host-ext4 gate is owner opt-in; exact enable command above |
 | `SILO_SMOKE_CAPTURE_FS` | Optional assertion on the observed host filesystem, not fixture setup |
 | Static C/Rust/assembly guest probes (`CC`, rustc, as/ld/objcopy/nm) | Built by session/test fixtures from repository or pinned native sources. The probe compiler is the first of `$CC`, `cc`, `gcc`, `/usr/bin/cc`, `/usr/bin/gcc`, `clang`, `musl-gcc` that links a static pthread program (`silo_smoke/toolchain.py`), so a dynamic-only `CC` such as Nix's clang falls through |
@@ -279,7 +282,8 @@ resume. It checks frozen workload evidence, user-owned authority, fresh-manager
 reconciliation, exact replay and GetOperation, stale-token and paused-cancel
 refusal, fenced new execution, unchanged boot/run identity and reseed count,
 and the exact generation acknowledgement. A second pause is stopped without
-resuming; the gate waits for the actual owners and checks storage-lease release.
+resuming on both hosts. A Linux-only sibling uses procfs and pidfds to pin the
+actual paused-run storage owners, wait for their exit and check lease release.
 An uncontained handoff is rejected before allocating a live command.
 
 `live_acceptance` is a standalone Rust public-API consumer, not a VM-starting
@@ -908,6 +912,24 @@ wiping prior Silo state. The systemd-owned SSH lane and the curl image have no
 published default; nothing in this repository builds them yet. On macOS, daemon-managed VMs use krun even when direct CLI tests
 select vz.
 
+### macOS arm64 with krun
+
+The Apple Silicon HVF lane covers raw and layered OCI boot, exec/TTY and
+file transfer, overlay persistence and worker descriptor modes, stop/restart,
+stopped snapshot/fork/restore, resident pause/resume, the loopback registry,
+image cache, network policy/forwarding and private daemon management.
+Guest-side `/proc`, cgroup and mount checks still run in the Linux guest.
+Host worker observations use the stock macOS `pgrep`, `ps`, and `lsof`;
+the candidate also reads the worker executable path from libproc.
+The candidate `upper-symlink` fault needs e2fsprogs `debugfs` on PATH to mutate
+and verify the ext4 image offline; only that parameter skips if it is absent.
+
+Live memory capture, restore, fork and hibernation are not available on macOS.
+Resident pause/resume does not require memory capture. The Linux-only crash,
+syscall and shutdown-certification lanes keep their pidfd, ptrace, inotify,
+subreaper and host filesystem oracles. The pinned Distribution binary has no
+macOS release, independent of the portable loopback-registry tests.
+
 ### Default-suite cost strategy
 
 The Phase 7 baseline in `.tmp/phase07-default-qualified.xml` ran the complete
@@ -1086,12 +1108,13 @@ performance guarantee.
 
 ## Isolation and evidence
 
-Every test creates a short workspace under `/tmp/silo-smoke-*` on Linux or
-`/private/tmp/silo-smoke-*` on macOS. It gets private `HOME`, `SILO_HOME`,
-`XDG_CONFIG_HOME` and `SILO_RUN_ROOT`. Subprocesses receive an explicit environment,
-not the developer's daemon configuration. Socket paths stay within the Unix
-socket path-length budget. A session guard records the live daemon's default
-control socket inode and modification time and asserts they remain unchanged.
+Each test creates a short workspace under the Linux durable scratch root
+described above or `/private/tmp/silo-smoke-*` on macOS. It gets private `HOME`,
+`SILO_HOME`, `XDG_CONFIG_HOME` and `SILO_RUN_ROOT`. Subprocesses receive an
+explicit environment, not the developer's daemon configuration. Socket paths
+stay within the Unix socket path-length budget. A session guard records the
+live daemon's default control socket inode and modification time and asserts
+they remain unchanged.
 
 Concurrent sessions serialize shared registry CA creation and OpenSSL serial
 updates with a close-only file lock; a thread-local lock cannot protect
@@ -1099,10 +1122,9 @@ independent pytest processes.
 
 Teardown stops/removes registered VMs and terminates tracked daemons. Failed
 runs and runs with `--keep` retain the workspace and print its path; successful
-runs otherwise remove it. Command transcripts and daemon output are in
-`/tmp/silo-smoke-*/evidence/*.log` (or the macOS equivalent), command and
-harness durations in `evidence/timing.log`. Keeping evidence does not keep the
-VMs running.
+runs otherwise remove it. The workspace holds command transcripts and daemon
+output in `evidence/*.log` and timings in `evidence/timing.log`. Keeping
+evidence does not keep the VMs running.
 
 ## Images and registry
 
@@ -1179,8 +1201,9 @@ The repository Rust toolchain includes the guest musl targets.
 The smoke session builds `virt/vmm/tests/guest/overlay_probe.rs` directly with
 `rustc`, using the existing self-contained musl linker convention. It includes
 the exact production init effective-options verifier by source path. No Cargo
-test launches a VM. `debugfs`, `e2fsck`, `unshare`, `mount`, `umount`, and GNU
-`cp` are needed by the corresponding Linux qualification fixtures.
+test launches a VM. `debugfs` is needed for the controlled `upper-symlink` fault
+on either host. The extended Linux fixtures also use `e2fsck`, `unshare`,
+`mount`, `umount` and GNU `cp`.
 
 ### Initial candidate, then production acceptance
 
@@ -1210,8 +1233,12 @@ formatter output contain exact artifact digests, host lane, actual guest kernel
 version, UUIDs, measured serials/geometry/RO, mountinfo, current module defaults,
 and accepted verifier/profile evidence. The staged manifest must bind the
 kernel, base-initramfs and **native executable** digests to those private
-snapshots. The actual worker `/proc/PID/exe` hash must match the consumed
-monitor/worker snapshot. The candidate records the real binary's
+snapshots. In positive cases the actual worker executable is located through
+`/proc/PID/exe` on Linux or `proc_pidpath` on macOS, and its hash must match the
+private monitor/worker snapshot. For a rejected boot the worker may already
+have exited. The monitor's spawn trace supplies its PID, and the final guest
+serial log must still contain the explicit fail-closed verdict.
+The candidate records the real binary's
 `capabilities --backend krun --json` build identity and corrected signed native
 revision; these are provenance, not a feature grant. For an authenticated OCI
 kernel, its artifact metadata supplies the resolved-config digest. A local
@@ -1646,15 +1673,14 @@ dirty ext4 recovery independently, and checks preserved filesystem UUIDs,
 guest machine-id/hardlinks, fresh host IDs/runs and actual socket namespaces.
 Network intent is explicitly `none`; this does not qualify a network/MAC lane.
 
-On macOS arm64 with krun, stopped snapshot, fork and restore need no guest
-execution and are admitted. This module's raw-root refusal case runs there: a
-never-started machine must refuse live fork, a memory snapshot and a missing
-restore without catalog or file effects. `tests/test_raw_live.py` adds a
-never-started raw-root snapshot, fork and restore with independent byte and
-inode checks. Every other case in both modules stays `linux_only`: it proves
-process and descriptor ownership through pidfds, `/proc`, the child subreaper
-or the x86_64 ptrace controller, needs a layered OCI root or host ext4, or
-needs memory capture.
+On macOS arm64 with krun, stopped snapshot, fork and restore are admitted.
+The raw and layered never-started refusal cases run there: the machine must
+refuse live fork, a memory snapshot and a missing restore without catalog or
+file effects. The fixture's seeded image-only catalog check runs there too.
+`tests/test_raw_live.py` adds a never-started raw-root snapshot, fork and restore
+with independent byte and inode checks. Cases that need pidfds, procfs,
+the child subreaper, the x86_64 ptrace controller, a host ext4 mount, or
+memory capture remain Linux-only.
 
 `tests/test_native_capabilities.py` owns real machine-less native queries,
 including invalid launch descriptors, immutable build binding and mutable-grant

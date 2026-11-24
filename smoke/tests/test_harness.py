@@ -6,7 +6,10 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import platform
+import shutil
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -14,8 +17,64 @@ from silo_smoke import fork, procs
 from silo_smoke.cli import Silo
 from silo_smoke.config import SmokeConfig
 from silo_smoke.errors import SmokeAssertion
+from silo_smoke.overlay_candidate import spawned_worker_pid
 from silo_smoke.registry import LoopbackRegistry, ensure_ca
 from silo_smoke.workspace import Workspace
+
+
+def test_krun_worker_observation_reads_real_process_and_file_modes(tmp_path: Path) -> None:
+    yes = shutil.which("yes")
+    assert yes is not None
+    executable = tmp_path / ("silo-vmm" if platform.system() == "Darwin" else "krun")
+    shutil.copyfile(yes, executable)
+    executable.chmod(0o700)
+    lower = tmp_path / "read only.extent"
+    upper = tmp_path / "read write.raw"
+    lower.touch()
+    upper.touch()
+    with lower.open("rb") as reader, upper.open("r+b") as writer, subprocess.Popen(
+        ["krun"], executable=executable, stdout=subprocess.PIPE,
+        pass_fds=(reader.fileno(), writer.fileno()),
+    ) as child, subprocess.Popen(
+        [yes], stdout=subprocess.PIPE,
+    ) as other_child:
+        try:
+            assert procs.krun_workers(os.getpid()) == [child.pid]
+            assert procs.executable_path(child.pid).resolve(strict=True) == executable.resolve(strict=True)
+            assert {
+                (reader.fileno(), str(lower.resolve()), os.O_RDONLY),
+                (writer.fileno(), str(upper.resolve()), os.O_RDWR),
+            }.issubset(procs.file_access_modes(child.pid))
+        finally:
+            child.terminate()
+            other_child.terminate()
+    assert procs.krun_workers(os.getpid()) == []
+
+
+def test_timeout_thread_states_observe_owned_process_without_logging_its_environment(workspace: Workspace) -> None:
+    yes = shutil.which("yes")
+    assert yes is not None
+    witness = "must-not-appear-in-thread-evidence"
+    with subprocess.Popen([yes], stdout=subprocess.PIPE, env=workspace.env(WITNESS=witness)) as child:
+        try:
+            text = procs.thread_states(workspace, "exec timeout-probe")
+            first, second = text.split("sample 1\n")
+            assert str(child.pid) in first and str(child.pid) in second, text
+            assert witness not in text
+        finally:
+            child.terminate()
+
+
+def test_candidate_worker_spawn_pid_requires_one_monitor_record() -> None:
+    spawn = "2026-11-24T14:17:16.804943Z  INFO krun worker spawned worker_pid=67926\n"
+    diagnostics = (
+        "2026-11-24T14:17:16.831100Z DEBUG krun diagnostic worker_pid=67926 "
+        "diagnostic=INFO krun worker spawned worker_pid=67926\n"
+    )
+    assert spawned_worker_pid(spawn + diagnostics) == 67926
+    for trace in (diagnostics, spawn + spawn, spawn.replace("67926", "0")):
+        with pytest.raises(AssertionError, match="expected one krun worker spawn record"):
+            spawned_worker_pid(trace)
 
 
 def test_catalog_matches_independent_sqlite_cli_with_full_schema_and_typed_rows(tmp_path: Path) -> None:

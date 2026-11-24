@@ -9,7 +9,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import json
-import os
 import shlex
 import subprocess
 import time
@@ -17,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, IO, Literal
 
+from . import procs
 from .errors import SmokeAssertion
 
 if TYPE_CHECKING:
@@ -109,33 +109,6 @@ class Vm:
     id: str
 
 
-def thread_states(ws: Workspace, command: str) -> str:
-    """Where every thread of this workspace's processes is waiting, sampled twice.
-
-    A command that times out is killed by the caller; this keeps the only
-    evidence that tells a guest spinning in KVM from a host-side deadlock.
-    """
-    roots = (os.fsencode(ws.root), os.fsencode(ws.run_root))
-    lines = [f"$ silo {command} timed out"]
-    for sample in range(2):
-        for process in sorted(Path("/proc").glob("[0-9]*"), key=lambda path: int(path.name)):
-            try:
-                identity = (process / "cmdline").read_bytes() + (process / "environ").read_bytes()
-                if not any(root in identity for root in roots):
-                    continue
-                arguments = (process / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
-                lines.append(f"sample {sample} pid {process.name} {arguments[:200]}")
-                for task in sorted((process / "task").iterdir(), key=lambda path: int(path.name)):
-                    fields = (task / "stat").read_text().rsplit(") ", 1)[1].split()
-                    lines.append(f"  {(task / 'comm').read_text().strip():<18} state={fields[0]} "
-                                 f"utime={fields[11]} stime={fields[12]} wchan={(task / 'wchan').read_text() or '-'}")
-            except (OSError, IndexError, ValueError):
-                continue
-        if sample == 0:
-            time.sleep(1)
-    return "\n".join(lines) + "\n"
-
-
 class Silo:
     def __init__(self, ws: Workspace) -> None:
         self.ws = ws
@@ -161,7 +134,7 @@ class Silo:
             )
         except subprocess.TimeoutExpired as exc:
             record_timing(self.ws, operation, started, "timeout")
-            self.ws.record("timeout-threads", thread_states(self.ws, shlex.join(args)))
+            self.ws.record("timeout-threads", procs.thread_states(self.ws, shlex.join(args)))
             stdout = (exc.stdout or b"").decode(errors="replace")
             stderr = (exc.stderr or b"").decode(errors="replace")
             self.ws.record(evidence_label, f"$ silo {shlex.join(args)}\n{stdout}\n[stderr]\n{stderr}\n")

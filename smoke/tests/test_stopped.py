@@ -21,10 +21,6 @@ from silo_smoke.config import SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
 
-# Cases marked Linux only prove process and descriptor ownership through
-# pidfds, /proc, the child subreaper or the x86_64 ptrace controller, or need
-# a layered OCI root. The rest drive only the CLI and independent readers.
-
 
 @pytest.fixture
 def stopped_silo(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_caches: dict[str, Path], request: pytest.FixtureRequest) -> Generator[Silo, None, None]:
@@ -189,7 +185,7 @@ sync
     stopped.stop(silo, source)
 
 
-@pytest.mark.parametrize("profile", ["raw", pytest.param("layered", marks=pytest.mark.linux_only)])
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_stopped_live_fork_memory_snapshot_and_missing_restore_refuse_before_effects(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
     silo = stopped_silo
     create(silo, stopped_image, "refuse-source", profile)
@@ -545,7 +541,6 @@ def test_stopped_fork_real_syscall_failure_never_publishes_partial_child(stopped
     stopped.independent(baseline, retried)
 
 
-@pytest.mark.linux_only
 def test_stopped_prepared_image_catalog_has_no_extra_retention_roots(stopped_silo: Silo, stopped_image: str) -> None:
     home = stopped_silo.ws.silo_home
     assert not (home / "machines").exists()

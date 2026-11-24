@@ -141,7 +141,6 @@ def test_overlay_sized_tmpfs_and_policy_removal(silo: Silo, overlay_image: str) 
     assert silo.exec(name, "cat", "/tmp/hidden-disk-sentinel", user="root").stdout == "committed\n"
 
 
-@pytest.mark.linux_only
 def test_overlay_actual_worker_readonly_handles(silo: Silo, overlay_image: str) -> None:
     name = "overlay-handles"
     overlay.create(silo, name, overlay_image)
@@ -487,7 +486,13 @@ def test_overlay_candidate_qualification(silo: Silo, overlay_image: str) -> None
         candidate.close()
 
 
-@pytest.mark.parametrize("fault", ["uuid", "lower-uuid", "length", "magic", "lower-magic", "lower-device-range", "journal-inode", "upper-symlink", "missing-bootstrap", "malformed-bootstrap"])
+@pytest.mark.parametrize("fault", [
+    "uuid", "lower-uuid", "length", "magic", "lower-magic", "lower-device-range", "journal-inode",
+    pytest.param("upper-symlink", marks=pytest.mark.skipif(
+        shutil.which("debugfs") is None, reason="upper-symlink requires e2fsprogs debugfs on PATH",
+    )),
+    "missing-bootstrap", "malformed-bootstrap",
+])
 def test_overlay_candidate_guest_rejection(silo: Silo, overlay_image: str, fault: str) -> None:
     from silo_smoke.overlay_candidate import Candidate
     candidate = Candidate(silo, overlay_image, fault=fault)

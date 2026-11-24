@@ -84,8 +84,9 @@ def skip_unavailable(config: pytest.Config, items: list[pytest.Item]) -> None:
     except SmokeEnvironmentError:
         system_image = None
     for item in items:
-        if item.get_closest_marker("linux_only") and system != "Linux":
-            item.add_marker(pytest.mark.skip(reason="requires Linux"))
+        linux_only = item.get_closest_marker("linux_only")
+        if linux_only and system != "Linux":
+            item.add_marker(pytest.mark.skip(reason=linux_only.kwargs.get("reason", "requires Linux")))
         if item.get_closest_marker("macos_only") and system != "Darwin":
             item.add_marker(pytest.mark.skip(reason="requires macOS"))
         if item.get_closest_marker("system") and system_image is None:
