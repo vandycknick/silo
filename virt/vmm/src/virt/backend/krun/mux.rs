@@ -104,6 +104,11 @@ impl Drop for ConnectCancellation {
     }
 }
 
+/// The sender's reference to a descriptor passed over the control socket.
+pub(super) struct InFlightDescriptor(
+    #[expect(dead_code, reason = "held only to keep the descriptor open")] OwnedFd,
+);
+
 impl KrunVsockMux {
     pub(super) fn pair(
         registry: KrunVsockRegistry,
@@ -150,11 +155,15 @@ impl KrunVsockMux {
         ))
     }
 
+    /// The third value keeps the passed descriptor open on this side. Hold it
+    /// until the worker has answered on the stream: macOS can tear down a
+    /// socket whose only reference is an SCM_RIGHTS message still in flight,
+    /// and the receiver then reads end of file from a peer that never closed.
     pub(super) async fn connect(
         &self,
         port: u32,
         deadline: Instant,
-    ) -> io::Result<(StdUnixStream, KrunVsockStreamGuard)> {
+    ) -> io::Result<(StdUnixStream, KrunVsockStreamGuard, InFlightDescriptor)> {
         if !self.session.is_active() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -169,6 +178,7 @@ impl KrunVsockMux {
         .map_err(|_| timed_out("reserving krun vsock queue capacity"))?
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "krun vsock mux stopped"))?;
         let (host, helper) = new_socketpair()?;
+        let in_flight = InFlightDescriptor(helper.try_clone()?);
         suppress_sigpipe(host.as_raw_fd())?;
         let (sent, received) = oneshot::channel();
         let mut cancellation = ConnectCancellation {
@@ -196,7 +206,7 @@ impl KrunVsockMux {
         result?;
         let stream = StdUnixStream::from(host);
         let guard = self.session.track(stream.as_fd())?;
-        Ok((stream, guard))
+        Ok((stream, guard, in_flight))
     }
 
     pub(super) async fn shutdown(&self) {
@@ -1022,9 +1032,12 @@ mod tests {
             data.set_nonblocking(false).expect("blocking data endpoint");
             data.write_all(b"OK 1073741824\npayload")
                 .expect("ordered response and payload");
+            // Closing the control end stops the session, which shuts the host
+            // stream down and may discard bytes the reader has not taken yet.
+            control
         });
 
-        let (mut stream, _guard) = mux
+        let (mut stream, _guard, _in_flight) = mux
             .connect(7000, std::time::Instant::now() + Duration::from_secs(1))
             .await
             .expect("connect request");
@@ -1037,7 +1050,8 @@ mod tests {
         .await
         .expect("join data reader");
         assert_eq!(&response, b"OK 1073741824\npayload");
-        helper.await.expect("join helper");
+        let control = helper.await.expect("join helper");
+        drop(control);
         mux.shutdown().await;
         task.join().await.expect("join mux");
     }

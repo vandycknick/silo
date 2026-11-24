@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed: on macOS a new connection to a guest could be cut off the moment it
+  was made when another connection was being closed at the same time. After
+  `silo resume` this showed up as a resume that took about 13 seconds or
+  timed out and left the machine in `pausing`.
 - Fixed: on macOS `silo stop` took 30 seconds for machines whose image runs
   its own init (most OCI images). The guest had already synced its
   filesystems and said it could not power itself off, but Silo still sent a

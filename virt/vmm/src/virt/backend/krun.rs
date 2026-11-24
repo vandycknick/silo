@@ -493,9 +493,11 @@ impl VirtBackend for KrunBackend {
         };
 
         let deadline = Instant::now() + VSOCK_CONNECT_TIMEOUT;
-        let (stream, session_guard) = mux.connect(port, deadline).await?;
+        let (stream, session_guard, in_flight) = mux.connect(port, deadline).await?;
         let mut stream = UnixStream::from_std(stream)?;
         let source_port = read_connect_response(&mut stream, deadline).await?;
+        // The worker answered, so it holds the descriptor now.
+        drop(in_flight);
         Ok(VsockStream::from_krun_stream(
             stream,
             source_port,
