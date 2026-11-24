@@ -56,6 +56,13 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
         self.stop().await
     }
 
+    /// Stop a guest that cannot power itself off: the image owns PID 1 and the
+    /// agent has already synced. Backends whose `stop` first asks the guest
+    /// to shut down skip that request here.
+    async fn stop_without_guest_request(&self) -> Result<(), VirtError> {
+        self.stop().await
+    }
+
     /// End a durably saved, parked run without executing guest shutdown.
     async fn hibernate_stop(&self) -> Result<(), VirtError> {
         Err(VirtError::Backend(

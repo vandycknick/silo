@@ -12,6 +12,11 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 pub const MAX_MANIFEST_ENTRIES: usize = 64;
 pub const MAX_HOLDER_BYTES: usize = 4 * 1024;
+/// Start of the status message an agent returns when the image owns PID 1:
+/// it has synced (or tried to) and cannot power the guest off, so the host
+/// stops the machine without asking the guest again.
+pub const IMAGE_OWNED_PID1_STOP: &str =
+    "image-owned PID1 has no admitted storage shutdown authority";
 
 pub fn validate_uuid(value: &str) -> Result<(), String> {
     let parsed = uuid::Uuid::parse_str(value).map_err(|_| "invalid UUID".to_owned())?;

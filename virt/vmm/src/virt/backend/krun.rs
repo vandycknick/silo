@@ -49,6 +49,7 @@ pub(crate) struct KrunBackend {
     stop: CancellationToken,
     force: CancellationToken,
     hibernate: CancellationToken,
+    immediate_stop: CancellationToken,
     console: Mutex<Option<OwnedFd>>,
     serial: Mutex<Option<(File, File)>>,
     attachments: Arc<Mutex<Option<crate::virt::backend::storage::PreparedAttachments>>>,
@@ -243,6 +244,7 @@ impl KrunBackend {
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
             hibernate: CancellationToken::new(),
+            immediate_stop: CancellationToken::new(),
             console: Mutex::new(Some(pty.slave)),
             serial: Mutex::new(Some((master.try_clone()?, master))),
             attachments: Arc::new(Mutex::new(None)),
@@ -311,6 +313,7 @@ impl VirtBackend for KrunBackend {
             stop: self.stop.clone(),
             force: self.force.clone(),
             hibernate: self.hibernate.clone(),
+            immediate_stop: self.immediate_stop.clone(),
             reclaim: self.host_memory_reclaim.clone(),
         };
         // No await between attempt reservation and establishing cleanup ownership.
@@ -409,6 +412,11 @@ impl VirtBackend for KrunBackend {
 
     async fn force_stop(&self) -> Result<(), VirtError> {
         self.force.cancel();
+        self.stop().await
+    }
+
+    async fn stop_without_guest_request(&self) -> Result<(), VirtError> {
+        self.immediate_stop.cancel();
         self.stop().await
     }
 

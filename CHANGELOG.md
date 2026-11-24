@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed: on macOS `silo stop` took 30 seconds for machines whose image runs
+  its own init (most OCI images). The guest had already synced its
+  filesystems and said it could not power itself off, but Silo still sent a
+  power-button request and waited for it to time out. It now stops such a
+  machine at once, as on Linux.
 - Fixed: a failed `silo pause` no longer leaves the machine stuck in
   `pausing`, where `exec` and `resume` were refused and only a stop helped.
   Silo now rolls the failed pause back and reports the original error together

@@ -136,20 +136,19 @@ impl OrderlyShutdown {
 async fn sync_before_image_stop() -> Status {
     let started = Instant::now();
     let mut worker = tokio::task::spawn_blocking(nix::unistd::sync);
-    let message = match tokio::time::timeout(IMAGE_SYNC_TIMEOUT, &mut worker).await {
-        Ok(Ok(())) => {
-            "image-owned PID1 has no admitted storage shutdown authority; guest filesystems synced before stop"
-        }
+    let outcome = match tokio::time::timeout(IMAGE_SYNC_TIMEOUT, &mut worker).await {
+        Ok(Ok(())) => "guest filesystems synced before stop",
         Ok(Err(error)) => {
             tracing::warn!(%error, "guest filesystem sync worker failed before image-owned stop");
-            "image-owned PID1 has no admitted storage shutdown authority; guest filesystem sync failed"
+            "guest filesystem sync failed"
         }
         Err(_) => {
             // A running sync syscall cannot be cancelled, but must not hold up the host stop.
             worker.abort();
-            "image-owned PID1 has no admitted storage shutdown authority; guest filesystem sync timed out"
+            "guest filesystem sync timed out"
         }
     };
+    let message = format!("{}; {outcome}", protocol::shutdown::IMAGE_OWNED_PID1_STOP);
     tracing::info!(
         duration_ms = started.elapsed().as_millis(),
         message,

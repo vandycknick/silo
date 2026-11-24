@@ -158,7 +158,9 @@ owner keeps its reap responsibility instead of inventing a status.
 | Service drain | 1 s |
 
 On macOS a stop sends SIGTERM to the worker, which asks libkrun to shut the
-guest down. On Linux a stop is SIGKILL. A second signal to the monitor escalates
+guest down, and waits the graceful timeout. When the agent has reported an
+image-owned PID 1 (it synced and cannot power the guest off) the request is
+skipped and the worker is killed at once. On Linux a stop is SIGKILL. A second signal to the monitor escalates
 to a forced stop.
 
 ## Terminal Outcome

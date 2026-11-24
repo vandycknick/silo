@@ -62,6 +62,8 @@ pub(crate) struct Owner {
     pub(crate) stop: CancellationToken,
     pub(crate) force: CancellationToken,
     pub(crate) hibernate: CancellationToken,
+    /// Set before `stop` when the guest cannot act on a shutdown request.
+    pub(crate) immediate_stop: CancellationToken,
     pub(crate) reclaim: watch::Sender<Option<HostMemoryReclaimReport>>,
 }
 
@@ -376,15 +378,18 @@ impl Owner {
                 _ = self.stop.cancelled(), if !stopping => {
                     shutdown_requested = true;
                     stopping = true;
+                    // macOS asks the guest to power off and waits; Linux, and a
+                    // guest known to be unable to power itself off, is killed.
+                    let ask_guest = cfg!(target_os = "macos") && started && !self.immediate_stop.is_cancelled();
                     #[cfg(target_os = "macos")]
-                    if started {
+                    if ask_guest {
                         let result = i32::try_from(pid).map_err(io::Error::other).and_then(|pid| {
                             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM).map_err(io::Error::from)
                         });
                         if let Err(error) = result { failure.get_or_insert_with(|| format!("request worker shutdown: {error}")); }
                         stop_deadline = tokio::time::Instant::now() + GRACEFUL_TIMEOUT;
                     }
-                    if !started || cfg!(target_os = "linux") {
+                    if !ask_guest {
                         let reason = if started { ForceReason::Stop } else { ForceReason::Cancelled };
                         if let Err(error) = force(&mut child, reason, &mut forced) { failure.get_or_insert_with(|| format!("stop worker: {error}")); }
                         stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;

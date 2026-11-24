@@ -106,6 +106,13 @@ impl VirtualMachine {
         self.inner.serial_console.drain().await
     }
 
+    /// Stop a guest that has synced and cannot power itself off.
+    pub async fn stop_without_guest_request(&self) -> Result<(), VirtError> {
+        self.inner.attempt.close();
+        self.inner.backend.stop_without_guest_request().await?;
+        self.inner.serial_console.drain().await
+    }
+
     /// Escalate shutdown while retaining the backend's termination/reap owner.
     pub async fn force_stop(&self) -> Result<(), VirtError> {
         self.inner.attempt.close();

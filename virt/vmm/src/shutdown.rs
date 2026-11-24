@@ -242,10 +242,11 @@ async fn graceful_stop(ctx: &DaemonContext, signals: &mut ShutdownSignals) -> ey
     }
     // A failed/missing exchange is never a certificate. The backend still owns
     // escalation and reaping; cancellation must not abandon that owner.
+    let image_owned_pid1 = protocol.as_ref().err().is_some_and(guest_cannot_power_off);
     if let Err(error) = &protocol {
-        tracing::warn!(%error, "guest orderly shutdown not completed; stopping backend");
+        tracing::warn!(%error, image_owned_pid1, "guest orderly shutdown not completed; stopping backend");
     }
-    let stopped = stop_backend(ctx, signals).await;
+    let stopped = stop_backend(ctx, signals, image_owned_pid1).await;
     match (protocol, stopped) {
         (Err(protocol), Err(stop)) => Err(eyre::eyre!("{protocol}; backend stop failed: {stop}")),
         (Err(protocol), Ok(())) => Err(protocol),
@@ -253,10 +254,33 @@ async fn graceful_stop(ctx: &DaemonContext, signals: &mut ShutdownSignals) -> ey
     }
 }
 
-async fn stop_backend(ctx: &DaemonContext, signals: &mut ShutdownSignals) -> eyre::Result<()> {
+/// The agent answered that the image owns PID 1: it synced and has no way to
+/// power the guest off.
+fn guest_cannot_power_off(error: &eyre::Report) -> bool {
+    error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+        status.code() == tonic::Code::Unimplemented
+            && status
+                .message()
+                .starts_with(protocol::shutdown::IMAGE_OWNED_PID1_STOP)
+    })
+}
+
+/// `guest_cannot_power_off`: the agent reported an image-owned PID 1 and has
+/// synced, so a shutdown request to the guest would only wait out its timeout.
+async fn stop_backend(
+    ctx: &DaemonContext,
+    signals: &mut ShutdownSignals,
+    guest_cannot_power_off: bool,
+) -> eyre::Result<()> {
     let mut stop_task = tokio::spawn({
         let machine = ctx.machine.clone();
-        async move { machine.stop().await }
+        async move {
+            if guest_cannot_power_off {
+                machine.stop_without_guest_request().await
+            } else {
+                machine.stop().await
+            }
+        }
     });
 
     tokio::select! {
@@ -492,5 +516,28 @@ mod tests {
             Some(VmState::Stopped as i32)
         );
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn only_the_image_owned_pid1_answer_skips_the_guest_shutdown_request() {
+        use crate::shutdown::guest_cannot_power_off;
+
+        let answer = |status: tonic::Status| guest_cannot_power_off(&eyre::Report::from(status));
+        let prefix = protocol::shutdown::IMAGE_OWNED_PID1_STOP;
+        for outcome in [
+            "guest filesystems synced before stop",
+            "guest filesystem sync failed",
+            "guest filesystem sync timed out",
+        ] {
+            assert!(answer(tonic::Status::unimplemented(format!(
+                "{prefix}; {outcome}"
+            ))));
+        }
+        // An agent without the RPC, or any other failure, still gets the request.
+        assert!(!answer(tonic::Status::unimplemented("unknown method")));
+        assert!(!answer(tonic::Status::unavailable(format!("{prefix}; x"))));
+        assert!(!guest_cannot_power_off(&eyre::eyre!(
+            "guest orderly shutdown deadline elapsed"
+        )));
     }
 }
