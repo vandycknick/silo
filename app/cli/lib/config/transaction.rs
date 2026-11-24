@@ -143,14 +143,14 @@ pub(super) fn update<T>(
     )?;
     let path = parent.join("config.yaml");
     let raw = read_config(&path)?.unwrap_or_else(|| "{}\n".into());
-    let config = parse_global_config(&raw)?;
+    let config = parse_global_config(&raw, &parent)?;
     let mut document: Value = serde_yaml_ng::from_str(&raw)?;
     let mapping = document
         .as_mapping_mut()
         .ok_or_else(|| eyre::eyre!("global config must be a YAML mapping"))?;
     let result = edit(mapping, &config)?;
     let rendered = serde_yaml_ng::to_string(&document)?;
-    parse_global_config(&rendered).context("validate prospective global config")?;
+    parse_global_config(&rendered, &parent).context("validate prospective global config")?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(&parent).context("create atomic config temporary")?;
     temporary.write_all(rendered.as_bytes())?;

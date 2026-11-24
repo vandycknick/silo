@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Added: per-registry extra TLS roots. `images.registries."<host[:port]>".ca`
+  in `config.yaml` names a PEM file or bundle (relative paths resolve against
+  the config file's directory) that is trusted, in addition to system roots,
+  for every request made on behalf of that registry, including blob redirects
+  and token services. `host` and `host:443` are one key and `index.docker.io`
+  is `docker.io`. Unknown fields, duplicate keys and missing, empty or invalid
+  bundles fail the configuration load. Changing the file's content restarts
+  the daemon. libvm: `RuntimeConfig::with_registry_policy` and
+  `RuntimeBuilder::registry_policy` are replaced by `with_image_registries`
+  and `image_registries`, taking the new `ImageRegistryConfig`.
 - Added: on Apple silicon Macs with the krun backend, `silo fork` of a stopped
   machine, `silo snapshot create` without `--memory` and `silo restore` of a
   snapshot without memory (or with `--without-memory`) are admitted. Live

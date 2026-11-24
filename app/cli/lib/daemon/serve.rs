@@ -153,7 +153,7 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
     )?);
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let registry_policy = global.images().clone();
+    let image_registries = global.images().clone();
     let lobby_host = host.clone();
     let lobby_settings = global.tailscale().clone();
     let state = std::sync::Arc::new(control::ControlState::new(
@@ -185,7 +185,7 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
             system_status.ok_or_else(|| eyre::eyre!("enabled system has no initial status"))?,
             system_shutdown.clone(),
             publisher.clone(),
-            registry_policy,
+            image_registries,
         )))
     } else {
         None

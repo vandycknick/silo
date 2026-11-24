@@ -20,7 +20,10 @@ pub use crate::image::progress::{
 };
 pub use ::oci::ImageConfig as OciImageConfigMetadata;
 pub use ::oci::Platform;
-pub use ::oci::{RegistryAction, RegistryPolicy, RegistryRule};
+pub use ::oci::{
+    ImageRegistryConfig, RegistryAction, RegistryCa, RegistryHost, RegistryPolicy, RegistryRule,
+    RegistryTrust,
+};
 
 /// Source used to create a machine root disk. Images only: a snapshot is
 /// restored with `Runtime::restore`, never created from.

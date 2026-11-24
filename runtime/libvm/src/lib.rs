@@ -95,8 +95,9 @@ pub use crate::image::transport::{
 pub use crate::image::{
     ImageBuilder, ImageCacheState, ImageLayerDetail, ImageProgress, ImageProgressLayer,
     ImageProgressReceiver, ImageProgressSender, ImagePruneReport, ImagePullOptions,
-    ImageResolveOptions, ImageSource, ImageSourceKind, Images, OciImageConfigMetadata, Platform,
-    PullPolicy, RegistryAction, RegistryPolicy, RegistryRule, ResolvedOciImage,
+    ImageRegistryConfig, ImageResolveOptions, ImageSource, ImageSourceKind, Images,
+    OciImageConfigMetadata, Platform, PullPolicy, RegistryAction, RegistryCa, RegistryHost,
+    RegistryPolicy, RegistryRule, RegistryTrust, ResolvedOciImage,
 };
 pub use crate::machine::{
     resolve_mount_location, AttachmentSignal, EgressCredentials, EgressSecret, Entrypoint,

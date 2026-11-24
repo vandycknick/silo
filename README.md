@@ -372,6 +372,40 @@ a local disk image. A snapshot name or snapshot artifact is refused with a hint
 to use `silo restore`. Without `--name`, `run` creates a generated
 ephemeral machine and removes it after the workload finishes.
 
+Registry access and TLS trust live under `images` in `config.yaml`:
+
+```yaml
+images:
+  default: deny
+  search_registries: ["registry.example:5443", docker.io]
+  rules:
+    - {prefix: "registry.example:5443/team", action: allow}
+    - {prefix: docker.io/library, action: allow}
+  registries:
+    "registry.example:5443":
+      ca: certs/registry-ca.pem
+```
+
+`rules` decide which references may contact a registry at all: the longest
+matching prefix wins and `default` applies otherwise. `registries` selects extra
+TLS roots by the registry named in an image reference. `ca` points to a PEM
+file holding one or more certificates; a relative path resolves against the
+directory of the `config.yaml` that was read. System roots stay trusted and TLS
+hostname verification stays on. The selected roots apply to every request made
+on behalf of that registry, including blob redirects and token services on
+other hosts. They are not installed globally, and a pull that names another
+registry does not inherit them. A CA entry never grants access; `rules` still
+decide that.
+
+Keys are `host[:port]`, compared in lowercase. `host` and `host:443` are the
+same key, and `index.docker.io` is `docker.io`. There are no wildcards, and a
+key that appears twice is an error. A `ca` file that is missing, unreadable,
+empty or not valid PEM fails the configuration load with the registry key and
+the resolved path; Silo never falls back to system roots alone. The bundle is
+read once per configuration load. Its digest is part of the daemon's
+configuration identity, so replacing a CA file counts as a configuration change
+and takes effect when the daemon restarts.
+
 A `disk:PATH` source is a quiesced regular raw or qcow2 file (never a symlink),
 booted directly with the host-native Linux platform, the whole disk as root and
 the packaged boot assets pinned at creation. The plan shows these assumptions.

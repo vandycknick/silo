@@ -89,7 +89,7 @@ impl ControlState {
     ) -> Self {
         let config = RuntimeConfig::local(host.home())
             .with_networking(global.networking().clone())
-            .with_registry_policy(global.images().clone());
+            .with_image_registries(global.images().clone());
         Self {
             host,
             config,

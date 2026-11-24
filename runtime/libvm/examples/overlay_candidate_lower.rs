@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir(&images)?;
     fs::set_permissions(&images, fs::Permissions::from_mode(0o700))?;
     let pool = StoragePool::open(&images)?;
-    let producer = oci::OciMaterializer::open(&images, oci::RegistryPolicy::default())?;
+    let producer = oci::OciMaterializer::open(&images, oci::ImageRegistryConfig::default())?;
     let platform = oci::Platform::host()?;
     let resolved = producer.resolve(reference, &platform, None).await?;
     let limits = ChangesetLimits::default();

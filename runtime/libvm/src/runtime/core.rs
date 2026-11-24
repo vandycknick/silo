@@ -13,7 +13,7 @@ use crate::paths::{vm_spec_path_in, LocalPaths, MachinePaths};
 use crate::runtime::boot_assets::{self, BootAssetOverrides, ResolvedBootAssets};
 use crate::runtime::components::{resolve_components, ResolvedRuntimeComponents};
 use crate::runtime::{RuntimeConfig, RuntimeNetworkingConfig};
-use crate::RegistryPolicy;
+use crate::{ImageRegistryConfig, RegistryPolicy};
 use utils::format_storage_size;
 use vm_spec::{Boot, Hardware, Kernel, VmSpec};
 
@@ -106,7 +106,7 @@ pub struct Runtime {
     store: Arc<dyn DataStore>,
     lock_manager: LockManager,
     networking: RuntimeNetworkingConfig,
-    registry_policy: RegistryPolicy,
+    registries: ImageRegistryConfig,
     components: ResolvedRuntimeComponents,
     supervisor: VmSupervisor,
     live_query: crate::runtime::capabilities::LiveCapabilityQuery,
@@ -201,7 +201,7 @@ impl Runtime {
             paths,
             Arc::new(store),
             config.networking,
-            config.registry_policy,
+            config.image_registries,
             components,
             live_query,
             Some(Arc::new(observation_store)),
@@ -338,7 +338,7 @@ impl Runtime {
             paths,
             Arc::new(store),
             networking,
-            RegistryPolicy::default(),
+            ImageRegistryConfig::default(),
             components,
             query,
             Some(Arc::new(observation)),
@@ -365,7 +365,7 @@ impl Runtime {
             paths,
             store,
             networking,
-            registry_policy,
+            registry_policy.into(),
             components,
             query,
             None,
@@ -377,7 +377,7 @@ impl Runtime {
         paths: LocalPaths,
         store: Arc<dyn DataStore>,
         networking: RuntimeNetworkingConfig,
-        registry_policy: RegistryPolicy,
+        registries: ImageRegistryConfig,
         components: ResolvedRuntimeComponents,
         live_query: crate::runtime::capabilities::LiveCapabilityQuery,
         observation_store: Option<Arc<crate::store::observation::ObservationStore>>,
@@ -396,7 +396,7 @@ impl Runtime {
             store,
             lock_manager,
             networking,
-            registry_policy,
+            registries,
             components,
             supervisor,
             live_query,
@@ -542,7 +542,7 @@ impl Runtime {
     }
 
     pub(crate) fn image_store(&self) -> oci::OciResult<OciMaterializer> {
-        OciMaterializer::open(self.local_images_dir(), self.registry_policy.clone())
+        OciMaterializer::open(self.local_images_dir(), self.registries.clone())
     }
 
     /// Read-only readiness using the start resolver. No values or signing material are returned.
@@ -767,7 +767,13 @@ impl Runtime {
     }
 
     pub(crate) fn registry_policy(&self) -> &RegistryPolicy {
-        &self.registry_policy
+        self.registries.policy()
+    }
+
+    /// Access policy, per-registry trust and the clients shared by every
+    /// registry operation of this runtime.
+    pub(crate) fn image_registries(&self) -> &ImageRegistryConfig {
+        &self.registries
     }
 
     /// Returns a runtime handle that reports future image materialization progress.
@@ -1104,7 +1110,7 @@ impl Runtime {
         let mut connection = store.pool.acquire().await?;
         crate::resolve::resolve_local(
             &mut connection,
-            &self.registry_policy,
+            self.registries.policy(),
             &reference.to_string(),
             crate::resolve::Kind::Image,
         )
@@ -1126,7 +1132,7 @@ impl Runtime {
             let mut connection = store.pool.acquire().await?;
             crate::resolve::resolve(
                 &mut connection,
-                &self.registry_policy,
+                self.registries.policy(),
                 reference,
                 crate::resolve::Kind::Image,
                 pull,
@@ -1281,7 +1287,8 @@ impl Runtime {
         platform: &oci::Platform,
     ) -> Result<Option<OciImageRecord>, LibVmError> {
         for candidate in self
-            .registry_policy
+            .registries
+            .policy()
             .candidates(reference)
             .map_err(|error| image_error(reference, error))?
         {
@@ -7272,12 +7279,13 @@ pub(crate) mod tests {
             &format!("sha256:{}", "b".repeat(64)),
         )
         .await;
-        runtime.registry_policy = crate::RegistryPolicy::new(
+        runtime.registries = crate::RegistryPolicy::new(
             crate::RegistryAction::Deny,
             vec!["docker.io".into()],
             vec![],
         )
-        .unwrap();
+        .unwrap()
+        .into();
         for policy in [PullPolicy::IfMissing, PullPolicy::Never] {
             assert_eq!(
                 runtime

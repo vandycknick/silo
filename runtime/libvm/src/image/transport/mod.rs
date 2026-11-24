@@ -168,7 +168,7 @@ impl crate::image::Images {
         &self,
         reference: &str,
     ) -> Result<ArtifactInspection, LibVmError> {
-        let registry = self.artifact_registry(reference)?;
+        let registry = self.artifact_registry();
         let (canonical, resolution) = self.resolve_artifact(&registry, reference).await?;
         let graph = registry
             .inspect(&resolution)
@@ -233,7 +233,7 @@ impl crate::image::Images {
         if let Some(name) = &name {
             crate::store::names::validate_name(name)?;
         }
-        let registry = self.artifact_registry(reference)?;
+        let registry = self.artifact_registry();
         let (canonical, resolution) = self.resolve_artifact(&registry, reference).await?;
         let index_digest = object(resolution.digest());
         let repository = resolution.repository();
@@ -357,8 +357,8 @@ impl crate::image::Images {
     /// for SDK and daemon callers until it has an encryption design for
     /// disks and memory (DESIGN section 9); tests exercise the exporter.
     #[cfg_attr(
-        any(not(test), not(target_os = "linux")),
-        expect(dead_code, reason = "snapshot push is reachable from Linux tests only")
+        not(test),
+        expect(dead_code, reason = "snapshot push is reachable from tests only")
     )]
     pub(crate) async fn publish_snapshot_artifact(
         &self,
@@ -382,7 +382,7 @@ impl crate::image::Images {
         encoding: ArtifactEncoding,
     ) -> Result<ArtifactPublishReport, LibVmError> {
         let (repository, tag) = parse_destination(destination)?;
-        let registry = self.artifact_registry(destination)?;
+        let registry = self.artifact_registry();
         let store = Arc::new(self.runtime.native_store()?);
         let source = match source {
             PublishSource::Image(id) => ExportSource::Image(Box::new(
@@ -428,9 +428,8 @@ impl crate::image::Images {
         })
     }
 
-    fn artifact_registry(&self, reference: &str) -> Result<ArtifactRegistry, LibVmError> {
-        ArtifactRegistry::new(self.runtime.registry_policy().clone())
-            .map_err(|error| image_error(reference, error))
+    fn artifact_registry(&self) -> ArtifactRegistry {
+        ArtifactRegistry::new(self.runtime.image_registries().clone())
     }
 }
 

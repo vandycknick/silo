@@ -10,8 +10,8 @@ use crate::image::{
 };
 use crate::runtime::RuntimeConfig;
 use crate::store::ReadOnlyStore;
+use crate::ImageRegistryConfig;
 use crate::LibVmError;
-use crate::RegistryPolicy;
 
 /// Read-only runtime facilities used to build a creation plan.
 ///
@@ -21,7 +21,7 @@ use crate::RegistryPolicy;
 pub struct ReadOnlyRuntime {
     home: PathBuf,
     store: Option<ReadOnlyStore>,
-    registry_policy: RegistryPolicy,
+    registries: ImageRegistryConfig,
 }
 
 impl ReadOnlyRuntime {
@@ -38,7 +38,7 @@ impl ReadOnlyRuntime {
         Ok(Self {
             home,
             store,
-            registry_policy: config.registry_policy,
+            registries: config.image_registries,
         })
     }
 
@@ -71,7 +71,7 @@ impl ReadOnlyRuntime {
         let mut connection = store.pool.acquire().await?;
         let local = crate::resolve::resolve_local(
             &mut connection,
-            &self.registry_policy,
+            self.registries.policy(),
             &reference,
             crate::resolve::Kind::Image,
         )
@@ -89,9 +89,8 @@ impl ReadOnlyRuntime {
         policy: PullPolicy,
         platform: Option<&crate::LinuxPlatform>,
     ) -> Result<ResolvedOciImage, LibVmError> {
-        let producer =
-            OciMaterializer::open(self.home.join("images"), self.registry_policy.clone())
-                .map_err(|error| image_error(&reference, error))?;
+        let producer = OciMaterializer::open(self.home.join("images"), self.registries.clone())
+            .map_err(|error| image_error(&reference, error))?;
         let options = match platform {
             Some(platform) => {
                 platform.validate()?;
@@ -138,7 +137,8 @@ impl ReadOnlyRuntime {
             return Ok(None);
         };
         for candidate in self
-            .registry_policy
+            .registries
+            .policy()
             .candidates(reference)
             .map_err(|error| image_error(reference, error))?
         {

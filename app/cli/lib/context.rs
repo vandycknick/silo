@@ -45,7 +45,7 @@ impl Context {
             let runtime_config = RuntimeConfig::from_env()
                 .context("resolve libvm runtime config")?
                 .with_networking(networking)
-                .with_registry_policy(images);
+                .with_image_registries(images);
             let host = libvm::HostPaths::from_env().context("resolve daemon identity paths")?;
             self.api = Some(AppApi::select(runtime_config, &host, self.admission).await?);
         }

@@ -1044,7 +1044,8 @@ pub(crate) mod tests {
     }
 
     fn producer(store: &Store) -> oci::OciMaterializer {
-        oci::OciMaterializer::open(store.images_path(), oci::RegistryPolicy::default()).unwrap()
+        oci::OciMaterializer::open(store.images_path(), oci::ImageRegistryConfig::default())
+            .unwrap()
     }
 
     fn tamper(path: &Path) {

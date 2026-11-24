@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride};
-use crate::{LibVmError, RegistryPolicy};
+use crate::{ImageRegistryConfig, LibVmError};
 
 /// Builder for opening a local libvm runtime.
 ///
@@ -48,9 +48,10 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the registry policy applied before contacting OCI registries.
-    pub fn registry_policy(mut self, policy: RegistryPolicy) -> Self {
-        self.config = self.config.with_registry_policy(policy);
+    /// Sets the registry access policy and per-registry TLS trust applied to
+    /// every OCI registry request.
+    pub fn image_registries(mut self, registries: ImageRegistryConfig) -> Self {
+        self.config = self.config.with_image_registries(registries);
         self
     }
 

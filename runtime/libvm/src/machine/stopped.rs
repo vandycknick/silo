@@ -2837,7 +2837,7 @@ mod tests {
         .unwrap();
         let config = crate::RuntimeConfig::local(home.path().join("silo"))
             .with_runtime_components(crate::runtime::components::test_components(home.path()))
-            .with_registry_policy(policy);
+            .with_image_registries(policy.into());
         let query = crate::LiveCapabilityQuery::open(&config).unwrap();
         let options = crate::RestoreOptions::default();
         let image_id = image.to_string();

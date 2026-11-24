@@ -170,7 +170,7 @@ pub(crate) async fn serve(
     mut status: SystemStatus,
     cancellation: CancellationToken,
     publisher: Arc<StatusPublisher>,
-    registry_policy: libvm::RegistryPolicy,
+    image_registries: libvm::ImageRegistryConfig,
 ) -> eyre::Result<()> {
     let mut shutdown = Shutdown(cancellation);
     let host_reclaim = desired.config.backend == SystemBackend::Krun;
@@ -184,7 +184,7 @@ pub(crate) async fn serve(
     let mut supervisor = Supervisor {
         runtime_config: libvm::RuntimeConfig::local(paths.home())
             .with_virt_backend(desired.config.backend.runtime_override())
-            .with_registry_policy(registry_policy),
+            .with_image_registries(image_registries),
         paths,
         publisher,
         desired,

@@ -685,9 +685,11 @@ mod tests {
                     .unwrap();
                 let resolved =
                     crate::image::oci::cached_resolved_oci_image(&record, REFERENCE.into());
-                let producer =
-                    oci::OciMaterializer::open(paths.images_dir(), oci::RegistryPolicy::default())
-                        .unwrap();
+                let producer = oci::OciMaterializer::open(
+                    paths.images_dir(),
+                    oci::ImageRegistryConfig::default(),
+                )
+                .unwrap();
                 Self {
                     _temp: temp,
                     paths,

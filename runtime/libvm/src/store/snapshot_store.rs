@@ -1409,7 +1409,7 @@ pub(crate) async fn observe_snapshot_record(
     let home = config.resolve_home()?;
     let store = crate::store::observation::ObservationStore::open(&home.join("state.db")).await?;
     let record = store
-        .restore_snapshot_record(reference, &config.registry_policy)
+        .restore_snapshot_record(reference, config.image_registries.policy())
         .await;
     store.close().await?;
     record

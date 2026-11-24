@@ -13,7 +13,7 @@ use crate::digest::Sha256Digest;
 use crate::lock::FileLock;
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::registry::{ImageConfig, RegistryClient, ResolvedImage, ResolvedLayer};
-use crate::{OciError, OciResult, Platform, RegistryPolicy};
+use crate::{ImageRegistryConfig, OciError, OciResult, Platform};
 
 const BLOBS_DIR_NAME: &str = "source-blobs";
 const PROGRESS_STEP_BYTES: u64 = 256 * 1024;
@@ -95,7 +95,7 @@ impl TryFrom<String> for StagingOperation {
 #[derive(Debug, Clone)]
 pub struct OciMaterializer {
     root: PathBuf,
-    policy: RegistryPolicy,
+    registries: ImageRegistryConfig,
 }
 
 /// One pull's verified compressed blobs. Drive `prefetch` alongside ordered
@@ -112,8 +112,8 @@ impl LayerDownloads<'_> {
     /// Fetch selected occurrences in ascending order, at most three at once.
     /// A repeated compressed digest shares one verified file and event sequence.
     pub async fn prefetch(&self, indices: &[usize]) -> OciResult<()> {
-        self.prefetch_with_registry(indices, &RegistryClient::new()?)
-            .await
+        let registry = self.producer.registries.admit(&self.resolved.reference)?;
+        self.prefetch_with_registry(indices, &registry).await
     }
 
     async fn prefetch_with_registry(
@@ -239,10 +239,10 @@ struct LayerStreamWrite<'a> {
 }
 
 impl OciMaterializer {
-    pub fn open(root: impl AsRef<Path>, policy: RegistryPolicy) -> OciResult<Self> {
+    pub fn open(root: impl AsRef<Path>, registries: ImageRegistryConfig) -> OciResult<Self> {
         Ok(Self {
             root: root.as_ref().to_path_buf(),
-            policy,
+            registries,
         })
     }
 
@@ -274,7 +274,7 @@ impl OciMaterializer {
             }
             .into());
         }
-        self.policy.check(&resolved.reference)?;
+        self.registries.policy().check(&resolved.reference)?;
         let mut paths = BTreeMap::new();
         for layer in &resolved.layers {
             paths
@@ -298,11 +298,15 @@ impl OciMaterializer {
     ) -> OciResult<ResolvedImage> {
         let mut denied = None;
         let mut missed = None;
-        for reference in self.policy.candidates(image_ref)? {
-            if let Err(err) = self.policy.check(&reference) {
-                denied.get_or_insert(err);
-                continue;
-            }
+        for reference in self.registries.policy().candidates(image_ref)? {
+            let registry = match self.registries.admit(&reference) {
+                Ok(registry) => registry,
+                Err(err @ OciError::RegistryPolicyDenied { .. }) => {
+                    denied.get_or_insert(err);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let canonical_ref = reference.to_string();
             emit_progress(
                 progress,
@@ -310,10 +314,7 @@ impl OciMaterializer {
                     image_ref: canonical_ref.clone(),
                 },
             );
-            let resolved = match RegistryClient::new()?
-                .resolve_manifest(&reference, platform)
-                .await
-            {
+            let resolved = match registry.resolve_manifest(&reference, platform).await {
                 Ok(resolved) => resolved,
                 Err(err) if err.is_search_miss() => {
                     missed = Some(err);
@@ -814,7 +815,7 @@ mod tests {
         digest_path_components, sha256_bytes, verified_blob_exists, verify_layer_file,
         OciMaterializer, StagingDir,
     };
-    use crate::{OciError, Platform, RegistryAction, RegistryPolicy};
+    use crate::{ImageRegistryConfig, OciError, Platform, RegistryAction, RegistryPolicy};
 
     fn operation(index: u64) -> crate::StagingOperation {
         crate::StagingOperation::try_from(format!("00000000-0000-4000-8000-{index:012x}")).unwrap()
@@ -823,7 +824,7 @@ mod tests {
     #[test]
     fn source_blob_paths_are_content_addressed() {
         let temp = tempfile::tempdir().unwrap();
-        let producer = OciMaterializer::open(temp.path(), RegistryPolicy::default()).unwrap();
+        let producer = OciMaterializer::open(temp.path(), ImageRegistryConfig::default()).unwrap();
         let hash = sha256_bytes(b"layer");
         assert_eq!(
             producer.blob_path(&format!("sha256:{hash}")).unwrap(),
@@ -861,7 +862,7 @@ mod tests {
         let root = temp.path().join("absent");
         let policy =
             RegistryPolicy::new(RegistryAction::Deny, vec!["docker.io".into()], vec![]).unwrap();
-        let producer = OciMaterializer::open(&root, policy).unwrap();
+        let producer = OciMaterializer::open(&root, policy.into()).unwrap();
         let result = futures_util::FutureExt::now_or_never(producer.resolve(
             "example.test/demo:latest",
             &Platform::linux_amd64(),
@@ -1247,10 +1248,12 @@ mod tests {
 
         fn client(&self) -> RegistryClient {
             RegistryClient {
-                client: oci_client::Client::new(oci_client::client::ClientConfig {
+                client: oci_client::Client::try_from(oci_client::client::ClientConfig {
                     protocol: oci_client::client::ClientProtocol::Http,
                     ..Default::default()
-                }),
+                })
+                .unwrap(),
+                http: reqwest::Client::new(),
             }
         }
 
@@ -1308,7 +1311,7 @@ mod tests {
     fn pull_downloads_three_at_once_authenticates_once_and_overlaps_ordered_unpack() {
         let registry = RegistryFixture::new(6, None);
         let temp = tempfile::tempdir().unwrap();
-        let producer = OciMaterializer::open(temp.path(), RegistryPolicy::default()).unwrap();
+        let producer = OciMaterializer::open(temp.path(), ImageRegistryConfig::default()).unwrap();
         let mut resolved = registry.resolved();
         resolved.layers.push(resolved.layers[0].clone());
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1412,7 +1415,7 @@ mod tests {
     fn failed_prefetch_cancels_other_downloads_and_preserves_resumable_files() {
         let registry = RegistryFixture::new(4, Some(1));
         let temp = tempfile::tempdir().unwrap();
-        let producer = OciMaterializer::open(temp.path(), RegistryPolicy::default()).unwrap();
+        let producer = OciMaterializer::open(temp.path(), ImageRegistryConfig::default()).unwrap();
         let resolved = registry.resolved();
         let downloads = producer
             .layer_downloads(

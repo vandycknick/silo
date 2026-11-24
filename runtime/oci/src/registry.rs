@@ -1,7 +1,9 @@
 use std::str::FromStr;
 
 use futures_util::TryStreamExt;
-use oci_client::client::{BlobResponse, SizedStream};
+use oci_client::client::{
+    BlobResponse, Certificate, CertificateEncoding, ClientConfig, SizedStream,
+};
 use oci_client::errors::{OciDistributionError, OciEnvelope};
 use oci_client::manifest::{ImageIndexEntry, OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
@@ -9,11 +11,16 @@ use oci_client::{Client, Reference, RegistryOperation};
 use serde::{Deserialize, Serialize};
 
 use crate::digest::Sha256Digest;
+use crate::error::RegistryClientError;
 use crate::{OciError, OciResult, Platform};
 
+/// The two HTTP clients one registry operation uses. Both carry the same
+/// trust roots, so every request made for a reference (token realms and
+/// redirects included) verifies TLS the same way.
 #[derive(Clone)]
 pub(crate) struct RegistryClient {
     pub(crate) client: Client,
+    pub(crate) http: reqwest::Client,
 }
 
 #[derive(Debug)]
@@ -113,9 +120,42 @@ pub struct ImageConfig {
 }
 
 impl RegistryClient {
-    pub(crate) fn new() -> OciResult<Self> {
+    /// System trust roots only.
+    pub(crate) fn system() -> Result<Self, RegistryClientError> {
+        Self::build(ClientConfig::default(), Vec::new())
+    }
+
+    /// System trust roots plus every certificate of a PEM bundle. `roots` is
+    /// the same bundle parsed for the plain HTTP client.
+    pub(crate) fn with_extra_roots(
+        pem: &[u8],
+        roots: Vec<reqwest::Certificate>,
+    ) -> Result<Self, RegistryClientError> {
+        Self::build(
+            ClientConfig {
+                extra_root_certificates: vec![Certificate {
+                    encoding: CertificateEncoding::Pem,
+                    data: pem.to_vec(),
+                }],
+                ..Default::default()
+            },
+            roots,
+        )
+    }
+
+    /// The only place registry HTTP clients are built. `Client::try_from`
+    /// reports TLS configuration errors; `Client::new` would swallow them and
+    /// fall back to system trust. Merging no roots keeps system trust as is.
+    fn build(
+        config: ClientConfig,
+        extra_roots: Vec<reqwest::Certificate>,
+    ) -> Result<Self, RegistryClientError> {
         Ok(Self {
-            client: Client::new(Default::default()),
+            client: Client::try_from(config)?,
+            http: reqwest::Client::builder()
+                .user_agent(concat!("silo-oci/", env!("CARGO_PKG_VERSION")))
+                .tls_certs_merge(extra_roots)
+                .build()?,
         })
     }
 
@@ -132,13 +172,9 @@ impl RegistryClient {
         platform: &Platform,
     ) -> OciResult<ResolvedImage> {
         let requested_ref = reference.to_string();
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("silo-oci/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| OciError::Io(std::io::Error::other(error)))?;
         let RegistryManifest {
             manifest, digest, ..
-        } = self.pull_manifest_bounded(&http, reference, None).await?;
+        } = self.pull_manifest_bounded(reference, None).await?;
 
         let (manifest, manifest_digest) = match manifest {
             OciManifest::Image(manifest) => (manifest, digest),
@@ -165,7 +201,7 @@ impl RegistryClient {
                     digest: selected_digest,
                     ..
                 } = self
-                    .pull_manifest_bounded(&http, &manifest_reference, Some(size))
+                    .pull_manifest_bounded(&manifest_reference, Some(size))
                     .await?;
                 match selected {
                     OciManifest::Image(manifest) => (manifest, selected_digest),
@@ -229,7 +265,6 @@ impl RegistryClient {
 
     pub(crate) async fn pull_manifest_bounded(
         &self,
-        http: &reqwest::Client,
         reference: &Reference,
         expected_size: Option<u64>,
     ) -> OciResult<RegistryManifest> {
@@ -267,7 +302,8 @@ impl RegistryClient {
             .auth(reference, &RegistryAuth::Anonymous, RegistryOperation::Pull)
             .await
             .map_err(|source| OciError::registry_manifest(requested.clone(), source))?;
-        let mut request = http
+        let mut request = self
+            .http
             .get(url)
             .header(reqwest::header::ACCEPT, MANIFEST_ACCEPT);
         if let Some(token) = token {

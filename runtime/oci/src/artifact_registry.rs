@@ -7,16 +7,16 @@ use oci_client::{Reference, RegistryOperation};
 use crate::changeset::model::ContentDigest;
 use crate::registry::RegistryClient;
 use crate::vm_artifact::graph::{Descriptor, GraphVerifier, VerifiedVmGraph};
-use crate::{OciError, OciResult, RegistryPolicy};
+use crate::{ImageRegistryConfig, OciError, OciResult};
 
 const METADATA_LIMIT: u64 = crate::vm_artifact::wire::MAX_METADATA_BYTES as u64;
 const PAYLOAD_LIMIT: u64 = crate::vm_artifact::wire::PayloadMediaType::DeviceState.maximum_size();
 const VM_ARTIFACT: &str = crate::vm_artifact::graph::ARTIFACT_TYPE;
 
+/// Every request goes through `ImageRegistryConfig::admit`, so the access
+/// policy and the registry's trust roots apply to each reference separately.
 pub struct ArtifactRegistry {
-    registry: RegistryClient,
-    http: reqwest::Client,
-    policy: RegistryPolicy,
+    registries: ImageRegistryConfig,
 }
 
 /// A resolved immutable envelope, not an authorization to acquire or execute it.
@@ -50,25 +50,17 @@ impl ArtifactResolution {
 }
 
 impl ArtifactRegistry {
-    pub fn new(policy: RegistryPolicy) -> OciResult<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("silo-oci/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| OciError::Io(std::io::Error::other(error)))?;
-        Ok(Self {
-            registry: RegistryClient::new()?,
-            http,
-            policy,
-        })
+    pub fn new(registries: ImageRegistryConfig) -> Self {
+        Self { registries }
     }
 
     /// Inspect the index type before considering any OCI platform selection.
     pub async fn resolve(&self, reference: &str) -> OciResult<ArtifactResolution> {
         let reference = RegistryClient::parse_reference(reference)?;
-        self.policy.check(&reference)?;
         let response = self
-            .registry
-            .pull_manifest_bounded(&self.http, &reference, None)
+            .registries
+            .admit(&reference)?
+            .pull_manifest_bounded(&reference, None)
             .await?;
         if !matches!(&response.manifest, OciManifest::ImageIndex(index)
             if index.artifact_type.as_deref() == Some(VM_ARTIFACT))
@@ -87,7 +79,7 @@ impl ArtifactRegistry {
 
     /// Verify one bounded metadata record at a time. Bulk payloads are not fetched.
     pub async fn inspect(&self, resolution: &ArtifactResolution) -> OciResult<VerifiedVmGraph> {
-        self.policy.check(&resolution.reference)?;
+        self.registries.policy().check(&resolution.reference)?;
         let mut verifier = GraphVerifier::new(resolution.index_bytes())?;
         while let Some(descriptor) = verifier.next_descriptor() {
             let bytes = self.fetch_metadata(resolution, descriptor).await?;
@@ -101,7 +93,7 @@ impl ArtifactRegistry {
         resolution: &ArtifactResolution,
         descriptor: &Descriptor,
     ) -> OciResult<Vec<u8>> {
-        self.policy.check(&resolution.reference)?;
+        let registry = self.registries.admit(&resolution.reference)?;
         if descriptor.size > METADATA_LIMIT {
             return Err(invalid(
                 &resolution.reference,
@@ -112,9 +104,8 @@ impl ArtifactRegistry {
             let reference = resolution
                 .reference
                 .clone_with_digest(descriptor.digest.to_string());
-            let response = self
-                .registry
-                .pull_manifest_bounded(&self.http, &reference, Some(descriptor.size))
+            let response = registry
+                .pull_manifest_bounded(&reference, Some(descriptor.size))
                 .await?;
             return Ok(response.bytes);
         }
@@ -127,14 +118,14 @@ impl ArtifactRegistry {
         resolution: &ArtifactResolution,
         descriptor: &Descriptor,
     ) -> OciResult<Vec<u8>> {
-        self.policy.check(&resolution.reference)?;
+        let registry = self.registries.admit(&resolution.reference)?;
         if descriptor.size > PAYLOAD_LIMIT {
             return Err(invalid(
                 &resolution.reference,
                 "artifact payload exceeds 32 MiB",
             ));
         }
-        self.registry
+        registry
             .authenticate_pull(&resolution.reference, &resolution.reference.to_string())
             .await?;
         let oci_descriptor = OciDescriptor {
@@ -144,8 +135,7 @@ impl ArtifactRegistry {
                 .map_err(|_| invalid(&resolution.reference, "blob size overflow"))?,
             ..Default::default()
         };
-        let mut stream = self
-            .registry
+        let mut stream = registry
             .client
             .pull_blob_stream(&resolution.reference, &oci_descriptor)
             .await
@@ -179,15 +169,14 @@ impl ArtifactRegistry {
         bytes: Vec<u8>,
     ) -> OciResult<()> {
         let reference = RegistryClient::parse_reference(target)?;
-        self.policy.check(&reference)?;
+        let registry = self.registries.admit(&reference)?;
         if bytes.len() as u64 > PAYLOAD_LIMIT || ContentDigest::of_bytes(&bytes) != digest {
             return Err(invalid(
                 &reference,
                 "upload blob does not match its bounded digest",
             ));
         }
-        let token = self
-            .registry
+        let token = registry
             .client
             .auth(
                 &reference,
@@ -201,7 +190,7 @@ impl ArtifactRegistry {
             reference.resolve_registry(),
             reference.repository()
         );
-        let mut request = self.http.head(url);
+        let mut request = registry.http.head(url);
         if let Some(token) = token {
             request = request.bearer_auth(token);
         }
@@ -237,7 +226,7 @@ impl ArtifactRegistry {
                 ))
             }
         }
-        self.registry
+        registry
             .client
             .push_blob(&reference, bytes, &digest.to_string())
             .await
@@ -248,7 +237,7 @@ impl ArtifactRegistry {
     /// Upload exact serialized bytes; the exporter orders blobs, children, then index.
     pub async fn push_manifest(&self, target: &str, bytes: Vec<u8>) -> OciResult<ContentDigest> {
         let reference = RegistryClient::parse_reference(target)?;
-        self.policy.check(&reference)?;
+        let registry = self.registries.admit(&reference)?;
         if bytes.len() as u64 > METADATA_LIMIT {
             return Err(invalid(&reference, "upload manifest exceeds 4 MiB"));
         }
@@ -267,7 +256,7 @@ impl ArtifactRegistry {
                 "upload manifest differs from target digest",
             ));
         }
-        self.registry
+        registry
             .client
             .auth(
                 &reference,
@@ -276,7 +265,7 @@ impl ArtifactRegistry {
             )
             .await
             .map_err(|error| OciError::registry(reference.to_string(), error))?;
-        self.registry
+        registry
             .client
             .push_manifest_raw(
                 &reference,
@@ -290,8 +279,8 @@ impl ArtifactRegistry {
             })?;
         // Verify that the registry preserved exact bytes rather than rewriting metadata.
         let pinned = reference.clone_with_digest(digest.to_string());
-        self.registry
-            .pull_manifest_bounded(&self.http, &pinned, None)
+        registry
+            .pull_manifest_bounded(&pinned, None)
             .await
             .map_err(|error| OciError::ArtifactRegistryIncompatible {
                 reference: reference.to_string(),

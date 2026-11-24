@@ -7,6 +7,15 @@ use thiserror::Error;
 
 pub type OciResult<T> = Result<T, OciError>;
 
+/// Why a registry HTTP client pair could not be built.
+#[derive(Debug, Error)]
+pub enum RegistryClientError {
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Oci(#[from] OciDistributionError),
+}
+
 #[derive(Debug, Error)]
 pub enum OciError {
     #[error(transparent)]
@@ -42,6 +51,38 @@ pub enum OciError {
     RegistryPolicyDenied {
         reference: String,
         rule: Option<String>,
+    },
+
+    #[error("invalid registry host {value:?}: {message}")]
+    InvalidRegistryHost { value: String, message: String },
+
+    #[error("images.registries has more than one entry for registry {registry:?}")]
+    DuplicateRegistry { registry: String },
+
+    /// The I/O cause is part of the message and deliberately not also a
+    /// `source`, so error chains print it once.
+    #[error("images.registries[{registry:?}].ca: cannot read {path}: {error}")]
+    RegistryCaRead {
+        registry: String,
+        path: PathBuf,
+        error: std::io::Error,
+    },
+
+    #[error("images.registries[{registry:?}].ca: {path} contains no PEM certificates")]
+    RegistryCaEmpty { registry: String, path: PathBuf },
+
+    #[error("images.registries[{registry:?}].ca: invalid PEM certificate bundle {path}")]
+    RegistryCaInvalid {
+        registry: String,
+        path: PathBuf,
+        #[source]
+        source: Box<RegistryClientError>,
+    },
+
+    #[error("cannot build the registry HTTP client")]
+    RegistryClientBuild {
+        #[source]
+        source: Box<RegistryClientError>,
     },
 
     #[error("registry request for image {reference:?} failed")]
