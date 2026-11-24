@@ -36,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_VSOCK_LISTENERS: usize = 1024;
 const VSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const SERIAL_RELEASE_POLL: Duration = Duration::from_millis(1);
 
 pub(crate) struct KrunBackend {
     config: VmConfig,
@@ -52,6 +53,11 @@ pub(crate) struct KrunBackend {
     immediate_stop: CancellationToken,
     console: Mutex<Option<OwnedFd>>,
     serial: Mutex<Option<(File, File)>>,
+    /// The monitor's own handle on the console PTY slave, with a master
+    /// handle to watch. macOS discards output the master has not read when
+    /// the last slave handle closes, so the worker's exit must not be that
+    /// last close.
+    console_hold: Mutex<Option<(OwnedFd, File)>>,
     attachments: Arc<Mutex<Option<crate::virt::backend::storage::PreparedAttachments>>>,
     storage_finalization: watch::Sender<Option<crate::virt::backend::StorageFinalization>>,
     storage_finalization_started: std::sync::atomic::AtomicBool,
@@ -245,6 +251,7 @@ impl KrunBackend {
             force: CancellationToken::new(),
             hibernate: CancellationToken::new(),
             immediate_stop: CancellationToken::new(),
+            console_hold: Mutex::new(Some((pty.slave.try_clone()?, master.try_clone()?))),
             console: Mutex::new(Some(pty.slave)),
             serial: Mutex::new(Some((master.try_clone()?, master))),
             attachments: Arc::new(Mutex::new(None)),
@@ -553,6 +560,32 @@ impl VirtBackend for KrunBackend {
             }
             None => Err(LifecycleError::Rejected(LifecycleRejection::NotReady)),
         }
+    }
+
+    async fn release_serial(&self) {
+        let hold = self
+            .console_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some((slave, master)) = hold else {
+            return;
+        };
+        // The worker is gone, so nothing new arrives: once the master has
+        // nothing left to read the reader holds every byte, and closing the
+        // slave then only delivers end of stream.
+        loop {
+            let mut pending = [nix::poll::PollFd::new(
+                master.as_fd(),
+                nix::poll::PollFlags::POLLIN,
+            )];
+            match nix::poll::poll(&mut pending, nix::poll::PollTimeout::ZERO) {
+                Ok(ready) if ready > 0 => tokio::time::sleep(SERIAL_RELEASE_POLL).await,
+                Err(nix::errno::Errno::EINTR) => {}
+                Ok(_) | Err(_) => break,
+            }
+        }
+        drop(slave);
     }
 
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {
@@ -913,6 +946,44 @@ mod tests {
         assert_eq!(first.expect("first"), second.expect("second"));
         backend.stop().await.expect("idempotent stop");
         assert!(backend.console.lock().expect("console").is_none());
+    }
+
+    #[tokio::test]
+    async fn output_left_unread_when_the_worker_closes_its_console_reaches_the_sinks() {
+        use crate::virt::backend::krun::KrunBackend;
+        let backend = Arc::new(
+            KrunBackend::new(
+                VmConfig::builder("console-tail")
+                    .base_directory(std::env::temp_dir())
+                    .cpus(1)
+                    .memory(128)
+                    .kernel("/not-opened/kernel")
+                    .build(),
+            )
+            .expect("backend"),
+        );
+        let output = b"init: overlay: boot failed; workload prohibited\n";
+        let worker_console = backend
+            .console
+            .lock()
+            .expect("console")
+            .take()
+            .expect("worker console");
+        nix::unistd::write(&worker_console, output).expect("guest output");
+        drop(worker_console);
+
+        let console = crate::virt::serial::SerialConsole::new(backend);
+        let (sink, mut log) = tokio::io::duplex(1024);
+        console.add_sink(sink).await;
+        console.attach().await.expect("attach serial reader");
+        console.drain().await.expect("reader reaches end of stream");
+
+        let mut received = vec![0; output.len()];
+        tokio::time::timeout(Duration::from_secs(1), log.read_exact(&mut received))
+            .await
+            .expect("output is already in the sink")
+            .expect("read sink");
+        assert_eq!(received, output);
     }
 
     #[tokio::test]

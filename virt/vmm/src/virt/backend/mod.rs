@@ -112,6 +112,11 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
     /// Open the guest serial device. Called once per boot by the serial console.
     async fn open_serial(&self) -> Result<SerialDevice, VirtError>;
 
+    /// Let the serial reader reach end of stream once it has taken everything
+    /// the stopped guest wrote. Backends whose serial device ends on its own
+    /// need nothing here.
+    async fn release_serial(&self) {}
+
     /// Live host memory reclaim reports, for backends that can observe them.
     /// The value is `None` until the first report of the current boot.
     fn host_memory_reclaim_updates(

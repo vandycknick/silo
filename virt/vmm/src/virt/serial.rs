@@ -209,6 +209,7 @@ impl SerialConsole {
             return Ok(());
         };
         let result = tokio::time::timeout(DRAIN_TIMEOUT, async {
+            self.backend.release_serial().await;
             let input_result = attachment.guest_input.lock().await.shutdown().await;
             let reader_result = (&mut attachment.reader_task).await.map_err(|error| {
                 VirtError::Backend(format!("serial reader task failed: {error}"))
