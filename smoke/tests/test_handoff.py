@@ -43,7 +43,7 @@ def runtimes(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_cach
     try:
         pair = []
         for label in ("laptop", "cloud"):
-            workspace = Workspace(config, registry.ca_path)
+            workspace = Workspace(config, registry.address, registry.ca_path)
             workspaces.append(workspace)
             seeded = image_cache.seed(overlay_image_caches["stopped"], workspace.silo_home)
             assert len(seeded) == 1, seeded

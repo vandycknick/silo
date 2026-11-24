@@ -32,7 +32,7 @@ def stopped_silo(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_
     parent = Path(supplied) if supplied else None
     if parent is not None:
         assert parent.is_absolute() and parent.is_dir(), "SILO_SMOKE_STOPPED_DIR must name an existing mounted writable directory"
-    workspace = Workspace(config, registry.ca_path, parent=parent, runtime_parent=Path("/tmp") if parent is not None else None)
+    workspace = Workspace(config, registry.address, registry.ca_path, parent=parent, runtime_parent=Path("/tmp") if parent is not None else None)
     try:
         with timed(workspace, "image_cache.seed"):
             seeded = image_cache.seed(overlay_image_caches["stopped"], workspace.silo_home)

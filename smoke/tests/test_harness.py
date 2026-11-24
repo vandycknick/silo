@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import replace
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -13,7 +14,7 @@ from silo_smoke import fork, procs
 from silo_smoke.cli import Silo
 from silo_smoke.config import SmokeConfig
 from silo_smoke.errors import SmokeAssertion
-from silo_smoke.registry import LoopbackRegistry
+from silo_smoke.registry import LoopbackRegistry, ensure_ca
 from silo_smoke.workspace import Workspace
 
 
@@ -75,7 +76,7 @@ def test_catalog_empty_database_and_missing_or_malformed_input(tmp_path: Path) -
 def test_workspace_long_durable_path_keeps_runtime_sockets_short(config: SmokeConfig, registry: LoopbackRegistry, tmp_path: Path) -> None:
     parent = tmp_path / ("durable-" + "x" * 100)
     parent.mkdir()
-    workspace = Workspace(replace(config, keep=False), registry.ca_path, parent=parent)
+    workspace = Workspace(replace(config, keep=False), registry.address, registry.ca_path, parent=parent)
     runtime = workspace.run_root.parent
     try:
         assert workspace.silo_home.is_relative_to(parent)
@@ -93,6 +94,40 @@ def test_workspace_long_durable_path_keeps_runtime_sockets_short(config: SmokeCo
         workspace.cleanup(failed=False)
     assert not workspace.root.exists()
     assert not runtime.exists()
+
+
+def test_workspace_merges_registry_ca_with_existing_config(config: SmokeConfig, tmp_path: Path) -> None:
+    ca, _ = ensure_ca(tmp_path / 'CA "with spaces"')
+    workspace = Workspace(replace(config, keep=False), "127.0.0.1:5043", ca, parent=tmp_path)
+    try:
+        workspace.update_config({
+            "default_machine": "smoke",
+            "images": {
+                "default": "deny",
+                "search_registries": ["127.0.0.1:5043"],
+                "rules": [{"prefix": "127.0.0.1:5043/smoke", "action": "allow"}],
+            },
+            "networking": {"drivers": {"netd": {"subnet": "192.168.86.0/24"}}},
+        })
+        workspace.trust_registry("127.0.0.1:6043", ca)
+        workspace.update_config({"networking": {"drivers": {"netd": {"pcap": True}}}})
+        path = workspace.config_home / "silo/config.yaml"
+        assert json.loads(path.read_text(encoding="utf-8")) == {
+            "default_machine": "smoke",
+            "images": {
+                "default": "deny",
+                "search_registries": ["127.0.0.1:5043"],
+                "rules": [{"prefix": "127.0.0.1:5043/smoke", "action": "allow"}],
+                "registries": {
+                    "127.0.0.1:5043": {"ca": str(ca.resolve())},
+                    "127.0.0.1:6043": {"ca": str(ca.resolve())},
+                },
+            },
+            "networking": {"drivers": {"netd": {"subnet": "192.168.86.0/24", "pcap": True}}},
+        }
+        assert "SSL_CERT_FILE" not in workspace.env()
+    finally:
+        workspace.cleanup(failed=False)
 
 
 def test_successful_remove_unregisters_and_recreate_registers(silo: Silo, basic_image: str) -> None:

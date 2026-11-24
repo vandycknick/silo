@@ -1151,22 +1151,20 @@ means pinning its hashes for both architectures. `IPROUTE` adds `iproute2-ss`
 `ss --vsock`; pins come from the v3.21 APKINDEX `P`/`V`/`D` fields and the
 SHA-256 of the downloaded archives.
 
-Linux trusts the registry through the workspace's `SSL_CERT_FILE`, which points
-at `<workspace>/ca-bundle.pem`: the host's CA bundle plus the suite CA, because
-that variable replaces (not extends) the trust store for Go and rustls consumers
-and `netd` still has to verify public upstreams. On macOS,
-the Rust OCI client's platform verifier ignores that variable. Trust the stable
-suite CA once in your login keychain after it has been generated (preflight
-prints the instruction):
+Smoke writes the suite CA path under `images.registries."<host:port>".ca` in
+each workspace's private `$XDG_CONFIG_HOME/silo/config.yaml`. This works on
+Linux and macOS without installing the CA in the system trust store or login
+keychain. Both the loopback and Distribution registries use leaves signed by
+the CA at `<cache>/registry-ca/ca.pem`, with localhost/127.0.0.1 subject
+alternatives. Python registry probes pass that CA directly to their TLS
+contexts; netd and other clients connecting to public endpoints use their
+normal system trust.
 
-```sh
-security add-trusted-cert -r trustRoot \
-  -k ~/Library/Keychains/login.keychain-db <cache>/registry-ca/ca.pem
-```
-
-Here `<cache>` is the resolved smoke cache directory. Changing that directory
-or replacing its CA requires trusting the new certificate. The registry's leaf
-certificate is issued per session with localhost/127.0.0.1 subject alternatives.
+If a test uses an additional registry, register its authority with
+`workspace.trust_registry(registry.address, registry.ca_path)` before the first
+CLI command that needs it and before starting the workspace's daemon. A registry
+trust change, including replacing the CA bundle's bytes, changes the daemon
+configuration identity and requires a daemon restart.
 
 ## EROFS-overlay and VMDK qualification
 

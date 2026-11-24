@@ -22,6 +22,11 @@ def ca_cert_path(cache_dir: Path) -> Path:
     return cache_dir / "registry-ca" / "ca.pem"
 
 
+# Apple's verifier rejects server certificates valid for more than 825 days as
+# "not standards compliant". Leaves are issued per run, so a short life is free.
+LEAF_VALIDITY_DAYS = 90
+
+
 @contextmanager
 def _ca_lock(cache_dir: Path) -> Iterator[None]:
     directory = ca_cert_path(cache_dir).parent
@@ -58,8 +63,7 @@ def ensure_ca(cache_dir: Path) -> tuple[Path, Path]:
 def issue_leaf_certificate(cache_dir: Path, directory: Path) -> tuple[Path, Path]:
     """Issue a loopback server certificate signed by the shared suite CA.
 
-    Returns `(certificate, key)` inside the caller-owned `directory`, so every
-    smoke workspace trusting the suite CA through `SSL_CERT_FILE` trusts it.
+    Returns `(certificate, key)` inside the caller-owned `directory`.
     """
     ca_path, ca_key = ensure_ca(cache_dir)
     leaf = directory / "leaf.pem"
@@ -72,7 +76,7 @@ def issue_leaf_certificate(cache_dir: Path, directory: Path) -> tuple[Path, Path
     extensions.write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n")
     with _ca_lock(cache_dir):
         _openssl("x509", "-req", "-in", str(csr), "-CA", str(ca_path), "-CAkey", str(ca_key),
-                 "-CAcreateserial", "-days", "3650", "-extfile", str(extensions), "-out", str(leaf))
+                 "-CAcreateserial", "-days", str(LEAF_VALIDITY_DAYS), "-extfile", str(extensions), "-out", str(leaf))
     return leaf, key
 
 
@@ -163,6 +167,10 @@ class LoopbackRegistry:
             shutil.rmtree(self._leaf_dir)
             raise
 
+    @property
+    def address(self) -> str:
+        return f"{self.host}:{self.port}"
+
     def start(self) -> None:
         if self._stopped:
             raise RuntimeError("A stopped registry cannot be restarted")
@@ -192,7 +200,7 @@ class LoopbackRegistry:
         with self._lock:
             self._publications = [entry for entry in self._publications if (entry.name, entry.tag) != (name, tag)]
             self._publications.append(_Publication(name, tag, image))
-        return f"{self.host}:{self.port}/smoke/{name}:{tag}"
+        return f"{self.address}/smoke/{name}:{tag}"
 
     @contextmanager
     def unpublished(self, reference: str) -> Iterator[None]:
@@ -203,7 +211,7 @@ class LoopbackRegistry:
         """
         with self._lock:
             matches = [entry for entry in self._publications
-                       if reference == f"{self.host}:{self.port}/smoke/{entry.name}:{entry.tag}"]
+                       if reference == f"{self.address}/smoke/{entry.name}:{entry.tag}"]
             if self._stopped or len(matches) != 1:
                 raise ValueError("source-free gate requires one exact live OCI publication")
             removed = matches[0]

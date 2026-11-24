@@ -1,36 +1,37 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
-import ssl
 import subprocess
 import tempfile
 import threading
 from typing import TYPE_CHECKING
 
 from .config import RUN_ROOT_PARENT, SmokeConfig
+from .errors import SmokeAssertion
 from .prereqs import workspace_parent
 
 if TYPE_CHECKING:
     from .daemon import Daemon
 
 
-def _system_trust_bundle() -> bytes:
-    """The host's CA bundle, so netd builds can still reach public TLS endpoints.
+type ConfigValue = str | int | float | bool | None | list[ConfigValue] | ConfigMapping
+type ConfigMapping = dict[str, ConfigValue]
 
-    The suite CA is appended to it: `SSL_CERT_FILE` replaces the trust store for Go and
-    rustls-native-certs consumers instead of extending it.
-    """
-    cafile = ssl.get_default_verify_paths().cafile
-    for candidate in (cafile, "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"):
-        if candidate and Path(candidate).is_file():
-            return Path(candidate).read_bytes().rstrip(b"\n") + b"\n"
-    return b""
+
+def _merge_config(document: ConfigMapping, updates: ConfigMapping) -> None:
+    for key, value in updates.items():
+        existing = document.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            _merge_config(existing, value)
+        else:
+            document[key] = value
 
 
 class Workspace:
-    def __init__(self, config: SmokeConfig, registry_ca: Path, *, parent: Path | None = None, runtime_parent: Path | None = None) -> None:
+    def __init__(self, config: SmokeConfig, registry_address: str, registry_ca: Path, *, parent: Path | None = None, runtime_parent: Path | None = None) -> None:
         self.config = config
         if parent is None:
             parent = workspace_parent()
@@ -46,7 +47,6 @@ class Workspace:
         self._runtime_directory = Path(tempfile.mkdtemp(prefix="silo-run-", dir=runtime_parent)) if runtime_parent is not None else None
         self.run_root = (self._runtime_directory or self.root) / "run"
         self.evidence = self.root / "evidence"
-        self._trust_bundle = self.root / "ca-bundle.pem"
         self._machines: list[str] = []
         self._daemons: list[Daemon] = []
         self._record_lock = threading.Lock()
@@ -54,9 +54,44 @@ class Workspace:
         for directory in (self.user_home, self.silo_home, self.config_home, self.run_root, self.evidence):
             directory.mkdir(mode=0o700)
             directory.chmod(0o700)
-        self._trust_bundle.write_bytes(_system_trust_bundle() + registry_ca.read_bytes())
+        self.trust_registry(registry_address, registry_ca)
         if self._runtime_directory is not None:
             self.record("runtime-placement", f"persistent={self.silo_home}\nruntime={self.run_root}\n")
+
+    def trust_registry(self, address: str, ca: Path) -> None:
+        self.update_config({"images": {"registries": {address: {"ca": str(ca.resolve())}}}})
+
+    def update_config(self, updates: ConfigMapping) -> None:
+        """Merge into the suite-owned Silo config, written as JSON-compatible YAML."""
+        directory = self.config_home / "silo"
+        path = directory / "config.yaml"
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw = None
+        try:
+            document: ConfigMapping = json.loads(raw) if raw is not None else {}
+        except json.JSONDecodeError as error:
+            raise SmokeAssertion(f"Expected JSON-compatible YAML in workspace config {path}: {error}") from error
+        if not isinstance(document, dict):
+            raise SmokeAssertion(f"Expected a mapping in workspace config {path}")
+        _merge_config(document, updates)
+        rendered = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+        if rendered == raw:
+            return
+        # Changes to registry roots (including the CA digest) change daemon identity.
+        # Configure before startup, or stop and explicitly restart the private daemon.
+        if any(daemon.proc is not None and daemon.proc.poll() is None for daemon in self._daemons):
+            raise SmokeAssertion("Stop the private daemon before changing its workspace config")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as temporary:
+            staged = Path(temporary.name)
+            try:
+                temporary.write(rendered)
+                temporary.close()
+                staged.replace(path)
+            finally:
+                staged.unlink(missing_ok=True)
 
     def env(self, **overrides: str) -> dict[str, str]:
         environment = {
@@ -67,7 +102,6 @@ class Workspace:
             "SILO_RUN_ROOT": str(self.run_root),
             "SILO_RUNTIME_DIR": str(self.config.runtime_dir),
             "SILO_VIRT_BACKEND": self.config.backend,
-            "SSL_CERT_FILE": str(self._trust_bundle),
             "TERM": "dumb", "NO_COLOR": "1", "RUST_LOG": "info",
         }
         for key, value in overrides.items():

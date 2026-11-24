@@ -70,7 +70,7 @@ def reclaim_silo(config: SmokeConfig, registry: LoopbackRegistry,
     expected = os.environ.get("SILO_SMOKE_STOPPED_FS")
     assert expected is None or parent is not None, (
         "SILO_SMOKE_STOPPED_FS requires SILO_SMOKE_STOPPED_DIR")
-    workspace = Workspace(config, registry.ca_path, parent=parent,
+    workspace = Workspace(config, registry.address, registry.ca_path, parent=parent,
                           runtime_parent=Path("/tmp") if parent is not None else None)
     try:
         silo = Silo(workspace)

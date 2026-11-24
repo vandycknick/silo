@@ -61,9 +61,15 @@ def artifact_runtime(config: SmokeConfig, tmp_path_factory: pytest.TempPathFacto
 
 
 @pytest.fixture
+def artifact_source(stopped_silo: Silo, artifact_registry: DistributionRegistry) -> Silo:
+    stopped_silo.ws.trust_registry(artifact_registry.address, artifact_registry.ca_path)
+    return stopped_silo
+
+
+@pytest.fixture
 def artifact_destination(config: SmokeConfig, artifact_registry: DistributionRegistry,
                          artifact_runtime: Path, request: pytest.FixtureRequest) -> Iterator[Silo]:
-    workspace = Workspace(replace(config, runtime_dir=artifact_runtime), artifact_registry.ca_path)
+    workspace = Workspace(replace(config, runtime_dir=artifact_runtime), artifact_registry.address, artifact_registry.ca_path)
     failures = request.session.testsfailed
     try:
         workspace.record("artifact-runtime", f"read-only broken-assets fixture: {artifact_runtime}\n")
@@ -264,10 +270,10 @@ def _as_snapshot_artifact(registry: DistributionRegistry, graph: Graph, tag: str
 
 
 @pytest.mark.parametrize("daemon_mode", [False, pytest.param(True, marks=pytest.mark.daemon)], ids=["local", "daemon"])
-def test_raw_artifact_same_identity_and_offline_reconstruction(stopped_silo: Silo, artifact_destination: Silo,
+def test_raw_artifact_same_identity_and_offline_reconstruction(artifact_source: Silo, artifact_destination: Silo,
                                                                artifact_registry: DistributionRegistry,
                                                                cloud_roots: Roots, daemon_mode: bool) -> None:
-    source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
+    source, consumer, registry = artifact_source, artifact_destination, artifact_registry
     disk = cloud_disk.sparse_clone(cloud_roots.root, source.ws.root / "input.raw")
     expected_sha = overlay.digest(disk)
     _start_daemon(source, daemon_mode)
@@ -295,10 +301,10 @@ def test_raw_artifact_same_identity_and_offline_reconstruction(stopped_silo: Sil
 
 
 @pytest.mark.parametrize("daemon_mode", [False, pytest.param(True, marks=pytest.mark.daemon)], ids=["local", "daemon"])
-def test_converted_artifact_survives_source_oci_deletion_and_registry_gc(stopped_silo: Silo, artifact_destination: Silo,
+def test_converted_artifact_survives_source_oci_deletion_and_registry_gc(artifact_source: Silo, artifact_destination: Silo,
                                                                       artifact_registry: DistributionRegistry,
                                                                       convert_image: tuple[str, images.OciImage], daemon_mode: bool) -> None:
-    source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
+    source, consumer, registry = artifact_source, artifact_destination, artifact_registry
     _, image = convert_image
     reference = _publish_oci(registry, image)
     _start_daemon(source, daemon_mode)
@@ -330,10 +336,10 @@ def test_converted_artifact_survives_source_oci_deletion_and_registry_gc(stopped
 
 
 def test_image_pull_and_create_refuse_snapshot_artifact_before_payload_fetch(
-    stopped_silo: Silo, artifact_destination: Silo,
+    artifact_source: Silo, artifact_destination: Silo,
     artifact_registry: DistributionRegistry, cloud_roots: Roots,
 ) -> None:
-    source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
+    source, consumer, registry = artifact_source, artifact_destination, artifact_registry
     disk = cloud_disk.sparse_clone(cloud_roots.root, source.ws.root / "relabel.raw")
     cloud_disk.import_disk(source, disk, root="whole-disk", name="relabel-source")
     graph = _push(source, registry, "relabel-source", "raw")
@@ -360,10 +366,10 @@ def test_image_pull_and_create_refuse_snapshot_artifact_before_payload_fetch(
 
 
 def test_restore_refuses_image_artifact_before_payload_fetch(
-    stopped_silo: Silo, artifact_destination: Silo,
+    artifact_source: Silo, artifact_destination: Silo,
     artifact_registry: DistributionRegistry, cloud_roots: Roots,
 ) -> None:
-    source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
+    source, consumer, registry = artifact_source, artifact_destination, artifact_registry
     disk = cloud_disk.sparse_clone(cloud_roots.root, source.ws.root / "restore-refused.raw")
     cloud_disk.import_disk(source, disk, root="whole-disk", name="restore-refused")
     graph = _push(source, registry, "restore-refused", "raw")
@@ -378,10 +384,10 @@ def test_restore_refuses_image_artifact_before_payload_fetch(
 
 
 def test_failed_pull_reuses_verified_chunks_and_refetches_corrupt_cache(
-    stopped_silo: Silo, artifact_destination: Silo,
+    artifact_source: Silo, artifact_destination: Silo,
     artifact_registry: DistributionRegistry, cloud_roots: Roots,
 ) -> None:
-    source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
+    source, consumer, registry = artifact_source, artifact_destination, artifact_registry
     disk = cloud_disk.sparse_clone(cloud_roots.root, source.ws.root / "resume.raw")
     imported = cloud_disk.import_disk(source, disk, root="whole-disk", name="resume-source")
     graph = _push(source, registry, "resume-source", "raw")

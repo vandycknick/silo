@@ -50,7 +50,7 @@ def main() -> None:
     values = request['config']
     for key in ('bin_dir', 'runtime_dir', 'cache_dir'):
         values[key] = Path(values[key])
-    ws = Workspace(SmokeConfig(**values), Path(request['registry_ca']))
+    ws = Workspace(SmokeConfig(**values), request['registry_address'], Path(request['registry_ca']))
     destination = Path(request['evidence'])
     destination.mkdir(parents=True, exist_ok=True)
     (destination / 'child-workspace.json').write_text(json.dumps({'root': str(ws.root), 'evidence': str(ws.evidence)}) + '\n')

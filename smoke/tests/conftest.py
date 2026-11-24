@@ -124,7 +124,7 @@ def registry(config: SmokeConfig) -> Generator[LoopbackRegistry, None, None]:
 @pytest.fixture(scope="session")
 def session_evidence(config: SmokeConfig, registry: LoopbackRegistry) -> Generator[Workspace, None, None]:
     """Keep one immutable-preparation evidence tree per worker, including successes."""
-    evidence = Workspace(replace(config, keep=True), registry.ca_path)
+    evidence = Workspace(replace(config, keep=True), registry.address, registry.ca_path)
     evidence.record("worker", os.environ.get("PYTEST_XDIST_WORKER", "main") + "\n")
     try:
         yield evidence
@@ -142,7 +142,7 @@ def cloud_roots(config: SmokeConfig, registry: LoopbackRegistry, tmp_path_factor
                 session_evidence: Workspace) -> Roots:
     directory = tmp_path_factory.mktemp("phase17-roots")
     base = images.fetch_alpine(config.cache_dir)
-    preparation = Workspace(config, registry.ca_path)
+    preparation = Workspace(config, registry.address, registry.ca_path)
     prepared: dict[str, Path] = {}
     try:
         silo = Silo(preparation)
@@ -210,7 +210,7 @@ def _prepared_image_catalogs(config: SmokeConfig, registry: LoopbackRegistry, re
     prepared = False
     try:
         for name, reference in references.items():
-            preparation = Workspace(config, registry.ca_path)
+            preparation = Workspace(config, registry.address, registry.ca_path)
             preparations.append((name, preparation))
             with timed(preparation, "image_cache.prepare"):
                 Silo(preparation).raw_image(reference)
@@ -241,7 +241,7 @@ def basic_image_cache(config: SmokeConfig, registry: LoopbackRegistry, basic_ima
 
 @pytest.fixture
 def workspace(config: SmokeConfig, registry: LoopbackRegistry, request: pytest.FixtureRequest) -> Generator[Workspace, None, None]:
-    instance = Workspace(config, registry.ca_path)
+    instance = Workspace(config, registry.address, registry.ca_path)
     try:
         yield instance
     finally:

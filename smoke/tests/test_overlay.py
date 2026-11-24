@@ -867,7 +867,11 @@ def test_overlay_native_range_and_real_fallback(silo: Silo, config: SmokeConfig,
     import sys
     request = silo.ws.evidence / "native-range-request.json"
     evidence = silo.ws.evidence / "native-range"
-    request.write_text(json.dumps({"config": asdict(config), "registry_ca": str(registry.ca_path), "image": overlay_image, "backing": backing, "operation": operation, "region": region, "evidence": str(evidence), "outer_uid": str(os.getuid()), "outer_user_namespace": os.readlink("/proc/self/ns/user")}, default=str))
+    request.write_text(json.dumps({
+        "config": asdict(config), "registry_address": registry.address, "registry_ca": str(registry.ca_path),
+        "image": overlay_image, "backing": backing, "operation": operation, "region": region,
+        "evidence": str(evidence), "outer_uid": str(os.getuid()), "outer_user_namespace": os.readlink("/proc/self/ns/user"),
+    }, default=str))
     result = subprocess.run(["unshare", "--user", "--map-root-user", "--mount", "--propagation", "private", sys.executable, "-m", "silo_smoke.overlay_range", str(request)], env=silo.ws.env(PYTHONPATH=str(REPO / "smoke"), TMPDIR=str(silo.ws.root.parent)), capture_output=True, text=True, timeout=240)
     silo.ws.record("overlay-native-range-namespace", result.stdout + result.stderr)
     assert result.returncode == 0, result.stderr

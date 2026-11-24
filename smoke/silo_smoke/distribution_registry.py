@@ -13,8 +13,8 @@ storage, the OCI upload API, deletion and stop-the-world garbage collection:
       stored_blob_digests()          on-disk blob inventory, proves physical sweep
 
 The registry is anonymous: Silo's OCI client uses anonymous registry access, and
-TLS uses a leaf signed by the shared suite CA that smoke workspaces trust through
-`SSL_CERT_FILE`. Nothing here contacts or mutates a hosted registry.
+TLS uses a leaf signed by the shared suite CA. Silo trusts the CA through its
+workspace's per-registry configuration. Nothing here mutates a hosted registry.
 """
 
 from __future__ import annotations

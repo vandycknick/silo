@@ -46,20 +46,6 @@ def _macos_checks(config: SmokeConfig) -> None:
                 warnings.warn(f"macOS virtualization check failed: {shlex.join(command)}\n{output}", stacklevel=2)
         except (OSError, subprocess.TimeoutExpired) as error:
             warnings.warn(f"macOS virtualization check unavailable: {error}", stacklevel=2)
-    from .registry import ensure_ca
-
-    ca, _ = ensure_ca(config.cache_dir)
-    try:
-        result = subprocess.run(["security", "verify-cert", "-c", str(ca)], capture_output=True, timeout=15)
-        trusted = result.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        trusted = False
-    if not trusted:
-        warnings.warn(
-            "Trust the smoke registry CA in the login keychain before VM pulls: "
-            "security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db "
-            + shlex.quote(str(ca)), stacklevel=2,
-        )
 
 
 def check(config: SmokeConfig) -> LiveDaemonMark | None:

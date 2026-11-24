@@ -6,6 +6,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
+from silo_smoke.cli import Silo
+from silo_smoke.daemon import Daemon
+from silo_smoke.registry import LoopbackRegistry
+
 
 _CLIENT = r'''
 import hashlib
@@ -55,3 +61,16 @@ def test_concurrent_registries_share_ca_and_issue_distinct_valid_certificates(tm
     results = cold + existing
     assert len({result["ca"] for result in results}) == 1
     assert len({result["serial"] for result in results}) == len(results)
+
+
+@pytest.mark.parametrize("daemon_mode", [False, pytest.param(True, marks=pytest.mark.daemon)], ids=["local", "daemon"])
+def test_silo_pulls_with_workspace_registry_ca(
+    silo: Silo, registry: LoopbackRegistry, basic_image: str, daemon: Daemon, daemon_mode: bool,
+) -> None:
+    if daemon_mode:
+        daemon.start()
+        daemon.wait_core()
+    requests = registry.requests
+    pulled = silo.json("image", "pull", basic_image)
+    assert pulled["kind"] == "oci" and basic_image in pulled["info"]["names"]
+    assert registry.requests > requests

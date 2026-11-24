@@ -101,16 +101,6 @@ def restore_network_image(config: SmokeConfig, registry: LoopbackRegistry,
     return registry.publish(images.build(spec, images.fetch_alpine(config.cache_dir)), "restore-network")
 
 
-def enable_packet_capture(silo: Silo) -> Path:
-    """Select netd's own capture through the ordinary user configuration file."""
-    directory = silo.ws.config_home / "silo"
-    directory.mkdir(mode=0o700, exist_ok=True)
-    path = directory / "config.yaml"
-    assert not path.exists(), "packet capture must be selected before any other configuration"
-    path.write_text("networking:\n  drivers:\n    netd:\n      pcap: true\n")
-    return path
-
-
 # -- trace events ---------------------------------------------------------------
 
 _LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?Z\s+(\w+)\s+(.*)$")
@@ -746,7 +736,7 @@ def networked_source(silo: Silo, image: str, name: str, *flags: str,
                      before_capture=None) -> Iterator[Source]:
     """Running workload on a netd network with packet capture, then a real
     preserving live checkpoint; the source stays paused for the caller."""
-    enable_packet_capture(silo)
+    silo.ws.update_config({"networking": {"drivers": {"netd": {"pcap": True}}}})
     peers = HostPeers(silo.ws.evidence / "host-peers.jsonl")
     try:
         info = create_source(silo, image, name, *flags)
