@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added: on Apple silicon Macs with the krun backend, `silo fork` of a stopped
+  machine, `silo snapshot create` without `--memory` and `silo restore` of a
+  snapshot without memory (or with `--without-memory`) are admitted. Live
+  fork and memory snapshots stay Linux only.
 - Changed: on macOS the Silo home must be on an APFS volume. Forks, snapshots
   and image staging rely on APFS clones, so a home on any other filesystem is
   now refused with a message naming the volume type.

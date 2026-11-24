@@ -493,6 +493,19 @@ impl CaptureLane {
             Self::Live => "live",
         }
     }
+
+    /// Stopped capture only clones stored files, so it runs wherever krun
+    /// direct boot does. Live capture needs the native memory path, which is
+    /// Linux only.
+    fn host_admitted(self) -> bool {
+        match self {
+            Self::Stopped => cfg!(any(
+                target_os = "linux",
+                all(target_os = "macos", target_arch = "aarch64")
+            )),
+            Self::Live => cfg!(target_os = "linux"),
+        }
+    }
 }
 
 /// Semantic variants do not qualify a destination lane. This check is also
@@ -507,9 +520,15 @@ pub(crate) fn validate_captured_boot_lane(
     };
 
     storage.validate()?;
-    if !cfg!(target_os = "linux") || backend != LiveBackend::Krun {
+    if backend != LiveBackend::Krun {
         return Err(invalid_capture(format!(
-            "{} boot capture requires the admitted Linux krun direct-boot lane",
+            "{} boot capture requires the krun direct-boot backend",
+            lane.label()
+        )));
+    }
+    if !lane.host_admitted() {
+        return Err(invalid_capture(format!(
+            "{} boot capture is not admitted on this host",
             lane.label()
         )));
     }
@@ -1700,6 +1719,16 @@ mod tests {
             fixture.initramfs.is_file(),
             "current default must not rescue a missing pin"
         );
+    }
+
+    #[test]
+    fn capture_lanes_are_admitted_per_host() {
+        use crate::runtime::boot_assets::CaptureLane as Lane;
+
+        let linux = cfg!(target_os = "linux");
+        let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        assert_eq!(Lane::Stopped.host_admitted(), linux || apple_silicon);
+        assert_eq!(Lane::Live.host_admitted(), linux);
     }
 
     #[cfg(target_os = "linux")]
