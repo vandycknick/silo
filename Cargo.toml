@@ -34,7 +34,7 @@ zeroize = "1.9.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 thiserror = "2.0.19"
 tempfile = "3.27.0"
-libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "767e621d8999159c44766bbff455e4436457dfb4", default-features = false, features = ["blk", "net"] }
+libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "6465253c991b6cc77735ed1e1cf4c5bff7391155", default-features = false, features = ["blk", "net"] }
 
 [profile.dev.package.sha2]
 opt-level = 3
