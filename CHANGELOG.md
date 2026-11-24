@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed: a failed `silo pause` no longer leaves the machine stuck in
+  `pausing`, where `exec` and `resume` were refused and only a stop helped.
+  Silo now rolls the failed pause back and reports the original error together
+  with the outcome: the machine is running again, or it is in `error` and
+  must be stopped with `silo stop`.
 - Changed: machines created from OCI images start the monitor by its resolved
   path on Linux and on Apple silicon Macs, the same way raw-disk machines do.
   On macOS with the krun backend `silo create` and `silo run` from an OCI

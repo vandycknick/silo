@@ -230,6 +230,17 @@ reconnection observes the same operation and current pause authority, rather
 than creating another pause. Historical success does not authorize a consumed
 token. A new `CancelOperation` is rejected while `Paused`; cancellation is
 the recovery exit from an unfinished or failed `Pausing`.
+
+The synchronous `silo pause` command automatically cancels its exact
+operation when the monitor reports a failed native pause. It still fails,
+but the machine returns to `running` only after native rollback, guest thaw
+and fresh readiness. If recovery fails, the machine stays fenced in `error`
+until `silo stop`. Direct CLI errors include the original cause and settled
+outcome, or say that recovery is unverified if the exact monitor cannot
+confirm it. The daemon uses its existing redacted error response; `silo
+list` or `silo info` shows the machine state. Raw `Pause` requests still
+require an explicit `CancelOperation` or stop after a native pause failure.
+
 Manager journal and authority updates acquire the SQLite writer reservation
 before reading current state, so concurrent snapshot publication cannot
 invalidate a deferred read-to-write upgrade.

@@ -980,8 +980,8 @@ async fn pause_lost_thaw_recovery_keeps_original_success_and_resume_replay_canno
 }
 
 #[tokio::test]
-async fn pause_partial_failure_cancel_and_failed_rollback_preserve_recovery_exit() {
-    use vm_spec::lifecycle::*;
+async fn synchronous_pause_native_failure_settles_recovery_and_keeps_original_error() {
+    use vm_spec::lifecycle::VmLifecycleState;
     for rollback_fails in [false, true] {
         let lifecycle = test_utils::LifecycleScenario {
             native_pause: vec![test_utils::NativePauseStep {
@@ -999,50 +999,114 @@ async fn pause_partial_failure_cancel_and_failed_rollback_preserve_recovery_exit
             ..Default::default()
         };
         let fixture = Fixture::new(&pause_scenario(lifecycle)).await;
-        assert!(fixture
+        let error = fixture
             .machine
             .pause(&fixture.machine.observe_live().await.unwrap())
             .await
-            .is_err());
-        let failed = wait_pause_state(&fixture.machine, VmLifecycleState::Pausing).await;
-        let lifecycle = failed.lifecycle().unwrap();
-        assert!(lifecycle.current_pause.is_none());
-        assert_eq!(
-            lifecycle.activity.as_ref().unwrap().stage,
-            LiveStage::PauseFailed
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("native-pause-failed during native-pause")
+                && error.contains("scripted native barrier failure"),
+            "{error}"
         );
-        let target = lifecycle.activity.unwrap().operation_id;
-        let result = fixture
-            .machine
-            .cancel_operation(&failed, uuid::Uuid::new_v4(), target)
-            .await
-            .unwrap();
+        let current = fixture.machine.observe_live().await.unwrap();
+        let lifecycle = current.lifecycle().unwrap();
+        assert!(lifecycle.current_pause.is_none());
+        assert!(lifecycle.activity.is_none());
         if rollback_fails {
-            assert!(matches!(
-                result,
-                LiveCommandResult::CancelOperation(CancelOperationOutcome::Failed { .. })
-            ));
-            let current = fixture.machine.observe_live().await.unwrap();
             assert_eq!(current.state().unwrap(), VmLifecycleState::Error);
-            assert!(current.lifecycle().unwrap().error.is_some());
-        } else {
-            assert!(matches!(
-                result,
-                LiveCommandResult::CancelOperation(CancelOperationOutcome::Completed { .. })
-            ));
             assert_eq!(
-                fixture
-                    .machine
-                    .observe_live()
-                    .await
-                    .unwrap()
-                    .state()
-                    .unwrap(),
-                VmLifecycleState::Running
+                fixture.machine.inspect().await.unwrap().status.label(),
+                "error"
             );
+            assert!(lifecycle.error.is_some());
+            assert!(
+                error.contains("fenced state error: native-rollback-failed during cancel-native")
+                    && error.contains("scripted native rollback failure")
+                    && error.ends_with("; stop the machine with silo stop"),
+                "{error}"
+            );
+        } else {
+            assert_eq!(current.state().unwrap(), VmLifecycleState::Running);
+            assert_eq!(
+                fixture.machine.inspect().await.unwrap().status.label(),
+                "running"
+            );
+            assert!(lifecycle.error.is_none());
+            assert!(
+                error.ends_with("; recovered state running (pause rolled back)"),
+                "{error}"
+            );
+            let execution = fixture
+                .machine
+                .exec("/bin/echo", ["recovered"])
+                .await
+                .unwrap();
+            assert_eq!(
+                execution.result(),
+                &libvm::ExecutionResult::Exited { code: Some(0) }
+            );
+            assert_eq!(execution.stdout_bytes(), b"recovered\n");
+            let later = fixture.machine.pause(&current).await.unwrap();
+            assert_eq!(later.state, VmLifecycleState::Paused);
+            assert!(later.lifecycle.current_pause.is_some());
         }
         fixture.stop().await;
+        assert_eq!(
+            fixture.machine.inspect().await.unwrap().status.label(),
+            "stopped"
+        );
     }
+}
+
+#[tokio::test]
+async fn synchronous_pause_native_failure_recovers_after_waiter_is_dropped() {
+    use vm_spec::lifecycle::VmLifecycleState;
+
+    let lifecycle = test_utils::LifecycleScenario {
+        native_pause: vec![test_utils::NativePauseStep {
+            delay_ms: 500,
+            result: test_utils::NativePauseResult::Fail,
+        }],
+        ..Default::default()
+    };
+    let fixture = Fixture::new(&pause_scenario(lifecycle)).await;
+    let machine = fixture.machine.clone();
+    let observation = machine.observe_live().await.unwrap();
+    let waiter = tokio::spawn(async move { machine.pause(&observation).await });
+    wait_pause_state(&fixture.machine, VmLifecycleState::Pausing).await;
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+
+    let current = wait_pause_state(&fixture.machine, VmLifecycleState::Running).await;
+    assert!(current.lifecycle().unwrap().activity.is_none());
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(fixture.home.join("state.db"))
+        .read_only(true)
+        .create_if_missing(false);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM live_command \
+                 WHERE json_extract(input_json,'$.command.command')='cancelOperation' \
+                 AND result_json IS NOT NULL",
+            )
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+            if count > 0 {
+                assert_eq!(count, 1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("recovery owner must persist the cancellation result without a waiter");
+    connection.close().await.unwrap();
+    fixture.stop().await;
 }
 
 #[tokio::test]

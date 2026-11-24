@@ -1,10 +1,12 @@
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use vm_spec::lifecycle::{
-    CancelOperationCommand, GetOperationCommand, GetOperationOutcome, LiveCommand,
-    LiveCommandEnvelope, LiveCommandResult, LiveId, LiveStage, OperationOutcome, PauseCommand,
-    PauseOutcome, ResumeCommand, ResumeOutcome, VmLifecycleState,
+    CancelOperationCommand, CancelOperationOutcome, GetOperationCommand, GetOperationOutcome,
+    LiveActivity, LiveCommand, LiveCommandEnvelope, LiveCommandKind, LiveCommandResult,
+    LiveFailure, LiveId, LiveStage, OperationKind, OperationObservation, OperationOutcome,
+    PauseCommand, PauseOutcome, ResumeCommand, ResumeOutcome, VmLifecycleState,
 };
 use vm_spec::live::LiveOperation;
 
@@ -14,6 +16,10 @@ use crate::store::live_store::{LiveCommandIntent, MachineLifecycle};
 use crate::store::models::{MachineConfig, MachineRuntimeState, MachineState};
 use crate::store::Store;
 use crate::{LibVmError, Runtime};
+
+// Monitor cancellation can spend 30s on native rollback, 15s on guest thaw
+// and 60s on readiness. Leave time for native reconciliation and RPC delivery.
+const PAUSE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30 + 15 + 60 + 15);
 
 /// Best-effort presentation stages, independent of durable operation outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +226,15 @@ impl Machine {
         observation: &MachineLiveObservation,
         command: LiveCommand,
     ) -> Result<LiveCommandResult, LibVmError> {
+        self.live_command_inner(observation, command, None).await
+    }
+
+    async fn live_command_inner(
+        &self,
+        observation: &MachineLiveObservation,
+        command: LiveCommand,
+        cancel_timeout: Option<Duration>,
+    ) -> Result<LiveCommandResult, LibVmError> {
         if matches!(command, LiveCommand::Pause(_) | LiveCommand::Resume(_)) {
             let config = self
                 .runtime()
@@ -307,7 +322,8 @@ impl Machine {
         if let Some(result) = prepared.result {
             return Ok(result);
         }
-        self.send_prepared(prepared.intent).await
+        self.send_prepared_inner(prepared.intent, cancel_timeout)
+            .await
     }
 
     /// Send an already durable intent and persist its exact result. Capture
@@ -316,6 +332,14 @@ impl Machine {
     pub(crate) async fn send_prepared(
         &self,
         intent: LiveCommandIntent,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        self.send_prepared_inner(intent, None).await
+    }
+
+    async fn send_prepared_inner(
+        &self,
+        intent: LiveCommandIntent,
+        cancel_timeout: Option<Duration>,
     ) -> Result<LiveCommandResult, LibVmError> {
         let runtime = self.runtime();
         let store = runtime.native_store()?;
@@ -385,7 +409,7 @@ impl Machine {
         let result = runtime
             .supervisor()
             .client(self.machine_id())
-            .lifecycle(intent.command.clone())
+            .lifecycle_with_cancel_timeout(intent.command.clone(), cancel_timeout)
             .await
             .map_err(|error| {
                 protocol(format!(
@@ -577,6 +601,16 @@ impl Machine {
         &self,
         observation: &MachineLiveObservation,
     ) -> Result<MachineLifecycle, LibVmError> {
+        let machine = self.clone();
+        let observation = observation.clone();
+        // The owner persists and settles recovery even if its waiter is dropped.
+        tokio::spawn(async move { machine.pause_inner(&observation).await }).await?
+    }
+
+    async fn pause_inner(
+        &self,
+        observation: &MachineLiveObservation,
+    ) -> Result<MachineLifecycle, LibVmError> {
         let config = self
             .runtime()
             .resolve_machine_config(&MachineRef::id(self.machine_id()))
@@ -595,7 +629,7 @@ impl Machine {
         }
         observation.require_pause_submission()?;
         let pending = self
-            .pending_command(observation, vm_spec::lifecycle::LiveCommandKind::Pause)
+            .pending_command(observation, LiveCommandKind::Pause)
             .await?;
         let request_id = pending
             .as_ref()
@@ -603,9 +637,13 @@ impl Machine {
             .transpose()?
             .unwrap_or_else(Uuid::new_v4);
         let operation_id = id(&request_id.to_string())?;
-        if pending.is_none() || !fenced_failure(observation)? {
+        if pending.is_none()
+            || !fenced_failure(observation)?
+            || pause_recovery_active(observation.lifecycle()?.activity.as_ref(), &operation_id)
+        {
             match self.pause_with_request(observation, request_id).await? {
-                LiveCommandResult::Pause(PauseOutcome::Accepted { .. }) => {}
+                LiveCommandResult::Pause(PauseOutcome::Accepted { receipt })
+                    if receipt.operation_id == operation_id => {}
                 result => return Err(result_error(&result)),
             }
         }
@@ -613,24 +651,31 @@ impl Machine {
         loop {
             let fresh = self.observe_live().await?;
             require_same_observation(observation, &fresh)?;
-            match self.observe_operation(&fresh, operation_id.clone()).await? {
-                LiveCommandResult::GetOperation(GetOperationOutcome::Observation {
-                    observation: observed,
-                }) => match observed.operation.outcome.clone() {
-                    OperationOutcome::Succeeded { .. } => {
-                        let mut current = projection(&self.observe_live().await?)?;
-                        current.operation = Some(observed.operation);
-                        return Ok(current);
-                    }
-                    OperationOutcome::Failed { failure } => {
-                        return Err(protocol(failure.to_string()))
-                    }
-                    OperationOutcome::CaptureSealed { .. } => {
-                        return Err(protocol("pause operation returned a capture seal"))
-                    }
-                    OperationOutcome::InProgress => {}
-                },
-                result => return Err(result_error(&result)),
+            let result = self.observe_operation(&fresh, operation_id.clone()).await?;
+            let LiveCommandResult::GetOperation(GetOperationOutcome::Observation {
+                observation: observed,
+            }) = result
+            else {
+                return Err(result_error(&result));
+            };
+            if observed.operation.operation_id != operation_id
+                || observed.operation.kind != OperationKind::Pause
+            {
+                return Err(protocol("monitor returned another operation's observation"));
+            }
+            match &observed.operation.outcome {
+                OperationOutcome::Succeeded { .. } => {
+                    let mut current = projection(&self.observe_live().await?)?;
+                    current.operation = Some(observed.operation);
+                    return Ok(current);
+                }
+                OperationOutcome::Failed { failure } => {
+                    return Err(self.failed_pause(&fresh, &observed, failure).await);
+                }
+                OperationOutcome::CaptureSealed { .. } => {
+                    return Err(protocol("pause operation returned a capture seal"));
+                }
+                OperationOutcome::InProgress => {}
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(protocol(format!(
@@ -640,6 +685,75 @@ impl Machine {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+
+    async fn failed_pause(
+        &self,
+        observation: &MachineLiveObservation,
+        observed: &OperationObservation,
+        failure: &LiveFailure,
+    ) -> LibVmError {
+        let operation = &observed.operation;
+        let target = &operation.operation_id;
+        let primary = format!("pause {target} failed: {failure}");
+        if observed.state != VmLifecycleState::Pausing
+            || !pause_recovery_active(observed.activity.as_ref(), target)
+        {
+            return pause_failure_state(&primary, observed.state, observation);
+        }
+
+        // GetOperation ties the failed outcome and fenced activity to the
+        // same operation in one reply. The command path rechecks run/monitor.
+        let request_id = match uuid(target) {
+            Ok(target) => pause_recovery_request(target),
+            Err(error) => return protocol(format!("{primary}; {error}")),
+        };
+        let recovery = async {
+            let command = LiveCommand::CancelOperation(CancelOperationCommand {
+                envelope: envelope(observation, request_id)?,
+                operation_id: target.clone(),
+            });
+            self.live_command_inner(observation, command, Some(PAUSE_RECOVERY_TIMEOUT))
+                .await
+        }
+        .await;
+        match recovery {
+            Ok(LiveCommandResult::CancelOperation(CancelOperationOutcome::Completed {
+                completed,
+            })) if &completed.operation == operation
+                && completed.state == VmLifecycleState::Running =>
+            {
+                pause_rolled_back(&primary)
+            }
+            Ok(LiveCommandResult::CancelOperation(CancelOperationOutcome::Failed { failed }))
+                if &failed.operation == operation && failed.state == VmLifecycleState::Error =>
+            {
+                pause_fenced(&primary, Some(&failed.cause))
+            }
+            Ok(LiveCommandResult::CancelOperation(CancelOperationOutcome::Failed { failed }))
+                if &failed.operation == operation && failed.state.is_stopping_or_terminal() =>
+            {
+                protocol(format!("{primary}; monitor reports {}", failed.state))
+            }
+            result => {
+                // A concurrent cancel or lost response may have settled the
+                // exact fence even when this request did not return its result.
+                if let Ok(current) = self.observe_live().await {
+                    let state = require_same_observation(observation, &current)
+                        .and_then(|()| current.state());
+                    if let Ok(state @ (VmLifecycleState::Running | VmLifecycleState::Error)) = state
+                    {
+                        return pause_failure_state(&primary, state, &current);
+                    }
+                }
+                let error =
+                    result.map_or_else(std::convert::identity, |result| result_error(&result));
+                protocol(format!(
+                    "{primary}; recovery {request_id} not verified: {error}; stop the machine with silo stop"
+                ))
+            }
+        }
+    }
+
     async fn pending_command(
         &self,
         observation: &MachineLiveObservation,
@@ -680,6 +794,60 @@ impl Machine {
         )
         .await?;
         projection(&self.observe_live().await?)
+    }
+}
+
+fn pause_recovery_active(activity: Option<&LiveActivity>, target: &LiveId) -> bool {
+    activity.is_some_and(|activity| {
+        &activity.operation_id == target
+            && (activity.command == LiveCommandKind::CancelOperation
+                || (activity.command == LiveCommandKind::Pause
+                    && activity.stage == LiveStage::PauseFailed))
+    })
+}
+
+fn pause_recovery_request(operation: Uuid) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"silo/pause-recovery");
+    hash.update(operation.as_bytes());
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hash.finalize()[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
+fn pause_rolled_back(primary: &str) -> LibVmError {
+    protocol(format!(
+        "{primary}; recovered state running (pause rolled back)"
+    ))
+}
+
+fn pause_fenced(primary: &str, cause: Option<&LiveFailure>) -> LibVmError {
+    if let Some(cause) = cause {
+        protocol(format!(
+            "{primary}; fenced state error: {cause}; stop the machine with silo stop"
+        ))
+    } else {
+        protocol(format!(
+            "{primary}; fenced state error; stop the machine with silo stop"
+        ))
+    }
+}
+
+fn pause_failure_state(
+    primary: &str,
+    state: VmLifecycleState,
+    observation: &MachineLiveObservation,
+) -> LibVmError {
+    match state {
+        VmLifecycleState::Running => pause_rolled_back(primary),
+        VmLifecycleState::Error => {
+            let cause = observation
+                .lifecycle()
+                .ok()
+                .and_then(|lifecycle| lifecycle.error);
+            pause_fenced(primary, cause.as_ref())
+        }
+        _ => protocol(format!("{primary}; monitor reports {state}")),
     }
 }
 
@@ -804,8 +972,9 @@ pub(crate) async fn save_result(
     Ok(())
 }
 
-/// Called under the existing machine lock. Reconnect never invents a Pause,
-/// resumes a user pause, or retries fenced Error / failed-Pausing work.
+/// Called under the existing machine lock. Reconnect never invents a Pause
+/// or Cancel or resumes a user pause. Only observations and exact retained
+/// cancellations may be replayed in a failed lifecycle.
 pub(crate) async fn reconcile(runtime: &Runtime, config: &MachineConfig) -> Result<(), LibVmError> {
     let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
     let current = projection(&fresh)?;
@@ -849,8 +1018,12 @@ pub(crate) async fn reconcile(runtime: &Runtime, config: &MachineConfig) -> Resu
             save_result(runtime, &store, config, &intent, &result).await?;
         }
         let latest = runtime.observe_live(&MachineRef::id(config.id)).await?;
+        require_same_observation(&fresh, &latest)?;
         if (fenced || fenced_failure(&latest)?)
-            && !matches!(retained.intent.command, LiveCommand::GetOperation(_))
+            && !matches!(
+                retained.intent.command,
+                LiveCommand::GetOperation(_) | LiveCommand::CancelOperation(_)
+            )
         {
             continue;
         }
@@ -1081,6 +1254,39 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("journal unavailable"), "{message}");
+    }
+
+    #[test]
+    fn pause_recovery_requires_exact_failed_pause_or_its_cancellation() {
+        use crate::machine::live_operations::pause_recovery_active;
+
+        let mut activity = LiveActivity {
+            operation_id: id(4),
+            request_id: id(4),
+            command: LiveCommandKind::Pause,
+            stage: LiveStage::NativePause,
+        };
+        assert!(!pause_recovery_active(Some(&activity), &id(4)));
+        activity.stage = LiveStage::PauseFailed;
+        assert!(pause_recovery_active(Some(&activity), &id(4)));
+        assert!(!pause_recovery_active(Some(&activity), &id(5)));
+        activity.command = LiveCommandKind::CancelOperation;
+        activity.stage = LiveStage::CancelNative;
+        activity.request_id = id(5);
+        assert!(pause_recovery_active(Some(&activity), &id(4)));
+        assert!(!pause_recovery_active(Some(&activity), &id(5)));
+    }
+
+    #[test]
+    fn pause_recovery_request_identity_is_stable_and_separate_from_pause() {
+        use crate::machine::live_operations::{pause_recovery_request, uuid};
+
+        let first = uuid(&id(4)).unwrap();
+        let second = uuid(&id(5)).unwrap();
+        let recovery = pause_recovery_request(first);
+        assert_ne!(recovery, first);
+        assert_eq!(recovery, pause_recovery_request(first));
+        assert_ne!(recovery, pause_recovery_request(second));
     }
 
     #[test]

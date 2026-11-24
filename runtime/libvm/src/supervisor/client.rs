@@ -91,6 +91,14 @@ impl VmmClient {
         &self,
         command: vm_spec::lifecycle::LiveCommand,
     ) -> Result<vm_spec::lifecycle::LiveCommandResult, VmmClientError> {
+        self.lifecycle_with_cancel_timeout(command, None).await
+    }
+
+    pub(crate) async fn lifecycle_with_cancel_timeout(
+        &self,
+        command: vm_spec::lifecycle::LiveCommand,
+        cancel_timeout: Option<Duration>,
+    ) -> Result<vm_spec::lifecycle::LiveCommandResult, VmmClientError> {
         use vm_spec::lifecycle::{LiveCommand as C, LiveCommandResult as R};
         if let C::Capture(capture) = &command {
             capture.validate_plan().map_err(VmmClientError::Protocol)?;
@@ -134,7 +142,7 @@ impl VmmClient {
                 client
                     .cancel_operation(timed_request(
                         protocol::v1::CancelOperationRequest::from(command),
-                        RPC_TIMEOUT,
+                        cancel_timeout.unwrap_or(RPC_TIMEOUT),
                     ))
                     .await
                     .map_err(|error| rpc_error("cancel-operation RPC failed", error))?
