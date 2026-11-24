@@ -183,9 +183,12 @@ def bound_port(status: bytes) -> int:
 
 
 def query(db: Path, sql: str) -> list[tuple[str, ...]]:
+    # Not `-readonly`: once the last connection has closed and removed the WAL
+    # files, a read-only open of a WAL database cannot recreate them and fails
+    # with "unable to open database file". query_only keeps this an observer.
     try:
         result = subprocess.run(
-            ["sqlite3", "-readonly", "-cmd", ".timeout 5000", "-separator", "\x1f", str(db), sql],
+            ["sqlite3", "-cmd", ".timeout 5000", "-cmd", "PRAGMA query_only=ON", "-separator", "\x1f", str(db), sql],
             capture_output=True, text=True, timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
