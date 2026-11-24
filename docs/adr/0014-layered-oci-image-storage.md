@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 
-Updated: 2026-11-18
+Updated: 2026-11-24
 
 ## Status
 
@@ -64,6 +64,12 @@ memory is a property. Snapshot push is withdrawn until it has mandatory
 encryption and a design for secrets held in memory. This revision also
 requires a fresh `SILO_HOME`.
 
+The 2026-11-24 revision specifies that overlay boot does not qualify the
+monitor. Linux and macOS launch it by its resolved path, exactly as for raw
+roots. The retained-monitor descriptor launch was a remnant of the withdrawn
+exact kernel/initramfs/monitor tuple and is removed. macOS cannot execute a
+descriptor.
+
 ## Implementation status (2026-11-09)
 
 Stages 1–4 are implemented on Linux/libkrun, with `linux-erofs-overlay-v1`
@@ -80,9 +86,8 @@ records passing live budgets on Btrfs and fresh ext4 with evidence under
 targets missed; the dated [acceptance-budget revision](#acceptance-budgets)
 records the revised targets, not a passing ingest qualification.
 
-Overlay boot admission now checks the Linux 6.6 kernel floor rather than
-an exact kernel/initramfs/monitor boot tuple. Kernel configuration remains
-a kernel-track build-time gate. The independent published-builder oracle
+Overlay boot admission checks the Linux 6.6 kernel floor. Kernel configuration
+remains a kernel-track build-time gate. The independent published-builder oracle
 exception is recorded under [Filesystem and Linux gates](#filesystem-and-linux-gates);
 it does not waive runtime, cross-host or performance gates.
 
@@ -168,9 +173,9 @@ one stored disk encoding**:
 
 - **Linux overlay roots (libkrun only):** deterministic per-layer payload packs
   and a merged metadata-only EROFS filesystem (`fsmeta`), with one private raw
-  ext4 upper per machine. libkrun presents the lower through a generated VMDK
-  flat-extent descriptor on Linux and macOS alike. No other backend presents
-  a layered root.
+  ext4 upper per machine. libkrun admits layered roots on Linux and Apple silicon
+  macOS and presents the lower through a generated VMDK flat-extent descriptor.
+  macOS runtime evidence is pending. No other backend presents a layered root.
 - **Snapshots with memory ([ADR 0021](0021-live-snapshots-and-forks.md)):** a memory capture of a running libkrun
   machine binds this storage model to captured RAM and device state. Its
   writable storage is represented by immutable raw captures sealed at the
@@ -185,10 +190,10 @@ one stored disk encoding**:
 
 The backend matrix is closed:
 
-| Backend | Linux overlay root (OCI) | Opaque raw root, Linux | Opaque raw root, macOS |
-| ------- | ------------------------ | ---------------------- | ---------------------- |
-| libkrun | Yes                      | Yes                    | No                     |
-| VZ      | No                       | Yes                    | Yes                    |
+| Backend | Overlay root (OCI), guest Linux                         | Opaque raw root, Linux | Opaque raw root, macOS |
+| ------- | ------------------------------------------------------- | ---------------------- | ---------------------- |
+| libkrun | Linux and macOS arm64 (macOS runtime evidence pending)   | Yes                    | Yes (arm64)            |
+| VZ      | No                                                      | Yes                    | Yes                    |
 
 Creating a machine from an OCI container image on a VZ runtime fails with a
 typed error. The supported route onto VZ is an explicit conversion of the OCI
@@ -292,8 +297,9 @@ root, and it does not share one object pool between homes.
 [ADR 0018](0018-silo-vmm-contract.md) fixes the boundary between libvm and `silo-vmm`: the monitor receives
 its data directory and `config.json` and never opens the database. This ADR
 keeps that boundary. libvm generates every launch input, including the VMDK
-descriptor and bootstrap record, before launching the monitor; `silo-vmm` and
-its libkrun worker attach what `config.json` names and resolve nothing else.
+descriptor and bootstrap record, then launches the monitor by its resolved
+path. `silo-vmm` and its libkrun worker attach what `config.json` names and
+resolve nothing else.
 Storage stop outcomes are reconciled from the monitor's exit record. [ADR 0009](0009-per-launch-guest-agent-initramfs-overlay.md)'s
 per-launch, non-accumulating initramfs construction remains in effect. [ADR 0012](0012-cross-platform-runtime-and-sdk-packaging.md)
 governs runtime packaging and boot-asset discovery; storage profiles add

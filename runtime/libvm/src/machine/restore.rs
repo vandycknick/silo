@@ -1342,7 +1342,6 @@ async fn launch_restored(
         startup_command: None,
         machine_log_dir: &logs,
         machine_lock: &lifetime,
-        qualification: None,
         storage_lease: lease.lock(),
         storage_lease_binding: protocol::shutdown::StorageLeaseBinding {
             operation_id: lease.operation_id().to_string(),

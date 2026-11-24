@@ -120,9 +120,10 @@ The tests cover:
   tests preserve a generated read-only VMDK rather than flattening it, and keep
   reading the inherited extent inode after its pathname is replaced. These are
   descriptor/journal unit tests, not proof of native guest restore execution.
-- Manager launch unit tests execute a retained ELF through `/proc/self/fd/N`
-  after child cleanup and check that its CLOEXEC executable FD is absent after
-  exec. These tests need no guest or hypervisor.
+- Manager launch unit tests check that overlay boots use the resolved monitor
+  path and that Linux restore executes the retained ELF through `/proc/self/fd/N`
+  after child cleanup, with the CLOEXEC executable FD absent after exec.
+  These tests need no guest or hypervisor.
 - The loaded-monitor replacement test creates executable copies in its child,
   then replaces the pathname and re-execs `/proc/self/exe`. This preserves the
   real ELF ownership check without letting other test threads' forks inherit

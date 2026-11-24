@@ -1264,9 +1264,9 @@ production positive control. Failed mounting or an unrelated parser error
 does not pass.
 
 The owned-stage replacement test uses private, byte-identical runtime copies
-with distinct monitor inodes. It removes the retained source inode at the
-actual launch boundary, requires the pre-exec identity recheck to refuse, then
-boots the successor inode normally. No fault-monitor build is required.
+with distinct monitor inodes. It replaces the monitor path while the launch
+copies pinned guest assets and verifies that the same start boots the successor
+without changing the pinned guest bytes. No fault-monitor build is required.
 
 The slow controlled historical native fixture uses the same real monitor/worker
 and guest verifier with `[a, empty, b, b]`: a valid flattener-produced ext4 prefix
@@ -1371,28 +1371,27 @@ mode/hardlink/ACL tests must not be reported as having exercised that branch.
 
 ### Whole private-stage replacement with owned boot files
 
-`test_overlay_owned_stage_replacement_rechecks_monitor` uses private complete
+`test_overlay_owned_stage_replacement_launches_monitor_by_path` uses private complete
 runtime clones, never Main's stage. A child-only Linux x86_64 syscall tracer holds
 the first write to the private `.launch-<uuid>.tmp` file, before kernel or
 composite publication. Pinned launches publish the kernel before the descriptor;
 the gate requires an empty temporary and absent final kernel/initramfs files.
-It checks that pinned kernel/base pool objects and
-the monitor are held as read-only CLOEXEC descriptors with independent inode and
-content evidence, then atomically swaps the stage and unlinks the retired tree.
+It checks that pinned kernel/base pool objects are held as read-only CLOEXEC
+descriptors with independent inode and content evidence, and that the monitor
+executable is not held. It replaces the private stage and unlinks the retired tree.
 
-The pre-exec metadata recheck must refuse the changed monitor before spawning it,
-without hashing or reopening the replaced executable path. Pinned guest assets
-remain owned independently of the stage. A fresh start must then boot with the
-successor monitor; changing a Silo-managed monitor does not require an artifact
-admission record. The controller retains EXITKILL and bounded descendant cleanup.
+The same start must boot the successor monitor by path, with the worker running
+the same executable. The published kernel and the composite's base bytes must
+still match the held sources. The VM stops before the tracer exits; the
+controller retains EXITKILL and bounded descendant cleanup.
 
 ```sh
-make smoke SMOKE_ARGS="-k overlay_owned_stage_replacement_rechecks_monitor --keep"
+make smoke SMOKE_ARGS="-k overlay_owned_stage_replacement_launches_monitor_by_path --keep"
 ```
 
 Retained `overlay-stage-*` and `boundary-*` evidence includes the held syscall,
-source and destination descriptor identities, retained asset hashes, CLI refusal
-and actual successor monitor/worker identities after the fresh successful boot.
+source and destination descriptor identities, retained asset hashes, and the
+actual successor monitor/worker identities from the traced start.
 
 Machine/run identity assertions compare parsed UUID values, not compact versus
 hyphenated serialization spellings. Malformed or different identities still

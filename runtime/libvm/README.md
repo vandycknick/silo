@@ -96,6 +96,22 @@ a snapshot artifact is refused with `LibVmError::SnapshotIsNotAnImage` and a
 `silo restore` hint; a Silo image artifact becomes a stored image. Stored image
 roots are copied from their authenticated stream capability.
 
+Registry traffic is governed by one `ImageRegistryConfig`, set with
+`RuntimeConfig::with_image_registries` or `RuntimeBuilder::image_registries`. It
+pairs the `RegistryPolicy` (default action, `search_registries`, prefix rules)
+with a `RegistryTrust`: extra PEM roots per `RegistryHost`, each loaded and
+validated by `RegistryCa::load` from an already resolved path.
+`ImageRegistryConfig::from(policy)` keeps system trust only. Every registry
+request (manifest and config resolution, layer downloads, artifact inspection,
+acquisition and publication) first passes the prefix policy and then uses the
+HTTP clients selected by the registry named in the reference. A configured CA
+is additive to system roots and follows that operation through redirects and
+token services; it is never applied to references naming another registry.
+`host` and `host:443` are one `RegistryHost`, `index.docker.io` folds to
+`docker.io`, and duplicate hosts are rejected. Clones of one
+`ImageRegistryConfig` share their clients, and its `Debug` output and equality
+cover the CA path and bundle SHA-256, never certificate bytes.
+
 `Runtime::snapshot(&MachineRef, SnapshotOptions, progress)` is the one capture
 entry point. Without `memory` the machine must be stopped
 (`SnapshotRequiresStoppedMachine` otherwise) and its disks are captured; with
@@ -402,7 +418,8 @@ optional local `name`). A snapshot artifact is refused with
 `ArtifactIsSnapshot` after config inspection and before any payload fetch;
 `Runtime::restore(RestoreSource::Registry(..))` acquires snapshot artifacts and
 refuses image artifacts with `ArtifactIsImage`. Short references expand via
-`search_registries`. A VM artifact is recognized before OCI container platform
+`search_registries`, and each expansion uses the TLS trust configured for its
+own registry. A VM artifact is recognized before OCI container platform
 selection; `Images::pull` and creation route it to acquisition.
 
 `publish_artifact(ArtifactPublishRequest { image, destination, encoding })`
@@ -601,19 +618,16 @@ retains closure ownership through startup or completed failure cleanup. The
 running machine's semantic root remains the durable retention root. Worker-FD
 lease transfer and certified storage shutdown remain separate lifecycle gates.
 
-Overlay launch requires Linux 6.6 or newer on krun. Unsupported VZ/mock backends
-and older kernels fail before materialization or launch effects. There is no
-artifact-specific admission list. `owned_boot_assets` retains read-only
-CLOEXEC descriptors, stages the mode-0400 `kernel-qualified` copy and builds the
-composite initramfs from held sources with bounded copies and metadata checks.
-No boot asset is hashed on start or inspect. On Linux launch executes the held
-monitor through `/proc/self/fd/N` after a pre-exec metadata recheck that fails
-closed on mutation or unlink/replacement; it never falls back to a replacement
-pathname. The worker reexecutes `/proc/self/exe`. Managed staging publishes a
-complete sibling tree atomically, not by rewriting a live ELF. These guarantees
-do not protect against hostile same-UID in-place writers. Root bootstrap remains
-independent of agent injection; root markers and fixed serials cannot be
-overridden, and there is no automatic raw fallback.
+Overlay launch uses krun on Linux and Apple silicon macOS hosts and requires a
+guest kernel of Linux 6.6 or newer. Unsupported VZ/mock backends and older
+kernels fail before materialization or launch effects. There is no
+artifact-specific admission list. `owned_boot_assets` retains read-only CLOEXEC
+descriptors for the guest kernel and base initramfs, stages the mode-0400
+`kernel-qualified` copy, and builds the composite initramfs from held sources
+with bounded copies and metadata checks. No boot asset is hashed on start or
+inspect. Overlay and raw boots start the monitor by its resolved path. Root
+bootstrap remains independent of agent injection; root markers and fixed
+serials cannot be overridden, and there is no automatic raw fallback.
 
 Stopped `MachineUpdate::root_disk_size(bytes)` publishes a replacement private
 upper generation, preserving its old byte prefix, UUID and journal state.
@@ -971,9 +985,12 @@ owned through qualification and checked kernel/composite generation; launch
 never reopens a verified pool pathname to read its kernel, base initramfs or
 agent. Each launch regenerates the composite bootstrap with the child's fresh
 machine/run configuration, never copies the source composite. Capture retains
-its independently admitted same-host Linux krun direct-boot profiles. General
-raw/cloud boot support does not qualify EFI, macOS, translation or partitioned
-roots for stopped/live capture.
+its independently admitted same-architecture krun direct-boot profiles. Stopped
+capture only clones stored files, so it is admitted on Linux hosts and on
+Apple silicon macOS; live capture needs the native memory path and is admitted
+on Linux hosts only. General raw/cloud boot support does not qualify EFI or
+macOS guest boot profiles or translation for capture, and a partitioned root is
+admitted for stopped capture only.
 
 Catalog writes use SQLite WAL with synchronous `NORMAL`, `fullfsync` and
 `checkpoint_fullfsync` enabled. Power-loss durability boundaries explicitly
@@ -1585,9 +1602,8 @@ Machine-then-Home fallback by default.
 and `agent` once, validates them as absolute paths, and retains that immutable
 set for the runtime lifetime. `SILO_VMM_PATH`, or
 `RuntimeConfig::with_supervisor_path` / `RuntimeBuilder::supervisor_path`,
-replaces only the `silo-vmm` path. Opaque raw starts launch that absolute path;
-qualified Linux overlay starts use the retained native executable FD described
-above. For the krun backend,
+replaces only the `silo-vmm` path. Raw and overlay boots start the monitor at
+that absolute path. For the krun backend,
 silo-vmm re-executes itself with `argv[0]` set to `krun` to run libkrun in a
 private worker, so there is no separate krun component to resolve (see
 [silo-vmm architecture](../../docs/architecture/silo-vmm.md)).
@@ -1608,7 +1624,7 @@ the agent into its initial root. Managed overlay boot uses the kernel's initial
 tmpfs default budget; embedding a large host debug ELF can exhaust it before
 `silo/rootfs.json` is extracted. Removing non-runtime debug sections avoids that
 footprint without weakening fail-closed bootstrap handling. The base initramfs,
-kernel and native monitor bytes are not changed by this agent packaging step.
+kernel and monitor bytes are not changed by this agent packaging step.
 
 ## Hybrid Vsock Paths
 

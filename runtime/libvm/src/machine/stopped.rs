@@ -395,7 +395,6 @@ async fn preflight_boot(
                 default_kernel: components.kernel(),
                 default_initramfs: components.initramfs(),
                 default_agent: components.agent(),
-                native_executable: components.supervisor(),
                 backend: selection.backend,
             },
             CaptureLane::Stopped,

@@ -877,7 +877,7 @@ def test_overlay_native_range_and_real_fallback(silo: Silo, config: SmokeConfig,
 
 
 @pytest.mark.linux_only
-def test_overlay_owned_stage_replacement_rechecks_monitor(silo: Silo, overlay_image: str) -> None:
+def test_overlay_owned_stage_replacement_launches_monitor_by_path(silo: Silo, overlay_image: str) -> None:
     from silo_smoke.overlay_stage import replacement
     replacement(silo, overlay_image)
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Changed: machines created from OCI images start the monitor by its resolved
+  path on Linux and on Apple silicon Macs, the same way raw-disk machines do.
+  On macOS with the krun backend `silo create` and `silo run` from an OCI
+  image no longer fail with "managed-overlay descriptor launch is unsupported
+  on host macos". Restoring a snapshot with memory on Linux still runs the
+  exact monitor binary that was inspected.
 - Added: per-registry extra TLS roots. `images.registries."<host[:port]>".ca`
   in `config.yaml` names a PEM file or bundle (relative paths resolve against
   the config file's directory) that is trusted, in addition to system roots,

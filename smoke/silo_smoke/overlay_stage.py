@@ -1,4 +1,4 @@
-"""Real CLI/KVM private-stage replacement while owned source FDs are held."""
+"""Real CLI/KVM stage replacement while held guest boot assets are copied."""
 from __future__ import annotations
 
 import json
@@ -31,12 +31,17 @@ def replacement(silo: Silo, reference: str) -> None:
     retired = root / 'unlinked-stage'
     overlay.copy_runtime(silo.ws.config.runtime_dir, private)
     overlay.copy_runtime(private, successor)
-    files = {'kernel': private / 'assets/kernel-default', 'base': private / 'assets/initramfs', 'native': private / 'bin/silo-vmm'}
+    monitor_path = private / 'bin/silo-vmm'
+    original = monitor_path.stat()
+    original_identity = (original.st_dev, original.st_ino)
     successor_monitor = successor / 'bin/silo-vmm'
-    successor_identity = successor_monitor.stat()
-    assert (successor_identity.st_dev, successor_identity.st_ino) != (files['native'].stat().st_dev, files['native'].stat().st_ino)
-    for kind in files:
-        assert overlay.digest(successor / files[kind].relative_to(private)) == overlay.digest(files[kind])
+    installed = successor_monitor.stat()
+    successor_identity = (installed.st_dev, installed.st_ino)
+    assert successor_identity != original_identity
+    monitor_digest = overlay.digest(monitor_path)
+    assert overlay.digest(successor_monitor) == monitor_digest
+    for path in ('assets/kernel-default', 'assets/initramfs'):
+        assert overlay.digest(successor / path) == overlay.digest(private / path)
     environment = silo.ws.env(SILO_RUNTIME_DIR=str(private))
     name = 'overlay-stage-replacement'
     silo.run('create', reference, '--name', name, '--disk-size', '128mib', '--network', 'none', '--vsock', env=environment)
@@ -45,11 +50,13 @@ def replacement(silo: Silo, reference: str) -> None:
     assert not (directory / 'kernel-qualified').exists(), 'fresh create must not have published a launch kernel'
     binding = stopped.record(silo, name)['boot']['binding']
     pool = silo.ws.silo_home / 'images/objects/sha256'
-    files['kernel'] = pool / binding['kernel'].removeprefix('sha256:')
-    files['base'] = pool / binding['baseInitramfs'].removeprefix('sha256:')
+    files = {
+        'kernel': pool / binding['kernel'].removeprefix('sha256:'),
+        'base': pool / binding['baseInitramfs'].removeprefix('sha256:'),
+    }
     identities = {kind: {'device': path.stat().st_dev, 'inode': path.stat().st_ino, 'length': path.stat().st_size, 'sha256': overlay.digest(path)} for kind, path in files.items()}
     command = ['/usr/bin/env', f'SILO_RUNTIME_DIR={private}', str(silo.ws.config.silo), 'start', name]
-    with stopped.syscall_boundary(silo, command, files['native'], 'boot-kernel-copy', expect_failure=True) as receipt:
+    with stopped.syscall_boundary(silo, command, files['kernel'], 'boot-kernel-copy') as receipt:
         pid = receipt['pid']
         observed = descriptors(pid)
         silo.ws.record('overlay-stage-interception', json.dumps({'receipt': receipt, 'descriptors': observed, 'sourceIdentities': identities}) + '\n')
@@ -60,6 +67,7 @@ def replacement(silo: Silo, reference: str) -> None:
         assert not (directory / 'initramfs').exists()
         assert not list(directory.glob('.initramfs.*.tmp'))
         assert procs.vmm_pid(silo.ws, name) is None
+        assert all((fd['device'], fd['inode']) != original_identity for fd in observed), 'boot held a monitor FD'
         captured_fds = {}
         for kind, identity in identities.items():
             matches = [fd for fd in observed if (fd['device'], fd['inode']) == (identity['device'], identity['inode'])]
@@ -76,29 +84,24 @@ def replacement(silo: Silo, reference: str) -> None:
             path = Path('/proc') / str(pid) / 'fd' / str(matches[0]['fd'])
             metadata = path.stat()
             assert (metadata.st_dev, metadata.st_ino) == (identities[kind]['device'], identities[kind]['inode'])
-            assert metadata.st_nlink == (0 if kind == 'native' else 1)
+            assert metadata.st_nlink == 1
             assert overlay.digest(path) == identities[kind]['sha256']
             retained[kind] = {'fd': matches[0]['fd'], 'target': os.readlink(path), 'links': metadata.st_nlink, 'sha256': identities[kind]['sha256']}
         silo.ws.record('overlay-stage-retained-owned-assets', json.dumps(retained) + '\n')
         (silo.ws.evidence / 'boundary-release').touch()
-    output = (silo.ws.evidence / 'boundary-command.log').read_text()
-    assert 'boot asset changed during inspection or launch' in output
-    assert procs.vmm_pid(silo.ws, name) is None
-    assert overlay.digest(directory / 'kernel-qualified') == identities['kernel']['sha256']
-    assert overlay.digest(directory / 'initramfs', identities['base']['length']) == identities['base']['sha256']
-    silo.ws.record('overlay-stage-replacement-refusal', output)
-    # A fresh launch owns the successor inode, even with byte-identical assets.
-    silo.run('start', name, env=environment)
-    silo.wait_ready(name)
-    actual = {}
-    monitor = procs.vmm_pid(silo.ws, name)
-    assert monitor is not None
-    for kind, pid in [('monitor', monitor), ('worker', overlay.worker_pid(silo, name))]:
-        executable = Path('/proc') / str(pid) / 'exe'
-        metadata = executable.stat()
-        assert (metadata.st_dev, metadata.st_ino) == (successor_identity.st_dev, successor_identity.st_ino)
-        assert overlay.digest(executable) == identities['native']['sha256']
-        actual[kind] = {'pid': pid, 'inode': metadata.st_ino, 'sha256': identities['native']['sha256'], 'target': os.readlink(executable)}
-    overlay.evidence(silo, name)
-    silo.ws.record('overlay-stage-successor-executables', json.dumps(actual) + '\n')
-    silo.stop(name)
+        # The tracer waits for descendants, so inspect and stop the live VM before leaving.
+        silo.wait_ready(name)
+        assert overlay.digest(directory / 'kernel-qualified') == identities['kernel']['sha256']
+        assert overlay.digest(directory / 'initramfs', identities['base']['length']) == identities['base']['sha256']
+        actual = {}
+        monitor = procs.vmm_pid(silo.ws, name)
+        assert monitor is not None
+        for kind, child_pid in [('monitor', monitor), ('worker', overlay.worker_pid(silo, name))]:
+            executable = Path('/proc') / str(child_pid) / 'exe'
+            metadata = executable.stat()
+            assert (metadata.st_dev, metadata.st_ino) == successor_identity
+            assert overlay.digest(executable) == monitor_digest
+            actual[kind] = {'pid': child_pid, 'inode': metadata.st_ino, 'sha256': monitor_digest, 'target': os.readlink(executable)}
+        overlay.evidence(silo, name)
+        silo.ws.record('overlay-stage-successor-executables', json.dumps(actual) + '\n')
+        silo.stop(name)

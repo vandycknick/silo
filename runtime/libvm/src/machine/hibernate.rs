@@ -613,7 +613,7 @@ impl Machine {
                 pidfile: &pidfile, exit_status: &exit_status, config: &spec_path, socket: &socket, serial_log: &serial, trace_log: &trace,
                 network: &network, run_id: &run_id, exit_command: None, agent_enabled: true,
                 rosetta_intent: crate::supervisor::start_request::VmmRosettaIntent::Disabled {}, asset_directory: runtime.asset_directory().to_path_buf(), startup_command: None,
-                machine_log_dir: &logs, machine_lock: &lifetime, qualification: None, storage_lease: lease_ref.lock(),
+                machine_log_dir: &logs, machine_lock: &lifetime, storage_lease: lease_ref.lock(),
                 storage_lease_binding: protocol::shutdown::StorageLeaseBinding { operation_id: lease_ref.operation_id().to_string(), file_device, file_inode },
                 storage_shutdown: &shutdown, disk_tracking_seeds: restore.request.disk_tracking_seeds.clone(), restore: Some(&restore),
             };

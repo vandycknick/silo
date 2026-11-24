@@ -2,7 +2,7 @@
 
 Date: 2026-09-24
 
-Updated: 2026-11-01
+Updated: 2026-11-24
 
 ## Status
 
@@ -19,6 +19,11 @@ a **hard breaking release** requiring reinstall and a full state wipe.
 Its monitor/launch callers cut over together without old-contract decoders,
 compatibility bridges or state-upgrade scripts. The earlier naming decisions
 below describe the existing surface, not a requirement to preserve old state.
+
+The 2026-11-24 revision requires boot launches to start the monitor by path on
+Linux and Darwin. Linux executes a retained monitor descriptor only for
+restore, to run the executable that passed native inspection. Darwin cannot
+exec `/dev/fd/N`.
 
 Supersedes the "`vmm` Process Model" and "Startup and Shutdown Semantics"
 sections of [ADR 0004](0004-daemonless-architecture.md). The daemonless
@@ -158,9 +163,12 @@ producer's duplicate/exec chain.
 
 All parent descriptors remain CLOEXEC, including during concurrent launches;
 only the intended child's bounded allowlist changes in pre-exec. Adoption
-restores CLOEXEC before starting threads or unrelated children. A retained
-qualified ELF descriptor stays open and CLOEXEC until exec resolves it, then
-is absent from the loaded monitor. The Linux worker re-execs `/proc/self/exe`.
+restores CLOEXEC before starting threads or unrelated children. Boot launches
+start the monitor by its resolved path on all hosts. Only restore on Linux
+executes the retained, inspected monitor through `/proc/self/fd/N`; the
+descriptor stays CLOEXEC and is absent from the loaded monitor. Darwin cannot
+exec `/dev/fd/N` and does not admit restore. The Linux worker re-execs
+`/proc/self/exe`.
 Manager lease ownership includes complete startup or actual failure cleanup.
 Monitor/worker lease ownership includes attachment terminality; the monitor
 also retains its lease through checked finalization and durable exit publication.
@@ -282,7 +290,7 @@ Writable shares, unknown namespaces, unqualified raw-device/unmounted Data
 writers, external concurrent writers, image-owned PID1 without admitted
 shutdown authority and unqualified framework-owned attachment closure remain
 noncertifying; these VM shapes are not removed. Linux Raw proof does not
-qualify Darwin full-sync, `/dev/fd` behavior or VZ closure by analogy.
+qualify Darwin full-sync or VZ closure by analogy.
 
 The manager alone reconciles lifecycle and storage outcome atomically for
 the expected run. A valid current forced/error outcome remains forced even

@@ -80,7 +80,6 @@ pub(crate) struct PackagedBoot {
     pub(crate) kernel: PathBuf,
     pub(crate) initramfs: PathBuf,
     pub(crate) agent: PathBuf,
-    pub(crate) native_executable: PathBuf,
     pub(crate) backend: vm_spec::live::LiveBackend,
 }
 
@@ -107,7 +106,6 @@ impl ConversionContext {
             default_kernel: &self.boot.kernel,
             default_initramfs: &self.boot.initramfs,
             default_agent: &self.boot.agent,
-            native_executable: &self.boot.native_executable,
             backend: self.boot.backend,
         }
     }
@@ -713,7 +711,6 @@ mod tests {
                         kernel: self.kernel.clone(),
                         initramfs: self.initramfs.clone(),
                         agent: self.agent.clone(),
-                        native_executable: self.kernel.clone(),
                         backend: vm_spec::live::LiveBackend::Krun,
                     },
                 }

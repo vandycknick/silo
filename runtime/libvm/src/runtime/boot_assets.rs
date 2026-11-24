@@ -286,7 +286,6 @@ pub(crate) struct BootSelectionContext<'a> {
     pub(crate) default_kernel: &'a Path,
     pub(crate) default_initramfs: &'a Path,
     pub(crate) default_agent: &'a Path,
-    pub(crate) native_executable: &'a Path,
     pub(crate) backend: LiveBackend,
 }
 
@@ -297,7 +296,6 @@ pub(crate) struct CapturedBootContext<'a> {
     pub(crate) default_kernel: &'a Path,
     pub(crate) default_initramfs: &'a Path,
     pub(crate) default_agent: &'a Path,
-    pub(crate) native_executable: &'a Path,
     pub(crate) backend: LiveBackend,
 }
 
@@ -308,7 +306,6 @@ impl CapturedBootContext<'_> {
             default_kernel: self.default_kernel,
             default_initramfs: self.default_initramfs,
             default_agent: self.default_agent,
-            native_executable: self.native_executable,
             backend: self.backend,
         }
     }
@@ -408,13 +405,7 @@ pub(crate) fn packaged_binding(
     let agent = agent
         .then(|| qualify_capture_source(context.default_agent))
         .transpose()?;
-    let assets = qualify_captured_assets(
-        boot,
-        kernel,
-        initramfs,
-        context.backend,
-        context.native_executable,
-    )?;
+    let assets = qualify_captured_assets(boot, kernel, initramfs, context.backend)?;
     Ok(BootBinding::Pinned {
         kernel: ObjectDigest::from_sha256(assets.kernel().digest()?),
         base_initramfs: ObjectDigest::from_sha256(assets.initramfs().digest()?),
@@ -622,7 +613,6 @@ fn qualify_captured_assets(
     kernel: InspectedKernel,
     initramfs: OwnedBootAsset,
     backend: LiveBackend,
-    native_executable: &Path,
 ) -> Result<CapturedBootAssets, LibVmError> {
     let BootProfile::LinuxDirect {
         kernel_architecture,
@@ -634,12 +624,7 @@ fn qualify_captured_assets(
     };
     if *root_selector == crate::RootSelector::ManagedOverlay {
         return Ok(CapturedBootAssets::Overlay(
-            crate::owned_boot_assets::open_overlay_assets(
-                kernel,
-                initramfs,
-                backend,
-                native_executable,
-            )?,
+            crate::owned_boot_assets::open_overlay_assets(kernel, initramfs, backend)?,
         ));
     }
     let kernel = kernel.admit_direct(*kernel_architecture)?;
@@ -678,13 +663,12 @@ fn resolve_kernel_object(
     Ok(kernel)
 }
 
-/// Pinned launches never consult mutable installed paths, even when an exact
-/// object is missing or incompatible. The composite is still generated anew.
+/// Pinned guest assets never fall back to installed assets, even when an
+/// exact object is missing or incompatible. The composite is generated anew.
 pub(crate) fn resolve_pinned_boot(
     storage: &MachineStorageRecord,
     pool: &StoragePool,
     backend: LiveBackend,
-    native_executable: &Path,
 ) -> Result<Option<ResolvedCapturedBoot>, LibVmError> {
     if !matches!(
         &storage.boot,
@@ -696,7 +680,7 @@ pub(crate) fn resolve_pinned_boot(
         return Ok(None);
     }
     validate_direct_boot(storage, backend)?;
-    resolve_pinned_profile(&storage.boot, pool, backend, native_executable).map(Some)
+    resolve_pinned_profile(&storage.boot, pool, backend).map(Some)
 }
 
 /// Authenticate and admit one complete pinned tuple from owned objects only.
@@ -704,7 +688,6 @@ fn resolve_pinned_profile(
     boot: &BootProfile,
     pool: &StoragePool,
     backend: LiveBackend,
-    native_executable: &Path,
 ) -> Result<ResolvedCapturedBoot, LibVmError> {
     let BootProfile::LinuxDirect { binding, .. } = boot else {
         return Err(invalid_capture("pinned launch requires direct boot"));
@@ -721,7 +704,7 @@ fn resolve_pinned_profile(
     resolve_boot_object(pool, &binding.digest()?)?;
     let kernel = resolve_kernel_object(pool, kernel)?;
     let initramfs = resolve_boot_object(pool, base_initramfs)?;
-    let assets = qualify_captured_assets(boot, kernel, initramfs, backend, native_executable)?;
+    let assets = qualify_captured_assets(boot, kernel, initramfs, backend)?;
     Ok(ResolvedCapturedBoot {
         assets,
         agent: agent
@@ -739,12 +722,7 @@ fn resolve_capture_selection(
     lane: CaptureLane,
 ) -> Result<ResolvedCapturedBoot, LibVmError> {
     validate_captured_boot_lane(storage, context.backend, lane)?;
-    if let Some(resolved) = resolve_pinned_boot(
-        storage,
-        context.pool,
-        context.backend,
-        context.native_executable,
-    )? {
+    if let Some(resolved) = resolve_pinned_boot(storage, context.pool, context.backend)? {
         if resolved.agent.is_some() != agent.enabled() {
             return Err(invalid_capture(
                 "pinned boot agent and configured agent mode disagree",
@@ -768,13 +746,7 @@ fn resolve_capture_selection(
         .map(qualify_capture_source)
         .transpose()?;
     Ok(ResolvedCapturedBoot {
-        assets: qualify_captured_assets(
-            &storage.boot,
-            kernel,
-            initramfs,
-            context.backend,
-            context.native_executable,
-        )?,
+        assets: qualify_captured_assets(&storage.boot, kernel, initramfs, context.backend)?,
         agent,
     })
 }
@@ -963,12 +935,7 @@ async fn pin_boot_profile(
                 *target = binding.clone();
             }
             validate_direct_boot_profile(&candidate)?;
-            resolve_pinned_profile(
-                &candidate,
-                context.pool,
-                context.backend,
-                context.native_executable,
-            )?;
+            resolve_pinned_profile(&candidate, context.pool, context.backend)?;
             pin_binding_dependencies(&binding, &context).await?;
             binding
         }
@@ -1001,14 +968,8 @@ async fn pin_boot_profile(
             }
             let agent = agent.map(qualify_capture_source).transpose()?;
             // Admission precedes ingestion: a rejected tuple publishes nothing.
-            let (kernel, initramfs) = qualify_captured_assets(
-                &boot,
-                kernel,
-                initramfs,
-                context.backend,
-                context.native_executable,
-            )?
-            .into_sources();
+            let (kernel, initramfs) =
+                qualify_captured_assets(&boot, kernel, initramfs, context.backend)?.into_sources();
             BootBinding::Pinned {
                 kernel: ingest_selected_object(kernel, &context).await?,
                 base_initramfs: ingest_selected_object(initramfs, &context).await?,
@@ -1038,20 +999,10 @@ async fn pin_boot_profile(
         Some(storage) => {
             let mut candidate = storage.clone();
             candidate.boot = boot.clone();
-            resolve_pinned_boot(
-                &candidate,
-                context.pool,
-                context.backend,
-                context.native_executable,
-            )?;
+            resolve_pinned_boot(&candidate, context.pool, context.backend)?;
         }
         None => {
-            resolve_pinned_profile(
-                &boot,
-                context.pool,
-                context.backend,
-                context.native_executable,
-            )?;
+            resolve_pinned_profile(&boot, context.pool, context.backend)?;
         }
     }
     Ok(boot)
@@ -1171,12 +1122,7 @@ pub(crate) async fn capture_boot(
     // before publication when an installer could have replaced the inputs.
     let mut captured = storage.clone();
     captured.boot = boot.clone();
-    resolve_pinned_boot(
-        &captured,
-        context.pool,
-        context.backend,
-        context.native_executable,
-    )?;
+    resolve_pinned_boot(&captured, context.pool, context.backend)?;
     Ok(boot)
 }
 
@@ -1450,7 +1396,6 @@ mod tests {
                 default_kernel: &self.kernel,
                 default_initramfs: &self.initramfs,
                 default_agent: &self.agent,
-                native_executable: &self.kernel,
                 backend: vm_spec::live::LiveBackend::Krun,
             }
         }
@@ -1581,14 +1526,10 @@ mod tests {
         fixture.store.prune_images().await.unwrap();
         let mut captured = fixture.storage.clone();
         captured.boot = boot.clone();
-        let resolved = resolve_pinned_boot(
-            &captured,
-            &fixture.pool,
-            vm_spec::live::LiveBackend::Krun,
-            &fixture.kernel,
-        )
-        .unwrap()
-        .unwrap();
+        let resolved =
+            resolve_pinned_boot(&captured, &fixture.pool, vm_spec::live::LiveBackend::Krun)
+                .unwrap()
+                .unwrap();
         assert_eq!(retained_bytes(resolved.assets.kernel()), custom_kernel());
         assert_eq!(
             retained_bytes(resolved.assets.initramfs()),
@@ -1685,24 +1626,18 @@ mod tests {
         let base_path = fixture.pool.object_path(base_initramfs);
         fixture.store.prune_images().await.unwrap();
         assert_eq!(fixture.pool.scan_objects().unwrap().count(), 3);
-        assert!(resolve_pinned_boot(
-            &storage,
-            &fixture.pool,
-            vm_spec::live::LiveBackend::Krun,
-            &fixture.kernel,
-        )
-        .unwrap()
-        .unwrap()
-        .agent
-        .is_none());
+        assert!(
+            resolve_pinned_boot(&storage, &fixture.pool, vm_spec::live::LiveBackend::Krun,)
+                .unwrap()
+                .unwrap()
+                .agent
+                .is_none()
+        );
         std::fs::remove_file(&base_path).unwrap();
-        assert!(resolve_pinned_boot(
-            &storage,
-            &fixture.pool,
-            vm_spec::live::LiveBackend::Krun,
-            &fixture.kernel,
-        )
-        .is_err());
+        assert!(
+            resolve_pinned_boot(&storage, &fixture.pool, vm_spec::live::LiveBackend::Krun,)
+                .is_err()
+        );
         assert!(
             fixture.initramfs.is_file(),
             "current default must not rescue a missing pin"
@@ -1890,14 +1825,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let resolved = resolve_pinned_boot(
-            &storage,
-            &fixture.pool,
-            vm_spec::live::LiveBackend::Krun,
-            &fixture.kernel,
-        )
-        .unwrap()
-        .unwrap();
+        let resolved =
+            resolve_pinned_boot(&storage, &fixture.pool, vm_spec::live::LiveBackend::Krun)
+                .unwrap()
+                .unwrap();
         let first = fixture.paths.home().join("child-first.initramfs");
         let second = fixture.paths.home().join("child-second.initramfs");
         for (destination, identity) in [
@@ -1950,13 +1881,10 @@ mod tests {
         std::fs::write(&kernel_path, b"corrupt retained kernel").unwrap();
         std::fs::set_permissions(&kernel_path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(resolved.assets.kernel().copy_into(&mut Vec::new()).is_err());
-        assert!(resolve_pinned_boot(
-            &storage,
-            &fixture.pool,
-            vm_spec::live::LiveBackend::Krun,
-            &fixture.kernel,
-        )
-        .is_err());
+        assert!(
+            resolve_pinned_boot(&storage, &fixture.pool, vm_spec::live::LiveBackend::Krun,)
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1975,14 +1903,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let resolved = resolve_pinned_boot(
-            &storage,
-            &fixture.pool,
-            vm_spec::live::LiveBackend::Krun,
-            &fixture.kernel,
-        )
-        .unwrap()
-        .unwrap();
+        let resolved =
+            resolve_pinned_boot(&storage, &fixture.pool, vm_spec::live::LiveBackend::Krun)
+                .unwrap()
+                .unwrap();
         let crate::BootProfile::LinuxDirect {
             binding:
                 crate::BootBinding::Pinned {
@@ -2031,13 +1955,8 @@ mod tests {
             .windows(b"replacement must never be consumed".len())
             .any(|part| part == b"replacement must never be consumed"));
         assert!(
-            resolve_pinned_boot(
-                &storage,
-                &fixture.pool,
-                vm_spec::live::LiveBackend::Krun,
-                &fixture.kernel,
-            )
-            .is_err(),
+            resolve_pinned_boot(&storage, &fixture.pool, vm_spec::live::LiveBackend::Krun,)
+                .is_err(),
             "a new resolution must reject the substituted objects"
         );
     }
@@ -2122,11 +2041,9 @@ mod tests {
                 vm_spec::live::LiveBackend::Krun,
                 vm_spec::live::LiveBackend::Vz,
             ] {
-                assert!(
-                    resolve_pinned_boot(&storage, &fixture.pool, backend, &fixture.kernel)
-                        .unwrap()
-                        .is_some()
-                );
+                assert!(resolve_pinned_boot(&storage, &fixture.pool, backend)
+                    .unwrap()
+                    .is_some());
             }
             assert!(validate_captured_boot_lane(
                 &storage,
@@ -2498,14 +2415,11 @@ mod tests {
         }
         assert_eq!(storage, pinned);
         assert_eq!(fixture.pool.scan_objects().unwrap().count(), before);
-        assert!(resolve_pinned_boot(
-            &storage,
-            &fixture.pool,
-            vm_spec::live::LiveBackend::Krun,
-            &fixture.kernel,
-        )
-        .unwrap()
-        .is_some());
+        assert!(
+            resolve_pinned_boot(&storage, &fixture.pool, vm_spec::live::LiveBackend::Krun,)
+                .unwrap()
+                .is_some()
+        );
 
         // A valid native complete file tuple is admitted.
         let valid = fixture.kernel.with_file_name("valid-kernel");
@@ -2591,14 +2505,9 @@ mod tests {
             *target = binding;
         }
         storage.validate_persistent().unwrap();
-        let error = resolve_pinned_boot(
-            &storage,
-            &fixture.pool,
-            vm_spec::live::LiveBackend::Krun,
-            &fixture.kernel,
-        )
-        .err()
-        .unwrap();
+        let error = resolve_pinned_boot(&storage, &fixture.pool, vm_spec::live::LiveBackend::Krun)
+            .err()
+            .unwrap();
         assert_eq!(
             rejection(error),
             crate::DirectKernelRejection::UnrecognizedFormat
@@ -2618,14 +2527,10 @@ mod tests {
         .await
         .unwrap();
         std::fs::remove_dir_all(fixture.kernel.parent().unwrap()).unwrap();
-        let resolved = resolve_pinned_boot(
-            &storage,
-            &fixture.pool,
-            vm_spec::live::LiveBackend::Krun,
-            &fixture.kernel,
-        )
-        .unwrap()
-        .unwrap();
+        let resolved =
+            resolve_pinned_boot(&storage, &fixture.pool, vm_spec::live::LiveBackend::Krun)
+                .unwrap()
+                .unwrap();
         assert_eq!(retained_bytes(resolved.assets.kernel()), custom_kernel());
         assert!(resolved.agent.is_some());
     }

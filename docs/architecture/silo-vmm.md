@@ -84,10 +84,11 @@ has a distinct descriptor and manifest binding. No configuration travels
 through argv or the environment. FD 8 is required even while config is withheld,
 and the worker retains its storage descriptors through actual process exit.
 
-The manager likewise changes only its child's inheritance flags. The
-qualified executable FD stays open but CLOEXEC during pre-exec cleanup so
-Linux can resolve its retained ELF; it does not survive into the monitor.
-Native Linux worker re-exec uses `/proc/self/exe`, never the restaged pathname.
+The manager likewise changes only its child's inheritance flags. Raw and
+overlay boots start the monitor by its resolved path. Linux restore executes
+the inspected monitor through its retained CLOEXEC descriptor, which is
+closed by exec. The Linux worker re-execs `/proc/self/exe`, and on other hosts
+the worker uses `current_exe()`.
 
 `KrunConfig` is the single wire type. The monitor validates and serializes it
 and closes fd 3, which marks the end of the config. The worker reads to EOF

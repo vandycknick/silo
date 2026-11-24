@@ -432,7 +432,6 @@ impl Runtime {
             kernel: self.components.kernel().to_path_buf(),
             initramfs: self.components.initramfs().to_path_buf(),
             agent: self.components.agent().to_path_buf(),
-            native_executable: self.components.supervisor().to_path_buf(),
             backend: self.effective_backend(),
         }
     }
@@ -469,7 +468,6 @@ impl Runtime {
             default_kernel: self.components.kernel(),
             default_initramfs: self.components.initramfs(),
             default_agent: self.components.agent(),
-            native_executable: self.components.supervisor(),
             backend: self.live_query.selection().backend,
         }
     }
@@ -832,13 +830,8 @@ impl Runtime {
             return Err(LibVmError::OverlayBackendUnsupported { backend });
         }
         let assets = self.resolve_boot_assets(kernel, initramfs)?;
-        crate::owned_boot_assets::open_overlay_boot(
-            &assets.kernel,
-            &assets.initramfs,
-            backend,
-            self.components.supervisor(),
-        )
-        .map_err(Into::into)
+        crate::owned_boot_assets::open_overlay_boot(&assets.kernel, &assets.initramfs, backend)
+            .map_err(Into::into)
     }
 
     fn complete_launch_boot_assets(&self, spec: &mut VmSpec) -> Result<(), LibVmError> {
@@ -2141,7 +2134,6 @@ impl Runtime {
                         crate::machine::root_storage::invalid("pinned boot pool is missing")
                     })?,
                     self.live_query.selection().backend,
-                    self.components.supervisor(),
                 )
                 .map_err(|error| LibVmError::InvalidStorageRecord {
                     record: "machine-boot",
@@ -2651,7 +2643,6 @@ impl Runtime {
                     pool.as_ref()
                         .ok_or_else(|| eyre::eyre!("pinned boot pool is missing"))?,
                     self.live_query.selection().backend,
-                    self.components.supervisor(),
                 )?,
                 _ => None,
             };
@@ -3164,7 +3155,6 @@ impl Runtime {
                                 default_kernel: self.components.kernel(),
                                 default_initramfs: self.components.initramfs(),
                                 default_agent: self.components.agent(),
-                                native_executable: self.components.supervisor(),
                                 backend: self.effective_backend(),
                             },
                         )

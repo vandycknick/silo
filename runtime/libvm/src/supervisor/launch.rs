@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -46,7 +46,6 @@ pub(crate) struct VmmLaunch<'a> {
     pub(crate) startup_command: Option<&'a VmmStartupCommand>,
     pub(crate) machine_log_dir: &'a OwnedDirectory,
     pub(crate) machine_lock: &'a MachineLifetimeLock,
-    pub(crate) qualification: Option<&'a crate::OwnedOverlayBoot>,
     pub(crate) storage_lease: &'a crate::storage::locks::StorageLock,
     pub(crate) storage_lease_binding: protocol::shutdown::StorageLeaseBinding,
     pub(crate) storage_shutdown: &'a protocol::shutdown::StorageShutdownContext,
@@ -160,17 +159,8 @@ impl VmSupervisor {
             .map(RestoreLaunch::transfer_descriptors)
             .transpose()?;
 
-        let mut command = monitor_command(
-            self.executable(),
-            launch
-                .restore
-                .map(|restore| std::os::fd::AsFd::as_fd(&restore.executable))
-                .or_else(|| {
-                    launch
-                        .qualification
-                        .map(|qualification| qualification.native_executable_fd())
-                }),
-        )?;
+        let restore_executable = launch.restore.map(|restore| restore.executable.as_fd());
+        let mut command = monitor_command(self.executable(), restore_executable)?;
         if let Some(descriptors) = &restore_descriptors {
             let encoded = serde_json::to_string(descriptors).map_err(io::Error::other)?;
             if encoded.len() > 16 * 1024 {
@@ -251,9 +241,6 @@ impl VmSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(qualification) = launch.qualification {
-            qualification.recheck_native_executable()?;
-        }
         if let Some(restore) = launch.restore {
             if crate::storage::identity_file::SourceFingerprint::new(
                 &restore.executable.metadata()?,
@@ -265,6 +252,11 @@ impl VmSupervisor {
             }
         }
         let child = command.spawn()?;
+        #[cfg(not(target_os = "linux"))]
+        let child = match restore_executable {
+            Some(executable) => confirm_retained_launch(child, self.executable(), executable)?,
+            None => child,
+        };
         if let Some(timeline) = timeline {
             timeline.admit_spawn += spawn_started.elapsed();
             timeline.emit(launch.machine_id, launch.run_id);
@@ -300,13 +292,16 @@ impl VmSupervisor {
     }
 }
 
-fn monitor_command(executable: &Path, retained: Option<BorrowedFd<'_>>) -> io::Result<Command> {
-    match retained {
+fn monitor_command(
+    executable: &Path,
+    restore_executable: Option<BorrowedFd<'_>>,
+) -> io::Result<Command> {
+    match restore_executable {
         None => Ok(Command::new(executable)),
         Some(descriptor) => {
             #[cfg(target_os = "linux")]
             {
-                // The retained ELF is resolved before exec closes CLOEXEC FDs.
+                // Exec resolves the inspected restore ELF before closing CLOEXEC FDs.
                 // Keep the parent's descriptor CLOEXEC during concurrent starts.
                 Ok(Command::new(format!(
                     "/proc/self/fd/{}",
@@ -315,10 +310,45 @@ fn monitor_command(executable: &Path, retained: Option<BorrowedFd<'_>>) -> io::R
             }
             #[cfg(not(target_os = "linux"))]
             {
-                Ok(Command::new(format!("/dev/fd/{}", descriptor.as_raw_fd())))
+                // Only restore retains an executable. Darwin cannot exec /dev/fd/N,
+                // so check that the path names the retained inode before and after spawn.
+                retained_path_identity(executable, descriptor)?;
+                Ok(Command::new(executable))
             }
         }
     }
+}
+
+/// The launch path still names the inode behind the retained descriptor.
+#[cfg(not(target_os = "linux"))]
+fn retained_path_identity(executable: &Path, retained: BorrowedFd<'_>) -> io::Result<()> {
+    let held = nix::sys::stat::fstat(retained)?;
+    // exec follows symlinks, so the comparison resolves the path the same way.
+    let named = nix::sys::stat::stat(executable)?;
+    if (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino) {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "monitor executable {} was replaced after it was retained",
+        executable.display()
+    )))
+}
+
+/// Exec has resolved the path by the time spawn returns. A path that no longer
+/// names the retained inode may have started other bytes, so that child is
+/// killed and reaped before the launch fails.
+#[cfg(not(target_os = "linux"))]
+fn confirm_retained_launch(
+    mut child: std::process::Child,
+    executable: &Path,
+    retained: BorrowedFd<'_>,
+) -> io::Result<std::process::Child> {
+    if let Err(error) = retained_path_identity(executable, retained) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child)
 }
 
 fn startup_budget(launch: &VmmLaunch<'_>) -> Duration {
@@ -730,7 +760,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn retained_elf_fd_is_resolved_before_cloexec_and_absent_after_exec() {
+    fn restore_retained_elf_fd_is_resolved_before_cloexec_and_absent_after_exec() {
         use std::os::fd::{AsFd, AsRawFd, FromRawFd};
         let executable = std::fs::File::open("/bin/sh").expect("ELF executable");
         let raw = nix::fcntl::fcntl(&executable, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(120))
@@ -1029,60 +1059,80 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn vmdk_monitor_exec_uses_retained_elf_after_atomic_path_replacement() {
-        use std::os::fd::{AsFd, AsRawFd};
-        use std::os::unix::fs::PermissionsExt;
+    fn overlay_boot_monitor_command_uses_supervisor_path() {
+        let executable = std::path::Path::new("/opt/silo/bin/silo-vmm");
+        let command = crate::supervisor::launch::monitor_command(executable, None).unwrap();
+        assert_eq!(command.get_program(), executable.as_os_str());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn restore_monitor_path_launch_fails_closed_after_path_replacement() {
+        use std::os::fd::AsFd;
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("selected-monitor");
         let replacement = temp.path().join("replacement-monitor");
         // Parallel test forks must never inherit a writable executable handle.
         // Keep staging writes in a separate process and wait for it to exit.
-        for (source, destination) in [("/bin/sh", &executable), ("/bin/false", &replacement)] {
-            assert!(Command::new("cp")
-                .arg(source)
-                .arg(destination)
-                .status()
-                .unwrap()
-                .success());
-        }
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "printf '#!/bin/sh\\nprintf inspected-restore-monitor\\n' > \"$1\" && \
+                 printf '#!/bin/sh\\nexit 1\\n' > \"$2\" && chmod 700 \"$1\" \"$2\"",
+            )
+            .arg("stage-monitor")
+            .arg(&executable)
+            .arg(&replacement)
+            .status()
+            .unwrap()
+            .success());
         let retained = std::fs::File::open(&executable).unwrap();
         let flags = nix::fcntl::fcntl(retained.as_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
         assert!(
             nix::fcntl::FdFlag::from_bits_retain(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
         );
-        let mut magic = [0; 4];
-        std::os::unix::fs::FileExt::read_exact_at(&retained, &mut magic, 0).unwrap();
-        assert_eq!(&magic, b"\x7fELF");
-        std::fs::rename(&replacement, &executable).unwrap();
 
         let mut command =
             crate::supervisor::launch::monitor_command(&executable, Some(retained.as_fd()))
                 .unwrap();
-        let output = command
-            .args([
-                "-c",
-                &format!(
-                    "test ! -e /proc/self/fd/{} || exit 91; printf retained-qualified-native",
-                    retained.as_raw_fd()
-                ),
-            ])
-            .output()
+        assert_eq!(command.get_program(), executable.as_os_str());
+        install_child_inheritance(&mut command, [None; 6]).expect("install cleanup");
+        let child = command
+            .stdout(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        let child = crate::supervisor::launch::confirm_retained_launch(
+            child,
+            &executable,
+            retained.as_fd(),
+        )
+        .expect("unreplaced path names the retained inode");
+        let output = child.wait_with_output().unwrap();
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(output.stdout, b"retained-qualified-native");
+        assert_eq!(output.stdout, b"inspected-restore-monitor");
         assert_eq!(
             nix::fcntl::fcntl(retained.as_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap(),
             flags
         );
 
-        let control = crate::supervisor::launch::monitor_command(&executable, None)
-            .unwrap()
-            .output()
-            .unwrap();
-        assert_eq!(control.status.code(), Some(1));
-        assert!(control.stdout.is_empty());
+        std::fs::rename(&replacement, &executable).unwrap();
+        let error = crate::supervisor::launch::monitor_command(&executable, Some(retained.as_fd()))
+            .expect_err("replaced path must not launch");
+        assert!(error.to_string().contains("was replaced"), "{error}");
+        // A launch that raced the replacement is killed and reaped.
+        let raced = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = nix::unistd::Pid::from_raw(raced.id() as i32);
+        let error = crate::supervisor::launch::confirm_retained_launch(
+            raced,
+            &executable,
+            retained.as_fd(),
+        )
+        .expect_err("replaced path must fail the started launch");
+        assert!(error.to_string().contains("was replaced"), "{error}");
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        );
     }
 }

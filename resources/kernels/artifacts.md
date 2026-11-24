@@ -209,24 +209,21 @@ effects:
 | x86-64 ELF `vmlinux` | `linux_banner`, located through the symbol table |
 | arm64 `Image` | `linux_banner`, found by scanning for `Linux version ` followed by a digit, because the `Image` has neither a version field nor a symbol table |
 
-Raw roots retain their independent native-format checks. The selected
-backend must support overlay roots; Mock and VZ are rejected before opening
-overlay boot assets. Kernel track gates verify the required configuration at
-build time; launch does not consult an artifact-specific admission list.
+Raw roots retain their independent native-format checks. Linux and Apple
+silicon macOS hosts admit overlay roots on krun only; Mock and VZ are rejected
+before opening overlay boot assets. Kernel track gates verify the required
+configuration at build time; launch does not consult an artifact-specific
+admission list.
 
-The `owned_boot_assets` module retains read-only CLOEXEC descriptors. Guest
-asset copies are bounded by their initial length and check file identity, size
-and timestamps before and after copying. The private `kernel-qualified` launch
-copy remains mode 0400; the per-launch composite initramfs is built from the held
-base plus the current root and agent archive. Atomic source publication never
-causes those copies to reopen replacement paths.
+The `owned_boot_assets` module retains read-only CLOEXEC descriptors for the
+guest kernel and base initramfs. Copies are bounded by their initial length
+and check file identity, size and timestamps before and after copying. The
+private `kernel-qualified` launch copy remains mode 0400; the per-launch
+composite initramfs is built from the held base plus the current root and
+agent archive. Atomic source publication never causes those copies to reopen
+replacement paths.
 
-Linux executes the held monitor via `/proc/self/fd/N`, normalized to at least
-descriptor 3 and kept CLOEXEC in the parent. Immediately before spawn, its
-metadata fingerprint must still match; unlink or replacement that changes it
-fails closed without rehashing or an executable-path fallback. The worker
-reexecutes its loaded image. This relies on cooperative atomic publication, not
-protection from malicious same-UID in-place modification.
+Both overlay and raw boots launch the monitor by its resolved path.
 
 Pinned bundle identities and checkpoint producer identities are independent of
 this version check. Capture receipts retain the monitor digest from its
@@ -371,8 +368,8 @@ against that resolved file; packaging retains and hashes that same file as
 running driver's behavior. See [generation ABI and evidence](README.md#vm-generation-contract-and-evidence).
 
 **Live generation qualification is unverified until the Phase 11 native device
-and real restore smoke gate run.** Retain exact kernel, resolved-config,
-patch/input and native executable identities and correlate guest RNG-return /
+and real restore smoke gate run.** Retain the exact kernel, resolved-config,
+patch/input and restore monitor identities and correlate guest RNG-return /
 low-word-access evidence with the native accepted exact-tuple commit before its
 deadline. This does not qualify userspace RNG state or grant live capability.
 

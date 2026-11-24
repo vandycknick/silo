@@ -2,7 +2,7 @@
 
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Write;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -13,12 +13,11 @@ use vm_spec::live::LiveBackend;
 
 use crate::GuestArchitecture;
 
-/// Owns guest assets and the monitor descriptor through launch.
+/// Owns the guest kernel and base initramfs through launch.
 #[derive(Debug)]
 pub struct OwnedOverlayBoot {
     kernel: OwnedBootAsset,
     initramfs: OwnedBootAsset,
-    native: OwnedBootAsset,
 }
 
 impl OwnedOverlayBoot {
@@ -34,15 +33,6 @@ impl OwnedOverlayBoot {
     }
     pub(crate) fn into_boot_assets(self) -> (OwnedBootAsset, OwnedBootAsset) {
         (self.kernel, self.initramfs)
-    }
-
-    /// Keep the CLOEXEC descriptor alive until spawn resolves /proc/self/fd/N.
-    pub(crate) fn native_executable_fd(&self) -> BorrowedFd<'_> {
-        self.native.file.as_fd()
-    }
-
-    pub(crate) fn recheck_native_executable(&self) -> Result<(), BootAssetError> {
-        self.native.recheck()
     }
 }
 
@@ -66,10 +56,6 @@ pub enum BootAssetError {
     },
     #[error("managed-overlay boot requires the krun backend, got {backend:?}")]
     UnsupportedBackend { backend: LiveBackend },
-    #[error("managed-overlay descriptor launch is unsupported on host {host_os}")]
-    UnsupportedHost { host_os: &'static str },
-    #[error("managed-overlay native image is not executable: {path}")]
-    InvalidExecutable { path: PathBuf },
     #[error("managed-overlay kernel version {version} is below the required Linux 6.6 floor")]
     KernelTooOld { version: String },
     #[error("cannot read managed-overlay kernel version from {path}: {detail}; Linux 6.6 or newer is required")]
@@ -80,7 +66,6 @@ pub(crate) fn open_overlay_boot(
     kernel: &Path,
     initramfs: &Path,
     backend: LiveBackend,
-    native_executable: &Path,
 ) -> Result<OwnedOverlayBoot, BootAssetError> {
     check_overlay_backend(backend)?;
     let kernel = InspectedKernel::from_asset(OwnedBootAsset::open(kernel)?)?;
@@ -88,7 +73,6 @@ pub(crate) fn open_overlay_boot(
     Ok(OwnedOverlayBoot {
         kernel: kernel.asset,
         initramfs: OwnedBootAsset::open(initramfs)?,
-        native: OwnedBootAsset::open_executable(native_executable)?,
     })
 }
 
@@ -96,11 +80,7 @@ fn check_overlay_backend(backend: LiveBackend) -> Result<(), BootAssetError> {
     if backend != LiveBackend::Krun {
         return Err(BootAssetError::UnsupportedBackend { backend });
     }
-    if !cfg!(target_os = "linux") {
-        return Err(BootAssetError::UnsupportedHost {
-            host_os: std::env::consts::OS,
-        });
-    }
+    // Every supported host (Linux, macOS arm64) launches krun overlay roots.
     Ok(())
 }
 
@@ -108,14 +88,12 @@ pub(crate) fn open_overlay_assets(
     kernel: InspectedKernel,
     initramfs: OwnedBootAsset,
     backend: LiveBackend,
-    native_executable: &Path,
 ) -> Result<OwnedOverlayBoot, BootAssetError> {
     check_overlay_backend(backend)?;
     kernel.check_overlay_version()?;
     Ok(OwnedOverlayBoot {
         kernel: kernel.asset,
         initramfs,
-        native: OwnedBootAsset::open_executable(native_executable)?,
     })
 }
 
@@ -205,16 +183,6 @@ impl OwnedBootAsset {
             path: path.to_path_buf(),
             fingerprint,
         })
-    }
-
-    fn open_executable(path: &Path) -> Result<Self, BootAssetError> {
-        let asset = Self::open(path)?;
-        if asset.fingerprint.mode & 0o111 == 0 {
-            return Err(BootAssetError::InvalidExecutable {
-                path: path.to_path_buf(),
-            });
-        }
-        Ok(asset)
     }
 
     fn recheck(&self) -> Result<(), BootAssetError> {
@@ -745,17 +713,12 @@ fn validate_elf_executable(header: &[u8], length: u64) -> Result<(), DirectKerne
 
 #[cfg(test)]
 pub(crate) mod tests {
-    #[cfg(target_os = "linux")]
-    use crate::owned_boot_assets::OwnedOverlayBoot;
     use crate::owned_boot_assets::{
         native_kernel_image, BootAssetError, DirectKernelRejection, InspectedKernel, KernelHeader,
         OwnedBootAsset,
     };
     use crate::GuestArchitecture;
     use std::io::Write;
-    #[cfg(target_os = "linux")]
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::PermissionsExt;
     use test_utils::direct_kernel as direct_kernel_fixture;
     use test_utils::direct_kernel::KernelArchitecture;
 
@@ -819,7 +782,7 @@ pub(crate) mod tests {
             vm_spec::live::LiveBackend::Vz,
         ] {
             assert!(matches!(
-                crate::owned_boot_assets::open_overlay_boot(missing, missing, backend, missing),
+                crate::owned_boot_assets::open_overlay_boot(missing, missing, backend),
                 Err(BootAssetError::UnsupportedBackend { .. })
             ));
         }
@@ -859,7 +822,7 @@ pub(crate) mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
+    // Atomic directory exchange: renameat2 on Linux, renamex_np on macOS.
     #[test]
     fn owned_boot_copies_retained_assets_after_atomic_parent_replacement() {
         use std::os::unix::fs::MetadataExt;
@@ -878,15 +841,28 @@ pub(crate) mod tests {
         let kernel = OwnedBootAsset::open(&assets.join("kernel")).unwrap();
         let initramfs = OwnedBootAsset::open(&assets.join("base-initramfs")).unwrap();
 
-        let parent = std::fs::File::open(directory.path()).unwrap();
-        nix::fcntl::renameat2(
-            &parent,
-            "assets",
-            &parent,
-            "replacement",
-            nix::fcntl::RenameFlags::RENAME_EXCHANGE,
-        )
-        .unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let parent = std::fs::File::open(directory.path()).unwrap();
+            nix::fcntl::renameat2(
+                &parent,
+                "assets",
+                &parent,
+                "replacement",
+                nix::fcntl::RenameFlags::RENAME_EXCHANGE,
+            )
+            .unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let from = std::ffi::CString::new(assets.as_os_str().as_bytes()).unwrap();
+            let to = std::ffi::CString::new(replacement.as_os_str().as_bytes()).unwrap();
+            // nix exposes no renamex_np wrapper; RENAME_SWAP is the macOS
+            // atomic exchange. Both C strings outlive the call.
+            let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_SWAP) };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        }
         std::fs::remove_dir_all(&replacement).unwrap();
         assert_eq!(kernel.file.metadata().unwrap().nlink(), 0);
         assert_eq!(initramfs.file.metadata().unwrap().nlink(), 0);
@@ -934,69 +910,6 @@ pub(crate) mod tests {
             std::fs::metadata(&path).unwrap().len(),
             (original.len() * 2) as u64
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn owned_boot_native_preexec_recheck_fails_closed_on_replacement() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("native-monitor");
-        let shell = std::fs::canonicalize("/bin/sh").unwrap();
-        std::fs::copy(shell, &path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let token = OwnedOverlayBoot {
-            kernel: OwnedBootAsset::open(&path).unwrap(),
-            initramfs: OwnedBootAsset::open(&path).unwrap(),
-            native: OwnedBootAsset::open_executable(&path).unwrap(),
-        };
-        token.recheck_native_executable().unwrap();
-        let fd = token.native_executable_fd();
-        assert!(fd.as_raw_fd() >= 3);
-        let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap();
-        assert!(
-            nix::fcntl::FdFlag::from_bits_truncate(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
-        );
-        let descriptor_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-        let script = format!(
-            "test ! -e /proc/self/fd/{} || exit 71; exit 23",
-            fd.as_raw_fd()
-        );
-        assert_eq!(
-            std::process::Command::new(&descriptor_path)
-                .args(["-c", &script])
-                .status()
-                .unwrap()
-                .code(),
-            Some(23)
-        );
-
-        let replacement = directory.path().join("replacement");
-        std::fs::write(&replacement, b"#!/bin/sh\nexit 99\n").unwrap();
-        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o500)).unwrap();
-        std::fs::rename(&replacement, &path).unwrap();
-        assert!(matches!(
-            token.recheck_native_executable(),
-            Err(BootAssetError::AssetChanged { .. })
-        ));
-    }
-
-    #[test]
-    fn owned_boot_native_recheck_rejects_in_place_mutation_and_nonexecutable() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("native");
-        std::fs::write(&path, b"original native fixture").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(
-            OwnedBootAsset::open_executable(&path),
-            Err(BootAssetError::InvalidExecutable { .. })
-        ));
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let asset = OwnedBootAsset::open_executable(&path).unwrap();
-        std::fs::write(&path, b"changed native fixture!").unwrap();
-        assert!(matches!(
-            asset.recheck(),
-            Err(BootAssetError::AssetChanged { .. })
-        ));
     }
 
     #[test]

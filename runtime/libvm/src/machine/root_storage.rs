@@ -926,22 +926,17 @@ mod tests {
         assert!(validate_spec(&storage, &changed_lower).is_err());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn vmdk_kernel_version_floor_precedes_pool_or_private_file_access() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().unwrap();
         let kernel = temp.path().join("kernel");
         let initramfs = temp.path().join("initramfs");
-        let native = temp.path().join("native");
         std::fs::write(&kernel, test_utils::direct_kernel::bzimage("5.15.219")).unwrap();
         let open = || {
             crate::owned_boot_assets::open_overlay_boot(
                 &kernel,
                 &initramfs,
                 vm_spec::live::LiveBackend::Krun,
-                &native,
             )
         };
         let error = open().unwrap_err();
@@ -949,12 +944,9 @@ mod tests {
         assert!(error.to_string().contains("5.15.219"));
         assert!(error.to_string().contains("6.6"));
         assert!(!initramfs.exists());
-        assert!(!native.exists());
         assert!(!temp.path().join("missing-pool").exists());
 
         std::fs::write(&initramfs, b"base archive").unwrap();
-        std::fs::write(&native, b"held executable").unwrap();
-        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o500)).unwrap();
         for version in ["6.6.0", "6.18.48", "7.2.2"] {
             std::fs::write(&kernel, test_utils::direct_kernel::bzimage(version)).unwrap();
             let assets = open().expect("6.6+ kernel passes the overlay floor");

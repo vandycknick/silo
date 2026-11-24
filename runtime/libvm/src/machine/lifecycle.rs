@@ -380,7 +380,6 @@ impl Machine {
                 startup_command: startup_command.as_ref(),
                 machine_log_dir: &machine_log_dir,
                 machine_lock: &lifetime_lock,
-                qualification: prepared_root.qualification.as_ref(),
                 storage_lease: storage_lease.lock(),
                 storage_lease_binding: protocol::shutdown::StorageLeaseBinding {
                     operation_id: storage_lease.operation_id().to_string(),
