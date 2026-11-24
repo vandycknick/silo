@@ -1899,7 +1899,6 @@ mod tests {
         check_policy, ExternalResourceKey, ExternalResourceMapping, ExternalResourcePolicy,
         ExternalResourceRequirement,
     };
-    #[cfg(target_os = "linux")]
     use test_utils::direct_kernel::host_kernel;
 
     #[test]
@@ -1970,7 +1969,6 @@ mod tests {
         assert!(!home.exists());
     }
 
-    #[cfg(target_os = "linux")]
     async fn raw_source(name: &str) -> (tempfile::TempDir, crate::Runtime, crate::Machine) {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("input.raw");
@@ -2012,7 +2010,6 @@ mod tests {
         (home, runtime, machine)
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stopped_child_secret_scope_override_refuses_before_effects_but_provider_is_preserved()
     {
@@ -2099,7 +2096,6 @@ mod tests {
             .is_none());
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stopped_fork_preserves_configured_process_and_managed_data_without_parent_paths() {
         use crate::store::MachineStore;
@@ -2262,7 +2258,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stopped_sql_rejection_cleans_only_owned_uncommitted_child() {
         use sha2::Digest;
@@ -2306,7 +2301,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn stopped_private_source_rejects_fifo_symlink_and_hardlinks_without_mutation() {
         use crate::machine::stopped::open_private;
@@ -2456,7 +2450,6 @@ mod tests {
         store.finish_stopped_operation(operation).await.unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stopped_fork_never_inherits_external_mapping_identity_even_for_the_same_path() {
         use crate::store::models::storage::ContentIdentityState;
@@ -2686,9 +2679,8 @@ mod tests {
         }
     }
 
-    // Boot capture is admitted only on the Linux krun lane
-    // (boot_assets::validate_captured_boot_lane), and memory snapshots need live capture.
-    #[cfg(target_os = "linux")]
+    // The memory snapshot is sealed from store fixtures, so no live capture
+    // runs here: recovering its disks only needs the stopped capture lane.
     #[tokio::test]
     async fn restore_without_memory_turns_a_memory_snapshot_into_a_stopped_machine() {
         use crate::store::MachineStore;
@@ -2780,7 +2772,6 @@ mod tests {
             .is_none());
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn memory_snapshot_of_a_stopped_machine_names_the_running_requirement() {
         let (_home, runtime, source) = raw_source("stopped-source").await;
@@ -2803,7 +2794,7 @@ mod tests {
         );
         assert!(runtime.snapshots().list().await.unwrap().is_empty());
     }
-    #[cfg(target_os = "linux")]
+
     #[tokio::test]
     async fn restore_preflight_resolves_local_kinds_without_registry_contacts() {
         let (home, runtime, _source) = raw_source("preflight-source").await;

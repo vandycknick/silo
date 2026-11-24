@@ -1649,6 +1649,16 @@ dirty ext4 recovery independently, and checks preserved filesystem UUIDs,
 guest machine-id/hardlinks, fresh host IDs/runs and actual socket namespaces.
 Network intent is explicitly `none`; this does not qualify a network/MAC lane.
 
+On macOS arm64 with krun, stopped snapshot, fork and restore need no guest
+execution and are admitted. This module's raw-root refusal case runs there: a
+never-started machine must refuse live fork, a memory snapshot and a missing
+restore without catalog or file effects. `tests/test_raw_live.py` adds a
+never-started raw-root snapshot, fork and restore with independent byte and
+inode checks. Every other case in both modules stays `linux_only`: it proves
+process and descriptor ownership through pidfds, `/proc`, the child subreaper
+or the x86_64 ptrace controller, needs a layered OCI root or host ext4, or
+needs memory capture.
+
 `tests/test_native_capabilities.py` owns real machine-less native queries,
 including invalid launch descriptors, immutable build binding and mutable-grant
 refusal. It creates no VM, but the linked query may open/query the system KVM fd

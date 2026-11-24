@@ -3370,7 +3370,6 @@ pub(crate) mod tests {
         fixture_with_external_data(false).await
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) async fn fixture_with_retention(retention: crate::MachineRetention) -> Fixture {
         fixture_source_profile(false, false, CapturePolicy::Full, 512, false, 2, retention).await
     }

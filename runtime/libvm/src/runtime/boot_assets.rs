@@ -1356,24 +1356,17 @@ mod tests {
 
     use crate::machine::{MachineAgent, MachineGuestConfig};
     use crate::runtime::boot_assets::{
-        canonicalize_boot_overrides, canonicalize_guest_config, resolve_asset, BootAssetOverrides,
+        canonicalize_boot_overrides, canonicalize_guest_config, capture_boot, ingest_boot_object,
+        preflight_captured_boot, resolve_asset, resolve_pinned_boot, validate_captured_boot_lane,
+        BootAssetOverrides, CaptureLane, CapturedBootContext,
     };
-
-    #[cfg(target_os = "linux")]
-    use crate::runtime::boot_assets::{
-        capture_boot, ingest_boot_object, preflight_captured_boot, resolve_pinned_boot,
-        validate_captured_boot_lane, CaptureLane, CapturedBootContext,
-    };
-    #[cfg(target_os = "linux")]
     use crate::store::ImageStore;
 
     /// A valid native-format kernel image; never executed.
-    #[cfg(target_os = "linux")]
     fn custom_kernel() -> Vec<u8> {
         test_utils::direct_kernel::host_kernel("exact custom kernel")
     }
 
-    #[cfg(target_os = "linux")]
     struct CaptureFixture {
         _temp: TempDir,
         paths: crate::paths::LocalPaths,
@@ -1386,7 +1379,6 @@ mod tests {
         spec: vm_spec::VmSpec,
     }
 
-    #[cfg(target_os = "linux")]
     impl CaptureFixture {
         async fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
@@ -1528,14 +1520,12 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     fn retained_bytes(asset: &crate::owned_boot_assets::OwnedBootAsset) -> Vec<u8> {
         let mut bytes = Vec::new();
         asset.copy_into(&mut bytes).unwrap();
         bytes
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn captured_boot_survives_path_replacement_source_deletion_and_gc() {
         let fixture = CaptureFixture::new().await;
@@ -1634,7 +1624,6 @@ mod tests {
         assert_eq!(fixture.pool.scan_objects().unwrap().count(), 0);
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn held_boot_input_ignores_replaced_path_and_rewinds_before_ingestion() {
         use std::io::{Seek, SeekFrom};
@@ -1664,7 +1653,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn disabled_agent_requires_only_kernel_and_base_and_never_falls_back() {
         let fixture = CaptureFixture::new().await;
@@ -1731,25 +1719,47 @@ mod tests {
         assert_eq!(Lane::Live.host_admitted(), linux);
     }
 
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn captured_boot_lane_refuses_mock_and_admits_krun_per_host() {
+        let storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        for lane in [CaptureLane::Stopped, CaptureLane::Live] {
+            assert!(
+                validate_captured_boot_lane(&storage, vm_spec::live::LiveBackend::Mock, lane)
+                    .is_err()
+            );
+        }
+        validate_captured_boot_lane(
+            &storage,
+            vm_spec::live::LiveBackend::Krun,
+            CaptureLane::Stopped,
+        )
+        .unwrap();
+        // Live capture needs the native memory path, which only Linux has.
+        let live = validate_captured_boot_lane(
+            &storage,
+            vm_spec::live::LiveBackend::Krun,
+            CaptureLane::Live,
+        );
+        if cfg!(target_os = "linux") {
+            live.unwrap();
+        } else {
+            assert!(matches!(
+                live,
+                Err(crate::LibVmError::InvalidStorageRecord { message, .. })
+                    if message == "live boot capture is not admitted on this host"
+            ));
+        }
+    }
+
     #[tokio::test]
-    async fn captured_boot_preflight_rejects_lane_abi_and_empty_input_before_publication() {
+    async fn captured_boot_preflight_rejects_profile_abi_and_empty_input_before_publication() {
         let fixture = CaptureFixture::new().await;
         let operation = uuid::Uuid::new_v4();
-        for lane in [CaptureLane::Stopped, CaptureLane::Live] {
-            assert!(validate_captured_boot_lane(
-                &fixture.storage,
-                vm_spec::live::LiveBackend::Mock,
-                lane
-            )
-            .is_err());
-            assert!(validate_captured_boot_lane(
-                &fixture.storage,
-                vm_spec::live::LiveBackend::Krun,
-                lane
-            )
-            .is_ok());
-        }
         let architecture = match &fixture.storage.boot {
             crate::BootProfile::LinuxDirect {
                 kernel_architecture,
@@ -1864,7 +1874,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pinned_boot_rejects_corruption_and_regenerates_child_composite_identity() {
         use std::os::unix::fs::PermissionsExt;
@@ -1950,7 +1959,6 @@ mod tests {
         .is_err());
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pinned_boot_consumes_authenticated_descriptors_after_pool_path_replacement() {
         use std::os::unix::fs::PermissionsExt;
@@ -2072,7 +2080,6 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn partition_boot_admits_stopped_but_not_live_capture() {
         for (table, selector) in [
@@ -2127,6 +2134,13 @@ mod tests {
                 CaptureLane::Stopped
             )
             .is_ok());
+            // Linux refuses the partitioned root in the live root table; other
+            // hosts refuse live capture before reaching it.
+            let live_refusal = if cfg!(target_os = "linux") {
+                "no admitted live capture lane"
+            } else {
+                "live boot capture is not admitted on this host"
+            };
             assert!(matches!(
                 validate_captured_boot_lane(
                     &storage,
@@ -2134,9 +2148,9 @@ mod tests {
                     CaptureLane::Live
                 ),
                 Err(crate::LibVmError::InvalidStorageRecord { message, .. })
-                    if message.contains("no admitted live capture lane")
+                    if message.contains(live_refusal)
             ));
-            // Partitioned stopped capture still requires the Linux krun lane.
+            // Partitioned stopped capture still requires the krun backend.
             assert!(validate_captured_boot_lane(
                 &storage,
                 vm_spec::live::LiveBackend::Vz,
@@ -2192,7 +2206,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn translated_and_foreign_roots_have_no_capture_lane() {
         let storage = crate::MachineStorageRecord::opaque_raw(
@@ -2223,7 +2236,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn exact_boot_selection_ignores_package_upgrade_and_rejects_missing_bundle() {
         let fixture = CaptureFixture::new().await;
@@ -2275,7 +2287,6 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn unknown_custom_base_abi_is_rejected_before_any_bundle_publication() {
         let fixture = CaptureFixture::new().await;
@@ -2305,7 +2316,6 @@ mod tests {
         assert_eq!(fixture.pool.scan_objects().unwrap().count(), 0);
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn local_replacement_inspection_uses_imported_identities_without_publication() {
         let fixture = CaptureFixture::new().await;
@@ -2369,7 +2379,6 @@ mod tests {
         assert_eq!(fixture.pool.scan_objects().unwrap().count(), before);
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn unimported_packaged_kernel_is_never_reported_as_a_replacement() {
         let fixture = CaptureFixture::new().await;
@@ -2395,14 +2404,12 @@ mod tests {
         assert_eq!(fixture.pool.scan_objects().unwrap().count(), before);
     }
 
-    #[cfg(target_os = "linux")]
     fn write_private(path: &Path, bytes: &[u8]) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, bytes).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     async fn import_operation(
         fixture: &CaptureFixture,
     ) -> (uuid::Uuid, crate::storage::locks::StorageLock) {
@@ -2418,7 +2425,6 @@ mod tests {
         (operation, lease)
     }
 
-    #[cfg(target_os = "linux")]
     fn rejection(error: crate::LibVmError) -> crate::DirectKernelRejection {
         match error {
             crate::LibVmError::DirectKernelRejected(rejected) => rejected.reason,
@@ -2426,7 +2432,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn raw_import_and_update_reject_unadmitted_kernels_before_publication() {
         use test_utils::direct_kernel::{kernel, KernelArchitecture};
@@ -2528,7 +2533,6 @@ mod tests {
         assert!(agent.is_none());
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn exact_bundle_with_unadmitted_kernel_fails_import_and_start() {
         let fixture = CaptureFixture::new().await;
@@ -2601,7 +2605,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pinned_start_survives_packaged_asset_removal() {
         let fixture = CaptureFixture::new().await;

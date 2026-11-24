@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import platform
 import selectors
 import signal
 import subprocess
@@ -20,7 +21,9 @@ from silo_smoke.config import SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
 
-pytestmark = pytest.mark.linux_only
+# Cases marked Linux only prove process and descriptor ownership through
+# pidfds, /proc, the child subreaper or the x86_64 ptrace controller, or need
+# a layered OCI root. The rest drive only the CLI and independent readers.
 
 
 @pytest.fixture
@@ -50,7 +53,9 @@ def stopped_image(registry: LoopbackRegistry, overlay_image_bytes: images.OciIma
 
 def create(silo: Silo, image: str, name: str, profile: RootProfile, *flags: str) -> None:
     silo.create(name, silo.root_image(image, profile), "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock", *flags)
-    stopped.mount_evidence(silo, os.environ.get("SILO_SMOKE_STOPPED_FS"))
+    if platform.system() == "Linux":
+        # findmnt qualifies the Linux host filesystem lanes; no other host has them.
+        stopped.mount_evidence(silo, os.environ.get("SILO_SMOKE_STOPPED_FS"))
 
 
 def boot(silo: Silo, name: str) -> dict:
@@ -101,6 +106,7 @@ def lower_backings(silo: Silo, name: str) -> dict[Path, str]:
     return overlay.lower_digests(overlay.machine_dir(silo, name) / "lower.vmdk")
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("dirty", [False, True], ids=["clean", "dirty-replay"])
 def test_stopped_two_child_fork_independent_replay(stopped_silo: Silo, stopped_image: str, profile: RootProfile, dirty: bool) -> None:
@@ -183,7 +189,7 @@ sync
     stopped.stop(silo, source)
 
 
-@pytest.mark.parametrize("profile", ROOT_PROFILES)
+@pytest.mark.parametrize("profile", ["raw", pytest.param("layered", marks=pytest.mark.linux_only)])
 def test_stopped_live_fork_memory_snapshot_and_missing_restore_refuse_before_effects(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
     silo = stopped_silo
     create(silo, stopped_image, "refuse-source", profile)
@@ -192,6 +198,7 @@ def test_stopped_live_fork_memory_snapshot_and_missing_restore_refuse_before_eff
     assert [item["name"] for item in silo.ls()] == ["refuse-source"]
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.slow
 def test_stopped_orphan_worker_fences_fork_and_snapshot(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
@@ -239,6 +246,7 @@ def test_stopped_orphan_worker_fences_fork_and_snapshot(stopped_silo: Silo, stop
             stopped.same_content({"root": baseline}, stopped.backing(silo, "after-orphan", "orphan-terminal-fork"))
 
 
+@pytest.mark.linux_only
 @pytest.mark.skipif(
     not os.environ.get("SILO_SMOKE_STOPPED_DIR"),
     reason="opt-in ext4 gate requires SILO_SMOKE_STOPPED_DIR pointing to an owner-mounted ext4 directory and SILO_SMOKE_STOPPED_FS=ext4",
@@ -256,6 +264,7 @@ def test_stopped_host_ext4_fork_requires_actual_mount(stopped_silo: Silo, stoppe
     stopped.independent(before, child)
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("custom_boot", [False, True], ids=["runtime-boot", "source-private-boot"])
 def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo, stopped_image: str, profile: RootProfile, custom_boot: bool) -> None:
@@ -369,6 +378,7 @@ cat /proc/cmdline
             stopped.same_content(first_after, stopped.backing(silo, "snapshot-first", "first-unchanged-after-sibling"))
 
 
+@pytest.mark.linux_only
 @pytest.mark.slow
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_stopped_restore_retains_closure_during_concurrent_snapshot_removal(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
@@ -409,6 +419,7 @@ def test_stopped_restore_retains_closure_during_concurrent_snapshot_removal(stop
     stopped.stop(silo, "retention-child", require_clean=False)
 
 
+@pytest.mark.linux_only
 @pytest.mark.slow
 def test_stopped_fork_cancelled_waiter_keeps_actual_worker_locks(stopped_silo: Silo, stopped_image: str) -> None:
     silo = stopped_silo
@@ -459,6 +470,7 @@ def test_stopped_fork_cancelled_waiter_keeps_actual_worker_locks(stopped_silo: S
         os.close(input_fd)
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_stopped_fork_snapshot_running_generation_refuses_without_implicit_stop(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
     silo = stopped_silo
@@ -486,6 +498,7 @@ def test_stopped_fork_snapshot_running_generation_refuses_without_implicit_stop(
             stopped.stop(silo, "running-source")
 
 
+@pytest.mark.linux_only
 @pytest.mark.slow
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize(("boundary", "injected_errno"), [
@@ -532,6 +545,7 @@ def test_stopped_fork_real_syscall_failure_never_publishes_partial_child(stopped
     stopped.independent(baseline, retried)
 
 
+@pytest.mark.linux_only
 def test_stopped_prepared_image_catalog_has_no_extra_retention_roots(stopped_silo: Silo, stopped_image: str) -> None:
     home = stopped_silo.ws.silo_home
     assert not (home / "machines").exists()

@@ -26,7 +26,7 @@ mod secrets;
 mod session;
 mod start;
 pub(crate) mod stopped;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod stopped_storage;
 mod streams;
 mod update;

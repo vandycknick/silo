@@ -1,11 +1,10 @@
 //! Real files and SQLite, initialized through the existing unit-test store seam.
 //! No capability query or hypervisor access. Native replay qualification lives in smoke.
 
-#[cfg(target_os = "linux")]
 #[path = "../../tests/support/live_catalog.rs"]
 mod live_catalog;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs::{File, OpenOptions};

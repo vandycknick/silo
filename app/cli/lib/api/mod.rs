@@ -749,9 +749,6 @@ mod tests {
         serde_json::from_str(r#"{"version":"1"}"#).expect("parse minimal template")
     }
 
-    // Stopped boot capture is admitted only on the Linux krun lane
-    // (libvm boot_assets::validate_captured_boot_lane).
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn snapshot_names_restore_machines_and_are_refused_as_creation_images() {
         let temp = tempfile::tempdir().unwrap();

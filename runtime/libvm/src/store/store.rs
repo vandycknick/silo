@@ -97,7 +97,7 @@ impl Store {
         &self.pool
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) async fn storage_operation_count(&self) -> Result<i64, LibVmError> {
         Ok(sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
             .fetch_one(&self.pool)
