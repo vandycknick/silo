@@ -379,6 +379,7 @@ def test_overlay_replacement_growth_and_short_tails(silo: Silo, overlay_image: s
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(shutil.which("debugfs") is None, reason="directory-scale requires e2fsprogs debugfs on PATH")
 def test_overlay_directory_scale_dir_nlink_htree(silo: Silo, overlay_image: str) -> None:
     name = "overlay-directories"
     overlay.create(silo, name, overlay_image, capacity="2gib")
