@@ -153,7 +153,10 @@ loop:
 				result = err
 			}
 			break loop
-		case result = <-served:
+		case err := <-served:
+			if !errors.Is(err, errOwnerGone) {
+				result = err
+			}
 			break loop
 		case <-ctx.Done():
 			result = ctx.Err()
@@ -185,6 +188,20 @@ loop:
 	case <-time.After(timeout):
 	}
 	return result
+}
+
+// errOwnerGone is serve's result when a control write found the owner gone.
+// The reader reports the same exit as EOF or ECONNRESET; whichever side
+// notices first ends the run, and neither is a gateway failure.
+var errOwnerGone = errors.New("control socket closed by owner")
+
+// notify writes one descriptor-free frame to the owner.
+func (s *session) notify(m wire.Message) error {
+	err := s.writer.Send(m, nil)
+	if errors.Is(err, unix.EPIPE) {
+		return errOwnerGone
+	}
+	return err
 }
 
 func validate(b wire.Bootstrap) error {
@@ -222,6 +239,10 @@ func (s *session) serve(ctx context.Context, b wire.Bootstrap, commands <-chan w
 		return secretPattern.ReplaceAllString(text, "[redacted]")
 	}
 	defer func() {
+		// Nothing to redact and nobody left to tell.
+		if errors.Is(err, errOwnerGone) {
+			return
+		}
 		if err != nil {
 			err = errors.New(redact(err.Error()))
 		}
@@ -232,7 +253,7 @@ func (s *session) serve(ctx context.Context, b wire.Bootstrap, commands <-chan w
 	if err = validate(b); err != nil {
 		return err
 	}
-	if err = s.writer.Send(wire.State{Type: "state", Phase: "starting", Tags: []string{}}, nil); err != nil {
+	if err = s.notify(wire.State{Type: "state", Phase: "starting", Tags: []string{}}); err != nil {
 		return err
 	}
 	authKey := ""
@@ -316,7 +337,7 @@ func (s *session) serve(ctx context.Context, b wire.Bootstrap, commands <-chan w
 			}
 			s.listeners = []net.Listener{ssh, https}
 			s.mu.Unlock()
-			if err = s.writer.Send(next, nil); err != nil {
+			if err = s.notify(next); err != nil {
 				return err
 			}
 			state = next
@@ -329,7 +350,7 @@ func (s *session) serve(ctx context.Context, b wire.Bootstrap, commands <-chan w
 				active = false
 			}
 			if !reflect.DeepEqual(state, next) {
-				if err = s.writer.Send(next, nil); err != nil {
+				if err = s.notify(next); err != nil {
 					return err
 				}
 				state = next
@@ -359,7 +380,7 @@ func (s *session) serve(ctx context.Context, b wire.Bootstrap, commands <-chan w
 								msg := "WhoIs unavailable"
 								result.Error = &msg
 							}
-							if e := s.writer.Send(result, nil); e != nil {
+							if e := s.notify(result); e != nil {
 								select {
 								case requestErrors <- e:
 								default:
@@ -372,7 +393,7 @@ func (s *session) serve(ctx context.Context, b wire.Bootstrap, commands <-chan w
 						reply.Error = &msg
 					}
 				}
-				if err = s.writer.Send(reply, nil); err != nil {
+				if err = s.notify(reply); err != nil {
 					return err
 				}
 			}

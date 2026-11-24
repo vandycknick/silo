@@ -251,3 +251,17 @@ read lobby credential`. Measured here by signalling the moment the status
 file shows the failure: 59 of 60 runs exited 1 before the fix, 60 of 60 exited
 0 after. The drain now ignores the result of a lobby that had already failed
 when shutdown began.
+
+### Fourth run (45333709852, `59e2cf4d`)
+
+**Core (macos) green**, Linux amd64 green. Linux arm64 passed every Rust and
+`netd` test and failed in `app/tsgate`, which no arm64 run had reached:
+`TestCommandUnixStream` saw `tsgate` exit 1 when its owner closed the control
+socket.
+
+A `tsgate` race, on every platform. The reader treats the owner's exit (EOF,
+ECONNRESET) as a clean stop, but when the first state write noticed it first
+it failed with `EPIPE`, and `serve` flattens its errors to redacted text, so
+the run ended as a failure. In a Linux arm64 guest 271 of 500 runs failed
+before the fix and 0 of 500 after. Control writes now report a broken pipe as
+the owner being gone.
