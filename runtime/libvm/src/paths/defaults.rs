@@ -116,6 +116,30 @@ pub(crate) fn absolute_path(name: &'static str, value: OsString) -> Result<PathB
     }
 }
 
+/// Silo storage on macOS depends on APFS clones for forks, snapshots and
+/// staging copies, so a home on any other volume is refused up front.
+pub(crate) fn require_home_filesystem(home: &Path) -> Result<(), LibVmError> {
+    #[cfg(target_os = "macos")]
+    {
+        let filesystem = nix::sys::statfs::statfs(home).map_err(std::io::Error::from)?;
+        admit_home_filesystem(home, filesystem.filesystem_type_name())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = home;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn admit_home_filesystem(home: &Path, filesystem: &str) -> Result<(), LibVmError> {
+    if filesystem == "apfs" {
+        return Ok(());
+    }
+    Err(LibVmError::UnsupportedHomeFilesystem {
+        path: home.to_path_buf(),
+        filesystem: filesystem.to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -125,8 +149,11 @@ mod tests {
 
     use nix::unistd::geteuid;
 
+    #[cfg(target_os = "macos")]
+    use crate::paths::defaults::admit_home_filesystem;
     use crate::paths::defaults::{
-        absolute_path, default_run_root, ensure_run_root, resolve_default_home, RUN_ROOT_PARENT,
+        absolute_path, default_run_root, ensure_run_root, require_home_filesystem,
+        resolve_default_home, RUN_ROOT_PARENT,
     };
     use crate::LibVmError;
 
@@ -142,6 +169,34 @@ mod tests {
                 path
             } if path == Path::new("relative")
         ));
+    }
+
+    #[test]
+    fn home_filesystem_admits_the_host_temporary_volume() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        require_home_filesystem(temp.path())
+            .expect("temporary directories are on a supported volume");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn home_filesystem_admits_only_apfs_on_macos() {
+        let home = Path::new("/Volumes/external/silo");
+        admit_home_filesystem(home, "apfs").expect("APFS is admitted");
+        for filesystem in ["hfs", "msdos", "exfat", "smbfs", "nfs", "APFS", ""] {
+            let error = admit_home_filesystem(home, filesystem).expect_err("refused");
+            assert!(matches!(
+                &error,
+                LibVmError::UnsupportedHomeFilesystem { path, filesystem: observed }
+                    if path == home && observed == filesystem
+            ));
+        }
+        assert_eq!(
+            admit_home_filesystem(home, "exfat")
+                .expect_err("refused")
+                .to_string(),
+            "the Silo home /Volumes/external/silo is on a exfat volume; macOS needs it on APFS (point SILO_HOME at a directory on an APFS volume)"
+        );
     }
 
     #[test]

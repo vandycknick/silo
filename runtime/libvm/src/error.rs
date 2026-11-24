@@ -230,6 +230,9 @@ pub enum LibVmError {
     #[error("could not resolve the Silo home from SILO_HOME or HOME")]
     HomeUnavailable,
 
+    #[error("the Silo home {path} is on a {filesystem} volume; macOS needs it on APFS (point SILO_HOME at a directory on an APFS volume)")]
+    UnsupportedHomeFilesystem { path: PathBuf, filesystem: String },
+
     #[error("could not resolve the Silo config directory from XDG_CONFIG_HOME or HOME")]
     ConfigDirUnavailable,
 
@@ -534,6 +537,7 @@ impl LibVmError {
             Self::SecretResolution { .. } => "SecretResolution",
             Self::MissingNetworkSecrets { .. } => "MissingNetworkSecrets",
             Self::HomeUnavailable => "HomeUnavailable",
+            Self::UnsupportedHomeFilesystem { .. } => "UnsupportedHomeFilesystem",
             Self::ConfigDirUnavailable => "ConfigDirUnavailable",
             Self::RelativeEnvironmentPath { .. } => "RelativeEnvironmentPath",
             Self::InvalidVirtBackendOverride { .. } => "InvalidVirtBackendOverride",

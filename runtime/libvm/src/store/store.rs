@@ -141,6 +141,7 @@ impl Store {
             ))
         })?;
         std::fs::create_dir_all(home)?;
+        crate::paths::require_home_filesystem(home)?;
         let guard = CatalogGuard::writable(home).await?;
         let pool = Self::connect_guarded(state_db_path, guard.clone()).await?;
         if let Err(error) = MIGRATOR.run(&pool).await {

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Changed: on macOS the Silo home must be on an APFS volume. Forks, snapshots
+  and image staging rely on APFS clones, so a home on any other filesystem is
+  now refused with a message naming the volume type.
 - Fixed: `silo shell` sessions start from the machine's process environment,
   as `silo exec` does, so image settings such as `PATH` apply. In
   `nixos/nix`, `nix` was "command not found" because the shell got a fixed
