@@ -83,7 +83,9 @@ def _copy_pool(source: Path, destination: Path) -> None:
         path = source / name
         if not path.is_dir():
             continue
-        command = (["cp", "-Rc"] if platform.system() == "Darwin" else ["cp", "-R", "--reflink=auto"])
+        # macOS: name the system cp. A GNU cp earlier on PATH rejects -c;
+        # only /bin/cp clones with it.
+        command = (["/bin/cp", "-Rc"] if platform.system() == "Darwin" else ["cp", "-R", "--reflink=auto"])
         subprocess.run([*command, str(path), str(destination / name)], check=True, capture_output=True, text=True, timeout=300)
 
 

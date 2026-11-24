@@ -61,6 +61,12 @@ class Workspace:
     def trust_registry(self, address: str, ca: Path) -> None:
         self.update_config({"images": {"registries": {address: {"ca": str(ca.resolve())}}}})
 
+    def registry_cas(self) -> list[tuple[str, str]]:
+        """Every `(registry, ca path)` this workspace's Silo config trusts."""
+        path = self.config_home / "silo" / "config.yaml"
+        registries = json.loads(path.read_text(encoding="utf-8")).get("images", {}).get("registries", {})
+        return [(address, entry["ca"]) for address, entry in sorted(registries.items())]
+
     def update_config(self, updates: ConfigMapping) -> None:
         """Merge into the suite-owned Silo config, written as JSON-compatible YAML."""
         directory = self.config_home / "silo"

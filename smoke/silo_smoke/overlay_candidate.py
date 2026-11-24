@@ -69,7 +69,8 @@ class Candidate:
             assert reference is not None, "root qualification requires an OCI reference"
             producer = silo.ws.config.bin_dir / "examples/overlay_candidate_lower"
             assert producer.is_file(), "missing overlay_candidate_lower helper; run make smoke-prereqs"
-            result = subprocess.run([str(producer), reference, str(self.root / "composition")], env=silo.ws.env(), check=True, capture_output=True, text=True, timeout=300)
+            trust = [argument for pair in silo.ws.registry_cas() for argument in pair]
+            result = subprocess.run([str(producer), reference, str(self.root / "composition"), *trust], env=silo.ws.env(), check=True, capture_output=True, text=True, timeout=300)
             silo.ws.record("overlay-candidate-composition", result.stdout + result.stderr)
             produced = json.loads(result.stdout)
             source_descriptor = Path(produced["descriptor"])

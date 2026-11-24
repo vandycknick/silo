@@ -16,9 +16,23 @@ use oci::erofs::Layer;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args_os().collect();
-    if args.len() != 3 {
-        return Err("usage: overlay_candidate_lower OCI_REFERENCE OUTPUT_DIRECTORY".into());
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Err(
+            "usage: overlay_candidate_lower OCI_REFERENCE OUTPUT_DIRECTORY [REGISTRY CA_PEM]..."
+                .into(),
+        );
     }
+    let mut trust = Vec::new();
+    for pair in args[3..].chunks_exact(2) {
+        let registry = pair[0].to_str().ok_or("registry is not UTF-8")?;
+        let registry = oci::RegistryHost::parse(registry)?;
+        let ca = oci::RegistryCa::load(&registry, Path::new(&pair[1]))?;
+        trust.push((registry, ca));
+    }
+    let registries = oci::ImageRegistryConfig::new(
+        oci::RegistryPolicy::default(),
+        oci::RegistryTrust::new(trust)?,
+    );
     let reference = args[1].to_str().ok_or("OCI reference is not UTF-8")?;
     let directory = Path::new(&args[2]);
     fs::create_dir(directory)?;
@@ -27,7 +41,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir(&images)?;
     fs::set_permissions(&images, fs::Permissions::from_mode(0o700))?;
     let pool = StoragePool::open(&images)?;
-    let producer = oci::OciMaterializer::open(&images, oci::ImageRegistryConfig::default())?;
+    let producer = oci::OciMaterializer::open(&images, registries)?;
     let platform = oci::Platform::host()?;
     let resolved = producer.resolve(reference, &platform, None).await?;
     let limits = ChangesetLimits::default();
