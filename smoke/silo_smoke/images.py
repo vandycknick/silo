@@ -20,8 +20,8 @@ ALPINE_SHA256: dict[str, str] = {
     "aarch64": "ead8a4b37867bd19e7417dd078748e2312c0aea364403d96758d63ea8ff261ea",
 }
 APK_SHA256: dict[tuple[str, str, str], str] = {
-    ("ca-certificates", "20260909-r0", "x86_64"): "21cbb1f7b825c7fee9fe469e0ee18f61da7fe62075796daf8c94b5da74b355d3",
-    ("ca-certificates", "20260909-r0", "aarch64"): "e229a539af3c7c9042ffd359089305fa9e98bd778a6b53e6cb077be5506d9526",
+    ("ca-certificates", "20261020-r0", "x86_64"): "961e7c87d9b0bf74a854fc73357dcc02f3df6a62dfcba2a50927fa30b4c5f45b",
+    ("ca-certificates", "20261020-r0", "aarch64"): "1819100af96003e62cf416f4d9b1e5f0ab31661bc0088584d54bcdb57901e861",
     ("iproute2-ss", "6.11.0-r0", "x86_64"): "2dd321b88e0509b41c308fa9481929b3073260c12e21b3b1d55bfe5d0bb1c302",
     ("iproute2-ss", "6.11.0-r0", "aarch64"): "212fb91f158d087ce6ce68a4aac5edc7c971b29fa457daee69703bfdc104a6cb",
     ("libmnl", "1.0.5-r2", "x86_64"): "0de58a7968c96825f7ad1205ae0d18dd4d96c37db9dca31fee4727f6b08bc308",
@@ -290,7 +290,7 @@ CA_TRUST = ImageSpec(
     dirs=BASIC.dirs,
     remove=BASIC.remove,
     append=BASIC.append,
-    packages=(ApkPackage("ca-certificates", "20260909-r0"),),
+    packages=(ApkPackage("ca-certificates", "20261020-r0"),),
 )
 
 
