@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Collect notices from the exact target-specific Go dependency graph."""
+from __future__ import annotations
+
 import argparse
 from dataclasses import dataclass
 import json
