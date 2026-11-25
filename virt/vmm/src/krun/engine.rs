@@ -804,6 +804,12 @@ pub(crate) fn disk_format(format: vm_spec::DiskFormat) -> DiskFormat {
     }
 }
 
+/// A guest flush reaches the host as a plain `fsync`. On macOS that hands the
+/// data to the drive without making the drive flush its own cache, so a host
+/// power loss can drop writes the guest was told were durable; a host crash
+/// cannot. Chosen for speed: a full flush per guest flush measured about 40
+/// times slower for flush-heavy guests on Apple silicon. Linux `fsync` already
+/// flushes the drive.
 const fn disk_sync_mode() -> SyncMode {
     SyncMode::Relaxed
 }
