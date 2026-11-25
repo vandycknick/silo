@@ -2682,6 +2682,12 @@ async fn wait_ready_returns_terminal_boot_poweroff_reason_promptly() {
         .await
         .expect("create machine");
     machine.start().await.expect("start machine");
+    // Attach before the guest powers off: a wait that starts after the monitor
+    // is gone reports AlreadyStopped, not the run's outcome.
+    let waiter = {
+        let machine = machine.clone();
+        tokio::spawn(async move { machine.wait().await })
+    };
     let readiness = tokio::time::timeout(
         Duration::from_secs(5),
         machine.wait_ready(Duration::from_secs(60)),
@@ -2695,7 +2701,10 @@ async fn wait_ready_returns_terminal_boot_poweroff_reason_promptly() {
         readiness.status.vm.message.as_deref(),
         Some("guest powered off during boot"),
     );
-    let exit = machine.wait().await.expect("wait for monitor cleanup");
+    let exit = waiter
+        .await
+        .expect("waiter task")
+        .expect("wait for monitor cleanup");
     assert!(matches!(exit.outcome, MachineExitOutcome::Error { .. }));
     machine.remove().await.expect("remove machine");
 }
