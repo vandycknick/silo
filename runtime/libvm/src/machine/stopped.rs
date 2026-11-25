@@ -344,6 +344,14 @@ pub async fn preflight_restore_snapshot(
 ) -> Result<(), LibVmError> {
     options.validate()?;
     let policy = &options.external_resources;
+    // With no catalog there is no snapshot whose kind could be looked up, so a
+    // host that cannot restore memory refuses here, before anything is created.
+    if !options.without_memory && !crate::LiveObservationReader::open(config)?.catalog_exists()? {
+        crate::require_host_live_operation(
+            &query.host_report().await?,
+            vm_spec::live::LiveOperation::Restore,
+        )?;
+    }
     let record = crate::store::snapshot_store::observe_snapshot_record(config, reference).await?;
     let memory = matches!(record.memory, SnapshotMemoryState::Included { .. });
     if memory && !options.without_memory {
