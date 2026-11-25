@@ -1,6 +1,8 @@
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use eyre::Context;
@@ -99,6 +101,8 @@ pub enum RuntimeOpenMode {
     Maintenance,
     Observation,
 }
+
+type RecoveryPhase<'a, T> = Pin<Box<dyn Future<Output = Result<T, LibVmError>> + Send + 'a>>;
 
 #[derive(Debug, Clone)]
 pub struct Runtime {
@@ -233,24 +237,42 @@ impl Runtime {
             let Some(_lock) = self.try_acquire_machine_lock(config.lock_id)? else {
                 continue;
             };
-            if let Err(error) = crate::machine::hibernate::recover_locked(self, &config).await {
+            if let Err(error) = self.hibernate_recovery(&config).await {
                 tracing::warn!(machine = %config.id, %error, "hibernate recovery retained uncertainty");
             }
         }
-        self.recover_constructed_children().await?;
-        if let Err(error) = crate::machine::live_capture::reconcile_captures(
-            self,
-            None,
-            crate::storage::pool::PublicationLockPolicy::Defer,
-        )
-        .await
-        {
+        self.constructed_children_recovery().await?;
+        if let Err(error) = self.capture_recovery().await {
             tracing::warn!(phase = "capture recovery", %error, "capture recovery deferred; runtime opening continues");
         }
-        if let Err(error) = crate::machine::live_fork::reconcile_forks(self).await {
+        if let Err(error) = self.fork_recovery().await {
             tracing::warn!(%error, "live fork recovery retained uncertainty");
         }
         Ok(())
+    }
+
+    // Each recovery phase is built and boxed in its own call. Built in
+    // `recover_machine_operations` they would all sit in its stack frame at
+    // once (about 300 KiB in a debug build), under every caller that opens a
+    // runtime, and that overflowed 2 MiB test threads on Linux.
+    fn hibernate_recovery<'a>(&'a self, config: &'a MachineConfig) -> RecoveryPhase<'a, bool> {
+        Box::pin(crate::machine::hibernate::recover_locked(self, config))
+    }
+
+    fn constructed_children_recovery(&self) -> RecoveryPhase<'_, ()> {
+        Box::pin(self.recover_constructed_children())
+    }
+
+    fn capture_recovery(&self) -> RecoveryPhase<'_, ()> {
+        Box::pin(crate::machine::live_capture::reconcile_captures(
+            self,
+            None,
+            crate::storage::pool::PublicationLockPolicy::Defer,
+        ))
+    }
+
+    fn fork_recovery(&self) -> RecoveryPhase<'_, ()> {
+        Box::pin(crate::machine::live_fork::reconcile_forks(self))
     }
 
     /// Snapshot listing, inspection, verification and removal.
