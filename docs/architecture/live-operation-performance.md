@@ -733,6 +733,11 @@ resolver reuses the launch lease instead of registering a second consumer,
 and launch artifacts are synchronized once at the spawn boundary (layered
 start: 13 explicit syncs → 7, raw 9 → 6).
 
+Persisted raw and overlay starts now resolve pinned guest assets once before
+launch registration. Kernel and composite publication use the same held
+kernel, base initramfs, and optional agent descriptors; publication does not
+reopen the object paths.
+
 Batch 4c's 2026-11-09 contract keeps the 8 MiB chunk-list identity and defines
 the 1 s incremental target on one contiguous 410 MiB dirty region in a 4 GiB
 guest; scattered dirties may require a full-RAM rehash, exposed through

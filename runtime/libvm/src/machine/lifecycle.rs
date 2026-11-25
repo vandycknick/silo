@@ -150,7 +150,7 @@ impl Machine {
             runtime
                 .admit_cold_launch_storage(&mut config, &mut storage)
                 .await?;
-            let qualification = runtime.open_machine_boot(&config, &storage)?;
+            let boot = runtime.open_machine_boot(&config, &storage)?;
             timeline.lower_resolve_authentication += lower_started.elapsed();
 
             let run_uuid = Uuid::new_v4();
@@ -169,7 +169,7 @@ impl Machine {
                 .saturating_sub(timeline.lower_resolve_authentication);
             let lower_started = std::time::Instant::now();
             let mut prepared_root = match runtime
-                .prepare_machine_root(&config, &storage_lease, qualification)
+                .prepare_machine_root(&config, &storage_lease, boot)
                 .await
             {
                 Ok(root) => root,

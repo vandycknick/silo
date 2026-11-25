@@ -441,13 +441,6 @@ impl CapturedBootAssets {
         }
     }
 
-    pub(crate) fn into_overlay_boot(self) -> Option<crate::OwnedOverlayBoot> {
-        match self {
-            Self::Overlay(qualification) => Some(qualification),
-            Self::Direct { .. } => None,
-        }
-    }
-
     fn into_sources(self) -> (OwnedBootAsset, OwnedBootAsset) {
         match self {
             Self::Direct { kernel, initramfs } => (kernel, initramfs),
@@ -459,6 +452,24 @@ impl CapturedBootAssets {
 pub(crate) struct ResolvedCapturedBoot {
     pub(crate) assets: CapturedBootAssets,
     pub(crate) agent: Option<OwnedBootAsset>,
+}
+
+pub(crate) enum AdmittedBoot {
+    Pinned(ResolvedCapturedBoot),
+    RuntimeOverlay(crate::OwnedOverlayBoot),
+    RuntimeSelected,
+}
+
+impl AdmittedBoot {
+    pub(crate) fn has_overlay_assets(&self) -> bool {
+        matches!(
+            self,
+            Self::Pinned(ResolvedCapturedBoot {
+                assets: CapturedBootAssets::Overlay(_),
+                ..
+            }) | Self::RuntimeOverlay(_)
+        )
+    }
 }
 
 fn invalid_capture(message: impl Into<String>) -> LibVmError {

@@ -5,6 +5,7 @@ use std::path::Path;
 
 use vm_spec::{BlockId, Disk, DiskFormat, DiskGeometry, DiskRole};
 
+use crate::runtime::boot_assets::AdmittedBoot;
 use crate::storage::pool::StoragePool;
 use crate::store::composition_store::LaunchLower;
 use crate::{LibVmError, MachineRoot, MachineStorageRecord, TemporaryDirectoryPolicy};
@@ -18,7 +19,7 @@ pub(crate) struct PreparedRoot {
     pub(crate) disks: Vec<Disk>,
     pub(crate) bootstrap: Vec<u8>,
     pub(crate) descriptor: Option<String>,
-    pub(crate) qualification: Option<crate::OwnedOverlayBoot>,
+    pub(crate) boot: AdmittedBoot,
     pub(crate) storage: MachineStorageRecord,
     pub(crate) rosetta: rootfs_spec::RosettaMode,
     /// Resolved lower protected by the caller's launch-generation lease until
@@ -262,7 +263,7 @@ pub(crate) fn prepare(
     images_dir: &Path,
     lower: Option<LaunchLower>,
     data_disks: u64,
-    qualification: Option<crate::OwnedOverlayBoot>,
+    boot: AdmittedBoot,
     rosetta: rootfs_spec::RosettaMode,
 ) -> Result<PreparedRoot, LibVmError> {
     storage.validate()?;
@@ -335,9 +336,9 @@ pub(crate) fn prepare(
             temporary_directory,
             ..
         } => {
-            qualification
-                .as_ref()
-                .ok_or_else(|| invalid("layered overlay boot has no owned boot assets"))?;
+            if !boot.has_overlay_assets() {
+                return Err(invalid("layered overlay boot has no owned boot assets"));
+            }
             let launch = lower
                 .as_ref()
                 .ok_or_else(|| invalid("overlay launch has no leased retained composition"))?;
@@ -423,7 +424,7 @@ pub(crate) fn prepare(
         disks,
         bootstrap,
         descriptor,
-        qualification,
+        boot,
         storage: storage.clone(),
         rosetta,
         _lower: lower,
@@ -956,7 +957,7 @@ mod tests {
                 &temp.path().join("missing-pool"),
                 None,
                 0,
-                Some(assets),
+                crate::runtime::boot_assets::AdmittedBoot::RuntimeOverlay(assets),
                 rootfs_spec::RosettaMode::Disabled,
             ) {
                 Ok(_) => panic!("root without retained lower unexpectedly prepared"),
@@ -1050,7 +1051,7 @@ mod tests {
             &temp.path().join("missing-pool"),
             None,
             0,
-            None,
+            crate::runtime::boot_assets::AdmittedBoot::RuntimeSelected,
             rootfs_spec::RosettaMode::Disabled,
         )
         .unwrap();
@@ -1093,7 +1094,7 @@ mod tests {
             &temp.path().join("images"),
             None,
             0,
-            None,
+            crate::runtime::boot_assets::AdmittedBoot::RuntimeSelected,
             rootfs_spec::RosettaMode::Required,
         )
         .unwrap();

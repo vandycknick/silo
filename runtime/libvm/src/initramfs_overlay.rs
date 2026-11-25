@@ -16,7 +16,6 @@ const CONFIG_MODE: u32 = 0o600;
 
 pub(crate) enum CompositeBase<'a> {
     Path(&'a Path),
-    Owned(&'a crate::OwnedOverlayBoot),
     Retained(&'a OwnedBootAsset),
 }
 
@@ -86,7 +85,6 @@ pub(crate) fn write_composite(
             io::copy(&mut source, &mut output)
                 .with_context(|| format!("copy base initramfs {}", path.display()))?
         }
-        CompositeBase::Owned(assets) => assets.copy_initramfs(&mut output)?,
         CompositeBase::Retained(asset) => asset.copy_into(&mut output)?,
     };
     let padding = (4 - (base_size % 4)) % 4;

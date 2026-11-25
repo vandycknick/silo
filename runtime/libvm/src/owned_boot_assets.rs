@@ -21,10 +21,6 @@ pub struct OwnedOverlayBoot {
 }
 
 impl OwnedOverlayBoot {
-    pub(crate) fn copy_initramfs(&self, output: &mut impl Write) -> Result<u64, BootAssetError> {
-        self.initramfs.copy_into(output)
-    }
-
     pub(crate) fn kernel_asset(&self) -> &OwnedBootAsset {
         &self.kernel
     }

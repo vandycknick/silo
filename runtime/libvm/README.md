@@ -621,12 +621,13 @@ lease transfer and certified storage shutdown remain separate lifecycle gates.
 Overlay launch uses krun on Linux and Apple silicon macOS hosts and requires a
 guest kernel of Linux 6.6 or newer. Unsupported VZ/mock backends and older
 kernels fail before materialization or launch effects. There is no
-artifact-specific admission list. `owned_boot_assets` retains read-only CLOEXEC
-descriptors for the guest kernel and base initramfs, stages the mode-0400
-`kernel-qualified` copy, and builds the composite initramfs from held sources
-with bounded copies and metadata checks. No boot asset is hashed on start or
-inspect. Overlay and raw boots start the monitor by its resolved path. Root
-bootstrap remains independent of agent injection; root markers and fixed
+artifact-specific admission list. Each persisted Linux direct-boot start opens
+its pinned guest kernel, base initramfs, and optional agent once, before launch
+registration. Both raw and overlay roots retain those read-only CLOEXEC
+descriptors to stage the mode-0400 `kernel-qualified` copy and build the
+composite initramfs with bounded copies and metadata checks. The guest asset
+files are not hashed on ordinary start. The monitor starts by its resolved path.
+Root bootstrap remains independent of agent injection; root markers and fixed
 serials cannot be overridden, and there is no automatic raw fallback.
 
 Stopped `MachineUpdate::root_disk_size(bytes)` publishes a replacement private

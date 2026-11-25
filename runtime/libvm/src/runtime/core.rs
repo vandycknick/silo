@@ -11,8 +11,9 @@ use oci::{MaterializeOptions, OciMaterializer};
 use crate::guest_agent::{self, GuestAgentConfigInput};
 use crate::lock_manager::{LockGuard, LockId, LockManager, MachineLifetimeLock, ManagedLock};
 use crate::machine::root_disk::resize_raw_disk;
+use crate::machine::root_storage::PreparedRoot;
 use crate::paths::{vm_spec_path_in, LocalPaths, MachinePaths};
-use crate::runtime::boot_assets::{self, BootAssetOverrides, ResolvedBootAssets};
+use crate::runtime::boot_assets::{self, AdmittedBoot, BootAssetOverrides, ResolvedBootAssets};
 use crate::runtime::components::{resolve_components, ResolvedRuntimeComponents};
 use crate::runtime::{RuntimeConfig, RuntimeNetworkingConfig};
 use crate::{ImageRegistryConfig, RegistryPolicy};
@@ -2143,14 +2144,17 @@ impl Runtime {
         &self,
         config: &MachineConfig,
         storage: &crate::MachineStorageRecord,
-    ) -> Result<Option<crate::OwnedOverlayBoot>, LibVmError> {
+    ) -> Result<AdmittedBoot, LibVmError> {
         let pool = crate::storage::pool::StoragePool::open_existing(self.local_images_dir())?;
-        let pinned = match &storage.boot {
-            crate::BootProfile::LinuxDirect {
-                binding: crate::BootBinding::Pinned { .. },
-                ..
-            } => Some(
-                boot_assets::resolve_pinned_boot(
+        match (&storage.boot, &storage.root) {
+            (
+                crate::BootProfile::LinuxDirect {
+                    binding: crate::BootBinding::Pinned { .. },
+                    ..
+                },
+                _,
+            ) => {
+                let pinned = boot_assets::resolve_pinned_boot(
                     storage,
                     pool.as_ref().ok_or_else(|| {
                         crate::machine::root_storage::invalid("pinned boot pool is missing")
@@ -2166,22 +2170,15 @@ impl Runtime {
                 })?
                 .ok_or_else(|| {
                     crate::machine::root_storage::invalid("pinned boot selection disappeared")
-                })?,
-            ),
-            _ => None,
-        };
-        if matches!(&storage.root, crate::MachineRoot::LinuxOverlay { .. }) {
-            if let Some(pinned) = pinned {
-                return pinned.assets.into_overlay_boot().map(Some).ok_or_else(|| {
-                    crate::machine::root_storage::invalid(
-                        "pinned overlay boot has no retained qualification",
-                    )
-                });
+                })?;
+                Ok(AdmittedBoot::Pinned(pinned))
             }
-            let (kernel, initramfs) = boot_asset_overrides_from_spec(&config.spec);
-            Ok(Some(self.open_overlay_boot(kernel, initramfs)?))
-        } else {
-            Ok(None)
+            (_, crate::MachineRoot::LinuxOverlay { .. }) => {
+                let (kernel, initramfs) = boot_asset_overrides_from_spec(&config.spec);
+                self.open_overlay_boot(kernel, initramfs)
+                    .map(AdmittedBoot::RuntimeOverlay)
+            }
+            _ => Ok(AdmittedBoot::RuntimeSelected),
         }
     }
 
@@ -2191,8 +2188,8 @@ impl Runtime {
         &self,
         config: &MachineConfig,
         lease: &crate::store::operation_store::LaunchStorageLease,
-        qualification: Option<crate::OwnedOverlayBoot>,
-    ) -> Result<crate::machine::root_storage::PreparedRoot, LibVmError> {
+        boot: AdmittedBoot,
+    ) -> Result<PreparedRoot, LibVmError> {
         let storage = lease.storage_record();
         let effective =
             boot_assets::effective_boot(storage, &config.spec, self.effective_backend())?;
@@ -2204,7 +2201,7 @@ impl Runtime {
                 .count() as u64
         });
         let lower = match &storage.root {
-            crate::MachineRoot::LinuxOverlay { .. } if qualification.is_some() => Some(
+            crate::MachineRoot::LinuxOverlay { .. } if boot.has_overlay_assets() => Some(
                 crate::store::layer_store::LayerStore::from_store(self.native_store()?)
                     .launch_lower(lease, storage)
                     .await
@@ -2224,7 +2221,7 @@ impl Runtime {
             self.local_images_dir(),
             lower,
             data_disks,
-            qualification,
+            boot,
             effective.rosetta,
         )
     }
@@ -2593,7 +2590,7 @@ impl Runtime {
         network: &VmmNetworkAttachment,
         resize_rootfs: bool,
         secrets: &crate::secrets::ResolvedSecrets,
-        root: &crate::machine::root_storage::PreparedRoot,
+        root: &PreparedRoot,
     ) -> Result<crate::supervisor::VmmLaunchInputs, LibVmError> {
         let prepare = || -> eyre::Result<crate::supervisor::VmmLaunchInputs> {
             let rosetta_intent = self
@@ -2655,20 +2652,7 @@ impl Runtime {
                     .chain(data)
                     .collect(),
             });
-            let pool = crate::storage::pool::StoragePool::open_existing(self.local_images_dir())?;
-            let pinned = match &root.storage.boot {
-                crate::BootProfile::LinuxDirect {
-                    binding: crate::BootBinding::Pinned { .. },
-                    ..
-                } => boot_assets::resolve_pinned_boot(
-                    &root.storage,
-                    pool.as_ref()
-                        .ok_or_else(|| eyre::eyre!("pinned boot pool is missing"))?,
-                    self.live_query.selection().backend,
-                )?,
-                _ => None,
-            };
-            if let Some(pinned) = &pinned {
+            if let AdmittedBoot::Pinned(pinned) = &root.boot {
                 let kernel = launch_spec
                     .boot
                     .as_mut()
@@ -2690,20 +2674,24 @@ impl Runtime {
                         descriptor,
                     )?);
             }
-            if let Some(qualification) = root.qualification.as_ref().filter(|_| pinned.is_none()) {
-                let (kernel_path, file) = crate::machine::root_storage::publish_kernel(
-                    &config.machine_dir,
-                    qualification.kernel_asset(),
-                )?;
-                artifacts.files.push(file);
-                let kernel = launch_spec
-                    .boot
-                    .as_mut()
-                    .and_then(|boot| boot.kernel.as_mut())
-                    .ok_or_else(|| eyre::eyre!("owned overlay has no direct kernel boot"))?;
-                kernel.path = Some(kernel_path);
-            } else if pinned.is_none() {
-                self.complete_launch_boot_assets(&mut launch_spec)?;
+            match &root.boot {
+                AdmittedBoot::Pinned(_) => {}
+                AdmittedBoot::RuntimeOverlay(qualification) => {
+                    let (kernel_path, file) = crate::machine::root_storage::publish_kernel(
+                        &config.machine_dir,
+                        qualification.kernel_asset(),
+                    )?;
+                    artifacts.files.push(file);
+                    let kernel = launch_spec
+                        .boot
+                        .as_mut()
+                        .and_then(|boot| boot.kernel.as_mut())
+                        .ok_or_else(|| eyre::eyre!("owned overlay has no direct kernel boot"))?;
+                    kernel.path = Some(kernel_path);
+                }
+                AdmittedBoot::RuntimeSelected => {
+                    self.complete_launch_boot_assets(&mut launch_spec)?;
+                }
             }
             let mut launch_spec = supervisor::prepare_launch_spec(LaunchSpecInput {
                 relative_mount_base: &relative_mount_base,
@@ -2717,19 +2705,19 @@ impl Runtime {
             )?;
 
             let agent_enabled = config.guest.agent.enabled();
-            let agent_path = if pinned.is_none() {
-                boot_assets::resolve_agent(&config.guest.agent, self.components.agent())?
-            } else {
-                None
-            };
-            let agent = match &pinned {
-                Some(pinned) => pinned
+            let agent_path;
+            let agent = match &root.boot {
+                AdmittedBoot::Pinned(pinned) => pinned
                     .agent
                     .as_ref()
                     .map(crate::initramfs_overlay::CompositeAgent::Retained),
-                None => agent_path
-                    .as_deref()
-                    .map(crate::initramfs_overlay::CompositeAgent::Path),
+                AdmittedBoot::RuntimeOverlay(_) | AdmittedBoot::RuntimeSelected => {
+                    agent_path =
+                        boot_assets::resolve_agent(&config.guest.agent, self.components.agent())?;
+                    agent_path
+                        .as_deref()
+                        .map(crate::initramfs_overlay::CompositeAgent::Path)
+                }
             };
             let serialized = if agent.is_some() {
                 let agent_config = guest_agent::build_config(GuestAgentConfigInput {
@@ -2752,22 +2740,20 @@ impl Runtime {
             } else {
                 None
             };
-            let base_path = boot_asset_overrides_from_spec(&launch_spec)
-                .1
-                .map(Path::to_path_buf);
-            let base = if let Some(pinned) = &pinned {
-                crate::initramfs_overlay::CompositeBase::Retained(pinned.assets.initramfs())
-            } else {
-                match root.qualification.as_ref() {
-                    Some(qualification) => {
-                        crate::initramfs_overlay::CompositeBase::Owned(qualification)
-                    }
-                    None => crate::initramfs_overlay::CompositeBase::Path(
-                        base_path
-                            .as_deref()
-                            .ok_or_else(|| eyre::eyre!("resolved launch spec has no initramfs"))?,
-                    ),
+            let base = match &root.boot {
+                AdmittedBoot::Pinned(pinned) => {
+                    crate::initramfs_overlay::CompositeBase::Retained(pinned.assets.initramfs())
                 }
+                AdmittedBoot::RuntimeOverlay(qualification) => {
+                    crate::initramfs_overlay::CompositeBase::Retained(
+                        qualification.initramfs_asset(),
+                    )
+                }
+                AdmittedBoot::RuntimeSelected => crate::initramfs_overlay::CompositeBase::Path(
+                    boot_asset_overrides_from_spec(&launch_spec)
+                        .1
+                        .ok_or_else(|| eyre::eyre!("resolved launch spec has no initramfs"))?,
+                ),
             };
             let composite_path = machine_paths.composite_initramfs_path();
             let composite = crate::initramfs_overlay::write_composite(
@@ -3724,7 +3710,7 @@ pub(crate) mod tests {
                     disks: vec![],
                     bootstrap: vec![],
                     descriptor: None,
-                    qualification: None,
+                    boot: crate::runtime::boot_assets::AdmittedBoot::RuntimeSelected,
                     storage: crate::MachineStorageRecord::opaque_raw(
                         crate::PrivatePath::new("root.raw").unwrap(),
                         512,

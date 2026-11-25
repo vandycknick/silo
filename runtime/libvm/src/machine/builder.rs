@@ -4042,7 +4042,7 @@ mod tests {
             store.machine_storage(id).await.unwrap(),
             Some(storage.clone())
         );
-        let qualification = runtime.open_machine_boot(&config, &storage).unwrap();
+        let boot = runtime.open_machine_boot(&config, &storage).unwrap();
         let run = uuid::Uuid::new_v4();
         let lease = runtime
             .register_launch_storage(&config, run, &storage)
@@ -4054,7 +4054,7 @@ mod tests {
             .unwrap();
         runtime.ensure_machine_runtime_directories(id).unwrap();
         let mut root = runtime
-            .prepare_machine_root(&config, &lease, qualification)
+            .prepare_machine_root(&config, &lease, boot)
             .await
             .unwrap();
         let secrets = runtime
@@ -4321,6 +4321,170 @@ mod tests {
     async fn layered_create_with_data_disks_and_managed_children_keeps_cold_launch_inventory_bound()
     {
         create_data_disks_then_cold_launch(true).await;
+    }
+
+    #[tokio::test]
+    async fn raw_cold_launch_uses_admitted_boot_assets_after_path_replacement() {
+        assert_cold_launch_uses_admitted_boot(false).await;
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn overlay_cold_launch_uses_admitted_boot_assets_after_path_replacement() {
+        assert_cold_launch_uses_admitted_boot(true).await;
+    }
+
+    async fn assert_cold_launch_uses_admitted_boot(layered: bool) {
+        use std::io::{Cursor, Read};
+
+        use crate::storage::pool::StoragePool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let (asset_owner, store) = runtime_with_sqlite_store(paths.clone()).await;
+        let components = crate::runtime::components::test_components_with_supervisor(
+            paths.home(),
+            &std::env::current_exe().unwrap(),
+        );
+        std::fs::write(components.agent(), b"original guest agent").unwrap();
+        if layered {
+            std::fs::write(
+                components.kernel(),
+                crate::owned_boot_assets::tests::elf_kernel_with_banner("6.6.0"),
+            )
+            .unwrap();
+        }
+        let runtime = Runtime::from_store(
+            paths,
+            store.clone(),
+            RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
+            components,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(asset_owner);
+
+        let source = write_base_rootfs(temp.path());
+        let mut request = create_request(source.clone(), "retained-boot");
+        request.kernel = None;
+        request.initramfs = None;
+        request.disk_size_bytes = Some(std::fs::metadata(&source).unwrap().len());
+        if layered {
+            let reference = "example.test/retained-boot:1";
+            let (record, _held) = crate::image::oci::tests::cache_layered_image(
+                &store,
+                reference,
+                crate::image::oci::tests::MANIFEST,
+            )
+            .await;
+            request.image_source = Some(ImageSource::oci(reference));
+            request.resolved_oci_image = Some(crate::image::oci::cached_resolved_oci_image(
+                &record,
+                reference.into(),
+            ));
+        }
+        let config = create_machine_config(&runtime, request).await.unwrap();
+        let (_lock, mut config) = runtime.lock_machine_config(config.id).await.unwrap();
+        let mut storage = runtime
+            .validate_machine_storage_for_launch(&config)
+            .await
+            .unwrap();
+        runtime
+            .admit_cold_launch_storage(&mut config, &mut storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            matches!(&storage.root, crate::MachineRoot::LinuxOverlay { .. }),
+            layered,
+        );
+        let crate::BootProfile::LinuxDirect {
+            binding:
+                crate::BootBinding::Pinned {
+                    kernel,
+                    base_initramfs,
+                    agent: Some(agent),
+                    ..
+                },
+            ..
+        } = &storage.boot
+        else {
+            panic!("cold start must use a pinned bundle with an agent");
+        };
+        let pool = StoragePool::open(runtime.local_images_dir()).unwrap();
+        let paths = [kernel, base_initramfs, agent].map(|digest| pool.object_path(digest));
+        let [kernel_bytes, base_bytes, agent_bytes] =
+            paths.each_ref().map(|path| std::fs::read(path).unwrap());
+        let replacement_kernel = if layered {
+            crate::owned_boot_assets::tests::elf_kernel_with_banner("6.7.0")
+        } else {
+            host_kernel("replacement kernel")
+        };
+
+        let boot = runtime.open_machine_boot(&config, &storage).unwrap();
+        for (path, replacement) in paths.iter().zip([
+            replacement_kernel.as_slice(),
+            b"replacement base initramfs",
+            b"replacement guest agent",
+        ]) {
+            let staged = path.with_extension("replacement");
+            std::fs::write(&staged, replacement).unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o400)).unwrap();
+            std::fs::rename(staged, path).unwrap();
+        }
+
+        let run = uuid::Uuid::new_v4();
+        let run_id = run.to_string();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .ensure_machine_runtime_directories(config.id)
+            .unwrap();
+        let root = runtime
+            .prepare_machine_root(&config, &lease, boot)
+            .await
+            .unwrap();
+        let secrets = runtime
+            .resolve_machine_secrets(&config, &run_id, &Default::default())
+            .unwrap();
+        let inputs = runtime
+            .prepare_vmm_launch_inputs(
+                &config,
+                &run_id,
+                &crate::network::VmmNetworkAttachment::None,
+                false,
+                &secrets,
+                &root,
+            )
+            .expect("launch preparation must use the admitted files, not resolve them again");
+        assert!(inputs.agent_enabled);
+
+        let machine_paths = runtime.machine_paths(config.id);
+        let spec: VmSpec =
+            serde_json::from_slice(&std::fs::read(machine_paths.vm_spec_path()).unwrap()).unwrap();
+        let boot = spec.boot.unwrap().kernel.unwrap();
+        let kernel = boot.path.unwrap();
+        assert_eq!(kernel, config.machine_dir.join("kernel-qualified"));
+        assert_eq!(std::fs::read(&kernel).unwrap(), kernel_bytes);
+        assert_eq!(
+            std::fs::metadata(&kernel).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        let initramfs = boot.initramfs.unwrap();
+        assert_eq!(initramfs, machine_paths.composite_initramfs_path());
+        let composite = std::fs::read(initramfs).unwrap();
+        assert!(composite.starts_with(&base_bytes));
+        let archive = Cursor::new(&composite[base_bytes.len().next_multiple_of(4)..]);
+        let directory = cpio::NewcReader::new(archive).unwrap();
+        assert_eq!(directory.entry().name(), "agent");
+        let mut agent = cpio::NewcReader::new(directory.finish().unwrap()).unwrap();
+        assert_eq!(agent.entry().name(), "agent/silo-agent");
+        let mut bytes = Vec::new();
+        agent.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, agent_bytes);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -4642,6 +4806,7 @@ mod tests {
             .await
             .unwrap();
         let cold_run = uuid::Uuid::new_v4();
+        let boot = runtime.open_machine_boot(&config, &storage).unwrap();
         let lease = runtime
             .register_launch_storage(&config, cold_run, &storage)
             .await
@@ -4655,7 +4820,7 @@ mod tests {
             .ensure_machine_runtime_directories(config.id)
             .unwrap();
         let root = runtime
-            .prepare_machine_root(&config, &lease, None)
+            .prepare_machine_root(&config, &lease, boot)
             .await
             .unwrap();
         let secrets = runtime
