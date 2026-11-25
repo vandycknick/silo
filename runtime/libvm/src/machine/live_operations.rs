@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -221,12 +222,15 @@ impl Machine {
     /// Exact retries recover the original response, not a replacement command.
     /// A NEW Capture is only created by [`Machine::submit_capture`], which
     /// registers its reservation and plan first; raw input can only replay it.
-    pub async fn live_command(
-        &self,
-        observation: &MachineLiveObservation,
+    pub fn live_command<'a>(
+        &'a self,
+        observation: &'a MachineLiveObservation,
         command: LiveCommand,
-    ) -> Result<LiveCommandResult, LibVmError> {
-        self.live_command_inner(observation, command, None).await
+    ) -> impl Future<Output = Result<LiveCommandResult, LibVmError>> + Send + 'a {
+        // Returned directly: an async wrapper would nest this large future one
+        // level deeper in every caller, and runtime open already runs close to
+        // the default thread stack in debug builds.
+        self.live_command_inner(observation, command, None)
     }
 
     async fn live_command_inner(
@@ -329,11 +333,11 @@ impl Machine {
     /// Send an already durable intent and persist its exact result. Capture
     /// dispatch holds the machine lock through acknowledgment to serialize
     /// fork cancellation; no database transaction spans the monitor round trip.
-    pub(crate) async fn send_prepared(
+    pub(crate) fn send_prepared(
         &self,
         intent: LiveCommandIntent,
-    ) -> Result<LiveCommandResult, LibVmError> {
-        self.send_prepared_inner(intent, None).await
+    ) -> impl Future<Output = Result<LiveCommandResult, LibVmError>> + Send + '_ {
+        self.send_prepared_inner(intent, None)
     }
 
     async fn send_prepared_inner(

@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -87,11 +88,12 @@ impl VmmClient {
 
     /// One exact, already-durable command. A transport timeout never implies
     /// cancellation or grants permission to submit a replacement identity.
-    pub(crate) async fn lifecycle(
+    pub(crate) fn lifecycle(
         &self,
         command: vm_spec::lifecycle::LiveCommand,
-    ) -> Result<vm_spec::lifecycle::LiveCommandResult, VmmClientError> {
-        self.lifecycle_with_cancel_timeout(command, None).await
+    ) -> impl Future<Output = Result<vm_spec::lifecycle::LiveCommandResult, VmmClientError>> + Send + '_
+    {
+        self.lifecycle_with_cancel_timeout(command, None)
     }
 
     pub(crate) async fn lifecycle_with_cancel_timeout(
