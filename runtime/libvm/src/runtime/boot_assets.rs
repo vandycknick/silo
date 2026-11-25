@@ -652,7 +652,7 @@ fn open_boot_object(pool: &StoragePool, digest: &ObjectDigest) -> Result<File, L
     })
 }
 
-/// Authenticate immutable objects without allocating a kernel-sized byte vector.
+/// Open immutable objects without allocating a kernel-sized byte vector.
 /// The caller retains their semantic closure through launch or publication.
 fn resolve_boot_object(
     pool: &StoragePool,
@@ -694,7 +694,7 @@ pub(crate) fn resolve_pinned_boot(
     resolve_pinned_profile(&storage.boot, pool, backend).map(Some)
 }
 
-/// Authenticate and admit one complete pinned tuple from owned objects only.
+/// Open and admit one complete pinned tuple from owned objects only.
 fn resolve_pinned_profile(
     boot: &BootProfile,
     pool: &StoragePool,

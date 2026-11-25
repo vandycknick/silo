@@ -226,8 +226,7 @@ replacement paths.
 Both overlay and raw boots launch the monitor by its resolved path.
 
 Pinned bundle identities and checkpoint producer identities are independent of
-this version check. Capture receipts retain the monitor digest from its
-capability report. Kernel, reusable initramfs or monitor updates do not require
+this version check. Kernel, reusable initramfs or monitor updates do not require
 recompiling libvm to authorize new artifact bytes.
 
 Real boot and storage gates still exercise the staged monitor/worker, actual

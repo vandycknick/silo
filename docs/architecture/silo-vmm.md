@@ -125,7 +125,7 @@ Both monitor backend validation and the worker use
 `vm_spec::Storage::validate_disks` for the same root-pair, ordering, uniqueness
 and geometry rules. User data attachments follow the explicitly typed roots.
 
-For the opt-in development flat-overlay profile, libvm supplies a generated
+For the layered overlay profile, libvm supplies a generated
 VMDK `RootLower` with serial `silo-root-lower` and read-only access, followed by
 a raw writable `RootUpper` with serial `silo-root-upper`. Its VMDK geometry is
 the virtual lower length, not the descriptor's host file size. The engine maps

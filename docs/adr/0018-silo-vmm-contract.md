@@ -114,7 +114,7 @@ The `--config` disk schema is exclusively VM spec `0.2.0`. Each disk requires
 path, semantic role, explicit raw/VMDK format, exact virtual geometry, validated
 block identity and read-only access. Missing fields and old spec versions
 reject, with no ordered-role inference or filename-based format detection.
-Opaque raw uses one writable raw root; the opt-in development overlay uses a
+Opaque raw uses one writable raw root; the layered overlay uses a
 read-only generated VMDK lower (`silo-root-lower`) and writable raw upper
 (`silo-root-upper`), followed by typed Data disks. Both public config and private
 worker boundaries enforce the same combinations, unique printable ASCII

@@ -579,22 +579,8 @@ impl InspectedKernel {
 }
 
 /// The first `KERNEL_HEADER_BYTES` of the kernel image.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct KernelHeader(Vec<u8>);
-
-impl Write for KernelHeader {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let wanted = KERNEL_HEADER_BYTES
-            .saturating_sub(self.0.len())
-            .min(bytes.len());
-        self.0.extend_from_slice(&bytes[..wanted]);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 
 fn le_bytes<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], DirectKernelRejection> {
     offset
@@ -711,10 +697,9 @@ fn validate_elf_executable(header: &[u8], length: u64) -> Result<(), DirectKerne
 pub(crate) mod tests {
     use crate::owned_boot_assets::{
         native_kernel_image, BootAssetError, DirectKernelRejection, InspectedKernel, KernelHeader,
-        OwnedBootAsset,
+        OwnedBootAsset, KERNEL_HEADER_BYTES,
     };
     use crate::GuestArchitecture;
-    use std::io::Write;
     use test_utils::direct_kernel as direct_kernel_fixture;
     use test_utils::direct_kernel::KernelArchitecture;
 
@@ -1119,9 +1104,7 @@ pub(crate) mod tests {
     ];
 
     fn header(bytes: &[u8]) -> KernelHeader {
-        let mut header = KernelHeader::default();
-        header.write_all(bytes).unwrap();
-        header
+        KernelHeader(bytes[..bytes.len().min(KERNEL_HEADER_BYTES)].to_vec())
     }
 
     fn admit(bytes: &[u8], architecture: GuestArchitecture) -> Result<(), DirectKernelRejection> {
@@ -1314,28 +1297,6 @@ pub(crate) mod tests {
         }
         assert_eq!(admit(&arm64[..64], requirement), Ok(()));
         assert_eq!(admit(&arm64, requirement), Ok(()));
-    }
-
-    #[test]
-    fn kernel_header_capture_is_bounded_and_independent_of_write_boundaries() {
-        for (fixture, _) in ARCHITECTURES {
-            let kernel = direct_kernel_fixture::image(fixture, &vec![0x33; 2 * 4096 + 5]);
-            let expected = header(&kernel).0;
-            assert_eq!(expected, kernel[..4096]);
-            for split in [0, 1, 63, 64, 4095, 4096, 4097, kernel.len()] {
-                let mut observed = KernelHeader::default();
-                observed.write_all(&kernel[..split]).unwrap();
-                observed.write_all(&kernel[split..]).unwrap();
-                assert_eq!(observed.0, expected, "split at {split}");
-            }
-            for chunk in [1, 7, 4095, 65536] {
-                let mut chunked = KernelHeader::default();
-                for part in kernel.chunks(chunk) {
-                    chunked.write_all(part).unwrap();
-                }
-                assert_eq!(chunked.0, expected, "chunk {chunk}");
-            }
-        }
     }
 
     #[test]
