@@ -27,6 +27,8 @@ const METRICS_INTERVAL: Duration = Duration::from_secs(5);
 const FIRST_STATUS_DEADLINE: Duration = Duration::from_secs(5);
 const FAST_DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
 const FAST_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
+const FAST_DISCOVERY_CONNECT: Duration = Duration::from_millis(100);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
@@ -94,7 +96,7 @@ async fn supervise_status(
         let result = tokio::select! {
             _ = shutdown.cancelled() => return,
             result = async {
-                match connect(&machine).await {
+                match connect_within(&machine, retries.connect_deadline(Instant::now())).await {
                     Ok(channel) => {
                         status_stream(
                             agent_client(channel),
@@ -409,6 +411,19 @@ impl RetrySchedule {
         self.started_at.elapsed()
     }
 
+    /// How long one connection attempt may take. A guest that is still booting
+    /// does not refuse a connection, it just never answers, so an attempt made
+    /// too early has to be given up quickly for the fast retry to mean anything.
+    fn connect_deadline(&self, now: Instant) -> Duration {
+        if !self.discovered
+            && now.saturating_duration_since(self.started_at) < FAST_DISCOVERY_WINDOW
+        {
+            FAST_DISCOVERY_CONNECT
+        } else {
+            CONNECT_TIMEOUT
+        }
+    }
+
     fn next(&mut self, received_snapshot: bool, now: Instant) -> RetryPlan {
         if received_snapshot {
             self.discovered = true;
@@ -445,9 +460,16 @@ async fn retry_sleep(shutdown: &CancellationToken, plan: RetryPlan, stream: &'st
 }
 
 pub(crate) async fn connect(machine: &VirtualMachine) -> Result<Channel, tonic::Status> {
+    connect_within(machine, CONNECT_TIMEOUT).await
+}
+
+async fn connect_within(
+    machine: &VirtualMachine,
+    deadline: Duration,
+) -> Result<Channel, tonic::Status> {
     let machine = machine.clone();
     Endpoint::from_static("http://guest-agent.invalid")
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(deadline)
         .connect_with_connector(service_fn(move |_| {
             let machine = machine.clone();
             async move {
@@ -644,5 +666,23 @@ mod tests {
         let next = retries.next(false, started_at);
         assert_eq!(reset.ceiling, INITIAL_BACKOFF);
         assert_eq!(next.ceiling, INITIAL_BACKOFF * 2);
+    }
+
+    #[test]
+    fn only_first_discovery_attempts_are_cut_short() {
+        use crate::guest::{CONNECT_TIMEOUT, FAST_DISCOVERY_CONNECT};
+        let started_at = Instant::now();
+        let booting = RetrySchedule::new(started_at, false);
+        assert_eq!(booting.connect_deadline(started_at), FAST_DISCOVERY_CONNECT);
+        assert_eq!(
+            booting.connect_deadline(started_at + FAST_DISCOVERY_WINDOW - Duration::from_millis(1)),
+            FAST_DISCOVERY_CONNECT
+        );
+        assert_eq!(
+            booting.connect_deadline(started_at + FAST_DISCOVERY_WINDOW),
+            CONNECT_TIMEOUT
+        );
+        let reconnecting = RetrySchedule::new(started_at, true);
+        assert_eq!(reconnecting.connect_deadline(started_at), CONNECT_TIMEOUT);
     }
 }
