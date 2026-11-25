@@ -117,7 +117,6 @@ impl ExecutableStat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheKey {
     executable: ExecutableStat,
-    executable_digest: String,
     boot: String,
     backend: LiveBackend,
     scenario_digest: Option<String>,
@@ -167,8 +166,8 @@ impl LiveCapabilityQuery {
         self.cache = previous.cache.clone();
     }
 
-    /// Reuse discovery's byte authentication while binding the held executable
-    /// used by native inspection and launch to the same stat identity.
+    /// The digest restore records for the monitor it inspected. Hashed here, on
+    /// first use, from the held file: ordinary discovery never reads the binary.
     pub(crate) async fn held_executable_digest(
         &self,
         file: &std::fs::File,
@@ -187,12 +186,21 @@ impl LiveCapabilityQuery {
         {
             return Err(discovery("held monitor differs from capability executable"));
         }
-        let cache = self.cache.lock().await;
-        let (_, digest) = cache
-            .executable
-            .as_ref()
-            .filter(|(known, _)| known == &stat)
-            .ok_or_else(|| discovery("monitor executable changed after capability discovery"))?;
+        let mut cache = self.cache.lock().await;
+        let digest = match &cache.executable {
+            Some((known, digest)) if known == &stat => digest.clone(),
+            _ => {
+                let held = file
+                    .try_clone()
+                    .map_err(|error| discovery(error.to_string()))?;
+                let value = executable_digest(held).await?;
+                if ExecutableStat::read(&self.executable)? != stat {
+                    return Err(discovery("monitor executable changed while hashing"));
+                }
+                cache.executable = Some((stat, value.clone()));
+                value
+            }
+        };
         crate::storage::identity::parse_hex(digest.as_bytes())
             .map(crate::storage::identity::ObjectDigest::from_sha256)
             .map_err(|error| discovery(error.to_string()))
@@ -215,20 +223,10 @@ impl LiveCapabilityQuery {
                 ));
             }
         }
-        let executable_digest = match &cache.executable {
-            Some((known, digest)) if known == &stat => digest.clone(),
-            _ => {
-                let value = executable_digest(&stat.canonical).await?;
-                if ExecutableStat::read(&self.executable)? != stat {
-                    return Err(discovery("monitor executable changed while hashing"));
-                }
-                cache.executable = Some((stat.clone(), value.clone()));
-                value
-            }
-        };
+        // The file's metadata identifies the binary for this process-scoped
+        // cache; any replacement or rewrite changes it and misses.
         let key = CacheKey {
             executable: stat.clone(),
-            executable_digest,
             boot,
             backend: self.selection.backend,
             scenario_digest: self.selection.scenario_digest.clone(),
@@ -241,11 +239,9 @@ impl LiveCapabilityQuery {
             return Ok(report.clone());
         }
         let report = query_process(&self.executable, &self.selection).await?;
-        if ExecutableStat::read(&self.executable)? != stat {
-            return Err(discovery(
-                "monitor executable changed during capability query",
-            ));
-        }
+        // A binary replaced while it answered is not an error: the answer is
+        // simply not kept, and the next call asks whatever is installed then.
+        let unchanged = ExecutableStat::read(&self.executable)? == stat;
         report.validate().map_err(protocol)?;
         if report.backend != self.selection.backend
             || report.scenario_digest != self.selection.scenario_digest
@@ -257,18 +253,18 @@ impl LiveCapabilityQuery {
         // Discovery is process-scoped. Native inspection and launch perform
         // admission again; repeated observations reuse the exact executable,
         // boot and backend selection rather than executing another monitor.
-        if cache.entries.len() == CACHE_LIMIT {
-            cache.entries.pop_front();
+        if unchanged {
+            if cache.entries.len() == CACHE_LIMIT {
+                cache.entries.pop_front();
+            }
+            cache.entries.push_back((key, report.clone()));
         }
-        cache.entries.push_back((key, report.clone()));
         Ok(report)
     }
 }
 
-async fn executable_digest(path: &Path) -> Result<String, LibVmError> {
-    let path = path.to_path_buf();
+async fn executable_digest(file: std::fs::File) -> Result<String, LibVmError> {
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(path).map_err(|error| discovery(error.to_string()))?;
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 64 * 1024];
         let mut offset = 0u64;
@@ -540,6 +536,10 @@ mod tests {
             .with_mock_vmm(&scenario_path);
         let query = crate::LiveCapabilityQuery::open(&config).unwrap();
         let first = query.host_report().await.unwrap();
+        assert!(
+            query.cache.lock().await.executable.is_none(),
+            "discovery alone must not hash the monitor"
+        );
         let file = std::fs::File::open(test_utils::mock_vmm_binary()).unwrap();
         let digest = query.held_executable_digest(&file).await.unwrap();
         for _ in 0..2 {
@@ -601,13 +601,9 @@ mod tests {
         for length in [0, 1, 65535, 65536, 65537, 2 * 65536 + 19] {
             let contents: Vec<_> = (0..length).map(|index| (index % 251) as u8).collect();
             std::fs::write(&executable, &contents).unwrap();
-            assert_eq!(
-                executable_digest(&executable).await.unwrap(),
-                digest(&contents)
-            );
+            let file = std::fs::File::open(&executable).unwrap();
+            assert_eq!(executable_digest(file).await.unwrap(), digest(&contents));
         }
-        std::fs::remove_file(&executable).unwrap();
-        assert!(executable_digest(&executable).await.is_err());
     }
 
     #[tokio::test]

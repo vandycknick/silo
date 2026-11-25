@@ -646,9 +646,9 @@ bytes at the device's sequential write rate (about 1 s per 1 GiB here).
    commit-then-unlink garbage collection, machine deletion) run a checked
    `wal_checkpoint(PASSIVE)` after their commit and fail closed if it cannot
    complete.
-4. Capability discovery caches validated reports per process (stat/digest
-   keyed, replacement still invalidates); disk-map verification overlaps
-   `inspect-restore`.
+4. Capability discovery caches validated reports per process (keyed by
+   the monitor file metadata, replacement still invalidates); disk-map
+   verification overlaps `inspect-restore`.
 5. Budgets: the non-CoW copy allowance applied to restore and fork as it
    did to capture; the harness probed `FICLONE` in the budget workspace
    to choose the lane. Phase 30 moves these gates from smoke to `make perf`.
