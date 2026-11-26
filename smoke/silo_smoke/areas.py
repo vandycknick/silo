@@ -21,7 +21,8 @@ AREAS: dict[str, Area] = {
     "host": Area("host-only unit coverage, no VM", (
         "test_guest_activation", "test_harness", "test_prereqs", "test_stopped_trace", "test_stream_map")),
     "lifecycle": Area("create, start, stop, pause, shutdown and guest init", (
-        "test_lifecycle", "test_guest_lifecycle", "test_shutdown", "test_pause", "test_contained_init")),
+        "test_lifecycle", "test_guest_lifecycle", "test_shutdown", "test_pause", "test_contained_init",
+        "test_refusals_macos")),
     "access": Area("exec, shell, terminal, cp, forwards, logs and ssh", (
         "test_exec_shell", "test_exec_stdin", "test_terminal", "test_cp", "test_forward_logs",
         "test_ssh_distros", "test_ssh_systemd_owned")),
