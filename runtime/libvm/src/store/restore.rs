@@ -34,7 +34,6 @@ pub(crate) struct RestoreIntent {
     pub consumer_operation: Uuid,
     pub request: vm_spec::restore::RestoreRequest,
     pub resources: RestoreResourceCharge,
-    pub inspected_executable: crate::storage::identity::ObjectDigest,
     pub inspection: vm_spec::restore::RestoreInspectionReport,
     pub network_attachment: bool,
 }

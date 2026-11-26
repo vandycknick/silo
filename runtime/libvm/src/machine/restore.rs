@@ -2,10 +2,10 @@
 //! repair, resize, bootstrap execution or fallback is part of this path.
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -185,33 +185,19 @@ async fn restore_consumer(
         lower_inputs.as_ref(),
         options.activation_hook,
     )?;
-    let executable =
-        crate::storage::stream::open_regular_source(runtime.supervisor().executable())?;
-    let executable_identity =
-        crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?);
     let network = !matches!(
         consumer.record.configuration.network,
         crate::store::models::MachineNetworkConfig::None
     );
-    let inspected_executable = runtime
-        .live_capability_query()
-        .held_executable_digest(&executable)
-        .await?;
     let images = runtime.local_images_dir().to_path_buf();
     let shape = tokio::task::spawn_blocking(move || inspection_shape.complete(&images));
-    let (inspection, shape) = tokio::try_join!(inspect(&executable, &request, network), async {
-        shape.await?
-    },)?;
+    let (inspection, shape) = tokio::try_join!(
+        inspect(runtime.supervisor().executable(), &request, network),
+        async { shape.await? },
+    )?;
     if inspection.lane != host_report.lane {
         return Err(invalid(
             "native restore inspection lane differs from the selected host capability report",
-        ));
-    }
-    if crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?)
-        != executable_identity
-    {
-        return Err(invalid(
-            "selected monitor executable changed during native inspection",
         ));
     }
     let storage = storage_from_snapshot(&consumer.record, consumer.info.id)?;
@@ -254,7 +240,6 @@ async fn restore_consumer(
         consumer_operation: consumer.operation_id,
         request: request.clone(),
         resources,
-        inspected_executable,
         inspection,
         network_attachment: network,
     };
@@ -267,8 +252,6 @@ async fn restore_consumer(
             intent,
             request,
             objects: objects.into(),
-            executable,
-            executable_identity,
             lower_inputs,
             shared_qualification: None,
             authentication: Some(RestoreAuthentication::new(snapshots.clone(), shape)),
@@ -393,8 +376,6 @@ struct PreparedRestore {
     intent: RestoreIntent,
     request: RestoreRequest,
     objects: Vec<File>,
-    executable: File,
-    executable_identity: crate::storage::identity_file::SourceFingerprint,
     lower_inputs: Option<LowerInputs>,
     authentication: Option<RestoreAuthentication>,
     shared_qualification: Option<Arc<crate::machine::root_disk::SharedCopyQualification>>,
@@ -439,8 +420,6 @@ async fn execute_prepared(
         intent,
         request,
         objects,
-        executable,
-        executable_identity,
         lower_inputs,
         authentication,
         shared_qualification,
@@ -502,8 +481,6 @@ async fn execute_prepared(
     let mut launch = RestoreLaunch {
         request,
         objects,
-        executable,
-        executable_identity,
         lowers: lower_inputs.map(|lower| lower.files).unwrap_or_default(),
     };
     if let Some(progress) = progress {
@@ -1410,7 +1387,7 @@ pub(crate) fn inspection_request(
 }
 
 pub(crate) async fn inspect(
-    executable: &File,
+    executable: &Path,
     restore: &RestoreRequest,
     network: bool,
 ) -> Result<vm_spec::restore::RestoreInspectionReport, LibVmError> {
@@ -1431,7 +1408,7 @@ pub(crate) async fn inspect(
             format!("{} encoded bytes", bytes.len()),
         ));
     }
-    let mut command = pinned_command(executable);
+    let mut command = Command::new(executable);
     command
         .arg("inspect-restore")
         .stdin(Stdio::piped())
@@ -1592,20 +1569,8 @@ async fn bounded_output(
     Ok(bytes)
 }
 
-fn pinned_command(executable: &File) -> std::process::Command {
-    let root = if cfg!(target_os = "linux") {
-        "/proc/self/fd"
-    } else {
-        "/dev/fd"
-    };
-    std::process::Command::new(Path::new(root).join(executable.as_fd().as_raw_fd().to_string()))
-}
-
 pub(crate) struct VerifiedForkRestore {
     cut: crate::store::fork::VerifiedRestoreCut,
-    executable: File,
-    executable_identity: crate::storage::identity_file::SourceFingerprint,
-    inspected_executable: crate::storage::identity::ObjectDigest,
     lane: vm_spec::live::LiveLane,
     shared_qualification: Arc<crate::machine::root_disk::SharedCopyQualification>,
 }
@@ -1616,29 +1581,11 @@ pub(crate) async fn prepare_fork_restore(
 ) -> Result<VerifiedForkRestore, LibVmError> {
     let host = runtime.live_capabilities().await?;
     crate::require_host_live_operation(&host, LiveOperation::Restore)?;
-    let executable =
-        crate::storage::stream::open_regular_source(runtime.supervisor().executable())?;
-    let executable_identity =
-        crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?);
-    let inspected_executable = runtime
-        .live_capability_query()
-        .held_executable_digest(&executable)
-        .await?;
-    if crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?)
-        != executable_identity
-    {
-        return Err(invalid(
-            "fork monitor executable changed during authentication",
-        ));
-    }
     let shared_qualification = Arc::new(crate::machine::root_disk::SharedCopyQualification::new(
         cut.directory(),
     )?);
     Ok(VerifiedForkRestore {
         cut,
-        executable,
-        executable_identity,
-        inspected_executable,
         lane: host.lane,
         shared_qualification,
     })
@@ -1839,19 +1786,15 @@ pub(crate) async fn restore_reserved_fork_child(
     } = prepare_fork_child_inputs(runtime, &prepared.cut, &child, &options)?;
     let store = runtime.native_store()?;
     let cut = &prepared.cut;
-    let executable = prepared.executable.try_clone()?;
-    let executable_identity = prepared.executable_identity;
-    let inspected_executable = prepared.inspected_executable;
     let network = !matches!(
         configuration.network,
         crate::store::models::MachineNetworkConfig::None
     );
-    let inspection = inspect(&executable, &request, network).await?;
-    if inspection.lane != prepared.lane
-        || crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?)
-            != executable_identity
-    {
-        return Err(invalid("fork restore native inspection identity changed"));
+    let inspection = inspect(runtime.supervisor().executable(), &request, network).await?;
+    if inspection.lane != prepared.lane {
+        return Err(invalid(
+            "fork restore native inspection lane differs from the selected host capability report",
+        ));
     }
     let intent = RestoreIntent {
         source: crate::store::restore::RestoreIdentity::LocalCut {
@@ -1860,7 +1803,6 @@ pub(crate) async fn restore_reserved_fork_child(
         consumer_operation: child.consumer_id,
         request: request.clone(),
         resources: store.fork_child_charge(child.consumer_id).await?,
-        inspected_executable,
         inspection,
         network_attachment: network,
     };
@@ -1874,8 +1816,6 @@ pub(crate) async fn restore_reserved_fork_child(
             intent,
             request,
             objects: files,
-            executable,
-            executable_identity,
             lower_inputs,
             authentication: None,
             shared_qualification: Some(Arc::clone(&prepared.shared_qualification)),
@@ -1974,9 +1914,6 @@ pub(crate) mod tests {
                 consumer_operation: consumer.operation_id,
                 request: request.clone(),
                 resources,
-                inspected_executable: crate::storage::identity::ObjectDigest::of_bytes(
-                    b"host construction only",
-                ),
                 inspection: inspection_report(&inspection),
                 network_attachment: false,
             };
@@ -2072,15 +2009,10 @@ pub(crate) mod tests {
         objects: Vec<std::fs::File>,
         lowers: Vec<std::fs::File>,
     ) {
-        let executable = tempfile::tempfile().unwrap();
-        let executable_identity =
-            crate::storage::identity_file::SourceFingerprint::new(&executable.metadata().unwrap());
         let mut launch = crate::supervisor::launch::RestoreLaunch {
             request,
             objects,
             lowers,
-            executable,
-            executable_identity,
         };
         let descriptors = launch.transfer_descriptors().unwrap();
         assert_eq!(
@@ -2142,9 +2074,6 @@ pub(crate) mod tests {
                 consumer_operation: child.consumer_id,
                 request: request.clone(),
                 resources: store.fork_child_charge(child.consumer_id).await.unwrap(),
-                inspected_executable: crate::storage::identity::ObjectDigest::of_bytes(
-                    b"host construction only",
-                ),
                 inspection: inspection_report(&inspection),
                 network_attachment: false,
             };
@@ -2574,8 +2503,10 @@ pub(crate) mod tests {
 
         request.version = 0;
         // This real file cannot execute. The request error must precede spawn.
-        let executable = tempfile::tempfile().unwrap();
-        let error = inspect(&executable, &request, false).await.unwrap_err();
+        let executable = tempfile::NamedTempFile::new().unwrap();
+        let error = inspect(executable.path(), &request, false)
+            .await
+            .unwrap_err();
         let crate::LibVmError::SnapshotPortability { refusal, .. } = error else {
             panic!("inspection request failure must be a restore-preflight refusal");
         };
@@ -2585,18 +2516,46 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn inspection_process_failure_is_a_restore_preflight_refusal() {
+    async fn inspection_runs_monitor_path_and_preserves_native_refusal() {
+        use std::process::Command;
+
+        use vm_spec::restore::{
+            RestoreInspectionFailure, RestorePortabilityRefusal, RESTORE_INSPECTION_VERSION,
+        };
+
         let (_fixture, _files, request) = owned_inspection_fixture().await;
-        let executable = tempfile::tempfile().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("silo-vmm");
+        let failure = RestoreInspectionFailure {
+            version: RESTORE_INSPECTION_VERSION,
+            refusal: RestorePortabilityRefusal::new("architecture", "x86_64", "aarch64"),
+        };
+        std::fs::write(
+            directory.path().join("refusal.json"),
+            format!("{}\n", serde_json::to_string(&failure).unwrap()),
+        )
+        .unwrap();
+        let script = r#"#!/bin/sh
+test "$#" -eq 1 && test "$1" = inspect-restore || exit 2
+/bin/cat >/dev/null && /bin/cat "${0%/*}/refusal.json" || exit 3
+exit 1"#;
+        // Stage in a separate process so concurrent forks cannot hold a writable handle.
+        assert!(Command::new("/bin/sh")
+            .args(["-c", r#"printf '%s\n' "$2" > "$1" && chmod 700 "$1""#])
+            .arg("stage-monitor")
+            .arg(&executable)
+            .arg(script)
+            .status()
+            .unwrap()
+            .success());
         let error = crate::machine::restore::inspect(&executable, &request, false)
             .await
             .unwrap_err();
         let crate::LibVmError::SnapshotPortability { snapshot, refusal } = error else {
-            panic!("inspection process failure must be a restore-preflight refusal");
+            panic!("native inspection refusal must be a restore-preflight refusal");
         };
         refusal.validate().unwrap();
         assert!(snapshot.starts_with("fork:"));
-        assert_eq!(refusal.stage, "restore-preflight");
-        assert_eq!(refusal.pin, "inspection.process");
+        assert_eq!(*refusal, failure.refusal);
     }
 }

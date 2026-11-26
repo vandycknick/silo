@@ -516,8 +516,7 @@ impl Runtime {
         self.live_query.host_report().await
     }
 
-    /// Reuse this runtime's stat-keyed executable digest for observation-only
-    /// preflight gates. Each host report still probes mutable host admission.
+    /// Reuse this runtime's host capability query for observation-only preflight.
     pub fn live_capability_query(&self) -> &crate::runtime::capabilities::LiveCapabilityQuery {
         &self.live_query
     }

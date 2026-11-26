@@ -62,11 +62,10 @@ the separately configured system appliance host capabilities. Each vector has
 tagged `supported`/`unsupported` availability and a closed reason code.
 The native implementation bit is diagnostic, not product admission.
 
-Host-capability discovery identifies the selected monitor executable by its
-file metadata and does not read it. Restore hashes the held monitor in bounded
-chunks when it records the executable it inspected. The streaming buffer is
-heap-owned only while that digest is computed. The buffer is not
-embedded in the inspection and lifecycle futures that await capability evidence.
+Host-capability discovery keys its cache by the selected monitor's file
+metadata without hashing the binary. Restore uses the resolved monitor path
+for native inspection and launch, with no executable identity check between
+them. Native inspection checks compatibility with the saved state.
 
 The explicit execution-state command grammar is:
 

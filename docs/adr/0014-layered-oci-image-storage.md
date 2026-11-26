@@ -66,9 +66,8 @@ requires a fresh `SILO_HOME`.
 
 The 2026-11-24 revision specifies that overlay boot does not qualify the
 monitor. Linux and macOS launch it by its resolved path, exactly as for raw
-roots. The retained-monitor descriptor launch was a remnant of the withdrawn
-exact kernel/initramfs/monitor tuple and is removed. macOS cannot execute a
-descriptor.
+roots. [ADR 0018](0018-silo-vmm-contract.md) defines the common launch rule
+for boot and restore.
 
 ## Implementation status (2026-11-09)
 

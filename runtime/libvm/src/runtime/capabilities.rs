@@ -1,7 +1,7 @@
 //! Machine-less discovery and the exact selection shared with monitor start.
 use std::collections::VecDeque;
 use std::io::Read;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,7 +142,6 @@ struct CacheKey {
 
 #[derive(Debug, Default)]
 struct QueryCache {
-    executable: Option<(ExecutableStat, String)>,
     entries: VecDeque<(CacheKey, LiveHostReport)>,
 }
 
@@ -184,45 +183,6 @@ impl LiveCapabilityQuery {
         self.cache = previous.cache.clone();
     }
 
-    /// The digest restore records for the monitor it inspected. Hashed here, on
-    /// first use, from the held file: ordinary discovery never reads the binary.
-    pub(crate) async fn held_executable_digest(
-        &self,
-        file: &std::fs::File,
-    ) -> Result<crate::storage::identity::ObjectDigest, LibVmError> {
-        let stat = ExecutableStat::read(&self.executable)?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| discovery(error.to_string()))?;
-        if (
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            (metadata.mtime(), metadata.mtime_nsec()),
-            (metadata.ctime(), metadata.ctime_nsec()),
-        ) != (stat.device, stat.inode, stat.length, stat.mtime, stat.ctime)
-        {
-            return Err(discovery("held monitor differs from capability executable"));
-        }
-        let mut cache = self.cache.lock().await;
-        let digest = match &cache.executable {
-            Some((known, digest)) if known == &stat => digest.clone(),
-            _ => {
-                let held = file
-                    .try_clone()
-                    .map_err(|error| discovery(error.to_string()))?;
-                let value = executable_digest(held).await?;
-                if ExecutableStat::read(&self.executable)? != stat {
-                    return Err(discovery("monitor executable changed while hashing"));
-                }
-                cache.executable = Some((stat, value.clone()));
-                value
-            }
-        };
-        crate::storage::identity::parse_hex(digest.as_bytes())
-            .map(crate::storage::identity::ObjectDigest::from_sha256)
-            .map_err(|error| discovery(error.to_string()))
-    }
     pub(crate) fn selection(&self) -> &Arc<ResolvedBackendSelection> {
         &self.selection
     }
@@ -279,27 +239,6 @@ impl LiveCapabilityQuery {
         }
         Ok(report)
     }
-}
-
-async fn executable_digest(file: std::fs::File) -> Result<String, LibVmError> {
-    tokio::task::spawn_blocking(move || {
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        let mut offset = 0u64;
-        loop {
-            let count = match file.read_at(&mut buffer, offset) {
-                Ok(0) => break,
-                Ok(count) => count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(discovery(error.to_string())),
-            };
-            hasher.update(&buffer[..count]);
-            offset += count as u64;
-        }
-        Ok(hex(&hasher.finalize()))
-    })
-    .await
-    .map_err(|error| discovery(format!("executable digest worker stopped: {error}")))?
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -473,9 +412,7 @@ fn protocol(message: impl Into<String>) -> LibVmError {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::capabilities::{
-        bounded_read, collect_child, digest, executable_digest, ResolvedBackendSelection,
-    };
+    use crate::runtime::capabilities::{bounded_read, collect_child, ResolvedBackendSelection};
     use crate::runtime::VirtBackendOverride;
     use std::future::Future;
     use vm_spec::live::LiveBackend;
@@ -525,7 +462,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn restore_discovery_reuses_supported_report_and_executable_digest() {
+    async fn restore_discovery_reuses_supported_report() {
         use vm_spec::live::{LiveAvailability, LiveCapability, LiveCapabilityVector, LiveLane};
         let temporary = tempfile::tempdir().unwrap();
         let scenario_path = temporary.path().join("scenario.json");
@@ -554,15 +491,8 @@ mod tests {
             .with_mock_vmm(&scenario_path);
         let query = crate::LiveCapabilityQuery::open(&config).unwrap();
         let first = query.host_report().await.unwrap();
-        assert!(
-            query.cache.lock().await.executable.is_none(),
-            "discovery alone must not hash the monitor"
-        );
-        let file = std::fs::File::open(test_utils::mock_vmm_binary()).unwrap();
-        let digest = query.held_executable_digest(&file).await.unwrap();
         for _ in 0..2 {
             assert_eq!(query.host_report().await.unwrap(), first);
-            assert_eq!(query.held_executable_digest(&file).await.unwrap(), digest);
         }
         let mut initialized = crate::LiveCapabilityQuery::open(&config).unwrap();
         initialized.reuse_cache(&query);
@@ -573,7 +503,6 @@ mod tests {
             1,
             "supported restore must take the cache-hit path"
         );
-        assert_eq!(cache.executable.as_ref().unwrap().1, digest.hex());
         assert!(!temporary.path().join("home").exists());
     }
 
@@ -610,18 +539,6 @@ mod tests {
                 .scenario_digest
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn executable_digest_hashes_empty_files_and_partial_final_buffers() {
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("monitor");
-        for length in [0, 1, 65535, 65536, 65537, 2 * 65536 + 19] {
-            let contents: Vec<_> = (0..length).map(|index| (index % 251) as u8).collect();
-            std::fs::write(&executable, &contents).unwrap();
-            let file = std::fs::File::open(&executable).unwrap();
-            assert_eq!(executable_digest(file).await.unwrap(), digest(&contents));
-        }
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 Date: 2026-09-24
 
-Updated: 2026-11-24
+Updated: 2026-11-26
 
 ## Status
 
@@ -20,10 +20,13 @@ Its monitor/launch callers cut over together without old-contract decoders,
 compatibility bridges or state-upgrade scripts. The earlier naming decisions
 below describe the existing surface, not a requirement to preserve old state.
 
-The 2026-11-24 revision requires boot launches to start the monitor by path on
-Linux and Darwin. Linux executes a retained monitor descriptor only for
-restore, to run the executable that passed native inspection. Darwin cannot
-exec `/dev/fd/N`.
+The 2026-11-24 revision requires boot launches to start the monitor by its
+resolved path on Linux and Darwin.
+
+The 2026-11-26 revision applies the same rule to every launch, including
+restore, on all hosts. The manager does not retain or compare the executable's
+identity between inspection and launch. Native inspection of the saved state
+determines restore compatibility. Darwin still does not admit restore.
 
 Supersedes the "`vmm` Process Model" and "Startup and Shutdown Semantics"
 sections of [ADR 0004](0004-daemonless-architecture.md). The daemonless
@@ -163,12 +166,12 @@ producer's duplicate/exec chain.
 
 All parent descriptors remain CLOEXEC, including during concurrent launches;
 only the intended child's bounded allowlist changes in pre-exec. Adoption
-restores CLOEXEC before starting threads or unrelated children. Boot launches
-start the monitor by its resolved path on all hosts. Only restore on Linux
-executes the retained, inspected monitor through `/proc/self/fd/N`; the
-descriptor stays CLOEXEC and is absent from the loaded monitor. Darwin cannot
-exec `/dev/fd/N` and does not admit restore. The Linux worker re-execs
-`/proc/self/exe`.
+restores CLOEXEC before starting threads or unrelated children. Every launch,
+including restore, starts the monitor by its resolved path on all hosts.
+The manager does not retain or compare the executable's identity between
+inspection and launch. The monitor's native inspection of the saved state
+admits or refuses restore on supported hosts. Darwin still does not admit
+restore. The Linux worker re-execs `/proc/self/exe`.
 Manager lease ownership includes complete startup or actual failure cleanup.
 Monitor/worker lease ownership includes attachment terminality; the monitor
 also retains its lease through checked finalization and durable exit publication.

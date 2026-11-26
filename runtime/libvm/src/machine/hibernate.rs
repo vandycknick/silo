@@ -592,10 +592,8 @@ impl Machine {
                 objects: descriptors, lowers, network: record.begin.effective_network.clone(), ssh_trusted_ca: Some(record.begin.ssh_trusted_ca.clone()), hook: None,
             };
             request.validate().map_err(|error| failure(config, error))?;
-            let executable = crate::storage::stream::open_regular_source(runtime.supervisor().executable())?;
-            let executable_identity = crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?);
-            crate::machine::restore::inspect(&executable, &request, request.network.is_some()).await.map_err(|_| LibVmError::HibernateUnusable { reference: config.name.clone(), reason: crate::storage::hibernate_file::HibernateUnusableReason::NotCompatible })?;
-            let restore = crate::supervisor::launch::RestoreLaunch { request, objects, executable, executable_identity, lowers: lower_files };
+            crate::machine::restore::inspect(runtime.supervisor().executable(), &request, request.network.is_some()).await.map_err(|_| LibVmError::HibernateUnusable { reference: config.name.clone(), reason: crate::storage::hibernate_file::HibernateUnusableReason::NotCompatible })?;
+            let restore = crate::supervisor::launch::RestoreLaunch { request, objects, lowers: lower_files };
             runtime.ensure_machine_runtime_directories(config.id)?;
             let paths = runtime.machine_paths(config.id);
             let lifetime = crate::lock_manager::MachineLifetimeLock::try_acquire(&paths.vmm_lock_path())?.ok_or_else(|| failure(config, "the previous run still owns the machine; retry after it exits"))?;
