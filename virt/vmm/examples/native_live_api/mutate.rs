@@ -5,10 +5,13 @@ use std::io::Write;
 use std::path::Path;
 
 use eyre::ensure;
+#[cfg(target_os = "linux")]
 use libkrun::live::{kvm, CpuExecutionState, ExecutionEnvelope, VmExecutionState};
 use serde_json::json;
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
 pub(crate) fn run(arguments: Vec<OsString>) -> eyre::Result<()> {
     ensure!(
         arguments.len() == 3,
@@ -115,6 +118,7 @@ pub(crate) fn run(arguments: Vec<OsString>) -> eyre::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn inspect(arguments: Vec<OsString>) -> eyre::Result<()> {
     ensure!(
         arguments.len() == 1,
@@ -150,6 +154,20 @@ pub(crate) fn inspect(arguments: Vec<OsString>) -> eyre::Result<()> {
             "cpus": cpus, "pitProfile": vm.pit_profile, "clock": vm.clock,
             "clockFlags": vm.clock_flags, "hostTsc": vm.host_tsc, "realtime": vm.realtime,
         })
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn inspect(arguments: Vec<OsString>) -> eyre::Result<()> {
+    ensure!(
+        arguments.len() == 1,
+        "usage: native-live-api inspect-execution INPUT"
+    );
+    writeln!(
+        std::io::stdout().lock(),
+        "{}",
+        crate::entry::execution_evidence(Path::new(&arguments[0]), None)?
     )?;
     Ok(())
 }

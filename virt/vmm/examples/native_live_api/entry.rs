@@ -1,7 +1,9 @@
 use std::fs::{File, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::io::Seek;
 use std::io::{self, BufRead, Read, Write};
-use std::num::NonZeroU32;
-use std::os::fd::{AsFd, AsRawFd};
+use std::num::{NonZeroU32, NonZeroU8};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -25,6 +27,8 @@ struct Launch {
     restore: Option<PathBuf>,
     echo_port: NonZeroU32,
     generation_proof_mode: u8,
+    #[serde(default)]
+    cpus: Option<NonZeroU8>,
     #[serde(default)]
     proof: Option<RestoreProof>,
     #[serde(default)]
@@ -81,6 +85,25 @@ fn reply(prefix: &str, value: &Value) -> eyre::Result<()> {
 }
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(30)
+}
+fn descriptor_path(fd: RawFd) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    const FD_DIR: &str = "/proc/self/fd";
+    #[cfg(target_os = "macos")]
+    const FD_DIR: &str = "/dev/fd";
+    Path::new(FD_DIR).join(fd.to_string())
+}
+fn copy_fixture_disk(disk: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    std::fs::copy(disk, destination)?;
+    #[cfg(target_os = "macos")]
+    {
+        // /dev/fd duplicates the paused disk's open file description and offset.
+        let mut source = File::open(disk)?;
+        source.rewind()?;
+        io::copy(&mut source, &mut new_output(destination)?)?;
+    }
+    Ok(())
 }
 fn field<const N: usize>(path: &Path) -> eyre::Result<[u8; N]> {
     bounded(path, N as u64)?
@@ -182,6 +205,7 @@ mod mutate;
 pub(crate) fn main() -> eyre::Result<()> {
     let mut arguments = std::env::args_os().skip(1);
     match arguments.next().as_deref() {
+        #[cfg(target_os = "linux")]
         Some(command) if command == std::ffi::OsStr::new("mutate-execution") => {
             return crate::entry::mutate::run(arguments.collect());
         }
@@ -254,6 +278,7 @@ pub(crate) fn main() -> eyre::Result<()> {
         proof_gate("build")?;
     }
     let endpoints = standalone.ok_or_else(|| eyre::eyre!("standalone provider roles missing"))?;
+    let cpus = launch.cpus.map_or(2, NonZeroU8::get);
     let mux = mux.ok_or_else(|| eyre::eyre!("mux role missing"))?;
     let mut worker = None;
     let mut queued_public = None;
@@ -280,14 +305,15 @@ pub(crate) fn main() -> eyre::Result<()> {
         let map_node_store = map_node_store.clone();
         let disks: Vec<PathBuf> = raw_handles
             .iter()
-            .map(|fd| PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())))
+            .map(|fd| descriptor_path(fd.as_raw_fd()))
             .collect();
         worker = Some(
             std::thread::Builder::new()
                 .name("native-api-proof-control".into())
                 .spawn(move || {
                     let cleanup = control.clone();
-                    let outcome = command_loop(control, token, binding, disks, map_node_store);
+                    let outcome =
+                        command_loop(control, token, binding, disks, map_node_store, cpus);
                     if outcome.is_err() {
                         // Malformed input never strands a native event-loop owner.
                         cleanup.stop(OperationId(u64::MAX), deadline())?;
@@ -357,7 +383,7 @@ pub(crate) fn main() -> eyre::Result<()> {
         let mut disks = Vec::new();
         for (index, fd) in raw_handles.iter().enumerate() {
             disks.push(vm_spec::Disk {
-                path: format!("/proc/self/fd/{}", fd.as_raw_fd()).into(),
+                path: descriptor_path(fd.as_raw_fd()),
                 role: if index == 0 {
                     vm_spec::DiskRole::Root
                 } else {
@@ -397,7 +423,7 @@ pub(crate) fn main() -> eyre::Result<()> {
                 || "native-api-proof".into(),
                 |fixture| fixture.machine_id.clone(),
             ),
-            cpus: 2,
+            cpus,
             memory_mib: 512,
             kernel: Some(launch.kernel.clone()),
             initramfs: Some(launch.initramfs.clone()),
@@ -744,6 +770,7 @@ struct Commands {
     current: Option<(CaptureTicket, PathBuf)>,
     baselines: Vec<BaselineToken>,
     map_node_store: PathBuf,
+    cpus: u8,
     layout_digest: [u8; 32],
 }
 impl Commands {
@@ -817,7 +844,7 @@ impl Commands {
             .control
             .flush_writable_disks(self.pause()?, operation, deadline())?;
         for (index, disk) in self.disks.iter().enumerate() {
-            std::fs::copy(disk, directory.join(format!("disk{index}.raw")))?;
+            copy_fixture_disk(disk, &directory.join(format!("disk{index}.raw")))?;
         }
         let binding = StateBinding {
             live_state_schema: libkrun::capabilities::LIVE_STATE_SCHEMA.to_string(),
@@ -902,6 +929,7 @@ impl Commands {
             let member = |name: &str| -> eyre::Result<Value> {
                 use std::os::unix::fs::PermissionsExt;
                 let file = File::open(directory.join(name))?;
+                #[cfg(target_os = "linux")]
                 crate::restore::inputs::reject_surviving_writer(&file)?;
                 file.set_permissions(std::fs::Permissions::from_mode(0o400))?;
                 Ok(serde_json::to_value(crate::restore::inputs::fingerprint(
@@ -984,7 +1012,7 @@ impl Commands {
             &directory.join("api-capture.json"),
             &json!({"schema":1,"api":"Silo engine / public libkrun::live","authority":"identified-snapshot",
             "binding":binding_json(&binding),"attachments":attachments,
-            "execution_evidence":execution_evidence(&directory.join("execution.state"))?,
+            "execution_evidence":execution_evidence(&directory.join("execution.state"), Some(self.cpus))?,
             "execution":object(&directory.join("execution.state"), execution.execution.length)?,
             "devices":object(&directory.join("devices.state"), execution.devices.length)?,
             "ram_map":object(&directory.join(vm_spec::capture::CAPTURE_RAM_MAP_FILE), map_length)?,
@@ -1186,9 +1214,10 @@ impl Commands {
                     &json!({"memory_generation":self.control.baseline(deadline())?.map(|token|token.memory_generation())}),
                 )?;
             }
+            #[cfg(target_os = "linux")]
             "profile" => {
                 self.control.set_capture_profile(
-                    observed_profile(Path::new(operand))?,
+                    observed_profile(Path::new(operand), self.cpus)?,
                     operation,
                     deadline(),
                 )?;
@@ -1202,13 +1231,20 @@ impl Commands {
         Ok(false)
     }
 }
-fn execution_evidence(path: &Path) -> eyre::Result<Value> {
+fn execution_evidence(path: &Path, expected_cpus: Option<u8>) -> eyre::Result<Value> {
     let saved = ExecutionEnvelope::decode(&bounded(path, 16 * 1024 * 1024)?)?;
-    ensure!(
-        saved.cpus.len() == 2,
-        "exact two-CPU native execution inventory"
-    );
-    let mut cpus = Vec::new();
+    if let Some(expected_cpus) = expected_cpus {
+        ensure!(
+            saved.cpus.len() == usize::from(expected_cpus),
+            "native execution inventory differs from fixture vCPU count {expected_cpus}"
+        );
+    }
+    platform_execution_evidence(&saved)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_execution_evidence(saved: &ExecutionEnvelope) -> eyre::Result<Value> {
+    let mut cpus = Vec::with_capacity(saved.cpus.len());
     for state in &saved.cpus {
         let CpuExecutionState::Kvm(kvm::KvmCpuState::X86(cpu)) = state else {
             eyre::bail!("proof lane requires actual KVM x86 execution");
@@ -1235,12 +1271,50 @@ fn execution_evidence(path: &Path) -> eyre::Result<Value> {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn platform_execution_evidence(saved: &ExecutionEnvelope) -> eyre::Result<Value> {
+    let VmExecutionState::Hvf(vm) = &saved.vm else {
+        eyre::bail!("proof lane requires actual HVF arm64 controller");
+    };
+    // The fork stores the HVF general registers in native hv_reg_t order.
+    const HV_REG_PC: usize = 31;
+    const HV_REG_CPSR: usize = 34;
+    let mut cpus = Vec::with_capacity(saved.cpus.len());
+    for state in &saved.cpus {
+        let CpuExecutionState::Hvf(cpu) = state else {
+            eyre::bail!("proof lane requires actual HVF arm64 execution");
+        };
+        cpus.push(json!({
+            "id": cpu.logical_id, "pc": cpu.general[HV_REG_PC], "cpsr": cpu.general[HV_REG_CPSR],
+            "mpidr": cpu.mpidr, "counter_frequency": cpu.frequency,
+            "timer": {
+                "offset": cpu.timer.offset, "masked": cpu.timer.masked,
+                "virtual_compare": cpu.timer.virtual_compare, "virtual_control": cpu.timer.virtual_control,
+                "physical_compare": cpu.timer.physical_compare, "physical_control": cpu.timer.physical_control,
+            },
+            "pending_irq": cpu.pending_irq, "pending_fiq": cpu.pending_fiq,
+            "disposition": format!("{:?}", cpu.software.disposition),
+            "software_pending_irqs": cpu.software.pending_irqs, "wake_pending": cpu.software.wake_pending,
+        }));
+    }
+    Ok(json!({
+        "decoder": "existing public ExecutionEnvelope::decode, not a second codec",
+        "lane": "HvfArm64", "cpus": cpus, "clock_cut": {
+            "host_counter": vm.clock.host_counter, "counter_frequency": vm.clock.frequency,
+            "mach_timebase_numer": vm.clock.timebase_numer, "mach_timebase_denom": vm.clock.timebase_denom,
+        },
+        "gic_blob_length": vm.gic.bytes.len(),
+        "irq_routes": format!("{:?}", saved.irq_routes), "legacy": format!("{:?}", saved.legacy),
+    }))
+}
+
 fn command_loop(
     control: Control,
     restore: Option<RestoreToken>,
     binding: PathBuf,
     disks: Vec<PathBuf>,
     map_node_store: PathBuf,
+    cpus: u8,
 ) -> eyre::Result<()> {
     let layout_digest = Sha256::digest(control.ram_layout(deadline())?.canonical_bytes()).into();
     let mut commands = Commands {
@@ -1254,6 +1328,7 @@ fn command_loop(
         current: None,
         baselines: Vec::new(),
         map_node_store,
+        cpus,
         layout_digest,
     };
     if let Some(baseline) = commands.control.baseline(deadline())? {
@@ -1293,7 +1368,8 @@ fn command_loop(
         }
     }
 }
-fn observed_profile(directory: &Path) -> eyre::Result<KvmCaptureProfile> {
+#[cfg(target_os = "linux")]
+fn observed_profile(directory: &Path, cpus: u8) -> eyre::Result<KvmCaptureProfile> {
     let text = |name: &str| -> eyre::Result<String> {
         Ok(String::from_utf8(bounded(&directory.join(name), 65536)?)?)
     };
@@ -1307,11 +1383,11 @@ fn observed_profile(directory: &Path) -> eyre::Result<KvmCaptureProfile> {
         "actual same-boot kernel/clock profile"
     );
     ensure!(
-        clockevents.lines().count() == 2
+        clockevents.lines().count() == usize::from(cpus)
             && clockevents
                 .lines()
                 .all(|value| value.trim() == "lapic-deadline"),
-        "two actual deadline clockevents"
+        "actual deadline clockevents for every fixture vCPU"
     );
     let header="path=/sys/devices/system/clockevents/broadcast/current_device\nread_complete=1\nbytes_read=";
     let (length, kind) = state
@@ -1338,4 +1414,31 @@ fn observed_profile(directory: &Path) -> eyre::Result<KvmCaptureProfile> {
         broadcast_uses_pit: false,
         speaker_or_counter_consumer: false,
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    use crate::entry::{copy_fixture_disk, descriptor_path, new_output};
+
+    #[test]
+    fn fixture_disk_copy_starts_at_zero_even_with_shared_offset() -> std::io::Result<()> {
+        let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&directory)?;
+        let result = (|| {
+            let mut source = new_output(&directory.join("original"))?;
+            source.write_all(b"fixture disk bytes")?;
+            source.seek(SeekFrom::Start(7))?;
+            let disk = descriptor_path(source.as_raw_fd());
+            for name in ["first", "second"] {
+                let destination = directory.join(name);
+                copy_fixture_disk(&disk, &destination)?;
+                assert_eq!(std::fs::read(destination)?, b"fixture disk bytes");
+            }
+            Ok(())
+        })();
+        result.and(std::fs::remove_dir_all(directory))
+    }
 }

@@ -12,6 +12,7 @@ import argparse
 import fcntl
 import json
 import os
+import sys
 from pathlib import Path
 
 
@@ -25,6 +26,7 @@ def main() -> None:
     parser.add_argument("--ram-image-fd", type=int)
     parser.add_argument("--ram-layout-fd", type=int)
     parser.add_argument("--generation", choices=("on",))
+    parser.add_argument("--cpus", type=int, choices=range(1, 256), metavar="1..255")
     parser.add_argument("--generation-proof-mode", type=int, choices=(1, 2, 3, 4), default=0)
     parser.add_argument("--silo-fixture", type=Path)
     args = parser.parse_args()
@@ -34,6 +36,8 @@ def main() -> None:
     launch = {"kernel": str(args.kernel), "initramfs": str(args.initramfs),
               "binding": str(args.binding), "restore": str(args.restore) if args.restore else None,
               "echo_port": args.echo_port, "generation_proof_mode": args.generation_proof_mode}
+    if args.cpus is not None:
+        launch["cpus"] = args.cpus
     if args.silo_fixture is not None:
         with args.silo_fixture.open("rb") as fixture:
             fixture_bytes = fixture.read(4097)
@@ -51,7 +55,8 @@ def main() -> None:
     payload = json.dumps(launch, separators=(",", ":")).encode()
     if len(payload) > 4096:
         raise ValueError("bounded bootstrap metadata exceeds atomic pipe write")
-    config, writer = os.pipe2(os.O_CLOEXEC)
+    # Python creates os.pipe() descriptors non-inheritable on Darwin.
+    config, writer = os.pipe() if sys.platform == "darwin" else os.pipe2(os.O_CLOEXEC)
     if os.write(writer, payload) != len(payload):
         raise RuntimeError("short bootstrap metadata write")
     os.close(writer)
@@ -72,14 +77,15 @@ def main() -> None:
                  for destination, source in roles.items()}
     for destination, source in temporary.items():
         os.dup2(source, destination, inheritable=True)
-    for raw in os.listdir("/proc/self/fd"):
+    fd_directory = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
+    for raw in os.listdir(fd_directory):
         fd = int(raw)
         if fd >= 3 and fd not in roles:
             try:
                 os.close(fd)
             except OSError:
                 # os.listdir's own directory FD is already closed.
-                if Path(f"/proc/self/fd/{fd}").exists():
+                if (fd_directory / raw).exists():
                     raise
     os.execv(entry, [str(entry), *(["--restore"] if args.restore else [])])
 

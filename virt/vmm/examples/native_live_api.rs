@@ -54,21 +54,33 @@ mod virt;
 #[path = "../src/vsock/mod.rs"]
 mod vsock;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 #[path = "native_live_api/stream_map.rs"]
 mod native_stream_map;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 #[path = "native_live_api/entry.rs"]
 mod entry;
 
 fn main() -> eyre::Result<()> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     {
         entry::main()
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
     {
-        eyre::bail!("native API proof is KVM x86_64 only; HVF/KVM arm64 pending-lane")
+        eyre::bail!("native API proof requires KVM x86_64 or HVF arm64")
     }
 }

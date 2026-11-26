@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,9 @@ from types import SimpleNamespace
 import unittest
 import time
 
-from silo_smoke import prereqs, shutdown
+import pytest
+
+from silo_smoke import native_live_launch, prereqs, shutdown
 from silo_smoke.native_live_api import cleanup_session, make_session_type
 from silo_smoke.native_live_trace import _record_restore_wait
 
@@ -467,6 +470,81 @@ class StoppedTraceLifecycleTests(unittest.TestCase):
             self.assertEqual(json.loads((directory / "return.json").read_text()), {"errno": 0})
 
 
+@pytest.mark.parametrize("restoring", [False, True])
+def test_launcher_exec_preserves_only_fixed_roles(tmp_path: Path, restoring: bool) -> None:
+    # The exec target observes real descriptors without starting a VM.
+    entry = tmp_path / "inspect-fds"
+    entry.write_text(f"#!{sys.executable}\n" + """\
+import json, os, sys
+roles = {}
+for fd in range(3, 128):
+    try:
+        status = os.fstat(fd)
+    except OSError:
+        continue
+    roles[fd] = [status.st_dev, status.st_ino]
+assert os.fstat(4) == os.fstat(1)
+assert os.fstat(5) == os.fstat(0)
+with os.fdopen(3) as config:
+    result = {"pid": os.getpid(), "roles": roles, "args": sys.argv[1:],
+              "config": json.load(config)}
+os.write(4, json.dumps(result).encode())
+""")
+    entry.chmod(0o700)
+    binding = tmp_path / "binding"
+    binding.mkdir()
+    command = [sys.executable, native_live_launch.__file__, "--binding", str(binding),
+               "--kernel", "unused-kernel", "--initramfs", "unused-initramfs", "--echo-port", "1"]
+    expected: dict[str, list[int]] = {}
+    inherited: list[int] = []
+    fd_arguments = {6: "console", 7: "mux", 29: "net", 30: "console-input", 31: "console-output"}
+    filenames = {9: "disk0", 10: "disk1"}
+    if restoring:
+        command += ["--restore", str(tmp_path), "--cpus", "3"]
+        fd_arguments.update({25: "ram-image", 26: "ram-layout"})
+        filenames.update({27: "execution.state", 28: "devices.state", 33: "memory.root"})
+
+    for role, name in filenames.items():
+        path = tmp_path / name
+        path.write_text(name)
+        status = path.stat()
+        expected[str(role)] = [status.st_dev, status.st_ino]
+        if role in (9, 10):
+            command += [f"--{name}", str(path)]
+    try:
+        for role, name in fd_arguments.items():
+            path = tmp_path / name
+            path.write_text(name)
+            fd = os.open(path, os.O_RDONLY)
+            inherited.append(fd)
+            status = os.fstat(fd)
+            expected[str(role)] = [status.st_dev, status.st_ino]
+            command += [f"--{name}-fd", str(fd)]
+        inherited.append(fcntl.fcntl(inherited[0], fcntl.F_DUPFD_CLOEXEC, 96))
+        with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, pass_fds=tuple(inherited),
+                              env={**os.environ, "SILO_NATIVE_API_EXECUTABLE": str(entry)}) as child:
+            try:
+                stdout, stderr = child.communicate(timeout=10)
+            except BaseException:
+                child.kill()
+                child.wait()
+                raise
+            assert child.returncode == 0, stderr.decode()
+            result = json.loads(stdout)
+            assert result["pid"] == child.pid
+    finally:
+        for fd in inherited:
+            os.close(fd)
+
+    roles = result["roles"]
+    assert set(roles) == {"3", "4", "5", "8", *expected}
+    assert {role: roles[role] for role in expected} == expected
+    lease = (tmp_path / "api.lease").stat()
+    assert roles["8"] == [lease.st_dev, lease.st_ino]
+    assert result["args"] == (["--restore"] if restoring else [])
+    assert result["config"].get("cpus") == (3 if restoring else None)
+    assert result["config"]["restore"] == (str(tmp_path) if restoring else None)
 
 if __name__ == "__main__":
     unittest.main()
