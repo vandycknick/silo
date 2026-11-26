@@ -9,7 +9,10 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
-use vm_spec::live::{LiveAvailability, LiveBackend, LiveHostReport, LiveOperation};
+use vm_spec::live::{
+    LiveAvailability, LiveBackend, LiveHostReport, LiveLane, LiveOperation, LiveReasonCode,
+    LiveUnsupportedReason,
+};
 
 use crate::runtime::{RuntimeConfig, VirtBackendOverride};
 use crate::LibVmError;
@@ -82,6 +85,21 @@ impl ResolvedBackendSelection {
             scenario_digest: self.scenario_digest.clone(),
         }
     }
+}
+
+pub(crate) fn require_operation_backend(
+    backend: LiveBackend,
+    operation: LiveOperation,
+) -> Result<(), LibVmError> {
+    if backend == LiveBackend::Vz {
+        return Err(LibVmError::LiveOperationUnsupported {
+            operation,
+            backend,
+            lane: LiveLane::NotApplicable,
+            reason: LiveUnsupportedReason::new(LiveReasonCode::BackendExcluded),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

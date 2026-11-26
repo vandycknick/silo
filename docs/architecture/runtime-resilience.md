@@ -89,8 +89,9 @@ These endpoints refuse unsupported operations with typed capability errors.
 They never stop a machine, capture only its disks, or cold boot as a fallback.
 `snapshot create` on a running VM without `--memory` is refused ("VM is running:
 stop it first, or use --memory to include its memory"), and `--memory` on a
-stopped VM is refused. For VZ the ordinary alternative is to use `silo stop`,
-then the snapshot workflow without memory.
+stopped VM is refused. On krun, a live refusal suggests stopping the machine
+with `silo stop`, then taking a snapshot without memory. On VZ, snapshots,
+forks and live operations need the krun backend.
 
 Snapshot-with-memory and live fork requests default to incremental capture and a 60 percent
 dirty crossover. `--capture-policy full` forces full capture; the existing

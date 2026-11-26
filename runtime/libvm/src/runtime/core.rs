@@ -446,6 +446,14 @@ impl Runtime {
         self.live_query.selection().backend
     }
 
+    /// Refuses operations excluded by this runtime's selected backend.
+    pub fn require_operation_backend(
+        &self,
+        operation: vm_spec::live::LiveOperation,
+    ) -> Result<(), LibVmError> {
+        crate::runtime::capabilities::require_operation_backend(self.effective_backend(), operation)
+    }
+
     pub(crate) fn image_progress(&self) -> Option<&ImageProgressSender> {
         self.image_progress.as_ref()
     }

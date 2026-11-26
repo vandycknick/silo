@@ -479,6 +479,8 @@ machine with private disks and the captured boot assets; RAM is discarded and
 the disks may need journal recovery on boot. Its stop outcome is unknown; an
 explicit `silo start <CHILD>` cold-boots it.
 
+The krun backend is required for snapshots, forks, restores and hibernation.
+
 Transfer a complete stored image through an OCI VM artifact:
 
 ```bash

@@ -1717,10 +1717,9 @@ weaken its no-mutation requirement.
 into a different operation: libvm never stops a machine to snapshot it, never
 downgrades a `--memory` snapshot request to one without memory, and never cold
 boots in place of a restore. Snapshots without memory and their restore in
-[ADR 0014](0014-layered-oci-image-storage.md) keep working unchanged on every
-backend, VZ included; restoring a snapshot with memory from its sealed disks
-only is the explicit `silo restore REF --without-memory` operation, requested
-by name.
+[ADR 0014](0014-layered-oci-image-storage.md) require the krun backend.
+Restoring a snapshot with memory from its sealed disks only is the explicit
+`silo restore REF --without-memory` operation, requested by name.
 
 **Restore admission.** A snapshot's compatibility profile names its lane.
 libvm compares it with the host vector before allocation; a VZ-selected
@@ -2227,8 +2226,9 @@ HVF arm64 on macOS 26 or later); their results do not grant runtime support.
   budget reservation, child allocation or monitor command; the machine state,
   run ID and database are byte-identical before and after; `silo system
   info`, `silo info` and the `silod` status API already reported the
-  unsupported bit. A snapshot without memory of the same machine, once stopped, succeeds
-  unchanged. Exercised through the mock backend's declared vector and on a
+  unsupported bit. On krun, a snapshot without memory of the same machine,
+  once stopped, succeeds unchanged. VZ refuses stopped snapshots before any
+  change as well. Exercised through the mock backend's declared vector and on a
   macOS host with VZ selected.
 - **Budgets.** Command start to agent ready, full and incremental pause,
   source-unavailable time, seal latency, N-child time to all agents ready,
@@ -2359,8 +2359,10 @@ acknowledgement. The acknowledged virtio protocol is adopted instead.
 Apple's `saveMachineStateTo` exists on Apple silicon from macOS 14, produces a
 host-bound encrypted file, offers no memory sharing between restores and
 rejects configurations Silo attaches today (entropy and console devices were
-reported unsupported by other implementers). VZ keeps snapshots without memory; a VZ
-execution profile would be a separate ADR.
+reported unsupported by other implementers). VZ supports no snapshots
+today. Snapshots with memory, restore with memory and pause are planned for VZ
+under a separate VZ execution-profile ADR; snapshots without memory, forks and
+hibernation are not planned there.
 
 ## Accepted Limitations
 

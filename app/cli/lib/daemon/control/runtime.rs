@@ -261,6 +261,9 @@ impl w::runtime_service_server::RuntimeService for Service {
     ) -> Result<Response<w::MachineSnapshot>, Status> {
         let (source, options) = silo_vm_control::stopped::restore_request_from_wire(r.into_inner())
             .map_err(conversion)?;
+        self.config
+            .require_operation_backend(vm_spec::live::LiveOperation::Restore)
+            .map_err(native)?;
         // A registry reference may need a pull first; libvm checks it in restore.
         if let libvm::RestoreSource::Local(reference) = &source {
             let query = match self.runtime.get() {

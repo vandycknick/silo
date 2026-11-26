@@ -424,6 +424,10 @@ async fn early_rejection_precedes_stopping_and_exhausted_daemon_admission() {
         ),
         (
             LiveOperation::Capture,
+            machines.hibernate_machine(request()).await.unwrap_err(),
+        ),
+        (
+            LiveOperation::Capture,
             machines
                 .create_snapshot(w::CreateSnapshotRequest {
                     machine: request().machine,
@@ -431,6 +435,29 @@ async fn early_rejection_precedes_stopping_and_exhausted_daemon_admission() {
                     capture_policy: Some(w::CapturePolicy::Full as i32),
                     dirty_crossover_percent: Some(60),
                     ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+        ),
+        (
+            LiveOperation::Capture,
+            machines
+                .create_snapshot(w::CreateSnapshotRequest {
+                    machine: request().machine,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+        ),
+        (
+            LiveOperation::Fork,
+            machines
+                .fork_stopped(w::StoppedForkRequest {
+                    machine: request().machine,
+                    name: Some("child".into()),
+                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
+                        &libvm::ExternalResourcePolicy::Reject,
+                    )),
                 })
                 .await
                 .unwrap_err(),
@@ -447,6 +474,22 @@ async fn early_rejection_precedes_stopping_and_exhausted_daemon_admission() {
                         &libvm::RestoreSource::Local("snap".parse().unwrap()),
                         &libvm::RestoreOptions {
                             name: Some("child".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap_err(),
+        ),
+        (
+            LiveOperation::Restore,
+            runtime
+                .restore_snapshot(
+                    silo_vm_control::stopped::restore_request_to_wire(
+                        &libvm::RestoreSource::Registry("registry.example/team/snapshot:v1".into()),
+                        &libvm::RestoreOptions {
+                            without_memory: true,
                             ..Default::default()
                         },
                     )

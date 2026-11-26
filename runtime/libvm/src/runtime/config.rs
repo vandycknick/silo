@@ -107,6 +107,20 @@ impl RuntimeConfig {
         self
     }
 
+    /// Refuses operations excluded by the selected backend, without opening a runtime.
+    pub fn require_operation_backend(
+        &self,
+        operation: vm_spec::live::LiveOperation,
+    ) -> Result<(), LibVmError> {
+        if self.virt_backend == Some(VirtBackendOverride::Vz) {
+            crate::runtime::capabilities::require_operation_backend(
+                vm_spec::live::LiveBackend::Vz,
+                operation,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Sets the default kernel path.
     pub fn with_kernel_path(mut self, kernel_path: impl Into<PathBuf>) -> Self {
         self.runtime_components = None;

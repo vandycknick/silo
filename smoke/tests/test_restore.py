@@ -433,6 +433,7 @@ def test_restore_selected_vz_backend_rejects_before_any_operational_allocation(
         silo, saved.reference, "restore-wrong-backend",
         env=silo.ws.env(SILO_VIRT_BACKEND="vz"), verification_lease=False)
     assert "backend-excluded" in result.stderr and "vz" in result.stderr.lower(), result.stderr
+    assert "snapshots, forks and live operations need the krun backend" in result.stderr, result.stderr
 
 
 @pytest.mark.skipif(platform.machine().lower() not in {"x86_64", "amd64"}, reason="hardware IRQ witness is x86_64 assembly")

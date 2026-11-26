@@ -47,6 +47,17 @@ impl w::machine_service_server::MachineService for Service {
         r: Request<w::LiveMachineRequest>,
     ) -> Result<Response<w::MachineSnapshot>, Status> {
         let reference = reference(r.into_inner().machine)?;
+        let operation = vm_spec::live::LiveOperation::Capture;
+        if !libvm::LiveObservationReader::open(&self.config)
+            .map_err(native)?
+            .catalog_exists()
+            .map_err(native)?
+        {
+            self.require_machine_live(&reference, operation).await?;
+        }
+        self.config
+            .require_operation_backend(operation)
+            .map_err(native)?;
         let state = self.clone();
         let result = self
             .mutate(async move {

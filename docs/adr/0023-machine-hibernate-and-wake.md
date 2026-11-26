@@ -341,6 +341,8 @@ User-facing messages say what happened and what to do:
 | Situation | Message |
 |---|---|
 | Hibernate succeeds | `Hibernated NAME` |
+| Capture unavailable on a home without a catalog | The host's typed `capture` refusal, without initializing the home. |
+| VZ backend | `capture unsupported: backend-excluded (backend=vz, lane=not-applicable)` with guidance to use krun. |
 | Not running or paused | ``machine `NAME` is not running; start it with `silo start NAME` `` |
 | Already hibernated | ``machine `NAME` is already hibernated; wake it with `silo start NAME` `` |
 | Temporary machine | ``machine `NAME` is a temporary `silo run` machine and cannot be hibernated`` |

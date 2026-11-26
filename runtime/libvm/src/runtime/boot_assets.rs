@@ -522,6 +522,11 @@ pub(crate) fn validate_captured_boot_lane(
     };
 
     storage.validate()?;
+    if backend == LiveBackend::Vz {
+        return Err(invalid_capture(
+            "snapshots, forks, restores and hibernation are not supported on the vz backend",
+        ));
+    }
     if backend != LiveBackend::Krun {
         return Err(invalid_capture(format!(
             "{} boot capture requires the krun direct-boot backend",

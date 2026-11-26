@@ -200,13 +200,20 @@ typed error. The supported route onto VZ is an explicit conversion of the OCI
 image into an opaque raw root (the flattener Silo already owns), which then
 boots on either backend. True layered boot exists only on libkrun.
 
+VZ machines boot from opaque raw roots. Owner decision 2026-11-26: VZ needs no
+parity with krun. Snapshots without memory, restore of such a snapshot, forks
+and hibernation are not supported on VZ and are refused before any change.
+Pause, snapshots with memory and restore with memory are refused on VZ today
+and are planned under a separate VZ execution-profile ADR.
+
 Both families use the same content-addressed artifact store, image references,
-stopped-snapshot contract, chunked transfer machinery and OCI VM-artifact
-format. An OCI container image is an input to Linux filesystem composition. An
-OCI Silo VM artifact is a distribution envelope for machine storage and boot
-metadata; it is also how a raw disk, including a macOS disk, is shared through
-a registry. The two are distinguished by the resolved index's OCI artifact type
-and its descriptors' media types, never by guessing from a tag name.
+chunked transfer machinery and OCI VM-artifact format. On krun they also use
+the same stopped-snapshot contract. An OCI container image is an input to Linux
+filesystem composition. An OCI Silo VM artifact is a distribution envelope for
+machine storage and boot metadata; it is also how a raw disk, including a macOS
+disk, is shared through a registry. The two are distinguished by the resolved
+index's OCI artifact type and its descriptors' media types, never by guessing
+from a tag name.
 
 Silo owns a bounded, deterministic Rust EROFS encoder and changeset composer.
 The initial profile uses uncompressed, block-addressable file payloads. It does
@@ -420,8 +427,9 @@ implicit creation path. Given a resolved OCI container
 image, it writes the merged namespace into a fresh ext4 filesystem through
 `disk-image`, publishes the result as an immutable opaque raw image with a
 whole-disk `LinuxDirect` boot profile and records the source manifest digest as
-provenance. The result is an ordinary raw image: it boots on libkrun and VZ, is
-forkable, snapshottable and publishable, and shares nothing with other images.
+provenance. The result is an ordinary raw image: it boots on libkrun and VZ,
+can be forked and snapshotted on krun, is publishable, and shares nothing with
+other images.
 
 The flattener is not deterministic and its output is transfer-only. So that
 repeated conversion does not accumulate images, the database records each

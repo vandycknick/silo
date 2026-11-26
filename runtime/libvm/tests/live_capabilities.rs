@@ -736,6 +736,26 @@ async fn wait_pause_state(
 }
 
 #[tokio::test]
+async fn resume_without_a_pause_refuses_and_keeps_the_run_running() {
+    use vm_spec::lifecycle::VmLifecycleState;
+    let fixture = Fixture::new(&pause_scenario(Default::default())).await;
+    let observed = fixture.machine.observe_live().await.unwrap();
+    assert_eq!(observed.state().unwrap(), VmLifecycleState::Running);
+    assert!(observed.lifecycle().unwrap().current_pause.is_none());
+
+    let result = fixture.machine.resume(&observed).await;
+    assert!(
+        matches!(&result, Err(LibVmError::MachineNotPaused { reference }) if reference == "source"),
+        "{result:?}"
+    );
+    let current = fixture.machine.observe_live().await.unwrap();
+    assert_eq!(current.state().unwrap(), VmLifecycleState::Running);
+    assert_eq!(current.report().run_id, observed.report().run_id);
+    assert!(current.lifecycle().unwrap().current_pause.is_none());
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn pause_independent_manager_recovers_lost_receipt_replay_conflict_and_stops_parked() {
     use vm_spec::lifecycle::*;
     let fixture = Fixture::new(&pause_scenario(Default::default())).await;
@@ -1021,6 +1041,13 @@ async fn synchronous_pause_native_failure_settles_recovery_and_keeps_original_er
                 "error"
             );
             assert!(lifecycle.error.is_some());
+            let resume = fixture.machine.resume(&current).await.unwrap_err();
+            assert!(
+                matches!(&resume, LibVmError::LiveProtocol { message }
+                    if message.contains("machine has no current pause authority")
+                        && message.contains("observed_state=error")),
+                "{resume:?}"
+            );
             assert!(
                 error.contains("fenced state error: native-rollback-failed during cancel-native")
                     && error.contains("scripted native rollback failure")

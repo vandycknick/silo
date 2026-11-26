@@ -107,6 +107,8 @@ impl Machine {
     /// Save this persistent run and release its processes without guest shutdown.
     /// Cancellation of the caller does not cancel the durable lifecycle owner.
     pub async fn hibernate(&self) -> Result<MachineData, LibVmError> {
+        self.runtime()
+            .require_operation_backend(vm_spec::live::LiveOperation::Capture)?;
         let machine = self.clone();
         tokio::spawn(async move { machine.hibernate_inner().await }).await?
     }

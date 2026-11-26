@@ -199,8 +199,9 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
         );
         let host: LiveHostReport =
             serde_json::from_slice(&query.stdout).expect("fixture monitor host report");
-        for (args, operation) in [
+        let live_cases = [
             (vec!["pause", "absent"], LiveOperation::Pause),
+            (vec!["hibernate", "absent"], LiveOperation::Capture),
             (
                 vec!["snapshot", "create", "absent", "--memory"],
                 LiveOperation::Capture,
@@ -220,7 +221,28 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
                 ],
                 LiveOperation::Restore,
             ),
-        ] {
+        ];
+        let vz_only_cases = [
+            (vec!["snapshot", "create", "absent"], LiveOperation::Capture),
+            (
+                vec!["fork", "absent", "--name", "unallocated-child"],
+                LiveOperation::Fork,
+            ),
+            (
+                vec![
+                    "restore",
+                    "checkpoint",
+                    "--without-memory",
+                    "--pull",
+                    "never",
+                ],
+                LiveOperation::Restore,
+            ),
+        ];
+        for (args, operation) in live_cases
+            .into_iter()
+            .chain(vz_only_cases.into_iter().filter(|_| backend == "vz"))
+        {
             let output = run(temp.path(), backend, &args);
             assert!(!output.status.success(), "unsupported {args:?} succeeded");
             assert!(output.stdout.is_empty());

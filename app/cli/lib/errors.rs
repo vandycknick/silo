@@ -89,15 +89,18 @@ pub(crate) fn native_message(error: &libvm::LibVmError) -> String {
         libvm::LibVmError::MachineNotRunning { reference } => {
             format!("machine `{reference}` is not running; start it with `silo start {reference}`")
         }
+        libvm::LibVmError::MachineNotPaused { reference } => {
+            format!("machine `{reference}` is not paused")
+        }
         _ => error.to_string(),
     }
 }
 
 fn live_refusal(value: &vm_spec::live::LiveOperationUnsupported) -> String {
     let alternative = if value.backend == vm_spec::live::LiveBackend::Vz {
-        "use silo stop, then a snapshot without memory"
+        "snapshots, forks and live operations need the krun backend"
     } else {
-        "use ordinary boot or a stopped-storage workflow; no live fallback is performed"
+        "use silo stop, then a snapshot without memory"
     };
     format!("{value}; {alternative}")
 }
@@ -114,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn vz_refusal_is_one_line_and_names_only_existing_command() {
+    fn vz_refusal_names_the_required_backend() {
         let value = vm_spec::live::LiveOperationUnsupported {
             operation: vm_spec::live::LiveOperation::Pause,
             backend: vm_spec::live::LiveBackend::Vz,
@@ -126,10 +129,39 @@ mod tests {
         let line = crate::errors::live_refusal(&value);
         assert_eq!(line.lines().count(), 1);
         assert!(line.contains("backend-excluded (backend=vz, lane=not-applicable)"));
-        assert!(line.contains("silo stop"));
-        assert!(line.contains("snapshot without memory"));
-        assert!(!line.contains("silo snapshot"));
+        assert!(line.ends_with("; snapshots, forks and live operations need the krun backend"));
+        assert!(!line.contains("silo stop"));
         assert!(!line.contains("checkpoint"));
+    }
+
+    #[test]
+    fn non_vz_refusal_suggests_a_stopped_snapshot() {
+        use vm_spec::live::{LiveBackend, LiveLane, LiveOperation, LiveOperationUnsupported};
+        use vm_spec::live::{LiveReasonCode, LiveUnsupportedReason};
+
+        for (backend, lane) in [
+            (LiveBackend::Krun, LiveLane::HvfArm64),
+            (LiveBackend::Mock, LiveLane::NotApplicable),
+        ] {
+            let line = crate::errors::live_refusal(&LiveOperationUnsupported {
+                operation: LiveOperation::Pause,
+                backend,
+                lane,
+                reason: LiveUnsupportedReason::new(LiveReasonCode::BuildExcluded),
+            });
+            assert!(line.ends_with("; use silo stop, then a snapshot without memory"));
+        }
+    }
+
+    #[test]
+    fn resume_on_running_machine_names_the_missing_pause() {
+        let error = libvm::LibVmError::MachineNotPaused {
+            reference: "dev".into(),
+        };
+        assert_eq!(
+            crate::errors::native_message(&error),
+            "machine `dev` is not paused"
+        );
     }
 
     #[test]

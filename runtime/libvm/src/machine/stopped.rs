@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use vm_spec::live::LiveOperation;
 
 use crate::machine::live_operations::{
     report_progress, LiveOperationProgress, LiveOperationProgressSender,
@@ -300,6 +301,11 @@ pub async fn preflight_stopped(
     if snapshot {
         validate_snapshot_policy(policy)?;
     }
+    config.require_operation_backend(if snapshot {
+        LiveOperation::Capture
+    } else {
+        LiveOperation::Fork
+    })?;
     crate::LiveObservationReader::open(config)?
         .require_machine_exists(reference)
         .await?;
@@ -343,6 +349,7 @@ pub async fn preflight_restore_snapshot(
     options: &RestoreOptions,
 ) -> Result<(), LibVmError> {
     options.validate()?;
+    config.require_operation_backend(LiveOperation::Restore)?;
     let policy = &options.external_resources;
     // With no catalog there is no snapshot whose kind could be looked up, so a
     // host that cannot restore memory refuses here, before anything is created.
@@ -413,6 +420,8 @@ async fn preflight_boot(
 
 impl Machine {
     pub async fn fork_stopped(&self, options: ForkOptions) -> Result<Machine, LibVmError> {
+        self.runtime()
+            .require_operation_backend(LiveOperation::Fork)?;
         let runtime = self.runtime().clone();
         let machine_id = self.machine_id();
         let handle = tokio::runtime::Handle::current();
@@ -435,6 +444,9 @@ impl Runtime {
         progress: Option<LiveOperationProgressSender>,
     ) -> Result<CreatedSnapshot, LibVmError> {
         options.validate()?;
+        if !options.memory {
+            self.require_operation_backend(LiveOperation::Capture)?;
+        }
         let machine = self.get_machine(machine).await?;
         let config = self
             .resolve_machine_config(&MachineRef::id(machine.machine_id()))
@@ -493,6 +505,7 @@ impl Runtime {
         progress: Option<LiveOperationProgressSender>,
     ) -> Result<Machine, LibVmError> {
         options.validate()?;
+        self.require_operation_backend(LiveOperation::Restore)?;
         // Refuse before resolution: a refused restore must not pull.
         self.require_recoverable_child_scopes()?;
         let snapshot = self.resolve_restore_source(source, options.pull).await?;
@@ -1974,6 +1987,64 @@ mod tests {
             Err(crate::LibVmError::InvalidStorageRecord { .. })
         ));
         assert!(!home.exists());
+    }
+
+    #[tokio::test]
+    async fn vz_preflights_refuse_before_creating_an_absent_home() {
+        use vm_spec::live::{LiveBackend, LiveLane, LiveOperation, LiveReasonCode};
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("absent-home");
+        let run = temp.path().join("absent-run");
+        let config = crate::RuntimeConfig::local(&home)
+            .with_runtime_components(crate::runtime::components::test_components(temp.path()))
+            .with_virt_backend(crate::VirtBackendOverride::Vz)
+            .with_run_root(&run);
+        let machine = crate::MachineRef::parse("source").unwrap();
+        let query = crate::LiveCapabilityQuery::open(&config).unwrap();
+        let snapshot = "snapshot".parse().unwrap();
+        let check = |result, expected| {
+            assert!(
+                matches!(&result, Err(crate::LibVmError::LiveOperationUnsupported {
+                    operation,
+                    backend: LiveBackend::Vz,
+                    lane: LiveLane::NotApplicable,
+                    reason,
+                }) if *operation == expected && reason.code == LiveReasonCode::BackendExcluded),
+                "{result:?}"
+            );
+            assert!(!home.exists());
+            assert!(!run.exists());
+        };
+
+        for (snapshot, operation) in [(true, LiveOperation::Capture), (false, LiveOperation::Fork)]
+        {
+            check(
+                crate::preflight_stopped(
+                    &config,
+                    &machine,
+                    snapshot,
+                    &ExternalResourcePolicy::Reject,
+                )
+                .await,
+                operation,
+            );
+        }
+        for without_memory in [false, true] {
+            check(
+                crate::preflight_restore_snapshot(
+                    &config,
+                    &query,
+                    &snapshot,
+                    &crate::RestoreOptions {
+                        without_memory,
+                        ..Default::default()
+                    },
+                )
+                .await,
+                LiveOperation::Restore,
+            );
+        }
     }
 
     async fn raw_source(name: &str) -> (tempfile::TempDir, crate::Runtime, crate::Machine) {

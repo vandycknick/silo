@@ -243,6 +243,13 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = "machine is not running".into();
             tonic::Code::FailedPrecondition
         }
+        E::MachineNotPaused { reference } => {
+            d.kind = 4;
+            d.code = w::ErrorCode::NotPaused as i32;
+            d.reference = Some(reference.clone());
+            d.safe_message = "machine is not paused".into();
+            tonic::Code::FailedPrecondition
+        }
         E::MachineStaleGeneration {
             reference,
             requested,
@@ -687,6 +694,12 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
         2 => E::MachineNotRunning {
             reference: required(d.reference, "error.reference")?,
         },
+        code if code == w::ErrorCode::NotPaused as i32 => {
+            category(tonic::Code::FailedPrecondition, 4, "error.not_paused")?;
+            E::MachineNotPaused {
+                reference: required(d.reference, "error.reference")?,
+            }
+        }
         3 => E::MachineStaleGeneration {
             reference: required(d.reference, "error.reference")?,
             requested: required(d.expected_run, "error.expected_run")?
@@ -1238,6 +1251,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn machine_not_paused_round_trips_as_failed_precondition() {
+        use libvm::LibVmError as E;
+        let status = native_error_to_status(&E::MachineNotPaused {
+            reference: "source".into(),
+        });
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "machine is not paused");
+        assert!(matches!(
+            status_to_native_error(&status).unwrap(),
+            E::MachineNotPaused { reference } if reference == "source"
+        ));
     }
 
     fn status(detail: w::ErrorDetail, code: tonic::Code) -> tonic::Status {

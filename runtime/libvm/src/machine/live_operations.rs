@@ -463,6 +463,15 @@ impl Machine {
                 let pending = self
                     .pending_command(observation, vm_spec::lifecycle::LiveCommandKind::Resume)
                     .await;
+                if matches!(pending, Ok(None))
+                    && matches!(observation.state(), Ok(VmLifecycleState::Running))
+                    && lifecycle.activity.is_none()
+                    && lifecycle.error.is_none()
+                {
+                    return Err(LibVmError::MachineNotPaused {
+                        reference: config.name,
+                    });
+                }
                 return Err(missing_pause_authority(
                     observation,
                     &lifecycle,

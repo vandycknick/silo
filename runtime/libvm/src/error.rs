@@ -305,6 +305,9 @@ pub enum LibVmError {
     #[error("machine {reference} is not running")]
     MachineNotRunning { reference: String },
 
+    #[error("machine {reference} is not paused")]
+    MachineNotPaused { reference: String },
+
     #[error("machine {reference} run {requested} is no longer current")]
     MachineStaleGeneration {
         reference: String,
@@ -558,6 +561,7 @@ impl LibVmError {
             Self::MachineAlreadyRunning { .. } => "MachineAlreadyRunning",
             Self::MachineCaptureBusy { .. } => "MachineCaptureBusy",
             Self::MachineNotRunning { .. } => "MachineNotRunning",
+            Self::MachineNotPaused { .. } => "MachineNotPaused",
             Self::MachineStaleGeneration { .. } => "MachineStaleGeneration",
             Self::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
             Self::MonitorConnection { .. } => "MonitorConnection",

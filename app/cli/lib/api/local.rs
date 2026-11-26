@@ -8,6 +8,7 @@ use libvm::{
     ReadOnlyRuntime, Runtime, RuntimeConfig,
 };
 use silo_vm_control::create::{NormalizedMachineCreate, ResolvedNetwork};
+use vm_spec::live::LiveOperation;
 
 use crate::api::machine::AppMachine;
 use crate::api::types::{
@@ -175,7 +176,32 @@ impl LocalVmService {
     }
 
     pub(crate) async fn hibernate_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
-        Ok(self.machine(reference).await?.hibernate().await?)
+        let reference = MachineRef::parse(reference)?;
+        match self {
+            Self::Uninitialized {
+                config: Some(config),
+                ..
+            } => {
+                let reader = libvm::LiveObservationReader::open(config)?;
+                if !reader.catalog_exists()? {
+                    libvm::require_host_live_operation(
+                        &self.live_capabilities().await?,
+                        LiveOperation::Capture,
+                    )?;
+                    reader.require_machine_exists(&reference).await?;
+                } else {
+                    config.require_operation_backend(LiveOperation::Capture)?;
+                }
+            }
+            Self::Ready { runtime, .. } => {
+                runtime.require_operation_backend(LiveOperation::Capture)?;
+            }
+            Self::Uninitialized { config: None, .. } => {
+                eyre::bail!("local runtime configuration unavailable");
+            }
+        }
+        let machine = self.runtime().await?.get_machine(&reference).await?;
+        Ok(machine.hibernate().await?)
     }
 
     pub(crate) async fn pause_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
@@ -370,9 +396,13 @@ impl LocalVmService {
             Self::Uninitialized { config: None, .. } => {
                 eyre::bail!("local runtime configuration unavailable")
             }
-            // Already initialized ownership is not new admission; the native API
-            // repeats authoritative checks under the source lifecycle locks.
-            Self::Ready { .. } => {}
+            Self::Ready { runtime, .. } => {
+                runtime.require_operation_backend(if snapshot {
+                    LiveOperation::Capture
+                } else {
+                    LiveOperation::Fork
+                })?;
+            }
         }
         Ok(())
     }
@@ -400,6 +430,18 @@ impl LocalVmService {
             libvm::validate_new_machine_name(name)?;
         }
         silo_vm_control::stopped::restore_request_to_wire(&source, &options)?;
+        match self {
+            Self::Uninitialized {
+                config: Some(config),
+                ..
+            } => config.require_operation_backend(LiveOperation::Restore)?,
+            Self::Ready { runtime, .. } => {
+                runtime.require_operation_backend(LiveOperation::Restore)?;
+            }
+            Self::Uninitialized { config: None, .. } => {
+                eyre::bail!("local runtime configuration unavailable");
+            }
+        }
         if let libvm::RestoreSource::Local(reference) = &source {
             if let Self::Uninitialized {
                 config: Some(config),
